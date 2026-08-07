@@ -61,6 +61,9 @@ async fn run(line: &str, boot_time: u64) {
             println!("  caps <space>    dump a space's capability table");
             println!("  probe           attempt four illegal operations, show the refusals");
             println!("  revoke <space>  pull a component's authority at runtime");
+            println!("  rustc hello     compile and run a Rust hello world, natively");
+            println!("  rustc demo      compile and run a larger sample (fib, gcd, loops)");
+            println!("  rustc edit      type your own program; end it with a lone `.`");
             println!("  chan            telemetry channel depth and totals");
             println!("  mem             kernel heap usage");
             println!("  uptime          seconds since boot");
@@ -106,24 +109,47 @@ async fn run(line: &str, boot_time: u64) {
                 println!("  usage: revoke <space>");
                 return;
             };
-            if target != "guest" {
-                println!("  init holds a REVOKE cap on `guest` only; nothing to revoke on `{}`", target);
-                return;
-            }
-            // Authority to do this comes from init's cap on the guest *space*.
-            let init = w.spaces["init"].clone();
-            let space_res = {
-                let cs = init.0.lock();
-                cs.lookup_as::<Space>(w.guest_space, Rights::REVOKE)
+            let handle = match target {
+                "guest" => w.guest_space,
+                "prog" => w.prog_space,
+                _ => {
+                    println!("  init holds REVOKE caps on `guest` and `prog` only");
+                    return;
+                }
             };
+            // Authority to do this comes from init's cap on the target *space*.
+            let init = w.spaces["init"].clone();
+            let space_res = init.0.lock().lookup_as::<Space>(handle, Rights::REVOKE);
             match space_res {
-                Ok(guest) => {
-                    let killed = guest.0.lock().revoke_slot(0);
-                    println!("  revoked {} cap(s) in `guest`", killed);
-                    println!("  (its next heartbeat will fail -- no restart, no signal)");
+                Ok(space) => {
+                    let killed = space.0.lock().revoke_slot(0);
+                    println!("  revoked {} cap(s) in `{}`", killed, target);
+                    match target {
+                        "guest" => println!("  (its next heartbeat will fail -- no restart, no signal)"),
+                        _ => println!("  (already-compiled machine code will now print nothing)"),
+                    }
                 }
                 Err(e) => println!("  refused: {}", e),
             }
+        }
+
+        "rustc" => {
+            let src = match rest.first().copied() {
+                Some("hello") | None => String::from(crate::rustc::HELLO_SRC),
+                Some("demo") => String::from(crate::rustc::DEMO_SRC),
+                Some("edit") => match read_source().await {
+                    Some(s) => s,
+                    None => {
+                        println!("  aborted");
+                        return;
+                    }
+                },
+                Some(other) => {
+                    println!("  usage: rustc [hello|demo|edit] (got `{}`)", other);
+                    return;
+                }
+            };
+            compile_and_run(&src).await;
         }
 
         "chan" => {
@@ -166,6 +192,69 @@ async fn run(line: &str, boot_time: u64) {
         }
 
         other => println!("  unknown command: {} (try `help`)", other),
+    }
+}
+
+/// Read a program from the console, terminated by a line containing only `.`.
+async fn read_source() -> Option<String> {
+    println!("  enter your program; finish with a single `.` on its own line");
+    let mut src = String::new();
+    let mut line = String::new();
+    loop {
+        print!("  | ");
+        line.clear();
+        loop {
+            let b = uart::read_byte().await;
+            match b {
+                b'\r' | b'\n' => {
+                    println!();
+                    break;
+                }
+                0x7f | 0x08 => {
+                    if line.pop().is_some() {
+                        print!("\x08 \x08");
+                    }
+                }
+                0x03 => {
+                    println!("^C");
+                    return None;
+                }
+                b if (0x20..0x7f).contains(&b) => {
+                    line.push(b as char);
+                    print!("{}", b as char);
+                }
+                _ => {}
+            }
+        }
+        if line == "." {
+            return Some(src);
+        }
+        src.push_str(&line);
+        src.push('\n');
+    }
+}
+
+async fn compile_and_run(src: &str) {
+    let t0 = sbi::time();
+    let compiled = match crate::rustc::compile(src) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  error: {}", e);
+            return;
+        }
+    };
+    let compile_us = (sbi::time() - t0) / (exec::TIMEBASE_HZ / 1_000_000);
+    println!(
+        "  compiled {} fn -> {} B of RV64 + {} B of data in {} us",
+        compiled.funcs, compiled.bytes, compiled.data_bytes, compile_us
+    );
+    println!("  --- running natively ---");
+
+    let out = crate::rustc::run(&compiled);
+
+    println!("  --- exited with {} in {} us ---", out.value, out.micros);
+    if out.denied {
+        println!("  note: output was suppressed -- `prog` holds no console capability");
     }
 }
 

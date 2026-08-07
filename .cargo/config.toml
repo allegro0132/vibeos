@@ -1,0 +1,16 @@
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+  "-C", "linker=ld.lld",
+  "-C", "linker-flavor=ld",
+  "-C", "link-arg=-Tkernel/linker.ld",
+  "-C", "link-arg=--gc-sections",
+  "-C", "force-frame-pointers=yes",
+]
+runner = "qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M -nographic -bios default -kernel"

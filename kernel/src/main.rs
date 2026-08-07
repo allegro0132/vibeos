@@ -21,6 +21,7 @@ mod dev;
 mod exec;
 mod heap;
 mod plic;
+mod rustc;
 mod sbi;
 mod shell;
 mod sync;
@@ -97,7 +98,7 @@ pub extern "C" fn kmain() -> ! {
     println!("  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled", uart::UART_IRQ);
 
     world::build();
-    println!("  world     4 capability spaces, 1 typed channel, 3 components");
+    println!("  world     5 capability spaces, 1 typed channel, 3 components");
 
     exec::spawn("shell", shell::shell_task(boot_time));
     println!("  sched     async executor, no threads, no preemption");

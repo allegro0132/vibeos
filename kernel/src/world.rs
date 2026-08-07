@@ -52,6 +52,9 @@ pub struct World {
     pub console: Cap,
     pub telemetry: Cap,
     pub guest_space: Cap,
+    /// The space compiled programs run with, and init's handle on it.
+    pub prog_space: Cap,
+    pub prog_console: Cap,
 }
 
 static WORLD: SpinLock<Option<Arc<World>>> = SpinLock::new(None);
@@ -68,6 +71,7 @@ pub fn build() {
     let sensor = Space::new("sensor");
     let logger = Space::new("logger");
     let guest = Space::new("guest");
+    let prog = Space::new("prog");
 
     // init is the root of authority: it mints the only unattenuated caps, then
     // hands out strictly weaker copies. Nothing else can widen what it gets.
@@ -75,6 +79,7 @@ pub fn build() {
     let c_console = cs.mint(console.clone(), Rights::ALL);
     let c_telemetry = cs.mint(telemetry.clone(), Rights::ALL);
     let c_guest_space = cs.mint(guest.clone(), Rights::READ.union(Rights::REVOKE));
+    let c_prog_space = cs.mint(prog.clone(), Rights::READ.union(Rights::REVOKE));
     cs.mint(sensor.clone(), Rights::READ);
     cs.mint(logger.clone(), Rights::READ);
 
@@ -85,6 +90,9 @@ pub fn build() {
     let logger_con = cap::grant(&cs, c_console, Rights::WRITE, &mut logger.0.lock()).unwrap();
     // The guest gets a console it can lose.
     let guest_con = cap::grant(&cs, c_console, Rights::WRITE, &mut guest.0.lock()).unwrap();
+    // Compiled programs get a console and nothing else. Machine code emitted by
+    // the in-kernel compiler reaches the outside world only through this cap.
+    let prog_con = cap::grant(&cs, c_console, Rights::WRITE, &mut prog.0.lock()).unwrap();
     drop(cs);
 
     *WORLD.lock() = Some(Arc::new(World {
@@ -93,10 +101,13 @@ pub fn build() {
             ("sensor", sensor.clone()),
             ("logger", logger.clone()),
             ("guest", guest.clone()),
+            ("prog", prog),
         ]),
         console: c_console,
         telemetry: c_telemetry,
         guest_space: c_guest_space,
+        prog_space: c_prog_space,
+        prog_console: prog_con,
     }));
 
     // Components are *handed* their handles at spawn. That is their whole

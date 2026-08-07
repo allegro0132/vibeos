@@ -99,6 +99,89 @@ match code {
 VibeOS parks in `wfi` and draws no CPU. The waker is the `TaskId` itself cast to
 the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 
+## A Rust compiler, inside the OS
+
+`rustc hello` compiles a Rust hello world to native RV64 and runs it, without
+leaving the kernel:
+
+```
+vibe> rustc hello
+  compiled 1 fn -> 328 B of RV64 + 14 B of data in 5559 us
+  --- running natively ---
+Hello, world!
+  --- exited with 0 in 228 us ---
+```
+
+`rustc demo` builds something with more in it — recursion, `while`, `%`,
+short-circuit `&&`, `if` as an expression:
+
+```
+vibe> rustc demo
+  compiled 3 fn -> 3528 B of RV64 + 70 B of data in 4533 us
+  --- running natively ---
+Hello, world!
+fib(0) = 0  fib(1) = 1  fib(2) = 1  ...  fib(9) = 34
+gcd(1071, 462) = 21
+30 is even and greater than ten
+```
+
+`rustc edit` takes a program typed at the console, ended with a lone `.`.
+
+### The subset
+
+`fn` with `i64` parameters and return type, `let` / `let mut`, assignment,
+`if`/`else` **as an expression**, `else if` chains, `while`, `return`, block tail
+expressions, recursion, `+ - * / %`, `== != < <= > >=`, short-circuiting
+`&& ||`, unary `-` and `!`, and `print!`/`println!` with `{}` holes. Line
+comments. Up to 8 parameters and 252 locals per function.
+
+Diagnostics carry line numbers and say what real rustc would say:
+
+```
+error: line 1: cannot assign twice to immutable variable `x` (declare it `let mut`)
+error: line 2: cannot find value `y` in this scope
+error: line 1: `f` takes 1 argument(s) but 2 were supplied
+error: line 1: format string wants at least 2 argument(s), 1 given
+```
+
+### How it works
+
+AST straight to machine code — no IR, no register allocator. Values live on the
+machine stack and only `t0`/`t1` are live between instructions, so nothing ever
+needs spilling across a call. Slots are 16 bytes wide to keep `sp` aligned to
+the RISC-V C ABI at every call boundary.
+
+Codegen runs twice: pass 1 discovers function addresses, pass 2 emits calls to
+them. Instruction *sizes* never depend on addresses — 64-bit constants are always
+materialized in a fixed 11-instruction sequence — so both passes agree on layout
+by construction. Branches are emitted as an inverted conditional over a `jal`,
+giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
+
+Because VibeOS has no MMU and no W^X, "load the program" is `fence.i` followed by
+transmuting the code buffer to a function pointer and calling it.
+
+### And this is where it earns its place in *this* OS
+
+Generated machine code has no way to reach hardware. Its only exit is a call to
+`rt_print_str`/`rt_print_int`, whose addresses the compiler bakes in and which a
+program cannot name, forge, or substitute. Those hooks resolve the `prog` space's
+console capability **on every call**:
+
+```
+vibe> revoke prog
+  revoked 1 cap(s) in `prog`
+vibe> rustc hello
+  compiled 1 fn -> 328 B of RV64 + 14 B of data in 589 us
+  --- running natively ---
+  --- exited with 0 in 165 us ---
+  note: output was suppressed -- `prog` holds no console capability
+```
+
+Same compiler, byte-identical machine code, and it still runs to completion — it
+just has no authority to say anything. On a conventional OS, native code that has
+already been loaded owns whatever its process owns. Here, authority is not a
+property of the code.
+
 ## What's here
 
 | file | |
@@ -110,10 +193,11 @@ the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 | `shell.rs` | interactive shell (`probe`, `revoke`, `caps`, `ps`, …) |
 | `trap.rs` | S-mode trap entry, IRQ → waker |
 | `uart.rs`, `plic.rs`, `sbi.rs`, `dev.rs` | hardware |
+| `rustc/` | lexer, parser, RV64 code generator, capability-gated runtime |
 | `heap.rs` | bump allocator with size-class free lists |
 | `sync.rs` | interrupt-safe spinlock |
 
-~1800 lines total.
+~3300 lines total.
 
 ## Shell
 
@@ -121,8 +205,11 @@ the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 ps              live tasks and how many times each was polled
 spaces          capability spaces in the system
 caps <space>    dump a space's capability table
+rustc hello     compile and run a Rust hello world, natively
+rustc demo      compile and run a larger sample (fib, gcd, loops)
+rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
-revoke <space>  pull a component's authority at runtime
+revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
 chan            telemetry channel depth and totals
 mem             kernel heap usage
 uptime          seconds since boot
@@ -143,4 +230,10 @@ Deliberate, not overlooked:
   that large.
 - **`lookup_as` uses `Arc::from_raw` after an `Any` check.** Sound, but it wants
   `Arc::downcast` once that's usable through the `Resource` trait object.
+- **The compiler's subset is `i64`-only.** No structs, arrays, references,
+  generics, traits, or borrow checking — a program is functions over integers
+  plus formatted printing. Division by zero follows RISC-V semantics (`-1`,
+  and `%` yields the dividend) rather than panicking.
+- **Compiled programs run on the shell task's 256 KiB stack**, so deep
+  recursion in generated code will run off the end of it.
 - **No persistence, no MMU, no user mode, no multicore.** In that order.

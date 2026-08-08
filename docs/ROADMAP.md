@@ -5,9 +5,11 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
-> **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial.
-> The current baseline is 117 host tests, 49 in-kernel checks, and 7 golden
-> transcripts. See [TESTING.md](../TESTING.md).
+> **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
+> M3.5 is under way with 3.8 complete. The current baseline is 145 host tests,
+> 65 in-kernel checks, and 7 QEMU transcript cases (6 goldens plus the dynamic
+> differential oracle). See
+> [TESTING.md](../TESTING.md).
 
 ## Reassessment: what should happen next
 
@@ -130,7 +132,7 @@ iteration on scheduler logic; interrupt behaviour still belongs in 1.5.
 ---
 
 > **M2 status: complete.** Every hole in BLUEPRINT §6.4 is closed and tested.
-> 117 host tests, 49 in-kernel checks, 7 golden transcripts including a
+> 117 host tests, 49 in-kernel checks, 7 QEMU transcript cases including a
 > differential run against real rustc.
 
 ### M2 — Confinement (v0.3)
@@ -242,14 +244,14 @@ first.
 
 ---
 
-### M3.5 — Lifecycle and evidence (next)
+### M3.5 — Lifecycle and evidence (in progress)
 
 **Goal:** turn the current demo components into bounded, observable, restartable
 units before adding persistence or more concurrency.
 
 | # | Work item | Acceptance |
 |---|---|---|
-| 3.8 | Introduce a `Component` record owning `TaskId`, `CSpace`, memory owner/budget, and state (`Running`, `Exited`, `Faulted`, `Cancelled`) | `ps` and `caps` report the same identity and terminal reason. |
+| 3.8 ✅ | Introduce a `Component` record owning `TaskId`, `CSpace`, memory owner/budget, and state (`Running`, `Exited`, `Faulted`, `Cancelled`) | `ps` and `caps` report the same identity and terminal reason. |
 | 3.9 | Add cooperative task cancellation and join/exit reporting | Cancelling a parked, ready, and self-waking task works; each is polled no more after cancellation. |
 | 3.10 | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
 | 3.11 | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit reclaims its arena. |
@@ -258,6 +260,17 @@ units before adding persistence or more concurrency.
 | 3.14 | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
 | 3.15 | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
 | 3.16 | Define resolved-capability lease semantics | Console hooks either revalidate a revocable token per operation or explicitly hold an invocation lease. Memory access documents the same choice; tests distinguish revoke-before-run from revoke-during-run. |
+
+3.8 separates stable `ComponentId` from a task incarnation's `TaskId`, so a
+later restart can keep its supervisory and memory-owner identity while replacing
+the task and CSpace. The boot-time `World` routing and supervisor-held space cap
+remain static; restart support in the remaining M3.5 work must replace those
+atomically with the component instance.
+`ps` and `caps` read the same retained snapshot, including
+`returned` and `fault` terminal reasons after the executor removes the task.
+The `prog` CSpace is reported honestly as unbound because generated code still
+runs synchronously in the shell task. Memory budgets are declared metadata in
+this node; allocator enforcement remains 3.11.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and

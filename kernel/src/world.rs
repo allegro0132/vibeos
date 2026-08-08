@@ -7,13 +7,108 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
+use core::fmt;
+use core::future::Future;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cap::{self, Cap, CSpace, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::exec;
 use crate::sync::SpinLock;
+
+const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
+pub const SHELL_MEMORY_BUDGET: usize = 256 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ComponentId(u64);
+
+impl fmt::Display for ComponentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "component:{}", self.0)
+    }
+}
+
+static NEXT_COMPONENT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_component_id() -> ComponentId {
+    let id = NEXT_COMPONENT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("ComponentId space exhausted");
+    ComponentId(id)
+}
+
+/// The allocation identity and declared limit owned by a component.
+///
+/// ROADMAP 3.11 will make the allocator enforce this limit. Keeping the owner
+/// and budget in the component now prevents lifecycle and allocation identity
+/// from becoming two unrelated namespaces later.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryAccount {
+    pub owner: ComponentId,
+    pub budget_bytes: usize,
+}
+
+/// One supervised unit: stable component identity, current task, authority,
+/// declared memory budget, and observable lifecycle state.
+pub struct Component {
+    id: ComponentId,
+    name: String,
+    instance: SpinLock<ComponentInstance>,
+    memory: MemoryAccount,
+}
+
+struct ComponentInstance {
+    generation: u64,
+    task: exec::TaskHandle,
+    space: Arc<Space>,
+    cspace: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ComponentSnapshot {
+    pub id: ComponentId,
+    pub generation: u64,
+    pub name: String,
+    pub task_id: exec::TaskId,
+    pub cspace: String,
+    pub state: exec::TaskState,
+    pub terminal_reason: Option<&'static str>,
+    pub polls: u64,
+    pub memory: MemoryAccount,
+}
+
+impl Component {
+    pub fn snapshot(&self) -> ComponentSnapshot {
+        let (generation, task_id, state, polls, cspace) = {
+            let instance = self.instance.lock();
+            (
+                instance.generation,
+                instance.task.id(),
+                instance.task.state(),
+                instance.task.polls(),
+                instance.cspace.clone(),
+            )
+        };
+        ComponentSnapshot {
+            id: self.id,
+            generation,
+            name: self.name.clone(),
+            task_id,
+            cspace,
+            state,
+            terminal_reason: state.terminal_reason(),
+            polls,
+            memory: self.memory,
+        }
+    }
+
+    pub fn space(&self) -> Arc<Space> {
+        self.instance.lock().space.clone()
+    }
+}
 
 /// A capability space is itself a resource. Holding a cap on a space with
 /// `REVOKE` is what lets a supervisor claw authority back from a component.
@@ -48,6 +143,7 @@ pub struct Reading {
 
 pub struct World {
     pub spaces: BTreeMap<&'static str, Arc<Space>>,
+    components: SpinLock<BTreeMap<ComponentId, Arc<Component>>>,
     /// init's handles onto everything it created.
     pub console: Cap,
     pub telemetry: Cap,
@@ -59,6 +155,62 @@ pub struct World {
     pub prog_memory: Cap,
     /// init's own handle on the same region, for reporting.
     pub region: Cap,
+}
+
+impl World {
+    /// Spawn and register a task under a stable component identity.
+    pub fn spawn_component(
+        &self,
+        name: &str,
+        space: Arc<Space>,
+        memory_budget: usize,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> Arc<Component> {
+        assert!(memory_budget > 0, "a component memory budget must be nonzero");
+        let mut components = self.components.lock();
+        assert!(
+            !components.values().any(|component| component.name == name),
+            "duplicate component name"
+        );
+        assert!(
+            !components
+                .values()
+                .any(|component| Arc::ptr_eq(&component.space(), &space)),
+            "a CSpace may have only one component owner"
+        );
+
+        let id = next_component_id();
+        let cspace = space.0.lock().name.clone();
+        let task = exec::spawn_tracked(name, fut);
+        let component = Arc::new(Component {
+            id,
+            name: String::from(name),
+            instance: SpinLock::new(ComponentInstance {
+                generation: 1,
+                task,
+                space,
+                cspace,
+            }),
+            memory: MemoryAccount { owner: id, budget_bytes: memory_budget },
+        });
+        let old = components.insert(id, component.clone());
+        debug_assert!(old.is_none());
+        component
+    }
+
+    /// Stable component order for `ps` and tests. Clone under the registry lock
+    /// so callers never hold it while inspecting a component or its CSpace.
+    pub fn components(&self) -> Vec<Arc<Component>> {
+        self.components.lock().values().cloned().collect()
+    }
+
+    /// Resolve a CSpace to its owning component by object identity, not by two
+    /// strings that merely happen to match. `shell` intentionally owns `init`.
+    pub fn component_for_space(&self, space: &Arc<Space>) -> Option<Arc<Component>> {
+        self.components()
+            .into_iter()
+            .find(|component| Arc::ptr_eq(&component.space(), space))
+    }
 }
 
 static WORLD: SpinLock<Option<Arc<World>>> = SpinLock::new(None);
@@ -113,7 +265,7 @@ pub fn build() {
     .unwrap();
     drop(cs);
 
-    *WORLD.lock() = Some(Arc::new(World {
+    let world = Arc::new(World {
         spaces: BTreeMap::from([
             ("init", init),
             ("sensor", sensor.clone()),
@@ -121,6 +273,7 @@ pub fn build() {
             ("guest", guest.clone()),
             ("prog", prog),
         ]),
+        components: SpinLock::new(BTreeMap::new()),
         console: c_console,
         telemetry: c_telemetry,
         guest_space: c_guest_space,
@@ -128,13 +281,30 @@ pub fn build() {
         prog_console: prog_con,
         prog_memory: prog_mem,
         region: init_region,
-    }));
+    });
 
     // Components are *handed* their handles at spawn. That is their whole
     // authority — there is no other way for them to reach anything.
-    exec::spawn("sensor", sensor_task(sensor, sensor_tx));
-    exec::spawn("logger", logger_task(logger, logger_rx, logger_con));
-    exec::spawn("guest", guest_task(guest, guest_con));
+    world.spawn_component(
+        "sensor",
+        sensor.clone(),
+        BACKGROUND_MEMORY_BUDGET,
+        sensor_task(sensor, sensor_tx),
+    );
+    world.spawn_component(
+        "logger",
+        logger.clone(),
+        BACKGROUND_MEMORY_BUDGET,
+        logger_task(logger, logger_rx, logger_con),
+    );
+    world.spawn_component(
+        "guest",
+        guest.clone(),
+        BACKGROUND_MEMORY_BUDGET,
+        guest_task(guest, guest_con),
+    );
+
+    *WORLD.lock() = Some(world);
 }
 
 /// Samples a (fake) thermometer and publishes it. Holds SEND and nothing else —

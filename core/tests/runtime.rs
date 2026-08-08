@@ -8,14 +8,24 @@
 //! What this file *cannot* test is interrupt ordering, because the host arch
 //! shim makes interrupts a no-op. That belongs to the in-kernel self-test.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use vibeos_core::arch::{advance_time, armed_timer, reset_time};
 use vibeos_core::chan::Endpoint;
-use vibeos_core::exec::{self, WaitQueue};
+use vibeos_core::exec::{self, TaskState, WaitQueue};
 
 static SERIAL: Mutex<()> = Mutex::new(());
+static FAULT_NEXT_POLL: AtomicBool = AtomicBool::new(false);
+
+fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
+    if FAULT_NEXT_POLL.swap(false, Ordering::SeqCst) {
+        true
+    } else {
+        poll();
+        false
+    }
+}
 
 fn scheduler() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -37,6 +47,95 @@ fn a_spawned_task_runs_to_completion() {
 
     assert_eq!(flag.load(Ordering::SeqCst), 7);
     assert_eq!(exec::completed_count(), before + 1);
+}
+
+#[test]
+fn a_tracked_task_preserves_its_identity_and_terminal_state() {
+    let _g = scheduler();
+    let handle = exec::spawn_tracked("tracked", async {});
+    let id = handle.id();
+
+    assert_eq!(handle.state(), TaskState::Running);
+    assert_eq!(handle.state().terminal_reason(), None);
+    assert_eq!(handle.polls(), 0);
+    assert_eq!(format!("{id}"), format!("task:{}", id.0));
+
+    exec::run_until_idle(BUDGET);
+
+    assert_eq!(handle.id(), id, "completion does not replace task identity");
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(handle.state().terminal_reason(), Some("returned"));
+    assert_eq!(handle.polls(), 1);
+    assert!(exec::task_report().iter().all(|report| report.id != id));
+
+    exec::wake(id);
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Exited, "a stale wake cannot revive a terminal task");
+    assert_eq!(handle.polls(), 1, "a stale wake cannot poll a terminal task again");
+}
+
+#[test]
+fn a_pending_tracked_task_remains_running_until_it_returns() {
+    let _g = scheduler();
+    let queue = Arc::new(WaitQueue::new());
+    let waiter = queue.clone();
+    let handle = exec::spawn_tracked("tracked-waiter", async move {
+        waiter.wait().await;
+    });
+
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Running);
+    assert_eq!(handle.polls(), 1);
+
+    queue.wake_all();
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(handle.polls(), 2);
+}
+
+#[test]
+fn a_tracked_fault_retains_its_terminal_state_and_cannot_be_revived() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+
+    let ran = Arc::new(AtomicU64::new(0));
+    let task_ran = ran.clone();
+    let faults_before = exec::faulted_count();
+    exec::set_fault_guard(fault_once_then_passthrough);
+    FAULT_NEXT_POLL.store(true, Ordering::SeqCst);
+    let handle = exec::spawn_tracked("faulted", async move {
+        task_ran.store(1, Ordering::SeqCst);
+    });
+    let id = handle.id();
+
+    exec::run_until_idle(BUDGET);
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "the injected fault interrupted the poll");
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(handle.state().terminal_reason(), Some("fault"));
+    assert_eq!(handle.polls(), 1);
+    assert_eq!(exec::faulted_count(), faults_before + 1);
+    assert!(exec::task_report().iter().all(|report| report.id != id));
+
+    exec::wake(id);
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(handle.polls(), 1, "a stale wake cannot poll a faulted task");
+}
+
+#[test]
+fn task_ids_disambiguate_reused_names() {
+    let _g = scheduler();
+    let first = exec::spawn_tracked("replica", async {});
+    let second = exec::spawn_tracked("replica", async {});
+
+    assert_ne!(first.id(), second.id());
+    let reports = exec::task_report();
+    assert!(reports.iter().any(|report| report.id == first.id()));
+    assert!(reports.iter().any(|report| report.id == second.id()));
+
+    exec::run_until_idle(BUDGET);
+    assert_eq!(first.state(), TaskState::Exited);
+    assert_eq!(second.state(), TaskState::Exited);
 }
 
 /// Regression. `poll_once` lifts the task out of the map before polling it, so
@@ -118,7 +217,9 @@ fn the_running_task_is_visible_while_it_is_polled() {
     exec::spawn("introspector", async move {
         let n = exec::task_report()
             .into_iter()
-            .filter(|(name, _)| name == "introspector")
+            .filter(|report| {
+                report.name == "introspector" && report.state == TaskState::Running
+            })
             .count();
         s.store(n as u64, Ordering::SeqCst);
     });

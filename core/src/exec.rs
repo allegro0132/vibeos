@@ -104,11 +104,24 @@ fn waker_for(id: TaskId) -> Waker {
 /// which is what makes an idle VibeOS box draw no CPU.
 pub fn run() -> ! {
     loop {
-        if !poll_once() {
-            // Nothing ready. Enable interrupts and idle until one arrives.
-            arch::enable_interrupts();
+        if poll_once() {
+            continue;
+        }
+        // Nothing was ready. "Check the queue" and "sleep" have to be one
+        // atomic step: with interrupts unmasked in between, a wake landing in
+        // the gap is not lost but is not seen either, and the hart sleeps until
+        // something else happens to fire.
+        //
+        // Masking interrupts closes it. `wfi` still wakes on a pending enabled
+        // interrupt when the global enable is off -- the RISC-V spec makes it a
+        // hint that resumes whenever `sip & sie` is non-zero, regardless of
+        // `sstatus.SIE` -- so an interrupt arriving inside this window stays
+        // pending and resumes us immediately. Unmasking then lets it be taken.
+        let irq = arch::irq_save();
+        if SCHED.lock().ready.is_empty() {
             arch::wait_for_interrupt();
         }
+        arch::irq_restore(irq);
     }
 }
 
@@ -227,10 +240,16 @@ pub fn timer_tick() {
     arm_next();
 }
 
+/// How long an idle hart sleeps with nothing scheduled.
+///
+/// This used to be 50 ms and was load-bearing: it bounded the latency of a wake
+/// lost to the check-then-sleep race in `run`. With that race closed the
+/// heartbeat is only a backstop, so it can be long enough to be nearly free.
+pub const HEARTBEAT_SECS: u64 = 10;
+
 fn arm_next() {
     let next = TIMERS.lock().iter().map(|(d, _)| *d).min();
-    // Always keep a heartbeat so the idle hart wakes even with no timers armed.
-    let heartbeat = arch::time() + TIMEBASE_HZ / 20;
+    let heartbeat = arch::time() + HEARTBEAT_SECS * TIMEBASE_HZ;
     arch::set_timer(next.map_or(heartbeat, |n| n.min(heartbeat)));
 }
 

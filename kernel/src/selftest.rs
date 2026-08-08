@@ -70,9 +70,10 @@ async fn timers(h: &mut Harness) {
     exec::sleep_ms(25).await;
     let elapsed_ms = (sbi::time() - start) / (exec::TIMEBASE_HZ / 1000);
     h.check("sleep_ms waits at least the requested time", elapsed_ms >= 25);
-    // The 50 ms idle heartbeat bounds the overshoot; anything past ~4x means a
-    // wake was lost and we came back on a later heartbeat.
-    h.check("sleep_ms wakes promptly", elapsed_ms < 200);
+    // With the check-then-sleep race closed, the heartbeat is 10 s and no longer
+    // masks a lost wake. Anything past a few ms here means the wake was lost and
+    // we are riding the backstop -- which would now show up as a 10 s stall.
+    h.check("sleep_ms wakes promptly", elapsed_ms < 100);
 
     let t0 = sbi::time();
     exec::sleep_ms(0).await;

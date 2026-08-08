@@ -159,14 +159,20 @@ breaks one is a security bug, not a behavior change.
 5. **Spaces are objects.** A `CSpace` is itself a `Resource`, so "supervise that
    component" is expressible as a capability rather than as a special case.
 
-### What is not yet true
+### How revocation reaches across spaces
 
-- **Cross-space revocation does not cascade.** `grant` into another space records no
-  parent link, so revoking the source leaves the copy alive. Intra-space `derive`
-  does cascade. This is the single largest correctness gap in the model and is the
-  first item on the roadmap.
-- **Generations are `u32` and wrap.** 2³² revocations of one slot would alias an old
-  handle. Not reachable today; needs to be made unreachable by construction.
+Every capability points at a node in an `Arc`-linked derivation graph. `derive`
+and `grant` both create a *child* node, so lineage survives a cap travelling into
+another space. A cap is live only if its own node and every ancestor are alive,
+which makes revocation O(1) to perform and immediately visible everywhere —
+including in spaces the revoker cannot name and does not know exist.
+
+Slots holding a cap killed by an ancestor become stale rather than empty; they
+stop resolving and stop appearing in `list` at once, and `collect` frees them.
+
+Generations are `u64` and saturate rather than wrap; a slot that somehow reached
+`u64::MAX` is retired instead of reused, so a stale handle can never alias a
+fresh one.
 
 ---
 

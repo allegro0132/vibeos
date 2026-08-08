@@ -3,13 +3,13 @@
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh
-cargo test --workspace     # 96 host tests, no QEMU, ~1s
+cargo test --workspace     # 101 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
 ```
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra, scheduler, timers, channels, allocator, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation, scheduler, timers, channels, allocator, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts, real wakeups, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
 | Golden transcripts | End-to-end shell behaviour and program output | `tests/cases/`, `tests/golden/` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |

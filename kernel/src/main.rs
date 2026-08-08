@@ -17,8 +17,8 @@ extern crate alloc;
 
 // The portable half of the kernel lives in `vibeos-core` so it can be tested on
 // the host. Re-exported under the names the rest of the tree already uses.
-pub use vibeos_core::{cap, chan, exec, heap, sync};
 pub use vibeos_core::arch as sbi;
+pub use vibeos_core::{cap, chan, exec, heap, sync};
 
 mod dev;
 mod plic;
@@ -106,10 +106,18 @@ pub extern "C" fn kmain() -> ! {
         core::ptr::addr_of!(__heap_end) as usize,
     );
     unsafe { HEAP.init(hs, he) };
-    println!("  heap      {:#x}..{:#x}  ({} KiB)", hs, he, (he - hs) / 1024);
+    println!(
+        "  heap      {:#x}..{:#x}  ({} KiB)",
+        hs,
+        he,
+        (he - hs) / 1024
+    );
 
     trap::init();
-    println!("  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled", uart::UART_IRQ);
+    println!(
+        "  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled",
+        uart::UART_IRQ
+    );
 
     world::build();
 
@@ -136,6 +144,14 @@ fn panic(info: &PanicInfo) -> ! {
     let mut w = SbiWriter;
     let _ = core::fmt::write(&mut w, format_args!("\n[!] panic: {}\n", info));
 
+    // An IRQ may preempt a guarded task, but its panic belongs to the kernel.
+    // Longjmp from here would skip the saved trap frame and corrupt interrupt
+    // state, so interrupt faults are deliberately fatal.
+    if trap::in_interrupt() {
+        let _ = core::fmt::write(&mut w, format_args!("[!] panic in interrupt; halting\n"));
+        sbi::shutdown(true);
+    }
+
     // If a compiled program is running, or a task is being polled behind the
     // fault guard, unwind to that landing pad instead of taking the machine
     // down. Innermost first.
@@ -161,5 +177,27 @@ impl core::fmt::Write for SbiWriter {
 
 #[alloc_error_handler]
 fn oom(layout: core::alloc::Layout) -> ! {
-    panic!("out of kernel heap: {:?}", layout)
+    match HEAP.take_last_failure() {
+        Some(heap::AllocationFailure::QuotaExceeded { owner, .. })
+            if owner != heap::OwnerId::SYSTEM =>
+        {
+            // Keep the panic text deterministic; the account snapshot carries
+            // exact live/peak/request evidence for diagnostics and tests.
+            panic!("component allocation quota exceeded")
+        }
+        failure => {
+            // A global allocator failure is kernel state, even if it happened
+            // while a task guard was armed. Bypass panic/longjmp so it cannot be
+            // misattributed to the interrupted component.
+            let mut w = SbiWriter;
+            let _ = core::fmt::write(
+                &mut w,
+                format_args!(
+                    "\n[!] fatal allocator failure: {:?}, layout {:?}\n",
+                    failure, layout
+                ),
+            );
+            sbi::shutdown(true)
+        }
+    }
 }

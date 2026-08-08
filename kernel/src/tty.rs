@@ -16,7 +16,7 @@ use alloc::string::String;
 use core::fmt::{self, Write};
 
 use crate::sync::SpinLock;
-use crate::uart;
+use crate::{heap, uart};
 
 struct Tty {
     prompt: &'static str,
@@ -72,7 +72,12 @@ pub fn prompt(p: &'static str) {
 
 pub fn type_char(c: char) {
     let mut t = TTY.lock();
+    // The line buffer is shared TTY state and grows while its lock is held.
+    // Charge that growth to kernel infrastructure so a shell quota fault
+    // cannot longjmp past the guard and permanently wedge input.
+    let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
     t.input.push(c);
+    system.restore();
     let mut buf = [0u8; 4];
     raw(c.encode_utf8(&mut buf));
 }

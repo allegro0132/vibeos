@@ -15,6 +15,18 @@ use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::heap::{self, OwnerId};
+
+/// Capability tables and derivation nodes are supervisor metadata. They can be
+/// mutated while a caller holds a CSpace lock, so their growth must not consume
+/// the currently-polled component's quota and fault past that shared lock.
+fn system_allocation<T>(f: impl FnOnce() -> T) -> T {
+    let mut scope = heap::enter_owner(OwnerId::SYSTEM);
+    let value = f();
+    scope.restore();
+    value
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Rights(u32);
 
@@ -190,7 +202,10 @@ pub struct CSpace {
 
 impl CSpace {
     pub fn new(name: &str) -> Self {
-        Self { name: String::from(name), slots: Vec::new() }
+        system_allocation(|| Self {
+            name: String::from(name),
+            slots: Vec::new(),
+        })
     }
 
     fn alloc_slot(&mut self) -> u32 {
@@ -203,7 +218,7 @@ impl CSpace {
         {
             return i as u32;
         }
-        self.slots.push(Slot { generation: 0, entry: None });
+        system_allocation(|| self.slots.push(Slot { generation: 0, entry: None }));
         (self.slots.len() - 1) as u32
     }
 
@@ -216,8 +231,8 @@ impl CSpace {
     /// only the code that creates a resource can do it.
     pub fn mint(&mut self, obj: Arc<dyn Resource>, rights: Rights) -> Cap {
         let slot = self.alloc_slot();
-        self.slots[slot as usize].entry =
-            Some(Entry { obj, rights, node: Derivation::root() });
+        let node = system_allocation(Derivation::root);
+        self.slots[slot as usize].entry = Some(Entry { obj, rights, node });
         Cap { slot, generation: self.slots[slot as usize].generation }
     }
 
@@ -271,7 +286,7 @@ impl CSpace {
             return Err(CapError::Amplification);
         }
         let obj = e.obj.clone();
-        let node = Derivation::child(&e.node);
+        let node = system_allocation(|| Derivation::child(&e.node));
         let slot = self.alloc_slot();
         self.slots[slot as usize].entry = Some(Entry { obj, rights, node });
         Ok(Cap { slot, generation: self.slots[slot as usize].generation })
@@ -331,19 +346,21 @@ impl CSpace {
     }
 
     pub fn list(&self) -> Vec<(Cap, &'static str, Rights, String)> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| {
-                let e = s.entry.as_ref().filter(|e| e.node.is_alive())?;
-                Some((
-                    Cap { slot: i as u32, generation: s.generation },
-                    e.obj.kind(),
-                    e.rights,
-                    e.obj.describe(),
-                ))
-            })
-            .collect()
+        system_allocation(|| {
+            self.slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let e = s.entry.as_ref().filter(|e| e.node.is_alive())?;
+                    Some((
+                        Cap { slot: i as u32, generation: s.generation },
+                        e.obj.kind(),
+                        e.rights,
+                        e.obj.describe(),
+                    ))
+                })
+                .collect()
+        })
     }
 }
 
@@ -367,7 +384,7 @@ pub fn grant(
     // The copy is a *child* of the source in the derivation graph, so revoking
     // the source later reaches it even though it now lives in another space.
     let parent = src.entry(cap)?;
-    let node = Derivation::child(&parent.node);
+    let node = system_allocation(|| Derivation::child(&parent.node));
     let obj = parent.obj.clone();
 
     let slot = dst.alloc_slot();

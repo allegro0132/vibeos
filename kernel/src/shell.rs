@@ -99,7 +99,7 @@ async fn run(line: &str, boot_time: u64) {
                 exec::faulted_count(),
                 exec::cancelled_count()
             );
-            println!("  memory budgets are declared; allocator accounting lands in 3.11");
+            println!("  component allocation quotas are enforced; `mem` shows live and peak use");
             if tty::is_quiet() {
                 println!("  background output is muted; poll counts still rising");
             }
@@ -132,8 +132,8 @@ async fn run(line: &str, boot_time: u64) {
                         c.terminal_reason.unwrap_or("-")
                     );
                     println!(
-                        "  memory owner {}  declared budget {} B (accounting pending)",
-                        c.memory.owner, c.memory.budget_bytes
+                        "  memory owner {}  budget {} B  quota denials {}",
+                        c.memory.owner, c.memory.budget_bytes, c.memory.denials
                     );
                     Some(c.state)
                 }
@@ -325,6 +325,21 @@ async fn run(line: &str, boot_time: u64) {
             match region {
                 Ok(r) => println!("  region {} x i64 granted to `prog`", r.len()),
                 Err(_) => println!("  region not reachable from init"),
+            }
+            println!(
+                "  {:<10} {:>9} {:>9} {:>9} {:>7}",
+                "COMPONENT", "LIVE", "PEAK", "BUDGET", "DENIED"
+            );
+            for component in w.components() {
+                let c = component.snapshot();
+                println!(
+                    "  {:<10} {:>7} B {:>7} B {:>7} B {:>7}",
+                    c.name,
+                    c.memory.live_bytes,
+                    c.memory.peak_bytes,
+                    c.memory.budget_bytes,
+                    c.memory.denials
+                );
             }
         }
 

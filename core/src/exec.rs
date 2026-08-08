@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
+use crate::heap::{self, OwnerId};
 use crate::sync::SpinLock;
 
 /// QEMU `virt` drives `mtime` at 10 MHz.
@@ -249,6 +250,14 @@ impl TaskStatus {
             waiter.waker.wake();
         }
     }
+
+    fn unregister_joiner(&self, id: u64) -> Option<Waker> {
+        let mut joiners = self.joiners.lock();
+        joiners
+            .iter()
+            .position(|waiter| waiter.id == id)
+            .map(|index| joiners.swap_remove(index).waker)
+    }
 }
 
 /// The immutable result retained after a task reaches a terminal state.
@@ -306,12 +315,17 @@ pub enum CancelOutcome {
 #[derive(Clone)]
 pub struct TaskHandle {
     id: TaskId,
+    owner: OwnerId,
     status: Arc<TaskStatus>,
 }
 
 impl TaskHandle {
     pub fn id(&self) -> TaskId {
         self.id
+    }
+
+    pub fn owner(&self) -> OwnerId {
+        self.owner
     }
 
     pub fn state(&self) -> TaskState {
@@ -366,7 +380,7 @@ impl Future for Join {
         let state = this.status.state();
         if state != TaskState::Running {
             if let Some(id) = this.registration.take() {
-                this.status.joiners.lock().retain(|waiter| waiter.id != id);
+                drop(this.status.unregister_joiner(id));
             }
             return Poll::Ready(TaskExit::new(
                 this.id,
@@ -375,45 +389,57 @@ impl Future for Join {
             ));
         }
 
-        // Register under the waiter lock, then re-read the terminal state.
-        // `finish` publishes before acquiring this lock, so either this read
-        // observes the terminal state or `finish` drains the waker we insert.
         let status = this.status.clone();
-        let mut joiners = status.joiners.lock();
-        let state = status.state();
-        if state != TaskState::Running {
-            if let Some(id) = this.registration.take() {
-                joiners.retain(|waiter| waiter.id != id);
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut candidate = Some(cx.waker().clone());
+        let mut discarded = None;
+        let mut allocation_failed = false;
+        let mut terminal = None;
+        {
+            // Register under the waiter lock, then re-read the terminal state.
+            // `publish` changes state before draining this list, so either this
+            // read observes terminal state or publication owns our waker.
+            let mut joiners = status.joiners.lock();
+            let state = status.state();
+            if state != TaskState::Running {
+                if let Some(id) = this.registration.take() {
+                    if let Some(index) = joiners.iter().position(|waiter| waiter.id == id) {
+                        discarded = Some(joiners.swap_remove(index).waker);
+                    }
+                }
+                terminal = Some(state);
+            } else {
+                let id = this.registration.unwrap_or_else(|| status.next_joiner_id());
+                if let Some(waiter) = joiners.iter_mut().find(|waiter| waiter.id == id) {
+                    if !waiter.waker.will_wake(cx.waker()) {
+                        discarded = Some(core::mem::replace(
+                            &mut waiter.waker,
+                            candidate.take().expect("waker candidate exists"),
+                        ));
+                    }
+                } else if joiners.try_reserve(1).is_err() {
+                    allocation_failed = true;
+                } else {
+                    joiners.push(JoinWaiter {
+                        id,
+                        waker: candidate.take().expect("waker candidate exists"),
+                    });
+                    this.registration = Some(id);
+                }
             }
-            drop(joiners);
+        }
+        drop(discarded);
+        drop(candidate);
+        system.restore();
+        if allocation_failed {
+            panic!("task join registration allocation failed");
+        }
+        if let Some(state) = terminal {
             return Poll::Ready(TaskExit::new(
                 this.id,
                 state,
                 status.polls.load(Ordering::Acquire),
             ));
-        }
-
-        match this.registration {
-            Some(id) => {
-                if let Some(waiter) = joiners.iter_mut().find(|waiter| waiter.id == id) {
-                    if !waiter.waker.will_wake(cx.waker()) {
-                        waiter.waker = cx.waker().clone();
-                    }
-                } else {
-                    joiners.push(JoinWaiter {
-                        id,
-                        waker: cx.waker().clone(),
-                    });
-                }
-            }
-            None => {
-                let id = status.next_joiner_id();
-                joiners.push(JoinWaiter {
-                    id,
-                    waker: cx.waker().clone(),
-                });
-                this.registration = Some(id);
-            }
         }
         Poll::Pending
     }
@@ -422,7 +448,7 @@ impl Future for Join {
 impl Drop for Join {
     fn drop(&mut self) {
         if let Some(id) = self.registration.take() {
-            self.status.joiners.lock().retain(|waiter| waiter.id != id);
+            drop(self.status.unregister_joiner(id));
         }
     }
 }
@@ -430,13 +456,15 @@ impl Drop for Join {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TaskReport {
     pub id: TaskId,
+    pub owner: OwnerId,
     pub name: String,
     pub state: TaskState,
     pub polls: u64,
 }
 
 struct Task {
-    name: String,
+    owner: OwnerId,
+    name: Arc<str>,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     status: Arc<TaskStatus>,
 }
@@ -460,7 +488,7 @@ struct Sched {
     /// The task being polled right now. It is lifted out of `tasks` for the
     /// duration of the poll, so both introspection and `wake` have to look
     /// for it here rather than in the map.
-    running: Option<(TaskId, String, Arc<TaskStatus>)>,
+    running: Option<(TaskId, OwnerId, Arc<str>, Arc<TaskStatus>)>,
     /// Set when the running task is woken while it is being polled — by itself
     /// (`yield_now`) or by an interrupt that lands mid-poll. Without this the
     /// wake would be dropped and the task would never be scheduled again.
@@ -494,12 +522,27 @@ pub fn spawn(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> Task
     spawn_tracked(name, fut).id()
 }
 
-/// Spawn a future and retain a handle suitable for a supervising component.
+/// Spawn a future and inherit the allocation owner active at the call site.
 pub fn spawn_tracked(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> TaskHandle {
+    spawn_tracked_owned(heap::current_owner(), name, fut)
+}
+
+/// Spawn a future under an explicit component allocation owner.
+///
+/// The task envelope and scheduler collections are kernel infrastructure and
+/// are therefore allocated to `SYSTEM`; only polling and destroying the future
+/// run with `owner` installed.
+pub fn spawn_tracked_owned(
+    owner: OwnerId,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
     let id = next_task_id();
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let status = Arc::new(TaskStatus::new());
     let task = Task {
-        name: String::from(name),
+        owner,
+        name: Arc::<str>::from(name),
         future: Box::pin(fut),
         status: status.clone(),
     };
@@ -511,12 +554,17 @@ pub fn spawn_tracked(name: &str, fut: impl Future<Output = ()> + Send + 'static)
     let ready_additional = live_after_spawn - s.ready.len();
     if s.ready.capacity() < live_after_spawn && s.ready.try_reserve(ready_additional).is_err() {
         drop(s);
-        drop(task);
+        system.restore();
+        // Even a task that could not be admitted owns its future's destructor.
+        // Reclaim it at the same guarded owner boundary as a scheduled task.
+        let _ = reclaim_task(task);
         panic!("ready queue allocation failed");
     }
     s.tasks.insert(id, task);
     s.ready.push_back(id);
-    TaskHandle { id, status }
+    drop(s);
+    system.restore();
+    TaskHandle { id, owner, status }
 }
 
 fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskState> {
@@ -539,15 +587,19 @@ fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskSta
 /// allocation is deliberately leaked rather than dropped a second time.
 fn reclaim_task(task: Task) -> bool {
     let Task {
+        owner,
         name,
         future,
         status,
     } = task;
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
     drop(name);
     drop(status);
+    system.restore();
 
     let guard = *FAULT_GUARD.lock();
-    match guard {
+    let mut owner_scope = heap::enter_owner(owner);
+    let faulted = match guard {
         Some(run_guarded) => {
             let mut future = Some(future);
             let faulted = run_guarded(&mut || {
@@ -568,7 +620,11 @@ fn reclaim_task(task: Task) -> bool {
             drop(future);
             false
         }
-    }
+    };
+    // A real task fault returns through longjmp and skips Rust destructors in
+    // the guarded closure. Restore explicitly after the landing pad returns.
+    owner_scope.restore();
+    faulted
 }
 
 fn reclaim_and_publish(task: Task, status: &TaskStatus, claim: TerminalClaim) {
@@ -607,7 +663,7 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
         let mut s = SCHED.lock();
         if s.running
             .as_ref()
-            .is_some_and(|(id, _, _)| *id == handle.id)
+            .is_some_and(|(id, _, _, _)| *id == handle.id)
         {
             Action::Return(requested_outcome(handle))
         } else if s.tasks.contains_key(&handle.id) {
@@ -645,34 +701,81 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
 }
 
 pub fn wake(id: TaskId) {
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let mut s = SCHED.lock();
-    if s.running.as_ref().is_some_and(|(r, _, _)| *r == id) {
+    let mut capacity_exhausted = false;
+    if s.running
+        .as_ref()
+        .is_some_and(|(running, _, _, _)| *running == id)
+    {
         s.running_woken = true;
     } else if s.tasks.contains_key(&id) && !s.ready.contains(&id) {
-        s.ready.push_back(id);
+        if s.ready.len() >= s.ready.capacity() {
+            capacity_exhausted = true;
+        } else {
+            s.ready.push_back(id);
+        }
+    }
+    drop(s);
+    system.restore();
+    if capacity_exhausted {
+        panic!("ready queue reservation invariant violated");
     }
 }
 
 /// Identity and poll accounting for every live task.
 pub fn task_report() -> Vec<TaskReport> {
-    let s = SCHED.lock();
-    let mut out: Vec<TaskReport> = s
-        .tasks
-        .iter()
-        .map(|(id, task)| TaskReport {
-            id: *id,
-            name: task.name.clone(),
-            state: task.status.state(),
-            polls: task.status.polls.load(Ordering::Acquire),
-        })
-        .collect();
-    out.extend(s.running.iter().map(|(id, name, status)| TaskReport {
-        id: *id,
-        name: name.clone(),
-        state: status.state(),
-        polls: status.polls.load(Ordering::Acquire),
-    }));
-    out.sort_by_key(|report| report.id);
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let mut out = Vec::new();
+    let mut allocation_failed = false;
+    {
+        let s = SCHED.lock();
+        let total = s.tasks.len() + usize::from(s.running.is_some());
+        if out.try_reserve(total).is_err() {
+            allocation_failed = true;
+        } else {
+            for (id, task) in &s.tasks {
+                let mut name = String::new();
+                if name.try_reserve(task.name.len()).is_err() {
+                    allocation_failed = true;
+                    break;
+                }
+                name.push_str(&task.name);
+                out.push(TaskReport {
+                    id: *id,
+                    owner: task.owner,
+                    name,
+                    state: task.status.state(),
+                    polls: task.status.polls.load(Ordering::Acquire),
+                });
+            }
+            if !allocation_failed {
+                if let Some((id, owner, running_name, status)) = &s.running {
+                    let mut name = String::new();
+                    if name.try_reserve(running_name.len()).is_err() {
+                        allocation_failed = true;
+                    } else {
+                        name.push_str(running_name);
+                        out.push(TaskReport {
+                            id: *id,
+                            owner: *owner,
+                            name,
+                            state: status.state(),
+                            polls: status.polls.load(Ordering::Acquire),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if allocation_failed {
+        system.restore();
+        panic!("task report allocation failed");
+    }
+    // The report order is deterministic but does not require a stable sort.
+    // Keeping this in-place also avoids another infallible allocation path.
+    out.sort_unstable_by_key(|report| report.id);
+    system.restore();
     out
 }
 
@@ -747,6 +850,7 @@ pub fn poll_once() -> bool {
     // Pop, detach, and publish `running` under one lock. This is the start-poll
     // linearization point: cancellation before it detaches the task without a
     // poll; cancellation after it waits for this poll boundary.
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let dispatch = {
         let mut s = SCHED.lock();
         let Some(id) = s.ready.pop_front() else {
@@ -762,13 +866,14 @@ pub fn poll_once() -> bool {
                 None => Dispatch::Invalid(task),
             }
         } else if status.raw_state() == TaskState::Running as u8 {
-            s.running = Some((id, task.name.clone(), status.clone()));
+            s.running = Some((id, task.owner, task.name.clone(), status.clone()));
             s.running_woken = false;
             Dispatch::Poll(id, task, status)
         } else {
             Dispatch::Invalid(task)
         }
     };
+    system.restore();
 
     let (id, mut task, status) = match dispatch {
         Dispatch::Poll(id, task, status) => (id, task, status),
@@ -789,6 +894,7 @@ pub fn poll_once() -> bool {
     // component that panics costs its own task instead of the machine.
     let guard = *FAULT_GUARD.lock();
     let mut poll = Poll::Pending;
+    let mut owner_scope = heap::enter_owner(task.owner);
     let faulted = match guard {
         Some(run_guarded) => {
             let fut = task.future.as_mut();
@@ -806,6 +912,10 @@ pub fn poll_once() -> bool {
             false
         }
     };
+    // `run_guarded` may have returned through a longjmp, which bypasses Drop
+    // for scopes created inside the guarded call. Restore at the executor
+    // boundary before touching scheduler infrastructure or another task.
+    owner_scope.restore();
 
     if faulted {
         // The future was interrupted mid-poll. Dropping it would run
@@ -826,6 +936,7 @@ pub fn poll_once() -> bool {
         return true;
     }
 
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let mut s = SCHED.lock();
     s.running = None;
     let woken = core::mem::take(&mut s.running_woken);
@@ -833,8 +944,18 @@ pub fn poll_once() -> bool {
         // A concurrent cancel cannot slip between this decision and reinsertion:
         // it also takes SCHED, then detaches the parked task synchronously.
         s.tasks.insert(id, task);
+        let mut capacity_exhausted = false;
         if woken {
-            s.ready.push_back(id);
+            if s.ready.len() >= s.ready.capacity() {
+                capacity_exhausted = true;
+            } else {
+                s.ready.push_back(id);
+            }
+        }
+        drop(s);
+        system.restore();
+        if capacity_exhausted {
+            panic!("ready queue reservation invariant violated");
         }
         return true;
     }
@@ -846,6 +967,7 @@ pub fn poll_once() -> bool {
     };
     let claim = status.claim_terminal(requested);
     drop(s);
+    system.restore();
 
     let Some(claim) = claim else {
         core::mem::forget(task);
@@ -957,7 +1079,9 @@ impl Future for WaitFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         // Cloning may invoke a custom RawWaker, so do it before taking the
-        // queue lock. The unused candidate is likewise dropped afterwards.
+        // queue lock. Registry wakers are SYSTEM infrastructure, including
+        // custom RawWakers whose clone/drop callbacks allocate.
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
         let mut candidate = Some(cx.waker().clone());
         let mut discarded = None;
         let mut allocation_failed = false;
@@ -1002,6 +1126,7 @@ impl Future for WaitFuture<'_> {
 
         drop(discarded);
         drop(candidate);
+        system.restore();
         if allocation_failed {
             panic!("wait queue registration allocation failed");
         }
@@ -1124,6 +1249,7 @@ impl Future for Sleep {
             return Poll::Ready(());
         }
 
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
         let mut candidate = Some(cx.waker().clone());
         let mut discarded = None;
         if let Some(id) = this.registration {
@@ -1143,6 +1269,7 @@ impl Future for Sleep {
             };
             drop(discarded);
             drop(candidate);
+            system.restore();
             if found {
                 return Poll::Pending;
             }
@@ -1175,6 +1302,7 @@ impl Future for Sleep {
             }
         }
         drop(candidate);
+        system.restore();
         if allocation_failed {
             panic!("timer registration allocation failed");
         }

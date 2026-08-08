@@ -3,8 +3,8 @@
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
 **Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 through 3.10 complete. The implementation is about 10,500 lines across `core`,
-`compiler`, and `kernel`, with 170 host tests, 88 in-kernel checks, and 8 QEMU
+with 3.8 through 3.11 complete. The implementation is about 10,500 lines across `core`,
+`compiler`, and `kernel`, with 182 host tests, 101 in-kernel checks, and 8 QEMU
 transcript cases (7 goldens plus the dynamic differential oracle). Everything
 described as *implemented* below runs today; planned work
 is marked as such. Version strings in the boot banner are historical and are not
@@ -356,11 +356,14 @@ against real rustc, and eventually a verified or verifying backend.
 ## 8. Cross-cutting concerns
 
 **Memory.** Compiled programs receive a bounded `MemoryRegion` capability and abort
-on exhaustion. Kernel components still share one global allocator with no ownership
-accounting; one component can exhaust it and take down the system. Large allocations
-(over 64 KiB) are not returned to the bump region, and faulted futures are deliberately
-leaked. Component-owned arenas or tagged allocations are therefore prerequisites for
-long-lived, restartable components.
+on exhaustion. Kernel heap blocks carry an immutable component-owner header and are
+charged by their actual size class, including allocator metadata and alignment. Each
+component has live/peak/denial counters and a hard live-byte quota; exceeding it faults
+that task before consuming another owner's budget, while deallocation credits the
+header owner even when it runs from another component or an IRQ. Normal return and
+cancellation run Drop and return live use to the account baseline. A future interrupted
+mid-poll is still deliberately leaked with its tagged blocks; bounded fault/restart
+reclamation remains the explicit 3.12 boundary.
 
 **Time.** `rdtime` at 10 MHz, SBI timer for wakeups. No monotonic-vs-wall
 distinction because there is no wall clock. Timer insertion and token removal are
@@ -402,9 +405,10 @@ execution unless a supervisor separately calls `cancel`. Cooperative cancellatio
 and join reporting now cover ready, parked, self-waking, and currently polling
 tasks. Wait queues and timers now own cancellation-safe registration tokens, replace
 wakers on repoll, and release them on Drop; their predicate call sites use
-listener-before-check epochs to close IRQ races. There is still no restart protocol,
-budgets are not enforced, the `World` space routes and supervisor handles
-are still boot-static, and a faulted task can only be leaked. The v1 promise “grant,
+listener-before-check epochs to close IRQ races. Component budgets are now enforced
+by tagged allocation ownership. There is still no restart protocol, the `World` space
+routes and supervisor handles are boot-static, and a faulted task can only be leaked;
+the v1 promise “grant,
 run, revoke, and kill” still depends on the remaining M3.5 lifecycle work.
 
 Five boundaries must stay explicit:

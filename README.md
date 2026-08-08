@@ -22,7 +22,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 170 host tests, no QEMU, ~1s
+cargo test --workspace     # 182 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
 ```
 
@@ -124,11 +124,12 @@ VibeOS parks in `wfi` and draws no CPU. The waker is the `TaskId` itself cast to
 the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 
 The system image binds each supervised unit into one retained `Component`
-record: a stable `ComponentId`, its current task incarnation, its CSpace, a
-declared memory owner/budget, and lifecycle state. `ps` and `caps` read that same
+record: a stable `ComponentId`, its current task incarnation, its CSpace, an
+enforced memory owner/budget, and lifecycle state. `ps` and `caps` read that same
 record, so an exited, faulted, or cancelled task keeps both its identity and terminal reason
-after the executor removes it. The allocator does not enforce those declared
-budgets yet; that is roadmap 3.11.
+after the executor removes it. Heap blocks carry immutable owner provenance;
+quota refusal faults only the requesting component, and cross-owner frees credit
+the allocator account that originally paid for the block.
 
 Each retained task handle supports cooperative cancellation and async join/exit
 reporting. Cancelling a ready or parked task detaches it and drops its future
@@ -305,9 +306,6 @@ showing rising poll counts while muted, because the components never stopped.
 Deliberate, not overlooked:
 
 - **Single hart.** The spinlock is real but `-smp 1` is the only tested config.
-- **The heap never returns large blocks.** Allocations over 64 KiB come from the
-  bump region and are leaked on free. Nothing in the current image allocates
-  that large.
 - **`lookup_as` uses `Arc::from_raw` after an `Any` check.** Sound, but it wants
   `Arc::downcast` once that's usable through the `Resource` trait object.
 - **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
@@ -318,9 +316,10 @@ Deliberate, not overlooked:
   functions over `i64`, `bool` and fixed-size arrays.
 - **Array indices are `i64`, not `usize`.** There is no `as`, so a corpus program
   valid in both languages keeps counters separate from values.
-- **Component heap budgets are declared but not enforced.** Compiled programs
-  are bounded by their region capability; kernel components still share the
-  global allocator until allocation ownership lands in roadmap 3.11.
+- **Runtime infrastructure is charged to the SYSTEM heap domain.** Component
+  quotas cover dynamic allocation while their future is polled or destroyed;
+  task envelopes, wait registries, capability tables, and IRQ work remain part
+  of the trusted kernel budget.
 - **A faulted task is leaked, not freed.** Dropping a future interrupted
   mid-poll would run destructors over state it never finished writing.
 - **A panic with no landing pad is still fatal** — a fault in the boot path or

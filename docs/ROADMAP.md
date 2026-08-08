@@ -6,8 +6,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 through 3.10 complete. The current baseline is 170 host tests,
-> 88 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
+> M3.5 is under way with 3.8 through 3.11 complete. The current baseline is 182 host tests,
+> 101 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
 > differential oracle). See
 > [TESTING.md](../TESTING.md).
 
@@ -18,8 +18,8 @@ algebra, cross-space revocation, scheduler edge cases, compiler front end, emitt
 instruction surface, and native execution paths all have automated coverage. The
 remaining risk is no longer dominated by missing syntax. It is dominated by the gap
 between **authority** and **lifecycle**: a space can be revoked and its task can now be
-cooperatively cancelled with owned wait/timer registrations, but fault reclamation, restart, and
-kernel-heap charging are not yet lifecycle-safe.
+cooperatively cancelled with owned wait/timer registrations and a bounded tagged heap account,
+but fault reclamation and restart are not yet lifecycle-safe.
 
 The revised priority order is:
 
@@ -191,8 +191,8 @@ re-measuring.
 ---
 
 > **M3 status: partial.** 3.1, 3.2, 3.3 and the acceptance demo are done; 3.7
-> (heap quotas) is done for programs and not for kernel components; 3.4 (structs
-> and references) and 3.5/3.6 (SSA IR and register allocation) are not started.
+> now covers both bounded program regions and tagged kernel-component allocations.
+> 3.4 (structs and references) and 3.5/3.6 (SSA IR and register allocation) are not started.
 > See "What M3 did not do" below.
 
 ### M3 — Memory and a real language (v0.4)
@@ -210,7 +210,7 @@ storage is exactly where confinement gets hard, which is why this comes after M2
 | 3.4 ⬜ | Structs and `&`/`&mut` with move semantics | Affine values, not a full borrow checker. Enough to write a program with state. |
 | 3.5 ⬜ | An SSA IR | Between AST and codegen. Required before any optimization is worth attempting, and it gives the emitter audit (2.7) a narrower surface. |
 | 3.6 ⬜ | Linear-scan register allocation | Retire the stack machine. Target: within 3× of `rustc -O0` on the benchmark corpus. |
-| 3.7 ◐ | Heap quotas per space | Done for compiled programs: their storage is a capability on a bounded region, so the bound *is* the capability and a runaway program aborts instead of eating the heap. Not done for kernel components, which allocate through the single global allocator with no notion of who is asking. Doing it properly needs a per-allocation owner tag, and that is a change to the allocator's core rather than a bolt-on. |
+| 3.7 ✅ | Heap quotas per space | Compiled programs allocate from their bounded `MemoryRegion` capability. Kernel components now run with a stable allocator owner, and every heap block carries that owner in its header; the allocator enforces live-byte quotas before consuming a block and credits deallocation to the original owner. |
 
 **Acceptance: met.** `tests/programs/sort.rs` allocates a 12-element array from
 the granted region, scrambles it, insertion-sorts it in place, prints both
@@ -255,7 +255,7 @@ units before adding persistence or more concurrency.
 | 3.8 ✅ | Introduce a `Component` record owning `TaskId`, `CSpace`, memory owner/budget, and state (`Running`, `Exited`, `Faulted`, `Cancelled`) | `ps` and `caps` report the same identity and terminal reason. |
 | 3.9 ✅ | Add cooperative task cancellation and join/exit reporting | Cancelling a parked, ready, and self-waking task works; each is polled no more after cancellation. |
 | 3.10 ✅ | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
-| 3.11 | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit reclaims its arena. |
+| 3.11 ✅ | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit drops its tagged allocations back to the account baseline. |
 | 3.12 | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
 | 3.13 | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
 | 3.14 | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
@@ -270,8 +270,8 @@ atomically with the component instance.
 `ps` and `caps` read the same retained snapshot, including
 `returned` and `fault` terminal reasons after the executor removes the task.
 The `prog` CSpace is reported honestly as unbound because generated code still
-runs synchronously in the shell task. Memory budgets are declared metadata in
-this node; allocator enforcement remains 3.11.
+runs synchronously in the shell task. Component snapshots now join that identity
+with the allocator's live, peak, budget, and denial counters.
 
 3.9 keeps cancellation cooperative and makes the poll boundary explicit. Ready
 and parked tasks are detached from the task map and ready queue, dropped outside the
@@ -293,6 +293,16 @@ hundreds of parked tasks and sleepers and require both registries to return to
 baseline. A task interrupted
 mid-poll by a fault is still leaked without Drop; incarnation-wide fault cleanup is
 the explicit 3.12 boundary.
+
+3.11 tags every allocation with its original owner, so cross-component and IRQ
+deallocation cannot debit whichever task happens to be running. The executor installs
+the component owner only while polling or destroying its future; scheduler, channel,
+timer, wait, capability, and TTY storage use the SYSTEM domain. A quota refusal records
+the denial and faults only that component. A normal return or cancellation runs Drop
+and returns live use to baseline, after which the temporary owner account can be
+unregistered. Faulted futures and their still-live tagged blocks remain deliberately
+owned and leaked until 3.12 can reclaim an incarnation without running destructors
+across `longjmp`.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and

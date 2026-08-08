@@ -155,6 +155,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_TASK_GUARDS: usize = 8;
 static mut TASK_JMPS: [JmpBuf; MAX_TASK_GUARDS] = [JmpBuf::ZERO; MAX_TASK_GUARDS];
+// A fault may longjmp across a SpinGuard whose constructor masked SIE. Keep
+// the entry state beside each landing pad so the fault return can restore the
+// hart even though Rust destructors on the abandoned stack are not run.
+static mut TASK_IRQ_WAS_ENABLED: [bool; MAX_TASK_GUARDS] = [false; MAX_TASK_GUARDS];
 static TASK_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// Poll a task with a landing pad installed. Returns true if it panicked.
@@ -172,11 +176,19 @@ pub fn guard_task(f: &mut dyn FnMut()) -> bool {
     if depth >= MAX_TASK_GUARDS {
         return true;
     }
+    let irq_was_enabled = crate::sbi::irq_save();
+    crate::sbi::irq_restore(irq_was_enabled);
     unsafe {
+        TASK_IRQ_WAS_ENABLED[depth] = irq_was_enabled;
         if vibe_setjmp(addr_of_mut!(TASK_JMPS[depth])) != 0 {
             // `unwind_faulted_task` already restored the previous depth. The
             // outer landing pad remains armed when a supervisor cancels and
             // reclaims another task from inside its own poll.
+            //
+            // Force an exact restore: irq_restore(false) alone intentionally
+            // does nothing, so first mask whatever state the fault path left.
+            let _ = crate::sbi::irq_save();
+            crate::sbi::irq_restore(TASK_IRQ_WAS_ENABLED[depth]);
             return true;
         }
     }

@@ -255,7 +255,7 @@ impl TaskStatus {
 
     fn next_joiner_id(&self) -> u64 {
         self.next_joiner
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("task join registration space exhausted")
     }
 
@@ -280,7 +280,7 @@ impl TaskStatus {
     fn register_owned(&self, registration: OwnedRegistration) -> Result<u64, OwnedRegistration> {
         let token = self
             .next_registration
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("task registration token space exhausted");
         let mut registrations = self.registrations.lock();
         if registrations.try_reserve(1).is_err() {
@@ -677,7 +677,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_task_id() -> TaskId {
     let id = NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("TaskId space exhausted");
     TaskId(id)
 }
@@ -1591,7 +1591,7 @@ static IRQ_POLL_PROBE_PHASE: AtomicU8 = AtomicU8::new(IRQ_POLL_PROBE_IDLE);
 
 fn next_irq_poll_probe_generation() -> u64 {
     NEXT_IRQ_POLL_PROBE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("IRQ-to-poll probe generation space exhausted")
 }
 
@@ -1777,7 +1777,7 @@ static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_timer_id() -> u64 {
     NEXT_TIMER_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("timer registration space exhausted")
 }
 

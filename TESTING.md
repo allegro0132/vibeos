@@ -3,11 +3,16 @@
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh
-cargo test --workspace     # 209 host tests, no QEMU, ~1s (2026-08-08 snapshot)
-./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
-./scripts/differential.sh  # re-record expectations from real rustc
-./scripts/bench.py         # fixed QEMU/TCG run checked against the baseline
+cargo test --workspace         # fast portable tests, no QEMU
+./scripts/differential.sh      # verify committed output with pinned real rustc
+./scripts/qemu-test.sh         # golden cases plus the differential oracle
+./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
+./scripts/status.sh            # derive current test/corpus counts on the host
 ```
+
+`status.sh` lists runnable and ignored host tests separately and derives corpus
+and transcript counts from the tree. Target checks are not guessed from source:
+`./scripts/qemu-test.sh selftest` reports the count observed in that QEMU run.
 
 | Layer | What it covers | Where |
 |---|---|---|
@@ -80,9 +85,11 @@ Every program in `tests/programs/` is valid Rust *and* valid in the VibeOS
 subset, so `rustc` is a free oracle for the code generator — the strongest check
 available for something this security-critical.
 
-`scripts/differential.sh` compiles each with the real `rustc`, runs it, and
-records the output. The QEMU `differential` case feeds the same source through
-`rustc edit` inside VibeOS and requires identical bytes. The case file is
+`scripts/differential.sh` compiles each with the exact real `rustc` pinned in
+`rust-toolchain.toml`, runs it, and verifies the committed output byte-for-byte.
+It is read-only unless passed `--update`; a missing expectation fails instead of
+silently becoming truth. The QEMU `differential` case feeds the same source
+through `rustc edit` inside VibeOS and requires identical bytes. The case file is
 regenerated from the corpus on every run, so the two cannot drift.
 
 Keeping the corpus inside the intersection of the two languages is a real
@@ -93,6 +100,7 @@ first draft because bare integer literals infer as `i32` while the subset is
 ## Updating goldens
 
 ```sh
+./scripts/differential.sh --update  # real-rustc corpus expectations
 ./scripts/qemu-test.sh --update      # all cases
 ./scripts/qemu-test.sh conform       # run one case
 ```

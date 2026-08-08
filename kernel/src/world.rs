@@ -39,7 +39,7 @@ static NEXT_COMPONENT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_component_id() -> ComponentId {
     let id = NEXT_COMPONENT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("ComponentId space exhausted");
     ComponentId(id)
 }

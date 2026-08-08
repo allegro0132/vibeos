@@ -25,6 +25,7 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KERNEL = ROOT / "target/riscv64gc-unknown-none-elf/release/vibeos-kernel"
 BASELINE = ROOT / "benchmarks/qemu-tcg-rv64.json"
+TOOLCHAIN_FILE = ROOT / "rust-toolchain.toml"
 SCHEMA = "vibeos.bench"
 SCHEMA_VERSION = 1
 METRIC_PREFIX = "VIBE_BENCH "
@@ -86,10 +87,54 @@ def first_line(command: list[str]) -> str:
     return result.stdout.splitlines()[0] if result.stdout else "unknown"
 
 
+def toolchain_pin() -> tuple[str, str]:
+    try:
+        manifest = TOOLCHAIN_FILE.read_text()
+    except OSError as exc:
+        raise BenchError(f"cannot read {TOOLCHAIN_FILE}: {exc}") from exc
+    channel_match = re.search(r'^channel = "([^"]+)"$', manifest, re.MULTILINE)
+    commit_match = re.search(r"^# rustc-commit: ([0-9a-f]+)$", manifest, re.MULTILINE)
+    if channel_match is None or commit_match is None:
+        raise BenchError("rust-toolchain.toml has no exact channel/commit pin")
+    return channel_match.group(1), commit_match.group(1)
+
+
+def pinned_rustc_version() -> str:
+    channel, expected_commit = toolchain_pin()
+    command = ["rustup", "run", channel, "rustc", "-Vv"]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise BenchError(
+            f"cannot run pinned compiler via rustup ({channel}): {exc}"
+        ) from exc
+    commit_match = re.search(r"^commit-hash: ([0-9a-f]+)$", result.stdout, re.MULTILINE)
+    actual_commit = commit_match.group(1) if commit_match is not None else "unavailable"
+    if actual_commit != expected_commit:
+        raise BenchError(
+            f"rustc commit {actual_commit} does not match pinned {expected_commit}"
+        )
+    return result.stdout.splitlines()[0] if result.stdout else "unknown"
+
+
+def rustup_which(channel: str, executable: str) -> str:
+    path = first_line(["rustup", "which", "--toolchain", channel, executable])
+    if path == "unknown" or not pathlib.Path(path).is_file():
+        raise BenchError(f"rustup returned no {executable} path for {channel}")
+    return path
+
+
 def host_metadata() -> dict[str, Any]:
     return {
         "qemu": first_line(["qemu-system-riscv64", "--version"]),
-        "toolchain": first_line(["rustc", "--version"]),
+        "toolchain": pinned_rustc_version(),
         "machine": QEMU_MACHINE,
         "cpu": QEMU_CPU,
         "smp": QEMU_SMP,
@@ -197,12 +242,19 @@ def parse_transcript(text: str) -> Parsed:
 
 
 def build_kernel() -> None:
+    channel, _ = toolchain_pin()
+    # `rustup run cargo` selects Cargo itself, but Cargo may still resolve a
+    # non-proxy `rustc` earlier on PATH. Absolute compiler paths close that gap.
+    pinned_rustc_version()
     env = os.environ.copy()
-    # M3.14 removes this compatibility bridge after the exact nightly is pinned.
-    env.setdefault("RUSTC_BOOTSTRAP", "1")
+    # The repository pins a real nightly. Never let an ambient compatibility
+    # escape hatch turn a stable compiler into an unrecorded pseudo-nightly.
+    env.pop("RUSTC_BOOTSTRAP", None)
+    env["RUSTC"] = rustup_which(channel, "rustc")
+    env["RUSTDOC"] = rustup_which(channel, "rustdoc")
     try:
         subprocess.run(
-            ["cargo", "build", "--release"],
+            ["rustup", "run", channel, "cargo", "build", "--release"],
             # Cargo discovers target/build-std settings from the invocation
             # directory; the bare-metal configuration lives under kernel/.
             cwd=ROOT / "kernel",
@@ -210,7 +262,7 @@ def build_kernel() -> None:
             check=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise BenchError(f"kernel build failed: {exc}") from exc
+        raise BenchError(f"pinned kernel build failed ({channel}): {exc}") from exc
 
 
 def capture_qemu(timeout: float) -> str:

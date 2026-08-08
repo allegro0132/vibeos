@@ -3,10 +3,10 @@
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
 **Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 through 3.13 complete. The implementation is about 10,500 lines across `core`,
-`compiler`, and `kernel`, with 209 host tests, 307 in-kernel checks, and 8 QEMU
-transcript cases (7 goldens plus the dynamic differential oracle). Everything
-described as *implemented* below runs today; planned work
+with 3.8 through 3.14 complete. The implementation is about 10,500 lines across
+`core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
+corpus inventory, while the QEMU harness reports target check counts from the boot
+it observed. Everything described as *implemented* below runs today; planned work
 is marked as such. Version strings in the boot banner are historical and are not
 used as the source of truth; milestone state lives in [ROADMAP.md](ROADMAP.md).
 

@@ -6,10 +6,9 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 through 3.13 complete. The current baseline is 209 host tests,
-> 307 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
-> differential oracle). See
-> [TESTING.md](../TESTING.md).
+> M3.5 is under way with 3.8 through 3.14 complete. Run `scripts/status.sh` for
+> the live host-test and corpus inventory; the QEMU harness reports target check
+> counts from the boot it actually observed. See [TESTING.md](../TESTING.md).
 
 ## Reassessment: what should happen next
 
@@ -258,7 +257,7 @@ units before adding persistence or more concurrency.
 | 3.11 ✅ | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit drops its tagged allocations back to the account baseline. |
 | 3.12 ✅ | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
 | 3.13 ✅ | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
-| 3.14 | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
+| 3.14 ✅ | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
 | 3.15 | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
 | 3.16 | Define resolved-capability lease semantics | Console hooks either revalidate a revocable token per operation or explicitly hold an invocation lease. Memory access documents the same choice; tests distinguish revoke-before-run from revoke-during-run. |
 
@@ -319,10 +318,19 @@ The runner fixes `virt`/`rv64`/one hart/single-threaded TCG plus deterministic
 `icount`, records QEMU and Rust revisions, and refuses silent schema or sample-count
 changes. The 2026-08-08 baseline records IPC p95 109 ticks (257 samples), timer
 IRQ-to-poll p95 24 ticks (129), cap lookup p50 2–4 ticks across derivation depths
-0–32, compile p50 350,362 source B/s (21), a 114,048 B heap high-water, and
+0–32, compile p50 361,017 source B/s (21), a 113,792 B heap high-water, and
 828 B code / 1 B data / 1,862 tick runtime for the fixed generated workload.
 These are regression coordinates for one virtual environment, not a cross-machine
 Linux-pipe comparison.
+
+3.14 makes the evidence reproducible rather than merely repeatable on one laptop.
+`rust-toolchain.toml` pins `nightly-2026-08-01` and records its full rustc commit;
+local scripts reject a mismatched compiler and no longer use the stable-compiler
+bootstrap escape hatch. CI is an explicit `host-tests -> differential -> qemu-tests`
+chain. The real-rustc oracle is byte-exact, read-only by default, fails on missing
+or orphan expectations, and updates only through `--update`. Repository inventory
+comes from `scripts/status.sh`; target self-test totals come from the live QEMU
+transcript instead of copied prose.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and
@@ -480,7 +488,7 @@ toolchain revision, build profile, sample count, and distribution (not only a mi
 | The single-hart executor design does not survive M5 | Medium | Treat 5.1 as a redesign, not a port; write the model check first |
 | Language features outrun confinement | Medium | M2 strictly before M3; no new syntax without an abort path |
 | Scope sprawl into POSIX compatibility | Medium | Blueprint §9 is binding |
-| Floating nightly + `RUSTC_BOOTSTRAP=1` breaks on a toolchain bump | Medium | Pin an exact nightly in M3.5 and make local scripts and CI consume the same file |
+| A pinned toolchain becomes unavailable or its provenance drifts | Medium | 3.14 records the exact rustc commit, verifies it locally and in CI, and makes all build entry points consume the same rustup file |
 
 ---
 

@@ -17,7 +17,15 @@ for arg in "$@"; do
   esac
 done
 
-RUSTC_BOOTSTRAP=1 sh -c 'cd kernel && cargo build --release' >&2
+toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+if [ -z "$toolchain" ] || ! command -v rustup >/dev/null 2>&1; then
+  echo "qemu-test.sh: rustup and an exact rust-toolchain.toml channel are required" >&2
+  exit 1
+fi
+pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
+pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
+(cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+  rustup run "$toolchain" cargo build --release) >&2
 
 # Strip everything that legitimately varies between runs: timings, addresses,
 # heap sizes, and the terminal control codes the line discipline emits.
@@ -121,7 +129,17 @@ for case_file in tests/cases/*.in; do
     echo "FAIL $name: no golden file; run with --update"
     fail=1
   elif diff -u "$golden" "$actual" > /dev/null; then
-    echo "ok   $name"
+    if [ "$name" = "selftest" ]; then
+      checks=$(sed -n 's/.*SELFTEST OK (\([0-9][0-9]*\) checks).*/\1/p' "$actual")
+      if [ -n "$checks" ]; then
+        echo "ok   $name ($checks checks)"
+      else
+        echo "FAIL $name: transcript has no SELFTEST OK summary"
+        fail=1
+      fi
+    else
+      echo "ok   $name"
+    fi
   else
     echo "FAIL $name"
     diff -u "$golden" "$actual" | head -40

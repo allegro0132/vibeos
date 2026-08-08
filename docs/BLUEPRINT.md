@@ -113,6 +113,7 @@ upward except through a capability it was handed.
 |---|---:|---|:--:|
 | `cap.rs` | ~600 | Rights, `Cap`, `CSpace`, attenuation, revocation, explicit leases | — |
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
+| `durable.rs` | ~1000 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `shell.rs` | 458 | Operator interface | — |
@@ -459,10 +460,12 @@ Five boundaries must stay explicit:
    hart. Cooperative cancellation takes effect only at poll boundaries; hard
    containment ultimately needs instrumentation, preemption, or a
    narrower admitted component format.
-3. **Revocation needs durable semantics before persistence.** Persisting raw slot and
-   generation pairs is insufficient: reboot must not resurrect a descendant of a
-   revoked cap. Stable object identity, derivation records, and atomic tombstones are
-   part of the storage design, not a later serialization detail.
+3. **Durable semantics precede durable media.** M4.0 now specifies stable typed IDs,
+   sealed append-only derivation records, prepare/commit grants, tombstone-first
+   revoke, and high-water allocation. Recovery rejects malformed ancestry and lets
+   an ancestor tombstone win over every descendant. This proves the pure crash model,
+   not persistence yet: virtio-blk, object resolution, and live CSpace installation
+   remain M4.1--M4.3. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md).
 4. **Revocation cannot retroactively erase an in-flight operation.** Console hooks
    revalidate a `Revocable` token before every write; a successful check linearizes
    that operation before an overlapping revoke. Direct generated loads and stores

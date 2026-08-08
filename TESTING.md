@@ -16,9 +16,9 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation, explicit revocable/invocation lease semantics, dishonest type-erasure implementations, and CSpace reset ABA; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault-arena teardown; wait/timer registration ownership and stress; owner-tagged heap quotas/provenance; channels, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation, explicit leases, dishonest type-erasure implementations, and CSpace reset ABA; durable-log canonical decoding and exhaustive prefix/flush crash recovery; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault-arena teardown; wait/timer registration ownership and stress; owner-tagged heap quotas/provenance; channels, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, and program output | `tests/cases/`, `tests/golden/` |
+| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, and program output | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |

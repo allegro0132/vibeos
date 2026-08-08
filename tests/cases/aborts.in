@@ -8,6 +8,10 @@ fn main() -> i64 { 9223372036854775807 + 1 }
 .
 @sleep 2
 rustc edit
+fn main() -> i64 { let a = 9223372036854775807; let b = 1; a + b }
+.
+@sleep 2
+rustc edit
 fn f(n: i64) -> i64 { f(n) }
 fn main() -> i64 { f(0) }
 .

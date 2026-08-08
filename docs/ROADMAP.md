@@ -158,6 +158,11 @@ re-measuring.
 
 ---
 
+> **M3 status: partial.** 3.1, 3.2, 3.3 and the acceptance demo are done; 3.7
+> (heap quotas) is done for programs and not for kernel components; 3.4 (structs
+> and references) and 3.5/3.6 (SSA IR and register allocation) are not started.
+> See "What M3 did not do" below.
+
 ### M3 — Memory and a real language (v0.4)
 
 **Goal:** make compiled programs useful without making them unconfined.
@@ -170,14 +175,41 @@ storage is exactly where confinement gets hard, which is why this comes after M2
 | 3.1 ✅ | `MemoryRegion` resource | A bounded arena obtained *by capability*, with `READ`/`WRITE` rights. A program gets memory the same way it gets a console. |
 | 3.2 ✅ | Arrays with bounds checks | Checks are unsigned, so a negative index fails the same test — Rust indexes with `usize`, and this is how the subset keeps that guarantee with only `i64`. The region base lives in `s3` and the cursor in `t5`, and the audit asserts that `t5` is only ever `s3 + offset` and always preceded by a bounds check: a program picks an *index*, never an address. |
 | 3.3 ✅ | `bool`, unit, and a real type checker | A separate pass that validates *and* annotates: `!` is rewritten to bitwise or logical by operand type, and printed values are tagged so a `bool` renders as `true`/`false`. The point was less catching user mistakes than making the subset a genuine subset — v0.1 accepted `if 1`, which Rust rejects, and every such disagreement was a hole in the differential oracle. |
-| 3.4 | Structs and `&`/`&mut` with move semantics | Affine values, not a full borrow checker. Enough to write a program with state. |
-| 3.5 | An SSA IR | Between AST and codegen. Required before any optimization is worth attempting, and it gives the emitter audit (2.7) a narrower surface. |
-| 3.6 | Linear-scan register allocation | Retire the stack machine. Target: within 3× of `rustc -O0` on the benchmark corpus. |
-| 3.7 | Heap quotas per space | Blueprint §8 "Memory". A component that leaks should exhaust its own budget, not the system's. |
+| 3.4 ⬜ | Structs and `&`/`&mut` with move semantics | Affine values, not a full borrow checker. Enough to write a program with state. |
+| 3.5 ⬜ | An SSA IR | Between AST and codegen. Required before any optimization is worth attempting, and it gives the emitter audit (2.7) a narrower surface. |
+| 3.6 ⬜ | Linear-scan register allocation | Retire the stack machine. Target: within 3× of `rustc -O0` on the benchmark corpus. |
+| 3.7 ◐ | Heap quotas per space | Done for compiled programs: their storage is a capability on a bounded region, so the bound *is* the capability and a runaway program aborts instead of eating the heap. Not done for kernel components, which allocate through the single global allocator with no notion of who is asking. Doing it properly needs a per-allocation owner tag, and that is a change to the allocator's core rather than a bolt-on. |
 
-**Acceptance:** a compiled program that allocates an array from a capability-granted
-region, sorts it, prints it, and is killed cleanly when it indexes out of bounds or
-exceeds its memory budget.
+**Acceptance: met.** `tests/programs/sort.rs` allocates a 12-element array from
+the granted region, scrambles it, insertion-sorts it in place, prints both
+orders, and verifies the result — and produces byte-identical output to real
+rustc. Out-of-bounds, negative-index, and region-exhaustion all abort cleanly
+with the shell surviving, covered by the in-kernel self-test.
+
+### What M3 did not do
+
+**3.5 / 3.6 — the SSA IR and register allocator are not written.** What landed
+instead was the cheap half of the same goal: constants are materialized in one
+or two instructions instead of a fixed eleven, and literal arithmetic is folded
+away. Measured on the demo program (5 runs, min / median):
+
+| | runtime | code size |
+|---|---|---|
+| pre-M2, unchecked | 1838 / 2036 us | 3528 B |
+| M2, checked | 1918 / 2063 us | 4020 B |
+| M3, checked + folded | 754 / 1486 us | 3500 B |
+
+So the safety checks now cost *nothing net* against the unchecked baseline —
+shortening constants more than paid for them — and the median is 28% faster than
+M2. That is a real gain, and it is not the milestone: a stack machine still
+spends two instructions per value on stack traffic, which is what an allocator
+would remove. The roadmap's "within 3× of `rustc -O0`" target also has no harness
+yet, because the comparison is across architectures and machines; that needs
+defining before it can be claimed.
+
+**3.4 — structs and references are not started.** This is the largest remaining
+language change and wants the type checker to grow a notion of place expressions
+first.
 
 ---
 

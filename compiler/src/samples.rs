@@ -54,7 +54,7 @@ fn main() {
     println!("neg {} {}", -5, -(2 + 3));
     println!("cmp {} {} {} {} {} {}", 1 < 2, 2 < 1, 1 <= 1, 1 > 2, 2 >= 2, 1 == 1);
     println!("ne {} {}", 1 != 2, 1 != 1);
-    println!("not {} {}", !0, !5);
+    println!("bitnot {} {}", !0, !5);
     println!("and {} {} {}", 1 && 1, 1 && 0, 0 && 1);
     println!("or {} {} {}", 0 || 0, 0 || 1, 1 || 0);
     println!("call {} {}", add(40, 2), fact(10));

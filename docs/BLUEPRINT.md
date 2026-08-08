@@ -272,25 +272,39 @@ argument because it is what Bet 4 rests on:
 **Verified by demo:** `revoke prog` leaves byte-identical machine code compiling and
 running to completion with nothing to say.
 
-### 6.4 Where the argument leaks — the honest list
+### 6.4 Where the argument used to leak
 
-These are the holes. Each one is a roadmap item, not a footnote.
+Five holes were listed here in v0.1. Four are closed; the code generator now
+emits a check for each, and a failed check calls a runtime hook that longjmps
+out of the program (`kernel/src/trampoline.rs`).
 
-1. **Stack overflow.** Deep recursion walks `sp` down past the 256 KiB stack into
-   `.bss`. The linker puts the stack *below* the heap, so an overflow corrupts kernel
-   state rather than faulting. No guard page (no MMU) and no stack probe.
-2. **Unbounded execution.** A compiled `while true {}` wedges the machine, because
-   there is no preemption and no way to abort a running program.
-3. **Division by zero** follows RISC-V semantics (`-1`; `%` yields the dividend)
-   instead of panicking, because aborting mid-program needs a non-local exit that
-   does not exist yet.
-4. **Integer overflow** wraps silently. Real Rust would panic in debug.
-5. **The emitter is unverified.** The confinement argument is a table in a document,
-   not a proof or even a test suite. A codegen bug that emits a wrong offset is a
-   privilege escalation, and nothing would currently catch it.
+| Was | Now |
+|---|---|
+| Deep recursion walked `sp` into `.bss` | Every prologue proves `sp >= s1` before the frame is used. `s1` is set by the trampoline and is callee-saved, so the check is a register compare and needs no memory access. |
+| `while true {}` wedged the machine | Fuel in `s2`, charged per call and per loop back-edge. A function with no call and no loop cannot fail to terminate and is not charged. |
+| Division by zero followed RISC-V semantics | Guarded, including `i64::MIN / -1`. A literal zero divisor is a compile error, as in real rustc. |
+| Integer overflow wrapped silently | `+`, `-`, `*` and unary `-` are checked and abort with rustc's own wording. |
 
-Items 1–3 share one fix: a trampoline that can unwind out of generated code. That
-is why they are scheduled together (Roadmap M2).
+The fifth — **the emitter is unverified** — is reduced rather than closed. It now
+has three defences, and it remains the highest risk in the system:
+
+- The confinement claims above are asserted as tests that walk the emitted
+  instruction stream: the permitted opcode set, every memory access
+  frame-relative, every indirect jump a recognised call or return, every
+  absolute address belonging to the program's own data, its own code, or a
+  runtime hook.
+- Real rustc is used as a differential oracle. Every program in
+  `tests/programs/` is valid in both languages; CI compiles each with rustc,
+  runs it, and requires VibeOS to produce identical bytes.
+- The front end is fuzzed against 25,000 generated inputs, every prefix and
+  every single-character deletion of the samples, and rejects nesting deeper
+  than 64 — `rustc edit` reads arbitrary console input onto a 256 KiB kernel
+  stack with no guard page, so unbounded parser recursion was itself a way to
+  corrupt memory from the shell prompt.
+
+Because these checks exist, `!` is now Rust's bitwise complement rather than
+logical negation: a subset that disagrees with the language it claims to subset
+cannot use that language as an oracle.
 
 ---
 
@@ -330,10 +344,11 @@ exhaust the heap and take down the system. Quotas are a capability question
 distinction because there is no wall clock. Timers are a linear scan, fine at ~10
 sleepers and wrong at 10,000.
 
-**Failure.** Kernel panic → SBI shutdown. Faults print cause/stval/sepc and halt.
-There is no per-component failure domain: a component that panics takes the machine
-with it, which for a system built on component isolation is an obvious gap. Task-
-level fault isolation needs the same unwinding machinery as §6.4.
+**Failure.** A compiled program that fails a safety check is aborted and the
+shell survives; that machinery is §6.4. A *component* that panics still takes the
+machine with it, which for a system built on component isolation remains the
+obvious gap — it needs the same trampoline applied at the executor's poll
+boundary (Roadmap 2.8).
 
 **Observability.** `ps` (poll counts), `caps` (capability tables), `chan` (queue
 depth), `mem` (heap). Poll counts are a genuinely good scheduler metric — they say

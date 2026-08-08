@@ -19,9 +19,33 @@ const ZERO: u32 = 0;
 const RA: u32 = 1;
 const SP: u32 = 2;
 const S0: u32 = 8;
+/// Lowest permitted `sp`, established by the trampoline. Callee-saved, so the
+/// runtime hooks preserve it and generated code never writes it.
+const S1: u32 = 9;
+/// Remaining fuel, likewise.
+const S2: u32 = 18;
 const T0: u32 = 5;
 const T1: u32 = 6;
+const T2: u32 = 7;
+const T3: u32 = 28;
+const T4: u32 = 29;
 const A0: u32 = 10;
+
+// Branch funct3 values.
+const BEQ: u32 = 0;
+const BNE: u32 = 1;
+const BGE: u32 = 5;
+const BGEU: u32 = 7;
+
+/// Abort reasons, shared with `kernel::trampoline::abort`.
+pub mod abort {
+    pub const STACK_OVERFLOW: u8 = 1;
+    pub const DIVIDE_BY_ZERO: u8 = 2;
+    pub const REMAINDER_BY_ZERO: u8 = 3;
+    pub const OUT_OF_FUEL: u8 = 4;
+    pub const ARITHMETIC_OVERFLOW: u8 = 5;
+    pub const DIVIDE_OVERFLOW: u8 = 6;
+}
 
 /// Every stack slot is 16 bytes so `sp` is always 16-byte aligned, which is
 /// what the RISC-V C ABI requires at a call boundary.
@@ -63,6 +87,23 @@ fn j(imm: i32, rd: u32) -> u32 {
 fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
     i(imm, rs1, 0, rd, 0x13)
 }
+fn mv(rd: u32, rs: u32) -> u32 {
+    addi(rd, rs, 0)
+}
+fn xor(rd: u32, rs1: u32, rs2: u32) -> u32 {
+    r(0, rs2, rs1, 4, rd, 0x33)
+}
+fn and(rd: u32, rs1: u32, rs2: u32) -> u32 {
+    r(0, rs2, rs1, 7, rd, 0x33)
+}
+/// `srai rd, rs1, shamt` — RV64 sets bit 10 of the immediate.
+fn srai(rd: u32, rs1: u32, shamt: u32) -> u32 {
+    i((0x400 | shamt) as i32, rs1, 5, rd, 0x13)
+}
+/// Materialize `i64::MIN` in two instructions, for the overflow checks.
+fn li_min(rd: u32) -> [u32; 2] {
+    [addi(rd, ZERO, 1), i(63, rd, 1, rd, 0x13)]
+}
 fn ld(rd: u32, rs1: u32, off: i32) -> u32 {
     i(off, rs1, 3, rd, 0x03)
 }
@@ -86,14 +127,20 @@ pub struct Codegen {
     str_addr: BTreeMap<String, u64>,
     rt_print_str: u64,
     rt_print_int: u64,
+    rt_abort: u64,
     scope: Vec<Scope>,
     next_slot: u32,
     ret_patches: Vec<usize>,
+    /// `jal` sites waiting to be pointed at a shared abort stub. Emitting one
+    /// stub per reason keeps each check site to two instructions instead of the
+    /// thirteen an inline call would cost.
+    abort_patches: Vec<(usize, u8)>,
 }
 
 pub struct Runtime {
     pub print_str: u64,
     pub print_int: u64,
+    pub abort: u64,
 }
 
 type CResult<T> = Result<T, String>;
@@ -160,6 +207,66 @@ impl Codegen {
     fn lookup(&self, name: &str) -> Option<&Scope> {
         self.scope.iter().rev().find(|s| s.name == name)
     }
+
+    /// Emit `guard` (a branch that skips the abort when the check passes),
+    /// followed by a jump to the shared stub for `reason`.
+    fn guard(&mut self, guard: u32, reason: u8) {
+        self.emit(guard);
+        let at = self.jump_placeholder();
+        self.abort_patches.push((at, reason));
+    }
+
+    /// One stub per distinct reason, emitted after every function.
+    fn emit_abort_stubs(&mut self) {
+        let mut reasons: Vec<u8> = self.abort_patches.iter().map(|(_, r)| *r).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+
+        let mut stub_of: Vec<(u8, usize)> = Vec::new();
+        for reason in reasons {
+            stub_of.push((reason, self.here()));
+            self.emit(addi(A0, ZERO, reason as i32));
+            let target = self.rt_abort;
+            self.call_abs(target);
+            // `rt_abort` diverges; if it ever returned, spinning here is far
+            // better than resuming a program that failed a safety check.
+            // `jal zero, 0` branches to itself.
+            self.emit(j(0, ZERO));
+        }
+
+        for (at, reason) in core::mem::take(&mut self.abort_patches) {
+            let target = stub_of.iter().find(|(r, _)| *r == reason).map(|(_, t)| *t);
+            if let Some(t) = target {
+                self.patch_to(at, t);
+            }
+        }
+    }
+}
+
+/// True when a function contains no call and no loop, and therefore executes a
+/// bounded number of instructions no matter its arguments.
+fn is_leaf(block: &Block) -> bool {
+    fn expr_leaf(e: &Expr) -> bool {
+        match e {
+            Expr::Call(..) => false,
+            Expr::Neg(a) | Expr::Not(a) => expr_leaf(a),
+            Expr::Bin(_, a, b) => expr_leaf(a) && expr_leaf(b),
+            Expr::If(c, t, e) => {
+                expr_leaf(c) && is_leaf(t) && e.as_ref().map_or(true, is_leaf)
+            }
+            _ => true,
+        }
+    }
+    block.stmts.iter().all(|st| match st {
+        Stmt::While(..) => false,
+        // A print is a call into the runtime; charge for it.
+        Stmt::Print { .. } => false,
+        Stmt::Let { init, .. } => expr_leaf(init),
+        Stmt::Assign { value, .. } => expr_leaf(value),
+        Stmt::Expr(e) => expr_leaf(e),
+        Stmt::Return(Some(e)) => expr_leaf(e),
+        Stmt::Return(None) => true,
+    }) && block.tail.as_ref().map_or(true, |e| expr_leaf(e))
 }
 
 /// Count every `let` in a function so the frame can be sized up front.
@@ -298,9 +405,11 @@ pub fn compile(
             str_addr: str_addr.clone(),
             rt_print_str: rt.print_str,
             rt_print_int: rt.print_int,
+            rt_abort: rt.abort,
             scope: Vec::new(),
             next_slot: 0,
             ret_patches: Vec::new(),
+            abort_patches: Vec::new(),
         };
 
         // `main` goes first so the entry point is the buffer's first instruction.
@@ -312,6 +421,7 @@ pub fn compile(
             found.insert(f.name.clone(), code_base + (cg.here() * 4) as u64);
             cg.func(f)?;
         }
+        cg.emit_abort_stubs();
         addrs = found;
         code = cg.code;
         let _ = pass;
@@ -336,6 +446,19 @@ impl Codegen {
         self.ret_patches.clear();
 
         self.emit(addi(SP, SP, -frame));
+
+        // Stack probe. The frame is already claimed, so this catches the
+        // overflow before anything writes through it.
+        self.guard(b(8, S1, SP, BGEU), abort::STACK_OVERFLOW);
+
+        // Fuel. Charged per call so that unbounded recursion runs out even when
+        // it contains no loop. A function that makes no call and contains no
+        // loop cannot fail to terminate, so it is not charged.
+        if !is_leaf(&f.body) {
+            self.emit(addi(S2, S2, -1));
+            self.guard(b(8, ZERO, S2, BGE), abort::OUT_OF_FUEL);
+        }
+
         self.emit(sd(RA, SP, 0));
         self.emit(sd(S0, SP, 8));
         self.emit(addi(S0, SP, 0));
@@ -415,6 +538,9 @@ impl Codegen {
             }
             Stmt::While(cond, body) => {
                 let top = self.here();
+                // Charge each iteration, so `while true {}` terminates.
+                self.emit(addi(S2, S2, -1));
+                self.guard(b(8, ZERO, S2, BGE), abort::OUT_OF_FUEL);
                 self.expr(cond)?;
                 let exit = self.jump_if_false();
                 self.block(body)?;
@@ -484,13 +610,21 @@ impl Codegen {
             Expr::Neg(a) => {
                 self.expr(a)?;
                 self.pop(T0);
+                // -i64::MIN overflows; real Rust panics.
+                for w in li_min(T2) {
+                    self.emit(w);
+                }
+                self.guard(b(8, T2, T0, BNE), abort::ARITHMETIC_OVERFLOW);
                 self.emit(r(0x20, T0, ZERO, 0, T0, 0x33)); // sub t0, zero, t0
                 self.push(T0);
             }
             Expr::Not(a) => {
                 self.expr(a)?;
                 self.pop(T0);
-                self.emit(i(1, T0, 3, T0, 0x13)); // sltiu t0, t0, 1
+                // Rust's `!` on an integer is bitwise complement, not logical
+                // negation. Matching it is what lets a program in this subset be
+                // compiled by real rustc as a differential oracle.
+                self.emit(i(-1, T0, 4, T0, 0x13)); // xori t0, t0, -1
                 self.push(T0);
             }
             Expr::Bin(BinOp::And, a, b) | Expr::Bin(BinOp::Or, a, b) => {
@@ -508,11 +642,22 @@ impl Codegen {
                 self.patch_to_here(end);
             }
             Expr::Bin(op, a, bb) => {
+                if matches!(op, BinOp::Div | BinOp::Rem) {
+                    if let Expr::Int(0) = **bb {
+                        return Err(format!(
+                            "this operation will panic at runtime: attempt to {} by zero",
+                            if *op == BinOp::Div { "divide" } else { "calculate the remainder" }
+                        ));
+                    }
+                }
                 self.expr(a)?;
                 self.expr(bb)?;
                 self.pop(T1);
                 self.pop(T0);
-                self.arith(*op)?;
+                // A positive literal divisor is neither zero nor -1, so both
+                // division guards are provably dead and are not emitted.
+                let divisor_is_safe = matches!(**bb, Expr::Int(v) if v > 0);
+                self.arith(*op, divisor_is_safe)?;
                 self.push(T0);
             }
             Expr::Call(name, args, line) => {
@@ -567,13 +712,64 @@ impl Codegen {
     }
 
     /// Combines `t0` (lhs) and `t1` (rhs), leaving the result in `t0`.
-    fn arith(&mut self, op: BinOp) -> CResult<()> {
+    ///
+    /// Arithmetic is checked. Real Rust panics on overflow and on division by
+    /// zero, and a subset that silently wraps is not a subset — it is a
+    /// different language that happens to parse the same.
+    fn arith(&mut self, op: BinOp, divisor_is_safe: bool) -> CResult<()> {
         match op {
-            BinOp::Add => self.emit(r(0, T1, T0, 0, T0, 0x33)),
-            BinOp::Sub => self.emit(r(0x20, T1, T0, 0, T0, 0x33)),
-            BinOp::Mul => self.emit(r(1, T1, T0, 0, T0, 0x33)),
-            BinOp::Div => self.emit(r(1, T1, T0, 4, T0, 0x33)),
-            BinOp::Rem => self.emit(r(1, T1, T0, 6, T0, 0x33)),
+            // r = a + b overflows iff a and b share a sign that r does not,
+            // i.e. (r^a) & (r^b) has its sign bit set.
+            BinOp::Add => {
+                self.emit(r(0, T1, T0, 0, T2, 0x33)); // add t2, t0, t1
+                self.emit(xor(T3, T2, T0));
+                self.emit(xor(T4, T2, T1));
+                self.emit(and(T3, T3, T4));
+                self.guard(b(8, ZERO, T3, BGE), abort::ARITHMETIC_OVERFLOW);
+                self.emit(mv(T0, T2));
+            }
+            // r = a - b overflows iff a and b differ in sign and r differs
+            // from a: (a^b) & (a^r).
+            BinOp::Sub => {
+                self.emit(r(0x20, T1, T0, 0, T2, 0x33)); // sub t2, t0, t1
+                self.emit(xor(T3, T0, T1));
+                self.emit(xor(T4, T0, T2));
+                self.emit(and(T3, T3, T4));
+                self.guard(b(8, ZERO, T3, BGE), abort::ARITHMETIC_OVERFLOW);
+                self.emit(mv(T0, T2));
+            }
+            // The full product fits in 128 bits; it fits in 64 exactly when the
+            // high half is the sign extension of the low half.
+            BinOp::Mul => {
+                self.emit(r(1, T1, T0, 0, T2, 0x33)); // mul  t2, t0, t1
+                self.emit(r(1, T1, T0, 1, T3, 0x33)); // mulh t3, t0, t1
+                self.emit(srai(T4, T2, 63));
+                self.guard(b(8, T4, T3, BEQ), abort::ARITHMETIC_OVERFLOW);
+                self.emit(mv(T0, T2));
+            }
+            BinOp::Div | BinOp::Rem => {
+                let is_div = op == BinOp::Div;
+                if !divisor_is_safe {
+                    let zero_reason = if is_div {
+                        abort::DIVIDE_BY_ZERO
+                    } else {
+                        abort::REMAINDER_BY_ZERO
+                    };
+                    self.guard(b(8, ZERO, T1, BNE), zero_reason);
+
+                    // i64::MIN / -1 is the one other case RISC-V answers and
+                    // Rust refuses. Only pay for the MIN comparison when b == -1.
+                    self.emit(addi(T2, ZERO, -1));
+                    self.emit(b(20, T2, T1, BNE)); // b != -1 -> skip the check
+                    for w in li_min(T2) {
+                        self.emit(w);
+                    }
+                    self.guard(b(8, T2, T0, BNE), abort::DIVIDE_OVERFLOW);
+                }
+
+                let f3 = if is_div { 4 } else { 6 };
+                self.emit(r(1, T1, T0, f3, T0, 0x33));
+            }
             BinOp::Lt => self.emit(r(0, T1, T0, 2, T0, 0x33)), // slt t0, t0, t1
             BinOp::Gt => self.emit(r(0, T0, T1, 2, T0, 0x33)), // slt t0, t1, t0
             BinOp::Ge => {

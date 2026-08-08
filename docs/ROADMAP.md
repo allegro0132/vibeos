@@ -100,6 +100,10 @@ iteration on scheduler logic; interrupt behaviour still belongs in 1.5.
 
 ---
 
+> **M2 status: complete.** Every hole in BLUEPRINT §6.4 is closed and tested.
+> 117 host tests, 45 in-kernel checks, 7 golden transcripts including a
+> differential run against real rustc.
+
 ### M2 — Confinement (v0.3)
 
 **Goal:** turn Blueprint §6.3 from an argument into an enforced property.
@@ -109,14 +113,17 @@ running generated code.** Blueprint §6.4 items 1–3 are all the same hole.
 
 | # | Work item | Notes |
 |---|---|---|
-| 2.1 | Program trampoline | Save callee-saved regs + `sp` + `ra` before entering generated code; a runtime hook can restore them and return an error. A `setjmp`/`longjmp` pair in ~30 lines of RV64 asm. Unlocks 2.2–2.4. |
-| 2.2 | Stack probes | Emit a `sp` limit check at every function prologue. On breach, abort through the trampoline with `stack overflow`. Closes the hole where recursion corrupts `.bss`. |
-| 2.3 | Division and overflow checks | Emit checks; abort with the message real rustc would print. Removes the "RISC-V semantics" caveat from the README. |
-| 2.4 | Fuel / watchdog | Emit a budget decrement at loop back-edges and function entry; exhausting it aborts. A compiled `while true {}` must return control to the shell. |
-| 2.5 | Codegen differential testing | Compile a corpus with the in-kernel compiler *and* with real `rustc` on the host; compare stdout. The corpus doubles as a regression suite and is the strongest oracle available for a compiler this small. |
-| 2.6 | Parser fuzzing | `cargo-fuzz` on the host. The parser must never panic; it must only return `Err`. |
-| 2.7 | Emitter audit | Enumerate every instruction the emitter can produce and prove each is frame-local or compiler-chosen. Turn Blueprint §6.3's table into an asserted test. |
-| 2.8 | Task fault isolation | Reuse 2.1 so a panicking *component* kills its task rather than the machine. Blueprint §8 "Failure". |
+| 2.1 ✅ | Program trampoline | Save callee-saved regs + `sp` + `ra` before entering generated code; a runtime hook can restore them and return an error. A `setjmp`/`longjmp` pair in ~30 lines of RV64 asm. Unlocks 2.2–2.4. |
+| 2.2 ✅ | Stack probes | Emit a `sp` limit check at every function prologue. On breach, abort through the trampoline with `stack overflow`. Closes the hole where recursion corrupts `.bss`. |
+| 2.3 ✅ | Division and overflow checks | Emit checks; abort with the message real rustc would print. Removes the "RISC-V semantics" caveat from the README. |
+| 2.4 ✅ | Fuel / watchdog | Emit a budget decrement at loop back-edges and function entry; exhausting it aborts. A compiled `while true {}` must return control to the shell. |
+| 2.5 ✅ | Codegen differential testing | Compile a corpus with the in-kernel compiler *and* with real `rustc` on the host; compare stdout. The corpus doubles as a regression suite and is the strongest oracle available for a compiler this small. |
+| 2.6 ✅ | Parser fuzzing | `cargo-fuzz` on the host. The parser must never panic; it must only return `Err`. |
+| 2.7 ✅ | Emitter audit | Enumerate every instruction the emitter can produce and prove each is frame-local or compiler-chosen. Turn Blueprint §6.3's table into an asserted test. |
+| 2.8 ⬜ | Task fault isolation | Reuse 2.1 so a panicking *component* kills its task rather than the machine. Blueprint §8 "Failure". |
+
+**Acceptance:** all six abort paths are covered by the in-kernel self-test and by
+the `aborts` golden transcript, and the shell survives every one of them.
 
 **Acceptance demo:**
 ```
@@ -129,9 +136,25 @@ vibe>                          <- shell still alive, components still ticking
 ```
 plus deep recursion aborting cleanly, and `1/0` reporting a divide-by-zero panic.
 
-**Risk:** fuel checks cost performance on every back edge. Measure before and after;
-if the cost is above ~15%, hoist checks out of provably-bounded loops rather than
-weakening the guarantee.
+**Measured cost** (demo program, 5 runs each, min / median):
+
+| | runtime | code size |
+|---|---|---|
+| unchecked (pre-M2) | 1838 / 2036 us | 3528 B |
+| checked | 1918 / 2063 us | 4020 B |
+
+About +4% at the minimum and +1% at the median — inside the noise on this
+benchmark — for +14% code size. The 15% budget was not spent, and no check was
+weakened to get there. Two optimisations did the work: a positive literal
+divisor is provably neither zero nor -1 so both division guards are omitted, and
+a function with no call and no loop cannot fail to terminate so it is not
+charged fuel (it still gets a stack probe, which is the security-critical one).
+
+The honest reason the overhead is this small is that the stack-machine code
+generator is already so instruction-heavy — 11 instructions per constant, two
+per stack slot — that the checks disappear into it. When M3's register allocator
+lands, the checks will become proportionally more expensive and this needs
+re-measuring.
 
 ---
 

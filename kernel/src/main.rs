@@ -25,6 +25,7 @@ mod plic;
 mod rustc;
 mod selftest;
 mod shell;
+mod trampoline;
 mod trap;
 mod tty;
 mod uart;
@@ -72,6 +73,15 @@ _start:
 extern "C" {
     static __heap_start: u8;
     static __heap_end: u8;
+    static __stack_bottom: u8;
+}
+
+/// Lowest address a compiled program's stack may reach. The linker puts the
+/// kernel stack directly above `.bss`, so without this a deep recursion in
+/// generated code would corrupt kernel state instead of faulting.
+pub fn stack_floor() -> usize {
+    // Leave a band so the abort path itself has room to run.
+    core::ptr::addr_of!(__stack_bottom) as usize + 8192
 }
 
 #[global_allocator]

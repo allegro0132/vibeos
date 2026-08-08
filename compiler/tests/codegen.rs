@@ -8,7 +8,11 @@
 use vibeos_rustc::{code_len, compile_at, samples, Runtime};
 
 fn rt() -> Runtime {
-    Runtime { print_str: 0x1111_2222_3333_4444, print_int: 0x5555_6666_7777_8888 }
+    Runtime {
+        print_str: 0x1111_2222_3333_4444,
+        print_int: 0x5555_6666_7777_8888,
+        abort: 0x9999_aaaa_bbbb_cccc,
+    }
 }
 
 fn emit(src: &str) -> Vec<u32> {
@@ -24,24 +28,29 @@ fn err(src: &str) -> String {
 
 // --- instruction encoding, checked against the spec by hand ---
 
-/// Every function ends with `ret`, whose encoding is the most widely known
-/// word in RISC-V: `jalr x0, x1, 0` == 0x00008067.
+/// `ret` is `jalr x0, x1, 0` == 0x00008067, the most widely known word in
+/// RISC-V. Every function must contain exactly one.
 #[test]
-fn functions_end_in_a_canonical_ret() {
-    let code = emit("fn main() {}");
-    assert_eq!(*code.last().unwrap(), 0x0000_8067, "expected `ret`");
+fn every_function_returns_through_a_canonical_ret() {
+    for (src, funcs) in [("fn main() {}", 1), ("fn f() {}\nfn main() { f(); }", 2)] {
+        let code = emit(src);
+        let rets = code.iter().filter(|w| **w == 0x0000_8067).count();
+        assert_eq!(rets, funcs, "expected one `ret` per function in {src:?}");
+    }
 }
 
 #[test]
-fn the_prologue_saves_ra_and_s0_and_establishes_a_frame() {
+fn the_prologue_claims_a_frame_and_saves_ra_and_s0() {
     let code = emit("fn main() {}");
-    // addi sp, sp, -16   |  sd ra, 0(sp)  |  sd s0, 8(sp)  |  addi s0, sp, 0
     // low 20 bits: opcode 0x13 | rd=sp(2)<<7 | funct3=0 | rs1=sp(2)<<15
-    assert_eq!(code[0] & 0x000f_ffff, 0x0001_0113, "addi sp, sp, imm");
+    assert_eq!(code[0] & 0x000f_ffff, 0x0001_0113, "opens with addi sp, sp, imm");
     assert_eq!(code[0] >> 20, 0xff0, "frame of 16 bytes");
-    assert_eq!(code[1], 0x0011_3023, "sd ra, 0(sp)");
-    assert_eq!(code[2], 0x0081_3423, "sd s0, 8(sp)");
-    assert_eq!(code[3], 0x0001_0413, "addi s0, sp, 0");
+    // The safety checks sit between the frame claim and the saves, so search
+    // rather than index.
+    let head = &code[..12];
+    assert!(head.contains(&0x0011_3023), "sd ra, 0(sp)");
+    assert!(head.contains(&0x0081_3423), "sd s0, 8(sp)");
+    assert!(head.contains(&0x0001_0413), "addi s0, sp, 0");
 }
 
 /// Decoded by hand from the spec's field layouts, so a change to the encoders
@@ -50,8 +59,10 @@ fn the_prologue_saves_ra_and_s0_and_establishes_a_frame() {
 fn known_words_for_each_instruction_format() {
     let code = emit("fn main() -> i64 { 1 + 2 }");
     let has = |w: u32| code.contains(&w);
-    assert!(has(0x0062_82b3), "add t0, t0, t1  (R-type)");
-    assert!(has(0x0002_8067) || has(0x0000_8067), "jalr (I-type, jump)");
+    // Checked addition computes into t2, tests, then moves.
+    assert!(has(0x0062_83b3), "add t2, t0, t1  (R-type)");
+    assert!(has(0x0003_8293), "mv t0, t2  (addi with imm 0)");
+    assert!(has(0x0000_8067), "ret (I-type, jump)");
     assert!(has(0x0001_3283) || has(0x0001_3303), "ld from sp (I-type, load)");
 }
 
@@ -69,6 +80,16 @@ fn the_stack_pointer_moves_in_16_byte_steps() {
 /// The constant materializer is 11 instructions of `addi`/`slli`. Rather than
 /// hand-encoding it, interpret those two forms and check the register lands on
 /// the intended value — including negative and boundary constants.
+/// Find the first 11-instruction constant-materialization run targeting `rd`.
+/// Position varies with how many safety checks precede it, so search for the
+/// shape rather than assuming an offset.
+fn first_li64_into(code: &[u32], rd: u32) -> Option<Vec<u32>> {
+    code.windows(11).find(|w| {
+        w.iter().all(|x| x & 0x7f == 0x13 && (x >> 7) & 0x1f == rd)
+            && (w[0] >> 15) & 0x1f == 0 // starts from x0
+    }).map(|w| w.to_vec())
+}
+
 fn simulate_li64(code: &[u32], rd: u32) -> u64 {
     let mut reg = 0u64;
     for w in code {
@@ -102,13 +123,8 @@ fn constants_materialize_exactly() {
         i64::MAX, 6765, 1_000_000_007,
     ] {
         let code = emit(&format!("fn main() -> i64 {{ {want} }}"));
-        // The literal is loaded into t0 before the first push.
-        let upto: Vec<u32> = code.iter().copied().skip(4).take(11).collect();
-        assert_eq!(
-            simulate_li64(&upto, 5) as i64,
-            want,
-            "materializing {want} from {upto:08x?}"
-        );
+        let run = first_li64_into(&code, 5).unwrap_or_else(|| panic!("no li64 for {want}"));
+        assert_eq!(simulate_li64(&run, 5) as i64, want, "materializing {want}");
     }
 }
 
@@ -117,10 +133,7 @@ fn constants_materialize_exactly() {
 #[test]
 fn negative_literals_are_materialized_then_negated() {
     let code = emit("fn main() -> i64 { -42 }");
-    assert!(
-        code.contains(&0x4050_02b3),
-        "expected `sub t0, zero, t0` in {code:08x?}"
-    );
+    assert!(code.contains(&0x4050_02b3), "expected `sub t0, zero, t0`");
 }
 
 #[test]
@@ -153,7 +166,7 @@ fn compilation_is_deterministic() {
 fn the_entry_point_is_the_first_instruction() {
     // `main` is emitted first so the buffer's address is the entry point.
     let code = emit("fn helper() -> i64 { 1 }\nfn main() -> i64 { helper() }");
-    assert_eq!(code[1], 0x0011_3023, "the buffer opens with main's prologue");
+    assert_eq!(code[0] & 0x000f_ffff, 0x0001_0113, "opens with main's frame claim");
 }
 
 #[test]
@@ -187,6 +200,14 @@ fn all_programs() -> Vec<Vec<u32>> {
     for src in [samples::HELLO, samples::DEMO, samples::CONFORMANCE] {
         out.push(emit(src));
     }
+    // Programs that carry every kind of abort stub, so the audit covers the
+    // failure paths and not just the happy ones.
+    out.push(emit(
+        "fn r(n: i64) -> i64 { r(n) }\n\
+         fn main() -> i64 { let a = 1; let b = 2; let mut i = 0;\
+             while i < 3 { i = i + 1; }\
+             r(a / b + a * b - a + -a) }",
+    ));
     out
 }
 
@@ -273,7 +294,7 @@ fn the_only_absolute_addresses_are_compiler_chosen() {
     for addr in found.iter().filter(|v| **v > 0x1000_0000) {
         let in_data = (0x8000_0000..0x8000_0000 + img.data.len() as u64).contains(addr);
         let in_code = (0x8010_0000..0x8010_0000 + (img.code.len() * 4) as u64).contains(addr);
-        let is_hook = *addr == rt.print_str || *addr == rt.print_int;
+        let is_hook = *addr == rt.print_str || *addr == rt.print_int || *addr == rt.abort;
         assert!(
             in_data || in_code || is_hook,
             "generated code materializes {addr:#x}, which is neither its own data, \
@@ -344,4 +365,122 @@ fn samples_compile() {
     ] {
         assert!(code_len(src).is_ok(), "{name} failed to compile");
     }
+}
+
+// --- M2: emitted safety checks ---
+
+/// Every function claims its frame and then immediately proves it is still
+/// inside the stack. Without this, deep recursion in generated code walks `sp`
+/// down into `.bss` and corrupts the kernel rather than faulting.
+#[test]
+fn every_function_probes_the_stack() {
+    // bgeu sp, s1, +8 : rs1=sp(2) rs2=s1(9) funct3=7
+    let probe = 0x0091_7463u32;
+    for src in ["fn main() {}", "fn f(a: i64) -> i64 { a }\nfn main() { f(1); }"] {
+        let code = emit(src);
+        let funcs = code.iter().filter(|w| **w == 0x0000_8067).count();
+        assert_eq!(
+            code.iter().filter(|w| **w == probe).count(),
+            funcs,
+            "one stack probe per function in {src:?}"
+        );
+    }
+}
+
+/// Fuel is charged per call and per loop iteration, so neither unbounded
+/// recursion nor `while true {}` can run forever.
+#[test]
+fn calls_and_loops_are_charged_fuel() {
+    let burn = 0xfff9_0913u32; // addi s2, s2, -1
+
+    let recursive = emit("fn f(n: i64) -> i64 { f(n) }\nfn main() -> i64 { f(0) }");
+    assert!(recursive.contains(&burn), "a recursive function is charged");
+
+    let looping = emit("fn main() { let mut i = 0; while i < 3 { i = i + 1; } }");
+    assert!(
+        looping.iter().filter(|w| **w == burn).count() >= 2,
+        "the function entry and the loop back-edge are both charged"
+    );
+}
+
+/// A function with no call and no loop executes a bounded number of
+/// instructions whatever its arguments, so charging it is pure overhead.
+#[test]
+fn a_leaf_function_is_not_charged_fuel() {
+    let burn = 0xfff9_0913u32;
+    let leaf = emit("fn square(n: i64) -> i64 { n * n }\nfn main() -> i64 { square(7) }");
+    // `main` calls, so it is charged; `square` is a leaf and is not.
+    assert_eq!(leaf.iter().filter(|w| **w == burn).count(), 1);
+    // The probe is still unconditional -- it is the security-critical one.
+    assert_eq!(leaf.iter().filter(|w| **w == 0x0091_7463).count(), 2);
+}
+
+#[test]
+fn division_is_guarded_against_zero_and_overflow() {
+    let code = emit("fn main() -> i64 { let a = 10; let b = 2; a / b }");
+    // bne t1, zero, +8 : rs1=t1(6) rs2=zero funct3=1
+    assert!(code.contains(&0x0003_1463), "divisor-is-zero guard");
+    // i64::MIN materialization for the MIN / -1 case
+    assert!(code.contains(&0x03f3_9393), "slli t2, t2, 63");
+}
+
+/// A positive literal divisor is neither zero nor -1, so both guards are
+/// provably dead and must not be paid for.
+#[test]
+fn a_constant_divisor_needs_no_guard() {
+    let code = emit("fn main() -> i64 { let a = 10; a / 2 }");
+    assert!(!code.contains(&0x0003_1463), "no divisor-is-zero guard");
+    assert!(!code.contains(&0x03f3_9393), "no MIN comparison");
+}
+
+#[test]
+fn dividing_by_a_literal_zero_is_a_compile_error() {
+    assert_eq!(
+        err("fn main() -> i64 { 1 / 0 }"),
+        "this operation will panic at runtime: attempt to divide by zero"
+    );
+    assert_eq!(
+        err("fn main() -> i64 { 1 % 0 }"),
+        "this operation will panic at runtime: attempt to calculate the remainder by zero"
+    );
+}
+
+/// Real Rust panics on overflow; a subset that silently wraps is a different
+/// language that happens to parse the same.
+#[test]
+fn arithmetic_is_overflow_checked() {
+    let add = emit("fn main() -> i64 { let a = 1; let b = 2; a + b }");
+    assert!(add.contains(&0x0062_83b3), "add into a scratch register");
+    assert!(add.contains(&0x0053_ce33), "xor t3, t2, t0 for the sign test");
+    assert!(add.contains(&0x0063_ceb3), "xor t4, t2, t1 for the sign test");
+
+    let mul = emit("fn main() -> i64 { let a = 1; let b = 2; a * b }");
+    assert!(mul.contains(&0x0262_9e33), "mulh t3, t0, t1");
+    assert!(mul.contains(&0x43f3_de93), "srai t4, t2, 63");
+
+    let neg = emit("fn main() -> i64 { let a = 1; -a }");
+    assert!(neg.contains(&0x03f3_9393), "compare against i64::MIN");
+}
+
+/// `!` on an integer is bitwise complement in Rust. Matching it is what lets a
+/// program in this subset be compiled by real rustc as a differential oracle.
+#[test]
+fn bang_is_bitwise_complement_not_logical_negation() {
+    let code = emit("fn main() -> i64 { let a = 5; !a }");
+    assert!(code.contains(&0xfff2_c293), "xori t0, t0, -1");
+    assert!(!code.contains(&0x0012_b293), "not sltiu t0, t0, 1");
+}
+
+/// The abort path must itself obey the confinement rules: a program that fails
+/// a check calls the runtime, it does not jump somewhere of its own choosing.
+#[test]
+fn the_abort_stubs_are_ordinary_guarded_calls() {
+    let code = emit("fn main() -> i64 { let a = 1; let b = 0; a / b }");
+    // One `addi a0, zero, <reason>` per distinct abort reason.
+    let reasons = code
+        .iter()
+        .filter(|w| **w & 0x000f_ffff == 0x0000_0513 && (**w >> 20) < 16 && (**w >> 20) > 0)
+        .count();
+    assert!(reasons >= 1, "at least one abort stub");
+    // And the audit tests below still apply to all of it.
 }

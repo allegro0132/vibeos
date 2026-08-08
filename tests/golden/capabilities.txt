@@ -18,12 +18,12 @@ vibe> caps init
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps logger
   HANDLE       KIND      RIGHTS   OBJECT
-  cap:0.0      endpoint  ---v--   telemetry [0/8 sent=1 recv=1]
-  cap:1.0      console   -w----   ns16550a @ 0xADDR [31 bytes out]
+  cap:0.0      endpoint  ---v--   telemetry [0/8 sent=0 recv=0]
+  cap:1.0      console   -w----   ns16550a @ 0xADDR [0 bytes out]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps sensor
   HANDLE       KIND      RIGHTS   OBJECT
-  cap:0.0      endpoint  --s---   telemetry [0/8 sent=1 recv=1]
+  cap:0.0      endpoint  --s---   telemetry [0/8 sent=0 recv=0]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> probe
   REFUSED  sensor tries to RECV on the channel it publishes to

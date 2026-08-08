@@ -2,9 +2,11 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> selftest
-[!] panic: panicked at kernel/src/selftest.rs:62:9:
+[!] panic: panicked at kernel/src/selftest.rs:181:9:
 deliberate destructor fault from the self-test
-[!] panic: panicked at kernel/src/selftest.rs:429:9:
+[!] panic: panicked at kernel/src/selftest.rs:147:13:
+deliberate nested catcher fault from the self-test
+[!] panic: panicked at kernel/src/selftest.rs:792:9:
 deliberate fault from the self-test
 [!] panic: panicked at kernel/src/main.rs:203:13:
 component allocation quota exceeded
@@ -40,6 +42,6 @@ component allocation quota exceeded
 component allocation quota exceeded
 [!] panic: panicked at kernel/src/main.rs:203:13:
 component allocation quota exceeded
-  selftest: 307 passed, 0 failed
-  SELFTEST OK (307 checks)
+  selftest: 330 passed, 0 failed
+  SELFTEST OK (330 checks)
 vibe> 

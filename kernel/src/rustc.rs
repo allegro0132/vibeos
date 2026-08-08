@@ -26,13 +26,13 @@ pub use vibeos_rustc::samples::{
 };
 
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cap::Rights;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::sbi;
 use crate::sync::SpinLock;
-use crate::trampoline::{self, abort, vibe_enter, vibe_longjmp, vibe_setjmp, JmpBuf};
+use crate::trampoline::{self, abort, vibe_catch, vibe_enter, vibe_longjmp, JmpBuf};
 use crate::world::world;
 
 /// Where a compiled program's authority lives while it runs. `None` means no
@@ -55,16 +55,39 @@ extern "C" fn rt_print_str(ptr: *const u8, len: usize) {
     }
 }
 
-/// Where a failed safety check lands, and the state it needs.
-///
-/// All of this lives in statics rather than locals because a `longjmp` returns
-/// into the middle of `run`, and a local held in a callee-saved register across
-/// that boundary is not reliable.
+/// Where a failed safety check lands. The buffer is static because runtime
+/// hooks need its address; invocation inputs and results remain ordinary
+/// locals now that Rust only sees the single-return `vibe_catch` boundary.
 static mut JMP: JmpBuf = JmpBuf::ZERO;
 static ARMED: AtomicBool = AtomicBool::new(false);
-static ABORT_CODE: AtomicI64 = AtomicI64::new(0);
-static ENTRY: AtomicUsize = AtomicUsize::new(0);
-static STARTED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+struct ProgramCatch {
+    entry: usize,
+    stack_limit: usize,
+    fuel: i64,
+    region: usize,
+    region_len: usize,
+    value: i64,
+}
+
+unsafe extern "C" fn enter_program(ctx: *mut ()) {
+    // Safety: run keeps this context alive for the complete catch call, and
+    // entry points at the freshly emitted main function.
+    let catch = unsafe { &mut *ctx.cast::<ProgramCatch>() };
+    // Do not advertise the global jump target until vibe_catch has populated
+    // it. This closes the stale-buffer window present in a direct setjmp call.
+    ARMED.store(true, Ordering::SeqCst);
+    catch.value = unsafe {
+        vibe_enter(
+            catch.entry,
+            catch.stack_limit,
+            catch.fuel,
+            catch.region,
+            catch.region_len,
+        )
+    };
+    ARMED.store(false, Ordering::SeqCst);
+}
 
 /// How many calls and loop iterations a program may execute.
 ///
@@ -79,8 +102,7 @@ pub fn unwind_running_program() {
     if !ARMED.swap(false, Ordering::SeqCst) {
         return;
     }
-    ABORT_CODE.store(RUNTIME_PANICKED, Ordering::SeqCst);
-    unsafe { vibe_longjmp(addr_of_mut!(JMP), 1) }
+    unsafe { vibe_longjmp(addr_of_mut!(JMP), RUNTIME_PANICKED) }
 }
 
 /// Reason code for "the kernel panicked while this program was running". Above
@@ -89,12 +111,13 @@ const RUNTIME_PANICKED: i64 = 64;
 
 /// Called by generated code when an emitted check fails. Never returns.
 extern "C" fn rt_abort(code: i64) -> ! {
-    if !ARMED.load(Ordering::SeqCst) {
-        panic!("generated code aborted with no landing pad: {}", abort::describe(code));
+    if !ARMED.swap(false, Ordering::SeqCst) {
+        panic!(
+            "generated code aborted with no landing pad: {}",
+            abort::describe(code)
+        );
     }
-    ABORT_CODE.store(code, Ordering::SeqCst);
-    ARMED.store(false, Ordering::SeqCst);
-    unsafe { vibe_longjmp(addr_of_mut!(JMP), 1) }
+    unsafe { vibe_longjmp(addr_of_mut!(JMP), code) }
 }
 
 extern "C" fn rt_print_int(v: i64) {
@@ -197,35 +220,35 @@ pub fn run(prog: &Compiled) -> RunOutcome {
 
     *PROG_OUT.lock() = console;
     *DENIED.lock() = false;
-    ABORT_CODE.store(0, Ordering::SeqCst);
-    ENTRY.store(prog.code.as_ptr() as usize, Ordering::SeqCst);
-    STARTED_AT.store(sbi::time(), Ordering::SeqCst);
+    let started_at = sbi::time();
+    let mut catch = ProgramCatch {
+        entry: prog.code.as_ptr() as usize,
+        stack_limit: crate::stack_floor(),
+        fuel: FUEL,
+        region: region_base,
+        region_len,
+        value: -1,
+    };
 
     // Safety: `entry` points at freshly written RV64 whose first instruction is
     // `main`'s prologue. `fence.i` makes those writes visible to instruction
-    // fetch. `vibe_setjmp` returns 0 on the way in and 1 if a safety check
-    // aborted; on that second return only statics may be read.
-    let value = unsafe {
+    // fetch. `vibe_catch` itself returns exactly once, with zero after a normal
+    // callback or the non-zero reason supplied by a safety check.
+    let code = unsafe {
         core::arch::asm!("fence.i");
-        ARMED.store(true, Ordering::SeqCst);
-        if vibe_setjmp(addr_of_mut!(JMP)) == 0 {
-            let v = vibe_enter(
-                ENTRY.load(Ordering::SeqCst),
-                crate::stack_floor(),
-                FUEL,
-                region_base,
-                region_len,
-            );
-            ARMED.store(false, Ordering::SeqCst);
-            v
-        } else {
-            -1
-        }
+        vibe_catch(
+            addr_of_mut!(JMP),
+            enter_program,
+            (&mut catch as *mut ProgramCatch).cast(),
+        )
     };
+    // Normal and non-local paths converge here. Clear defensively even though
+    // the thunk and every abort path already perform their exact transition.
+    ARMED.store(false, Ordering::SeqCst);
+    let value = if code == 0 { catch.value } else { -1 };
 
-    let ticks = sbi::time() - STARTED_AT.load(Ordering::SeqCst);
+    let ticks = sbi::time() - started_at;
     let micros = ticks / (crate::exec::TIMEBASE_HZ / 1_000_000);
-    let code = ABORT_CODE.load(Ordering::SeqCst);
 
     *PROG_OUT.lock() = None;
     RunOutcome {

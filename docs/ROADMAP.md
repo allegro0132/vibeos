@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 through 3.14 complete. Run `scripts/status.sh` for
+> M3.5 is under way with 3.8 through 3.15 complete. Run `scripts/status.sh` for
 > the live host-test and corpus inventory; the QEMU harness reports target check
 > counts from the boot it actually observed. See [TESTING.md](../TESTING.md).
 
@@ -144,14 +144,14 @@ running generated code.** Blueprint §6.4 items 1–3 are all the same hole.
 
 | # | Work item | Notes |
 |---|---|---|
-| 2.1 ✅ | Program trampoline | Save callee-saved regs + `sp` + `ra` before entering generated code; a runtime hook can restore them and return an error. A `setjmp`/`longjmp` pair in ~30 lines of RV64 asm. Unlocks 2.2–2.4. |
+| 2.1 ✅ | Program trampoline | Save callee-saved regs + `sp` + `ra` before entering generated code; a runtime hook can restore them and return an error. A small catch/longjmp pair in RV64 asm unlocks 2.2–2.4; 3.15 later moved the entire returns-twice edge behind its assembly ABI. |
 | 2.2 ✅ | Stack probes | Emit a `sp` limit check at every function prologue. On breach, abort through the trampoline with `stack overflow`. Closes the hole where recursion corrupts `.bss`. |
 | 2.3 ✅ | Division and overflow checks | Emit checks; abort with the message real rustc would print. Removes the "RISC-V semantics" caveat from the README. |
 | 2.4 ✅ | Fuel / watchdog | Emit a budget decrement at loop back-edges and function entry; exhausting it aborts. A compiled `while true {}` must return control to the shell. |
 | 2.5 ✅ | Codegen differential testing | Compile a corpus with the in-kernel compiler *and* with real `rustc` on the host; compare stdout. The corpus doubles as a regression suite and is the strongest oracle available for a compiler this small. |
 | 2.6 ✅ | Parser fuzzing | `cargo-fuzz` on the host. The parser must never panic; it must only return `Err`. |
 | 2.7 ✅ | Emitter audit | Enumerate every instruction the emitter can produce and prove each is frame-local or compiler-chosen. Turn Blueprint §6.3's table into an asserted test. |
-| 2.8 ✅ | Task fault isolation | A panicking component costs its own task, not the machine. `setjmp` sits inside the guard function rather than the caller, so a `longjmp` restores *that* frame and returns normally — the scheduler's frame and locals are never disturbed. The faulted task is leaked rather than dropped, because running destructors over a future interrupted mid-poll would be worse than leaking. |
+| 2.8 ✅ | Task fault isolation | A panicking component costs its own task, not the machine. The guard invokes user poll code inside an assembly catch boundary, so `longjmp` abandons only that thunk and the scheduler's frame and locals are never disturbed. The faulted task is leaked rather than dropped, because running destructors over a future interrupted mid-poll would be worse than leaking. |
 
 **Acceptance:** all six abort paths are covered by the in-kernel self-test and by
 the `aborts` golden transcript, and the shell survives every one of them.
@@ -258,7 +258,7 @@ units before adding persistence or more concurrency.
 | 3.12 ✅ | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
 | 3.13 ✅ | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
 | 3.14 ✅ | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
-| 3.15 | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
+| 3.15 ✅ | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
 | 3.16 | Define resolved-capability lease semantics | Console hooks either revalidate a revocable token per operation or explicitly hold an invocation lease. Memory access documents the same choice; tests distinguish revoke-before-run from revoke-during-run. |
 
 3.8 separates stable `ComponentId` from a task incarnation's `TaskId`, so a
@@ -316,9 +316,9 @@ restart cycles, observes no destructor calls, and requires heap use to plateau.
 3.13 publishes a versioned guest JSON stream and a checked-in QEMU/TCG baseline.
 The runner fixes `virt`/`rv64`/one hart/single-threaded TCG plus deterministic
 `icount`, records QEMU and Rust revisions, and refuses silent schema or sample-count
-changes. The 2026-08-08 baseline records IPC p95 109 ticks (257 samples), timer
+changes. The 2026-08-08 baseline records IPC p95 110 ticks (257 samples), timer
 IRQ-to-poll p95 24 ticks (129), cap lookup p50 2–4 ticks across derivation depths
-0–32, compile p50 361,017 source B/s (21), a 113,792 B heap high-water, and
+0–32, compile p50 357,646 source B/s (21), a 113,792 B heap high-water, and
 828 B code / 1 B data / 1,862 tick runtime for the fixed generated workload.
 These are regression coordinates for one virtual environment, not a cross-machine
 Linux-pipe comparison.
@@ -331,6 +331,22 @@ chain. The real-rustc oracle is byte-exact, read-only by default, fails on missi
 or orphan expectations, and updates only through `--update`. Repository inventory
 comes from `scripts/status.sh`; target self-test totals come from the live QEMU
 transcript instead of copied prose.
+
+3.15 separates a task's lifecycle phase from the place that owns its future. A
+pure fixed-point model exhaustively explores two tasks in the same and different
+fault arenas across wake, cancel, dispatch, pending/ready/fault, destructor fault,
+reclaim, and publication. Debug builds check the corresponding concrete scheduler
+invariants at mutation boundaries: a future has one owner, the single hart has at
+most one running slot, ready IDs are unique, and a committed terminal claim cannot
+be revived or rewritten. The RISC-V fault boundary is now a single-return
+`vibe_catch` call from Rust; its internal assembly owns both the initial save and
+the non-local return, including per-frame interrupt state. This removes the
+unmodelled returns-twice edge from Rust/LLVM while preserving nested task and
+generated-program recovery. The kernel now builds for the integer-only
+`riscv64imac-unknown-none-elf` `lp64` ABI, matching the integer register context
+the catcher actually preserves rather than silently promising `lp64d` FPU state.
+None of this turns cooperative scheduling into
+temporal isolation: an admitted in-tree future that never yields remains trusted.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and

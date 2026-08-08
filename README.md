@@ -211,11 +211,24 @@ rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
 chan            telemetry channel depth and totals
+quiet           mute background components (`verbose` restores)
 mem             kernel heap usage
 uptime          seconds since boot
 echo <text>     write via init's console capability
 halt            shut the machine down
 ```
+
+## The console
+
+Components print from tasks the shell knows nothing about, so the tty owns the
+bottom line of the screen: any asynchronous write erases the prompt, prints, and
+redraws the prompt with your partial input intact. Type `up`, let a reading land,
+finish with `time`, and you still ran `uptime`.
+
+`quiet` mutes the demo components; `verbose` brings them back. That is a
+rendering setting, not an authority one — muting decides what reaches the
+screen, whereas `revoke` decides who is allowed to speak at all. `ps` keeps
+showing rising poll counts while muted, because the components never stopped.
 
 ## Known limits of v0.1
 

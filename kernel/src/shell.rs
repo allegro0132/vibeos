@@ -11,40 +11,36 @@ use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
 use crate::heap::HEAP;
 use crate::world::{world, Reading, Space};
-use crate::{exec, println, print, sbi, uart};
+use crate::{exec, println, sbi, tty, uart};
 
 pub async fn shell_task(boot_time: u64) {
-    println!("\ntype `help` for commands.\n");
-    let mut line = String::new();
+    println!("\ntype `help` for commands, `quiet` to mute background components.\n");
     loop {
-        print!("vibe> ");
-        line.clear();
-        loop {
-            let b = uart::read_byte().await;
-            match b {
-                b'\r' | b'\n' => {
-                    println!();
-                    break;
-                }
-                0x7f | 0x08 => {
-                    if line.pop().is_some() {
-                        print!("\x08 \x08");
-                    }
-                }
-                0x03 => {
-                    println!("^C");
-                    line.clear();
-                    break;
-                }
-                b if (0x20..0x7f).contains(&b) => {
-                    line.push(b as char);
-                    print!("{}", b as char);
-                }
-                _ => {}
+        tty::prompt("vibe> ");
+        if let Some(line) = read_line().await {
+            if !line.is_empty() {
+                run(&line, boot_time).await;
             }
         }
-        if !line.is_empty() {
-            run(&line, boot_time).await;
+    }
+}
+
+/// Read one line at the active prompt. `None` means the user hit Ctrl-C.
+///
+/// Nothing here echoes directly: the tty owns the line, so a component printing
+/// mid-keystroke redraws the prompt and whatever has been typed so far.
+async fn read_line() -> Option<String> {
+    loop {
+        let b = uart::read_byte().await;
+        match b {
+            b'\r' | b'\n' => return Some(tty::submit()),
+            0x7f | 0x08 => tty::backspace(),
+            0x03 => {
+                tty::cancel();
+                return None;
+            }
+            b if (0x20..0x7f).contains(&b) => tty::type_char(b as char),
+            _ => {}
         }
     }
 }
@@ -65,6 +61,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  rustc demo      compile and run a larger sample (fib, gcd, loops)");
             println!("  rustc edit      type your own program; end it with a lone `.`");
             println!("  chan            telemetry channel depth and totals");
+            println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
             println!("  uptime          seconds since boot");
             println!("  echo <text>     write via init's console capability");
@@ -77,6 +74,9 @@ async fn run(line: &str, boot_time: u64) {
                 println!("  {:<10} {:>8}", name, polls);
             }
             println!("  ({} tasks exited)", exec::completed_count());
+            if tty::is_quiet() {
+                println!("  background output is muted; poll counts still rising");
+            }
         }
 
         "spaces" => {
@@ -165,6 +165,16 @@ async fn run(line: &str, boot_time: u64) {
             }
         }
 
+        "quiet" | "verbose" => {
+            let quiet = cmd == "quiet";
+            tty::set_quiet(quiet);
+            if quiet {
+                println!("  background components muted; they keep running (`ps` proves it)");
+            } else {
+                println!("  background components audible again");
+            }
+        }
+
         "mem" => {
             let (live, peak, free) = HEAP.stats();
             println!("  live {:>7} B   peak {:>7} B   bump remaining {:>9} B", live, peak, free);
@@ -199,33 +209,9 @@ async fn run(line: &str, boot_time: u64) {
 async fn read_source() -> Option<String> {
     println!("  enter your program; finish with a single `.` on its own line");
     let mut src = String::new();
-    let mut line = String::new();
     loop {
-        print!("  | ");
-        line.clear();
-        loop {
-            let b = uart::read_byte().await;
-            match b {
-                b'\r' | b'\n' => {
-                    println!();
-                    break;
-                }
-                0x7f | 0x08 => {
-                    if line.pop().is_some() {
-                        print!("\x08 \x08");
-                    }
-                }
-                0x03 => {
-                    println!("^C");
-                    return None;
-                }
-                b if (0x20..0x7f).contains(&b) => {
-                    line.push(b as char);
-                    print!("{}", b as char);
-                }
-                _ => {}
-            }
-        }
+        tty::prompt("  | ");
+        let line = read_line().await?;
         if line == "." {
             return Some(src);
         }

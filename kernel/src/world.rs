@@ -122,7 +122,7 @@ pub fn build() {
 async fn sensor_task(space: Arc<Space>, tx: Cap) {
     let mut seq = 0u64;
     loop {
-        exec::sleep_ms(1200).await;
+        exec::sleep_ms(3000).await;
         seq += 1;
         let ep = match space.0.lock().lookup_as::<Endpoint<Reading>>(tx, Rights::SEND) {
             Ok(ep) => ep,
@@ -154,7 +154,7 @@ async fn logger_task(space: Arc<Space>, rx: Cap, con: Cap) {
             return;
         };
         let r = ep.recv().await;
-        console.write(&format!(
+        console.write_bg(&format!(
             "[logger] reading #{} = {}.{:03} C\n",
             r.seq,
             r.millicelsius / 1000,
@@ -169,11 +169,11 @@ async fn logger_task(space: Arc<Space>, rx: Cap, con: Cap) {
 async fn guest_task(space: Arc<Space>, con: Cap) {
     let mut n = 0u64;
     loop {
-        exec::sleep_ms(2500).await;
+        exec::sleep_ms(9000).await;
         n += 1;
         let resolved = space.0.lock().lookup_as::<ConsoleDev>(con, Rights::WRITE);
         match resolved {
-            Ok(console) => console.write(&format!("[guest]  heartbeat {}\n", n)),
+            Ok(console) => console.write_bg(&format!("[guest]  heartbeat {}\n", n)),
             Err(e) => {
                 crate::println!("[guest]  console denied: {} -- guest is now mute", e);
                 return;

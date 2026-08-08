@@ -122,13 +122,25 @@ impl Write for Console {
     }
 }
 
+/// Foreground output: erases and redraws an active prompt around itself.
 pub fn _print(args: fmt::Arguments) {
-    let _ = Console.write_fmt(args);
+    crate::tty::emit(args, false);
+}
+
+/// Background chatter from demo components; dropped while `quiet` is set.
+pub fn _print_bg(args: fmt::Arguments) {
+    crate::tty::emit(args, true);
 }
 
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::uart::_print(format_args!($($arg)*)));
+}
+
+/// Like `println!`, but suppressible with the shell's `quiet` command.
+#[macro_export]
+macro_rules! bgprintln {
+    ($($arg:tt)*) => ($crate::uart::_print_bg(format_args!("{}\n", format_args!($($arg)*))));
 }
 
 #[macro_export]

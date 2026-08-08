@@ -498,15 +498,23 @@ pub fn spawn(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> Task
 pub fn spawn_tracked(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> TaskHandle {
     let id = next_task_id();
     let status = Arc::new(TaskStatus::new());
+    let task = Task {
+        name: String::from(name),
+        future: Box::pin(fut),
+        status: status.clone(),
+    };
     let mut s = SCHED.lock();
-    s.tasks.insert(
-        id,
-        Task {
-            name: String::from(name),
-            future: Box::pin(fut),
-            status: status.clone(),
-        },
-    );
+    // Every live task can become ready at once. Reserve that upper bound in
+    // task context so an IRQ wake never grows the ready queue while holding
+    // SCHED. A currently polled task is outside `tasks` and counts separately.
+    let live_after_spawn = s.tasks.len() + 1 + usize::from(s.running.is_some());
+    let ready_additional = live_after_spawn - s.ready.len();
+    if s.ready.capacity() < live_after_spawn && s.ready.try_reserve(ready_additional).is_err() {
+        drop(s);
+        drop(task);
+        panic!("ready queue allocation failed");
+    }
+    s.tasks.insert(id, task);
     s.ready.push_back(id);
     TaskHandle { id, status }
 }
@@ -680,6 +688,12 @@ pub fn faulted_count() -> u64 {
 /// Tasks reclaimed at a cooperative poll boundary after cancellation.
 pub fn cancelled_count() -> u64 {
     SCHED.lock().cancelled
+}
+
+/// Capacity reserved for IRQ/task wakes. Spawn keeps this at least as large as
+/// the live-task upper bound so the wake path never allocates.
+pub fn ready_queue_capacity() -> usize {
+    SCHED.lock().ready.capacity()
 }
 
 // --- Waker: the pointer *is* the TaskId. No refcount, no allocation. ---
@@ -859,73 +873,216 @@ pub fn run_until_idle(budget: usize) -> usize {
 
 /// A parking spot for tasks waiting on an event an interrupt will signal.
 pub struct WaitQueue {
-    waiters: SpinLock<Vec<Waker>>,
+    inner: SpinLock<WaitQueueInner>,
+}
+
+struct WaitQueueInner {
+    epoch: u64,
+    next_id: u64,
+    waiters: Vec<QueueWaiter>,
+}
+
+struct QueueWaiter {
+    id: u64,
+    waker: Waker,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
         Self {
-            waiters: SpinLock::new(Vec::new()),
+            inner: SpinLock::new(WaitQueueInner {
+                epoch: 0,
+                next_id: 1,
+                waiters: Vec::new(),
+            }),
         }
     }
 
     pub fn wake_all(&self) {
-        let mut w = self.waiters.lock();
-        for waker in w.drain(..) {
-            waker.wake();
+        let waiters = {
+            let mut inner = self.inner.lock();
+            // A listener created before this point observes the event even if
+            // it has not reached its first poll yet. Wrapping only creates an
+            // ABA after 2^64 signals to the same queue.
+            inner.epoch = inner.epoch.wrapping_add(1);
+            core::mem::take(&mut inner.waiters)
+        };
+        for waiter in waiters {
+            waiter.waker.wake();
         }
     }
 
-    /// Park until the next `wake_all`. Registers on first poll, completes on
-    /// second — so a wake that races in between is never lost.
+    /// Number of futures currently registered on this queue.
+    pub fn waiter_count(&self) -> usize {
+        self.inner.lock().waiters.len()
+    }
+
+    /// Prepare to park until the next `wake_all`.
+    ///
+    /// Construct this listener *before* checking the condition it protects,
+    /// then await it only when that check says to block. The captured epoch
+    /// closes the condition-check/register race with an interrupt.
     pub fn wait(&self) -> WaitFuture<'_> {
+        let epoch = self.inner.lock().epoch;
         WaitFuture {
             queue: self,
-            registered: false,
+            epoch,
+            registration: None,
         }
+    }
+
+    fn unregister(&self, id: u64) -> Option<Waker> {
+        let removed = {
+            let mut inner = self.inner.lock();
+            inner
+                .waiters
+                .iter()
+                .position(|waiter| waiter.id == id)
+                .map(|index| inner.waiters.swap_remove(index).waker)
+        };
+        // A custom RawWaker may run arbitrary code from Drop, including
+        // re-entering this queue. Never release it under the queue lock.
+        removed
     }
 }
 
 pub struct WaitFuture<'a> {
     queue: &'a WaitQueue,
-    registered: bool,
+    epoch: u64,
+    registration: Option<u64>,
 }
 
 impl Future for WaitFuture<'_> {
     type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.registered {
-            return Poll::Ready(());
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        // Cloning may invoke a custom RawWaker, so do it before taking the
+        // queue lock. The unused candidate is likewise dropped afterwards.
+        let mut candidate = Some(cx.waker().clone());
+        let mut discarded = None;
+        let mut allocation_failed = false;
+
+        let result = {
+            let mut inner = this.queue.inner.lock();
+            if inner.epoch != this.epoch {
+                if let Some(id) = this.registration.take() {
+                    if let Some(index) = inner.waiters.iter().position(|waiter| waiter.id == id) {
+                        discarded = Some(inner.waiters.swap_remove(index).waker);
+                    }
+                }
+                Poll::Ready(())
+            } else {
+                let id = this.registration.unwrap_or_else(|| {
+                    let id = inner.next_id;
+                    inner.next_id = inner.next_id.wrapping_add(1).max(1);
+                    id
+                });
+
+                if let Some(waiter) = inner.waiters.iter_mut().find(|waiter| waiter.id == id) {
+                    if !waiter.waker.will_wake(cx.waker()) {
+                        discarded = Some(core::mem::replace(
+                            &mut waiter.waker,
+                            candidate.take().expect("waker candidate exists"),
+                        ));
+                    }
+                    Poll::Pending
+                } else if inner.waiters.try_reserve(1).is_err() {
+                    allocation_failed = true;
+                    Poll::Pending
+                } else {
+                    inner.waiters.push(QueueWaiter {
+                        id,
+                        waker: candidate.take().expect("waker candidate exists"),
+                    });
+                    this.registration = Some(id);
+                    Poll::Pending
+                }
+            }
+        };
+
+        drop(discarded);
+        drop(candidate);
+        if allocation_failed {
+            panic!("wait queue registration allocation failed");
         }
-        self.registered = true;
-        self.queue.waiters.lock().push(cx.waker().clone());
-        Poll::Pending
+        result
+    }
+}
+
+impl Drop for WaitFuture<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration.take() {
+            drop(self.queue.unregister(id));
+        }
     }
 }
 
 // --- Timers ---
 
-static TIMERS: SpinLock<Vec<(u64, Waker)>> = SpinLock::new(Vec::new());
+struct TimerEntry {
+    id: u64,
+    deadline: u64,
+    waker: Waker,
+}
+
+// Entries are ordered by descending deadline, so the next deadline is the
+// final element and timer IRQ handling can pop without allocating.
+static TIMERS: SpinLock<Vec<TimerEntry>> = SpinLock::new(Vec::new());
+static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_timer_id() -> u64 {
+    NEXT_TIMER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("timer registration space exhausted")
+}
+
+fn arm_locked(timers: &[TimerEntry]) {
+    let heartbeat = arch::time().saturating_add(HEARTBEAT_SECS.saturating_mul(TIMEBASE_HZ));
+    let next = timers.last().map(|timer| timer.deadline);
+    arch::set_timer(next.map_or(heartbeat, |deadline| deadline.min(heartbeat)));
+}
+
+fn unregister_timer(id: u64) -> Option<Waker> {
+    let removed = {
+        let mut timers = TIMERS.lock();
+        let removed = timers
+            .iter()
+            .position(|timer| timer.id == id)
+            .map(|index| timers.remove(index).waker);
+        if removed.is_some() {
+            arm_locked(&timers);
+        }
+        removed
+    };
+    // See WaitQueue::unregister: Waker Drop must run outside registry locks.
+    removed
+}
+
+/// Number of live sleep registrations, for scheduler diagnostics and tests.
+pub fn timer_registration_count() -> usize {
+    TIMERS.lock().len()
+}
 
 /// Called from the timer trap. Wakes everything due and re-arms the hardware.
 pub fn timer_tick() {
-    let now = arch::time();
-    let mut due = Vec::new();
-    {
-        let mut t = TIMERS.lock();
-        t.retain(|(deadline, waker)| {
-            if *deadline <= now {
-                due.push(waker.clone());
-                false
+    loop {
+        let due = {
+            let mut timers = TIMERS.lock();
+            if timers
+                .last()
+                .is_some_and(|timer| timer.deadline <= arch::time())
+            {
+                timers.pop()
             } else {
-                true
+                arm_locked(&timers);
+                None
             }
-        });
+        };
+        let Some(timer) = due else {
+            return;
+        };
+        timer.waker.wake();
     }
-    for w in due {
-        w.wake();
-    }
-    arm_next();
 }
 
 /// How long an idle hart sleeps with nothing scheduled.
@@ -936,9 +1093,8 @@ pub fn timer_tick() {
 pub const HEARTBEAT_SECS: u64 = 10;
 
 fn arm_next() {
-    let next = TIMERS.lock().iter().map(|(d, _)| *d).min();
-    let heartbeat = arch::time() + HEARTBEAT_SECS * TIMEBASE_HZ;
-    arch::set_timer(next.map_or(heartbeat, |n| n.min(heartbeat)));
+    let timers = TIMERS.lock();
+    arm_locked(&timers);
 }
 
 pub fn init_timer() {
@@ -947,28 +1103,90 @@ pub fn init_timer() {
 
 pub fn sleep_ms(ms: u64) -> Sleep {
     Sleep {
-        deadline: arch::time() + ms * (TIMEBASE_HZ / 1000),
-        armed: false,
+        deadline: arch::time().saturating_add(ms.saturating_mul(TIMEBASE_HZ / 1000)),
+        registration: None,
     }
 }
 
 pub struct Sleep {
     deadline: u64,
-    armed: bool,
+    registration: Option<u64>,
 }
 
 impl Future for Sleep {
     type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if arch::time() >= self.deadline {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if arch::time() >= this.deadline {
+            if let Some(id) = this.registration.take() {
+                drop(unregister_timer(id));
+            }
             return Poll::Ready(());
         }
-        if !self.armed {
-            self.armed = true;
-            TIMERS.lock().push((self.deadline, cx.waker().clone()));
-            arm_next();
+
+        let mut candidate = Some(cx.waker().clone());
+        let mut discarded = None;
+        if let Some(id) = this.registration {
+            let found = {
+                let mut timers = TIMERS.lock();
+                if let Some(timer) = timers.iter_mut().find(|timer| timer.id == id) {
+                    if !timer.waker.will_wake(cx.waker()) {
+                        discarded = Some(core::mem::replace(
+                            &mut timer.waker,
+                            candidate.take().expect("waker candidate exists"),
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            drop(discarded);
+            drop(candidate);
+            if found {
+                return Poll::Pending;
+            }
+            // timer_tick owns and has already woken the removed registration.
+            this.registration = None;
+            return Poll::Ready(());
+        }
+
+        let id = next_timer_id();
+        let mut allocation_failed = false;
+        {
+            let mut timers = TIMERS.lock();
+            if timers.try_reserve(1).is_err() {
+                allocation_failed = true;
+            } else {
+                let index = timers
+                    .iter()
+                    .position(|timer| timer.deadline < this.deadline)
+                    .unwrap_or(timers.len());
+                timers.insert(
+                    index,
+                    TimerEntry {
+                        id,
+                        deadline: this.deadline,
+                        waker: candidate.take().expect("waker candidate exists"),
+                    },
+                );
+                this.registration = Some(id);
+                arm_locked(&timers);
+            }
+        }
+        drop(candidate);
+        if allocation_failed {
+            panic!("timer registration allocation failed");
         }
         Poll::Pending
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration.take() {
+            drop(unregister_timer(id));
+        }
     }
 }
 

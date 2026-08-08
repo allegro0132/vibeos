@@ -101,10 +101,13 @@ pub fn try_read() -> Option<u8> {
 /// Await one byte from the console.
 pub async fn read_byte() -> u8 {
     loop {
+        // Prepare before inspecting RX so an IRQ between the check and the
+        // first poll is observed through the wait queue's epoch.
+        let ready = RX_WAIT.wait();
         if let Some(b) = try_read() {
             return b;
         }
-        RX_WAIT.wait().await;
+        ready.await;
     }
 }
 

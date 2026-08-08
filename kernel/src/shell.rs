@@ -62,6 +62,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  rustc hello     compile and run a Rust hello world, natively");
             println!("  rustc demo      compile and run a larger sample (fib, gcd, loops)");
             println!("  rustc conform   compile and run the language conformance program");
+            println!("  rustc lease     revoke during a run, then retry without new grants");
             println!("  rustc edit      type your own program; end it with a lone `.`");
             println!("  chan            telemetry channel depth and totals");
             println!("  bench           emit the versioned machine-readable benchmark suite");
@@ -276,6 +277,10 @@ async fn run(line: &str, boot_time: u64) {
         }
 
         "rustc" => {
+            if rest.first().copied() == Some("lease") {
+                run_lease_demo().await;
+                return;
+            }
             let src = match rest.first().copied() {
                 Some("hello") | None => String::from(crate::rustc::HELLO_SRC),
                 Some("demo") => String::from(crate::rustc::DEMO_SRC),
@@ -288,7 +293,10 @@ async fn run(line: &str, boot_time: u64) {
                     }
                 },
                 Some(other) => {
-                    println!("  usage: rustc [hello|demo|conform|edit] (got `{}`)", other);
+                    println!(
+                        "  usage: rustc [hello|demo|conform|lease|edit] (got `{}`)",
+                        other
+                    );
                     return;
                 }
             };
@@ -430,14 +438,55 @@ async fn compile_and_run(src: &str) {
     println!("  --- running natively ---");
 
     let out = crate::rustc::run(&compiled);
+    report_run(&out);
+}
 
+fn report_run(out: &crate::rustc::RunOutcome) {
     match out.aborted {
         Some(reason) => println!("  --- aborted: {} (after {} us) ---", reason, out.micros),
         None => println!("  --- exited with {} in {} us ---", out.value, out.micros),
     }
     if out.denied {
-        println!("  note: output was suppressed -- `prog` holds no console capability");
+        println!("  note: output was suppressed -- `prog` console authority is absent or revoked");
     }
+}
+
+async fn run_lease_demo() {
+    let t0 = sbi::time();
+    let compiled = match crate::rustc::compile(crate::rustc::LEASE_SRC) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  error: {}", e);
+            return;
+        }
+    };
+    let compile_us = (sbi::time() - t0) / (exec::TIMEBASE_HZ / 1_000_000);
+    println!(
+        "  compiled {} fn -> {} B of RV64 + {} B of data in {} us",
+        compiled.funcs, compiled.bytes, compiled.data_bytes, compile_us
+    );
+
+    println!("  --- lease run 1: revoke before console operation 2 ---");
+    if !crate::rustc::arm_console_revoke_hook(2) {
+        println!("  refused: the console revocation hook is already armed");
+        return;
+    }
+    let first = crate::rustc::run(&compiled);
+    report_run(&first);
+    if first.aborted.is_none() && first.value == 42 && first.revoked_caps > 0 {
+        println!(
+            "  note: hook revoked {} cap(s); the active memory lease completed",
+            first.revoked_caps
+        );
+    } else {
+        println!("  note: this demo requires fresh `prog` console and memory authority");
+        return;
+    }
+
+    println!("  --- lease run 2: cold launch after revocation ---");
+    let second = crate::rustc::run(&compiled);
+    report_run(&second);
+    println!("  note: no grant or hook was installed between runs");
 }
 
 /// Four operations a conventional OS would let you attempt and fail at runtime,

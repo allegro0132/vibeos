@@ -10,6 +10,12 @@ use vibeos_core::cap::{grant, CSpace, CapError, Resource, Rights};
 struct Widget(&'static str);
 struct Gadget;
 
+/// A safe but dishonest implementation. Typed resolution must follow the
+/// trait object's actual dynamic type, never this method's answer.
+struct Liar {
+    disguise: Gadget,
+}
+
 impl Resource for Widget {
     fn kind(&self) -> &'static str {
         "widget"
@@ -28,6 +34,15 @@ impl Resource for Gadget {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl Resource for Liar {
+    fn kind(&self) -> &'static str {
+        "liar"
+    }
+    fn as_any(&self) -> &dyn Any {
+        &self.disguise
     }
 }
 
@@ -160,6 +175,25 @@ fn typed_lookup_rejects_the_wrong_type() {
 }
 
 #[test]
+fn typed_resolve_ignores_a_dishonest_as_any_implementation() {
+    let mut cs = CSpace::new("liar-test");
+    let cap = cs.mint(Arc::new(Liar { disguise: Gadget }), Rights::ALL);
+
+    assert_eq!(
+        cs.lookup_as::<Gadget>(cap, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
+    assert_eq!(
+        cs.lookup_revocable::<Gadget>(cap, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
+    assert_eq!(
+        cs.lookup_lease::<Gadget>(cap, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
+}
+
+#[test]
 fn typed_lookup_checks_rights_before_type() {
     let (mut cs, w) = space();
     let c = cs.mint(w, Rights::READ);
@@ -169,7 +203,7 @@ fn typed_lookup_checks_rights_before_type() {
 }
 
 #[test]
-fn typed_lookup_preserves_the_arc() {
+fn legacy_tcb_typed_lookup_returns_an_owned_arc_lease() {
     let (mut cs, w) = space();
     let c = cs.mint(w.clone(), Rights::ALL);
     let before = Arc::strong_count(&w);
@@ -179,6 +213,172 @@ fn typed_lookup_preserves_the_arc() {
         assert!(Arc::strong_count(&w) > before, "lookup holds a reference");
     }
     assert_eq!(Arc::strong_count(&w), before, "and releases it on drop");
+}
+
+// --- ROADMAP 3.16: explicit resolved-capability leases ---
+
+#[test]
+fn revocable_token_revalidates_after_local_revoke() {
+    let (mut cs, w) = space();
+    let cap = cs.mint(w, Rights::ALL);
+    let token = cs.lookup_revocable::<Widget>(cap, Rights::READ).unwrap();
+    let token_copy = token.clone();
+
+    assert_eq!(token.try_with(|widget| widget.0), Ok("w"));
+    assert_eq!(cs.revoke(cap).unwrap(), 1);
+    assert_eq!(
+        token.try_with(|widget| widget.0),
+        Err(CapError::Invalid),
+        "an already-resolved token must check its node again"
+    );
+    assert_eq!(
+        token_copy.try_with(|widget| widget.0),
+        Err(CapError::Invalid),
+        "cloning the token must not cache a successful validity check"
+    );
+}
+
+#[test]
+fn revocable_token_observes_ancestor_revoke_in_the_same_space() {
+    let (mut cs, w) = space();
+    let root = cs.mint(w, Rights::ALL);
+    let child = cs.derive(root, Rights::READ).unwrap();
+    let token = cs.lookup_revocable::<Widget>(child, Rights::READ).unwrap();
+
+    assert_eq!(token.try_with(|widget| widget.0), Ok("w"));
+    assert_eq!(cs.revoke(root).unwrap(), 2);
+    assert_eq!(token.try_with(|widget| widget.0), Err(CapError::Invalid));
+}
+
+#[test]
+fn revocable_token_observes_ancestor_revoke_across_spaces() {
+    let (mut src, w) = space();
+    let mut dst = CSpace::new("dst");
+    let root = src.mint(w, Rights::ALL);
+    let granted = grant(&src, root, Rights::READ, &mut dst).unwrap();
+    let token = dst
+        .lookup_revocable::<Widget>(granted, Rights::READ)
+        .unwrap();
+
+    assert_eq!(token.try_with(|widget| widget.0), Ok("w"));
+    src.revoke(root).unwrap();
+    assert_eq!(token.try_with(|widget| widget.0), Err(CapError::Invalid));
+}
+
+#[test]
+fn invocation_lease_survives_revoke_but_a_new_lease_does_not() {
+    let (mut cs, w) = space();
+    let cap = cs.mint(w, Rights::ALL);
+    let lease = cs.lookup_lease::<Widget>(cap, Rights::READ).unwrap();
+
+    assert_eq!(lease.with(|widget| widget.0), "w");
+    cs.revoke(cap).unwrap();
+    assert_eq!(
+        lease.with(|widget| widget.0),
+        "w",
+        "revocation does not interrupt an invocation that already owns a lease"
+    );
+    assert_eq!(
+        cs.lookup_lease::<Widget>(cap, Rights::READ).err(),
+        Some(CapError::Invalid),
+        "revocation prevents the next invocation from acquiring a lease"
+    );
+}
+
+#[test]
+fn cross_space_invocation_lease_survives_only_if_already_acquired() {
+    let (mut src, w) = space();
+    let mut dst = CSpace::new("dst");
+    let root = src.mint(w, Rights::ALL);
+    let granted = grant(&src, root, Rights::READ, &mut dst).unwrap();
+    let lease = dst.lookup_lease::<Widget>(granted, Rights::READ).unwrap();
+
+    src.revoke(root).unwrap();
+    assert_eq!(lease.with(|widget| widget.0), "w");
+    assert_eq!(
+        dst.lookup_lease::<Widget>(granted, Rights::READ).err(),
+        Some(CapError::Invalid)
+    );
+}
+
+#[test]
+fn resolved_token_apis_preserve_invalid_rights_type_error_order() {
+    let (mut cs, w) = space();
+    let cap = cs.mint(w, Rights::READ);
+
+    assert_eq!(
+        cs.lookup_revocable::<Gadget>(cap, Rights::WRITE).err(),
+        Some(CapError::InsufficientRights)
+    );
+    assert_eq!(
+        cs.lookup_lease::<Gadget>(cap, Rights::WRITE).err(),
+        Some(CapError::InsufficientRights)
+    );
+    assert_eq!(
+        cs.lookup_revocable::<Gadget>(cap, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
+    assert_eq!(
+        cs.lookup_lease::<Gadget>(cap, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
+
+    cs.revoke_slot(cap.slot());
+    assert_eq!(
+        cs.lookup_revocable::<Gadget>(cap, Rights::WRITE).err(),
+        Some(CapError::Invalid)
+    );
+    assert_eq!(
+        cs.lookup_lease::<Gadget>(cap, Rights::WRITE).err(),
+        Some(CapError::Invalid)
+    );
+}
+
+#[test]
+fn resolved_tokens_own_exactly_one_object_reference_and_release_it_on_drop() {
+    let (mut cs, w) = space();
+    let cap = cs.mint(w.clone(), Rights::ALL);
+    let baseline = Arc::strong_count(&w);
+
+    let token = cs.lookup_revocable::<Widget>(cap, Rights::READ).unwrap();
+    assert_eq!(Arc::strong_count(&w), baseline + 1);
+    let token_copy = token.clone();
+    assert_eq!(Arc::strong_count(&w), baseline + 2);
+    drop(token_copy);
+    drop(token);
+    assert_eq!(Arc::strong_count(&w), baseline);
+
+    let lease = cs.lookup_lease::<Widget>(cap, Rights::READ).unwrap();
+    assert_eq!(Arc::strong_count(&w), baseline + 1);
+    drop(lease);
+    assert_eq!(Arc::strong_count(&w), baseline);
+}
+
+#[test]
+fn resolved_tokens_keep_the_resource_alive_only_until_their_drop() {
+    let (mut revocable_space, revocable_object) = space();
+    let revocable_weak = Arc::downgrade(&revocable_object);
+    let cap = revocable_space.mint(revocable_object.clone(), Rights::ALL);
+    let token = revocable_space
+        .lookup_revocable::<Widget>(cap, Rights::READ)
+        .unwrap();
+    drop(revocable_object);
+    drop(revocable_space);
+    assert!(revocable_weak.upgrade().is_some());
+    drop(token);
+    assert!(revocable_weak.upgrade().is_none());
+
+    let (mut lease_space, lease_object) = space();
+    let lease_weak = Arc::downgrade(&lease_object);
+    let cap = lease_space.mint(lease_object.clone(), Rights::ALL);
+    let lease = lease_space
+        .lookup_lease::<Widget>(cap, Rights::READ)
+        .unwrap();
+    drop(lease_object);
+    drop(lease_space);
+    assert!(lease_weak.upgrade().is_some());
+    drop(lease);
+    assert!(lease_weak.upgrade().is_none());
 }
 
 // --- Cross-space grant ---

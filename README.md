@@ -224,25 +224,32 @@ transmuting the code buffer to a function pointer and calling it.
 
 Generated machine code has no way to reach hardware. Its only output path is a
 call to compiler-chosen runtime hooks whose addresses a program cannot name,
-forge, or substitute. At each program invocation, `rustc::run` resolves the
-`prog` space's console and memory capabilities and holds those resolved objects
-for that invocation. Revocation before the run is enforced; whether revocation
-during a run should invalidate that invocation lease is roadmap 3.16:
+forge, or substitute. At each invocation, `rustc::run` resolves the `prog`
+space's capabilities with two explicit lifetimes. Console output holds a
+revocable token and rechecks its complete derivation before every print operation.
+Raw memory holds one non-cloneable, exclusive invocation lease across the native
+call because generated loads and stores cannot be interposed. Revocation therefore
+denies the next console operation while allowing already-authorized memory work to
+finish; a later launch cannot acquire either lease. `rustc lease` demonstrates all
+three boundaries:
 
 ```
-vibe> revoke prog
-  revoked 2 cap(s) in `prog`
-vibe> rustc hello
-  compiled 1 fn -> 460 B of RV64 + 14 B of data in N us
-  --- running natively ---
-  --- exited with 0 in N us ---
-  note: output was suppressed -- `prog` holds no console capability
+vibe> rustc lease
+  --- lease run 1: revoke before console operation 2 ---
+lease-visible
+  --- exited with 42 in N us ---
+  note: output was suppressed -- `prog` console authority is absent or revoked
+  note: hook revoked 2 cap(s); the active memory lease completed
+  --- lease run 2: cold launch after revocation ---
+  --- aborted: the granted memory region is too small for this program (after N us) ---
+  note: no grant or hook was installed between runs
 ```
 
-Same compiler, byte-identical machine code, and it still runs to completion — it
-just has no authority to say anything. On a conventional OS, native code that has
-already been loaded owns whatever its process owns. Here, authority is not a
-property of the code.
+The second print is absent because its revocable console token was killed first.
+The value 42 proves that the already-acquired memory lease completed, while the
+cold second launch proves that revocation was not mistaken for a permanent cached
+object. On a conventional OS, native code that has already been loaded owns whatever
+its process owns. Here, authority is not a property of the code.
 
 ## What's here
 
@@ -270,6 +277,7 @@ caps <space>    component owner and capability table
 rustc hello     compile and run a Rust hello world, natively
 rustc demo      compile and run a larger sample (fib, gcd, loops)
 rustc conform   compile and run the language conformance program
+rustc lease     revoke during a run, then retry without new grants
 selftest        run the in-kernel test suite
 bench           emit the versioned machine-readable benchmark suite
 rustc edit      type your own program; end it with a lone `.`
@@ -320,8 +328,6 @@ showing rising poll counts while muted, because the components never stopped.
 Deliberate, not overlooked:
 
 - **Single hart.** The spinlock is real but `-smp 1` is the only tested config.
-- **`lookup_as` uses `Arc::from_raw` after an `Any` check.** Sound, but it wants
-  `Arc::downcast` once that's usable through the `Resource` trait object.
 - **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
   so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
   not a strict subset, and it is what the roadmap's differential testing against

@@ -1,0 +1,18 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> rustc lease
+  compiled 1 fn -> 984 B of RV64 + 28 B of data in N us
+  --- lease run 1: revoke before console operation 2 ---
+lease-visible
+  --- exited with 42 in N us ---
+  note: output was suppressed -- `prog` console authority is absent or revoked
+  note: hook revoked 2 cap(s); the active memory lease completed
+  --- lease run 2: cold launch after revocation ---
+  --- aborted: the granted memory region is too small for this program (after N us) ---
+  note: no grant or hook was installed between runs
+vibe> caps prog
+  owner unbound (generated code executes synchronously in the shell task)
+  HANDLE       KIND      RIGHTS   OBJECT
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> 

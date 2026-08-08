@@ -17,7 +17,7 @@ vibe> caps init
   cap:3.0      cspace    r----x   prog [2 caps]
   cap:4.0      cspace    r-----   sensor [1 caps]
   cap:5.0      cspace    r-----   logger [2 caps]
-  cap:6.0      memory    rwsvgx   prog-arena [4096 x i64 @ 0xADDR]
+  cap:6.0      memory    rwsvgx   prog-arena [4096 x i64]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps logger
   owner component:2  task task:2  name logger  state running  reason -

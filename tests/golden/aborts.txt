@@ -46,7 +46,7 @@ vibe> ps
   component:2  task:2   logger     logger   running   -                9    65536 B
   component:3  task:3   guest      guest    running   -                3    65536 B
   component:4  task:4   shell      init     running   -               20   262144 B
-  executor totals (including untracked tasks): 0 exited, 0 faulted
+  executor totals (including untracked tasks): 0 exited, 0 faulted, 0 cancelled
   memory budgets are declared; allocator accounting lands in 3.11
   background output is muted; poll counts still rising
 vibe> 

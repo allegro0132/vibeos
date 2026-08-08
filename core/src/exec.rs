@@ -36,8 +36,8 @@ impl fmt::Display for TaskId {
 
 /// The lifecycle states shared by the executor and a supervising component.
 ///
-/// Cancellation is introduced as a state here so component identity does not
-/// have to change when ROADMAP 3.9 adds the transition into it.
+/// Cancellation is a terminal state of a task incarnation; the supervising
+/// component keeps its own stable identity across that transition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TaskState {
@@ -46,6 +46,11 @@ pub enum TaskState {
     Faulted = 2,
     Cancelled = 3,
 }
+
+const CANCEL_REQUESTED: u8 = 4;
+const EXIT_COMMITTED: u8 = 5;
+const CANCEL_COMMITTED: u8 = 6;
+const FAULT_COMMITTED: u8 = 7;
 
 impl TaskState {
     pub const fn terminal_reason(self) -> Option<&'static str> {
@@ -63,6 +68,10 @@ impl TaskState {
             1 => Self::Exited,
             2 => Self::Faulted,
             3 => Self::Cancelled,
+            // Cancellation is cooperative. Until the executor reaches a poll
+            // boundary and reclaims the future, the public lifecycle remains
+            // Running rather than claiming a terminal state too early.
+            CANCEL_REQUESTED | EXIT_COMMITTED | CANCEL_COMMITTED | FAULT_COMMITTED => Self::Running,
             _ => unreachable!("invalid task state"),
         }
     }
@@ -79,9 +88,40 @@ impl fmt::Display for TaskState {
     }
 }
 
+struct JoinWaiter {
+    id: u64,
+    waker: Waker,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalClaim {
+    state: TaskState,
+    raw: u8,
+}
+
+impl TerminalClaim {
+    const fn new(state: TaskState) -> Self {
+        let raw = match state {
+            TaskState::Exited => EXIT_COMMITTED,
+            TaskState::Faulted => FAULT_COMMITTED,
+            TaskState::Cancelled => CANCEL_COMMITTED,
+            TaskState::Running => unreachable!(),
+        };
+        Self { state, raw }
+    }
+}
+
+enum CancelRequest {
+    Requested,
+    Terminal,
+    TooLate(TaskState),
+}
+
 struct TaskStatus {
     polls: AtomicU64,
     state: AtomicU8,
+    next_joiner: AtomicU64,
+    joiners: SpinLock<Vec<JoinWaiter>>,
 }
 
 impl TaskStatus {
@@ -89,6 +129,8 @@ impl TaskStatus {
         Self {
             polls: AtomicU64::new(0),
             state: AtomicU8::new(TaskState::Running as u8),
+            next_joiner: AtomicU64::new(1),
+            joiners: SpinLock::new(Vec::new()),
         }
     }
 
@@ -96,17 +138,164 @@ impl TaskStatus {
         TaskState::from_raw(self.state.load(Ordering::Acquire))
     }
 
-    fn finish(&self, state: TaskState) -> bool {
-        debug_assert!(state != TaskState::Running);
+    fn raw_state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.state.load(Ordering::Acquire) == CANCEL_REQUESTED
+    }
+
+    fn request_cancel(&self) -> CancelRequest {
+        loop {
+            let current = self.raw_state();
+            match current {
+                x if x == TaskState::Running as u8 => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            current,
+                            CANCEL_REQUESTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return CancelRequest::Requested;
+                    }
+                }
+                CANCEL_REQUESTED => return CancelRequest::Requested,
+                1..=3 => return CancelRequest::Terminal,
+                EXIT_COMMITTED => return CancelRequest::TooLate(TaskState::Exited),
+                CANCEL_COMMITTED => return CancelRequest::TooLate(TaskState::Cancelled),
+                FAULT_COMMITTED => return CancelRequest::TooLate(TaskState::Faulted),
+                _ => unreachable!("invalid task state"),
+            }
+        }
+    }
+
+    /// Commit the terminal action while holding SCHED, before reclaiming the
+    /// future. The public state remains Running until `publish` establishes the
+    /// reclamation boundary.
+    fn claim_terminal(&self, requested: TaskState) -> Option<TerminalClaim> {
+        debug_assert!(requested != TaskState::Running);
+        loop {
+            let current = self.raw_state();
+            let terminal = match (requested, current) {
+                (TaskState::Faulted, x)
+                    if x == TaskState::Running as u8 || x == CANCEL_REQUESTED =>
+                {
+                    TaskState::Faulted
+                }
+                (TaskState::Exited, CANCEL_REQUESTED)
+                | (TaskState::Cancelled, CANCEL_REQUESTED) => TaskState::Cancelled,
+                (TaskState::Exited, x) if x == TaskState::Running as u8 => TaskState::Exited,
+                (TaskState::Cancelled, x) if x == TaskState::Running as u8 => TaskState::Cancelled,
+                _ => return None,
+            };
+            let claim = TerminalClaim::new(terminal);
+            if self
+                .state
+                .compare_exchange(current, claim.raw, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(claim);
+            }
+        }
+    }
+
+    fn promote_to_fault(&self, claim: TerminalClaim) -> TerminalClaim {
+        if claim.state == TaskState::Faulted {
+            return claim;
+        }
+        let fault = TerminalClaim::new(TaskState::Faulted);
         self.state
+            .compare_exchange(claim.raw, fault.raw, Ordering::AcqRel, Ordering::Acquire)
+            .expect("only the executor may own a terminal claim");
+        fault
+    }
+
+    /// Publish only after normal reclamation completed, or after a faulted
+    /// future was deliberately abandoned without running its destructor.
+    fn publish(&self, claim: TerminalClaim) -> bool {
+        if self
+            .state
             .compare_exchange(
-                TaskState::Running as u8,
-                state as u8,
+                claim.raw,
+                claim.state as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        self.wake_joiners();
+        true
     }
+
+    fn next_joiner_id(&self) -> u64 {
+        self.next_joiner
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("task join registration space exhausted")
+    }
+
+    fn wake_joiners(&self) {
+        let joiners = {
+            let mut joiners = self.joiners.lock();
+            core::mem::take(&mut *joiners)
+        };
+        for waiter in joiners {
+            waiter.waker.wake();
+        }
+    }
+}
+
+/// The immutable result retained after a task reaches a terminal state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TaskExit {
+    id: TaskId,
+    state: TaskState,
+    polls: u64,
+}
+
+impl TaskExit {
+    fn new(id: TaskId, state: TaskState, polls: u64) -> Self {
+        assert!(
+            state != TaskState::Running,
+            "TaskExit requires a terminal state"
+        );
+        Self { id, state, polls }
+    }
+
+    pub fn id(self) -> TaskId {
+        self.id
+    }
+
+    pub fn state(self) -> TaskState {
+        self.state
+    }
+
+    pub fn polls(self) -> u64 {
+        self.polls
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self.state.terminal_reason() {
+            Some(reason) => reason,
+            None => unreachable!("TaskExit cannot contain a running task"),
+        }
+    }
+}
+
+/// Result of requesting cancellation through a retained task handle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CancelOutcome {
+    Requested,
+    AlreadyTerminal(TaskExit),
+    /// The executor already committed return, fault, or cancellation and is
+    /// finishing reclamation before publishing the terminal report.
+    TooLate(TaskState),
 }
 
 /// A persistent view of one task's identity and lifecycle.
@@ -114,6 +303,7 @@ impl TaskStatus {
 /// The scheduler owns the future; a `Component` owns this handle. That keeps a
 /// terminal task observable after its future has been removed (or deliberately
 /// leaked after a fault).
+#[derive(Clone)]
 pub struct TaskHandle {
     id: TaskId,
     status: Arc<TaskStatus>,
@@ -130,6 +320,110 @@ impl TaskHandle {
 
     pub fn polls(&self) -> u64 {
         self.status.polls.load(Ordering::Acquire)
+    }
+
+    /// Request cooperative cancellation.
+    ///
+    /// A ready or parked task is reclaimed before this call returns. A task
+    /// currently inside `Future::poll` observes the request at that poll's
+    /// boundary; a trusted future that never yields still cannot be rescued.
+    pub fn cancel(&self) -> CancelOutcome {
+        cancel_task(self)
+    }
+
+    pub fn cancellation_requested(&self) -> bool {
+        self.status.cancellation_requested()
+    }
+
+    pub fn try_exit(&self) -> Option<TaskExit> {
+        let state = self.status.state();
+        (state != TaskState::Running)
+            .then(|| TaskExit::new(self.id, state, self.status.polls.load(Ordering::Acquire)))
+    }
+
+    /// Wait for return, fault, or cancellation without losing terminal state
+    /// when completion races waiter registration.
+    pub fn join(&self) -> Join {
+        Join {
+            id: self.id,
+            status: self.status.clone(),
+            registration: None,
+        }
+    }
+}
+
+pub struct Join {
+    id: TaskId,
+    status: Arc<TaskStatus>,
+    registration: Option<u64>,
+}
+
+impl Future for Join {
+    type Output = TaskExit;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let state = this.status.state();
+        if state != TaskState::Running {
+            if let Some(id) = this.registration.take() {
+                this.status.joiners.lock().retain(|waiter| waiter.id != id);
+            }
+            return Poll::Ready(TaskExit::new(
+                this.id,
+                state,
+                this.status.polls.load(Ordering::Acquire),
+            ));
+        }
+
+        // Register under the waiter lock, then re-read the terminal state.
+        // `finish` publishes before acquiring this lock, so either this read
+        // observes the terminal state or `finish` drains the waker we insert.
+        let status = this.status.clone();
+        let mut joiners = status.joiners.lock();
+        let state = status.state();
+        if state != TaskState::Running {
+            if let Some(id) = this.registration.take() {
+                joiners.retain(|waiter| waiter.id != id);
+            }
+            drop(joiners);
+            return Poll::Ready(TaskExit::new(
+                this.id,
+                state,
+                status.polls.load(Ordering::Acquire),
+            ));
+        }
+
+        match this.registration {
+            Some(id) => {
+                if let Some(waiter) = joiners.iter_mut().find(|waiter| waiter.id == id) {
+                    if !waiter.waker.will_wake(cx.waker()) {
+                        waiter.waker = cx.waker().clone();
+                    }
+                } else {
+                    joiners.push(JoinWaiter {
+                        id,
+                        waker: cx.waker().clone(),
+                    });
+                }
+            }
+            None => {
+                let id = status.next_joiner_id();
+                joiners.push(JoinWaiter {
+                    id,
+                    waker: cx.waker().clone(),
+                });
+                this.registration = Some(id);
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for Join {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration.take() {
+            self.status.joiners.lock().retain(|waiter| waiter.id != id);
+        }
     }
 }
 
@@ -173,6 +467,7 @@ struct Sched {
     running_woken: bool,
     completed: u64,
     faulted: u64,
+    cancelled: u64,
 }
 
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
@@ -182,6 +477,7 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     running_woken: false,
     completed: 0,
     faulted: 0,
+    cancelled: 0,
 });
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -199,10 +495,7 @@ pub fn spawn(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> Task
 }
 
 /// Spawn a future and retain a handle suitable for a supervising component.
-pub fn spawn_tracked(
-    name: &str,
-    fut: impl Future<Output = ()> + Send + 'static,
-) -> TaskHandle {
+pub fn spawn_tracked(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> TaskHandle {
     let id = next_task_id();
     let status = Arc::new(TaskStatus::new());
     let mut s = SCHED.lock();
@@ -216,6 +509,131 @@ pub fn spawn_tracked(
     );
     s.ready.push_back(id);
     TaskHandle { id, status }
+}
+
+fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskState> {
+    if !status.publish(claim) {
+        return None;
+    }
+    let mut s = SCHED.lock();
+    match claim.state {
+        TaskState::Exited => s.completed += 1,
+        TaskState::Faulted => s.faulted += 1,
+        TaskState::Cancelled => s.cancelled += 1,
+        TaskState::Running => unreachable!("a terminal transition returned Running"),
+    }
+    Some(claim.state)
+}
+
+/// Drop a normally suspended/completed future behind the same fault domain as
+/// polling it. The task metadata is reclaimed first; if the future destructor
+/// faults, the landing pad leaves its Option empty and the interrupted future
+/// allocation is deliberately leaked rather than dropped a second time.
+fn reclaim_task(task: Task) -> bool {
+    let Task {
+        name,
+        future,
+        status,
+    } = task;
+    drop(name);
+    drop(status);
+
+    let guard = *FAULT_GUARD.lock();
+    match guard {
+        Some(run_guarded) => {
+            let mut future = Some(future);
+            let faulted = run_guarded(&mut || {
+                if let Some(future) = future.take() {
+                    drop(future);
+                }
+            });
+            if faulted {
+                // A synthetic host guard may report a fault without entering
+                // the closure. Real longjmp faults have already taken it.
+                if let Some(future) = future.take() {
+                    core::mem::forget(future);
+                }
+            }
+            faulted
+        }
+        None => {
+            drop(future);
+            false
+        }
+    }
+}
+
+fn reclaim_and_publish(task: Task, status: &TaskStatus, claim: TerminalClaim) {
+    let destructor_faulted = reclaim_task(task);
+    let claim = if destructor_faulted {
+        status.promote_to_fault(claim)
+    } else {
+        claim
+    };
+    publish_terminal(status, claim);
+}
+
+fn requested_outcome(handle: &TaskHandle) -> CancelOutcome {
+    match handle.status.request_cancel() {
+        CancelRequest::Requested => CancelOutcome::Requested,
+        CancelRequest::Terminal => CancelOutcome::AlreadyTerminal(
+            handle
+                .try_exit()
+                .expect("a published terminal state has an exit report"),
+        ),
+        CancelRequest::TooLate(state) => CancelOutcome::TooLate(state),
+    }
+}
+
+fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
+    enum Action {
+        Reclaim(Task, TerminalClaim),
+        Return(CancelOutcome),
+        InvariantViolation,
+    }
+
+    // Ready and parked tasks can be detached synchronously. A running task is
+    // cooperative: only publish its request here and let `poll_once` reclaim
+    // it after the current poll returns.
+    let action = {
+        let mut s = SCHED.lock();
+        if s.running
+            .as_ref()
+            .is_some_and(|(id, _, _)| *id == handle.id)
+        {
+            Action::Return(requested_outcome(handle))
+        } else if s.tasks.contains_key(&handle.id) {
+            match handle.status.claim_terminal(TaskState::Cancelled) {
+                Some(claim) => {
+                    let task = s
+                        .tasks
+                        .remove(&handle.id)
+                        .expect("contains_key was checked under the same lock");
+                    s.ready.retain(|id| *id != handle.id);
+                    Action::Reclaim(task, claim)
+                }
+                None => Action::Return(requested_outcome(handle)),
+            }
+        } else {
+            match requested_outcome(handle) {
+                CancelOutcome::Requested => Action::InvariantViolation,
+                outcome => Action::Return(outcome),
+            }
+        }
+    };
+
+    match action {
+        Action::Reclaim(task, claim) => {
+            // Never reclaim under SCHED: destructors may wake another task or
+            // unregister from a wait primitive.
+            reclaim_and_publish(task, &handle.status, claim);
+            CancelOutcome::Requested
+        }
+        Action::Return(outcome) => outcome,
+        Action::InvariantViolation => {
+            panic!("a running task handle has no scheduler location or terminal claim")
+        }
+    }
 }
 
 pub fn wake(id: TaskId) {
@@ -257,6 +675,11 @@ pub fn completed_count() -> u64 {
 /// Tasks killed by a fault rather than by returning.
 pub fn faulted_count() -> u64 {
     SCHED.lock().faulted
+}
+
+/// Tasks reclaimed at a cooperative poll boundary after cancellation.
+pub fn cancelled_count() -> u64 {
+    SCHED.lock().cancelled
 }
 
 // --- Waker: the pointer *is* the TaskId. No refcount, no allocation. ---
@@ -301,22 +724,50 @@ pub fn run() -> ! {
 ///
 /// Split out of `run` so tests can drive the scheduler a step at a time.
 pub fn poll_once() -> bool {
-    let Some(id) = SCHED.lock().ready.pop_front() else { return false };
-
-    // Take the future out of the map so the task can spawn/wake freely
-    // while it is being polled without deadlocking on SCHED.
-    let Some(mut task) = SCHED.lock().tasks.remove(&id) else { return true };
-
-    // Keep a status reference outside the future-bearing `Task`. A fault
-    // longjmps out of `Future::poll`, so the fault path must not inspect any
-    // field adjacent to that interrupted future before deliberately leaking it.
-    let status = task.status.clone();
-    status.polls.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut s = SCHED.lock();
-        s.running = Some((id, task.name.clone(), status.clone()));
-        s.running_woken = false;
+    enum Dispatch {
+        Poll(TaskId, Task, Arc<TaskStatus>),
+        Reclaim(Task, Arc<TaskStatus>, TerminalClaim),
+        Invalid(Task),
     }
+
+    // Pop, detach, and publish `running` under one lock. This is the start-poll
+    // linearization point: cancellation before it detaches the task without a
+    // poll; cancellation after it waits for this poll boundary.
+    let dispatch = {
+        let mut s = SCHED.lock();
+        let Some(id) = s.ready.pop_front() else {
+            return false;
+        };
+        let Some(task) = s.tasks.remove(&id) else {
+            return true;
+        };
+        let status = task.status.clone();
+        if status.cancellation_requested() {
+            match status.claim_terminal(TaskState::Cancelled) {
+                Some(claim) => Dispatch::Reclaim(task, status, claim),
+                None => Dispatch::Invalid(task),
+            }
+        } else if status.raw_state() == TaskState::Running as u8 {
+            s.running = Some((id, task.name.clone(), status.clone()));
+            s.running_woken = false;
+            Dispatch::Poll(id, task, status)
+        } else {
+            Dispatch::Invalid(task)
+        }
+    };
+
+    let (id, mut task, status) = match dispatch {
+        Dispatch::Poll(id, task, status) => (id, task, status),
+        Dispatch::Reclaim(task, status, claim) => {
+            reclaim_and_publish(task, &status, claim);
+            return true;
+        }
+        Dispatch::Invalid(task) => {
+            core::mem::forget(task);
+            panic!("a queued task had an invalid lifecycle phase");
+        }
+    };
+
     let waker = waker_for(id);
     let mut cx = Context::from_waker(&waker);
 
@@ -330,11 +781,13 @@ pub fn poll_once() -> bool {
             let mut once = Some(fut);
             run_guarded(&mut || {
                 if let Some(f) = once.take() {
+                    status.polls.fetch_add(1, Ordering::Relaxed);
                     poll = f.poll(&mut cx);
                 }
             })
         }
         None => {
+            status.polls.fetch_add(1, Ordering::Relaxed);
             poll = task.future.as_mut().poll(&mut cx);
             false
         }
@@ -345,39 +798,48 @@ pub fn poll_once() -> bool {
         // destructors over state it never finished writing, so the task is
         // leaked instead: leaking is always sound, and a faulted component is
         // not going to be resumed.
-        let mut s = SCHED.lock();
-        s.running = None;
-        s.running_woken = false;
-        if status.finish(TaskState::Faulted) {
-            s.faulted += 1;
-        }
-        drop(s);
+        let claim = {
+            let mut s = SCHED.lock();
+            s.running = None;
+            s.running_woken = false;
+            status.claim_terminal(TaskState::Faulted)
+        };
         core::mem::forget(task);
+        let Some(claim) = claim else {
+            panic!("a faulted running task could not claim its terminal state");
+        };
+        publish_terminal(&status, claim);
         return true;
     }
 
     let mut s = SCHED.lock();
     s.running = None;
     let woken = core::mem::take(&mut s.running_woken);
-    match poll {
-        Poll::Ready(()) => {
-            // `Exited` is also the reclamation boundary: publish it only after
-            // the completed future has run its normal destructor, with SCHED
-            // unlocked in case that destructor wakes or spawns another task.
-            drop(s);
-            drop(task);
-            let mut s = SCHED.lock();
-            if status.finish(TaskState::Exited) {
-                s.completed += 1;
-            }
+    if poll == Poll::Pending && !status.cancellation_requested() {
+        // A concurrent cancel cannot slip between this decision and reinsertion:
+        // it also takes SCHED, then detaches the parked task synchronously.
+        s.tasks.insert(id, task);
+        if woken {
+            s.ready.push_back(id);
         }
-        Poll::Pending => {
-            s.tasks.insert(id, task);
-            if woken {
-                s.ready.push_back(id);
-            }
-        }
+        return true;
     }
+
+    let requested = if poll == Poll::Ready(()) {
+        TaskState::Exited
+    } else {
+        TaskState::Cancelled
+    };
+    let claim = status.claim_terminal(requested);
+    drop(s);
+
+    let Some(claim) = claim else {
+        core::mem::forget(task);
+        panic!("a running task could not commit its terminal state");
+    };
+    // The claim prevents a late cancellation from rewriting Ready into
+    // Cancelled while the destructor runs. Publication follows reclamation.
+    reclaim_and_publish(task, &status, claim);
     true
 }
 
@@ -402,7 +864,9 @@ pub struct WaitQueue {
 
 impl WaitQueue {
     pub const fn new() -> Self {
-        Self { waiters: SpinLock::new(Vec::new()) }
+        Self {
+            waiters: SpinLock::new(Vec::new()),
+        }
     }
 
     pub fn wake_all(&self) {
@@ -415,7 +879,10 @@ impl WaitQueue {
     /// Park until the next `wake_all`. Registers on first poll, completes on
     /// second — so a wake that races in between is never lost.
     pub fn wait(&self) -> WaitFuture<'_> {
-        WaitFuture { queue: self, registered: false }
+        WaitFuture {
+            queue: self,
+            registered: false,
+        }
     }
 }
 
@@ -479,7 +946,10 @@ pub fn init_timer() {
 }
 
 pub fn sleep_ms(ms: u64) -> Sleep {
-    Sleep { deadline: arch::time() + ms * (TIMEBASE_HZ / 1000), armed: false }
+    Sleep {
+        deadline: arch::time() + ms * (TIMEBASE_HZ / 1000),
+        armed: false,
+    }
 }
 
 pub struct Sleep {

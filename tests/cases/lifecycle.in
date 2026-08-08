@@ -1,0 +1,9 @@
+quiet
+@sleep 2
+cancel guest
+ps
+caps guest
+cancel guest
+cancel shell
+cancel
+cancel missing

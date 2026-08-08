@@ -22,11 +22,11 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 145 host tests, no QEMU, ~1s
-./scripts/qemu-test.sh     # 7 QEMU cases (6 goldens + differential), ~3min
+cargo test --workspace     # 155 host tests, no QEMU, ~1s
+./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
 ```
 
-Plus an in-kernel self-test (65 checks) for what the host cannot fake — real
+Plus an in-kernel self-test (82 checks) for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
 actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
 for why there are four layers and which mutations each one catches.
@@ -79,9 +79,9 @@ explicitly unbound execution space used synchronously by the shell task:
 | guest  | console `WRITE`                          | pass the console on       |
 | prog   | console `WRITE`, memory `READ|WRITE`      | reach any other resource  |
 
-Run `probe` in the shell to watch four attacks get refused, and `revoke guest`
-to pull a live component's authority out from under it — no signal, no restart,
-no cooperation from the component.
+Run `probe` in the shell to watch four attacks get refused. `revoke guest` pulls
+a live component's authority out from under it, while `cancel guest` separately
+stops its task; authority and lifecycle are deliberately different controls.
 
 ### 2. Isolation is a type system, not a page table
 
@@ -126,9 +126,17 @@ the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 The system image binds each supervised unit into one retained `Component`
 record: a stable `ComponentId`, its current task incarnation, its CSpace, a
 declared memory owner/budget, and lifecycle state. `ps` and `caps` read that same
-record, so an exited or faulted task keeps both its identity and terminal reason
+record, so an exited, faulted, or cancelled task keeps both its identity and terminal reason
 after the executor removes it. The allocator does not enforce those declared
 budgets yet; that is roadmap 3.11.
+
+Each retained task handle supports cooperative cancellation and async join/exit
+reporting. Cancelling a ready or parked task detaches it and drops its future
+without another poll; cancelling the task currently running takes effect when
+that poll returns. Faults win over simultaneous cancellation, terminal states
+are absorbing, and a stale wake cannot revive a task. This is not preemption: an
+in-tree future that never yields can still wedge the single hart. Wait/timer
+registration cleanup is the next lifecycle node (3.10).
 
 ## A Rust compiler, inside the OS
 
@@ -235,7 +243,7 @@ property of the code.
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |
 
-~8,400 Rust lines across `core`, `compiler`, and `kernel` (2026-08-08 snapshot).
+~9,700 Rust lines across `core`, `compiler`, and `kernel` (2026-08-08 snapshot).
 
 ## Shell
 
@@ -250,6 +258,7 @@ selftest        run the in-kernel test suite
 rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
+cancel <name>   cooperatively stop a component (shell protected until restart exists)
 chan            telemetry channel depth and totals
 quiet           mute background components (`verbose` restores)
 mem             kernel heap usage

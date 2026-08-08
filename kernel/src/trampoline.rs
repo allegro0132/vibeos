@@ -25,6 +25,7 @@ use core::arch::global_asm;
 
 /// `ra`, `sp`, and `s0`–`s11`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct JmpBuf {
     regs: [u64; 14],
 }
@@ -147,14 +148,14 @@ pub mod abort {
     }
 }
 
-
 // --- Task fault isolation (ROADMAP 2.8) ---
 
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-static mut TASK_JMP: JmpBuf = JmpBuf::ZERO;
-static TASK_ARMED: AtomicBool = AtomicBool::new(false);
+const MAX_TASK_GUARDS: usize = 8;
+static mut TASK_JMPS: [JmpBuf; MAX_TASK_GUARDS] = [JmpBuf::ZERO; MAX_TASK_GUARDS];
+static TASK_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// Poll a task with a landing pad installed. Returns true if it panicked.
 ///
@@ -163,22 +164,35 @@ static TASK_ARMED: AtomicBool = AtomicBool::new(false);
 /// frame and locals are never disturbed and stay safe to use afterwards.
 #[inline(never)]
 pub fn guard_task(f: &mut dyn FnMut()) -> bool {
+    let depth = TASK_GUARD_DEPTH.load(Ordering::SeqCst);
+    // Panicking here would be caught by the *outer* landing pad and longjmp
+    // across the caller that owns this operation's terminal claim. Report a
+    // synthetic fault instead so that caller can still reclaim/publish its
+    // task before returning to the outer component.
+    if depth >= MAX_TASK_GUARDS {
+        return true;
+    }
     unsafe {
-        if vibe_setjmp(addr_of_mut!(TASK_JMP)) != 0 {
-            TASK_ARMED.store(false, Ordering::SeqCst);
+        if vibe_setjmp(addr_of_mut!(TASK_JMPS[depth])) != 0 {
+            // `unwind_faulted_task` already restored the previous depth. The
+            // outer landing pad remains armed when a supervisor cancels and
+            // reclaims another task from inside its own poll.
             return true;
         }
     }
-    TASK_ARMED.store(true, Ordering::SeqCst);
+    TASK_GUARD_DEPTH.store(depth + 1, Ordering::SeqCst);
     f();
-    TASK_ARMED.store(false, Ordering::SeqCst);
+    TASK_GUARD_DEPTH.store(depth, Ordering::SeqCst);
     false
 }
 
 /// Called from the panic handler. Returns only if there is no pad to jump to.
 pub fn unwind_faulted_task() {
-    if !TASK_ARMED.swap(false, Ordering::SeqCst) {
+    let depth = TASK_GUARD_DEPTH.load(Ordering::SeqCst);
+    if depth == 0 {
         return;
     }
-    unsafe { vibe_longjmp(addr_of_mut!(TASK_JMP), 1) }
+    let target = depth - 1;
+    TASK_GUARD_DEPTH.store(target, Ordering::SeqCst);
+    unsafe { vibe_longjmp(addr_of_mut!(TASK_JMPS[target]), 1) }
 }

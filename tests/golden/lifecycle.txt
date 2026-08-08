@@ -1,0 +1,29 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> cancel guest
+  cancelled component:3  task task:3 after 1 poll(s)
+vibe> ps
+  COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
+  component:1  task:1   sensor     sensor   running   -                2    65536 B
+  component:2  task:2   logger     logger   running   -                2    65536 B
+  component:3  task:3   guest      guest    cancelled cancelled        1    65536 B
+  component:4  task:4   shell      init     running   -                4   262144 B
+  executor totals (including untracked tasks): 0 exited, 0 faulted, 1 cancelled
+  memory budgets are declared; allocator accounting lands in 3.11
+  background output is muted; poll counts still rising
+vibe> caps guest
+  owner component:3  task task:3  name guest  state cancelled  reason cancelled
+  memory owner component:3  declared budget 65536 B (accounting pending)
+  HANDLE       KIND      RIGHTS   OBJECT
+  cap:0.0      console   -w----   ns16550a @ 0xADDR [31 bytes out]
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> cancel guest
+  component:3 already cancelled  task task:3 after 1 poll(s)
+vibe> cancel shell
+  refused: shell cannot be cancelled until restart supervision exists
+vibe> cancel
+  usage: cancel <component>
+vibe> cancel missing
+  no such component: missing
+vibe> 

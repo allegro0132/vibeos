@@ -12,7 +12,7 @@
 use vibeos_rustc::{compile_at, Runtime};
 
 fn rt() -> Runtime {
-    Runtime { print_str: 0, print_int: 0, abort: 0 }
+    Runtime { print_str: 0, print_int: 0, print_bool: 0, abort: 0 }
 }
 
 /// Must return, whatever it is handed.

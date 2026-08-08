@@ -96,6 +96,9 @@ impl Parser {
             Tok::While => "`while`".to_string(),
             Tok::Return => "`return`".to_string(),
             Tok::I64 => "`i64`".to_string(),
+            Tok::Bool => "`bool`".to_string(),
+            Tok::True => "`true`".to_string(),
+            Tok::False => "`false`".to_string(),
         }
     }
 
@@ -143,23 +146,29 @@ impl Parser {
             }
             let p = self.ident()?;
             self.expect(":")?;
-            self.expect_i64()?;
-            params.push(p);
+            let t = self.ty()?;
+            params.push((p, t));
         }
-        // `-> i64` is accepted and ignored: every value in the subset is i64.
-        if self.eat("->") {
-            self.expect_i64()?;
-        }
+        let ret = if self.eat("->") { self.ty()? } else { Ty::Unit };
         let body = self.block()?;
-        Ok(Func { name, params, body, line })
+        Ok(Func { name, params, ret, body, line })
     }
 
-    fn expect_i64(&mut self) -> PResult<()> {
-        if matches!(self.peek(), Tok::I64) {
-            self.bump();
-            Ok(())
-        } else {
-            Err(format!("line {}: the only type in this subset is `i64`, found {}", self.line(), self.describe()))
+    fn ty(&mut self) -> PResult<Ty> {
+        match self.peek() {
+            Tok::I64 => {
+                self.bump();
+                Ok(Ty::I64)
+            }
+            Tok::Bool => {
+                self.bump();
+                Ok(Ty::Bool)
+            }
+            _ => Err(format!(
+                "line {}: expected a type (`i64` or `bool`), found {}",
+                self.line(),
+                self.describe()
+            )),
         }
     }
 
@@ -192,13 +201,11 @@ impl Parser {
                         true
                     };
                     let name = self.ident()?;
-                    if self.eat(":") {
-                        self.expect_i64()?;
-                    }
+                    let declared = if self.eat(":") { Some(self.ty()?) } else { None };
                     self.expect("=")?;
                     let init = self.expr()?;
                     self.expect(";")?;
-                    stmts.push(Stmt::Let { name, mutable, init });
+                    stmts.push(Stmt::Let { name, mutable, declared, init, line });
                 }
                 Tok::Return => {
                     self.bump();
@@ -214,7 +221,7 @@ impl Parser {
                     self.bump();
                     let cond = self.expr()?;
                     let body = self.block()?;
-                    stmts.push(Stmt::While(cond, body));
+                    stmts.push(Stmt::While(cond, body, line));
                 }
                 Tok::Macro(m) if m == "println" || m == "print" => {
                     self.bump();
@@ -318,7 +325,8 @@ impl Parser {
                     if !lit.is_empty() {
                         parts.push(PrintPart::Str(core::mem::take(&mut lit)));
                     }
-                    parts.push(PrintPart::Val(args[used].clone()));
+                    // The checker fills the real type in.
+                    parts.push(PrintPart::Val(args[used].clone(), Ty::I64));
                     used += 1;
                 }
                 c => lit.push(c),
@@ -353,9 +361,10 @@ impl Parser {
             if prec < min_prec {
                 break;
             }
+            let line = self.line();
             self.bump();
             let rhs = self.bin_expr(prec + 1)?;
-            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs), line);
         }
         Ok(lhs)
     }
@@ -377,6 +386,14 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Int(v))
             }
+            Tok::True => {
+                self.bump();
+                Ok(Expr::Bool(true))
+            }
+            Tok::False => {
+                self.bump();
+                Ok(Expr::Bool(false))
+            }
             Tok::If => {
                 self.bump();
                 let cond = self.expr()?;
@@ -393,7 +410,7 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Expr::If(Box::new(cond), then, els))
+                Ok(Expr::If(Box::new(cond), then, els, line))
             }
             Tok::Ident(name) => {
                 self.bump();

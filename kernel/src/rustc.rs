@@ -101,6 +101,16 @@ extern "C" fn rt_print_int(v: i64) {
     console.write(&format!("{}", v));
 }
 
+/// `Display for bool` prints `true`/`false`, and the subset must agree with
+/// Rust here or the differential oracle stops being one.
+extern "C" fn rt_print_bool(v: i64) {
+    let Some(console) = PROG_OUT.lock().clone() else {
+        *DENIED.lock() = true;
+        return;
+    };
+    console.write(if v == 0 { "false" } else { "true" });
+}
+
 pub struct Compiled {
     /// Kept alive because generated code holds absolute pointers into it.
     _data: Vec<u8>,
@@ -114,6 +124,7 @@ pub fn compile(src: &str) -> Result<Compiled, String> {
     let rt = vibeos_rustc::Runtime {
         print_str: rt_print_str as *const () as u64,
         print_int: rt_print_int as *const () as u64,
+        print_bool: rt_print_bool as *const () as u64,
         abort: rt_abort as *const () as u64,
     };
 

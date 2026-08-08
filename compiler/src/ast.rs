@@ -7,6 +7,26 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// The subset's types. `i64` was load-bearing for everything in v0.1 —
+/// conditions included — which is exactly where it stopped being a subset of
+/// Rust, since Rust has no truthiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ty {
+    I64,
+    Bool,
+    Unit,
+}
+
+impl core::fmt::Display for Ty {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Ty::I64 => "i64",
+            Ty::Bool => "bool",
+            Ty::Unit => "()",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BinOp {
     Add,
@@ -27,26 +47,33 @@ pub enum BinOp {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Int(i64),
+    Bool(bool),
     Var(String, u32),
     Neg(Box<Expr>),
+    /// `!` on a `bool`: logical negation.
     Not(Box<Expr>),
-    Bin(BinOp, Box<Expr>, Box<Expr>),
+    /// `!` on an `i64`: bitwise complement. The parser cannot tell these apart,
+    /// so it always emits `Not` and the type checker rewrites.
+    BitNot(Box<Expr>),
+    Bin(BinOp, Box<Expr>, Box<Expr>, u32),
     Call(String, Vec<Expr>, u32),
-    If(Box<Expr>, Block, Option<Block>),
+    If(Box<Expr>, Block, Option<Block>, u32),
 }
 
 #[derive(Clone, Debug)]
 pub enum PrintPart {
     Str(String),
-    Val(Expr),
+    /// The type is a placeholder until the checker fills it in; code generation
+    /// needs it because a `bool` prints `true`/`false`, not `1`/`0`.
+    Val(Expr, Ty),
 }
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    Let { name: String, mutable: bool, init: Expr },
+    Let { name: String, mutable: bool, declared: Option<Ty>, init: Expr, line: u32 },
     Assign { name: String, value: Expr, line: u32 },
     Expr(Expr),
-    While(Expr, Block),
+    While(Expr, Block, u32),
     Return(Option<Expr>),
     Print { parts: Vec<PrintPart>, newline: bool },
 }
@@ -61,7 +88,8 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<(String, Ty)>,
+    pub ret: Ty,
     pub body: Block,
     pub line: u32,
 }

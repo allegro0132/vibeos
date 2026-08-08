@@ -11,6 +11,7 @@ fn rt() -> Runtime {
     Runtime {
         print_str: 0x1111_2222_3333_4444,
         print_int: 0x5555_6666_7777_8888,
+        print_bool: 0x1357_9bdf_0246_8ace,
         abort: 0x9999_aaaa_bbbb_cccc,
     }
 }
@@ -294,7 +295,7 @@ fn the_only_absolute_addresses_are_compiler_chosen() {
     for addr in found.iter().filter(|v| **v > 0x1000_0000) {
         let in_data = (0x8000_0000..0x8000_0000 + img.data.len() as u64).contains(addr);
         let in_code = (0x8010_0000..0x8010_0000 + (img.code.len() * 4) as u64).contains(addr);
-        let is_hook = *addr == rt.print_str || *addr == rt.print_int || *addr == rt.abort;
+        let is_hook = *addr == rt.print_str || *addr == rt.print_int || *addr == rt.print_bool || *addr == rt.abort;
         assert!(
             in_data || in_code || is_hook,
             "generated code materializes {addr:#x}, which is neither its own data, \
@@ -318,7 +319,7 @@ fn scope_and_mutability_are_enforced() {
 #[test]
 fn a_variable_leaves_scope_at_the_end_of_its_block() {
     assert_eq!(
-        err("fn main() { if 1 { let inner = 1; } inner; }"),
+        err("fn main() { if 1 < 2 { let inner = 1; } inner; }"),
         "line 1: cannot find value `inner` in this scope"
     );
 }

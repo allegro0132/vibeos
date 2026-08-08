@@ -55,8 +55,9 @@ fn main() {
     println!("cmp {} {} {} {} {} {}", 1 < 2, 2 < 1, 1 <= 1, 1 > 2, 2 >= 2, 1 == 1);
     println!("ne {} {}", 1 != 2, 1 != 1);
     println!("bitnot {} {}", !0, !5);
-    println!("and {} {} {}", 1 && 1, 1 && 0, 0 && 1);
-    println!("or {} {} {}", 0 || 0, 0 || 1, 1 || 0);
+    println!("and {} {} {}", true && true, true && false, false && true);
+    println!("or {} {} {}", false || false, false || true, true || false);
+    println!("boolop {} {}", !true, true == false);
     println!("call {} {}", add(40, 2), fact(10));
     println!("branch {} {} {} {}", classify(-1), classify(0), classify(5), classify(50));
     let mut i = 0;
@@ -64,7 +65,7 @@ fn main() {
     while i <= 100 { sum = sum + i; i = i + 1; }
     println!("loop {} {}", i, sum);
     println!("tail {}", squared(3));
-    if 1 { println!("if-statement runs"); }
+    if 2 > 1 { println!("if-statement runs"); }
     println!("after if-statement");
     println!("shadow {}", shadowed());
     println!("escapes a\tb {{}} done");

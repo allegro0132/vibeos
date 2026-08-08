@@ -7,38 +7,78 @@ on:
 jobs:
   host-tests:
     name: Host unit tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchain
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install repository toolchain
         run: |
-          rustup toolchain install nightly --component rust-src
-          rustup default nightly
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
+            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+          } >> "$GITHUB_ENV"
+          rustup run "$toolchain" rustc -Vv
+          rustup run "$toolchain" cargo -V
       - name: Test the portable core and the compiler
         # The kernel binary is no_std and has `test = false`; its tests run
         # inside QEMU in the job below.
-        run: cargo test --workspace --verbose
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --workspace --verbose
+      - name: Report repository status
+        run: ./scripts/status.sh --check
+
+  differential:
+    name: Real-rustc differential oracle
+    needs: host-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install repository toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
+            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+          } >> "$GITHUB_ENV"
+          rustup run "$toolchain" rustc -Vv
+          rustup run "$toolchain" cargo -V
+      - name: Compare the corpus with real rustc
+        run: ./scripts/differential.sh
 
   qemu-tests:
     name: QEMU integration
-    runs-on: ubuntu-latest
+    needs: differential
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchain
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install repository toolchain
         run: |
-          rustup toolchain install nightly --component rust-src
-          rustup default nightly
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
+            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+          } >> "$GITHUB_ENV"
+          rustup run "$toolchain" rustc -Vv
+          rustup run "$toolchain" cargo -V
       - name: Install QEMU and lld
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc lld
           # Cargo's rustflags name `ld.lld`; Ubuntu ships it as lld-<version>.
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
-      - name: Build the kernel
-        run: cd kernel && cargo build --release
+          qemu-system-riscv64 --version
+          ld.lld --version
       - name: Golden transcripts
         run: ./scripts/qemu-test.sh
       - name: QEMU/TCG benchmark regression budget
         run: python3 scripts/bench.py --no-build
-      - name: In-kernel self-test must pass
-        run: grep -q 'SELFTEST OK' tests/golden/selftest.txt

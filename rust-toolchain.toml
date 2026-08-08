@@ -1,5 +1,6 @@
-# Honoured by rustup (CI). Ignored by a rustup-less toolchain such as Homebrew's,
-# where `RUSTC_BOOTSTRAP=1` in run.sh unlocks the same `-Z build-std` support.
+# rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)
+# rustc-commit: ad3d0bc141a02cf446e384136d250a1f6950fed5
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-01"
 components = ["rust-src"]
+profile = "minimal"

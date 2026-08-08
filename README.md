@@ -22,15 +22,18 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 209 host tests, no QEMU, ~1s
-./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
-./scripts/bench.py         # fixed QEMU/TCG baseline + regression policy
+cargo test --workspace       # fast portable tests, no QEMU
+./scripts/differential.sh    # exact-output oracle using the pinned rustc
+./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
+./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
+./scripts/status.sh --check  # derive inventory and verify the active rustc pin
 ```
 
-Plus an in-kernel self-test (307 checks) for what the host cannot fake — real
+Plus an in-kernel self-test for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
-actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
-for why there are four layers and which mutations each one catches.
+actually executing. Type `selftest` in the shell; the QEMU harness reports its
+observed check count. See **[TESTING.md](TESTING.md)** for why there are four
+layers and which mutations each one catches.
 
 ## Running it
 
@@ -39,9 +42,10 @@ for why there are four layers and which mutations each one catches.
 ./qrun.sh 10      # run for 10 seconds, feed the shell from stdin
 ```
 
-Needs `qemu-system-riscv64`, a Rust toolchain with `rust-src`, and `ld.lld`.
-`RUSTC_BOOTSTRAP=1` is set by the scripts because `-Z build-std` is required to
-get `core`/`alloc` for a bare-metal target; a nightly toolchain works without it.
+Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
+`nightly-2026-08-01` (including `rust-src`) in `rust-toolchain.toml`; every local
+script and CI build consumes that same file. `scripts/status.sh --check` fails if
+the active compiler commit differs from the recorded pin.
 
 `bench` in the shell emits a versioned JSON-lines measurement set. The host
 runner fixes the machine, CPU, hart count, TCG mode, and virtual clock, records

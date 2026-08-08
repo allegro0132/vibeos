@@ -8,7 +8,7 @@
     "profile": "release",
     "qemu": "QEMU emulator version 11.0.3",
     "smp": 1,
-    "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)"
+    "toolchain": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)"
   },
   "guest": {
     "clock": "riscv.rdtime",
@@ -177,12 +177,12 @@
     "compile_bytes_per_second": {
       "baseline": {
         "direction": "higher",
-        "max": 350362,
-        "mean": 350344,
-        "min": 350301,
+        "max": 361081,
+        "mean": 361047,
+        "min": 361017,
         "name": "compile_bytes_per_second",
-        "p50": 350362,
-        "p95": 350362,
+        "p50": 361017,
+        "p95": 361081,
         "samples": 21,
         "schema": "vibeos.bench.metric",
         "unit": "source_bytes_per_second",
@@ -265,12 +265,12 @@
     "heap_peak_bytes": {
       "baseline": {
         "direction": "lower",
-        "max": 114048,
-        "mean": 114048,
-        "min": 114048,
+        "max": 113792,
+        "mean": 113792,
+        "min": 113792,
         "name": "heap_peak_bytes",
-        "p50": 114048,
-        "p95": 114048,
+        "p50": 113792,
+        "p95": 113792,
         "samples": 1,
         "schema": "vibeos.bench.metric",
         "unit": "bytes",
@@ -291,7 +291,7 @@
         "mean": 108,
         "min": 108,
         "name": "ipc_roundtrip_ticks",
-        "p50": 108,
+        "p50": 109,
         "p95": 109,
         "samples": 257,
         "schema": "vibeos.bench.metric",

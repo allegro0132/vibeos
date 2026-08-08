@@ -32,6 +32,19 @@ struct Task {
     polls: u64,
 }
 
+/// Runs `f` with a landing pad installed, returning true if `f` faulted.
+///
+/// The kernel supplies this; `core` cannot, because a landing pad is
+/// architecture-specific assembly. On the host there is none, and a panicking
+/// task simply fails the test — which is the right behaviour there.
+pub type FaultGuard = fn(&mut dyn FnMut()) -> bool;
+
+static FAULT_GUARD: SpinLock<Option<FaultGuard>> = SpinLock::new(None);
+
+pub fn set_fault_guard(guard: FaultGuard) {
+    *FAULT_GUARD.lock() = Some(guard);
+}
+
 struct Sched {
     tasks: BTreeMap<TaskId, Task>,
     ready: VecDeque<TaskId>,
@@ -44,6 +57,7 @@ struct Sched {
     /// wake would be dropped and the task would never be scheduled again.
     running_woken: bool,
     completed: u64,
+    faulted: u64,
 }
 
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
@@ -52,6 +66,7 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     running: None,
     running_woken: false,
     completed: 0,
+    faulted: 0,
 });
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -85,6 +100,11 @@ pub fn task_report() -> Vec<(String, u64)> {
 
 pub fn completed_count() -> u64 {
     SCHED.lock().completed
+}
+
+/// Tasks killed by a fault rather than by returning.
+pub fn faulted_count() -> u64 {
+    SCHED.lock().faulted
 }
 
 // --- Waker: the pointer *is* the TaskId. No refcount, no allocation. ---
@@ -143,7 +163,39 @@ pub fn poll_once() -> bool {
     }
     let waker = waker_for(id);
     let mut cx = Context::from_waker(&waker);
-    let poll = task.future.as_mut().poll(&mut cx);
+
+    // Poll behind the kernel's landing pad when one is installed, so a
+    // component that panics costs its own task instead of the machine.
+    let guard = *FAULT_GUARD.lock();
+    let mut poll = Poll::Pending;
+    let faulted = match guard {
+        Some(run_guarded) => {
+            let fut = task.future.as_mut();
+            let mut once = Some(fut);
+            run_guarded(&mut || {
+                if let Some(f) = once.take() {
+                    poll = f.poll(&mut cx);
+                }
+            })
+        }
+        None => {
+            poll = task.future.as_mut().poll(&mut cx);
+            false
+        }
+    };
+
+    if faulted {
+        // The future was interrupted mid-poll. Dropping it would run
+        // destructors over state it never finished writing, so the task is
+        // leaked instead: leaking is always sound, and a faulted component is
+        // not going to be resumed.
+        core::mem::forget(task);
+        let mut s = SCHED.lock();
+        s.running = None;
+        s.running_woken = false;
+        s.faulted += 1;
+        return true;
+    }
 
     let mut s = SCHED.lock();
     s.running = None;

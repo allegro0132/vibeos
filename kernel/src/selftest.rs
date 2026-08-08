@@ -54,6 +54,7 @@ pub async fn run() -> Report {
     timers(&mut h).await;
     scheduler(&mut h).await;
     channels(&mut h).await;
+    fault_isolation(&mut h).await;
     capabilities(&mut h);
     compiler(&mut h);
 
@@ -108,6 +109,36 @@ async fn scheduler(h: &mut Harness) {
     let (visible, polls) = ep.recv().await;
     h.check("a task polling right now is visible in task_report", visible);
     h.check("poll counts advance", polls > 1);
+}
+
+/// ROADMAP 2.8. A component that panics must cost its own task, not the box.
+/// This can only be tested on target: the host has no landing pad, and a panic
+/// there correctly fails the test run instead.
+async fn fault_isolation(h: &mut Harness) {
+    let faults_before = exec::faulted_count();
+    let live_before = exec::task_report().len();
+
+    exec::spawn("selftest-doomed", async {
+        exec::yield_now().await;
+        panic!("deliberate fault from the self-test");
+    });
+
+    // Give it enough turns to be polled, panic, and be reaped.
+    for _ in 0..8 {
+        exec::yield_now().await;
+    }
+
+    h.eq("a panicking task is counted as faulted", exec::faulted_count(), faults_before + 1);
+    h.check(
+        "a panicking task is removed from the scheduler",
+        !exec::task_report().iter().any(|(n, _)| n == "selftest-doomed"),
+    );
+    h.check(
+        "the other tasks are untouched",
+        exec::task_report().len() >= live_before.saturating_sub(1),
+    );
+    // And the machine is obviously still running, because we got here.
+    h.check("the kernel survived the fault", true);
 }
 
 async fn channels(h: &mut Harness) {

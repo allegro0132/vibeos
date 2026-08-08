@@ -26,7 +26,7 @@ cargo test --workspace     # 117 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
 ```
 
-Plus an in-kernel self-test (45 checks) for what the host cannot fake — real
+Plus an in-kernel self-test (49 checks) for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
 actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
 for why there are four layers and which mutations each one catches.
@@ -240,6 +240,24 @@ echo <text>     write via init's console capability
 halt            shut the machine down
 ```
 
+## Confinement
+
+A compiled program cannot reach hardware, and every way it could get stuck is
+checked. Try them:
+
+```
+vibe> rustc edit
+  | fn main() -> i64 { let mut i = 0; while i >= 0 { i = i + 0; } i }
+  | .
+  --- aborted: exceeded execution budget (after N us) ---
+vibe> ps
+  ...                        <- shell alive, every component still ticking
+```
+
+The same for stack overflow, divide by zero, remainder by zero, `i64::MIN / -1`,
+and arithmetic overflow — each with the wording real rustc uses. A component
+that *panics* is caught the same way and costs only its own task.
+
 ## The console
 
 Components print from tasks the shell knows nothing about, so the tty owns the
@@ -269,9 +287,10 @@ Deliberate, not overlooked:
 - **The compiler's subset is `i64`-only.** No structs, arrays, references,
   generics, traits, or borrow checking — a program is functions over integers
   plus formatted printing.
-- **A component that panics still takes the machine down.** Compiled *programs*
-  are aborted safely; applying the same trampoline at the executor's poll
-  boundary is Roadmap 2.8.
+- **A faulted task is leaked, not freed.** Dropping a future interrupted
+  mid-poll would run destructors over state it never finished writing.
+- **A panic with no landing pad is still fatal** — a fault in the boot path or
+  inside an interrupt handler halts the machine.
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.

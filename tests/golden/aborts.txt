@@ -41,6 +41,6 @@ vibe> ps
   logger            8
   guest             3
   shell            17
-  (0 tasks exited)
+  (0 exited, 0 faulted)
   background output is muted; poll counts still rising
 vibe> 

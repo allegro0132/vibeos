@@ -2,6 +2,8 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> selftest
-  selftest: 45 passed, 0 failed
-  SELFTEST OK (45 checks)
+[!] panic: panicked at kernel/src/selftest.rs:123:9:
+deliberate fault from the self-test
+  selftest: 49 passed, 0 failed
+  SELFTEST OK (49 checks)
 vibe> 

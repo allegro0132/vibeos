@@ -75,7 +75,11 @@ async fn run(line: &str, boot_time: u64) {
             for (name, polls) in exec::task_report() {
                 println!("  {:<10} {:>8}", name, polls);
             }
-            println!("  ({} tasks exited)", exec::completed_count());
+            println!(
+                "  ({} exited, {} faulted)",
+                exec::completed_count(),
+                exec::faulted_count()
+            );
             if tty::is_quiet() {
                 println!("  background output is muted; poll counts still rising");
             }

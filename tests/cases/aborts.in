@@ -1,0 +1,21 @@
+quiet
+rustc edit
+fn main() -> i64 { let z = 0; 1 / z }
+.
+@sleep 2
+rustc edit
+fn main() -> i64 { 9223372036854775807 + 1 }
+.
+@sleep 2
+rustc edit
+fn f(n: i64) -> i64 { f(n) }
+fn main() -> i64 { f(0) }
+.
+@sleep 3
+rustc edit
+fn main() -> i64 { let mut i = 0; while i >= 0 { i = i + 0; } i }
+.
+@sleep 8
+rustc hello
+@sleep 2
+ps

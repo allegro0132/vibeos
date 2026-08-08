@@ -2,6 +2,6 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> selftest
-  selftest: 37 passed, 0 failed
-  SELFTEST OK (37 checks)
+  selftest: 45 passed, 0 failed
+  SELFTEST OK (45 checks)
 vibe> 

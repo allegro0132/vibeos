@@ -22,10 +22,14 @@ use alloc::vec::Vec;
 
 pub use vibeos_rustc::samples::{CONFORMANCE as CONFORM_SRC, DEMO as DEMO_SRC, HELLO as HELLO_SRC};
 
+use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+
 use crate::cap::Rights;
 use crate::dev::ConsoleDev;
 use crate::sbi;
 use crate::sync::SpinLock;
+use crate::trampoline::{self, abort, vibe_enter, vibe_longjmp, vibe_setjmp, JmpBuf};
 use crate::world::world;
 
 /// Where a compiled program's authority lives while it runs. `None` means no
@@ -46,6 +50,34 @@ extern "C" fn rt_print_str(ptr: *const u8, len: usize) {
     if let Ok(s) = core::str::from_utf8(bytes) {
         console.write(s);
     }
+}
+
+/// Where a failed safety check lands, and the state it needs.
+///
+/// All of this lives in statics rather than locals because a `longjmp` returns
+/// into the middle of `run`, and a local held in a callee-saved register across
+/// that boundary is not reliable.
+static mut JMP: JmpBuf = JmpBuf::ZERO;
+static ARMED: AtomicBool = AtomicBool::new(false);
+static ABORT_CODE: AtomicI64 = AtomicI64::new(0);
+static ENTRY: AtomicUsize = AtomicUsize::new(0);
+static STARTED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many calls and loop iterations a program may execute.
+///
+/// Fuel rather than a clock, because reading the timer needs a CSR access and
+/// generated code is not permitted a SYSTEM instruction — see the confinement
+/// audit in the compiler's tests.
+pub const FUEL: i64 = 20_000_000;
+
+/// Called by generated code when an emitted check fails. Never returns.
+extern "C" fn rt_abort(code: i64) -> ! {
+    if !ARMED.load(Ordering::SeqCst) {
+        panic!("generated code aborted with no landing pad: {}", abort::describe(code));
+    }
+    ABORT_CODE.store(code, Ordering::SeqCst);
+    ARMED.store(false, Ordering::SeqCst);
+    unsafe { vibe_longjmp(addr_of_mut!(JMP), 1) }
 }
 
 extern "C" fn rt_print_int(v: i64) {
@@ -69,6 +101,7 @@ pub fn compile(src: &str) -> Result<Compiled, String> {
     let rt = vibeos_rustc::Runtime {
         print_str: rt_print_str as *const () as u64,
         print_int: rt_print_int as *const () as u64,
+        abort: rt_abort as *const () as u64,
     };
 
     // Sizing pass: instruction counts never depend on addresses, so the length
@@ -103,6 +136,8 @@ pub struct RunOutcome {
     pub value: i64,
     pub micros: u64,
     pub denied: bool,
+    /// Set when an emitted safety check stopped the program.
+    pub aborted: Option<&'static str>,
 }
 
 /// Execute compiled code, having first resolved the console capability the
@@ -115,19 +150,35 @@ pub fn run(prog: &Compiled) -> RunOutcome {
 
     *PROG_OUT.lock() = console;
     *DENIED.lock() = false;
+    ABORT_CODE.store(0, Ordering::SeqCst);
+    ENTRY.store(prog.code.as_ptr() as usize, Ordering::SeqCst);
+    STARTED_AT.store(sbi::time(), Ordering::SeqCst);
 
-    let entry = prog.code.as_ptr() as usize;
     // Safety: `entry` points at freshly written RV64 whose first instruction is
-    // `main`'s prologue. `fence.i` makes the writes visible to instruction fetch.
-    let f: extern "C" fn() -> i64 = unsafe {
+    // `main`'s prologue. `fence.i` makes those writes visible to instruction
+    // fetch. `vibe_setjmp` returns 0 on the way in and 1 if a safety check
+    // aborted; on that second return only statics may be read.
+    let value = unsafe {
         core::arch::asm!("fence.i");
-        core::mem::transmute(entry)
+        ARMED.store(true, Ordering::SeqCst);
+        if vibe_setjmp(addr_of_mut!(JMP)) == 0 {
+            let v = vibe_enter(ENTRY.load(Ordering::SeqCst), crate::stack_floor(), FUEL);
+            ARMED.store(false, Ordering::SeqCst);
+            v
+        } else {
+            -1
+        }
     };
 
-    let start = sbi::time();
-    let value = f();
-    let micros = (sbi::time() - start) / (crate::exec::TIMEBASE_HZ / 1_000_000);
+    let micros =
+        (sbi::time() - STARTED_AT.load(Ordering::SeqCst)) / (crate::exec::TIMEBASE_HZ / 1_000_000);
+    let code = ABORT_CODE.load(Ordering::SeqCst);
 
     *PROG_OUT.lock() = None;
-    RunOutcome { value, micros, denied: *DENIED.lock() }
+    RunOutcome {
+        value,
+        micros,
+        denied: *DENIED.lock(),
+        aborted: (code != 0).then(|| trampoline::abort::describe(code)),
+    }
 }

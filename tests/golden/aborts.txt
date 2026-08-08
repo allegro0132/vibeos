@@ -1,0 +1,46 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn main() -> i64 { let z = 0; 1 / z }
+  | .
+  compiled 1 fn -> 408 B of RV64 + 1 B of data in N us
+  --- running natively ---
+  --- aborted: attempt to divide by zero (after N us) ---
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn main() -> i64 { 9223372036854775807 + 1 }
+  | .
+  compiled 1 fn -> 320 B of RV64 + 1 B of data in N us
+  --- running natively ---
+  --- aborted: attempt to perform arithmetic that overflowed (after N us) ---
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn f(n: i64) -> i64 { f(n) }
+  | fn main() -> i64 { f(0) }
+  | .
+  compiled 2 fn -> 436 B of RV64 + 1 B of data in N us
+  --- running natively ---
+  --- aborted: stack overflow (after N us) ---
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn main() -> i64 { let mut i = 0; while i >= 0 { i = i + 0; } i }
+  | .
+  compiled 1 fn -> 584 B of RV64 + 1 B of data in N us
+  --- running natively ---
+  --- aborted: exceeded execution budget (after N us) ---
+vibe> rustc hello
+  compiled 1 fn -> 460 B of RV64 + 14 B of data in N us
+  --- running natively ---
+Hello, world!
+  --- exited with 0 in N us ---
+vibe> ps
+  TASK          POLLS
+  sensor            8
+  logger            8
+  guest             3
+  shell            17
+  (0 tasks exited)
+  background output is muted; poll counts still rising
+vibe> 

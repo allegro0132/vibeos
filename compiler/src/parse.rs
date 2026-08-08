@@ -13,13 +13,36 @@ use crate::lex::{Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    depth: u32,
 }
+
+/// Deepest nesting of parentheses, blocks, and `if`s the parser will descend
+/// through.
+///
+/// This is a kernel-safety limit, not a style rule. `rustc edit` feeds arbitrary
+/// console input to a recursive-descent parser running on a 256 KiB kernel stack
+/// with no guard page, so unbounded nesting is a way to corrupt memory from the
+/// shell prompt. 64 is far past anything a person writes and far short of
+/// anything that threatens the stack.
+const MAX_DEPTH: u32 = 64;
 
 type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Self { toks, pos: 0 }
+        Self { toks, pos: 0, depth: 0 }
+    }
+
+    fn descend(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!("line {}: expression nests more than {} deep", self.line(), MAX_DEPTH));
+        }
+        Ok(())
+    }
+
+    fn ascend(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn peek(&self) -> &Tok {
@@ -141,6 +164,13 @@ impl Parser {
     }
 
     fn block(&mut self) -> PResult<Block> {
+        self.descend()?;
+        let out = self.block_inner();
+        self.ascend();
+        out
+    }
+
+    fn block_inner(&mut self) -> PResult<Block> {
         self.expect("{")?;
         let mut stmts = Vec::new();
         let mut tail = None;
@@ -309,7 +339,10 @@ impl Parser {
     }
 
     fn expr(&mut self) -> PResult<Expr> {
-        self.bin_expr(0)
+        self.descend()?;
+        let out = self.bin_expr(0);
+        self.ascend();
+        out
     }
 
     fn bin_expr(&mut self, min_prec: u8) -> PResult<Expr> {

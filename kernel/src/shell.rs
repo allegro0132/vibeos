@@ -251,7 +251,10 @@ async fn compile_and_run(src: &str) {
 
     let out = crate::rustc::run(&compiled);
 
-    println!("  --- exited with {} in {} us ---", out.value, out.micros);
+    match out.aborted {
+        Some(reason) => println!("  --- aborted: {} (after {} us) ---", reason, out.micros),
+        None => println!("  --- exited with {} in {} us ---", out.value, out.micros),
+    }
     if out.denied {
         println!("  note: output was suppressed -- `prog` holds no console capability");
     }

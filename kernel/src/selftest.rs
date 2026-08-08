@@ -261,7 +261,54 @@ fn compiler(h: &mut Harness) {
             == 5050,
     );
 
+    // M2: every emitted safety check, exercised end to end. These need real
+    // execution -- a host test can prove the check was *emitted*, only this can
+    // prove it fires and that the shell survives it.
+    let aborts: [(&str, &str); 6] = [
+        ("fn main() -> i64 { let z = 0; 1 / z }", "attempt to divide by zero"),
+        (
+            "fn main() -> i64 { let z = 0; 1 % z }",
+            "attempt to calculate the remainder with a divisor of zero",
+        ),
+        (
+            "fn main() -> i64 { 9223372036854775807 + 1 }",
+            "attempt to perform arithmetic that overflowed",
+        ),
+        (
+            "fn main() -> i64 { let a = 9223372036854775807; let b = 0 - a - 1; let c = 0 - 1; b / c }",
+            "attempt to divide with overflow",
+        ),
+        (
+            "fn main() -> i64 { let mut i = 0; while i >= 0 { i = i + 0; } i }",
+            "exceeded execution budget",
+        ),
+        ("fn f(n: i64) -> i64 { f(n) }\nfn main() -> i64 { f(0) }", "stack overflow"),
+    ];
+    for (src, want) in aborts {
+        match crate::rustc::compile(src) {
+            Ok(c) => {
+                let out = crate::rustc::run(&c);
+                h.eq(want, out.aborted, Some(want));
+            }
+            Err(e) => {
+                crate::println!("  FAIL  {} did not compile: {}", want, e);
+                h.check(want, false);
+            }
+        }
+    }
+    h.check(
+        "the shell survives an aborted program",
+        crate::rustc::compile("fn main() -> i64 { 2 + 2 }")
+            .map(|c| crate::rustc::run(&c).value)
+            .unwrap_or(-1)
+            == 4,
+    );
+
     h.check("undefined names are rejected", crate::rustc::compile("fn main() { y; }").is_err());
+    h.check(
+        "a literal zero divisor is a compile error",
+        crate::rustc::compile("fn main() -> i64 { 1 / 0 }").is_err(),
+    );
     h.check(
         "immutable reassignment is rejected",
         crate::rustc::compile("fn main() { let x = 1; x = 2; }").is_err(),

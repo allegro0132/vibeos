@@ -36,6 +36,9 @@ pub struct Image {
 pub struct Runtime {
     pub print_str: u64,
     pub print_int: u64,
+    /// Called with an abort reason when an emitted safety check fails. Must not
+    /// return; the kernel implements it as a longjmp out of the program.
+    pub abort: u64,
 }
 
 /// Compile source to machine code laid out for `code_base`.
@@ -59,7 +62,11 @@ pub fn compile_at(
         data.extend_from_slice(s.as_bytes());
     }
 
-    let rt = codegen::Runtime { print_str: rt.print_str, print_int: rt.print_int };
+    let rt = codegen::Runtime {
+        print_str: rt.print_str,
+        print_int: rt.print_int,
+        abort: rt.abort,
+    };
     let code = codegen::compile(&prog, code_base, str_addr, &rt)?;
     Ok(Image { data, code, funcs: prog.funcs.len() })
 }
@@ -69,6 +76,6 @@ pub fn compile_at(
 /// Sound because instruction sizes never depend on addresses — see
 /// `codegen::li64`, which is deliberately a fixed 11 instructions.
 pub fn code_len(src: &str) -> Result<usize, String> {
-    let rt = Runtime { print_str: 0, print_int: 0 };
+    let rt = Runtime { print_str: 0, print_int: 0, abort: 0 };
     Ok(compile_at(src, 0, 0, &rt)?.code.len())
 }

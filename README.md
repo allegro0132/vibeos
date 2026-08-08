@@ -22,11 +22,11 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 101 host tests, no QEMU, ~1s
+cargo test --workspace     # 117 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
 ```
 
-Plus an in-kernel self-test (37 checks) for what the host cannot fake — real
+Plus an in-kernel self-test (45 checks) for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
 actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
 for why there are four layers and which mutations each one catches.
@@ -268,8 +268,11 @@ Deliberate, not overlooked:
   real rustc would flag first.
 - **The compiler's subset is `i64`-only.** No structs, arrays, references,
   generics, traits, or borrow checking — a program is functions over integers
-  plus formatted printing. Division by zero follows RISC-V semantics (`-1`,
-  and `%` yields the dividend) rather than panicking.
-- **Compiled programs run on the shell task's 256 KiB stack**, so deep
-  recursion in generated code will run off the end of it.
+  plus formatted printing.
+- **A component that panics still takes the machine down.** Compiled *programs*
+  are aborted safely; applying the same trampoline at the executor's poll
+  boundary is Roadmap 2.8.
+- **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
+  is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
+  which generated code is not permitted.
 - **No persistence, no MMU, no user mode, no multicore.** In that order.

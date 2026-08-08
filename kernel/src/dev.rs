@@ -28,6 +28,13 @@ impl ConsoleDev {
         self.bytes.fetch_add(s.len() as u64, Ordering::Relaxed);
         uart::_print(format_args!("{}", s));
     }
+
+    /// Routine status output. Counts against the device the same way, but the
+    /// console may drop it when the operator asks for quiet.
+    pub fn write_bg(&self, s: &str) {
+        self.bytes.fetch_add(s.len() as u64, Ordering::Relaxed);
+        uart::_print_bg(format_args!("{}", s));
+    }
 }
 
 impl Resource for ConsoleDev {

@@ -26,6 +26,7 @@ mod sbi;
 mod shell;
 mod sync;
 mod trap;
+mod tty;
 mod uart;
 mod world;
 

@@ -222,20 +222,84 @@ fn a_handle_is_meaningless_in_another_space() {
     assert_eq!(b.lookup_as::<Widget>(ca, Rights::READ).err(), Some(CapError::WrongType));
 }
 
-/// Documents a known gap (BLUEPRINT §3, ROADMAP 1.8): revoking the source of a
-/// cross-space grant does *not* kill the copy. When 1.8 lands this test should
-/// fail, and the assertion is written so that its failure is the signal.
+/// ROADMAP 1.8. Revoking the source of a cross-space grant kills the copy,
+/// even though the revoker cannot reach — and does not know about — the space
+/// the copy ended up in.
 #[test]
-fn known_gap_cross_space_revoke_does_not_cascade() {
+fn revoke_reaches_copies_in_other_spaces() {
+    let (mut src, w) = space();
+    let mut dst = CSpace::new("dst");
+    let c = src.mint(w, Rights::ALL);
+    let given = grant(&src, c, Rights::READ, &mut dst).unwrap();
+    assert!(dst.lookup(given, Rights::READ).is_ok());
+
+    src.revoke(c).unwrap();
+    assert_eq!(
+        dst.lookup(given, Rights::READ).err(),
+        Some(CapError::Invalid),
+        "the copy died with its ancestor"
+    );
+}
+
+#[test]
+fn revocation_cascades_through_a_chain_of_spaces() {
+    let (mut a, w) = space();
+    let mut b = CSpace::new("b");
+    let mut c = CSpace::new("c");
+
+    let root = a.mint(w, Rights::ALL);
+    let in_b = grant(&a, root, Rights::READ.union(Rights::GRANT), &mut b).unwrap();
+    let in_c = grant(&b, in_b, Rights::READ, &mut c).unwrap();
+    assert!(c.lookup(in_c, Rights::READ).is_ok());
+
+    // Cut the chain at the middle link: c dies, a survives.
+    b.revoke_slot(in_b.slot());
+    assert_eq!(c.lookup(in_c, Rights::READ).err(), Some(CapError::Invalid));
+    assert!(a.lookup(root, Rights::READ).is_ok());
+}
+
+#[test]
+fn revoking_a_grant_does_not_touch_the_source() {
     let (mut src, w) = space();
     let mut dst = CSpace::new("dst");
     let c = src.mint(w, Rights::ALL);
     let given = grant(&src, c, Rights::READ, &mut dst).unwrap();
 
+    dst.revoke_slot(given.slot());
+    assert_eq!(dst.lookup(given, Rights::READ).err(), Some(CapError::Invalid));
+    assert!(src.lookup(c, Rights::READ).is_ok(), "authority flows down, not up");
+}
+
+#[test]
+fn a_dead_cap_disappears_from_the_listing_after_collection() {
+    let (mut src, w) = space();
+    let mut dst = CSpace::new("dst");
+    let c = src.mint(w, Rights::ALL);
+    grant(&src, c, Rights::READ, &mut dst).unwrap();
+
     src.revoke(c).unwrap();
-    assert!(
-        dst.lookup(given, Rights::READ).is_ok(),
-        "ROADMAP 1.8 has landed -- delete this test and assert the cascade instead"
+    // `dst` was never consulted during the revoke, so its slot is stale until
+    // it sweeps -- but the cap must already be invisible and unusable.
+    assert!(dst.list().is_empty(), "a dead cap is not listed");
+    assert_eq!(dst.collect(), 1, "sweeping frees the slot");
+    assert_eq!(dst.collect(), 0, "and is idempotent");
+}
+
+#[test]
+fn a_slot_freed_by_cascade_is_safely_reused() {
+    let (mut src, w) = space();
+    let mut dst = CSpace::new("dst");
+    let c = src.mint(w.clone(), Rights::ALL);
+    let given = grant(&src, c, Rights::READ, &mut dst).unwrap();
+
+    src.revoke(c).unwrap();
+    dst.collect();
+    let fresh = dst.mint(w, Rights::ALL);
+    assert_eq!(fresh.slot(), given.slot(), "the slot came back round");
+    assert_eq!(
+        dst.lookup(given, Rights::READ).err(),
+        Some(CapError::Invalid),
+        "and the old handle still does not resolve"
     );
 }
 

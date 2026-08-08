@@ -187,12 +187,27 @@ fn the_hardware_timer_is_armed_no_later_than_the_heartbeat() {
     let _g = scheduler();
     reset_time();
     exec::init_timer();
-    let heartbeat = exec::TIMEBASE_HZ / 20;
+    let heartbeat = exec::HEARTBEAT_SECS * exec::TIMEBASE_HZ;
     assert!(
         armed_timer() <= heartbeat,
         "idle must still wake within the heartbeat, armed at {}",
         armed_timer()
     );
+}
+
+/// A pending sleep must pull the hardware timer in ahead of the heartbeat,
+/// otherwise a 10 ms sleep would take 10 s.
+#[test]
+fn a_pending_sleep_arms_the_timer_before_the_heartbeat() {
+    let _g = scheduler();
+    reset_time();
+    exec::spawn("sleeper", async { exec::sleep_ms(10).await });
+    exec::run_until_idle(BUDGET);
+
+    let heartbeat = exec::HEARTBEAT_SECS * exec::TIMEBASE_HZ;
+    let deadline = 10 * exec::TIMEBASE_HZ / 1000;
+    assert!(armed_timer() <= deadline, "armed at {} for a {} tick sleep", armed_timer(), deadline);
+    assert!(armed_timer() < heartbeat);
 }
 
 // --- channels under the scheduler ---

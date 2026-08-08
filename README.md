@@ -22,7 +22,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 96 host tests, no QEMU, ~1s
+cargo test --workspace     # 101 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
 ```
 
@@ -257,9 +257,6 @@ showing rising poll counts while muted, because the components never stopped.
 Deliberate, not overlooked:
 
 - **Single hart.** The spinlock is real but `-smp 1` is the only tested config.
-- **Cross-space revoke doesn't cascade.** `grant` into another space records no
-  parent link, so revoking the source doesn't chase the copy. Intra-space
-  revoke does cascade. Fixing this needs a global derivation tree.
 - **The heap never returns large blocks.** Allocations over 64 KiB come from the
   bump region and are leaked on free. Nothing in the current image allocates
   that large.

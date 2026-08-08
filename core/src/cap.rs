@@ -13,6 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Rights(u32);
@@ -78,11 +79,52 @@ impl fmt::Display for Rights {
     }
 }
 
+/// A node in the derivation graph.
+///
+/// Every capability points at one. A cap is live only if its own node is alive
+/// *and* every ancestor is — which is what makes revocation reach copies that
+/// have travelled into other spaces. The graph is held together by `Arc`, so
+/// there is no registry to keep in sync and no requirement that the revoker be
+/// able to reach the spaces holding the copies.
+struct Derivation {
+    alive: AtomicBool,
+    parent: Option<Arc<Derivation>>,
+}
+
+impl Derivation {
+    fn root() -> Arc<Self> {
+        Arc::new(Self { alive: AtomicBool::new(true), parent: None })
+    }
+
+    fn child(parent: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self { alive: AtomicBool::new(true), parent: Some(parent.clone()) })
+    }
+
+    fn is_alive(&self) -> bool {
+        let mut node = self;
+        loop {
+            if !node.alive.load(Ordering::Acquire) {
+                return false;
+            }
+            match &node.parent {
+                Some(p) => node = p,
+                None => return true,
+            }
+        }
+    }
+
+    fn kill(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 /// An opaque handle. Meaningless outside the `CSpace` that issued it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cap {
     slot: u32,
-    generation: u32,
+    /// 64 bits so exhausting it is unreachable; a slot that somehow did exhaust
+    /// it is retired rather than reused (see `alloc_slot`).
+    generation: u64,
 }
 
 impl Cap {
@@ -130,15 +172,14 @@ pub trait Resource: Any + Send + Sync {
 }
 
 struct Slot {
-    generation: u32,
+    generation: u64,
     entry: Option<Entry>,
 }
 
 struct Entry {
     obj: Arc<dyn Resource>,
     rights: Rights,
-    /// Slot this cap was derived from, so revoke can cascade.
-    parent: Option<u32>,
+    node: Arc<Derivation>,
 }
 
 /// A task's capability space. Owning one *is* the task's entire authority.
@@ -153,18 +194,30 @@ impl CSpace {
     }
 
     fn alloc_slot(&mut self) -> u32 {
-        if let Some(i) = self.slots.iter().position(|s| s.entry.is_none()) {
+        // A slot whose generation saturated is retired forever rather than
+        // reused, so a stale handle can never alias a fresh one.
+        if let Some(i) = self
+            .slots
+            .iter()
+            .position(|s| s.entry.is_none() && s.generation != u64::MAX)
+        {
             return i as u32;
         }
         self.slots.push(Slot { generation: 0, entry: None });
         (self.slots.len() - 1) as u32
     }
 
+    fn invalidate(slot: &mut Slot) {
+        slot.entry = None;
+        slot.generation = slot.generation.saturating_add(1);
+    }
+
     /// Mint a fresh capability for a resource. This is the root of authority —
     /// only the code that creates a resource can do it.
     pub fn mint(&mut self, obj: Arc<dyn Resource>, rights: Rights) -> Cap {
         let slot = self.alloc_slot();
-        self.slots[slot as usize].entry = Some(Entry { obj, rights, parent: None });
+        self.slots[slot as usize].entry =
+            Some(Entry { obj, rights, node: Derivation::root() });
         Cap { slot, generation: self.slots[slot as usize].generation }
     }
 
@@ -173,7 +226,13 @@ impl CSpace {
         if slot.generation != cap.generation {
             return Err(CapError::Invalid);
         }
-        slot.entry.as_ref().ok_or(CapError::Invalid)
+        let entry = slot.entry.as_ref().ok_or(CapError::Invalid)?;
+        // An ancestor revoked in another space kills this cap too; the slot
+        // here simply has not been swept yet.
+        if !entry.node.is_alive() {
+            return Err(CapError::Invalid);
+        }
+        Ok(entry)
     }
 
     pub fn rights_of(&self, cap: Cap) -> Result<Rights, CapError> {
@@ -212,40 +271,48 @@ impl CSpace {
             return Err(CapError::Amplification);
         }
         let obj = e.obj.clone();
-        let parent = cap.slot;
+        let node = Derivation::child(&e.node);
         let slot = self.alloc_slot();
-        self.slots[slot as usize].entry = Some(Entry { obj, rights, parent: Some(parent) });
+        self.slots[slot as usize].entry = Some(Entry { obj, rights, node });
         Ok(Cap { slot, generation: self.slots[slot as usize].generation })
     }
 
     /// Destroy a cap and everything derived from it. Bumping the slot
     /// generation is what makes outstanding copies of the handle go stale.
-    #[allow(dead_code)] // API surface: self-revoke via a cap carrying REVOKE
+    /// Destroy a cap and everything derived from it, in every space.
     pub fn revoke(&mut self, cap: Cap) -> Result<usize, CapError> {
         let e = self.entry(cap)?;
         if !e.rights.contains(Rights::REVOKE) {
             return Err(CapError::InsufficientRights);
         }
-        Ok(self.revoke_slot(cap.slot))
+        e.node.kill();
+        Ok(self.collect())
     }
 
     /// Administrative revoke, used by a holder of a cap on *this whole space*.
     /// Authority lives in the space cap, so no per-cap right is required here.
     pub fn revoke_slot(&mut self, slot: u32) -> usize {
+        let Some(node) = self
+            .slots
+            .get(slot as usize)
+            .and_then(|s| s.entry.as_ref())
+            .map(|e| e.node.clone())
+        else {
+            return 0;
+        };
+        node.kill();
+        self.collect()
+    }
+
+    /// Drop every slot whose derivation is dead; returns how many went.
+    ///
+    /// Killing a node takes effect immediately for lookups everywhere; this is
+    /// the local bookkeeping that frees slots and updates `list`.
+    pub fn collect(&mut self) -> usize {
         let mut killed = 0;
-        let mut frontier = alloc::vec![slot];
-        while let Some(slot) = frontier.pop() {
-            let children: Vec<u32> = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.entry.as_ref().is_some_and(|e| e.parent == Some(slot)))
-                .map(|(i, _)| i as u32)
-                .collect();
-            frontier.extend(children);
-            let Some(s) = self.slots.get_mut(slot as usize) else { continue };
-            if s.entry.take().is_some() {
-                s.generation = s.generation.wrapping_add(1);
+        for slot in &mut self.slots {
+            if slot.entry.as_ref().is_some_and(|e| !e.node.is_alive()) {
+                Self::invalidate(slot);
                 killed += 1;
             }
         }
@@ -257,7 +324,7 @@ impl CSpace {
             .iter()
             .enumerate()
             .filter_map(|(i, s)| {
-                let e = s.entry.as_ref()?;
+                let e = s.entry.as_ref().filter(|e| e.node.is_alive())?;
                 Some((
                     Cap { slot: i as u32, generation: s.generation },
                     e.obj.kind(),
@@ -286,6 +353,13 @@ pub fn grant(
     if !held.contains(rights) {
         return Err(CapError::Amplification);
     }
-    let obj = src.lookup(cap, Rights::NONE)?;
-    Ok(dst.mint(obj, rights))
+    // The copy is a *child* of the source in the derivation graph, so revoking
+    // the source later reaches it even though it now lives in another space.
+    let parent = src.entry(cap)?;
+    let node = Derivation::child(&parent.node);
+    let obj = parent.obj.clone();
+
+    let slot = dst.alloc_slot();
+    dst.slots[slot as usize].entry = Some(Entry { obj, rights, node });
+    Ok(Cap { slot, generation: dst.slots[slot as usize].generation })
 }

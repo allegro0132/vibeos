@@ -31,9 +31,9 @@ normalize() {
            -e 's/[0-9]+ KiB/N KiB/g' \
            -e 's/^  live +[0-9]+ B.*$/  live N B peak N B bump remaining N B/' \
            -e 's/\{[0-9]+\}//g' \
-  | grep -v '^[[:space:]]*$' \
-  | grep -v 'terminating on signal' \
-  | grep -v '^OpenSBI' || true
+  | grep -a -v '^[[:space:]]*$' \
+  | grep -a -v 'terminating on signal' \
+  | grep -a -v '^OpenSBI' || true
 }
 
 # Feed a case file to the shell. Lines starting with @sleep pause instead.

@@ -55,6 +55,59 @@ impl Wake for WakeCounter {
     }
 }
 
+struct QueueInspectWake {
+    queue: Arc<WaitQueue>,
+    wakes: AtomicU64,
+    waiters_seen_during_wake: AtomicU64,
+}
+
+struct QueueDropInspectWake {
+    queue: Arc<WaitQueue>,
+    drops: Arc<AtomicU64>,
+    waiters_seen_during_drop: Arc<AtomicU64>,
+}
+
+impl Wake for QueueDropInspectWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+impl Drop for QueueDropInspectWake {
+    fn drop(&mut self) {
+        self.waiters_seen_during_drop
+            .store(self.queue.waiter_count() as u64, Ordering::SeqCst);
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct TimerDropInspectWake {
+    drops: Arc<AtomicU64>,
+    timers_seen_during_drop: Arc<AtomicU64>,
+}
+
+impl Wake for TimerDropInspectWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+impl Drop for TimerDropInspectWake {
+    fn drop(&mut self) {
+        self.timers_seen_during_drop
+            .store(exec::timer_registration_count() as u64, Ordering::SeqCst);
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Wake for QueueInspectWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.waiters_seen_during_wake
+            .store(self.queue.waiter_count() as u64, Ordering::SeqCst);
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 struct ReadyThenCancelOnDrop {
     handle: Arc<Mutex<Option<exec::TaskHandle>>>,
     outcome: Arc<Mutex<Option<CancelOutcome>>>,
@@ -256,16 +309,47 @@ fn cancelling_a_parked_task_never_polls_it_again() {
 
     exec::run_until_idle(BUDGET);
     assert_eq!(handle.polls(), 1);
+    assert_eq!(queue.waiter_count(), 1);
     assert_eq!(handle.cancel(), CancelOutcome::Requested);
     assert_eq!(handle.state(), TaskState::Cancelled);
     assert_eq!(handle.polls(), 1);
+    assert_eq!(
+        queue.waiter_count(),
+        0,
+        "cancellation drops and unregisters the suspended waiter"
+    );
 
-    // 3.10 removes this stale wait registration at Drop. Even before that
-    // cleanup lands, waking it must not put the terminal task back on a queue.
     queue.wake_all();
     exec::run_until_idle(BUDGET);
     assert!(!resumed.load(Ordering::SeqCst));
     assert_eq!(handle.polls(), 1);
+}
+
+#[test]
+fn cancelling_many_parked_tasks_leaves_no_wait_registrations() {
+    let _g = scheduler();
+    let queue = Arc::new(WaitQueue::new());
+    let mut handles = Vec::new();
+
+    for _ in 0..256 {
+        let waiter = queue.clone();
+        handles.push(exec::spawn_tracked("cancel-wait-stress", async move {
+            waiter.wait().await;
+        }));
+    }
+    exec::run_until_idle(BUDGET);
+    assert_eq!(queue.waiter_count(), handles.len());
+
+    for handle in &handles {
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    }
+    assert_eq!(queue.waiter_count(), 0);
+
+    queue.wake_all();
+    exec::run_until_idle(BUDGET);
+    assert!(handles
+        .iter()
+        .all(|handle| { handle.state() == TaskState::Cancelled && handle.polls() == 1 }));
 }
 
 #[test]
@@ -543,8 +627,8 @@ fn a_parked_task_stays_parked_until_woken() {
     assert_eq!(stage.load(Ordering::SeqCst), 2, "the wake resumed it");
 }
 
-/// The wait future registers on its first poll and completes on its second, so
-/// a wake landing between the two must not be lost.
+/// Once the first poll registers a token, a wake must consume that token and
+/// make the following poll ready rather than getting lost.
 #[test]
 fn a_wake_racing_registration_is_not_lost() {
     let _g = scheduler();
@@ -563,6 +647,205 @@ fn a_wake_racing_registration_is_not_lost() {
     exec::run_until_idle(BUDGET);
 
     assert_eq!(done.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_wait_listener_observes_a_wake_before_its_first_poll() {
+    let _g = scheduler();
+    let queue = WaitQueue::new();
+    let counter = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let waker = Waker::from(counter.clone());
+    let mut listener = Box::pin(queue.wait());
+
+    queue.wake_all();
+
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_ready());
+    assert_eq!(queue.waiter_count(), 0);
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        0,
+        "an unregistered listener observes the epoch without a stale wake"
+    );
+}
+
+#[test]
+fn a_wait_listener_repolls_pending_and_replaces_its_waker() {
+    let _g = scheduler();
+    let queue = WaitQueue::new();
+    let first = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let second = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let first_waker = Waker::from(first.clone());
+    let second_waker = Waker::from(second.clone());
+    let first_baseline = Arc::strong_count(&first);
+    let second_baseline = Arc::strong_count(&second);
+    let mut listener = Box::pin(queue.wait());
+
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&first_waker))
+        .is_pending());
+    assert_eq!(queue.waiter_count(), 1);
+    assert_eq!(Arc::strong_count(&first), first_baseline + 1);
+
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&second_waker))
+        .is_pending());
+    assert_eq!(queue.waiter_count(), 1, "repoll does not duplicate entry");
+    assert_eq!(Arc::strong_count(&first), first_baseline);
+    assert_eq!(Arc::strong_count(&second), second_baseline + 1);
+
+    queue.wake_all();
+    assert_eq!(queue.waiter_count(), 0);
+    assert_eq!(first.0.load(Ordering::SeqCst), 0);
+    assert_eq!(second.0.load(Ordering::SeqCst), 1);
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&second_waker))
+        .is_ready());
+
+    queue.wake_all();
+    assert_eq!(second.0.load(Ordering::SeqCst), 1, "a token wakes once");
+}
+
+#[test]
+fn dropping_a_wait_listener_unregisters_and_releases_its_waker() {
+    let _g = scheduler();
+    let queue = WaitQueue::new();
+    let counter = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let waker = Waker::from(counter.clone());
+    let baseline = Arc::strong_count(&counter);
+    let mut listener = Box::pin(queue.wait());
+
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    assert_eq!(queue.waiter_count(), 1);
+    assert_eq!(Arc::strong_count(&counter), baseline + 1);
+
+    drop(listener);
+    assert_eq!(queue.waiter_count(), 0);
+    assert_eq!(Arc::strong_count(&counter), baseline);
+    queue.wake_all();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn wait_listener_releases_a_reentrant_waker_outside_the_queue_lock() {
+    let _g = scheduler();
+    let queue = Arc::new(WaitQueue::new());
+    let drops = Arc::new(AtomicU64::new(0));
+    let seen = Arc::new(AtomicU64::new(u64::MAX));
+    let waker = Waker::from(Arc::new(QueueDropInspectWake {
+        queue: queue.clone(),
+        drops: drops.clone(),
+        waiters_seen_during_drop: seen.clone(),
+    }));
+    let mut listener = Box::pin(queue.wait());
+
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    drop(waker);
+    drop(listener);
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn wait_queue_wakes_and_drops_wakers_outside_its_lock() {
+    let _g = scheduler();
+    let queue = Arc::new(WaitQueue::new());
+    let observer = Arc::new(QueueInspectWake {
+        queue: queue.clone(),
+        wakes: AtomicU64::new(0),
+        waiters_seen_during_wake: AtomicU64::new(u64::MAX),
+    });
+    let waker = Waker::from(observer.clone());
+    let mut listener = Box::pin(queue.wait());
+
+    assert!(listener
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    queue.wake_all();
+
+    assert_eq!(observer.wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observer.waiters_seen_during_wake.load(Ordering::SeqCst),
+        0,
+        "the callback re-entered the already-drained queue"
+    );
+}
+
+#[test]
+fn wait_queue_registration_stress_returns_to_zero() {
+    let _g = scheduler();
+    let queue = WaitQueue::new();
+    let counter = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let waker = Waker::from(counter.clone());
+    let mut listeners: Vec<_> = (0..512).map(|_| Box::pin(queue.wait())).collect();
+
+    for listener in &mut listeners {
+        assert!(listener
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+    }
+    assert_eq!(queue.waiter_count(), 512);
+
+    let mut survivors = listeners.split_off(256);
+    drop(listeners);
+    assert_eq!(queue.waiter_count(), 256);
+
+    queue.wake_all();
+    assert_eq!(queue.waiter_count(), 0);
+    assert_eq!(counter.0.load(Ordering::SeqCst), 256);
+    for listener in &mut survivors {
+        assert!(listener
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready());
+    }
+}
+
+#[test]
+fn waking_many_individually_parked_tasks_does_not_allocate_ready_capacity() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let queue = Arc::new(WaitQueue::new());
+    let target = exec::ready_queue_capacity() + 64;
+    let mut handles = Vec::with_capacity(target);
+
+    // Spawn and park one at a time so the ready queue itself never grows from
+    // ordinary spawn pressure. Capacity must instead track the live-task bound.
+    for _ in 0..target {
+        let waiter = queue.clone();
+        handles.push(exec::spawn_tracked("wake-capacity", async move {
+            waiter.wait().await;
+        }));
+        assert!(exec::poll_once());
+    }
+    assert_eq!(queue.waiter_count(), target);
+    let capacity_before_wake = exec::ready_queue_capacity();
+    assert!(capacity_before_wake >= target);
+
+    queue.wake_all();
+    assert_eq!(
+        exec::ready_queue_capacity(),
+        capacity_before_wake,
+        "IRQ-style wakes consume capacity reserved by spawn"
+    );
+    exec::run_until_idle(BUDGET);
+    assert!(handles
+        .iter()
+        .all(|handle| handle.state() == TaskState::Exited));
 }
 
 #[test]
@@ -603,6 +886,7 @@ fn poll_once_reports_whether_anything_ran() {
 fn a_sleeping_task_wakes_when_its_deadline_passes() {
     let _g = scheduler();
     reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
     let done = Arc::new(AtomicU64::new(0));
     let d = done.clone();
 
@@ -613,6 +897,7 @@ fn a_sleeping_task_wakes_when_its_deadline_passes() {
 
     exec::run_until_idle(BUDGET);
     assert_eq!(done.load(Ordering::SeqCst), 0, "deadline has not passed");
+    assert_eq!(exec::timer_registration_count(), 1);
 
     // The timer interrupt alone must not wake it early.
     advance_time(exec::TIMEBASE_HZ / 1000); // 1 ms
@@ -624,12 +909,14 @@ fn a_sleeping_task_wakes_when_its_deadline_passes() {
     exec::timer_tick();
     exec::run_until_idle(BUDGET);
     assert_eq!(done.load(Ordering::SeqCst), 1, "woke after the deadline");
+    assert_eq!(exec::timer_registration_count(), 0);
 }
 
 #[test]
 fn a_sleep_already_past_completes_without_parking() {
     let _g = scheduler();
     reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
     let done = Arc::new(AtomicU64::new(0));
     let d = done.clone();
 
@@ -640,12 +927,14 @@ fn a_sleep_already_past_completes_without_parking() {
     exec::run_until_idle(BUDGET);
 
     assert_eq!(done.load(Ordering::SeqCst), 1);
+    assert_eq!(exec::timer_registration_count(), 0);
 }
 
 #[test]
 fn the_hardware_timer_is_armed_no_later_than_the_heartbeat() {
     let _g = scheduler();
     reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
     exec::init_timer();
     let heartbeat = exec::HEARTBEAT_SECS * exec::TIMEBASE_HZ;
     assert!(
@@ -661,11 +950,13 @@ fn the_hardware_timer_is_armed_no_later_than_the_heartbeat() {
 fn a_pending_sleep_arms_the_timer_before_the_heartbeat() {
     let _g = scheduler();
     reset_time();
-    exec::spawn("sleeper", async { exec::sleep_ms(10).await });
+    assert_eq!(exec::timer_registration_count(), 0);
+    let sleeper = exec::spawn_tracked("sleeper", async { exec::sleep_ms(10).await });
     exec::run_until_idle(BUDGET);
 
     let heartbeat = exec::HEARTBEAT_SECS * exec::TIMEBASE_HZ;
     let deadline = 10 * exec::TIMEBASE_HZ / 1000;
+    assert_eq!(exec::timer_registration_count(), 1);
     assert!(
         armed_timer() <= deadline,
         "armed at {} for a {} tick sleep",
@@ -673,25 +964,179 @@ fn a_pending_sleep_arms_the_timer_before_the_heartbeat() {
         deadline
     );
     assert!(armed_timer() < heartbeat);
+
+    assert_eq!(sleeper.cancel(), CancelOutcome::Requested);
+    assert_eq!(exec::timer_registration_count(), 0);
 }
 
 #[test]
 fn cancelling_a_sleeping_task_prevents_a_deadline_from_polling_it_again() {
     let _g = scheduler();
     reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
     let handle = exec::spawn_tracked("cancel-sleeper", async {
         exec::sleep_ms(10).await;
     });
     exec::run_until_idle(BUDGET);
     assert_eq!(handle.polls(), 1);
+    assert_eq!(exec::timer_registration_count(), 1);
 
     assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    assert_eq!(
+        exec::timer_registration_count(),
+        0,
+        "cancellation removes the timer before its deadline"
+    );
     advance_time(20 * exec::TIMEBASE_HZ / 1000);
     exec::timer_tick();
     exec::run_until_idle(BUDGET);
 
     assert_eq!(handle.state(), TaskState::Cancelled);
     assert_eq!(handle.polls(), 1);
+}
+
+#[test]
+fn a_sleep_repoll_replaces_its_waker_and_drop_unregisters_it() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+
+    let first = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let second = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let first_waker = Waker::from(first.clone());
+    let second_waker = Waker::from(second.clone());
+    let first_baseline = Arc::strong_count(&first);
+    let second_baseline = Arc::strong_count(&second);
+    let mut sleep = Box::pin(exec::sleep_ms(10));
+
+    assert!(sleep
+        .as_mut()
+        .poll(&mut Context::from_waker(&first_waker))
+        .is_pending());
+    assert_eq!(exec::timer_registration_count(), 1);
+    assert_eq!(Arc::strong_count(&first), first_baseline + 1);
+
+    assert!(sleep
+        .as_mut()
+        .poll(&mut Context::from_waker(&second_waker))
+        .is_pending());
+    assert_eq!(exec::timer_registration_count(), 1);
+    assert_eq!(Arc::strong_count(&first), first_baseline);
+    assert_eq!(Arc::strong_count(&second), second_baseline + 1);
+
+    drop(sleep);
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(Arc::strong_count(&second), second_baseline);
+    advance_time(20 * exec::TIMEBASE_HZ / 1000);
+    exec::timer_tick();
+    assert_eq!(first.0.load(Ordering::SeqCst), 0);
+    assert_eq!(second.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn sleep_releases_a_reentrant_waker_outside_the_timer_lock() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    let drops = Arc::new(AtomicU64::new(0));
+    let seen = Arc::new(AtomicU64::new(u64::MAX));
+    let waker = Waker::from(Arc::new(TimerDropInspectWake {
+        drops: drops.clone(),
+        timers_seen_during_drop: seen.clone(),
+    }));
+    let mut sleep = Box::pin(exec::sleep_ms(10));
+
+    assert!(sleep
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    drop(waker);
+    drop(sleep);
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn polling_a_past_deadline_removes_the_timer_before_the_tick() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    let counter = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let waker = Waker::from(counter.clone());
+    let mut sleep = Box::pin(exec::sleep_ms(10));
+
+    assert!(sleep
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    advance_time(11 * exec::TIMEBASE_HZ / 1000);
+    assert!(sleep
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_ready());
+
+    assert_eq!(exec::timer_registration_count(), 0);
+    exec::timer_tick();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn removing_the_earliest_timer_rearms_the_next_deadline() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    let counter = Arc::new(WakeCounter(AtomicU64::new(0)));
+    let waker = Waker::from(counter);
+    let mut early = Box::pin(exec::sleep_ms(10));
+    let mut late = Box::pin(exec::sleep_ms(20));
+
+    assert!(early
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    assert!(late
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    assert_eq!(exec::timer_registration_count(), 2);
+    assert_eq!(armed_timer(), 10 * exec::TIMEBASE_HZ / 1000);
+
+    drop(early);
+    assert_eq!(exec::timer_registration_count(), 1);
+    assert_eq!(armed_timer(), 20 * exec::TIMEBASE_HZ / 1000);
+
+    drop(late);
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(armed_timer(), exec::HEARTBEAT_SECS * exec::TIMEBASE_HZ);
+}
+
+#[test]
+fn cancelling_many_sleepers_leaves_no_timer_registrations() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    let mut handles = Vec::new();
+
+    for _ in 0..256 {
+        handles.push(exec::spawn_tracked("cancel-timer-stress", async {
+            exec::sleep_ms(1_000).await;
+        }));
+    }
+    exec::run_until_idle(BUDGET);
+    assert_eq!(exec::timer_registration_count(), handles.len());
+
+    for handle in &handles {
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    }
+    assert_eq!(exec::timer_registration_count(), 0);
+
+    advance_time(2_000 * exec::TIMEBASE_HZ / 1000);
+    exec::timer_tick();
+    exec::run_until_idle(BUDGET);
+    assert!(handles
+        .iter()
+        .all(|handle| { handle.state() == TaskState::Cancelled && handle.polls() == 1 }));
 }
 
 // --- channels under the scheduler ---
@@ -721,6 +1166,32 @@ fn a_send_wakes_a_parked_receiver() {
     exec::run_until_idle(BUDGET);
 
     assert_eq!(got.load(Ordering::SeqCst), 99);
+}
+
+#[test]
+fn cancelling_a_channel_receiver_does_not_poison_the_next_receiver() {
+    let _g = scheduler();
+    let ep: Arc<Endpoint<u64>> = Endpoint::new("cancel-rx", 1);
+    let abandoned = ep.clone();
+    let cancelled = exec::spawn_tracked("cancel-channel-rx", async move {
+        let _ = abandoned.recv().await;
+    });
+    exec::run_until_idle(BUDGET);
+    assert_eq!(cancelled.polls(), 1);
+    assert_eq!(cancelled.cancel(), CancelOutcome::Requested);
+
+    assert!(ep.try_send(41).is_ok());
+    let got = Arc::new(AtomicU64::new(0));
+    let fresh = ep.clone();
+    let result = got.clone();
+    exec::spawn("fresh-channel-rx", async move {
+        result.store(fresh.recv().await, Ordering::SeqCst);
+    });
+    exec::run_until_idle(BUDGET);
+
+    assert_eq!(got.load(Ordering::SeqCst), 41);
+    assert_eq!(cancelled.state(), TaskState::Cancelled);
+    assert_eq!(cancelled.polls(), 1);
 }
 
 /// Backpressure is an await, not an error the caller may ignore.
@@ -753,4 +1224,31 @@ fn a_full_channel_parks_the_sender_until_space_appears() {
     assert_eq!(ep.try_recv(), Some(2));
     exec::run_until_idle(BUDGET);
     assert_eq!(sent.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn cancelling_a_channel_sender_does_not_poison_the_next_sender() {
+    let _g = scheduler();
+    let ep: Arc<Endpoint<u64>> = Endpoint::new("cancel-tx", 1);
+    assert!(ep.try_send(1).is_ok());
+
+    let blocked = ep.clone();
+    let cancelled = exec::spawn_tracked("cancel-channel-tx", async move {
+        blocked.send(2).await;
+    });
+    exec::run_until_idle(BUDGET);
+    assert_eq!(cancelled.polls(), 1);
+    assert_eq!(cancelled.cancel(), CancelOutcome::Requested);
+
+    assert_eq!(ep.try_recv(), Some(1));
+    let fresh = ep.clone();
+    let replacement = exec::spawn_tracked("fresh-channel-tx", async move {
+        fresh.send(3).await;
+    });
+    exec::run_until_idle(BUDGET);
+
+    assert_eq!(replacement.state(), TaskState::Exited);
+    assert_eq!(ep.try_recv(), Some(3));
+    assert_eq!(cancelled.state(), TaskState::Cancelled);
+    assert_eq!(cancelled.polls(), 1);
 }

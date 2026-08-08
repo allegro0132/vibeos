@@ -6,8 +6,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 and 3.9 complete. The current baseline is 155 host tests,
-> 82 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
+> M3.5 is under way with 3.8 through 3.10 complete. The current baseline is 170 host tests,
+> 88 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
 > differential oracle). See
 > [TESTING.md](../TESTING.md).
 
@@ -18,7 +18,7 @@ algebra, cross-space revocation, scheduler edge cases, compiler front end, emitt
 instruction surface, and native execution paths all have automated coverage. The
 remaining risk is no longer dominated by missing syntax. It is dominated by the gap
 between **authority** and **lifecycle**: a space can be revoked and its task can now be
-cooperatively cancelled, but wait registrations, fault reclamation, restart, and
+cooperatively cancelled with owned wait/timer registrations, but fault reclamation, restart, and
 kernel-heap charging are not yet lifecycle-safe.
 
 The revised priority order is:
@@ -254,7 +254,7 @@ units before adding persistence or more concurrency.
 |---|---|---|
 | 3.8 ✅ | Introduce a `Component` record owning `TaskId`, `CSpace`, memory owner/budget, and state (`Running`, `Exited`, `Faulted`, `Cancelled`) | `ps` and `caps` report the same identity and terminal reason. |
 | 3.9 ✅ | Add cooperative task cancellation and join/exit reporting | Cancelling a parked, ready, and self-waking task works; each is polled no more after cancellation. |
-| 3.10 | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
+| 3.10 ✅ | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
 | 3.11 | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit reclaims its arena. |
 | 3.12 | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
 | 3.13 | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
@@ -279,8 +279,20 @@ scheduler lock, and then published as `Cancelled`; an active poll is allowed to
 return, after which `Faulted` takes precedence over `Cancelled`, which takes
 precedence over a normal return. Poll counts therefore count only real calls to
 `Future::poll`. Retained handles provide race-free join/exit reports, and `cancel`
-is intentionally separate from capability `revoke`. Wait and timer registration
-cleanup remains 3.10 rather than being hidden inside this node.
+is intentionally separate from capability `revoke`.
+
+3.10 gives every wait and timer registration a unique token. Wait queues also carry
+an epoch: channel and UART consumers create a listener before checking their
+predicate, so an IRQ or peer wake in the check/register gap is observed on first
+poll. Repoll updates the existing waker; Ready, Drop, and cancellation unregister
+immediately. Timer entries are deadline-ordered, removing the earliest re-arms the
+hardware, and the IRQ path pops due entries without allocating. Wakers are invoked
+and released outside registry locks; spawn pre-reserves the ready queue to the
+live-task upper bound, so those IRQ wakes do not grow it. Stress tests cancel
+hundreds of parked tasks and sleepers and require both registries to return to
+baseline. A task interrupted
+mid-poll by a fault is still leaked without Drop; incarnation-wide fault cleanup is
+the explicit 3.12 boundary.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and
@@ -433,7 +445,7 @@ toolchain revision, build profile, sample count, and distribution (not only a mi
 | A codegen bug is a privilege escalation, and the emitter is unverified | **High** | 2.5 differential testing, 2.7 emitter audit, 3.5 SSA IR to narrow the surface |
 | Authority revocation is mistaken for task termination | **High** | M3.5 supervised `Component`, explicit cancellation states, end-to-end revoke/cancel/restart test |
 | A resolved object outlives the cap that authorized it | **High** | 3.16 explicit lease semantics; operation-time revalidation for revocable devices; no “immediate” claim for raw memory without enforcement |
-| Faulted or cancelled tasks leak heap and stale wakers | **High** | Owned arenas plus cancellation-safe wait/timer registrations before persistent services |
+| Faulted tasks leak heap and may retain registrations until a later event | **High** | 3.12 owned fault arenas and incarnation-wide teardown; cancellation-safe wait/timer Drop is complete in 3.10 |
 | Bet 2's cheap-IPC claim goes unmeasured and turns out false | High | §5 metrics in M3.5, before optimizing or scaling the design |
 | The single-hart executor design does not survive M5 | Medium | Treat 5.1 as a redesign, not a port; write the model check first |
 | Language features outrun confinement | Medium | M2 strictly before M3; no new syntax without an abort path |

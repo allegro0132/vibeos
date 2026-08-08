@@ -62,11 +62,15 @@ impl<T: Send + 'static> Endpoint<T> {
     pub async fn send(&self, msg: T) {
         let mut pending = msg;
         loop {
+            // Prepare the listener before checking queue capacity. If a
+            // receiver creates space between these two operations, the
+            // listener's epoch records that wake and the await completes.
+            let space = self.on_space.wait();
             match self.try_send(pending) {
                 Ok(()) => return,
                 Err(m) => {
                     pending = m;
-                    self.on_space.wait().await;
+                    space.await;
                 }
             }
         }
@@ -83,10 +87,12 @@ impl<T: Send + 'static> Endpoint<T> {
 
     pub async fn recv(&self) -> T {
         loop {
+            // See send: listener-before-check closes the IRQ/producer race.
+            let message = self.on_message.wait();
             if let Some(m) = self.try_recv() {
                 return m;
             }
-            self.on_message.wait().await;
+            message.await;
         }
     }
 

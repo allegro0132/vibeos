@@ -12,10 +12,12 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
@@ -34,6 +36,18 @@ struct Harness {
 }
 
 struct PanicOnDrop;
+
+struct CountingWake(AtomicUsize);
+
+impl Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 impl Future for PanicOnDrop {
     type Output = ();
@@ -214,9 +228,19 @@ async fn cancellation(h: &mut Harness) {
         1,
     );
     h.eq(
+        "the parked cancellation probe owns one wait registration",
+        queue.waiter_count(),
+        1,
+    );
+    h.eq(
         "cancelling a parked task is accepted",
         parked.cancel(),
         exec::CancelOutcome::Requested,
+    );
+    h.eq(
+        "cancelling a parked task removes its wait registration",
+        queue.waiter_count(),
+        0,
     );
     queue.wake_all();
     for _ in 0..2 {
@@ -249,6 +273,33 @@ async fn cancellation(h: &mut Harness) {
         "a faulting destructor is counted in its task domain",
         exec::faulted_count(),
         faults_before + 1,
+    );
+
+    let timer_wakes = Arc::new(CountingWake(AtomicUsize::new(0)));
+    let timer_waker = Waker::from(timer_wakes.clone());
+    let timer_waker_baseline = Arc::strong_count(&timer_wakes);
+    let mut sleep = exec::sleep_ms(60_000);
+    h.check(
+        "a live sleep registers its waker",
+        Pin::new(&mut sleep)
+            .poll(&mut Context::from_waker(&timer_waker))
+            .is_pending(),
+    );
+    h.eq(
+        "the timer registry owns exactly one waker reference",
+        Arc::strong_count(&timer_wakes),
+        timer_waker_baseline + 1,
+    );
+    drop(sleep);
+    h.eq(
+        "dropping a sleep releases its timer waker immediately",
+        Arc::strong_count(&timer_wakes),
+        timer_waker_baseline,
+    );
+    h.eq(
+        "dropping a sleep does not spuriously wake it",
+        timer_wakes.0.load(Ordering::SeqCst),
+        0,
     );
 
     let mut guards_entered = 0;

@@ -3,8 +3,8 @@
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
 **Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 and 3.9 complete. The implementation is about 9,700 lines across `core`,
-`compiler`, and `kernel`, with 155 host tests, 82 in-kernel checks, and 8 QEMU
+with 3.8 through 3.10 complete. The implementation is about 10,500 lines across `core`,
+`compiler`, and `kernel`, with 170 host tests, 88 in-kernel checks, and 8 QEMU
 transcript cases (7 goldens plus the dynamic differential oracle). Everything
 described as *implemented* below runs today; planned work
 is marked as such. Version strings in the boot banner are historical and are not
@@ -112,18 +112,18 @@ upward except through a capability it was handed.
 | Module | Approx. lines | Role | Contains `unsafe` |
 |---|---:|---|:--:|
 | `cap.rs` | 376 | Rights, `Cap`, `CSpace`, attenuation, revocation | 1 (downcast) |
-| `chan.rs` | 110 | Typed bounded endpoints; rights pick the direction | — |
-| `exec.rs` | 994 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
+| `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
+| `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `shell.rs` | 458 | Operator interface | — |
 | `tty.rs` | 110 | Console line discipline, quiet | — |
 | `dev.rs` | 102 | Devices and bounded memory as capability-guarded resources | — |
 | `compiler/` | 2454 | Lexer, parser, type checker, RV64 code generator | — |
-| `kernel/rustc.rs`, `trampoline.rs` | 430 | Confined runtime and nested non-local fault exit | yes |
+| `kernel/rustc.rs`, `trampoline.rs` | 433 | Confined runtime and nested non-local fault exit | yes |
 | `heap.rs` | 106 | Bump allocator + size-class free lists | yes |
 | `sync.rs` | 59 | Interrupt-safe spinlock | yes |
 | `trap.rs` | 161 | S-mode trap entry; IRQ → waker | 3 |
-| `uart.rs` `plic.rs` `arch/riscv.rs` | 250 | Hardware | 10 |
+| `uart.rs` `plic.rs` `arch/riscv.rs` | 253 | Hardware | 10 |
 | `main.rs` | 159 | Boot, panic, entry | 1 |
 
 Line counts are a dated snapshot, not a target. `unsafe` is concentrated in the
@@ -190,8 +190,9 @@ A task is `Pin<Box<dyn Future<Output = ()> + Send>>` plus a name and a poll coun
 The scheduler is a `BTreeMap<TaskId, Task>` and a ready `VecDeque<TaskId>`.
 
 **The waker is the `TaskId` itself**, cast into the raw-waker data pointer. Clone is
-identity, drop is a no-op, wake is a queue push. No `Arc`, no refcount, no allocation
-on the wake path.
+identity, drop is a no-op, wake is a queue push. No `Arc` or refcount is involved;
+spawn reserves ready-queue capacity for the live-task upper bound so the wake path
+does not allocate.
 
 The main loop:
 
@@ -208,12 +209,20 @@ map and had the wake dropped, which hung `yield_now` forever. `Sched::running_wo
 now catches that, and it covers the harder case too — an interrupt that lands
 mid-poll for the task being polled.
 
-**Timers** are a `Vec<(deadline, Waker)>` scanned on the timer interrupt, plus a
-50 ms heartbeat so the idle hart always wakes even with nothing armed. That
-heartbeat also papers over a real race: the gap between "ready queue is empty" and
-`wfi` is not atomic, so a wake landing in that window costs up to 50 ms of latency
-instead of being lost. Fixing it properly needs the check and the wait to be one
-operation.
+**Wait queues** give every listener a unique registration token and capture the
+queue epoch when the listener is constructed. Consumers prepare the listener before
+checking their channel/UART predicate; a wake between construction, the check, and
+first poll advances the epoch and is observed rather than lost. Repoll replaces the
+waker, and Drop/cancellation removes the token. `wake_all` drains under the queue
+lock and invokes wakers only after releasing it.
+
+**Timers** are kept in deadline order with the earliest entry at the end of the
+vector. A `Sleep` owns one token, updates rather than duplicates its waker, and
+unregisters on Ready or Drop. Removing the earliest timer reprograms the hardware
+immediately. The timer interrupt pops due entries without allocating and wakes them
+outside the registry lock. A 10 s heartbeat is only an idle backstop; the scheduler
+masks interrupts, rechecks the ready queue, executes `wfi`, and restores the prior
+interrupt state as one lost-wake-free sleep sequence.
 
 ---
 
@@ -354,8 +363,9 @@ leaked. Component-owned arenas or tagged allocations are therefore prerequisites
 long-lived, restartable components.
 
 **Time.** `rdtime` at 10 MHz, SBI timer for wakeups. No monotonic-vs-wall
-distinction because there is no wall clock. Timers are a linear scan, fine at ~10
-sleepers and wrong at 10,000.
+distinction because there is no wall clock. Timer insertion and token removal are
+linear, while the interrupt pops due entries from the ordered tail without allocating;
+this is fine at ~10 sleepers and still the wrong data structure at 10,000.
 
 **Failure.** Two failure domains, both built on the same trampoline. A compiled
 program that fails a safety check is aborted and the shell survives (§6.4). A
@@ -390,8 +400,10 @@ CSpace, declared memory owner/budget, and retained terminal state. That closes t
 identity and observability gap. `revoke` still removes authority without stopping
 execution unless a supervisor separately calls `cancel`. Cooperative cancellation
 and join reporting now cover ready, parked, self-waking, and currently polling
-tasks, but wait/timer registrations are not yet removed on Drop, there is no restart
-protocol, budgets are not enforced, the `World` space routes and supervisor handles
+tasks. Wait queues and timers now own cancellation-safe registration tokens, replace
+wakers on repoll, and release them on Drop; their predicate call sites use
+listener-before-check epochs to close IRQ races. There is still no restart protocol,
+budgets are not enforced, the `World` space routes and supervisor handles
 are still boot-static, and a faulted task can only be leaked. The v1 promise “grant,
 run, revoke, and kill” still depends on the remaining M3.5 lifecycle work.
 

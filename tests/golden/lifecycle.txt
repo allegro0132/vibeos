@@ -10,11 +10,11 @@ vibe> ps
   component:3  task:3   guest      guest    cancelled cancelled        1    65536 B
   component:4  task:4   shell      init     running   -                4   262144 B
   executor totals (including untracked tasks): 0 exited, 0 faulted, 1 cancelled
-  memory budgets are declared; allocator accounting lands in 3.11
+  component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising
 vibe> caps guest
   owner component:3  task task:3  name guest  state cancelled  reason cancelled
-  memory owner component:3  declared budget 65536 B (accounting pending)
+  memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      console   -w----   ns16550a @ 0xADDR [31 bytes out]
   rights: r=read w=write s=send v=recv g=grant x=revoke

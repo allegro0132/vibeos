@@ -5,12 +5,20 @@
 //! handler is short, allocation-free, and never blocks.
 
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{exec, plic, sbi, uart};
+use crate::heap::OwnerId;
+use crate::{exec, heap, plic, sbi, uart};
 
 const SIE_STIE: usize = 1 << 5; // supervisor timer
 const SIE_SEIE: usize = 1 << 9; // supervisor external
 const SSTATUS_SIE: usize = 1 << 1;
+
+// A task fault landing pad is still armed when an interrupt preempts its poll.
+// Panicking from that interrupt must not longjmp into the interrupted task: it
+// would abandon the trap frame and falsely blame the component. The panic path
+// reads this flag before considering task-local recovery.
+static IN_INTERRUPT: AtomicBool = AtomicBool::new(false);
 
 global_asm!(
     r#"
@@ -105,6 +113,10 @@ pub fn enable_interrupts() {
     unsafe { asm!("csrs sstatus, {}", in(reg) SSTATUS_SIE) };
 }
 
+pub fn in_interrupt() -> bool {
+    IN_INTERRUPT.load(Ordering::Acquire)
+}
+
 #[no_mangle]
 extern "C" fn __trap_handler() {
     let scause: usize;
@@ -130,6 +142,13 @@ extern "C" fn __trap_handler() {
         sbi::shutdown(true);
     }
 
+    // IRQ work belongs to the kernel, never to the component it interrupted.
+    // This also protects future handler changes from accidentally consuming a
+    // component quota. Deallocation remains owner-correct because heap headers
+    // carry the allocation owner independently of this ambient scope.
+    IN_INTERRUPT.store(true, Ordering::Release);
+    let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
+
     match code {
         5 => exec::timer_tick(),
         9 => {
@@ -142,6 +161,9 @@ extern "C" fn __trap_handler() {
         }
         _ => {}
     }
+
+    system_owner.restore();
+    IN_INTERRUPT.store(false, Ordering::Release);
 }
 
 fn exception_name(code: usize) -> &'static str {

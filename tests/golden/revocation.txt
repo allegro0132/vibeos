@@ -23,7 +23,7 @@ vibe> revoke guest
   (its next heartbeat will fail -- no restart, no signal)
 vibe> caps guest
   owner component:3  task task:3  name guest  state running  reason -
-  memory owner component:3  declared budget 65536 B (accounting pending)
+  memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> 
@@ -35,11 +35,11 @@ vibe> ps
   component:3  task:3   guest      guest    exited    returned         2    65536 B
   component:4  task:4   shell      init     running   -                9   262144 B
   executor totals (including untracked tasks): 1 exited, 0 faulted, 0 cancelled
-  memory budgets are declared; allocator accounting lands in 3.11
+  component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising
 vibe> caps guest
   owner component:3  task task:3  name guest  state exited  reason returned
-  memory owner component:3  declared budget 65536 B (accounting pending)
+  memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> 

@@ -16,8 +16,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::cap::{self, CSpace, Cap, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
-use crate::exec;
+use crate::heap::{self, OwnerId};
 use crate::sync::SpinLock;
+use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 pub const SHELL_MEMORY_BUDGET: usize = 256 * 1024;
@@ -40,15 +41,14 @@ fn next_component_id() -> ComponentId {
     ComponentId(id)
 }
 
-/// The allocation identity and declared limit owned by a component.
-///
-/// ROADMAP 3.11 will make the allocator enforce this limit. Keeping the owner
-/// and budget in the component now prevents lifecycle and allocation identity
-/// from becoming two unrelated namespaces later.
+/// A point-in-time view of the allocation account owned by a component.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MemoryAccount {
     pub owner: ComponentId,
     pub budget_bytes: usize,
+    pub live_bytes: usize,
+    pub peak_bytes: usize,
+    pub denials: u64,
 }
 
 /// One supervised unit: stable component identity, current task, authority,
@@ -57,7 +57,7 @@ pub struct Component {
     id: ComponentId,
     name: String,
     instance: SpinLock<ComponentInstance>,
-    memory: MemoryAccount,
+    memory_owner: OwnerId,
 }
 
 struct ComponentInstance {
@@ -82,6 +82,7 @@ pub struct ComponentSnapshot {
 
 impl Component {
     pub fn snapshot(&self) -> ComponentSnapshot {
+        let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
         let (generation, task_id, state, polls, cspace) = {
             let instance = self.instance.lock();
             (
@@ -92,7 +93,11 @@ impl Component {
                 instance.cspace.clone(),
             )
         };
-        ComponentSnapshot {
+        let account = HEAP
+            .account_stats(self.memory_owner)
+            .expect("a component allocation owner must remain registered");
+        debug_assert_eq!(account.owner, self.memory_owner);
+        let snapshot = ComponentSnapshot {
             id: self.id,
             generation,
             name: self.name.clone(),
@@ -101,8 +106,20 @@ impl Component {
             state,
             terminal_reason: state.terminal_reason(),
             polls,
-            memory: self.memory,
-        }
+            memory: MemoryAccount {
+                owner: self.id,
+                budget_bytes: account.quota_bytes,
+                live_bytes: account.live_bytes,
+                peak_bytes: account.peak_bytes,
+                denials: account.denials,
+            },
+        };
+        system_owner.restore();
+        snapshot
+    }
+
+    pub fn memory_owner(&self) -> OwnerId {
+        self.memory_owner
     }
 
     pub fn space(&self) -> Arc<Space> {
@@ -130,8 +147,11 @@ impl Component {
 pub struct Space(pub SpinLock<CSpace>);
 
 impl Space {
-    fn new(name: &str) -> Arc<Self> {
-        Arc::new(Space(SpinLock::new(CSpace::new(name))))
+    pub(crate) fn new(name: &str) -> Arc<Self> {
+        let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
+        let space = Arc::new(Space(SpinLock::new(CSpace::new(name))));
+        system_owner.restore();
+        space
     }
 }
 
@@ -185,21 +205,29 @@ impl World {
             memory_budget > 0,
             "a component memory budget must be nonzero"
         );
-        let mut components = self.components.lock();
-        assert!(
-            !components.values().any(|component| component.name == name),
-            "duplicate component name"
-        );
-        assert!(
-            !components
-                .values()
-                .any(|component| Arc::ptr_eq(&component.space(), &space)),
-            "a CSpace may have only one component owner"
-        );
-
+        // Component records, scheduler envelopes, CSpaces, and the registry are
+        // supervisor infrastructure. Only polling/destroying `fut` runs under
+        // the component owner installed by the executor.
+        let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
+        {
+            let components = self.components.lock();
+            assert!(
+                !components.values().any(|component| component.name == name),
+                "duplicate component name"
+            );
+            assert!(
+                !components
+                    .values()
+                    .any(|component| Arc::ptr_eq(&component.space(), &space)),
+                "a CSpace may have only one component owner"
+            );
+        }
         let id = next_component_id();
+        let memory_owner = OwnerId::new(id.0);
+        HEAP.register_owner(memory_owner, memory_budget)
+            .expect("a fresh component allocation owner must register");
         let cspace = space.0.lock().name.clone();
-        let task = exec::spawn_tracked(name, fut);
+        let task = exec::spawn_tracked_owned(memory_owner, name, fut);
         let component = Arc::new(Component {
             id,
             name: String::from(name),
@@ -209,20 +237,55 @@ impl World {
                 space,
                 cspace,
             }),
-            memory: MemoryAccount {
-                owner: id,
-                budget_bytes: memory_budget,
-            },
+            memory_owner,
         });
+        let mut components = self.components.lock();
+        // There is no yield between the two checks on the single-hart executor,
+        // but keep the insertion assertion as the registry invariant.
         let old = components.insert(id, component.clone());
         debug_assert!(old.is_none());
+        drop(components);
+        system_owner.restore();
         component
+    }
+
+    /// Remove a terminal test/supervisor record. Normal owners are unregistered
+    /// only after Drop returned their account to zero; fault owners remain
+    /// registered until M3.12 performs incarnation-wide raw reclamation.
+    pub(crate) fn remove_terminal_component(&self, id: ComponentId) -> bool {
+        let component = self.components.lock().get(&id).cloned();
+        let Some(component) = component else {
+            return false;
+        };
+        let snapshot = component.snapshot();
+        if snapshot.state == exec::TaskState::Running {
+            return false;
+        }
+
+        let normal = matches!(
+            snapshot.state,
+            exec::TaskState::Exited | exec::TaskState::Cancelled
+        );
+        // A component may legally hand an owned payload to another component.
+        // Pointer provenance keeps that payload charged to its creator, so the
+        // account cannot be retired until the last escaped allocation is gone.
+        if normal && snapshot.memory.live_bytes != 0 {
+            return false;
+        }
+        if normal {
+            HEAP.unregister_owner(component.memory_owner())
+                .expect("a normally terminated component must have no live allocations");
+        }
+        self.components.lock().remove(&id).is_some()
     }
 
     /// Stable component order for `ps` and tests. Clone under the registry lock
     /// so callers never hold it while inspecting a component or its CSpace.
     pub fn components(&self) -> Vec<Arc<Component>> {
-        self.components.lock().values().cloned().collect()
+        let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
+        let components = self.components.lock().values().cloned().collect();
+        system_owner.restore();
+        components
     }
 
     /// Resolve a CSpace to its owning component by object identity, not by two

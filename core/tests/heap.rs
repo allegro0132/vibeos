@@ -2,8 +2,20 @@
 //! these run in parallel and never touch the kernel's global allocator.
 
 use std::alloc::{GlobalAlloc, Layout};
+use std::sync::{Mutex, MutexGuard};
 
-use vibeos_core::heap::Heap;
+use vibeos_core::heap::{current_owner, enter_owner, AllocationFailure, Heap, OwnerError, OwnerId};
+
+// Allocation owner is deliberately a single-hart global. Serialize this test
+// binary so an owner-scope test cannot change the provenance seen by another
+// local Heap instance running on a host worker thread.
+static HEAP_TEST: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    HEAP_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Build a heap over a leaked buffer. Leaking is deliberate: generated pointers
 /// must stay valid for the whole test, and the process exits right after.
@@ -21,6 +33,7 @@ fn layout(size: usize, align: usize) -> Layout {
 
 #[test]
 fn allocations_are_aligned_and_distinct() {
+    let _serial = serial();
     let h = heap_of(64 * 1024);
     let l = layout(24, 8);
     let a = unsafe { h.alloc(l) };
@@ -32,6 +45,7 @@ fn allocations_are_aligned_and_distinct() {
 
 #[test]
 fn a_freed_block_is_reused_for_the_same_size_class() {
+    let _serial = serial();
     let h = heap_of(64 * 1024);
     let l = layout(24, 8); // 32-byte class
     let a = unsafe { h.alloc(l) };
@@ -42,17 +56,22 @@ fn a_freed_block_is_reused_for_the_same_size_class() {
 
 #[test]
 fn size_classes_do_not_leak_into_each_other() {
+    let _serial = serial();
     let h = heap_of(64 * 1024);
     let small = layout(16, 8);
     let large = layout(1024, 8);
     let a = unsafe { h.alloc(small) };
     unsafe { h.dealloc(a, small) };
     let b = unsafe { h.alloc(large) };
-    assert_ne!(a, b, "a 1 KiB request must not be served from the 16 B list");
+    assert_ne!(
+        a, b,
+        "a 1 KiB request must not be served from the 16 B list"
+    );
 }
 
 #[test]
 fn every_size_class_round_trips() {
+    let _serial = serial();
     let h = heap_of(1024 * 1024);
     for shift in 4..=16 {
         let size = 1usize << shift;
@@ -66,18 +85,23 @@ fn every_size_class_round_trips() {
 }
 
 #[test]
-fn over_aligned_requests_bypass_the_free_lists() {
+fn over_aligned_requests_are_aligned_and_recycled() {
+    let _serial = serial();
     let h = heap_of(64 * 1024);
     let l = layout(32, 64);
     let a = unsafe { h.alloc(l) };
     assert_eq!(a as usize % 64, 0, "requested alignment is honoured");
     unsafe { h.dealloc(a, l) };
     let b = unsafe { h.alloc(l) };
-    assert_ne!(a, b, "not recycled -- documented in README known limits");
+    assert_eq!(
+        a, b,
+        "the tagged block retains enough base provenance to recycle"
+    );
 }
 
 #[test]
 fn exhaustion_returns_null_rather_than_wrapping() {
+    let _serial = serial();
     let h = heap_of(4096);
     let l = layout(1024, 8);
     let mut nulls = 0;
@@ -91,12 +115,14 @@ fn exhaustion_returns_null_rather_than_wrapping() {
 
 #[test]
 fn a_request_larger_than_the_heap_is_refused() {
+    let _serial = serial();
     let h = heap_of(4096);
     assert!(unsafe { h.alloc(layout(1 << 20, 8)) }.is_null());
 }
 
 #[test]
 fn stats_track_live_and_peak() {
+    let _serial = serial();
     let h = heap_of(64 * 1024);
     let l = layout(64, 8);
     let (live0, _, free0) = h.stats();
@@ -114,6 +140,7 @@ fn stats_track_live_and_peak() {
 
 #[test]
 fn recycled_memory_is_usable() {
+    let _serial = serial();
     let h = heap_of(64 * 1024);
     let l = layout(64, 8);
     let a = unsafe { h.alloc(l) };
@@ -123,4 +150,239 @@ fn recycled_memory_is_usable() {
     let b = unsafe { h.alloc(l) };
     unsafe { std::ptr::write_bytes(b, 0xCD, 64) };
     assert_eq!(unsafe { *b }, 0xCD, "the block is writable after reuse");
+}
+
+#[test]
+fn owner_scopes_nest_and_support_explicit_restore() {
+    let _serial = serial();
+    assert_eq!(current_owner(), OwnerId::SYSTEM);
+    let first = OwnerId::new(41);
+    let second = OwnerId::new(42);
+
+    let mut outer = enter_owner(first);
+    assert_eq!(outer.previous(), OwnerId::SYSTEM);
+    assert_eq!(current_owner(), first);
+    {
+        let _inner = enter_owner(second);
+        assert_eq!(current_owner(), second);
+    }
+    assert_eq!(current_owner(), first);
+
+    outer.restore();
+    assert_eq!(current_owner(), OwnerId::SYSTEM);
+    outer.restore();
+    assert_eq!(current_owner(), OwnerId::SYSTEM, "restore is idempotent");
+}
+
+#[test]
+fn quotas_charge_physical_blocks_and_denial_changes_no_heap_state() {
+    let _serial = serial();
+    let h = heap_of(1024 * 1024);
+    let owner = OwnerId::new(1);
+    let l = layout(100, 8);
+    let charge = Heap::allocation_charge(l).expect("layout is representable");
+    h.register_owner(owner, charge * 2).unwrap();
+
+    let mut scope = enter_owner(owner);
+    let a = unsafe { h.alloc(l) };
+    let b = unsafe { h.alloc(l) };
+    assert!(!a.is_null() && !b.is_null());
+    let before = h.stats();
+    let denied = unsafe { h.alloc(l) };
+    let after = h.stats();
+    scope.restore();
+
+    assert!(denied.is_null());
+    assert_eq!(
+        after, before,
+        "denial consumes neither a free block nor bump space"
+    );
+    let stats = h.account_stats(owner).unwrap();
+    assert_eq!(stats.live_bytes, charge * 2);
+    assert_eq!(stats.peak_bytes, charge * 2);
+    assert_eq!(stats.live_allocations, 2);
+    assert_eq!(stats.denials, 1);
+    assert_eq!(
+        h.last_failure(),
+        Some(AllocationFailure::QuotaExceeded {
+            owner,
+            requested_bytes: charge,
+            live_bytes: charge * 2,
+            quota_bytes: charge * 2,
+        })
+    );
+
+    unsafe {
+        h.dealloc(a, l);
+        h.dealloc(b, l);
+    }
+    let stats = h.account_stats(owner).unwrap();
+    assert_eq!(stats.live_bytes, 0);
+    assert_eq!(stats.live_allocations, 0);
+    assert_eq!(
+        stats.peak_bytes,
+        charge * 2,
+        "peak remains a high-water mark"
+    );
+}
+
+#[test]
+fn deallocation_uses_header_owner_not_current_owner() {
+    let _serial = serial();
+    let h = heap_of(1024 * 1024);
+    let producer = OwnerId::new(7);
+    let consumer = OwnerId::new(8);
+    let l = layout(200, 16);
+    let charge = Heap::allocation_charge(l).unwrap();
+    h.register_owner(producer, charge).unwrap();
+    h.register_owner(consumer, charge).unwrap();
+
+    let p = {
+        let _scope = enter_owner(producer);
+        unsafe { h.alloc(l) }
+    };
+    assert!(!p.is_null());
+    {
+        let _scope = enter_owner(consumer);
+        unsafe { h.dealloc(p, l) };
+    }
+
+    assert_eq!(h.account_stats(producer).unwrap().live_bytes, 0);
+    assert_eq!(h.account_stats(producer).unwrap().live_allocations, 0);
+    assert_eq!(h.account_stats(consumer).unwrap().live_bytes, 0);
+
+    let q = {
+        let _scope = enter_owner(consumer);
+        unsafe { h.alloc(l) }
+    };
+    assert_eq!(
+        q, p,
+        "the other owner can reuse the returned physical block"
+    );
+    unsafe { h.dealloc(q, l) };
+}
+
+#[test]
+fn one_owners_quota_denial_does_not_touch_another_account() {
+    let _serial = serial();
+    let h = heap_of(1024 * 1024);
+    let first = OwnerId::new(10);
+    let second = OwnerId::new(11);
+    let l = layout(64, 8);
+    let charge = Heap::allocation_charge(l).unwrap();
+    h.register_owner(first, charge).unwrap();
+    h.register_owner(second, charge).unwrap();
+
+    let first_ptr = {
+        let _scope = enter_owner(first);
+        let p = unsafe { h.alloc(l) };
+        assert!(unsafe { h.alloc(l) }.is_null());
+        p
+    };
+    let second_before = h.account_stats(second).unwrap();
+    let second_ptr = {
+        let _scope = enter_owner(second);
+        unsafe { h.alloc(l) }
+    };
+    assert!(!second_ptr.is_null());
+    assert_eq!(second_before.denials, 0);
+    assert_eq!(h.account_stats(second).unwrap().live_bytes, charge);
+    assert_eq!(h.account_stats(second).unwrap().denials, 0);
+
+    unsafe {
+        h.dealloc(first_ptr, l);
+        h.dealloc(second_ptr, l);
+    }
+}
+
+#[test]
+fn unknown_owner_is_refused_without_falling_back_to_system() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let unknown = OwnerId::new(999);
+    let l = layout(16, 8);
+    let system_before = h.account_stats(OwnerId::SYSTEM).unwrap();
+    let p = {
+        let _scope = enter_owner(unknown);
+        unsafe { h.alloc(l) }
+    };
+
+    assert!(p.is_null());
+    assert_eq!(
+        h.last_failure(),
+        Some(AllocationFailure::UnknownOwner { owner: unknown })
+    );
+    assert_eq!(h.account_stats(OwnerId::SYSTEM).unwrap(), system_before);
+}
+
+#[test]
+fn physical_exhaustion_has_a_distinct_failure_reason() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let l = layout(4096, 8);
+    let charge = Heap::allocation_charge(l).unwrap();
+    assert!(unsafe { h.alloc(l) }.is_null());
+    assert_eq!(
+        h.take_last_failure(),
+        Some(AllocationFailure::HeapExhausted {
+            owner: OwnerId::SYSTEM,
+            requested_bytes: charge,
+        })
+    );
+    assert_eq!(h.last_failure(), None, "take consumes the diagnostic");
+}
+
+#[test]
+fn a_successful_allocation_clears_a_stale_failure() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let too_large = layout(4096, 8);
+    assert!(unsafe { h.alloc(too_large) }.is_null());
+    assert!(h.last_failure().is_some());
+
+    let small = layout(16, 8);
+    let p = unsafe { h.alloc(small) };
+    assert!(!p.is_null());
+    assert_eq!(h.last_failure(), None);
+    unsafe { h.dealloc(p, small) };
+}
+
+#[test]
+fn allocations_larger_than_the_old_64k_limit_are_recycled() {
+    let _serial = serial();
+    let h = heap_of(2 * 1024 * 1024);
+    let l = layout(100 * 1024, 4096);
+    let a = unsafe { h.alloc(l) };
+    assert!(!a.is_null());
+    assert_eq!(a as usize % 4096, 0);
+    unsafe { h.dealloc(a, l) };
+    let b = unsafe { h.alloc(l) };
+    assert_eq!(b, a, "large tagged blocks return to their size class");
+    unsafe { h.dealloc(b, l) };
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn owner_slots_unregister_only_after_provenance_is_gone() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(4096).unwrap();
+    let l = layout(32, 8);
+    let p = {
+        let _scope = enter_owner(owner);
+        unsafe { h.alloc(l) }
+    };
+
+    assert!(matches!(
+        h.unregister_owner(owner),
+        Err(OwnerError::OwnerBusy {
+            live_allocations: 1,
+            ..
+        })
+    ));
+    unsafe { h.dealloc(p, l) };
+    h.unregister_owner(owner).unwrap();
+    assert_eq!(h.account_stats(owner), None);
+    h.register_owner(owner, 8192).unwrap();
+    assert_eq!(h.account_stats(owner).unwrap().quota_bytes, 8192);
 }

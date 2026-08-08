@@ -17,9 +17,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use vibeos_core::arch::{advance_time, armed_timer, reset_time};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::exec::{self, CancelOutcome, TaskExit, TaskState, WaitQueue};
+use vibeos_core::heap::{self, OwnerId};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static FAULT_NEXT_POLL: AtomicBool = AtomicBool::new(false);
+static OWNER_SEEN_BY_FAULT_GUARD: Mutex<Option<OwnerId>> = Mutex::new(None);
 
 fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
     if FAULT_NEXT_POLL.swap(false, Ordering::SeqCst) {
@@ -35,11 +37,39 @@ fn fault_after_poll(poll: &mut dyn FnMut()) -> bool {
     true
 }
 
+fn fault_once_and_record_owner(poll: &mut dyn FnMut()) -> bool {
+    *OWNER_SEEN_BY_FAULT_GUARD.lock().unwrap() = Some(heap::current_owner());
+    fault_once_then_passthrough(poll)
+}
+
 struct DropFlag(Arc<AtomicBool>);
 
 impl Drop for DropFlag {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct OwnerDropFuture {
+    owner_seen: Arc<Mutex<Option<OwnerId>>>,
+    ready: bool,
+}
+
+impl Future for OwnerDropFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for OwnerDropFuture {
+    fn drop(&mut self) {
+        *self.owner_seen.lock().unwrap() = Some(heap::current_owner());
     }
 }
 
@@ -148,6 +178,168 @@ fn a_spawned_task_runs_to_completion() {
 
     assert_eq!(flag.load(Ordering::SeqCst), 7);
     assert_eq!(exec::completed_count(), before + 1);
+}
+
+#[test]
+fn an_owned_task_installs_its_owner_for_pending_and_ready_polls() {
+    let _g = scheduler();
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+    let owner = OwnerId::new(10_001);
+    let queue = Arc::new(WaitQueue::new());
+    let waiter = queue.clone();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let task_observed = observed.clone();
+    let handle = exec::spawn_tracked_owned(owner, "owned-poll", async move {
+        task_observed.lock().unwrap().push(heap::current_owner());
+        waiter.wait().await;
+        task_observed.lock().unwrap().push(heap::current_owner());
+    });
+
+    assert_eq!(handle.owner(), owner);
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Running);
+    assert_eq!(observed.lock().unwrap().as_slice(), &[owner]);
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+    assert!(exec::task_report()
+        .iter()
+        .any(|report| report.id == handle.id() && report.owner == owner));
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+
+    queue.wake_all();
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(observed.lock().unwrap().as_slice(), &[owner, owner]);
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+}
+
+#[test]
+fn nested_spawn_inherits_owner_and_explicit_spawn_restores_the_parent() {
+    let _g = scheduler();
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+    let parent_owner = OwnerId::new(10_002);
+    let child_owner = OwnerId::new(10_003);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let parent_observed = observed.clone();
+
+    let parent = exec::spawn_tracked_owned(parent_owner, "owner-parent", async move {
+        parent_observed
+            .lock()
+            .unwrap()
+            .push(("parent-before", heap::current_owner()));
+
+        let inherited_observed = parent_observed.clone();
+        exec::spawn("owner-inherited-child", async move {
+            inherited_observed
+                .lock()
+                .unwrap()
+                .push(("inherited-child", heap::current_owner()));
+        });
+        parent_observed
+            .lock()
+            .unwrap()
+            .push(("parent-after-inherited", heap::current_owner()));
+
+        let explicit_observed = parent_observed.clone();
+        let explicit = exec::spawn_tracked_owned(child_owner, "owner-explicit-child", async move {
+            explicit_observed
+                .lock()
+                .unwrap()
+                .push(("explicit-child", heap::current_owner()));
+        });
+        assert_eq!(explicit.owner(), child_owner);
+        parent_observed
+            .lock()
+            .unwrap()
+            .push(("parent-after-explicit", heap::current_owner()));
+    });
+
+    exec::run_until_idle(BUDGET);
+    assert_eq!(parent.state(), TaskState::Exited);
+    assert_eq!(parent.owner(), parent_owner);
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        &[
+            ("parent-before", parent_owner),
+            ("parent-after-inherited", parent_owner),
+            ("parent-after-explicit", parent_owner),
+            ("inherited-child", parent_owner),
+            ("explicit-child", child_owner),
+        ]
+    );
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+}
+
+#[test]
+fn fault_and_destructor_paths_restore_the_system_owner() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+
+    let fault_owner = OwnerId::new(10_004);
+    *OWNER_SEEN_BY_FAULT_GUARD.lock().unwrap() = None;
+    exec::set_fault_guard(fault_once_and_record_owner);
+    FAULT_NEXT_POLL.store(true, Ordering::SeqCst);
+    let faulted = exec::spawn_tracked_owned(fault_owner, "owner-fault", async {});
+    exec::run_until_idle(BUDGET);
+    assert_eq!(faulted.state(), TaskState::Faulted);
+    assert_eq!(
+        *OWNER_SEEN_BY_FAULT_GUARD.lock().unwrap(),
+        Some(fault_owner)
+    );
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+
+    exec::set_fault_guard(fault_once_then_passthrough);
+    let ready_owner = OwnerId::new(10_005);
+    let ready_drop_owner = Arc::new(Mutex::new(None));
+    let ready = exec::spawn_tracked_owned(
+        ready_owner,
+        "owner-ready-drop",
+        OwnerDropFuture {
+            owner_seen: ready_drop_owner.clone(),
+            ready: true,
+        },
+    );
+    exec::run_until_idle(BUDGET);
+    assert_eq!(ready.state(), TaskState::Exited);
+    assert_eq!(*ready_drop_owner.lock().unwrap(), Some(ready_owner));
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+
+    let pending_owner = OwnerId::new(10_006);
+    let pending_drop_owner = Arc::new(Mutex::new(None));
+    let pending = exec::spawn_tracked_owned(
+        pending_owner,
+        "owner-pending-drop",
+        OwnerDropFuture {
+            owner_seen: pending_drop_owner.clone(),
+            ready: false,
+        },
+    );
+    assert!(exec::poll_once());
+    assert_eq!(pending.state(), TaskState::Running);
+    assert_eq!(pending.cancel(), CancelOutcome::Requested);
+    assert_eq!(pending.state(), TaskState::Cancelled);
+    assert_eq!(*pending_drop_owner.lock().unwrap(), Some(pending_owner));
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+
+    // A destructor fault is reported by the synthetic guard after it ran the
+    // destructor. The executor must still restore the prior owner explicitly,
+    // just as it does after the kernel landing pad returns through longjmp.
+    exec::set_fault_guard(fault_after_poll);
+    let destructor_owner = OwnerId::new(10_007);
+    let faulting_drop_owner = Arc::new(Mutex::new(None));
+    let destructor_fault = exec::spawn_tracked_owned(
+        destructor_owner,
+        "owner-destructor-fault",
+        OwnerDropFuture {
+            owner_seen: faulting_drop_owner.clone(),
+            ready: false,
+        },
+    );
+    assert_eq!(destructor_fault.cancel(), CancelOutcome::Requested);
+    assert_eq!(destructor_fault.state(), TaskState::Faulted);
+    assert_eq!(*faulting_drop_owner.lock().unwrap(), Some(destructor_owner));
+    assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
+    exec::set_fault_guard(fault_once_then_passthrough);
 }
 
 #[test]

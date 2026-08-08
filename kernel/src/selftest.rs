@@ -22,8 +22,9 @@ use core::task::{Context, Poll, Waker};
 use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
+use crate::sync::SpinLock;
 use crate::world::{world, Space};
-use crate::{exec, println, sbi};
+use crate::{exec, heap, println, sbi};
 
 pub struct Report {
     pub passed: usize,
@@ -108,6 +109,7 @@ pub async fn run() -> Report {
     components(&mut h);
     channels(&mut h).await;
     fault_isolation(&mut h).await;
+    component_memory(&mut h).await;
     capabilities(&mut h);
     compiler(&mut h);
 
@@ -375,6 +377,132 @@ async fn fault_isolation(h: &mut Harness) {
     );
     // And the machine is obviously still running, because we got here.
     h.check("the kernel survived the fault", true);
+}
+
+/// ROADMAP 3.11. Allocation ownership follows the supervised component across
+/// polls. Exhausting A's quota faults A, while B retains an independent budget;
+/// a normal B exit drops its allocations back to the account baseline.
+async fn component_memory(h: &mut Harness) {
+    const TEST_BUDGET: usize = 4 * 1024;
+
+    let w = world();
+    let shell_owner = w
+        .component_named("shell")
+        .expect("the self-test runs inside the shell component")
+        .memory_owner();
+    let unaffected = w
+        .component_named("guest")
+        .expect("the system image has a guest component");
+    let unaffected_before = unaffected.snapshot().memory;
+    let offender_lock = {
+        let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
+        let lock = Arc::new(SpinLock::new(()));
+        system.restore();
+        lock
+    };
+
+    let offender = w.spawn_component(
+        "selftest-quota-offender",
+        Space::new("selftest-quota-offender"),
+        TEST_BUDGET,
+        async move {
+            // Retain one successful allocation, then exceed the quota while a
+            // component-private lock has SIE masked. The future and its lock
+            // are abandoned on fault; the landing pad must nevertheless
+            // restore the hart's entry interrupt state.
+            let mut held = Vec::new();
+            held.resize(512, 0xA5);
+            let _private = offender_lock.lock();
+            held.resize(TEST_BUDGET * 2, 0x5A);
+        },
+    );
+    let (_, offender_join) = offender.join_current();
+    let offender_exit = offender_join.await;
+    let offender_snapshot = offender.snapshot();
+
+    h.eq(
+        "a component exceeding its allocation quota is faulted",
+        offender_exit.state(),
+        exec::TaskState::Faulted,
+    );
+    h.check(
+        "the quota account records the refused allocation",
+        offender_snapshot.memory.denials > 0,
+    );
+    h.check(
+        "a refused allocation never pushes the offender beyond its budget",
+        offender_snapshot.memory.live_bytes <= offender_snapshot.memory.budget_bytes,
+    );
+
+    let irq_probe_start = sbi::time();
+    exec::sleep_ms(1).await;
+    let irq_probe_ms = (sbi::time() - irq_probe_start) / (exec::TIMEBASE_HZ / 1000);
+    h.check(
+        "quota fault restores interrupts skipped by longjmp",
+        irq_probe_ms < 100,
+    );
+
+    let unaffected_after = unaffected.snapshot().memory;
+    h.eq(
+        "quota exhaustion does not consume another component's live budget",
+        unaffected_after.live_bytes,
+        unaffected_before.live_bytes,
+    );
+    h.eq(
+        "quota exhaustion does not deny another component",
+        unaffected_after.denials,
+        unaffected_before.denials,
+    );
+
+    let survivor = w.spawn_component(
+        "selftest-quota-survivor",
+        Space::new("selftest-quota-survivor"),
+        TEST_BUDGET,
+        async {
+            let mut bytes = Vec::new();
+            bytes.resize(512, 0x5A);
+            exec::yield_now().await;
+            core::hint::black_box(&bytes);
+        },
+    );
+    let survivor_baseline = survivor.snapshot().memory.live_bytes;
+    let (_, survivor_join) = survivor.join_current();
+    let survivor_exit = survivor_join.await;
+    let survivor_snapshot = survivor.snapshot();
+
+    h.eq(
+        "a fresh component still allocates after another owner exhausts its quota",
+        survivor_exit.state(),
+        exec::TaskState::Exited,
+    );
+    h.check(
+        "the survivor account observes its component allocation",
+        survivor_snapshot.memory.peak_bytes > survivor_baseline,
+    );
+    h.eq(
+        "normal component exit drops live allocation use to its baseline",
+        survivor_snapshot.memory.live_bytes,
+        survivor_baseline,
+    );
+    h.eq(
+        "the survivor uses none of the offender's denial budget",
+        survivor_snapshot.memory.denials,
+        0,
+    );
+    h.eq(
+        "the executor restores the polling component's allocation owner",
+        heap::current_owner(),
+        shell_owner,
+    );
+
+    h.check(
+        "the terminal offender component record can be reaped",
+        w.remove_terminal_component(offender_snapshot.id),
+    );
+    h.check(
+        "the terminal survivor component record can be reaped",
+        w.remove_terminal_component(survivor_snapshot.id),
+    );
 }
 
 /// ROADMAP 3.8. Scheduler identity, authority, and declared memory ownership

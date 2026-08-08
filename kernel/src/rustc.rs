@@ -14,60 +14,19 @@
 
 extern crate alloc;
 
-pub mod ast;
-pub mod codegen;
-pub mod lex;
-pub mod parse;
-
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub use vibeos_rustc::samples::{CONFORMANCE as CONFORM_SRC, DEMO as DEMO_SRC, HELLO as HELLO_SRC};
+
 use crate::cap::Rights;
 use crate::dev::ConsoleDev;
 use crate::sbi;
 use crate::sync::SpinLock;
 use crate::world::world;
-
-pub const HELLO_SRC: &str = r#"fn main() {
-    println!("Hello, world!");
-}
-"#;
-
-pub const DEMO_SRC: &str = r#"// Compiled to RV64 by VibeOS, in VibeOS.
-fn fib(n: i64) -> i64 {
-    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
-}
-
-fn gcd(a: i64, b: i64) -> i64 {
-    let mut x = a;
-    let mut y = b;
-    while y != 0 {
-        let t = x % y;
-        x = y;
-        y = t;
-    }
-    return x;
-}
-
-fn main() {
-    println!("Hello, world!");
-    let mut i = 0;
-    while i < 10 {
-        print!("fib({}) = {}  ", i, fib(i));
-        i = i + 1;
-    }
-    println!("");
-    println!("gcd(1071, 462) = {}", gcd(1071, 462));
-    let n = 30;
-    if n % 2 == 0 && n > 10 {
-        println!("{} is even and greater than ten", n);
-    }
-}
-"#;
 
 /// Where a compiled program's authority lives while it runs. `None` means no
 /// program is executing and the runtime hooks refuse everything.
@@ -107,43 +66,32 @@ pub struct Compiled {
 }
 
 pub fn compile(src: &str) -> Result<Compiled, String> {
-    let toks = lex::lex(src)?;
-    let prog = parse::Parser::new(toks).program()?;
-
-    // Lay the string table out first: generated code refers to literals by
-    // absolute address, so those addresses must be settled before codegen.
-    let literals = codegen::collect_strings(&prog, "\n");
-    let mut data = Vec::new();
-    let mut offsets = Vec::new();
-    for s in &literals {
-        offsets.push(data.len());
-        data.extend_from_slice(s.as_bytes());
-    }
-    let data_base = data.as_ptr() as u64;
-    let str_addr: BTreeMap<String, u64> = literals
-        .iter()
-        .zip(&offsets)
-        .map(|(s, off)| (s.clone(), data_base + *off as u64))
-        .collect();
-
-    let rt = codegen::Runtime {
+    let rt = vibeos_rustc::Runtime {
         print_str: rt_print_str as *const () as u64,
         print_int: rt_print_int as *const () as u64,
     };
 
     // Sizing pass: instruction counts never depend on addresses, so the length
-    // measured at base 0 is the length we will need at the real base.
-    let sized = codegen::compile(&prog, 0, str_addr.clone(), &rt)?;
-    let mut code = vec![0u32; sized.len()];
-    let code_base = code.as_ptr() as u64;
-    let real = codegen::compile(&prog, code_base, str_addr, &rt)?;
-    if real.len() != sized.len() {
+    // measured at base 0 is the length we will need at the real base. The data
+    // buffer it produces is also final, since only its *address* was a guess.
+    let sized = vibeos_rustc::compile_at(src, 0, 0, &rt)?;
+    let mut data = sized.data;
+    let mut code = vec![0u32; sized.code.len()];
+
+    let real = vibeos_rustc::compile_at(
+        src,
+        data.as_ptr() as u64,
+        code.as_ptr() as u64,
+        &rt,
+    )?;
+    if real.code.len() != code.len() || real.data.len() != data.len() {
         return Err("internal error: code layout was not stable across passes".to_string());
     }
-    code.copy_from_slice(&real);
+    data.copy_from_slice(&real.data);
+    code.copy_from_slice(&real.code);
 
     Ok(Compiled {
-        funcs: prog.funcs.len(),
+        funcs: real.funcs,
         bytes: code.len() * 4,
         data_bytes: data.len(),
         _data: data,

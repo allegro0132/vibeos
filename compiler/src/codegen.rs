@@ -12,7 +12,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::ast::*;
+use crate::ast::*;
 
 // Registers.
 const ZERO: u32 = 0;

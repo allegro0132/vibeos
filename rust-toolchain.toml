@@ -1,0 +1,5 @@
+# Honoured by rustup (CI). Ignored by a rustup-less toolchain such as Homebrew's,
+# where `RUSTC_BOOTSTRAP=1` in run.sh unlocks the same `-Z build-std` support.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

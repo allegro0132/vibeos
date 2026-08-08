@@ -1,0 +1,9 @@
+quiet
+rustc hello
+@sleep 2
+revoke prog
+rustc hello
+@sleep 2
+caps prog
+revoke guest
+caps guest

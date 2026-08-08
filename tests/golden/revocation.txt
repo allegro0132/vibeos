@@ -1,0 +1,28 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> rustc hello
+  compiled 1 fn -> 328 B of RV64 + 14 B of data in N us
+  --- running natively ---
+Hello, world!
+  --- exited with 0 in N us ---
+vibe> revoke prog
+  revoked 1 cap(s) in `prog`
+  (already-compiled machine code will now print nothing)
+vibe> rustc hello
+  compiled 1 fn -> 328 B of RV64 + 14 B of data in N us
+  --- running natively ---
+  --- exited with 0 in N us ---
+  note: output was suppressed -- `prog` holds no console capability
+vibe> caps prog
+  HANDLE       KIND      RIGHTS   OBJECT
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> revoke guest
+  revoked 1 cap(s) in `guest`
+  (its next heartbeat will fail -- no restart, no signal)
+vibe> 
+[guest]  console denied: invalid or revoked capability -- guest is now mute
+vibe> caps guest
+  HANDLE       KIND      RIGHTS   OBJECT
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> 

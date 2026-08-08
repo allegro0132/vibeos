@@ -17,6 +17,19 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   leaks, and the trust model.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
   workstreams, testing strategy, metrics, and the risk register.
+- **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
+
+## Testing
+
+```sh
+cargo test --workspace     # 96 host tests, no QEMU, ~1s
+./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
+```
+
+Plus an in-kernel self-test (37 checks) for what the host cannot fake — real
+timer interrupts, real wakeups, the live capability graph, and machine code
+actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
+for why there are four layers and which mutations each one catches.
 
 ## Running it
 
@@ -194,16 +207,15 @@ property of the code.
 
 | file | |
 |---|---|
-| `cap.rs` | capabilities, rights, CSpaces, attenuation, cascading revoke |
-| `chan.rs` | typed bounded channels; rights decide which end you hold |
-| `exec.rs` | the executor, wakers, wait queues, timers |
 | `world.rs` | the system image: spaces, components, wiring |
 | `shell.rs` | interactive shell (`probe`, `revoke`, `caps`, `ps`, …) |
 | `trap.rs` | S-mode trap entry, IRQ → waker |
 | `uart.rs`, `plic.rs`, `sbi.rs`, `dev.rs` | hardware |
-| `rustc/` | lexer, parser, RV64 code generator, capability-gated runtime |
-| `heap.rs` | bump allocator with size-class free lists |
-| `sync.rs` | interrupt-safe spinlock |
+| `compiler/` | lexer, parser, RV64 code generator (its own crate, host-testable) |
+| `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
+| `rustc.rs` | wires the compiler to the capability system and to hardware |
+| `selftest.rs` | in-kernel test suite |
+| `arch/` | the seam between portable logic and the machine (riscv + host shim) |
 
 ~3300 lines total.
 
@@ -215,6 +227,8 @@ spaces          capability spaces in the system
 caps <space>    dump a space's capability table
 rustc hello     compile and run a Rust hello world, natively
 rustc demo      compile and run a larger sample (fib, gcd, loops)
+rustc conform   compile and run the language conformance program
+selftest        run the in-kernel test suite
 rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
@@ -251,6 +265,10 @@ Deliberate, not overlooked:
   that large.
 - **`lookup_as` uses `Arc::from_raw` after an `Any` check.** Sound, but it wants
   `Arc::downcast` once that's usable through the `Resource` trait object.
+- **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
+  so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
+  not a strict subset, and it is what the roadmap's differential testing against
+  real rustc would flag first.
 - **The compiler's subset is `i64`-only.** No structs, arrays, references,
   generics, traits, or borrow checking — a program is functions over integers
   plus formatted printing. Division by zero follows RISC-V semantics (`-1`,

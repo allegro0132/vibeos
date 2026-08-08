@@ -9,12 +9,12 @@ use alloc::vec::Vec;
 use crate::cap::{CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
-use crate::heap::HEAP;
+use crate::HEAP;
 use crate::world::{world, Reading, Space};
 use crate::{exec, println, sbi, tty, uart};
 
 pub async fn shell_task(boot_time: u64) {
-    println!("\ntype `help` for commands, `quiet` to mute background components.\n");
+    println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
     loop {
         tty::prompt("vibe> ");
         if let Some(line) = read_line().await {
@@ -59,8 +59,10 @@ async fn run(line: &str, boot_time: u64) {
             println!("  revoke <space>  pull a component's authority at runtime");
             println!("  rustc hello     compile and run a Rust hello world, natively");
             println!("  rustc demo      compile and run a larger sample (fib, gcd, loops)");
+            println!("  rustc conform   compile and run the language conformance program");
             println!("  rustc edit      type your own program; end it with a lone `.`");
             println!("  chan            telemetry channel depth and totals");
+            println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
             println!("  uptime          seconds since boot");
@@ -137,6 +139,7 @@ async fn run(line: &str, boot_time: u64) {
             let src = match rest.first().copied() {
                 Some("hello") | None => String::from(crate::rustc::HELLO_SRC),
                 Some("demo") => String::from(crate::rustc::DEMO_SRC),
+                Some("conform") => String::from(crate::rustc::CONFORM_SRC),
                 Some("edit") => match read_source().await {
                     Some(s) => s,
                     None => {
@@ -145,7 +148,7 @@ async fn run(line: &str, boot_time: u64) {
                     }
                 },
                 Some(other) => {
-                    println!("  usage: rustc [hello|demo|edit] (got `{}`)", other);
+                    println!("  usage: rustc [hello|demo|conform|edit] (got `{}`)", other);
                     return;
                 }
             };
@@ -162,6 +165,16 @@ async fn run(line: &str, boot_time: u64) {
                     println!("  telemetry  sent={} recv={} queued={}", sent, recv, depth);
                 }
                 Err(e) => println!("  refused: {}", e),
+            }
+        }
+
+        "selftest" => {
+            let r = crate::selftest::run().await;
+            // CI greps for this line, so keep the wording stable.
+            if r.failed == 0 {
+                println!("  SELFTEST OK ({} checks)", r.passed);
+            } else {
+                println!("  SELFTEST FAILED ({} of {})", r.failed, r.passed + r.failed);
             }
         }
 

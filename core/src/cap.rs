@@ -42,6 +42,14 @@ impl Rights {
     }
 }
 
+/// Renders as the same `rwsvgx` string as `Display`, so a failed assertion in a
+/// test names the rights instead of a bitmask.
+impl fmt::Debug for Rights {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 impl fmt::Display for Rights {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const NAMES: [(Rights, char); 6] = [

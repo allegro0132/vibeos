@@ -7,8 +7,8 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::ast::*;
-use super::lex::{Tok, Token};
+use crate::ast::*;
+use crate::lex::{Tok, Token};
 
 pub struct Parser {
     toks: Vec<Token>,
@@ -63,18 +63,32 @@ impl Parser {
             Tok::Str(_) => "a string literal".to_string(),
             Tok::Macro(m) => format!("`{}!`", m),
             Tok::Punct(p) => format!("`{}`", p),
-            t => format!("`{:?}`", t),
+            // Keywords must render as they are written, not as their Debug name:
+            // "found `Fn`" is not a token the user typed.
+            Tok::Fn => "`fn`".to_string(),
+            Tok::Let => "`let`".to_string(),
+            Tok::Mut => "`mut`".to_string(),
+            Tok::If => "`if`".to_string(),
+            Tok::Else => "`else`".to_string(),
+            Tok::While => "`while`".to_string(),
+            Tok::Return => "`return`".to_string(),
+            Tok::I64 => "`i64`".to_string(),
         }
     }
 
+    // Note: `bump` deliberately does not advance past `Eof`, so nothing here may
+    // undo a bump by decrementing `pos` -- at end of input that walks backwards
+    // onto the previous token and blames it for the error. Peek, then commit.
     fn ident(&mut self) -> PResult<String> {
-        match self.bump() {
-            Tok::Ident(s) => Ok(s),
-            _ => {
-                self.pos -= 1;
-                Err(format!("line {}: expected an identifier, found {}", self.line(), self.describe()))
-            }
-        }
+        let Tok::Ident(s) = self.peek().clone() else {
+            return Err(format!(
+                "line {}: expected an identifier, found {}",
+                self.line(),
+                self.describe()
+            ));
+        };
+        self.bump();
+        Ok(s)
     }
 
     pub fn program(&mut self) -> PResult<Program> {
@@ -90,10 +104,10 @@ impl Parser {
 
     fn func(&mut self) -> PResult<Func> {
         let line = self.line();
-        if !matches!(self.bump(), Tok::Fn) {
-            self.pos -= 1;
+        if !matches!(self.peek(), Tok::Fn) {
             return Err(format!("line {}: expected `fn`, found {}", line, self.describe()));
         }
+        self.bump();
         let name = self.ident()?;
         self.expect("(")?;
         let mut params = Vec::new();
@@ -195,6 +209,14 @@ impl Parser {
                 _ => {
                     let e = self.expr()?;
                     if self.eat(";") {
+                        stmts.push(Stmt::Expr(e));
+                    } else if matches!(e, Expr::If(..))
+                        && !matches!(self.peek(), Tok::Punct("}"))
+                    {
+                        // As in real Rust: a block-like expression in statement
+                        // position takes no semicolon. Without this, an `if`
+                        // parses only as a block's final expression, so any `if`
+                        // followed by more statements is a syntax error.
                         stmts.push(Stmt::Expr(e));
                     } else {
                         self.expect("}")?;

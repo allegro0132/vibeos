@@ -1,0 +1,37 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> spaces
+  guest    1 caps
+  init     6 caps
+  logger   2 caps
+  prog     1 caps
+  sensor   1 caps
+vibe> caps init
+  HANDLE       KIND      RIGHTS   OBJECT
+  cap:0.0      console   rwsvgx   ns16550a @ 0xADDR [0 bytes out]
+  cap:1.0      endpoint  rwsvgx   telemetry [0/8 sent=0 recv=0]
+  cap:2.0      cspace    r----x   guest [1 caps]
+  cap:3.0      cspace    r----x   prog [1 caps]
+  cap:4.0      cspace    r-----   sensor [1 caps]
+  cap:5.0      cspace    r-----   logger [2 caps]
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> caps logger
+  HANDLE       KIND      RIGHTS   OBJECT
+  cap:0.0      endpoint  ---v--   telemetry [0/8 sent=1 recv=1]
+  cap:1.0      console   -w----   ns16550a @ 0xADDR [31 bytes out]
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> caps sensor
+  HANDLE       KIND      RIGHTS   OBJECT
+  cap:0.0      endpoint  --s---   telemetry [0/8 sent=1 recv=1]
+  rights: r=read w=write s=send v=recv g=grant x=revoke
+vibe> probe
+  REFUSED  sensor tries to RECV on the channel it publishes to
+           reason: insufficient rights
+  REFUSED  logger tries to SEND a forged reading
+           reason: insufficient rights
+  REFUSED  logger tries to hand its console cap to a third party
+           reason: insufficient rights
+  REFUSED  a WRITE|GRANT console cap tries to derive REVOKE for itself
+           reason: rights amplification refused
+vibe> 

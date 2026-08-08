@@ -5,9 +5,15 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
+> **M1 status:** landed, except 1.8/1.9 (cross-space revocation) and 1.10 (the
+> `wfi` race). 96 host tests, 37 in-kernel checks, 5 golden transcripts, CI on
+> every push. See [TESTING.md](../TESTING.md).
+
 ## 0. The one thing to fix first
 
-**VibeOS has zero automated tests.** Every claim in this repository — the four
+*(Written before M1. Kept as the rationale.)*
+
+**VibeOS had zero automated tests.** Every claim in this repository — the four
 capability refusals, the compiler's output, the scheduler's wake semantics — was
 verified by a human reading QEMU output once. Two real bugs (the dropped self-wake,
 the missing `running` task in `ps`) reached `main` and were caught by eye.
@@ -55,23 +61,35 @@ hole it closes is closed better upstream by M2.
 
 | # | Work item | Notes |
 |---|---|---|
-| 1.1 | Split into three crates | `vibeos-core` (no_std lib: cap, chan, exec, heap, sync), `vibeos-rustc` (no_std lib: the compiler), `vibeos-kernel` (bin). |
-| 1.1a | Extract an `arch` shim | `cap`, `chan`, and the compiler are already pure and will build for the host as-is. `sync`, `heap`, and `exec` are not: they contain RISC-V `csr`/`wfi` inline asm. Put interrupt enable/disable, `wfi`, and `rdtime` behind a small trait with a no-op host implementation. Without this, the most bug-prone code in the tree (the scheduler) stays untestable off-target. |
-| 1.2 | Host unit tests for `cap` | Attenuation, cascading revoke, generation staleness, `WrongType`, every `CapError` variant. This is the security core; it should have the densest tests in the tree. |
-| 1.3 | Host unit tests for `lex`/`parse` | Golden ASTs, and every diagnostic string asserted — error messages are a UI. |
-| 1.4 | Host unit tests for the instruction encoders | Encode each instruction and compare against known-good words. Cheap, and catches the class of bug that is a privilege escalation. |
-| 1.5 | In-kernel test runner | `selftest` shell command plus a `--test` boot mode that runs assertions and exits via SBI with a nonzero code on failure. This is what CI drives. |
-| 1.6 | QEMU integration harness | A script that boots, feeds stdin, captures output, strips `\r`/ANSI, and diffs against expected. Every shell command gets a golden transcript. |
-| 1.7 | GitHub Actions CI | `cargo test` on host + QEMU integration on every push. No merge without green. |
+| 1.1 ✅ | Split into three crates | `vibeos-core` (no_std lib: cap, chan, exec, heap, sync), `vibeos-rustc` (no_std lib: the compiler), `vibeos-kernel` (bin). |
+| 1.1a ✅ | Extract an `arch` shim | `cap`, `chan`, and the compiler are already pure and will build for the host as-is. `sync`, `heap`, and `exec` are not: they contain RISC-V `csr`/`wfi` inline asm. Put interrupt enable/disable, `wfi`, and `rdtime` behind a small trait with a no-op host implementation. Without this, the most bug-prone code in the tree (the scheduler) stays untestable off-target. |
+| 1.2 ✅ | Host unit tests for `cap` | Attenuation, cascading revoke, generation staleness, `WrongType`, every `CapError` variant. This is the security core; it should have the densest tests in the tree. |
+| 1.3 ✅ | Host unit tests for `lex`/`parse` | Golden ASTs, and every diagnostic string asserted — error messages are a UI. |
+| 1.4 ✅ | Host unit tests for the instruction encoders | Encode each instruction and compare against known-good words. Cheap, and catches the class of bug that is a privilege escalation. |
+| 1.5 ✅ | In-kernel test runner | `selftest` shell command plus a `--test` boot mode that runs assertions and exits via SBI with a nonzero code on failure. This is what CI drives. |
+| 1.6 ✅ | QEMU integration harness | A script that boots, feeds stdin, captures output, strips `\r`/ANSI, and diffs against expected. Every shell command gets a golden transcript. |
+| 1.7 ✅ | GitHub Actions CI | `cargo test` on host + QEMU integration on every push. No merge without green. |
 | 1.8 | **Cross-space revocation** | Replace the intra-space `parent: Option<u32>` with a global derivation tree keyed by a monotone `DerivationId`. Revoking any cap kills every descendant in every space. Blueprint §3 "what is not yet true". |
 | 1.9 | Make generation wrap unreachable | `u64` generations, or refuse to reuse a slot that has wrapped. |
 | 1.10 | Fix the `wfi` wake race | Make "check ready queue" and "sleep" atomic w.r.t. interrupts, so the 50 ms heartbeat is a heartbeat rather than a correctness crutch. |
 
 **Acceptance:**
-- `cargo test` runs on the host with no QEMU and covers cap/lex/parse/encode.
-- CI fails when a deliberate one-word change to an instruction encoder is introduced.
-- `revoke` on a cap granted into another space kills the copy; a test proves it.
-- The heartbeat can be raised to 10 s with no change in observable latency.
+- ✅ `cargo test` runs on the host with no QEMU and covers cap/lex/parse/encode.
+- ✅ CI fails on a deliberate one-word change to an encoder. Ten mutations were
+  verified to be caught; the one that is *not* caught by host tests — a wrong
+  frame offset — is caught by the QEMU conformance run, and that asymmetry is
+  documented in TESTING.md as the reason both layers exist.
+- ⬜ `revoke` on a cap granted into another space kills the copy. Currently
+  documented by `known_gap_cross_space_revoke_does_not_cascade`, which is written
+  to fail when 1.8 lands.
+- ⬜ The heartbeat can be raised to 10 s with no change in observable latency.
+
+**Found by the tests as they were written** (all fixed in the same commit):
+- An `if` statement anywhere but last in a block failed to parse. The demo only
+  worked because its `if` happened to be final.
+- `bump()` does not advance past `Eof`, so the `pos -= 1` backtrack in `ident()`
+  walked onto the *previous* token and blamed it for the error.
+- Keywords rendered in diagnostics via `Debug`: "expected identifier, found `Fn`".
 
 **Risk:** the crate split touches every file. Do it first, in one commit, before the
 tree grows further. The `arch` shim is the part likely to be under-scoped — the

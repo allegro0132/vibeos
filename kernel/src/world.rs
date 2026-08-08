@@ -16,12 +16,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::cap::{self, CSpace, Cap, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
-use crate::heap::{self, OwnerId};
+use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::sync::SpinLock;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
-pub const SHELL_MEMORY_BUDGET: usize = 256 * 1024;
+// The interactive compiler's conform program now charges its future envelope
+// and every transient AST/code buffer to the shell owner. Keep enough headroom
+// for that audited workload while retaining a hard component quota.
+pub const SHELL_MEMORY_BUDGET: usize = 512 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ComponentId(u64);
@@ -56,21 +59,92 @@ pub struct MemoryAccount {
 pub struct Component {
     id: ComponentId,
     name: String,
+    cspace: String,
+    space: Arc<Space>,
+    template: Option<ComponentTemplate>,
     instance: SpinLock<ComponentInstance>,
     memory_owner: OwnerId,
+    memory_budget: usize,
 }
 
 struct ComponentInstance {
     generation: u64,
     task: exec::TaskHandle,
-    space: Arc<Space>,
-    cspace: String,
+}
+
+/// The only component programs admitted to restart supervision. Keeping this
+/// list sealed is part of the fault-arena safety argument: these tasks pass
+/// only pointer-free messages, never publish component-owned allocations, and
+/// register only against SYSTEM-owned endpoints or the global timer registry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ComponentTemplate {
+    Sensor,
+    Logger,
+    Guest,
+    FaultProbe,
+}
+
+enum ComponentGrants {
+    Sensor(Cap),
+    Logger { rx: Cap, console: Cap },
+    Guest(Cap),
+    FaultProbe,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RestartError {
+    NotFound,
+    NotRestartable,
+    StillRunning,
+    GenerationExhausted,
+}
+
+impl fmt::Display for RestartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "no such component",
+            Self::NotRestartable => "component has no audited restart template",
+            Self::StillRunning => "component is still running; cancel it first",
+            Self::GenerationExhausted => "component generation space exhausted",
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RestartReport {
+    pub component: ComponentId,
+    pub old_generation: u64,
+    pub new_generation: u64,
+    pub old_task: exec::TaskId,
+    pub new_task: exec::TaskId,
+    pub retired_caps: usize,
+}
+
+/// Non-owning access used only by the sealed component templates. `Component`
+/// and the boot-static World route retain the `Arc<Space>` until the task is
+/// terminal, so a fault cannot strand an extra strong reference each cycle.
+#[derive(Clone, Copy)]
+struct SpaceRef(*const Space);
+
+unsafe impl Send for SpaceRef {}
+
+impl SpaceRef {
+    fn new(space: &Arc<Space>) -> Self {
+        Self(Arc::as_ptr(space))
+    }
+
+    fn get(self) -> &'static Space {
+        // Safety: SpaceRef is constructed only for a supervised task, and the
+        // Component's stable Arc outlives every incarnation of that task.
+        unsafe { &*self.0 }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ComponentSnapshot {
     pub id: ComponentId,
     pub generation: u64,
+    pub arena: ArenaId,
     pub name: String,
     pub task_id: exec::TaskId,
     pub cspace: String,
@@ -83,14 +157,14 @@ pub struct ComponentSnapshot {
 impl Component {
     pub fn snapshot(&self) -> ComponentSnapshot {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let (generation, task_id, state, polls, cspace) = {
+        let (generation, arena, task_id, state, polls) = {
             let instance = self.instance.lock();
             (
                 instance.generation,
+                instance.task.arena(),
                 instance.task.id(),
                 instance.task.state(),
                 instance.task.polls(),
-                instance.cspace.clone(),
             )
         };
         let account = HEAP
@@ -100,9 +174,10 @@ impl Component {
         let snapshot = ComponentSnapshot {
             id: self.id,
             generation,
+            arena,
             name: self.name.clone(),
             task_id,
-            cspace,
+            cspace: self.cspace.clone(),
             state,
             terminal_reason: state.terminal_reason(),
             polls,
@@ -123,7 +198,7 @@ impl Component {
     }
 
     pub fn space(&self) -> Arc<Space> {
-        self.instance.lock().space.clone()
+        self.space.clone()
     }
 
     /// Cooperatively stop the current task incarnation without conflating
@@ -176,6 +251,20 @@ pub struct Reading {
     pub millicelsius: i32,
 }
 
+static FAULT_PROBE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+struct FaultProbeDrop;
+
+impl Drop for FaultProbeDrop {
+    fn drop(&mut self) {
+        FAULT_PROBE_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn fault_probe_drop_count() -> u64 {
+    FAULT_PROBE_DROPS.load(Ordering::SeqCst)
+}
+
 pub struct World {
     pub spaces: BTreeMap<&'static str, Arc<Space>>,
     components: SpinLock<BTreeMap<ComponentId, Arc<Component>>>,
@@ -199,6 +288,17 @@ impl World {
         name: &str,
         space: Arc<Space>,
         memory_budget: usize,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> Arc<Component> {
+        self.spawn_component_inner(name, space, memory_budget, None, fut)
+    }
+
+    fn spawn_component_inner(
+        &self,
+        name: &str,
+        space: Arc<Space>,
+        memory_budget: usize,
+        template: Option<ComponentTemplate>,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> Arc<Component> {
         assert!(
@@ -227,17 +327,36 @@ impl World {
         HEAP.register_owner(memory_owner, memory_budget)
             .expect("a fresh component allocation owner must register");
         let cspace = space.0.lock().name.clone();
-        let task = exec::spawn_tracked_owned(memory_owner, name, fut);
+        let task = match template {
+            Some(_) => {
+                let arena = HEAP
+                    .create_arena(memory_owner)
+                    .expect("a fresh component arena must register");
+                // Safety: only sealed ComponentTemplate futures enter tracked
+                // arenas. Their IPC payloads are pointer-free and no owning
+                // reference into the arena is published to SYSTEM or a peer.
+                unsafe {
+                    exec::spawn_reclaimable_owned(
+                        AllocationDomain::new(memory_owner, arena),
+                        name,
+                        fut,
+                    )
+                }
+            }
+            None => exec::spawn_tracked_owned(memory_owner, name, fut),
+        };
         let component = Arc::new(Component {
             id,
             name: String::from(name),
+            cspace,
+            space,
+            template,
             instance: SpinLock::new(ComponentInstance {
                 generation: 1,
                 task,
-                space,
-                cspace,
             }),
             memory_owner,
+            memory_budget,
         });
         let mut components = self.components.lock();
         // There is no yield between the two checks on the single-hart executor,
@@ -249,9 +368,132 @@ impl World {
         component
     }
 
-    /// Remove a terminal test/supervisor record. Normal owners are unregistered
-    /// only after Drop returned their account to zero; fault owners remain
-    /// registered until M3.12 performs incarnation-wide raw reclamation.
+    fn grant_template(&self, template: ComponentTemplate, space: &Arc<Space>) -> ComponentGrants {
+        let init = self.spaces["init"].clone();
+        let init = init.0.lock();
+        let mut target = space.0.lock();
+        match template {
+            ComponentTemplate::Sensor => ComponentGrants::Sensor(
+                cap::grant(&init, self.telemetry, Rights::SEND, &mut target)
+                    .expect("init retains the telemetry grant root"),
+            ),
+            ComponentTemplate::Logger => ComponentGrants::Logger {
+                rx: cap::grant(&init, self.telemetry, Rights::RECV, &mut target)
+                    .expect("init retains the telemetry grant root"),
+                console: cap::grant(&init, self.console, Rights::WRITE, &mut target)
+                    .expect("init retains the console grant root"),
+            },
+            ComponentTemplate::Guest => ComponentGrants::Guest(
+                cap::grant(&init, self.console, Rights::WRITE, &mut target)
+                    .expect("init retains the console grant root"),
+            ),
+            ComponentTemplate::FaultProbe => ComponentGrants::FaultProbe,
+        }
+    }
+
+    fn spawn_template_task(
+        &self,
+        component: &Component,
+        template: ComponentTemplate,
+    ) -> exec::TaskHandle {
+        let grants = self.grant_template(template, &component.space);
+        let space = SpaceRef::new(&component.space);
+        let arena = HEAP
+            .create_arena(component.memory_owner)
+            .expect("a restarted component needs a fresh arena");
+        let domain = AllocationDomain::new(component.memory_owner, arena);
+        match grants {
+            // Safety: this match is the sealed audited factory. Reading is POD;
+            // none of these tasks exports arena-backed Vec/Box/Arc payloads.
+            ComponentGrants::Sensor(tx) => unsafe {
+                exec::spawn_reclaimable_owned(domain, &component.name, sensor_task(space, tx))
+            },
+            ComponentGrants::Logger { rx, console } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    logger_task(space, rx, console),
+                )
+            },
+            ComponentGrants::Guest(console) => unsafe {
+                exec::spawn_reclaimable_owned(domain, &component.name, guest_task(space, console))
+            },
+            ComponentGrants::FaultProbe => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    fault_probe_task(space, component.memory_budget),
+                )
+            },
+        }
+    }
+
+    pub(crate) fn spawn_fault_probe(
+        &self,
+        name: &'static str,
+        memory_budget: usize,
+    ) -> Arc<Component> {
+        let space = Space::new(name);
+        self.spawn_component_inner(
+            name,
+            space.clone(),
+            memory_budget,
+            Some(ComponentTemplate::FaultProbe),
+            fault_probe_task(SpaceRef::new(&space), memory_budget),
+        )
+    }
+
+    /// Replace a terminal task incarnation while retaining stable component,
+    /// memory-owner, Space, and supervisor-route identities.
+    pub fn restart_component(&self, name: &str) -> Result<RestartReport, RestartError> {
+        let component = self.component_named(name).ok_or(RestartError::NotFound)?;
+        let template = component.template.ok_or(RestartError::NotRestartable)?;
+        let before = component.snapshot();
+        if before.state == exec::TaskState::Running {
+            return Err(RestartError::StillRunning);
+        }
+        let new_generation = before
+            .generation
+            .checked_add(1)
+            .ok_or(RestartError::GenerationExhausted)?;
+
+        match before.state {
+            exec::TaskState::Exited | exec::TaskState::Cancelled => HEAP
+                .close_empty_arena(before.arena)
+                .expect("a normally terminated audited arena must be empty"),
+            exec::TaskState::Faulted => {
+                debug_assert!(HEAP.arena_stats(before.arena).is_none());
+            }
+            exec::TaskState::Running => unreachable!(),
+        }
+
+        // `reset` retires every old derivation while preserving incremented
+        // slot generations. A stale cap therefore cannot alias a fresh grant
+        // even though the stable Space wrapper is reused. Fault teardown has
+        // already recovered any abandoned guard before publishing Faulted.
+        let retired_caps = component.space.0.lock().reset();
+        let task = self.spawn_template_task(&component, template);
+        let new_task = task.id();
+
+        let mut instance = component.instance.lock();
+        debug_assert_eq!(instance.generation, before.generation);
+        debug_assert_eq!(instance.task.id(), before.task_id);
+        instance.generation = new_generation;
+        instance.task = task;
+        drop(instance);
+
+        Ok(RestartReport {
+            component: before.id,
+            old_generation: before.generation,
+            new_generation,
+            old_task: before.task_id,
+            new_task,
+            retired_caps,
+        })
+    }
+
+    /// Remove a terminal test/supervisor record once its allocation domain is
+    /// empty (normal Drop) or has been raw-reclaimed (audited fault arena).
     pub(crate) fn remove_terminal_component(&self, id: ComponentId) -> bool {
         let component = self.components.lock().get(&id).cloned();
         let Some(component) = component else {
@@ -272,10 +514,27 @@ impl World {
         if normal && snapshot.memory.live_bytes != 0 {
             return false;
         }
-        if normal {
-            HEAP.unregister_owner(component.memory_owner())
-                .expect("a normally terminated component must have no live allocations");
+        let reclaimed_fault = snapshot.state == exec::TaskState::Faulted
+            && snapshot.arena.is_tracked()
+            && HEAP.arena_stats(snapshot.arena).is_none()
+            && snapshot.memory.live_bytes == 0;
+        if !(normal || reclaimed_fault) {
+            // An ordinary untracked fault is intentionally leaked. Keep its
+            // owner record observable instead of silently consuming an owner
+            // slot that can never be unregistered soundly.
+            return false;
         }
+        if normal && snapshot.arena.is_tracked() {
+            HEAP.close_empty_arena(snapshot.arena)
+                .expect("a normal terminal arena must be empty");
+        }
+        if reclaimed_fault {
+            // Fault teardown recovered the abandoned guard before publishing
+            // Faulted; this safe lifecycle operation only consumes that state.
+            component.space.0.lock().reset();
+        }
+        HEAP.unregister_owner(component.memory_owner())
+            .expect("a reaped component must have no live allocation domain");
         self.components.lock().remove(&id).is_some()
     }
 
@@ -300,6 +559,47 @@ impl World {
         self.components()
             .into_iter()
             .find(|component| component.name == name)
+    }
+
+    /// Recover the stable CSpace lock abandoned by one audited fault domain.
+    ///
+    /// This is deliberately part of the executor's pre-publication teardown,
+    /// rather than `restart_component` or removal. A safe lifecycle caller may
+    /// itself hold a Space guard; letting it force-unlock that guard would
+    /// create overlapping mutable access. At this boundary the faulting task
+    /// is permanently detached and no supervisor can observe `Faulted` yet.
+    ///
+    /// # Safety
+    ///
+    /// `domain` must be the tracked domain currently being torn down by the
+    /// single-hart executor, after every task in it has become unable to resume
+    /// and before its terminal state is published.
+    pub(crate) unsafe fn recover_faulted_domain(&self, domain: AllocationDomain) {
+        assert!(
+            domain.arena.is_tracked(),
+            "only a tracked component domain can abandon its CSpace lock"
+        );
+
+        // Iterate the registry in place: this callback runs at the raw fault
+        // boundary and must not allocate or clone the component collection.
+        let components = self.components.lock();
+        let mut recovered = false;
+        for component in components.values() {
+            if component.memory_owner != domain.owner {
+                continue;
+            }
+            let owns_domain = component.instance.lock().task.allocation_domain() == domain;
+            if !owns_domain {
+                continue;
+            }
+            assert!(!recovered, "an allocation domain must identify one component");
+            // Safety: the exact current incarnation was found above, and the
+            // executor contract supplied by this method's caller makes it
+            // terminal before this direct lock-state recovery.
+            let _ = unsafe { component.space.0.recover_after_fault(domain) };
+            recovered = true;
+        }
+        assert!(recovered, "faulted allocation domain has no component owner");
     }
 }
 
@@ -375,23 +675,26 @@ pub fn build() {
 
     // Components are *handed* their handles at spawn. That is their whole
     // authority — there is no other way for them to reach anything.
-    world.spawn_component(
+    world.spawn_component_inner(
         "sensor",
         sensor.clone(),
         BACKGROUND_MEMORY_BUDGET,
-        sensor_task(sensor, sensor_tx),
+        Some(ComponentTemplate::Sensor),
+        sensor_task(SpaceRef::new(&sensor), sensor_tx),
     );
-    world.spawn_component(
+    world.spawn_component_inner(
         "logger",
         logger.clone(),
         BACKGROUND_MEMORY_BUDGET,
-        logger_task(logger, logger_rx, logger_con),
+        Some(ComponentTemplate::Logger),
+        logger_task(SpaceRef::new(&logger), logger_rx, logger_con),
     );
-    world.spawn_component(
+    world.spawn_component_inner(
         "guest",
         guest.clone(),
         BACKGROUND_MEMORY_BUDGET,
-        guest_task(guest, guest_con),
+        Some(ComponentTemplate::Guest),
+        guest_task(SpaceRef::new(&guest), guest_con),
     );
 
     *WORLD.lock() = Some(world);
@@ -399,12 +702,13 @@ pub fn build() {
 
 /// Samples a (fake) thermometer and publishes it. Holds SEND and nothing else —
 /// asking the very same endpoint for RECV is refused.
-async fn sensor_task(space: Arc<Space>, tx: Cap) {
+async fn sensor_task(space: SpaceRef, tx: Cap) {
     let mut seq = 0u64;
     loop {
         exec::sleep_ms(3000).await;
         seq += 1;
         let ep = match space
+            .get()
             .0
             .lock()
             .lookup_as::<Endpoint<Reading>>(tx, Rights::SEND)
@@ -425,10 +729,10 @@ async fn sensor_task(space: Arc<Space>, tx: Cap) {
 
 /// Consumes telemetry and renders it. Holds RECV on the channel and WRITE on
 /// the console — it cannot inject fake readings, because it has no SEND.
-async fn logger_task(space: Arc<Space>, rx: Cap, con: Cap) {
+async fn logger_task(space: SpaceRef, rx: Cap, con: Cap) {
     loop {
         let resolved = {
-            let cs = space.0.lock();
+            let cs = space.get().0.lock();
             match (
                 cs.lookup_as::<Endpoint<Reading>>(rx, Rights::RECV),
                 cs.lookup_as::<ConsoleDev>(con, Rights::WRITE),
@@ -454,12 +758,16 @@ async fn logger_task(space: Arc<Space>, rx: Cap, con: Cap) {
 /// A component whose authority the operator can pull at runtime. Run
 /// `revoke guest` in the shell and watch this task start failing — with no
 /// change to its code, no signal, and no restart.
-async fn guest_task(space: Arc<Space>, con: Cap) {
+async fn guest_task(space: SpaceRef, con: Cap) {
     let mut n = 0u64;
     loop {
         exec::sleep_ms(9000).await;
         n += 1;
-        let resolved = space.0.lock().lookup_as::<ConsoleDev>(con, Rights::WRITE);
+        let resolved = space
+            .get()
+            .0
+            .lock()
+            .lookup_as::<ConsoleDev>(con, Rights::WRITE);
         match resolved {
             Ok(console) => console.write_bg(&format!("[guest]  heartbeat {}\n", n)),
             Err(e) => {
@@ -468,4 +776,16 @@ async fn guest_task(space: Arc<Space>, con: Cap) {
             }
         }
     }
+}
+
+/// Audited target-only probe for M3.12. It leaves a live Vec and a destructor
+/// bomb behind, then quota-faults while holding the generation's CSpace lock.
+/// Restart must recover the lock and raw-reclaim the arena without running Drop.
+async fn fault_probe_task(space: SpaceRef, memory_budget: usize) {
+    let _must_not_drop = FaultProbeDrop;
+    let mut held = Vec::new();
+    held.resize(512, 0xA5);
+    let _abandoned_cspace = space.get().0.lock();
+    held.resize(memory_budget.saturating_mul(2), 0x5A);
+    panic!("fault probe unexpectedly stayed within its allocation quota");
 }

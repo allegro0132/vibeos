@@ -6,8 +6,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 through 3.11 complete. The current baseline is 182 host tests,
-> 101 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
+> M3.5 is under way with 3.8 through 3.12 complete. The current baseline is 199 host tests,
+> 307 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
 > differential oracle). See
 > [TESTING.md](../TESTING.md).
 
@@ -18,8 +18,8 @@ algebra, cross-space revocation, scheduler edge cases, compiler front end, emitt
 instruction surface, and native execution paths all have automated coverage. The
 remaining risk is no longer dominated by missing syntax. It is dominated by the gap
 between **authority** and **lifecycle**: a space can be revoked and its task can now be
-cooperatively cancelled with owned wait/timer registrations and a bounded tagged heap account,
-but fault reclamation and restart are not yet lifecycle-safe.
+cooperatively cancelled with owned wait/timer registrations and a bounded tagged heap account;
+audited components now also have bounded fault reclamation and fresh-grant restart.
 
 The revised priority order is:
 
@@ -256,7 +256,7 @@ units before adding persistence or more concurrency.
 | 3.9 ✅ | Add cooperative task cancellation and join/exit reporting | Cancelling a parked, ready, and self-waking task works; each is polled no more after cancellation. |
 | 3.10 ✅ | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
 | 3.11 ✅ | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit drops its tagged allocations back to the account baseline. |
-| 3.12 | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
+| 3.12 ✅ | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
 | 3.13 | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
 | 3.14 | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
 | 3.15 | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
@@ -290,9 +290,9 @@ hardware, and the IRQ path pops due entries without allocating. Wakers are invok
 and released outside registry locks; spawn pre-reserves the ready queue to the
 live-task upper bound, so those IRQ wakes do not grow it. Stress tests cancel
 hundreds of parked tasks and sleepers and require both registries to return to
-baseline. A task interrupted
-mid-poll by a fault is still leaked without Drop; incarnation-wide fault cleanup is
-the explicit 3.12 boundary.
+baseline. A task interrupted mid-poll is never dropped. Ordinary tasks remain
+conservatively leaked; audited World tasks are reclaimed only after incarnation-wide
+registration cleanup and quiescence.
 
 3.11 tags every allocation with its original owner, so cross-component and IRQ
 deallocation cannot debit whichever task happens to be running. The executor installs
@@ -300,9 +300,19 @@ the component owner only while polling or destroying its future; scheduler, chan
 timer, wait, capability, and TTY storage use the SYSTEM domain. A quota refusal records
 the denial and faults only that component. A normal return or cancellation runs Drop
 and returns live use to baseline, after which the temporary owner account can be
-unregistered. Faulted futures and their still-live tagged blocks remain deliberately
-owned and leaked until 3.12 can reclaim an incarnation without running destructors
-across `longjmp`.
+unregistered. Faulted allocations remain owned until the 3.12 arena boundary either
+observes normal Drop returning them or raw-reclaims a faulted incarnation without
+running destructors across `longjmp`.
+
+3.12 keeps the stable `ComponentId`, allocator owner, and `Space` object while every
+restart installs a new generation, `TaskId`, `ArenaId`, and explicitly granted CSpace.
+CSpace reset retains slot generations, preventing stale handles from aliasing new grants.
+The raw path is deliberately sealed: registration targets must be SYSTEM/supervisor
+stable, messages may not carry arena-backed ownership across the boundary, and only
+the audited World factory can opt a task into reclamation. Host tests cover sibling
+teardown, nested cancellation, recursive-executor rejection, registry cleanup, and
+domain-tagged lock recovery. The target self-test performs sixteen real quota-fault /
+restart cycles, observes no destructor calls, and requires heap use to plateau.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and
@@ -455,7 +465,7 @@ toolchain revision, build profile, sample count, and distribution (not only a mi
 | A codegen bug is a privilege escalation, and the emitter is unverified | **High** | 2.5 differential testing, 2.7 emitter audit, 3.5 SSA IR to narrow the surface |
 | Authority revocation is mistaken for task termination | **High** | M3.5 supervised `Component`, explicit cancellation states, end-to-end revoke/cancel/restart test |
 | A resolved object outlives the cap that authorized it | **High** | 3.16 explicit lease semantics; operation-time revalidation for revocable devices; no “immediate” claim for raw memory without enforcement |
-| Faulted tasks leak heap and may retain registrations until a later event | **High** | 3.12 owned fault arenas and incarnation-wide teardown; cancellation-safe wait/timer Drop is complete in 3.10 |
+| Ordinary faulted tasks leak heap | **Medium** | 3.12 reclaims only sealed World arenas after incarnation-wide teardown; generic tasks retain the sound conservative leak policy until they gain an equivalent no-escape contract |
 | Bet 2's cheap-IPC claim goes unmeasured and turns out false | High | §5 metrics in M3.5, before optimizing or scaling the design |
 | The single-hart executor design does not survive M5 | Medium | Treat 5.1 as a redesign, not a port; write the model check first |
 | Language features outrun confinement | Medium | M2 strictly before M3; no new syntax without an abort path |

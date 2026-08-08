@@ -1,9 +1,18 @@
 quiet
 @sleep 2
+revoke guest
 cancel guest
 ps
 caps guest
+restart guest
+@sleep 1
+ps
+caps guest
+restart guest
 cancel guest
+restart shell
+restart
+restart missing
 cancel shell
 cancel
 cancel missing

@@ -10,6 +10,7 @@ use core::mem::{align_of, size_of};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arch;
 use crate::sync::SpinLock;
 
 const MIN_CLASS_SHIFT: usize = 4; // 16-byte minimum block
@@ -18,6 +19,11 @@ const MIN_CLASS_SIZE: usize = 1 << MIN_CLASS_SHIFT;
 // This also makes allocations above the old 64 KiB ceiling recyclable.
 const NUM_CLASSES: usize = usize::BITS as usize - MIN_CLASS_SHIFT;
 pub const MAX_OWNER_ACCOUNTS: usize = 64;
+/// Maximum number of simultaneously live reclaimable fault domains.
+///
+/// The table is fixed so creating or reclaiming an arena never recursively
+/// allocates allocator metadata. Slots are reused after close/reclaim.
+pub const MAX_ALLOCATION_ARENAS: usize = 64;
 const HEADER_MAGIC: u64 = 0x5649_4245_4f57_4e52; // "VIBEOWNR"
 const FREED_MAGIC: u64 = 0x4652_4545_4442_4c4b; // "FREEDBLK"
 
@@ -48,11 +54,71 @@ impl fmt::Display for OwnerId {
     }
 }
 
+/// One allocation incarnation within a stable owner account.
+///
+/// Arena zero is deliberately untracked: ordinary tasks retain the M3.11
+/// leak-on-fault behaviour until their escape boundaries have been audited.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[repr(transparent)]
+pub struct ArenaId(u64);
+
+impl ArenaId {
+    pub const UNTRACKED: Self = Self(0);
+
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_tracked(self) -> bool {
+        self.0 != 0
+    }
+}
+
+/// The complete ambient allocation identity installed while polling a task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AllocationDomain {
+    pub owner: OwnerId,
+    pub arena: ArenaId,
+}
+
+impl AllocationDomain {
+    pub const SYSTEM: Self = Self::untracked(OwnerId::SYSTEM);
+
+    pub const fn new(owner: OwnerId, arena: ArenaId) -> Self {
+        Self { owner, arena }
+    }
+
+    pub const fn untracked(owner: OwnerId) -> Self {
+        Self {
+            owner,
+            arena: ArenaId::UNTRACKED,
+        }
+    }
+}
+
 static CURRENT_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.0);
+static CURRENT_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.0);
 
 /// Allocation owner active on the single v0.1 hart.
 pub fn current_owner() -> OwnerId {
     OwnerId(CURRENT_OWNER.load(Ordering::SeqCst))
+}
+
+/// Allocation arena active on the single v0.1 hart.
+pub fn current_arena() -> ArenaId {
+    ArenaId(CURRENT_ARENA.load(Ordering::SeqCst))
+}
+
+/// Complete allocation identity active on the single v0.1 hart.
+pub fn current_domain() -> AllocationDomain {
+    AllocationDomain {
+        owner: current_owner(),
+        arena: current_arena(),
+    }
 }
 
 /// Enter an allocation-owner scope.
@@ -61,7 +127,27 @@ pub fn current_owner() -> OwnerId {
 /// so the executor must keep this value in its caller frame and invoke
 /// [`OwnerScope::restore`] explicitly after its landing pad returns.
 pub fn enter_owner(owner: OwnerId) -> OwnerScope {
-    let previous = OwnerId(CURRENT_OWNER.swap(owner.0, Ordering::SeqCst));
+    // Untracked allocations are never eligible for arena-wide raw reclaim.
+    unsafe { enter_domain(AllocationDomain::untracked(owner)) }
+}
+
+/// Enter a complete owner/arena allocation scope.
+///
+/// The pair is updated with interrupts masked so an IRQ cannot observe a torn
+/// identity and later restore an owner with the wrong incarnation.
+///
+/// # Safety
+/// For a tracked domain, `arena` must be active and registered to `owner`.
+/// Until this scope is restored, every allocation and executor registration
+/// must obey the arena's no-escape contract and use only non-panicking cleanup;
+/// otherwise a later raw fault reclaim can invalidate safe references or enter
+/// arbitrary user code. Prefer [`enter_owner`] for ordinary untracked work.
+pub unsafe fn enter_domain(domain: AllocationDomain) -> OwnerScope {
+    let irq = arch::irq_save();
+    let previous = current_domain();
+    CURRENT_OWNER.store(domain.owner.0, Ordering::SeqCst);
+    CURRENT_ARENA.store(domain.arena.0, Ordering::SeqCst);
+    arch::irq_restore(irq);
     OwnerScope {
         previous,
         active: true,
@@ -69,19 +155,26 @@ pub fn enter_owner(owner: OwnerId) -> OwnerScope {
 }
 
 pub struct OwnerScope {
-    previous: OwnerId,
+    previous: AllocationDomain,
     active: bool,
 }
 
 impl OwnerScope {
     pub const fn previous(&self) -> OwnerId {
+        self.previous.owner
+    }
+
+    pub const fn previous_domain(&self) -> AllocationDomain {
         self.previous
     }
 
     /// Restore now rather than waiting for Drop. This is idempotent.
     pub fn restore(&mut self) {
         if self.active {
-            CURRENT_OWNER.store(self.previous.0, Ordering::SeqCst);
+            let irq = arch::irq_save();
+            CURRENT_OWNER.store(self.previous.owner.0, Ordering::SeqCst);
+            CURRENT_ARENA.store(self.previous.arena.0, Ordering::SeqCst);
+            arch::irq_restore(irq);
             self.active = false;
         }
     }
@@ -115,12 +208,55 @@ pub enum OwnerError {
         live_bytes: usize,
         live_allocations: usize,
     },
+    ArenasActive {
+        active_arenas: usize,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ArenaStats {
+    pub arena: ArenaId,
+    pub owner: OwnerId,
+    pub live_bytes: usize,
+    pub live_allocations: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReclaimStats {
+    pub arena: ArenaId,
+    pub owner: OwnerId,
+    pub reclaimed_bytes: usize,
+    pub reclaimed_allocations: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArenaError {
+    UntrackedArenaReserved,
+    SystemOwnerReserved,
+    UnknownOwner,
+    UnknownArena,
+    TableFull,
+    ArenaIdExhausted,
+    ArenaBusy {
+        live_bytes: usize,
+        live_allocations: usize,
+    },
+    CorruptList,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AllocationFailure {
     UnknownOwner {
         owner: OwnerId,
+    },
+    UnknownArena {
+        owner: OwnerId,
+        arena: ArenaId,
+    },
+    ArenaOwnerMismatch {
+        owner: OwnerId,
+        arena: ArenaId,
+        arena_owner: OwnerId,
     },
     QuotaExceeded {
         owner: OwnerId,
@@ -145,6 +281,20 @@ impl fmt::Display for AllocationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::UnknownOwner { owner } => write!(f, "unregistered allocation owner {owner}"),
+            Self::UnknownArena { owner, arena } => write!(
+                f,
+                "unregistered allocation arena {} for {owner}",
+                arena.get()
+            ),
+            Self::ArenaOwnerMismatch {
+                owner,
+                arena,
+                arena_owner,
+            } => write!(
+                f,
+                "allocation arena {} belongs to {arena_owner}, not {owner}",
+                arena.get()
+            ),
             Self::QuotaExceeded {
                 owner,
                 requested_bytes,
@@ -228,8 +378,41 @@ struct FreeNode {
 struct AllocationHeader {
     magic: u64,
     owner: OwnerId,
+    arena: ArenaId,
     base: usize,
     class: usize,
+    arena_prev: Option<NonNull<AllocationHeader>>,
+    arena_next: Option<NonNull<AllocationHeader>>,
+}
+
+#[derive(Clone, Copy)]
+struct ArenaRecord {
+    arena: ArenaId,
+    owner: OwnerId,
+    head: Option<NonNull<AllocationHeader>>,
+    live_bytes: usize,
+    live_allocations: usize,
+    active: bool,
+}
+
+impl ArenaRecord {
+    const EMPTY: Self = Self {
+        arena: ArenaId::UNTRACKED,
+        owner: OwnerId::SYSTEM,
+        head: None,
+        live_bytes: 0,
+        live_allocations: 0,
+        active: false,
+    };
+
+    fn stats(self) -> ArenaStats {
+        ArenaStats {
+            arena: self.arena,
+            owner: self.owner,
+            live_bytes: self.live_bytes,
+            live_allocations: self.live_allocations,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -246,7 +429,9 @@ struct HeapInner {
     live_bytes: usize,
     peak_bytes: usize,
     owners: [OwnerAccount; MAX_OWNER_ACCOUNTS],
+    arenas: [ArenaRecord; MAX_ALLOCATION_ARENAS],
     next_owner_id: u64,
+    next_arena_id: u64,
     last_failure: Option<AllocationFailure>,
 }
 
@@ -265,7 +450,9 @@ impl Heap {
             live_bytes: 0,
             peak_bytes: 0,
             owners,
+            arenas: [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS],
             next_owner_id: 1,
+            next_arena_id: 1,
             last_failure: None,
         }))
     }
@@ -283,7 +470,9 @@ impl Heap {
         h.peak_bytes = 0;
         h.owners = [OwnerAccount::EMPTY; MAX_OWNER_ACCOUNTS];
         h.owners[0] = OwnerAccount::SYSTEM;
+        h.arenas = [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS];
         h.next_owner_id = 1;
+        h.next_arena_id = 1;
         h.last_failure = None;
     }
 
@@ -369,8 +558,172 @@ impl Heap {
                 live_allocations: account.live_allocations,
             });
         }
+        let active_arenas = h
+            .arenas
+            .iter()
+            .filter(|arena| arena.active && arena.owner == owner)
+            .count();
+        if active_arenas != 0 {
+            return Err(OwnerError::ArenasActive { active_arenas });
+        }
         h.owners[index] = OwnerAccount::EMPTY;
         Ok(())
+    }
+
+    /// Create a reclaimable allocation incarnation under an existing owner.
+    pub fn create_arena(&self, owner: OwnerId) -> Result<ArenaId, ArenaError> {
+        if owner == OwnerId::SYSTEM {
+            return Err(ArenaError::SystemOwnerReserved);
+        }
+        let mut h = self.0.lock();
+        if find_owner(&h, owner).is_none() {
+            return Err(ArenaError::UnknownOwner);
+        }
+        let Some(index) = h.arenas.iter().position(|arena| !arena.active) else {
+            return Err(ArenaError::TableFull);
+        };
+
+        let mut raw = h.next_arena_id;
+        loop {
+            if raw == ArenaId::UNTRACKED.0 {
+                return Err(ArenaError::ArenaIdExhausted);
+            }
+            let arena = ArenaId(raw);
+            if find_arena(&h, arena).is_none() {
+                h.next_arena_id = raw.checked_add(1).unwrap_or(0);
+                h.arenas[index] = ArenaRecord {
+                    arena,
+                    owner,
+                    head: None,
+                    live_bytes: 0,
+                    live_allocations: 0,
+                    active: true,
+                };
+                return Ok(arena);
+            }
+            raw = raw.checked_add(1).ok_or(ArenaError::ArenaIdExhausted)?;
+        }
+    }
+
+    pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
+        if !arena.is_tracked() {
+            return None;
+        }
+        let h = self.0.lock();
+        find_arena(&h, arena).map(|index| h.arenas[index].stats())
+    }
+
+    /// Close an arena after normal Drop has returned every tracked block.
+    pub fn close_empty_arena(&self, arena: ArenaId) -> Result<(), ArenaError> {
+        if !arena.is_tracked() {
+            return Err(ArenaError::UntrackedArenaReserved);
+        }
+        let mut h = self.0.lock();
+        let Some(index) = find_arena(&h, arena) else {
+            return Err(ArenaError::UnknownArena);
+        };
+        let record = h.arenas[index];
+        if record.live_bytes != 0 || record.live_allocations != 0 || record.head.is_some() {
+            return Err(ArenaError::ArenaBusy {
+                live_bytes: record.live_bytes,
+                live_allocations: record.live_allocations,
+            });
+        }
+        h.arenas[index] = ArenaRecord::EMPTY;
+        Ok(())
+    }
+
+    /// Raw-reclaim every allocation belonging to a faulted incarnation.
+    ///
+    /// # Safety
+    /// The caller must have permanently quiesced every task in `arena`, raw
+    /// deallocated their future envelopes, removed runtime registrations, and
+    /// proved that no pointer or reference into an arena allocation escaped.
+    /// No destructor is run here.
+    pub unsafe fn reclaim_faulted_arena(&self, arena: ArenaId) -> Result<ReclaimStats, ArenaError> {
+        if !arena.is_tracked() {
+            return Err(ArenaError::UntrackedArenaReserved);
+        }
+        let mut h = self.0.lock();
+        let Some(arena_index) = find_arena(&h, arena) else {
+            return Err(ArenaError::UnknownArena);
+        };
+        let record = h.arenas[arena_index];
+        let Some(owner_index) = find_owner(&h, record.owner) else {
+            return Err(ArenaError::UnknownOwner);
+        };
+
+        // Validate the entire chain before mutating allocator state. A corrupt
+        // or cyclic list is leaked intact rather than partially double-freed.
+        let mut node = record.head;
+        let mut previous = None;
+        let mut allocations = 0usize;
+        let mut bytes = 0usize;
+        while let Some(header_ptr) = node {
+            if allocations >= record.live_allocations {
+                return Err(ArenaError::CorruptList);
+            }
+            let header = unsafe { header_ptr.as_ref() };
+            if header.magic != HEADER_MAGIC
+                || header.owner != record.owner
+                || header.arena != arena
+                || header.class >= NUM_CLASSES
+                || header.arena_prev != previous
+            {
+                return Err(ArenaError::CorruptList);
+            }
+            bytes = bytes
+                .checked_add(class_size(header.class))
+                .ok_or(ArenaError::CorruptList)?;
+            allocations += 1;
+            previous = Some(header_ptr);
+            node = header.arena_next;
+        }
+        if allocations != record.live_allocations || bytes != record.live_bytes {
+            return Err(ArenaError::CorruptList);
+        }
+
+        let account = h.owners[owner_index];
+        let Some(owner_live) = account.live_bytes.checked_sub(bytes) else {
+            return Err(ArenaError::CorruptList);
+        };
+        let Some(owner_allocations) = account.live_allocations.checked_sub(allocations) else {
+            return Err(ArenaError::CorruptList);
+        };
+        let Some(global_live) = h.live_bytes.checked_sub(bytes) else {
+            return Err(ArenaError::CorruptList);
+        };
+
+        node = record.head;
+        while let Some(header_ptr) = node {
+            let header = unsafe { *header_ptr.as_ptr() };
+            let next = header.arena_next;
+            let base = header.base;
+            let class = header.class;
+            unsafe {
+                header_ptr.as_ptr().write(AllocationHeader {
+                    magic: FREED_MAGIC,
+                    ..header
+                });
+                let free = base as *mut FreeNode;
+                free.write(FreeNode {
+                    next: h.free[class],
+                });
+                h.free[class] = NonNull::new(free);
+            }
+            node = next;
+        }
+
+        h.owners[owner_index].live_bytes = owner_live;
+        h.owners[owner_index].live_allocations = owner_allocations;
+        h.live_bytes = global_live;
+        h.arenas[arena_index] = ArenaRecord::EMPTY;
+        Ok(ReclaimStats {
+            arena,
+            owner: record.owner,
+            reclaimed_bytes: bytes,
+            reclaimed_allocations: allocations,
+        })
     }
 
     pub fn account_stats(&self, owner: OwnerId) -> Option<OwnerStats> {
@@ -407,6 +760,12 @@ fn find_owner(h: &HeapInner, owner: OwnerId) -> Option<usize> {
         .position(|account| account.active && account.owner == owner)
 }
 
+fn find_arena(h: &HeapInner, arena: ArenaId) -> Option<usize> {
+    h.arenas
+        .iter()
+        .position(|record| record.active && record.arena == arena)
+}
+
 fn align_up(value: usize, align: usize) -> Option<usize> {
     value
         .checked_add(align - 1)
@@ -418,7 +777,10 @@ fn class_size(index: usize) -> usize {
 }
 
 fn allocation_plan(layout: Layout) -> Option<AllocationPlan> {
-    let user_align = layout.align().max(align_of::<AllocationHeader>());
+    let user_align = layout
+        .align()
+        .max(align_of::<AllocationHeader>())
+        .max(MIN_CLASS_SIZE);
     let required = size_of::<AllocationHeader>()
         .checked_add(layout.size().max(1))?
         .checked_add(user_align - 1)?
@@ -443,7 +805,8 @@ fn user_address(base: usize, plan: AllocationPlan, layout: Layout) -> Option<usi
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let owner = current_owner();
+        let domain = current_domain();
+        let owner = domain.owner;
         let Some(plan) = allocation_plan(layout) else {
             self.record_failure(owner, AllocationFailure::LayoutOverflow { owner });
             return ptr::null_mut();
@@ -453,6 +816,28 @@ unsafe impl GlobalAlloc for Heap {
         let Some(owner_index) = find_owner(&h, owner) else {
             h.last_failure = Some(AllocationFailure::UnknownOwner { owner });
             return ptr::null_mut();
+        };
+
+        let arena_index = if domain.arena.is_tracked() {
+            let Some(index) = find_arena(&h, domain.arena) else {
+                h.last_failure = Some(AllocationFailure::UnknownArena {
+                    owner,
+                    arena: domain.arena,
+                });
+                return ptr::null_mut();
+            };
+            let arena_owner = h.arenas[index].owner;
+            if arena_owner != owner {
+                h.last_failure = Some(AllocationFailure::ArenaOwnerMismatch {
+                    owner,
+                    arena: domain.arena,
+                    arena_owner,
+                });
+                return ptr::null_mut();
+            }
+            Some(index)
+        } else {
+            None
         };
 
         let account = h.owners[owner_index];
@@ -481,6 +866,28 @@ unsafe impl GlobalAlloc for Heap {
                 requested_bytes: plan.charge,
             });
             return ptr::null_mut();
+        };
+        let new_arena_totals = if let Some(index) = arena_index {
+            let arena = h.arenas[index];
+            let Some(live_bytes) = arena.live_bytes.checked_add(plan.charge) else {
+                h.owners[owner_index].denials = account.denials.saturating_add(1);
+                h.last_failure = Some(AllocationFailure::AccountingOverflow {
+                    owner,
+                    requested_bytes: plan.charge,
+                });
+                return ptr::null_mut();
+            };
+            let Some(live_allocations) = arena.live_allocations.checked_add(1) else {
+                h.owners[owner_index].denials = account.denials.saturating_add(1);
+                h.last_failure = Some(AllocationFailure::AccountingOverflow {
+                    owner,
+                    requested_bytes: plan.charge,
+                });
+                return ptr::null_mut();
+            };
+            Some((live_bytes, live_allocations))
+        } else {
+            None
         };
         let Some(new_global_live) = h.live_bytes.checked_add(plan.charge) else {
             h.owners[owner_index].denials = account.denials.saturating_add(1);
@@ -528,19 +935,33 @@ unsafe impl GlobalAlloc for Heap {
         };
 
         let header = (user - size_of::<AllocationHeader>()) as *mut AllocationHeader;
+        let header_ptr = unsafe { NonNull::new_unchecked(header) };
+        let arena_next = arena_index.and_then(|index| h.arenas[index].head);
         unsafe {
             header.write(AllocationHeader {
                 magic: HEADER_MAGIC,
                 owner,
+                arena: domain.arena,
                 base,
                 class: plan.class,
+                arena_prev: None,
+                arena_next,
             });
+            if let Some(mut next) = arena_next {
+                next.as_mut().arena_prev = Some(header_ptr);
+            }
         }
 
         let account = &mut h.owners[owner_index];
         account.live_bytes = new_owner_live;
         account.peak_bytes = account.peak_bytes.max(new_owner_live);
         account.live_allocations = new_owner_allocations;
+        if let (Some(index), Some((live_bytes, live_allocations))) = (arena_index, new_arena_totals)
+        {
+            h.arenas[index].head = Some(header_ptr);
+            h.arenas[index].live_bytes = live_bytes;
+            h.arenas[index].live_allocations = live_allocations;
+        }
         h.live_bytes = new_global_live;
         h.peak_bytes = h.peak_bytes.max(new_global_live);
         h.last_failure = None;
@@ -565,6 +986,44 @@ unsafe impl GlobalAlloc for Heap {
         let Some(owner_index) = find_owner(&h, header.owner) else {
             return;
         };
+        let header_node = unsafe { NonNull::new_unchecked(header_ptr) };
+        let arena_index = if header.arena.is_tracked() {
+            let Some(index) = find_arena(&h, header.arena) else {
+                return;
+            };
+            let arena = h.arenas[index];
+            if arena.owner != header.owner {
+                return;
+            }
+            match header.arena_prev {
+                Some(previous) => {
+                    let previous = unsafe { previous.as_ref() };
+                    if previous.magic != HEADER_MAGIC
+                        || previous.arena != header.arena
+                        || previous.arena_next != Some(header_node)
+                    {
+                        return;
+                    }
+                }
+                None if arena.head != Some(header_node) => return,
+                None => {}
+            }
+            if let Some(next) = header.arena_next {
+                let next = unsafe { next.as_ref() };
+                if next.magic != HEADER_MAGIC
+                    || next.arena != header.arena
+                    || next.arena_prev != Some(header_node)
+                {
+                    return;
+                }
+            }
+            Some(index)
+        } else {
+            if header.arena_prev.is_some() || header.arena_next.is_some() {
+                return;
+            }
+            None
+        };
         let account = h.owners[owner_index];
         let (Some(owner_live), Some(owner_allocations), Some(global_live)) = (
             account.live_bytes.checked_sub(charge),
@@ -573,8 +1032,28 @@ unsafe impl GlobalAlloc for Heap {
         ) else {
             return;
         };
+        let new_arena_totals = if let Some(index) = arena_index {
+            let arena = h.arenas[index];
+            let (Some(live_bytes), Some(live_allocations)) = (
+                arena.live_bytes.checked_sub(charge),
+                arena.live_allocations.checked_sub(1),
+            ) else {
+                return;
+            };
+            Some((live_bytes, live_allocations))
+        } else {
+            None
+        };
 
         unsafe {
+            if let Some(mut previous) = header.arena_prev {
+                previous.as_mut().arena_next = header.arena_next;
+            } else if let Some(index) = arena_index {
+                h.arenas[index].head = header.arena_next;
+            }
+            if let Some(mut next) = header.arena_next {
+                next.as_mut().arena_prev = header.arena_prev;
+            }
             header_ptr.write(AllocationHeader {
                 magic: FREED_MAGIC,
                 ..header
@@ -587,6 +1066,11 @@ unsafe impl GlobalAlloc for Heap {
         }
         h.owners[owner_index].live_bytes = owner_live;
         h.owners[owner_index].live_allocations = owner_allocations;
+        if let (Some(index), Some((live_bytes, live_allocations))) = (arena_index, new_arena_totals)
+        {
+            h.arenas[index].live_bytes = live_bytes;
+            h.arenas[index].live_allocations = live_allocations;
+        }
         h.live_bytes = global_live;
     }
 }

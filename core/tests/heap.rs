@@ -4,7 +4,10 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::{Mutex, MutexGuard};
 
-use vibeos_core::heap::{current_owner, enter_owner, AllocationFailure, Heap, OwnerError, OwnerId};
+use vibeos_core::heap::{
+    current_domain, current_owner, enter_domain, enter_owner, AllocationDomain, AllocationFailure,
+    ArenaError, ArenaId, Heap, OwnerError, OwnerId,
+};
 
 // Allocation owner is deliberately a single-hart global. Serialize this test
 // binary so an owner-scope test cannot change the provenance seen by another
@@ -172,6 +175,33 @@ fn owner_scopes_nest_and_support_explicit_restore() {
     assert_eq!(current_owner(), OwnerId::SYSTEM);
     outer.restore();
     assert_eq!(current_owner(), OwnerId::SYSTEM, "restore is idempotent");
+}
+
+#[test]
+fn domain_scopes_restore_both_owner_and_arena() {
+    let _serial = serial();
+    assert_eq!(current_domain(), AllocationDomain::SYSTEM);
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(8192).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+
+    let mut outer = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+    assert_eq!(outer.previous_domain(), AllocationDomain::SYSTEM);
+    assert_eq!(current_domain(), AllocationDomain::new(owner, arena));
+    {
+        let _system = enter_owner(OwnerId::SYSTEM);
+        assert_eq!(
+            current_domain(),
+            AllocationDomain::SYSTEM,
+            "legacy owner scopes deliberately clear the tracked arena"
+        );
+    }
+    assert_eq!(current_domain(), AllocationDomain::new(owner, arena));
+
+    outer.restore();
+    h.close_empty_arena(arena).unwrap();
+    h.unregister_owner(owner).unwrap();
+    assert_eq!(current_domain(), AllocationDomain::SYSTEM);
 }
 
 #[test]
@@ -385,4 +415,177 @@ fn owner_slots_unregister_only_after_provenance_is_gone() {
     assert_eq!(h.account_stats(owner), None);
     h.register_owner(owner, 8192).unwrap();
     assert_eq!(h.account_stats(owner).unwrap().quota_bytes, 8192);
+}
+
+#[test]
+fn arenas_isolate_incarnations_under_one_owner() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let owner = h.create_owner(32 * 1024).unwrap();
+    let first = h.create_arena(owner).unwrap();
+    let second = h.create_arena(owner).unwrap();
+    let l = layout(80, 16);
+    let charge = Heap::allocation_charge(l).unwrap();
+
+    let first_ptr = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, first)) };
+        unsafe { h.alloc(l) }
+    };
+    let second_ptr = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, second)) };
+        unsafe { h.alloc(l) }
+    };
+    assert!(!first_ptr.is_null() && !second_ptr.is_null());
+    unsafe { second_ptr.write(0xA7) };
+    assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge * 2);
+
+    let reclaimed = unsafe { h.reclaim_faulted_arena(first) }.unwrap();
+    assert_eq!(reclaimed.reclaimed_bytes, charge);
+    assert_eq!(reclaimed.reclaimed_allocations, 1);
+    assert_eq!(h.arena_stats(first), None);
+    assert_eq!(h.arena_stats(second).unwrap().live_bytes, charge);
+    assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge);
+    assert_eq!(
+        unsafe { second_ptr.read() },
+        0xA7,
+        "the peer arena survives"
+    );
+
+    unsafe { h.dealloc(second_ptr, l) };
+    h.close_empty_arena(second).unwrap();
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn tracked_deallocation_unlinks_head_middle_and_tail() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let owner = h.create_owner(32 * 1024).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let l = layout(48, 16);
+    let charge = Heap::allocation_charge(l).unwrap();
+    let (a, b, c) = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { (h.alloc(l), h.alloc(l), h.alloc(l)) }
+    };
+
+    unsafe { h.dealloc(b, l) };
+    assert_eq!(h.arena_stats(arena).unwrap().live_bytes, charge * 2);
+    unsafe { h.dealloc(c, l) };
+    assert_eq!(h.arena_stats(arena).unwrap().live_allocations, 1);
+    unsafe { h.dealloc(a, l) };
+    assert_eq!(
+        h.arena_stats(arena).unwrap().live_allocations,
+        0,
+        "all intrusive links were removed"
+    );
+    h.close_empty_arena(arena).unwrap();
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn fault_reclaim_returns_every_block_to_its_size_class() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let owner = h.create_owner(32 * 1024).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let l = layout(72, 16);
+    let charge = Heap::allocation_charge(l).unwrap();
+    let pointers = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { [h.alloc(l), h.alloc(l), h.alloc(l)] }
+    };
+    assert!(pointers.iter().all(|pointer| !pointer.is_null()));
+
+    let reclaimed = unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    assert_eq!(reclaimed.reclaimed_bytes, charge * pointers.len());
+    assert_eq!(reclaimed.reclaimed_allocations, pointers.len());
+    assert_eq!(h.account_stats(owner).unwrap().live_bytes, 0);
+
+    let replacement_arena = h.create_arena(owner).unwrap();
+    let replacements = {
+        let _scope = unsafe {
+            enter_domain(AllocationDomain::new(owner, replacement_arena))
+        };
+        unsafe { [h.alloc(l), h.alloc(l), h.alloc(l)] }
+    };
+    for pointer in pointers {
+        assert!(
+            replacements.contains(&pointer),
+            "raw-reclaimed blocks are immediately recyclable"
+        );
+    }
+    for pointer in replacements {
+        unsafe { h.dealloc(pointer, l) };
+    }
+    h.close_empty_arena(replacement_arena).unwrap();
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn busy_or_active_arenas_block_close_and_owner_unregister() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(8192).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let l = layout(32, 8);
+    let p = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { h.alloc(l) }
+    };
+
+    assert!(matches!(
+        h.close_empty_arena(arena),
+        Err(ArenaError::ArenaBusy {
+            live_allocations: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        h.unregister_owner(owner),
+        Err(OwnerError::OwnerBusy {
+            live_allocations: 1,
+            ..
+        })
+    ));
+
+    unsafe { h.dealloc(p, l) };
+    assert_eq!(
+        h.unregister_owner(owner),
+        Err(OwnerError::ArenasActive { active_arenas: 1 })
+    );
+    h.close_empty_arena(arena).unwrap();
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn arena_reclaim_never_touches_untracked_owner_allocations() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let owner = h.create_owner(32 * 1024).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let l = layout(64, 16);
+    let charge = Heap::allocation_charge(l).unwrap();
+    let untracked = {
+        let _scope = enter_owner(owner);
+        unsafe { h.alloc(l) }
+    };
+    let tracked = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { h.alloc(l) }
+    };
+    unsafe { untracked.write(0x5C) };
+
+    unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge);
+    assert_eq!(unsafe { untracked.read() }, 0x5C);
+    assert_eq!(h.arena_stats(ArenaId::UNTRACKED), None);
+    assert_eq!(
+        unsafe { h.reclaim_faulted_arena(ArenaId::UNTRACKED) },
+        Err(ArenaError::UntrackedArenaReserved)
+    );
+
+    let _ = tracked; // deliberately dangling after the unsafe reclaim contract
+    unsafe { h.dealloc(untracked, l) };
+    h.unregister_owner(owner).unwrap();
 }

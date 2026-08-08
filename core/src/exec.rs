@@ -15,12 +15,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
-use crate::heap::{self, OwnerId};
+use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::sync::SpinLock;
 
 /// QEMU `virt` drives `mtime` at 10 MHz.
@@ -94,6 +95,18 @@ struct JoinWaiter {
     waker: Waker,
 }
 
+#[derive(Clone)]
+enum OwnedRegistration {
+    Wait { queue: usize, id: u64 },
+    Timer { id: u64 },
+    Join { status: Arc<TaskStatus>, id: u64 },
+}
+
+struct OwnedRegistrationEntry {
+    token: u64,
+    registration: OwnedRegistration,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TerminalClaim {
     state: TaskState,
@@ -123,6 +136,8 @@ struct TaskStatus {
     state: AtomicU8,
     next_joiner: AtomicU64,
     joiners: SpinLock<Vec<JoinWaiter>>,
+    next_registration: AtomicU64,
+    registrations: SpinLock<Vec<OwnedRegistrationEntry>>,
 }
 
 impl TaskStatus {
@@ -132,6 +147,8 @@ impl TaskStatus {
             state: AtomicU8::new(TaskState::Running as u8),
             next_joiner: AtomicU64::new(1),
             joiners: SpinLock::new(Vec::new()),
+            next_registration: AtomicU64::new(1),
+            registrations: SpinLock::new(Vec::new()),
         }
     }
 
@@ -258,6 +275,91 @@ impl TaskStatus {
             .position(|waiter| waiter.id == id)
             .map(|index| joiners.swap_remove(index).waker)
     }
+
+    fn register_owned(&self, registration: OwnedRegistration) -> Result<u64, OwnedRegistration> {
+        let token = self
+            .next_registration
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("task registration token space exhausted");
+        let mut registrations = self.registrations.lock();
+        if registrations.try_reserve(1).is_err() {
+            return Err(registration);
+        }
+        registrations.push(OwnedRegistrationEntry {
+            token,
+            registration,
+        });
+        Ok(token)
+    }
+
+    fn disarm_owned(&self, token: u64) -> Option<OwnedRegistration> {
+        let mut registrations = self.registrations.lock();
+        registrations
+            .iter()
+            .position(|entry| entry.token == token)
+            .map(|index| registrations.swap_remove(index).registration)
+    }
+
+    fn take_owned_registrations(&self) -> Vec<OwnedRegistrationEntry> {
+        let mut registrations = self.registrations.lock();
+        core::mem::take(&mut *registrations)
+    }
+}
+
+static CURRENT_TASK_STATUS: SpinLock<Option<Arc<TaskStatus>>> = SpinLock::new(None);
+
+struct CurrentTaskScope {
+    previous: Option<Arc<TaskStatus>>,
+    active: bool,
+}
+
+fn enter_current_task(status: Arc<TaskStatus>) -> CurrentTaskScope {
+    let previous = core::mem::replace(&mut *CURRENT_TASK_STATUS.lock(), Some(status));
+    CurrentTaskScope {
+        previous,
+        active: true,
+    }
+}
+
+impl CurrentTaskScope {
+    fn restore(&mut self) {
+        if self.active {
+            *CURRENT_TASK_STATUS.lock() = self.previous.take();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for CurrentTaskScope {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn register_owned_for_current(
+    registration: OwnedRegistration,
+) -> Result<Option<u64>, OwnedRegistration> {
+    let status = CURRENT_TASK_STATUS.lock().clone();
+    match status {
+        Some(status) => status.register_owned(registration).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn disarm_owned_for_current(token: Option<u64>) {
+    let Some(token) = token else {
+        return;
+    };
+    if let Some(status) = CURRENT_TASK_STATUS.lock().clone() {
+        drop(status.disarm_owned(token));
+    }
+}
+
+fn drain_task_registrations(status: &TaskStatus) {
+    let registrations = status.take_owned_registrations();
+    for entry in registrations {
+        cleanup_owned_registration(entry.registration);
+    }
 }
 
 /// The immutable result retained after a task reaches a terminal state.
@@ -315,7 +417,7 @@ pub enum CancelOutcome {
 #[derive(Clone)]
 pub struct TaskHandle {
     id: TaskId,
-    owner: OwnerId,
+    domain: AllocationDomain,
     status: Arc<TaskStatus>,
 }
 
@@ -325,7 +427,15 @@ impl TaskHandle {
     }
 
     pub fn owner(&self) -> OwnerId {
-        self.owner
+        self.domain.owner
+    }
+
+    pub fn arena(&self) -> ArenaId {
+        self.domain.arena
+    }
+
+    pub fn allocation_domain(&self) -> AllocationDomain {
+        self.domain
     }
 
     pub fn state(&self) -> TaskState {
@@ -336,10 +446,19 @@ impl TaskHandle {
         self.status.polls.load(Ordering::Acquire)
     }
 
+    /// Number of tasks currently registered to join this task.
+    ///
+    /// This is exposed for runtime diagnostics and reclamation invariants.
+    pub fn joiner_count(&self) -> usize {
+        self.status.joiners.lock().len()
+    }
+
     /// Request cooperative cancellation.
     ///
-    /// A ready or parked task is reclaimed before this call returns. A task
-    /// currently inside `Future::poll` observes the request at that poll's
+    /// Outside user poll/Drop code, a ready or parked task is reclaimed before
+    /// this call returns. Calls made by another active task are deferred to the
+    /// next outer executor boundary so nested destructors cannot fault through
+    /// that task's live stack. A running task observes its request at the poll
     /// boundary; a trusted future that never yields still cannot be rescued.
     pub fn cancel(&self) -> CancelOutcome {
         cancel_task(self)
@@ -362,6 +481,7 @@ impl TaskHandle {
             id: self.id,
             status: self.status.clone(),
             registration: None,
+            owned_registration: None,
         }
     }
 }
@@ -370,6 +490,7 @@ pub struct Join {
     id: TaskId,
     status: Arc<TaskStatus>,
     registration: Option<u64>,
+    owned_registration: Option<u64>,
 }
 
 impl Future for Join {
@@ -379,6 +500,7 @@ impl Future for Join {
         let this = self.get_mut();
         let state = this.status.state();
         if state != TaskState::Running {
+            disarm_owned_for_current(this.owned_registration.take());
             if let Some(id) = this.registration.take() {
                 drop(this.status.unregister_joiner(id));
             }
@@ -402,6 +524,7 @@ impl Future for Join {
             let mut joiners = status.joiners.lock();
             let state = status.state();
             if state != TaskState::Running {
+                disarm_owned_for_current(this.owned_registration.take());
                 if let Some(id) = this.registration.take() {
                     if let Some(index) = joiners.iter().position(|waiter| waiter.id == id) {
                         discarded = Some(joiners.swap_remove(index).waker);
@@ -410,7 +533,19 @@ impl Future for Join {
                 terminal = Some(state);
             } else {
                 let id = this.registration.unwrap_or_else(|| status.next_joiner_id());
-                if let Some(waiter) = joiners.iter_mut().find(|waiter| waiter.id == id) {
+                if this.registration.is_none() && this.owned_registration.is_none() {
+                    match register_owned_for_current(OwnedRegistration::Join {
+                        status: status.clone(),
+                        id,
+                    }) {
+                        Ok(token) => this.owned_registration = token,
+                        Err(_) => allocation_failed = true,
+                    }
+                }
+                if allocation_failed {
+                    // The target registry remains untouched when the owning
+                    // task could not reserve its cleanup ledger.
+                } else if let Some(waiter) = joiners.iter_mut().find(|waiter| waiter.id == id) {
                     if !waiter.waker.will_wake(cx.waker()) {
                         discarded = Some(core::mem::replace(
                             &mut waiter.waker,
@@ -447,6 +582,7 @@ impl Future for Join {
 
 impl Drop for Join {
     fn drop(&mut self) {
+        disarm_owned_for_current(self.owned_registration.take());
         if let Some(id) = self.registration.take() {
             drop(self.status.unregister_joiner(id));
         }
@@ -457,15 +593,16 @@ impl Drop for Join {
 pub struct TaskReport {
     pub id: TaskId,
     pub owner: OwnerId,
+    pub arena: ArenaId,
     pub name: String,
     pub state: TaskState,
     pub polls: u64,
 }
 
 struct Task {
-    owner: OwnerId,
+    domain: AllocationDomain,
     name: Arc<str>,
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    future: ManuallyDrop<Pin<Box<dyn Future<Output = ()> + Send>>>,
     status: Arc<TaskStatus>,
 }
 
@@ -476,10 +613,19 @@ struct Task {
 /// task simply fails the test — which is the right behaviour there.
 pub type FaultGuard = fn(&mut dyn FnMut()) -> bool;
 
+/// Reclaim all raw allocations in one audited fault arena without running
+/// their Rust destructors. The kernel installs this alongside its heap.
+pub type FaultReclaimer = unsafe fn(AllocationDomain);
+
 static FAULT_GUARD: SpinLock<Option<FaultGuard>> = SpinLock::new(None);
+static FAULT_RECLAIMER: SpinLock<Option<FaultReclaimer>> = SpinLock::new(None);
 
 pub fn set_fault_guard(guard: FaultGuard) {
     *FAULT_GUARD.lock() = Some(guard);
+}
+
+pub fn set_fault_reclaimer(reclaimer: FaultReclaimer) {
+    *FAULT_RECLAIMER.lock() = Some(reclaimer);
 }
 
 struct Sched {
@@ -488,7 +634,7 @@ struct Sched {
     /// The task being polled right now. It is lifted out of `tasks` for the
     /// duration of the poll, so both introspection and `wake` have to look
     /// for it here rather than in the map.
-    running: Option<(TaskId, OwnerId, Arc<str>, Arc<TaskStatus>)>,
+    running: Option<(TaskId, AllocationDomain, Arc<str>, Arc<TaskStatus>)>,
     /// Set when the running task is woken while it is being polled — by itself
     /// (`yield_now`) or by an interrupt that lands mid-poll. Without this the
     /// wake would be dropped and the task would never be scheduled again.
@@ -524,7 +670,7 @@ pub fn spawn(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> Task
 
 /// Spawn a future and inherit the allocation owner active at the call site.
 pub fn spawn_tracked(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> TaskHandle {
-    spawn_tracked_owned(heap::current_owner(), name, fut)
+    spawn_tracked_domain(heap::current_domain(), name, fut)
 }
 
 /// Spawn a future under an explicit component allocation owner.
@@ -537,13 +683,70 @@ pub fn spawn_tracked_owned(
     name: &str,
     fut: impl Future<Output = ()> + Send + 'static,
 ) -> TaskHandle {
+    spawn_tracked_domain(AllocationDomain::untracked(owner), name, fut)
+}
+
+/// Spawn into an audited, raw-reclaimable allocation arena.
+///
+/// # Safety
+/// Every allocation left in `domain.arena` at a task fault must be local to
+/// that arena. No pointer, owning smart pointer, borrowed reference, or payload
+/// backed by one of those allocations may escape to another arena or SYSTEM
+/// storage. Child tasks spawned with [`spawn`] inherit this same domain and are
+/// torn down together if any member faults. Executor registries may only be
+/// given the task waker supplied through this future's executor-owned
+/// [`Context`], using executor primitives whose cleanup is non-panicking; the
+/// future must not poll those primitives with a fabricated custom context.
+/// Every wait/registration target must live in SYSTEM or supervisor-stable
+/// storage for the entire domain teardown; arena-owned `WaitQueue` values may
+/// not be shared with siblings because a faulting destructor may already have
+/// destroyed such a target before sibling ledgers are drained.
+/// `domain.arena` must already be active and registered to `domain.owner` for
+/// the complete lifetime of this task incarnation.
+pub unsafe fn spawn_reclaimable_owned(
+    domain: AllocationDomain,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    assert!(
+        domain.arena.is_tracked(),
+        "a reclaimable task needs a tracked arena"
+    );
+    assert!(
+        domain.owner != OwnerId::SYSTEM,
+        "SYSTEM cannot be a raw-reclaimable component arena"
+    );
+    assert!(
+        FAULT_RECLAIMER.lock().is_some(),
+        "a reclaimable task needs an installed fault reclaimer"
+    );
+    spawn_tracked_domain(domain, name, fut)
+}
+
+fn spawn_tracked_domain(
+    domain: AllocationDomain,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
     let id = next_task_id();
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let status = Arc::new(TaskStatus::new());
+    let task_name = Arc::<str>::from(name);
+    system.restore();
+
+    // The future state itself belongs to the incarnation arena. Scheduler
+    // metadata remains SYSTEM-owned and can be dropped after a longjmp.
+    // Safe callers can supply only untracked domains. A tracked domain comes
+    // from `spawn_reclaimable_owned`, whose unsafe contract covers this scope.
+    let mut allocation = unsafe { heap::enter_domain(domain) };
+    let future = ManuallyDrop::new(Box::pin(fut) as Pin<Box<dyn Future<Output = ()> + Send>>);
+    allocation.restore();
+
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let task = Task {
-        owner,
-        name: Arc::<str>::from(name),
-        future: Box::pin(fut),
+        domain,
+        name: task_name,
+        future,
         status: status.clone(),
     };
     let mut s = SCHED.lock();
@@ -564,7 +767,7 @@ pub fn spawn_tracked_owned(
     s.ready.push_back(id);
     drop(s);
     system.restore();
-    TaskHandle { id, owner, status }
+    TaskHandle { id, domain, status }
 }
 
 fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskState> {
@@ -581,24 +784,36 @@ fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskSta
     Some(claim.state)
 }
 
+struct ReclaimResult {
+    domain: AllocationDomain,
+    faulted: bool,
+}
+
 /// Drop a normally suspended/completed future behind the same fault domain as
-/// polling it. The task metadata is reclaimed first; if the future destructor
-/// faults, the landing pad leaves its Option empty and the interrupted future
-/// allocation is deliberately leaked rather than dropped a second time.
-fn reclaim_task(task: Task) -> bool {
+/// polling it. If the destructor faults, its allocation stays linked in the
+/// arena and the caller performs raw domain teardown without invoking Drop
+/// again.
+fn reclaim_task(task: Task) -> ReclaimResult {
     let Task {
-        owner,
+        domain,
         name,
-        future,
+        mut future,
         status,
     } = task;
-    let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    drop(name);
-    drop(status);
-    system.restore();
+
+    // Registration targets may themselves live inside the future. Detach all
+    // external references before entering user Drop: a destructor fault may
+    // longjmp past the rest of that destructor, after it already destroyed a
+    // WaitQueue (or another registration target). Individual future drops
+    // unregister again, idempotently, on the normal path.
+    drain_task_registrations(&status);
+    let future = unsafe { ManuallyDrop::take(&mut future) };
 
     let guard = *FAULT_GUARD.lock();
-    let mut owner_scope = heap::enter_owner(owner);
+    let mut current_task = enter_current_task(status.clone());
+    // Task construction established the domain provenance; polling and Drop
+    // must re-enter that exact audited domain.
+    let mut owner_scope = unsafe { heap::enter_domain(domain) };
     let faulted = match guard {
         Some(run_guarded) => {
             let mut future = Some(future);
@@ -624,17 +839,131 @@ fn reclaim_task(task: Task) -> bool {
     // A real task fault returns through longjmp and skips Rust destructors in
     // the guarded closure. Restore explicitly after the landing pad returns.
     owner_scope.restore();
-    faulted
+    current_task.restore();
+
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    drop(name);
+    drop(status);
+    system.restore();
+    ReclaimResult { domain, faulted }
 }
 
-fn reclaim_and_publish(task: Task, status: &TaskStatus, claim: TerminalClaim) {
-    let destructor_faulted = reclaim_task(task);
-    let claim = if destructor_faulted {
+fn abandon_task_without_drop(task: Task) {
+    let Task {
+        domain: _,
+        name,
+        future,
+        status,
+    } = task;
+    // ManuallyDrop's wrapper is discarded, but the future and its fields are
+    // never visited. The heap reclaimer returns the arena bytes afterwards.
+    core::mem::forget(future);
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    drop(name);
+    drop(status);
+    system.restore();
+}
+
+struct FaultVictim {
+    task: Option<Task>,
+    status: Arc<TaskStatus>,
+    claim: TerminalClaim,
+}
+
+fn teardown_faulted_domain(
+    domain: AllocationDomain,
+    primary_task: Option<Task>,
+    primary_status: Arc<TaskStatus>,
+    primary_claim: TerminalClaim,
+) {
+    debug_assert!(domain.arena.is_tracked());
+    {
+        let s = SCHED.lock();
+        if let Some((_, running_domain, _, running_status)) = &s.running {
+            assert!(
+                primary_task.is_some()
+                    && *running_domain == domain
+                    && Arc::ptr_eq(running_status, &primary_status),
+                "nested arena teardown cannot reclaim an active user poll"
+            );
+        }
+    }
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let mut victims = Vec::new();
+    {
+        let s = SCHED.lock();
+        victims.reserve(s.tasks.len() + 1);
+    }
+    victims.push(FaultVictim {
+        task: primary_task,
+        status: primary_status,
+        claim: primary_claim,
+    });
+
+    {
+        let mut s = SCHED.lock();
+        s.running = None;
+        s.running_woken = false;
+        let sibling_ids: Vec<_> = s
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| (task.domain == domain).then_some(*id))
+            .collect();
+        for id in sibling_ids {
+            let task = s
+                .tasks
+                .remove(&id)
+                .expect("an arena sibling disappeared under SCHED");
+            s.ready.retain(|ready| *ready != id);
+            let status = task.status.clone();
+            let claim = status
+                .claim_terminal(TaskState::Faulted)
+                .expect("an arena sibling could not claim fault teardown");
+            victims.push(FaultVictim {
+                task: Some(task),
+                status,
+                claim,
+            });
+        }
+    }
+    system.restore();
+
+    // Registration targets may point into any sibling future. Drain every
+    // ledger while all arena memory is still intact, then abandon holders.
+    for victim in &victims {
+        drain_task_registrations(&victim.status);
+    }
+    for victim in &mut victims {
+        if let Some(task) = victim.task.take() {
+            abandon_task_without_drop(task);
+        }
+    }
+
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    if let Some(reclaim) = *FAULT_RECLAIMER.lock() {
+        unsafe { reclaim(domain) };
+    }
+    system.restore();
+
+    // Publication is the teardown linearization point: a supervisor cannot
+    // observe Faulted and restart the component before raw reclaim completed.
+    for victim in victims {
+        publish_terminal(&victim.status, victim.claim);
+    }
+}
+
+fn reclaim_and_publish(task: Task, status: &Arc<TaskStatus>, claim: TerminalClaim) {
+    let result = reclaim_task(task);
+    let claim = if result.faulted {
         status.promote_to_fault(claim)
     } else {
         claim
     };
-    publish_terminal(status, claim);
+    if result.faulted && result.domain.arena.is_tracked() {
+        teardown_faulted_domain(result.domain, None, status.clone(), claim);
+    } else {
+        publish_terminal(status, claim);
+    }
 }
 
 fn requested_outcome(handle: &TaskHandle) -> CancelOutcome {
@@ -656,9 +985,13 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
         InvariantViolation,
     }
 
-    // Ready and parked tasks can be detached synchronously. A running task is
-    // cooperative: only publish its request here and let `poll_once` reclaim
-    // it after the current poll returns.
+    // Reclamation may enter arbitrary user Drop code. Never do that while a
+    // different user poll/Drop is already active: a destructor fault could
+    // otherwise tear down the active task's arena before its outer executor
+    // boundary regains control. Turn such cancellation into a ready request;
+    // the next top-level `poll_once` boundary performs the reclamation.
+    let user_code_active = CURRENT_TASK_STATUS.lock().is_some();
+    let mut ready_capacity_exhausted = false;
     let action = {
         let mut s = SCHED.lock();
         if s.running
@@ -667,16 +1000,31 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
         {
             Action::Return(requested_outcome(handle))
         } else if s.tasks.contains_key(&handle.id) {
-            match handle.status.claim_terminal(TaskState::Cancelled) {
-                Some(claim) => {
-                    let task = s
-                        .tasks
-                        .remove(&handle.id)
-                        .expect("contains_key was checked under the same lock");
-                    s.ready.retain(|id| *id != handle.id);
-                    Action::Reclaim(task, claim)
+            // `running` covers the small dispatch/return windows before the
+            // current-task scope is installed or after it is restored, which
+            // matters if cancellation is requested from an interrupt hook.
+            if user_code_active || s.running.is_some() {
+                let outcome = requested_outcome(handle);
+                if outcome == CancelOutcome::Requested && !s.ready.contains(&handle.id) {
+                    if s.ready.len() >= s.ready.capacity() {
+                        ready_capacity_exhausted = true;
+                    } else {
+                        s.ready.push_back(handle.id);
+                    }
                 }
-                None => Action::Return(requested_outcome(handle)),
+                Action::Return(outcome)
+            } else {
+                match handle.status.claim_terminal(TaskState::Cancelled) {
+                    Some(claim) => {
+                        let task = s
+                            .tasks
+                            .remove(&handle.id)
+                            .expect("contains_key was checked under the same lock");
+                        s.ready.retain(|id| *id != handle.id);
+                        Action::Reclaim(task, claim)
+                    }
+                    None => Action::Return(requested_outcome(handle)),
+                }
             }
         } else {
             match requested_outcome(handle) {
@@ -685,6 +1033,10 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
             }
         }
     };
+
+    if ready_capacity_exhausted {
+        panic!("ready queue reservation invariant violated during deferred cancellation");
+    }
 
     match action {
         Action::Reclaim(task, claim) => {
@@ -743,14 +1095,15 @@ pub fn task_report() -> Vec<TaskReport> {
                 name.push_str(&task.name);
                 out.push(TaskReport {
                     id: *id,
-                    owner: task.owner,
+                    owner: task.domain.owner,
+                    arena: task.domain.arena,
                     name,
                     state: task.status.state(),
                     polls: task.status.polls.load(Ordering::Acquire),
                 });
             }
             if !allocation_failed {
-                if let Some((id, owner, running_name, status)) = &s.running {
+                if let Some((id, domain, running_name, status)) = &s.running {
                     let mut name = String::new();
                     if name.try_reserve(running_name.len()).is_err() {
                         allocation_failed = true;
@@ -758,7 +1111,8 @@ pub fn task_report() -> Vec<TaskReport> {
                         name.push_str(running_name);
                         out.push(TaskReport {
                             id: *id,
-                            owner: *owner,
+                            owner: domain.owner,
+                            arena: domain.arena,
                             name,
                             state: status.state(),
                             polls: status.polls.load(Ordering::Acquire),
@@ -841,6 +1195,15 @@ pub fn run() -> ! {
 ///
 /// Split out of `run` so tests can drive the scheduler a step at a time.
 pub fn poll_once() -> bool {
+    // The scheduler lifts its current task out of `tasks`, so recursive
+    // driving would overwrite `SCHED.running`. More importantly, an inner
+    // same-arena fault could raw-reclaim the still-executing outer future.
+    // Reject re-entry while the outer fault guard is still authoritative.
+    assert!(
+        CURRENT_TASK_STATUS.lock().is_none() && SCHED.lock().running.is_none(),
+        "the executor cannot be driven recursively from task poll or Drop"
+    );
+
     enum Dispatch {
         Poll(TaskId, Task, Arc<TaskStatus>),
         Reclaim(Task, Arc<TaskStatus>, TerminalClaim),
@@ -866,7 +1229,7 @@ pub fn poll_once() -> bool {
                 None => Dispatch::Invalid(task),
             }
         } else if status.raw_state() == TaskState::Running as u8 {
-            s.running = Some((id, task.owner, task.name.clone(), status.clone()));
+            s.running = Some((id, task.domain, task.name.clone(), status.clone()));
             s.running_woken = false;
             Dispatch::Poll(id, task, status)
         } else {
@@ -894,7 +1257,10 @@ pub fn poll_once() -> bool {
     // component that panics costs its own task instead of the machine.
     let guard = *FAULT_GUARD.lock();
     let mut poll = Poll::Pending;
-    let mut owner_scope = heap::enter_owner(task.owner);
+    let mut current_task = enter_current_task(status.clone());
+    // Tracked task domains originate only at the unsafe reclaimable spawn
+    // boundary; ordinary safe tasks carry an untracked domain.
+    let mut owner_scope = unsafe { heap::enter_domain(task.domain) };
     let faulted = match guard {
         Some(run_guarded) => {
             let fut = task.future.as_mut();
@@ -916,23 +1282,26 @@ pub fn poll_once() -> bool {
     // for scopes created inside the guarded call. Restore at the executor
     // boundary before touching scheduler infrastructure or another task.
     owner_scope.restore();
+    current_task.restore();
 
     if faulted {
-        // The future was interrupted mid-poll. Dropping it would run
-        // destructors over state it never finished writing, so the task is
-        // leaked instead: leaking is always sound, and a faulted component is
-        // not going to be resumed.
-        let claim = {
+        let Some(claim) = status.claim_terminal(TaskState::Faulted) else {
+            panic!("a faulted running task could not claim its terminal state");
+        };
+        if task.domain.arena.is_tracked() {
+            let domain = task.domain;
+            teardown_faulted_domain(domain, Some(task), status, claim);
+        } else {
             let mut s = SCHED.lock();
             s.running = None;
             s.running_woken = false;
-            status.claim_terminal(TaskState::Faulted)
-        };
-        core::mem::forget(task);
-        let Some(claim) = claim else {
-            panic!("a faulted running task could not claim its terminal state");
-        };
-        publish_terminal(&status, claim);
+            drop(s);
+            // Ordinary tasks have no audited escape contract. Clean external
+            // registrations, but conservatively leak their future allocation.
+            drain_task_registrations(&status);
+            core::mem::forget(task);
+            publish_terminal(&status, claim);
+        }
         return true;
     }
 
@@ -941,8 +1310,9 @@ pub fn poll_once() -> bool {
     s.running = None;
     let woken = core::mem::take(&mut s.running_woken);
     if poll == Poll::Pending && !status.cancellation_requested() {
-        // A concurrent cancel cannot slip between this decision and reinsertion:
-        // it also takes SCHED, then detaches the parked task synchronously.
+        // A cancellation cannot slip between this decision and reinsertion:
+        // it also takes SCHED. A nested request was already published before
+        // this branch, while an outer request sees the reinserted parked task.
         s.tasks.insert(id, task);
         let mut capacity_exhausted = false;
         if woken {
@@ -1050,6 +1420,7 @@ impl WaitQueue {
             queue: self,
             epoch,
             registration: None,
+            owned_registration: None,
         }
     }
 
@@ -1072,6 +1443,7 @@ pub struct WaitFuture<'a> {
     queue: &'a WaitQueue,
     epoch: u64,
     registration: Option<u64>,
+    owned_registration: Option<u64>,
 }
 
 impl Future for WaitFuture<'_> {
@@ -1089,6 +1461,7 @@ impl Future for WaitFuture<'_> {
         let result = {
             let mut inner = this.queue.inner.lock();
             if inner.epoch != this.epoch {
+                disarm_owned_for_current(this.owned_registration.take());
                 if let Some(id) = this.registration.take() {
                     if let Some(index) = inner.waiters.iter().position(|waiter| waiter.id == id) {
                         discarded = Some(inner.waiters.swap_remove(index).waker);
@@ -1102,7 +1475,20 @@ impl Future for WaitFuture<'_> {
                     id
                 });
 
-                if let Some(waiter) = inner.waiters.iter_mut().find(|waiter| waiter.id == id) {
+                if this.owned_registration.is_none() {
+                    match register_owned_for_current(OwnedRegistration::Wait {
+                        queue: this.queue as *const WaitQueue as usize,
+                        id,
+                    }) {
+                        Ok(token) => this.owned_registration = token,
+                        Err(_) => allocation_failed = true,
+                    }
+                }
+
+                if allocation_failed {
+                    Poll::Pending
+                } else if let Some(waiter) = inner.waiters.iter_mut().find(|waiter| waiter.id == id)
+                {
                     if !waiter.waker.will_wake(cx.waker()) {
                         discarded = Some(core::mem::replace(
                             &mut waiter.waker,
@@ -1136,6 +1522,7 @@ impl Future for WaitFuture<'_> {
 
 impl Drop for WaitFuture<'_> {
     fn drop(&mut self) {
+        disarm_owned_for_current(self.owned_registration.take());
         if let Some(id) = self.registration.take() {
             drop(self.queue.unregister(id));
         }
@@ -1181,6 +1568,19 @@ fn unregister_timer(id: u64) -> Option<Waker> {
     };
     // See WaitQueue::unregister: Waker Drop must run outside registry locks.
     removed
+}
+
+fn cleanup_owned_registration(registration: OwnedRegistration) {
+    match registration {
+        OwnedRegistration::Wait { queue, id } => {
+            // Safety: the WaitFuture that registered this token remains inside
+            // its still-allocated task arena until every ledger is drained.
+            let queue = unsafe { &*(queue as *const WaitQueue) };
+            drop(queue.unregister(id));
+        }
+        OwnedRegistration::Timer { id } => drop(unregister_timer(id)),
+        OwnedRegistration::Join { status, id } => drop(status.unregister_joiner(id)),
+    }
 }
 
 /// Number of live sleep registrations, for scheduler diagnostics and tests.
@@ -1230,12 +1630,14 @@ pub fn sleep_ms(ms: u64) -> Sleep {
     Sleep {
         deadline: arch::time().saturating_add(ms.saturating_mul(TIMEBASE_HZ / 1000)),
         registration: None,
+        owned_registration: None,
     }
 }
 
 pub struct Sleep {
     deadline: u64,
     registration: Option<u64>,
+    owned_registration: Option<u64>,
 }
 
 impl Future for Sleep {
@@ -1243,6 +1645,7 @@ impl Future for Sleep {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if arch::time() >= this.deadline {
+            disarm_owned_for_current(this.owned_registration.take());
             if let Some(id) = this.registration.take() {
                 drop(unregister_timer(id));
             }
@@ -1253,6 +1656,18 @@ impl Future for Sleep {
         let mut candidate = Some(cx.waker().clone());
         let mut discarded = None;
         if let Some(id) = this.registration {
+            let mut allocation_failed = false;
+            if this.owned_registration.is_none() {
+                match register_owned_for_current(OwnedRegistration::Timer { id }) {
+                    Ok(token) => this.owned_registration = token,
+                    Err(_) => allocation_failed = true,
+                }
+            }
+            if allocation_failed {
+                drop(candidate);
+                system.restore();
+                panic!("timer cleanup ledger allocation failed");
+            }
             let found = {
                 let mut timers = TIMERS.lock();
                 if let Some(timer) = timers.iter_mut().find(|timer| timer.id == id) {
@@ -1274,15 +1689,20 @@ impl Future for Sleep {
                 return Poll::Pending;
             }
             // timer_tick owns and has already woken the removed registration.
+            disarm_owned_for_current(this.owned_registration.take());
             this.registration = None;
             return Poll::Ready(());
         }
 
         let id = next_timer_id();
         let mut allocation_failed = false;
+        match register_owned_for_current(OwnedRegistration::Timer { id }) {
+            Ok(token) => this.owned_registration = token,
+            Err(_) => allocation_failed = true,
+        }
         {
             let mut timers = TIMERS.lock();
-            if timers.try_reserve(1).is_err() {
+            if allocation_failed || timers.try_reserve(1).is_err() {
                 allocation_failed = true;
             } else {
                 let index = timers
@@ -1312,6 +1732,7 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
+        disarm_owned_for_current(self.owned_registration.take());
         if let Some(id) = self.registration.take() {
             drop(unregister_timer(id));
         }

@@ -20,7 +20,7 @@ vibe> caps prog
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> revoke guest
   revoked 1 cap(s) in `guest`
-  (its next heartbeat will fail -- no restart, no signal)
+  (authority is gone; cancel then restart to install fresh grants)
 vibe> caps guest
   owner component:3  task task:3  name guest  state running  reason -
   memory owner component:3  budget 65536 B  quota denials 0
@@ -30,10 +30,10 @@ vibe>
 [guest]  console denied: invalid or revoked capability -- guest is now mute
 vibe> ps
   COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
-  component:1  task:1   sensor     sensor   running   -                6    65536 B
-  component:2  task:2   logger     logger   running   -                6    65536 B
+  component:1  task:1   sensor     sensor   running   -        N    65536 B
+  component:2  task:2   logger     logger   running   -        N    65536 B
   component:3  task:3   guest      guest    exited    returned         2    65536 B
-  component:4  task:4   shell      init     running   -                9   262144 B
+  component:4  task:4   shell      init     running   -        N    524288 B
   executor totals (including untracked tasks): 1 exited, 0 faulted, 0 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising

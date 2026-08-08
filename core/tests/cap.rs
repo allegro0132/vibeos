@@ -303,6 +303,23 @@ fn a_slot_freed_by_cascade_is_safely_reused() {
     );
 }
 
+#[test]
+fn resetting_a_space_never_revives_an_old_incarnation_handle() {
+    let (mut cs, w) = space();
+    let stale = cs.mint(w.clone(), Rights::WRITE);
+
+    assert_eq!(cs.reset(), 1);
+    let fresh = cs.mint(w, Rights::WRITE);
+
+    assert_eq!(fresh.slot(), stale.slot(), "reset may reuse the table slot");
+    assert_eq!(
+        cs.lookup(stale, Rights::WRITE).err(),
+        Some(CapError::Invalid),
+        "the retained slot generation prevents cross-incarnation ABA"
+    );
+    assert!(cs.lookup(fresh, Rights::WRITE).is_ok());
+}
+
 // --- Rights algebra ---
 
 #[test]

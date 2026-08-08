@@ -58,6 +58,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  probe           attempt four illegal operations, show the refusals");
             println!("  revoke <space>  pull a component's authority at runtime");
             println!("  cancel <name>   cooperatively stop a component (shell is protected)");
+            println!("  restart <name>  start a fresh terminal component incarnation");
             println!("  rustc hello     compile and run a Rust hello world, natively");
             println!("  rustc demo      compile and run a larger sample (fib, gcd, loops)");
             println!("  rustc conform   compile and run the language conformance program");
@@ -190,9 +191,9 @@ async fn run(line: &str, boot_time: u64) {
                     let killed = space.0.lock().revoke_all();
                     println!("  revoked {} cap(s) in `{}`", killed, target);
                     match target {
-                        "guest" => {
-                            println!("  (its next heartbeat will fail -- no restart, no signal)")
-                        }
+                        "guest" => println!(
+                            "  (authority is gone; cancel then restart to install fresh grants)"
+                        ),
                         _ => println!("  (already-compiled machine code will now print nothing)"),
                     }
                 }
@@ -206,7 +207,7 @@ async fn run(line: &str, boot_time: u64) {
                 return;
             };
             if name == "shell" {
-                println!("  refused: shell cannot be cancelled until restart supervision exists");
+                println!("  refused: the active shell supervisor cannot cancel itself");
                 return;
             }
             let w = world();
@@ -247,6 +248,29 @@ async fn run(line: &str, boot_time: u64) {
                     "  cancellation was too late; task completion is already committed as {}",
                     state
                 ),
+            }
+        }
+
+        "restart" => {
+            let Some(name) = rest.first().copied() else {
+                println!("  usage: restart <component>");
+                return;
+            };
+            match world().restart_component(name) {
+                Ok(report) => {
+                    println!(
+                        "  restarted {}  generation {} -> {}",
+                        report.component, report.old_generation, report.new_generation
+                    );
+                    println!(
+                        "  task {} -> {}; retired {} old cap(s), fresh grants installed",
+                        report.old_task, report.new_task, report.retired_caps
+                    );
+                }
+                Err(crate::world::RestartError::NotFound) => {
+                    println!("  no such component: {}", name)
+                }
+                Err(e) => println!("  refused: {}", e),
             }
         }
 

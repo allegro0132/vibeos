@@ -17,11 +17,18 @@ use std::task::{Context, Poll, Wake, Waker};
 use vibeos_core::arch::{advance_time, armed_timer, reset_time};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::exec::{self, CancelOutcome, TaskExit, TaskState, WaitQueue};
-use vibeos_core::heap::{self, OwnerId};
+use vibeos_core::heap::{self, AllocationDomain, ArenaId, OwnerId};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static FAULT_NEXT_POLL: AtomicBool = AtomicBool::new(false);
+static FAULT_AFTER_GUARDED_CALLS: AtomicU64 = AtomicU64::new(0);
 static OWNER_SEEN_BY_FAULT_GUARD: Mutex<Option<OwnerId>> = Mutex::new(None);
+static RECLAIMED_DOMAINS: Mutex<Vec<AllocationDomain>> = Mutex::new(Vec::new());
+static FAULT_WAIT_QUEUE: WaitQueue = WaitQueue::new();
+
+unsafe fn record_fault_reclaim(domain: AllocationDomain) {
+    RECLAIMED_DOMAINS.lock().unwrap().push(domain);
+}
 
 fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
     if FAULT_NEXT_POLL.swap(false, Ordering::SeqCst) {
@@ -35,6 +42,17 @@ fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
 fn fault_after_poll(poll: &mut dyn FnMut()) -> bool {
     poll();
     true
+}
+
+fn fault_after_guarded_calls(poll: &mut dyn FnMut()) -> bool {
+    poll();
+    let remaining = FAULT_AFTER_GUARDED_CALLS.load(Ordering::SeqCst);
+    if remaining == 0 {
+        false
+    } else {
+        FAULT_AFTER_GUARDED_CALLS.store(remaining - 1, Ordering::SeqCst);
+        remaining == 1
+    }
 }
 
 fn fault_once_and_record_owner(poll: &mut dyn FnMut()) -> bool {
@@ -70,6 +88,49 @@ impl Future for OwnerDropFuture {
 impl Drop for OwnerDropFuture {
     fn drop(&mut self) {
         *self.owner_seen.lock().unwrap() = Some(heap::current_owner());
+    }
+}
+
+struct DropBombFuture {
+    drops: Arc<AtomicU64>,
+}
+
+impl Future for DropBombFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+impl Drop for DropBombFuture {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct RegisteredDropBombFuture {
+    wait: exec::WaitFuture<'static>,
+    sleep: exec::Sleep,
+    join: exec::Join,
+    drops: Arc<AtomicU64>,
+}
+
+impl Future for RegisteredDropBombFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        assert!(Pin::new(&mut this.wait).poll(cx).is_pending());
+        assert!(Pin::new(&mut this.sleep).poll(cx).is_pending());
+        assert!(Pin::new(&mut this.join).poll(cx).is_pending());
+        Poll::Pending
+    }
+}
+
+impl Drop for RegisteredDropBombFuture {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -340,6 +401,368 @@ fn fault_and_destructor_paths_restore_the_system_owner() {
     assert_eq!(*faulting_drop_owner.lock().unwrap(), Some(destructor_owner));
     assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
     exec::set_fault_guard(fault_once_then_passthrough);
+}
+
+#[test]
+fn a_reclaimable_poll_fault_skips_drop_and_invokes_the_reclaimer() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+
+    let domain = AllocationDomain::new(OwnerId::new(20_001), ArenaId::new(30_001));
+    let drops = Arc::new(AtomicU64::new(0));
+    let faults_before = exec::faulted_count();
+    exec::set_fault_guard(fault_after_poll);
+    let handle = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "reclaimable-drop-bomb",
+            DropBombFuture {
+                drops: drops.clone(),
+            },
+        )
+    };
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(handle.polls(), 1);
+    assert_eq!(handle.allocation_domain(), domain);
+    assert_eq!(drops.load(Ordering::SeqCst), 0, "fault teardown ran Drop");
+    assert_eq!(exec::faulted_count(), faults_before + 1);
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    assert_eq!(heap::current_domain(), AllocationDomain::SYSTEM);
+}
+
+#[test]
+fn a_reclaimable_fault_detaches_every_sibling_in_the_same_arena() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+
+    let domain = AllocationDomain::new(OwnerId::new(20_002), ArenaId::new(30_002));
+    let primary_drops = Arc::new(AtomicU64::new(0));
+    let sibling_drops = Arc::new(AtomicU64::new(0));
+    let faults_before = exec::faulted_count();
+    exec::set_fault_guard(fault_after_poll);
+    let primary = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "reclaimable-primary",
+            DropBombFuture {
+                drops: primary_drops.clone(),
+            },
+        )
+    };
+    let sibling = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "reclaimable-sibling",
+            DropBombFuture {
+                drops: sibling_drops.clone(),
+            },
+        )
+    };
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(primary.state(), TaskState::Faulted);
+    assert_eq!(sibling.state(), TaskState::Faulted);
+    assert_eq!(primary.polls(), 1);
+    assert_eq!(sibling.polls(), 0, "the sibling ran before arena teardown");
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(sibling_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(exec::faulted_count(), faults_before + 2);
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    assert!(exec::task_report()
+        .iter()
+        .all(|task| task.id != primary.id() && task.id != sibling.id()));
+    assert!(!exec::poll_once(), "a detached sibling remained ready");
+}
+
+#[test]
+fn reclaimable_fault_teardown_restores_wait_sleep_and_join_registries() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+    assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
+
+    let target = exec::spawn_tracked("reclaimable-join-target", std::future::pending::<()>());
+    assert!(exec::poll_once());
+    assert_eq!(target.polls(), 1);
+    let timers_before = exec::timer_registration_count();
+    let joiners_before = target.joiner_count();
+    let domain = AllocationDomain::new(OwnerId::new(20_003), ArenaId::new(30_003));
+    let drops = Arc::new(AtomicU64::new(0));
+    exec::set_fault_guard(fault_after_poll);
+    let handle = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "reclaimable-registered",
+            RegisteredDropBombFuture {
+                wait: FAULT_WAIT_QUEUE.wait(),
+                sleep: exec::sleep_ms(60_000),
+                join: target.join(),
+                drops: drops.clone(),
+            },
+        )
+    };
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
+    assert_eq!(exec::timer_registration_count(), timers_before);
+    assert_eq!(target.joiner_count(), joiners_before);
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    assert_eq!(target.cancel(), CancelOutcome::Requested);
+    assert_eq!(target.state(), TaskState::Cancelled);
+}
+
+#[test]
+fn a_reclaimable_destructor_fault_cleans_registries_before_entering_drop() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+    assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
+
+    let target = exec::spawn_tracked(
+        "reclaimable-destructor-join-target",
+        std::future::pending::<()>(),
+    );
+    assert!(exec::poll_once());
+    let timers_before = exec::timer_registration_count();
+    let joiners_before = target.joiner_count();
+    let domain = AllocationDomain::new(OwnerId::new(20_004), ArenaId::new(30_004));
+    let drops = Arc::new(AtomicU64::new(0));
+    let handle = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "reclaimable-destructor-registered",
+            RegisteredDropBombFuture {
+                wait: FAULT_WAIT_QUEUE.wait(),
+                sleep: exec::sleep_ms(60_000),
+                join: target.join(),
+                drops: drops.clone(),
+            },
+        )
+    };
+    assert!(exec::poll_once(), "the task must first register and park");
+    assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 1);
+    assert_eq!(exec::timer_registration_count(), timers_before + 1);
+    assert_eq!(target.joiner_count(), joiners_before + 1);
+
+    // The synthetic guard reports a destructor fault after executing Drop.
+    // Real target faults may longjmp partway through Drop, so the ledger must
+    // already be empty before the guarded destructor starts.
+    exec::set_fault_guard(fault_after_poll);
+    assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
+    assert_eq!(exec::timer_registration_count(), timers_before);
+    assert_eq!(target.joiner_count(), joiners_before);
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    assert_eq!(target.cancel(), CancelOutcome::Requested);
+}
+
+#[test]
+fn nested_cancel_defers_a_same_arena_destructor_fault_to_the_outer_boundary() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+
+    let domain = AllocationDomain::new(OwnerId::new(20_006), ArenaId::new(30_006));
+    let victim_drops = Arc::new(AtomicU64::new(0));
+    let victim = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "nested-cancel-same-victim",
+            DropBombFuture {
+                drops: victim_drops.clone(),
+            },
+        )
+    };
+    assert!(exec::poll_once(), "the victim must first become parked");
+
+    let actor_handle: Arc<Mutex<Option<exec::TaskHandle>>> = Arc::new(Mutex::new(None));
+    let actor_handle_inside = actor_handle.clone();
+    let actor_dropped = Arc::new(AtomicBool::new(false));
+    let actor_drop_guard = DropFlag(actor_dropped.clone());
+    let continued = Arc::new(AtomicBool::new(false));
+    let continued_inside = continued.clone();
+    let running_visible = Arc::new(AtomicBool::new(false));
+    let running_visible_inside = running_visible.clone();
+    let victim_inside = victim.clone();
+    let actor = unsafe {
+        exec::spawn_reclaimable_owned(domain, "nested-cancel-same-actor", async move {
+            let _drop_guard = actor_drop_guard;
+            assert_eq!(victim_inside.cancel(), CancelOutcome::Requested);
+            let actor_id = actor_handle_inside.lock().unwrap().as_ref().unwrap().id();
+            running_visible_inside.store(
+                exec::task_report().iter().any(|task| task.id == actor_id),
+                Ordering::SeqCst,
+            );
+            continued_inside.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+    };
+    *actor_handle.lock().unwrap() = Some(actor.clone());
+
+    // First guarded call polls the actor. The second is the victim's deferred
+    // destructor, which synthetically faults after Drop executes.
+    FAULT_AFTER_GUARDED_CALLS.store(2, Ordering::SeqCst);
+    exec::set_fault_guard(fault_after_guarded_calls);
+    assert!(exec::poll_once());
+    assert!(continued.load(Ordering::SeqCst));
+    assert!(running_visible.load(Ordering::SeqCst));
+    assert_eq!(actor.state(), TaskState::Running);
+    assert_eq!(victim.state(), TaskState::Running);
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(FAULT_AFTER_GUARDED_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(victim.state(), TaskState::Faulted);
+    assert_eq!(actor.state(), TaskState::Faulted);
+    assert_eq!(victim_drops.load(Ordering::SeqCst), 1);
+    assert!(!actor_dropped.load(Ordering::SeqCst));
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    assert!(exec::task_report()
+        .iter()
+        .all(|task| task.id != actor.id() && task.id != victim.id()));
+}
+
+#[test]
+fn nested_cancel_keeps_a_different_domain_running_across_destructor_fault() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+
+    let victim_domain =
+        AllocationDomain::new(OwnerId::new(20_007), ArenaId::new(30_007));
+    let actor_domain =
+        AllocationDomain::new(OwnerId::new(20_008), ArenaId::new(30_008));
+    let victim_drops = Arc::new(AtomicU64::new(0));
+    let victim = unsafe {
+        exec::spawn_reclaimable_owned(
+            victim_domain,
+            "nested-cancel-other-victim",
+            DropBombFuture {
+                drops: victim_drops.clone(),
+            },
+        )
+    };
+    assert!(exec::poll_once(), "the victim must first become parked");
+
+    let actor_handle: Arc<Mutex<Option<exec::TaskHandle>>> = Arc::new(Mutex::new(None));
+    let actor_handle_inside = actor_handle.clone();
+    let actor_dropped = Arc::new(AtomicBool::new(false));
+    let actor_drop_guard = DropFlag(actor_dropped.clone());
+    let stage = Arc::new(AtomicU64::new(0));
+    let stage_inside = stage.clone();
+    let running_visible = Arc::new(AtomicBool::new(false));
+    let running_visible_inside = running_visible.clone();
+    let victim_inside = victim.clone();
+    let actor = unsafe {
+        exec::spawn_reclaimable_owned(
+            actor_domain,
+            "nested-cancel-other-actor",
+            async move {
+                let _drop_guard = actor_drop_guard;
+                assert_eq!(victim_inside.cancel(), CancelOutcome::Requested);
+                let actor_id = actor_handle_inside.lock().unwrap().as_ref().unwrap().id();
+                running_visible_inside.store(
+                    exec::task_report().iter().any(|task| task.id == actor_id),
+                    Ordering::SeqCst,
+                );
+                stage_inside.store(1, Ordering::SeqCst);
+                exec::yield_now().await;
+                stage_inside.store(2, Ordering::SeqCst);
+            },
+        )
+    };
+    *actor_handle.lock().unwrap() = Some(actor.clone());
+
+    FAULT_AFTER_GUARDED_CALLS.store(2, Ordering::SeqCst);
+    exec::set_fault_guard(fault_after_guarded_calls);
+    assert!(exec::poll_once());
+    assert_eq!(stage.load(Ordering::SeqCst), 1);
+    assert!(running_visible.load(Ordering::SeqCst));
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(victim.state(), TaskState::Faulted);
+    assert_eq!(victim_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(actor.state(), TaskState::Running);
+    assert!(exec::task_report().iter().any(|task| task.id == actor.id()));
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[victim_domain]);
+
+    assert!(exec::poll_once());
+    assert_eq!(actor.state(), TaskState::Exited);
+    assert_eq!(actor.polls(), 2);
+    assert_eq!(stage.load(Ordering::SeqCst), 2);
+    assert!(actor_dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_task_cannot_reenter_the_executor_and_overwrite_running_state() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+
+    let rejected = Arc::new(AtomicBool::new(false));
+    let rejected_inside = rejected.clone();
+    let handle = exec::spawn_tracked("recursive-executor-drive", async move {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exec::poll_once();
+        }));
+        rejected_inside.store(result.is_err(), Ordering::SeqCst);
+    });
+
+    assert!(exec::poll_once());
+    assert!(rejected.load(Ordering::SeqCst));
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(handle.polls(), 1);
+    assert!(exec::task_report().iter().all(|task| task.id != handle.id()));
+}
+
+#[test]
+fn an_untracked_fault_remains_conservative_and_never_raw_reclaims() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+
+    let drops = Arc::new(AtomicU64::new(0));
+    exec::set_fault_guard(fault_after_poll);
+    let handle = exec::spawn_tracked_owned(
+        OwnerId::new(20_005),
+        "ordinary-drop-bomb",
+        DropBombFuture {
+            drops: drops.clone(),
+        },
+    );
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(handle.arena(), ArenaId::UNTRACKED);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(RECLAIMED_DOMAINS.lock().unwrap().is_empty());
 }
 
 #[test]

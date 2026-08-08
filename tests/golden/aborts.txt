@@ -42,10 +42,10 @@ Hello, world!
   --- exited with 0 in N us ---
 vibe> ps
   COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
-  component:1  task:1   sensor     sensor   running   -                9    65536 B
-  component:2  task:2   logger     logger   running   -                9    65536 B
-  component:3  task:3   guest      guest    running   -                3    65536 B
-  component:4  task:4   shell      init     running   -               20   262144 B
+  component:1  task:1   sensor     sensor   running   -        N    65536 B
+  component:2  task:2   logger     logger   running   -        N    65536 B
+  component:3  task:3   guest      guest    running   -        N    65536 B
+  component:4  task:4   shell      init     running   -        N    524288 B
   executor totals (including untracked tasks): 0 exited, 0 faulted, 0 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising

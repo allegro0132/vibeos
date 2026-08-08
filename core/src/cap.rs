@@ -330,6 +330,16 @@ impl CSpace {
         self.collect()
     }
 
+    /// Retire every capability in preparation for a fresh component
+    /// incarnation.
+    ///
+    /// Vacant slots are deliberately retained with their incremented
+    /// generations. Replacing the table with `CSpace::new` would let an old
+    /// `Cap { slot, generation }` alias the first grant in the new incarnation.
+    pub fn reset(&mut self) -> usize {
+        self.revoke_all()
+    }
+
     /// Drop every slot whose derivation is dead; returns how many went.
     ///
     /// Killing a node takes effect immediately for lookups everywhere; this is

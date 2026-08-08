@@ -343,3 +343,25 @@ fn an_empty_or_out_of_range_handle_is_invalid() {
     assert_eq!(cs.lookup(c, Rights::READ).err(), Some(CapError::Invalid));
     assert_eq!(cs.rights_of(c).err(), Some(CapError::Invalid));
 }
+
+/// "Revoke that component" means all of its authority, not one handle.
+#[test]
+fn revoke_all_empties_a_space_and_reaches_its_grants() {
+    let (mut src, w) = space();
+    let mut victim = CSpace::new("victim");
+    let a = src.mint(w.clone(), Rights::ALL);
+    let b = src.mint(w.clone(), Rights::ALL);
+    let ca = grant(&src, a, Rights::READ, &mut victim).unwrap();
+    let cb = grant(&src, b, Rights::WRITE, &mut victim).unwrap();
+    let mut onward = CSpace::new("onward");
+    victim.mint(w, Rights::READ); // an unrelated cap the victim minted itself
+
+    assert_eq!(victim.revoke_all(), 3);
+    assert!(victim.list().is_empty());
+    assert_eq!(victim.lookup(ca, Rights::READ).err(), Some(CapError::Invalid));
+    assert_eq!(victim.lookup(cb, Rights::WRITE).err(), Some(CapError::Invalid));
+
+    // The source keeps its own authority; revocation flows down, never up.
+    assert!(src.lookup(a, Rights::READ).is_ok());
+    assert!(grant(&src, a, Rights::READ, &mut onward).is_ok());
+}

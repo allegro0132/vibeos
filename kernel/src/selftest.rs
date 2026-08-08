@@ -335,6 +335,43 @@ fn compiler(h: &mut Harness) {
             == 4,
     );
 
+    // M3: arrays in the capability-granted region.
+    h.check(
+        "arrays round-trip through the region",
+        crate::rustc::compile(
+            "fn main() -> i64 { let mut a = [0; 8]; let mut i = 0; let mut v = 0;\
+             while i < 8 { a[i] = v * v; v = v + 1; i = i + 1; }\
+             let mut s = 0; i = 0; while i < 8 { s = s + a[i]; i = i + 1; } s }",
+        )
+        .map(|c| crate::rustc::run(&c).value)
+        .unwrap_or(-1)
+            == 140,
+    );
+    let region_aborts: [(&str, &str); 3] = [
+        ("fn main() -> i64 { let mut a = [1; 4]; a[9] }", "index out of bounds"),
+        (
+            "fn main() -> i64 { let mut a = [1; 4]; let i = 0 - 1; a[i] }",
+            "index out of bounds",
+        ),
+        (
+            "fn main() -> i64 { let mut a = [0; 3000]; let mut b = [0; 3000]; a[0] + b[0] }",
+            "the granted memory region is too small for this program",
+        ),
+    ];
+    for (src, want) in region_aborts {
+        match crate::rustc::compile(src) {
+            Ok(c) => h.eq(want, crate::rustc::run(&c).aborted, Some(want)),
+            Err(e) => {
+                crate::println!("  FAIL  {} did not compile: {}", want, e);
+                h.check(want, false);
+            }
+        }
+    }
+    h.check(
+        "a program with no memory capability cannot allocate",
+        crate::rustc::compile("fn main() -> i64 { let mut a = [1; 2]; a[0] }").is_ok(),
+    );
+
     h.check("undefined names are rejected", crate::rustc::compile("fn main() { y; }").is_err());
     h.check(
         "a literal zero divisor is a compile error",

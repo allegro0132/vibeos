@@ -26,7 +26,7 @@ use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use crate::cap::Rights;
-use crate::dev::ConsoleDev;
+use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::sbi;
 use crate::sync::SpinLock;
 use crate::trampoline::{self, abort, vibe_enter, vibe_longjmp, vibe_setjmp, JmpBuf};
@@ -80,8 +80,9 @@ pub fn unwind_running_program() {
     unsafe { vibe_longjmp(addr_of_mut!(JMP), 1) }
 }
 
-/// Reason code for "the kernel panicked while this program was running".
-const RUNTIME_PANICKED: i64 = 7;
+/// Reason code for "the kernel panicked while this program was running". Above
+/// the codes the code generator emits.
+const RUNTIME_PANICKED: i64 = 64;
 
 /// Called by generated code when an emitted check fails. Never returns.
 extern "C" fn rt_abort(code: i64) -> ! {
@@ -172,6 +173,22 @@ pub fn run(prog: &Compiled) -> RunOutcome {
     let space = w.spaces["prog"].clone();
     let console = space.0.lock().lookup_as::<ConsoleDev>(w.prog_console, Rights::WRITE).ok();
 
+    // Memory is resolved through the capability on every run, exactly like the
+    // console. Without it a program simply has a zero-length region, and its
+    // first array allocation aborts.
+    let region = space
+        .0
+        .lock()
+        .lookup_as::<MemoryRegion>(w.prog_memory, Rights::READ.union(Rights::WRITE))
+        .ok();
+    let (region_base, region_len) = match &region {
+        Some(r) => {
+            r.clear();
+            r.extent()
+        }
+        None => (0, 0),
+    };
+
     *PROG_OUT.lock() = console;
     *DENIED.lock() = false;
     ABORT_CODE.store(0, Ordering::SeqCst);
@@ -186,7 +203,13 @@ pub fn run(prog: &Compiled) -> RunOutcome {
         core::arch::asm!("fence.i");
         ARMED.store(true, Ordering::SeqCst);
         if vibe_setjmp(addr_of_mut!(JMP)) == 0 {
-            let v = vibe_enter(ENTRY.load(Ordering::SeqCst), crate::stack_floor(), FUEL);
+            let v = vibe_enter(
+                ENTRY.load(Ordering::SeqCst),
+                crate::stack_floor(),
+                FUEL,
+                region_base,
+                region_len,
+            );
             ARMED.store(false, Ordering::SeqCst);
             v
         } else {

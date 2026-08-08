@@ -128,7 +128,7 @@ async fn run(line: &str, boot_time: u64) {
             let space_res = init.0.lock().lookup_as::<Space>(handle, Rights::REVOKE);
             match space_res {
                 Ok(space) => {
-                    let killed = space.0.lock().revoke_slot(0);
+                    let killed = space.0.lock().revoke_all();
                     println!("  revoked {} cap(s) in `{}`", killed, target);
                     match target {
                         "guest" => println!("  (its next heartbeat will fail -- no restart, no signal)"),
@@ -194,7 +194,17 @@ async fn run(line: &str, boot_time: u64) {
 
         "mem" => {
             let (live, peak, free) = HEAP.stats();
-            println!("  live {:>7} B   peak {:>7} B   bump remaining {:>9} B", live, peak, free);
+            println!("  heap   live {:>7} B  peak {:>7} B  bump remaining {:>9} B", live, peak, free);
+            let w = world();
+            let init = w.spaces["init"].clone();
+            let region = init
+                .0
+                .lock()
+                .lookup_as::<crate::dev::MemoryRegion>(w.region, Rights::READ);
+            match region {
+                Ok(r) => println!("  region {} x i64 granted to `prog`", r.len()),
+                Err(_) => println!("  region not reachable from init"),
+            }
         }
 
         "uptime" => {

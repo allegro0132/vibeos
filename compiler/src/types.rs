@@ -111,10 +111,31 @@ impl Checker {
             Stmt::Let { name, mutable, declared, init, line } => {
                 let (init, t) = self.expr(init)?;
                 if let Some(d) = declared {
-                    self.unify(*d, t, *line, &format!("initializer for `{}`", name))?;
+                    // A `let` is the one place an array type may be written, so
+                    // it compares directly rather than going through `unify`,
+                    // which rejects arrays as values everywhere else.
+                    match (d, t) {
+                        (Ty::Array(want), Ty::Array(got)) if *want != got => {
+                            return Err(format!(
+                                "line {}: mismatched types: `{}` is `[i64; {}]` but its initializer has {} element(s)",
+                                line, name, want, got
+                            ))
+                        }
+                        (Ty::Array(_), Ty::Array(_)) => {}
+                        _ => self.unify(*d, t, *line, &format!("initializer for `{}`", name))?,
+                    }
                 }
                 if t == Ty::Unit {
                     return Err(format!("line {}: `{}` cannot have type `()`", line, name));
+                }
+                if matches!(t, Ty::Array(_)) && !*mutable {
+                    // An immutable array can never be written, and there is no
+                    // initializer syntax other than repeat, so it would be a
+                    // constant nobody can use.
+                    return Err(format!(
+                        "line {}: `{}` is an array and must be declared `let mut`",
+                        line, name
+                    ));
                 }
                 self.scope.push((name.clone(), t, *mutable));
                 Stmt::Let { name: name.clone(), mutable: *mutable, declared: *declared, init, line: *line }
@@ -132,6 +153,28 @@ impl Checker {
                 let (value, t) = self.expr(value)?;
                 self.unify(want, t, *line, &format!("assignment to `{}`", name))?;
                 Stmt::Assign { name: name.clone(), value, line: *line }
+            }
+            Stmt::IndexAssign { name, index, value, line } => {
+                let Some((t, mutable)) = self.lookup(name) else {
+                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                };
+                let Ty::Array(_) = t else {
+                    return Err(format!(
+                        "line {}: cannot index into `{}`, which has type `{}`",
+                        line, name, t
+                    ));
+                };
+                if !mutable {
+                    return Err(format!(
+                        "line {}: cannot assign to an element of immutable `{}` (declare it `let mut`)",
+                        line, name
+                    ));
+                }
+                let (index, ti) = self.expr(index)?;
+                self.unify(Ty::I64, ti, *line, "array index")?;
+                let (value, tv) = self.expr(value)?;
+                self.unify(Ty::I64, tv, *line, &format!("element assigned to `{}`", name))?;
+                Stmt::IndexAssign { name: name.clone(), index, value, line: *line }
             }
             Stmt::Expr(e) => Stmt::Expr(self.expr(e)?.0),
             Stmt::While(cond, body, line) => {
@@ -160,8 +203,17 @@ impl Checker {
                         PrintPart::Str(s) => PrintPart::Str(s.clone()),
                         PrintPart::Val(e, _) => {
                             let (e, t) = self.expr(e)?;
-                            if t == Ty::Unit {
-                                return Err("`()` cannot be formatted with `{}`".to_string());
+                            match t {
+                                Ty::Unit => {
+                                    return Err("`()` cannot be formatted with `{}`".to_string())
+                                }
+                                Ty::Array(_) => {
+                                    return Err(format!(
+                                        "`{}` cannot be formatted with `{{}}`; print elements instead",
+                                        t
+                                    ))
+                                }
+                                _ => {}
                             }
                             PrintPart::Val(e, t)
                         }
@@ -194,7 +246,7 @@ impl Checker {
                 match t {
                     Ty::Bool => (Expr::Not(a), Ty::Bool),
                     Ty::I64 => (Expr::BitNot(a), Ty::I64),
-                    Ty::Unit => return Err("cannot apply `!` to `()`".to_string()),
+                    other => return Err(format!("cannot apply `!` to `{}`", other)),
                 }
             }
             Expr::Bin(op, a, b, line) => {
@@ -245,6 +297,28 @@ impl Checker {
                 }
                 (Expr::Call(name.clone(), out, *line), ret)
             }
+            Expr::Index(name, idx, line) => {
+                let Some((t, _)) = self.lookup(name) else {
+                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                };
+                let Ty::Array(_) = t else {
+                    return Err(format!(
+                        "line {}: cannot index into `{}`, which has type `{}`",
+                        line, name, t
+                    ));
+                };
+                let (idx, ti) = self.expr(idx)?;
+                self.unify(Ty::I64, ti, *line, "array index")?;
+                (Expr::Index(name.clone(), alloc::boxed::Box::new(idx), *line), Ty::I64)
+            }
+            Expr::ArrayRepeat(v, n, line) => {
+                let (v, tv) = self.expr(v)?;
+                self.unify(Ty::I64, tv, *line, "array element")?;
+                (
+                    Expr::ArrayRepeat(alloc::boxed::Box::new(v), *n, *line),
+                    Ty::Array(*n),
+                )
+            }
             Expr::If(cond, then, els, line) => {
                 let line = *line;
                 let (cond, t) = self.expr(cond)?;
@@ -279,6 +353,14 @@ impl Checker {
 
     fn unify(&self, want: Ty, got: Ty, line: u32, what: &str) -> TResult<()> {
         if want == got {
+            if matches!(want, Ty::Array(_)) {
+                let where_ = if line > 0 { format!("line {}: ", line) } else { String::new() };
+                return Err(format!(
+                    "{}arrays cannot be passed, returned or assigned as values yet; \
+                     index them instead",
+                    where_
+                ));
+            }
             return Ok(());
         }
         let where_ = if line > 0 { format!("line {}: ", line) } else { String::new() };

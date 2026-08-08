@@ -304,6 +304,17 @@ impl CSpace {
         self.collect()
     }
 
+    /// Revoke everything in this space. What an operator means by "revoke that
+    /// component": not one handle, but all of its authority.
+    pub fn revoke_all(&mut self) -> usize {
+        for slot in &self.slots {
+            if let Some(e) = &slot.entry {
+                e.node.kill();
+            }
+        }
+        self.collect()
+    }
+
     /// Drop every slot whose derivation is dead; returns how many went.
     ///
     /// Killing a node takes effect immediately for lookups everywhere; this is

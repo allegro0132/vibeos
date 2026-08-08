@@ -3,18 +3,19 @@ vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> spaces
   guest    1 caps
-  init     6 caps
+  init     7 caps
   logger   2 caps
-  prog     1 caps
+  prog     2 caps
   sensor   1 caps
 vibe> caps init
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      console   rwsvgx   ns16550a @ 0xADDR [0 bytes out]
   cap:1.0      endpoint  rwsvgx   telemetry [0/8 sent=0 recv=0]
   cap:2.0      cspace    r----x   guest [1 caps]
-  cap:3.0      cspace    r----x   prog [1 caps]
+  cap:3.0      cspace    r----x   prog [2 caps]
   cap:4.0      cspace    r-----   sensor [1 caps]
   cap:5.0      cspace    r-----   logger [2 caps]
+  cap:6.0      memory    rwsvgx   prog-arena [4096 x i64 @ 0xADDR]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps logger
   HANDLE       KIND      RIGHTS   OBJECT

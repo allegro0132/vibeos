@@ -111,7 +111,7 @@ upward except through a capability it was handed.
 
 | Module | Approx. lines | Role | Contains `unsafe` |
 |---|---:|---|:--:|
-| `cap.rs` | 376 | Rights, `Cap`, `CSpace`, attenuation, revocation | 1 (downcast) |
+| `cap.rs` | ~600 | Rights, `Cap`, `CSpace`, attenuation, revocation, explicit leases | — |
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
@@ -127,7 +127,7 @@ upward except through a capability it was handed.
 | `main.rs` | 159 | Boot, panic, entry | 1 |
 
 Line counts are a dated snapshot, not a target. `unsafe` is concentrated in the
-hardware layer, allocator, waker construction, the `lookup_as` downcast, and the
+hardware layer, allocator, waker construction, and the
 generated-code/fault trampolines. None is in the rights or revocation decision path.
 
 ---
@@ -159,11 +159,13 @@ breaks one is a security bug, not a behavior change.
    privileged, not admin-only. Absent.
 3. **Rights are checked at use, not at acquisition.** Every `lookup` names what it
    needs. Holding a handle is not permission; holding a handle *with the right* is.
-4. **Revocation is immediate for capability lookup.** Bumping a slot's generation
-   makes every outstanding copy of that handle stale on its next lookup. A service
-   that caches the resolved object has created a lease outside this guarantee; the
-   current generated-program runtime does this for the duration of one invocation,
-   as called out in §6.3 and §8.1.
+4. **Resolved authority has an explicit lifetime.** Bumping a slot generation or
+   killing a derivation makes later lookups stale. `Revocable<T>` additionally
+   revalidates the complete ancestry at every operation acquisition; an acquisition
+   that overlaps a concurrent revoke may finish, but no later one succeeds.
+   `InvocationLease<T>` instead authorizes one already-started bounded invocation
+   and deliberately survives revocation. Legacy raw `Arc` lookup is TCB-only and
+   documents that it has the latter lifetime.
 5. **Spaces are objects.** A `CSpace` is itself a `Resource`, so "supervise that
    component" is expressible as a capability rather than as a special case.
 
@@ -304,11 +306,12 @@ argument because it is what Bet 4 rests on:
 | Forge a pointer | Nothing in the language produces an address. Address materialization is limited to string-table addresses, function targets, runtime hooks, and the capability-granted region base — all compiler- or kernel-chosen. |
 | Call something it was not given | Call targets are statically resolved function names or the print/abort runtime hooks. There is no function pointer or user-selected indirect branch. |
 | Name the runtime hooks | Their addresses are baked into the emitted stream. The language has no syntax that reaches them. |
-| Keep authority after revocation | **Partially closed.** Program launch resolves console and memory caps, so revocation before launch is enforced. The current runtime caches the console object and raw memory extent for the invocation; revocation during an invocation is therefore not yet a demonstrated boundary. |
+| Keep authority after revocation | Console hooks use `Revocable<ConsoleDev>` and revalidate before each operation. Raw memory is deliberately invocation-scoped: a non-cloneable `InvocationLease<MemoryRegion>` plus an exclusive claim covers the catcher call and is dropped after normal or abort return. Revocation prevents the next invocation. |
 
-**Verified by demo:** `revoke prog` followed by a new run leaves byte-identical machine
-code running to completion with nothing to say. This proves launch-time authority,
-not operation-time revocation of already-running code.
+**Verified by demo:** `revoke prog` followed by a new run proves launch-time denial.
+`rustc lease` additionally revokes immediately before the second generated console
+operation: that operation is suppressed, the active memory lease still computes 42,
+and a second cold launch without fresh grants aborts on its first array allocation.
 
 ### 6.4 Where the argument used to leak
 
@@ -443,7 +446,7 @@ boot-static `Space`, while installing a new `TaskId`, `ArenaId`, generation, and
 grants. Slot generations survive CSpace reset, so an old `Cap` cannot alias a fresh
 grant. Sixteen target fault/restart cycles verify bounded heap growth and zero interrupted
 destructors. Reproducible builds and the single-hart scheduler/panic model are now
-in place; the remaining M3.5 work is resolved-cap lease semantics.
+in place. Explicit resolved-cap lease semantics now complete the M3.5 sequence.
 
 Five boundaries must stay explicit:
 
@@ -460,12 +463,12 @@ Five boundaries must stay explicit:
    generation pairs is insufficient: reboot must not resurrect a descendant of a
    revoked cap. Stable object identity, derivation records, and atomic tombstones are
    part of the storage design, not a later serialization detail.
-4. **Lookup-time revocation is not use-time revocation after resolution.**
-   `rustc::run` currently resolves console and memory once, then caches an `Arc` and
-   a raw region extent. The design must explicitly choose between revocable
-   operation-time handles and invocation-scoped leases. Direct generated loads and
-   stores cannot promise immediate revocation without instrumentation or a mapping
-   boundary.
+4. **Revocation cannot retroactively erase an in-flight operation.** Console hooks
+   revalidate a `Revocable` token before every write; a successful check linearizes
+   that operation before an overlapping revoke. Direct generated loads and stores
+   use an explicit invocation lease because they cannot be interposed without
+   instrumentation or a mapping boundary. Revocation blocks the next invocation,
+   not raw accesses already covered by that lease.
 5. **Claims need reproducible measurements.** IPC cost, wake latency, capability
    lookup depth, heap high-water marks, code size, and generated-code performance
    need automated baselines. Optimizing with SSA or adding multicore before those

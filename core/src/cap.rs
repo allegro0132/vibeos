@@ -194,6 +194,155 @@ struct Entry {
     node: Arc<Derivation>,
 }
 
+/// A resolved capability that revalidates its derivation at the start of every
+/// operation.
+///
+/// The object and derivation node deliberately remain private. Callers can use
+/// the resource only through [`Revocable::try_with`]; there is no `Deref`,
+/// `AsRef`, or `Arc` extractor that could turn one successful check into
+/// authority which silently survives revocation. Cloning this token is safe:
+/// every clone performs the same ancestry check before every operation.
+/// The successful check is the operation's authority-acquisition linearization
+/// point: a concurrent revocation prevents later acquisitions but does not
+/// forcibly interrupt a callback which already passed that check.
+///
+/// This wrapper prevents the resource borrow and backing `Arc` from escaping.
+/// A resource method that deliberately returns an owned handle or raw address
+/// defines its own authority boundary and remains part of that resource's TCB.
+///
+/// A borrow of the resource cannot escape the operation callback:
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{Resource, Revocable};
+///
+/// fn leak<T: Resource>(token: &Revocable<T>) -> &T {
+///     token.try_with(|resource| resource).unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{Resource, Revocable};
+///
+/// fn deref<T: Resource>(token: &Revocable<T>) -> &T {
+///     token
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{Resource, Revocable};
+///
+/// fn as_ref<T: Resource>(token: &Revocable<T>) -> &T {
+///     token.as_ref()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use vibeos_core::cap::{Resource, Revocable};
+///
+/// fn into_arc<T: Resource>(token: Revocable<T>) -> Arc<T> {
+///     token.into_inner()
+/// }
+/// ```
+#[must_use = "dropping a revocable token relinquishes the resolved authority"]
+pub struct Revocable<T: Resource> {
+    object: Arc<T>,
+    node: Arc<Derivation>,
+}
+
+impl<T: Resource> Clone for Revocable<T> {
+    fn clone(&self) -> Self {
+        Self {
+            object: self.object.clone(),
+            node: self.node.clone(),
+        }
+    }
+}
+
+impl<T: Resource> Revocable<T> {
+    /// Revalidate the complete derivation ancestry, then perform one operation.
+    ///
+    /// The higher-ranked callback permits returning owned values but prevents a
+    /// reference borrowed from the resource from escaping this call.
+    pub fn try_with<R, F>(&self, operation: F) -> Result<R, CapError>
+    where
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        if !self.node.is_alive() {
+            return Err(CapError::Invalid);
+        }
+        Ok(operation(&self.object))
+    }
+}
+
+/// A resolved capability whose authority lasts for one explicit invocation.
+///
+/// Revocation prevents acquisition of a new lease but does not invalidate a
+/// lease already acquired. The lease is intentionally non-`Clone`, has no
+/// `Deref`, and exposes neither its `Arc` nor a resource reference. Invocation
+/// owners must retain this value for the complete lifetime of any raw state
+/// derived inside [`InvocationLease::with`].
+///
+/// Neither the resource borrow nor the backing `Arc` can be extracted:
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{InvocationLease, Resource};
+///
+/// fn leak<T: Resource>(lease: &InvocationLease<T>) -> &T {
+///     lease.with(|resource| resource)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{InvocationLease, Resource};
+///
+/// fn deref<T: Resource>(lease: &InvocationLease<T>) -> &T {
+///     lease
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{InvocationLease, Resource};
+///
+/// fn as_ref<T: Resource>(lease: &InvocationLease<T>) -> &T {
+///     lease.as_ref()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use vibeos_core::cap::{InvocationLease, Resource};
+///
+/// fn into_arc<T: Resource>(lease: InvocationLease<T>) -> Arc<T> {
+///     lease.into_inner()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{InvocationLease, Resource};
+///
+/// fn duplicate<T: Resource>(lease: &InvocationLease<T>) -> InvocationLease<T> {
+///     (*lease).clone()
+/// }
+/// ```
+#[must_use = "the invocation lease must remain alive for the complete invocation"]
+pub struct InvocationLease<T: Resource> {
+    object: Arc<T>,
+}
+
+impl<T: Resource> InvocationLease<T> {
+    /// Perform work through this invocation's already-resolved authority.
+    ///
+    /// Unlike [`Revocable::try_with`], this intentionally does not revalidate:
+    /// revocation affects the next lease acquisition, not the active invocation.
+    pub fn with<R, F>(&self, operation: F) -> R
+    where
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        operation(&self.object)
+    }
+}
+
 /// A task's capability space. Owning one *is* the task's entire authority.
 pub struct CSpace {
     pub name: String,
@@ -254,25 +403,73 @@ impl CSpace {
         Ok(self.entry(cap)?.rights)
     }
 
-    /// Resolve a cap, enforcing that it carries `need`. Every operation in the
-    /// system goes through here.
-    pub fn lookup(&self, cap: Cap, need: Rights) -> Result<Arc<dyn Resource>, CapError> {
-        let e = self.entry(cap)?;
-        if !e.rights.contains(need) {
+    /// Validate a handle and rights before disclosing either object type or
+    /// resolved authority. All typed resolve APIs share this path so their
+    /// observable error order remains Invalid -> rights -> type.
+    fn checked_entry(&self, cap: Cap, need: Rights) -> Result<&Entry, CapError> {
+        let entry = self.entry(cap)?;
+        if !entry.rights.contains(need) {
             return Err(CapError::InsufficientRights);
         }
-        Ok(e.obj.clone())
+        Ok(entry)
     }
 
-    /// Typed resolve: rights check plus a downcast to the concrete resource.
+    fn typed_parts<T: Resource>(
+        &self,
+        cap: Cap,
+        need: Rights,
+    ) -> Result<(Arc<T>, Arc<Derivation>), CapError> {
+        let entry = self.checked_entry(cap, need)?;
+        // Upcast through the real trait-object metadata and let `Any` perform
+        // the downcast. This must not trust `Resource::as_any`: safe external
+        // code implements that method and could return a different object.
+        let object: Arc<dyn Any + Send + Sync> = entry.obj.clone();
+        let object = Arc::downcast::<T>(object).map_err(|_| CapError::WrongType)?;
+        let node = entry.node.clone();
+        Ok((object, node))
+    }
+
+    /// Legacy untyped TCB resolve into an owned `Arc` lease.
+    ///
+    /// The returned object remains usable after revocation. New code should
+    /// prefer an operation-time service API or one of the explicit typed lease
+    /// forms below so this lifetime choice is visible at the call site.
+    pub fn lookup(&self, cap: Cap, need: Rights) -> Result<Arc<dyn Resource>, CapError> {
+        Ok(self.checked_entry(cap, need)?.obj.clone())
+    }
+
+    /// Legacy TCB typed resolve: rights check plus a downcast to an owned
+    /// resolved-object lease.
+    ///
+    /// The returned `Arc` intentionally remains usable after revocation. New
+    /// code that needs operation-time revocation must use `lookup_revocable`;
+    /// code with explicit invocation semantics should use `lookup_lease`.
     pub fn lookup_as<T: Resource>(&self, cap: Cap, need: Rights) -> Result<Arc<T>, CapError> {
-        let obj = self.lookup(cap, need)?;
-        if obj.as_any().is::<T>() {
-            // Safety: the `Any` check above proves the concrete type matches.
-            Ok(unsafe { Arc::from_raw(Arc::into_raw(obj) as *const T) })
-        } else {
-            Err(CapError::WrongType)
-        }
+        self.typed_parts(cap, need).map(|(object, _node)| object)
+    }
+
+    /// Resolve a typed operation-time token. Every call through the returned
+    /// token rechecks whether this capability or any ancestor was revoked.
+    pub fn lookup_revocable<T: Resource>(
+        &self,
+        cap: Cap,
+        need: Rights,
+    ) -> Result<Revocable<T>, CapError> {
+        let (object, node) = self.typed_parts(cap, need)?;
+        Ok(Revocable { object, node })
+    }
+
+    /// Resolve a typed invocation lease.
+    ///
+    /// Revocation after this call does not interrupt the active lease, but it
+    /// does make every subsequent lookup fail.
+    pub fn lookup_lease<T: Resource>(
+        &self,
+        cap: Cap,
+        need: Rights,
+    ) -> Result<InvocationLease<T>, CapError> {
+        let (object, _node) = self.typed_parts(cap, need)?;
+        Ok(InvocationLease { object })
     }
 
     /// Attenuate: produce a new cap on the same object with a *subset* of the

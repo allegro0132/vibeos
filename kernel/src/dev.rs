@@ -10,9 +10,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::cap::Resource;
+use crate::cap::{InvocationLease, Resource};
 use crate::sync::SpinLock;
 use crate::uart;
 
@@ -61,6 +61,7 @@ pub struct MemoryRegion {
     name: &'static str,
     words: SpinLock<alloc::vec::Vec<u64>>,
     len: usize,
+    claimed: AtomicBool,
 }
 
 impl MemoryRegion {
@@ -69,22 +70,61 @@ impl MemoryRegion {
             name,
             words: SpinLock::new(alloc::vec![0u64; elements]),
             len: elements,
+            claimed: AtomicBool::new(false),
         })
-    }
-
-    /// Base address and length in elements, for the program's register contract.
-    pub fn extent(&self) -> (usize, usize) {
-        (self.words.lock().as_ptr() as usize, self.len)
     }
 
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Zero the region between runs, so one program cannot read what another
-    /// left behind.
-    pub fn clear(&self) {
-        self.words.lock().iter_mut().for_each(|w| *w = 0);
+    pub(crate) fn invocation_claimed(&self) -> bool {
+        self.claimed.load(Ordering::Acquire)
+    }
+}
+
+/// Exclusive raw-memory access for one generated-code invocation.
+///
+/// The non-`Clone` capability lease remains in this object for as long as the
+/// raw extent is live. Dropping it releases the region claim on both normal and
+/// non-local program returns.
+pub struct MemoryInvocation {
+    lease: InvocationLease<MemoryRegion>,
+    base: usize,
+    len: usize,
+}
+
+impl MemoryInvocation {
+    pub fn claim(lease: InvocationLease<MemoryRegion>) -> Result<Self, ()> {
+        let claimed = lease.with(|region| {
+            region
+                .claimed
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        });
+        if !claimed {
+            return Err(());
+        }
+
+        let (base, len) = lease.with(|region| {
+            let mut words = region.words.lock();
+            words.iter_mut().for_each(|word| *word = 0);
+            (words.as_mut_ptr() as usize, region.len)
+        });
+        Ok(Self { lease, base, len })
+    }
+
+    /// Base address and element count for the generated program's register
+    /// contract. This is intentionally unavailable from `MemoryRegion`.
+    pub(crate) fn extent(&self) -> (usize, usize) {
+        (self.base, self.len)
+    }
+}
+
+impl Drop for MemoryInvocation {
+    fn drop(&mut self) {
+        self.lease
+            .with(|region| region.claimed.store(false, Ordering::Release));
     }
 }
 
@@ -93,8 +133,7 @@ impl Resource for MemoryRegion {
         "memory"
     }
     fn describe(&self) -> String {
-        let (base, len) = self.extent();
-        format!("{} [{} x i64 @ {:#x}]", self.name, len, base)
+        format!("{} [{} x i64]", self.name, self.len)
     }
     fn as_any(&self) -> &dyn Any {
         self

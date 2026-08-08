@@ -21,7 +21,7 @@ use core::task::{Context, Poll, Waker};
 
 use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
-use crate::dev::ConsoleDev;
+use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
 use crate::trampoline::{self, CatchThunk, JmpBuf};
 use crate::world::{world, Space};
 use crate::{exec, heap, println, sbi};
@@ -1250,6 +1250,51 @@ fn capabilities(h: &mut Harness) {
 fn compiler(h: &mut Harness) {
     let hello = crate::rustc::compile(crate::rustc::HELLO_SRC);
     h.check("hello compiles", hello.is_ok());
+    h.check(
+        "the console revoke hook rejects its reserved arm state",
+        !crate::rustc::arm_console_revoke_hook(usize::MAX),
+    );
+
+    let w = world();
+    let memory_region = w.spaces["init"]
+        .0
+        .lock()
+        .lookup_as::<MemoryRegion>(w.region, Rights::READ)
+        .expect("init retains the program memory root");
+    h.check(
+        "the program memory claim starts released",
+        !memory_region.invocation_claimed(),
+    );
+
+    let leases = {
+        let cspace = w.spaces["prog"].0.lock();
+        (
+            cspace.lookup_lease::<MemoryRegion>(
+                w.prog_memory,
+                Rights::READ.union(Rights::WRITE),
+            ),
+            cspace.lookup_lease::<MemoryRegion>(
+                w.prog_memory,
+                Rights::READ.union(Rights::WRITE),
+            ),
+        )
+    };
+    if let (Ok(first), Ok(second)) = leases {
+        let first = MemoryInvocation::claim(first).ok();
+        let second_refused = MemoryInvocation::claim(second).is_err();
+        h.check(
+            "the program memory region permits one invocation claim",
+            first.is_some() && second_refused,
+        );
+        drop(first);
+        h.check(
+            "dropping a memory invocation releases its claim",
+            !memory_region.invocation_claimed(),
+        );
+    } else {
+        h.check("the program memory region permits one invocation claim", false);
+        h.check("dropping a memory invocation releases its claim", false);
+    }
 
     // Layout must be identical across the sizing pass and the real pass, or
     // every absolute address in the program is wrong.
@@ -1269,6 +1314,10 @@ fn compiler(h: &mut Harness) {
             .map(|c| crate::rustc::run(&c).value)
             .unwrap_or(-1)
             == 42,
+    );
+    h.check(
+        "a normal generated return releases its memory claim",
+        !memory_region.invocation_claimed(),
     );
     h.check(
         "recursion runs",
@@ -1326,6 +1375,10 @@ fn compiler(h: &mut Harness) {
             }
         }
     }
+    h.check(
+        "a generated longjmp releases its memory claim",
+        !memory_region.invocation_claimed(),
+    );
     h.check(
         "the shell survives an aborted program",
         crate::rustc::compile("fn main() -> i64 { 2 + 2 }")

@@ -5,10 +5,11 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
-> **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 through 3.15 complete. Run `scripts/status.sh` for
-> the live host-test and corpus inventory; the QEMU harness reports target check
-> counts from the boot it actually observed. See [TESTING.md](../TESTING.md).
+> **Current status (2026-08-08):** M1, M2, and the M3.5 lifecycle/evidence
+> sequence through 3.16 are complete. M4.0 durable-authority specification is
+> next. Run `scripts/status.sh` for the live host-test and corpus inventory; the
+> QEMU harness reports target check counts from the boot it actually observed.
+> See [TESTING.md](../TESTING.md).
 
 ## Reassessment: what should happen next
 
@@ -244,7 +245,7 @@ first.
 
 ---
 
-### M3.5 — Lifecycle and evidence (in progress)
+### M3.5 — Lifecycle and evidence (complete)
 
 **Goal:** turn the current demo components into bounded, observable, restartable
 units before adding persistence or more concurrency.
@@ -259,13 +260,13 @@ units before adding persistence or more concurrency.
 | 3.13 ✅ | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
 | 3.14 ✅ | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
 | 3.15 ✅ | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
-| 3.16 | Define resolved-capability lease semantics | Console hooks either revalidate a revocable token per operation or explicitly hold an invocation lease. Memory access documents the same choice; tests distinguish revoke-before-run from revoke-during-run. |
+| 3.16 ✅ | Define resolved-capability lease semantics | Console hooks revalidate a revocable token per operation. Raw memory is covered by a non-cloneable, exclusive invocation lease. Host and QEMU tests distinguish revoke-before-run, revoke-during-run, and a cold launch after revocation. |
 
 3.8 separates stable `ComponentId` from a task incarnation's `TaskId`, so a
 later restart can keep its supervisory and memory-owner identity while replacing
 the task and CSpace. The boot-time `World` routing and supervisor-held space cap
-remain static; restart support in the remaining M3.5 work must replace those
-atomically with the component instance.
+remain static; the 3.12 restart path replaces the component instance atomically
+with a fresh generation, task, arena, and explicit grants.
 `ps` and `caps` read the same retained snapshot, including
 `returned` and `fault` terminal reasons after the executor removes the task.
 The `prog` CSpace is reported honestly as unbound because generated code still
@@ -347,6 +348,20 @@ generated-program recovery. The kernel now builds for the integer-only
 the catcher actually preserves rather than silently promising `lp64d` FPU state.
 None of this turns cooperative scheduling into
 temporal isolation: an admitted in-tree future that never yields remains trusted.
+
+3.16 makes resolution lifetime part of the capability API instead of an implicit
+property of `Arc`. `Revocable<T>` rechecks the complete derivation ancestry at every
+operation acquisition; a successful check linearizes an already-started operation,
+so revocation prevents later operations without pretending to interrupt one in
+flight. `InvocationLease<T>` is non-cloneable and deliberately survives revocation
+for one bounded invocation. Generated console hooks use the first form. Generated
+raw memory uses the second form, holds an exclusive `MemoryInvocation` across the
+complete catcher call, and releases it after both normal and non-local returns.
+`rustc lease` deterministically revokes `prog` before its second console operation:
+the second write is denied, the active memory computation still returns 42, and a
+second launch with no fresh grants aborts before acquiring memory. Typed resolution
+now uses safe `Arc::downcast` on the real trait object rather than trusting a
+resource-provided `as_any` result.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and
@@ -432,7 +447,7 @@ The continuing tracks after the partial M3 milestone are:
 |---|---|---|
 | **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
 | **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
-| **Compiler** | `compiler`, `kernel/rustc`, trampoline | 3.16 lease semantics first; 3.4–3.6 only after the performance baseline identifies the useful next step |
+| **Compiler** | `compiler`, `kernel/rustc`, trampoline | Resolved-cap lease semantics are complete; 3.4–3.6 remain evidence-driven language-track work rather than a persistence prerequisite |
 | **Platform** | drivers, storage, `tty`, `shell` | M4 durable-capability model and virtio-blk prototype |
 | **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 

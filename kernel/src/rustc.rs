@@ -70,6 +70,19 @@ static STARTED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// audit in the compiler's tests.
 pub const FUEL: i64 = 20_000_000;
 
+/// Called from the panic handler: if a compiled program is on the stack, treat
+/// the panic as an abort of that program. Returns if none is running.
+pub fn unwind_running_program() {
+    if !ARMED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    ABORT_CODE.store(RUNTIME_PANICKED, Ordering::SeqCst);
+    unsafe { vibe_longjmp(addr_of_mut!(JMP), 1) }
+}
+
+/// Reason code for "the kernel panicked while this program was running".
+const RUNTIME_PANICKED: i64 = 7;
+
 /// Called by generated code when an emitted check fails. Never returns.
 extern "C" fn rt_abort(code: i64) -> ! {
     if !ARMED.load(Ordering::SeqCst) {
@@ -179,6 +192,9 @@ pub fn run(prog: &Compiled) -> RunOutcome {
         value,
         micros,
         denied: *DENIED.lock(),
-        aborted: (code != 0).then(|| trampoline::abort::describe(code)),
+        aborted: (code != 0).then(|| match code {
+            RUNTIME_PANICKED => "the runtime panicked while the program was running",
+            other => trampoline::abort::describe(other),
+        }),
     }
 }

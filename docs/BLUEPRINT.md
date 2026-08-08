@@ -344,11 +344,15 @@ exhaust the heap and take down the system. Quotas are a capability question
 distinction because there is no wall clock. Timers are a linear scan, fine at ~10
 sleepers and wrong at 10,000.
 
-**Failure.** A compiled program that fails a safety check is aborted and the
-shell survives; that machinery is §6.4. A *component* that panics still takes the
-machine with it, which for a system built on component isolation remains the
-obvious gap — it needs the same trampoline applied at the executor's poll
-boundary (Roadmap 2.8).
+**Failure.** Two failure domains, both built on the same trampoline. A compiled
+program that fails a safety check is aborted and the shell survives (§6.4). A
+component that panics is caught at the executor's poll boundary: its task is
+counted as faulted, removed, and leaked — running destructors over a future
+interrupted mid-poll would be worse than leaking — and every other component
+keeps running. `ps` reports both counts.
+
+What is still fatal: a panic with no landing pad armed, which means a fault in
+the kernel's own boot path or inside an interrupt handler.
 
 **Observability.** `ps` (poll counts), `caps` (capability tables), `chan` (queue
 depth), `mem` (heap). Poll counts are a genuinely good scheduler metric — they say

@@ -128,3 +128,39 @@ pub mod abort {
         }
     }
 }
+
+
+// --- Task fault isolation (ROADMAP 2.8) ---
+
+use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static mut TASK_JMP: JmpBuf = JmpBuf::ZERO;
+static TASK_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Poll a task with a landing pad installed. Returns true if it panicked.
+///
+/// `setjmp` lives in *this* function rather than in the caller on purpose: a
+/// `longjmp` restores this frame and then returns normally, so the caller's
+/// frame and locals are never disturbed and stay safe to use afterwards.
+#[inline(never)]
+pub fn guard_task(f: &mut dyn FnMut()) -> bool {
+    unsafe {
+        if vibe_setjmp(addr_of_mut!(TASK_JMP)) != 0 {
+            TASK_ARMED.store(false, Ordering::SeqCst);
+            return true;
+        }
+    }
+    TASK_ARMED.store(true, Ordering::SeqCst);
+    f();
+    TASK_ARMED.store(false, Ordering::SeqCst);
+    false
+}
+
+/// Called from the panic handler. Returns only if there is no pad to jump to.
+pub fn unwind_faulted_task() {
+    if !TASK_ARMED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    unsafe { vibe_longjmp(addr_of_mut!(TASK_JMP), 1) }
+}

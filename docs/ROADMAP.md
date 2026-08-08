@@ -101,7 +101,7 @@ iteration on scheduler logic; interrupt behaviour still belongs in 1.5.
 ---
 
 > **M2 status: complete.** Every hole in BLUEPRINT §6.4 is closed and tested.
-> 117 host tests, 45 in-kernel checks, 7 golden transcripts including a
+> 117 host tests, 49 in-kernel checks, 7 golden transcripts including a
 > differential run against real rustc.
 
 ### M2 — Confinement (v0.3)
@@ -120,7 +120,7 @@ running generated code.** Blueprint §6.4 items 1–3 are all the same hole.
 | 2.5 ✅ | Codegen differential testing | Compile a corpus with the in-kernel compiler *and* with real `rustc` on the host; compare stdout. The corpus doubles as a regression suite and is the strongest oracle available for a compiler this small. |
 | 2.6 ✅ | Parser fuzzing | `cargo-fuzz` on the host. The parser must never panic; it must only return `Err`. |
 | 2.7 ✅ | Emitter audit | Enumerate every instruction the emitter can produce and prove each is frame-local or compiler-chosen. Turn Blueprint §6.3's table into an asserted test. |
-| 2.8 ⬜ | Task fault isolation | Reuse 2.1 so a panicking *component* kills its task rather than the machine. Blueprint §8 "Failure". |
+| 2.8 ✅ | Task fault isolation | A panicking component costs its own task, not the machine. `setjmp` sits inside the guard function rather than the caller, so a `longjmp` restores *that* frame and returns normally — the scheduler's frame and locals are never disturbed. The faulted task is leaked rather than dropped, because running destructors over a future interrupted mid-poll would be worse than leaking. |
 
 **Acceptance:** all six abort paths are covered by the in-kernel self-test and by
 the `aborts` golden transcript, and the shell survives every one of them.

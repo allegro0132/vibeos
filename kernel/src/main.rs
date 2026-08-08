@@ -114,6 +114,9 @@ pub extern "C" fn kmain() -> ! {
     world::build();
     println!("  world     5 capability spaces, 1 typed channel, 3 components");
 
+    // A panicking component should cost its own task, not the machine.
+    exec::set_fault_guard(trampoline::guard_task);
+
     exec::spawn("shell", shell::shell_task(boot_time));
     println!("  sched     async executor, no threads, no preemption");
 
@@ -124,11 +127,16 @@ pub extern "C" fn kmain() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Deliberately bypasses the UART driver: a panic may already hold its lock.
-    for b in "\n\n[!] kernel panic: ".bytes() {
-        sbi::legacy_putchar(b);
-    }
     let mut w = SbiWriter;
-    let _ = core::fmt::write(&mut w, format_args!("{}\n", info));
+    let _ = core::fmt::write(&mut w, format_args!("\n[!] panic: {}\n", info));
+
+    // If a compiled program is running, or a task is being polled behind the
+    // fault guard, unwind to that landing pad instead of taking the machine
+    // down. Innermost first.
+    rustc::unwind_running_program();
+    trampoline::unwind_faulted_task();
+
+    let _ = core::fmt::write(&mut w, format_args!("[!] no landing pad; halting\n"));
     sbi::shutdown(true);
 }
 

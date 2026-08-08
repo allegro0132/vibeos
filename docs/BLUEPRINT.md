@@ -3,9 +3,9 @@
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
 **Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 complete. The implementation is about 8,400 lines across `core`,
-`compiler`, and `kernel`, with 145 host tests, 65 in-kernel checks, and 7 QEMU
-transcript cases (6 goldens plus the dynamic differential oracle). Everything
+with 3.8 and 3.9 complete. The implementation is about 9,700 lines across `core`,
+`compiler`, and `kernel`, with 155 host tests, 82 in-kernel checks, and 8 QEMU
+transcript cases (7 goldens plus the dynamic differential oracle). Everything
 described as *implemented* below runs today; planned work
 is marked as such. Version strings in the boot banner are historical and are not
 used as the source of truth; milestone state lives in [ROADMAP.md](ROADMAP.md).
@@ -113,13 +113,13 @@ upward except through a capability it was handed.
 |---|---:|---|:--:|
 | `cap.rs` | 376 | Rights, `Cap`, `CSpace`, attenuation, revocation | 1 (downcast) |
 | `chan.rs` | 110 | Typed bounded endpoints; rights pick the direction | — |
-| `exec.rs` | 524 | Scheduler, tracked lifecycle, wakers, wait queues, timers | 1 (waker construction) |
-| `world.rs` | 373 | The system image: supervised components, spaces, wiring | — |
-| `shell.rs` | 374 | Operator interface | — |
+| `exec.rs` | 994 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
+| `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
+| `shell.rs` | 458 | Operator interface | — |
 | `tty.rs` | 110 | Console line discipline, quiet | — |
 | `dev.rs` | 102 | Devices and bounded memory as capability-guarded resources | — |
 | `compiler/` | 2454 | Lexer, parser, type checker, RV64 code generator | — |
-| `kernel/rustc.rs`, `trampoline.rs` | 419 | Confined runtime and non-local fault exit | yes |
+| `kernel/rustc.rs`, `trampoline.rs` | 430 | Confined runtime and nested non-local fault exit | yes |
 | `heap.rs` | 106 | Bump allocator + size-class free lists | yes |
 | `sync.rs` | 59 | Interrupt-safe spinlock | yes |
 | `trap.rs` | 161 | S-mode trap entry; IRQ → waker | 3 |
@@ -362,8 +362,11 @@ program that fails a safety check is aborted and the shell survives (§6.4). A
 component that panics is caught at the executor's poll boundary: its task is
 counted as faulted, removed, and leaked — running destructors over a future
 interrupted mid-poll would be worse than leaking — and every other component
-keeps running. `ps` retains supervised components' exact identity, state, terminal
-reason, and final poll count, alongside executor-wide exit and fault totals.
+keeps running. Cooperative cancellation instead detaches a ready or parked future
+and drops it normally, or waits for the active poll to return before reclaiming it.
+Joiners retain the exact exit, fault, or cancellation report. `ps` retains supervised
+components' exact identity, state, terminal reason, and final poll count, alongside
+executor-wide exit, fault, and cancellation totals.
 
 What is still fatal: a panic with no landing pad armed, which means a fault in
 the kernel's own boot path or inside an interrupt handler.
@@ -384,13 +387,15 @@ architecture seam.
 The current design step is **component lifecycle**, not a wider language. A
 supervised `Component` now binds a stable `ComponentId` to its current `TaskId`,
 CSpace, declared memory owner/budget, and retained terminal state. That closes the
-identity and observability gap, but `revoke` still removes authority without stopping
-execution, there is no cancellation or restart protocol, budgets are not enforced,
-the `World` space routes and supervisor handles are still boot-static, and a faulted
-task can only be leaked. The v1 promise “grant, run, revoke, and kill” still depends
-on the remaining M3.5 lifecycle work.
+identity and observability gap. `revoke` still removes authority without stopping
+execution unless a supervisor separately calls `cancel`. Cooperative cancellation
+and join reporting now cover ready, parked, self-waking, and currently polling
+tasks, but wait/timer registrations are not yet removed on Drop, there is no restart
+protocol, budgets are not enforced, the `World` space routes and supervisor handles
+are still boot-static, and a faulted task can only be leaked. The v1 promise “grant,
+run, revoke, and kill” still depends on the remaining M3.5 lifecycle work.
 
-Four boundaries must stay explicit:
+Five boundaries must stay explicit:
 
 1. **Capabilities constrain object access, not arbitrary trusted component code.**
    In-tree Rust components remain in the TCB and may call kernel internals directly.
@@ -398,8 +403,8 @@ Four boundaries must stay explicit:
    confinement claim in §6.3.
 2. **Cooperative scheduling is not temporal isolation.** Fuel bounds generated
    programs, but an in-tree future that never returns `Pending` can still wedge the
-   hart. Planned cooperative cancellation in 3.9 will take effect only at poll
-   boundaries; hard containment ultimately needs instrumentation, preemption, or a
+   hart. Cooperative cancellation takes effect only at poll boundaries; hard
+   containment ultimately needs instrumentation, preemption, or a
    narrower admitted component format.
 3. **Revocation needs durable semantics before persistence.** Persisting raw slot and
    generation pairs is insufficient: reboot must not resurrect a descendant of a

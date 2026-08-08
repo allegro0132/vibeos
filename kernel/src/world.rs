@@ -13,7 +13,7 @@ use core::fmt;
 use core::future::Future;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cap::{self, Cap, CSpace, Resource, Rights};
+use crate::cap::{self, CSpace, Cap, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::exec;
@@ -108,6 +108,21 @@ impl Component {
     pub fn space(&self) -> Arc<Space> {
         self.instance.lock().space.clone()
     }
+
+    /// Cooperatively stop the current task incarnation without conflating
+    /// lifecycle control with capability revocation.
+    pub fn cancel(&self) -> exec::CancelOutcome {
+        let task = self.instance.lock().task.clone();
+        task.cancel()
+    }
+
+    /// Bind a join to the task incarnation that was current at this call.
+    /// A later restart may replace the task, but cannot silently retarget an
+    /// already-created supervisor wait to the new generation.
+    pub fn join_current(&self) -> (u64, exec::Join) {
+        let instance = self.instance.lock();
+        (instance.generation, instance.task.join())
+    }
 }
 
 /// A capability space is itself a resource. Holding a cap on a space with
@@ -166,7 +181,10 @@ impl World {
         memory_budget: usize,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> Arc<Component> {
-        assert!(memory_budget > 0, "a component memory budget must be nonzero");
+        assert!(
+            memory_budget > 0,
+            "a component memory budget must be nonzero"
+        );
         let mut components = self.components.lock();
         assert!(
             !components.values().any(|component| component.name == name),
@@ -191,7 +209,10 @@ impl World {
                 space,
                 cspace,
             }),
-            memory: MemoryAccount { owner: id, budget_bytes: memory_budget },
+            memory: MemoryAccount {
+                owner: id,
+                budget_bytes: memory_budget,
+            },
         });
         let old = components.insert(id, component.clone());
         debug_assert!(old.is_none());
@@ -210,6 +231,12 @@ impl World {
         self.components()
             .into_iter()
             .find(|component| Arc::ptr_eq(&component.space(), space))
+    }
+
+    pub fn component_named(&self, name: &str) -> Option<Arc<Component>> {
+        self.components()
+            .into_iter()
+            .find(|component| component.name == name)
     }
 }
 
@@ -314,14 +341,22 @@ async fn sensor_task(space: Arc<Space>, tx: Cap) {
     loop {
         exec::sleep_ms(3000).await;
         seq += 1;
-        let ep = match space.0.lock().lookup_as::<Endpoint<Reading>>(tx, Rights::SEND) {
+        let ep = match space
+            .0
+            .lock()
+            .lookup_as::<Endpoint<Reading>>(tx, Rights::SEND)
+        {
             Ok(ep) => ep,
             Err(e) => {
                 crate::println!("[sensor] denied: {}", e);
                 return;
             }
         };
-        ep.send(Reading { seq, millicelsius: 21_500 + ((seq as i32 * 37) % 900) }).await;
+        ep.send(Reading {
+            seq,
+            millicelsius: 21_500 + ((seq as i32 * 37) % 900),
+        })
+        .await;
     }
 }
 

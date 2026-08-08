@@ -13,6 +13,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
@@ -30,6 +33,36 @@ struct Harness {
     failures: Vec<String>,
 }
 
+struct PanicOnDrop;
+
+impl Future for PanicOnDrop {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        panic!("deliberate destructor fault from the self-test");
+    }
+}
+
+fn nested_task_fault_guard(
+    remaining: usize,
+    entered: &mut usize,
+    overflow_seen: &mut bool,
+) -> bool {
+    let mut body = || {
+        *entered += 1;
+        if remaining != 0 && nested_task_fault_guard(remaining - 1, entered, overflow_seen) {
+            *overflow_seen = true;
+        }
+    };
+    crate::trampoline::guard_task(&mut body)
+}
+
 impl Harness {
     fn check(&mut self, name: &str, ok: bool) {
         if ok {
@@ -43,16 +76,21 @@ impl Harness {
         if got == want {
             self.passed += 1;
         } else {
-            self.failures.push(format!("{} (got {:?}, want {:?})", name, got, want));
+            self.failures
+                .push(format!("{} (got {:?}, want {:?})", name, got, want));
         }
     }
 }
 
 pub async fn run() -> Report {
-    let mut h = Harness { passed: 0, failures: Vec::new() };
+    let mut h = Harness {
+        passed: 0,
+        failures: Vec::new(),
+    };
 
     timers(&mut h).await;
     scheduler(&mut h).await;
+    cancellation(&mut h).await;
     components(&mut h);
     channels(&mut h).await;
     fault_isolation(&mut h).await;
@@ -62,8 +100,15 @@ pub async fn run() -> Report {
     for f in &h.failures {
         println!("  FAIL  {}", f);
     }
-    println!("  selftest: {} passed, {} failed", h.passed, h.failures.len());
-    Report { passed: h.passed, failed: h.failures.len() }
+    println!(
+        "  selftest: {} passed, {} failed",
+        h.passed,
+        h.failures.len()
+    );
+    Report {
+        passed: h.passed,
+        failed: h.failures.len(),
+    }
 }
 
 /// Needs a real timer interrupt to fire and a real waker to run.
@@ -71,7 +116,10 @@ async fn timers(h: &mut Harness) {
     let start = sbi::time();
     exec::sleep_ms(25).await;
     let elapsed_ms = (sbi::time() - start) / (exec::TIMEBASE_HZ / 1000);
-    h.check("sleep_ms waits at least the requested time", elapsed_ms >= 25);
+    h.check(
+        "sleep_ms waits at least the requested time",
+        elapsed_ms >= 25,
+    );
     // With the check-then-sleep race closed, the heartbeat is 10 s and no longer
     // masks a lost wake. Anything past a few ms here means the wake was lost and
     // we are riding the backstop -- which would now show up as a 10 s stall.
@@ -79,7 +127,10 @@ async fn timers(h: &mut Harness) {
 
     let t0 = sbi::time();
     exec::sleep_ms(0).await;
-    h.check("sleep_ms(0) does not block", sbi::time() - t0 < exec::TIMEBASE_HZ / 100);
+    h.check(
+        "sleep_ms(0) does not block",
+        sbi::time() - t0 < exec::TIMEBASE_HZ / 100,
+    );
 }
 
 async fn scheduler(h: &mut Harness) {
@@ -90,9 +141,15 @@ async fn scheduler(h: &mut Harness) {
     for _ in 0..64 {
         exec::yield_now().await;
     }
-    h.check("yield_now resumes (self-wake during poll)", sbi::time() >= before);
+    h.check(
+        "yield_now resumes (self-wake during poll)",
+        sbi::time() >= before,
+    );
 
-    h.check("task_report sees the running components", exec::task_report().len() >= 3);
+    h.check(
+        "task_report sees the running components",
+        exec::task_report().len() >= 3,
+    );
 
     // Regression: `ps` omitted the task being polled, because `poll_once` lifts
     // it out of the map first. The only faithful way to test that is to ask
@@ -108,8 +165,119 @@ async fn scheduler(h: &mut Harness) {
         tx.send((seen.is_some(), seen.unwrap_or(0))).await;
     });
     let (visible, polls) = ep.recv().await;
-    h.check("a task polling right now is visible in task_report", visible);
+    h.check(
+        "a task polling right now is visible in task_report",
+        visible,
+    );
     h.check("poll counts advance", polls > 1);
+}
+
+/// ROADMAP 3.9. Cancellation is cooperative for a task inside `poll`, but a
+/// ready or parked future is detached and reclaimed without one extra poll.
+async fn cancellation(h: &mut Harness) {
+    let cancelled_before = exec::cancelled_count();
+    let ready = exec::spawn_tracked("selftest-cancel-ready", async {
+        panic!("a cancelled ready task must never be polled");
+    });
+    h.eq(
+        "cancelling a ready task is accepted",
+        ready.cancel(),
+        exec::CancelOutcome::Requested,
+    );
+    h.eq(
+        "a ready task is cancelled before its first poll",
+        ready.polls(),
+        0,
+    );
+    h.eq(
+        "a cancelled task retains its exact state",
+        ready.state(),
+        exec::TaskState::Cancelled,
+    );
+    let ready_exit = ready.join().await;
+    h.eq(
+        "join reports a cancelled exit",
+        ready_exit.state(),
+        exec::TaskState::Cancelled,
+    );
+
+    let queue = Arc::new(exec::WaitQueue::new());
+    let waiter = queue.clone();
+    let parked = exec::spawn_tracked("selftest-cancel-parked", async move {
+        waiter.wait().await;
+        panic!("a cancelled parked task must never resume");
+    });
+    exec::yield_now().await;
+    h.eq(
+        "the cancellation probe parked after one poll",
+        parked.polls(),
+        1,
+    );
+    h.eq(
+        "cancelling a parked task is accepted",
+        parked.cancel(),
+        exec::CancelOutcome::Requested,
+    );
+    queue.wake_all();
+    for _ in 0..2 {
+        exec::yield_now().await;
+    }
+    h.eq(
+        "a cancelled parked task is not polled again",
+        parked.polls(),
+        1,
+    );
+    h.eq(
+        "kernel cancellation accounting advances",
+        exec::cancelled_count(),
+        cancelled_before + 2,
+    );
+
+    let faults_before = exec::faulted_count();
+    let bad_drop = exec::spawn_tracked("selftest-drop-fault", PanicOnDrop);
+    h.eq(
+        "cancelling a task with a faulting destructor returns control",
+        bad_drop.cancel(),
+        exec::CancelOutcome::Requested,
+    );
+    h.eq(
+        "a faulting destructor takes precedence over cancellation",
+        bad_drop.state(),
+        exec::TaskState::Faulted,
+    );
+    h.eq(
+        "a faulting destructor is counted in its task domain",
+        exec::faulted_count(),
+        faults_before + 1,
+    );
+
+    let mut guards_entered = 0;
+    let mut guard_overflow_seen = false;
+    let outer_faulted = nested_task_fault_guard(8, &mut guards_entered, &mut guard_overflow_seen);
+    h.check(
+        "outer fault guard survives nested saturation",
+        !outer_faulted,
+    );
+    h.check(
+        "nested fault guard saturation reports a local fault",
+        guard_overflow_seen,
+    );
+    h.eq(
+        "nested fault guard saturation skips the overflowing body",
+        guards_entered,
+        7,
+    );
+
+    let mut recovery_ran = false;
+    let recovery_faulted = crate::trampoline::guard_task(&mut || recovery_ran = true);
+    h.check(
+        "fault guard depth recovers after saturation",
+        !recovery_faulted,
+    );
+    h.check(
+        "fault guard accepts later work after saturation",
+        recovery_ran,
+    );
 }
 
 /// ROADMAP 2.8. A component that panics must cost its own task, not the box.
@@ -129,8 +297,16 @@ async fn fault_isolation(h: &mut Harness) {
         exec::yield_now().await;
     }
 
-    h.eq("a panicking task is counted as faulted", exec::faulted_count(), faults_before + 1);
-    h.eq("a panicking task retains its exact faulted state", doomed.state(), exec::TaskState::Faulted);
+    h.eq(
+        "a panicking task is counted as faulted",
+        exec::faulted_count(),
+        faults_before + 1,
+    );
+    h.eq(
+        "a panicking task retains its exact faulted state",
+        doomed.state(),
+        exec::TaskState::Faulted,
+    );
     h.eq(
         "a panicking task retains its terminal reason",
         doomed.state().terminal_reason(),
@@ -138,7 +314,9 @@ async fn fault_isolation(h: &mut Harness) {
     );
     h.check(
         "a panicking task is removed from the scheduler",
-        !exec::task_report().iter().any(|report| report.id == doomed.id()),
+        !exec::task_report()
+            .iter()
+            .any(|report| report.id == doomed.id()),
     );
     h.check(
         "the other tasks are untouched",
@@ -153,31 +331,46 @@ async fn fault_isolation(h: &mut Harness) {
 fn components(h: &mut Harness) {
     let w = world();
     let components = w.components();
-    let snapshots: Vec<_> = components.iter().map(|component| component.snapshot()).collect();
+    let snapshots: Vec<_> = components
+        .iter()
+        .map(|component| component.snapshot())
+        .collect();
     let tasks = exec::task_report();
 
-    h.eq("the system image registers four supervised components", snapshots.len(), 4);
+    h.eq(
+        "the system image registers four supervised components",
+        snapshots.len(),
+        4,
+    );
     h.check(
         "component memory accounts use the stable component identity",
-        snapshots
-            .iter()
-            .all(|snapshot| snapshot.memory.owner == snapshot.id && snapshot.memory.budget_bytes > 0),
+        snapshots.iter().all(|snapshot| {
+            snapshot.memory.owner == snapshot.id && snapshot.memory.budget_bytes > 0
+        }),
     );
     h.check(
         "component instance generations are explicit",
         snapshots.iter().all(|snapshot| snapshot.generation == 1),
     );
     h.check(
+        "component joins bind the current task generation",
+        components
+            .iter()
+            .zip(&snapshots)
+            .all(|(component, snapshot)| {
+                let (generation, join) = component.join_current();
+                drop(join);
+                generation == snapshot.generation
+            }),
+    );
+    h.check(
         "component lifecycle agrees with scheduler liveness",
         snapshots.iter().all(|snapshot| {
             let live = tasks.iter().find(|task| task.id == snapshot.task_id);
             match snapshot.state {
-                exec::TaskState::Running => live.is_some_and(|task| {
-                    task.name == snapshot.name && task.polls == snapshot.polls
-                }),
-                exec::TaskState::Exited
-                | exec::TaskState::Faulted
-                | exec::TaskState::Cancelled => {
+                exec::TaskState::Running => live
+                    .is_some_and(|task| task.name == snapshot.name && task.polls == snapshot.polls),
+                exec::TaskState::Exited | exec::TaskState::Faulted | exec::TaskState::Cancelled => {
                     live.is_none() && snapshot.terminal_reason.is_some()
                 }
             }
@@ -223,7 +416,11 @@ async fn channels(h: &mut Harness) {
     for _ in 0..4 {
         got.push(ep.recv().await);
     }
-    h.eq("channel delivers across tasks", got, alloc::vec![0, 10, 20, 30]);
+    h.eq(
+        "channel delivers across tasks",
+        got,
+        alloc::vec![0, 10, 20, 30],
+    );
 
     let (sent, received, depth) = ep.stats();
     h.eq("channel accounting", (sent, received, depth), (6, 6, 0));
@@ -266,7 +463,11 @@ fn capabilities(h: &mut Harness) {
     );
 
     let init = w.spaces["init"].clone();
-    let weak = init.0.lock().derive(w.console, Rights::WRITE.union(Rights::GRANT)).unwrap();
+    let weak = init
+        .0
+        .lock()
+        .derive(w.console, Rights::WRITE.union(Rights::GRANT))
+        .unwrap();
     h.eq(
         "a cap cannot derive rights it lacks",
         init.0.lock().derive(weak, Rights::REVOKE).err(),
@@ -301,11 +502,17 @@ fn capabilities(h: &mut Harness) {
     );
     h.check(
         "typed lookup accepts the right resource type",
-        init.0.lock().lookup_as::<ConsoleDev>(w.console, Rights::WRITE).is_ok(),
+        init.0
+            .lock()
+            .lookup_as::<ConsoleDev>(w.console, Rights::WRITE)
+            .is_ok(),
     );
     h.check(
         "a space is itself a resource",
-        init.0.lock().lookup_as::<Space>(w.prog_space, Rights::REVOKE).is_ok(),
+        init.0
+            .lock()
+            .lookup_as::<Space>(w.prog_space, Rights::REVOKE)
+            .is_ok(),
     );
 }
 
@@ -411,7 +618,10 @@ fn compiler(h: &mut Harness) {
             == 140,
     );
     let region_aborts: [(&str, &str); 3] = [
-        ("fn main() -> i64 { let mut a = [1; 4]; a[9] }", "index out of bounds"),
+        (
+            "fn main() -> i64 { let mut a = [1; 4]; a[9] }",
+            "index out of bounds",
+        ),
         (
             "fn main() -> i64 { let mut a = [1; 4]; let i = 0 - 1; a[i] }",
             "index out of bounds",
@@ -435,7 +645,10 @@ fn compiler(h: &mut Harness) {
         crate::rustc::compile("fn main() -> i64 { let mut a = [1; 2]; a[0] }").is_ok(),
     );
 
-    h.check("undefined names are rejected", crate::rustc::compile("fn main() { y; }").is_err());
+    h.check(
+        "undefined names are rejected",
+        crate::rustc::compile("fn main() { y; }").is_err(),
+    );
     h.check(
         "a literal zero divisor is a compile error",
         crate::rustc::compile("fn main() -> i64 { 1 / 0 }").is_err(),
@@ -459,5 +672,8 @@ fn compiler(h: &mut Harness) {
         "arity mismatch is rejected",
         crate::rustc::compile("fn f(a: i64) -> i64 { a }\nfn main() { f(1, 2); }").is_err(),
     );
-    h.check("a program with no main is rejected", crate::rustc::compile("fn f() {}").is_err());
+    h.check(
+        "a program with no main is rejected",
+        crate::rustc::compile("fn f() {}").is_err(),
+    );
 }

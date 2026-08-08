@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 use crate::cap::{CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
-use crate::HEAP;
 use crate::world::{world, Reading, Space};
+use crate::HEAP;
 use crate::{exec, println, sbi, tty, uart};
 
 pub async fn shell_task(boot_time: u64) {
@@ -57,6 +57,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  caps <space>    component owner and capability table");
             println!("  probe           attempt four illegal operations, show the refusals");
             println!("  revoke <space>  pull a component's authority at runtime");
+            println!("  cancel <name>   cooperatively stop a component (shell is protected)");
             println!("  rustc hello     compile and run a Rust hello world, natively");
             println!("  rustc demo      compile and run a larger sample (fib, gcd, loops)");
             println!("  rustc conform   compile and run the language conformance program");
@@ -93,9 +94,10 @@ async fn run(line: &str, boot_time: u64) {
                 );
             }
             println!(
-                "  executor totals (including untracked tasks): {} exited, {} faulted",
+                "  executor totals (including untracked tasks): {} exited, {} faulted, {} cancelled",
                 exec::completed_count(),
-                exec::faulted_count()
+                exec::faulted_count(),
+                exec::cancelled_count()
             );
             println!("  memory budgets are declared; allocator accounting lands in 3.11");
             if tty::is_quiet() {
@@ -131,8 +133,7 @@ async fn run(line: &str, boot_time: u64) {
                     );
                     println!(
                         "  memory owner {}  declared budget {} B (accounting pending)",
-                        c.memory.owner,
-                        c.memory.budget_bytes
+                        c.memory.owner, c.memory.budget_bytes
                     );
                     Some(c.state)
                 }
@@ -149,9 +150,18 @@ async fn run(line: &str, boot_time: u64) {
                 );
                 return;
             }
-            println!("  {:<12} {:<9} {:<8} {}", "HANDLE", "KIND", "RIGHTS", "OBJECT");
+            println!(
+                "  {:<12} {:<9} {:<8} {}",
+                "HANDLE", "KIND", "RIGHTS", "OBJECT"
+            );
             for (cap, kind, rights, desc) in space.0.lock().list() {
-                println!("  {:<12} {:<9} {:<8} {}", alloc::format!("{}", cap), kind, alloc::format!("{}", rights), desc);
+                println!(
+                    "  {:<12} {:<9} {:<8} {}",
+                    alloc::format!("{}", cap),
+                    kind,
+                    alloc::format!("{}", rights),
+                    desc
+                );
             }
             println!("  rights: r=read w=write s=send v=recv g=grant x=revoke");
         }
@@ -180,11 +190,63 @@ async fn run(line: &str, boot_time: u64) {
                     let killed = space.0.lock().revoke_all();
                     println!("  revoked {} cap(s) in `{}`", killed, target);
                     match target {
-                        "guest" => println!("  (its next heartbeat will fail -- no restart, no signal)"),
+                        "guest" => {
+                            println!("  (its next heartbeat will fail -- no restart, no signal)")
+                        }
                         _ => println!("  (already-compiled machine code will now print nothing)"),
                     }
                 }
                 Err(e) => println!("  refused: {}", e),
+            }
+        }
+
+        "cancel" => {
+            let Some(name) = rest.first().copied() else {
+                println!("  usage: cancel <component>");
+                return;
+            };
+            if name == "shell" {
+                println!("  refused: shell cannot be cancelled until restart supervision exists");
+                return;
+            }
+            let w = world();
+            let Some(component) = w.component_named(name) else {
+                println!("  no such component: {}", name);
+                return;
+            };
+            match component.cancel() {
+                exec::CancelOutcome::Requested => {
+                    let c = component.snapshot();
+                    match c.state {
+                        exec::TaskState::Cancelled => println!(
+                            "  cancelled {}  task {} after {} poll(s)",
+                            c.id, c.task_id, c.polls
+                        ),
+                        exec::TaskState::Running => println!(
+                            "  cancellation requested for {}  task {}; waiting for a poll boundary",
+                            c.id, c.task_id
+                        ),
+                        exec::TaskState::Exited | exec::TaskState::Faulted => println!(
+                            "  cancellation completed as {} ({}) for {}  task {} after {} poll(s)",
+                            c.state,
+                            c.terminal_reason.unwrap_or("-"),
+                            c.id,
+                            c.task_id,
+                            c.polls
+                        ),
+                    }
+                }
+                exec::CancelOutcome::AlreadyTerminal(exit) => println!(
+                    "  {} already {}  task {} after {} poll(s)",
+                    component.snapshot().id,
+                    exit.state(),
+                    exit.id(),
+                    exit.polls()
+                ),
+                exec::CancelOutcome::TooLate(state) => println!(
+                    "  cancellation was too late; task completion is already committed as {}",
+                    state
+                ),
             }
         }
 
@@ -211,7 +273,10 @@ async fn run(line: &str, boot_time: u64) {
         "chan" => {
             let w = world();
             let init = w.spaces["init"].clone();
-            let ep = init.0.lock().lookup_as::<Endpoint<Reading>>(w.telemetry, Rights::READ);
+            let ep = init
+                .0
+                .lock()
+                .lookup_as::<Endpoint<Reading>>(w.telemetry, Rights::READ);
             match ep {
                 Ok(ep) => {
                     let (sent, recv, depth) = ep.stats();
@@ -227,7 +292,11 @@ async fn run(line: &str, boot_time: u64) {
             if r.failed == 0 {
                 println!("  SELFTEST OK ({} checks)", r.passed);
             } else {
-                println!("  SELFTEST FAILED ({} of {})", r.failed, r.passed + r.failed);
+                println!(
+                    "  SELFTEST FAILED ({} of {})",
+                    r.failed,
+                    r.passed + r.failed
+                );
             }
         }
 
@@ -243,7 +312,10 @@ async fn run(line: &str, boot_time: u64) {
 
         "mem" => {
             let (live, peak, free) = HEAP.stats();
-            println!("  heap   live {:>7} B  peak {:>7} B  bump remaining {:>9} B", live, peak, free);
+            println!(
+                "  heap   live {:>7} B  peak {:>7} B  bump remaining {:>9} B",
+                live, peak, free
+            );
             let w = world();
             let init = w.spaces["init"].clone();
             let region = init
@@ -265,7 +337,10 @@ async fn run(line: &str, boot_time: u64) {
         "echo" => {
             let w = world();
             let init = w.spaces["init"].clone();
-            let con = init.0.lock().lookup_as::<ConsoleDev>(w.console, Rights::WRITE);
+            let con = init
+                .0
+                .lock()
+                .lookup_as::<ConsoleDev>(w.console, Rights::WRITE);
             match con {
                 Ok(c) => c.write(&alloc::format!("  {}\n", rest.join(" "))),
                 Err(e) => println!("  refused: {}", e),
@@ -333,7 +408,11 @@ async fn probe() {
     let sensor_cap = sensor.0.lock().list()[0].0;
     report(
         "sensor tries to RECV on the channel it publishes to",
-        sensor.0.lock().lookup_as::<Endpoint<Reading>>(sensor_cap, Rights::RECV).map(|_| ()),
+        sensor
+            .0
+            .lock()
+            .lookup_as::<Endpoint<Reading>>(sensor_cap, Rights::RECV)
+            .map(|_| ()),
     );
 
     // 2. The logger holds RECV. Ask it for SEND, i.e. forge a reading.
@@ -341,7 +420,11 @@ async fn probe() {
     let logger_cap = logger.0.lock().list()[0].0;
     report(
         "logger tries to SEND a forged reading",
-        logger.0.lock().lookup_as::<Endpoint<Reading>>(logger_cap, Rights::SEND).map(|_| ()),
+        logger
+            .0
+            .lock()
+            .lookup_as::<Endpoint<Reading>>(logger_cap, Rights::SEND)
+            .map(|_| ()),
     );
 
     // 3. The logger's console cap is WRITE-only, with no GRANT. Try to pass it on.
@@ -356,7 +439,8 @@ async fn probe() {
     let init = w.spaces["init"].clone();
     let weak = {
         let mut cs = init.0.lock();
-        cs.derive(w.console, Rights::WRITE.union(Rights::GRANT)).unwrap()
+        cs.derive(w.console, Rights::WRITE.union(Rights::GRANT))
+            .unwrap()
     };
     report(
         "a WRITE|GRANT console cap tries to derive REVOKE for itself",

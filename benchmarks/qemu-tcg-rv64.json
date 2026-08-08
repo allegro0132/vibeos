@@ -1,0 +1,334 @@
+{
+  "environment": {
+    "accelerator": "tcg,thread=single",
+    "cpu": "rv64",
+    "icount": "shift=0,align=off,sleep=off",
+    "machine": "virt",
+    "memory": "128M",
+    "profile": "release",
+    "qemu": "QEMU emulator version 11.0.3",
+    "smp": 1,
+    "toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)"
+  },
+  "guest": {
+    "clock": "riscv.rdtime",
+    "heap_start_live_bytes": 82176,
+    "profile": "release",
+    "schema": "vibeos.bench.meta",
+    "target": "riscv64gc-unknown-none-elf",
+    "timebase_hz": 10000000,
+    "version": 1
+  },
+  "metrics": {
+    "cap_lookup_depth_0_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 2,
+        "mean": 2,
+        "min": 2,
+        "name": "cap_lookup_depth_0_ticks",
+        "p50": 2,
+        "p95": 2,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "cap_lookup_depth_16_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 3,
+        "mean": 3,
+        "min": 3,
+        "name": "cap_lookup_depth_16_ticks",
+        "p50": 3,
+        "p95": 3,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "cap_lookup_depth_1_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 2,
+        "mean": 2,
+        "min": 2,
+        "name": "cap_lookup_depth_1_ticks",
+        "p50": 2,
+        "p95": 2,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "cap_lookup_depth_2_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 2,
+        "mean": 2,
+        "min": 2,
+        "name": "cap_lookup_depth_2_ticks",
+        "p50": 2,
+        "p95": 2,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "cap_lookup_depth_32_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 4,
+        "mean": 4,
+        "min": 4,
+        "name": "cap_lookup_depth_32_ticks",
+        "p50": 4,
+        "p95": 4,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "cap_lookup_depth_4_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 2,
+        "mean": 2,
+        "min": 2,
+        "name": "cap_lookup_depth_4_ticks",
+        "p50": 2,
+        "p95": 2,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "cap_lookup_depth_8_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 2,
+        "mean": 2,
+        "min": 2,
+        "name": "cap_lookup_depth_8_ticks",
+        "p50": 2,
+        "p95": 2,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks_per_lookup",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1,
+        "direction": "lower",
+        "ratio": 1.3,
+        "stat": "p50"
+      }
+    },
+    "compile_bytes_per_second": {
+      "baseline": {
+        "direction": "higher",
+        "max": 350362,
+        "mean": 350344,
+        "min": 350301,
+        "name": "compile_bytes_per_second",
+        "p50": 350362,
+        "p95": 350362,
+        "samples": 21,
+        "schema": "vibeos.bench.metric",
+        "unit": "source_bytes_per_second",
+        "version": 1,
+        "warmup": 3
+      },
+      "policy": {
+        "absolute": 1024,
+        "direction": "higher",
+        "ratio": 0.7,
+        "stat": "p50"
+      }
+    },
+    "generated_code_bytes": {
+      "baseline": {
+        "direction": "lower",
+        "max": 828,
+        "mean": 828,
+        "min": 828,
+        "name": "generated_code_bytes",
+        "p50": 828,
+        "p95": 828,
+        "samples": 1,
+        "schema": "vibeos.bench.metric",
+        "unit": "bytes",
+        "version": 1,
+        "warmup": 0
+      },
+      "policy": {
+        "absolute": 64,
+        "direction": "lower",
+        "ratio": 1.02,
+        "stat": "p50"
+      }
+    },
+    "generated_data_bytes": {
+      "baseline": {
+        "direction": "lower",
+        "max": 1,
+        "mean": 1,
+        "min": 1,
+        "name": "generated_data_bytes",
+        "p50": 1,
+        "p95": 1,
+        "samples": 1,
+        "schema": "vibeos.bench.metric",
+        "unit": "bytes",
+        "version": 1,
+        "warmup": 0
+      },
+      "policy": {
+        "absolute": 16,
+        "direction": "lower",
+        "ratio": 1.0,
+        "stat": "p50"
+      }
+    },
+    "generated_runtime_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 1862,
+        "mean": 1861,
+        "min": 1861,
+        "name": "generated_runtime_ticks",
+        "p50": 1861,
+        "p95": 1862,
+        "samples": 41,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks",
+        "version": 1,
+        "warmup": 5
+      },
+      "policy": {
+        "absolute": 64,
+        "direction": "lower",
+        "ratio": 1.4,
+        "stat": "p95"
+      }
+    },
+    "heap_peak_bytes": {
+      "baseline": {
+        "direction": "lower",
+        "max": 114048,
+        "mean": 114048,
+        "min": 114048,
+        "name": "heap_peak_bytes",
+        "p50": 114048,
+        "p95": 114048,
+        "samples": 1,
+        "schema": "vibeos.bench.metric",
+        "unit": "bytes",
+        "version": 1,
+        "warmup": 0
+      },
+      "policy": {
+        "absolute": 65536,
+        "direction": "lower",
+        "ratio": 1.1,
+        "stat": "max"
+      }
+    },
+    "ipc_roundtrip_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 109,
+        "mean": 108,
+        "min": 108,
+        "name": "ipc_roundtrip_ticks",
+        "p50": 108,
+        "p95": 109,
+        "samples": 257,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks",
+        "version": 1,
+        "warmup": 32
+      },
+      "policy": {
+        "absolute": 32,
+        "direction": "lower",
+        "ratio": 1.4,
+        "stat": "p95"
+      }
+    },
+    "irq_to_poll_ticks": {
+      "baseline": {
+        "direction": "lower",
+        "max": 24,
+        "mean": 23,
+        "min": 23,
+        "name": "irq_to_poll_ticks",
+        "p50": 23,
+        "p95": 24,
+        "samples": 129,
+        "schema": "vibeos.bench.metric",
+        "unit": "ticks",
+        "version": 1,
+        "warmup": 16
+      },
+      "policy": {
+        "absolute": 8,
+        "direction": "lower",
+        "ratio": 1.75,
+        "stat": "p95"
+      }
+    }
+  },
+  "schema": "vibeos.bench-baseline",
+  "version": 1
+}

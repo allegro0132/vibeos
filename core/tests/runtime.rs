@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
-use vibeos_core::arch::{advance_time, armed_timer, reset_time};
+use vibeos_core::arch::{advance_time, armed_timer, reset_time, time};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::exec::{self, CancelOutcome, TaskExit, TaskState, WaitQueue};
 use vibeos_core::heap::{self, AllocationDomain, ArenaId, OwnerId};
@@ -113,6 +113,7 @@ struct RegisteredDropBombFuture {
     wait: exec::WaitFuture<'static>,
     sleep: exec::Sleep,
     join: exec::Join,
+    probe: Option<exec::IrqPollProbe>,
     drops: Arc<AtomicU64>,
 }
 
@@ -124,6 +125,11 @@ impl Future for RegisteredDropBombFuture {
         assert!(Pin::new(&mut this.wait).poll(cx).is_pending());
         assert!(Pin::new(&mut this.sleep).poll(cx).is_pending());
         assert!(Pin::new(&mut this.join).poll(cx).is_pending());
+        if this.probe.is_none() {
+            this.probe = Some(
+                exec::arm_irq_poll_probe().expect("the registered task owns the probe slot"),
+            );
+        }
         Poll::Pending
     }
 }
@@ -491,6 +497,7 @@ fn reclaimable_fault_teardown_restores_wait_sleep_and_join_registries() {
     exec::set_fault_reclaimer(record_fault_reclaim);
     RECLAIMED_DOMAINS.lock().unwrap().clear();
     assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
 
     let target = exec::spawn_tracked("reclaimable-join-target", std::future::pending::<()>());
     assert!(exec::poll_once());
@@ -508,6 +515,7 @@ fn reclaimable_fault_teardown_restores_wait_sleep_and_join_registries() {
                 wait: FAULT_WAIT_QUEUE.wait(),
                 sleep: exec::sleep_ms(60_000),
                 join: target.join(),
+                probe: None,
                 drops: drops.clone(),
             },
         )
@@ -521,6 +529,7 @@ fn reclaimable_fault_teardown_restores_wait_sleep_and_join_registries() {
     assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
     assert_eq!(exec::timer_registration_count(), timers_before);
     assert_eq!(target.joiner_count(), joiners_before);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
     assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
     assert_eq!(target.cancel(), CancelOutcome::Requested);
     assert_eq!(target.state(), TaskState::Cancelled);
@@ -533,6 +542,7 @@ fn a_reclaimable_destructor_fault_cleans_registries_before_entering_drop() {
     exec::set_fault_reclaimer(record_fault_reclaim);
     RECLAIMED_DOMAINS.lock().unwrap().clear();
     assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
 
     let target = exec::spawn_tracked(
         "reclaimable-destructor-join-target",
@@ -551,6 +561,7 @@ fn a_reclaimable_destructor_fault_cleans_registries_before_entering_drop() {
                 wait: FAULT_WAIT_QUEUE.wait(),
                 sleep: exec::sleep_ms(60_000),
                 join: target.join(),
+                probe: None,
                 drops: drops.clone(),
             },
         )
@@ -559,6 +570,7 @@ fn a_reclaimable_destructor_fault_cleans_registries_before_entering_drop() {
     assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 1);
     assert_eq!(exec::timer_registration_count(), timers_before + 1);
     assert_eq!(target.joiner_count(), joiners_before + 1);
+    assert_eq!(exec::irq_poll_probe_count(), 1);
 
     // The synthetic guard reports a destructor fault after executing Drop.
     // Real target faults may longjmp partway through Drop, so the ledger must
@@ -572,6 +584,7 @@ fn a_reclaimable_destructor_fault_cleans_registries_before_entering_drop() {
     assert_eq!(FAULT_WAIT_QUEUE.waiter_count(), 0);
     assert_eq!(exec::timer_registration_count(), timers_before);
     assert_eq!(target.joiner_count(), joiners_before);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
     assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
     assert_eq!(target.cancel(), CancelOutcome::Requested);
 }
@@ -1496,6 +1509,152 @@ fn poll_once_reports_whether_anything_ran() {
 }
 
 // --- timers ---
+
+#[test]
+fn an_irq_poll_probe_requires_a_running_task() {
+    let _g = scheduler();
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+    assert!(matches!(
+        exec::arm_irq_poll_probe(),
+        Err(exec::IrqPollProbeError::NotInTask)
+    ));
+}
+
+#[test]
+fn a_timer_irq_probe_observes_the_target_tasks_next_poll() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+    let observed = Arc::new(AtomicU64::new(u64::MAX));
+    let task_observed = observed.clone();
+
+    exec::spawn("irq-poll-probe", async move {
+        let probe = exec::arm_irq_poll_probe().expect("task owns the profiling slot");
+        exec::sleep_ms(10).await;
+        task_observed.store(
+            probe.finish().expect("the matching timer IRQ was observed"),
+            Ordering::SeqCst,
+        );
+    });
+    exec::run_until_idle(BUDGET);
+
+    assert_eq!(exec::timer_registration_count(), 1);
+    assert_eq!(exec::irq_poll_probe_count(), 1);
+    advance_time(10 * exec::TIMEBASE_HZ / 1000);
+    let irq_entry = time();
+    // Eleven ticks model the architecture trap save/dispatch work before the
+    // portable timer registry runs; the supplied entry timestamp must retain
+    // them in the sample.
+    advance_time(11);
+    exec::timer_tick_at(irq_entry);
+    // The remaining ticks model interrupt return and scheduler dispatch before
+    // the next Future::poll endpoint.
+    advance_time(26);
+    exec::run_until_idle(BUDGET);
+
+    assert_eq!(observed.load(Ordering::SeqCst), 37);
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+}
+
+#[test]
+fn an_irq_poll_probe_ignores_another_timer_owned_by_the_same_task() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+    let observed = Arc::new(AtomicU64::new(u64::MAX));
+    let task_observed = observed.clone();
+
+    exec::spawn("irq-poll-exact-timer", async move {
+        let probe = exec::arm_irq_poll_probe().expect("task owns the profiling slot");
+        let mut measured = Box::pin(exec::sleep_ms(10));
+        let mut earlier = Box::pin(exec::sleep_ms(5));
+        // Poll the measured timer first so it is the registration bound to the
+        // probe, then wait on another timer in the same task.
+        std::future::poll_fn(|cx| {
+            assert!(measured.as_mut().poll(cx).is_pending());
+            earlier.as_mut().poll(cx)
+        })
+        .await;
+        assert_eq!(probe.sample(), None, "the unrelated timer poisoned the probe");
+        measured.await;
+        task_observed.store(
+            probe.finish().expect("the bound timer IRQ was observed"),
+            Ordering::SeqCst,
+        );
+    });
+    exec::run_until_idle(BUDGET);
+
+    advance_time(5 * exec::TIMEBASE_HZ / 1000);
+    let unrelated_entry = time();
+    exec::timer_tick_at(unrelated_entry);
+    advance_time(7);
+    exec::run_until_idle(BUDGET);
+    assert_eq!(observed.load(Ordering::SeqCst), u64::MAX);
+    assert_eq!(exec::irq_poll_probe_count(), 1);
+
+    advance_time(5 * exec::TIMEBASE_HZ / 1000);
+    let measured_entry = time();
+    exec::timer_tick_at(measured_entry);
+    advance_time(19);
+    exec::run_until_idle(BUDGET);
+    assert_eq!(observed.load(Ordering::SeqCst), 19);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+    assert_eq!(exec::timer_registration_count(), 0);
+}
+
+#[test]
+fn cancelling_a_profiled_sleeper_clears_timer_and_probe_ledgers() {
+    let _g = scheduler();
+    reset_time();
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+
+    let handle = exec::spawn_tracked("cancel-profiled-sleeper", async {
+        let _probe = exec::arm_irq_poll_probe().expect("task owns the profiling slot");
+        exec::sleep_ms(10).await;
+    });
+    exec::run_until_idle(BUDGET);
+    assert_eq!(exec::timer_registration_count(), 1);
+    assert_eq!(exec::irq_poll_probe_count(), 1);
+
+    assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    assert_eq!(handle.state(), TaskState::Cancelled);
+    assert_eq!(exec::timer_registration_count(), 0);
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+
+    advance_time(20 * exec::TIMEBASE_HZ / 1000);
+    exec::timer_tick();
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.polls(), 1, "a cancelled probe cannot wake its task");
+}
+
+#[test]
+fn dropping_a_probe_releases_the_single_slot_immediately() {
+    let _g = scheduler();
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+    let saw_busy = Arc::new(AtomicBool::new(false));
+    let task_saw_busy = saw_busy.clone();
+
+    exec::spawn("drop-irq-poll-probe", async move {
+        let first = exec::arm_irq_poll_probe().expect("first probe owns the slot");
+        task_saw_busy.store(
+            matches!(
+                exec::arm_irq_poll_probe(),
+                Err(exec::IrqPollProbeError::Busy)
+            ),
+            Ordering::SeqCst,
+        );
+        drop(first);
+        assert_eq!(exec::irq_poll_probe_count(), 0);
+    });
+    exec::run_until_idle(BUDGET);
+
+    assert!(saw_busy.load(Ordering::SeqCst));
+    assert_eq!(exec::irq_poll_probe_count(), 0);
+}
 
 #[test]
 fn a_sleeping_task_wakes_when_its_deadline_passes() {

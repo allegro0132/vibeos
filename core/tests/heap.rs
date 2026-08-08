@@ -139,6 +139,19 @@ fn stats_track_live_and_peak() {
     let (live2, peak2, _) = h.stats();
     assert_eq!(live2, live0, "live returned to baseline");
     assert_eq!(peak2, peak1, "peak is a high-water mark");
+
+    let snapshot = h.snapshot();
+    assert_eq!(snapshot.live_bytes, live0);
+    assert_eq!(snapshot.peak_live_bytes, peak1);
+    assert!(
+        snapshot.bump_used_bytes > 0,
+        "the bump high-water is retained"
+    );
+    assert_eq!(
+        snapshot.bump_used_bytes + snapshot.bump_remaining_bytes,
+        free0,
+        "the aligned test heap capacity is fully accounted"
+    );
 }
 
 #[test]

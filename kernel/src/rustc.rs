@@ -21,7 +21,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-pub use vibeos_rustc::samples::{CONFORMANCE as CONFORM_SRC, DEMO as DEMO_SRC, HELLO as HELLO_SRC};
+pub use vibeos_rustc::samples::{
+    BENCHMARK as BENCH_SRC, CONFORMANCE as CONFORM_SRC, DEMO as DEMO_SRC, HELLO as HELLO_SRC,
+};
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -160,6 +162,9 @@ pub fn compile(src: &str) -> Result<Compiled, String> {
 
 pub struct RunOutcome {
     pub value: i64,
+    /// Raw `rdtime` delta. Benchmark consumers use ticks rather than the
+    /// rounded human-readable microsecond value.
+    pub ticks: u64,
     pub micros: u64,
     pub denied: bool,
     /// Set when an emitted safety check stopped the program.
@@ -218,13 +223,14 @@ pub fn run(prog: &Compiled) -> RunOutcome {
         }
     };
 
-    let micros =
-        (sbi::time() - STARTED_AT.load(Ordering::SeqCst)) / (crate::exec::TIMEBASE_HZ / 1_000_000);
+    let ticks = sbi::time() - STARTED_AT.load(Ordering::SeqCst);
+    let micros = ticks / (crate::exec::TIMEBASE_HZ / 1_000_000);
     let code = ABORT_CODE.load(Ordering::SeqCst);
 
     *PROG_OUT.lock() = None;
     RunOutcome {
         value,
+        ticks,
         micros,
         denied: *DENIED.lock(),
         aborted: (code != 0).then(|| match code {

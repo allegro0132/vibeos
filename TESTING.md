@@ -3,9 +3,10 @@
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh
-cargo test --workspace     # 199 host tests, no QEMU, ~1s (2026-08-08 snapshot)
+cargo test --workspace     # 209 host tests, no QEMU, ~1s (2026-08-08 snapshot)
 ./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
 ./scripts/differential.sh  # re-record expectations from real rustc
+./scripts/bench.py         # fixed QEMU/TCG run checked against the baseline
 ```
 
 | Layer | What it covers | Where |
@@ -16,6 +17,32 @@ cargo test --workspace     # 199 host tests, no QEMU, ~1s (2026-08-08 snapshot)
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
+
+## Performance baseline
+
+The shell's `bench` command measures two-endpoint IPC round trips, timer-IRQ to
+task-poll latency, capability lookup at derivation depths 0 through 32, global
+heap high-water, compiler throughput, and generated code/data size and runtime.
+Every timing distribution reports warmup/sample counts plus min, p50, p95, max,
+and integer mean in raw `rdtime` ticks.
+
+`scripts/bench.py` boots the release kernel with `virt`, `rv64`, one hart,
+single-threaded TCG, and deterministic `icount`; it rejects missing, duplicate,
+or schema-changed metrics before comparing the checked-in
+`benchmarks/qemu-tcg-rv64.json`. Latency/size regressions are upper-bounded and
+throughput is lower-bounded. Relative budgets are combined with small absolute
+allowances for timer quantisation; heap and generated buffers use the documented
+larger byte allowances.
+
+```sh
+./scripts/bench.py                 # collect and check; never rewrites truth
+./scripts/bench.py --update        # intentional baseline replacement
+./scripts/bench.py --input log.txt # validate/recheck a saved transcript
+```
+
+The guest IPC number is a repeatable VibeOS trend measurement, not yet a claim
+against a Linux pipe: a host pipe measured on another ISA/runtime would not be a
+controlled comparison.
 
 ## Why four layers
 

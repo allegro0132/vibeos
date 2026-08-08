@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod bench;
 pub mod cap;
 pub mod chan;
 pub mod exec;

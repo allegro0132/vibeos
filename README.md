@@ -10,6 +10,14 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
      \_/  |_||_.__/ \___/ \____/|____/   v0.1
 ```
 
+## Documents
+
+- **[docs/BLUEPRINT.md](docs/BLUEPRINT.md)** — architecture, the four bets, the
+  capability model's invariants, the compiler's confinement argument and where it
+  leaks, and the trust model.
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
+  workstreams, testing strategy, metrics, and the risk register.
+
 ## Running it
 
 ```sh

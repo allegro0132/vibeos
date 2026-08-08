@@ -2,9 +2,12 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status:** v0.1 — boots on RISC-V under QEMU, ~3400 lines. Everything described as
-*implemented* below runs today; everything described as *planned* does not exist yet
-and is marked as such.
+**Status (2026-08-08):** M1 and M2 are complete; M3 is partial. The implementation
+is about 6,600 lines across `core`, `compiler`, and `kernel`, with 117 host tests,
+49 in-kernel checks, and 7 QEMU transcripts. Everything described as *implemented*
+below runs today; planned work is marked as such. Version strings in the boot banner
+are historical and are not used as the source of truth; milestone state lives in
+[ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -50,8 +53,9 @@ suspended `Future` is exactly the bytes it needs, and it says when to come back.
 interrupt handler's entire job is to turn a hardware event into `Waker::wake()`.
 Idle draws no power.
 
-**The bill:** a task that never yields wedges the machine. Cooperative scheduling
-is a contract, and v0.1 has no way to enforce it (§6.4).
+**The bill:** a task that never yields wedges the machine. Generated programs are
+instrumented with fuel, but cooperative scheduling remains an unenforced contract
+for in-tree component futures (§8.1).
 
 ### Bet 4 — The toolchain is a kernel service
 
@@ -104,25 +108,26 @@ upward except through a capability it was handed.
 
 ### Module map
 
-| Module | Lines | Role | Contains `unsafe` |
+| Module | Approx. lines | Role | Contains `unsafe` |
 |---|---:|---|:--:|
-| `cap.rs` | 283 | Rights, `Cap`, `CSpace`, attenuation, revocation | 1 (downcast) |
+| `cap.rs` | 376 | Rights, `Cap`, `CSpace`, attenuation, revocation | 1 (downcast) |
 | `chan.rs` | 110 | Typed bounded endpoints; rights pick the direction | — |
-| `exec.rs` | 267 | Scheduler, wakers, wait queues, timers | 3 (waker vtable, `wfi`) |
-| `world.rs` | 183 | The system image: spaces, components, wiring | — |
-| `shell.rs` | 295 | Operator interface | — |
+| `exec.rs` | 355 | Scheduler, wakers, wait queues, timers | 1 (waker construction) |
+| `world.rs` | 203 | The system image: spaces, components, wiring | — |
+| `shell.rs` | 325 | Operator interface | — |
 | `tty.rs` | 110 | Console line discipline, quiet | — |
-| `dev.rs` | 50 | Devices as capability-guarded resources | — |
-| `rustc/` | 1417 | Lexer, parser, RV64 codegen, confined runtime | 2 (call generated code) |
-| `heap.rs` | 109 | Bump allocator + size-class free lists | 7 |
-| `sync.rs` | 72 | Interrupt-safe spinlock | 6 |
+| `dev.rs` | 102 | Devices and bounded memory as capability-guarded resources | — |
+| `compiler/` | 2454 | Lexer, parser, type checker, RV64 code generator | — |
+| `kernel/rustc.rs`, `trampoline.rs` | 418 | Confined runtime and non-local fault exit | yes |
+| `heap.rs` | 106 | Bump allocator + size-class free lists | yes |
+| `sync.rs` | 59 | Interrupt-safe spinlock | yes |
 | `trap.rs` | 161 | S-mode trap entry; IRQ → waker | 3 |
 | `uart.rs` `plic.rs` `sbi.rs` | 223 | Hardware | 10 |
-| `main.rs` | 138 | Boot, panic, entry | 1 |
+| `main.rs` | 159 | Boot, panic, entry | 1 |
 
-All `unsafe` is in the hardware layer, the allocator, the waker vtable, and the two
-places that deliberately cross a type boundary (`lookup_as`, calling generated code).
-None of it is in the capability decision path.
+Line counts are a dated snapshot, not a target. `unsafe` is concentrated in the
+hardware layer, allocator, waker construction, the `lookup_as` downcast, and the
+generated-code/fault trampolines. None is in the rights or revocation decision path.
 
 ---
 
@@ -153,9 +158,11 @@ breaks one is a security bug, not a behavior change.
    privileged, not admin-only. Absent.
 3. **Rights are checked at use, not at acquisition.** Every `lookup` names what it
    needs. Holding a handle is not permission; holding a handle *with the right* is.
-4. **Revocation is immediate and retroactive.** Bumping a slot's generation makes
-   every outstanding copy of that handle stale on its next use, including inside
-   already-running native code.
+4. **Revocation is immediate for capability lookup.** Bumping a slot's generation
+   makes every outstanding copy of that handle stale on its next lookup. A service
+   that caches the resolved object has created a lease outside this guarantee; the
+   current generated-program runtime does this for the duration of one invocation,
+   as called out in §6.3 and §8.1.
 5. **Spaces are objects.** A `CSpace` is itself a `Resource`, so "supervise that
    component" is expressible as a capability rather than as a special case.
 
@@ -164,8 +171,8 @@ breaks one is a security bug, not a behavior change.
 Every capability points at a node in an `Arc`-linked derivation graph. `derive`
 and `grant` both create a *child* node, so lineage survives a cap travelling into
 another space. A cap is live only if its own node and every ancestor are alive,
-which makes revocation O(1) to perform and immediately visible everywhere —
-including in spaces the revoker cannot name and does not know exist.
+which makes revocation O(1) to perform and immediately visible to subsequent lookups
+everywhere — including in spaces the revoker cannot name and does not know exist.
 
 Slots holding a cap killed by an ancestor become stale rather than empty; they
 stop resolving and stop appearing in `list` at once, and `collect` frees them.
@@ -243,9 +250,10 @@ than speed, because the emitter is a security boundary (§6.3).
 
 ### 6.2 Two invariants that make it simple
 
-- **Instruction size never depends on an address.** 64-bit constants always take a
-  fixed 11-instruction sequence. So pass 1 (discover function addresses) and pass 2
-  (emit calls to them) agree on layout by construction, with no fixpoint iteration.
+- **Instruction size never depends on an address.** Addresses use a fixed-length
+  materialization sequence; ordinary integer constants use a shorter value-dependent
+  sequence. So pass 1 (discover function addresses) and pass 2 (emit calls to them)
+  still agree on layout by construction, with no fixpoint iteration.
 - **Stack slots are 16 bytes, not 8.** Wasteful, and it makes `sp` ABI-aligned at
   every call boundary for free, including calls back into Rust.
 
@@ -263,14 +271,15 @@ argument because it is what Bet 4 rests on:
 
 | Escape route | Why it is closed |
 |---|---|
-| Reach hardware directly | The language has no MMIO, no `asm`, no pointer type. Codegen emits `ld`/`sd` only at `s0`-relative frame offsets. |
-| Forge a pointer | Nothing in the language produces an address. `li64` materializes only integer literals, string-table addresses, and call targets — all compiler-chosen. |
-| Call something it was not given | Call targets are statically resolved function names or the two runtime hooks. There is no computed call, no function pointer, no indirect branch. |
+| Reach hardware directly | The language has no MMIO, no `asm`, no pointer type. Codegen emits `ld`/`sd` only at `s0`-relative frame offsets or through the bounds-checked memory-region cursor. |
+| Forge a pointer | Nothing in the language produces an address. Address materialization is limited to string-table addresses, function targets, runtime hooks, and the capability-granted region base — all compiler- or kernel-chosen. |
+| Call something it was not given | Call targets are statically resolved function names or the print/abort runtime hooks. There is no function pointer or user-selected indirect branch. |
 | Name the runtime hooks | Their addresses are baked into the emitted stream. The language has no syntax that reaches them. |
-| Keep authority after revocation | `rt_print_*` resolves the `prog` space's console cap **on every call**, not once at load. |
+| Keep authority after revocation | **Partially closed.** Program launch resolves console and memory caps, so revocation before launch is enforced. The current runtime caches the console object and raw memory extent for the invocation; revocation during an invocation is therefore not yet a demonstrated boundary. |
 
-**Verified by demo:** `revoke prog` leaves byte-identical machine code compiling and
-running to completion with nothing to say.
+**Verified by demo:** `revoke prog` followed by a new run leaves byte-identical machine
+code running to completion with nothing to say. This proves launch-time authority,
+not operation-time revocation of already-running code.
 
 ### 6.4 Where the argument used to leak
 
@@ -336,9 +345,12 @@ against real rustc, and eventually a verified or verifying backend.
 
 ## 8. Cross-cutting concerns
 
-**Memory.** One heap, one allocator, no per-component accounting. A component can
-exhaust the heap and take down the system. Quotas are a capability question
-(a `MemoryRegion` resource with a budget) and are not yet modelled.
+**Memory.** Compiled programs receive a bounded `MemoryRegion` capability and abort
+on exhaustion. Kernel components still share one global allocator with no ownership
+accounting; one component can exhaust it and take down the system. Large allocations
+(over 64 KiB) are not returned to the bump region, and faulted futures are deliberately
+leaked. Component-owned arenas or tagged allocations are therefore prerequisites for
+long-lived, restartable components.
 
 **Time.** `rdtime` at 10 MHz, SBI timer for wakeups. No monotonic-vs-wall
 distinction because there is no wall clock. Timers are a linear scan, fine at ~10
@@ -357,6 +369,53 @@ the kernel's own boot path or inside an interrupt handler.
 **Observability.** `ps` (poll counts), `caps` (capability tables), `chan` (queue
 depth), `mem` (heap). Poll counts are a genuinely good scheduler metric — they say
 how often a component *needed* the CPU, which threads cannot tell you.
+
+### 8.1 Current assessment and design corrections
+
+The project is strongest where its thesis is executable rather than aspirational:
+capability attenuation and cross-space revocation have dense host tests; generated
+code has a small audited instruction surface, differential tests, bounded memory,
+stack probes, and fuel; and QEMU transcripts exercise the complete path. The crate
+split also puts most policy and compiler logic on the host-testable side of a narrow
+architecture seam.
+
+The next design step is **component lifecycle**, not a wider language. A `CSpace`
+describes what a component may do, while `TaskId` describes when its future is polled,
+but no object binds those two identities together. Consequently `revoke` removes
+authority but does not stop execution, there is no cancellation or restart protocol,
+and a faulted task can only be leaked. The v1 promise “grant, run, revoke, and kill”
+cannot be made precise until a supervised `Component` owns its task, CSpace, memory
+budget, and terminal state.
+
+Four boundaries must stay explicit:
+
+1. **Capabilities constrain object access, not arbitrary trusted component code.**
+   In-tree Rust components remain in the TCB and may call kernel internals directly.
+   Only code accepted by the in-kernel compiler currently gets the stronger
+   confinement claim in §6.3.
+2. **Cooperative scheduling is not temporal isolation.** Fuel bounds generated
+   programs, but an in-tree future that never returns `Pending` can still wedge the
+   hart. Supervision can cancel at poll boundaries; hard containment ultimately
+   needs instrumentation, preemption, or a narrower admitted component format.
+3. **Revocation needs durable semantics before persistence.** Persisting raw slot and
+   generation pairs is insufficient: reboot must not resurrect a descendant of a
+   revoked cap. Stable object identity, derivation records, and atomic tombstones are
+   part of the storage design, not a later serialization detail.
+4. **Lookup-time revocation is not use-time revocation after resolution.**
+   `rustc::run` currently resolves console and memory once, then caches an `Arc` and
+   a raw region extent. The design must explicitly choose between revocable
+   operation-time handles and invocation-scoped leases. Direct generated loads and
+   stores cannot promise immediate revocation without instrumentation or a mapping
+   boundary.
+5. **Claims need reproducible measurements.** IPC cost, wake latency, capability
+   lookup depth, heap high-water marks, code size, and generated-code performance
+   need automated baselines. Optimizing with SSA or adding multicore before those
+   baselines would make the thesis harder to evaluate, not easier.
+
+These corrections preserve the four bets, but change the order of work: establish
+truthful, repeatable baselines; add ownership and lifecycle; specify durable authority;
+then widen the language and scale across harts. See the reassessed sequence in the
+Roadmap.
 
 ---
 

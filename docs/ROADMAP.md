@@ -5,8 +5,33 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
-> **M1 status: complete.** 101 host tests, 37 in-kernel checks, 5 golden
-> transcripts, CI on every push. See [TESTING.md](../TESTING.md).
+> **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial.
+> The current baseline is 117 host tests, 49 in-kernel checks, and 7 golden
+> transcripts. See [TESTING.md](../TESTING.md).
+
+## Reassessment: what should happen next
+
+The repository now proves much more than the original plan expected: the capability
+algebra, cross-space revocation, scheduler edge cases, compiler front end, emitted
+instruction surface, and native execution paths all have automated coverage. The
+remaining risk is no longer dominated by missing syntax. It is dominated by the gap
+between **authority** and **lifecycle**: a space can be revoked, but its task cannot be
+cancelled, reclaimed, restarted, or charged for kernel-heap use.
+
+The revised priority order is:
+
+| Priority | Outcome | Why now |
+|---|---|---|
+| P0 | Reproducible truth | Pin the toolchain, run the real-rustc oracle in CI, add benchmarks, and remove stale generated/status facts from prose. Performance is part of Bets 2–3 and currently mostly unmeasured. |
+| P1 | Supervised components | Bind `TaskId`, `CSpace`, memory ownership, cancellation, exit reason, and restart policy into one lifecycle. This closes the largest gap in the v1 contract. |
+| P2 | Resource-safe async runtime | Cancellation-safe wait/timer registration, component heap quotas, and reclaimable fault domains. Required before persistent or numerous components are credible. |
+| P3 | Durable authority and one real device | Specify object identity, derivation/tombstone persistence, and crash consistency; then build virtio-blk and the capability-addressed store against that model. |
+| P4 | Language performance and breadth | Establish the benchmark first, then decide whether SSA/register allocation or structs/references buys more evidence for the thesis. |
+| P5 | Multicore and MMU integrity | Scale only after lifecycle and single-hart invariants are explicit and model-tested; bring W^X/guard pages forward if threat-model work shows they outrank throughput. |
+
+This is a sequencing correction, not a change of thesis. Blueprint §8.1 records the
+architectural reasons. The completed M1/M2 history below remains useful evidence;
+the new execution plan starts after the M3 record.
 
 ## 0. The one thing to fix first
 
@@ -31,22 +56,26 @@ and nothing else should be built first.
 Milestones are ordered by **what unblocks what**, not by what is most fun.
 
 ```
-M1 Foundations ──┬─► M2 Confinement ──┬─► M3 Memory & Language ──► M5 Multicore
-   (tests, CI,   │     (unwinding,    │      (arenas, arrays,       (per-hart
-    crate split, │      stack probes, │       IR, regalloc)          queues, IPI)
+M1 Foundations ──┬─► M2 Confinement ──┬─► M3 Memory & Types
+   (tests, CI,   │     (unwinding,    │      (regions, arrays,
+    crate split, │      stack probes, │       type checking)
     revocation)  │      watchdog)     │
-                 │                    └─► M4 Devices & Persistence
+                 │                    └─► M3.5 Lifecycle & Evidence
                  └─► (unblocks everything: no milestone lands untested)
-                                                    │
-                                              M6 MMU for integrity
-                                                    │
-                                                  v1.0
+                                             │
+                              M4 Durable authority + block device
+                                      ┌──────┴──────┐
+                           language track       M5 Multicore
+                                      │         M6 MMU integrity
+                                      └──────┬──────┘
+                                           v1.0
 ```
 
 M2 comes before M3 because adding language features to a compiler whose generated
 code cannot be safely aborted multiplies the blast radius of every new feature.
-M6 comes last because it is the only milestone that is pure defence-in-depth: every
-hole it closes is closed better upstream by M2.
+Multicore stays late because it multiplies scheduler states before lifecycle is
+defined. MMU work is no longer forced to be last: W^X and guard pages may be pulled
+forward as a small integrity slice, but per-process isolation remains a non-goal.
 
 ---
 
@@ -213,20 +242,52 @@ first.
 
 ---
 
+### M3.5 — Lifecycle and evidence (next)
+
+**Goal:** turn the current demo components into bounded, observable, restartable
+units before adding persistence or more concurrency.
+
+| # | Work item | Acceptance |
+|---|---|---|
+| 3.8 | Introduce a `Component` record owning `TaskId`, `CSpace`, memory owner/budget, and state (`Running`, `Exited`, `Faulted`, `Cancelled`) | `ps` and `caps` report the same identity and terminal reason. |
+| 3.9 | Add cooperative task cancellation and join/exit reporting | Cancelling a parked, ready, and self-waking task works; each is polled no more after cancellation. |
+| 3.10 | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
+| 3.11 | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit reclaims its arena. |
+| 3.12 | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
+| 3.13 | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
+| 3.14 | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
+| 3.15 | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
+| 3.16 | Define resolved-capability lease semantics | Console hooks either revalidate a revocable token per operation or explicitly hold an invocation lease. Memory access documents the same choice; tests distinguish revoke-before-run from revoke-during-run. |
+
+**Acceptance:** start a component, revoke its authority, cancel it while blocked,
+observe its terminal state, restart it with a fresh explicitly granted CSpace, and
+repeat fault/restart enough times to demonstrate bounded memory. Publish the first
+repeatable measurement table for the four architectural bets. The generated-program
+demo reports whether revocation is immediate or invocation-scoped and tests exactly
+that contract.
+
+**Non-goal:** cancellation is not preemption. It takes effect at a poll boundary and
+cannot rescue a trusted future that never yields; the API and documentation must not
+claim otherwise.
+
+---
+
 ### M4 — Devices and persistence (v0.5)
 
 **Goal:** stop being a demo.
 
 | # | Work item | Notes |
 |---|---|---|
-| 4.1 | virtio-blk driver as a component | An async task holding an MMIO capability. The first driver that is not built into the kernel. |
+| 4.0 | Specify the durable-capability format and crash model | Stable object IDs, derivation IDs, generations, atomic grant/revoke records, and tombstones. Prove by recovery tests that power loss at each write boundary cannot amplify authority. |
+| 4.1 | virtio-blk driver as a supervised component | An async task holding an MMIO capability and a DMA memory region, with bounded queues, timeout/cancel behavior, and restart policy. The first driver that is not built into the kernel. |
 | 4.2 | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
-| 4.3 | Persist a CSpace | Save and restore a component's authority across boot. This is the interesting half: a persisted cap must not resurrect revoked authority. |
+| 4.3 | Persist a CSpace | Save and restore a component's authority across boot from durable derivation records; a revoked ancestor's tombstone wins over every descendant record. |
 | 4.4 | virtio-net + a typed socket endpoint | `Endpoint<Packet>`, not a byte stream. |
 | 4.5 | Source and binary persistence | `rustc save hello` / `run hello`. Compiled code becomes a storable object with a cap on it. |
 
 **Acceptance:** write a program at the shell, save it, reboot, run it — and its
 authority after reboot is exactly what was persisted, with revoked caps staying dead.
+Repeat with injected power loss at every store commit boundary.
 
 ---
 
@@ -265,27 +326,31 @@ Not for isolation — Blueprint §9. For the things software checks do worse:
 
 1. Every Blueprint §6.4 hole closed or documented as accepted, with a test.
 2. CI green: host unit tests, QEMU integration, compiler differential corpus, fuzzing.
-3. A component can be added, granted authority, run, revoked, and killed — without
-   restarting the machine and without a hole in the story.
+3. A supervised component can be added, granted authority, run, revoked, cancelled,
+   observed, reclaimed, and restarted — without restarting the machine. “Cancelled”
+   is explicitly cooperative unless a later isolation mechanism strengthens it.
 4. `-smp 4`.
 5. Programs survive reboot with exactly the authority that was persisted.
-6. Published measurements for every number in §4.
+6. Published measurements for every number in §5.
 
 ---
 
 ## 3. Workstreams
 
-Four tracks that can proceed in parallel once M1 lands.
+The continuing tracks after the partial M3 milestone are:
 
-| Track | Owns | Milestones |
+| Track | Owns | Near-term outcome |
 |---|---|---|
-| **Kernel core** | `exec`, `sync`, `heap`, `trap`, boot | 1.10, M5, M6 |
-| **Capability system** | `cap`, `chan`, `world` | 1.2, 1.8, 1.9, 3.7, 4.3 |
-| **Compiler** | `rustc/` | 1.3–1.4, M2, M3 |
-| **Platform** | drivers, storage, `tty`, `shell` | M4 |
+| **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
+| **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
+| **Compiler** | `compiler`, `kernel/rustc`, trampoline | 3.16 lease semantics first; 3.4–3.6 only after the performance baseline identifies the useful next step |
+| **Platform** | drivers, storage, `tty`, `shell` | M4 durable-capability model and virtio-blk prototype |
+| **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 
-Cross-track dependency to watch: M2's trampoline (2.1) is owned by Compiler but is
-what Kernel core needs for task fault isolation (2.8). Land it early in M2.
+The lifecycle track is the integration spine: a driver, persisted program, or remote
+endpoint is not ready to ship until it has an owner, budget, cancellation path, and
+observable exit state. Evidence can proceed in parallel; language breadth must not
+silently become the critical path for storage or supervision.
 
 ---
 
@@ -326,14 +391,15 @@ are just assertions.
 | Metric | Why | Today |
 |---|---|---|
 | IPC round-trip (ns) | Bet 2 claims a queue push beats a mode switch. Prove it against a Linux pipe. | unmeasured |
-| Wake latency: IRQ → task polled | Bet 3's core claim | unmeasured (≤50 ms worst case, from the `wfi` race) |
+| Wake latency: IRQ → task polled | Bet 3's core claim | unmeasured; the known `wfi` lost-wake race is fixed |
 | Idle CPU draw | Should be zero | unmeasured |
 | Compile throughput (KB/s) | 3528 B from ~3 fn in ~5–15 ms today | rough |
 | Generated code vs `rustc -O0` | Honest accounting of the stack machine's cost | unmeasured |
 | Cap lookup cost | On every operation; must stay cheap | unmeasured |
-| Kernel size / `unsafe` count | TCB is the product | 3418 lines, ~33 `unsafe` |
+| Kernel size / `unsafe` count | TCB is the product | snapshot required; report source lines and `unsafe` sites separately |
 
-Add a `bench` shell command in M1 so these are trackable from the start.
+Add the `bench` shell command in M3.5. Results must include QEMU version, CPU model,
+toolchain revision, build profile, sample count, and distribution (not only a minimum).
 
 ---
 
@@ -342,11 +408,14 @@ Add a `bench` shell command in M1 so these are trackable from the start.
 | Risk | Severity | Mitigation |
 |---|---|---|
 | A codegen bug is a privilege escalation, and the emitter is unverified | **High** | 2.5 differential testing, 2.7 emitter audit, 3.5 SSA IR to narrow the surface |
-| Bet 2's cheap-IPC claim goes unmeasured and turns out false | High | §5 metrics in M1, before the design ossifies |
+| Authority revocation is mistaken for task termination | **High** | M3.5 supervised `Component`, explicit cancellation states, end-to-end revoke/cancel/restart test |
+| A resolved object outlives the cap that authorized it | **High** | 3.16 explicit lease semantics; operation-time revalidation for revocable devices; no “immediate” claim for raw memory without enforcement |
+| Faulted or cancelled tasks leak heap and stale wakers | **High** | Owned arenas plus cancellation-safe wait/timer registrations before persistent services |
+| Bet 2's cheap-IPC claim goes unmeasured and turns out false | High | §5 metrics in M3.5, before optimizing or scaling the design |
 | The single-hart executor design does not survive M5 | Medium | Treat 5.1 as a redesign, not a port; write the model check first |
 | Language features outrun confinement | Medium | M2 strictly before M3; no new syntax without an abort path |
 | Scope sprawl into POSIX compatibility | Medium | Blueprint §9 is binding |
-| Homebrew Rust + `RUSTC_BOOTSTRAP=1` breaks on a toolchain bump | Low | Pin via `rust-toolchain.toml` in M1; CI on a fixed nightly |
+| Floating nightly + `RUSTC_BOOTSTRAP=1` breaks on a toolchain bump | Medium | Pin an exact nightly in M3.5 and make local scripts and CI consume the same file |
 
 ---
 

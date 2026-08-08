@@ -11,7 +11,7 @@ use core::any::Any;
 
 use crate::cap::{self, Cap, CSpace, Resource, Rights};
 use crate::chan::Endpoint;
-use crate::dev::ConsoleDev;
+use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::exec;
 use crate::sync::SpinLock;
 
@@ -55,6 +55,10 @@ pub struct World {
     /// The space compiled programs run with, and init's handle on it.
     pub prog_space: Cap,
     pub prog_console: Cap,
+    /// The region compiled programs allocate arrays from, as `prog` holds it.
+    pub prog_memory: Cap,
+    /// init's own handle on the same region, for reporting.
+    pub region: Cap,
 }
 
 static WORLD: SpinLock<Option<Arc<World>>> = SpinLock::new(None);
@@ -65,6 +69,9 @@ pub fn world() -> Arc<World> {
 
 pub fn build() {
     let console = ConsoleDev::new();
+    // 4096 i64s: enough for real programs, small enough that a runaway one hits
+    // the bound rather than the heap.
+    let region = MemoryRegion::new("prog-arena", 4096);
     let telemetry: Arc<Endpoint<Reading>> = Endpoint::new("telemetry", 8);
 
     let init = Space::new("init");
@@ -93,6 +100,17 @@ pub fn build() {
     // Compiled programs get a console and nothing else. Machine code emitted by
     // the in-kernel compiler reaches the outside world only through this cap.
     let prog_con = cap::grant(&cs, c_console, Rights::WRITE, &mut prog.0.lock()).unwrap();
+    // Memory is granted the same way as the console, and `revoke prog` takes
+    // both -- an operator revoking a component means all of its authority.
+    let c_region = cs.mint(region.clone(), Rights::ALL);
+    let init_region = c_region;
+    let prog_mem = cap::grant(
+        &cs,
+        c_region,
+        Rights::READ.union(Rights::WRITE),
+        &mut prog.0.lock(),
+    )
+    .unwrap();
     drop(cs);
 
     *WORLD.lock() = Some(Arc::new(World {
@@ -108,6 +126,8 @@ pub fn build() {
         guest_space: c_guest_space,
         prog_space: c_prog_space,
         prog_console: prog_con,
+        prog_memory: prog_mem,
+        region: init_region,
     }));
 
     // Components are *handed* their handles at spawn. That is their whole

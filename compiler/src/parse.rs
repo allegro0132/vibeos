@@ -26,6 +26,10 @@ pub struct Parser {
 /// anything that threatens the stack.
 const MAX_DEPTH: u32 = 64;
 
+/// Longest array the subset will allocate. Bounded because the region a program
+/// is granted is bounded, and because a length is a compile-time constant here.
+pub const MAX_ARRAY: u32 = 4096;
+
 type PResult<T> = Result<T, String>;
 
 impl Parser {
@@ -105,6 +109,30 @@ impl Parser {
     // Note: `bump` deliberately does not advance past `Eof`, so nothing here may
     // undo a bump by decrementing `pos` -- at end of input that walks backwards
     // onto the previous token and blames it for the error. Peek, then commit.
+    /// Look past a balanced `[...]` starting at `pos + 1` for an `=`.
+    fn index_assign_ahead(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos + 1;
+        while i < self.toks.len() {
+            match self.toks[i].tok {
+                Tok::Punct("[") => depth += 1,
+                Tok::Punct("]") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.toks.get(i + 1).map(|t| &t.tok),
+                            Some(Tok::Punct("="))
+                        );
+                    }
+                }
+                Tok::Eof | Tok::Punct(";") => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn ident(&mut self) -> PResult<String> {
         let Tok::Ident(s) = self.peek().clone() else {
             return Err(format!(
@@ -155,6 +183,38 @@ impl Parser {
     }
 
     fn ty(&mut self) -> PResult<Ty> {
+        if self.eat("[") {
+            // `[i64; N]`
+            if !matches!(self.peek(), Tok::I64) {
+                return Err(format!(
+                    "line {}: arrays hold `i64`, found {}",
+                    self.line(),
+                    self.describe()
+                ));
+            }
+            self.bump();
+            self.expect(";")?;
+            let n = match self.bump() {
+                Tok::Int(v) if v > 0 && v <= MAX_ARRAY as i64 => v as u32,
+                Tok::Int(v) => {
+                    return Err(format!(
+                        "line {}: array length {} is out of range (1..={})",
+                        self.line(),
+                        v,
+                        MAX_ARRAY
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "line {}: expected an array length, found {}",
+                        self.line(),
+                        self.describe()
+                    ))
+                }
+            };
+            self.expect("]")?;
+            return Ok(Ty::Array(n));
+        }
         match self.peek() {
             Tok::I64 => {
                 self.bump();
@@ -242,6 +302,21 @@ impl Parser {
                     let value = self.expr()?;
                     self.expect(";")?;
                     stmts.push(Stmt::Assign { name, value, line });
+                }
+                // `a[i] = v;` -- distinguished from the expression `a[i]` by
+                // looking past the closing bracket for an `=`.
+                Tok::Ident(name)
+                    if matches!(self.toks[self.pos + 1].tok, Tok::Punct("["))
+                        && self.index_assign_ahead() =>
+                {
+                    self.bump();
+                    self.bump();
+                    let index = self.expr()?;
+                    self.expect("]")?;
+                    self.expect("=")?;
+                    let value = self.expr()?;
+                    self.expect(";")?;
+                    stmts.push(Stmt::IndexAssign { name, index, value, line });
                 }
                 _ => {
                     let e = self.expr()?;
@@ -412,8 +487,37 @@ impl Parser {
                 };
                 Ok(Expr::If(Box::new(cond), then, els, line))
             }
+            Tok::Punct("[") => {
+                // `[value; N]`
+                self.bump();
+                let value = self.expr()?;
+                self.expect(";")?;
+                let n = match self.bump() {
+                    Tok::Int(v) if v > 0 && v <= MAX_ARRAY as i64 => v as u32,
+                    Tok::Int(v) => {
+                        return Err(format!(
+                            "line {}: array length {} is out of range (1..={})",
+                            line, v, MAX_ARRAY
+                        ))
+                    }
+                    _ => {
+                        return Err(format!(
+                            "line {}: expected an array length, found {}",
+                            line,
+                            self.describe()
+                        ))
+                    }
+                };
+                self.expect("]")?;
+                Ok(Expr::ArrayRepeat(Box::new(value), n, line))
+            }
             Tok::Ident(name) => {
                 self.bump();
+                if self.eat("[") {
+                    let idx = self.expr()?;
+                    self.expect("]")?;
+                    return Ok(Expr::Index(name, Box::new(idx), line));
+                }
                 if self.eat("(") {
                     let mut args = Vec::new();
                     while !self.eat(")") {

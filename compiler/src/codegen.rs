@@ -24,17 +24,30 @@ const S0: u32 = 8;
 const S1: u32 = 9;
 /// Remaining fuel, likewise.
 const S2: u32 = 18;
+/// Base of the capability-granted memory region, likewise.
+///
+/// Arrays are the only reason generated code touches memory outside its frame.
+/// Keeping the base in a reserved callee-saved register — rather than letting a
+/// program compute an address — is what preserves the confinement argument: an
+/// element access is `s3 + index*8` with a bounds check against `s4`, so a
+/// program still cannot name an address of its own choosing.
+const S3: u32 = 19;
+/// Length of that region, in elements.
+const S4: u32 = 20;
 const T0: u32 = 5;
 const T1: u32 = 6;
 const T2: u32 = 7;
 const T3: u32 = 28;
 const T4: u32 = 29;
+/// The region cursor: the only non-frame base register a memory access may use.
+const T5: u32 = 30;
 const A0: u32 = 10;
 
 // Branch funct3 values.
 const BEQ: u32 = 0;
 const BNE: u32 = 1;
 const BGE: u32 = 5;
+const BLTU: u32 = 6;
 const BGEU: u32 = 7;
 
 /// Abort reasons, shared with `kernel::trampoline::abort`.
@@ -45,6 +58,8 @@ pub mod abort {
     pub const OUT_OF_FUEL: u8 = 4;
     pub const ARITHMETIC_OVERFLOW: u8 = 5;
     pub const DIVIDE_OVERFLOW: u8 = 6;
+    pub const INDEX_OUT_OF_BOUNDS: u8 = 7;
+    pub const OUT_OF_MEMORY: u8 = 8;
 }
 
 /// Every stack slot is 16 bytes so `sp` is always 16-byte aligned, which is
@@ -115,6 +130,10 @@ struct Scope {
     name: String,
     slot: u32,
     mutable: bool,
+    /// `(base, len)` in elements, for an array. Arrays live in the granted
+    /// region rather than the frame, and both numbers are compile-time
+    /// constants, so no frame slot holds a pointer a program could tamper with.
+    array: Option<(u32, u32)>,
 }
 
 pub struct Codegen {
@@ -131,6 +150,9 @@ pub struct Codegen {
     rt_abort: u64,
     scope: Vec<Scope>,
     next_slot: u32,
+    /// Next free element index in the region. Allocation is a compile-time bump
+    /// with a single runtime check, because every array length is a constant.
+    next_region: u32,
     ret_patches: Vec<usize>,
     /// `jal` sites waiting to be pointed at a shared abort stub. Emitting one
     /// stub per reason keeps each check site to two instructions instead of the
@@ -210,6 +232,65 @@ impl Codegen {
         self.scope.iter().rev().find(|s| s.name == name)
     }
 
+    /// Materialize a small constant in one instruction where possible. Lengths
+    /// and bases are program constants, so this stays layout-stable across the
+    /// two passes.
+    fn li_small(&mut self, rd: u32, v: i64) {
+        if (-2048..2048).contains(&v) {
+            self.emit(addi(rd, ZERO, v as i32));
+        } else {
+            self.li64(rd, v as u64);
+        }
+    }
+
+    /// Resolve an array binding to its `(base, len)` in the region.
+    fn array_of(&self, name: &str, line: u32) -> CResult<(u32, u32)> {
+        match self.lookup(name).and_then(|s| s.array) {
+            Some(pair) => Ok(pair),
+            None => Err(format!("line {}: `{}` is not an array", line, name)),
+        }
+    }
+
+    /// Bounds-check the index in `t0` and leave the element address in `t5`.
+    ///
+    /// This is the *only* place generated code computes a memory address that
+    /// is not frame-relative, and it always emits the check with the address in
+    /// one piece — which is what makes the invariant auditable: every write to
+    /// `t5` is an `add t5, s3, _` preceded by this exact guard.
+    ///
+    /// The comparison is unsigned, so a negative index becomes a huge value and
+    /// fails the same check. Rust indexes with `usize`; the subset has only
+    /// `i64`, and this is how it keeps the same guarantee.
+    fn element_address(&mut self, base: u32, len: u32) {
+        self.li_small(T4, len as i64);
+        self.guard(b(8, T4, T0, BLTU), abort::INDEX_OUT_OF_BOUNDS);
+        if base != 0 {
+            self.li_small(T4, base as i64);
+            self.emit(r(0, T4, T0, 0, T0, 0x33)); // add t0, t0, t4
+        }
+        self.emit(i(3, T0, 1, T0, 0x13)); // slli t0, t0, 3
+        self.emit(r(0, T0, S3, 0, T5, 0x33)); // add t5, s3, t0
+    }
+
+    /// `[value; len]`: store `t2` into every element, as Rust does for a `Copy`
+    /// element type.
+    fn fill_array(&mut self, base: u32, len: u32) {
+        self.li_small(T3, 0);
+        let top = self.here();
+        self.li_small(T4, len as i64);
+        // Exit when the cursor reaches the length.
+        self.emit(b(8, T4, T3, BLTU)); // continue while t3 < t4
+        let done = self.jump_placeholder();
+
+        self.emit(mv(T0, T3));
+        self.element_address(base, len);
+        self.emit(sd(T2, T5, 0));
+        self.emit(addi(T3, T3, 1));
+        let back = self.jump_placeholder();
+        self.patch_to(back, top);
+        self.patch_to_here(done);
+    }
+
     /// Emit `guard` (a branch that skips the abort when the check passes),
     /// followed by a jump to the shared stub for `reason`.
     fn guard(&mut self, guard: u32, reason: u8) {
@@ -251,6 +332,8 @@ fn is_leaf(block: &Block) -> bool {
     fn expr_leaf(e: &Expr) -> bool {
         match e {
             Expr::Call(..) => false,
+            Expr::ArrayRepeat(..) => false,
+            Expr::Index(_, i, _) => expr_leaf(i),
             Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => expr_leaf(a),
             Expr::Bin(_, a, b, _) => expr_leaf(a) && expr_leaf(b),
             Expr::If(c, t, e, _) => {
@@ -261,6 +344,9 @@ fn is_leaf(block: &Block) -> bool {
     }
     block.stmts.iter().all(|st| match st {
         Stmt::While(..) => false,
+        // An array initializer emits a fill loop.
+        Stmt::Let { init: Expr::ArrayRepeat(..), .. } => false,
+        Stmt::IndexAssign { index, value, .. } => expr_leaf(index) && expr_leaf(value),
         // A print is a call into the runtime; charge for it.
         Stmt::Print { .. } => false,
         Stmt::Let { init, .. } => expr_leaf(init),
@@ -278,6 +364,8 @@ fn count_lets(block: &Block) -> u32 {
             Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => expr_lets(a),
             Expr::Bin(_, a, b, _) => expr_lets(a) + expr_lets(b),
             Expr::Call(_, args, _) => args.iter().map(expr_lets).sum(),
+            Expr::Index(_, i, _) => expr_lets(i),
+            Expr::ArrayRepeat(v, _, _) => expr_lets(v),
             Expr::If(c, t, e, _) => {
                 expr_lets(c) + count_lets(t) + e.as_ref().map_or(0, count_lets)
             }
@@ -289,6 +377,7 @@ fn count_lets(block: &Block) -> u32 {
         n += match st {
             Stmt::Let { init, .. } => 1 + expr_lets(init),
             Stmt::Assign { value, .. } => expr_lets(value),
+            Stmt::IndexAssign { index, value, .. } => expr_lets(index) + expr_lets(value),
             Stmt::Expr(e) => expr_lets(e),
             Stmt::While(c, b, _) => expr_lets(c) + count_lets(b),
             Stmt::Return(Some(e)) => expr_lets(e),
@@ -339,6 +428,7 @@ pub fn collect_strings(prog: &Program, newline_marker: &str) -> Vec<String> {
         match st {
             Stmt::Let { init, .. } => alloc::vec![init],
             Stmt::Assign { value, .. } => alloc::vec![value],
+            Stmt::IndexAssign { index, value, .. } => alloc::vec![index, value],
             Stmt::Expr(e) => alloc::vec![e],
             Stmt::While(c, _, _) => alloc::vec![c],
             Stmt::Return(Some(e)) => alloc::vec![e],
@@ -360,6 +450,8 @@ pub fn collect_strings(prog: &Program, newline_marker: &str) -> Vec<String> {
                 walk_expr(b, out, add);
             }
             Expr::Call(_, args, _) => args.iter().for_each(|a| walk_expr(a, out, add)),
+            Expr::Index(_, i, _) => walk_expr(i, out, add),
+            Expr::ArrayRepeat(v, _, _) => walk_expr(v, out, add),
             Expr::If(c, t, els, _) => {
                 walk_expr(c, out, add);
                 walk(t, out, add);
@@ -407,6 +499,7 @@ pub fn compile(
             rt_abort: rt.abort,
             scope: Vec::new(),
             next_slot: 0,
+            next_region: 0,
             ret_patches: Vec::new(),
             abort_patches: Vec::new(),
         };
@@ -469,7 +562,7 @@ impl Codegen {
             }
             let slot = self.next_slot;
             self.next_slot += 1;
-            self.scope.push(Scope { name: p.clone(), slot, mutable: false });
+            self.scope.push(Scope { name: p.clone(), slot, mutable: false, array: None });
             let off = 16 + 8 * slot as i32;
             self.emit(sd(A0 + n as u32, S0, off));
         }
@@ -508,13 +601,42 @@ impl Codegen {
 
     fn stmt(&mut self, st: &Stmt) -> CResult<()> {
         match st {
+            Stmt::Let { name, mutable, init: Expr::ArrayRepeat(value, n, _), .. } => {
+                let base = self.next_region;
+                let len = *n;
+                self.next_region = self.next_region.saturating_add(len);
+
+                // One runtime check per array: does the granted region actually
+                // reach this far? Everything else about the layout is decided
+                // here, at compile time.
+                self.li_small(T4, (base + len) as i64);
+                self.guard(b(8, T4, S4, BGEU), abort::OUT_OF_MEMORY);
+
+                self.expr(value)?;
+                self.pop(T2);
+                self.fill_array(base, len);
+
+                let slot = self.next_slot;
+                self.next_slot += 1;
+                self.scope.push(Scope {
+                    name: name.clone(),
+                    slot,
+                    mutable: *mutable,
+                    array: Some((base, len)),
+                });
+            }
             Stmt::Let { name, mutable, init, .. } => {
                 self.expr(init)?;
                 self.pop(T0);
                 let slot = self.next_slot;
                 self.next_slot += 1;
                 self.emit(sd(T0, S0, 16 + 8 * slot as i32));
-                self.scope.push(Scope { name: name.clone(), slot, mutable: *mutable });
+                self.scope.push(Scope {
+                    name: name.clone(),
+                    slot,
+                    mutable: *mutable,
+                    array: None,
+                });
             }
             Stmt::Assign { name, value, line } => {
                 let Some(v) = self.lookup(name) else {
@@ -530,6 +652,15 @@ impl Codegen {
                 self.expr(value)?;
                 self.pop(T0);
                 self.emit(sd(T0, S0, off));
+            }
+            Stmt::IndexAssign { name, index, value, line } => {
+                let (base, len) = self.array_of(name, *line)?;
+                self.expr(index)?;
+                self.expr(value)?;
+                self.pop(T2); // value
+                self.pop(T0); // index
+                self.element_address(base, len);
+                self.emit(sd(T2, T5, 0));
             }
             Stmt::Expr(e) => {
                 self.expr(e)?;
@@ -694,6 +825,19 @@ impl Codegen {
                 let addr = self.fn_addrs.get(name).copied().unwrap_or(self.code_base);
                 self.call_abs(addr);
                 self.push(A0);
+            }
+            Expr::Index(name, idx, line) => {
+                let (base, len) = self.array_of(name, *line)?;
+                self.expr(idx)?;
+                self.pop(T0);
+                self.element_address(base, len);
+                self.emit(ld(T0, T5, 0));
+                self.push(T0);
+            }
+            Expr::ArrayRepeat(..) => {
+                return Err(
+                    "an array literal may only initialise a `let` binding".to_string()
+                )
             }
             Expr::If(cond, then, els, _) => {
                 self.expr(cond)?;

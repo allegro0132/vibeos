@@ -20,5 +20,8 @@ Rust rejects. Programs here must stay inside the intersection:
 - **Annotate `i64` on every binding.** Rust infers `i32` for a bare integer
   literal; the subset has only `i64`. Without the annotation the two languages
   compute in different widths, which real rustc catches as an overflow error.
+- **Array indices are `usize` in Rust and `i64` here.** Rust infers a loop
+  counter as `usize` from the indexing, so keep counters separate from values:
+  the subset has no `as`, so a counter cannot be converted to `i64`.
 - **No arithmetic that overflows**, unless the point of the program is the abort
   — real rustc in release mode wraps rather than panicking, so the two disagree.

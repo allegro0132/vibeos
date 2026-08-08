@@ -18,6 +18,8 @@
 //! |-----|-------|-----------------|
 //! | `s1` | lowest permitted `sp` | callee-saved, so the Rust runtime hooks preserve it |
 //! | `s2` | remaining fuel | likewise; generated functions only ever save `ra`/`s0` |
+//! | `s3` | base of the granted memory region | likewise |
+//! | `s4` | that region's length, in elements | likewise |
 
 use core::arch::global_asm;
 
@@ -77,24 +79,30 @@ vibe_longjmp:
     mv a0, a1
     ret
 
-// i64 vibe_enter(entry a0, stack_limit a1, fuel a2)
+// i64 vibe_enter(entry a0, stack_limit a1, fuel a2, region a3, region_len a4)
 //
 // Establishes the register contract above, then calls the program. On a normal
 // return the saved registers come back; on an abort we never get here, because
 // the longjmp lands back in the Rust frame that called vibe_setjmp.
 .global vibe_enter
 vibe_enter:
-    addi sp, sp, -32
+    addi sp, sp, -48
     sd ra,  0(sp)
     sd s1,  8(sp)
     sd s2, 16(sp)
+    sd s3, 24(sp)
+    sd s4, 32(sp)
     mv s1, a1
     mv s2, a2
+    mv s3, a3
+    mv s4, a4
     jalr ra, a0, 0
     ld ra,  0(sp)
     ld s1,  8(sp)
     ld s2, 16(sp)
-    addi sp, sp, 32
+    ld s3, 24(sp)
+    ld s4, 32(sp)
+    addi sp, sp, 48
     ret
 "#
 );
@@ -102,7 +110,13 @@ vibe_enter:
 extern "C" {
     pub fn vibe_setjmp(buf: *mut JmpBuf) -> i64;
     pub fn vibe_longjmp(buf: *mut JmpBuf, value: i64) -> !;
-    pub fn vibe_enter(entry: usize, stack_limit: usize, fuel: i64) -> i64;
+    pub fn vibe_enter(
+        entry: usize,
+        stack_limit: usize,
+        fuel: i64,
+        region: usize,
+        region_len: usize,
+    ) -> i64;
 }
 
 /// Abort reasons. The numbers are baked into emitted code, so they are part of
@@ -114,6 +128,8 @@ pub mod abort {
     pub const OUT_OF_FUEL: u8 = 4;
     pub const ARITHMETIC_OVERFLOW: u8 = 5;
     pub const DIVIDE_OVERFLOW: u8 = 6;
+    pub const INDEX_OUT_OF_BOUNDS: u8 = 7;
+    pub const OUT_OF_MEMORY: u8 = 8;
 
     /// What real rustc prints for the same condition, where there is one.
     pub fn describe(code: i64) -> &'static str {
@@ -124,6 +140,8 @@ pub mod abort {
             OUT_OF_FUEL => "exceeded execution budget",
             ARITHMETIC_OVERFLOW => "attempt to perform arithmetic that overflowed",
             DIVIDE_OVERFLOW => "attempt to divide with overflow",
+            INDEX_OUT_OF_BOUNDS => "index out of bounds",
+            OUT_OF_MEMORY => "the granted memory region is too small for this program",
             _ => "aborted",
         }
     }

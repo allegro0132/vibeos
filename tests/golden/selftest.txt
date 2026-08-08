@@ -4,6 +4,6 @@ vibe> quiet
 vibe> selftest
 [!] panic: panicked at kernel/src/selftest.rs:123:9:
 deliberate fault from the self-test
-  selftest: 49 passed, 0 failed
-  SELFTEST OK (49 checks)
+  selftest: 54 passed, 0 failed
+  SELFTEST OK (54 checks)
 vibe> 

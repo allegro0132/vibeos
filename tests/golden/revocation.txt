@@ -7,7 +7,7 @@ vibe> rustc hello
 Hello, world!
   --- exited with 0 in N us ---
 vibe> revoke prog
-  revoked 1 cap(s) in `prog`
+  revoked 2 cap(s) in `prog`
   (already-compiled machine code will now print nothing)
 vibe> rustc hello
   compiled 1 fn -> 460 B of RV64 + 14 B of data in N us

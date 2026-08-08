@@ -194,13 +194,29 @@ const ZERO: u32 = 0;
 const RA: u32 = 1;
 const SP: u32 = 2;
 const T0: u32 = 5;
+const T4: u32 = 29;
+const T5: u32 = 30;
 const S0: u32 = 8;
+const S3: u32 = 19;
+const BLTU: u32 = 6;
+
+/// Programs that exercise the region: allocation, read, write, and a loop.
+fn all_programs_with_arrays() -> Vec<Vec<u32>> {
+    vec![
+        emit("fn main() { let mut a = [0; 4]; a[0] = 1; println!(\"{}\", a[0]); }"),
+        emit(
+            "fn main() { let mut a = [7; 16]; let mut b = [0; 8]; let mut i = 0;\
+             while i < 8 { b[i] = a[i] * 2; i = i + 1; } println!(\"{}\", b[3]); }",
+        ),
+    ]
+}
 
 fn all_programs() -> Vec<Vec<u32>> {
     let mut out = vec![];
     for src in [samples::HELLO, samples::DEMO, samples::CONFORMANCE] {
         out.push(emit(src));
     }
+    out.extend(all_programs_with_arrays());
     // Programs that carry every kind of abort stub, so the audit covers the
     // failure paths and not just the happy ones.
     out.push(emit(
@@ -231,10 +247,14 @@ fn the_emitter_produces_no_privileged_instructions() {
     }
 }
 
-/// Every memory access must be frame-relative. A load or store through any
-/// other base register would be an arbitrary read or write of kernel memory.
+/// Every memory access is frame-relative, or goes through the region cursor.
+///
+/// A load or store through any other base register is an arbitrary read or
+/// write of kernel memory. This caught a real bug: element assignment stored
+/// through `t0`, which holds the *scaled index* rather than the address, so
+/// `a[1] = 9` wrote near address 8.
 #[test]
-fn every_memory_access_is_frame_relative() {
+fn every_memory_access_is_frame_relative_or_through_the_region_cursor() {
     for code in all_programs() {
         for (i, w) in code.iter().enumerate() {
             let op = w & 0x7f;
@@ -243,9 +263,69 @@ fn every_memory_access_is_frame_relative() {
             }
             let rs1 = (w >> 15) & 0x1f;
             assert!(
-                rs1 == S0 || rs1 == SP,
+                rs1 == S0 || rs1 == SP || rs1 == T5,
                 "instruction {i} ({w:08x}) addresses memory through x{rs1}; \
-                 only s0 (frame) and sp (eval stack) are permitted"
+                 only s0 (frame), sp (eval stack) and t5 (region cursor) are permitted"
+            );
+        }
+    }
+}
+
+/// ...and the region cursor is only ever formed by adding to the granted base.
+///
+/// Together with the bounds check asserted below, this is what keeps arrays
+/// from reopening the address-forgery hole: a program can choose an *index*,
+/// never an address.
+#[test]
+fn the_region_cursor_is_only_ever_the_granted_base_plus_an_offset() {
+    for code in all_programs_with_arrays() {
+        let mut writes = 0;
+        for (i, w) in code.iter().enumerate() {
+            let writes_t5 = match w & 0x7f {
+                OP | OP_IMM | LOAD => (w >> 7) & 0x1f == T5,
+                JAL | JALR => (w >> 7) & 0x1f == T5,
+                _ => false,
+            };
+            if !writes_t5 {
+                continue;
+            }
+            writes += 1;
+            // add t5, s3, rX
+            let is_add_from_base =
+                w & 0x7f == OP && (w >> 12) & 7 == 0 && w >> 25 == 0 && (w >> 15) & 0x1f == S3;
+            assert!(
+                is_add_from_base,
+                "instruction {i} ({w:08x}) writes t5 without deriving it from s3"
+            );
+        }
+        assert!(writes > 0, "a program using arrays must form region addresses");
+    }
+}
+
+/// Every region address is preceded by an unsigned bounds check against the
+/// array's length. Unsigned, so a negative index fails the same test — Rust
+/// indexes with `usize`, and this is how the subset keeps that guarantee with
+/// only `i64`.
+#[test]
+fn every_region_address_is_preceded_by_a_bounds_check() {
+    for code in all_programs_with_arrays() {
+        for (i, w) in code.iter().enumerate() {
+            let is_add_from_base =
+                w & 0x7f == OP && (w >> 7) & 0x1f == T5 && (w >> 15) & 0x1f == S3;
+            if !is_add_from_base {
+                continue;
+            }
+            // Look back a short window for `bltu t0, t4, +8`.
+            let start = i.saturating_sub(8);
+            let guarded = code[start..i].iter().any(|g| {
+                g & 0x7f == BRANCH
+                    && (g >> 12) & 7 == BLTU
+                    && (g >> 15) & 0x1f == T0
+                    && (g >> 20) & 0x1f == T4
+            });
+            assert!(
+                guarded,
+                "region address at {i} ({w:08x}) has no bounds check in the preceding window"
             );
         }
     }

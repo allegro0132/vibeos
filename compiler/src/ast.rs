@@ -15,6 +15,10 @@ pub enum Ty {
     I64,
     Bool,
     Unit,
+    /// `[i64; N]`. Arrays live in the capability-granted region, not the frame,
+    /// and are the only reason generated code touches memory it does not own
+    /// outright — see `codegen`'s region register contract.
+    Array(u32),
 }
 
 impl core::fmt::Display for Ty {
@@ -23,6 +27,7 @@ impl core::fmt::Display for Ty {
             Ty::I64 => "i64",
             Ty::Bool => "bool",
             Ty::Unit => "()",
+            Ty::Array(n) => return write!(f, "[i64; {}]", n),
         })
     }
 }
@@ -57,6 +62,10 @@ pub enum Expr {
     BitNot(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>, u32),
     Call(String, Vec<Expr>, u32),
+    /// `a[i]` — always bounds-checked.
+    Index(String, Box<Expr>, u32),
+    /// `[value; N]`, the only way to make an array.
+    ArrayRepeat(Box<Expr>, u32, u32),
     If(Box<Expr>, Block, Option<Block>, u32),
 }
 
@@ -72,6 +81,8 @@ pub enum PrintPart {
 pub enum Stmt {
     Let { name: String, mutable: bool, declared: Option<Ty>, init: Expr, line: u32 },
     Assign { name: String, value: Expr, line: u32 },
+    /// `a[i] = value`.
+    IndexAssign { name: String, index: Expr, value: Expr, line: u32 },
     Expr(Expr),
     While(Expr, Block, u32),
     Return(Option<Expr>),

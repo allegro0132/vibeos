@@ -155,7 +155,8 @@ be `bool`, so `if 1` is the error it is in Rust.
 
 `fn` with typed parameters and return type, `let` / `let mut`, assignment,
 `if`/`else` **as an expression**, `else if` chains, `while`, `return`, block tail
-expressions, recursion, `+ - * / %`, `== != < <= > >=`, short-circuiting
+expressions, fixed-size `[i64; N]` arrays with bounds-checked indexing,
+recursion, `+ - * / %`, `== != < <= > >=`, short-circuiting
 `&& ||`, unary `-` and `!`, and `print!`/`println!` with `{}` holes. Line
 comments. Up to 8 parameters and 252 locals per function.
 
@@ -211,6 +212,7 @@ property of the code.
 | file | |
 |---|---|
 | `world.rs` | the system image: spaces, components, wiring |
+| `dev.rs` | console and memory-region resources |
 | `shell.rs` | interactive shell (`probe`, `revoke`, `caps`, `ps`, …) |
 | `trap.rs` | S-mode trap entry, IRQ → waker |
 | `uart.rs`, `plic.rs`, `sbi.rs`, `dev.rs` | hardware |

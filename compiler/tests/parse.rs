@@ -40,6 +40,9 @@ fn stmt(s: &Stmt) -> String {
             expr(init)
         ),
         Stmt::Assign { name, value, .. } => format!("(= {} {})", name, expr(value)),
+        Stmt::IndexAssign { name, index, value, .. } => {
+            format!("(=[] {} {} {})", name, expr(index), expr(value))
+        }
         Stmt::Expr(e) => format!("(expr {})", expr(e)),
         Stmt::While(c, b, _) => format!("(while {} {})", expr(c), block(b)),
         Stmt::Return(Some(e)) => format!("(return {})", expr(e)),
@@ -61,6 +64,8 @@ fn expr(e: &Expr) -> String {
     match e {
         Expr::Int(v) => v.to_string(),
         Expr::Bool(v) => v.to_string(),
+        Expr::Index(n, i, _) => format!("(index {} {})", n, expr(i)),
+        Expr::ArrayRepeat(v, n, _) => format!("(array {} {})", expr(v), n),
         Expr::BitNot(a) => format!("(bitnot {})", expr(a)),
         Expr::Var(n, _) => n.clone(),
         Expr::Neg(a) => format!("(neg {})", expr(a)),
@@ -217,4 +222,36 @@ fn the_parser_never_panics_on_truncated_input() {
     for n in 0..=full.len() {
         let _ = parse(&full[..n]);
     }
+}
+
+
+// --- arrays ---
+
+#[test]
+fn arrays_are_declared_indexed_and_assigned() {
+    assert_eq!(body("let mut a = [0; 4];"), "((let-mut a (array 0 4)))");
+    assert_eq!(
+        body("let mut a: [i64; 4] = [0; 4];"),
+        "((let-mut:[i64; 4] a (array 0 4)))"
+    );
+    assert_eq!(body("x = a[1];"), "((= x (index a 1)))");
+    assert_eq!(body("a[1] = 2;"), "((=[] a 1 2))");
+    assert_eq!(body("a[i + 1] = a[i] * 2;"), "((=[] a (Add i 1) (Mul (index a i) 2)))");
+}
+
+/// `a[i]` and `a[i] = v` differ only after a balanced bracket, so the parser
+/// has to look past it rather than at the next token.
+#[test]
+fn indexing_is_distinguished_from_index_assignment() {
+    assert_eq!(body("f(a[0]);"), "((expr (call f (index a 0))))");
+    assert_eq!(body("a[b[0]] = 1;"), "((=[] a (index b 0) 1))");
+    assert_eq!(body("x = a[b[0]];"), "((= x (index a (index b 0))))");
+}
+
+#[test]
+fn array_lengths_are_bounded_and_must_be_literals() {
+    assert!(err("fn main() { let mut a = [0; 0]; }").contains("out of range"));
+    assert!(err("fn main() { let mut a = [0; 99999]; }").contains("out of range"));
+    assert!(err("fn main() { let mut a = [0; n]; }").contains("expected an array length"));
+    assert!(err("fn main() { let a: [bool; 2] = x; }").contains("arrays hold `i64`"));
 }

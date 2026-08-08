@@ -3,8 +3,8 @@
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
 **Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 through 3.11 complete. The implementation is about 10,500 lines across `core`,
-`compiler`, and `kernel`, with 182 host tests, 101 in-kernel checks, and 8 QEMU
+with 3.8 through 3.12 complete. The implementation is about 10,500 lines across `core`,
+`compiler`, and `kernel`, with 199 host tests, 307 in-kernel checks, and 8 QEMU
 transcript cases (7 goldens plus the dynamic differential oracle). Everything
 described as *implemented* below runs today; planned work
 is marked as such. Version strings in the boot banner are historical and are not
@@ -361,9 +361,11 @@ charged by their actual size class, including allocator metadata and alignment. 
 component has live/peak/denial counters and a hard live-byte quota; exceeding it faults
 that task before consuming another owner's budget, while deallocation credits the
 header owner even when it runs from another component or an IRQ. Normal return and
-cancellation run Drop and return live use to the account baseline. A future interrupted
-mid-poll is still deliberately leaked with its tagged blocks; bounded fault/restart
-reclamation remains the explicit 3.12 boundary.
+cancellation run Drop and return live use to the account baseline. Audited World
+components additionally receive a per-incarnation arena. A fault first quiesces every
+task in that arena, drains SYSTEM-owned runtime registrations, abandons future envelopes
+without Drop, and raw-reclaims the arena. Ordinary tasks retain the conservative leak
+policy because they have no proven allocation-escape boundary.
 
 **Time.** `rdtime` at 10 MHz, SBI timer for wakeups. No monotonic-vs-wall
 distinction because there is no wall clock. Timer insertion and token removal are
@@ -372,10 +374,10 @@ this is fine at ~10 sleepers and still the wrong data structure at 10,000.
 
 **Failure.** Two failure domains, both built on the same trampoline. A compiled
 program that fails a safety check is aborted and the shell survives (§6.4). A
-component that panics is caught at the executor's poll boundary: its task is
-counted as faulted, removed, and leaked — running destructors over a future
-interrupted mid-poll would be worse than leaking — and every other component
-keeps running. Cooperative cancellation instead detaches a ready or parked future
+component that panics is caught at the executor's poll boundary. An audited component
+fault tears down its whole incarnation arena without running interrupted destructors;
+an ordinary task is still leaked because that is the only sound generic fallback.
+Every other component keeps running. Cooperative cancellation instead detaches a ready or parked future
 and drops it normally, or waits for the active poll to return before reclaiming it.
 Joiners retain the exact exit, fault, or cancellation report. `ps` retains supervised
 components' exact identity, state, terminal reason, and final poll count, alongside
@@ -405,11 +407,14 @@ execution unless a supervisor separately calls `cancel`. Cooperative cancellatio
 and join reporting now cover ready, parked, self-waking, and currently polling
 tasks. Wait queues and timers now own cancellation-safe registration tokens, replace
 wakers on repoll, and release them on Drop; their predicate call sites use
-listener-before-check epochs to close IRQ races. Component budgets are now enforced
-by tagged allocation ownership. There is still no restart protocol, the `World` space
-routes and supervisor handles are boot-static, and a faulted task can only be leaked;
-the v1 promise “grant,
-run, revoke, and kill” still depends on the remaining M3.5 lifecycle work.
+listener-before-check epochs to close IRQ races. Component budgets are enforced
+by tagged allocation ownership. Audited component incarnations now add a reclaimable
+arena and sealed restart template: restart retains `ComponentId`, memory owner, and the
+boot-static `Space`, while installing a new `TaskId`, `ArenaId`, generation, and CSpace
+grants. Slot generations survive CSpace reset, so an old `Cap` cannot alias a fresh
+grant. Sixteen target fault/restart cycles verify bounded heap growth and zero interrupted
+destructors. The remaining M3.5 work is measurement reproducibility and resolved-cap
+lease semantics.
 
 Five boundaries must stay explicit:
 

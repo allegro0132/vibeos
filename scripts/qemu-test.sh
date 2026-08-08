@@ -31,6 +31,7 @@ normalize() {
            -e 's/[0-9]+ KiB/N KiB/g' \
            -e 's/^  live +[0-9]+ B.*$/  live N B peak N B bump remaining N B/' \
            -e 's/\{[0-9]+\}//g' \
+           -e '/^  component:.*  running   /s/ +[0-9]+ +([0-9]+ B)$/        N    \1/' \
   | grep -a -v '^[[:space:]]*$' \
   | grep -a -v 'terminating on signal' \
   | grep -a -v '^OpenSBI' || true

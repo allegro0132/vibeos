@@ -119,10 +119,12 @@ pub extern "C" fn kmain() -> ! {
         uart::UART_IRQ
     );
 
-    world::build();
-
-    // A panicking component should cost its own task, not the machine.
+    // Install the complete fault boundary before World admits any reclaimable
+    // component task. A tracked arena must never run without both hooks.
     exec::set_fault_guard(trampoline::guard_task);
+    exec::set_fault_reclaimer(reclaim_faulted_component);
+
+    world::build();
 
     let world = world::world();
     world.spawn_component(
@@ -136,6 +138,20 @@ pub extern "C" fn kmain() -> ! {
 
     trap::enable_interrupts();
     exec::run()
+}
+
+/// Executor callback after every task and external registration in a tracked
+/// incarnation has been detached. The sealed World templates prove that no
+/// arena-backed pointer escaped, so raw reclamation is sound and runs no Drop.
+unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
+    unsafe {
+        // Repair component-stable synchronization state while the exact
+        // faulting incarnation is still identifiable and before Faulted is
+        // visible to safe lifecycle callers.
+        world::world().recover_faulted_domain(domain);
+        HEAP.reclaim_faulted_arena(domain.arena)
+            .expect("a faulted audited arena must reclaim atomically");
+    }
 }
 
 #[panic_handler]

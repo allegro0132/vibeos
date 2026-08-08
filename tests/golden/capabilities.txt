@@ -9,7 +9,7 @@ vibe> spaces
   sensor   1 caps
 vibe> caps init
   owner component:4  task task:4  name shell  state running  reason -
-  memory owner component:4  budget 262144 B  quota denials 0
+  memory owner component:4  budget 524288 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      console   rwsvgx   ns16550a @ 0xADDR [0 bytes out]
   cap:1.0      endpoint  rwsvgx   telemetry [0/8 sent=0 recv=0]

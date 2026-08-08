@@ -22,11 +22,11 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 182 host tests, no QEMU, ~1s
+cargo test --workspace     # 199 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
 ```
 
-Plus an in-kernel self-test (88 checks) for what the host cannot fake — real
+Plus an in-kernel self-test (307 checks) for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
 actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
 for why there are four layers and which mutations each one catches.
@@ -139,8 +139,10 @@ are absorbing, and a stale wake cannot revive a task. This is not preemption: an
 in-tree future that never yields can still wedge the single hart. Wait listeners
 carry an epoch and unique registration token, while sleeps carry a unique timer
 token; normal completion, Drop, and cancellation release those registrations
-immediately. A future interrupted mid-poll by a fault is still deliberately leaked,
-so fault-domain reclamation remains roadmap 3.12.
+immediately. Audited World components run in per-incarnation fault arenas: a
+fault detaches the entire arena, purges its registrations, and reclaims its
+blocks without invoking the interrupted future's destructors. Ordinary tasks
+without that no-escape audit still use the conservative leak-on-fault policy.
 
 ## A Rust compiler, inside the OS
 
@@ -262,7 +264,8 @@ selftest        run the in-kernel test suite
 rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
-cancel <name>   cooperatively stop a component (shell protected until restart exists)
+cancel <name>   cooperatively stop a component (the active shell is protected)
+restart <name>  restart a terminal audited component with fresh grants
 chan            telemetry channel depth and totals
 quiet           mute background components (`verbose` restores)
 mem             kernel heap usage
@@ -320,8 +323,9 @@ Deliberate, not overlooked:
   quotas cover dynamic allocation while their future is polled or destroyed;
   task envelopes, wait registries, capability tables, and IRQ work remain part
   of the trusted kernel budget.
-- **A faulted task is leaked, not freed.** Dropping a future interrupted
-  mid-poll would run destructors over state it never finished writing.
+- **Only audited component fault arenas are reclaimed.** Their tasks, runtime
+  registrations, and allocation escape boundaries are sealed by the World
+  factory. An ordinary task interrupted mid-poll is still conservatively leaked.
 - **A panic with no landing pad is still fatal** — a fault in the boot path or
   inside an interrupt handler halts the machine.
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program

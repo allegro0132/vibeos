@@ -22,7 +22,6 @@ use core::task::{Context, Poll, Waker};
 use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
-use crate::sync::SpinLock;
 use crate::world::{world, Space};
 use crate::{exec, heap, println, sbi};
 
@@ -107,9 +106,11 @@ pub async fn run() -> Report {
     scheduler(&mut h).await;
     cancellation(&mut h).await;
     components(&mut h);
+    component_restart(&mut h).await;
     channels(&mut h).await;
     fault_isolation(&mut h).await;
     component_memory(&mut h).await;
+    fault_arena_restart(&mut h).await;
     capabilities(&mut h);
     compiler(&mut h);
 
@@ -125,6 +126,82 @@ pub async fn run() -> Report {
         passed: h.passed,
         failed: h.failures.len(),
     }
+}
+
+/// ROADMAP 3.12. A restart keeps the supervised identity and Space route while
+/// replacing the task incarnation and every explicitly granted capability.
+async fn component_restart(h: &mut Harness) {
+    let w = world();
+    let guest = w
+        .component_named("guest")
+        .expect("the system image has a guest component");
+    let stable_space = guest.space();
+    let before = guest.snapshot();
+    let stable_owner = guest.memory_owner();
+    let stale_cap = stable_space
+        .0
+        .lock()
+        .list()
+        .first()
+        .expect("guest begins with one console grant")
+        .0;
+    let (_, stale_join) = guest.join_current();
+
+    h.eq(
+        "the boot guest can be stopped for restart",
+        guest.cancel(),
+        exec::CancelOutcome::Requested,
+    );
+    h.eq(
+        "the pre-restart join retains the cancelled incarnation",
+        stale_join.await.state(),
+        exec::TaskState::Cancelled,
+    );
+
+    let report = w
+        .restart_component("guest")
+        .expect("guest has an audited restart template");
+    let after = guest.snapshot();
+    h.eq("restart retains ComponentId", after.id, before.id);
+    h.eq(
+        "restart increments the component generation",
+        after.generation,
+        before.generation + 1,
+    );
+    h.check(
+        "restart installs a fresh TaskId",
+        after.task_id != before.task_id && after.task_id == report.new_task,
+    );
+    h.eq(
+        "restart preserves the allocation owner",
+        guest.memory_owner(),
+        stable_owner,
+    );
+    h.check(
+        "restart preserves the boot-static Space route",
+        Arc::ptr_eq(&stable_space, &guest.space()),
+    );
+    h.eq(
+        "a stale capability cannot alias a fresh-incarnation slot",
+        stable_space.0.lock().lookup(stale_cap, Rights::WRITE).err(),
+        Some(CapError::Invalid),
+    );
+    let fresh_caps = stable_space.0.lock().list();
+    h.eq(
+        "the fresh guest CSpace is explicitly regranted once",
+        fresh_caps.len(),
+        1,
+    );
+    h.eq(
+        "the fresh guest grant remains WRITE-only",
+        stable_space.0.lock().rights_of(fresh_caps[0].0),
+        Ok(Rights::WRITE),
+    );
+    h.eq(
+        "a running incarnation cannot be restarted over itself",
+        w.restart_component("guest").err(),
+        Some(crate::world::RestartError::StillRunning),
+    );
 }
 
 /// Needs a real timer interrupt to fire and a real waker to run.
@@ -205,12 +282,12 @@ async fn cancellation(h: &mut Harness) {
         ready.polls(),
         0,
     );
+    let ready_exit = ready.join().await;
     h.eq(
         "a cancelled task retains its exact state",
         ready.state(),
         exec::TaskState::Cancelled,
     );
-    let ready_exit = ready.join().await;
     h.eq(
         "join reports a cancelled exit",
         ready_exit.state(),
@@ -239,6 +316,12 @@ async fn cancellation(h: &mut Harness) {
         parked.cancel(),
         exec::CancelOutcome::Requested,
     );
+    let parked_exit = parked.join().await;
+    h.eq(
+        "join reports the parked task cancellation",
+        parked_exit.state(),
+        exec::TaskState::Cancelled,
+    );
     h.eq(
         "cancelling a parked task removes its wait registration",
         queue.waiter_count(),
@@ -266,9 +349,10 @@ async fn cancellation(h: &mut Harness) {
         bad_drop.cancel(),
         exec::CancelOutcome::Requested,
     );
+    let bad_drop_exit = bad_drop.join().await;
     h.eq(
         "a faulting destructor takes precedence over cancellation",
-        bad_drop.state(),
+        bad_drop_exit.state(),
         exec::TaskState::Faulted,
     );
     h.eq(
@@ -394,28 +478,7 @@ async fn component_memory(h: &mut Harness) {
         .component_named("guest")
         .expect("the system image has a guest component");
     let unaffected_before = unaffected.snapshot().memory;
-    let offender_lock = {
-        let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
-        let lock = Arc::new(SpinLock::new(()));
-        system.restore();
-        lock
-    };
-
-    let offender = w.spawn_component(
-        "selftest-quota-offender",
-        Space::new("selftest-quota-offender"),
-        TEST_BUDGET,
-        async move {
-            // Retain one successful allocation, then exceed the quota while a
-            // component-private lock has SIE masked. The future and its lock
-            // are abandoned on fault; the landing pad must nevertheless
-            // restore the hart's entry interrupt state.
-            let mut held = Vec::new();
-            held.resize(512, 0xA5);
-            let _private = offender_lock.lock();
-            held.resize(TEST_BUDGET * 2, 0x5A);
-        },
-    );
+    let offender = w.spawn_fault_probe("selftest-quota-offender", TEST_BUDGET);
     let (_, offender_join) = offender.join_current();
     let offender_exit = offender_join.await;
     let offender_snapshot = offender.snapshot();
@@ -459,7 +522,10 @@ async fn component_memory(h: &mut Harness) {
         Space::new("selftest-quota-survivor"),
         TEST_BUDGET,
         async {
-            let mut bytes = Vec::new();
+            // Keep this comfortably below the quota after the future itself
+            // is charged to its owner. An inferred Vec<i32> would consume a
+            // 4 KiB size class before accounting for that future envelope.
+            let mut bytes = Vec::<u8>::new();
             bytes.resize(512, 0x5A);
             exec::yield_now().await;
             core::hint::black_box(&bytes);
@@ -480,9 +546,9 @@ async fn component_memory(h: &mut Harness) {
         survivor_snapshot.memory.peak_bytes > survivor_baseline,
     );
     h.eq(
-        "normal component exit drops live allocation use to its baseline",
+        "normal component exit drops all live allocation use",
         survivor_snapshot.memory.live_bytes,
-        survivor_baseline,
+        0,
     );
     h.eq(
         "the survivor uses none of the offender's denial budget",
@@ -502,6 +568,127 @@ async fn component_memory(h: &mut Harness) {
     h.check(
         "the terminal survivor component record can be reaped",
         w.remove_terminal_component(survivor_snapshot.id),
+    );
+}
+
+/// ROADMAP 3.12. Raw fault teardown is per incarnation: it never invokes the
+/// interrupted future's destructors, and a fresh arena can be installed under
+/// the same supervised identity without monotonically consuming the heap.
+async fn fault_arena_restart(h: &mut Harness) {
+    const CYCLES: usize = 16;
+    const TEST_BUDGET: usize = 4 * 1024;
+
+    let w = world();
+    let drops_before = crate::world::fault_probe_drop_count();
+    let probe = w.spawn_fault_probe("selftest-fault-arena", TEST_BUDGET);
+    let stable_id = probe.snapshot().id;
+    let stable_owner = probe.memory_owner();
+    let stable_space = probe.space();
+    let mut previous_task = None;
+    let mut previous_arena = None;
+    let mut warm_remaining = None;
+    let mut warm_live = None;
+
+    for cycle in 0..CYCLES {
+        let before = probe.snapshot();
+        h.eq(
+            "fault restart generation is monotonic",
+            before.generation,
+            cycle as u64 + 1,
+        );
+        h.eq(
+            "fault restart retains ComponentId",
+            before.id,
+            stable_id,
+        );
+        h.eq(
+            "fault restart retains OwnerId",
+            probe.memory_owner(),
+            stable_owner,
+        );
+        h.check(
+            "fault restart assigns a fresh TaskId",
+            previous_task.is_none_or(|old| old != before.task_id),
+        );
+        h.check(
+            "fault restart assigns a fresh ArenaId",
+            previous_arena.is_none_or(|old| old != before.arena),
+        );
+
+        let (_, join) = probe.join_current();
+        h.eq(
+            "the audited fault probe reaches Faulted",
+            join.await.state(),
+            exec::TaskState::Faulted,
+        );
+        let faulted = probe.snapshot();
+        h.check(
+            "fault publication follows raw arena reclamation",
+            crate::HEAP.arena_stats(faulted.arena).is_none(),
+        );
+        h.eq(
+            "raw fault reclamation returns owner live bytes to zero",
+            faulted.memory.live_bytes,
+            0,
+        );
+        h.eq(
+            "raw fault reclamation never invokes the future destructor",
+            crate::world::fault_probe_drop_count(),
+            drops_before,
+        );
+        let irq_probe_start = sbi::time();
+        exec::sleep_ms(1).await;
+        let irq_probe_ms =
+            (sbi::time() - irq_probe_start) / (exec::TIMEBASE_HZ / 1000);
+        h.check(
+            "a faulted CSpace lock does not leave interrupts masked",
+            irq_probe_ms < 100,
+        );
+
+        let (live, _, remaining) = crate::HEAP.stats();
+        if cycle == 1 {
+            warm_remaining = Some(remaining);
+            warm_live = Some(live);
+        }
+        previous_task = Some(faulted.task_id);
+        previous_arena = Some(faulted.arena);
+
+        if cycle + 1 != CYCLES {
+            let report = w
+                .restart_component("selftest-fault-arena")
+                .expect("the sealed fault probe is restartable");
+            h.eq(
+                "restart report advances exactly one generation",
+                report.new_generation,
+                report.old_generation + 1,
+            );
+            h.check(
+                "restart keeps the stable Space object",
+                Arc::ptr_eq(&stable_space, &probe.space()),
+            );
+        }
+    }
+
+    let (_, _, final_remaining) = crate::HEAP.stats();
+    h.eq(
+        "fault/restart heap bump use stabilizes after warmup",
+        final_remaining,
+        warm_remaining.expect("sixteen cycles include a warmup point"),
+    );
+    h.check(
+        "fault/restart global live use never exceeds its warm baseline",
+        crate::HEAP.stats().0 <= warm_live.expect("sixteen cycles include a warmup point"),
+    );
+    h.check(
+        "the terminal fault probe can be fully reaped",
+        w.remove_terminal_component(probe.snapshot().id),
+    );
+    drop(probe);
+    drop(stable_space);
+    h.eq(
+        "reaping unregisters the fault probe allocation owner",
+        crate::HEAP.account_stats(stable_owner),
+        None,
     );
 }
 
@@ -529,7 +716,7 @@ fn components(h: &mut Harness) {
     );
     h.check(
         "component instance generations are explicit",
-        snapshots.iter().all(|snapshot| snapshot.generation == 1),
+        snapshots.iter().all(|snapshot| snapshot.generation >= 1),
     );
     h.check(
         "component joins bind the current task generation",

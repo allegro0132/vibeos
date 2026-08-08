@@ -5,14 +5,19 @@ vibe> rustc edit
   enter your program; finish with a single `.` on its own line
   | fn main() -> i64 { let z = 0; 1 / z }
   | .
-  compiled 1 fn -> 408 B of RV64 + 1 B of data in N us
+  compiled 1 fn -> 328 B of RV64 + 1 B of data in N us
   --- running natively ---
   --- aborted: attempt to divide by zero (after N us) ---
 vibe> rustc edit
   enter your program; finish with a single `.` on its own line
   | fn main() -> i64 { 9223372036854775807 + 1 }
   | .
-  compiled 1 fn -> 320 B of RV64 + 1 B of data in N us
+  error: line 1: this arithmetic operation will overflow: `9223372036854775807 + 1`
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn main() -> i64 { let a = 9223372036854775807; let b = 1; a + b }
+  | .
+  compiled 1 fn -> 328 B of RV64 + 1 B of data in N us
   --- running natively ---
   --- aborted: attempt to perform arithmetic that overflowed (after N us) ---
 vibe> rustc edit
@@ -20,14 +25,14 @@ vibe> rustc edit
   | fn f(n: i64) -> i64 { f(n) }
   | fn main() -> i64 { f(0) }
   | .
-  compiled 2 fn -> 436 B of RV64 + 1 B of data in N us
+  compiled 2 fn -> 396 B of RV64 + 1 B of data in N us
   --- running natively ---
   --- aborted: stack overflow (after N us) ---
 vibe> rustc edit
   enter your program; finish with a single `.` on its own line
   | fn main() -> i64 { let mut i = 0; while i >= 0 { i = i + 0; } i }
   | .
-  compiled 1 fn -> 584 B of RV64 + 1 B of data in N us
+  compiled 1 fn -> 464 B of RV64 + 1 B of data in N us
   --- running natively ---
   --- aborted: exceeded execution budget (after N us) ---
 vibe> rustc hello
@@ -37,10 +42,10 @@ Hello, world!
   --- exited with 0 in N us ---
 vibe> ps
   TASK          POLLS
-  sensor            8
-  logger            8
+  sensor            9
+  logger            9
   guest             3
-  shell            17
+  shell            20
   (0 exited, 0 faulted)
   background output is muted; poll counts still rising
 vibe> 

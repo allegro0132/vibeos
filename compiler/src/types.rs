@@ -237,6 +237,16 @@ impl Checker {
             Expr::Neg(a) => {
                 let (a, t) = self.expr(a)?;
                 self.unify(Ty::I64, t, 0, "operand of unary `-`")?;
+                if let Expr::Int(v) = a {
+                    match v.checked_neg() {
+                        Some(n) => return Ok((Expr::Int(n), Ty::I64)),
+                        None => {
+                            return Err(
+                                "this arithmetic operation will overflow: `-i64::MIN`".to_string()
+                            )
+                        }
+                    }
+                }
                 (Expr::Neg(alloc::boxed::Box::new(a)), Ty::I64)
             }
             // The parser cannot tell the two `!`s apart; the operand type does.
@@ -270,6 +280,14 @@ impl Checker {
                 };
                 self.unify(want, ta, line, &format!("left operand of `{}`", op_name(*op)))?;
                 self.unify(want, tb, line, &format!("right operand of `{}`", op_name(*op)))?;
+                // Fold constants here rather than emitting code for them. Real
+                // rustc reports literal arithmetic that overflows as an error
+                // rather than a runtime panic, and so does this.
+                if let (Expr::Int(x), Expr::Int(y)) = (&a, &b) {
+                    if let Some(folded) = fold(*op, *x, *y, line)? {
+                        return Ok((folded, out));
+                    }
+                }
                 (
                     Expr::Bin(*op, alloc::boxed::Box::new(a), alloc::boxed::Box::new(b), line),
                     out,
@@ -390,4 +408,46 @@ fn op_name(op: BinOp) -> &'static str {
         BinOp::And => "&&",
         BinOp::Or => "||",
     }
+}
+
+/// Fold an operation on two literals. `None` means "not a foldable operator".
+fn fold(op: BinOp, x: i64, y: i64, line: u32) -> TResult<Option<Expr>> {
+    let overflow = |what: &str| {
+        Err(format!(
+            "line {}: this arithmetic operation will overflow: `{} {} {}`",
+            line, x, what, y
+        ))
+    };
+    Ok(Some(match op {
+        BinOp::Add => Expr::Int(x.checked_add(y).ok_or_else(|| overflow("+").unwrap_err())?),
+        BinOp::Sub => Expr::Int(x.checked_sub(y).ok_or_else(|| overflow("-").unwrap_err())?),
+        BinOp::Mul => Expr::Int(x.checked_mul(y).ok_or_else(|| overflow("*").unwrap_err())?),
+        BinOp::Div => match x.checked_div(y) {
+            Some(v) => Expr::Int(v),
+            None if y == 0 => {
+                return Err(format!(
+                    "line {}: this operation will panic at runtime: attempt to divide by zero",
+                    line
+                ))
+            }
+            None => return overflow("/"),
+        },
+        BinOp::Rem => match x.checked_rem(y) {
+            Some(v) => Expr::Int(v),
+            None if y == 0 => {
+                return Err(format!(
+                    "line {}: this operation will panic at runtime: attempt to calculate the remainder by zero",
+                    line
+                ))
+            }
+            None => return overflow("%"),
+        },
+        BinOp::Eq => Expr::Bool(x == y),
+        BinOp::Ne => Expr::Bool(x != y),
+        BinOp::Lt => Expr::Bool(x < y),
+        BinOp::Le => Expr::Bool(x <= y),
+        BinOp::Gt => Expr::Bool(x > y),
+        BinOp::Ge => Expr::Bool(x >= y),
+        BinOp::And | BinOp::Or => return Ok(None),
+    }))
 }

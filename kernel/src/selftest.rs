@@ -302,7 +302,9 @@ fn compiler(h: &mut Harness) {
             "attempt to calculate the remainder with a divisor of zero",
         ),
         (
-            "fn main() -> i64 { 9223372036854775807 + 1 }",
+            // Through variables, so it is a runtime check: the literal form is
+            // now folded and rejected at compile time, as real rustc does.
+            "fn main() -> i64 { let a = 9223372036854775807; let b = 1; a + b }",
             "attempt to perform arithmetic that overflowed",
         ),
         (
@@ -376,6 +378,17 @@ fn compiler(h: &mut Harness) {
     h.check(
         "a literal zero divisor is a compile error",
         crate::rustc::compile("fn main() -> i64 { 1 / 0 }").is_err(),
+    );
+    h.check(
+        "literal overflow is a compile error, as in rustc",
+        crate::rustc::compile("fn main() -> i64 { 9223372036854775807 + 1 }").is_err(),
+    );
+    h.check(
+        "constant folding preserves the value",
+        crate::rustc::compile("fn main() -> i64 { 2 + 3 * 4 - 1 }")
+            .map(|c| crate::rustc::run(&c).value)
+            .unwrap_or(-1)
+            == 13,
     );
     h.check(
         "immutable reassignment is rejected",

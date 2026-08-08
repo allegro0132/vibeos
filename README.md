@@ -289,9 +289,12 @@ Deliberate, not overlooked:
   so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
   not a strict subset, and it is what the roadmap's differential testing against
   real rustc would flag first.
-- **The compiler's subset is `i64`-only.** No structs, arrays, references,
-  generics, traits, or borrow checking — a program is functions over integers
-  plus formatted printing.
+- **No structs, references, generics, traits, or borrow checking.** A program is
+  functions over `i64`, `bool` and fixed-size arrays.
+- **Array indices are `i64`, not `usize`.** There is no `as`, so a corpus program
+  valid in both languages keeps counters separate from values.
+- **Kernel components have no heap quota.** Compiled programs are bounded by
+  their region capability; components share the global allocator.
 - **A faulted task is leaked, not freed.** Dropping a future interrupted
   mid-poll would run destructors over state it never finished writing.
 - **A panic with no landing pad is still fatal** — a fault in the boot path or

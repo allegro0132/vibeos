@@ -89,6 +89,9 @@ fn b(imm: i32, rs2: u32, rs1: u32, f3: u32) -> u32 {
         | (((im >> 11) & 1) << 7)
         | 0x63
 }
+fn u_type(imm: i32, rd: u32, op: u32) -> u32 {
+    ((imm as u32 & 0xfffff) << 12) | (rd << 7) | op
+}
 fn j(imm: i32, rd: u32) -> u32 {
     let im = imm as u32;
     (((im >> 20) & 1) << 31)
@@ -178,8 +181,37 @@ impl Codegen {
         self.code.len()
     }
 
-    /// Materialize an arbitrary 64-bit constant. Fixed at 11 instructions so
-    /// that code size does not change between pass 1 and pass 2.
+    /// Materialize a constant in as few instructions as the value allows.
+    ///
+    /// Layout stays stable across the two passes because the length depends
+    /// only on the *value*, which is a property of the program — never on an
+    /// address, which is what pass 1 does not yet know. Addresses keep using
+    /// the fixed-length `li64`.
+    fn li(&mut self, rd: u32, v: i64) {
+        // One instruction: a 12-bit signed immediate.
+        if (-2048..2048).contains(&v) {
+            self.emit(addi(rd, ZERO, v as i32));
+            return;
+        }
+        // Two: `lui` plus a sign-extending 32-bit add. `lui` sign-extends bit
+        // 31 on RV64, and `addiw` re-signs the low half, so this reproduces any
+        // value that fits in an i32.
+        if v == v as i32 as i64 {
+            let hi = ((v + 0x800) >> 12) as i32;
+            let lo = (v - ((hi as i64) << 12)) as i32;
+            self.emit(u_type(hi, rd, 0x37)); // lui
+            if lo != 0 {
+                self.emit(i(lo, rd, 0, rd, 0x1b)); // addiw
+            }
+            return;
+        }
+        self.li64(rd, v as u64);
+    }
+
+    /// Materialize an arbitrary 64-bit constant in a *fixed* 11 instructions.
+    ///
+    /// Reserved for addresses: pass 1 does not know them, so their encoding
+    /// must not depend on their value.
     fn li64(&mut self, rd: u32, v: u64) {
         self.emit(addi(rd, ZERO, ((v >> 55) & 0x1ff) as i32));
         for k in (0..5).rev() {
@@ -236,11 +268,7 @@ impl Codegen {
     /// and bases are program constants, so this stays layout-stable across the
     /// two passes.
     fn li_small(&mut self, rd: u32, v: i64) {
-        if (-2048..2048).contains(&v) {
-            self.emit(addi(rd, ZERO, v as i32));
-        } else {
-            self.li64(rd, v as u64);
-        }
+        self.li(rd, v);
     }
 
     /// Resolve an array binding to its `(base, len)` in the region.
@@ -730,7 +758,7 @@ impl Codegen {
     fn expr(&mut self, e: &Expr) -> CResult<()> {
         match e {
             Expr::Int(v) => {
-                self.li64(T0, *v as u64);
+                self.li(T0, *v);
                 self.push(T0);
             }
             Expr::Bool(v) => {

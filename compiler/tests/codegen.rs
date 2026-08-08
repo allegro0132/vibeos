@@ -58,7 +58,7 @@ fn the_prologue_claims_a_frame_and_saves_ra_and_s0() {
 /// has to be justified against the ISA rather than against itself.
 #[test]
 fn known_words_for_each_instruction_format() {
-    let code = emit("fn main() -> i64 { 1 + 2 }");
+    let code = emit("fn main() -> i64 { let a = 1; let b = 2; a + b }");
     let has = |w: u32| code.contains(&w);
     // Checked addition computes into t2, tests, then moves.
     assert!(has(0x0062_83b3), "add t2, t0, t1  (R-type)");
@@ -70,7 +70,7 @@ fn known_words_for_each_instruction_format() {
 #[test]
 fn the_stack_pointer_moves_in_16_byte_steps() {
     // Slots are 16 bytes so `sp` stays ABI-aligned at every call boundary.
-    let code = emit("fn main() -> i64 { 1 + 2 }");
+    let code = emit("fn main() -> i64 { let a = 1; let b = 2; a + b }");
     let push = code.iter().filter(|w| **w == 0xff01_0113).count(); // addi sp, sp, -16
     let pop = code.iter().filter(|w| **w == 0x0101_0113).count(); // addi sp, sp, 16
     assert!(push > 0 && pop > 0, "push/pop use 16-byte slots");
@@ -115,34 +115,91 @@ fn simulate_li64(code: &[u32], rd: u32) -> u64 {
     reg
 }
 
+/// Each constant is materialized in the shortest correct form, and the long
+/// form still reproduces the value exactly. Encodings are computed here from the
+/// spec's field layouts rather than copied from the emitter.
 #[test]
 fn constants_materialize_exactly() {
-    // Only non-negative literals reach `li64` directly: the lexer never produces
-    // a negative token, so `-5` parses as `Neg(Int(5))` and is negated at runtime.
-    for want in [
-        0i64, 1, 42, 2047, 2048, 0xffff, 1 << 31, 1 << 40, 1 << 62,
-        i64::MAX, 6765, 1_000_000_007,
-    ] {
+    // One instruction: addi t0, zero, v
+    for want in [0i64, 1, -1, 42, -42, 2047, -2048] {
         let code = emit(&format!("fn main() -> i64 {{ {want} }}"));
-        let run = first_li64_into(&code, 5).unwrap_or_else(|| panic!("no li64 for {want}"));
-        assert_eq!(simulate_li64(&run, 5) as i64, want, "materializing {want}");
+        let expect = ((want as u32 & 0xfff) << 20) | (T0 << 7) | OP_IMM;
+        assert!(code.contains(&expect), "addi form for {want}");
+    }
+
+    // Two: lui t0, hi ; addiw t0, t0, lo
+    for want in [2048i64, -2049, 0xffff, 1 << 30, -(1 << 30), i32::MAX as i64] {
+        let code = emit(&format!("fn main() -> i64 {{ {want} }}"));
+        let hi = ((want + 0x800) >> 12) as i32;
+        let lo = (want - ((hi as i64) << 12)) as i32;
+        let lui = ((hi as u32 & 0xfffff) << 12) | (T0 << 7) | LUI;
+        assert!(code.contains(&lui), "lui form for {want}");
+        if lo != 0 {
+            let addiw = ((lo as u32 & 0xfff) << 20) | (T0 << 15) | (T0 << 7) | OP_IMM_32;
+            assert!(code.contains(&addiw), "addiw for {want}");
+        }
+    }
+
+    // Eleven: the fixed form, verified by interpreting it.
+    for want in [1i64 << 40, 1 << 62, i64::MAX, 1_000_000_007_000] {
+        let code = emit(&format!("fn main() -> i64 {{ {want} }}"));
+        let run = first_li64_into(&code, T0).unwrap_or_else(|| panic!("no li64 for {want}"));
+        assert_eq!(simulate_li64(&run, T0) as i64, want, "materializing {want}");
     }
 }
 
-/// A negative literal is a unary negation of a positive one, so the emitter
-/// must follow the constant with a `sub rd, zero, rd`.
+/// Negation of a *literal* is folded; negation of a value is emitted, with an
+/// overflow check because `-i64::MIN` panics in Rust.
 #[test]
-fn negative_literals_are_materialized_then_negated() {
-    let code = emit("fn main() -> i64 { -42 }");
-    assert!(code.contains(&0x4050_02b3), "expected `sub t0, zero, t0`");
+fn negation_is_folded_for_literals_and_emitted_for_values() {
+    let folded = emit("fn main() -> i64 { -42 }");
+    assert!(!folded.contains(&0x4050_02b3), "a literal needs no `sub`");
+
+    let emitted = emit("fn main() -> i64 { let a = 42; -a }");
+    assert!(emitted.contains(&0x4050_02b3), "expected `sub t0, zero, t0`");
+}
+
+/// Literal arithmetic is folded away entirely, which is both faster and closer
+/// to Rust: rustc reports literal overflow at compile time, not at runtime.
+#[test]
+fn literal_arithmetic_is_folded() {
+    let code = emit("fn main() -> i64 { 2 + 3 * 4 }");
+    // The whole expression collapses to one constant, so no OP arithmetic and
+    // no overflow checks survive.
+    assert!(!code.iter().any(|w| w & 0x7f == OP && (w >> 12) & 7 == 0 && w >> 25 == 0
+        && (w >> 7) & 0x1f == T2), "no add/sub into the scratch register");
+    assert!(code.contains(&((14u32 << 20) | (T0 << 7) | OP_IMM)), "folded to addi t0, zero, 14");
 }
 
 #[test]
-fn constant_materialization_is_a_fixed_length() {
-    // Layout stability across the two passes depends on this exactly.
-    let small = emit("fn main() -> i64 { 1 }").len();
-    let large = emit("fn main() -> i64 { 1234567890123 }").len();
-    assert_eq!(small, large, "constant size must not depend on its value");
+fn literal_overflow_is_a_compile_error_as_in_rustc() {
+    assert_eq!(
+        err("fn main() -> i64 { 9223372036854775807 + 1 }"),
+        "line 1: this arithmetic operation will overflow: `9223372036854775807 + 1`"
+    );
+    assert!(err("fn main() -> i64 { 3037000500 * 3037000500 }").contains("will overflow"));
+}
+
+/// Constants are materialized in as few instructions as the value allows: one
+/// for a 12-bit immediate, two for anything fitting in 32 bits, and the fixed
+/// eleven only for the rest. Layout stability is preserved because the length
+/// depends on the *value*, which pass 1 already knows — unlike an address.
+#[test]
+fn constants_cost_only_what_their_value_needs() {
+    let one = emit("fn main() -> i64 { 1 }").len();
+    let million = emit("fn main() -> i64 { 1000000 }").len();
+    let huge = emit("fn main() -> i64 { 1234567890123 }").len();
+    assert_eq!(million, one + 1, "a 32-bit constant costs one more instruction");
+    assert_eq!(huge, one + 10, "a 64-bit constant costs the fixed eleven");
+}
+
+/// Addresses keep the fixed-length form, which is what makes the two-pass
+/// layout stable at all.
+#[test]
+fn address_materialization_is_a_fixed_length() {
+    let a = compile_at(samples::HELLO, 0, 0, &rt()).unwrap().code.len();
+    let b = compile_at(samples::HELLO, 0x8000_0000, 0x9fff_0000, &rt()).unwrap().code.len();
+    assert_eq!(a, b);
 }
 
 // --- two-pass layout stability ---
@@ -183,6 +240,8 @@ fn string_literals_are_interned_once() {
 // --- the confinement audit, as a test ---
 
 const OP_IMM: u32 = 0x13;
+const OP_IMM_32: u32 = 0x1b;
+const LUI: u32 = 0x37;
 const OP: u32 = 0x33;
 const LOAD: u32 = 0x03;
 const STORE: u32 = 0x23;
@@ -194,6 +253,7 @@ const ZERO: u32 = 0;
 const RA: u32 = 1;
 const SP: u32 = 2;
 const T0: u32 = 5;
+const T2: u32 = 7;
 const T4: u32 = 29;
 const T5: u32 = 30;
 const S0: u32 = 8;
@@ -233,7 +293,9 @@ fn all_programs() -> Vec<Vec<u32>> {
 /// assert the opcode set directly rather than trusting the prose.
 #[test]
 fn the_emitter_produces_no_privileged_instructions() {
-    let allowed = [OP_IMM, OP, LOAD, STORE, BRANCH, JAL, JALR];
+    // `lui`/`addiw` only build integer constants; they cannot reach memory, and
+    // the frame-relative rule below is what makes an address unusable anyway.
+    let allowed = [OP_IMM, OP_IMM_32, LUI, OP, LOAD, STORE, BRANCH, JAL, JALR];
     for code in all_programs() {
         for (i, w) in code.iter().enumerate() {
             let op = w & 0x7f;
@@ -354,33 +416,47 @@ fn every_indirect_jump_is_a_call_or_a_return() {
     }
 }
 
-/// The only addresses a program can name are the ones the compiler put there.
+/// Every computed call target is a function in this program or one of the
+/// runtime hooks. This is the precise form of "a program cannot call something
+/// it was not given": call targets are materialized into `t0` by the
+/// fixed-length `li64` and then jumped to, so the sequence can be recovered and
+/// checked. Integer literals also use `li64` when they are large, which is
+/// harmless — an integer only becomes dangerous if it reaches memory or a jump,
+/// and both are checked separately.
 #[test]
-fn the_only_absolute_addresses_are_compiler_chosen() {
+fn every_computed_call_target_is_a_function_or_a_runtime_hook() {
     let rt = rt();
-    let img = compile_at(samples::DEMO, 0x8000_0000, 0x8010_0000, &rt).unwrap();
-    // Reconstruct every constant the program materializes into t0/a0/a1.
-    let mut found = vec![];
-    let mut i = 0;
-    while i + 11 <= img.code.len() {
-        let window = &img.code[i..i + 11];
-        if window.iter().all(|w| w & 0x7f == OP_IMM) {
-            let rd = (window[0] >> 7) & 0x1f;
-            found.push(simulate_li64(window, rd));
-            i += 11;
-        } else {
-            i += 1;
+    let (data_base, code_base) = (0x8000_0000u64, 0x8010_0000u64);
+    for src in [samples::HELLO, samples::DEMO, samples::CONFORMANCE] {
+        let img = compile_at(src, data_base, code_base, &rt).unwrap();
+        let code = &img.code;
+        let code_range = code_base..code_base + (code.len() * 4) as u64;
+
+        let mut checked = 0;
+        for (i, w) in code.iter().enumerate() {
+            // jalr ra, t0, 0
+            let is_call = w & 0x7f == JALR
+                && (w >> 7) & 0x1f == RA
+                && (w >> 15) & 0x1f == T0;
+            if !is_call || i < 11 {
+                continue;
+            }
+            let run: Vec<u32> = code[i - 11..i].to_vec();
+            if !run.iter().all(|x| x & 0x7f == OP_IMM && (x >> 7) & 0x1f == T0) {
+                continue; // not the fixed address form; nothing to recover
+            }
+            let target = simulate_li64(&run, T0);
+            let is_hook =
+                target == rt.print_str || target == rt.print_int
+                    || target == rt.print_bool || target == rt.abort;
+            assert!(
+                is_hook || code_range.contains(&target),
+                "call at {i} targets {target:#x}, which is neither this program's \
+                 code nor a runtime hook"
+            );
+            checked += 1;
         }
-    }
-    for addr in found.iter().filter(|v| **v > 0x1000_0000) {
-        let in_data = (0x8000_0000..0x8000_0000 + img.data.len() as u64).contains(addr);
-        let in_code = (0x8010_0000..0x8010_0000 + (img.code.len() * 4) as u64).contains(addr);
-        let is_hook = *addr == rt.print_str || *addr == rt.print_int || *addr == rt.print_bool || *addr == rt.abort;
-        assert!(
-            in_data || in_code || is_hook,
-            "generated code materializes {addr:#x}, which is neither its own data, \
-             its own code, nor a runtime hook"
-        );
+        assert!(checked > 0, "expected at least one recoverable call target");
     }
 }
 
@@ -518,12 +594,14 @@ fn a_constant_divisor_needs_no_guard() {
 fn dividing_by_a_literal_zero_is_a_compile_error() {
     assert_eq!(
         err("fn main() -> i64 { 1 / 0 }"),
-        "this operation will panic at runtime: attempt to divide by zero"
+        "line 1: this operation will panic at runtime: attempt to divide by zero"
     );
     assert_eq!(
         err("fn main() -> i64 { 1 % 0 }"),
-        "this operation will panic at runtime: attempt to calculate the remainder by zero"
+        "line 1: this operation will panic at runtime: attempt to calculate the remainder by zero"
     );
+    // A non-literal zero is still a runtime check.
+    assert!(compile_at("fn main() -> i64 { let z = 0; 1 / z }", 0, 0, &rt()).is_ok());
 }
 
 /// Real Rust panics on overflow; a subset that silently wraps is a different

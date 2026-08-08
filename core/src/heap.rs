@@ -29,7 +29,7 @@ unsafe impl Send for HeapInner {}
 pub struct Heap(SpinLock<HeapInner>);
 
 impl Heap {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Heap(SpinLock::new(HeapInner {
             cursor: 0,
             end: 0,
@@ -104,6 +104,3 @@ unsafe impl GlobalAlloc for Heap {
         h.live_bytes = h.live_bytes.saturating_sub(class_size(idx));
     }
 }
-
-#[global_allocator]
-pub static HEAP: Heap = Heap::new();

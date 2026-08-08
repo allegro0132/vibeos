@@ -17,7 +17,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use crate::sbi;
+use crate::arch;
 use crate::sync::SpinLock;
 
 /// QEMU `virt` drives `mtime` at 10 MHz.
@@ -104,42 +104,59 @@ fn waker_for(id: TaskId) -> Waker {
 /// which is what makes an idle VibeOS box draw no CPU.
 pub fn run() -> ! {
     loop {
-        let next = SCHED.lock().ready.pop_front();
-
-        let Some(id) = next else {
+        if !poll_once() {
             // Nothing ready. Enable interrupts and idle until one arrives.
-            unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1) };
-            unsafe { core::arch::asm!("wfi") };
-            continue;
-        };
-
-        // Take the future out of the map so the task can spawn/wake freely
-        // while it is being polled without deadlocking on SCHED.
-        let Some(mut task) = SCHED.lock().tasks.remove(&id) else { continue };
-
-        task.polls += 1;
-        {
-            let mut s = SCHED.lock();
-            s.running = Some((id, task.name.clone(), task.polls));
-            s.running_woken = false;
+            arch::enable_interrupts();
+            arch::wait_for_interrupt();
         }
-        let waker = waker_for(id);
-        let mut cx = Context::from_waker(&waker);
-        let poll = task.future.as_mut().poll(&mut cx);
+    }
+}
 
+/// Poll at most one ready task. Returns false when nothing was runnable.
+///
+/// Split out of `run` so tests can drive the scheduler a step at a time.
+pub fn poll_once() -> bool {
+    let Some(id) = SCHED.lock().ready.pop_front() else { return false };
+
+    // Take the future out of the map so the task can spawn/wake freely
+    // while it is being polled without deadlocking on SCHED.
+    let Some(mut task) = SCHED.lock().tasks.remove(&id) else { return true };
+
+    task.polls += 1;
+    {
         let mut s = SCHED.lock();
-        s.running = None;
-        let woken = core::mem::take(&mut s.running_woken);
-        match poll {
-            Poll::Ready(()) => s.completed += 1,
-            Poll::Pending => {
-                s.tasks.insert(id, task);
-                if woken {
-                    s.ready.push_back(id);
-                }
+        s.running = Some((id, task.name.clone(), task.polls));
+        s.running_woken = false;
+    }
+    let waker = waker_for(id);
+    let mut cx = Context::from_waker(&waker);
+    let poll = task.future.as_mut().poll(&mut cx);
+
+    let mut s = SCHED.lock();
+    s.running = None;
+    let woken = core::mem::take(&mut s.running_woken);
+    match poll {
+        Poll::Ready(()) => s.completed += 1,
+        Poll::Pending => {
+            s.tasks.insert(id, task);
+            if woken {
+                s.ready.push_back(id);
             }
         }
     }
+    true
+}
+
+/// Drive tasks until nothing is runnable, or until `budget` polls have run.
+///
+/// The budget is not a nicety: a task that wakes itself every poll (`yield_now`
+/// in a loop) never goes idle, and a test that hangs is a test nobody runs.
+pub fn run_until_idle(budget: usize) -> usize {
+    let mut polls = 0;
+    while polls < budget && poll_once() {
+        polls += 1;
+    }
+    polls
 }
 
 // --- Wait queues ---
@@ -191,7 +208,7 @@ static TIMERS: SpinLock<Vec<(u64, Waker)>> = SpinLock::new(Vec::new());
 
 /// Called from the timer trap. Wakes everything due and re-arms the hardware.
 pub fn timer_tick() {
-    let now = sbi::time();
+    let now = arch::time();
     let mut due = Vec::new();
     {
         let mut t = TIMERS.lock();
@@ -213,8 +230,8 @@ pub fn timer_tick() {
 fn arm_next() {
     let next = TIMERS.lock().iter().map(|(d, _)| *d).min();
     // Always keep a heartbeat so the idle hart wakes even with no timers armed.
-    let heartbeat = sbi::time() + TIMEBASE_HZ / 20;
-    sbi::set_timer(next.map_or(heartbeat, |n| n.min(heartbeat)));
+    let heartbeat = arch::time() + TIMEBASE_HZ / 20;
+    arch::set_timer(next.map_or(heartbeat, |n| n.min(heartbeat)));
 }
 
 pub fn init_timer() {
@@ -222,7 +239,7 @@ pub fn init_timer() {
 }
 
 pub fn sleep_ms(ms: u64) -> Sleep {
-    Sleep { deadline: sbi::time() + ms * (TIMEBASE_HZ / 1000), armed: false }
+    Sleep { deadline: arch::time() + ms * (TIMEBASE_HZ / 1000), armed: false }
 }
 
 pub struct Sleep {
@@ -233,7 +250,7 @@ pub struct Sleep {
 impl Future for Sleep {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if sbi::time() >= self.deadline {
+        if arch::time() >= self.deadline {
             return Poll::Ready(());
         }
         if !self.armed {

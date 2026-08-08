@@ -1,0 +1,3 @@
+quiet
+selftest
+@sleep 3

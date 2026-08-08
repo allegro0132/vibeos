@@ -3,4 +3,13 @@ name = "vibeos-kernel"
 version = "0.1.0"
 edition = "2021"
 
+# The kernel is `no_std` and cannot link a host test harness. Its tests live in
+# `selftest.rs` and run inside QEMU; `cargo test --workspace` must skip it.
+[[bin]]
+name = "vibeos-kernel"
+path = "src/main.rs"
+test = false
+
 [dependencies]
+vibeos-core = { path = "../core" }
+vibeos-rustc = { path = "../compiler" }

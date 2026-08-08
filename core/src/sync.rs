@@ -5,20 +5,7 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Disable S-mode interrupts, returning the previous SIE bit.
-#[inline]
-fn irq_save() -> bool {
-    let sstatus: usize;
-    unsafe { core::arch::asm!("csrrc {}, sstatus, {}", out(reg) sstatus, in(reg) 1usize << 1) };
-    (sstatus >> 1) & 1 == 1
-}
-
-#[inline]
-fn irq_restore(was_on: bool) {
-    if was_on {
-        unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1) };
-    }
-}
+use crate::arch::{irq_restore, irq_save};
 
 pub struct SpinLock<T> {
     locked: AtomicBool,

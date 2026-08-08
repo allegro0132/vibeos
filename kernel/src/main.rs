@@ -15,16 +15,16 @@
 
 extern crate alloc;
 
-mod cap;
-mod chan;
+// The portable half of the kernel lives in `vibeos-core` so it can be tested on
+// the host. Re-exported under the names the rest of the tree already uses.
+pub use vibeos_core::{cap, chan, exec, heap, sync};
+pub use vibeos_core::arch as sbi;
+
 mod dev;
-mod exec;
-mod heap;
 mod plic;
 mod rustc;
-mod sbi;
+mod selftest;
 mod shell;
-mod sync;
 mod trap;
 mod tty;
 mod uart;
@@ -74,6 +74,9 @@ extern "C" {
     static __heap_end: u8;
 }
 
+#[global_allocator]
+pub static HEAP: heap::Heap = heap::Heap::new();
+
 const BANNER: &str = r#"
    __   __ __  _           ____  ____
    \ \ / /(_)| |__   ___  / __ \/ ___|
@@ -92,7 +95,7 @@ pub extern "C" fn kmain() -> ! {
         core::ptr::addr_of!(__heap_start) as usize,
         core::ptr::addr_of!(__heap_end) as usize,
     );
-    unsafe { heap::HEAP.init(hs, he) };
+    unsafe { HEAP.init(hs, he) };
     println!("  heap      {:#x}..{:#x}  ({} KiB)", hs, he, (he - hs) / 1024);
 
     trap::init();

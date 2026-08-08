@@ -1,0 +1,25 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn main() { let x = 1; x = 2; }
+  | .
+  error: line 1: cannot assign twice to immutable variable `x` (declare it `let mut`)
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn main() { println!("{}", y); }
+  | .
+  error: line 1: cannot find value `y` in this scope
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn f(a: i64) -> i64 { a }
+  | fn main() { f(1, 2); }
+  | .
+  error: line 2: `f` takes 1 argument(s) but 2 were supplied
+vibe> rustc edit
+  enter your program; finish with a single `.` on its own line
+  | fn helper() {}
+  | .
+  error: no `main` function found
+vibe> 

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install nightly --component rust-src
+          rustup default nightly
+      - name: Test the portable core and the compiler
+        # The kernel binary is no_std and has `test = false`; its tests run
+        # inside QEMU in the job below.
+        run: cargo test --workspace --verbose
+
+  qemu-tests:
+    name: QEMU integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install nightly --component rust-src
+          rustup default nightly
+      - name: Install QEMU and lld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc lld
+          # Cargo's rustflags name `ld.lld`; Ubuntu ships it as lld-<version>.
+          sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
+      - name: Build the kernel
+        run: cd kernel && cargo build --release
+      - name: Golden transcripts
+        run: ./scripts/qemu-test.sh
+      - name: In-kernel self-test must pass
+        run: grep -q 'SELFTEST OK' tests/golden/selftest.txt

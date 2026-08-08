@@ -3,5 +3,17 @@
 version = 4
 
 [[package]]
+name = "vibeos-core"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-kernel"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-rustc",
+]
+
+[[package]]
+name = "vibeos-rustc"
 version = "0.1.0"

@@ -100,6 +100,7 @@ enum OwnedRegistration {
     Wait { queue: usize, id: u64 },
     Timer { id: u64 },
     Join { status: Arc<TaskStatus>, id: u64 },
+    IrqPollProbe { generation: u64 },
 }
 
 struct OwnedRegistrationEntry {
@@ -351,6 +352,24 @@ fn disarm_owned_for_current(token: Option<u64>) {
         return;
     };
     if let Some(status) = CURRENT_TASK_STATUS.lock().clone() {
+        drop(status.disarm_owned(token));
+    }
+}
+
+fn disarm_owned_for_task(task: TaskId, token: Option<u64>) {
+    let Some(token) = token else {
+        return;
+    };
+    let status = {
+        let sched = SCHED.lock();
+        sched
+            .running
+            .as_ref()
+            .filter(|(id, _, _, _)| *id == task)
+            .map(|(_, _, _, status)| status.clone())
+            .or_else(|| sched.tasks.get(&task).map(|task| task.status.clone()))
+    };
+    if let Some(status) = status {
         drop(status.disarm_owned(token));
     }
 }
@@ -1267,12 +1286,14 @@ pub fn poll_once() -> bool {
             let mut once = Some(fut);
             run_guarded(&mut || {
                 if let Some(f) = once.take() {
+                    complete_irq_poll_probe(id);
                     status.polls.fetch_add(1, Ordering::Relaxed);
                     poll = f.poll(&mut cx);
                 }
             })
         }
         None => {
+            complete_irq_poll_probe(id);
             status.polls.fetch_add(1, Ordering::Relaxed);
             poll = task.future.as_mut().poll(&mut cx);
             false
@@ -1529,11 +1550,223 @@ impl Drop for WaitFuture<'_> {
     }
 }
 
+// --- One-shot timer IRQ -> task poll profiling ---
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqPollProbeError {
+    /// Probes are task-owned so cancellation and fault teardown can clean them.
+    NotInTask,
+    /// M3.13 deliberately provides one global slot to keep the IRQ path fixed.
+    Busy,
+    /// The task cleanup ledger could not reserve its ownership record.
+    RegistrationFailed,
+}
+
+#[derive(Clone, Copy)]
+struct IrqPollProbeState {
+    generation: u64,
+    target: Option<TaskId>,
+    timer_id: Option<u64>,
+    irq_entry: Option<u64>,
+    sample: Option<u64>,
+}
+
+impl IrqPollProbeState {
+    const EMPTY: Self = Self {
+        generation: 0,
+        target: None,
+        timer_id: None,
+        irq_entry: None,
+        sample: None,
+    };
+}
+
+static IRQ_POLL_PROBE: SpinLock<IrqPollProbeState> = SpinLock::new(IrqPollProbeState::EMPTY);
+static NEXT_IRQ_POLL_PROBE: AtomicU64 = AtomicU64::new(1);
+const IRQ_POLL_PROBE_IDLE: u8 = 0;
+const IRQ_POLL_PROBE_ARMED: u8 = 1;
+const IRQ_POLL_PROBE_IRQ_RECORDED: u8 = 2;
+const IRQ_POLL_PROBE_COMPLETE: u8 = 3;
+static IRQ_POLL_PROBE_PHASE: AtomicU8 = AtomicU8::new(IRQ_POLL_PROBE_IDLE);
+
+fn next_irq_poll_probe_generation() -> u64 {
+    NEXT_IRQ_POLL_PROBE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("IRQ-to-poll probe generation space exhausted")
+}
+
+/// A task-owned, one-shot measurement of timer IRQ entry to its next poll.
+///
+/// Arm this from inside the target task immediately before awaiting a timer:
+///
+/// ```ignore
+/// let probe = arm_irq_poll_probe()?;
+/// sleep_ms(1).await;
+/// let ticks = probe.finish().expect("the timer IRQ woke this task");
+/// ```
+///
+/// The first timer this task registers after arming is bound to the probe; only
+/// that exact timer starts the clock when it becomes due. The
+/// endpoint is captured immediately before the executor invokes the task's
+/// next `Future::poll`, so unrelated heartbeat interrupts cannot poison a
+/// sample. Dropping the token disarms it; task cancellation and fault cleanup
+/// also clear it through the executor's ownership ledger.
+pub struct IrqPollProbe {
+    generation: u64,
+    target: TaskId,
+    owned_registration: Option<u64>,
+    active: bool,
+}
+
+impl IrqPollProbe {
+    /// Read the completed sample without disarming the probe.
+    pub fn sample(&self) -> Option<u64> {
+        let probe = IRQ_POLL_PROBE.lock();
+        (self.active && probe.generation == self.generation && probe.target == Some(self.target))
+            .then_some(probe.sample)
+            .flatten()
+    }
+
+    /// Return the completed timer-tick sample and release the global slot.
+    ///
+    /// `None` means the token was dropped/finished before a matching timer IRQ
+    /// followed by a target poll.
+    pub fn finish(mut self) -> Option<u64> {
+        let sample = self.sample();
+        self.deactivate();
+        sample
+    }
+
+    fn deactivate(&mut self) {
+        if !self.active {
+            return;
+        }
+        clear_irq_poll_probe(self.generation);
+        disarm_owned_for_task(self.target, self.owned_registration.take());
+        self.active = false;
+    }
+}
+
+impl Drop for IrqPollProbe {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
+
+/// Arm the single allocation-free IRQ-to-poll profiler for the current task.
+pub fn arm_irq_poll_probe() -> Result<IrqPollProbe, IrqPollProbeError> {
+    let current_status = CURRENT_TASK_STATUS
+        .lock()
+        .clone()
+        .ok_or(IrqPollProbeError::NotInTask)?;
+    let target = {
+        let sched = SCHED.lock();
+        sched
+            .running
+            .as_ref()
+            .filter(|(_, _, _, status)| Arc::ptr_eq(status, &current_status))
+            .map(|(id, _, _, _)| *id)
+            .ok_or(IrqPollProbeError::NotInTask)?
+    };
+    let generation = next_irq_poll_probe_generation();
+
+    // Cleanup records are executor infrastructure even when the task itself is
+    // using a reclaimable component arena.
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let owned_registration = current_status
+        .register_owned(OwnedRegistration::IrqPollProbe { generation })
+        .map_err(|_| IrqPollProbeError::RegistrationFailed)?;
+    let mut probe = IRQ_POLL_PROBE.lock();
+    if probe.target.is_some() {
+        drop(probe);
+        drop(current_status.disarm_owned(owned_registration));
+        system.restore();
+        return Err(IrqPollProbeError::Busy);
+    }
+    *probe = IrqPollProbeState {
+        generation,
+        target: Some(target),
+        timer_id: None,
+        irq_entry: None,
+        sample: None,
+    };
+    IRQ_POLL_PROBE_PHASE.store(IRQ_POLL_PROBE_ARMED, Ordering::Release);
+    drop(probe);
+    system.restore();
+
+    Ok(IrqPollProbe {
+        generation,
+        target,
+        owned_registration: Some(owned_registration),
+        active: true,
+    })
+}
+
+/// Number of active profiling slots (currently always zero or one).
+pub fn irq_poll_probe_count() -> usize {
+    usize::from(IRQ_POLL_PROBE_PHASE.load(Ordering::Acquire) != IRQ_POLL_PROBE_IDLE)
+}
+
+fn clear_irq_poll_probe(generation: u64) {
+    let mut probe = IRQ_POLL_PROBE.lock();
+    if probe.target.is_some() && probe.generation == generation {
+        *probe = IrqPollProbeState::EMPTY;
+        IRQ_POLL_PROBE_PHASE.store(IRQ_POLL_PROBE_IDLE, Ordering::Release);
+    }
+}
+
+fn bind_timer_to_probe(task: Option<TaskId>, timer_id: u64) {
+    let Some(task) = task else {
+        return;
+    };
+    if IRQ_POLL_PROBE_PHASE.load(Ordering::Acquire) != IRQ_POLL_PROBE_ARMED {
+        return;
+    }
+    let mut probe = IRQ_POLL_PROBE.lock();
+    if probe.target == Some(task) && probe.timer_id.is_none() {
+        probe.timer_id = Some(timer_id);
+    }
+}
+
+fn record_timer_irq_for_probe(task: TaskId, timer_id: u64, irq_entry: u64) {
+    if IRQ_POLL_PROBE_PHASE.load(Ordering::Acquire) != IRQ_POLL_PROBE_ARMED {
+        return;
+    }
+    let mut probe = IRQ_POLL_PROBE.lock();
+    if probe.target == Some(task)
+        && probe.timer_id == Some(timer_id)
+        && probe.irq_entry.is_none()
+        && probe.sample.is_none()
+    {
+        probe.irq_entry = Some(irq_entry);
+        IRQ_POLL_PROBE_PHASE.store(IRQ_POLL_PROBE_IRQ_RECORDED, Ordering::Release);
+    }
+}
+
+fn complete_irq_poll_probe(task: TaskId) {
+    // The common scheduler path does only this load; inactive and merely
+    // armed probes do not add a timer read or lock to unrelated task polls.
+    if IRQ_POLL_PROBE_PHASE.load(Ordering::Acquire) != IRQ_POLL_PROBE_IRQ_RECORDED {
+        return;
+    }
+    // Capture the endpoint before taking the profiling lock: the intended
+    // endpoint is entry to Future::poll, not completion of bookkeeping.
+    let poll_entry = arch::time();
+    let mut probe = IRQ_POLL_PROBE.lock();
+    if probe.target == Some(task) && probe.sample.is_none() {
+        if let Some(irq_entry) = probe.irq_entry {
+            probe.sample = Some(poll_entry.saturating_sub(irq_entry));
+            IRQ_POLL_PROBE_PHASE.store(IRQ_POLL_PROBE_COMPLETE, Ordering::Release);
+        }
+    }
+}
+
 // --- Timers ---
 
 struct TimerEntry {
     id: u64,
     deadline: u64,
+    task: Option<TaskId>,
     waker: Waker,
 }
 
@@ -1580,6 +1813,7 @@ fn cleanup_owned_registration(registration: OwnedRegistration) {
         }
         OwnedRegistration::Timer { id } => drop(unregister_timer(id)),
         OwnedRegistration::Join { status, id } => drop(status.unregister_joiner(id)),
+        OwnedRegistration::IrqPollProbe { generation } => clear_irq_poll_probe(generation),
     }
 }
 
@@ -1588,8 +1822,19 @@ pub fn timer_registration_count() -> usize {
     TIMERS.lock().len()
 }
 
-/// Called from the timer trap. Wakes everything due and re-arms the hardware.
+/// Called when no earlier architecture-specific trap timestamp is available.
+/// Host tests use this entry point; real targets should call
+/// [`timer_tick_at`] with a timestamp captured in their trap prologue.
 pub fn timer_tick() {
+    timer_tick_at(arch::time());
+}
+
+/// Wake due timers using a timestamp captured at the architecture IRQ entry.
+///
+/// The probe endpoint is captured immediately before the target
+/// `Future::poll`; this supplied endpoint lets the measurement include trap
+/// save/dispatch and all executor work between hardware entry and that poll.
+pub fn timer_tick_at(irq_entry: u64) {
     loop {
         let due = {
             let mut timers = TIMERS.lock();
@@ -1606,6 +1851,9 @@ pub fn timer_tick() {
         let Some(timer) = due else {
             return;
         };
+        if let Some(task) = timer.task {
+            record_timer_irq_for_probe(task, timer.id, irq_entry);
+        }
         timer.waker.wake();
     }
 }
@@ -1695,6 +1943,7 @@ impl Future for Sleep {
         }
 
         let id = next_timer_id();
+        let task = SCHED.lock().running.as_ref().map(|(id, _, _, _)| *id);
         let mut allocation_failed = false;
         match register_owned_for_current(OwnedRegistration::Timer { id }) {
             Ok(token) => this.owned_registration = token,
@@ -1714,10 +1963,14 @@ impl Future for Sleep {
                     TimerEntry {
                         id,
                         deadline: this.deadline,
+                        task,
                         waker: candidate.take().expect("waker candidate exists"),
                     },
                 );
                 this.registration = Some(id);
+                // Bind while timer IRQs are still masked by the registry lock;
+                // otherwise an immediately-due timer could fire in the gap.
+                bind_timer_to_probe(task, id);
                 arm_locked(&timers);
             }
         }

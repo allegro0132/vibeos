@@ -79,3 +79,24 @@ fn shadowed() -> i64 {
     x
 }
 "#;
+
+/// Fixed no-output workload used by the in-kernel performance baseline.
+///
+/// Keeping this beside the other shared samples makes changes to the measured
+/// language workload explicit in review. The loop is long enough to rise above
+/// `rdtime` granularity under QEMU TCG while staying well inside the generated
+/// program fuel budget.
+pub const BENCHMARK: &str = r#"fn mix(n: i64) -> i64 {
+    let mut i = 0;
+    let mut x = 17;
+    while i < n {
+        x = (x * 1664525 + 1013904223) % 2147483647;
+        i = i + 1;
+    }
+    x
+}
+
+fn main() -> i64 {
+    mix(2000)
+}
+"#;

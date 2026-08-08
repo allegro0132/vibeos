@@ -64,6 +64,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  rustc conform   compile and run the language conformance program");
             println!("  rustc edit      type your own program; end it with a lone `.`");
             println!("  chan            telemetry channel depth and totals");
+            println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -309,6 +310,8 @@ async fn run(line: &str, boot_time: u64) {
                 Err(e) => println!("  refused: {}", e),
             }
         }
+
+        "bench" => crate::bench::run().await,
 
         "selftest" => {
             let r = crate::selftest::run().await;

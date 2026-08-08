@@ -196,6 +196,20 @@ pub struct OwnerStats {
     pub denials: u64,
 }
 
+/// Global allocator gauges used by diagnostics and reproducible benchmarks.
+///
+/// `live_bytes` can fall when allocations are freed, while
+/// `peak_live_bytes` and `bump_used_bytes` are high-water-style gauges. Blocks
+/// returned to a size-class free list reduce `live_bytes` but deliberately do
+/// not rewind the bump cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeapSnapshot {
+    pub live_bytes: usize,
+    pub peak_live_bytes: usize,
+    pub bump_used_bytes: usize,
+    pub bump_remaining_bytes: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OwnerError {
     SystemOwnerReserved,
@@ -423,6 +437,7 @@ struct AllocationPlan {
 }
 
 struct HeapInner {
+    start: usize,
     cursor: usize,
     end: usize,
     free: [Option<NonNull<FreeNode>>; NUM_CLASSES],
@@ -444,6 +459,7 @@ impl Heap {
         let mut owners = [OwnerAccount::EMPTY; MAX_OWNER_ACCOUNTS];
         owners[0] = OwnerAccount::SYSTEM;
         Heap(SpinLock::new(HeapInner {
+            start: 0,
             cursor: 0,
             end: 0,
             free: [None; NUM_CLASSES],
@@ -463,7 +479,8 @@ impl Heap {
         let mut h = self.0.lock();
         let start = align_up(start, MIN_CLASS_SIZE).unwrap_or(end);
         let end = end & !(MIN_CLASS_SIZE - 1);
-        h.cursor = start.min(end);
+        h.start = start.min(end);
+        h.cursor = h.start;
         h.end = end;
         h.free = [None; NUM_CLASSES];
         h.live_bytes = 0;
@@ -478,8 +495,23 @@ impl Heap {
 
     /// Global physical live/peak bytes and never-yet-used bump bytes.
     pub fn stats(&self) -> (usize, usize, usize) {
+        let snapshot = self.snapshot();
+        (
+            snapshot.live_bytes,
+            snapshot.peak_live_bytes,
+            snapshot.bump_remaining_bytes,
+        )
+    }
+
+    /// Read all global allocator gauges under one lock.
+    pub fn snapshot(&self) -> HeapSnapshot {
         let h = self.0.lock();
-        (h.live_bytes, h.peak_bytes, h.end.saturating_sub(h.cursor))
+        HeapSnapshot {
+            live_bytes: h.live_bytes,
+            peak_live_bytes: h.peak_bytes,
+            bump_used_bytes: h.cursor.saturating_sub(h.start),
+            bump_remaining_bytes: h.end.saturating_sub(h.cursor),
+        }
     }
 
     /// Register a stable externally-chosen owner identity.

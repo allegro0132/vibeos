@@ -28,8 +28,13 @@ global_asm!(
 .global __trap_entry
 __trap_entry:
     addi sp, sp, -256
-    sd ra,   0(sp)
+    // Capture the IRQ-side benchmark endpoint before the full register save.
+    // t0 is the first scratch register saved, so using it after this store
+    // preserves the interrupted context. Offset 240 is otherwise unused.
     sd t0,   8(sp)
+    rdtime t0
+    sd t0, 240(sp)
+    sd ra,   0(sp)
     sd t1,  16(sp)
     sd t2,  24(sp)
     sd t3,  32(sp)
@@ -59,6 +64,7 @@ __trap_entry:
     sd tp, 224(sp)
     sd gp, 232(sp)
 
+    ld a0, 240(sp)
     call __trap_handler
 
     ld ra,   0(sp)
@@ -118,7 +124,7 @@ pub fn in_interrupt() -> bool {
 }
 
 #[no_mangle]
-extern "C" fn __trap_handler() {
+extern "C" fn __trap_handler(irq_entry: u64) {
     let scause: usize;
     let stval: usize;
     let sepc: usize;
@@ -150,7 +156,7 @@ extern "C" fn __trap_handler() {
     let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
 
     match code {
-        5 => exec::timer_tick(),
+        5 => exec::timer_tick_at(irq_entry),
         9 => {
             while let Some(irq) = plic::claim() {
                 if irq == uart::UART_IRQ {

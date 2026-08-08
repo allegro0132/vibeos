@@ -22,8 +22,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 199 host tests, no QEMU, ~1s
+cargo test --workspace     # 209 host tests, no QEMU, ~1s
 ./scripts/qemu-test.sh     # 8 QEMU cases (7 goldens + differential), ~4min
+./scripts/bench.py         # fixed QEMU/TCG baseline + regression policy
 ```
 
 Plus an in-kernel self-test (307 checks) for what the host cannot fake — real
@@ -41,6 +42,11 @@ for why there are four layers and which mutations each one catches.
 Needs `qemu-system-riscv64`, a Rust toolchain with `rust-src`, and `ld.lld`.
 `RUSTC_BOOTSTRAP=1` is set by the scripts because `-Z build-std` is required to
 get `core`/`alloc` for a bare-metal target; a nightly toolchain works without it.
+
+`bench` in the shell emits a versioned JSON-lines measurement set. The host
+runner fixes the machine, CPU, hart count, TCG mode, and virtual clock, records
+QEMU/toolchain metadata, and checks the committed baseline. Updating that truth
+is always explicit: `./scripts/bench.py --update`.
 
 ## The design
 
@@ -261,6 +267,7 @@ rustc hello     compile and run a Rust hello world, natively
 rustc demo      compile and run a larger sample (fib, gcd, loops)
 rustc conform   compile and run the language conformance program
 selftest        run the in-kernel test suite
+bench           emit the versioned machine-readable benchmark suite
 rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)

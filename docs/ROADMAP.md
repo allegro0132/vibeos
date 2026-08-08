@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1 and M2 are complete; M3 is partial, and
-> M3.5 is under way with 3.8 through 3.12 complete. The current baseline is 199 host tests,
+> M3.5 is under way with 3.8 through 3.13 complete. The current baseline is 209 host tests,
 > 307 in-kernel checks, and 8 QEMU transcript cases (7 goldens plus the dynamic
 > differential oracle). See
 > [TESTING.md](../TESTING.md).
@@ -257,7 +257,7 @@ units before adding persistence or more concurrency.
 | 3.10 ✅ | Make wait queues and timers cancellation-safe | Dropping/cancelling a waiter removes or invalidates its registration; stress tests leave no stale wakers. |
 | 3.11 ✅ | Add component-owned allocation accounting | A component exceeding its quota faults without consuming another component's budget; normal exit drops its tagged allocations back to the account baseline. |
 | 3.12 ✅ | Replace the permanent fault leak with an owned fault arena | Repeated fault/restart cycles have bounded heap growth. No destructor is run across a `longjmp`. |
-| 3.13 | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
+| 3.13 ✅ | Add a `bench` command and machine-readable baseline | Record IPC round-trip, IRQ-to-poll latency, cap lookup by derivation depth, heap high-water, compile throughput, and generated code size/runtime. CI detects agreed regression thresholds. |
 | 3.14 | Make builds and differential tests reproducible | Pin an exact nightly; CI runs `scripts/differential.sh` before QEMU; status/test counts come from commands or are explicitly dated snapshots. |
 | 3.15 | Write single-hart scheduler and panic invariants | Model wake/cancel/fault transitions; document that an in-tree non-yielding future remains trusted until preemption or instrumentation exists. |
 | 3.16 | Define resolved-capability lease semantics | Console hooks either revalidate a revocable token per operation or explicitly hold an invocation lease. Memory access documents the same choice; tests distinguish revoke-before-run from revoke-during-run. |
@@ -313,6 +313,16 @@ the audited World factory can opt a task into reclamation. Host tests cover sibl
 teardown, nested cancellation, recursive-executor rejection, registry cleanup, and
 domain-tagged lock recovery. The target self-test performs sixteen real quota-fault /
 restart cycles, observes no destructor calls, and requires heap use to plateau.
+
+3.13 publishes a versioned guest JSON stream and a checked-in QEMU/TCG baseline.
+The runner fixes `virt`/`rv64`/one hart/single-threaded TCG plus deterministic
+`icount`, records QEMU and Rust revisions, and refuses silent schema or sample-count
+changes. The 2026-08-08 baseline records IPC p95 109 ticks (257 samples), timer
+IRQ-to-poll p95 24 ticks (129), cap lookup p50 2–4 ticks across derivation depths
+0–32, compile p50 350,362 source B/s (21), a 114,048 B heap high-water, and
+828 B code / 1 B data / 1,862 tick runtime for the fixed generated workload.
+These are regression coordinates for one virtual environment, not a cross-machine
+Linux-pipe comparison.
 
 **Acceptance:** start a component, revoke its authority, cancel it while blocked,
 observe its terminal state, restart it with a fresh explicitly granted CSpace, and

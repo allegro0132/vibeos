@@ -20,6 +20,7 @@ extern crate alloc;
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::{cap, chan, exec, heap, sync};
 
+mod bench;
 mod dev;
 mod plic;
 mod rustc;

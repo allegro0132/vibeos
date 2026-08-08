@@ -38,5 +38,7 @@ jobs:
         run: cd kernel && cargo build --release
       - name: Golden transcripts
         run: ./scripts/qemu-test.sh
+      - name: QEMU/TCG benchmark regression budget
+        run: python3 scripts/bench.py --no-build
       - name: In-kernel self-test must pass
         run: grep -q 'SELFTEST OK' tests/golden/selftest.txt

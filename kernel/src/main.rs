@@ -112,12 +112,18 @@ pub extern "C" fn kmain() -> ! {
     println!("  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled", uart::UART_IRQ);
 
     world::build();
-    println!("  world     5 capability spaces, 1 typed channel, 3 components");
 
     // A panicking component should cost its own task, not the machine.
     exec::set_fault_guard(trampoline::guard_task);
 
-    exec::spawn("shell", shell::shell_task(boot_time));
+    let world = world::world();
+    world.spawn_component(
+        "shell",
+        world.spaces["init"].clone(),
+        world::SHELL_MEMORY_BUDGET,
+        shell::shell_task(boot_time),
+    );
+    println!("  world     5 capability spaces, 1 typed channel, 4 components");
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();

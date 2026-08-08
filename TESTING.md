@@ -3,15 +3,15 @@
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh
-cargo test --workspace     # 117 host tests, no QEMU, ~1s
-./scripts/qemu-test.sh     # 7 golden transcripts under QEMU, ~3min
+cargo test --workspace     # 145 host tests, no QEMU, ~1s (2026-08-08 snapshot)
+./scripts/qemu-test.sh     # 7 QEMU cases (6 goldens + differential), ~3min
 ./scripts/differential.sh  # re-record expectations from real rustc
 ```
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation, scheduler, timers, channels, allocator, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
-| In-kernel self-test | Real timer interrupts, real wakeups, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
+| Host unit tests | Capability algebra including cross-space revocation, tracked task lifecycle, scheduler, timers, channels, allocator, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
+| In-kernel self-test | Real timer interrupts and wakeups, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
 | Golden transcripts | End-to-end shell behaviour and program output | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |

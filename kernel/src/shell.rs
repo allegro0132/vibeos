@@ -52,9 +52,9 @@ async fn run(line: &str, boot_time: u64) {
 
     match cmd {
         "help" => {
-            println!("  ps              live tasks and how many times each was polled");
+            println!("  ps              component identities, lifecycle, and poll counts");
             println!("  spaces          capability spaces in the system");
-            println!("  caps <space>    dump a space's capability table");
+            println!("  caps <space>    component owner and capability table");
             println!("  probe           attempt four illegal operations, show the refusals");
             println!("  revoke <space>  pull a component's authority at runtime");
             println!("  rustc hello     compile and run a Rust hello world, natively");
@@ -71,15 +71,33 @@ async fn run(line: &str, boot_time: u64) {
         }
 
         "ps" => {
-            println!("  {:<10} {:>8}", "TASK", "POLLS");
-            for (name, polls) in exec::task_report() {
-                println!("  {:<10} {:>8}", name, polls);
+            println!(
+                "  {:<12} {:<8} {:<10} {:<8} {:<9} {:<9} {:>8} {:>10}",
+                "COMPONENT", "TASK", "NAME", "CSPACE", "STATE", "REASON", "POLLS", "BUDGET"
+            );
+            for component in world().components() {
+                let c = component.snapshot();
+                let component_id = alloc::format!("{}", c.id);
+                let task_id = alloc::format!("{}", c.task_id);
+                let state = alloc::format!("{}", c.state);
+                println!(
+                    "  {:<12} {:<8} {:<10} {:<8} {:<9} {:<9} {:>8} {:>8} B",
+                    component_id,
+                    task_id,
+                    c.name,
+                    c.cspace,
+                    state,
+                    c.terminal_reason.unwrap_or("-"),
+                    c.polls,
+                    c.memory.budget_bytes
+                );
             }
             println!(
-                "  ({} exited, {} faulted)",
+                "  executor totals (including untracked tasks): {} exited, {} faulted",
                 exec::completed_count(),
                 exec::faulted_count()
             );
+            println!("  memory budgets are declared; allocator accounting lands in 3.11");
             if tty::is_quiet() {
                 println!("  background output is muted; poll counts still rising");
             }
@@ -100,6 +118,37 @@ async fn run(line: &str, boot_time: u64) {
                 println!("  no such space: {}", name);
                 return;
             };
+            let owner_state = match w.component_for_space(space) {
+                Some(component) => {
+                    let c = component.snapshot();
+                    println!(
+                        "  owner {}  task {}  name {}  state {}  reason {}",
+                        c.id,
+                        c.task_id,
+                        c.name,
+                        c.state,
+                        c.terminal_reason.unwrap_or("-")
+                    );
+                    println!(
+                        "  memory owner {}  declared budget {} B (accounting pending)",
+                        c.memory.owner,
+                        c.memory.budget_bytes
+                    );
+                    Some(c.state)
+                }
+                None => {
+                    println!(
+                        "  owner unbound (generated code executes synchronously in the shell task)"
+                    );
+                    None
+                }
+            };
+            if owner_state == Some(exec::TaskState::Faulted) {
+                println!(
+                    "  capability table unavailable: a fault may have abandoned its CSpace lock"
+                );
+                return;
+            }
             println!("  {:<12} {:<9} {:<8} {}", "HANDLE", "KIND", "RIGHTS", "OBJECT");
             for (cap, kind, rights, desc) in space.0.lock().list() {
                 println!("  {:<12} {:<9} {:<8} {}", alloc::format!("{}", cap), kind, alloc::format!("{}", rights), desc);

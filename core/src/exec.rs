@@ -11,10 +11,12 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
@@ -26,10 +28,123 @@ pub const TIMEBASE_HZ: u64 = 10_000_000;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TaskId(pub u64);
 
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "task:{}", self.0)
+    }
+}
+
+/// The lifecycle states shared by the executor and a supervising component.
+///
+/// Cancellation is introduced as a state here so component identity does not
+/// have to change when ROADMAP 3.9 adds the transition into it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum TaskState {
+    Running = 0,
+    Exited = 1,
+    Faulted = 2,
+    Cancelled = 3,
+}
+
+impl TaskState {
+    pub const fn terminal_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Running => None,
+            Self::Exited => Some("returned"),
+            Self::Faulted => Some("fault"),
+            Self::Cancelled => Some("cancelled"),
+        }
+    }
+
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Running,
+            1 => Self::Exited,
+            2 => Self::Faulted,
+            3 => Self::Cancelled,
+            _ => unreachable!("invalid task state"),
+        }
+    }
+}
+
+impl fmt::Display for TaskState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Faulted => "faulted",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+struct TaskStatus {
+    polls: AtomicU64,
+    state: AtomicU8,
+}
+
+impl TaskStatus {
+    fn new() -> Self {
+        Self {
+            polls: AtomicU64::new(0),
+            state: AtomicU8::new(TaskState::Running as u8),
+        }
+    }
+
+    fn state(&self) -> TaskState {
+        TaskState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn finish(&self, state: TaskState) -> bool {
+        debug_assert!(state != TaskState::Running);
+        self.state
+            .compare_exchange(
+                TaskState::Running as u8,
+                state as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// A persistent view of one task's identity and lifecycle.
+///
+/// The scheduler owns the future; a `Component` owns this handle. That keeps a
+/// terminal task observable after its future has been removed (or deliberately
+/// leaked after a fault).
+pub struct TaskHandle {
+    id: TaskId,
+    status: Arc<TaskStatus>,
+}
+
+impl TaskHandle {
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+
+    pub fn state(&self) -> TaskState {
+        self.status.state()
+    }
+
+    pub fn polls(&self) -> u64 {
+        self.status.polls.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TaskReport {
+    pub id: TaskId,
+    pub name: String,
+    pub state: TaskState,
+    pub polls: u64,
+}
+
 struct Task {
     name: String,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    polls: u64,
+    status: Arc<TaskStatus>,
 }
 
 /// Runs `f` with a landing pad installed, returning true if `f` faulted.
@@ -51,7 +166,7 @@ struct Sched {
     /// The task being polled right now. It is lifted out of `tasks` for the
     /// duration of the poll, so both introspection and `wake` have to look
     /// for it here rather than in the map.
-    running: Option<(TaskId, String, u64)>,
+    running: Option<(TaskId, String, Arc<TaskStatus>)>,
     /// Set when the running task is woken while it is being polled — by itself
     /// (`yield_now`) or by an interrupt that lands mid-poll. Without this the
     /// wake would be dropped and the task would never be scheduled again.
@@ -71,13 +186,36 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+fn next_task_id() -> TaskId {
+    let id = NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("TaskId space exhausted");
+    TaskId(id)
+}
+
 /// Spawn a future as a task. Safe to call from inside another task.
 pub fn spawn(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> TaskId {
-    let id = TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+    spawn_tracked(name, fut).id()
+}
+
+/// Spawn a future and retain a handle suitable for a supervising component.
+pub fn spawn_tracked(
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    let id = next_task_id();
+    let status = Arc::new(TaskStatus::new());
     let mut s = SCHED.lock();
-    s.tasks.insert(id, Task { name: String::from(name), future: Box::pin(fut), polls: 0 });
+    s.tasks.insert(
+        id,
+        Task {
+            name: String::from(name),
+            future: Box::pin(fut),
+            status: status.clone(),
+        },
+    );
     s.ready.push_back(id);
-    id
+    TaskHandle { id, status }
 }
 
 pub fn wake(id: TaskId) {
@@ -89,12 +227,26 @@ pub fn wake(id: TaskId) {
     }
 }
 
-/// (name, polls) for every live task.
-pub fn task_report() -> Vec<(String, u64)> {
+/// Identity and poll accounting for every live task.
+pub fn task_report() -> Vec<TaskReport> {
     let s = SCHED.lock();
-    let mut out: Vec<(String, u64)> =
-        s.tasks.values().map(|t| (t.name.clone(), t.polls)).collect();
-    out.extend(s.running.iter().map(|(_, n, p)| (n.clone(), *p)));
+    let mut out: Vec<TaskReport> = s
+        .tasks
+        .iter()
+        .map(|(id, task)| TaskReport {
+            id: *id,
+            name: task.name.clone(),
+            state: task.status.state(),
+            polls: task.status.polls.load(Ordering::Acquire),
+        })
+        .collect();
+    out.extend(s.running.iter().map(|(id, name, status)| TaskReport {
+        id: *id,
+        name: name.clone(),
+        state: status.state(),
+        polls: status.polls.load(Ordering::Acquire),
+    }));
+    out.sort_by_key(|report| report.id);
     out
 }
 
@@ -155,10 +307,14 @@ pub fn poll_once() -> bool {
     // while it is being polled without deadlocking on SCHED.
     let Some(mut task) = SCHED.lock().tasks.remove(&id) else { return true };
 
-    task.polls += 1;
+    // Keep a status reference outside the future-bearing `Task`. A fault
+    // longjmps out of `Future::poll`, so the fault path must not inspect any
+    // field adjacent to that interrupted future before deliberately leaking it.
+    let status = task.status.clone();
+    status.polls.fetch_add(1, Ordering::Relaxed);
     {
         let mut s = SCHED.lock();
-        s.running = Some((id, task.name.clone(), task.polls));
+        s.running = Some((id, task.name.clone(), status.clone()));
         s.running_woken = false;
     }
     let waker = waker_for(id);
@@ -189,11 +345,14 @@ pub fn poll_once() -> bool {
         // destructors over state it never finished writing, so the task is
         // leaked instead: leaking is always sound, and a faulted component is
         // not going to be resumed.
-        core::mem::forget(task);
         let mut s = SCHED.lock();
         s.running = None;
         s.running_woken = false;
-        s.faulted += 1;
+        if status.finish(TaskState::Faulted) {
+            s.faulted += 1;
+        }
+        drop(s);
+        core::mem::forget(task);
         return true;
     }
 
@@ -201,7 +360,17 @@ pub fn poll_once() -> bool {
     s.running = None;
     let woken = core::mem::take(&mut s.running_woken);
     match poll {
-        Poll::Ready(()) => s.completed += 1,
+        Poll::Ready(()) => {
+            // `Exited` is also the reclamation boundary: publish it only after
+            // the completed future has run its normal destructor, with SCHED
+            // unlocked in case that destructor wakes or spawns another task.
+            drop(s);
+            drop(task);
+            let mut s = SCHED.lock();
+            if status.finish(TaskState::Exited) {
+                s.completed += 1;
+            }
+        }
         Poll::Pending => {
             s.tasks.insert(id, task);
             if woken {

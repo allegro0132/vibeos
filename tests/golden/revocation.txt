@@ -15,14 +15,31 @@ vibe> rustc hello
   --- exited with 0 in N us ---
   note: output was suppressed -- `prog` holds no console capability
 vibe> caps prog
+  owner unbound (generated code executes synchronously in the shell task)
   HANDLE       KIND      RIGHTS   OBJECT
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> revoke guest
   revoked 1 cap(s) in `guest`
   (its next heartbeat will fail -- no restart, no signal)
 vibe> caps guest
+  owner component:3  task task:3  name guest  state running  reason -
+  memory owner component:3  declared budget 65536 B (accounting pending)
   HANDLE       KIND      RIGHTS   OBJECT
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> 
 [guest]  console denied: invalid or revoked capability -- guest is now mute
+vibe> ps
+  COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
+  component:1  task:1   sensor     sensor   running   -                6    65536 B
+  component:2  task:2   logger     logger   running   -                6    65536 B
+  component:3  task:3   guest      guest    exited    returned         2    65536 B
+  component:4  task:4   shell      init     running   -                9   262144 B
+  executor totals (including untracked tasks): 1 exited, 0 faulted
+  memory budgets are declared; allocator accounting lands in 3.11
+  background output is muted; poll counts still rising
+vibe> caps guest
+  owner component:3  task task:3  name guest  state exited  reason returned
+  memory owner component:3  declared budget 65536 B (accounting pending)
+  HANDLE       KIND      RIGHTS   OBJECT
+  rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> 

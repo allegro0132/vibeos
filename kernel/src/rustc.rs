@@ -7,10 +7,11 @@
 //! `print!`/`println!` with `{}` holes.
 //!
 //! The interesting part is not the code generator — it is where the generated
-//! code's authority comes from. Emitted programs cannot touch hardware. Their
-//! only exit is a call into `rt_print_*`, which resolves the `prog` space's
-//! console capability *on every call*. Revoke it and the next `println!` in
-//! already-compiled, already-running machine code stops working.
+//! code's authority comes from. Emitted programs cannot touch hardware. At the
+//! start of each invocation, `run` resolves the `prog` space's console and
+//! memory capabilities; runtime hooks use those invocation-scoped objects.
+//! Revoking before the next run denies them. Whether revoke-during-run should
+//! invalidate an active invocation lease is ROADMAP 3.16.
 
 extern crate alloc;
 

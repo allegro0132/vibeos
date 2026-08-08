@@ -53,6 +53,7 @@ pub async fn run() -> Report {
 
     timers(&mut h).await;
     scheduler(&mut h).await;
+    components(&mut h);
     channels(&mut h).await;
     fault_isolation(&mut h).await;
     capabilities(&mut h);
@@ -102,8 +103,8 @@ async fn scheduler(h: &mut Harness) {
         exec::yield_now().await; // guarantee this is not the first poll
         let seen = exec::task_report()
             .into_iter()
-            .find(|(n, _)| n == "selftest-probe")
-            .map(|(_, polls)| polls);
+            .find(|report| report.name == "selftest-probe")
+            .map(|report| report.polls);
         tx.send((seen.is_some(), seen.unwrap_or(0))).await;
     });
     let (visible, polls) = ep.recv().await;
@@ -118,7 +119,7 @@ async fn fault_isolation(h: &mut Harness) {
     let faults_before = exec::faulted_count();
     let live_before = exec::task_report().len();
 
-    exec::spawn("selftest-doomed", async {
+    let doomed = exec::spawn_tracked("selftest-doomed", async {
         exec::yield_now().await;
         panic!("deliberate fault from the self-test");
     });
@@ -129,9 +130,15 @@ async fn fault_isolation(h: &mut Harness) {
     }
 
     h.eq("a panicking task is counted as faulted", exec::faulted_count(), faults_before + 1);
+    h.eq("a panicking task retains its exact faulted state", doomed.state(), exec::TaskState::Faulted);
+    h.eq(
+        "a panicking task retains its terminal reason",
+        doomed.state().terminal_reason(),
+        Some("fault"),
+    );
     h.check(
         "a panicking task is removed from the scheduler",
-        !exec::task_report().iter().any(|(n, _)| n == "selftest-doomed"),
+        !exec::task_report().iter().any(|report| report.id == doomed.id()),
     );
     h.check(
         "the other tasks are untouched",
@@ -139,6 +146,60 @@ async fn fault_isolation(h: &mut Harness) {
     );
     // And the machine is obviously still running, because we got here.
     h.check("the kernel survived the fault", true);
+}
+
+/// ROADMAP 3.8. Scheduler identity, authority, and declared memory ownership
+/// are one supervised record rather than three name-based conventions.
+fn components(h: &mut Harness) {
+    let w = world();
+    let components = w.components();
+    let snapshots: Vec<_> = components.iter().map(|component| component.snapshot()).collect();
+    let tasks = exec::task_report();
+
+    h.eq("the system image registers four supervised components", snapshots.len(), 4);
+    h.check(
+        "component memory accounts use the stable component identity",
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.memory.owner == snapshot.id && snapshot.memory.budget_bytes > 0),
+    );
+    h.check(
+        "component instance generations are explicit",
+        snapshots.iter().all(|snapshot| snapshot.generation == 1),
+    );
+    h.check(
+        "component lifecycle agrees with scheduler liveness",
+        snapshots.iter().all(|snapshot| {
+            let live = tasks.iter().find(|task| task.id == snapshot.task_id);
+            match snapshot.state {
+                exec::TaskState::Running => live.is_some_and(|task| {
+                    task.name == snapshot.name && task.polls == snapshot.polls
+                }),
+                exec::TaskState::Exited
+                | exec::TaskState::Faulted
+                | exec::TaskState::Cancelled => {
+                    live.is_none() && snapshot.terminal_reason.is_some()
+                }
+            }
+        }),
+    );
+
+    let init = w.spaces["init"].clone();
+    h.check(
+        "the shell component explicitly owns the init CSpace",
+        w.component_for_space(&init)
+            .is_some_and(|component| component.snapshot().name == "shell"),
+    );
+    let guest = w.spaces["guest"].clone();
+    h.check(
+        "the guest CSpace resolves to the guest component by object identity",
+        w.component_for_space(&guest)
+            .is_some_and(|component| component.snapshot().name == "guest"),
+    );
+    h.check(
+        "the synchronous program CSpace is honestly unbound",
+        w.component_for_space(&w.spaces["prog"]).is_none(),
+    );
 }
 
 async fn channels(h: &mut Harness) {

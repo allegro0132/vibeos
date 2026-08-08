@@ -22,11 +22,11 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 ## Testing
 
 ```sh
-cargo test --workspace     # 117 host tests, no QEMU, ~1s
-./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
+cargo test --workspace     # 145 host tests, no QEMU, ~1s
+./scripts/qemu-test.sh     # 7 QEMU cases (6 goldens + differential), ~3min
 ```
 
-Plus an in-kernel self-test (49 checks) for what the host cannot fake — real
+Plus an in-kernel self-test (65 checks) for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
 actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
 for why there are four layers and which mutations each one catches.
@@ -67,7 +67,9 @@ ep.send(reading).await;
 from a holder — and `grant`/`derive` can only ever *shrink* rights. Amplification
 isn't policed at runtime; it's absent from the API.
 
-The system image in `world.rs` is 4 spaces wired to 1 channel and 1 device:
+The system image in `world.rs` has 5 spaces wired to 1 channel, a console, and a
+bounded memory region. Four are owned by supervised components; `prog` is the
+explicitly unbound execution space used synchronously by the shell task:
 
 | space  | holds                                    | therefore cannot          |
 |--------|------------------------------------------|---------------------------|
@@ -75,6 +77,7 @@ The system image in `world.rs` is 4 spaces wired to 1 channel and 1 device:
 | sensor | telemetry `SEND`                         | read others' readings     |
 | logger | telemetry `RECV`, console `WRITE`        | forge a reading           |
 | guest  | console `WRITE`                          | pass the console on       |
+| prog   | console `WRITE`, memory `READ|WRITE`      | reach any other resource  |
 
 Run `probe` in the shell to watch four attacks get refused, and `revoke guest`
 to pull a live component's authority out from under it — no signal, no restart,
@@ -120,6 +123,13 @@ match code {
 VibeOS parks in `wfi` and draws no CPU. The waker is the `TaskId` itself cast to
 the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 
+The system image binds each supervised unit into one retained `Component`
+record: a stable `ComponentId`, its current task incarnation, its CSpace, a
+declared memory owner/budget, and lifecycle state. `ps` and `caps` read that same
+record, so an exited or faulted task keeps both its identity and terminal reason
+after the executor removes it. The allocator does not enforce those declared
+budgets yet; that is roadmap 3.11.
+
 ## A Rust compiler, inside the OS
 
 `rustc hello` compiles a Rust hello world to native RV64 and runs it, without
@@ -127,10 +137,10 @@ leaving the kernel:
 
 ```
 vibe> rustc hello
-  compiled 1 fn -> 328 B of RV64 + 14 B of data in 5559 us
+  compiled 1 fn -> 460 B of RV64 + 14 B of data in N us
   --- running natively ---
 Hello, world!
-  --- exited with 0 in 228 us ---
+  --- exited with 0 in N us ---
 ```
 
 `rustc demo` builds something with more in it — recursion, `while`, `%`,
@@ -138,7 +148,7 @@ short-circuit `&&`, `if` as an expression:
 
 ```
 vibe> rustc demo
-  compiled 3 fn -> 3528 B of RV64 + 70 B of data in 4533 us
+  compiled 3 fn -> N B of RV64 + N B of data in N us
   --- running natively ---
 Hello, world!
 fib(0) = 0  fib(1) = 1  fib(2) = 1  ...  fib(9) = 34
@@ -177,28 +187,31 @@ needs spilling across a call. Slots are 16 bytes wide to keep `sp` aligned to
 the RISC-V C ABI at every call boundary.
 
 Codegen runs twice: pass 1 discovers function addresses, pass 2 emits calls to
-them. Instruction *sizes* never depend on addresses — 64-bit constants are always
-materialized in a fixed 11-instruction sequence — so both passes agree on layout
-by construction. Branches are emitted as an inverted conditional over a `jal`,
-giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
+them. Instruction sizes never depend on addresses: compiler-chosen function and
+runtime addresses use the fixed-length `li64` sequence, while ordinary integer
+literals use the shortest stable one- or two-instruction form when possible. Both
+passes therefore agree on layout. Branches are emitted as an inverted conditional
+over a `jal`, giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
 
 Because VibeOS has no MMU and no W^X, "load the program" is `fence.i` followed by
 transmuting the code buffer to a function pointer and calling it.
 
 ### And this is where it earns its place in *this* OS
 
-Generated machine code has no way to reach hardware. Its only exit is a call to
-`rt_print_str`/`rt_print_int`, whose addresses the compiler bakes in and which a
-program cannot name, forge, or substitute. Those hooks resolve the `prog` space's
-console capability **on every call**:
+Generated machine code has no way to reach hardware. Its only output path is a
+call to compiler-chosen runtime hooks whose addresses a program cannot name,
+forge, or substitute. At each program invocation, `rustc::run` resolves the
+`prog` space's console and memory capabilities and holds those resolved objects
+for that invocation. Revocation before the run is enforced; whether revocation
+during a run should invalidate that invocation lease is roadmap 3.16:
 
 ```
 vibe> revoke prog
-  revoked 1 cap(s) in `prog`
+  revoked 2 cap(s) in `prog`
 vibe> rustc hello
-  compiled 1 fn -> 328 B of RV64 + 14 B of data in 589 us
+  compiled 1 fn -> 460 B of RV64 + 14 B of data in N us
   --- running natively ---
-  --- exited with 0 in 165 us ---
+  --- exited with 0 in N us ---
   note: output was suppressed -- `prog` holds no console capability
 ```
 
@@ -222,14 +235,14 @@ property of the code.
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |
 
-~3300 lines total.
+~8,400 Rust lines across `core`, `compiler`, and `kernel` (2026-08-08 snapshot).
 
 ## Shell
 
 ```
-ps              live tasks and how many times each was polled
+ps              component identities, lifecycle, and poll counts
 spaces          capability spaces in the system
-caps <space>    dump a space's capability table
+caps <space>    component owner and capability table
 rustc hello     compile and run a Rust hello world, natively
 rustc demo      compile and run a larger sample (fib, gcd, loops)
 rustc conform   compile and run the language conformance program
@@ -293,8 +306,9 @@ Deliberate, not overlooked:
   functions over `i64`, `bool` and fixed-size arrays.
 - **Array indices are `i64`, not `usize`.** There is no `as`, so a corpus program
   valid in both languages keeps counters separate from values.
-- **Kernel components have no heap quota.** Compiled programs are bounded by
-  their region capability; components share the global allocator.
+- **Component heap budgets are declared but not enforced.** Compiled programs
+  are bounded by their region capability; kernel components still share the
+  global allocator until allocation ownership lands in roadmap 3.11.
 - **A faulted task is leaked, not freed.** Dropping a future interrupted
   mid-poll would run destructors over state it never finished writing.
 - **A panic with no landing pad is still fatal** — a fault in the boot path or

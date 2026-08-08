@@ -12,6 +12,7 @@ pub mod arch;
 pub mod bench;
 pub mod cap;
 pub mod chan;
+pub mod durable;
 pub mod exec;
 pub mod heap;
 pub mod sync;

@@ -17,6 +17,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   leaks, and the trust model.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
   workstreams, testing strategy, metrics, and the risk register.
+- **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
+  ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
@@ -280,6 +282,7 @@ rustc conform   compile and run the language conformance program
 rustc lease     revoke during a run, then retry without new grants
 selftest        run the in-kernel test suite
 bench           emit the versioned machine-readable benchmark suite
+durable         recover a sealed capability log and tombstone
 rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
@@ -348,4 +351,6 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **No persistence, no MMU, no user mode, no multicore.** In that order.
+- **No durable media yet, no MMU, no user mode, no multicore.** The M4.0
+  authority format and recovery proof are complete, but virtio-blk and live
+  CSpace persistence start at M4.1.

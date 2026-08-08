@@ -18,7 +18,7 @@ extern crate alloc;
 // The portable half of the kernel lives in `vibeos-core` so it can be tested on
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
-pub use vibeos_core::{cap, chan, exec, heap, sync};
+pub use vibeos_core::{cap, chan, durable, exec, heap, sync};
 
 mod bench;
 mod dev;

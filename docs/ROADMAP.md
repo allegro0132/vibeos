@@ -6,8 +6,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16 are complete. M4.0 durable-authority specification is
-> next. Run `scripts/status.sh` for the live host-test and corpus inventory; the
+> sequence through 3.16 and M4.0 are complete. M4.1 virtio-blk is next. Run
+> `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
 
@@ -382,12 +382,27 @@ claim otherwise.
 
 | # | Work item | Notes |
 |---|---|---|
-| 4.0 | Specify the durable-capability format and crash model | Stable object IDs, derivation IDs, generations, atomic grant/revoke records, and tombstones. Prove by recovery tests that power loss at each write boundary cannot amplify authority. |
+| 4.0 ✅ | Specify the durable-capability format and crash model | Stable object/derivation/space/transaction IDs, fixed sealed records, prepare/commit grants, tombstone-first revoke, high-water allocation, and fail-closed recovery. Host tests enumerate every sector-prefix and flush boundary. |
 | 4.1 | virtio-blk driver as a supervised component | An async task holding an MMIO capability and a DMA memory region, with bounded queues, timeout/cancel behavior, and restart policy. The first driver that is not built into the kernel. |
 | 4.2 | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
 | 4.3 | Persist a CSpace | Save and restore a component's authority across boot from durable derivation records; a revoked ancestor's tombstone wins over every descendant record. |
 | 4.4 | virtio-net + a typed socket endpoint | `Endpoint<Packet>`, not a byte stream. |
 | 4.5 | Source and binary persistence | `rustc save hello` / `run hello`. Compiled code becomes a storable object with a cap on it. |
+
+4.0 fixes the authority-store ABI before a device can make accidental bytes durable.
+The append-only v1 log uses canonical 512-byte little-endian records, CRC32C, a
+non-zero final seal, and a strict previous-sequence/CRC chain. Stable typed IDs are
+reserved by a flushed exclusive high-water mark before use. Grants publish only
+after a matching prepare and commit have each been flushed; revocation writes and
+flushes its tombstone before killing live state. Recovery revalidates exact external
+root policy, parent `GRANT`, rights attenuation, object/type identity, transaction
+binding, and slot-generation reuse, then applies ancestor tombstones in a final pass.
+All 0..512 prefix cuts of every record and every grant/revoke/high-water protocol
+boundary recover either the old state or the exact requested subset. The proof is
+explicitly limited to the documented single-writer, prefix-torn-write, ordered-flush
+media contract; CRC is not authentication or rollback resistance. See
+[DURABLE_FORMAT.md](DURABLE_FORMAT.md). The `durable` shell demo runs the same pure
+recovery verifier, while real media remains M4.1.
 
 **Acceptance:** write a program at the shell, save it, reboot, run it — and its
 authority after reboot is exactly what was persisted, with revoked caps staying dead.

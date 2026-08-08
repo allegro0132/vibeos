@@ -66,6 +66,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  rustc edit      type your own program; end it with a lone `.`");
             println!("  chan            telemetry channel depth and totals");
             println!("  bench           emit the versioned machine-readable benchmark suite");
+            println!("  durable         recover a sealed capability log and tombstone");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -321,6 +322,8 @@ async fn run(line: &str, boot_time: u64) {
 
         "bench" => crate::bench::run().await,
 
+        "durable" => durable_demo(),
+
         "selftest" => {
             let r = crate::selftest::run().await;
             // CI greps for this line, so keep the wording stable.
@@ -546,4 +549,80 @@ fn report(what: &str, outcome: Result<(), CapError>) {
         Ok(()) => println!("  ALLOWED  {}   <-- this is a bug", what),
         Err(e) => println!("  REFUSED  {}\n           reason: {}", what, e),
     }
+}
+
+fn durable_demo() {
+    use crate::durable::{
+        recover, DecodeStatus, DerivationId, DurableRights, GrantFlags, GrantRecord,
+        LogRecord, ObjectId, RecordBody, RecordChain, RecoveryPolicy, ResourceKind,
+        RootPolicy, SlotIdentity, SpaceId, StoreId, TransactionId,
+    };
+
+    let store = StoreId::new(1).unwrap();
+    let root = GrantRecord {
+        derivation_id: DerivationId::new(10).unwrap(),
+        parent_id: None,
+        object_id: ObjectId::new(11).unwrap(),
+        target: SlotIdentity {
+            space: SpaceId::new(12).unwrap(),
+            slot: 0,
+            generation: 0,
+        },
+        rights: DurableRights::READ.union(DurableRights::GRANT),
+        resource_kind: ResourceKind::new(1).unwrap(),
+        flags: GrantFlags::ROOT,
+    };
+    let transaction = TransactionId::new(20).unwrap();
+    let mut chain = RecordChain::new(store);
+    let mut sectors = Vec::new();
+    sectors.push(chain.append(None, RecordBody::Format).unwrap());
+    sectors.push(
+        chain
+            .append(None, RecordBody::IdHighWater { exclusive_end: 100 })
+            .unwrap(),
+    );
+    let prepare = chain
+        .append(Some(transaction), RecordBody::GrantPrepare(root.clone()))
+        .unwrap();
+    let DecodeStatus::Valid(decoded) = LogRecord::decode(&prepare).unwrap() else {
+        unreachable!()
+    };
+    sectors.push(prepare);
+    sectors.push(
+        chain
+            .append(
+                Some(transaction),
+                RecordBody::GrantCommit {
+                    prepare_sequence: decoded.record.sequence,
+                    prepare_crc32c: decoded.crc32c,
+                    derivation_id: root.derivation_id,
+                },
+            )
+            .unwrap(),
+    );
+    let roots = [RootPolicy { grant: root.clone() }];
+    let before = recover(&sectors, RecoveryPolicy { store_id: store, roots: &roots }).unwrap();
+
+    sectors.push(
+        chain
+            .append(
+                Some(TransactionId::new(21).unwrap()),
+                RecordBody::RevokeTombstone { derivation_id: root.derivation_id },
+            )
+            .unwrap(),
+    );
+    let after = recover(&sectors, RecoveryPolicy { store_id: store, roots: &roots }).unwrap();
+
+    println!("  durable-cap v1: 512-byte LE records, CRC32C + sealed chain");
+    println!(
+        "  committed grant: {} live root at sequence {}",
+        before.grants.len(), before.last_sequence
+    );
+    println!(
+        "  tombstone recovery: {} live grants, {} retained tombstone at sequence {}",
+        after.grants.len(),
+        after.tombstones.len(),
+        after.last_sequence
+    );
+    println!("  authority result: stable IDs only; no path or object pointer was persisted");
 }

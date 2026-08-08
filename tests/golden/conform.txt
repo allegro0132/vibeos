@@ -2,16 +2,17 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> rustc conform
-  compiled 6 fn -> 16408 B of RV64 + 121 B of data in N us
+  compiled 6 fn -> 16616 B of RV64 + 128 B of data in N us
   --- running natively ---
 arith 10 4 21 2 1
 prec 14 20
 neg -5 -5
-cmp 1 0 1 0 1 1
-ne 1 0
+cmp true false true false true true
+ne true false
 bitnot -1 -6
-and 1 0 0
-or 0 1 1
+and true false false
+or false true true
+boolop false false
 call 42 3628800
 branch 0 1 2 3
 loop 101 5050

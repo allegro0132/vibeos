@@ -16,6 +16,9 @@ pub enum Tok {
     While,
     Return,
     I64,
+    Bool,
+    True,
+    False,
     Ident(String),
     Int(i64),
     Str(String),
@@ -83,6 +86,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 "while" => Tok::While,
                 "return" => Tok::Return,
                 "i64" => Tok::I64,
+                "bool" => Tok::Bool,
+                "true" => Tok::True,
+                "false" => Tok::False,
                 _ => Tok::Ident(word.to_string()),
             };
             out.push(Token { tok, line });

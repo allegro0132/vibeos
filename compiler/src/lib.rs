@@ -16,6 +16,7 @@ pub mod ast;
 pub mod codegen;
 pub mod lex;
 pub mod parse;
+pub mod types;
 
 pub mod samples;
 
@@ -36,6 +37,8 @@ pub struct Image {
 pub struct Runtime {
     pub print_str: u64,
     pub print_int: u64,
+    /// Prints `true`/`false`, as Rust's `Display for bool` does.
+    pub print_bool: u64,
     /// Called with an abort reason when an emitted safety check fails. Must not
     /// return; the kernel implements it as a longjmp out of the program.
     pub abort: u64,
@@ -53,6 +56,8 @@ pub fn compile_at(
 ) -> Result<Image, String> {
     let toks = lex::lex(src)?;
     let prog = parse::Parser::new(toks).program()?;
+    // Validates, and annotates what code generation needs.
+    let prog = types::check(&prog)?;
 
     let literals = codegen::collect_strings(&prog, "\n");
     let mut data = Vec::new();
@@ -65,6 +70,7 @@ pub fn compile_at(
     let rt = codegen::Runtime {
         print_str: rt.print_str,
         print_int: rt.print_int,
+        print_bool: rt.print_bool,
         abort: rt.abort,
     };
     let code = codegen::compile(&prog, code_base, str_addr, &rt)?;
@@ -76,6 +82,6 @@ pub fn compile_at(
 /// Sound because instruction sizes never depend on addresses — see
 /// `codegen::li64`, which is deliberately a fixed 11 instructions.
 pub fn code_len(src: &str) -> Result<usize, String> {
-    let rt = Runtime { print_str: 0, print_int: 0, abort: 0 };
+    let rt = Runtime { print_str: 0, print_int: 0, print_bool: 0, abort: 0 };
     Ok(compile_at(src, 0, 0, &rt)?.code.len())
 }

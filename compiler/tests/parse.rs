@@ -32,12 +32,16 @@ fn block(b: &Block) -> String {
 
 fn stmt(s: &Stmt) -> String {
     match s {
-        Stmt::Let { name, mutable, init } => {
-            format!("(let{} {} {})", if *mutable { "-mut" } else { "" }, name, expr(init))
-        }
+        Stmt::Let { name, mutable, init, declared, .. } => format!(
+            "(let{}{} {} {})",
+            if *mutable { "-mut" } else { "" },
+            declared.map(|t| format!(":{t}")).unwrap_or_default(),
+            name,
+            expr(init)
+        ),
         Stmt::Assign { name, value, .. } => format!("(= {} {})", name, expr(value)),
         Stmt::Expr(e) => format!("(expr {})", expr(e)),
-        Stmt::While(c, b) => format!("(while {} {})", expr(c), block(b)),
+        Stmt::While(c, b, _) => format!("(while {} {})", expr(c), block(b)),
         Stmt::Return(Some(e)) => format!("(return {})", expr(e)),
         Stmt::Return(None) => "(return)".into(),
         Stmt::Print { parts, newline } => {
@@ -45,7 +49,7 @@ fn stmt(s: &Stmt) -> String {
                 .iter()
                 .map(|p| match p {
                     PrintPart::Str(s) => format!("{s:?}"),
-                    PrintPart::Val(e) => expr(e),
+                    PrintPart::Val(e, _) => expr(e),
                 })
                 .collect();
             format!("({} {})", if *newline { "println" } else { "print" }, ps.join(" "))
@@ -56,16 +60,18 @@ fn stmt(s: &Stmt) -> String {
 fn expr(e: &Expr) -> String {
     match e {
         Expr::Int(v) => v.to_string(),
+        Expr::Bool(v) => v.to_string(),
+        Expr::BitNot(a) => format!("(bitnot {})", expr(a)),
         Expr::Var(n, _) => n.clone(),
         Expr::Neg(a) => format!("(neg {})", expr(a)),
         Expr::Not(a) => format!("(not {})", expr(a)),
-        Expr::Bin(op, a, b) => format!("({:?} {} {})", op, expr(a), expr(b)),
+        Expr::Bin(op, a, b, _) => format!("({:?} {} {})", op, expr(a), expr(b)),
         Expr::Call(n, args, _) => {
             let a: Vec<String> = args.iter().map(expr).collect();
             format!("(call {} {})", n, a.join(" ")).replace(" )", ")")
         }
-        Expr::If(c, t, None) => format!("(if {} {})", expr(c), block(t)),
-        Expr::If(c, t, Some(e)) => format!("(if {} {} {})", expr(c), block(t), block(e)),
+        Expr::If(c, t, None, _) => format!("(if {} {})", expr(c), block(t)),
+        Expr::If(c, t, Some(e), _) => format!("(if {} {} {})", expr(c), block(t), block(e)),
     }
 }
 
@@ -136,10 +142,11 @@ fn calls_parse_with_trailing_commas_and_no_args() {
 }
 
 #[test]
-fn function_signatures_accept_and_ignore_the_return_type() {
+fn function_signatures_record_parameter_and_return_types() {
     let p = parse("fn f(a: i64, b: i64) -> i64 { a } fn main() {}").unwrap();
     let f = &p.funcs[0];
-    assert_eq!(f.params, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(f.params, vec![("a".to_string(), Ty::I64), ("b".to_string(), Ty::I64)]);
+    assert_eq!(f.ret, Ty::I64);
 }
 
 // --- format strings ---
@@ -180,7 +187,7 @@ fn duplicate_and_arity_problems_name_the_line() {
 fn unsupported_syntax_says_what_is_supported() {
     assert_eq!(
         err("fn main() { let x: u8 = 1; }"),
-        "line 1: the only type in this subset is `i64`, found `u8`"
+        "line 1: expected a type (`i64` or `bool`), found `u8`"
     );
     assert_eq!(err(r#"fn main() { format!("x"); }"#), "line 1: unsupported macro `format!`");
     assert_eq!(

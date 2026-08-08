@@ -127,6 +127,7 @@ pub struct Codegen {
     str_addr: BTreeMap<String, u64>,
     rt_print_str: u64,
     rt_print_int: u64,
+    rt_print_bool: u64,
     rt_abort: u64,
     scope: Vec<Scope>,
     next_slot: u32,
@@ -140,6 +141,7 @@ pub struct Codegen {
 pub struct Runtime {
     pub print_str: u64,
     pub print_int: u64,
+    pub print_bool: u64,
     pub abort: u64,
 }
 
@@ -249,9 +251,9 @@ fn is_leaf(block: &Block) -> bool {
     fn expr_leaf(e: &Expr) -> bool {
         match e {
             Expr::Call(..) => false,
-            Expr::Neg(a) | Expr::Not(a) => expr_leaf(a),
-            Expr::Bin(_, a, b) => expr_leaf(a) && expr_leaf(b),
-            Expr::If(c, t, e) => {
+            Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => expr_leaf(a),
+            Expr::Bin(_, a, b, _) => expr_leaf(a) && expr_leaf(b),
+            Expr::If(c, t, e, _) => {
                 expr_leaf(c) && is_leaf(t) && e.as_ref().map_or(true, is_leaf)
             }
             _ => true,
@@ -273,10 +275,10 @@ fn is_leaf(block: &Block) -> bool {
 fn count_lets(block: &Block) -> u32 {
     fn expr_lets(e: &Expr) -> u32 {
         match e {
-            Expr::Neg(a) | Expr::Not(a) => expr_lets(a),
-            Expr::Bin(_, a, b) => expr_lets(a) + expr_lets(b),
+            Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => expr_lets(a),
+            Expr::Bin(_, a, b, _) => expr_lets(a) + expr_lets(b),
             Expr::Call(_, args, _) => args.iter().map(expr_lets).sum(),
-            Expr::If(c, t, e) => {
+            Expr::If(c, t, e, _) => {
                 expr_lets(c) + count_lets(t) + e.as_ref().map_or(0, count_lets)
             }
             _ => 0,
@@ -288,13 +290,13 @@ fn count_lets(block: &Block) -> u32 {
             Stmt::Let { init, .. } => 1 + expr_lets(init),
             Stmt::Assign { value, .. } => expr_lets(value),
             Stmt::Expr(e) => expr_lets(e),
-            Stmt::While(c, b) => expr_lets(c) + count_lets(b),
+            Stmt::While(c, b, _) => expr_lets(c) + count_lets(b),
             Stmt::Return(Some(e)) => expr_lets(e),
             Stmt::Return(None) => 0,
             Stmt::Print { parts, .. } => parts
                 .iter()
                 .map(|p| match p {
-                    PrintPart::Val(e) => expr_lets(e),
+                    PrintPart::Val(e, _) => expr_lets(e),
                     PrintPart::Str(_) => 0,
                 })
                 .sum(),
@@ -314,7 +316,7 @@ pub fn collect_strings(prog: &Program, newline_marker: &str) -> Vec<String> {
     fn walk(block: &Block, out: &mut Vec<String>, add: &mut impl FnMut(&str, &mut Vec<String>)) {
         for st in &block.stmts {
             match st {
-                Stmt::While(_, b) => walk(b, out, add),
+                Stmt::While(_, b, _) => walk(b, out, add),
                 Stmt::Print { parts, .. } => {
                     for p in parts {
                         if let PrintPart::Str(s) = p {
@@ -338,12 +340,12 @@ pub fn collect_strings(prog: &Program, newline_marker: &str) -> Vec<String> {
             Stmt::Let { init, .. } => alloc::vec![init],
             Stmt::Assign { value, .. } => alloc::vec![value],
             Stmt::Expr(e) => alloc::vec![e],
-            Stmt::While(c, _) => alloc::vec![c],
+            Stmt::While(c, _, _) => alloc::vec![c],
             Stmt::Return(Some(e)) => alloc::vec![e],
             Stmt::Print { parts, .. } => parts
                 .iter()
                 .filter_map(|p| match p {
-                    PrintPart::Val(e) => Some(e),
+                    PrintPart::Val(e, _) => Some(e),
                     PrintPart::Str(_) => None,
                 })
                 .collect(),
@@ -352,13 +354,13 @@ pub fn collect_strings(prog: &Program, newline_marker: &str) -> Vec<String> {
     }
     fn walk_expr(e: &Expr, out: &mut Vec<String>, add: &mut impl FnMut(&str, &mut Vec<String>)) {
         match e {
-            Expr::Neg(a) | Expr::Not(a) => walk_expr(a, out, add),
-            Expr::Bin(_, a, b) => {
+            Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => walk_expr(a, out, add),
+            Expr::Bin(_, a, b, _) => {
                 walk_expr(a, out, add);
                 walk_expr(b, out, add);
             }
             Expr::Call(_, args, _) => args.iter().for_each(|a| walk_expr(a, out, add)),
-            Expr::If(c, t, els) => {
+            Expr::If(c, t, els, _) => {
                 walk_expr(c, out, add);
                 walk(t, out, add);
                 if let Some(e) = els {
@@ -384,14 +386,10 @@ pub fn compile(
     str_addr: BTreeMap<String, u64>,
     rt: &Runtime,
 ) -> CResult<Vec<u32>> {
+    // Names, arities and types were already validated by `types::check`.
     let mut fn_arity = BTreeMap::new();
     for f in &prog.funcs {
-        if fn_arity.insert(f.name.clone(), f.params.len()).is_some() {
-            return Err(format!("line {}: function `{}` is defined twice", f.line, f.name));
-        }
-    }
-    if fn_arity["main"] != 0 {
-        return Err("`main` must take no arguments".to_string());
+        fn_arity.insert(f.name.clone(), f.params.len());
     }
 
     let mut addrs = BTreeMap::new();
@@ -405,6 +403,7 @@ pub fn compile(
             str_addr: str_addr.clone(),
             rt_print_str: rt.print_str,
             rt_print_int: rt.print_int,
+            rt_print_bool: rt.print_bool,
             rt_abort: rt.abort,
             scope: Vec::new(),
             next_slot: 0,
@@ -464,7 +463,7 @@ impl Codegen {
         self.emit(addi(S0, SP, 0));
 
         // Spill incoming arguments into their frame slots.
-        for (n, p) in f.params.iter().enumerate() {
+        for (n, (p, _)) in f.params.iter().enumerate() {
             if n >= 8 {
                 return Err(format!("line {}: at most 8 parameters are supported", f.line));
             }
@@ -536,7 +535,7 @@ impl Codegen {
                 self.expr(e)?;
                 self.pop(T0); // discard
             }
-            Stmt::While(cond, body) => {
+            Stmt::While(cond, body, _) => {
                 let top = self.here();
                 // Charge each iteration, so `while true {}` terminates.
                 self.emit(addi(S2, S2, -1));
@@ -564,10 +563,14 @@ impl Codegen {
                 for p in parts {
                     match p {
                         PrintPart::Str(s) => self.call_print_str(s)?,
-                        PrintPart::Val(e) => {
+                        PrintPart::Val(e, ty) => {
                             self.expr(e)?;
                             self.pop(A0);
-                            let f = self.rt_print_int;
+                            // `bool` renders as true/false, matching Rust.
+                            let f = match ty {
+                                Ty::Bool => self.rt_print_bool,
+                                _ => self.rt_print_int,
+                            };
                             self.call_abs(f);
                         }
                     }
@@ -599,6 +602,10 @@ impl Codegen {
                 self.li64(T0, *v as u64);
                 self.push(T0);
             }
+            Expr::Bool(v) => {
+                self.emit(addi(T0, ZERO, i32::from(*v)));
+                self.push(T0);
+            }
             Expr::Var(name, line) => {
                 let Some(v) = self.lookup(name) else {
                     return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
@@ -618,17 +625,22 @@ impl Codegen {
                 self.emit(r(0x20, T0, ZERO, 0, T0, 0x33)); // sub t0, zero, t0
                 self.push(T0);
             }
+            // `!` on a bool. Values are already 0 or 1, so this is exact.
             Expr::Not(a) => {
                 self.expr(a)?;
                 self.pop(T0);
-                // Rust's `!` on an integer is bitwise complement, not logical
-                // negation. Matching it is what lets a program in this subset be
-                // compiled by real rustc as a differential oracle.
+                self.emit(i(1, T0, 3, T0, 0x13)); // sltiu t0, t0, 1
+                self.push(T0);
+            }
+            // `!` on an integer is bitwise complement, as in Rust.
+            Expr::BitNot(a) => {
+                self.expr(a)?;
+                self.pop(T0);
                 self.emit(i(-1, T0, 4, T0, 0x13)); // xori t0, t0, -1
                 self.push(T0);
             }
-            Expr::Bin(BinOp::And, a, b) | Expr::Bin(BinOp::Or, a, b) => {
-                let is_and = matches!(e, Expr::Bin(BinOp::And, _, _));
+            Expr::Bin(BinOp::And, a, b, _) | Expr::Bin(BinOp::Or, a, b, _) => {
+                let is_and = matches!(e, Expr::Bin(BinOp::And, ..));
                 self.expr(a)?;
                 let short = self.short_circuit(is_and);
                 self.expr(b)?;
@@ -641,7 +653,7 @@ impl Codegen {
                 self.push(T0);
                 self.patch_to_here(end);
             }
-            Expr::Bin(op, a, bb) => {
+            Expr::Bin(op, a, bb, _) => {
                 if matches!(op, BinOp::Div | BinOp::Rem) {
                     if let Expr::Int(0) = **bb {
                         return Err(format!(
@@ -683,7 +695,7 @@ impl Codegen {
                 self.call_abs(addr);
                 self.push(A0);
             }
-            Expr::If(cond, then, els) => {
+            Expr::If(cond, then, els, _) => {
                 self.expr(cond)?;
                 let to_else = self.jump_if_false();
                 self.block(then)?;

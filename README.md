@@ -150,7 +150,10 @@ gcd(1071, 462) = 21
 
 ### The subset
 
-`fn` with `i64` parameters and return type, `let` / `let mut`, assignment,
+Types are `i64`, `bool`, and `()`, checked by a real type pass — conditions must
+be `bool`, so `if 1` is the error it is in Rust.
+
+`fn` with typed parameters and return type, `let` / `let mut`, assignment,
 `if`/`else` **as an expression**, `else if` chains, `while`, `return`, block tail
 expressions, recursion, `+ - * / %`, `== != < <= > >=`, short-circuiting
 `&& ||`, unary `-` and `!`, and `print!`/`println!` with `{}` holes. Line

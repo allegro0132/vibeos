@@ -169,7 +169,7 @@ storage is exactly where confinement gets hard, which is why this comes after M2
 |---|---|---|
 | 3.1 | `MemoryRegion` resource | A bounded arena obtained *by capability*, with `READ`/`WRITE` rights. A program gets memory the same way it gets a console. |
 | 3.2 | Arrays with bounds checks | Emitted checks, abort on breach via the M2 trampoline. Bounds checking is what keeps 3.1 from reopening the pointer-forgery hole. |
-| 3.3 | `bool`, unit, and a real type checker | Currently `i64` is load-bearing for everything, including conditions. A separate type pass replaces the ad-hoc checks scattered through codegen. |
+| 3.3 ✅ | `bool`, unit, and a real type checker | A separate pass that validates *and* annotates: `!` is rewritten to bitwise or logical by operand type, and printed values are tagged so a `bool` renders as `true`/`false`. The point was less catching user mistakes than making the subset a genuine subset — v0.1 accepted `if 1`, which Rust rejects, and every such disagreement was a hole in the differential oracle. |
 | 3.4 | Structs and `&`/`&mut` with move semantics | Affine values, not a full borrow checker. Enough to write a program with state. |
 | 3.5 | An SSA IR | Between AST and codegen. Required before any optimization is worth attempting, and it gives the emitter audit (2.7) a narrower surface. |
 | 3.6 | Linear-scan register allocation | Retire the stack machine. Target: within 3× of `rustc -O0` on the benchmark corpus. |

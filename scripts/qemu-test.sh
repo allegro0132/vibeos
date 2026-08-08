@@ -7,7 +7,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-KERNEL=target/riscv64gc-unknown-none-elf/release/vibeos-kernel
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
 UPDATE=0
 FILTER=""
 for arg in "$@"; do

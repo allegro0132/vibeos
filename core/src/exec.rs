@@ -673,6 +673,165 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     cancelled: 0,
 });
 
+/// Validate the single-hart ownership projection while `SCHED` is locked.
+///
+/// This intentionally allocates nothing: wake can call it from IRQ context,
+/// and debug checking must not invalidate the ready queue's allocation-free
+/// contract.  Lifecycle commits whose future has already been detached do not
+/// appear in `Sched`; retained `TaskStatus` is their sole owner until publish.
+#[cfg(debug_assertions)]
+fn assert_sched_invariants(s: &Sched) {
+    let live = s.tasks.len() + usize::from(s.running.is_some());
+    debug_assert!(
+        s.ready.capacity() >= live,
+        "ready capacity {} is below the live-task bound {live}",
+        s.ready.capacity()
+    );
+    debug_assert!(
+        s.running.is_some() || !s.running_woken,
+        "running_woken is set without a running task"
+    );
+
+    for (index, id) in s.ready.iter().enumerate() {
+        debug_assert!(
+            s.tasks.contains_key(id),
+            "ready task {id} is absent from the task map"
+        );
+        debug_assert!(
+            !s.ready.iter().skip(index + 1).any(|later| later == id),
+            "ready task {id} is queued more than once"
+        );
+    }
+
+    for (id, task) in &s.tasks {
+        let raw = task.status.raw_state();
+        debug_assert!(
+            raw == TaskState::Running as u8 || raw == CANCEL_REQUESTED,
+            "mapped task {id} has detached lifecycle phase {raw}"
+        );
+        if raw == CANCEL_REQUESTED {
+            debug_assert!(
+                s.ready.contains(id),
+                "cancel-requested mapped task {id} is not queued for its boundary"
+            );
+        }
+        if let Some((running_id, _, _, running_status)) = &s.running {
+            debug_assert_ne!(id, running_id, "task {id} is mapped and running");
+            debug_assert!(
+                !Arc::ptr_eq(&task.status, running_status),
+                "two scheduler locations share one task status"
+            );
+        }
+    }
+
+    if let Some((id, _, _, status)) = &s.running {
+        debug_assert!(
+            !s.ready.contains(id),
+            "running task {id} also has a ready entry"
+        );
+        debug_assert!(
+            !s.tasks.contains_key(id),
+            "running task {id} also remains in the task map"
+        );
+        let raw = status.raw_state();
+        debug_assert!(
+            raw == TaskState::Running as u8 || raw == CANCEL_REQUESTED,
+            "running task {id} has invalid lifecycle phase {raw}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+fn assert_status_detached(s: &Sched, status: &TaskStatus) {
+    debug_assert!(
+        !s.tasks
+            .values()
+            .any(|task| core::ptr::eq(task.status.as_ref(), status)),
+        "a committed/published status still owns a mapped future"
+    );
+    debug_assert!(
+        !s.running
+            .as_ref()
+            .is_some_and(|(_, _, _, running)| core::ptr::eq(running.as_ref(), status)),
+        "a committed/published status still owns the running future"
+    );
+}
+
+#[cfg(debug_assertions)]
+fn assert_arena_detached(s: &Sched, domain: AllocationDomain) {
+    debug_assert!(domain.arena.is_tracked());
+    debug_assert!(
+        s.tasks.values().all(|task| task.domain != domain),
+        "fault teardown left an arena sibling in the task map"
+    );
+    debug_assert!(
+        !s.running
+            .as_ref()
+            .is_some_and(|(_, running_domain, _, _)| *running_domain == domain),
+        "fault teardown left its arena in the running slot"
+    );
+}
+
+#[cfg(debug_assertions)]
+fn assert_active_poll(id: TaskId, domain: AllocationDomain, status: &Arc<TaskStatus>) {
+    debug_assert_eq!(
+        heap::current_domain(),
+        domain,
+        "poll is executing under the wrong allocation domain"
+    );
+    {
+        let current = CURRENT_TASK_STATUS.lock();
+        debug_assert!(
+            current
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, status)),
+            "poll status is not installed as the active task"
+        );
+    }
+    let s = SCHED.lock();
+    assert_sched_invariants(&s);
+    debug_assert!(
+        s.running
+            .as_ref()
+            .is_some_and(|(running_id, running_domain, _, running_status)| {
+                *running_id == id
+                    && *running_domain == domain
+                    && Arc::ptr_eq(running_status, status)
+            }),
+        "active poll does not match the scheduler running slot"
+    );
+}
+
+// In release builds each invocation, including its argument expressions,
+// disappears at cfg expansion time.
+macro_rules! check_sched {
+    ($sched:expr) => {
+        #[cfg(debug_assertions)]
+        assert_sched_invariants($sched)
+    };
+}
+
+macro_rules! check_status_detached {
+    ($sched:expr, $status:expr) => {
+        #[cfg(debug_assertions)]
+        assert_status_detached($sched, $status)
+    };
+}
+
+macro_rules! check_arena_detached {
+    ($sched:expr, $domain:expr) => {
+        #[cfg(debug_assertions)]
+        assert_arena_detached($sched, $domain)
+    };
+}
+
+macro_rules! check_active_poll {
+    ($id:expr, $domain:expr, $status:expr) => {
+        #[cfg(debug_assertions)]
+        assert_active_poll($id, $domain, $status)
+    };
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_task_id() -> TaskId {
@@ -784,6 +943,7 @@ fn spawn_tracked_domain(
     }
     s.tasks.insert(id, task);
     s.ready.push_back(id);
+    check_sched!(&s);
     drop(s);
     system.restore();
     TaskHandle { id, domain, status }
@@ -800,6 +960,8 @@ fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskSta
         TaskState::Cancelled => s.cancelled += 1,
         TaskState::Running => unreachable!("a terminal transition returned Running"),
     }
+    check_sched!(&s);
+    check_status_detached!(&s, status);
     Some(claim.state)
 }
 
@@ -898,6 +1060,7 @@ fn teardown_faulted_domain(
     debug_assert!(domain.arena.is_tracked());
     {
         let s = SCHED.lock();
+        check_sched!(&s);
         if let Some((_, running_domain, _, running_status)) = &s.running {
             assert!(
                 primary_task.is_some()
@@ -911,6 +1074,7 @@ fn teardown_faulted_domain(
     let mut victims = Vec::new();
     {
         let s = SCHED.lock();
+        check_sched!(&s);
         victims.reserve(s.tasks.len() + 1);
     }
     victims.push(FaultVictim {
@@ -944,6 +1108,8 @@ fn teardown_faulted_domain(
                 claim,
             });
         }
+        check_sched!(&s);
+        check_arena_detached!(&s, domain);
     }
     system.restore();
 
@@ -1013,7 +1179,9 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
     let mut ready_capacity_exhausted = false;
     let action = {
         let mut s = SCHED.lock();
-        if s.running
+        check_sched!(&s);
+        let action = if s
+            .running
             .as_ref()
             .is_some_and(|(id, _, _, _)| *id == handle.id)
         {
@@ -1050,7 +1218,13 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
                 CancelOutcome::Requested => Action::InvariantViolation,
                 outcome => Action::Return(outcome),
             }
+        };
+        check_sched!(&s);
+        #[cfg(debug_assertions)]
+        if matches!(&action, Action::Reclaim(_, _)) {
+            check_status_detached!(&s, handle.status.as_ref());
         }
+        action
     };
 
     if ready_capacity_exhausted {
@@ -1074,6 +1248,7 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
 pub fn wake(id: TaskId) {
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let mut s = SCHED.lock();
+    check_sched!(&s);
     let mut capacity_exhausted = false;
     if s.running
         .as_ref()
@@ -1087,6 +1262,7 @@ pub fn wake(id: TaskId) {
             s.ready.push_back(id);
         }
     }
+    check_sched!(&s);
     drop(s);
     system.restore();
     if capacity_exhausted {
@@ -1101,6 +1277,7 @@ pub fn task_report() -> Vec<TaskReport> {
     let mut allocation_failed = false;
     {
         let s = SCHED.lock();
+        check_sched!(&s);
         let total = s.tasks.len() + usize::from(s.running.is_some());
         if out.try_reserve(total).is_err() {
             allocation_failed = true;
@@ -1235,6 +1412,7 @@ pub fn poll_once() -> bool {
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let dispatch = {
         let mut s = SCHED.lock();
+        check_sched!(&s);
         let Some(id) = s.ready.pop_front() else {
             return false;
         };
@@ -1242,7 +1420,7 @@ pub fn poll_once() -> bool {
             return true;
         };
         let status = task.status.clone();
-        if status.cancellation_requested() {
+        let dispatch = if status.cancellation_requested() {
             match status.claim_terminal(TaskState::Cancelled) {
                 Some(claim) => Dispatch::Reclaim(task, status, claim),
                 None => Dispatch::Invalid(task),
@@ -1253,7 +1431,13 @@ pub fn poll_once() -> bool {
             Dispatch::Poll(id, task, status)
         } else {
             Dispatch::Invalid(task)
+        };
+        check_sched!(&s);
+        #[cfg(debug_assertions)]
+        if let Dispatch::Reclaim(_, status, _) = &dispatch {
+            check_status_detached!(&s, status.as_ref());
         }
+        dispatch
     };
     system.restore();
 
@@ -1280,6 +1464,7 @@ pub fn poll_once() -> bool {
     // Tracked task domains originate only at the unsafe reclaimable spawn
     // boundary; ordinary safe tasks carry an untracked domain.
     let mut owner_scope = unsafe { heap::enter_domain(task.domain) };
+    check_active_poll!(id, task.domain, &status);
     let faulted = match guard {
         Some(run_guarded) => {
             let fut = task.future.as_mut();
@@ -1306,17 +1491,35 @@ pub fn poll_once() -> bool {
     current_task.restore();
 
     if faulted {
-        let Some(claim) = status.claim_terminal(TaskState::Faulted) else {
+        // Detach and commit under the same IRQ-masking scheduler critical
+        // section. Otherwise a wake interrupt could observe the intermediate
+        // FaultCommitted + running combination that neither the model nor the
+        // public ownership rules permit.
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let claim = {
+            let mut s = SCHED.lock();
+            debug_assert!(s.running.as_ref().is_some_and(
+                |(running_id, running_domain, _, running_status)| {
+                    *running_id == id
+                        && *running_domain == task.domain
+                        && Arc::ptr_eq(running_status, &status)
+                }
+            ));
+            s.running = None;
+            s.running_woken = false;
+            let claim = status.claim_terminal(TaskState::Faulted);
+            check_sched!(&s);
+            check_status_detached!(&s, status.as_ref());
+            claim
+        };
+        system.restore();
+        let Some(claim) = claim else {
             panic!("a faulted running task could not claim its terminal state");
         };
         if task.domain.arena.is_tracked() {
             let domain = task.domain;
             teardown_faulted_domain(domain, Some(task), status, claim);
         } else {
-            let mut s = SCHED.lock();
-            s.running = None;
-            s.running_woken = false;
-            drop(s);
             // Ordinary tasks have no audited escape contract. Clean external
             // registrations, but conservatively leak their future allocation.
             drain_task_registrations(&status);
@@ -1343,6 +1546,7 @@ pub fn poll_once() -> bool {
                 s.ready.push_back(id);
             }
         }
+        check_sched!(&s);
         drop(s);
         system.restore();
         if capacity_exhausted {
@@ -1357,6 +1561,8 @@ pub fn poll_once() -> bool {
         TaskState::Cancelled
     };
     let claim = status.claim_terminal(requested);
+    check_sched!(&s);
+    check_status_detached!(&s, status.as_ref());
     drop(s);
     system.restore();
 

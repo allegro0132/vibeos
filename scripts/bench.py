@@ -23,7 +23,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-KERNEL = ROOT / "target/riscv64gc-unknown-none-elf/release/vibeos-kernel"
+KERNEL = ROOT / "target/riscv64imac-unknown-none-elf/release/vibeos-kernel"
 BASELINE = ROOT / "benchmarks/qemu-tcg-rv64.json"
 TOOLCHAIN_FILE = ROOT / "rust-toolchain.toml"
 SCHEMA = "vibeos.bench"

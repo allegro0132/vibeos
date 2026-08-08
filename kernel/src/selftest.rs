@@ -22,6 +22,7 @@ use core::task::{Context, Poll, Waker};
 use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
+use crate::trampoline::{self, CatchThunk, JmpBuf};
 use crate::world::{world, Space};
 use crate::{exec, heap, println, sbi};
 
@@ -38,6 +39,124 @@ struct Harness {
 struct PanicOnDrop;
 
 struct CountingWake(AtomicUsize);
+
+const CATCH_STATUS: i64 = 0x315;
+const NESTED_CATCHES: usize = 8;
+const NESTED_STATUS_BASE: i64 = 0x380;
+const CATCH_CANARY_LOW: u64 = 0x1357_2468_89ab_cdef;
+const CATCH_CANARY_HIGH: u64 = 0xfedc_ba98_7531_6420;
+
+#[repr(C)]
+struct CatchJump {
+    buf: *mut JmpBuf,
+    status: i64,
+}
+
+struct NestedCatchState {
+    caught: usize,
+    mismatches: usize,
+}
+
+#[repr(C)]
+struct NestedCatch {
+    buf: *mut JmpBuf,
+    level: usize,
+    state: *mut NestedCatchState,
+    low: u64,
+    high: u64,
+}
+
+struct NestedTaskFault {
+    entered: usize,
+    caught: usize,
+    canary_failures: usize,
+}
+
+unsafe extern "C" fn catch_noop(_ctx: *mut ()) {}
+
+unsafe extern "C" fn catch_disable_irqs(_ctx: *mut ()) {
+    let _ = sbi::irq_save();
+}
+
+unsafe extern "C" fn catch_enable_irqs(_ctx: *mut ()) {
+    sbi::enable_interrupts();
+}
+
+unsafe extern "C" fn catch_disable_irqs_and_jump(ctx: *mut ()) {
+    // Safety: catcher_abi supplies this exact context for an active buffer.
+    let jump = unsafe { &*ctx.cast::<CatchJump>() };
+    let _ = sbi::irq_save();
+    unsafe { trampoline::vibe_longjmp(jump.buf, jump.status) }
+}
+
+unsafe extern "C" fn catch_enable_irqs_and_jump(ctx: *mut ()) {
+    // Safety: catcher_abi supplies this exact context for an active buffer.
+    let jump = unsafe { &*ctx.cast::<CatchJump>() };
+    sbi::enable_interrupts();
+    unsafe { trampoline::vibe_longjmp(jump.buf, jump.status) }
+}
+
+fn interrupts_enabled() -> bool {
+    let enabled = sbi::irq_save();
+    sbi::irq_restore(enabled);
+    enabled
+}
+
+fn run_nested_catch(level: usize, state: *mut NestedCatchState) -> i64 {
+    let mut buf = JmpBuf::ZERO;
+    let mut catch = NestedCatch {
+        buf: &mut buf,
+        level,
+        state,
+        low: CATCH_CANARY_LOW,
+        high: CATCH_CANARY_HIGH,
+    };
+    let status = unsafe {
+        trampoline::vibe_catch(
+            &mut buf,
+            nested_catch_thunk,
+            (&mut catch as *mut NestedCatch).cast(),
+        )
+    };
+    if catch.low != CATCH_CANARY_LOW || catch.high != CATCH_CANARY_HIGH {
+        // Safety: every recursive frame receives the same live state pointer.
+        unsafe { (*state).mismatches += 1 };
+    }
+    status
+}
+
+unsafe extern "C" fn nested_catch_thunk(ctx: *mut ()) {
+    // Safety: run_nested_catch keeps this context alive until its catch returns.
+    let catch = unsafe { &mut *ctx.cast::<NestedCatch>() };
+    if catch.level + 1 < NESTED_CATCHES {
+        let child = run_nested_catch(catch.level + 1, catch.state);
+        if child != NESTED_STATUS_BASE + catch.level as i64 + 1 {
+            unsafe { (*catch.state).mismatches += 1 };
+        }
+    }
+    unsafe { (*catch.state).caught += 1 };
+    unsafe { trampoline::vibe_longjmp(catch.buf, NESTED_STATUS_BASE + catch.level as i64) }
+}
+
+fn nested_task_panic(remaining: usize, state: &mut NestedTaskFault) -> bool {
+    let mut canaries = [CATCH_CANARY_LOW, CATCH_CANARY_HIGH];
+    core::hint::black_box(&mut canaries);
+    let mut body = || {
+        state.entered += 1;
+        if remaining == 1 {
+            panic!("deliberate nested catcher fault from the self-test");
+        }
+        if nested_task_panic(remaining - 1, state) {
+            state.caught += 1;
+        }
+    };
+    let faulted = trampoline::guard_task(&mut body);
+    core::hint::black_box(&mut canaries);
+    if canaries != [CATCH_CANARY_LOW, CATCH_CANARY_HIGH] {
+        state.canary_failures += 1;
+    }
+    faulted
+}
 
 impl Wake for CountingWake {
     fn wake(self: Arc<Self>) {
@@ -105,6 +224,7 @@ pub async fn run() -> Report {
     timers(&mut h).await;
     scheduler(&mut h).await;
     cancellation(&mut h).await;
+    catcher_abi(&mut h).await;
     components(&mut h);
     component_restart(&mut h).await;
     channels(&mut h).await;
@@ -415,6 +535,249 @@ async fn cancellation(h: &mut Harness) {
         "fault guard accepts later work after saturation",
         recovery_ran,
     );
+}
+
+/// ROADMAP 3.15. Rust sees a conventional, single-return FFI call even though
+/// a panic or generated-code abort may abandon every frame inside its thunk.
+/// Exercise the actual release ABI on target, including the state LLVM assumes
+/// a C callee preserves.
+fn catcher_abi_sync(h: &mut Harness) {
+    h.eq(
+        "catch buffer has the assembly ABI size",
+        core::mem::size_of::<JmpBuf>(),
+        128,
+    );
+    h.eq(
+        "catch buffer has the assembly ABI alignment",
+        core::mem::align_of::<JmpBuf>(),
+        16,
+    );
+
+    let mut normal_buf = JmpBuf::ZERO;
+    let normal_mismatches = unsafe {
+        trampoline::vibe_catch_abi_probe(&mut normal_buf, catch_noop, core::ptr::null_mut(), 0)
+    };
+    h.eq(
+        "normal catch preserves callee registers, stack, and canaries",
+        normal_mismatches,
+        0,
+    );
+
+    let mut jump_buf = JmpBuf::ZERO;
+    let mut jump = CatchJump {
+        buf: &mut jump_buf,
+        status: CATCH_STATUS,
+    };
+    let jump_mismatches = unsafe {
+        trampoline::vibe_catch_abi_probe(
+            &mut jump_buf,
+            trampoline::vibe_catch_test_jump as CatchThunk,
+            (&mut jump as *mut CatchJump).cast(),
+            CATCH_STATUS,
+        )
+    };
+    h.eq(
+        "longjmp restores callee registers, exact stack, and canaries",
+        jump_mismatches,
+        0,
+    );
+
+    let mut zero_buf = JmpBuf::ZERO;
+    let mut zero_jump = CatchJump {
+        buf: &mut zero_buf,
+        status: 0,
+    };
+    let zero_mismatches = unsafe {
+        trampoline::vibe_catch_abi_probe(
+            &mut zero_buf,
+            trampoline::vibe_catch_test_jump as CatchThunk,
+            (&mut zero_jump as *mut CatchJump).cast(),
+            1,
+        )
+    };
+    h.eq(
+        "a zero longjmp status is normalized to one",
+        zero_mismatches,
+        0,
+    );
+
+    let mut nested = NestedCatchState {
+        caught: 0,
+        mismatches: 0,
+    };
+    let outer_status = run_nested_catch(0, &mut nested);
+    h.eq(
+        "eight nested catchers return the outer status",
+        outer_status,
+        NESTED_STATUS_BASE,
+    );
+    h.eq(
+        "eight nested catchers each take a non-local exit",
+        nested.caught,
+        NESTED_CATCHES,
+    );
+    h.eq(
+        "eight nested catcher frames retain statuses and canaries",
+        nested.mismatches,
+        0,
+    );
+
+    // The executor's guard around this self-test is the first active layer;
+    // these seven make eight total and panic in the deepest one.
+    let mut task_nested = NestedTaskFault {
+        entered: 0,
+        caught: 0,
+        canary_failures: 0,
+    };
+    let outer_faulted = nested_task_panic(7, &mut task_nested);
+    h.check(
+        "an eight-layer task catch faults only the innermost guard",
+        !outer_faulted,
+    );
+    h.eq(
+        "all seven nested task bodies run before the deepest panic",
+        task_nested.entered,
+        7,
+    );
+    h.eq(
+        "exactly one nested task guard observes the panic",
+        task_nested.caught,
+        1,
+    );
+    h.eq(
+        "nested task catch restores every caller stack canary",
+        task_nested.canary_failures,
+        0,
+    );
+    let mut fresh_ran = false;
+    let fresh_faulted = trampoline::guard_task(&mut || fresh_ran = true);
+    h.check(
+        "a fresh task catch runs after an eight-layer fault",
+        !fresh_faulted && fresh_ran,
+    );
+
+    let original_irq = interrupts_enabled();
+    h.check(
+        "catcher ABI tests begin with interrupts enabled",
+        original_irq,
+    );
+    if !original_irq {
+        sbi::enable_interrupts();
+    }
+
+    let mut enabled_normal_buf = JmpBuf::ZERO;
+    let enabled_normal_status = unsafe {
+        trampoline::vibe_catch(
+            &mut enabled_normal_buf,
+            catch_disable_irqs,
+            core::ptr::null_mut(),
+        )
+    };
+    let enabled_after_normal = interrupts_enabled();
+    h.eq(
+        "normal catch returns zero after masking interrupts",
+        enabled_normal_status,
+        0,
+    );
+    h.check(
+        "normal catch restores an enabled IRQ entry state",
+        enabled_after_normal,
+    );
+
+    let mut enabled_jump_buf = JmpBuf::ZERO;
+    let mut enabled_jump = CatchJump {
+        buf: &mut enabled_jump_buf,
+        status: CATCH_STATUS,
+    };
+    let enabled_jump_status = unsafe {
+        trampoline::vibe_catch(
+            &mut enabled_jump_buf,
+            catch_disable_irqs_and_jump,
+            (&mut enabled_jump as *mut CatchJump).cast(),
+        )
+    };
+    let enabled_after_jump = interrupts_enabled();
+    h.eq(
+        "longjmp returns its status after masking interrupts",
+        enabled_jump_status,
+        CATCH_STATUS,
+    );
+    h.check(
+        "longjmp restores an enabled IRQ entry state",
+        enabled_after_jump,
+    );
+
+    let disabled_normal_restore = sbi::irq_save();
+    let mut disabled_normal_buf = JmpBuf::ZERO;
+    let disabled_normal_status = unsafe {
+        trampoline::vibe_catch(
+            &mut disabled_normal_buf,
+            catch_enable_irqs,
+            core::ptr::null_mut(),
+        )
+    };
+    let disabled_after_normal = !interrupts_enabled();
+    let _ = sbi::irq_save();
+    sbi::irq_restore(disabled_normal_restore);
+    h.eq(
+        "normal catch returns zero after enabling interrupts",
+        disabled_normal_status,
+        0,
+    );
+    h.check(
+        "normal catch restores a disabled IRQ entry state",
+        disabled_after_normal,
+    );
+
+    let disabled_jump_restore = sbi::irq_save();
+    let mut disabled_jump_buf = JmpBuf::ZERO;
+    let mut disabled_jump = CatchJump {
+        buf: &mut disabled_jump_buf,
+        status: CATCH_STATUS,
+    };
+    let disabled_jump_status = unsafe {
+        trampoline::vibe_catch(
+            &mut disabled_jump_buf,
+            catch_enable_irqs_and_jump,
+            (&mut disabled_jump as *mut CatchJump).cast(),
+        )
+    };
+    let disabled_after_jump = !interrupts_enabled();
+    let _ = sbi::irq_save();
+    sbi::irq_restore(disabled_jump_restore);
+    h.eq(
+        "longjmp returns its status after enabling interrupts",
+        disabled_jump_status,
+        CATCH_STATUS,
+    );
+    h.check(
+        "longjmp restores a disabled IRQ entry state",
+        disabled_after_jump,
+    );
+
+    // The four quadrants deliberately perturb SIE in both directions. Repair
+    // the exact state observed on entry even if an earlier assertion failed.
+    let _ = sbi::irq_save();
+    sbi::irq_restore(original_irq);
+}
+
+async fn catcher_abi(h: &mut Harness) {
+    // Keep raw jump-buffer pointers out of the async state machine. Every
+    // synchronous catch has completed before this future reaches its await.
+    catcher_abi_sync(h);
+    let timer_entry_irq = interrupts_enabled();
+    if !timer_entry_irq {
+        sbi::enable_interrupts();
+    }
+    let timer_start = sbi::time();
+    exec::sleep_ms(1).await;
+    let timer_ms = (sbi::time() - timer_start) / (exec::TIMEBASE_HZ / 1000);
+    h.check(
+        "timer IRQs remain live after nested non-local exits",
+        timer_ms < 100,
+    );
+    let _ = sbi::irq_save();
+    sbi::irq_restore(timer_entry_irq);
 }
 
 /// ROADMAP 2.8. A component that panics must cost its own task, not the box.

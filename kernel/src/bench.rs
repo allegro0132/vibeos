@@ -68,7 +68,7 @@ fn emit(name: &str, unit: &str, direction: Direction, warmup: usize, values: &mu
 pub async fn run() {
     let heap_start = HEAP.snapshot();
     println!(
-        "VIBE_BENCH_META {{\"schema\":\"vibeos.bench.meta\",\"version\":{},\"clock\":\"riscv.rdtime\",\"timebase_hz\":{},\"target\":\"riscv64gc-unknown-none-elf\",\"profile\":\"release\",\"heap_start_live_bytes\":{}}}",
+        "VIBE_BENCH_META {{\"schema\":\"vibeos.bench.meta\",\"version\":{},\"clock\":\"riscv.rdtime\",\"timebase_hz\":{},\"target\":\"riscv64imac-unknown-none-elf\",\"profile\":\"release\",\"heap_start_live_bytes\":{}}}",
         SCHEMA_VERSION,
         exec::TIMEBASE_HZ,
         heap_start.live_bytes,

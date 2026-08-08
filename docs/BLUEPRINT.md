@@ -3,7 +3,7 @@
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
 **Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 through 3.14 complete. The implementation is about 10,500 lines across
+with 3.8 through 3.15 complete. The implementation is about 10,500 lines across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -209,6 +209,25 @@ map and had the wake dropped, which hung `yield_now` forever. `Sched::running_wo
 now catches that, and it covers the harder case too — an interrupt that lands
 mid-poll for the task being polled.
 
+The single-hart lifecycle has two orthogonal coordinates. Its **phase** is running,
+cancel-requested, terminal-committed, or terminal-published; its **location** is
+ready, parked, the one running slot, detached for reclamation, or gone. The runtime
+and its fixed-point host model enforce these invariants:
+
+- every live future has exactly one owner, and every ready ID occurs once;
+- at most one task occupies the running slot, and only it may carry a deferred wake;
+- cancellation becomes terminal only at a poll/reclaim boundary;
+- fault wins over a pending cancellation, while a committed normal exit resists a
+  late cancellation;
+- publication happens only after Drop or audited raw reclamation, so a supervisor
+  cannot restart against memory still being torn down;
+- a tracked-arena fault detaches every sibling in that arena and no task outside it.
+
+Debug builds check the concrete collections at scheduler mutation boundaries. A
+pure two-task BFS explores the lifecycle state space for both shared and distinct
+arenas, so violations report a deterministic predecessor trace instead of depending
+on host timing.
+
 **Wait queues** give every listener a unique registration token and capture the
 queue epoch when the listener is constructed. Consumers prepare the listener before
 checking their channel/UART predicate; a wake between construction, the check, and
@@ -386,6 +405,16 @@ executor-wide exit, fault, and cancellation totals.
 What is still fatal: a panic with no landing pad armed, which means a fault in
 the kernel's own boot path or inside an interrupt handler.
 
+Rust calls the trampoline through `vibe_catch(buf, thunk, context)`, an ordinary
+single-return FFI function. Assembly performs both the context save and any later
+non-local return internally, restoring `ra`, `sp`, `s0..s11`, and the entry SIE bit
+from each 16-byte-aligned frame. Rust/LLVM therefore never has to reason about a
+callsite returning twice. Nested catch frames are independent; the target self-test
+checks normal and fault returns, register/stack canaries, eight nested frames, and
+interrupt-state restoration. The kernel target is explicitly the integer-only
+`riscv64imac-unknown-none-elf` `lp64` ABI; it does not advertise the `lp64d`
+callee-save contract without an FPU context implementation.
+
 **Observability.** `ps` (poll counts), `caps` (capability tables), `chan` (queue
 depth), `mem` (heap). Poll counts are a genuinely good scheduler metric — they say
 how often a component *needed* the CPU, which threads cannot tell you.
@@ -413,8 +442,8 @@ arena and sealed restart template: restart retains `ComponentId`, memory owner, 
 boot-static `Space`, while installing a new `TaskId`, `ArenaId`, generation, and CSpace
 grants. Slot generations survive CSpace reset, so an old `Cap` cannot alias a fresh
 grant. Sixteen target fault/restart cycles verify bounded heap growth and zero interrupted
-destructors. The remaining M3.5 work is measurement reproducibility and resolved-cap
-lease semantics.
+destructors. Reproducible builds and the single-hart scheduler/panic model are now
+in place; the remaining M3.5 work is resolved-cap lease semantics.
 
 Five boundaries must stay explicit:
 

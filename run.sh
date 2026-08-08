@@ -16,4 +16,4 @@ pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
 exec qemu-system-riscv64 \
   -machine virt -cpu rv64 -smp 1 -m 128M \
   -nographic -bios default \
-  -kernel target/riscv64gc-unknown-none-elf/release/vibeos-kernel
+  -kernel target/riscv64imac-unknown-none-elf/release/vibeos-kernel

@@ -40,10 +40,18 @@ SECTIONS {
     __dma_end = .;
   } > RAM
 
+  /* One fixed kernel stack per logical scheduler hart.  The bank is indexed
+     by the HSM opaque logical id before the secondary enters Rust, so no two
+     physical harts ever share a live stack. */
   . = ALIGN(4K);
   __stack_bottom = .;
-  . += 256K;
-  __stack_top = .;
+  __stacks_bottom = .;
+  __kernel_stack_size = 256K;
+  . += 4 * 256K;
+  __stacks_top = .;
+
+  /* Retain the historical boot-stack top symbol for the cold entry path. */
+  __stack_top = __stack_bottom + 256K;
 
   . = ALIGN(4K);
   __heap_start = .;

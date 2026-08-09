@@ -1,4 +1,5 @@
-//! SiFive PLIC as wired up by the QEMU `virt` machine, hart 0 / S-mode context.
+//! SiFive PLIC as wired up by the QEMU `virt` machine, using the firmware-
+//! selected boot hart's S-mode context.
 //!
 //! IRQ handlers live in a small, fixed-capacity atomic registry. Registration
 //! never allocates. Dispatch takes one bounded sequence snapshot per slot and
@@ -7,13 +8,21 @@
 
 use crate::interrupt::{AtomicIrqHandlerSlot, IrqHandlerPublication};
 use crate::sync::SpinLock;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PLIC_BASE: usize = 0x0c00_0000;
 
 const PRIORITY: usize = PLIC_BASE;
-const ENABLE_S: usize = PLIC_BASE + 0x2080; // hart 0, S-mode
-const THRESHOLD_S: usize = PLIC_BASE + 0x20_1000;
-const CLAIM_S: usize = PLIC_BASE + 0x20_1004;
+const ENABLE_CONTEXTS: usize = PLIC_BASE + 0x2000;
+const ENABLE_CONTEXT_STRIDE: usize = 0x80;
+const CONTEXTS: usize = PLIC_BASE + 0x20_0000;
+const CONTEXT_STRIDE: usize = 0x1000;
+const CLAIM_OFFSET: usize = 4;
+const UNINITIALIZED_CONTEXT: usize = usize::MAX;
+
+// QEMU virt exposes M/S context pairs for each physical hart; VibeOS routes
+// every external interrupt through the dynamically selected boot hart.
+static BOOT_S_CONTEXT: AtomicUsize = AtomicUsize::new(UNINITIALIZED_CONTEXT);
 
 // A PLIC context owns 0x80 bytes of enable words on QEMU `virt`: 32 words,
 // covering source IDs 0..=1023. Source zero is reserved as "no interrupt".
@@ -44,8 +53,13 @@ static HANDLER_WRITER: SpinLock<()> = SpinLock::new(());
 // deliberately absent from claim, dispatch, and completion.
 static ENABLE_LOCK: SpinLock<()> = SpinLock::new(());
 
-/// Reset this S-mode PLIC context to a known, fully masked state.
-pub fn init() {
+/// Reset the boot physical hart's S-mode PLIC context to a fully masked state.
+pub fn init(physical_hart: usize) {
+    let context = physical_hart
+        .checked_mul(2)
+        .and_then(|context| context.checked_add(1))
+        .expect("PLIC S-mode context index overflowed");
+    BOOT_S_CONTEXT.store(context, Ordering::Release);
     let _writer = HANDLER_WRITER.lock();
     for slot in &HANDLERS {
         // Safety: HANDLER_WRITER is the sole registry writer and interrupts
@@ -54,7 +68,7 @@ pub fn init() {
     }
     let _enable = ENABLE_LOCK.lock();
     unsafe {
-        (THRESHOLD_S as *mut u32).write_volatile(0);
+        threshold_reg().write_volatile(0);
         for word in 0..ENABLE_WORDS {
             enable_reg(word).write_volatile(0);
         }
@@ -171,14 +185,35 @@ fn set_enabled(irq: u32, enabled: bool) -> Result<(), RegisterError> {
 
 #[inline]
 unsafe fn enable_reg(word: usize) -> *mut u32 {
-    (ENABLE_S + word * core::mem::size_of::<u32>()) as *mut u32
+    (ENABLE_CONTEXTS + boot_context() * ENABLE_CONTEXT_STRIDE + word * core::mem::size_of::<u32>())
+        as *mut u32
+}
+
+#[inline]
+fn boot_context() -> usize {
+    let context = BOOT_S_CONTEXT.load(Ordering::Acquire);
+    assert_ne!(
+        context, UNINITIALIZED_CONTEXT,
+        "PLIC context used before boot initialization"
+    );
+    context
+}
+
+#[inline]
+unsafe fn threshold_reg() -> *mut u32 {
+    (CONTEXTS + boot_context() * CONTEXT_STRIDE) as *mut u32
+}
+
+#[inline]
+unsafe fn claim_reg() -> *mut u32 {
+    (CONTEXTS + boot_context() * CONTEXT_STRIDE + CLAIM_OFFSET) as *mut u32
 }
 
 pub fn claim() -> Option<u32> {
-    let irq = unsafe { (CLAIM_S as *mut u32).read_volatile() };
+    let irq = unsafe { claim_reg().read_volatile() };
     (irq != 0).then_some(irq)
 }
 
 pub fn complete(irq: u32) {
-    unsafe { (CLAIM_S as *mut u32).write_volatile(irq) };
+    unsafe { claim_reg().write_volatile(irq) };
 }

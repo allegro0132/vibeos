@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, and M5.4 are complete. M5.5 secondary-hart boot is next. Run
+> sequence through 3.16, M4.5, and M5.5 are complete. M6.1 Sv39 paging is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -480,13 +480,13 @@ recovered source/binary object with exactly the fixed persisted authority manife
 | 5.2 ✅ | IPI-based cross-hart wakeups (SBI `sbi_send_ipi`) |
 | 5.3 ✅ | Audit every `SpinLock` for real contention; replace the hot ones with lock-free structures |
 | 5.4 ✅ | Hart-local storage for the scheduler's `running` slot |
-| 5.5 | Boot secondary harts via SBI HSM |
+| 5.5 ✅ | Boot secondary harts via SBI HSM |
 
 **Acceptance:** `-smp 4` with the integration suite green and measurable throughput
 scaling on a parallel benchmark. Loom or a similar model checker on the scheduler.
 
-**Risk:** the `running`/`running_woken` mechanism is single-hart by construction and
-will need rethinking, not porting.
+**Resolved risk:** 5.4 replaced the singleton running state; 5.5 validates those
+slots under simultaneous physical execution.
 
 5.1 makes ready ownership explicit across four logical hart queues. Each enqueue,
 wake, cancel, fault, and dispatch keeps `TaskId -> queue owner` synchronized under
@@ -594,10 +594,33 @@ simultaneous physical execution is deliberately gated to M5.5. The fixed QEMU
 budget remains green (`ipc_roundtrip_ticks` p95 152, `irq_to_poll_ticks` p95 36)
 without widening the committed thresholds.
 
-**M5.5 preflight risk:** a pre-M5.5 `-smp 4` smoke run did not produce the
-shell-ready marker even though `_start` contains a non-boot-hart park branch. M5.1
-does not hide that gap or claim parked-hart evidence; the SBI/QEMU handoff must be
-diagnosed before secondary boot is enabled or `-smp 4` becomes acceptance.
+5.5 implements SBI HSM status/start with its asynchronous contract intact. The boot
+hart reserves mappings while targets remain offline; each secondary selects a
+private 256 KiB stack from its logical opaque value, installs hart-local trap and
+timer state, self-registers, and only then publishes the ready barrier and accepts
+IPIs. OpenSBI may choose any coldboot physical hart, which dynamically becomes
+logical 0 and owns the sole enabled PLIC S-mode context. BSS, heap, World, device,
+and PLIC initialization therefore still execute exactly once. The boot scanner is
+deliberately limited to QEMU `virt`'s dense physical IDs `0..3`; the mapping layer
+itself retains sparse-ID host coverage, while a general platform port needs FDT
+topology enumeration.
+
+Machine-local tasks can opt into non-stealable placement; the UART shell is pinned
+to logical 0 so its acceptance commands have an unambiguous source. `smp queues`
+parks one exact-hart task on each secondary, drains the placement doorbells, and
+wakes all three from the boot hart through real SBI/SSIP delivery. A synchronized
+four-hart scheduler-lock sample must observe nonzero contention; the final full
+suite run recorded 1,688 contended acquisitions out of 2,170. Existing exhaustive
+run-queue, lifecycle, scheduler, and IPI state models remain the similar-model-
+checker acceptance layer.
+
+**M5.5 acceptance:** all 18 integration cases pass with `-smp 4`, including 336
+in-kernel checks, raw disk/network evidence, three-boot persistent CSpace, and
+two-boot program persistence. The equal-work scaling command uses four exact-hart
+workers and a roughly 75 ms serial window; the final run measured 773,610 serial
+ticks versus 275,290 parallel ticks (`2.810x`) against a conservative `1.25x` CI
+floor. Its strict parser has positive and fail-closed fixtures, and both the parser
+and physical scaling run are CI steps.
 
 ---
 

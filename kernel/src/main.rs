@@ -41,6 +41,19 @@ mod world;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+const KERNEL_STACK_SIZE: usize = 256 * 1024;
+const STACK_ABORT_RESERVE: usize = 8192;
+const SECONDARY_START_TIMEOUT_TICKS: u64 = exec::TIMEBASE_HZ * 5;
+const BOOT_HART_BIT: usize = 1;
+
+// Release/acquire publication makes the boot hart's heap, hooks, and mapping
+// reservations visible before a secondary touches shared kernel state.
+static SECONDARY_BOOT_RELEASED: AtomicBool = AtomicBool::new(false);
+// A bit is published only after the hart has a private stack, logical token,
+// local trap vector, and timer. This is the real HSM completion barrier.
+static KERNEL_READY_HARTS: AtomicUsize = AtomicUsize::new(0);
 
 global_asm!(
     r#"
@@ -63,9 +76,9 @@ _start:
     la gp, __global_pointer$
     .option pop
 
-    // Only hart 0 boots; anything else parks.
-    bnez a0, .Lpark
-
+    // OpenSBI chooses the coldboot hart dynamically. Firmware retains every
+    // other hart in HSM STOPPED, so whichever physical id arrives here owns
+    // logical slot 0 and performs the one global initialization pass.
     la sp, __stack_top
 
     // Zero .bss before any Rust runs.
@@ -79,9 +92,37 @@ _start:
 .Ldone:
     j kmain
 
-.Lpark:
+.align 4
+.global _secondary_start
+_secondary_start:
+    csrw sie, zero
+    csrw sip, zero
+    csrw sscratch, zero
+
+    // HSM supplies the physical hartid in a0 and our logical index in a1.
+    // Keep the physical id in tp and select the corresponding private stack
+    // before making any Rust call.
+    mv tp, a0
+
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+
+    beqz a1, .Lsecondary_park
+    li t0, 4
+    bgeu a1, t0, .Lsecondary_park
+    la t0, __stacks_bottom
+    slli t1, a1, 18
+    add sp, t0, t1
+    li t1, 1
+    slli t1, t1, 18
+    add sp, sp, t1
+    j secondary_kmain
+
+.Lsecondary_park:
     wfi
-    j .Lpark
+    j .Lsecondary_park
 "#
 );
 
@@ -89,14 +130,30 @@ extern "C" {
     static __heap_start: u8;
     static __heap_end: u8;
     static __stack_bottom: u8;
+    fn _secondary_start();
 }
 
-/// Lowest address a compiled program's stack may reach. The linker puts the
-/// kernel stack directly above `.bss`, so without this a deep recursion in
-/// generated code would corrupt kernel state instead of faulting.
+/// Lowest address a compiled program's current-hart stack may reach.
+///
+/// The four fixed stacks are contiguous above `.bss`; selecting the logical
+/// slot here keeps generated-code stack probes inside the same private stack
+/// chosen by `_secondary_start`.
 pub fn stack_floor() -> usize {
     // Leave a band so the abort path itself has room to run.
-    core::ptr::addr_of!(__stack_bottom) as usize + 8192
+    let hart =
+        ipi::current_logical_hart().expect("compiled program stack requires a mapped logical hart");
+    core::ptr::addr_of!(__stack_bottom) as usize
+        + hart.index() * KERNEL_STACK_SIZE
+        + STACK_ABORT_RESERVE
+}
+
+/// Harts which have completed the complete VibeOS-local startup handshake.
+pub fn online_hart_mask() -> usize {
+    KERNEL_READY_HARTS.load(Ordering::Acquire)
+}
+
+pub fn online_hart_count() -> usize {
+    online_hart_mask().count_ones() as usize
 }
 
 #[global_allocator]
@@ -112,6 +169,7 @@ const BANNER: &str = r#"
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     let boot_time = sbi::time();
+    let boot_physical_hart = sbi::current_hart_id();
 
     uart::init();
     println!("{}", BANNER);
@@ -128,13 +186,15 @@ pub extern "C" fn kmain() -> ! {
         (he - hs) / 1024
     );
 
-    ipi::mark_online(exec::HartId::BOOT, sbi::current_hart_id())
+    ipi::mark_online(exec::HartId::BOOT, boot_physical_hart)
         .expect("boot physical hart must have one logical scheduler identity");
     // Install the logical identity before any trap-local state can be used.
-    trap::init();
+    trap::init_boot();
+    KERNEL_READY_HARTS.store(BOOT_HART_BIT, Ordering::Release);
     exec::set_ready_notify_hook(ipi::notify_ready);
     println!(
-        "  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled",
+        "  traps     stvec armed, PLIC ctx S/hart{}, IRQ {} enabled",
+        boot_physical_hart,
         uart::UART_IRQ
     );
 
@@ -143,6 +203,9 @@ pub extern "C" fn kmain() -> ! {
     exec::set_fault_guard(trampoline::guard_task);
     exec::set_fault_cleanup(cleanup_faulted_task);
     exec::set_fault_reclaimer(reclaim_faulted_component);
+
+    let online = start_secondary_harts();
+    println!("  smp       {} hart(s) online", online);
 
     world::build();
 
@@ -168,6 +231,113 @@ pub extern "C" fn kmain() -> ! {
     );
     println!("  sched     async executor, no threads, no preemption");
 
+    trap::enable_interrupts();
+    exec::run()
+}
+
+/// Discover the other physical harts, assign dense logical identities, ask
+/// HSM to start them, and wait for their VibeOS-local ready publication.
+fn start_secondary_harts() -> usize {
+    let boot_physical_hart = sbi::current_hart_id();
+    let mut expected = BOOT_HART_BIT;
+    let mut physical_for_logical = [usize::MAX; exec::MAX_HARTS];
+    physical_for_logical[exec::HartId::BOOT.index()] = boot_physical_hart;
+    let mut next_logical_index = 1;
+    for physical_hart in 0..exec::MAX_HARTS {
+        if physical_hart == boot_physical_hart {
+            continue;
+        }
+        match sbi::hart_status(physical_hart) {
+            Ok(sbi::HartState::Stopped) => {
+                let logical = exec::HartId::new(next_logical_index)
+                    .expect("secondary logical hart index is in range");
+                ipi::prepare_start(logical, physical_hart)
+                    .expect("secondary logical-to-physical mapping must be unique");
+                physical_for_logical[logical.index()] = physical_hart;
+                expected |= 1usize << logical.index();
+                next_logical_index += 1;
+            }
+            Err(sbi::IpiError::InvalidParam) => {
+                // A smaller machine is valid: deterministic benchmarks retain
+                // their existing `-smp 1` boundary.
+            }
+            Ok(state) => panic!(
+                "secondary physical hart {} is not stopped before HSM start: {:?}",
+                physical_hart, state
+            ),
+            Err(error) => panic!(
+                "could not discover secondary physical hart {} through SBI HSM: {:?}",
+                physical_hart, error
+            ),
+        }
+    }
+
+    // The acquire side in secondary_kmain publishes every preceding boot-hart
+    // initialization before a newly started CPU touches shared state.
+    SECONDARY_BOOT_RELEASED.store(true, Ordering::Release);
+    let entry = _secondary_start as *const () as usize;
+    for (logical_index, physical_hart) in physical_for_logical.iter().copied().enumerate().skip(1) {
+        if physical_hart == usize::MAX {
+            break;
+        }
+        sbi::hart_start(physical_hart, entry, logical_index)
+            .expect("SBI HSM must accept every discovered stopped hart");
+    }
+
+    let started_at = sbi::time();
+    loop {
+        let ready = online_hart_mask();
+        if ready & expected == expected {
+            break;
+        }
+        if sbi::time().wrapping_sub(started_at) >= SECONDARY_START_TIMEOUT_TICKS {
+            panic!(
+                "secondary startup timed out: expected mask {:#x}, ready mask {:#x}",
+                expected, ready
+            );
+        }
+        core::hint::spin_loop();
+    }
+
+    for index in 0..exec::MAX_HARTS {
+        if expected & (1usize << index) != 0 {
+            let hart = exec::HartId::new(index).expect("ready hart index is in range");
+            assert!(
+                ipi::is_online(hart),
+                "kernel-ready hart {} did not publish its executor identity",
+                index
+            );
+        }
+    }
+    (online_hart_mask() & expected).count_ones() as usize
+}
+
+/// Rust destination for the SBI HSM secondary entry. The assembly path has
+/// already installed `tp`, `gp`, and this logical hart's private stack.
+#[no_mangle]
+pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) -> ! {
+    while !SECONDARY_BOOT_RELEASED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let Some(logical) = exec::HartId::new(logical_index) else {
+        sbi::shutdown(true);
+    };
+    if sbi::current_hart_id() != physical_hart || logical == exec::HartId::BOOT {
+        sbi::shutdown(true);
+    }
+
+    // Install stvec and the local interrupt-enable mask before ONLINE can let
+    // another hart send SSIP here. Global SIE remains clear throughout.
+    trap::prepare_secondary();
+    if ipi::mark_online(logical, physical_hart).is_err() {
+        sbi::shutdown(true);
+    }
+    // Timer initialization uses hart-local allocation/recovery context and
+    // therefore follows self-registration.
+    trap::finish_secondary();
+
+    KERNEL_READY_HARTS.fetch_or(1usize << logical.index(), Ordering::Release);
     trap::enable_interrupts();
     exec::run()
 }

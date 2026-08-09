@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cap::{CapError, Rights};
 use crate::chan::Endpoint;
@@ -75,7 +75,8 @@ async fn run(line: &str, boot_time: u64) {
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  pcspace test    exercise three-boot persistent authority recovery");
-            println!("  smp queues      prove logical stealing plus the SBI/SSIP wake path");
+            println!("  smp queues      prove four physical executors and cross-hart wakeups");
+            println!("  smp scale       compare equal serial and four-hart parallel work");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -360,11 +361,11 @@ async fn run(line: &str, boot_time: u64) {
         "pcspace" => persistent_cspace_command(&rest).await,
 
         "smp" => {
-            if rest.as_slice() != ["queues"] {
-                println!("  usage: smp queues");
-                return;
+            match rest.as_slice() {
+                ["queues"] => smp_queue_demo().await,
+                ["scale"] => smp_scale_demo().await,
+                _ => println!("  usage: smp queues|scale"),
             }
-            smp_queue_demo().await;
         }
 
         "selftest" => {
@@ -452,110 +453,335 @@ async fn run(line: &str, boot_time: u64) {
     }
 }
 
-/// Deterministic M5.1 queue and M5.2 IPI acceptance probe.
-///
-/// Secondary physical harts remain gated until M5.5. These untracked tasks are
-/// placed on the three logical remote queues so hart 0 must steal them.
+/// M5.5 physical-hart and cross-hart wake acceptance probe.
 async fn smp_queue_demo() {
     let scheduler_lock_before = exec::scheduler_lock_stats();
-    let before = exec::scheduler_stats();
-    let remote_ipi_before: Vec<_> = (1..exec::MAX_HARTS)
+    let boot_initiator = ipi::current_logical_hart() == Some(exec::HartId::BOOT);
+    let all_online = (0..exec::MAX_HARTS).all(|index| {
+        ipi::is_online(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+    });
+    let physical_ids: Vec<_> = (0..exec::MAX_HARTS)
         .map(|index| {
             ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+                .physical_hart_id
         })
         .collect();
-    let mut counters = Vec::new();
-    let mut handles = Vec::new();
-    let mut placement_ok = true;
+    let unique_physical = physical_ids.iter().enumerate().all(|(index, physical)| {
+        physical.is_some() && physical_ids[..index].iter().all(|other| other != physical)
+    });
 
+    let mut gates = Vec::new();
+    let mut started = Vec::new();
+    let mut resumed = Vec::new();
+    let mut handles = Vec::new();
     for index in 1..exec::MAX_HARTS {
         let hart = exec::HartId::new(index).expect("logical scheduler hart is valid");
-        let counter = Arc::new(AtomicU64::new(0));
-        let task_counter = counter.clone();
-        let handle = exec::spawn_tracked_on(hart, "smp-queue-probe", async move {
-            task_counter.fetch_add(1, Ordering::SeqCst);
+        let gate = Arc::new(exec::WaitQueue::new());
+        let start = Arc::new(AtomicU64::new(0));
+        let resume = Arc::new(AtomicU64::new(0));
+        let task_gate = gate.clone();
+        let task_start = start.clone();
+        let task_resume = resume.clone();
+        let handle = exec::spawn_pinned_on(hart, "smp-physical-wake-probe", async move {
+            task_start.store(
+                ipi::current_logical_hart().map_or(0, |current| current.index() as u64 + 1),
+                Ordering::SeqCst,
+            );
+            task_gate.wait().await;
+            task_resume.store(
+                ipi::current_logical_hart().map_or(0, |current| current.index() as u64 + 1),
+                Ordering::SeqCst,
+            );
         });
-        placement_ok &= exec::task_queue_owner(handle.id()) == Some(hart);
-        counters.push(counter);
+        gates.push(gate);
+        started.push(start);
+        resumed.push(resume);
         handles.push(handle);
     }
 
-    let placed = exec::scheduler_stats();
-    placement_ok &= (1..exec::MAX_HARTS)
-        .all(|index| placed.harts[index].queued == before.harts[index].queued + 1);
-
-    let mut exits_once = true;
-    for handle in &handles {
-        let exit = handle.join().await;
-        exits_once &= exit.state() == exec::TaskState::Exited && exit.polls() == 1;
-    }
-
-    let after = exec::scheduler_stats();
-    let ran_once = placement_ok
-        && exits_once
-        && counters
-            .iter()
-            .all(|counter| counter.load(Ordering::SeqCst) == 1)
-        && (1..exec::MAX_HARTS)
-            .all(|index| after.harts[index].queued == before.harts[index].queued);
-    let steals = after.harts[exec::HartId::BOOT.index()]
-        .steals
-        .saturating_sub(before.harts[exec::HartId::BOOT.index()].steals);
-
-    let offline_mailboxes_ok = (1..exec::MAX_HARTS).all(|index| {
-        let hart = exec::HartId::new(index).expect("logical scheduler hart is valid");
-        let before = remote_ipi_before[index - 1];
-        let after = ipi::stats(hart);
-        !after.online
-            && after.pending_reasons & ipi::REASON_RUNNABLE != 0
-            && after.doorbells == before.doorbells
-            && after.send_failures == before.send_failures
-    });
-
-    // Normal current-hart notifications need no IPI because the hart is
-    // already executing. Force exactly one pending self-doorbell here so QEMU
-    // proves the real SBI/SSIP/ack path before physical secondaries are booted.
-    let boot_ipi_before = ipi::stats(exec::HartId::BOOT);
-    let local_probe = exec::spawn_tracked_on(exec::HartId::BOOT, "ipi-probe", async {});
-    let forced = ipi::retry_pending(exec::HartId::BOOT);
-    let local_exit = local_probe.join().await;
-    for _ in 0..4 {
-        if ipi::stats(exec::HartId::BOOT).acknowledged > boot_ipi_before.acknowledged {
+    // Wait until every exact-hart task has returned Pending with its waiter
+    // registered. Waking below therefore crosses from the boot hart into each
+    // remote ready queue and must ring an SBI doorbell.
+    let mut waiters_parked = false;
+    for _ in 0..10_000 {
+        if gates.iter().all(|gate| gate.waiter_count() == 1) {
+            waiters_parked = true;
             break;
         }
         exec::yield_now().await;
     }
-    let boot_ipi_after = ipi::stats(exec::HartId::BOOT);
+    if !waiters_parked {
+        for handle in &handles {
+            let _ = handle.cancel();
+        }
+        println!("  smp queues: FAILED remote waiters did not park");
+        return;
+    }
+    // Drain each spawn-time doorbell before taking the wake baseline. This
+    // makes the increment below belong uniquely to `wake_all`, not to initial
+    // placement of the probe.
+    let mut mailboxes_drained = false;
+    for _ in 0..10_000 {
+        if (1..exec::MAX_HARTS).all(|index| {
+            ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+                .pending_reasons
+                == 0
+        }) {
+            mailboxes_drained = true;
+            break;
+        }
+        exec::yield_now().await;
+    }
+    if !mailboxes_drained {
+        for handle in &handles {
+            let _ = handle.cancel();
+        }
+        println!("  smp queues: FAILED spawn doorbells did not drain");
+        return;
+    }
+    let before_ipi: Vec<_> = (1..exec::MAX_HARTS)
+        .map(|index| {
+            ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+        })
+        .collect();
+    for gate in &gates {
+        gate.wake_all();
+    }
+
+    let mut exits_twice = true;
+    for handle in &handles {
+        let exit = handle.join().await;
+        exits_twice &= exit.state() == exec::TaskState::Exited && exit.polls() == 2;
+    }
+    // Give a stale SSIP (possible when the idle gate consumed the reason first)
+    // one executor turn to reach the trap acknowledgement path.
+    for _ in 0..8 {
+        exec::yield_now().await;
+    }
+    let after_ipi: Vec<_> = (1..exec::MAX_HARTS)
+        .map(|index| {
+            ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+        })
+        .collect();
+    let exact_harts = started.iter().zip(&resumed).enumerate().all(
+        |(offset, (start, resume))| {
+            let encoded = (offset + 2) as u64;
+            start.load(Ordering::SeqCst) == encoded && resume.load(Ordering::SeqCst) == encoded
+        },
+    );
+    let ipis_observed = before_ipi.iter().zip(&after_ipi).all(|(before, after)| {
+        after.doorbells == before.doorbells + 1
+            && after.send_failures == before.send_failures
+            && (after.acknowledged + after.stale > before.acknowledged + before.stale
+                || after.idle_consumed > before.idle_consumed)
+    });
+
+    // Force a short four-way sample of the retained scheduler lock. M5.3
+    // deferred physical contention evidence until secondaries were real; a
+    // nonzero delta here proves the counter is observing overlapping harts,
+    // rather than merely printing an always-zero field.
+    let contention_ready = Arc::new(AtomicUsize::new(0));
+    let contention_release = Arc::new(AtomicBool::new(false));
+    let mut contention_handles = Vec::new();
+    for index in 1..exec::MAX_HARTS {
+        let hart = exec::HartId::new(index).expect("logical scheduler hart is valid");
+        let task_ready = contention_ready.clone();
+        let task_release = contention_release.clone();
+        contention_handles.push(exec::spawn_pinned_on(
+            hart,
+            "smp-scheduler-contention",
+            async move {
+                task_ready.fetch_add(1, Ordering::AcqRel);
+                while !task_release.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                for _ in 0..512 {
+                    core::hint::black_box(exec::scheduler_stats());
+                }
+            },
+        ));
+    }
+    let contention_preflight = sbi::time();
+    while contention_ready.load(Ordering::Acquire) != exec::MAX_HARTS - 1
+        && sbi::time().wrapping_sub(contention_preflight) < exec::TIMEBASE_HZ
+    {
+        exec::yield_now().await;
+    }
+    let contention_started = contention_ready.load(Ordering::Acquire) == exec::MAX_HARTS - 1;
+    contention_release.store(true, Ordering::Release);
+    if !contention_started {
+        for handle in &contention_handles {
+            let _ = handle.cancel();
+        }
+        println!("  smp queues: FAILED scheduler contention preflight");
+        return;
+    }
+    for _ in 0..512 {
+        core::hint::black_box(exec::scheduler_stats());
+    }
+    let mut contention_workers_ok = true;
+    for handle in &contention_handles {
+        let exit = handle.join().await;
+        contention_workers_ok &= exit.state() == exec::TaskState::Exited && exit.polls() == 1;
+    }
+
     let scheduler_lock_after = exec::scheduler_lock_stats();
-    let scheduler_lock_sampled =
-        scheduler_lock_after.acquisitions > scheduler_lock_before.acquisitions;
+    let scheduler_acquisitions = scheduler_lock_after
+        .acquisitions
+        .saturating_sub(scheduler_lock_before.acquisitions);
     let scheduler_contention = scheduler_lock_after
         .contended_acquisitions
         .saturating_sub(scheduler_lock_before.contended_acquisitions);
-    let self_ipi_ok = forced == ipi::DoorbellDisposition::Sent
-        && local_exit.state() == exec::TaskState::Exited
-        && local_exit.polls() == 1
-        && boot_ipi_after.doorbells == boot_ipi_before.doorbells + 1
-        && boot_ipi_after.send_failures == boot_ipi_before.send_failures
-        && boot_ipi_after.acknowledged > boot_ipi_before.acknowledged;
-
-    if ran_once
-        && steals == (exec::MAX_HARTS - 1) as u64
-        && offline_mailboxes_ok
-        && self_ipi_ok
-        && scheduler_lock_sampled
-        && scheduler_contention == 0
+    if boot_initiator
+        && all_online
+        && unique_physical
+        && exits_twice
+        && exact_harts
+        && ipis_observed
+        && contention_workers_ok
+        && scheduler_acquisitions > 0
+        && scheduler_contention > 0
+        && scheduler_contention <= scheduler_acquisitions
     {
-        println!("  smp queues: remote hart1..hart3 tasks each ran once");
-        println!("  smp queues: hart0 steal delta=3");
-        println!("  smp ipi: offline remote reasons retained without SBI calls");
-        println!("  smp ipi: forced boot-hart doorbell acknowledged");
+        println!("  smp boot: four logical harts own four physical executors");
+        println!("  smp queues: pinned hart1..hart3 tasks parked and resumed in place");
+        println!("  smp ipi: boot-hart wakes reached all three remote executors");
         println!("  smp locks: PLIC/UART RX/virtio IRQ data handoff is lock-free");
-        println!("  smp locks: scheduler sampled; single-hart contention delta=0");
-        println!("  smp queues: physical secondary harts gated until M5.5");
+        println!(
+            "  smp locks: scheduler acquisitions delta={} contention delta={}",
+            scheduler_acquisitions, scheduler_contention
+        );
     } else {
-        println!("  smp queues: FAILED scheduler acceptance invariant");
+        println!("  smp queues: FAILED physical SMP acceptance invariant");
     }
+}
+
+// Long enough that a sample spans tens of milliseconds under QEMU TCG. Short
+// millisecond-scale probes let host scheduling jitter dominate the result.
+const SMP_SCALE_ROUNDS: usize = 12_000_000;
+
+#[inline(never)]
+fn smp_work_segment(worker: usize) -> u64 {
+    let mut value = 0x9e37_79b9_7f4a_7c15u64 ^ worker as u64;
+    for iteration in 0..SMP_SCALE_ROUNDS {
+        value ^= (iteration as u64).wrapping_add(0xa076_1d64_78bd_642f);
+        value = value.rotate_left(17).wrapping_mul(0xe703_7ed1_a0b4_28db);
+        core::hint::black_box(value);
+    }
+    value
+}
+
+/// Compare equal work executed sequentially and on four exact logical harts.
+async fn smp_scale_demo() {
+    if ipi::current_logical_hart() != Some(exec::HartId::BOOT)
+        || !(0..exec::MAX_HARTS).all(|index| {
+        ipi::is_online(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+    })
+    {
+        println!("VIBE_SMP_SCALE_FAILED harts_offline");
+        return;
+    }
+
+    let serial_started = sbi::time();
+    let mut serial_checksum = 0u64;
+    for worker in 0..exec::MAX_HARTS {
+        serial_checksum ^= smp_work_segment(worker);
+    }
+    let serial_ticks = sbi::time().saturating_sub(serial_started).max(1);
+
+    let remote_ready = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicBool::new(false));
+    let start_tick = Arc::new(AtomicU64::new(0));
+    let finish_tick = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let checksum = Arc::new(AtomicU64::new(0));
+    let observed = Arc::new([const { AtomicU64::new(0) }; exec::MAX_HARTS]);
+    let mut handles = Vec::new();
+
+    // Start only the three remote workers first. The boot-hart shell remains
+    // schedulable and can report a bounded preflight failure instead of
+    // entering a four-way spin barrier before a remote executor ever ran.
+    for index in 1..exec::MAX_HARTS {
+        let hart = exec::HartId::new(index).expect("logical scheduler hart is valid");
+        let task_ready = remote_ready.clone();
+        let task_released = released.clone();
+        let task_finish = finish_tick.clone();
+        let task_finished = finished.clone();
+        let task_checksum = checksum.clone();
+        let task_observed = observed.clone();
+        handles.push(exec::spawn_pinned_on(hart, "smp-scale-worker", async move {
+            task_observed[index].store(
+                ipi::current_logical_hart().map_or(0, |current| current.index() as u64 + 1),
+                Ordering::SeqCst,
+            );
+            task_ready.fetch_add(1, Ordering::AcqRel);
+            while !task_released.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+
+            let result = smp_work_segment(index);
+            task_checksum.fetch_xor(result, Ordering::AcqRel);
+            if task_finished.fetch_add(1, Ordering::AcqRel) + 1 == exec::MAX_HARTS {
+                task_finish.store(sbi::time(), Ordering::Release);
+            }
+        }));
+    }
+
+    let mut remotes_started = false;
+    let preflight_started = sbi::time();
+    while sbi::time().wrapping_sub(preflight_started) < exec::TIMEBASE_HZ {
+        if remote_ready.load(Ordering::Acquire) == exec::MAX_HARTS - 1 {
+            remotes_started = true;
+            break;
+        }
+        exec::yield_now().await;
+    }
+    if !remotes_started {
+        // Release any subset which reached the spin gate so no physical hart
+        // remains permanently occupied after the diagnostic is printed.
+        released.store(true, Ordering::Release);
+        for handle in &handles {
+            let _ = handle.cancel();
+        }
+        println!("VIBE_SMP_SCALE_FAILED remote_preflight");
+        return;
+    }
+
+    observed[exec::HartId::BOOT.index()].store(1, Ordering::SeqCst);
+    start_tick.store(sbi::time(), Ordering::Release);
+    released.store(true, Ordering::Release);
+    let boot_result = smp_work_segment(exec::HartId::BOOT.index());
+    checksum.fetch_xor(boot_result, Ordering::AcqRel);
+    if finished.fetch_add(1, Ordering::AcqRel) + 1 == exec::MAX_HARTS {
+        finish_tick.store(sbi::time(), Ordering::Release);
+    }
+
+    let mut workers_ok = true;
+    for handle in &handles {
+        let exit = handle.join().await;
+        workers_ok &= exit.state() == exec::TaskState::Exited && exit.polls() == 1;
+    }
+    let parallel_ticks = finish_tick
+        .load(Ordering::Acquire)
+        .saturating_sub(start_tick.load(Ordering::Acquire))
+        .max(1);
+    let exact_harts = observed.iter().enumerate().all(|(index, seen)| {
+        seen.load(Ordering::SeqCst) == index as u64 + 1
+    });
+    let parallel_checksum = checksum.load(Ordering::Acquire);
+    if !workers_ok || !exact_harts || parallel_checksum != serial_checksum {
+        println!("VIBE_SMP_SCALE_FAILED worker_invariant");
+        return;
+    }
+    let speedup_milli = serial_ticks.saturating_mul(1_000) / parallel_ticks;
+    println!(
+        "VIBE_SMP_SCALE {{\"schema\":\"vibeos.smp-scale\",\"version\":1,\"workers\":{},\"serial_ticks\":{},\"parallel_ticks\":{},\"speedup_milli\":{},\"checksum\":{}}}",
+        exec::MAX_HARTS,
+        serial_ticks,
+        parallel_ticks,
+        speedup_milli,
+        parallel_checksum,
+    );
 }
 
 /// Read a program from the console, terminated by a line containing only `.`.

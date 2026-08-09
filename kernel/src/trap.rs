@@ -112,15 +112,35 @@ extern "C" {
     fn __trap_entry();
 }
 
-pub fn init() {
+fn install_local(enabled: usize) {
     unsafe {
         asm!("csrw stvec, {}", in(reg) __trap_entry as *const () as usize);
-        asm!("csrs sie, {}", in(reg) SIE_SSIE | SIE_STIE | SIE_SEIE);
+        // Entry assembly cleared SIE. Writing the exact local mask keeps
+        // secondary harts away from the boot hart's sole PLIC context.
+        asm!("csrw sie, {}", in(reg) enabled);
     }
-    plic::init();
+}
+
+/// Initialize the boot hart's local trap CSRs and the one global PLIC setup.
+pub fn init_boot() {
+    install_local(SIE_SSIE | SIE_STIE | SIE_SEIE);
+    plic::init(sbi::current_hart_id());
     plic::register(uart::UART_IRQ, uart_irq, 0)
         .expect("UART IRQ must fit in the PLIC handler registry");
     plic::enable(uart::UART_IRQ).expect("UART IRQ must be a valid PLIC source");
+    exec::init_timer();
+}
+
+/// Install a secondary's trap vector before publishing it ONLINE.
+///
+/// Global SIE is still clear, so a concurrently published SSIP may become
+/// pending but cannot enter Rust until the complete local init is ready.
+pub fn prepare_secondary() {
+    install_local(SIE_SSIE | SIE_STIE);
+}
+
+/// Finish secondary-local initialization after logical self-registration.
+pub fn finish_secondary() {
     exec::init_timer();
 }
 

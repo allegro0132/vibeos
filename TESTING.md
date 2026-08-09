@@ -7,6 +7,7 @@ cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/differential.sh      # verify committed output with pinned real rustc
 ./scripts/qemu-test.sh         # golden cases plus the differential oracle
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
+./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
 ```
 
@@ -80,19 +81,18 @@ then requires a second HELLO plus the complete exchange after the shared device
 epoch advances. A canonical evidence file is checked separately from the guest
 golden; TAP, root privileges, and host network access are never used.
 
-The `smp_queues` case keeps the one-CPU physical QEMU boundary and places one
-untracked task on each of the three logical remote queues. It requires logical
-hart 0 to report an exact steal delta of three with every probe executing once.
-Because those logical targets are offline, their Release-published reasons must
-remain pending with no SBI attempts. A separate ready boot-hart probe deliberately
-forces one self-doorbell and requires real OpenSBI delivery, SSIP acknowledgement,
-and executor return. The same transcript confirms the PLIC/UART RX/virtio IRQ-data
-handoffs have no SpinLock and samples the retained scheduler counter with an exact
-zero single-hart contention delta. M5.4's host test nests the hart-1 executor while
-a hart-0 task remains active and checks running/current-task/domain isolation,
-remote cancellation, and fault survival. Physical secondary execution is still
-reported as gated until M5.5, and no timing value appears in the golden. A pre-M5.5 `-smp 4` smoke did not
-reach the shell, so it remains M5.5 work rather than parked-hart evidence.
+The QEMU harness now defaults every integration case to four multithreaded TCG
+vCPUs and requires the boot-time `4 hart(s) online` barrier before accepting a
+shell transcript. `smp_queues` places non-stealable waiters on logical harts 1--3,
+proves each parks and resumes on its exact executor, drains the placement
+doorbells, then wakes all three from the boot-pinned shell. It requires one new
+successful SBI doorbell per target and receiver-side acknowledgement/idle evidence.
+The same case runs a synchronized four-hart scheduler-lock sample and requires a
+coherent, nonzero contention delta; the final full-suite run observed 1,688
+contended acquisitions out of 2,170. Numeric telemetry is normalized only for the
+golden diff and is separately parsed from the raw serial log. M5.4's nested host
+model still checks running/current-task/domain isolation, remote cancellation, and
+cross-hart fault survival without pretending host threads reproduce target IRQs.
 
 ## Performance baseline
 
@@ -114,7 +114,17 @@ larger byte allowances.
 ./scripts/bench.py                 # collect and check; never rewrites truth
 ./scripts/bench.py --update        # intentional baseline replacement
 ./scripts/bench.py --input log.txt # validate/recheck a saved transcript
+./scripts/bench.py --smp-scaling   # four exact-hart workers; require >=1.25x
+./scripts/bench.py --selftest      # positive and fail-closed SMP parser fixtures
 ```
+
+The scaling mode intentionally does not share the deterministic one-hart
+baseline. It boots `-smp 4` with multithreaded TCG, waits for all three remote
+workers before releasing the boot hart, and compares identical integer work run
+serially and in parallel. Each measurement spans tens of milliseconds rather
+than a scheduler quantum. The final M5.5 run measured 773,610 serial ticks and
+275,290 parallel ticks (`2.810x`); CI enforces only the conservative `1.25x`
+floor so host noise cannot turn the observation into an overfit baseline.
 
 The guest IPC number is a repeatable VibeOS trend measurement, not yet a claim
 against a Linux pipe: a host pipe measured on another ISA/runtime would not be a

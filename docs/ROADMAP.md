@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, and M5.5 are complete. M6.1 Sv39 paging is next. Run
+> sequence through 3.16, M4.5, M5.5, and M6.1 are complete. M6.2 guard pages are next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -630,10 +630,27 @@ Not for isolation — Blueprint §9. For the things software checks do worse:
 
 | # | Work item |
 |---|---|
-| 6.1 | Sv39 paging with a single address space |
+| 6.1 ✅ | Sv39 paging with a single address space |
 | 6.2 | Guard pages below every stack (makes 2.2 defence-in-depth rather than sole defence) |
 | 6.3 | W^X for code buffers: writable while emitting, execute-only after `fence.i` |
 | 6.4 | Read-only mapping for `.rodata` and the capability tables |
+
+M6.1 installs one ASID-zero Sv39 root shared by every hart. It identity-maps only
+the 126 MiB kernel RAM window and only the 4 KiB device pages touched by the PLIC,
+UART, and eight virtio-mmio transports; the OpenSBI prefix, null page, unused MMIO,
+and unused physical space stay absent. RAM and devices deliberately use 4 KiB
+leaves even before RAM permissions diverge. Device leaves are non-executable. The
+boot hart constructs the hierarchy in zeroed `.bss`, publishes it,
+and enables paging before global kernel initialization. SBI HSM starts peers with
+`satp=0`; each secondary installs and reads back the shared root before trap setup,
+self-registration, or its online bit.
+
+**M6.1 acceptance:** six host tests cover known-word PTE/satp encoding, canonical
+virtual addresses, and fail-closed leaf validation. The `mmu` command reports the
+live ranges, leaf sizes, and all four hart readbacks; 21 in-kernel checks walk the
+live hierarchy and verify identity, permissions, and deliberate holes. Every QEMU boot
+must publish the Sv39 marker,
+so the complete integration suite cannot silently fall back to Bare mode.
 
 ---
 

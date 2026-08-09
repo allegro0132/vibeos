@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.5 are
-complete; M6.1 Sv39 paging is next, and the original M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6.1 are
+complete; M6.2 guard pages are next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -352,8 +352,10 @@ than speed, because the emitter is a security boundary (§6.3).
 Branches are an inverted conditional over a `jal`: ±1 MB of range instead of the
 4 KB a bare `beq` allows.
 
-With no MMU and no W^X, loading a program is `fence.i` plus a transmute of the code
-buffer to a function pointer.
+M6.1 now runs this single address space through Sv39, but RAM intentionally remains
+RWX until M6.3. Loading a program is therefore still `fence.i` plus a transmute of
+the code buffer to a function pointer; the dedicated W^X transition is not yet
+claimed.
 
 ### 6.3 Why generated code is confined
 

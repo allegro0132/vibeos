@@ -221,6 +221,7 @@ pub async fn run() -> Report {
         failures: Vec::new(),
     };
 
+    paging(&mut h);
     timers(&mut h).await;
     scheduler(&mut h).await;
     cancellation(&mut h).await;
@@ -246,6 +247,105 @@ pub async fn run() -> Report {
         passed: h.passed,
         failed: h.failures.len(),
     }
+}
+
+/// M6.1: the live kernel runs through one identity-mapped Sv39 root on every
+/// online hart. Device apertures remain writable but are never executable.
+fn paging(h: &mut Harness) {
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
+
+    h.check(
+        "the current hart has Sv39 enabled",
+        crate::mmu::local_paging_enabled(),
+    );
+    h.eq(
+        "every online hart read back the shared satp root",
+        crate::mmu::enabled_hart_mask(),
+        crate::online_hart_mask(),
+    );
+    h.eq(
+        "the Sv39 root is page aligned",
+        crate::mmu::root_physical() % PAGE_SIZE,
+        0,
+    );
+
+    let text_address = paging as *const () as usize;
+    let text = crate::mmu::mapping(text_address).expect("self-test text is mapped");
+    h.eq(
+        "kernel text remains identity mapped",
+        text.physical,
+        text_address,
+    );
+    h.eq("kernel RAM uses 4 KiB leaves", text.page_size, PAGE_SIZE);
+    h.check(
+        "M6.1 kernel RAM remains readable, writable, and executable",
+        text.permissions.contains(
+            PagePermissions::READ
+                .union(PagePermissions::WRITE)
+                .union(PagePermissions::EXECUTE),
+        ),
+    );
+
+    for (name, address) in [
+        ("PLIC is identity mapped", crate::mmu::PLIC_START),
+        (
+            "UART/virtio is identity mapped",
+            crate::mmu::UART_VIRTIO_START,
+        ),
+    ] {
+        let device = crate::mmu::mapping(address).expect("required MMIO aperture is mapped");
+        h.eq(name, device.physical, address);
+        h.eq("MMIO uses 4 KiB leaves", device.page_size, PAGE_SIZE);
+        h.check(
+            "MMIO is readable and writable but not executable",
+            device
+                .permissions
+                .contains(PagePermissions::READ.union(PagePermissions::WRITE))
+                && !device.permissions.contains(PagePermissions::EXECUTE),
+        );
+    }
+    h.check(
+        "the null page is absent from the shared address space",
+        crate::mmu::mapping(0).is_none(),
+    );
+    h.check(
+        "the OpenSBI firmware prefix is absent from S-mode mappings",
+        crate::mmu::mapping(0x8000_0000).is_none(),
+    );
+    h.check(
+        "RAM beyond the configured machine is absent",
+        crate::mmu::mapping(crate::mmu::KERNEL_RAM_END).is_none(),
+    );
+    h.check(
+        "unused PLIC pages are absent",
+        crate::mmu::mapping(crate::mmu::PLIC_START + PAGE_SIZE).is_none(),
+    );
+    let boot_physical = sbi::current_hart_id();
+    let boot_s_context = crate::mmu::plic_s_context_page(boot_physical)
+        .expect("the boot physical hart is within the dense QEMU topology");
+    h.check(
+        "only the boot hart's PLIC S-context is mapped",
+        crate::mmu::mapping(boot_s_context).is_some(),
+    );
+    h.check(
+        "PLIC M-context and unused S-context pages are absent",
+        (0..exec::MAX_HARTS * 2)
+            .map(|context| crate::mmu::PLIC_CONTEXT_START + context * PAGE_SIZE)
+            .filter(|address| *address != boot_s_context)
+            .all(|address| crate::mmu::mapping(address).is_none()),
+    );
+    h.check(
+        "the end of the PLIC aperture is absent",
+        crate::mmu::mapping(crate::mmu::PLIC_END).is_none(),
+    );
+    h.check(
+        "unused UART/virtio pages are absent",
+        crate::mmu::mapping(crate::mmu::UART_VIRTIO_END).is_none(),
+    );
+    h.check(
+        "the diagnostic walker rejects non-canonical Sv39 addresses",
+        crate::mmu::mapping(1usize << 39).is_none(),
+    );
 }
 
 /// ROADMAP 3.12. A restart keeps the supervised identity and Space route while

@@ -277,6 +277,11 @@ for case_file in tests/cases/*.in; do
       boot_output_ok=0
       fail=1
     fi
+    if ! grep -a -Eq 'mmu +Sv39 single address space, hart mask 0x[0-9a-f]+' "$qemu_log"; then
+      echo "FAIL $name: boot $boot did not publish the Sv39 activation marker"
+      boot_output_ok=0
+      fail=1
+    fi
 
     if [ "$name" = "persistent_cspace" ]; then
       printf '=== persistent CSpace boot %s ===\n' "$boot" >> "$actual"

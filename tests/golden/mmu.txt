@@ -1,0 +1,11 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> mmu
+  mode: Sv39, ASID 0, one shared root at 0xADDR
+  harts: satp read back on mask 0xADDR (4/4 online)
+  kernel RAM: 0xADDR..0xADDR, identity, N KiB leaves, rwx
+  MMIO: PLIC N KiB leaves rw-, UART/virtio N KiB leaves rw-
+  unmapped: firmware prefix, null page, and unused physical space
+vibe> halt
+  powering off.

@@ -24,6 +24,7 @@ pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, s
 mod bench;
 mod dev;
 mod durable_cspace;
+mod mmu;
 mod plic;
 mod rustc;
 mod saved_program;
@@ -171,6 +172,9 @@ pub extern "C" fn kmain() -> ! {
     let boot_time = sbi::time();
     let boot_physical_hart = sbi::current_hart_id();
 
+    mmu::init_boot(boot_physical_hart);
+    mmu::enable(exec::HartId::BOOT.index());
+
     uart::init();
     println!("{}", BANNER);
 
@@ -206,6 +210,15 @@ pub extern "C" fn kmain() -> ! {
 
     let online = start_secondary_harts();
     println!("  smp       {} hart(s) online", online);
+    assert_eq!(
+        mmu::enabled_hart_mask(),
+        online_hart_mask(),
+        "every online hart must publish Sv39 readback"
+    );
+    println!(
+        "  mmu       Sv39 single address space, hart mask {:#x}",
+        mmu::enabled_hart_mask()
+    );
 
     world::build();
 
@@ -326,6 +339,11 @@ pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) ->
     if sbi::current_hart_id() != physical_hart || logical == exec::HartId::BOOT {
         sbi::shutdown(true);
     }
+
+    // SBI HSM starts every secondary with satp=0. Install the boot-published
+    // shared root while all addresses are still valid physical identities,
+    // before trap state or ONLINE publication can expose this hart.
+    mmu::enable(logical.index());
 
     // Install stvec and the local interrupt-enable mask before ONLINE can let
     // another hart send SSIP here. Global SIE remains clear throughout.

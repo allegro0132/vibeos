@@ -1,11 +1,14 @@
 //! M4.0 durable-authority format and crash-recovery proof tests.
 
 use vibeos_core::durable::{
-    crc32c, recover, DecodeError, DecodeStatus, DerivationId, DurableRights, GrantFlags,
-    GrantRecord, LogRecord, ObjectId, RecordBody, RecordChain, RecoveredStore, RecoveryError,
-    RecoveryPolicy, ResourceKind, RootPolicy, SlotIdentity, SpaceId, StoreId, TransactionId,
-    CRC_OFFSET, PAYLOAD_OFFSET, RECORD_SIZE,
+    crc32c, preflight_recovery, preview_grant_transaction, preview_id_high_water,
+    preview_revoke_transaction, recover, DecodeError, DecodeStatus, DerivationId, DurableRights,
+    GrantFlags, GrantRecord, LogRecord, ObjectId, ObjectKind, RecordBody, RecordChain,
+    RecoveredStore, RecoveryError, RecoveryPolicy, ResourceKind, RootConstraint, RootPolicy,
+    RootRightsConstraint, SlotIdentity, SpaceId, StoreId, TransactionId, CRC_OFFSET,
+    PAYLOAD_OFFSET, RECORD_SIZE,
 };
+use vibeos_core::store::encode_object_transaction;
 
 const HIGH_WATER: u128 = 1_000;
 
@@ -33,7 +36,11 @@ fn root_grant(id: u128, space_id: u128, slot: u32, generation: u64) -> GrantReco
         derivation_id: deriv(id),
         parent_id: None,
         object_id: object(100),
-        target: SlotIdentity { space: space(space_id), slot, generation },
+        target: SlotIdentity {
+            space: space(space_id),
+            slot,
+            generation,
+        },
         rights: DurableRights::ALL,
         resource_kind: kind(7),
         flags: GrantFlags::ROOT,
@@ -45,7 +52,11 @@ fn child_grant(id: u128, parent: u128, space_id: u128, slot: u32) -> GrantRecord
         derivation_id: deriv(id),
         parent_id: Some(deriv(parent)),
         object_id: object(100),
-        target: SlotIdentity { space: space(space_id), slot, generation: 0 },
+        target: SlotIdentity {
+            space: space(space_id),
+            slot,
+            generation: 0,
+        },
         rights: DurableRights::READ,
         resource_kind: kind(7),
         flags: GrantFlags::DERIVED,
@@ -59,9 +70,17 @@ struct TestLog {
 
 impl TestLog {
     fn formatted() -> Self {
-        let mut this = Self { chain: RecordChain::new(store()), sectors: Vec::new() };
+        let mut this = Self {
+            chain: RecordChain::new(store()),
+            sectors: Vec::new(),
+        };
         this.push(None, RecordBody::Format);
-        this.push(None, RecordBody::IdHighWater { exclusive_end: HIGH_WATER });
+        this.push(
+            None,
+            RecordBody::IdHighWater {
+                exclusive_end: HIGH_WATER,
+            },
+        );
         this
     }
 
@@ -89,7 +108,23 @@ impl TestLog {
     }
 
     fn tombstone(&mut self, transaction: TransactionId, id: DerivationId) {
-        self.push(Some(transaction), RecordBody::RevokeTombstone { derivation_id: id });
+        self.push(
+            Some(transaction),
+            RecordBody::RevokeTombstone { derivation_id: id },
+        );
+    }
+
+    fn object(
+        &mut self,
+        transaction: TransactionId,
+        object_id: ObjectId,
+        object_kind: ObjectKind,
+        bytes: &[u8],
+    ) {
+        let encoded =
+            encode_object_transaction(&mut self.chain, transaction, object_id, object_kind, bytes)
+                .unwrap();
+        self.sectors.extend(encoded.records);
     }
 }
 
@@ -97,8 +132,18 @@ fn recover_with(
     sectors: &[[u8; RECORD_SIZE]],
     roots: &[GrantRecord],
 ) -> Result<RecoveredStore, RecoveryError> {
-    let policies: Vec<_> = roots.iter().cloned().map(|grant| RootPolicy { grant }).collect();
-    recover(sectors, RecoveryPolicy { store_id: store(), roots: &policies })
+    let policies: Vec<_> = roots
+        .iter()
+        .cloned()
+        .map(|grant| RootPolicy { grant })
+        .collect();
+    recover(
+        sectors,
+        RecoveryPolicy {
+            store_id: store(),
+            roots: &policies,
+        },
+    )
 }
 
 fn prefix(bytes: &[u8; RECORD_SIZE], cut: usize) -> [u8; RECORD_SIZE] {
@@ -139,7 +184,10 @@ fn every_record_kind_has_a_canonical_round_trip() {
             panic!("canonical record did not decode")
         };
         assert_eq!(decoded.record.encode().unwrap(), *bytes);
-        assert_eq!(decoded.crc32c, u32::from_le_bytes(bytes[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap()));
+        assert_eq!(
+            decoded.crc32c,
+            u32::from_le_bytes(bytes[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap())
+        );
     }
     assert_eq!(&log.sectors[0][..8], b"VIBECAP\0");
     assert_eq!(&log.sectors[0][0x1f0..], b"VIBECAP-COMMIT!!");
@@ -181,7 +229,10 @@ fn grant_prepare_and_commit_cuts_never_publish_extra_authority() {
         let mut image = base.sectors.clone();
         image.push(prefix(&prepare, cut));
         let recovered = recover_with(&image, core::slice::from_ref(&root)).unwrap();
-        assert!(recovered.grants.is_empty(), "prepare cut {cut} published a grant");
+        assert!(
+            recovered.grants.is_empty(),
+            "prepare cut {cut} published a grant"
+        );
     }
 
     base.sectors.push(prepare);
@@ -217,7 +268,9 @@ fn tombstone_cuts_only_preserve_or_shrink_authority() {
         .chain
         .append(
             Some(tx(31)),
-            RecordBody::RevokeTombstone { derivation_id: root.derivation_id },
+            RecordBody::RevokeTombstone {
+                derivation_id: root.derivation_id,
+            },
         )
         .unwrap();
 
@@ -245,6 +298,11 @@ fn an_ancestor_tombstone_wins_across_spaces_and_record_order() {
     let recovered = recover_with(&log.sectors, core::slice::from_ref(&root)).unwrap();
     assert!(recovered.grants.is_empty());
     assert_eq!(recovered.tombstones, vec![root.derivation_id]);
+    assert_eq!(recovered.slots.len(), 2);
+    assert!(recovered
+        .slots
+        .iter()
+        .all(|slot| { slot.max_generation == 0 && slot.live_derivation.is_none() }));
 }
 
 #[test]
@@ -265,7 +323,9 @@ fn high_water_must_precede_ids_and_never_move_backward() {
     let mut okay = TestLog::formatted();
     okay.grant(tx(998), root.clone());
     assert_eq!(
-        recover_with(&okay.sectors, core::slice::from_ref(&root)).unwrap().id_high_water,
+        recover_with(&okay.sectors, core::slice::from_ref(&root))
+            .unwrap()
+            .id_high_water,
         HIGH_WATER
     );
 
@@ -298,7 +358,10 @@ fn every_high_water_cut_recovers_the_old_or_exact_new_reservation() {
     for cut in 0..=RECORD_SIZE {
         let image = [format, old, prefix(&new, cut)];
         let recovered = recover_with(&image, &[]).unwrap();
-        assert_eq!(recovered.id_high_water, if cut == RECORD_SIZE { 200 } else { 100 });
+        assert_eq!(
+            recovered.id_high_water,
+            if cut == RECORD_SIZE { 200 } else { 100 }
+        );
     }
 
     // Only the fully written-and-flushed high-water permits issuing these IDs.
@@ -306,7 +369,11 @@ fn every_high_water_cut_recovers_the_old_or_exact_new_reservation() {
         derivation_id: deriv(150),
         parent_id: None,
         object_id: object(151),
-        target: SlotIdentity { space: space(152), slot: 0, generation: 0 },
+        target: SlotIdentity {
+            space: space(152),
+            slot: 0,
+            generation: 0,
+        },
         rights: DurableRights::ALL,
         resource_kind: kind(7),
         flags: GrantFlags::ROOT,
@@ -328,12 +395,40 @@ fn every_high_water_cut_recovers_the_old_or_exact_new_reservation() {
         )
         .unwrap();
     assert_eq!(
-        recover_with(&[format, old, new, prepare, commit], core::slice::from_ref(&root))
-            .unwrap()
-            .grants
-            .len(),
+        recover_with(
+            &[format, old, new, prepare, commit],
+            core::slice::from_ref(&root)
+        )
+        .unwrap()
+        .grants
+        .len(),
         1
     );
+}
+
+#[test]
+fn authority_previews_never_advance_the_live_chain() {
+    let chain = RecordChain::new(store());
+    let original = chain.checkpoint();
+    let (high_water, after_high_water) = preview_id_high_water(&chain, HIGH_WATER).unwrap();
+    assert_eq!(chain.checkpoint(), original);
+    assert_eq!(high_water.records.len(), 1);
+    assert_eq!(after_high_water.next_sequence(), 2);
+
+    let root = root_grant(10, 20, 0, 0);
+    let before_grant = after_high_water.checkpoint();
+    let (grant, after_grant) =
+        preview_grant_transaction(&after_high_water, tx(30), root.clone()).unwrap();
+    assert_eq!(after_high_water.checkpoint(), before_grant);
+    assert_eq!(grant.records.len(), 2);
+    assert_eq!(after_grant.next_sequence(), 4);
+
+    let before_revoke = after_grant.checkpoint();
+    let (revoke, after_revoke) =
+        preview_revoke_transaction(&after_grant, tx(31), root.derivation_id).unwrap();
+    assert_eq!(after_grant.checkpoint(), before_revoke);
+    assert_eq!(revoke.records.len(), 1);
+    assert_eq!(after_revoke.next_sequence(), 5);
 }
 
 #[test]
@@ -385,7 +480,10 @@ fn only_exact_trusted_roots_and_one_kind_per_object_are_recovered() {
     let root = root_grant(10, 20, 0, 0);
     let mut log = TestLog::formatted();
     log.grant(tx(30), root.clone());
-    assert!(matches!(recover_with(&log.sectors, &[]), Err(RecoveryError::RootNotTrusted { .. })));
+    assert!(matches!(
+        recover_with(&log.sectors, &[]),
+        Err(RecoveryError::RootNotTrusted { .. })
+    ));
 
     let mut other_kind = root_grant(11, 21, 0, 0);
     other_kind.resource_kind = kind(8);
@@ -394,6 +492,69 @@ fn only_exact_trusted_roots_and_one_kind_per_object_are_recovered() {
         recover_with(&log.sectors, &[root, other_kind]),
         Err(RecoveryError::ObjectMismatch { .. })
     ));
+}
+
+#[test]
+fn dynamic_root_selection_binds_external_policy_and_object_commit_order() {
+    let root = root_grant(10, 20, 0, 0);
+    let object_kind = ObjectKind::new(3).unwrap();
+    let constraint = RootConstraint {
+        space: root.target.space,
+        first_slot: 0,
+        last_slot_inclusive: 0,
+        rights: RootRightsConstraint::exact(DurableRights::ALL),
+        resource_kind: root.resource_kind,
+        object_kind,
+    };
+
+    let mut ordered = TestLog::formatted();
+    ordered.object(tx(40), root.object_id, object_kind, b"typed-root");
+    ordered.grant(tx(30), root.clone());
+    let preflight = preflight_recovery(&ordered.sectors, store()).unwrap();
+    assert_eq!(preflight.committed_objects()[0].bytes, b"typed-root");
+    let roots = preflight.select_roots(&[constraint]).unwrap();
+    assert_eq!(
+        roots,
+        vec![RootPolicy {
+            grant: root.clone()
+        }]
+    );
+    let recovered = preflight.finish(&roots).unwrap();
+    assert_eq!(recovered.grants.len(), 1);
+    assert_eq!(recovered.objects.len(), 1);
+
+    let mut too_late = TestLog::formatted();
+    too_late.grant(tx(30), root.clone());
+    too_late.object(tx(40), root.object_id, object_kind, b"late-object");
+    let preflight = preflight_recovery(&too_late.sectors, store()).unwrap();
+    assert_eq!(
+        preflight.select_roots(&[constraint]),
+        Err(RecoveryError::MissingRootConstraint)
+    );
+}
+
+#[test]
+fn multiple_live_roots_matching_one_constraint_fail_closed() {
+    let first = root_grant(10, 20, 0, 0);
+    let second = root_grant(11, 20, 1, 0);
+    let object_kind = ObjectKind::new(4).unwrap();
+    let mut log = TestLog::formatted();
+    log.object(tx(40), first.object_id, object_kind, b"ambiguous");
+    log.grant(tx(30), first.clone());
+    log.grant(tx(31), second);
+    let preflight = preflight_recovery(&log.sectors, store()).unwrap();
+    let constraint = RootConstraint {
+        space: first.target.space,
+        first_slot: 0,
+        last_slot_inclusive: 1,
+        rights: RootRightsConstraint::exact(DurableRights::ALL),
+        resource_kind: first.resource_kind,
+        object_kind,
+    };
+    assert_eq!(
+        preflight.select_roots(&[constraint]),
+        Err(RecoveryError::AmbiguousRootConstraint)
+    );
 }
 
 fn slot_log(second_generation: u64, tombstone_first: bool) -> (TestLog, GrantRecord, GrantRecord) {
@@ -426,6 +587,22 @@ fn slot_reuse_requires_a_prior_tombstone_and_strict_generation_growth() {
     let recovered = recover_with(&valid.sectors, &[first, second.clone()]).unwrap();
     assert_eq!(recovered.grants.len(), 1);
     assert_eq!(recovered.grants[0].grant, second);
+}
+
+#[test]
+fn tombstoned_latest_slot_retains_its_historical_generation() {
+    let root = root_grant(10, 20, 4, 37);
+    let mut log = TestLog::formatted();
+    log.grant(tx(30), root.clone());
+    log.tombstone(tx(31), root.derivation_id);
+
+    let recovered = recover_with(&log.sectors, core::slice::from_ref(&root)).unwrap();
+    assert!(recovered.grants.is_empty());
+    assert_eq!(recovered.slots.len(), 1);
+    assert_eq!(recovered.slots[0].space, root.target.space);
+    assert_eq!(recovered.slots[0].slot, root.target.slot);
+    assert_eq!(recovered.slots[0].max_generation, 37);
+    assert_eq!(recovered.slots[0].live_derivation, None);
 }
 
 #[test]
@@ -518,7 +695,10 @@ fn sealed_noncanonical_records_fail_closed() {
         assert_eq!(LogRecord::decode(&bad), Err(*expected));
         assert_eq!(
             recover_with(&[bad], &[]),
-            Err(RecoveryError::SealedRecord { sector: 0, source: *expected })
+            Err(RecoveryError::SealedRecord {
+                sector: 0,
+                source: *expected
+            })
         );
     }
 }
@@ -638,7 +818,9 @@ fn write_flush_publish_and_revoke_ack_boundaries_are_ordered() {
         .chain
         .append(
             Some(tx(31)),
-            RecordBody::RevokeTombstone { derivation_id: root.derivation_id },
+            RecordBody::RevokeTombstone {
+                derivation_id: root.derivation_id,
+            },
         )
         .unwrap();
     for cut in 0..=RECORD_SIZE {
@@ -667,7 +849,9 @@ fn valid_records_can_chain_around_a_permanently_torn_physical_slot() {
         sequence: 2,
         previous_sequence: 1,
         previous_crc32c: decoded_format.crc32c,
-        body: RecordBody::IdHighWater { exclusive_end: HIGH_WATER },
+        body: RecordBody::IdHighWater {
+            exclusive_end: HIGH_WATER,
+        },
     }
     .encode()
     .unwrap();
@@ -687,11 +871,16 @@ fn a_valid_but_broken_chain_and_wrong_store_are_rejected() {
         sequence: 3,
         previous_sequence: 1,
         previous_crc32c: u32::from_le_bytes(format[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap()),
-        body: RecordBody::IdHighWater { exclusive_end: HIGH_WATER },
+        body: RecordBody::IdHighWater {
+            exclusive_end: HIGH_WATER,
+        },
     }
     .encode()
     .unwrap();
-    assert_eq!(recover_with(&[format, broken], &[]), Err(RecoveryError::BrokenSequence { sector: 1 }));
+    assert_eq!(
+        recover_with(&[format, broken], &[]),
+        Err(RecoveryError::BrokenSequence { sector: 1 })
+    );
 
     let other_store = StoreId::new(9001).unwrap();
     let wrong = LogRecord {
@@ -704,5 +893,8 @@ fn a_valid_but_broken_chain_and_wrong_store_are_rejected() {
     }
     .encode()
     .unwrap();
-    assert_eq!(recover_with(&[wrong], &[]), Err(RecoveryError::WrongStore { sector: 0 }));
+    assert_eq!(
+        recover_with(&[wrong], &[]),
+        Err(RecoveryError::WrongStore { sector: 0 })
+    );
 }

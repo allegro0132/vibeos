@@ -739,7 +739,7 @@ fn duplicate_transaction_object_chunk_and_commit_are_rejected() {
     );
     assert!(matches!(
         recover_store(&duplicate_chunk.sectors),
-        Err(RecoveryError::UnexpectedChunkIndex { .. })
+        Err(RecoveryError::UnexpectedObjectChunkIndex { .. })
     ));
 }
 
@@ -780,7 +780,7 @@ fn missing_wrong_order_and_wrong_length_chunks_fail_closed() {
     );
     assert!(matches!(
         recover_store(&missing.sectors),
-        Err(RecoveryError::MissingChunks { .. })
+        Err(RecoveryError::MissingObjectChunks { .. })
     ));
 
     let mut wrong_order = TestLog::formatted();
@@ -804,7 +804,7 @@ fn missing_wrong_order_and_wrong_length_chunks_fail_closed() {
     );
     assert!(matches!(
         recover_store(&wrong_order.sectors),
-        Err(RecoveryError::UnexpectedChunkIndex { .. })
+        Err(RecoveryError::UnexpectedObjectChunkIndex { .. })
     ));
 
     let mut wrong_length = TestLog::formatted();
@@ -828,7 +828,7 @@ fn missing_wrong_order_and_wrong_length_chunks_fail_closed() {
     );
     assert!(matches!(
         recover_store(&wrong_length.sectors),
-        Err(RecoveryError::ChunkLength { .. })
+        Err(RecoveryError::ObjectChunkLength { .. })
     ));
 }
 
@@ -857,7 +857,7 @@ fn chunks_and_commits_cannot_be_spliced_between_transactions_or_objects() {
     );
     assert!(matches!(
         recover_store(&chunk_splice.sectors),
-        Err(RecoveryError::ObjectMismatch { .. })
+        Err(RecoveryError::ObjectIdentityMismatch { .. })
     ));
 
     let mut orphan = TestLog::formatted();
@@ -875,7 +875,7 @@ fn chunks_and_commits_cannot_be_spliced_between_transactions_or_objects() {
     );
     assert!(matches!(
         recover_store(&orphan.sectors),
-        Err(RecoveryError::CommitWithoutPrepare { .. })
+        Err(RecoveryError::ObjectCommitWithoutPrepare { .. })
     ));
 }
 
@@ -905,9 +905,12 @@ fn every_commit_binding_field_is_exact() {
         log.sectors[final_index] = record.encode().unwrap();
         let error = recover_store(&log.sectors).unwrap_err();
         if *object_mismatch {
-            assert!(matches!(error, RecoveryError::ObjectMismatch { .. }));
+            assert!(matches!(
+                error,
+                RecoveryError::ObjectIdentityMismatch { .. }
+            ));
         } else {
-            assert!(matches!(error, RecoveryError::CommitMismatch { .. }));
+            assert!(matches!(error, RecoveryError::ObjectCommitMismatch { .. }));
         }
     }
 }
@@ -949,7 +952,7 @@ fn whole_content_crc_detects_reencoded_but_wrong_payload() {
     );
     assert!(matches!(
         recover_store(&log.sectors),
-        Err(RecoveryError::ContentCrcMismatch { .. })
+        Err(RecoveryError::ObjectContentCrcMismatch { .. })
     ));
 }
 

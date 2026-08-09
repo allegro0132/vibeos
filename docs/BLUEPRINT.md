@@ -2,7 +2,7 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-08):** M1, M2, M3.5, and M4.0--M4.2 are complete; the original
+**Status (2026-08-09):** M1, M2, M3.5, and M4.0--M4.3 are complete; the original
 M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
@@ -470,10 +470,13 @@ Five boundaries must stay explicit:
    revoke, and high-water allocation. Recovery rejects malformed ancestry and lets
    an ancestor tombstone win over every descendant. This proves the pure crash model,
    M4.1 now supplies real supervised virtio-blk media with reset-before-DMA-reuse.
-   M4.2 now resolves immutable bytes through object capabilities over a unified
-   kinds 1--8 journal, with commit-flush-before-mint and raw-backing verification.
-   Live CSpace installation remains M4.3. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md),
-   [VIRTIO_BLK.md](VIRTIO_BLK.md), and [OBJECT_STORE.md](OBJECT_STORE.md).
+   M4.2 resolves immutable bytes through object capabilities over a unified kinds
+   1--8 journal, with commit-flush-before-mint and raw-backing verification. M4.3
+   now restores the fixed `persistent-test` CSpace only after inert preflight,
+   external root selection, ancestor-tombstone filtering, and atomic typed graph
+   installation. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md),
+   [VIRTIO_BLK.md](VIRTIO_BLK.md), [OBJECT_STORE.md](OBJECT_STORE.md), and
+   [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
 4. **Revocation cannot retroactively erase an in-flight operation.** Console hooks
    revalidate a `Revocable` token before every write; a successful check linearizes
    that operation before an overlapping revoke. Direct generated loads and stores

@@ -5,8 +5,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
-> **Current status (2026-08-08):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16 and M4.2 are complete. M4.3 persistent CSpace is next. Run
+> **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
+> sequence through 3.16 and M4.3 are complete. M4.4 virtio-net is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -385,7 +385,7 @@ claim otherwise.
 | 4.0 ✅ | Specify the durable-capability format and crash model | Stable object/derivation/space/transaction IDs, fixed sealed records, prepare/commit grants, tombstone-first revoke, high-water allocation, and fail-closed recovery. Host tests enumerate every sector-prefix and flush boundary. |
 | 4.1 ✅ | virtio-blk driver as a supervised component | Modern virtio-mmio discovery, explicit MMIO/DMA/service grants, fixed SYSTEM DMA, bounded split queue, IRQ completion, timeout/reset, cancel, quarantine, and bounded fault restart. QEMU verifies the host backing sector after write+flush. |
 | 4.2 ✅ | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
-| 4.3 | Persist a CSpace | Save and restore a component's authority across boot from durable derivation records; a revoked ancestor's tombstone wins over every descendant record. |
+| 4.3 ✅ | Persist a CSpace | The fixed `persistent-test` SpaceId restores a typed object-capability graph only after inert preflight, external root policy, and atomic installation. Three boots prove ancestor tombstones and generation-1 slot reuse. |
 | 4.4 | virtio-net + a typed socket endpoint | `Endpoint<Packet>`, not a byte stream. |
 | 4.5 | Source and binary persistence | `rustc save hello` / `run hello`. Compiled code becomes a storable object with a cap on it. |
 
@@ -426,9 +426,21 @@ exact-task/domain claim cleanup remain heap-bounded; the final append fills all
 512 slots before the host independently parses the powered-off raw image. See
 [OBJECT_STORE.md](OBJECT_STORE.md).
 
-**Acceptance:** write a program at the shell, save it, reboot, run it — and its
-authority after reboot is exactly what was persisted, with revoked caps staying dead.
-Repeat with injected power loss at every store commit boundary.
+4.3 registers one fixed `persistent-test` `SpaceId` and restores only its externally
+admitted `StoredObject` graph. Unified journal recovery remains inert until an exact
+root policy matches; the complete slot table and `root -> child -> grandchild`
+derivation graph are then installed atomically into the same CSpace incarnation.
+One disk survives three QEMU boots: creation and readback, tombstone-first ancestor
+revoke, then generation-1 child-slot reuse. The target never receives Store `WRITE`,
+and an independent host parser checks the final raw graph plus 19 records times 512
+strict prefix cuts. See [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
+
+**M4.3 acceptance:** the three-boot fixed-space lifecycle above is green, including
+raw-media verification and tombstoned descendants staying dead.
+
+**M4 final acceptance (after 4.5):** write a program at the shell, save it, reboot,
+run it — and its authority after reboot is exactly what was persisted. Source and
+binary persistence is not part of M4.3 and remains unfinished.
 
 ---
 
@@ -485,7 +497,7 @@ The continuing tracks after the partial M3 milestone are:
 | **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
 | **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
 | **Compiler** | `compiler`, `kernel/rustc`, trampoline | Resolved-cap lease semantics are complete; 3.4–3.6 remain evidence-driven language-track work rather than a persistence prerequisite |
-| **Platform** | drivers, storage, `tty`, `shell` | M4 durable-capability model and virtio-blk prototype |
+| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.3 durable model, virtio-blk, object store, and fixed persistent CSpace; networking is next |
 | **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 
 The lifecycle track is the integration spine: a driver, persisted program, or remote

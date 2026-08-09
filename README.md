@@ -21,6 +21,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
   API, unified on-disk journal, publication boundary, and raw-media acceptance.
+- **[docs/PERSISTENT_CSPACE.md](docs/PERSISTENT_CSPACE.md)** — the fixed
+  `persistent-test` CSpace, external root policy, atomic recovery install, and
+  three-boot acceptance boundary.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
@@ -81,11 +84,13 @@ ep.send(reading).await;
 from a holder — and `grant`/`derive` can only ever *shrink* rights. Amplification
 isn't policed at runtime; it's absent from the API.
 
-The base system image in `world.rs` has 5 spaces wired to 1 channel, a console,
+The base system image in `world.rs` has five spaces wired to one channel, a console,
 and a bounded memory region. Four are owned by supervised components; `prog` is
 the explicitly unbound execution space used synchronously by the shell task.
-When virtio-blk is discovered, private driver and store-backend spaces are added;
-the latter holds only an attenuated block `READ|WRITE` cap:
+When virtio-blk is discovered, private driver and store-backend spaces plus the
+fixed `persistent-test` CSpace are added. The backend holds only attenuated block
+`READ|WRITE`; `persistent-test` receives restored object authority but never Store
+`WRITE`:
 
 | space  | holds                                    | therefore cannot          |
 |--------|------------------------------------------|---------------------------|
@@ -96,6 +101,7 @@ the latter holds only an attenuated block `READ|WRITE` cap:
 | prog   | console `WRITE`, memory `READ|WRITE`      | reach any other resource  |
 | virtio-blk | MMIO, DMA, block service `READ|WRITE` | console or object caps    |
 | store-backend | block service `READ|WRITE`        | paths or client CSpaces   |
+| persistent-test | durable stored-object caps      | Store `WRITE` or paths    |
 
 Run `probe` in the shell to watch four attacks get refused. `revoke guest` pulls
 a live component's authority out from under it, while `cancel guest` separately
@@ -294,6 +300,7 @@ durable         recover a sealed capability log and tombstone
 blk info        report the supervised virtio-blk transport and capacity
 blk test        read, write, flush, read back, and verify the real backing disk
 rustc edit      type your own program; end it with a lone `.`
+pcspace test    exercise the three-boot persistent CSpace lifecycle
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
 cancel <name>   cooperatively stop a component (the active shell is protected)
@@ -361,10 +368,11 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **Objects persist, live CSpaces do not yet; no MMU, user mode, or multicore.**
-  The M4.2 store commits immutable bytes to the real virtio backing device and
-  exposes them only through capabilities. M4.3 must restore exact authority
-  after reboot, and M4.5 must bind saved source/binaries to that authority.
+- **Persistent authority is currently limited to one fixed test CSpace; no MMU,
+  user mode, or multicore.** M4.3 restores the externally constrained
+  `persistent-test` object graph across boot and keeps ancestor tombstones dead,
+  but it is not yet a general component checkpoint facility. M4.5 must still bind
+  saved source and binaries to durable authority before `rustc save` / `run` exist.
 - **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.

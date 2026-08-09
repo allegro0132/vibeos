@@ -11,7 +11,7 @@ vibe> ps
   component:1  task:1   sensor     sensor   running   -        N    65536 B
   component:2  task:2   logger     logger   running   -        N    65536 B
   component:3  task:3   guest      guest    cancelled cancelled        1    65536 B
-  component:4  task:4   virtio-blk virtio-blk running   -                1    65536 B
+  component:4  task:4   virtio-blk virtio-blk running   -        N    65536 B
   component:5  task:6   shell      init     running   -        N    8388608 B
   executor totals (including untracked tasks): 0 exited, 0 faulted, 1 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use
@@ -29,7 +29,7 @@ vibe> ps
   component:1  task:1   sensor     sensor   running   -        N    65536 B
   component:2  task:2   logger     logger   running   -        N    65536 B
   component:3  task:7   guest      guest    running   -        N    65536 B
-  component:4  task:4   virtio-blk virtio-blk running   -                1    65536 B
+  component:4  task:4   virtio-blk virtio-blk running   -        N    65536 B
   component:5  task:6   shell      init     running   -        N    8388608 B
   executor totals (including untracked tasks): 0 exited, 0 faulted, 1 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use

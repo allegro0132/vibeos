@@ -1,0 +1,33 @@
+=== persistent CSpace boot 1 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> pcspace test
+  durable CSpace gate: ready, dependent started
+  boot1 root: slot 0 generation 0, rights r---gx
+  boot1 child: slot 1 generation 0 (descendant readback ok)
+  persistent-test Store WRITE: absent
+vibe> halt
+  powering off.
+=== persistent CSpace boot 2 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> pcspace test
+  durable CSpace gate: ready, dependent started
+  boot2 restored child: slot 1 generation 0, readback ok
+  tombstone-first ancestor revoke: child absent, descendant absent
+  persistent-test Store WRITE: absent
+vibe> halt
+  powering off.
+=== persistent CSpace boot 3 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> pcspace test
+  durable CSpace gate: ready, dependent started
+  boot3 tombstoned child: slot 1 generation 0 absent
+  slot reuse: slot 1 generation 1 (higher), readback ok
+  persistent-test Store WRITE: absent
+vibe> halt
+  powering off.

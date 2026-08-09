@@ -787,6 +787,13 @@ pub struct ChainCheckpoint {
     pub previous_crc32c: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedAuthorityTransaction {
+    /// Canonical records in the order they must be written. The caller must
+    /// flush the last record before publishing the corresponding live change.
+    pub records: Vec<[u8; RECORD_SIZE]>,
+}
+
 impl RecordChain {
     pub const fn new(store_id: StoreId) -> Self {
         Self {
@@ -863,6 +870,73 @@ impl RecordChain {
     }
 }
 
+/// Preview a high-water reservation without advancing `chain` in place.
+pub fn preview_id_high_water(
+    chain: &RecordChain,
+    exclusive_end: u128,
+) -> Result<(EncodedAuthorityTransaction, RecordChain), EncodeError> {
+    let mut next = chain.clone();
+    let record = next.append(None, RecordBody::IdHighWater { exclusive_end })?;
+    Ok((
+        EncodedAuthorityTransaction {
+            records: alloc::vec![record],
+        },
+        next,
+    ))
+}
+
+/// Preview one prepare/commit grant transaction without advancing `chain`.
+pub fn preview_grant_transaction(
+    chain: &RecordChain,
+    transaction_id: TransactionId,
+    grant: GrantRecord,
+) -> Result<(EncodedAuthorityTransaction, RecordChain), EncodeError> {
+    let mut next = chain.clone();
+    next.ensure_capacity(2)?;
+    let prepare = next.append(
+        Some(transaction_id),
+        RecordBody::GrantPrepare(grant.clone()),
+    )?;
+    let DecodeStatus::Valid(decoded) =
+        LogRecord::decode(&prepare).expect("a freshly encoded prepare must decode")
+    else {
+        unreachable!()
+    };
+    let commit = next.append(
+        Some(transaction_id),
+        RecordBody::GrantCommit {
+            prepare_sequence: decoded.record.sequence,
+            prepare_crc32c: decoded.crc32c,
+            derivation_id: grant.derivation_id,
+        },
+    )?;
+    Ok((
+        EncodedAuthorityTransaction {
+            records: alloc::vec![prepare, commit],
+        },
+        next,
+    ))
+}
+
+/// Preview a tombstone-first revoke record without advancing `chain`.
+pub fn preview_revoke_transaction(
+    chain: &RecordChain,
+    transaction_id: TransactionId,
+    derivation_id: DerivationId,
+) -> Result<(EncodedAuthorityTransaction, RecordChain), EncodeError> {
+    let mut next = chain.clone();
+    let record = next.append(
+        Some(transaction_id),
+        RecordBody::RevokeTombstone { derivation_id },
+    )?;
+    Ok((
+        EncodedAuthorityTransaction {
+            records: alloc::vec![record],
+        },
+        next,
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootPolicy {
     /// Root grants are trust anchors and must match this record exactly.
@@ -884,13 +958,243 @@ pub struct RecoveredGrant {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredObject {
+    pub object_id: ObjectId,
+    pub object_kind: ObjectKind,
+    pub bytes: Vec<u8>,
+    pub transaction_id: TransactionId,
+    pub prepare_sequence: u64,
+    pub commit_sequence: u64,
+}
+
+/// Complete historical state of one durable CSpace slot. `max_generation`
+/// remains meaningful when the latest derivation was tombstoned, so a reboot
+/// cannot accidentally reuse that generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveredSlot {
+    pub space: SpaceId,
+    pub slot: u32,
+    pub max_generation: u64,
+    pub live_derivation: Option<DerivationId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveredStore {
     pub store_id: StoreId,
     pub id_high_water: u128,
     pub grants: Vec<RecoveredGrant>,
+    pub objects: Vec<RecoveredObject>,
+    pub slots: Vec<RecoveredSlot>,
     pub tombstones: Vec<DerivationId>,
     pub last_sequence: u64,
     pub last_crc32c: u32,
+}
+
+impl RecoveredStore {
+    pub fn chain_checkpoint(&self) -> Result<ChainCheckpoint, RecoveryError> {
+        Ok(ChainCheckpoint {
+            next_sequence: self
+                .last_sequence
+                .checked_add(1)
+                .ok_or(RecoveryError::SequenceOverflow)?,
+            previous_sequence: self.last_sequence,
+            previous_crc32c: self.last_crc32c,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootRightsConstraint {
+    /// Every selected root must carry these rights.
+    pub required: DurableRights,
+    /// A selected root may carry no rights outside this mask. Set this equal
+    /// to `required` for an exact-rights match.
+    pub allowed: DurableRights,
+}
+
+impl RootRightsConstraint {
+    pub const fn exact(rights: DurableRights) -> Self {
+        Self {
+            required: rights,
+            allowed: rights,
+        }
+    }
+
+    pub const fn at_most(required: DurableRights, allowed: DurableRights) -> Self {
+        Self { required, allowed }
+    }
+}
+
+/// External trust constraint for selecting one dynamic durable root. On-media
+/// ROOT is only a candidate marker; exactly one final live root must satisfy
+/// every field below or selection fails closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootConstraint {
+    pub space: SpaceId,
+    pub first_slot: u32,
+    pub last_slot_inclusive: u32,
+    pub rights: RootRightsConstraint,
+    pub resource_kind: ResourceKind,
+    pub object_kind: ObjectKind,
+}
+
+/// A decoded and semantically checked journal which has not yet been allowed
+/// to confer authority. It deliberately exposes candidates and committed
+/// objects only as inert typed records, never as an ObjectId lookup service.
+#[derive(Clone, Debug)]
+pub struct RecoveryPreflight {
+    store_id: StoreId,
+    id_high_water: u128,
+    committed: Vec<RecoveredGrant>,
+    objects: Vec<RecoveredObject>,
+    tombstone_sequence: BTreeMap<DerivationId, u64>,
+    graph: BTreeMap<DerivationId, RecoveredGrant>,
+    slots: Vec<RecoveredSlot>,
+    last_sequence: u64,
+    last_crc32c: u32,
+}
+
+impl RecoveryPreflight {
+    pub const fn store_id(&self) -> StoreId {
+        self.store_id
+    }
+
+    pub const fn id_high_water(&self) -> u128 {
+        self.id_high_water
+    }
+
+    pub fn committed_objects(&self) -> &[RecoveredObject] {
+        &self.objects
+    }
+
+    pub fn committed_grants(&self) -> &[RecoveredGrant] {
+        &self.committed
+    }
+
+    pub fn slots(&self) -> &[RecoveredSlot] {
+        &self.slots
+    }
+
+    pub const fn last_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
+    pub const fn last_crc32c(&self) -> u32 {
+        self.last_crc32c
+    }
+
+    pub fn chain_checkpoint(&self) -> Result<ChainCheckpoint, RecoveryError> {
+        Ok(ChainCheckpoint {
+            next_sequence: self
+                .last_sequence
+                .checked_add(1)
+                .ok_or(RecoveryError::SequenceOverflow)?,
+            previous_sequence: self.last_sequence,
+            previous_crc32c: self.last_crc32c,
+        })
+    }
+
+    /// Select exactly one live root for every external constraint. Multiple
+    /// matching roots are ambiguous even if their commit order differs.
+    pub fn select_roots(
+        &self,
+        constraints: &[RootConstraint],
+    ) -> Result<Vec<RootPolicy>, RecoveryError> {
+        let mut selected = Vec::with_capacity(constraints.len());
+        let mut selected_ids = BTreeSet::new();
+        for constraint in constraints {
+            if constraint.first_slot > constraint.last_slot_inclusive
+                || !constraint
+                    .rights
+                    .allowed
+                    .contains(constraint.rights.required)
+            {
+                return Err(RecoveryError::InvalidRootConstraint);
+            }
+            let mut match_ = None;
+            for candidate in &self.committed {
+                let grant = &candidate.grant;
+                if !grant.flags.is_root()
+                    || grant.parent_id.is_some()
+                    || is_tombstoned(grant.derivation_id, &self.graph, &self.tombstone_sequence)
+                    || grant.target.space != constraint.space
+                    || grant.target.slot < constraint.first_slot
+                    || grant.target.slot > constraint.last_slot_inclusive
+                    || grant.resource_kind != constraint.resource_kind
+                    || !grant.rights.contains(constraint.rights.required)
+                    || !constraint.rights.allowed.contains(grant.rights)
+                {
+                    continue;
+                }
+                let object_matches = self.objects.iter().any(|object| {
+                    object.object_id == grant.object_id
+                        && object.object_kind == constraint.object_kind
+                        && object.commit_sequence < candidate.commit_sequence
+                });
+                if !object_matches {
+                    continue;
+                }
+                if match_.replace(candidate).is_some() {
+                    return Err(RecoveryError::AmbiguousRootConstraint);
+                }
+            }
+            let Some(candidate) = match_ else {
+                return Err(RecoveryError::MissingRootConstraint);
+            };
+            if !selected_ids.insert(candidate.grant.derivation_id) {
+                return Err(RecoveryError::AmbiguousRootConstraint);
+            }
+            selected.push(RootPolicy {
+                grant: candidate.grant.clone(),
+            });
+        }
+        Ok(selected)
+    }
+
+    /// Apply exact external root policy and publish the unified object,
+    /// authority, slot-history, and chain-checkpoint view.
+    pub fn finish(self, roots: &[RootPolicy]) -> Result<RecoveredStore, RecoveryError> {
+        for recovered in &self.committed {
+            let grant = &recovered.grant;
+            if grant.flags.is_root()
+                && !is_tombstoned(grant.derivation_id, &self.graph, &self.tombstone_sequence)
+                && !roots.iter().any(|root| root.grant == *grant)
+            {
+                return Err(RecoveryError::RootNotTrusted {
+                    sequence: recovered.commit_sequence,
+                });
+            }
+        }
+
+        let grants = self
+            .committed
+            .into_iter()
+            .filter(|grant| {
+                !is_tombstoned(
+                    grant.grant.derivation_id,
+                    &self.graph,
+                    &self.tombstone_sequence,
+                )
+            })
+            .collect();
+        let tombstones = self.tombstone_sequence.keys().copied().collect();
+        Ok(RecoveredStore {
+            store_id: self.store_id,
+            id_high_water: self.id_high_water,
+            grants,
+            objects: self.objects,
+            slots: self.slots,
+            tombstones,
+            last_sequence: self.last_sequence,
+            last_crc32c: self.last_crc32c,
+        })
+    }
+
+    /// Consume the same semantic pass as an object-only compatibility view.
+    /// No root candidate acquires live authority through this operation.
+    pub fn into_objects(self) -> Vec<RecoveredObject> {
+        self.objects
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,6 +1219,9 @@ pub enum RecoveryError {
     ObjectCommitWithoutPrepare { sequence: u64 },
     ObjectCommitMismatch { sequence: u64 },
     ObjectContentCrcMismatch { sequence: u64 },
+    ObjectIdentityMismatch { sequence: u64 },
+    UnexpectedObjectChunkIndex { sequence: u64 },
+    MissingObjectChunks { sequence: u64 },
     RootShape { sequence: u64 },
     RootNotTrusted { sequence: u64 },
     MissingParent { sequence: u64 },
@@ -923,6 +1230,9 @@ pub enum RecoveryError {
     ObjectMismatch { sequence: u64 },
     SlotGeneration { sequence: u64 },
     SlotStillLive { sequence: u64 },
+    InvalidRootConstraint,
+    MissingRootConstraint,
+    AmbiguousRootConstraint,
 }
 
 struct PreparedGrant {
@@ -940,6 +1250,7 @@ struct PreparedObject {
     chunk_digest: Crc32cDigest,
     content_digest: Crc32cDigest,
     byte_len: usize,
+    bytes: Vec<u8>,
 }
 
 enum TxState {
@@ -956,14 +1267,16 @@ enum IdClass {
     Transaction,
 }
 
-/// Recover live authority from physical sectors.
+/// Decode and semantically validate one unified object/authority journal.
 ///
 /// Empty and unsealed sectors are skipped. Any *sealed* non-canonical sector,
-/// chain break, invalid graph, or policy mismatch rejects the entire store.
-pub fn recover(
+/// chain break, invalid object transaction, or invalid derivation graph rejects
+/// the entire store. The result is inert until exact external root policy is
+/// supplied to [`RecoveryPreflight::finish`].
+pub fn preflight_recovery(
     sectors: &[[u8; RECORD_SIZE]],
-    policy: RecoveryPolicy<'_>,
-) -> Result<RecoveredStore, RecoveryError> {
+    store_id: StoreId,
+) -> Result<RecoveryPreflight, RecoveryError> {
     // Decode-only preflight rejects every sealed malformed sector without
     // retaining ObjectChunk Vecs for the full journal.
     for (sector, bytes) in sectors.iter().enumerate() {
@@ -987,7 +1300,7 @@ pub fn recover(
         {
             return Err(RecoveryError::FormatNotFirst);
         }
-        if record.store_id != policy.store_id {
+        if record.store_id != store_id {
             return Err(RecoveryError::WrongStore { sector });
         }
         let expected = previous_sequence
@@ -1016,6 +1329,7 @@ pub fn recover(
     let mut seen_derivations = BTreeSet::new();
     let mut seen_objects = BTreeSet::new();
     let mut committed: Vec<RecoveredGrant> = Vec::new();
+    let mut committed_objects: Vec<RecoveredObject> = Vec::new();
     let mut tombstone_sequence: BTreeMap<DerivationId, u64> = BTreeMap::new();
 
     // Decode and validate one record at a time. At most one <=360-byte chunk
@@ -1195,6 +1509,7 @@ pub fn recover(
                         chunk_digest: Crc32cDigest::new(),
                         content_digest: Crc32cDigest::new(),
                         byte_len: 0,
+                        bytes: Vec::new(),
                     }),
                 );
             }
@@ -1221,11 +1536,13 @@ pub fn recover(
                 let TxState::ObjectPrepared(prepared) = state else {
                     return Err(RecoveryError::DuplicateTransaction { sequence });
                 };
-                if prepared.metadata.object_id != chunk.object_id
-                    || chunk.chunk_index != prepared.next_chunk
+                if prepared.metadata.object_id != chunk.object_id {
+                    return Err(RecoveryError::ObjectIdentityMismatch { sequence });
+                }
+                if chunk.chunk_index != prepared.next_chunk
                     || prepared.next_chunk >= prepared.metadata.chunk_count
                 {
-                    return Err(RecoveryError::UnexpectedObjectChunk { sequence });
+                    return Err(RecoveryError::UnexpectedObjectChunkIndex { sequence });
                 }
                 let expected_len = expected_chunk_len(
                     prepared.metadata.byte_len as usize,
@@ -1241,6 +1558,7 @@ pub fn recover(
                 prepared.chunk_digest.update(&decoded.crc32c.to_le_bytes());
                 prepared.content_digest.update(&chunk.data);
                 prepared.byte_len += chunk.data.len();
+                prepared.bytes.extend_from_slice(&chunk.data);
                 prepared.next_chunk += 1;
             }
             RecordBody::ObjectCommit(commit) => {
@@ -1268,9 +1586,13 @@ pub fn recover(
                 let TxState::ObjectPrepared(prepared) = state else {
                     return Err(RecoveryError::DuplicateTransaction { sequence });
                 };
-                if prepared.metadata.object_id != commit.object_id
-                    || prepared.next_chunk != prepared.metadata.chunk_count
-                    || commit.prepare_sequence != prepared.sequence
+                if prepared.metadata.object_id != commit.object_id {
+                    return Err(RecoveryError::ObjectIdentityMismatch { sequence });
+                }
+                if prepared.next_chunk != prepared.metadata.chunk_count {
+                    return Err(RecoveryError::MissingObjectChunks { sequence });
+                }
+                if commit.prepare_sequence != prepared.sequence
                     || commit.prepare_crc32c != prepared.crc32c
                     || commit.chunk_count != prepared.metadata.chunk_count
                     || commit.first_chunk_sequence != prepared.first_chunk_sequence
@@ -1284,6 +1606,14 @@ pub fn recover(
                 {
                     return Err(RecoveryError::ObjectContentCrcMismatch { sequence });
                 }
+                committed_objects.push(RecoveredObject {
+                    object_id: prepared.metadata.object_id,
+                    object_kind: prepared.metadata.object_kind,
+                    bytes: prepared.bytes,
+                    transaction_id: tx,
+                    prepare_sequence: prepared.sequence,
+                    commit_sequence: sequence,
+                });
                 transactions.insert(tx, TxState::Finished);
             }
         }
@@ -1303,11 +1633,6 @@ pub fn recover(
         if grant.flags.is_root() {
             if grant.parent_id.is_some() {
                 return Err(RecoveryError::RootShape {
-                    sequence: recovered.commit_sequence,
-                });
-            }
-            if !policy.roots.iter().any(|root| root.grant == *grant) {
-                return Err(RecoveryError::RootNotTrusted {
                     sequence: recovered.commit_sequence,
                 });
             }
@@ -1372,19 +1697,38 @@ pub fn recover(
         );
     }
 
-    let grants = committed
+    let slots = slots
         .into_iter()
-        .filter(|grant| !is_tombstoned(grant.grant.derivation_id, &graph, &tombstone_sequence))
+        .map(
+            |((space, slot), (max_generation, derivation))| RecoveredSlot {
+                space,
+                slot,
+                max_generation,
+                live_derivation: (!is_tombstoned(derivation, &graph, &tombstone_sequence))
+                    .then_some(derivation),
+            },
+        )
         .collect();
-    let tombstones = tombstone_sequence.keys().copied().collect();
-    Ok(RecoveredStore {
-        store_id: policy.store_id,
+    Ok(RecoveryPreflight {
+        store_id,
         id_high_water: high_water,
-        grants,
-        tombstones,
+        committed,
+        objects: committed_objects,
+        tombstone_sequence,
+        graph,
+        slots,
         last_sequence: previous_sequence,
         last_crc32c: previous_crc,
     })
+}
+
+/// Compatibility wrapper for callers with an already-known exact root policy.
+/// It shares the same unified semantic pass as dynamic-root recovery.
+pub fn recover(
+    sectors: &[[u8; RECORD_SIZE]],
+    policy: RecoveryPolicy<'_>,
+) -> Result<RecoveredStore, RecoveryError> {
+    preflight_recovery(sectors, policy.store_id)?.finish(policy.roots)
 }
 
 fn ids_reserved_for_grant(grant: &GrantRecord, tx: TransactionId, high_water: u128) -> bool {

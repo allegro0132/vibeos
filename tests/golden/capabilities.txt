@@ -3,8 +3,9 @@ vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> spaces
   guest    1 caps
-  init     12 caps
+  init     13 caps
   logger   2 caps
+  persistent-test 0 caps
   prog     2 caps
   sensor   1 caps
   store-backend 1 caps
@@ -25,6 +26,7 @@ vibe> caps init
   cap:9.0      dma-region rwsvgx   SYSTEM stable slab @ 0xADDR, 4096 bytes
   cap:10.0     block-device rwsvgx   virtio-blk [2048 sectors, queue 8, epoch 1]
   cap:11.0     object-store rwsvgx   capability-addressed object store (recovery pending)
+  cap:12.0     durable-cspace rw----   persistent-test CSpace [Ready, 0 live grants, 0 tombstones]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps logger
   owner component:2  task task:2  name logger  state running  reason -

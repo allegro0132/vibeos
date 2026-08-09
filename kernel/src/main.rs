@@ -18,7 +18,7 @@ extern crate alloc;
 // The portable half of the kernel lives in `vibeos-core` so it can be tested on
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
-pub use vibeos_core::{cap, chan, durable, exec, heap, sync};
+pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, sync, virtio};
 
 mod bench;
 mod dev;
@@ -30,6 +30,8 @@ mod trampoline;
 mod trap;
 mod tty;
 mod uart;
+mod virtio_blk;
+mod virtio_mmio;
 mod world;
 
 use core::arch::global_asm;
@@ -128,13 +130,18 @@ pub extern "C" fn kmain() -> ! {
     world::build();
 
     let world = world::world();
+    world::start_block_supervisor();
     world.spawn_component(
         "shell",
         world.spaces["init"].clone(),
         world::SHELL_MEMORY_BUDGET,
         shell::shell_task(boot_time),
     );
-    println!("  world     5 capability spaces, 1 typed channel, 4 components");
+    println!(
+        "  world     {} capability spaces, 1 typed channel, {} components",
+        world.spaces.len(),
+        world.components().len()
+    );
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();
@@ -149,6 +156,7 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         // Repair component-stable synchronization state while the exact
         // faulting incarnation is still identifiable and before Faulted is
         // visible to safe lifecycle callers.
+        virtio_blk::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
         HEAP.reclaim_faulted_arena(domain.arena)
             .expect("a faulted audited arena must reclaim atomically");

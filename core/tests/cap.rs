@@ -286,6 +286,23 @@ fn invocation_lease_survives_revoke_but_a_new_lease_does_not() {
 }
 
 #[test]
+fn invocation_lease_retains_actual_rights_for_service_side_enforcement() {
+    let mut cs = CSpace::new("service-rights");
+    let read = cs.mint(Arc::new(Widget("read")), Rights::READ);
+    let none = cs.mint(Arc::new(Widget("none")), Rights::NONE);
+
+    // Even a lookup which asks for NONE records the slot's real authority;
+    // service methods, rather than callers, choose the right they require.
+    let read_lease = cs.lookup_lease::<Widget>(read, Rights::NONE).unwrap();
+    assert!(read_lease.authorizes(Rights::READ));
+    assert!(!read_lease.authorizes(Rights::WRITE));
+
+    let none_lease = cs.lookup_lease::<Widget>(none, Rights::NONE).unwrap();
+    assert!(!none_lease.authorizes(Rights::READ));
+    assert!(!none_lease.authorizes(Rights::WRITE));
+}
+
+#[test]
 fn cross_space_invocation_lease_survives_only_if_already_acquired() {
     let (mut src, w) = space();
     let mut dst = CSpace::new("dst");

@@ -16,12 +16,18 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation, explicit leases, dishonest type-erasure implementations, and CSpace reset ABA; durable-log canonical decoding and exhaustive prefix/flush crash recovery; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault-arena teardown; wait/timer registration ownership and stress; owner-tagged heap quotas/provenance; channels, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation and explicit leases; durable-log canonical decoding and exhaustive prefix/flush crash recovery; modern virtio feature/status negotiation, split-ring layout, malformed completion quarantine, index wrap, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; channels and the compiler | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, and program output | `tests/cases/`, `tests/golden/` |
+| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, timeout reset, cancellation, and fault restart | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
+
+The `block` QEMU case is intentionally stronger than a transcript: every case
+gets a fresh raw disk, sector 7 is seeded by the host, and after `blk test` exits
+the host compares all 512 bytes of sector 8. `block_recovery` suppresses one real
+QueueNotify to exercise the timer/reset path, injects a component fault after DMA
+publication, and separately verifies cancellation plus explicit restart.
 
 ## Performance baseline
 

@@ -18,6 +18,7 @@ use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::sync::SpinLock;
+use crate::virtio_blk;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
@@ -81,6 +82,7 @@ enum ComponentTemplate {
     Sensor,
     Logger,
     Guest,
+    VirtioBlk,
     FaultProbe,
 }
 
@@ -88,6 +90,7 @@ enum ComponentGrants {
     Sensor(Cap),
     Logger { rx: Cap, console: Cap },
     Guest(Cap),
+    VirtioBlk { mmio: Cap, dma: Cap, service: Cap },
     FaultProbe,
 }
 
@@ -279,6 +282,12 @@ pub struct World {
     pub prog_memory: Cap,
     /// init's own handle on the same region, for reporting.
     pub region: Cap,
+    /// init's client authority on the discovered block service. The transport
+    /// and DMA roots remain private supervisor grants.
+    pub block: Option<Cap>,
+    pub block_space: Option<Cap>,
+    block_mmio: Option<Cap>,
+    block_dma: Option<Cap>,
 }
 
 impl World {
@@ -387,6 +396,29 @@ impl World {
                 cap::grant(&init, self.console, Rights::WRITE, &mut target)
                     .expect("init retains the console grant root"),
             ),
+            ComponentTemplate::VirtioBlk => ComponentGrants::VirtioBlk {
+                mmio: cap::grant(
+                    &init,
+                    self.block_mmio.expect("block MMIO root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("init retains the block MMIO grant root"),
+                dma: cap::grant(
+                    &init,
+                    self.block_dma.expect("block DMA root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("init retains the block DMA grant root"),
+                service: cap::grant(
+                    &init,
+                    self.block.expect("block service root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("init retains the block service grant root"),
+            },
             ComponentTemplate::FaultProbe => ComponentGrants::FaultProbe,
         }
     }
@@ -417,6 +449,13 @@ impl World {
             },
             ComponentGrants::Guest(console) => unsafe {
                 exec::spawn_reclaimable_owned(domain, &component.name, guest_task(space, console))
+            },
+            ComponentGrants::VirtioBlk { mmio, dma, service } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    virtio_blk::driver_task(space.get(), mmio, dma, service),
+                )
             },
             ComponentGrants::FaultProbe => unsafe {
                 exec::spawn_reclaimable_owned(
@@ -609,6 +648,44 @@ pub fn world() -> Arc<World> {
     WORLD.lock().as_ref().expect("world not built").clone()
 }
 
+/// Restart only faulted block-driver incarnations, with a bounded exponential
+/// backoff. Explicit cancellation is an operator decision and is never
+/// converted into an automatic restart.
+pub fn start_block_supervisor() {
+    let world = world();
+    let Some(component) = world.component_named("virtio-blk") else {
+        return;
+    };
+    exec::spawn("supervisor:virtio-blk", async move {
+        let mut attempts = 0u32;
+        loop {
+            let (generation, join) = component.join_current();
+            let exit = join.await;
+            match exit.state() {
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("virtio-blk").is_err() {
+                        return;
+                    }
+                }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => {
+                    // Cancellation itself never authorizes restart. Keep the
+                    // stable supervisor alive so an explicit later restart is
+                    // supervised just like the boot incarnation.
+                    loop {
+                        if component.snapshot().generation > generation {
+                            break;
+                        }
+                        exec::sleep_ms(100).await;
+                    }
+                }
+                exec::TaskState::Faulted | exec::TaskState::Running => return,
+            }
+        }
+    });
+}
+
 pub fn build() {
     let console = ConsoleDev::new();
     // 4096 i64s: enough for real programs, small enough that a runaway one hits
@@ -621,6 +698,8 @@ pub fn build() {
     let logger = Space::new("logger");
     let guest = Space::new("guest");
     let prog = Space::new("prog");
+    let block_resources = virtio_blk::discover();
+    let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
 
     // init is the root of authority: it mints the only unattenuated caps, then
     // hands out strictly weaker copies. Nothing else can widen what it gets.
@@ -629,6 +708,9 @@ pub fn build() {
     let c_telemetry = cs.mint(telemetry.clone(), Rights::ALL);
     let c_guest_space = cs.mint(guest.clone(), Rights::READ.union(Rights::REVOKE));
     let c_prog_space = cs.mint(prog.clone(), Rights::READ.union(Rights::REVOKE));
+    let c_block_space = block_space
+        .as_ref()
+        .map(|space| cs.mint(space.clone(), Rights::READ.union(Rights::REVOKE)));
     cs.mint(sensor.clone(), Rights::READ);
     cs.mint(logger.clone(), Rights::READ);
 
@@ -653,16 +735,58 @@ pub fn build() {
         &mut prog.0.lock(),
     )
     .unwrap();
+
+    let (block_root, block_mmio_root, block_dma_root, block_grants) =
+        match (block_resources, block_space.as_ref()) {
+            (Some(resources), Some(space)) => {
+                let mmio_root = cs.mint(resources.mmio, Rights::ALL);
+                let dma_root = cs.mint(resources.dma, Rights::ALL);
+                let service_root = cs.mint(resources.device, Rights::ALL);
+                let mut target = space.0.lock();
+                let grants = (
+                    cap::grant(
+                        &cs,
+                        mmio_root,
+                        Rights::READ.union(Rights::WRITE),
+                        &mut target,
+                    )
+                    .unwrap(),
+                    cap::grant(
+                        &cs,
+                        dma_root,
+                        Rights::READ.union(Rights::WRITE),
+                        &mut target,
+                    )
+                    .unwrap(),
+                    cap::grant(
+                        &cs,
+                        service_root,
+                        Rights::READ.union(Rights::WRITE),
+                        &mut target,
+                    )
+                    .unwrap(),
+                );
+                drop(target);
+                (Some(service_root), Some(mmio_root), Some(dma_root), Some(grants))
+            }
+            (None, None) => (None, None, None, None),
+            _ => unreachable!("block resources and CSpace are constructed together"),
+        };
     drop(cs);
 
+    let mut spaces = BTreeMap::from([
+        ("init", init),
+        ("sensor", sensor.clone()),
+        ("logger", logger.clone()),
+        ("guest", guest.clone()),
+        ("prog", prog),
+    ]);
+    if let Some(space) = block_space.as_ref() {
+        spaces.insert("virtio-blk", space.clone());
+    }
+
     let world = Arc::new(World {
-        spaces: BTreeMap::from([
-            ("init", init),
-            ("sensor", sensor.clone()),
-            ("logger", logger.clone()),
-            ("guest", guest.clone()),
-            ("prog", prog),
-        ]),
+        spaces,
         components: SpinLock::new(BTreeMap::new()),
         console: c_console,
         telemetry: c_telemetry,
@@ -671,6 +795,10 @@ pub fn build() {
         prog_console: prog_con,
         prog_memory: prog_mem,
         region: init_region,
+        block: block_root,
+        block_space: c_block_space,
+        block_mmio: block_mmio_root,
+        block_dma: block_dma_root,
     });
 
     // Components are *handed* their handles at spawn. That is their whole
@@ -696,6 +824,16 @@ pub fn build() {
         Some(ComponentTemplate::Guest),
         guest_task(SpaceRef::new(&guest), guest_con),
     );
+
+    if let (Some(space), Some((mmio, dma, service))) = (block_space, block_grants) {
+        world.spawn_component_inner(
+            "virtio-blk",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::VirtioBlk),
+            virtio_blk::driver_task(SpaceRef::new(&space).get(), mmio, dma, service),
+        );
+    }
 
     *WORLD.lock() = Some(world);
 }

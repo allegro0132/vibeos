@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::cap::{InvocationLease, Resource};
+use crate::cap::{InvocationLease, Resource, Rights};
 use crate::sync::SpinLock;
 use crate::uart;
 
@@ -96,6 +96,9 @@ pub struct MemoryInvocation {
 
 impl MemoryInvocation {
     pub fn claim(lease: InvocationLease<MemoryRegion>) -> Result<Self, ()> {
+        if !lease.authorizes(Rights::READ.union(Rights::WRITE)) {
+            return Err(());
+        }
         let claimed = lease.with(|region| {
             region
                 .claimed

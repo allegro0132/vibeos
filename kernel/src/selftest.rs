@@ -1067,9 +1067,9 @@ fn components(h: &mut Harness) {
     let tasks = exec::task_report();
 
     h.eq(
-        "the system image registers four supervised components",
+        "the system image registers every discovered supervised component",
         snapshots.len(),
-        4,
+        4 + usize::from(w.block.is_some()),
     );
     h.check(
         "component memory accounts use the stable component identity",

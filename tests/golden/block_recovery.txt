@@ -1,0 +1,15 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> blk timeout
+  timeout recovery: reset-before-reuse, retry ok, waiters bounded
+vibe> blk cancel
+  cancellation recovery: reset confirmed, explicit restart online
+vibe> blk revoke
+  authority revocation: next request denied, fresh grants online
+vibe> blk recover
+[!] panic: panicked at kernel/src/virtio_blk.rs:LINE:COL:
+injected virtio-blk fault after DMA publication
+  fault recovery: reset confirmed, fresh generation online
+vibe> halt
+  powering off.

@@ -236,6 +236,86 @@ fn linking_rewrites_only_declared_placeholders_to_checked_targets() {
         image.link_with_runtime(data_base, code_base, &rt).unwrap(),
         linked
     );
+
+    let mut in_place = vec![0xfeed_face; image.code_template().len()];
+    image
+        .link_into_with_runtime(data_base, code_base, &rt, &mut in_place)
+        .unwrap();
+    assert_eq!(in_place, linked.code);
+}
+
+#[test]
+fn in_place_linking_is_byte_for_byte_compatible_with_owned_linking() {
+    let rt = runtime();
+    for (data_base, code_base) in [
+        (0, 0),
+        (0x8000_0000, 0x8010_0000),
+        (0x1234_5678_9abc_0000, 0x2345_6789_abcd_0000),
+    ] {
+        for source in [samples::HELLO, samples::DEMO, samples::CONFORMANCE, RICH] {
+            let image = compile_relocatable(source).unwrap();
+            let owned = image.link_with_runtime(data_base, code_base, &rt).unwrap();
+            let mut in_place = vec![0xa5a5_a5a5; image.code_template().len()];
+            image
+                .link_into_with_runtime(data_base, code_base, &rt, &mut in_place)
+                .unwrap();
+            assert_eq!(
+                in_place, owned.code,
+                "changed in-place output at bases {data_base:#x}/{code_base:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn in_place_linking_rejects_wrong_lengths_without_writing() {
+    let image = compile_relocatable(RICH).unwrap();
+    let rt = runtime();
+    let words = image.code_template().len();
+    assert!(words > 1);
+
+    let mut short = vec![0x1357_9bdf; words - 1];
+    let short_before = short.clone();
+    let short_error = image
+        .link_into_with_runtime(0x1000, 0x2000, &rt, &mut short)
+        .unwrap_err();
+    assert!(short_error.contains("code buffer length mismatch"));
+    assert_eq!(short, short_before);
+
+    let bindings = [
+        RuntimeBinding {
+            import: RuntimeImport::PrintStr,
+            address: rt.print_str,
+        },
+        RuntimeBinding {
+            import: RuntimeImport::PrintInt,
+            address: rt.print_int,
+        },
+        RuntimeBinding {
+            import: RuntimeImport::PrintBool,
+            address: rt.print_bool,
+        },
+        RuntimeBinding {
+            import: RuntimeImport::Abort,
+            address: rt.abort,
+        },
+    ];
+    let mut long = vec![0x2468_ace0; words + 1];
+    let long_before = long.clone();
+    let long_error = image
+        .link_into(0x1000, 0x2000, &bindings, &mut long)
+        .unwrap_err();
+    assert!(long_error.contains("code buffer length mismatch"));
+    assert_eq!(long, long_before);
+
+    // Length is exact here, so this also proves that a later preflight error
+    // cannot expose a template copy or partially relocated caller buffer.
+    let mut missing_import = vec![0xdead_beef; words];
+    let missing_before = missing_import.clone();
+    assert!(image
+        .link_into(0x1000, 0x2000, &bindings[..3], &mut missing_import)
+        .is_err());
+    assert_eq!(missing_import, missing_before);
 }
 
 #[test]

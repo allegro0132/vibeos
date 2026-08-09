@@ -3,10 +3,12 @@ vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> mmu
   mode: Sv39, ASID 0, one shared root at 0xADDR
-  harts: satp read back on mask 0xADDR (4/4 online)
-  kernel RAM: 0xADDR..0xADDR, identity, N KiB leaves, rwx
+  harts: satp read back on mask 0xADDR (4/4 online), MXR clear mask 0xADDR
+  kernel RAM: 0xADDR..0xADDR, identity, N KiB leaves, strict W^X
+  text: r-x, writable RAM: rw-, no writable-executable leaf
   MMIO: PLIC N KiB leaves rw-, UART/virtio N KiB leaves rw-
   stacks: 4 x N KiB usable, N KiB guards invalid, rw-
+  code pool: N KiB, 0 live/0 sealed pages, free/write rw-, sealed --x
   unmapped: firmware prefix, null page, and unused physical space
 vibe> halt
   powering off.

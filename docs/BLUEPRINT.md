@@ -2,9 +2,10 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6.1--M6.2
-are complete; M6.3 W^X is next, and the original M3 language-expansion items
-remain partial. The implementation is across `core`, `compiler`, and `kernel`.
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6.1--M6.3
+are complete; M6.4 read-only data and capability tables is next, and the original
+M3 language-expansion items remain partial. The implementation is across `core`,
+`compiler`, and `kernel`.
 `scripts/status.sh` derives the current host and corpus inventory, while the QEMU
 harness reports target check counts from the boot it observed. Everything
 described as *implemented* below runs today; planned work is marked as such.
@@ -334,9 +335,15 @@ from the packet into stable SYSTEM DMA. See [VIRTIO_NET.md](VIRTIO_NET.md).
 ### 6.1 Pipeline
 
 ```
-source ──lex──► tokens ──parse──► AST ──collect──► string table
-                                   │                    │
-                                   └────codegen(2 passes)┘──► Vec<u32> ──fence.i──► call
+source ──lex──► tokens ──parse──► AST ──collect──► relocatable template + strings
+                                   │                              │
+                                   └────codegen(2 passes)─────────┘
+                                                                  │
+                     RW-NX code-pool run ◄──link_into─────────────┘
+                               │
+                   break-before-make + all-hart fences
+                               │
+                               └────────► execute-only image ──► call
 ```
 
 No IR and no register allocator. Values live on the machine stack; only `t0`/`t1`
@@ -356,12 +363,15 @@ than speed, because the emitter is a security boundary (§6.3).
 Branches are an inverted conditional over a `jal`: ±1 MB of range instead of the
 4 KB a bare `beq` allows.
 
-M6.1 now runs this single address space through Sv39. M6.2 makes each stack's 4 KiB
-guard invalid and its 252 KiB usable portion RW-NX; ordinary RAM, including the
-current heap-backed code buffer, remains RWX until M6.3. Loading a program is
-therefore still `fence.i` plus a transmute of the code buffer to a function pointer;
-the dedicated W^X transition is not yet claimed. Generated-code probes keep an
-additional 8 KiB of mapped abort room above the guard.
+M6.1 runs this single address space through Sv39. M6.2 makes each stack's 4 KiB
+guard invalid and its 252 KiB usable portion RW-NX. M6.3 removes execute from all
+ordinary RAM, maps linker-delimited kernel text R-X, and moves generated instructions
+into a dedicated 2 MiB page pool. A trusted linker receives an exclusive RW-NX
+`WritableCode`, relocates directly into its exact slice, then consumes it to produce
+an immutable execute-only `ExecutableCode`; no writable slice survives publication.
+Every permission change uses invalid PTEs as a break-before-make phase, two all-hart
+TLB shootdowns, and, when sealing, an all-hart instruction-cache fence. Generated-
+code probes retain an additional 8 KiB of mapped abort room above the stack guard.
 
 ### 6.3 Why generated code is confined
 
@@ -375,12 +385,21 @@ argument because it is what Bet 4 rests on:
 | Forge a pointer | Nothing in the language produces an address. Address materialization is limited to string-table addresses, function targets, runtime hooks, and the capability-granted region base — all compiler- or kernel-chosen. |
 | Call something it was not given | Call targets are statically resolved function names or the print/abort runtime hooks. There is no function pointer or user-selected indirect branch. |
 | Name the runtime hooks | Their addresses are baked into the emitted stream. The language has no syntax that reaches them. |
+| Rewrite admitted code | The linker writes a private RW-NX page run, then removes write and read permission before publishing it. All harts complete the permission and instruction-cache transition first, and `sstatus.MXR` is cleared so execute-only does not imply readable. |
 | Keep authority after revocation | Console hooks use `Revocable<ConsoleDev>` and revalidate before each operation. Raw memory is deliberately invocation-scoped: a non-cloneable `InvocationLease<MemoryRegion>` plus an exclusive claim covers the catcher call and is dropped after normal or abort return. Revocation prevents the next invocation. |
 
 **Verified by demo:** `revoke prog` followed by a new run proves launch-time denial.
 `rustc lease` additionally revokes immediately before the second generated console
 operation: that operation is suppressed, the active memory lease still computes 42,
 and a second cold launch without fresh grants aborts on its first array allocation.
+
+`mmu wx` supplies the mapping-side evidence: it executes one sealed image on both
+the boot hart and hart 1, releases it, observes a zeroed same-address first-fit run,
+seals different instructions there, and obtains the new result on hart 1 without a
+per-run `fence.i`. Separate fatal probes prove that writable code cannot execute and
+that sealed code can neither be loaded nor stored. SBI RFENCE is a boot requirement
+for multicore; a missing extension, unrepresentable online physical-hart mask, or
+failed live shootdown is fail-stop rather than a partially published permission state.
 
 ### 6.4 Where the argument used to leak
 
@@ -397,6 +416,10 @@ out of the program (`kernel/src/trampoline.rs`).
 
 The fifth — **the emitter is unverified** — is reduced rather than closed. It now
 has three defences, and it remains the highest risk in the system:
+
+W^X prevents an accepted image from remaining writable and executable; it does not
+prove that the instructions accepted from the trusted emitter are safe. That remains
+the purpose of the structural audit, differential oracle, and fuzzing below.
 
 - The confinement claims above are asserted as tests that walk the emitted
   instruction stream: the permitted opcode set, every memory access
@@ -535,7 +558,8 @@ Five boundaries must stay explicit:
 1. **Capabilities constrain object access, not arbitrary trusted component code.**
    In-tree Rust components remain in the TCB and may call kernel internals directly.
    Only code accepted by the in-kernel compiler currently gets the stronger
-   confinement claim in §6.3.
+   confinement claim in §6.3. M6.3 protects code-page integrity inside the shared
+   S-mode address space; it does not turn that address space into a privilege boundary.
 2. **Cooperative scheduling is not temporal isolation.** Fuel bounds generated
    programs, but an in-tree future that never returns `Pending` can still wedge the
    hart. Cooperative cancellation takes effect only at poll boundaries; hard

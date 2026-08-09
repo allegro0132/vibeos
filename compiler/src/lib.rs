@@ -1,12 +1,14 @@
 //! The VibeOS Rust-subset compiler: lexer, parser, and RV64 code generator.
 //!
-//! Deliberately free of any dependency on the kernel. It emits `Vec<u32>` and
-//! knows nothing about how that gets executed, which is what lets the whole
-//! front end and back end be tested on the host.
+//! Deliberately free of any dependency on the kernel. It emits a relocatable
+//! `Vec<u32>` template and can link into caller-owned storage, but knows nothing
+//! about page tables or execution; the whole front end and back end therefore
+//! remain testable on the host.
 //!
-//! This crate is security-critical. Generated code runs in the kernel's address
-//! space with no MMU, so a wrong frame offset here is a privilege escalation,
-//! not a wrong answer. Test it accordingly.
+//! This crate is security-critical. Generated code runs in the kernel's shared
+//! S-mode address space. The kernel's Sv39 W^X policy prevents writable code
+//! from executing, but it is not a privilege boundary: a wrong frame offset
+//! here is a privilege escalation, not a wrong answer. Test it accordingly.
 
 #![cfg_attr(not(test), no_std)]
 

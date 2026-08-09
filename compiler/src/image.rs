@@ -1,9 +1,11 @@
 //! Canonical, address-independent executable images.
 //!
-//! Generated code runs without an MMU, so loading a persisted binary is a
-//! security boundary rather than a convenience parser.  The decoder accepts
-//! one exact little-endian representation, and the linker revalidates every
-//! address placeholder before writing an absolute address into it.
+//! Generated code ultimately runs in the kernel's shared S-mode address space,
+//! so loading a persisted binary is a security boundary rather than a
+//! convenience parser. The decoder accepts one exact little-endian
+//! representation, and the linker revalidates every address placeholder before
+//! writing an absolute address into caller-owned storage. The kernel separately
+//! enforces the writable-to-execute-only page transition.
 //!
 //! Structural validation is not proof that arbitrary machine code came from
 //! this compiler.  A loader must receive the image through a trusted compiled-
@@ -404,7 +406,24 @@ impl RelocatableImage {
         Ok(image)
     }
 
-    /// Link with an explicit import table.  Duplicate bindings are rejected;
+    /// Link into caller-owned code storage with an explicit import table.
+    ///
+    /// `code` must have exactly the same number of words as the validated
+    /// template. Every image, address, import, and output-length check runs
+    /// before the first write, so an error always leaves `code` unchanged.
+    pub fn link_into(
+        &self,
+        data_base: u64,
+        code_base: u64,
+        bindings: &[RuntimeBinding],
+        code: &mut [u32],
+    ) -> Result<(), String> {
+        let import_addresses = self.preflight_link(data_base, code_base, bindings, code.len())?;
+        self.link_into_prevalidated(data_base, code_base, &import_addresses, code);
+        Ok(())
+    }
+
+    /// Link with an explicit import table. Duplicate bindings are rejected;
     /// all imports named by the image must be present.
     pub fn link(
         &self,
@@ -412,7 +431,35 @@ impl RelocatableImage {
         code_base: u64,
         bindings: &[RuntimeBinding],
     ) -> Result<Image, String> {
+        // Preflight before allocating preserves the owned linker's hostile-
+        // input bound while sharing the exact write path with `link_into`.
+        let import_addresses =
+            self.preflight_link(data_base, code_base, bindings, self.code_template.len())?;
+        let mut code = alloc::vec![0; self.code_template.len()];
+        self.link_into_prevalidated(data_base, code_base, &import_addresses, &mut code);
+
+        Ok(Image {
+            data: self.data.clone(),
+            code,
+            funcs: self.metadata.funcs as usize,
+        })
+    }
+
+    fn preflight_link(
+        &self,
+        data_base: u64,
+        code_base: u64,
+        bindings: &[RuntimeBinding],
+        output_words: usize,
+    ) -> Result<[u64; 4], String> {
         self.validate()?;
+        if output_words != self.code_template.len() {
+            return Err(format!(
+                "linked code buffer length mismatch: image requires {} words, caller supplied {}",
+                self.code_template.len(),
+                output_words
+            ));
+        }
         if code_base & 3 != 0 {
             return Err("linked code base is not four-byte aligned".to_string());
         }
@@ -426,17 +473,23 @@ impl RelocatableImage {
             .checked_add(code_bytes)
             .ok_or_else(|| "linked code address range overflows u64".to_string())?;
 
-        let mut import_addresses = [None; 4];
+        let mut import_addresses = [0; 4];
+        let mut import_present = [false; 4];
         for binding in bindings {
             let slot = (binding.import.id() - 1) as usize;
-            if import_addresses[slot].replace(binding.address).is_some() {
+            if import_present[slot] {
                 return Err(format!("duplicate runtime import {:?}", binding.import));
             }
+            import_addresses[slot] = binding.address;
+            import_present[slot] = true;
         }
 
-        let mut code = self.code_template.clone();
+        // Resolve every relocation before touching caller storage. `validate`
+        // already proved each target is within its corresponding image range;
+        // these checked additions prove the chosen bases keep those concrete
+        // addresses representable as well.
         for relocation in &self.relocations {
-            let address = match relocation.target {
+            match relocation.target {
                 RelocationTarget::DataOffset(offset) => data_base
                     .checked_add(u64::from(offset))
                     .ok_or_else(|| "linked data relocation overflows u64".to_string())?,
@@ -449,22 +502,74 @@ impl RelocatableImage {
                         .ok_or_else(|| "linked code relocation overflows u64".to_string())?
                 }
                 RelocationTarget::Runtime(import) => {
+                    if !import_present[(import.id() - 1) as usize] {
+                        return Err(format!("missing runtime import {:?}", import));
+                    }
                     import_addresses[(import.id() - 1) as usize]
-                        .ok_or_else(|| format!("missing runtime import {:?}", import))?
                 }
+            };
+        }
+        Ok(import_addresses)
+    }
+
+    fn link_into_prevalidated(
+        &self,
+        data_base: u64,
+        code_base: u64,
+        import_addresses: &[u64; 4],
+        code: &mut [u32],
+    ) {
+        code.copy_from_slice(&self.code_template);
+        for relocation in &self.relocations {
+            // `preflight_link` proved these additions and import lookups. The
+            // inputs are all immutably borrowed across both phases, so none of
+            // those facts can change after the output copy begins.
+            let address = match relocation.target {
+                RelocationTarget::DataOffset(offset) => data_base + u64::from(offset),
+                RelocationTarget::CodeWord(word) => code_base + u64::from(word) * 4,
+                RelocationTarget::Runtime(import) => import_addresses[(import.id() - 1) as usize],
             };
             let rd = match relocation.target {
                 RelocationTarget::DataOffset(_) => A0,
                 RelocationTarget::CodeWord(_) | RelocationTarget::Runtime(_) => T0,
             };
-            write_li64(&mut code, relocation.site_word as usize, rd, address);
+            write_li64(code, relocation.site_word as usize, rd, address);
         }
+    }
 
-        Ok(Image {
-            data: self.data.clone(),
+    /// Link into caller-owned code storage using the compatibility runtime
+    /// table. The exact-length and no-write-on-error guarantees are identical
+    /// to [`Self::link_into`].
+    pub fn link_into_with_runtime(
+        &self,
+        data_base: u64,
+        code_base: u64,
+        runtime: &Runtime,
+        code: &mut [u32],
+    ) -> Result<(), String> {
+        self.link_into(
+            data_base,
+            code_base,
+            &[
+                RuntimeBinding {
+                    import: RuntimeImport::PrintStr,
+                    address: runtime.print_str,
+                },
+                RuntimeBinding {
+                    import: RuntimeImport::PrintInt,
+                    address: runtime.print_int,
+                },
+                RuntimeBinding {
+                    import: RuntimeImport::PrintBool,
+                    address: runtime.print_bool,
+                },
+                RuntimeBinding {
+                    import: RuntimeImport::Abort,
+                    address: runtime.abort,
+                },
+            ],
             code,
-            funcs: self.metadata.funcs as usize,
-        })
+        )
     }
 
     /// Compatibility convenience for the compiler's existing runtime struct.

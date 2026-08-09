@@ -17,9 +17,9 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Sv39 PTE/satp encoding and invalid-leaf rejection; capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle, four-queue ownership, per-hart running/current-task/domain state, and IPI lost-wakeup models; work stealing, wake/remote-cancel/fault boundaries and cross-hart fault survival; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; atomic IRQ publication, SPSC byte ordering, SpinLock contention/generation recovery/hart ownership; fault arenas; wait/timer registration ownership; per-hart heap provenance and OOM diagnostics; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
-| In-kernel self-test | Live Sv39 identity/permission walks and all-hart `satp` readback; invalid per-hart stack guards, endpoint RW-NX stack mappings, fixed slot stride, and the 8 KiB generated-code abort reserve; real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including the live shared page-table and stack-guard report, an expected-fatal real guard-page store, retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
+| Host unit tests | Sv39 PTE/satp encoding and invalid-leaf rejection; SBI RFENCE request/error handling, local fence/MXR state, and exact online physical-hart masks; capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and no-write-on-error in-place relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle, four-queue ownership, per-hart running/current-task/domain state, and IPI lost-wakeup models; work stealing, wake/remote-cancel/fault boundaries and cross-hart fault survival; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; atomic IRQ publication, SPSC byte ordering, SpinLock contention/generation recovery/hart ownership; fault arenas; wait/timer registration ownership; per-hart heap provenance and OOM diagnostics; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
+| In-kernel self-test | Live Sv39 identity/permission walks plus all-hart `satp` and MXR readback; R-X kernel text, RW-NX free code-pool pages, execute-only compiled pages, and a full RAM scan excluding writable-executable leaves; invalid per-hart stack guards, endpoint RW-NX stack mappings, fixed slot stride, and the 8 KiB generated-code abort reserve; zeroed same-address code reuse; real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap and code-pool use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, and machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
+| Golden transcripts | End-to-end shell behaviour, including the live shared page-table, stack-guard, and strict W^X reports; sealed local/cross-hart execution and zeroed same-address reuse; expected-fatal real guard-page and W^X instruction/load/store faults; retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
@@ -82,8 +82,9 @@ epoch advances. A canonical evidence file is checked separately from the guest
 golden; TAP, root privileges, and host network access are never used.
 
 The QEMU harness now defaults every integration case to four multithreaded TCG
-vCPUs and requires both the boot-time `4 hart(s) online` barrier and the shared
-Sv39 activation marker before accepting a shell transcript. `smp_queues` places non-stealable waiters on logical harts 1--3,
+vCPUs and requires the boot-time `4 hart(s) online` barrier, shared Sv39
+activation marker, and W^X/MXR/RFENCE marker before accepting a shell transcript.
+`smp_queues` places non-stealable waiters on logical harts 1--3,
 proves each parks and resumes on its exact executor, drains the placement
 doorbells, then wakes all three from the boot-pinned shell. It requires one new
 successful SBI doorbell per target and receiver-side acknowledgement/idle evidence.
@@ -103,6 +104,27 @@ address landed in the guard; it does not simulate a corrupted `sp` or a jump ove
 the single-page guard. A real bad-`sp` overflow may fault recursively while trap
 entry saves registers on the same stack, so M6.2 claims guard-page enforcement,
 not complete stack-clash protection, reliable recovery, or diagnostics.
+
+`wx` is the non-fatal W^X lifecycle case. The boot-pinned shell links code into
+an RW-NX page, seals it execute-only, and obtains 41 on both the boot hart and a
+task pinned to logical hart 1. It then drops the image, requires the complete
+same-address page to have been cleared, links code returning 42 there, and executes
+the new image on hart 1 without a per-run `fence.i`. The transcript reports the
+actual PTE state and the transition/remote-fence deltas; the in-kernel RAM scan
+must find no writable-executable leaf.
+
+The three `wx_*_fault` cases are separate expected-fatal boots because each proves
+one hardware denial: instruction fetch from writable RW-NX storage (cause 12), load
+from sealed execute-only storage with MXR clear (cause 13), and store to sealed
+storage (cause 15). For each, the raw-log validator requires the printed probe
+address to equal `stval` and requires the W^X-specific trap marker. A normalized
+golden alone is insufficient because it deliberately hides addresses.
+
+The sixteen audited fault/restart cycles now abandon a sealed code allocation as
+well as heap data and a held CSpace lock. After all-hart task quiescence, raw
+recovery must unseal, zero, and release exactly that allocation domain without
+running the interrupted future's destructor; live code-pool pages must return to
+their pre-probe baseline every cycle.
 
 ## Performance baseline
 
@@ -199,6 +221,10 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
 ./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
 ./scripts/qemu-test.sh guard_page   # expected-fatal store-page-fault + exact stval
+./scripts/qemu-test.sh wx           # seal, cross-hart execute, clear, same-address reuse
+./scripts/qemu-test.sh wx_execute_fault # expected-fatal instruction-page-fault + exact stval
+./scripts/qemu-test.sh wx_read_fault    # expected-fatal load-page-fault + exact stval
+./scripts/qemu-test.sh wx_write_fault   # expected-fatal store-page-fault + exact stval
 ```
 
 Read the diff before updating. The `--update` flag is the only thing standing

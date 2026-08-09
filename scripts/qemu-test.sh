@@ -282,6 +282,11 @@ for case_file in tests/cases/*.in; do
       boot_output_ok=0
       fail=1
     fi
+    if ! grep -a -Eq 'W\^X +[0-9]+ KiB code pool 0x[0-9a-f]+\.\.0x[0-9a-f]+, MXR clear, RFENCE ready' "$qemu_log"; then
+      echo "FAIL $name: boot $boot did not publish the W^X/RFENCE marker"
+      boot_output_ok=0
+      fail=1
+    fi
 
     if [ "$name" = "persistent_cspace" ]; then
       printf '=== persistent CSpace boot %s ===\n' "$boot" >> "$actual"
@@ -299,6 +304,28 @@ for case_file in tests/cases/*.in; do
     if [ -z "$guard_probe" ] || [ "$guard_probe" != "$guard_stval" ] \
       || ! grep -a -q '\[!\] stack guard: hart0 blocked store page fault' "$qemu_log"; then
       echo "FAIL guard_page: expected store-page-fault stval did not match hart0 guard"
+      boot_output_ok=0
+      fail=1
+    fi
+  fi
+
+  wx_action=""
+  wx_cause=""
+  wx_exception=""
+  case "$name" in
+    wx_execute_fault)
+      wx_action="execute writable"; wx_cause=12; wx_exception="instruction page fault" ;;
+    wx_read_fault)
+      wx_action="read sealed"; wx_cause=13; wx_exception="load page fault" ;;
+    wx_write_fault)
+      wx_action="write sealed"; wx_cause=15; wx_exception="store page fault" ;;
+  esac
+  if [ -n "$wx_action" ]; then
+    wx_probe=$(sed -n "s/.*W\^X probe: $wx_action \(0x[0-9a-f][0-9a-f]*\).*/\1/p" "$qemu_log" | tail -1)
+    wx_stval=$(sed -n "s/.*fatal trap: cause=$wx_cause stval=\(0x[0-9a-f][0-9a-f]*\).*/\1/p" "$qemu_log" | tail -1)
+    if [ -z "$wx_probe" ] || [ "$wx_probe" != "$wx_stval" ] \
+      || ! grep -a -q "\[!\] W\^X code pool blocked $wx_exception" "$qemu_log"; then
+      echo "FAIL $name: expected W^X page-fault stval did not match the printed probe"
       boot_output_ok=0
       fail=1
     fi

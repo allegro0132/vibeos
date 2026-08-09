@@ -79,6 +79,8 @@ async fn run(line: &str, boot_time: u64) {
             println!("  smp scale       compare equal serial and four-hart parallel work");
             println!("  mmu             inspect the shared Sv39 integrity map");
             println!("  mmu guard fault prove a stack guard with a real page fault");
+            println!("  mmu wx          prove seal, cross-hart execute, and cleared reuse");
+            println!("  mmu wx fault execute|read|write  run expected-fatal W^X probes");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -373,7 +375,11 @@ async fn run(line: &str, boot_time: u64) {
         "mmu" => match rest.as_slice() {
             [] => mmu_status(),
             ["guard", "fault"] => mmu_guard_fault(),
-            _ => println!("  usage: mmu [guard fault]"),
+            ["wx"] => mmu_wx_demo().await,
+            ["wx", "fault", "execute"] => crate::code_pool::execute_writable_probe(),
+            ["wx", "fault", "read"] => crate::rustc::sealed_access_probe(false),
+            ["wx", "fault", "write"] => crate::rustc::sealed_access_probe(true),
+            _ => println!("  usage: mmu [guard fault|wx [fault execute|read|write]]"),
         },
 
         "selftest" => {
@@ -473,16 +479,20 @@ fn mmu_status() {
         mmu::root_physical()
     );
     println!(
-        "  harts: satp read back on mask {:#x} ({}/{} online)",
+        "  harts: satp read back on mask {:#x} ({}/{} online), MXR clear mask {:#x}",
         enabled,
         (enabled & online).count_ones(),
-        online.count_ones()
+        online.count_ones(),
+        mmu::mxr_cleared_hart_mask(),
     );
     println!(
-        "  kernel RAM: {:#x}..{:#x}, identity, {} KiB leaves, {}",
+        "  kernel RAM: {:#x}..{:#x}, identity, {} KiB leaves, strict W^X",
         mmu::KERNEL_RAM_START,
         mmu::KERNEL_RAM_END,
         text.page_size / 1024,
+    );
+    println!(
+        "  text: {}, writable RAM: rw-, no writable-executable leaf",
         permission_text(text.permissions)
     );
     println!(
@@ -504,7 +514,123 @@ fn mmu_status() {
         mmu::STACK_GUARD_SIZE / 1024,
         permission_text(stack.permissions)
     );
+    let pool = crate::code_pool::stats();
+    println!(
+        "  code pool: {} KiB, {} live/{} sealed pages, free/write rw-, sealed --x",
+        crate::code_pool::CODE_POOL_BYTES / 1024,
+        pool.live_pages,
+        pool.sealed_pages,
+    );
     println!("  unmapped: firmware prefix, null page, and unused physical space");
+}
+
+async fn mmu_wx_demo() {
+    use vibeos_core::mmu::PagePermissions;
+
+    let Some(remote_hart) = exec::HartId::new(1) else {
+        println!("  W^X: FAILED no remote logical hart");
+        return;
+    };
+    if !ipi::is_online(remote_hart) {
+        println!("  W^X: FAILED remote hart offline");
+        return;
+    }
+
+    let before = mmu::wx_sync_stats();
+    let zeroed = crate::code_pool::reuse_zero_probe();
+    let first = match crate::rustc::compile("fn main() -> i64 { 41 }") {
+        Ok(compiled) => Arc::new(compiled),
+        Err(error) => {
+            println!("  W^X: FAILED first compile ({})", error);
+            return;
+        }
+    };
+    let first_start = first.code_start();
+    let first_mapping = mmu::mapping(first_start);
+    let local_first = crate::rustc::run(first.as_ref());
+    let remote_first = run_generated_on(remote_hart, first.clone()).await;
+    let first_pages = first.code_pages();
+    drop(first);
+
+    let second = match crate::rustc::compile("fn main() -> i64 { 42 }") {
+        Ok(compiled) => Arc::new(compiled),
+        Err(error) => {
+            println!("  W^X: FAILED second compile ({})", error);
+            return;
+        }
+    };
+    let same_address = second.code_start() == first_start;
+    let second_mapping = mmu::mapping(second.code_start());
+    let remote_second = run_generated_on(remote_hart, second.clone()).await;
+    let after = mmu::wx_sync_stats();
+
+    let sealed = [first_mapping, second_mapping].into_iter().all(|mapping| {
+        mapping.is_some_and(|mapping| {
+            mapping.page_size == vibeos_core::mmu::PAGE_SIZE
+                && mapping.permissions == PagePermissions::EXECUTE
+        })
+    });
+    let no_wx = mmu::first_writable_executable_ram_page().is_none();
+    let local_ok = local_first.aborted.is_none() && local_first.value == 41;
+    let remote_ok = remote_first == Some(41) && remote_second == Some(42);
+    println!(
+        "  W^X: {} KiB pool, free/write rw-, sealed --x, MXR mask {:#x}",
+        crate::code_pool::CODE_POOL_BYTES / 1024,
+        mmu::mxr_cleared_hart_mask(),
+    );
+    println!(
+        "  sealed: {} page(s) at {:#x}, boot=41 {}, hart1=41 {}",
+        first_pages,
+        first_start,
+        if sealed && no_wx { "ok" } else { "FAILED" },
+        if local_ok && remote_first == Some(41) {
+            "ok"
+        } else {
+            "FAILED"
+        },
+    );
+    println!(
+        "  reuse: zeroed {}, same-address {}, hart1=42 {}",
+        if zeroed { "yes" } else { "NO" },
+        if same_address { "yes" } else { "NO" },
+        if remote_second == Some(42) { "ok" } else { "FAILED" },
+    );
+    println!(
+        "  shootdown: {} transitions, {} remote sfence, {} remote fence.i",
+        after.transitions.saturating_sub(before.transitions),
+        after.remote_sfences.saturating_sub(before.remote_sfences),
+        after.remote_fence_i.saturating_sub(before.remote_fence_i),
+    );
+    if !zeroed || !same_address || !sealed || !no_wx || !local_ok || !remote_ok {
+        println!("  W^X: FAILED acceptance invariant");
+    }
+}
+
+async fn run_generated_on(
+    hart: exec::HartId,
+    compiled: Arc<crate::rustc::Compiled>,
+) -> Option<i64> {
+    let value = Arc::new(AtomicU64::new(u64::MAX));
+    let aborted = Arc::new(AtomicBool::new(false));
+    let observed_hart = Arc::new(AtomicUsize::new(usize::MAX));
+    let task_value = value.clone();
+    let task_aborted = aborted.clone();
+    let task_hart = observed_hart.clone();
+    let handle = exec::spawn_pinned_on(hart, "wx-generated", async move {
+        task_hart.store(
+            ipi::current_logical_hart().map_or(usize::MAX, exec::HartId::index),
+            Ordering::Release,
+        );
+        let outcome = crate::rustc::run(compiled.as_ref());
+        task_aborted.store(outcome.aborted.is_some(), Ordering::Release);
+        task_value.store(outcome.value as u64, Ordering::Release);
+    });
+    let exit = handle.join().await;
+    (exit.state() == exec::TaskState::Exited
+        && observed_hart.load(Ordering::Acquire) == hart.index()
+        && !aborted.load(Ordering::Acquire)
+        && value.load(Ordering::Acquire) != u64::MAX)
+        .then(|| value.load(Ordering::Acquire) as i64)
 }
 
 fn mmu_guard_fault() {

@@ -19,7 +19,6 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 pub use vibeos_rustc::samples::{
@@ -254,10 +253,20 @@ extern "C" fn rt_print_bool(v: i64) {
 pub struct Compiled {
     /// Kept alive because generated code holds absolute pointers into it.
     _data: Vec<u8>,
-    code: Vec<u32>,
+    code: crate::code_pool::ExecutableCode,
     pub funcs: usize,
     pub bytes: usize,
     pub data_bytes: usize,
+}
+
+impl Compiled {
+    pub fn code_start(&self) -> usize {
+        self.code.entry()
+    }
+
+    pub fn code_pages(&self) -> usize {
+        self.code.page_count()
+    }
 }
 
 fn runtime() -> vibeos_rustc::Runtime {
@@ -272,27 +281,27 @@ fn runtime() -> vibeos_rustc::Runtime {
 fn link_relocatable(image: &vibeos_rustc::RelocatableImage) -> Result<Compiled, String> {
     let rt = runtime();
 
-    // Allocate the exact final buffers before linking. The linker emits another
-    // owned Image, whose bytes are copied into these stable-address buffers;
-    // generated absolute references therefore name the storage retained by
-    // `Compiled`, never a temporary linker allocation.
-    let mut data = image.data().to_vec();
-    let mut code = vec![0u32; image.code_template().len()];
+    // Allocate both final buffers before linking, so every absolute reference
+    // names storage retained by `Compiled`. Code comes from the dedicated
+    // page-granular RW-NX pool rather than the general heap.
+    let data = image.data().to_vec();
+    let mut code = crate::code_pool::WritableCode::allocate(image.code_template().len())
+        .map_err(|error| error.to_string())?;
 
-    let linked = image.link_with_runtime(
+    image.link_into_with_runtime(
         data.as_ptr() as u64,
-        code.as_ptr() as u64,
+        code.start() as u64,
         &rt,
+        code.words_mut(),
     )?;
-    if linked.code.len() != code.len() || linked.data.len() != data.len() {
-        return Err("internal error: executable layout changed while linking".to_string());
-    }
-    data.copy_from_slice(&linked.data);
-    code.copy_from_slice(&linked.code);
+
+    let funcs = image.metadata().funcs as usize;
+    let code = code.seal();
+    let bytes = code.byte_len();
 
     Ok(Compiled {
-        funcs: linked.funcs,
-        bytes: code.len() * 4,
+        funcs,
+        bytes,
         data_bytes: data.len(),
         _data: data,
         code,
@@ -389,7 +398,7 @@ pub fn run_with_authority(
     let started_at = sbi::time();
     let mut catch = ProgramCatch {
         hart,
-        entry: prog.code.as_ptr() as usize,
+        entry: prog.code.entry(),
         stack_limit: crate::stack_floor(),
         fuel: FUEL,
         region: region_base,
@@ -397,15 +406,14 @@ pub fn run_with_authority(
         value: -1,
     };
 
-    // Safety: `entry` points at freshly written RV64 whose first instruction is
-    // `main`'s prologue. `fence.i` makes those writes visible to instruction
-    // fetch. `vibe_catch` itself returns exactly once, with zero after a normal
-    // callback or the non-zero reason supplied by a safety check. The short TCB
-    // path from `MemoryInvocation::claim` to this boundary must not non-locally
-    // fault: once the catcher is established, normal and abort returns converge
-    // below and explicitly drop the claim.
+    // Safety: `entry` points at immutable execute-only RV64 whose first
+    // instruction is `main`'s prologue. Sealing the buffer already completed
+    // local and remote `fence.i`, so executing it on another hart does not rely
+    // on a per-run cache fence. `vibe_catch` returns exactly once, with zero
+    // after a normal callback or the non-zero reason supplied by a safety
+    // check. Once the catcher is established, normal and abort returns converge
+    // below and explicitly drop the memory claim.
     let code = unsafe {
-        core::arch::asm!("fence.i");
         vibe_catch(
             addr_of_mut!(JMP[hart]),
             enter_program,
@@ -437,5 +445,28 @@ pub fn run_with_authority(
             RUNTIME_PANICKED => "the runtime panicked while the program was running",
             other => trampoline::abort::describe(other),
         }),
+    }
+}
+
+/// Expected-fatal W^X probe against one sealed execute-only code page.
+pub fn sealed_access_probe(write: bool) -> ! {
+    let compiled =
+        compile("fn main() -> i64 { 42 }").expect("fixed W^X access probe must compile and seal");
+    let address = compiled.code_start();
+    crate::println!(
+        "  W^X probe: {} sealed {:#x}",
+        if write { "write" } else { "read" },
+        address
+    );
+    if write {
+        // Safety: this deliberate negative test must take a store page fault.
+        unsafe { (address as *mut u8).write_volatile(0x5a) };
+        panic!("execute-only code page accepted a store")
+    } else {
+        // MXR is cleared on every hart, so even a load from an executable page
+        // must fault when the PTE has no explicit read permission.
+        let value = unsafe { (address as *const u8).read_volatile() };
+        core::hint::black_box(value);
+        panic!("execute-only code page accepted a load")
     }
 }

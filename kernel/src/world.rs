@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::cap::{self, CSpace, Cap, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
+use crate::durable_cspace;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::store;
 use crate::sync::SpinLock;
@@ -234,6 +235,18 @@ impl Space {
         system_owner.restore();
         space
     }
+
+    pub(crate) fn new_persistent(
+        name: &str,
+        space_id: crate::durable::SpaceId,
+    ) -> Arc<Self> {
+        let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
+        let space = Arc::new(Space(SpinLock::new(CSpace::new_persistent(
+            name, space_id,
+        ))));
+        system_owner.restore();
+        space
+    }
 }
 
 impl Resource for Space {
@@ -290,6 +303,9 @@ pub struct World {
     pub block: Option<Cap>,
     /// init's authority on the capability-addressed persistent object service.
     pub store: Option<Cap>,
+    /// init's explicit authority on the persistent-test CSpace lifecycle.
+    pub durable_cspace: Option<Cap>,
+    durable_cspace_service: Option<Arc<durable_cspace::DurableCSpaceService>>,
     pub block_space: Option<Cap>,
     block_mmio: Option<Cap>,
     block_dma: Option<Cap>,
@@ -703,8 +719,86 @@ pub fn start_block_supervisor() {
     let Some(component) = world.component_named("virtio-blk") else {
         return;
     };
+    let durable_cspace = world.durable_cspace_service.clone();
     exec::spawn("supervisor:virtio-blk", async move {
         let mut attempts = 0u32;
+        let mut recovery_operation = durable_cspace.as_ref().and_then(|service| {
+            match service.begin_boot_recovery() {
+                Ok(operation) => Some(operation),
+                Err(_) => {
+                    service.fail_closed();
+                    None
+                }
+            }
+        });
+        let mut recovery_pending = recovery_operation.is_some();
+
+        // Reuse the pre-existing supervisor task instead of consuming new
+        // TaskIds. While the recovery gate waits for an online device, driver
+        // terminal state remains higher priority and uses the same bounded
+        // restart budget as steady-state supervision. Every transient scan
+        // failure returns the gate to WaitingBlock and starts at sector zero.
+        while recovery_pending {
+            let snapshot = component.snapshot();
+            match snapshot.state {
+                exec::TaskState::Running if virtio_blk::is_online() => {
+                    let service = durable_cspace
+                        .as_ref()
+                        .expect("a pending durable recovery has a service");
+                    match service.recover_after_block_online().await {
+                        Ok(()) => {
+                            if service.activate_dependent().await.is_err() {
+                                recovery_operation
+                                    .take()
+                                    .expect("pending recovery has an exact claim")
+                                    .fail();
+                            } else {
+                                recovery_operation
+                                    .take()
+                                    .expect("pending recovery has an exact claim")
+                                    .finish();
+                            }
+                            recovery_pending = false;
+                        }
+                        Err(_) if service.state()
+                            == durable_cspace::DurableCSpaceState::WaitingBlock => {}
+                        Err(_) => {
+                            recovery_operation
+                                .take()
+                                .expect("pending recovery has an exact claim")
+                                .fail();
+                            recovery_pending = false;
+                        }
+                    }
+                }
+                exec::TaskState::Running => {}
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("virtio-blk").is_err() {
+                        if let Some(operation) = recovery_operation.take() {
+                            operation.fail();
+                        }
+                        return;
+                    }
+                }
+                exec::TaskState::Faulted => {
+                    if let Some(operation) = recovery_operation.take() {
+                        operation.fail();
+                    }
+                    return;
+                }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => {
+                    // Preserve the operator's decision. An explicit restart
+                    // changes the generation and this loop then resumes.
+                    exec::sleep_ms(100).await;
+                }
+            }
+            if recovery_pending {
+                exec::sleep_ms(1).await;
+            }
+        }
+
         loop {
             let (generation, join) = component.join_current();
             let exit = join.await;
@@ -750,6 +844,12 @@ pub fn build() {
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
+    let persistent_test = block_resources.as_ref().map(|_| {
+        Space::new_persistent(
+            "persistent-test",
+            durable_cspace::persistent_space_id(),
+        )
+    });
 
     // init is the root of authority: it mints the only unattenuated caps, then
     // hands out strictly weaker copies. Nothing else can widen what it gets.
@@ -822,8 +922,9 @@ pub fn build() {
             (None, None) => (None, None, None, None),
             _ => unreachable!("block resources and CSpace are constructed together"),
         };
-    let store_root = match (block_root, store_backend.as_ref()) {
-        (Some(block), Some(backend)) => {
+    let (store_root, durable_cspace_root, durable_cspace_service) =
+        match (block_root, store_backend.as_ref(), persistent_test.as_ref()) {
+        (Some(block), Some(backend), Some(persistent)) => {
             // The store receives only block read/write authority in a private
             // backend CSpace. Its public service cap discloses neither the
             // device nor stable object identifiers.
@@ -835,9 +936,19 @@ pub fn build() {
             )
             .unwrap();
             let service = store::StoreService::new(backend.clone(), block_grant);
-            Some(cs.mint(service, Rights::ALL))
+            let journal = service.authority_journal();
+            let store_cap = cs.mint(service, Rights::ALL);
+            let durable = durable_cspace::DurableCSpaceService::new(
+                journal,
+                persistent.clone(),
+            );
+            let durable_cap = cs.mint(
+                durable.clone(),
+                Rights::READ.union(Rights::WRITE),
+            );
+            (Some(store_cap), Some(durable_cap), Some(durable))
         }
-        (None, None) => None,
+        (None, None, None) => (None, None, None),
         _ => unreachable!("store backend exists exactly when a block device exists"),
     };
     drop(cs);
@@ -855,6 +966,9 @@ pub fn build() {
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
     }
+    if let Some(space) = persistent_test.as_ref() {
+        spaces.insert("persistent-test", space.clone());
+    }
 
     let world = Arc::new(World {
         spaces,
@@ -868,6 +982,8 @@ pub fn build() {
         region: init_region,
         block: block_root,
         store: store_root,
+        durable_cspace: durable_cspace_root,
+        durable_cspace_service,
         block_space: c_block_space,
         block_mmio: block_mmio_root,
         block_dma: block_dma_root,

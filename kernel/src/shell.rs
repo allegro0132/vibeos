@@ -69,6 +69,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  durable         recover a sealed capability log and tombstone");
             println!("  blk info|test   inspect or exercise the supervised block device");
             println!("  store info|test|fault  exercise capability-addressed persistence");
+            println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -329,6 +330,8 @@ async fn run(line: &str, boot_time: u64) {
         "blk" => block_command(&rest).await,
 
         "store" => store_command(&rest).await,
+
+        "pcspace" => persistent_cspace_command(&rest).await,
 
         "selftest" => {
             let r = crate::selftest::run().await;
@@ -1092,6 +1095,104 @@ async fn store_command(args: &[&str]) {
         }
         other => println!("  usage: store [info|test|fault] (got `{}`)", other),
     }
+}
+
+async fn persistent_cspace_command(args: &[&str]) {
+    let w = world();
+    let Some(service_cap) = w.durable_cspace else {
+        println!("  durable CSpace: offline (no writable block backend)");
+        return;
+    };
+    if args.first().copied().unwrap_or("test") != "test" {
+        println!("  usage: pcspace test");
+        return;
+    }
+    let init = w.spaces["init"].clone();
+    let lease = init
+        .0
+        .lock()
+        .lookup_lease::<crate::durable_cspace::DurableCSpaceService>(
+            service_cap,
+            Rights::WRITE,
+        );
+    let report = match lease {
+        Ok(lease) => crate::durable_cspace::test_with(lease).await,
+        Err(_) => Err(crate::durable_cspace::DurableCSpaceError::PermissionDenied),
+    };
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            println!("  durable CSpace test: failed ({})", error);
+            return;
+        }
+    };
+    println!(
+        "  durable CSpace gate: ready, dependent {}",
+        if report.dependent_started {
+            "started"
+        } else {
+            "blocked"
+        }
+    );
+    match report.phase {
+        crate::durable_cspace::PersistentTestPhase::Boot1Created => {
+            println!(
+                "  boot1 root: slot {} generation {}, rights r---gx",
+                report.root_slot, report.root_generation
+            );
+            println!(
+                "  boot1 child: slot {} generation {} (descendant readback {})",
+                report.child_slot,
+                report.child_generation,
+                if report.read_ok { "ok" } else { "mismatch" }
+            );
+        }
+        crate::durable_cspace::PersistentTestPhase::Boot2Revoked => {
+            println!(
+                "  boot2 restored child: slot {} generation {}, readback {}",
+                report.child_slot,
+                report.old_child_generation,
+                if report.read_ok { "ok" } else { "mismatch" }
+            );
+            println!(
+                "  tombstone-first ancestor revoke: child {}, descendant {}",
+                if report.old_child_absent { "absent" } else { "live" },
+                if report.descendant_absent {
+                    "absent"
+                } else {
+                    "live"
+                }
+            );
+        }
+        crate::durable_cspace::PersistentTestPhase::Boot3Reused => {
+            println!(
+                "  boot3 tombstoned child: slot {} generation {} absent",
+                report.child_slot, report.old_child_generation
+            );
+            println!(
+                "  slot reuse: slot {} generation {} (higher), readback {}",
+                report.child_slot,
+                report.child_generation,
+                if report.read_ok { "ok" } else { "mismatch" }
+            );
+        }
+        crate::durable_cspace::PersistentTestPhase::AlreadyComplete => {
+            println!(
+                "  persistent child already live: slot {} generation {}, readback {}",
+                report.child_slot,
+                report.child_generation,
+                if report.read_ok { "ok" } else { "mismatch" }
+            );
+        }
+    }
+    println!(
+        "  persistent-test Store WRITE: {}",
+        if report.no_store_write {
+            "absent"
+        } else {
+            "invariant failed"
+        }
+    );
 }
 
 async fn store_fault_recovery() {

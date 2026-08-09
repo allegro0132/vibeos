@@ -22,6 +22,7 @@ pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, sync, virtio};
 
 mod bench;
 mod dev;
+mod durable_cspace;
 mod plic;
 mod rustc;
 mod selftest;
@@ -169,7 +170,10 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
 /// audited arena faults. The executor has detached the task permanently before
 /// entering this non-allocating hook.
 unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomain) {
-    unsafe { store::recover_faulted_task(task, domain) };
+    unsafe {
+        store::recover_faulted_task(task, domain);
+        durable_cspace::recover_faulted_task(task, domain);
+    }
 }
 
 #[panic_handler]

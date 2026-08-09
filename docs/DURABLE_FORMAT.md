@@ -1,9 +1,10 @@
 # Durable capability log v1
 
-This document is the normative M4.0/M4.2 journal format and crash model for
+This document is the normative M4.0--M4.3 journal format and crash model for
 persistent authority and capability-addressed objects. M4.0 defined the pure
-`no_std` authority verifier; M4.2 extends that same journal and canonical decoder
-with object records. Live `CSpace` restoration remains M4.3.
+`no_std` authority verifier, M4.2 extended the same journal and canonical decoder
+with object records, and M4.3 installs one externally constrained recovered graph
+into the fixed `persistent-test` CSpace.
 
 The safety goal is narrower and stronger than “the file usually parses”:
 
@@ -198,9 +199,20 @@ to disappear after reboot. An invocation lease acquired before step 3 may finish
 as specified by M3.16; durable revoke does not retroactively interrupt an in-flight
 operation.
 
-No CSpace or service lock may be held across asynchronous write/flush. M4.3 needs a
-pending slot reservation or a centralized authority transaction serializer, followed
-by generation revalidation before publication.
+No CSpace or service lock may be held across asynchronous write/flush. The M4.3
+service serializes authority transactions and holds an opaque pending slot
+reservation containing the exact target incarnation, slot, generation, and token.
+Publication revalidates that reservation and the typed parent witness only after the
+records have been flushed and the real device has been rescanned.
+
+The reservation lives in a SYSTEM-stable operation ledger keyed by exact task,
+allocation domain, and operation token. If an append returns ambiguously after a
+possible final flush, publication fails, the caller is cancelled, or raw fault
+recovery skips Rust destructors, the target CSpace is quarantined until reboot.
+Quarantine blocks generic and durable lookups, kills revocable derivation nodes,
+and retains resource entries so fault cleanup allocates nothing and runs no
+resource destructor. A lease acquired before quarantine retains the bounded
+M3.16 invocation semantics.
 
 Object put:
 
@@ -230,10 +242,12 @@ Recovery scans physical sectors in order:
    Pair object prepare/chunks/commit by transaction, object, prepare sequence/CRC,
    exact chunk index/count/length, ordered chunk-record digest, and content CRC.
    Only a complete exact pair becomes a candidate grant or object.
-5. Validate each candidate in commit order. Roots must exactly match an external
-   `RootPolicy`. A derived parent must already exist, carry `GRANT`, and have rights
-   containing the child. Object and resource kind must match every ancestor. One
-   `ObjectId` has one stable `ResourceKind` across all roots and derivations.
+5. Validate each candidate in commit order. Root records remain inert until they
+   exactly match an external `RootPolicy`; M4.3 first derives that exact policy from
+   one boot-owned `RootConstraint`. A derived parent must already exist, carry
+   `GRANT`, and have rights containing the child. Object and resource kind must
+   match every ancestor. One `ObjectId` has one stable `ResourceKind` across all
+   roots and derivations.
 6. For each `(SpaceId, slot)`, generations strictly increase. Reuse is accepted only
    if the prior derivation or an ancestor had a tombstone before the new commit;
    generation `u64::MAX` retires the slot.
@@ -242,10 +256,29 @@ Recovery scans physical sectors in order:
 8. Enforce one numeric ID class map across every object, derivation, space, and
    transaction mention, including interleaved kinds 1 through 8.
 
-Recovery returns stable IDs, immutable recovered bytes, and live `RecoveredGrant`
-records, not an ambient object namespace or automatically installed
-`Arc<Resource>`. M4.3 must resolve and install only exact type-matched objects;
-missing or type-mismatched objects are not installed.
+Boot recovery is retried only for block transport loss (`Offline`, driver fault,
+or driver restart). The same supervisor claim survives the bounded driver restart;
+each retry discards the previous scan and begins again at sector 0. Semantic,
+policy, device-shape, and installation failures do not retry.
+
+The semantic pass first returns an inert preflight containing committed object and
+grant candidates, tombstones, and complete slot history. Selecting roots cannot by
+itself install authority: `finish` rejects every additional final-live root not in
+the exact external policy and only then returns the live subset.
+
+M4.3 accepts only the boot-registered `persistent-test` `SpaceId` (`0x5053`). Its
+dynamic root must occupy slot 0 at generation 0, have no parent, carry exactly
+`READ | GRANT | REVOKE`, name the stable `StoredObject` resource kind, and reference
+an allowed object kind committed earlier in this journal. Recovery constructs the
+entire candidate slot table and derivation graph in the SYSTEM domain, verifies
+typed resource witnesses and the pre-await CSpace incarnation, then replaces the
+live table once. Missing resources, type mismatches, foreign histories, partial
+graphs, or generation rollback publish nothing. The target CSpace receives no
+Store `WRITE` capability. See [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
+
+Recovery still returns stable IDs and immutable bytes rather than an ambient object
+namespace. Only the graph admitted by the external M4.3 policy receives typed live
+`StoredObject` capabilities.
 
 ## Crash-safety argument
 
@@ -264,8 +297,12 @@ missing or type-mismatched objects are not installed.
    prepare and all ordered chunks. Every strict prepare/chunk/commit prefix therefore
    recovers the old object set; only the complete commit adds the exact bytes.
 
-The host suite enumerates all 0 through 512 prefix cuts for every record kind and
-again at grant, revoke, high-water, and object protocol boundaries. It also checks
+The Rust host suite enumerates all 0 through 512 prefix cuts for every record kind
+and again at grant, revoke, high-water, and object protocol boundaries. The
+independent M4.3 host verifier additionally applies all 512 *strict* byte-prefix
+cuts to each of a 19-record root/child/grandchild, tombstone, and generation-reuse
+fixture (9,728 cuts), always requiring the preceding complete record state. The
+suites also check
 CRC vectors, canonical round trips, torn holes, high-water ordering, exact root
 policy, transaction binding, rights attenuation, object/type consistency,
 cross-space ancestor tombstones, slot-generation reuse, interleaved kinds 1--8,

@@ -40,7 +40,7 @@ normalize() {
            -e 's/[0-9]+ KiB/N KiB/g' \
            -e 's/^  live +[0-9]+ B.*$/  live N B peak N B bump remaining N B/' \
            -e 's/\{[0-9]+\}//g' \
-           -e '/^  component:.*  running   /s/ +[0-9]+ +([0-9]+ B)$/        N    \1/' \
+           -e '/^  component:.* +running +/s/ +[0-9]+ +([0-9]+ B)$/        N    \1/' \
   | grep -a -v '^[[:space:]]*$' \
   | grep -a -v 'terminating on signal' \
   | grep -a -v '^OpenSBI' || true
@@ -152,28 +152,50 @@ for case_file in tests/cases/*.in; do
   fi
   mkfifo "$input_fifo"
 
-  feed "$case_file" > "$input_fifo" &
-  FEED_PID=$!
-  qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M \
-    -nographic -bios default -kernel "$KERNEL" \
-    -drive if=none,id=vibeos-test-disk,format=raw,file="$disk",cache=writeback \
-    -device virtio-blk-device,drive=vibeos-test-disk,bus=virtio-mmio-bus.0,queue-size=8 \
-    -global virtio-mmio.force-legacy=false \
-    < "$input_fifo" > "$qemu_log" 2>/dev/null &
-  QEMU_PID=$!
-  ( sleep "$(budget_for "$case_file")"; kill "$QEMU_PID" 2>/dev/null || true ) &
-  KILLER_PID=$!
+  # Durable CSpace acceptance deliberately reboots three times against the
+  # exact same raw image. Every other case retains the stronger isolation of
+  # one fresh image and one boot per transcript.
+  boots=1
+  if [ "$name" = "persistent_cspace" ]; then
+    boots=3
+  fi
+  : > "$actual"
+  boot_output_ok=1
+  boot=1
+  while [ "$boot" -le "$boots" ]; do
+    feed "$case_file" > "$input_fifo" &
+    FEED_PID=$!
+    qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M \
+      -nographic -bios default -kernel "$KERNEL" \
+      -drive if=none,id=vibeos-test-disk,format=raw,file="$disk",cache=writeback \
+      -device virtio-blk-device,drive=vibeos-test-disk,bus=virtio-mmio-bus.0,queue-size=8 \
+      -global virtio-mmio.force-legacy=false \
+      < "$input_fifo" > "$qemu_log" 2>/dev/null &
+    QEMU_PID=$!
+    ( sleep "$(budget_for "$case_file")"; kill "$QEMU_PID" 2>/dev/null || true ) &
+    KILLER_PID=$!
 
-  wait "$QEMU_PID" 2>/dev/null || true
-  QEMU_PID=""
-  kill "$KILLER_PID" 2>/dev/null || true
-  wait "$KILLER_PID" 2>/dev/null || true
-  KILLER_PID=""
-  wait "$FEED_PID" 2>/dev/null || true
-  FEED_PID=""
+    wait "$QEMU_PID" 2>/dev/null || true
+    QEMU_PID=""
+    kill "$KILLER_PID" 2>/dev/null || true
+    wait "$KILLER_PID" 2>/dev/null || true
+    KILLER_PID=""
+    wait "$FEED_PID" 2>/dev/null || true
+    FEED_PID=""
 
-  normalize < "$qemu_log" \
-    | sed -n '/VibeOS shell ready/,$p' > "$actual" || true
+    if ! grep -a -q 'VibeOS shell ready' "$qemu_log"; then
+      echo "FAIL $name: boot $boot produced no shell-ready marker"
+      boot_output_ok=0
+      fail=1
+    fi
+
+    if [ "$boots" -gt 1 ]; then
+      printf '=== persistent CSpace boot %s ===\n' "$boot" >> "$actual"
+    fi
+    normalize < "$qemu_log" \
+      | sed -n '/VibeOS shell ready/,$p' >> "$actual" || true
+    boot=$((boot + 1))
+  done
 
   backing_ok=1
   if [ "$name" = "block" ]; then
@@ -192,8 +214,15 @@ for case_file in tests/cases/*.in; do
       fail=1
     fi
   fi
+  if [ "$name" = "persistent_cspace" ]; then
+    if ! python3 scripts/persistent-cspace-image.py --selftest \
+      || ! python3 scripts/persistent-cspace-image.py "$disk"; then
+      backing_ok=0
+      fail=1
+    fi
+  fi
 
-  if [ ! -s "$actual" ]; then
+  if [ ! -s "$actual" ] || [ "$boot_output_ok" != "1" ]; then
     echo "FAIL $name: no output captured (did the kernel boot?)"
     fail=1
     cleanup_case
@@ -238,6 +267,8 @@ for case_file in tests/cases/*.in; do
       echo "ok   block (raw backing sector 8 verified)"
     elif [ "$name" = "store" ] && [ "$backing_ok" = "1" ]; then
       echo "ok   store (raw backing journal verified)"
+    elif [ "$name" = "persistent_cspace" ] && [ "$backing_ok" = "1" ]; then
+      echo "ok   persistent_cspace (three boots and raw authority graph verified)"
     else
       echo "ok   $name"
     fi

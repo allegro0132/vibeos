@@ -17,7 +17,10 @@ use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use vibeos_core::durable::{ObjectId, StoreId, TransactionId};
+use vibeos_core::durable::{
+    self as authority, ChainCheckpoint, DecodeStatus, ObjectId, RecordBody, StoreId,
+    TransactionId,
+};
 use vibeos_core::store as journal;
 
 use crate::cap::{Cap, CapError, InvocationLease, Resource, Rights};
@@ -78,6 +81,7 @@ pub enum StoreError {
     PublicationTargetRestarted,
     ObjectUnavailable,
     ObjectMismatch,
+    JournalChanged,
     InsufficientMemory,
     OutsideTask,
 }
@@ -103,6 +107,7 @@ impl core::fmt::Display for StoreError {
                 }
                 Self::ObjectUnavailable => "stored object is absent from the recovered journal",
                 Self::ObjectMismatch => "committed object failed read-back verification",
+                Self::JournalChanged => "object journal changed before append",
                 Self::InsufficientMemory => {
                     "store caller lacks the bounded journal-recovery headroom"
                 }
@@ -260,13 +265,20 @@ impl StoreInner {
         }
     }
 
-    fn install_recovery(&self, recovered: &journal::RecoveredStore, used_sectors: usize) {
+    fn install_recovery(
+        &self,
+        recovered: &authority::RecoveryPreflight,
+        used_sectors: usize,
+    ) {
+        let checkpoint = recovered
+            .chain_checkpoint()
+            .expect("a successful recovery has a usable checkpoint");
         *self.state.lock() = RuntimeState {
             ready: true,
             used_sectors,
-            recovered_objects: recovered.objects.len(),
-            id_high_water: recovered.id_high_water,
-            last_sequence: recovered.last_sequence,
+            recovered_objects: recovered.committed_objects().len(),
+            id_high_water: recovered.id_high_water(),
+            last_sequence: checkpoint.previous_sequence,
         };
     }
 }
@@ -333,6 +345,140 @@ impl StoreService {
     pub fn info(&self) -> StoreInfo {
         self.inner.info()
     }
+
+    /// Sealed kernel-only access to the unified object/authority journal. This
+    /// is deliberately not a capability operation: only the separately
+    /// constructed durable-CSpace service receives a handle, and no caller can
+    /// use it as an ambient ObjectId lookup namespace.
+    pub(crate) fn authority_journal(&self) -> AuthorityJournal {
+        AuthorityJournal {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// One inert view of the shared journal. Authority is still absent: callers
+/// must apply external root constraints and construct typed resource witnesses
+/// before installing anything into a CSpace.
+pub(crate) struct AuthoritySnapshot {
+    pub(crate) formatted: bool,
+    pub(crate) checkpoint: ChainCheckpoint,
+    pub(crate) used_sectors: usize,
+    pub(crate) preflight: Option<authority::RecoveryPreflight>,
+}
+
+impl AuthoritySnapshot {
+    pub(crate) fn id_high_water(&self) -> u128 {
+        self.preflight
+            .as_ref()
+            .map(authority::RecoveryPreflight::id_high_water)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn chain(&self) -> Result<authority::RecordChain, StoreError> {
+        authority::RecordChain::from_checkpoint(store_id(), self.checkpoint)
+            .map_err(|_| StoreError::Corrupt)
+    }
+}
+
+/// Kernel-only writer for authority records in the exact object-store journal.
+/// Each operation rescans media and compares the caller's checkpoint before
+/// writing, so no stale preview can fork the sequence/CRC chain.
+#[derive(Clone)]
+pub(crate) struct AuthorityJournal {
+    inner: Arc<StoreInner>,
+}
+
+impl AuthorityJournal {
+    pub(crate) async fn recover(&self) -> Result<AuthoritySnapshot, StoreError> {
+        ensure_working_headroom()?;
+        let operation = self.inner.begin()?;
+        let result = async {
+            validate_writable_backend(&self.inner)?;
+            let scan = scan_region(&self.inner).await?;
+            let snapshot = authority_snapshot(&scan)?;
+            if let Some(preflight) = snapshot.preflight.as_ref() {
+                self.inner
+                    .install_recovery(preflight, snapshot.used_sectors);
+            }
+            Ok(snapshot)
+        }
+        .await;
+        // Ordinary errors release explicitly; async cancellation retains the
+        // StoreOperation Drop backstop, while guarded panics use the executor's
+        // exact-task/domain recovery hook.
+        operation.finish();
+        result
+    }
+
+    /// Append an already-previewed sequence after checking that physical media
+    /// still has the checkpoint against which it was encoded. Every record is
+    /// written and flushed independently, preserving the v1 prefix model.
+    pub(crate) async fn append(
+        &self,
+        expected: ChainCheckpoint,
+        records: &[[u8; journal::RECORD_SIZE]],
+    ) -> Result<AuthoritySnapshot, StoreError> {
+        if records.is_empty() {
+            return Err(StoreError::Corrupt);
+        }
+        ensure_working_headroom()?;
+        let operation = self.inner.begin()?;
+        let result = async {
+            validate_writable_backend(&self.inner)?;
+            let mut scan = scan_region(&self.inner).await?;
+            let before = authority_snapshot(&scan)?;
+            if before.checkpoint != expected {
+                return Err(StoreError::JournalChanged);
+            }
+            if scan
+                .next_physical
+                .checked_add(records.len())
+                .is_none_or(|end| end > STORE_LOG_SECTORS)
+            {
+                return Err(StoreError::JournalFull);
+            }
+
+            let final_checkpoint = validate_preview(&before, records)?;
+            for record in records {
+                append_record(&self.inner, &mut scan.next_physical, record).await?;
+            }
+
+            // A flush is not accepted on faith: the complete semantic pass
+            // must observe the exact chain head encoded by the preview.
+            let verified_scan = scan_region(&self.inner).await?;
+            let verified = authority_snapshot(&verified_scan)?;
+            if verified.checkpoint != final_checkpoint {
+                return Err(StoreError::ObjectMismatch);
+            }
+            let preflight = verified
+                .preflight
+                .as_ref()
+                .ok_or(StoreError::Corrupt)?;
+            self.inner
+                .install_recovery(preflight, verified.used_sectors);
+            Ok(verified)
+        }
+        .await;
+        // Every ordinary append error reaches this exact claim release. Async
+        // cancellation uses Drop; guarded panic cleanup uses the exact task and
+        // allocation domain recorded by StoreInner.
+        operation.finish();
+        result
+    }
+
+    /// Read one restored object through a live typed capability. The durable
+    /// service gets journal access but still cannot bypass CSpace authority by
+    /// naming an ObjectId directly.
+    pub(crate) async fn read(
+        &self,
+        object: InvocationLease<StoredObject>,
+    ) -> Result<Vec<u8>, StoreError> {
+        if !object.authorizes(Rights::READ) {
+            return Err(StoreError::PermissionDenied);
+        }
+        read_committed_object(self.inner.clone(), object).await
+    }
 }
 
 /// Number of audited puts that reached the deterministic pre-write panic. The
@@ -393,6 +539,20 @@ pub struct StoredObject {
     object_kind: journal::ObjectKind,
     byte_len: usize,
     commit_sequence: u64,
+}
+
+impl StoredObject {
+    pub(crate) fn from_recovered(object: &authority::RecoveredObject) -> Arc<Self> {
+        system_allocation(|| {
+            Arc::new(Self {
+                store_id: store_id(),
+                object_id: object.object_id,
+                object_kind: object.object_kind,
+                byte_len: object.bytes.len(),
+                commit_sequence: object.commit_sequence,
+            })
+        })
+    }
 }
 
 impl Resource for StoredObject {
@@ -482,25 +642,17 @@ async fn put_to_space(
     let inner = lease.with(|service| service.inner.clone());
     let operation = inner.begin()?;
 
-    let backend = backend_info(&inner)?;
-    if backend.read_only {
-        return Err(StoreError::ReadOnly);
-    }
-    if !backend.supports_flush {
-        return Err(StoreError::FlushUnsupported);
-    }
+    validate_writable_backend(&inner)?;
 
     let mut scan = scan_region(&inner).await?;
     let recovered = recover_scan(&scan);
     let (mut chain, old_high_water, format_record) = match recovered {
         Ok(recovered) => {
-            let checkpoint = recovered
-                .chain_checkpoint()
-                .map_err(|_| StoreError::Corrupt)?;
+            let checkpoint = recovered.chain_checkpoint().map_err(|_| StoreError::Corrupt)?;
             let chain = journal::RecordChain::from_checkpoint(store_id(), checkpoint)
                 .map_err(|_| StoreError::Corrupt)?;
             inner.install_recovery(&recovered, scan.next_physical);
-            (chain, recovered.id_high_water, None)
+            (chain, recovered.id_high_water(), None)
         }
         Err(StoreError::Unformatted) => {
             let mut chain = journal::RecordChain::new(store_id());
@@ -573,9 +725,9 @@ async fn put_to_space(
     // decode the actual backing sectors and require the exact committed bytes.
     let verified_scan = scan_region(&inner).await?;
     let verified = recover_scan(&verified_scan)?;
-    let catalog_count = verified.objects.len();
+    let catalog_count = verified.committed_objects().len();
     let committed = verified
-        .objects
+        .committed_objects()
         .iter()
         .find(|object| object.object_id == object_id)
         .ok_or(StoreError::ObjectMismatch)?;
@@ -588,7 +740,7 @@ async fn put_to_space(
     debug_assert!(catalog_count > 0);
     let object: Arc<StoredObject> = system_allocation(|| {
         Arc::new(StoredObject {
-            store_id: verified.store_id,
+            store_id: verified.store_id(),
             object_id,
             object_kind,
             byte_len,
@@ -614,8 +766,15 @@ pub async fn get_with(
     if !service.authorizes(Rights::READ) || !object.authorizes(Rights::READ) {
         return Err(StoreError::PermissionDenied);
     }
-    ensure_working_headroom()?;
     let inner = service.with(|store| store.inner.clone());
+    read_committed_object(inner, object).await
+}
+
+async fn read_committed_object(
+    inner: Arc<StoreInner>,
+    object: InvocationLease<StoredObject>,
+) -> Result<Vec<u8>, StoreError> {
+    ensure_working_headroom()?;
     let key = object.with(|stored| {
         (
             stored.store_id,
@@ -631,9 +790,9 @@ pub async fn get_with(
 
     let operation = inner.begin()?;
     let scan = scan_region(&inner).await?;
-    let mut recovered = recover_scan(&scan)?;
+    let recovered = recover_scan(&scan)?;
     let found = recovered
-        .objects
+        .committed_objects()
         .iter()
         .position(|candidate| {
             candidate.object_id == key.1
@@ -644,7 +803,8 @@ pub async fn get_with(
         .ok_or(StoreError::ObjectUnavailable)?;
 
     inner.install_recovery(&recovered, scan.next_physical);
-    let recovered_bytes = recovered.objects.swap_remove(found).bytes;
+    let mut objects = recovered.into_objects();
+    let recovered_bytes = objects.swap_remove(found).bytes;
     operation.finish();
     Ok(recovered_bytes)
 }
@@ -673,17 +833,82 @@ async fn scan_region(inner: &StoreInner) -> Result<PhysicalScan, StoreError> {
     Ok(PhysicalScan { next_physical })
 }
 
-fn recover_scan(_scan: &PhysicalScan) -> Result<journal::RecoveredStore, StoreError> {
-    journal::recover(
-        STORE_SCRATCH.sectors(),
-        journal::RecoveryPolicy {
-            store_id: store_id(),
-        },
-    )
-    .map_err(|error| match error {
-        journal::RecoveryError::MissingFormat => StoreError::Unformatted,
-        _ => StoreError::Corrupt,
+fn recover_scan(_scan: &PhysicalScan) -> Result<authority::RecoveryPreflight, StoreError> {
+    authority::preflight_recovery(STORE_SCRATCH.sectors(), store_id()).map_err(map_recovery_error)
+}
+
+fn authority_snapshot(scan: &PhysicalScan) -> Result<AuthoritySnapshot, StoreError> {
+    match authority::preflight_recovery(STORE_SCRATCH.sectors(), store_id()) {
+        Ok(preflight) => {
+            let checkpoint = preflight
+                .chain_checkpoint()
+                .map_err(|_| StoreError::Corrupt)?;
+            Ok(AuthoritySnapshot {
+                formatted: true,
+                checkpoint,
+                used_sectors: scan.next_physical,
+                preflight: Some(preflight),
+            })
+        }
+        Err(authority::RecoveryError::MissingFormat) => Ok(AuthoritySnapshot {
+            formatted: false,
+            checkpoint: ChainCheckpoint {
+                next_sequence: 1,
+                previous_sequence: 0,
+                previous_crc32c: 0,
+            },
+            used_sectors: scan.next_physical,
+            preflight: None,
+        }),
+        Err(_) => Err(StoreError::Corrupt),
+    }
+}
+
+fn validate_preview(
+    before: &AuthoritySnapshot,
+    records: &[[u8; journal::RECORD_SIZE]],
+) -> Result<ChainCheckpoint, StoreError> {
+    let mut next_sequence = before.checkpoint.next_sequence;
+    let mut previous_sequence = before.checkpoint.previous_sequence;
+    let mut previous_crc32c = before.checkpoint.previous_crc32c;
+    for (index, bytes) in records.iter().enumerate() {
+        let DecodeStatus::Valid(decoded) = authority::LogRecord::decode(bytes)
+            .map_err(|_| StoreError::Corrupt)?
+        else {
+            return Err(StoreError::Corrupt);
+        };
+        if decoded.record.store_id != store_id()
+            || decoded.record.sequence != next_sequence
+            || decoded.record.previous_sequence != previous_sequence
+            || decoded.record.previous_crc32c != previous_crc32c
+        {
+            return Err(StoreError::JournalChanged);
+        }
+        let is_format = matches!(decoded.record.body, RecordBody::Format);
+        if (!before.formatted && index == 0) != is_format {
+            return Err(StoreError::Corrupt);
+        }
+        if before.formatted && is_format {
+            return Err(StoreError::Corrupt);
+        }
+        previous_sequence = decoded.record.sequence;
+        previous_crc32c = decoded.crc32c;
+        next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or(StoreError::JournalFull)?;
+    }
+    Ok(ChainCheckpoint {
+        next_sequence,
+        previous_sequence,
+        previous_crc32c,
     })
+}
+
+fn map_recovery_error(error: authority::RecoveryError) -> StoreError {
+    match error {
+        authority::RecoveryError::MissingFormat => StoreError::Unformatted,
+        _ => StoreError::Corrupt,
+    }
 }
 
 async fn append_record(
@@ -703,6 +928,17 @@ async fn append_record(
 fn backend_info(inner: &StoreInner) -> Result<virtio_blk::BlockInfo, StoreError> {
     let lease = backend_lease(inner, Rights::READ)?;
     Ok(virtio_blk::info_with(&lease)?)
+}
+
+fn validate_writable_backend(inner: &StoreInner) -> Result<(), StoreError> {
+    let backend = backend_info(inner)?;
+    if backend.read_only {
+        return Err(StoreError::ReadOnly);
+    }
+    if !backend.supports_flush {
+        return Err(StoreError::FlushUnsupported);
+    }
+    Ok(())
 }
 
 async fn read_sector(inner: &StoreInner, sector: u64) -> Result<[u8; 512], StoreError> {

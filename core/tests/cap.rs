@@ -3,12 +3,24 @@
 //! `CapError` variant has a case that produces it.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use vibeos_core::cap::{grant, CSpace, CapError, Resource, Rights};
+use vibeos_core::cap::{
+    grant, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource, Rights,
+    MAX_PERSISTENT_SLOTS,
+};
+use vibeos_core::durable::{
+    DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
+    ResourceKind, SlotIdentity, SpaceId, TransactionId,
+};
 
 struct Widget(&'static str);
 struct Gadget;
+
+struct DropTrackedWidget {
+    drops: Arc<AtomicUsize>,
+}
 
 /// A safe but dishonest implementation. Typed resolution must follow the
 /// trait object's actual dynamic type, never this method's answer.
@@ -37,6 +49,21 @@ impl Resource for Gadget {
     }
 }
 
+impl Resource for DropTrackedWidget {
+    fn kind(&self) -> &'static str {
+        "drop-tracked-widget"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl Drop for DropTrackedWidget {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl Resource for Liar {
     fn kind(&self) -> &'static str {
         "liar"
@@ -50,6 +77,45 @@ fn space() -> (CSpace, Arc<Widget>) {
     (CSpace::new("test"), Arc::new(Widget("w")))
 }
 
+fn stable<T>(value: u128, constructor: fn(u128) -> Option<T>) -> T {
+    constructor(value).unwrap()
+}
+
+fn durable_grant(
+    transaction: u128,
+    derivation: u128,
+    parent: Option<u128>,
+    object: u128,
+    space: SpaceId,
+    slot: u32,
+    generation: u64,
+    rights: DurableRights,
+    kind: ResourceKind,
+) -> RecoveredGrant {
+    RecoveredGrant {
+        grant: GrantRecord {
+            derivation_id: stable(derivation, DerivationId::new),
+            parent_id: parent.map(|id| stable(id, DerivationId::new)),
+            object_id: stable(object, ObjectId::new),
+            target: SlotIdentity {
+                space,
+                slot,
+                generation,
+            },
+            rights,
+            resource_kind: kind,
+            flags: if parent.is_none() {
+                GrantFlags::ROOT
+            } else {
+                GrantFlags::DERIVED
+            },
+        },
+        transaction_id: stable(transaction, TransactionId::new),
+        prepare_sequence: transaction as u64 * 2,
+        commit_sequence: transaction as u64 * 2 + 1,
+    }
+}
+
 // --- Invariant 3: rights are checked at use ---
 
 #[test]
@@ -59,7 +125,10 @@ fn lookup_requires_the_named_right() {
     assert!(cs.lookup(c, Rights::READ).is_ok());
     assert!(cs.lookup(c, Rights::WRITE).is_ok());
     assert!(cs.lookup(c, Rights::READ.union(Rights::WRITE)).is_ok());
-    assert_eq!(cs.lookup(c, Rights::SEND).err(), Some(CapError::InsufficientRights));
+    assert_eq!(
+        cs.lookup(c, Rights::SEND).err(),
+        Some(CapError::InsufficientRights)
+    );
 }
 
 #[test]
@@ -68,7 +137,13 @@ fn holding_a_handle_is_not_permission() {
     let c = cs.mint(w, Rights::NONE);
     // The handle resolves to a live slot, and still authorises nothing.
     assert!(cs.rights_of(c).is_ok());
-    for r in [Rights::READ, Rights::WRITE, Rights::SEND, Rights::RECV, Rights::GRANT] {
+    for r in [
+        Rights::READ,
+        Rights::WRITE,
+        Rights::SEND,
+        Rights::RECV,
+        Rights::GRANT,
+    ] {
         assert_eq!(cs.lookup(c, r).err(), Some(CapError::InsufficientRights));
     }
 }
@@ -89,7 +164,10 @@ fn derive_requires_grant() {
 fn derive_cannot_amplify() {
     let (mut cs, w) = space();
     let c = cs.mint(w, Rights::READ.union(Rights::GRANT));
-    assert_eq!(cs.derive(c, Rights::WRITE).err(), Some(CapError::Amplification));
+    assert_eq!(
+        cs.derive(c, Rights::WRITE).err(),
+        Some(CapError::Amplification)
+    );
     assert_eq!(
         cs.derive(c, Rights::READ.union(Rights::REVOKE)).err(),
         Some(CapError::Amplification)
@@ -102,7 +180,10 @@ fn derive_produces_a_strict_subset() {
     let c = cs.mint(w, Rights::ALL);
     let weak = cs.derive(c, Rights::READ).unwrap();
     assert!(cs.lookup(weak, Rights::READ).is_ok());
-    assert_eq!(cs.lookup(weak, Rights::WRITE).err(), Some(CapError::InsufficientRights));
+    assert_eq!(
+        cs.lookup(weak, Rights::WRITE).err(),
+        Some(CapError::InsufficientRights)
+    );
     // ...and the parent is untouched.
     assert!(cs.lookup(c, Rights::WRITE).is_ok());
 }
@@ -113,8 +194,14 @@ fn derived_caps_cannot_re_widen_through_a_chain() {
     let root = cs.mint(w, Rights::ALL);
     let mid = cs.derive(root, Rights::READ.union(Rights::GRANT)).unwrap();
     let leaf = cs.derive(mid, Rights::READ).unwrap();
-    assert_eq!(cs.derive(mid, Rights::WRITE).err(), Some(CapError::Amplification));
-    assert_eq!(cs.derive(leaf, Rights::READ).err(), Some(CapError::InsufficientRights));
+    assert_eq!(
+        cs.derive(mid, Rights::WRITE).err(),
+        Some(CapError::Amplification)
+    );
+    assert_eq!(
+        cs.derive(leaf, Rights::READ).err(),
+        Some(CapError::InsufficientRights)
+    );
 }
 
 // --- Invariant 4: revocation is immediate and retroactive ---
@@ -136,11 +223,18 @@ fn revoke_cascades_to_the_whole_derivation_subtree() {
     let b = cs.derive(a, Rights::READ.union(Rights::GRANT)).unwrap();
     let c = cs.derive(root, Rights::WRITE).unwrap();
 
-    assert_eq!(cs.revoke(a).err(), Some(CapError::InsufficientRights), "a has no REVOKE");
+    assert_eq!(
+        cs.revoke(a).err(),
+        Some(CapError::InsufficientRights),
+        "a has no REVOKE"
+    );
     assert_eq!(cs.revoke_slot(a.slot()), 2, "a and its descendant b");
     assert_eq!(cs.lookup(a, Rights::READ).err(), Some(CapError::Invalid));
     assert_eq!(cs.lookup(b, Rights::READ).err(), Some(CapError::Invalid));
-    assert!(cs.lookup(c, Rights::WRITE).is_ok(), "a sibling branch survives");
+    assert!(
+        cs.lookup(c, Rights::WRITE).is_ok(),
+        "a sibling branch survives"
+    );
     assert!(cs.lookup(root, Rights::READ).is_ok(), "the parent survives");
 }
 
@@ -171,7 +265,10 @@ fn typed_lookup_rejects_the_wrong_type() {
     let (mut cs, w) = space();
     let c = cs.mint(w, Rights::ALL);
     assert!(cs.lookup_as::<Widget>(c, Rights::READ).is_ok());
-    assert_eq!(cs.lookup_as::<Gadget>(c, Rights::READ).err(), Some(CapError::WrongType));
+    assert_eq!(
+        cs.lookup_as::<Gadget>(c, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
 }
 
 #[test]
@@ -199,7 +296,10 @@ fn typed_lookup_checks_rights_before_type() {
     let c = cs.mint(w, Rights::READ);
     // Wrong type *and* missing rights: rights win, so a caller cannot use type
     // confusion to learn what a resource is without authority over it.
-    assert_eq!(cs.lookup_as::<Gadget>(c, Rights::WRITE).err(), Some(CapError::InsufficientRights));
+    assert_eq!(
+        cs.lookup_as::<Gadget>(c, Rights::WRITE).err(),
+        Some(CapError::InsufficientRights)
+    );
 }
 
 #[test]
@@ -408,7 +508,10 @@ fn grant_moves_authority_between_spaces_with_attenuation() {
 
     let given = grant(&src, c, Rights::READ, &mut dst).unwrap();
     assert!(dst.lookup(given, Rights::READ).is_ok());
-    assert_eq!(dst.lookup(given, Rights::WRITE).err(), Some(CapError::InsufficientRights));
+    assert_eq!(
+        dst.lookup(given, Rights::WRITE).err(),
+        Some(CapError::InsufficientRights)
+    );
 }
 
 #[test]
@@ -436,7 +539,10 @@ fn a_handle_is_meaningless_in_another_space() {
     let ca = a.mint(w.clone(), Rights::ALL);
     b.mint(Arc::new(Gadget), Rights::ALL);
     // Same slot number, different space: resolving there must not yield a's object.
-    assert_eq!(b.lookup_as::<Widget>(ca, Rights::READ).err(), Some(CapError::WrongType));
+    assert_eq!(
+        b.lookup_as::<Widget>(ca, Rights::READ).err(),
+        Some(CapError::WrongType)
+    );
 }
 
 /// ROADMAP 1.8. Revoking the source of a cross-space grant kills the copy,
@@ -483,8 +589,14 @@ fn revoking_a_grant_does_not_touch_the_source() {
     let given = grant(&src, c, Rights::READ, &mut dst).unwrap();
 
     dst.revoke_slot(given.slot());
-    assert_eq!(dst.lookup(given, Rights::READ).err(), Some(CapError::Invalid));
-    assert!(src.lookup(c, Rights::READ).is_ok(), "authority flows down, not up");
+    assert_eq!(
+        dst.lookup(given, Rights::READ).err(),
+        Some(CapError::Invalid)
+    );
+    assert!(
+        src.lookup(c, Rights::READ).is_ok(),
+        "authority flows down, not up"
+    );
 }
 
 #[test]
@@ -544,22 +656,17 @@ fn async_publication_requires_the_same_cspace_incarnation() {
     cs.reset();
     assert_eq!(cs.incarnation(), expected + 1);
 
-    let stale = cs.mint_if_incarnation(
-        expected,
-        Arc::new(Widget("stale")),
-        Rights::READ,
-    );
+    let stale = cs.mint_if_incarnation(expected, Arc::new(Widget("stale")), Rights::READ);
     assert_eq!(stale, None);
     assert!(cs.list().is_empty());
 
     let current = cs
-        .mint_if_incarnation(
-            cs.incarnation(),
-            Arc::new(Widget("current")),
-            Rights::READ,
-        )
+        .mint_if_incarnation(cs.incarnation(), Arc::new(Widget("current")), Rights::READ)
         .unwrap();
-    assert_eq!(cs.lookup_as::<Widget>(current, Rights::READ).unwrap().0, "current");
+    assert_eq!(
+        cs.lookup_as::<Widget>(current, Rights::READ).unwrap().0,
+        "current"
+    );
 }
 
 // --- Rights algebra ---
@@ -617,10 +724,516 @@ fn revoke_all_empties_a_space_and_reaches_its_grants() {
 
     assert_eq!(victim.revoke_all(), 3);
     assert!(victim.list().is_empty());
-    assert_eq!(victim.lookup(ca, Rights::READ).err(), Some(CapError::Invalid));
-    assert_eq!(victim.lookup(cb, Rights::WRITE).err(), Some(CapError::Invalid));
+    assert_eq!(
+        victim.lookup(ca, Rights::READ).err(),
+        Some(CapError::Invalid)
+    );
+    assert_eq!(
+        victim.lookup(cb, Rights::WRITE).err(),
+        Some(CapError::Invalid)
+    );
 
     // The source keeps its own authority; revocation flows down, never up.
     assert!(src.lookup(a, Rights::READ).is_ok());
     assert!(grant(&src, a, Rights::READ, &mut onward).is_ok());
+}
+
+// --- ROADMAP M4.3: durable CSpace installation and lifecycle ---
+
+#[test]
+fn committed_root_and_child_install_with_exact_identity_and_attenuation() {
+    let space_id = stable(101, SpaceId::new);
+    let kind = ResourceKind::new(7).unwrap();
+    let root_rights = DurableRights::READ
+        .union(DurableRights::GRANT)
+        .union(DurableRights::REVOKE);
+    let mut cs = CSpace::new_persistent("durable", space_id);
+    let incarnation = cs.incarnation();
+
+    let root_reservation = cs.reserve_persistent_slot(incarnation).unwrap();
+    assert_eq!(root_reservation.target().slot, 0);
+    assert_eq!(root_reservation.target().generation, 0);
+    let root_record = durable_grant(110, 111, None, 112, space_id, 0, 0, root_rights, kind).grant;
+    let (root_cap, root) = cs
+        .install_reserved_root(&root_reservation, &root_record, Arc::new(Widget("durable")))
+        .unwrap();
+
+    let child_reservation = cs.reserve_persistent_slot(incarnation).unwrap();
+    assert_eq!(child_reservation.target().slot, 1);
+    let child_record = durable_grant(
+        113,
+        114,
+        Some(111),
+        112,
+        space_id,
+        1,
+        0,
+        DurableRights::READ,
+        kind,
+    )
+    .grant;
+    let (child_cap, child) = cs
+        .install_reserved_child(&child_reservation, &root, &child_record)
+        .unwrap();
+
+    assert_eq!(child.identity().rights(), Rights::READ);
+    assert_eq!(child.identity().target(), child_record.target);
+    assert_eq!(
+        cs.lookup_persistent_identity::<Widget>(child.identity(), Rights::READ)
+            .unwrap()
+            .with(|widget| widget.0),
+        "durable"
+    );
+    assert_eq!(
+        cs.derive(root_cap, Rights::READ).err(),
+        Some(CapError::PersistentLifecycleRequired)
+    );
+    assert_eq!(
+        cs.revoke(child_cap).err(),
+        Some(CapError::PersistentLifecycleRequired)
+    );
+    assert_eq!(cs.revoke_slot(child_cap.slot()), 0);
+    assert_eq!(cs.revoke_all(), 0);
+    assert_eq!(cs.reset(), 0);
+    assert_eq!(cs.incarnation(), incarnation);
+    assert_eq!(cs.list().len(), 2);
+    let mut other = CSpace::new("ordinary-destination");
+    assert_eq!(
+        grant(&cs, root_cap, Rights::READ, &mut other).err(),
+        Some(CapError::PersistentLifecycleRequired)
+    );
+
+    assert_eq!(
+        cs.complete_persistent_revoke(&root, child.identity())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        cs.lookup_persistent_identity::<Widget>(child.identity(), Rights::READ)
+            .err(),
+        Some(CapError::Invalid)
+    );
+    let reused = cs.reserve_persistent_slot(incarnation).unwrap();
+    assert_eq!(reused.target().slot, 1);
+    assert_eq!(reused.target().generation, 1);
+    cs.cancel_persistent_slot(&reused).unwrap();
+}
+
+#[test]
+fn recovered_graph_restores_typed_root_and_child_in_one_publish() {
+    let space_id = stable(201, SpaceId::new);
+    let object_id = stable(202, ObjectId::new);
+    let kind = ResourceKind::new(8).unwrap();
+    let root_rights = DurableRights::READ
+        .union(DurableRights::GRANT)
+        .union(DurableRights::REVOKE);
+    let root = durable_grant(210, 211, None, 202, space_id, 0, 4, root_rights, kind);
+    let child = durable_grant(
+        212,
+        213,
+        Some(211),
+        202,
+        space_id,
+        1,
+        7,
+        DurableRights::READ,
+        kind,
+    );
+    let slots = [
+        RecoveredSlot {
+            space: space_id,
+            slot: 0,
+            max_generation: 4,
+            live_derivation: Some(root.grant.derivation_id),
+        },
+        RecoveredSlot {
+            space: space_id,
+            slot: 1,
+            max_generation: 7,
+            live_derivation: Some(child.grant.derivation_id),
+        },
+    ];
+    let object = Arc::new(Widget("restored"));
+    let resources = [PersistentResourceWitness::new(object_id, kind, object)];
+    let mut cs = CSpace::new_persistent("restored", space_id);
+    let identities = cs
+        .install_recovered_graph(
+            cs.incarnation(),
+            &slots,
+            &[root.clone(), child.clone()],
+            &resources,
+        )
+        .unwrap();
+
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0].generation(), 4);
+    assert_eq!(identities[1].generation(), 7);
+    assert_eq!(identities[1].rights(), Rights::READ);
+    let witness = cs
+        .persistent_witness_for_identity::<Widget>(identities[1], Rights::READ)
+        .unwrap();
+    assert_eq!(witness.identity(), identities[1]);
+    assert_eq!(
+        cs.lookup_persistent_identity::<Widget>(identities[1], Rights::READ)
+            .unwrap()
+            .with(|widget| widget.0),
+        "restored"
+    );
+}
+
+#[test]
+fn recovered_dead_slot_is_reserved_at_strictly_next_generation() {
+    let space_id = stable(301, SpaceId::new);
+    let object_id = stable(302, ObjectId::new);
+    let kind = ResourceKind::new(9).unwrap();
+    let root = durable_grant(
+        310,
+        311,
+        None,
+        302,
+        space_id,
+        0,
+        5,
+        DurableRights::ALL,
+        kind,
+    );
+    let slots = [
+        RecoveredSlot {
+            space: space_id,
+            slot: 0,
+            max_generation: 5,
+            live_derivation: Some(root.grant.derivation_id),
+        },
+        RecoveredSlot {
+            space: space_id,
+            slot: 1,
+            max_generation: 8,
+            live_derivation: None,
+        },
+    ];
+    let resources = [PersistentResourceWitness::new(
+        object_id,
+        kind,
+        Arc::new(Widget("root")),
+    )];
+    let mut cs = CSpace::new_persistent("reuse", space_id);
+    cs.install_recovered_graph(cs.incarnation(), &slots, &[root], &resources)
+        .unwrap();
+
+    let reservation = cs.reserve_persistent_slot(cs.incarnation()).unwrap();
+    assert_eq!(reservation.target().slot, 1);
+    assert_eq!(reservation.target().generation, 9);
+}
+
+#[test]
+fn failed_recovery_install_never_publishes_a_partial_graph() {
+    let space_id = stable(401, SpaceId::new);
+    let object_id = stable(402, ObjectId::new);
+    let kind = ResourceKind::new(10).unwrap();
+    let root = durable_grant(
+        410,
+        411,
+        None,
+        402,
+        space_id,
+        0,
+        0,
+        DurableRights::READ.union(DurableRights::GRANT),
+        kind,
+    );
+    let amplified = durable_grant(
+        412,
+        413,
+        Some(411),
+        402,
+        space_id,
+        1,
+        0,
+        DurableRights::WRITE,
+        kind,
+    );
+    let slots = [
+        RecoveredSlot {
+            space: space_id,
+            slot: 0,
+            max_generation: 0,
+            live_derivation: Some(root.grant.derivation_id),
+        },
+        RecoveredSlot {
+            space: space_id,
+            slot: 1,
+            max_generation: 0,
+            live_derivation: Some(amplified.grant.derivation_id),
+        },
+    ];
+    let resources = [PersistentResourceWitness::new(
+        object_id,
+        kind,
+        Arc::new(Widget("never-published")),
+    )];
+    let mut cs = CSpace::new_persistent("atomic", space_id);
+
+    assert_eq!(
+        cs.install_recovered_graph(cs.incarnation(), &slots, &[root, amplified], &resources,)
+            .err(),
+        Some(PersistentInstallError::RightsAmplification)
+    );
+    assert!(cs.list().is_empty());
+    let reservation = cs.reserve_persistent_slot(cs.incarnation()).unwrap();
+    assert_eq!(reservation.target().slot, 0);
+    assert_eq!(reservation.target().generation, 0);
+}
+
+#[test]
+fn recovery_refuses_generation_rollback_and_ephemeral_identity() {
+    let space_id = stable(501, SpaceId::new);
+    let object_id = stable(502, ObjectId::new);
+    let kind = ResourceKind::new(11).unwrap();
+    let root = durable_grant(
+        510,
+        511,
+        None,
+        502,
+        space_id,
+        0,
+        0,
+        DurableRights::ALL,
+        kind,
+    );
+    let slots = [RecoveredSlot {
+        space: space_id,
+        slot: 0,
+        max_generation: 0,
+        live_derivation: Some(root.grant.derivation_id),
+    }];
+    let resources = [PersistentResourceWitness::new(
+        object_id,
+        kind,
+        Arc::new(Widget("rollback")),
+    )];
+    let mut cs = CSpace::new_persistent("rollback", space_id);
+    let ephemeral = cs.mint(Arc::new(Widget("ephemeral")), Rights::ALL);
+    assert_eq!(
+        cs.persistent_witness::<Widget>(ephemeral, Rights::READ)
+            .err(),
+        Some(CapError::NotPersistent)
+    );
+    assert_eq!(cs.revoke_slot(ephemeral.slot()), 1);
+
+    assert_eq!(
+        cs.install_recovered_graph(cs.incarnation(), &slots, &[root], &resources)
+            .err(),
+        Some(PersistentInstallError::GenerationRegression)
+    );
+    assert!(cs.list().is_empty());
+}
+
+#[test]
+fn recovery_rejects_duplicate_and_out_of_range_metadata() {
+    let space_id = stable(601, SpaceId::new);
+    let dead = RecoveredSlot {
+        space: space_id,
+        slot: 0,
+        max_generation: 3,
+        live_derivation: None,
+    };
+    let mut duplicate = CSpace::new_persistent("duplicate", space_id);
+    assert_eq!(
+        duplicate
+            .install_recovered_graph(duplicate.incarnation(), &[dead, dead], &[], &[])
+            .err(),
+        Some(PersistentInstallError::DuplicateSlot)
+    );
+    assert!(duplicate.list().is_empty());
+
+    let mut out_of_range = CSpace::new_persistent("out-of-range", space_id);
+    let invalid = RecoveredSlot {
+        slot: MAX_PERSISTENT_SLOTS,
+        ..dead
+    };
+    assert_eq!(
+        out_of_range
+            .install_recovered_graph(out_of_range.incarnation(), &[invalid], &[], &[])
+            .err(),
+        Some(PersistentInstallError::SlotOutOfRange)
+    );
+
+    let object_id = stable(602, ObjectId::new);
+    let kind = ResourceKind::new(12).unwrap();
+    let resources = [
+        PersistentResourceWitness::new(object_id, kind, Arc::new(Widget("first"))),
+        PersistentResourceWitness::new(object_id, kind, Arc::new(Widget("second"))),
+    ];
+    let mut duplicate_resource = CSpace::new_persistent("duplicate-resource", space_id);
+    assert_eq!(
+        duplicate_resource
+            .install_recovered_graph(duplicate_resource.incarnation(), &[], &[], &resources)
+            .err(),
+        Some(PersistentInstallError::DuplicateResource)
+    );
+}
+
+#[test]
+fn persistent_fault_quarantine_hides_authority_and_blocks_lifecycle_operations() {
+    let space_id = stable(701, SpaceId::new);
+    let kind = ResourceKind::new(13).unwrap();
+    let mut cs = CSpace::new_persistent("quarantine", space_id);
+    let incarnation = cs.incarnation();
+
+    let reservation = cs.reserve_persistent_slot(incarnation).unwrap();
+    let retained_for_ledger = reservation;
+    let root_record = durable_grant(
+        710,
+        711,
+        None,
+        712,
+        space_id,
+        0,
+        0,
+        DurableRights::ALL,
+        kind,
+    )
+    .grant;
+    let (root_cap, root) = cs
+        .install_reserved_root(&reservation, &root_record, Arc::new(Widget("quarantined")))
+        .unwrap();
+    assert_eq!(
+        cs.cancel_persistent_slot(&retained_for_ledger).err(),
+        Some(PersistentInstallError::ReservationMismatch),
+        "copying the opaque reservation cannot consume it twice"
+    );
+
+    let pending_child = cs.reserve_persistent_slot(incarnation).unwrap();
+    let child_record = durable_grant(
+        713,
+        714,
+        Some(711),
+        712,
+        space_id,
+        1,
+        0,
+        DurableRights::READ,
+        kind,
+    )
+    .grant;
+
+    // Keep only a Weak outside the CSpace for this independent root. If
+    // quarantine were to invalidate the slot, its Resource destructor would
+    // run inside fault cleanup and this counter would change immediately.
+    let drops = Arc::new(AtomicUsize::new(0));
+    let drop_tracked = Arc::new(DropTrackedWidget {
+        drops: drops.clone(),
+    });
+    let drop_tracked_weak = Arc::downgrade(&drop_tracked);
+    let tracked_reservation = cs.reserve_persistent_slot(incarnation).unwrap();
+    assert_eq!(tracked_reservation.target().slot, 2);
+    let tracked_record = durable_grant(
+        715,
+        716,
+        None,
+        717,
+        space_id,
+        2,
+        0,
+        DurableRights::READ,
+        ResourceKind::new(14).unwrap(),
+    )
+    .grant;
+    let (_, tracked_witness) = cs
+        .install_reserved_root(&tracked_reservation, &tracked_record, drop_tracked)
+        .unwrap();
+    drop(tracked_witness);
+    assert!(drop_tracked_weak.upgrade().is_some());
+
+    let root_identity = root.identity();
+    let revocable = cs
+        .lookup_revocable::<Widget>(root_cap, Rights::READ)
+        .unwrap();
+    let active_lease = cs.lookup_lease::<Widget>(root_cap, Rights::READ).unwrap();
+    assert_eq!(cs.list().len(), 2);
+
+    assert_eq!(cs.quarantine_persistent(), Ok(2));
+    assert!(cs.is_persistent_quarantined());
+    assert!(cs.list().is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(
+        drop_tracked_weak.upgrade().is_some(),
+        "quarantine must retain slot entries instead of running Resource::drop"
+    );
+    assert_eq!(
+        cs.lookup(root_cap, Rights::READ).err(),
+        Some(CapError::PersistentQuarantined)
+    );
+    assert_eq!(active_lease.with(|widget| widget.0), "quarantined");
+    assert_eq!(
+        cs.lookup_lease::<Widget>(root_cap, Rights::READ).err(),
+        Some(CapError::PersistentQuarantined),
+        "quarantine blocks every new invocation lease"
+    );
+    assert_eq!(
+        cs.lookup_persistent_identity::<Widget>(root_identity, Rights::READ)
+            .err(),
+        Some(CapError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.persistent_witness::<Widget>(root_cap, Rights::READ)
+            .err(),
+        Some(CapError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.persistent_witness_for_identity::<Widget>(root_identity, Rights::READ)
+            .err(),
+        Some(CapError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.reserve_persistent_slot(incarnation).err(),
+        Some(PersistentInstallError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.install_reserved_child(&pending_child, &root, &child_record)
+            .err(),
+        Some(PersistentInstallError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.cancel_persistent_slot(&pending_child).err(),
+        Some(PersistentInstallError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.install_recovered_graph(incarnation, &[], &[], &[]).err(),
+        Some(PersistentInstallError::PersistentQuarantined)
+    );
+    assert_eq!(
+        cs.complete_persistent_revoke(&root, root_identity).err(),
+        Some(CapError::PersistentQuarantined)
+    );
+    assert_eq!(
+        revocable.try_with(|widget| widget.0),
+        Err(CapError::Invalid),
+        "quarantine kills authority already resolved as a revocable token"
+    );
+    assert_eq!(cs.quarantine_persistent(), Ok(0));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    drop(cs);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(drop_tracked_weak.upgrade().is_none());
+
+    let mut restarted = CSpace::new_persistent("restarted", space_id);
+    assert!(!restarted.is_persistent_quarantined());
+    assert!(restarted
+        .reserve_persistent_slot(restarted.incarnation())
+        .is_ok());
+}
+
+#[test]
+fn ordinary_space_cannot_enter_persistent_quarantine() {
+    let (mut cs, widget) = space();
+    let cap = cs.mint(widget, Rights::READ);
+
+    assert_eq!(
+        cs.quarantine_persistent().err(),
+        Some(PersistentInstallError::NotPersistentSpace)
+    );
+    assert!(!cs.is_persistent_quarantined());
+    assert!(cs.lookup(cap, Rights::READ).is_ok());
 }

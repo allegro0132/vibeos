@@ -36,7 +36,7 @@ records extend the common kind namespace:
 Object, derivation, space, and transaction IDs share the one monotonic numeric
 namespace. Recovery decodes the full record-kind set and rejects a number used
 for two ID classes. The format marker, high-water record, object records, and
-future authority records therefore form one sequence/CRC chain rather than
+live M4.3 authority records therefore form one sequence/CRC chain rather than
 independent logs that could disagree about identity.
 
 The physical scan always covers the complete fixed region. A single fixed 256 KiB `.bss`
@@ -74,9 +74,12 @@ No CSpace, store-state, or block-service lock is held across an await. If a
 target component restarts while the write is in flight, the durable object may
 exist but no capability is installed into the replacement incarnation.
 
-M4.2 deliberately does not recreate object capabilities after reboot. Recovery
-rebuilds an inert internal catalog, while M4.3 persists and reinstalls the
-authority graph that decides which CSpaces receive capabilities.
+The generic M4.2 object API still does not reopen every committed object after
+reboot. Recovery first rebuilds an inert catalog. M4.3 then admits only the graph
+for the fixed `persistent-test` SpaceId after external root-policy validation and
+atomically reinstalls its typed `StoredObject` capabilities. There is still no
+ambient `ObjectId` lookup or enumeration path. See
+[PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
 
 ## Acceptance evidence
 
@@ -97,3 +100,6 @@ than trusting the kernel's in-memory result.
 Host tests enumerate every prefix cut and commit boundary, exercise torn holes,
 multi-chunk and empty objects, malformed bindings, shared identity collisions,
 and allocation-amplification attempts from incomplete maximum-size prepares.
+The separate M4.3 acceptance reboots three times on one disk and independently
+verifies the unified object/authority graph, ancestor tombstone, and generation-1
+slot reuse; it does not change the M4.2 public store API.

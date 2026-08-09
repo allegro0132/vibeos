@@ -16,9 +16,9 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation and explicit leases; unified authority/object journal decoding, exhaustive prefix/flush recovery, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio feature/status negotiation, split-ring layout, malformed completion quarantine, index wrap, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; channels and the compiler | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, external root selection, exhaustive prefix/flush recovery, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio feature/status negotiation, split-ring layout, malformed completion quarantine, index wrap, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; channels and the compiler | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, timeout reset, cancellation/fault restart, and capability-addressed object commit/read/revoke | `tests/cases/`, `tests/golden/` |
+| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, and three boots of one persistent CSpace against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
@@ -41,6 +41,23 @@ deterministic 900-byte object, filling all 512 slots. After shutdown,
 canonical kinds 1--8, shared ID/transaction classes, chain/CRC/commit binding,
 and both exact payloads. Its positive interleaving and negative parity fixtures
 run before the real backing image is accepted.
+
+The `persistent_cspace` case reboots three times against one unchanged raw disk.
+Boot 1 persists and installs a `root -> child -> grandchild` object-capability
+graph; boot 2 reads it, flushes a tombstone for the child ancestor, and proves
+both child and grandchild absent; boot 3 keeps that tombstone effective and
+reuses child slot 1 only at generation 1. Every boot also checks that the target
+`persistent-test` CSpace has no Store `WRITE` authority and that its first dependent
+observation occurs only after recovery reaches `Ready`. After the third shutdown,
+`persistent-cspace-image.py` independently parses the raw journal. Its host-side
+self-test applies all 512 strict byte-prefix cuts to each of 19 canonical fixture
+records (9,728 cuts) and requires every cut to recover exactly the preceding
+flushed boundary before checking malformed graph and root-policy fixtures.
+Core tests additionally prove that persistent quarantine denies generic lookups,
+invalidates `Revocable` tokens, preserves an already acquired invocation lease,
+and retains resource entries without running `Drop`. The service's stable
+task/domain/token ledger lets raw-fault cleanup clear only the exact abandoned
+reservation without touching another caller.
 
 ## Performance baseline
 

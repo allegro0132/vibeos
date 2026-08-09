@@ -19,7 +19,7 @@ extern crate alloc;
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, program, sync, virtio};
+pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync, virtio};
 
 mod bench;
 mod dev;
@@ -50,6 +50,10 @@ global_asm!(
 _start:
     csrw sie, zero
     csrw sip, zero
+
+    // OpenSBI passes the hart id in a0. S-mode cannot read mhartid, so retain
+    // it in tp for IRQ routing now and hart-local state from M5.4 onward.
+    mv tp, a0
 
     .option push
     .option norelax
@@ -122,6 +126,9 @@ pub extern "C" fn kmain() -> ! {
     );
 
     trap::init();
+    ipi::mark_online(exec::HartId::BOOT, sbi::current_hart_id())
+        .expect("boot physical hart must have one logical scheduler identity");
+    exec::set_ready_notify_hook(ipi::notify_ready);
     println!(
         "  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled",
         uart::UART_IRQ

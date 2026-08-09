@@ -13,7 +13,7 @@ use crate::dev::ConsoleDev;
 use crate::net::Packet;
 use crate::world::{world, Reading, Space};
 use crate::HEAP;
-use crate::{exec, println, sbi, tty, uart};
+use crate::{exec, ipi, println, sbi, tty, uart};
 
 pub async fn shell_task(boot_time: u64) {
     println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
@@ -75,7 +75,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  pcspace test    exercise three-boot persistent authority recovery");
-            println!("  smp queues      prove logical remote queues are stolen exactly once");
+            println!("  smp queues      prove logical stealing plus the SBI/SSIP wake path");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -452,12 +452,17 @@ async fn run(line: &str, boot_time: u64) {
     }
 }
 
-/// Deterministic M5.1 acceptance probe.
+/// Deterministic M5.1 queue and M5.2 IPI acceptance probe.
 ///
 /// Secondary physical harts remain gated until M5.5. These untracked tasks are
 /// placed on the three logical remote queues so hart 0 must steal them.
 async fn smp_queue_demo() {
     let before = exec::scheduler_stats();
+    let remote_ipi_before: Vec<_> = (1..exec::MAX_HARTS)
+        .map(|index| {
+            ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+        })
+        .collect();
     let mut counters = Vec::new();
     let mut handles = Vec::new();
     let mut placement_ok = true;
@@ -496,9 +501,46 @@ async fn smp_queue_demo() {
         .steals
         .saturating_sub(before.harts[exec::HartId::BOOT.index()].steals);
 
-    if ran_once && steals == (exec::MAX_HARTS - 1) as u64 {
+    let offline_mailboxes_ok = (1..exec::MAX_HARTS).all(|index| {
+        let hart = exec::HartId::new(index).expect("logical scheduler hart is valid");
+        let before = remote_ipi_before[index - 1];
+        let after = ipi::stats(hart);
+        !after.online
+            && after.pending_reasons & ipi::REASON_RUNNABLE != 0
+            && after.doorbells == before.doorbells
+            && after.send_failures == before.send_failures
+    });
+
+    // Normal current-hart notifications need no IPI because the hart is
+    // already executing. Force exactly one pending self-doorbell here so QEMU
+    // proves the real SBI/SSIP/ack path before physical secondaries are booted.
+    let boot_ipi_before = ipi::stats(exec::HartId::BOOT);
+    let local_probe = exec::spawn_tracked_on(exec::HartId::BOOT, "ipi-probe", async {});
+    let forced = ipi::retry_pending(exec::HartId::BOOT);
+    let local_exit = local_probe.join().await;
+    for _ in 0..4 {
+        if ipi::stats(exec::HartId::BOOT).acknowledged > boot_ipi_before.acknowledged {
+            break;
+        }
+        exec::yield_now().await;
+    }
+    let boot_ipi_after = ipi::stats(exec::HartId::BOOT);
+    let self_ipi_ok = forced == ipi::DoorbellDisposition::Sent
+        && local_exit.state() == exec::TaskState::Exited
+        && local_exit.polls() == 1
+        && boot_ipi_after.doorbells == boot_ipi_before.doorbells + 1
+        && boot_ipi_after.send_failures == boot_ipi_before.send_failures
+        && boot_ipi_after.acknowledged > boot_ipi_before.acknowledged;
+
+    if ran_once
+        && steals == (exec::MAX_HARTS - 1) as u64
+        && offline_mailboxes_ok
+        && self_ipi_ok
+    {
         println!("  smp queues: remote hart1..hart3 tasks each ran once");
         println!("  smp queues: hart0 steal delta=3");
+        println!("  smp ipi: offline remote reasons retained without SBI calls");
+        println!("  smp ipi: forced boot-hart doorbell acknowledged");
         println!("  smp queues: physical secondary harts gated until M5.5");
     } else {
         println!("  smp queues: FAILED scheduler acceptance invariant");

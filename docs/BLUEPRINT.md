@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and the M5.1 logical
-per-hart queue layer are complete; M5.2 cross-hart wakeups are next, and the original M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.2 are
+complete; M5.3 lock contention work is next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -225,6 +225,15 @@ notification hook and idle predicate form the M5.2 IPI seam.
 Tasks in audited raw-reclaim arenas are hart-affine and non-stealable until sibling
 quiescence spans physical harts. The single `running` slot is intentionally retained
 until M5.4, and physical secondary execution remains gated until M5.5.
+
+M5.2 implements that seam with per-logical-hart atomic reason mailboxes. A mailbox
+also owns its kick-armed bit, so interrupt acknowledgement consumes both atomically;
+Release/Acquire ordering and explicit RVWMO I/O fences bridge ready-queue publication,
+the SBI ecall, SSIP clear, and executor return. An IRQ-masked idle turn consumes a
+reason rather than spinning forever if its work was stolen or cancelled. Logical
+hart ids bind explicitly to firmware-provided physical hartids, and only online
+physical harts receive standardized `mask=1, base=hartid` SBI calls. M5.2 keeps only
+the boot hart online; stopped secondaries retain software reasons for M5.5.
 
 The single-hart lifecycle has two orthogonal coordinates. Its **phase** is running,
 cancel-requested, terminal-committed, or terminal-published; its **location** is

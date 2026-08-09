@@ -16,7 +16,7 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle and four-queue ownership models; work stealing, wake/cancel/fault boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle, four-queue ownership, and IPI lost-wakeup models; work stealing, wake/cancel/fault boundaries; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; fault arenas; wait/timer registration ownership; heap quotas/provenance; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
 | Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
@@ -81,11 +81,14 @@ epoch advances. A canonical evidence file is checked separately from the guest
 golden; TAP, root privileges, and host network access are never used.
 
 The `smp_queues` case keeps the one-CPU physical QEMU boundary and places one
-untracked task on each of the three logical remote queues. It requires physical
-hart 0 to report an exact steal delta of three with every probe executing once,
-and reports physical secondary execution as gated until M5.5. No timing value
-appears in its golden transcript. A pre-M5.5 `-smp 4` smoke did not reach the shell,
-so it is recorded as M5.5 work rather than treated as parked-hart evidence.
+untracked task on each of the three logical remote queues. It requires logical
+hart 0 to report an exact steal delta of three with every probe executing once.
+Because those logical targets are offline, their Release-published reasons must
+remain pending with no SBI attempts. A separate ready boot-hart probe deliberately
+forces one self-doorbell and requires real OpenSBI delivery, SSIP acknowledgement,
+and executor return. Physical secondary execution is still reported as gated until
+M5.5, and no timing value appears in the golden. A pre-M5.5 `-smp 4` smoke did not
+reach the shell, so it remains M5.5 work rather than parked-hart evidence.
 
 ## Performance baseline
 
@@ -170,7 +173,7 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-test.sh net           # raw L2 exchange plus host evidence
 ./scripts/qemu-test.sh net_recovery  # post-publish fault and fresh-epoch retry
 ./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
-./scripts/qemu-test.sh smp_queues   # four logical queues, physical hart0 only
+./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
 ```
 
 Read the diff before updating. The `--update` flag is the only thing standing

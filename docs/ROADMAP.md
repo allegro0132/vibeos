@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, and M5.1 are complete. M5.2 cross-hart wakeups are next. Run
+> sequence through 3.16, M4.5, and M5.2 are complete. M5.3 lock contention audit is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -477,7 +477,7 @@ recovered source/binary object with exactly the fixed persisted authority manife
 | # | Work item |
 |---|---|
 | 5.1 ✅ | Per-hart run queues with work stealing |
-| 5.2 | IPI-based cross-hart wakeups (SBI `sbi_send_ipi`) |
+| 5.2 ✅ | IPI-based cross-hart wakeups (SBI `sbi_send_ipi`) |
 | 5.3 | Audit every `SpinLock` for real contention; replace the hot ones with lock-free structures |
 | 5.4 | Hart-local storage for the scheduler's `running` slot |
 | 5.5 | Boot secondary harts via SBI HSM |
@@ -505,6 +505,37 @@ places one untracked task on each logical remote queue, and requires hart 0 to
 steal all three with each task executing exactly once. IPI delivery, hart-local
 running slots, and secondary-hart boot remain gated to 5.2, 5.4, and 5.5
 respectively.
+
+5.2 publishes a lock-free runnable reason only after queue insertion. Each logical
+hart mailbox combines reason bits and a kick-armed bit in one atomic word: a
+`Release` publication arms at most one SBI doorbell, a failed send clears only the
+armed bit so later publication can retry, and the receiver clears SSIP, executes an
+explicit `fence iorw, iorw`, then consumes reasons plus armed state in one `Acquire`
+swap. The producer likewise fences before its SBI call. Current-hart notifications
+do not send needless self-IPIs. The IRQ-masked idle gate samples the ready queue and
+consumes its local mailbox before WFI; a consumed reason forces another executor
+turn, while a later delivered SSIP is harmlessly stale. This avoids both lost sleep
+and a permanently busy idle loop after work is stolen or cancelled.
+
+Logical queue ids are not assumed to be firmware hartids. Online registration binds
+each logical hart to the physical id supplied by SBI, and standardized sends use
+`hart_mask = 1, hart_mask_base = physical_hartid`. VibeOS does not guess the
+topology-sized bit vector required by legacy EID 0x04; unavailable modern IPI support
+is therefore fail-stop instead of a falsely successful wake.
+Only the boot hart is online in M5.2. Offline logical queues retain reasons without
+issuing invalid SBI calls, ready for the already-awake HSM startup handoff in M5.5.
+An unexpected send failure for an online hart is fail-stop at the executor hook so
+firmware failure cannot be misreported as a component fault.
+
+**M5.2 acceptance:** concrete host tests cover coalescing, stale IPIs, offline
+handoff, non-contiguous physical hartid mapping, failed-send retention and retry.
+Small-state models enumerate all 70 enqueue/set/fence/send versus
+IRQ-off/check/check/WFI merges and all 35 clear/fence/swap versus concurrent-publish
+merges. The one-CPU `smp_queues` QEMU case proves stopped logical harts retain reasons
+without SBI calls and deliberately forces one boot-hart self-doorbell through real
+OpenSBI, SSIP trap acknowledgement, and executor return. Physical secondary
+execution, per-hart running state, and `-smp 4` acceptance remain gated to 5.5, 5.4,
+and the M5 final acceptance respectively.
 
 **M5.5 preflight risk:** a pre-M5.5 `-smp 4` smoke run did not produce the
 shell-ready marker even though `_start` contains a non-boot-hart park branch. M5.1

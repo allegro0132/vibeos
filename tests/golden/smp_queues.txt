@@ -1,0 +1,8 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> smp queues
+  smp queues: remote hart1..hart3 tasks each ran once
+  smp queues: hart0 steal delta=3
+  smp queues: physical secondary harts gated until M5.5
+vibe> 

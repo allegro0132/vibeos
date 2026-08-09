@@ -1525,6 +1525,105 @@ fn waking_many_individually_parked_tasks_does_not_allocate_ready_capacity() {
 }
 
 #[test]
+fn hart0_steals_each_logical_remote_task_exactly_once() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let before = exec::scheduler_stats();
+    let mut counters = Vec::new();
+    let mut handles = Vec::new();
+
+    for index in 1..exec::MAX_HARTS {
+        let hart = exec::HartId::new(index).unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        let task_counter = counter.clone();
+        let handle = exec::spawn_tracked_on(hart, "logical-remote", async move {
+            task_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(exec::task_queue_owner(handle.id()), Some(hart));
+        counters.push(counter);
+        handles.push(handle);
+    }
+
+    exec::run_until_idle(BUDGET);
+    let after = exec::scheduler_stats();
+    assert!(counters
+        .iter()
+        .all(|counter| counter.load(Ordering::SeqCst) == 1));
+    assert!(handles
+        .iter()
+        .all(|handle| handle.state() == TaskState::Exited && handle.polls() == 1));
+    assert_eq!(
+        after.harts[0].steals - before.harts[0].steals,
+        (exec::MAX_HARTS - 1) as u64
+    );
+}
+
+#[test]
+fn stolen_wake_during_poll_migrates_one_ready_owner_to_hart0() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let polls = Arc::new(AtomicU64::new(0));
+    let task_polls = polls.clone();
+    let remote = exec::HartId::new(3).unwrap();
+    let handle = exec::spawn_tracked_on(remote, "remote-self-wake", async move {
+        task_polls.fetch_add(1, Ordering::SeqCst);
+        exec::yield_now().await;
+        task_polls.fetch_add(1, Ordering::SeqCst);
+    });
+
+    assert!(exec::poll_once());
+    assert_eq!(handle.polls(), 1);
+    assert_eq!(
+        exec::task_queue_owner(handle.id()),
+        Some(exec::HartId::BOOT)
+    );
+    assert_eq!(
+        exec::wake_with_disposition(handle.id()),
+        exec::WakeDisposition::AlreadyQueued {
+            hart: exec::HartId::BOOT
+        }
+    );
+    assert!(exec::poll_once());
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(handle.state(), TaskState::Exited);
+}
+
+#[test]
+fn remote_cancel_and_fault_leave_no_queue_owner_or_stale_wake() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+
+    let cancelled = exec::spawn_tracked_on(
+        exec::HartId::new(2).unwrap(),
+        "remote-cancel",
+        std::future::pending::<()>(),
+    );
+    assert_eq!(cancelled.cancel(), CancelOutcome::Requested);
+    assert_eq!(cancelled.state(), TaskState::Cancelled);
+    assert_eq!(cancelled.polls(), 0);
+    assert_eq!(exec::task_queue_owner(cancelled.id()), None);
+    assert_eq!(
+        exec::wake_with_disposition(cancelled.id()),
+        exec::WakeDisposition::Inactive
+    );
+
+    exec::set_fault_guard(fault_once_then_passthrough);
+    FAULT_NEXT_POLL.store(true, Ordering::SeqCst);
+    let faulted = exec::spawn_tracked_on(
+        exec::HartId::new(1).unwrap(),
+        "remote-fault",
+        std::future::pending::<()>(),
+    );
+    assert!(exec::poll_once());
+    assert_eq!(faulted.state(), TaskState::Faulted);
+    assert_eq!(exec::task_queue_owner(faulted.id()), None);
+    assert_eq!(
+        exec::wake_with_disposition(faulted.id()),
+        exec::WakeDisposition::Inactive
+    );
+}
+
+#[test]
 fn the_running_task_is_visible_while_it_is_polled() {
     let _g = scheduler();
     let seen = Arc::new(AtomicU64::new(0));

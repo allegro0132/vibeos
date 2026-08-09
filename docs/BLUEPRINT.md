@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, and M4.0--M4.5 are complete; M5.1
-per-hart run queues are next, and the original M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and the M5.1 logical
+per-hart queue layer are complete; M5.2 cross-hart wakeups are next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -192,12 +192,14 @@ fresh one.
 ## 4. The execution model
 
 A task is `Pin<Box<dyn Future<Output = ()> + Send>>` plus a name and a poll count.
-The scheduler is a `BTreeMap<TaskId, Task>` and a ready `VecDeque<TaskId>`.
+The scheduler is a `BTreeMap<TaskId, Task>` and four logical per-hart ready
+`VecDeque`s. Queue ownership is explicit task metadata and is updated atomically
+with queue membership under the scheduler lock.
 
 **The waker is the `TaskId` itself**, cast into the raw-waker data pointer. Clone is
 identity, drop is a no-op, wake is a queue push. No `Arc` or refcount is involved;
-spawn reserves ready-queue capacity for the live-task upper bound so the wake path
-does not allocate.
+spawn reserves every ready queue for the global live-task upper bound so the wake
+path does not allocate even after a task migrates through stealing.
 
 The main loop:
 
@@ -213,6 +215,16 @@ system so far: a task that wakes *itself* during its own poll found nothing in t
 map and had the wake dropped, which hung `yield_now` forever. `Sched::running_woken`
 now catches that, and it covers the harder case too — an interrupt that lands
 mid-poll for the task being polled.
+
+M5.1 keeps physical execution on hart 0 while making queue behavior genuinely
+four-hart: a dispatcher consumes local FIFO work first, then steals eligible work
+from remote queue backs in cyclic order. `wake_with_disposition` reports whether
+work was newly enqueued, already queued, running, or inactive together with its
+target hart while the original `wake` API remains intact; an allocation-free
+notification hook and idle predicate form the M5.2 IPI seam.
+Tasks in audited raw-reclaim arenas are hart-affine and non-stealable until sibling
+quiescence spans physical harts. The single `running` slot is intentionally retained
+until M5.4, and physical secondary execution remains gated until M5.5.
 
 The single-hart lifecycle has two orthogonal coordinates. Its **phase** is running,
 cancel-requested, terminal-committed, or terminal-published; its **location** is
@@ -457,8 +469,9 @@ arena and sealed restart template: restart retains `ComponentId`, memory owner, 
 boot-static `Space`, while installing a new `TaskId`, `ArenaId`, generation, and CSpace
 grants. Slot generations survive CSpace reset, so an old `Cap` cannot alias a fresh
 grant. Sixteen target fault/restart cycles verify bounded heap growth and zero interrupted
-destructors. Reproducible builds and the single-hart scheduler/panic model are now
-in place. Explicit resolved-cap lease semantics now complete the M3.5 sequence.
+destructors. Reproducible builds, the lifecycle model, and the M5.1 logical queue
+model are now in place; physical execution is still single-hart. Explicit
+resolved-cap lease semantics now complete the M3.5 sequence.
 
 Five boundaries must stay explicit:
 

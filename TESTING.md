@@ -16,9 +16,9 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, external root selection, exhaustive prefix/flush recovery, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, and three boots of one persistent CSpace against the same disk | `tests/cases/`, `tests/golden/` |
+| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
@@ -58,6 +58,16 @@ invalidates `Revocable` tokens, preserves an already acquired invocation lease,
 and retains resource entries without running `Drop`. The service's stable
 task/domain/token ledger lets raw-fault cleanup clear only the exact abandoned
 reservation without touching another caller.
+
+The `program_persistence` case reboots twice against one unchanged raw disk.
+Boot 1 publishes the fixed `hello` source plus canonical relocatable VIBEEXE as
+one read-only ProgramArtifact root and runs it. Boot 2 proves a repeat save
+appends nothing, recovers the exact slot-0/generation-0 capability, recompiles the
+source with the current trusted compiler, requires byte-identical VIBEEXE, and
+runs using only reconstructed console `WRITE` and memory `READ|WRITE` authority.
+After shutdown, `program-image.py` independently validates the journal, artifact,
+hashes, relocation table, stable imports, publication order, authority manifest,
+and strict 512-byte prefix cuts. See `docs/PROGRAM_PERSISTENCE.md`.
 
 The `net` and `net_recovery` cases are also stronger than their transcripts.
 Only those cases add a modern virtio-net device. Before QEMU starts, the harness
@@ -152,6 +162,7 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-test.sh conform       # run one case
 ./scripts/qemu-test.sh net           # raw L2 exchange plus host evidence
 ./scripts/qemu-test.sh net_recovery  # post-publish fault and fresh-epoch retry
+./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
 ```
 
 Read the diff before updating. The `--update` flag is the only thing standing

@@ -24,6 +24,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/PERSISTENT_CSPACE.md](docs/PERSISTENT_CSPACE.md)** — the fixed
   `persistent-test` CSpace, external root policy, atomic recovery install, and
   three-boot acceptance boundary.
+- **[docs/PROGRAM_PERSISTENCE.md](docs/PROGRAM_PERSISTENCE.md)** — canonical
+  source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
+  restored least authority.
 - **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
@@ -90,9 +93,10 @@ The base system image in `world.rs` has five spaces wired to one channel, a cons
 and a bounded memory region. Four are owned by supervised components; `prog` is
 the explicitly unbound execution space used synchronously by the shell task.
 When virtio-blk is discovered, private driver and store-backend spaces plus the
-fixed `persistent-test` CSpace are added. The backend holds only attenuated block
-`READ|WRITE`; `persistent-test` receives restored object authority but never Store
-`WRITE`:
+fixed `persistent-test` and `saved-program` CSpaces are added. A private
+`saved-program-policy` space is the supervisor root for reconstructed console and
+memory authority. The backend holds only attenuated block `READ|WRITE`; neither
+persistent target receives Store `WRITE`:
 
 | space  | holds                                    | therefore cannot          |
 |--------|------------------------------------------|---------------------------|
@@ -104,6 +108,8 @@ fixed `persistent-test` CSpace are added. The backend holds only attenuated bloc
 | virtio-blk | MMIO, DMA, block service `READ|WRITE` | console or object caps    |
 | store-backend | block service `READ|WRITE`        | paths or client CSpaces   |
 | persistent-test | durable stored-object caps      | Store `WRITE` or paths    |
+| saved-program-policy | console/memory policy roots | block, Store, or program artifact |
+| saved-program | artifact `READ`, console `WRITE`, memory `READ|WRITE` | Store `WRITE`, paths, or legacy `prog` authority |
 
 Run `probe` in the shell to watch four attacks get refused. `revoke guest` pulls
 a live component's authority out from under it, while `cancel guest` separately
@@ -373,11 +379,12 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **Persistent authority is currently limited to one fixed test CSpace; no MMU,
-  user mode, or multicore.** M4.3 restores the externally constrained
-  `persistent-test` object graph across boot and keeps ancestor tombstones dead,
-  but it is not yet a general component checkpoint facility. M4.5 must still bind
-  saved source and binaries to durable authority before `rustc save` / `run` exist.
+- **Persistent authority is deliberately fixed-shape; no MMU, user mode, or
+  multicore yet.** M4.3 restores the externally constrained `persistent-test`
+  graph. M4.5 adds one immutable `hello` ProgramArtifact whose source and canonical
+  VIBEEXE are revalidated against the current compiler before execution, with an
+  exact console/memory manifest. This is not a general component checkpoint,
+  update, naming, authentication, or rollback-resistance facility.
 - **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.

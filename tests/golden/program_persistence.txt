@@ -1,0 +1,32 @@
+=== program persistence boot 1 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> rustc save hello
+  saved `hello`: 45 B source + 636 B canonical VIBEEXE
+  durable artifact cap: slot 0 generation 0, rights r
+  authority manifest: console=w memory=rw; Store WRITE absent
+vibe> run hello
+Hello, world!
+  recovered `hello`: cap slot 0 generation 0, 45 B source + 636 B VIBEEXE
+  verified current compiler match; linked 1 fn -> 460 B RV64 + 14 B data
+  authority: console=w memory=rw; Store WRITE absent
+  --- running recovered program ---
+  --- exited with 0 in N us ---
+vibe> halt
+  powering off.
+=== program persistence boot 2 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> rustc save hello
+  saved `hello`: already present; no object or grant appended
+vibe> run hello
+Hello, world!
+  recovered `hello`: cap slot 0 generation 0, 45 B source + 636 B VIBEEXE
+  verified current compiler match; linked 1 fn -> 460 B RV64 + 14 B data
+  authority: console=w memory=rw; Store WRITE absent
+  --- running recovered program ---
+  --- exited with 0 in N us ---
+vibe> halt
+  powering off.

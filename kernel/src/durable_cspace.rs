@@ -21,11 +21,13 @@ use vibeos_core::cap::{
 };
 use vibeos_core::durable::{
     self, DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, ObjectKind,
-    RecoveredGrant, RecoveredSlot, ResourceKind, RootConstraint, RootRightsConstraint,
-    SlotIdentity, SpaceId, TransactionId,
+    RecoveredGrant, RecoveredSlot, RecoveredStore, ResourceKind, RootConstraint,
+    RootRightsConstraint, SlotIdentity, SpaceId, TransactionId,
 };
+use vibeos_core::program::{self as program_model, RootPolicyPartition};
 use vibeos_core::store as object_codec;
 
+use crate::saved_program::{self, SavedProgramService, TrustedProgram};
 use crate::store::{AuthorityJournal, AuthoritySnapshot, StoreError, StoredObject};
 use crate::world::Space;
 use crate::{exec, heap, sync::SpinLock, virtio_blk};
@@ -181,6 +183,7 @@ struct DurableActiveClaim {
 struct DurableCSpaceInner {
     journal: AuthorityJournal,
     target: Arc<Space>,
+    saved_program: Arc<SavedProgramService>,
     state: AtomicU8,
     active: SpinLock<Option<DurableActiveClaim>>,
     dependent_started: AtomicBool,
@@ -243,13 +246,19 @@ impl DurableCSpaceInner {
     }
 
     fn clear_claim(&self, task: exec::TaskId, domain: heap::AllocationDomain, token: u64) -> bool {
-        let Some(claim) = self.take_claim(task, domain, Some(token)) else {
-            return false;
+        let reservation = {
+            let active = self.active.lock();
+            let Some(claim) = active.as_ref().filter(|claim| {
+                claim.task == task && claim.domain == domain && claim.token == token
+            }) else {
+                return false;
+            };
+            claim.reservation
         };
-        if let Some(reservation) = claim.reservation {
+        if let Some(reservation) = reservation {
             let _ = self.target.0.lock().cancel_persistent_slot(&reservation);
         }
-        true
+        self.take_claim(task, domain, Some(token)).is_some()
     }
 
     fn quarantine_claim(
@@ -258,22 +267,37 @@ impl DurableCSpaceInner {
         domain: heap::AllocationDomain,
         token: Option<u64>,
     ) -> bool {
-        let Some(_claim) = self.take_claim(task, domain, token) else {
+        let claimed = self.active.lock().as_ref().is_some_and(|claim| {
+            claim.task == task
+                && claim.domain == domain
+                && token.is_none_or(|expected| claim.token == expected)
+        });
+        if !claimed {
             return false;
-        };
+        }
+
+        // Retain the exact claim until both durable targets are fail-closed.
+        // If any step below faults, raw cleanup can still attribute and repeat
+        // this idempotent sequence instead of losing the recovery breadcrumb.
         self.dependent_started.store(false, Ordering::Release);
         self.state
             .store(DurableCSpaceState::FailedClosed as u8, Ordering::Release);
         let _ = self.target.0.lock().quarantine_persistent();
-        true
+        self.saved_program.mark_failed_closed();
+        self.take_claim(task, domain, token).is_some()
     }
 }
 
 impl DurableCSpaceService {
-    pub(crate) fn new(journal: AuthorityJournal, target: Arc<Space>) -> Arc<Self> {
+    pub(crate) fn new(
+        journal: AuthorityJournal,
+        target: Arc<Space>,
+        saved_program: Arc<SavedProgramService>,
+    ) -> Arc<Self> {
         let inner = Arc::new(DurableCSpaceInner {
             journal,
             target,
+            saved_program,
             state: AtomicU8::new(DurableCSpaceState::Cold as u8),
             active: SpinLock::new(None),
             dependent_started: AtomicBool::new(false),
@@ -342,6 +366,7 @@ impl DurableCSpaceService {
         // Capture the target before the first await. The atomic installer
         // checks this exact incarnation after journal recovery completes.
         let expected_incarnation = self.inner.target.0.lock().incarnation();
+        let expected_program_incarnation = self.inner.saved_program.target().0.lock().incarnation();
         let result = async {
             let snapshot = self.inner.journal.recover().await?;
             let trusted = authorize_snapshot(snapshot)?;
@@ -356,6 +381,26 @@ impl DurableCSpaceService {
                     &trusted.grants,
                     &trusted.resources,
                 )
+                .map_err(|_| DurableCSpaceError::Install)?;
+            let program_identities = self
+                .inner
+                .saved_program
+                .target()
+                .0
+                .lock()
+                .install_recovered_graph(
+                    expected_program_incarnation,
+                    &trusted.program.slots,
+                    &trusted.program.grants,
+                    &trusted.program.resources,
+                )
+                .map_err(|_| DurableCSpaceError::Install)?;
+            if program_identities.len() != usize::from(trusted.program.live) {
+                return Err(DurableCSpaceError::Install);
+            }
+            self.inner
+                .saved_program
+                .install_recovered(program_identities.first().copied())
                 .map_err(|_| DurableCSpaceError::Install)?;
             self.install_live_graph(&identities, trusted.shape);
             Ok(())
@@ -385,6 +430,7 @@ impl DurableCSpaceService {
             .state
             .store(DurableCSpaceState::FailedClosed as u8, Ordering::Release);
         let _ = self.inner.target.0.lock().quarantine_persistent();
+        self.inner.saved_program.mark_failed_closed();
     }
 
     pub(crate) async fn activate_dependent(&self) -> Result<(), DurableCSpaceError> {
@@ -928,30 +974,16 @@ pub(crate) unsafe fn recover_faulted_task(task: exec::TaskId, domain: heap::Allo
     };
 
     // Safety: the executor detached the exact task before this hook. Repair
-    // each possibly abandoned lock before taking it, and never hold the claim
-    // lock while touching the target CSpace.
+    // each possibly abandoned lock before taking it. The saved-program hook is
+    // ordered before this one in `cleanup_faulted_task`, because quarantine of
+    // a durable boot claim also fail-closes the saved-program target.
     let _ = unsafe { inner.active.recover_after_fault(domain) };
-    let claim = {
-        let mut active = inner.active.lock();
-        if active
-            .as_ref()
-            .is_some_and(|claim| claim.task == task && claim.domain == domain)
-        {
-            active.take()
-        } else {
-            None
-        }
-    };
-    if claim.is_none() {
-        return;
-    }
-
-    inner.dependent_started.store(false, Ordering::Release);
-    inner
-        .state
-        .store(DurableCSpaceState::FailedClosed as u8, Ordering::Release);
     let _ = unsafe { inner.target.0.recover_after_fault(domain) };
-    let _ = inner.target.0.lock().quarantine_persistent();
+    let _ = unsafe { inner.graph.recover_after_fault(domain) };
+
+    // Keep the exact claim published until both CSpaces have been quarantined.
+    // Repeating this after a partially completed cleanup is intentionally safe.
+    let _ = inner.quarantine_claim(task, domain, None);
 }
 
 impl Resource for DurableCSpaceService {
@@ -1123,6 +1155,7 @@ struct TrustedSnapshot {
     grants: Vec<RecoveredGrant>,
     resources: Vec<PersistentResourceWitness>,
     shape: ValidatedGraphShape,
+    program: TrustedProgram,
 }
 
 fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, DurableCSpaceError> {
@@ -1136,60 +1169,143 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
                 descendant_history_generation: None,
                 tombstones: 0,
             },
+            program: TrustedProgram {
+                slots: Vec::new(),
+                grants: Vec::new(),
+                resources: Vec::new(),
+                live: false,
+            },
         });
     };
     let committed_grants = preflight.committed_grants().to_vec();
-    // A fully tombstoned graph has history but no live authority. It is valid
-    // with an empty external root set; the slot generations must still reach
-    // the atomic installer. Any live node implies a live root and therefore
-    // requires the exact dynamic constraint below.
+    let persistent_committed_grants: Vec<_> = committed_grants
+        .iter()
+        .filter(|grant| grant.grant.target.space == persistent_space_id())
+        .cloned()
+        .collect();
+    // Root selection is global. Each independently owned SpaceId contributes a
+    // constraint only when its slot history says it has live authority; finish
+    // then rejects every extra root not present in this union.
     let has_live_authority = preflight
         .slots()
         .iter()
-        .any(|slot| slot.live_derivation.is_some());
-    let (roots, root_object) = if has_live_authority {
-        let roots = preflight
-            .select_roots(&[RootConstraint {
-                space: persistent_space_id(),
-                first_slot: ROOT_SLOT,
-                last_slot_inclusive: ROOT_SLOT,
-                rights: RootRightsConstraint::exact(ROOT_RIGHTS),
-                resource_kind: stored_object_resource_kind(),
-                object_kind: persistent_object_kind(),
-            }])
-            .map_err(|_| DurableCSpaceError::RootPolicy)?;
-        let root = roots.first().ok_or(DurableCSpaceError::RootPolicy)?;
-        if roots.len() != 1 || root.grant.target.generation != 0 {
-            return Err(DurableCSpaceError::RootPolicy);
-        }
-        let object = preflight
-            .committed_objects()
-            .iter()
-            .find(|object| object.object_id == root.grant.object_id)
-            .ok_or(DurableCSpaceError::RootPolicy)?;
-        if object.object_kind != persistent_object_kind() {
-            return Err(DurableCSpaceError::RootPolicy);
-        }
-        (roots, Some(StoredObject::from_recovered(object)))
-    } else {
-        (Vec::new(), None)
-    };
-    let recovered = preflight
-        .finish(&roots)
+        .any(|slot| slot.space == persistent_space_id() && slot.live_derivation.is_some());
+    let has_live_program = preflight.slots().iter().any(|slot| {
+        slot.space == program_model::program_space_id() && slot.live_derivation.is_some()
+    });
+    let persistent_constraints = [RootConstraint {
+        space: persistent_space_id(),
+        first_slot: ROOT_SLOT,
+        last_slot_inclusive: ROOT_SLOT,
+        rights: RootRightsConstraint::exact(ROOT_RIGHTS),
+        resource_kind: stored_object_resource_kind(),
+        object_kind: persistent_object_kind(),
+    }];
+    let program_constraints = [program_model::program_root_constraint()];
+    let mut partitions = Vec::new();
+    if has_live_authority {
+        partitions.push(RootPolicyPartition {
+            space: persistent_space_id(),
+            constraints: &persistent_constraints,
+        });
+    }
+    if has_live_program {
+        partitions.push(RootPolicyPartition {
+            space: program_model::program_space_id(),
+            constraints: &program_constraints,
+        });
+    }
+    let roots = program_model::select_root_policy_union(&preflight, &partitions)
         .map_err(|_| DurableCSpaceError::RootPolicy)?;
-    if recovered.grants.iter().any(|grant| {
-        grant.grant.target.space != persistent_space_id()
-            || grant.grant.resource_kind != stored_object_resource_kind()
-            || grant.grant.rights.contains(DurableRights::WRITE)
-    }) || recovered
-        .slots
-        .iter()
-        .any(|slot| slot.space != persistent_space_id())
+    if has_live_program
+        && !roots.iter().any(|root| {
+            root.grant.target.space == program_model::program_space_id()
+                && program_model::program_root_policy_is_exact(root)
+        })
     {
         return Err(DurableCSpaceError::RootPolicy);
     }
-    let shape = validate_fixed_graph_shape(&committed_grants, &recovered)?;
-    let resources = match (roots.first(), root_object) {
+    let root_object = roots
+        .iter()
+        .find(|root| root.grant.target.space == persistent_space_id())
+        .map(|root| {
+            if root.grant.target.generation != 0 {
+                return Err(DurableCSpaceError::RootPolicy);
+            }
+            let object = preflight
+                .committed_objects()
+                .iter()
+                .find(|object| object.object_id == root.grant.object_id)
+                .ok_or(DurableCSpaceError::RootPolicy)?;
+            if object.object_kind != persistent_object_kind() {
+                return Err(DurableCSpaceError::RootPolicy);
+            }
+            Ok(StoredObject::from_recovered(object))
+        })
+        .transpose()?;
+    let recovered = preflight
+        .finish(&roots)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let policy_spaces = [persistent_space_id(), program_model::program_space_id()];
+    let tombstone_partitions = program_model::partition_tombstones_by_space(
+        &committed_grants,
+        &recovered.tombstones,
+        &policy_spaces,
+    )
+    .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let persistent_tombstones = tombstone_partitions
+        .iter()
+        .find(|partition| partition.space == persistent_space_id())
+        .ok_or(DurableCSpaceError::RootPolicy)?
+        .tombstones
+        .clone();
+    let program_tombstones = tombstone_partitions
+        .iter()
+        .find(|partition| partition.space == program_model::program_space_id())
+        .ok_or(DurableCSpaceError::RootPolicy)?
+        .tombstones
+        .clone();
+    if recovered.grants.iter().any(|grant| {
+        !matches!(
+            grant.grant.target.space,
+            space if space == persistent_space_id() || space == program_model::program_space_id()
+        )
+    }) || recovered.slots.iter().any(|slot| {
+        slot.space != persistent_space_id() && slot.space != program_model::program_space_id()
+    }) {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let persistent = RecoveredStore {
+        store_id: recovered.store_id,
+        id_high_water: recovered.id_high_water,
+        grants: recovered
+            .grants
+            .iter()
+            .filter(|grant| grant.grant.target.space == persistent_space_id())
+            .cloned()
+            .collect(),
+        objects: recovered.objects.clone(),
+        slots: recovered
+            .slots
+            .iter()
+            .filter(|slot| slot.space == persistent_space_id())
+            .copied()
+            .collect(),
+        tombstones: persistent_tombstones,
+        last_sequence: recovered.last_sequence,
+        last_crc32c: recovered.last_crc32c,
+    };
+    if persistent.grants.iter().any(|grant| {
+        grant.grant.resource_kind != stored_object_resource_kind()
+            || grant.grant.rights.contains(DurableRights::WRITE)
+    }) {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let shape = validate_fixed_graph_shape(&persistent_committed_grants, &persistent)?;
+    let persistent_root = roots
+        .iter()
+        .find(|root| root.grant.target.space == persistent_space_id());
+    let resources = match (persistent_root, root_object) {
         (Some(root), Some(object)) => vec![PersistentResourceWitness::new(
             root.grant.object_id,
             stored_object_resource_kind(),
@@ -1198,11 +1314,34 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
         (None, None) => Vec::new(),
         _ => return Err(DurableCSpaceError::RootPolicy),
     };
+    let program_recovered = RecoveredStore {
+        store_id: recovered.store_id,
+        id_high_water: recovered.id_high_water,
+        grants: recovered
+            .grants
+            .iter()
+            .filter(|grant| grant.grant.target.space == program_model::program_space_id())
+            .cloned()
+            .collect(),
+        objects: recovered.objects,
+        slots: recovered
+            .slots
+            .iter()
+            .filter(|slot| slot.space == program_model::program_space_id())
+            .copied()
+            .collect(),
+        tombstones: program_tombstones,
+        last_sequence: recovered.last_sequence,
+        last_crc32c: recovered.last_crc32c,
+    };
+    let program = saved_program::authorize_recovered(&program_recovered)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
     Ok(TrustedSnapshot {
-        slots: recovered.slots,
-        grants: recovered.grants,
+        slots: persistent.slots,
+        grants: persistent.grants,
         resources,
         shape,
+        program,
     })
 }
 

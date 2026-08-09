@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16 and M4.4 are complete. M4.5 source/binary persistence is next. Run
+> sequence through 3.16 and M4.5 are complete. M5.1 per-hart run queues are next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -387,7 +387,7 @@ claim otherwise.
 | 4.2 ✅ | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
 | 4.3 ✅ | Persist a CSpace | The fixed `persistent-test` SpaceId restores a typed object-capability graph only after inert preflight, external root policy, and atomic installation. Three boots prove ancestor tombstones and generation-1 slot reuse. |
 | 4.4 ✅ | virtio-net + a typed socket endpoint | Modern device ID 1, q0 RX/q1 TX, two fixed eight-entry queues, bounded `Endpoint<Packet>`, shared reset/quarantine, and independent raw-L2 host evidence. |
-| 4.5 | Source and binary persistence | `rustc save hello` / `run hello`. Compiled code becomes a storable object with a cap on it. |
+| 4.5 ✅ | Source and binary persistence | `rustc save hello` / `run hello`. One canonical ProgramArtifact binds source, relocatable VIBEEXE, ABIs, hashes, and exact reconstructed authority. |
 
 4.0 fixes the authority-store ABI before a device can make accidental bytes durable.
 The append-only v1 log uses canonical 512-byte little-endian records, CRC32C, a
@@ -453,9 +453,22 @@ incarnation's abandoned HELLO, then a second HELLO and complete exchange from a
 fresh device epoch. Both focused non-update QEMU cases and the complete regression
 suite are green.
 
-**M4 final acceptance (after 4.5):** write a program at the shell, save it, reboot,
-run it — and its authority after reboot is exactly what was persisted. Source and
-binary persistence is not part of M4.3 and remains unfinished.
+4.5 publishes the fixed `hello` source and canonical address-independent VIBEEXE
+as one read-only durable object root. A global SpaceId-partitioned root-policy
+union admits the M4.3 and program graphs together and rejects every extra root.
+Recovery strictly decodes both formats, recompiles the source with the current
+trusted compiler, requires byte-identical VIBEEXE, and only then links it. Console
+`WRITE` and memory `READ|WRITE` are reconstructed from a private supervisor policy
+CSpace; legacy `prog` authority and Store `WRITE` are absent. See
+[PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
+
+**M4.5 acceptance:** one raw disk survives two boots. The first saves and runs;
+the second appends nothing, restores slot 0/generation 0, verifies current compiler
+identity, and runs with the exact manifest. An independent parser verifies the
+powered-off journal/artifact/VIBEEXE plus every strict record-prefix cut.
+
+**M4 final acceptance: met.** Save `hello` at the shell, reboot, and run the
+recovered source/binary object with exactly the fixed persisted authority manifest.
 
 ---
 
@@ -512,7 +525,7 @@ The continuing tracks after the partial M3 milestone are:
 | **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
 | **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
 | **Compiler** | `compiler`, `kernel/rustc`, trampoline | Resolved-cap lease semantics are complete; 3.4–3.6 remain evidence-driven language-track work rather than a persistence prerequisite |
-| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.4 durable model, virtio block/network, object store, and fixed persistent CSpace; source/binary persistence is next |
+| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.5 durable model, virtio block/network, object store, fixed persistent CSpace, and verified source/binary persistence |
 | **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 
 The lifecycle track is the integration spine: a driver, persisted program, or remote

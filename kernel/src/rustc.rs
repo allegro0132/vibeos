@@ -18,6 +18,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -40,12 +41,12 @@ pub const LEASE_SRC: &str = r#"fn main() -> i64 {
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::cap::{Revocable, Rights};
+use crate::cap::{Cap, Revocable, Rights};
 use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
 use crate::sbi;
 use crate::sync::SpinLock;
 use crate::trampoline::{self, abort, vibe_catch, vibe_enter, vibe_longjmp, JmpBuf};
-use crate::world::world;
+use crate::world::{world, Space};
 
 /// Where a compiled program's authority lives while it runs. `None` means no
 /// program is executing and the runtime hooks refuse everything.
@@ -230,40 +231,66 @@ pub struct Compiled {
     pub data_bytes: usize,
 }
 
-pub fn compile(src: &str) -> Result<Compiled, String> {
-    let rt = vibeos_rustc::Runtime {
+fn runtime() -> vibeos_rustc::Runtime {
+    vibeos_rustc::Runtime {
         print_str: rt_print_str as *const () as u64,
         print_int: rt_print_int as *const () as u64,
         print_bool: rt_print_bool as *const () as u64,
         abort: rt_abort as *const () as u64,
-    };
+    }
+}
 
-    // Sizing pass: instruction counts never depend on addresses, so the length
-    // measured at base 0 is the length we will need at the real base. The data
-    // buffer it produces is also final, since only its *address* was a guess.
-    let sized = vibeos_rustc::compile_at(src, 0, 0, &rt)?;
-    let mut data = sized.data;
-    let mut code = vec![0u32; sized.code.len()];
+fn link_relocatable(image: &vibeos_rustc::RelocatableImage) -> Result<Compiled, String> {
+    let rt = runtime();
 
-    let real = vibeos_rustc::compile_at(
-        src,
+    // Allocate the exact final buffers before linking. The linker emits another
+    // owned Image, whose bytes are copied into these stable-address buffers;
+    // generated absolute references therefore name the storage retained by
+    // `Compiled`, never a temporary linker allocation.
+    let mut data = image.data().to_vec();
+    let mut code = vec![0u32; image.code_template().len()];
+
+    let linked = image.link_with_runtime(
         data.as_ptr() as u64,
         code.as_ptr() as u64,
         &rt,
     )?;
-    if real.code.len() != code.len() || real.data.len() != data.len() {
-        return Err("internal error: code layout was not stable across passes".to_string());
+    if linked.code.len() != code.len() || linked.data.len() != data.len() {
+        return Err("internal error: executable layout changed while linking".to_string());
     }
-    data.copy_from_slice(&real.data);
-    code.copy_from_slice(&real.code);
+    data.copy_from_slice(&linked.data);
+    code.copy_from_slice(&linked.code);
 
     Ok(Compiled {
-        funcs: real.funcs,
+        funcs: linked.funcs,
         bytes: code.len() * 4,
         data_bytes: data.len(),
         _data: data,
         code,
     })
+}
+
+pub fn compile(src: &str) -> Result<Compiled, String> {
+    let image = vibeos_rustc::compile_relocatable(src)?;
+    link_relocatable(&image)
+}
+
+/// Produce the canonical address-independent VIBEEXE stored inside a durable
+/// ProgramArtifact.
+pub fn compile_persistable(src: &str) -> Result<Vec<u8>, String> {
+    Ok(vibeos_rustc::compile_relocatable(src)?.encode())
+}
+
+/// Admit persisted native code only after the current trusted compiler emits
+/// the identical canonical VIBEEXE for the persisted source. The durable CRCs
+/// are corruption checks, not authority to introduce arbitrary machine code.
+pub fn compile_verified(src: &str, executable: &[u8]) -> Result<Compiled, String> {
+    let persisted = vibeos_rustc::RelocatableImage::decode(executable)?;
+    let current = vibeos_rustc::compile_relocatable(src)?;
+    if current.encode().as_slice() != executable {
+        return Err("persisted VIBEEXE does not match the current compiler output".to_string());
+    }
+    link_relocatable(&persisted)
 }
 
 pub struct RunOutcome {
@@ -285,14 +312,26 @@ pub struct RunOutcome {
 pub fn run(prog: &Compiled) -> RunOutcome {
     let w = world();
     let space = w.spaces["prog"].clone();
+    run_with_authority(prog, &space, w.prog_console, w.prog_memory)
+}
+
+/// Execute with one explicit CSpace and its exact capability handles. Saved
+/// programs use this entry point so the legacy boot-local `prog` grants cannot
+/// accidentally become ambient authority after recovery.
+pub fn run_with_authority(
+    prog: &Compiled,
+    space: &Arc<Space>,
+    console_cap: Cap,
+    memory_cap: Cap,
+) -> RunOutcome {
     let (console, memory_lease) = {
         let cspace = space.0.lock();
         (
             cspace
-                .lookup_revocable::<ConsoleDev>(w.prog_console, Rights::WRITE)
+                .lookup_revocable::<ConsoleDev>(console_cap, Rights::WRITE)
                 .ok(),
             cspace.lookup_lease::<MemoryRegion>(
-                w.prog_memory,
+                memory_cap,
                 Rights::READ.union(Rights::WRITE),
             ),
         )

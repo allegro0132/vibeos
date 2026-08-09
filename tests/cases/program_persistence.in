@@ -1,0 +1,4 @@
+quiet
+rustc save hello
+run hello
+halt

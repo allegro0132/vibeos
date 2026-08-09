@@ -220,11 +220,15 @@ for case_file in tests/cases/*.in; do
   fi
 
   # Durable CSpace acceptance deliberately reboots three times against the
-  # exact same raw image. Every other case retains the stronger isolation of
-  # one fresh image and one boot per transcript.
+  # exact same raw image. Program persistence uses two boots: the first
+  # publishes the fixed `hello` artifact and the second must recover and run
+  # that exact source/binary/capability object without another publication.
+  # Every other case retains one fresh image and one boot per transcript.
   boots=1
   if [ "$name" = "persistent_cspace" ]; then
     boots=3
+  elif [ "$name" = "program_persistence" ]; then
+    boots=2
   fi
   : > "$actual"
   boot_output_ok=1
@@ -261,8 +265,10 @@ for case_file in tests/cases/*.in; do
       fail=1
     fi
 
-    if [ "$boots" -gt 1 ]; then
+    if [ "$name" = "persistent_cspace" ]; then
       printf '=== persistent CSpace boot %s ===\n' "$boot" >> "$actual"
+    elif [ "$name" = "program_persistence" ]; then
+      printf '=== program persistence boot %s ===\n' "$boot" >> "$actual"
     fi
     normalize < "$qemu_log" \
       | sed -n '/VibeOS shell ready/,$p' >> "$actual" || true
@@ -309,6 +315,13 @@ for case_file in tests/cases/*.in; do
   if [ "$name" = "persistent_cspace" ]; then
     if ! python3 scripts/persistent-cspace-image.py --selftest \
       || ! python3 scripts/persistent-cspace-image.py "$disk"; then
+      backing_ok=0
+      fail=1
+    fi
+  fi
+  if [ "$name" = "program_persistence" ]; then
+    if ! python3 -B scripts/program-image.py --selftest \
+      || ! python3 -B scripts/program-image.py "$disk"; then
       backing_ok=0
       fail=1
     fi
@@ -364,6 +377,8 @@ for case_file in tests/cases/*.in; do
       echo "ok   store (raw backing journal verified)"
     elif [ "$name" = "persistent_cspace" ] && [ "$backing_ok" = "1" ]; then
       echo "ok   persistent_cspace (three boots and raw authority graph verified)"
+    elif [ "$name" = "program_persistence" ] && [ "$backing_ok" = "1" ]; then
+      echo "ok   program_persistence (rebooted source, binary, and authority verified)"
     elif [ "$name" = "net" ] && [ "$network_ok" = "1" ]; then
       echo "ok   net (raw L2 HELLO/CHALLENGE/ACK verified)"
     elif [ "$name" = "net_recovery" ] && [ "$network_ok" = "1" ]; then

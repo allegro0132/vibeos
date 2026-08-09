@@ -19,6 +19,7 @@ use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::durable_cspace;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::net::{Endpoint as NetEndpoint, Packet};
+use crate::saved_program;
 use crate::store;
 use crate::sync::SpinLock;
 use crate::virtio_blk;
@@ -313,6 +314,10 @@ pub struct World {
     pub block: Option<Cap>,
     /// init's authority on the capability-addressed persistent object service.
     pub store: Option<Cap>,
+    /// init's explicit operation capability for the fixed durable `hello`
+    /// program. The program's console/memory grants come from a separate private
+    /// supervisor policy CSpace, never from the legacy `prog` handles.
+    pub saved_program: Option<Cap>,
     /// init's explicit authority on the persistent-test CSpace lifecycle.
     pub durable_cspace: Option<Cap>,
     durable_cspace_service: Option<Arc<durable_cspace::DurableCSpaceService>>,
@@ -968,6 +973,12 @@ pub fn build() {
     let guest = Space::new("guest");
     let prog = Space::new("prog");
     let block_resources = virtio_blk::discover();
+    let saved_program_policy = block_resources
+        .as_ref()
+        .map(|_| Space::new("saved-program-policy"));
+    let saved_program_space = block_resources.as_ref().map(|_| {
+        Space::new_persistent("saved-program", crate::program::program_space_id())
+    });
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
     let net_resources = virtio_net::discover();
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
@@ -983,6 +994,20 @@ pub fn build() {
             durable_cspace::persistent_space_id(),
         )
     });
+
+    // A saved program's ephemeral boot-resource authority is rooted in an
+    // explicit supervisor-only CSpace. The canonical artifact manifest permits
+    // exactly console WRITE and memory READ|WRITE; no `prog` CSpace cap is used.
+    let (saved_console_policy, saved_memory_policy) = match saved_program_policy.as_ref() {
+        Some(policy) => {
+            let mut policy = policy.0.lock();
+            (
+                Some(policy.mint(console.clone(), Rights::ALL)),
+                Some(policy.mint(region.clone(), Rights::ALL)),
+            )
+        }
+        None => (None, None),
+    };
 
     // init is the root of authority: it mints the only unattenuated caps, then
     // hands out strictly weaker copies. Nothing else can widen what it gets.
@@ -1135,9 +1160,25 @@ pub fn build() {
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
     };
-    let (store_root, durable_cspace_root, durable_cspace_service) =
-        match (block_root, store_backend.as_ref(), persistent_test.as_ref()) {
-        (Some(block), Some(backend), Some(persistent)) => {
+    let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) =
+        match (
+            block_root,
+            store_backend.as_ref(),
+            persistent_test.as_ref(),
+            saved_program_space.as_ref(),
+            saved_program_policy.as_ref(),
+            saved_console_policy,
+            saved_memory_policy,
+        ) {
+        (
+            Some(block),
+            Some(backend),
+            Some(persistent),
+            Some(saved_target),
+            Some(saved_policy),
+            Some(saved_console),
+            Some(saved_memory),
+        ) => {
             // The store receives only block read/write authority in a private
             // backend CSpace. Its public service cap discloses neither the
             // device nor stable object identifiers.
@@ -1151,17 +1192,31 @@ pub fn build() {
             let service = store::StoreService::new(backend.clone(), block_grant);
             let journal = service.authority_journal();
             let store_cap = cs.mint(service, Rights::ALL);
+            let saved = saved_program::SavedProgramService::new(
+                journal.clone(),
+                saved_target.clone(),
+                saved_policy.clone(),
+                saved_console,
+                saved_memory,
+            );
             let durable = durable_cspace::DurableCSpaceService::new(
                 journal,
                 persistent.clone(),
+                saved.clone(),
             );
             let durable_cap = cs.mint(
                 durable.clone(),
                 Rights::READ.union(Rights::WRITE),
             );
-            (Some(store_cap), Some(durable_cap), Some(durable))
+            let saved_cap = cs.mint(saved, Rights::READ.union(Rights::WRITE));
+            (
+                Some(store_cap),
+                Some(durable_cap),
+                Some(durable),
+                Some(saved_cap),
+            )
         }
-        (None, None, None) => (None, None, None),
+        (None, None, None, None, None, None, None) => (None, None, None, None),
         _ => unreachable!("store backend exists exactly when a block device exists"),
     };
     drop(cs);
@@ -1188,6 +1243,12 @@ pub fn build() {
     if let Some(space) = persistent_test.as_ref() {
         spaces.insert("persistent-test", space.clone());
     }
+    if let Some(space) = saved_program_policy.as_ref() {
+        spaces.insert("saved-program-policy", space.clone());
+    }
+    if let Some(space) = saved_program_space.as_ref() {
+        spaces.insert("saved-program", space.clone());
+    }
 
     let world = Arc::new(World {
         spaces,
@@ -1201,6 +1262,7 @@ pub fn build() {
         region: init_region,
         block: block_root,
         store: store_root,
+        saved_program: saved_program_root,
         durable_cspace: durable_cspace_root,
         durable_cspace_service,
         block_space: c_block_space,

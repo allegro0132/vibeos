@@ -17,6 +17,7 @@ pub mod exec;
 pub mod heap;
 pub mod interrupt;
 pub mod net;
+pub mod program;
 pub mod store;
 pub mod sync;
 pub mod virtio;

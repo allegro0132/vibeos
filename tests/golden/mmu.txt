@@ -6,6 +6,7 @@ vibe> mmu
   harts: satp read back on mask 0xADDR (4/4 online)
   kernel RAM: 0xADDR..0xADDR, identity, N KiB leaves, rwx
   MMIO: PLIC N KiB leaves rw-, UART/virtio N KiB leaves rw-
+  stacks: 4 x N KiB usable, N KiB guards invalid, rw-
   unmapped: firmware prefix, null page, and unused physical space
 vibe> halt
   powering off.

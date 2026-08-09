@@ -293,6 +293,17 @@ for case_file in tests/cases/*.in; do
     boot=$((boot + 1))
   done
 
+  if [ "$name" = "guard_page" ]; then
+    guard_probe=$(sed -n 's/.*guard probe: hart0 store into \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
+    guard_stval=$(sed -n 's/.*fatal trap: cause=15 stval=\(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
+    if [ -z "$guard_probe" ] || [ "$guard_probe" != "$guard_stval" ] \
+      || ! grep -a -q '\[!\] stack guard: hart0 blocked store page fault' "$qemu_log"; then
+      echo "FAIL guard_page: expected store-page-fault stval did not match hart0 guard"
+      boot_output_ok=0
+      fail=1
+    fi
+  fi
+
   backing_ok=1
   network_ok=1
   if [ "$net_case" = "1" ]; then

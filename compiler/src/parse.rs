@@ -20,10 +20,12 @@ pub struct Parser {
 /// through.
 ///
 /// This is a kernel-safety limit, not a style rule. `rustc edit` feeds arbitrary
-/// console input to a recursive-descent parser running on a 256 KiB kernel stack
-/// with no guard page, so unbounded nesting is a way to corrupt memory from the
-/// shell prompt. 64 is far past anything a person writes and far short of
-/// anything that threatens the stack.
+/// console input to a recursive-descent parser running on the 252 KiB usable part
+/// of a fixed 256 KiB kernel stack slot. M6.2's invalid 4 KiB page faults accesses
+/// that land in the guard, but one page cannot catch a corrupted `sp` that jumps
+/// over it; exhausting the stack is still fatal and a bad `sp` can refault during
+/// trap entry. Rejecting nesting at 64 keeps hostile input far from that boundary
+/// while remaining far past anything a person writes.
 const MAX_DEPTH: u32 = 64;
 
 /// Longest array the subset will allocate. Bounded because the region a program

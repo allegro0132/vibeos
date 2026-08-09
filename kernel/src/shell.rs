@@ -77,7 +77,8 @@ async fn run(line: &str, boot_time: u64) {
             println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  smp queues      prove four physical executors and cross-hart wakeups");
             println!("  smp scale       compare equal serial and four-hart parallel work");
-            println!("  mmu             inspect the shared Sv39 identity map");
+            println!("  mmu             inspect the shared Sv39 integrity map");
+            println!("  mmu guard fault prove a stack guard with a real page fault");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -369,7 +370,11 @@ async fn run(line: &str, boot_time: u64) {
             }
         }
 
-        "mmu" => mmu_status(),
+        "mmu" => match rest.as_slice() {
+            [] => mmu_status(),
+            ["guard", "fault"] => mmu_guard_fault(),
+            _ => println!("  usage: mmu [guard fault]"),
+        },
 
         "selftest" => {
             let r = crate::selftest::run().await;
@@ -487,7 +492,34 @@ fn mmu_status() {
         uart.page_size / 1024,
         permission_text(uart.permissions)
     );
+    let stack = mmu::mapping(
+        mmu::stack_usable_start(exec::HartId::BOOT.index())
+            .expect("the boot stack slot must exist"),
+    )
+    .expect("the boot stack must be mapped above its guard");
+    println!(
+        "  stacks: {} x {} KiB usable, {} KiB guards invalid, {}",
+        exec::MAX_HARTS,
+        (mmu::STACK_SLOT_STRIDE - mmu::STACK_GUARD_SIZE) / 1024,
+        mmu::STACK_GUARD_SIZE / 1024,
+        permission_text(stack.permissions)
+    );
     println!("  unmapped: firmware prefix, null page, and unused physical space");
+}
+
+fn mmu_guard_fault() {
+    let hart = ipi::current_logical_hart().expect("guard probe requires a registered hart");
+    let guard = mmu::stack_guard_page(hart.index()).expect("current hart guard must exist");
+    println!(
+        "  guard probe: hart{} store into {:#x}",
+        hart.index(),
+        guard
+    );
+    // Safety: this command is an explicit fatal acceptance probe. The address
+    // is the current hart's statically reserved guard page, never heap or
+    // device memory. A successful return is itself an integrity failure.
+    unsafe { (guard as *mut u8).write_volatile(0x5a) };
+    panic!("stack guard accepted a store")
 }
 
 fn permission_text(permissions: vibeos_core::mmu::PagePermissions) -> &'static str {

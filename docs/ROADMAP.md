@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, M5.5, and M6.1 are complete. M6.2 guard pages are next. Run
+> sequence through 3.16, M4.5, M5.5, and M6.2 are complete. M6.3 W^X is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -596,11 +596,13 @@ without widening the committed thresholds.
 
 5.5 implements SBI HSM status/start with its asynchronous contract intact. The boot
 hart reserves mappings while targets remain offline; each secondary selects a
-private 256 KiB stack from its logical opaque value, installs hart-local trap and
-timer state, self-registers, and only then publishes the ready barrier and accepts
-IPIs. OpenSBI may choose any coldboot physical hart, which dynamically becomes
-logical 0 and owns the sole enabled PLIC S-mode context. BSS, heap, World, device,
-and PLIC initialization therefore still execute exactly once. The boot scanner is
+private 256 KiB stack slot from its logical opaque value, installs hart-local trap
+and timer state, self-registers, and only then publishes the ready barrier and
+accepts IPIs. M6.2 subsequently leaves the first 4 KiB of each slot unmapped and
+uses the remaining 252 KiB as its stack without changing the HSM slot stride.
+OpenSBI may choose any coldboot physical hart, which dynamically becomes logical 0
+and owns the sole enabled PLIC S-mode context. BSS, heap, World, device, and PLIC
+initialization therefore still execute exactly once. The boot scanner is
 deliberately limited to QEMU `virt`'s dense physical IDs `0..3`; the mapping layer
 itself retains sparse-ID host coverage, while a general platform port needs FDT
 topology enumeration.
@@ -631,7 +633,7 @@ Not for isolation — Blueprint §9. For the things software checks do worse:
 | # | Work item |
 |---|---|
 | 6.1 ✅ | Sv39 paging with a single address space |
-| 6.2 | Guard pages below every stack (makes 2.2 defence-in-depth rather than sole defence) |
+| 6.2 ✅ | Guard pages below every stack (makes 2.2 defence-in-depth rather than sole defence) |
 | 6.3 | W^X for code buffers: writable while emitting, execute-only after `fence.i` |
 | 6.4 | Read-only mapping for `.rodata` and the capability tables |
 
@@ -651,6 +653,27 @@ live ranges, leaf sizes, and all four hart readbacks; 21 in-kernel checks walk t
 live hierarchy and verify identity, permissions, and deliberate holes. Every QEMU boot
 must publish the Sv39 marker,
 so the complete integration suite cannot silently fall back to Bare mode.
+
+M6.2 divides every fixed 256 KiB per-hart slot into one invalid 4 KiB page at its
+low end and 252 KiB of identity-mapped, read/write, non-executable stack. The slot
+stride remains 256 KiB, so the secondary-entry shift and hart-to-slot mapping do
+not change. Generated-code stack probes stop 8 KiB above the first usable byte,
+leaving mapped room for the normal abort path between their floor and the guard.
+
+**M6.2 acceptance:** four in-kernel checks cover all four invalid guard PTEs, the
+first and last usable RW-NX pages, the unchanged aligned slot stride, guard address
+classification, and the exact 8 KiB abort reserve. The expected-fatal
+`guard_page` QEMU case performs a real store into hart 0's printed guard address;
+the raw harness requires exception cause 15 (`store page fault`), requires `stval`
+to equal that address exactly, and requires the guard-specific trap marker.
+
+This is a fail-stop boundary for accesses whose address lands in the guard, not a
+complete stack-clash defence or recovery stack. A sufficiently large or corrupted
+`sp` adjustment can jump over one guard page into another mapped page. A real
+overflow can also fault again when trap entry tries to save registers on the same
+bad stack, so skipped-guard protection would require probing or a stronger boundary
+and reliable diagnostics or recovery would require a separate per-hart emergency
+trap stack. M6.2 claims exact guard-page enforcement, not either stronger property.
 
 ---
 

@@ -21,6 +21,8 @@ pub const PLIC_START: usize = 0x0c00_0000;
 pub const PLIC_END: usize = 0x0c40_0000;
 pub const UART_VIRTIO_START: usize = 0x1000_0000;
 pub const UART_VIRTIO_END: usize = 0x1000_9000;
+pub const STACK_GUARD_SIZE: usize = sv39::PAGE_SIZE;
+pub const STACK_SLOT_STRIDE: usize = 256 * 1024;
 
 const MEGAPAGE_SIZE: usize = 2 * 1024 * 1024;
 const RAM_LEVEL0_TABLES: usize = (KERNEL_RAM_END - KERNEL_RAM_START) / MEGAPAGE_SIZE;
@@ -31,6 +33,11 @@ const RAM_PERMISSIONS: PagePermissions = PagePermissions::READ
     .union(PagePermissions::WRITE)
     .union(PagePermissions::EXECUTE);
 const MMIO_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
+const STACK_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
+
+extern "C" {
+    static __stacks_bottom: u8;
+}
 
 #[repr(C, align(4096))]
 struct PageTable {
@@ -164,6 +171,17 @@ pub fn init_boot(boot_physical_hart: usize) {
         }
     }
 
+    for logical_index in 0..exec::MAX_HARTS {
+        let guard = stack_guard_page(logical_index).expect("logical stack guard is in range");
+        *ram_leaf_mut(tables, guard) = PageTableEntry::EMPTY;
+        for address in
+            (guard + STACK_GUARD_SIZE..guard + STACK_SLOT_STRIDE).step_by(sv39::PAGE_SIZE)
+        {
+            *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, STACK_PERMISSIONS)
+                .expect("mapped kernel stack page is valid");
+        }
+    }
+
     // Release publishes every PTE to secondaries before their acquire of the
     // boot barrier. The enabling hart also issues a full fence around `satp`.
     TABLES_READY.store(true, Ordering::Release);
@@ -222,6 +240,26 @@ pub fn plic_s_context_page(physical_hart: usize) -> Option<usize> {
         .then(|| PLIC_CONTEXT_START + (physical_hart * 2 + 1) * sv39::PAGE_SIZE)
 }
 
+pub fn stack_slots_start() -> usize {
+    core::ptr::addr_of!(__stacks_bottom) as usize
+}
+
+pub fn stack_guard_page(logical_index: usize) -> Option<usize> {
+    (logical_index < exec::MAX_HARTS)
+        .then(|| stack_slots_start() + logical_index * STACK_SLOT_STRIDE)
+}
+
+pub fn stack_usable_start(logical_index: usize) -> Option<usize> {
+    stack_guard_page(logical_index).map(|guard| guard + STACK_GUARD_SIZE)
+}
+
+pub fn stack_guard_hart(address: usize) -> Option<usize> {
+    let offset = address.checked_sub(stack_slots_start())?;
+    let logical_index = offset / STACK_SLOT_STRIDE;
+    (logical_index < exec::MAX_HARTS && offset % STACK_SLOT_STRIDE < STACK_GUARD_SIZE)
+        .then_some(logical_index)
+}
+
 /// Walk the live hierarchy exactly as the hardware would for diagnostics and
 /// in-kernel acceptance tests. The returned physical address includes the
 /// offset within a 4 KiB or 2 MiB leaf.
@@ -264,6 +302,15 @@ fn map_page(level0: &mut PageTable, physical: usize, permissions: PagePermission
     assert_eq!(physical % sv39::PAGE_SIZE, 0);
     level0.entries[sv39::vpn_index(physical, 0)] = PageTableEntry::leaf(physical, permissions)
         .expect("identity MMIO page is architecturally valid");
+}
+
+fn ram_leaf_mut(tables: &mut AddressSpace, address: usize) -> &mut PageTableEntry {
+    assert!(address >= KERNEL_RAM_START && address < KERNEL_RAM_END);
+    assert_eq!(address % sv39::PAGE_SIZE, 0);
+    let offset = address - KERNEL_RAM_START;
+    let table_index = offset / MEGAPAGE_SIZE;
+    let page_index = offset % MEGAPAGE_SIZE / sv39::PAGE_SIZE;
+    &mut tables.ram_level0[table_index].entries[page_index]
 }
 
 fn table_address(table: &PageTable) -> usize {

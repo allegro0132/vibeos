@@ -18,8 +18,8 @@ and transcript counts from the tree. Target checks are not guessed from source:
 | Layer | What it covers | Where |
 |---|---|---|
 | Host unit tests | Sv39 PTE/satp encoding and invalid-leaf rejection; capability algebra including cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle, four-queue ownership, per-hart running/current-task/domain state, and IPI lost-wakeup models; work stealing, wake/remote-cancel/fault boundaries and cross-hart fault survival; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; atomic IRQ publication, SPSC byte ordering, SpinLock contention/generation recovery/hart ownership; fault arenas; wait/timer registration ownership; per-hart heap provenance and OOM diagnostics; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
-| In-kernel self-test | Live Sv39 identity/permission walks and all-hart `satp` readback; real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including the live shared page-table report, retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
+| In-kernel self-test | Live Sv39 identity/permission walks and all-hart `satp` readback; invalid per-hart stack guards, endpoint RW-NX stack mappings, fixed slot stride, and the 8 KiB generated-code abort reserve; real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
+| Golden transcripts | End-to-end shell behaviour, including the live shared page-table and stack-guard report, an expected-fatal real guard-page store, retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
@@ -93,6 +93,16 @@ contended acquisitions out of 2,170. Numeric telemetry is normalized only for th
 golden diff and is separately parsed from the raw serial log. M5.4's nested host
 model still checks running/current-task/domain isolation, remote cancellation, and
 cross-hart fault survival without pretending host threads reproduce target IRQs.
+
+`guard_page` is the deliberate exception to the usual clean-shell-exit shape. The
+boot-pinned shell prints hart 0's invalid 4 KiB guard address and stores to it. The
+raw-log validator requires exception cause 15 (`store page fault`), requires the
+reported `stval` to equal the printed probe address exactly, and requires the
+hart-specific guard marker. This proves that hardware blocked the store whose
+address landed in the guard; it does not simulate a corrupted `sp` or a jump over
+the single-page guard. A real bad-`sp` overflow may fault recursively while trap
+entry saves registers on the same stack, so M6.2 claims guard-page enforcement,
+not complete stack-clash protection, reliable recovery, or diagnostics.
 
 ## Performance baseline
 
@@ -188,6 +198,7 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-test.sh net_recovery  # post-publish fault and fresh-epoch retry
 ./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
 ./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
+./scripts/qemu-test.sh guard_page   # expected-fatal store-page-fault + exact stval
 ```
 
 Read the diff before updating. The `--update` flag is the only thing standing

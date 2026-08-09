@@ -13,6 +13,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ast::*;
+use crate::image::{Relocation, RuntimeImport};
 
 // Registers.
 const ZERO: u32 = 0;
@@ -151,6 +152,10 @@ pub struct Codegen {
     rt_print_int: u64,
     rt_print_bool: u64,
     rt_abort: u64,
+    /// Address-independent emission writes canonical zero `li64` templates and
+    /// records exactly how the loader may fill them.
+    relocatable: bool,
+    relocations: Vec<Relocation>,
     scope: Vec<Scope>,
     next_slot: u32,
     /// Next free element index in the region. Allocation is a compile-time bump
@@ -260,6 +265,54 @@ impl Codegen {
         self.emit(i(0, T0, 0, RA, 0x67)); // jalr ra, t0, 0
     }
 
+    fn relocation_site(&self) -> CResult<u32> {
+        u32::try_from(self.here())
+            .map_err(|_| "generated code exceeds the executable ABI".to_string())
+    }
+
+    fn data_address(&mut self, addr: u64) -> CResult<()> {
+        if self.relocatable {
+            let site = self.relocation_site()?;
+            let offset = u32::try_from(addr)
+                .map_err(|_| "generated string table exceeds the executable ABI".to_string())?;
+            self.relocations.push(Relocation::data_address(site, offset));
+            self.li64(A0, 0);
+        } else {
+            self.li64(A0, addr);
+        }
+        Ok(())
+    }
+
+    fn call_runtime(&mut self, import: RuntimeImport, addr: u64) -> CResult<()> {
+        if self.relocatable {
+            let site = self.relocation_site()?;
+            self.relocations.push(Relocation::runtime_call(site, import));
+            self.call_abs(0);
+        } else {
+            self.call_abs(addr);
+        }
+        Ok(())
+    }
+
+    fn call_code(&mut self, addr: u64) -> CResult<()> {
+        if self.relocatable {
+            let byte_offset = addr
+                .checked_sub(self.code_base)
+                .ok_or_else(|| "internal function address precedes the code base".to_string())?;
+            if byte_offset & 3 != 0 {
+                return Err("internal function address is not instruction-aligned".to_string());
+            }
+            let target_word = u32::try_from(byte_offset / 4)
+                .map_err(|_| "generated function table exceeds the executable ABI".to_string())?;
+            let site = self.relocation_site()?;
+            self.relocations.push(Relocation::code_call(site, target_word));
+            self.call_abs(0);
+        } else {
+            self.call_abs(addr);
+        }
+        Ok(())
+    }
+
     fn lookup(&self, name: &str) -> Option<&Scope> {
         self.scope.iter().rev().find(|s| s.name == name)
     }
@@ -328,7 +381,7 @@ impl Codegen {
     }
 
     /// One stub per distinct reason, emitted after every function.
-    fn emit_abort_stubs(&mut self) {
+    fn emit_abort_stubs(&mut self) -> CResult<()> {
         let mut reasons: Vec<u8> = self.abort_patches.iter().map(|(_, r)| *r).collect();
         reasons.sort_unstable();
         reasons.dedup();
@@ -338,7 +391,7 @@ impl Codegen {
             stub_of.push((reason, self.here()));
             self.emit(addi(A0, ZERO, reason as i32));
             let target = self.rt_abort;
-            self.call_abs(target);
+            self.call_runtime(RuntimeImport::Abort, target)?;
             // `rt_abort` diverges; if it ever returned, spinning here is far
             // better than resuming a program that failed a safety check.
             // `jal zero, 0` branches to itself.
@@ -351,6 +404,7 @@ impl Codegen {
                 self.patch_to(at, t);
             }
         }
+        Ok(())
     }
 }
 
@@ -506,6 +560,27 @@ pub fn compile(
     str_addr: BTreeMap<String, u64>,
     rt: &Runtime,
 ) -> CResult<Vec<u32>> {
+    compile_impl(prog, code_base, str_addr, rt, false).map(|(code, _)| code)
+}
+
+/// Compile the address-independent template used by persisted images.  String
+/// values are byte offsets, function calls are word offsets, and runtime calls
+/// use stable import IDs; every corresponding instruction template is zero.
+pub(crate) fn compile_relocatable(
+    prog: &Program,
+    str_offsets: BTreeMap<String, u64>,
+) -> CResult<(Vec<u32>, Vec<Relocation>)> {
+    let runtime = Runtime { print_str: 0, print_int: 0, print_bool: 0, abort: 0 };
+    compile_impl(prog, 0, str_offsets, &runtime, true)
+}
+
+fn compile_impl(
+    prog: &Program,
+    code_base: u64,
+    str_addr: BTreeMap<String, u64>,
+    rt: &Runtime,
+    relocatable: bool,
+) -> CResult<(Vec<u32>, Vec<Relocation>)> {
     // Names, arities and types were already validated by `types::check`.
     let mut fn_arity = BTreeMap::new();
     for f in &prog.funcs {
@@ -514,6 +589,7 @@ pub fn compile(
 
     let mut addrs = BTreeMap::new();
     let mut code = Vec::new();
+    let mut relocations = Vec::new();
     for pass in 0..2 {
         let mut cg = Codegen {
             code: Vec::new(),
@@ -525,6 +601,8 @@ pub fn compile(
             rt_print_int: rt.print_int,
             rt_print_bool: rt.print_bool,
             rt_abort: rt.abort,
+            relocatable,
+            relocations: Vec::new(),
             scope: Vec::new(),
             next_slot: 0,
             next_region: 0,
@@ -538,15 +616,22 @@ pub fn compile(
 
         let mut found = BTreeMap::new();
         for f in order {
-            found.insert(f.name.clone(), code_base + (cg.here() * 4) as u64);
+            let offset = (cg.here() as u64)
+                .checked_mul(4)
+                .ok_or_else(|| "generated code byte length overflow".to_string())?;
+            let address = code_base
+                .checked_add(offset)
+                .ok_or_else(|| "generated function address overflow".to_string())?;
+            found.insert(f.name.clone(), address);
             cg.func(f)?;
         }
-        cg.emit_abort_stubs();
+        cg.emit_abort_stubs()?;
         addrs = found;
         code = cg.code;
+        relocations = cg.relocations;
         let _ = pass;
     }
-    Ok(code)
+    Ok((code, relocations))
 }
 
 impl Codegen {
@@ -726,11 +811,11 @@ impl Codegen {
                             self.expr(e)?;
                             self.pop(A0);
                             // `bool` renders as true/false, matching Rust.
-                            let f = match ty {
-                                Ty::Bool => self.rt_print_bool,
-                                _ => self.rt_print_int,
+                            let (import, f) = match ty {
+                                Ty::Bool => (RuntimeImport::PrintBool, self.rt_print_bool),
+                                _ => (RuntimeImport::PrintInt, self.rt_print_int),
                             };
-                            self.call_abs(f);
+                            self.call_runtime(import, f)?;
                         }
                     }
                 }
@@ -747,10 +832,10 @@ impl Codegen {
             .str_addr
             .get(s)
             .ok_or_else(|| format!("internal error: string literal {:?} was not interned", s))?;
-        self.li64(A0, addr);
+        self.data_address(addr)?;
         self.li64(A0 + 1, s.len() as u64);
         let f = self.rt_print_str;
-        self.call_abs(f);
+        self.call_runtime(RuntimeImport::PrintStr, f)?;
         Ok(())
     }
 
@@ -851,7 +936,7 @@ impl Codegen {
                     self.pop(A0 + n as u32);
                 }
                 let addr = self.fn_addrs.get(name).copied().unwrap_or(self.code_base);
-                self.call_abs(addr);
+                self.call_code(addr)?;
                 self.push(A0);
             }
             Expr::Index(name, idx, line) => {

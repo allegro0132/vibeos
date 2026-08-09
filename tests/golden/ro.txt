@@ -1,0 +1,11 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> mmu ro
+  .rodata: N KiB at 0xADDR..0xADDR, first/last page r--
+  capability tables: N KiB pool, COW publish r--, live pages all read-only
+  mutation: mint r--, derive r--, revoke r--, same-address reuse yes
+  hart1: derived lookup=64 ok, revoke removed 2 and stale lookup denied
+  shootdown: 5 table transitions, 10 remote sfence, authoritative pages r--
+vibe> halt
+  powering off.

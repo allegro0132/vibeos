@@ -1,9 +1,10 @@
 //! Code generation.
 //!
-//! This crate emits machine code that runs in the kernel's address space with
-//! no MMU. A wrong frame offset here is a privilege escalation, not a wrong
-//! answer — so these tests check encodings against the RISC-V spec by hand, and
-//! then audit every instruction the emitter can produce.
+//! This crate emits machine code that runs in the kernel's shared S-mode address
+//! space. Sv39 W^X protects the instruction pages but cannot make a wrong frame
+//! offset safe: that remains a privilege escalation, not a wrong answer. These
+//! tests therefore check encodings against the RISC-V spec by hand, then audit
+//! every instruction the emitter can produce.
 
 use vibeos_rustc::{code_len, compile_at, samples, Runtime};
 

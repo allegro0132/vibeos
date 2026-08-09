@@ -5,12 +5,26 @@
 //! handler is short, allocation-free, and never blocks.
 
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{exec, plic, sbi, uart};
+use crate::heap::OwnerId;
+use crate::{exec, heap, ipi, plic, sbi, uart};
 
+const SIE_SSIE: usize = 1 << 1; // supervisor software / SBI IPI
 const SIE_STIE: usize = 1 << 5; // supervisor timer
 const SIE_SEIE: usize = 1 << 9; // supervisor external
 const SSTATUS_SIE: usize = 1 << 1;
+
+// A task fault landing pad is still armed when an interrupt preempts its poll.
+// Panicking from that interrupt must not longjmp into the interrupted task: it
+// would abandon the trap frame and falsely blame the component. The panic path
+// reads this flag before considering task-local recovery.
+static IN_INTERRUPT: [AtomicBool; exec::MAX_HARTS] =
+    [const { AtomicBool::new(false) }; exec::MAX_HARTS];
+
+fn current_hart_index() -> Option<usize> {
+    ipi::current_logical_hart().map(exec::HartId::index)
+}
 
 global_asm!(
     r#"
@@ -20,8 +34,13 @@ global_asm!(
 .global __trap_entry
 __trap_entry:
     addi sp, sp, -256
-    sd ra,   0(sp)
+    // Capture the IRQ-side benchmark endpoint before the full register save.
+    // t0 is the first scratch register saved, so using it after this store
+    // preserves the interrupted context. Offset 240 is otherwise unused.
     sd t0,   8(sp)
+    rdtime t0
+    sd t0, 240(sp)
+    sd ra,   0(sp)
     sd t1,  16(sp)
     sd t2,  24(sp)
     sd t3,  32(sp)
@@ -51,6 +70,7 @@ __trap_entry:
     sd tp, 224(sp)
     sd gp, 232(sp)
 
+    ld a0, 240(sp)
     call __trap_handler
 
     ld ra,   0(sp)
@@ -92,21 +112,57 @@ extern "C" {
     fn __trap_entry();
 }
 
-pub fn init() {
+fn install_local(enabled: usize) {
     unsafe {
         asm!("csrw stvec, {}", in(reg) __trap_entry as *const () as usize);
-        asm!("csrs sie, {}", in(reg) SIE_STIE | SIE_SEIE);
+        // Entry assembly cleared SIE. Writing the exact local mask keeps
+        // secondary harts away from the boot hart's sole PLIC context.
+        asm!("csrw sie, {}", in(reg) enabled);
     }
-    plic::init(&[uart::UART_IRQ]);
+}
+
+/// Initialize the boot hart's local trap CSRs and the one global PLIC setup.
+pub fn init_boot() {
+    install_local(SIE_SSIE | SIE_STIE | SIE_SEIE);
+    plic::init(sbi::current_hart_id());
+    plic::register(uart::UART_IRQ, uart_irq, 0)
+        .expect("UART IRQ must fit in the PLIC handler registry");
+    plic::enable(uart::UART_IRQ).expect("UART IRQ must be a valid PLIC source");
     exec::init_timer();
+}
+
+/// Install a secondary's trap vector before publishing it ONLINE.
+///
+/// Global SIE is still clear, so a concurrently published SSIP may become
+/// pending but cannot enter Rust until the complete local init is ready.
+pub fn prepare_secondary() {
+    install_local(SIE_SSIE | SIE_STIE);
+}
+
+/// Finish secondary-local initialization after logical self-registration.
+pub fn finish_secondary() {
+    exec::init_timer();
+}
+
+fn uart_irq(_context: usize, _irq_entry: u64) {
+    uart::handle_irq();
 }
 
 pub fn enable_interrupts() {
     unsafe { asm!("csrs sstatus, {}", in(reg) SSTATUS_SIE) };
 }
 
+pub fn in_interrupt() -> bool {
+    // An unknown physical hart has no safe task/program landing pad. Treat it
+    // as interrupt context so the panic path fails stop instead of jumping
+    // through another hart's saved stack.
+    current_hart_index()
+        .map(|hart| IN_INTERRUPT[hart].load(Ordering::Acquire))
+        .unwrap_or(true)
+}
+
 #[no_mangle]
-extern "C" fn __trap_handler() {
+extern "C" fn __trap_handler(irq_entry: u64) {
     let scause: usize;
     let stval: usize;
     let sepc: usize;
@@ -127,21 +183,70 @@ extern "C" fn __trap_handler() {
             sepc,
             exception_name(code)
         );
+        if let Some(hart) = crate::mmu::stack_guard_hart(stval) {
+            crate::println!(
+                "[!] stack guard: hart{} blocked {}",
+                hart,
+                exception_name(code)
+            );
+        }
+        if crate::mmu::code_pool_contains(stval) {
+            crate::println!("[!] W^X code pool blocked {}", exception_name(code));
+        }
+        if crate::mmu::rodata_contains(stval) {
+            crate::println!("[!] read-only .rodata blocked {}", exception_name(code));
+        }
+        if crate::cap_table_pool::contains(stval) {
+            crate::println!(
+                "[!] read-only capability table blocked {}",
+                exception_name(code)
+            );
+        }
         sbi::shutdown(true);
     }
 
+    let Some(hart) = current_hart_index() else {
+        // Trap-local state cannot be addressed safely until firmware identity
+        // has been bound to one logical scheduler hart.
+        sbi::shutdown(true);
+    };
+
+    // IRQ work belongs to the kernel, never to the component it interrupted.
+    // This also protects future handler changes from accidentally consuming a
+    // component quota. Deallocation remains owner-correct because heap headers
+    // carry the allocation owner independently of this ambient scope.
+    IN_INTERRUPT[hart].store(true, Ordering::Release);
+
+    if code == 1 {
+        // SBI IPIs arrive as SSIP. Acknowledge the CSR before consuming the
+        // Release-published reason; doing it in the opposite order can clear a
+        // concurrent publisher's fresh doorbell. No scheduler lock or poll is
+        // entered from this path.
+        let _ = ipi::acknowledge_current();
+        IN_INTERRUPT[hart].store(false, Ordering::Release);
+        return;
+    }
+
+    let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
+
     match code {
-        5 => exec::timer_tick(),
+        5 => exec::timer_tick_at(irq_entry),
         9 => {
             while let Some(irq) = plic::claim() {
-                if irq == uart::UART_IRQ {
-                    uart::handle_irq();
+                if !plic::dispatch(irq, irq_entry) {
+                    // A level-triggered source without a handler would
+                    // otherwise immediately retrigger forever. Mask it before
+                    // returning ownership to the PLIC.
+                    let _ = plic::disable(irq);
                 }
                 plic::complete(irq);
             }
         }
         _ => {}
     }
+
+    system_owner.restore();
+    IN_INTERRUPT[hart].store(false, Ordering::Release);
 }
 
 fn exception_name(code: usize) -> &'static str {

@@ -1,14 +1,17 @@
 [build]
-target = "riscv64gc-unknown-none-elf"
+target = "riscv64imac-unknown-none-elf"
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 
-[target.riscv64gc-unknown-none-elf]
+[target.riscv64imac-unknown-none-elf]
 rustflags = [
   "-C", "linker=ld.lld",
   "-C", "linker-flavor=ld",
+  # The built-in IMAC target is integer-only (`lp64`). CSR access and fence.i
+  # are still architectural kernel requirements and do not change that ABI.
+  "-C", "target-feature=+zicsr,+zifencei",
   "-C", "link-arg=-Tkernel/linker.ld",
   "-C", "link-arg=--gc-sections",
   "-C", "force-frame-pointers=yes",

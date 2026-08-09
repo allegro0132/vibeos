@@ -3,19 +3,186 @@
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh
-cargo test --workspace     # 117 host tests, no QEMU, ~1s
-./scripts/qemu-test.sh     # 7 golden transcripts under QEMU, ~3min
-./scripts/differential.sh  # re-record expectations from real rustc
+cargo test --workspace         # fast portable tests, no QEMU
+./scripts/differential.sh      # verify committed output with pinned real rustc
+./scripts/qemu-test.sh         # golden cases plus the differential oracle
+./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
+./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
+./scripts/status.sh            # derive current test/corpus counts on the host
 ```
+
+`status.sh` lists runnable and ignored host tests separately and derives corpus
+and transcript counts from the tree. Target checks are not guessed from source:
+`./scripts/qemu-test.sh selftest` reports the count observed in that QEMU run.
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation, scheduler, timers, channels, allocator, lexer, parser, instruction encoding | `core/tests/`, `compiler/tests/` |
-| In-kernel self-test | Real timer interrupts, real wakeups, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour and program output | `tests/cases/`, `tests/golden/` |
+| Host unit tests | Sv39 PTE/satp encoding and invalid-leaf rejection; SBI RFENCE request/error handling, local fence/MXR state, and exact online physical-hart masks; capability algebra including page-aligned COW table replacement and exact backend callback ordering, cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and no-write-on-error in-place relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle, four-queue ownership, per-hart running/current-task/domain state, and IPI lost-wakeup models; work stealing, wake/remote-cancel/fault boundaries and cross-hart fault survival; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; atomic IRQ publication, SPSC byte ordering, SpinLock contention/generation recovery/hart ownership; fault arenas; wait/timer registration ownership; per-hart heap provenance and OOM diagnostics; typed channels and the compiler | `core/tests/`, `compiler/tests/` |
+| In-kernel self-test | Live Sv39 identity/permission walks plus all-hart `satp` and MXR readback; R-X kernel text, R-- `.rodata` endpoints, RW-NX free code/capability-pool pages, execute-only compiled pages, every non-empty published capability table and all live table-pool pages R--, and a full RAM scan excluding writable-executable leaves; invalid per-hart stack guards, endpoint RW-NX stack mappings, fixed slot stride, and the 8 KiB generated-code abort reserve; zeroed same-address code and capability-table reuse; real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap and code-pool use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, and machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
+| Golden transcripts | End-to-end shell behaviour, including the live shared page-table, stack-guard, strict W^X, and read-only data/table reports; sealed local/cross-hart execution, COW capability mutation, cross-hart lookup/revoke, and zeroed same-address reuse; expected-fatal real guard-page, W^X instruction/load/store, `.rodata` store, and capability-table store faults; retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
+
+The `block` QEMU case is intentionally stronger than a transcript: every case
+gets a fresh raw disk, sector 7 is seeded by the host, and after `blk test` exits
+the host compares all 512 bytes of sector 8. `block_recovery` suppresses one real
+QueueNotify to exercise the timer/reset path, injects a component fault after DMA
+publication, and separately verifies cancellation plus explicit restart.
+
+The `store` case is likewise stronger than its transcript. The host first seeds
+506 valid records containing a 180,720-byte object, leaving exactly six journal
+slots. Four injected raw component faults must each reach the task/domain-bound
+pre-write hook after this dense recovery, clear the exact store claim, reclaim
+each arena, and reach a stable heap plateau. Store calls require 4 MiB of free
+caller headroom before claiming the writer; the shell and probe each have an 8 MiB
+quota. The next command commits and reads a
+deterministic 900-byte object, filling all 512 slots. After shutdown,
+`store-image.py` independently checks the fixed sectors 64--575, platform StoreId,
+canonical kinds 1--8, shared ID/transaction classes, chain/CRC/commit binding,
+and both exact payloads. Its positive interleaving and negative parity fixtures
+run before the real backing image is accepted.
+
+The `persistent_cspace` case reboots three times against one unchanged raw disk.
+Boot 1 persists and installs a `root -> child -> grandchild` object-capability
+graph; boot 2 reads it, flushes a tombstone for the child ancestor, and proves
+both child and grandchild absent; boot 3 keeps that tombstone effective and
+reuses child slot 1 only at generation 1. Every boot also checks that the target
+`persistent-test` CSpace has no Store `WRITE` authority and that its first dependent
+observation occurs only after recovery reaches `Ready`. After the third shutdown,
+`persistent-cspace-image.py` independently parses the raw journal. Its host-side
+self-test applies all 512 strict byte-prefix cuts to each of 19 canonical fixture
+records (9,728 cuts) and requires every cut to recover exactly the preceding
+flushed boundary before checking malformed graph and root-policy fixtures.
+Core tests additionally prove that persistent quarantine denies generic lookups,
+invalidates `Revocable` tokens, preserves an already acquired invocation lease,
+and retains resource entries without running `Drop`. The service's stable
+task/domain/token ledger lets raw-fault cleanup clear only the exact abandoned
+reservation without touching another caller.
+
+The `program_persistence` case reboots twice against one unchanged raw disk.
+Boot 1 publishes the fixed `hello` source plus canonical relocatable VIBEEXE as
+one read-only ProgramArtifact root and runs it. Boot 2 proves a repeat save
+appends nothing, recovers the exact slot-0/generation-0 capability, recompiles the
+source with the current trusted compiler, requires byte-identical VIBEEXE, and
+runs using only reconstructed console `WRITE` and memory `READ|WRITE` authority.
+After shutdown, `program-image.py` independently validates the journal, artifact,
+hashes, relocation table, stable imports, publication order, authority manifest,
+and strict 512-byte prefix cuts. See `docs/PROGRAM_PERSISTENCE.md`.
+
+The `net` and `net_recovery` cases are also stronger than their transcripts.
+Only those cases add a modern virtio-net device. Before QEMU starts, the harness
+launches `scripts/net-peer.py` on an ephemeral localhost TCP port and connects
+QEMU's socket netdev to it. The peer parses the four-byte big-endian QEMU frame
+length and compares every byte of the 60-byte raw Ethernet messages. `net`
+requires HELLO, CHALLENGE, and ACK in order. `net_recovery` first observes the
+HELLO exposed before an injected component fault, withholds its response, and
+then requires a second HELLO plus the complete exchange after the shared device
+epoch advances. A canonical evidence file is checked separately from the guest
+golden; TAP, root privileges, and host network access are never used.
+
+The QEMU harness now defaults every integration case to four multithreaded TCG
+vCPUs and requires the boot-time `4 hart(s) online` barrier, shared Sv39
+activation marker, W^X/MXR/RFENCE marker, and `.rodata`/4 MiB COW capability-table
+marker before accepting a shell transcript.
+`smp_queues` places non-stealable waiters on logical harts 1--3,
+proves each parks and resumes on its exact executor, drains the placement
+doorbells, then wakes all three from the boot-pinned shell. It requires one new
+successful SBI doorbell per target and receiver-side acknowledgement/idle evidence.
+The same case runs a synchronized four-hart scheduler-lock sample and requires a
+coherent, nonzero contention delta; the final full-suite run observed 1,688
+contended acquisitions out of 2,170. Numeric telemetry is normalized only for the
+golden diff and is separately parsed from the raw serial log. M5.4's nested host
+model still checks running/current-task/domain isolation, remote cancellation, and
+cross-hart fault survival without pretending host threads reproduce target IRQs.
+
+`guard_page` is the deliberate exception to the usual clean-shell-exit shape. The
+boot-pinned shell prints hart 0's invalid 4 KiB guard address and stores to it. The
+raw-log validator requires exception cause 15 (`store page fault`), requires the
+reported `stval` to equal the printed probe address exactly, and requires the
+hart-specific guard marker. This proves that hardware blocked the store whose
+address landed in the guard; it does not simulate a corrupted `sp` or a jump over
+the single-page guard. A real bad-`sp` overflow may fault recursively while trap
+entry saves registers on the same stack, so M6.2 claims guard-page enforcement,
+not complete stack-clash protection, reliable recovery, or diagnostics.
+
+`wx` is the non-fatal W^X lifecycle case. The boot-pinned shell links code into
+an RW-NX page, seals it execute-only, and obtains 41 on both the boot hart and a
+task pinned to logical hart 1. It then drops the image, requires the complete
+same-address page to have been cleared, links code returning 42 there, and executes
+the new image on hart 1 without a per-run `fence.i`. The transcript reports the
+actual PTE state and the transition/remote-fence deltas; the in-kernel RAM scan
+must find no writable-executable leaf.
+
+The three `wx_*_fault` cases are separate expected-fatal boots because each proves
+one hardware denial: instruction fetch from writable RW-NX storage (cause 12), load
+from sealed execute-only storage with MXR clear (cause 13), and store to sealed
+storage (cause 15). For each, the raw-log validator requires the printed probe
+address to equal `stval` and requires the W^X-specific trap marker. A normalized
+golden alone is insufficient because it deliberately hides addresses.
+
+`ro` is the non-fatal M6.4 lifecycle case. It requires both `.rodata` endpoint
+pages to be R--, then performs capability mint, derive, hart-1 lookup, revoke, and
+stale lookup denial while every published replacement remains R--. It also requires
+the first-fit pool to reuse the same address after the retired table has returned to
+RW-NX, dropped its slots, and been completely cleared, and checks the expected
+all-hart TLB-shootdown deltas.
+
+`rodata_write_fault` and `cap_table_write_fault` are separate expected-fatal boots.
+Each performs a real store and must report cause 15 (`store page fault`); the raw-log
+validator requires `stval` to equal the printed `.rodata` or published-table address
+exactly and requires the matching read-only marker. The normalized transcript is
+necessary but not sufficient because it hides those addresses.
+
+The protection is intentionally narrower than complete capability-graph
+immutability. It covers the published `Slot` snapshot—generation, rights, object
+pointer, and derivation pointer—while CSpace lifecycle scalars and
+`Derivation.alive` remain RW supervisor metadata. Candidate construction and commit
+are synchronous and use SYSTEM allocation; ordinary errors leave the old table
+authoritative, while an exceptional candidate allocation/protection failure may be
+conservatively leaked rather than rolled back across a non-local exit.
+
+The sixteen audited fault/restart cycles now abandon a sealed code allocation as
+well as heap data and a held CSpace lock. After all-hart task quiescence, raw
+recovery must unseal, zero, and release exactly that allocation domain without
+running the interrupted future's destructor; live code-pool pages must return to
+their pre-probe baseline every cycle.
+
+## Performance baseline
+
+The shell's `bench` command measures two-endpoint IPC round trips, timer-IRQ to
+task-poll latency, capability lookup at derivation depths 0 through 32, global
+heap high-water, compiler throughput, and generated code/data size and runtime.
+Every timing distribution reports warmup/sample counts plus min, p50, p95, max,
+and integer mean in raw `rdtime` ticks.
+
+`scripts/bench.py` boots the release kernel with `virt`, `rv64`, one hart,
+single-threaded TCG, and deterministic `icount`; it rejects missing, duplicate,
+or schema-changed metrics before comparing the checked-in
+`benchmarks/qemu-tcg-rv64.json`. Latency/size regressions are upper-bounded and
+throughput is lower-bounded. Relative budgets are combined with small absolute
+allowances for timer quantisation; heap and generated buffers use the documented
+larger byte allowances.
+
+```sh
+./scripts/bench.py                 # collect and check; never rewrites truth
+./scripts/bench.py --update        # intentional baseline replacement
+./scripts/bench.py --input log.txt # validate/recheck a saved transcript
+./scripts/bench.py --smp-scaling   # four exact-hart workers; require >=1.25x
+./scripts/bench.py --selftest      # positive and fail-closed SMP parser fixtures
+```
+
+The scaling mode intentionally does not share the deterministic one-hart
+baseline. It boots `-smp 4` with multithreaded TCG, waits for all three remote
+workers before releasing the boot hart, and compares identical integer work run
+serially and in parallel. Each measurement spans tens of milliseconds rather
+than a scheduler quantum. The final M5.5 run measured 773,610 serial ticks and
+275,290 parallel ticks (`2.810x`); CI enforces only the conservative `1.25x`
+floor so host noise cannot turn the observation into an overfit baseline.
+
+The guest IPC number is a repeatable VibeOS trend measurement, not yet a claim
+against a Linux pipe: a host pipe measured on another ISA/runtime would not be a
+controlled comparison.
 
 ## Why four layers
 
@@ -53,9 +220,11 @@ Every program in `tests/programs/` is valid Rust *and* valid in the VibeOS
 subset, so `rustc` is a free oracle for the code generator — the strongest check
 available for something this security-critical.
 
-`scripts/differential.sh` compiles each with the real `rustc`, runs it, and
-records the output. The QEMU `differential` case feeds the same source through
-`rustc edit` inside VibeOS and requires identical bytes. The case file is
+`scripts/differential.sh` compiles each with the exact real `rustc` pinned in
+`rust-toolchain.toml`, runs it, and verifies the committed output byte-for-byte.
+It is read-only unless passed `--update`; a missing expectation fails instead of
+silently becoming truth. The QEMU `differential` case feeds the same source
+through `rustc edit` inside VibeOS and requires identical bytes. The case file is
 regenerated from the corpus on every run, so the two cannot drift.
 
 Keeping the corpus inside the intersection of the two languages is a real
@@ -66,8 +235,21 @@ first draft because bare integer literals infer as `i32` while the subset is
 ## Updating goldens
 
 ```sh
+./scripts/differential.sh --update  # real-rustc corpus expectations
 ./scripts/qemu-test.sh --update      # all cases
 ./scripts/qemu-test.sh conform       # run one case
+./scripts/qemu-test.sh net           # raw L2 exchange plus host evidence
+./scripts/qemu-test.sh net_recovery  # post-publish fault and fresh-epoch retry
+./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
+./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
+./scripts/qemu-test.sh guard_page   # expected-fatal store-page-fault + exact stval
+./scripts/qemu-test.sh wx           # seal, cross-hart execute, clear, same-address reuse
+./scripts/qemu-test.sh wx_execute_fault # expected-fatal instruction-page-fault + exact stval
+./scripts/qemu-test.sh wx_read_fault    # expected-fatal load-page-fault + exact stval
+./scripts/qemu-test.sh wx_write_fault   # expected-fatal store-page-fault + exact stval
+./scripts/qemu-test.sh ro           # .rodata + COW table lifecycle across harts
+./scripts/qemu-test.sh rodata_write_fault # expected-fatal `.rodata` store + exact stval
+./scripts/qemu-test.sh cap_table_write_fault # expected-fatal table store + exact stval
 ```
 
 Read the diff before updating. The `--update` flag is the only thing standing

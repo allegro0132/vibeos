@@ -9,8 +9,18 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod bench;
 pub mod cap;
 pub mod chan;
+pub mod durable;
 pub mod exec;
 pub mod heap;
+pub mod interrupt;
+pub mod ipi;
+pub mod mmu;
+pub mod net;
+pub mod program;
+pub mod runqueue;
+pub mod store;
 pub mod sync;
+pub mod virtio;

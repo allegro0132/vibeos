@@ -17,19 +17,42 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   leaks, and the trust model.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
   workstreams, testing strategy, metrics, and the risk register.
+- **[docs/SPINLOCK_AUDIT.md](docs/SPINLOCK_AUDIT.md)** — the M5.3 complete lock
+  inventory, IRQ hot-path replacements, retained transaction boundaries, and
+  multicore measurement gates.
+- **[docs/MMU.md](docs/MMU.md)** — the shared Sv39 map, boot publication
+  contract, mapped apertures, per-hart stack guards, and integrity-hardening
+  sequence.
+- **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
+  ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
+- **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
+  API, unified on-disk journal, publication boundary, and raw-media acceptance.
+- **[docs/PERSISTENT_CSPACE.md](docs/PERSISTENT_CSPACE.md)** — the fixed
+  `persistent-test` CSpace, external root policy, atomic recovery install, and
+  three-boot acceptance boundary.
+- **[docs/PROGRAM_PERSISTENCE.md](docs/PROGRAM_PERSISTENCE.md)** — canonical
+  source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
+  restored least authority.
+- **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
+  typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
 
 ```sh
-cargo test --workspace     # 117 host tests, no QEMU, ~1s
-./scripts/qemu-test.sh     # 5 golden transcripts under QEMU, ~2min
+cargo test --workspace       # fast portable tests, no QEMU
+./scripts/differential.sh    # exact-output oracle using the pinned rustc
+./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
+./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
+./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
+./scripts/status.sh --check  # derive inventory and verify the active rustc pin
 ```
 
-Plus an in-kernel self-test (49 checks) for what the host cannot fake — real
+Plus an in-kernel self-test for what the host cannot fake — real
 timer interrupts, real wakeups, the live capability graph, and machine code
-actually executing. Type `selftest` in the shell. See **[TESTING.md](TESTING.md)**
-for why there are four layers and which mutations each one catches.
+actually executing. Type `selftest` in the shell; the QEMU harness reports its
+observed check count. See **[TESTING.md](TESTING.md)** for why there are four
+layers and which mutations each one catches.
 
 ## Running it
 
@@ -38,9 +61,17 @@ for why there are four layers and which mutations each one catches.
 ./qrun.sh 10      # run for 10 seconds, feed the shell from stdin
 ```
 
-Needs `qemu-system-riscv64`, a Rust toolchain with `rust-src`, and `ld.lld`.
-`RUSTC_BOOTSTRAP=1` is set by the scripts because `-Z build-std` is required to
-get `core`/`alloc` for a bare-metal target; a nightly toolchain works without it.
+Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
+`nightly-2026-08-01` (including `rust-src`) in `rust-toolchain.toml`; every local
+script and CI build consumes that same file. `scripts/status.sh --check` fails if
+the active compiler commit differs from the recorded pin.
+
+`bench` in the shell emits a versioned JSON-lines measurement set. The host
+runner fixes the machine, CPU, hart count, TCG mode, and virtual clock, records
+QEMU/toolchain metadata, and checks the committed baseline. Updating that truth
+is always explicit: `./scripts/bench.py --update`. The separate `--smp-scaling`
+mode uses four multithreaded TCG vCPUs, exact-hart workers, equal serial/parallel
+work, and a committed minimum `1.25x` speedup.
 
 ## The design
 
@@ -67,7 +98,14 @@ ep.send(reading).await;
 from a holder — and `grant`/`derive` can only ever *shrink* rights. Amplification
 isn't policed at runtime; it's absent from the API.
 
-The system image in `world.rs` is 4 spaces wired to 1 channel and 1 device:
+The base system image in `world.rs` has five spaces wired to one channel, a console,
+and a bounded memory region. Four are owned by supervised components; `prog` is
+the explicitly unbound execution space used synchronously by the shell task.
+When virtio-blk is discovered, private driver and store-backend spaces plus the
+fixed `persistent-test` and `saved-program` CSpaces are added. A private
+`saved-program-policy` space is the supervisor root for reconstructed console and
+memory authority. The backend holds only attenuated block `READ|WRITE`; neither
+persistent target receives Store `WRITE`:
 
 | space  | holds                                    | therefore cannot          |
 |--------|------------------------------------------|---------------------------|
@@ -75,10 +113,16 @@ The system image in `world.rs` is 4 spaces wired to 1 channel and 1 device:
 | sensor | telemetry `SEND`                         | read others' readings     |
 | logger | telemetry `RECV`, console `WRITE`        | forge a reading           |
 | guest  | console `WRITE`                          | pass the console on       |
+| prog   | console `WRITE`, memory `READ|WRITE`      | reach any other resource  |
+| virtio-blk | MMIO, DMA, block service `READ|WRITE` | console or object caps    |
+| store-backend | block service `READ|WRITE`        | paths or client CSpaces   |
+| persistent-test | durable stored-object caps      | Store `WRITE` or paths    |
+| saved-program-policy | console/memory policy roots | block, Store, or program artifact |
+| saved-program | artifact `READ`, console `WRITE`, memory `READ|WRITE` | Store `WRITE`, paths, or legacy `prog` authority |
 
-Run `probe` in the shell to watch four attacks get refused, and `revoke guest`
-to pull a live component's authority out from under it — no signal, no restart,
-no cooperation from the component.
+Run `probe` in the shell to watch four attacks get refused. `revoke guest` pulls
+a live component's authority out from under it, while `cancel guest` separately
+stops its task; authority and lifecycle are deliberately different controls.
 
 ### 2. Isolation is a type system, not a page table
 
@@ -87,10 +131,12 @@ a syscall or IPC costs a mode switch, a TLB flush, and a copy. That price bought
 protection from *unsafe languages*. If components are memory-safe by
 construction, you can charge a function call instead.
 
-VibeOS runs every component in one address space with no MMU and no user mode.
-The enforcement boundary is `unsafe` — of which there are ~10 uses, all in the
-hardware layer (`sbi`, `uart`, `plic`, `trap`, `heap`, `sync`) and none in the
-capability core's decision path. IPC is a queue push, not a context switch.
+VibeOS runs every component in one shared S-mode address space with no user mode
+or per-process page tables. Its shared Sv39 map enforces kernel integrity
+properties such as invalid stack guards, not component isolation. The enforcement
+boundary remains `unsafe` — of which there are ~10 uses, all in the hardware layer
+(`sbi`, `uart`, `plic`, `trap`, `heap`, `sync`) and none in the capability core's
+decision path. IPC is a queue push, not a context switch.
 
 The honest caveat: this makes the Rust compiler part of the TCB, and a component
 compiled from unsafe code could forge a `Cap` by transmuting one. v0.1 is a
@@ -120,6 +166,29 @@ match code {
 VibeOS parks in `wfi` and draws no CPU. The waker is the `TaskId` itself cast to
 the raw-waker pointer — no allocation, no refcounting, no `Arc` per wake.
 
+The system image binds each supervised unit into one retained `Component`
+record: a stable `ComponentId`, its current task incarnation, its CSpace, an
+enforced memory owner/budget, and lifecycle state. `ps` and `caps` read that same
+record, so an exited, faulted, or cancelled task keeps both its identity and terminal reason
+after the executor removes it. Heap blocks carry immutable owner provenance;
+quota refusal faults only the requesting component, and cross-owner frees credit
+the allocator account that originally paid for the block.
+
+Each retained task handle supports cooperative cancellation and async join/exit
+reporting. Cancelling a ready or parked task detaches it and drops its future
+without another poll; cancelling the task currently running takes effect when
+that poll returns. Faults win over simultaneous cancellation, terminal states
+are absorbing, and a stale wake cannot revive a task. This is not preemption: an
+in-tree future that never yields can still wedge its executor hart. Wait listeners
+carry an epoch and unique registration token, while sleeps carry a unique timer
+token; normal completion, Drop, and cancellation release those registrations
+immediately. Audited World components run in per-incarnation fault arenas: a
+fault detaches the entire arena, purges its registrations, and reclaims its
+blocks without invoking the interrupted future's destructors. Ordinary tasks
+without that no-escape audit still use the conservative leak-on-fault policy.
+Both paths first notify a non-allocating exact-task fault hook after permanent
+detach, so an abandoned persistent-store claim cannot wedge later callers.
+
 ## A Rust compiler, inside the OS
 
 `rustc hello` compiles a Rust hello world to native RV64 and runs it, without
@@ -127,10 +196,10 @@ leaving the kernel:
 
 ```
 vibe> rustc hello
-  compiled 1 fn -> 328 B of RV64 + 14 B of data in 5559 us
+  compiled 1 fn -> 460 B of RV64 + 14 B of data in N us
   --- running natively ---
 Hello, world!
-  --- exited with 0 in 228 us ---
+  --- exited with 0 in N us ---
 ```
 
 `rustc demo` builds something with more in it — recursion, `while`, `%`,
@@ -138,7 +207,7 @@ short-circuit `&&`, `if` as an expression:
 
 ```
 vibe> rustc demo
-  compiled 3 fn -> 3528 B of RV64 + 70 B of data in 4533 us
+  compiled 3 fn -> N B of RV64 + N B of data in N us
   --- running natively ---
 Hello, world!
 fib(0) = 0  fib(1) = 1  fib(2) = 1  ...  fib(9) = 34
@@ -177,35 +246,76 @@ needs spilling across a call. Slots are 16 bytes wide to keep `sp` aligned to
 the RISC-V C ABI at every call boundary.
 
 Codegen runs twice: pass 1 discovers function addresses, pass 2 emits calls to
-them. Instruction *sizes* never depend on addresses — 64-bit constants are always
-materialized in a fixed 11-instruction sequence — so both passes agree on layout
-by construction. Branches are emitted as an inverted conditional over a `jal`,
-giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
+them. Instruction sizes never depend on addresses: compiler-chosen function and
+runtime addresses use the fixed-length `li64` sequence, while ordinary integer
+literals use the shortest stable one- or two-instruction form when possible. Both
+passes therefore agree on layout. Branches are emitted as an inverted conditional
+over a `jal`, giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
 
-Because VibeOS has no MMU and no W^X, "load the program" is `fence.i` followed by
-transmuting the code buffer to a function pointer and calling it.
+VibeOS now has one shared Sv39 address space. M6.2 leaves each 4 KiB stack guard
+invalid and maps the remaining 252 KiB in its fixed 256 KiB per-hart slot RW-NX.
+M6.3 makes ordinary RAM RW-NX and linker-delimited kernel text R-X. Generated
+instructions no longer live in the heap: the compiler relocates directly into an
+exclusive page run from a dedicated 2 MiB code pool while it is RW-NX, then seals
+that run execute-only before exposing its entry point. Every hart clears
+`sstatus.MXR`, so execute-only pages cannot be read as data.
+
+Sealing and unsealing use break-before-make PTE updates, local fences, and
+synchronous SBI RFENCE operations for every other online physical hart. A sealed
+buffer is never published until both TLB shootdowns and the all-hart instruction-
+cache fence complete. Drop removes execute permission, zeros the complete page run
+including padding, and only then permits same-address reuse; audited component-fault
+recovery applies that same sequence after all-hart quiescence when `longjmp` skipped
+Rust destructors. `mmu wx` demonstrates sealed execution on the boot hart and hart 1,
+zeroed same-address reuse, and different code executing remotely after reuse.
+
+M6.4 also maps linker-delimited `.rodata` R-- at boot and gives capability tables a
+linker-reserved 4 MiB COW pool. Each mutation finishes a detached SYSTEM-owned
+candidate, moves it into exclusive RW-NX pages, seals them R-- with all-hart
+break-before-make shootdowns, and only then swaps the authoritative snapshot. The
+retired table returns to RW-NX only after that swap, then drops its entries, clears
+the full run, and permits same-address reuse. `mmu ro` exercises mint, derive,
+cross-hart lookup, revoke, stale-handle denial, and reuse; separate fatal probes prove
+that stores to `.rodata` and a published table fault at the exact address.
+
+This protects the published `Slot` snapshot—generation, rights, object pointer, and
+derivation pointer—not the complete capability graph. CSpace lifecycle scalars and
+the derivation nodes' `alive` atomics remain writable supervisor metadata, and the
+shared S-mode address space still provides integrity hardening rather than component
+isolation. Candidate commit is synchronous and ordinary errors preserve the old
+authoritative table; an exceptional SYSTEM allocation/protection failure may
+conservatively leak a detached candidate.
 
 ### And this is where it earns its place in *this* OS
 
-Generated machine code has no way to reach hardware. Its only exit is a call to
-`rt_print_str`/`rt_print_int`, whose addresses the compiler bakes in and which a
-program cannot name, forge, or substitute. Those hooks resolve the `prog` space's
-console capability **on every call**:
+Generated machine code has no way to reach hardware. Its only output path is a
+call to compiler-chosen runtime hooks whose addresses a program cannot name,
+forge, or substitute. At each invocation, `rustc::run` resolves the `prog`
+space's capabilities with two explicit lifetimes. Console output holds a
+revocable token and rechecks its complete derivation before every print operation.
+Raw memory holds one non-cloneable, exclusive invocation lease across the native
+call because generated loads and stores cannot be interposed. Revocation therefore
+denies the next console operation while allowing already-authorized memory work to
+finish; a later launch cannot acquire either lease. `rustc lease` demonstrates all
+three boundaries:
 
 ```
-vibe> revoke prog
-  revoked 1 cap(s) in `prog`
-vibe> rustc hello
-  compiled 1 fn -> 328 B of RV64 + 14 B of data in 589 us
-  --- running natively ---
-  --- exited with 0 in 165 us ---
-  note: output was suppressed -- `prog` holds no console capability
+vibe> rustc lease
+  --- lease run 1: revoke before console operation 2 ---
+lease-visible
+  --- exited with 42 in N us ---
+  note: output was suppressed -- `prog` console authority is absent or revoked
+  note: hook revoked 2 cap(s); the active memory lease completed
+  --- lease run 2: cold launch after revocation ---
+  --- aborted: the granted memory region is too small for this program (after N us) ---
+  note: no grant or hook was installed between runs
 ```
 
-Same compiler, byte-identical machine code, and it still runs to completion — it
-just has no authority to say anything. On a conventional OS, native code that has
-already been loaded owns whatever its process owns. Here, authority is not a
-property of the code.
+The second print is absent because its revocable console token was killed first.
+The value 42 proves that the already-acquired memory lease completed, while the
+cold second launch proves that revocation was not mistaken for a permanent cached
+object. On a conventional OS, native code that has already been loaded owns whatever
+its process owns. Here, authority is not a property of the code.
 
 ## What's here
 
@@ -222,21 +332,33 @@ property of the code.
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |
 
-~3300 lines total.
+~10,500 Rust lines across `core`, `compiler`, and `kernel` (2026-08-08 snapshot).
 
 ## Shell
 
 ```
-ps              live tasks and how many times each was polled
+ps              component identities, lifecycle, and poll counts
 spaces          capability spaces in the system
-caps <space>    dump a space's capability table
+caps <space>    component owner and capability table
 rustc hello     compile and run a Rust hello world, natively
 rustc demo      compile and run a larger sample (fib, gcd, loops)
 rustc conform   compile and run the language conformance program
+rustc lease     revoke during a run, then retry without new grants
 selftest        run the in-kernel test suite
+bench           emit the versioned machine-readable benchmark suite
+durable         recover a sealed capability log and tombstone
+blk info        report the supervised virtio-blk transport and capacity
+blk test        read, write, flush, read back, and verify the real backing disk
+net info        report the supervised modern virtio-net transport and queue state
+net test        exchange a typed raw-L2 challenge with the localhost test peer
+net fault       fault after TX publication, reset/restart, then repeat the exchange
 rustc edit      type your own program; end it with a lone `.`
+pcspace test    exercise the three-boot persistent CSpace lifecycle
+smp queues      prove queues/IPIs and report the M5 lock audit sample
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
+cancel <name>   cooperatively stop a component (the active shell is protected)
+restart <name>  restart a terminal audited component with fresh grants
 chan            telemetry channel depth and totals
 quiet           mute background components (`verbose` restores)
 mem             kernel heap usage
@@ -279,12 +401,11 @@ showing rising poll counts while muted, because the components never stopped.
 
 Deliberate, not overlooked:
 
-- **Single hart.** The spinlock is real but `-smp 1` is the only tested config.
-- **The heap never returns large blocks.** Allocations over 64 KiB come from the
-  bump region and are leaked on free. Nothing in the current image allocates
-  that large.
-- **`lookup_as` uses `Arc::from_raw` after an `Any` check.** Sound, but it wants
-  `Arc::downcast` once that's usable through the `Resource` trait object.
+- **Boot topology discovery is QEMU-virt-specific.** Four physical harts boot via
+  SBI HSM and may use any firmware-selected coldboot hart, but the current boot
+  scanner deliberately covers QEMU `virt`'s dense physical IDs `0..3`. The
+  logical/physical mapping itself rejects aliases and is tested with sparse IDs;
+  a general platform port still needs FDT topology enumeration.
 - **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
   so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
   not a strict subset, and it is what the roadmap's differential testing against
@@ -293,13 +414,49 @@ Deliberate, not overlooked:
   functions over `i64`, `bool` and fixed-size arrays.
 - **Array indices are `i64`, not `usize`.** There is no `as`, so a corpus program
   valid in both languages keeps counters separate from values.
-- **Kernel components have no heap quota.** Compiled programs are bounded by
-  their region capability; components share the global allocator.
-- **A faulted task is leaked, not freed.** Dropping a future interrupted
-  mid-poll would run destructors over state it never finished writing.
+- **Runtime infrastructure is charged to the SYSTEM heap domain.** Component
+  quotas cover dynamic allocation while their future is polled or destroyed;
+  task envelopes, wait registries, capability tables, and IRQ work remain part
+  of the trusted kernel budget.
+- **Only audited component fault arenas are reclaimed.** Their tasks, runtime
+  registrations, and allocation escape boundaries are sealed by the World
+  factory. An ordinary task interrupted mid-poll is still conservatively leaked.
 - **A panic with no landing pad is still fatal** — a fault in the boot path or
   inside an interrupt handler halts the machine.
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **No persistence, no MMU, no user mode, no multicore.** In that order.
+- **Persistent authority is deliberately fixed-shape; there is still no user
+  mode or per-process isolation.** M5.1 provides four logical ready queues
+  and hart0 work stealing. M5.2 adds SBI/SSIP doorbells, atomic reason mailboxes,
+  and explicit logical-to-physical hart mapping. M5.3 removes the PLIC/UART
+  RX/virtio data locks, hardens fault-recoverable
+  locks, and publishes their contention telemetry. M5.4 partitions scheduler
+  running/wake slots, current-task and allocation provenance, interrupt markers,
+  and task/program recovery state per logical hart. A validated per-hart
+  `sscratch` token keeps those lookups O(1). M5.5 boots three secondaries through
+  SBI HSM, gives all four harts private 256 KiB stack slots and local trap/timer
+  state, routes external interrupts only through the dynamic boot-hart PLIC
+  context, and runs the complete integration suite with `-smp 4`.
+  M6.1 installs one shared Sv39 identity map on all four harts, with 4 KiB RAM
+  leaves, non-executable device mappings, and deliberate holes for firmware,
+  null, and unused physical space. M6.2 makes the first 4 KiB of every stack slot
+  an invalid guard, maps the remaining 252 KiB RW-NX, and keeps 8 KiB of that
+  usable stack below the generated-code floor for its normal abort path. Any access
+  that lands in the guard faults, but a single-page guard does not catch a corrupted
+  `sp` that jumps over it into another mapped page and is not a recovery stack: an
+  already bad `sp` may fault recursively during trap entry before a diagnostic can
+  run. Type/capability confinement remains the isolation boundary; this page table
+  exists for integrity hardening.
+  M4.3 restores
+  the externally constrained `persistent-test` graph. M4.5 adds one immutable
+  `hello` ProgramArtifact whose source and canonical
+  VIBEEXE are revalidated against the current compiler before execution, with an
+  exact console/memory manifest. This is not a general component checkpoint,
+  update, naming, authentication, or rollback-resistance facility.
+- **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
+  checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
+  quarantines the slab instead of pretending revocation stopped in-flight DMA.
+- **Networking is raw Ethernet only.** M4.4 carries owned `Packet` values through
+  bounded typed endpoints; it does not yet provide ARP, IP, UDP/TCP, DNS, or a
+  POSIX byte-stream socket API.

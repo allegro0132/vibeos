@@ -1,0 +1,9 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> durable
+  durable-cap v1: 512-byte LE records, CRC32C + sealed chain
+  committed grant: 1 live root at sequence 4
+  tombstone recovery: 0 live grants, 1 retained tombstone at sequence 5
+  authority result: stable IDs only; no path or object pointer was persisted
+vibe> 

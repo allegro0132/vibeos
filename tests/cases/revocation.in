@@ -7,3 +7,6 @@ rustc hello
 caps prog
 revoke guest
 caps guest
+@sleep 10
+ps
+caps guest

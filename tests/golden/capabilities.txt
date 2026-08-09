@@ -3,26 +3,44 @@ vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> spaces
   guest    1 caps
-  init     7 caps
+  init     14 caps
   logger   2 caps
+  persistent-test 0 caps
   prog     2 caps
+  saved-program 0 caps
+  saved-program-policy 2 caps
   sensor   1 caps
+  store-backend 1 caps
+  virtio-blk 3 caps
 vibe> caps init
+  owner component:5  task task:6  name shell  state running  reason -
+  memory owner component:5  budget 8388608 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      console   rwsvgx   ns16550a @ 0xADDR [0 bytes out]
   cap:1.0      endpoint  rwsvgx   telemetry [0/8 sent=0 recv=0]
   cap:2.0      cspace    r----x   guest [1 caps]
   cap:3.0      cspace    r----x   prog [2 caps]
-  cap:4.0      cspace    r-----   sensor [1 caps]
-  cap:5.0      cspace    r-----   logger [2 caps]
-  cap:6.0      memory    rwsvgx   prog-arena [4096 x i64 @ 0xADDR]
+  cap:4.0      cspace    r----x   virtio-blk [3 caps]
+  cap:5.0      cspace    r-----   sensor [1 caps]
+  cap:6.0      cspace    r-----   logger [2 caps]
+  cap:7.0      memory    rwsvgx   prog-arena [4096 x i64]
+  cap:8.0      virtio-mmio rwsvgx   modern block transport slot 0 @ 0xADDR, IRQ 1, vendor 0xADDR
+  cap:9.0      dma-region rwsvgx   SYSTEM stable slab @ 0xADDR, 4096 bytes
+  cap:10.0     block-device rwsvgx   virtio-blk [2048 sectors, queue 8, epoch 1]
+  cap:11.0     object-store rwsvgx   capability-addressed object store (recovery pending)
+  cap:12.0     durable-cspace rw----   persistent-test CSpace [Ready, 0 live grants, 0 tombstones]
+  cap:13.0     saved-program rw----   fixed saved program `hello` [ReadyEmpty, artifact absent, authority console=w memory=rw]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps logger
+  owner component:2  task task:2  name logger  state running  reason -
+  memory owner component:2  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      endpoint  ---v--   telemetry [0/8 sent=0 recv=0]
   cap:1.0      console   -w----   ns16550a @ 0xADDR [0 bytes out]
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> caps sensor
+  owner component:1  task task:1  name sensor  state running  reason -
+  memory owner component:1  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      endpoint  --s---   telemetry [0/8 sent=0 recv=0]
   rights: r=read w=write s=send v=recv g=grant x=revoke

@@ -1,0 +1,4 @@
+quiet
+pcspace test
+@sleep 12
+halt

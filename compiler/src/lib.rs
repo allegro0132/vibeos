@@ -1,12 +1,14 @@
 //! The VibeOS Rust-subset compiler: lexer, parser, and RV64 code generator.
 //!
-//! Deliberately free of any dependency on the kernel. It emits `Vec<u32>` and
-//! knows nothing about how that gets executed, which is what lets the whole
-//! front end and back end be tested on the host.
+//! Deliberately free of any dependency on the kernel. It emits a relocatable
+//! `Vec<u32>` template and can link into caller-owned storage, but knows nothing
+//! about page tables or execution; the whole front end and back end therefore
+//! remain testable on the host.
 //!
-//! This crate is security-critical. Generated code runs in the kernel's address
-//! space with no MMU, so a wrong frame offset here is a privilege escalation,
-//! not a wrong answer. Test it accordingly.
+//! This crate is security-critical. Generated code runs in the kernel's shared
+//! S-mode address space. The kernel's Sv39 W^X policy prevents writable code
+//! from executing, but it is not a privilege boundary: a wrong frame offset
+//! here is a privilege escalation, not a wrong answer. Test it accordingly.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -14,16 +16,25 @@ extern crate alloc;
 
 pub mod ast;
 pub mod codegen;
+pub mod image;
 pub mod lex;
 pub mod parse;
 pub mod types;
 
 pub mod samples;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+pub use image::{
+    ImageMetadata, RelocatableImage, Relocation, RelocationKind, RelocationTarget,
+    RuntimeBinding, RuntimeImport, COMPILER_ABI_VERSION, IMAGE_FORMAT_VERSION,
+    IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_ENCODED_IMAGE_BYTES, RUNTIME_ABI_VERSION,
+    TARGET_ABI_RV64IM_LP64_V1,
+};
+
 /// Everything a compiled program needs in memory before it can run.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
     /// String literals. Generated code holds absolute pointers into this, so it
     /// must outlive execution.
@@ -34,6 +45,7 @@ pub struct Image {
 
 /// Addresses of the runtime hooks generated code is allowed to call. These are
 /// the program's *entire* interface to the outside world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Runtime {
     pub print_str: u64,
     pub print_int: u64,
@@ -54,6 +66,15 @@ pub fn compile_at(
     code_base: u64,
     rt: &Runtime,
 ) -> Result<Image, String> {
+    compile_relocatable(src)?.link_with_runtime(data_base, code_base, rt)
+}
+
+/// Compile a deterministic, address-independent executable suitable for
+/// capability-addressed persistence.  Linking is a separate, checked step once
+/// the loader knows the data/code addresses and runtime import table.
+pub fn compile_relocatable(src: &str) -> Result<RelocatableImage, String> {
+    let source_len = u32::try_from(src.len())
+        .map_err(|_| "source length exceeds the executable ABI".to_string())?;
     let toks = lex::lex(src)?;
     let prog = parse::Parser::new(toks).program()?;
     // Validates, and annotates what code generation needs.
@@ -61,20 +82,25 @@ pub fn compile_at(
 
     let literals = codegen::collect_strings(&prog, "\n");
     let mut data = Vec::new();
-    let mut str_addr = alloc::collections::BTreeMap::new();
+    let mut str_offsets = alloc::collections::BTreeMap::new();
     for s in &literals {
-        str_addr.insert(s.clone(), data_base + data.len() as u64);
+        let offset = u64::try_from(data.len())
+            .map_err(|_| "string table length exceeds the executable ABI".to_string())?;
+        str_offsets.insert(s.clone(), offset);
         data.extend_from_slice(s.as_bytes());
     }
 
-    let rt = codegen::Runtime {
-        print_str: rt.print_str,
-        print_int: rt.print_int,
-        print_bool: rt.print_bool,
-        abort: rt.abort,
-    };
-    let code = codegen::compile(&prog, code_base, str_addr, &rt)?;
-    Ok(Image { data, code, funcs: prog.funcs.len() })
+    let funcs = u32::try_from(prog.funcs.len())
+        .map_err(|_| "function count exceeds the executable ABI".to_string())?;
+    let (code_template, relocations) = codegen::compile_relocatable(&prog, str_offsets)?;
+    RelocatableImage::from_parts(
+        funcs,
+        source_len,
+        image::crc32c(src.as_bytes()),
+        data,
+        code_template,
+        relocations,
+    )
 }
 
 /// Measure how long the emitted code will be, without committing to an address.
@@ -82,6 +108,5 @@ pub fn compile_at(
 /// Sound because instruction sizes never depend on addresses — see
 /// `codegen::li64`, which is deliberately a fixed 11 instructions.
 pub fn code_len(src: &str) -> Result<usize, String> {
-    let rt = Runtime { print_str: 0, print_int: 0, print_bool: 0, abort: 0 };
-    Ok(compile_at(src, 0, 0, &rt)?.code.len())
+    Ok(compile_relocatable(src)?.code_template().len())
 }

@@ -1,4 +1,5 @@
-//! Pure Virtio 1.2 protocol helpers used by the supervised block driver.
+//! Pure Virtio 1.2 protocol helpers used by the supervised block and network
+//! drivers.
 //!
 //! This module deliberately performs no MMIO and owns no DMA memory.  It keeps
 //! the wire constants, feature/status state machine, descriptor construction,
@@ -34,6 +35,7 @@ pub const MMIO_CONFIG_OFFSET: usize = 0x100;
 
 pub const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 pub const MMIO_VERSION_MODERN: u32 = 2;
+pub const DEVICE_ID_NETWORK: u32 = 1;
 pub const DEVICE_ID_BLOCK: u32 = 2;
 
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
@@ -49,6 +51,26 @@ pub const INTERRUPT_KNOWN_MASK: u32 = INTERRUPT_USED_BUFFER | INTERRUPT_CONFIGUR
 
 pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+pub const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
+pub const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
+pub const VIRTIO_NET_F_MTU: u64 = 1 << 3;
+pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+pub const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
+pub const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
+pub const VIRTIO_NET_F_GUEST_ECN: u64 = 1 << 9;
+pub const VIRTIO_NET_F_GUEST_UFO: u64 = 1 << 10;
+pub const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
+pub const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
+pub const VIRTIO_NET_F_HOST_ECN: u64 = 1 << 13;
+pub const VIRTIO_NET_F_HOST_UFO: u64 = 1 << 14;
+pub const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
+pub const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
+pub const VIRTIO_NET_F_CTRL_VQ: u64 = 1 << 17;
+pub const VIRTIO_NET_F_CTRL_RX: u64 = 1 << 18;
+pub const VIRTIO_NET_F_CTRL_VLAN: u64 = 1 << 19;
+pub const VIRTIO_NET_F_GUEST_ANNOUNCE: u64 = 1 << 21;
+pub const VIRTIO_NET_F_MQ: u64 = 1 << 22;
+pub const VIRTIO_NET_F_CTRL_MAC_ADDR: u64 = 1 << 23;
 pub const VIRTIO_RING_F_INDIRECT_DESC: u64 = 1 << 28;
 pub const VIRTIO_RING_F_EVENT_IDX: u64 = 1 << 29;
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
@@ -66,7 +88,44 @@ pub const BLOCK_DRIVER_REJECTED_FEATURES: u64 = VIRTIO_RING_F_INDIRECT_DESC
     | VIRTIO_F_ACCESS_PLATFORM
     | VIRTIO_F_RING_PACKED;
 
+/// The M4.4 network model deliberately implements a single queue pair with no
+/// checksum/segmentation offload, merged receive buffers, control queue, MQ,
+/// device-supplied MAC, or optional ring/platform mode. Only VERSION_1 is
+/// acknowledged; the device may offer any of these bits without becoming
+/// unusable, but the driver must leave them clear.
+pub const NET_DRIVER_FEATURES: u64 = VIRTIO_F_VERSION_1;
+pub const NET_DRIVER_REJECTED_FEATURES: u64 = VIRTIO_NET_F_CSUM
+    | VIRTIO_NET_F_GUEST_CSUM
+    | VIRTIO_NET_F_MTU
+    | VIRTIO_NET_F_MAC
+    | VIRTIO_NET_F_GUEST_TSO4
+    | VIRTIO_NET_F_GUEST_TSO6
+    | VIRTIO_NET_F_GUEST_ECN
+    | VIRTIO_NET_F_GUEST_UFO
+    | VIRTIO_NET_F_HOST_TSO4
+    | VIRTIO_NET_F_HOST_TSO6
+    | VIRTIO_NET_F_HOST_ECN
+    | VIRTIO_NET_F_HOST_UFO
+    | VIRTIO_NET_F_MRG_RXBUF
+    | VIRTIO_NET_F_STATUS
+    | VIRTIO_NET_F_CTRL_VQ
+    | VIRTIO_NET_F_CTRL_RX
+    | VIRTIO_NET_F_CTRL_VLAN
+    | VIRTIO_NET_F_GUEST_ANNOUNCE
+    | VIRTIO_NET_F_MQ
+    | VIRTIO_NET_F_CTRL_MAC_ADDR
+    | VIRTIO_RING_F_INDIRECT_DESC
+    | VIRTIO_RING_F_EVENT_IDX
+    | VIRTIO_F_ACCESS_PLATFORM
+    | VIRTIO_F_RING_PACKED;
+
 pub const SPLIT_QUEUE_SIZE: u16 = 8;
+pub const NET_QUEUE_SIZE: u16 = SPLIT_QUEUE_SIZE;
+pub const NET_RECEIVE_QUEUE: u16 = 0;
+pub const NET_TRANSMIT_QUEUE: u16 = 1;
+pub const NET_HEADER_SIZE: u32 = 12;
+pub const NET_MAX_FRAME_SIZE: u32 = crate::net::MAX_PACKET_LEN as u32;
+pub const NET_RECEIVE_BUFFER_SIZE: u32 = NET_HEADER_SIZE + NET_MAX_FRAME_SIZE;
 pub const BLOCK_SECTOR_SIZE: u32 = 512;
 pub const BLOCK_HEADER_DESCRIPTOR: u16 = 0;
 pub const BLOCK_DATA_DESCRIPTOR: u16 = 1;
@@ -98,6 +157,7 @@ pub enum ProbeError {
     LegacyTransport { observed: u32 },
     UnsupportedVersion { observed: u32 },
     NotBlockDevice { observed: u32 },
+    NotNetworkDevice { observed: u32 },
 }
 
 /// Accept only the non-legacy block transport described by Virtio 1.2.
@@ -119,6 +179,31 @@ pub const fn probe_modern_block(identity: MmioIdentity) -> Result<(), ProbeError
     }
     if identity.device_id != DEVICE_ID_BLOCK {
         return Err(ProbeError::NotBlockDevice {
+            observed: identity.device_id,
+        });
+    }
+    Ok(())
+}
+
+/// Accept only a non-legacy Virtio network transport (device ID 1).
+pub const fn probe_modern_net(identity: MmioIdentity) -> Result<(), ProbeError> {
+    if identity.magic != MMIO_MAGIC_VALUE {
+        return Err(ProbeError::BadMagic {
+            observed: identity.magic,
+        });
+    }
+    if identity.version == 1 {
+        return Err(ProbeError::LegacyTransport {
+            observed: identity.version,
+        });
+    }
+    if identity.version != MMIO_VERSION_MODERN {
+        return Err(ProbeError::UnsupportedVersion {
+            observed: identity.version,
+        });
+    }
+    if identity.device_id != DEVICE_ID_NETWORK {
+        return Err(ProbeError::NotNetworkDevice {
             observed: identity.device_id,
         });
     }
@@ -239,6 +324,23 @@ pub const fn negotiate_block_features(offered: u64) -> Result<NegotiatedFeatures
     })
 }
 
+/// Negotiate the deliberately feature-minimal modern network profile.
+///
+/// Optional network features are not prerequisites: frames carry no offload
+/// metadata, RX uses exactly one 1,526-byte buffer, and only queue pair 0/1 is
+/// configured. Unsupported offered bits stay clear in DriverFeatures.
+pub const fn negotiate_net_features(offered: u64) -> Result<NegotiatedFeatures, FeatureError> {
+    if offered & VIRTIO_F_VERSION_1 == 0 {
+        return Err(FeatureError::MissingVersion1);
+    }
+
+    Ok(NegotiatedFeatures {
+        offered,
+        accepted: offered & NET_DRIVER_FEATURES,
+        rejected: offered & NET_DRIVER_REJECTED_FEATURES,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitPhase {
     Reset,
@@ -316,6 +418,21 @@ impl ModernInit {
     pub fn select_features(&mut self, offered: u64) -> Result<NegotiatedFeatures, InitError> {
         self.require_phase(InitPhase::Driver)?;
         let features = match negotiate_block_features(offered) {
+            Ok(features) => features,
+            Err(FeatureError::MissingVersion1) => {
+                self.fail();
+                return Err(InitError::MissingVersion1);
+            }
+        };
+        self.features = Some(features);
+        self.phase = InitPhase::FeaturesSelected;
+        Ok(features)
+    }
+
+    /// Select the modern network profile instead of the block profile.
+    pub fn select_net_features(&mut self, offered: u64) -> Result<NegotiatedFeatures, InitError> {
+        self.require_phase(InitPhase::Driver)?;
+        let features = match negotiate_net_features(offered) {
             Ok(features) => features,
             Err(FeatureError::MissingVersion1) => {
                 self.fail();
@@ -499,6 +616,217 @@ pub struct UsedRing {
     pub ring: [UsedElement; SPLIT_QUEUE_SIZE as usize],
 }
 
+/// The 12-byte modern `virtio_net_hdr` used before every Ethernet frame.
+///
+/// M4.4 negotiates no checksum or segmentation offload and no merged receive
+/// buffers. TX writes an all-zero header. For RX, the driver preinitializes
+/// bytes 10..12 to `num_buffers == 1`: QEMU 11's modern no-MRG path uses the
+/// 12-byte prefix but overwrites only the first 10 bytes. Completion still
+/// validates the final `num_buffers` value strictly rather than trusting it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VirtioNetHeader {
+    pub flags: u8,
+    pub gso_type: u8,
+    pub header_length: u16,
+    pub gso_size: u16,
+    pub checksum_start: u16,
+    pub checksum_offset: u16,
+    pub num_buffers: u16,
+}
+
+impl VirtioNetHeader {
+    pub const fn transmit() -> Self {
+        Self {
+            flags: 0,
+            gso_type: 0,
+            header_length: 0,
+            gso_size: 0,
+            checksum_start: 0,
+            checksum_offset: 0,
+            num_buffers: 0,
+        }
+    }
+
+    /// Canonical header with which the driver preinitializes a no-offload,
+    /// no-MRG RX buffer before handing it to the device.
+    pub const fn received_without_offload() -> Self {
+        Self {
+            num_buffers: 1u16.to_le(),
+            ..Self::transmit()
+        }
+    }
+
+    pub const fn header_length(self) -> u16 {
+        u16::from_le(self.header_length)
+    }
+
+    pub const fn gso_size(self) -> u16 {
+        u16::from_le(self.gso_size)
+    }
+
+    pub const fn checksum_start(self) -> u16 {
+        u16::from_le(self.checksum_start)
+    }
+
+    pub const fn checksum_offset(self) -> u16 {
+        u16::from_le(self.checksum_offset)
+    }
+
+    pub const fn num_buffers(self) -> u16 {
+        u16::from_le(self.num_buffers)
+    }
+
+    pub const fn to_bytes(self) -> [u8; NET_HEADER_SIZE as usize] {
+        let header_length = self.header_length().to_le_bytes();
+        let gso_size = self.gso_size().to_le_bytes();
+        let checksum_start = self.checksum_start().to_le_bytes();
+        let checksum_offset = self.checksum_offset().to_le_bytes();
+        let num_buffers = self.num_buffers().to_le_bytes();
+        [
+            self.flags,
+            self.gso_type,
+            header_length[0],
+            header_length[1],
+            gso_size[0],
+            gso_size[1],
+            checksum_start[0],
+            checksum_start[1],
+            checksum_offset[0],
+            checksum_offset[1],
+            num_buffers[0],
+            num_buffers[1],
+        ]
+    }
+
+    pub const fn from_bytes(bytes: [u8; NET_HEADER_SIZE as usize]) -> Self {
+        Self {
+            flags: bytes[0],
+            gso_type: bytes[1],
+            header_length: u16::from_le_bytes([bytes[2], bytes[3]]).to_le(),
+            gso_size: u16::from_le_bytes([bytes[4], bytes[5]]).to_le(),
+            checksum_start: u16::from_le_bytes([bytes[6], bytes[7]]).to_le(),
+            checksum_offset: u16::from_le_bytes([bytes[8], bytes[9]]).to_le(),
+            num_buffers: u16::from_le_bytes([bytes[10], bytes[11]]).to_le(),
+        }
+    }
+
+    pub const fn is_plain_transmit(self) -> bool {
+        self.flags == 0
+            && self.gso_type == 0
+            && self.header_length() == 0
+            && self.gso_size() == 0
+            && self.checksum_start() == 0
+            && self.checksum_offset() == 0
+            && self.num_buffers() == 0
+    }
+
+    pub const fn is_plain_receive(self) -> bool {
+        // Without the corresponding offload features, the four middle u16
+        // fields carry no authority and must be ignored rather than treated as
+        // trusted metadata or a reason to reset a conforming device.
+        self.flags == 0 && self.gso_type == 0 && self.num_buffers() == 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetQueue {
+    Receive,
+    Transmit,
+}
+
+impl NetQueue {
+    pub const fn index(self) -> u16 {
+        match self {
+            Self::Receive => NET_RECEIVE_QUEUE,
+            Self::Transmit => NET_TRANSMIT_QUEUE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetOperation {
+    Receive,
+    Transmit { frame_length: u16 },
+}
+
+impl NetOperation {
+    pub const fn queue(self) -> NetQueue {
+        match self {
+            Self::Receive => NetQueue::Receive,
+            Self::Transmit { .. } => NetQueue::Transmit,
+        }
+    }
+
+    pub const fn frame_length(self) -> Option<u16> {
+        match self {
+            Self::Receive => None,
+            Self::Transmit { frame_length } => Some(frame_length),
+        }
+    }
+}
+
+/// Size of one contiguous DMA buffer holding header followed by frame bytes.
+pub const fn net_descriptor_length(operation: NetOperation) -> Option<u32> {
+    match operation {
+        NetOperation::Receive => Some(NET_RECEIVE_BUFFER_SIZE),
+        NetOperation::Transmit { frame_length }
+            if frame_length != 0 && frame_length as u32 <= NET_MAX_FRAME_SIZE =>
+        {
+            Some(NET_HEADER_SIZE + frame_length as u32)
+        }
+        NetOperation::Transmit { .. } => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetReceiveLengthError {
+    HeaderIncomplete { minimum: u32, observed: u32 },
+    BufferOverrun { maximum: u32, observed: u32 },
+}
+
+/// Validate `used.len` before a driver reads even the first header byte from
+/// RX DMA. This separate first-stage API prevents an under-reported completion
+/// from causing uninitialized header memory to be interpreted merely to call
+/// `NetDeviceModel::complete_receive`.
+pub const fn validate_net_receive_length(used_length: u32) -> Result<u16, NetReceiveLengthError> {
+    if used_length < NET_HEADER_SIZE {
+        return Err(NetReceiveLengthError::HeaderIncomplete {
+            minimum: NET_HEADER_SIZE,
+            observed: used_length,
+        });
+    }
+    if used_length > NET_RECEIVE_BUFFER_SIZE {
+        return Err(NetReceiveLengthError::BufferOverrun {
+            maximum: NET_RECEIVE_BUFFER_SIZE,
+            observed: used_length,
+        });
+    }
+    Ok((used_length - NET_HEADER_SIZE) as u16)
+}
+
+/// Build the one-descriptor network buffer required by the minimal profile.
+/// RX is wholly device-writable; TX is wholly device-readable. Keeping header
+/// and frame contiguous also makes a no-MRG receive packet exactly one Virtio
+/// buffer even though callers expose the two logical regions separately.
+pub fn build_net_descriptor(
+    operation: NetOperation,
+    buffer_address: u64,
+) -> Result<Descriptor, ChainError> {
+    if buffer_address == 0 {
+        return Err(ChainError::ZeroAddress);
+    }
+    let length = net_descriptor_length(operation).ok_or(ChainError::InvalidPacketLength {
+        observed: operation.frame_length().unwrap_or(0),
+    })?;
+    checked_end(buffer_address, length)?;
+    let flags = match operation {
+        NetOperation::Receive => DESC_F_WRITE,
+        NetOperation::Transmit { .. } => 0,
+    };
+    Ok(Descriptor::new(buffer_address, length, flags, 0))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlockRequestHeader {
@@ -561,6 +889,7 @@ pub enum ChainError {
     ZeroAddress,
     AddressOverflow,
     OverlappingBuffers,
+    InvalidPacketLength { observed: u16 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -971,6 +1300,495 @@ impl SplitQueueModel {
         self.state = QueueState::ResetRequired {
             reason: ResetReason::MalformedCompletion,
             abandoned,
+        };
+        Err(error)
+    }
+}
+
+// --- Modern Virtio network device model ----------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetToken {
+    pub epoch: u64,
+    pub serial: u64,
+    pub queue: NetQueue,
+    pub head: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetSubmission {
+    pub token: NetToken,
+    /// Producer index after publishing this head.
+    pub available_index: u16,
+    pub available_slot: u16,
+    pub operation: NetOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetReceiveCompletion {
+    pub submission: NetSubmission,
+    /// Bytes following the 12-byte Virtio header. A zero-length device frame
+    /// is represented here but remains rejected by `net::Packet`.
+    pub frame_length: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetTransmitCompletion {
+    pub submission: NetSubmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetResetReason {
+    Timeout,
+    Cancelled,
+    DriverFault,
+    DeviceNeedsReset,
+    MalformedCompletion,
+    ResetFailed,
+    IdentityExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetDeviceState {
+    Active,
+    ResetRequired {
+        reason: NetResetReason,
+    },
+    /// Status read back as zero and all old DMA is reusable, but the driver
+    /// must reinstall both virtqueues before publishing new buffers.
+    ResetConfirmed,
+    /// Terminal for this instance; only constructing a new model after driver
+    /// restart may publish DMA again.
+    Quarantined {
+        reason: NetResetReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetQueueError {
+    QueueFull {
+        queue: NetQueue,
+    },
+    InvalidPacketLength {
+        observed: usize,
+    },
+    ResetRequired,
+    ReinitializeRequired,
+    Quarantined,
+    NoUsedCompletion {
+        queue: NetQueue,
+    },
+    UsedIndexAdvancedTooFar {
+        queue: NetQueue,
+        pending: u16,
+        active: u8,
+    },
+    UsedIdOutOfRange {
+        queue: NetQueue,
+        observed: u32,
+    },
+    UsedIdNotActive {
+        queue: NetQueue,
+        observed: u16,
+    },
+    UsedLengthOutOfRange {
+        maximum: u32,
+        observed: u32,
+    },
+    UsedLengthTooShort {
+        minimum: u32,
+        observed: u32,
+    },
+    UnsupportedReceiveHeader {
+        observed: VirtioNetHeader,
+    },
+    StaleSession {
+        expected: u64,
+        observed: u64,
+    },
+    WrongToken,
+    ResetNotRequired,
+    ResetNotConfirmed {
+        observed_status: u32,
+    },
+    ReinitializeNotReady,
+    EpochExhausted,
+    SerialExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NetQueueBook {
+    available_index: u16,
+    used_index: u16,
+    active: [Option<NetSubmission>; SPLIT_QUEUE_SIZE as usize],
+    active_count: u8,
+}
+
+impl NetQueueBook {
+    const fn new() -> Self {
+        Self {
+            available_index: 0,
+            used_index: 0,
+            active: [None; SPLIT_QUEUE_SIZE as usize],
+            active_count: 0,
+        }
+    }
+
+    fn free_head(&self) -> Option<u16> {
+        self.active
+            .iter()
+            .position(Option::is_none)
+            .map(|index| index as u16)
+    }
+}
+
+/// Allocation-free lifecycle model for the minimal modern network device.
+///
+/// Receive queue 0 and transmit queue 1 each permit eight in-flight buffers.
+/// They have independent wrapping ring cursors but share one non-zero epoch
+/// and one reset/quarantine boundary, because a status=0 device reset stops
+/// both virtqueues. Any malformed completion therefore quarantines every
+/// exposed RX and TX DMA buffer until reset is confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetDeviceModel {
+    epoch: u64,
+    next_serial: u64,
+    receive: NetQueueBook,
+    transmit: NetQueueBook,
+    state: NetDeviceState,
+}
+
+impl Default for NetDeviceModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NetDeviceModel {
+    pub const fn new() -> Self {
+        Self {
+            epoch: 1,
+            next_serial: 1,
+            receive: NetQueueBook::new(),
+            transmit: NetQueueBook::new(),
+            state: NetDeviceState::Active,
+        }
+    }
+
+    pub const fn at_epoch(epoch: u64) -> Option<Self> {
+        Self::at_epoch_and_serial(epoch, 1)
+    }
+
+    /// Test/support constructor for a caller-persisted non-zero identity
+    /// cursor. Neither value may be zero.
+    pub const fn at_epoch_and_serial(epoch: u64, next_serial: u64) -> Option<Self> {
+        if epoch == 0 || next_serial == 0 {
+            None
+        } else {
+            Some(Self {
+                epoch,
+                next_serial,
+                receive: NetQueueBook::new(),
+                transmit: NetQueueBook::new(),
+                state: NetDeviceState::Active,
+            })
+        }
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn state(&self) -> NetDeviceState {
+        self.state
+    }
+
+    pub const fn queue_size(&self) -> u16 {
+        SPLIT_QUEUE_SIZE
+    }
+
+    pub const fn available_index(&self, queue: NetQueue) -> u16 {
+        self.book(queue).available_index
+    }
+
+    pub const fn used_index(&self, queue: NetQueue) -> u16 {
+        self.book(queue).used_index
+    }
+
+    pub const fn inflight(&self, queue: NetQueue) -> u8 {
+        self.book(queue).active_count
+    }
+
+    pub const fn active_submission(&self, queue: NetQueue, head: u16) -> Option<NetSubmission> {
+        if head >= SPLIT_QUEUE_SIZE {
+            None
+        } else {
+            self.book(queue).active[head as usize]
+        }
+    }
+
+    /// Whether one descriptor/DMA slot is safe to clear or initialize. In
+    /// `ResetConfirmed` the old device no longer owns it, but publication is
+    /// still forbidden until `reinitialize` returns the model to `Active`.
+    pub const fn slot_reusable(&self, queue: NetQueue, head: u16) -> bool {
+        if head >= SPLIT_QUEUE_SIZE {
+            return false;
+        }
+        matches!(
+            self.state,
+            NetDeviceState::Active | NetDeviceState::ResetConfirmed
+        ) && self.book(queue).active[head as usize].is_none()
+    }
+
+    pub const fn all_dma_reusable(&self) -> bool {
+        matches!(
+            self.state,
+            NetDeviceState::Active | NetDeviceState::ResetConfirmed
+        ) && self.receive.active_count == 0
+            && self.transmit.active_count == 0
+    }
+
+    pub fn post_receive(&mut self) -> Result<NetSubmission, NetQueueError> {
+        self.submit(NetOperation::Receive)
+    }
+
+    pub fn submit_transmit(&mut self, frame_length: usize) -> Result<NetSubmission, NetQueueError> {
+        self.require_active()?;
+        if frame_length == 0 || frame_length > NET_MAX_FRAME_SIZE as usize {
+            return Err(NetQueueError::InvalidPacketLength {
+                observed: frame_length,
+            });
+        }
+        self.submit(NetOperation::Transmit {
+            frame_length: frame_length as u16,
+        })
+    }
+
+    pub fn complete_receive(
+        &mut self,
+        observed_used_index: u16,
+        used: UsedElement,
+        header: VirtioNetHeader,
+    ) -> Result<NetReceiveCompletion, NetQueueError> {
+        let (head, submission) =
+            self.validate_used(NetQueue::Receive, observed_used_index, used)?;
+        let length = used.length();
+        let frame_length = match validate_net_receive_length(length) {
+            Ok(frame_length) => frame_length,
+            Err(NetReceiveLengthError::BufferOverrun { maximum, observed }) => {
+                return self.malformed(NetQueueError::UsedLengthOutOfRange { maximum, observed });
+            }
+            Err(NetReceiveLengthError::HeaderIncomplete { minimum, observed }) => {
+                return self.malformed(NetQueueError::UsedLengthTooShort { minimum, observed });
+            }
+        };
+        if !header.is_plain_receive() {
+            return self.malformed(NetQueueError::UnsupportedReceiveHeader { observed: header });
+        }
+        self.finish(NetQueue::Receive, head, observed_used_index);
+        Ok(NetReceiveCompletion {
+            submission,
+            frame_length,
+        })
+    }
+
+    pub fn complete_transmit(
+        &mut self,
+        observed_used_index: u16,
+        used: UsedElement,
+    ) -> Result<NetTransmitCompletion, NetQueueError> {
+        let (head, submission) =
+            self.validate_used(NetQueue::Transmit, observed_used_index, used)?;
+        // TX exposes no device-writable bytes. Virtio specifies no useful
+        // completion length here, and historical devices report either zero or
+        // the descriptor length, so the value is deliberately ignored.
+        self.finish(NetQueue::Transmit, head, observed_used_index);
+        Ok(NetTransmitCompletion { submission })
+    }
+
+    pub fn timeout(&mut self, token: NetToken) -> Result<(), NetQueueError> {
+        self.abandon(token, NetResetReason::Timeout)
+    }
+
+    pub fn cancel(&mut self, token: NetToken) -> Result<(), NetQueueError> {
+        self.abandon(token, NetResetReason::Cancelled)
+    }
+
+    /// Require one status=0 reset for both queues. Existing active slot records
+    /// remain intact so no exposed DMA can be reused early.
+    pub fn require_reset(&mut self, reason: NetResetReason) {
+        if !matches!(self.state, NetDeviceState::Quarantined { .. }) {
+            self.state = NetDeviceState::ResetRequired { reason };
+        }
+    }
+
+    /// Permanently fail closed after a bounded reset attempt could not confirm
+    /// status zero. This instance exposes no recovery transition.
+    pub fn quarantine(&mut self, reason: NetResetReason) {
+        self.state = NetDeviceState::Quarantined { reason };
+    }
+
+    /// Confirm status zero, release both DMA books together, and advance the
+    /// shared epoch. Queue publication remains blocked until `reinitialize`.
+    pub fn confirm_reset(&mut self, observed_status: u32) -> Result<(), NetQueueError> {
+        match self.state {
+            NetDeviceState::Quarantined { .. } => return Err(NetQueueError::Quarantined),
+            NetDeviceState::ResetRequired { .. } => {}
+            _ => return Err(NetQueueError::ResetNotRequired),
+        }
+        if observed_status != 0 {
+            return Err(NetQueueError::ResetNotConfirmed { observed_status });
+        }
+        let Some(epoch) = self.epoch.checked_add(1) else {
+            return Err(NetQueueError::EpochExhausted);
+        };
+        self.epoch = epoch;
+        self.next_serial = 1;
+        self.receive = NetQueueBook::new();
+        self.transmit = NetQueueBook::new();
+        self.state = NetDeviceState::ResetConfirmed;
+        Ok(())
+    }
+
+    /// Mark both freshly reset queue structures ready for publication.
+    pub fn reinitialize(&mut self) -> Result<(), NetQueueError> {
+        match self.state {
+            NetDeviceState::ResetConfirmed => {
+                self.state = NetDeviceState::Active;
+                Ok(())
+            }
+            NetDeviceState::Quarantined { .. } => Err(NetQueueError::Quarantined),
+            _ => Err(NetQueueError::ReinitializeNotReady),
+        }
+    }
+
+    fn submit(&mut self, operation: NetOperation) -> Result<NetSubmission, NetQueueError> {
+        self.require_active()?;
+        let queue = operation.queue();
+        let (head, previous) = {
+            let book = self.book(queue);
+            let Some(head) = book.free_head() else {
+                return Err(NetQueueError::QueueFull { queue });
+            };
+            (head, book.available_index)
+        };
+        let Some(serial_after) = self.next_serial.checked_add(1) else {
+            self.state = NetDeviceState::Quarantined {
+                reason: NetResetReason::IdentityExhausted,
+            };
+            return Err(NetQueueError::SerialExhausted);
+        };
+        let serial = self.next_serial;
+        let epoch = self.epoch;
+        let book = self.book_mut(queue);
+        let submission = NetSubmission {
+            token: NetToken {
+                epoch,
+                serial,
+                queue,
+                head,
+            },
+            available_index: advance_ring_index(previous),
+            available_slot: ring_slot(previous),
+            operation,
+        };
+        book.available_index = submission.available_index;
+        book.active[head as usize] = Some(submission);
+        book.active_count += 1;
+        self.next_serial = serial_after;
+        Ok(submission)
+    }
+
+    fn validate_used(
+        &mut self,
+        queue: NetQueue,
+        observed_used_index: u16,
+        used: UsedElement,
+    ) -> Result<(u16, NetSubmission), NetQueueError> {
+        self.require_active()?;
+        let book = self.book(queue);
+        let pending = observed_used_index.wrapping_sub(book.used_index);
+        if pending == 0 {
+            return Err(NetQueueError::NoUsedCompletion { queue });
+        }
+        if pending > book.active_count as u16 {
+            return self.malformed(NetQueueError::UsedIndexAdvancedTooFar {
+                queue,
+                pending,
+                active: book.active_count,
+            });
+        }
+        let used_id = used.id();
+        if used_id >= SPLIT_QUEUE_SIZE as u32 {
+            return self.malformed(NetQueueError::UsedIdOutOfRange {
+                queue,
+                observed: used_id,
+            });
+        }
+        let head = used_id as u16;
+        let Some(submission) = book.active[head as usize] else {
+            return self.malformed(NetQueueError::UsedIdNotActive {
+                queue,
+                observed: head,
+            });
+        };
+        Ok((head, submission))
+    }
+
+    fn finish(&mut self, queue: NetQueue, head: u16, _observed_used_index: u16) {
+        let book = self.book_mut(queue);
+        book.active[head as usize] = None;
+        book.active_count -= 1;
+        // Consume exactly the UsedElement validated by this call. If the
+        // device published a batch, subsequent calls retain the same observed
+        // device index and drain one ring element at a time.
+        book.used_index = advance_ring_index(book.used_index);
+    }
+
+    fn abandon(&mut self, token: NetToken, reason: NetResetReason) -> Result<(), NetQueueError> {
+        if token.epoch != self.epoch {
+            return Err(NetQueueError::StaleSession {
+                expected: self.epoch,
+                observed: token.epoch,
+            });
+        }
+        self.require_active()?;
+        if token.head >= SPLIT_QUEUE_SIZE
+            || self.book(token.queue).active[token.head as usize]
+                .is_none_or(|submission| submission.token != token)
+        {
+            return Err(NetQueueError::WrongToken);
+        }
+        self.state = NetDeviceState::ResetRequired { reason };
+        Ok(())
+    }
+
+    fn require_active(&self) -> Result<(), NetQueueError> {
+        match self.state {
+            NetDeviceState::Active => Ok(()),
+            NetDeviceState::ResetRequired { .. } => Err(NetQueueError::ResetRequired),
+            NetDeviceState::ResetConfirmed => Err(NetQueueError::ReinitializeRequired),
+            NetDeviceState::Quarantined { .. } => Err(NetQueueError::Quarantined),
+        }
+    }
+
+    const fn book(&self, queue: NetQueue) -> &NetQueueBook {
+        match queue {
+            NetQueue::Receive => &self.receive,
+            NetQueue::Transmit => &self.transmit,
+        }
+    }
+
+    fn book_mut(&mut self, queue: NetQueue) -> &mut NetQueueBook {
+        match queue {
+            NetQueue::Receive => &mut self.receive,
+            NetQueue::Transmit => &mut self.transmit,
+        }
+    }
+
+    fn malformed<T>(&mut self, error: NetQueueError) -> Result<T, NetQueueError> {
+        self.state = NetDeviceState::ResetRequired {
+            reason: NetResetReason::MalformedCompletion,
         };
         Err(error)
     }

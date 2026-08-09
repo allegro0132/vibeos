@@ -1,0 +1,9 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> net fault
+[!] panic: panicked at kernel/src/virtio_net.rs:LINE:COL:
+injected virtio-net fault after DMA publication
+  network fault recovery: reset confirmed, generation 1 -> 2, handshake ok
+vibe> halt
+  powering off.

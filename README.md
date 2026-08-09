@@ -24,6 +24,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/PERSISTENT_CSPACE.md](docs/PERSISTENT_CSPACE.md)** — the fixed
   `persistent-test` CSpace, external root policy, atomic recovery install, and
   three-boot acceptance boundary.
+- **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
+  typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
@@ -299,6 +301,9 @@ bench           emit the versioned machine-readable benchmark suite
 durable         recover a sealed capability log and tombstone
 blk info        report the supervised virtio-blk transport and capacity
 blk test        read, write, flush, read back, and verify the real backing disk
+net info        report the supervised modern virtio-net transport and queue state
+net test        exchange a typed raw-L2 challenge with the localhost test peer
+net fault       fault after TX publication, reset/restart, then repeat the exchange
 rustc edit      type your own program; end it with a lone `.`
 pcspace test    exercise the three-boot persistent CSpace lifecycle
 probe           attempt four illegal operations, show the refusals
@@ -376,3 +381,6 @@ Deliberate, not overlooked:
 - **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.
+- **Networking is raw Ethernet only.** M4.4 carries owned `Packet` values through
+  bounded typed endpoints; it does not yet provide ARP, IP, UDP/TCP, DNS, or a
+  POSIX byte-stream socket API.

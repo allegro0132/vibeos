@@ -4,7 +4,7 @@
 //! zero; a live modern transport has the virtio magic, version 2, and a
 //! non-zero device id.  This module deliberately contains only volatile MMIO
 //! access and transport sequencing.  Queue ownership and descriptor safety
-//! live in `virtio_blk`.
+//! live in the supervised `virtio_blk` and `virtio_net` drivers.
 
 use core::arch::asm;
 
@@ -15,6 +15,7 @@ pub const VIRTIO_MMIO_FIRST_IRQ: u32 = 1;
 
 pub const VIRTIO_MAGIC: u32 = 0x7472_6976;
 pub const VIRTIO_MODERN_VERSION: u32 = 2;
+pub const VIRTIO_DEVICE_NETWORK: u32 = 1;
 pub const VIRTIO_DEVICE_BLOCK: u32 = 2;
 
 const MAGIC_VALUE: usize = 0x000;
@@ -80,6 +81,14 @@ impl MmioTransport {
         (0..VIRTIO_MMIO_SLOTS)
             .filter_map(Self::probe_slot)
             .find(|transport| transport.device_id() == VIRTIO_DEVICE_BLOCK)
+    }
+
+    /// Find the first modern virtio network transport. Other device types and
+    /// legacy (version 1) transports are deliberately skipped.
+    pub fn scan_network() -> Option<Self> {
+        (0..VIRTIO_MMIO_SLOTS)
+            .filter_map(Self::probe_slot)
+            .find(|transport| transport.device_id() == VIRTIO_DEVICE_NETWORK)
     }
 
     pub const fn base(self) -> usize {

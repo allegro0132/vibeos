@@ -1,0 +1,4 @@
+quiet
+net info
+net test
+halt

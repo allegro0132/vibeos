@@ -844,3 +844,635 @@ fn queue_ring_indices_really_cross_the_u16_boundary() {
     assert_eq!(queue.used_index(), 0);
     assert_eq!(queue.state(), QueueState::Idle);
 }
+
+// --- ROADMAP M4.4: minimal modern virtio-net -----------------------------
+
+fn complete_net_rx(
+    device: &mut NetDeviceModel,
+    submission: NetSubmission,
+    used_length: u32,
+) -> NetReceiveCompletion {
+    device
+        .complete_receive(
+            device.used_index(NetQueue::Receive).wrapping_add(1),
+            UsedElement::new(submission.token.head as u32, used_length),
+            VirtioNetHeader::received_without_offload(),
+        )
+        .unwrap()
+}
+
+fn complete_net_tx(
+    device: &mut NetDeviceModel,
+    submission: NetSubmission,
+    used_length: u32,
+) -> NetTransmitCompletion {
+    device
+        .complete_transmit(
+            device.used_index(NetQueue::Transmit).wrapping_add(1),
+            UsedElement::new(submission.token.head as u32, used_length),
+        )
+        .unwrap()
+}
+
+#[test]
+fn modern_network_identity_queues_and_minimal_features_are_exact() {
+    assert_eq!(DEVICE_ID_NETWORK, 1);
+    assert_eq!(NET_RECEIVE_QUEUE, 0);
+    assert_eq!(NET_TRANSMIT_QUEUE, 1);
+    assert_eq!(NET_QUEUE_SIZE, 8);
+    assert_eq!(NET_HEADER_SIZE, 12);
+    assert_eq!(NET_MAX_FRAME_SIZE, 1_514);
+    assert_eq!(NET_RECEIVE_BUFFER_SIZE, 1_526);
+    assert_eq!(NetQueue::Receive.index(), NET_RECEIVE_QUEUE);
+    assert_eq!(NetQueue::Transmit.index(), NET_TRANSMIT_QUEUE);
+
+    let valid = MmioIdentity {
+        magic: MMIO_MAGIC_VALUE,
+        version: MMIO_VERSION_MODERN,
+        device_id: DEVICE_ID_NETWORK,
+        vendor_id: 0x554d_4551,
+    };
+    assert_eq!(probe_modern_net(valid), Ok(()));
+    assert_eq!(
+        probe_modern_net(MmioIdentity { magic: 0, ..valid }),
+        Err(ProbeError::BadMagic { observed: 0 })
+    );
+    assert_eq!(
+        probe_modern_net(MmioIdentity {
+            version: 1,
+            ..valid
+        }),
+        Err(ProbeError::LegacyTransport { observed: 1 })
+    );
+    assert_eq!(
+        probe_modern_net(MmioIdentity {
+            version: 3,
+            ..valid
+        }),
+        Err(ProbeError::UnsupportedVersion { observed: 3 })
+    );
+    assert_eq!(
+        probe_modern_net(MmioIdentity {
+            device_id: DEVICE_ID_BLOCK,
+            ..valid
+        }),
+        Err(ProbeError::NotNetworkDevice {
+            observed: DEVICE_ID_BLOCK
+        })
+    );
+
+    assert_eq!(
+        negotiate_net_features(VIRTIO_NET_F_MAC),
+        Err(FeatureError::MissingVersion1)
+    );
+    let optional = VIRTIO_NET_F_CSUM
+        | VIRTIO_NET_F_GUEST_CSUM
+        | VIRTIO_NET_F_MAC
+        | VIRTIO_NET_F_GUEST_TSO4
+        | VIRTIO_NET_F_HOST_TSO6
+        | VIRTIO_NET_F_MRG_RXBUF
+        | VIRTIO_NET_F_CTRL_VQ
+        | VIRTIO_NET_F_MQ
+        | VIRTIO_RING_F_INDIRECT_DESC
+        | VIRTIO_RING_F_EVENT_IDX
+        | VIRTIO_F_ACCESS_PLATFORM
+        | VIRTIO_F_RING_PACKED;
+    let features = negotiate_net_features(VIRTIO_F_VERSION_1 | optional).unwrap();
+    assert_eq!(features.accepted(), VIRTIO_F_VERSION_1);
+    assert_eq!(features.rejected(), optional);
+
+    let mut init = ModernInit::new();
+    init.acknowledge().unwrap();
+    init.declare_driver().unwrap();
+    assert_eq!(
+        init.select_net_features(VIRTIO_F_VERSION_1 | optional)
+            .unwrap()
+            .accepted(),
+        VIRTIO_F_VERSION_1
+    );
+}
+
+#[test]
+fn modern_net_header_is_12_byte_little_endian_and_ignores_unused_rx_fields() {
+    assert_eq!(size_of::<VirtioNetHeader>(), 12);
+    assert_eq!(align_of::<VirtioNetHeader>(), 2);
+    assert_eq!(VirtioNetHeader::transmit().to_bytes(), [0; 12]);
+    assert!(VirtioNetHeader::transmit().is_plain_transmit());
+
+    let bytes = [0, 0, 0x22, 0x11, 0x44, 0x33, 0x66, 0x55, 0x88, 0x77, 1, 0];
+    let header = VirtioNetHeader::from_bytes(bytes);
+    assert_eq!(header.to_bytes(), bytes);
+    assert_eq!(header.header_length(), 0x1122);
+    assert_eq!(header.gso_size(), 0x3344);
+    assert_eq!(header.checksum_start(), 0x5566);
+    assert_eq!(header.checksum_offset(), 0x7788);
+    assert_eq!(header.num_buffers(), 1);
+    assert!(
+        header.is_plain_receive(),
+        "unnegotiated u16 offload fields are ignored, never consumed"
+    );
+
+    for malformed in [
+        VirtioNetHeader {
+            flags: 1,
+            ..VirtioNetHeader::received_without_offload()
+        },
+        VirtioNetHeader {
+            gso_type: 1,
+            ..VirtioNetHeader::received_without_offload()
+        },
+        VirtioNetHeader {
+            num_buffers: 0,
+            ..VirtioNetHeader::received_without_offload()
+        },
+        VirtioNetHeader {
+            num_buffers: 2u16.to_le(),
+            ..VirtioNetHeader::received_without_offload()
+        },
+    ] {
+        assert!(!malformed.is_plain_receive());
+    }
+}
+
+#[test]
+fn net_descriptors_are_one_contiguous_buffer_with_exact_direction_and_bounds() {
+    let receive = build_net_descriptor(NetOperation::Receive, 0x1000).unwrap();
+    assert_eq!(receive.address(), 0x1000);
+    assert_eq!(receive.length(), 1_526);
+    assert_eq!(receive.flags(), DESC_F_WRITE);
+    assert_eq!(receive.next(), 0);
+
+    for length in [1, 60, 1_500, 1_514] {
+        let operation = NetOperation::Transmit {
+            frame_length: length,
+        };
+        let transmit = build_net_descriptor(operation, 0x2000).unwrap();
+        assert_eq!(transmit.length(), NET_HEADER_SIZE + length as u32);
+        assert_eq!(transmit.flags(), 0);
+        assert!(!transmit.device_writable());
+        assert_eq!(net_descriptor_length(operation), Some(12 + length as u32));
+    }
+
+    assert_eq!(
+        build_net_descriptor(NetOperation::Receive, 0),
+        Err(ChainError::ZeroAddress)
+    );
+    assert_eq!(
+        build_net_descriptor(NetOperation::Receive, u64::MAX - 1_000),
+        Err(ChainError::AddressOverflow)
+    );
+    for length in [0, 1_515, u16::MAX] {
+        let operation = NetOperation::Transmit {
+            frame_length: length,
+        };
+        assert_eq!(net_descriptor_length(operation), None);
+        assert_eq!(
+            build_net_descriptor(operation, 0x2000),
+            Err(ChainError::InvalidPacketLength { observed: length })
+        );
+    }
+}
+
+#[test]
+fn both_network_queues_are_independently_bounded_at_eight() {
+    let mut device = NetDeviceModel::new();
+    let mut receive = Vec::new();
+    let mut transmit = Vec::new();
+    for index in 0..NET_QUEUE_SIZE {
+        let rx = device.post_receive().unwrap();
+        let tx = device.submit_transmit(index as usize + 1).unwrap();
+        assert_eq!(rx.token.queue, NetQueue::Receive);
+        assert_eq!(tx.token.queue, NetQueue::Transmit);
+        assert_eq!(rx.token.head, index);
+        assert_eq!(tx.token.head, index);
+        assert_eq!(rx.available_slot, index);
+        assert_eq!(tx.available_slot, index);
+        receive.push(rx);
+        transmit.push(tx);
+    }
+    assert_eq!(device.inflight(NetQueue::Receive), 8);
+    assert_eq!(device.inflight(NetQueue::Transmit), 8);
+    assert_eq!(
+        device.post_receive(),
+        Err(NetQueueError::QueueFull {
+            queue: NetQueue::Receive
+        })
+    );
+    assert_eq!(
+        device.submit_transmit(64),
+        Err(NetQueueError::QueueFull {
+            queue: NetQueue::Transmit
+        })
+    );
+    assert_eq!(device.available_index(NetQueue::Receive), 8);
+    assert_eq!(device.available_index(NetQueue::Transmit), 8);
+
+    // Descriptor head allocation is independent from the wrapping available
+    // ring slot: an out-of-order completion frees head 3 while avail slot 0 is
+    // published next.
+    complete_net_rx(&mut device, receive[3], NET_HEADER_SIZE + 60);
+    let replacement = device.post_receive().unwrap();
+    assert_eq!(replacement.token.head, 3);
+    assert_eq!(replacement.available_slot, 0);
+    assert!(replacement.token.serial > transmit[7].token.serial);
+}
+
+#[test]
+fn receive_completion_checks_bounds_before_header_and_ignores_unused_fields() {
+    assert_eq!(
+        validate_net_receive_length(11),
+        Err(NetReceiveLengthError::HeaderIncomplete {
+            minimum: 12,
+            observed: 11,
+        })
+    );
+    assert_eq!(validate_net_receive_length(12), Ok(0));
+    assert_eq!(validate_net_receive_length(13), Ok(1));
+    assert_eq!(validate_net_receive_length(1_526), Ok(1_514));
+    assert_eq!(
+        validate_net_receive_length(1_527),
+        Err(NetReceiveLengthError::BufferOverrun {
+            maximum: 1_526,
+            observed: 1_527,
+        })
+    );
+
+    for (used_length, frame_length) in [(12, 0), (13, 1), (1_526, 1_514)] {
+        let mut device = NetDeviceModel::new();
+        let submission = device.post_receive().unwrap();
+        let completion = device
+            .complete_receive(
+                1,
+                UsedElement::new(submission.token.head as u32, used_length),
+                VirtioNetHeader::from_bytes([0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0]),
+            )
+            .unwrap();
+        assert_eq!(completion.frame_length, frame_length);
+        assert_eq!(device.inflight(NetQueue::Receive), 0);
+    }
+
+    for (used_length, expected) in [
+        (
+            11,
+            NetQueueError::UsedLengthTooShort {
+                minimum: 12,
+                observed: 11,
+            },
+        ),
+        (
+            1_527,
+            NetQueueError::UsedLengthOutOfRange {
+                maximum: 1_526,
+                observed: 1_527,
+            },
+        ),
+    ] {
+        let mut device = NetDeviceModel::new();
+        let submission = device.post_receive().unwrap();
+        // Deliberately malformed too: a short used length must be rejected
+        // before this header can be interpreted.
+        let malformed_header = VirtioNetHeader {
+            flags: 0xff,
+            ..VirtioNetHeader::default()
+        };
+        assert_eq!(
+            device.complete_receive(
+                1,
+                UsedElement::new(submission.token.head as u32, used_length),
+                malformed_header,
+            ),
+            Err(expected)
+        );
+        assert_eq!(
+            device.state(),
+            NetDeviceState::ResetRequired {
+                reason: NetResetReason::MalformedCompletion
+            }
+        );
+    }
+}
+
+#[test]
+fn unsupported_receive_metadata_quarantines_both_queues_until_reset() {
+    for header in [
+        VirtioNetHeader {
+            flags: 1,
+            ..VirtioNetHeader::received_without_offload()
+        },
+        VirtioNetHeader {
+            gso_type: 1,
+            ..VirtioNetHeader::received_without_offload()
+        },
+        VirtioNetHeader {
+            num_buffers: 2u16.to_le(),
+            ..VirtioNetHeader::received_without_offload()
+        },
+    ] {
+        let mut device = NetDeviceModel::new();
+        let receive = device.post_receive().unwrap();
+        let transmit = device.submit_transmit(60).unwrap();
+        assert_eq!(
+            device.complete_receive(1, UsedElement::new(receive.token.head as u32, 72), header,),
+            Err(NetQueueError::UnsupportedReceiveHeader { observed: header })
+        );
+        assert_eq!(device.inflight(NetQueue::Receive), 1);
+        assert_eq!(device.inflight(NetQueue::Transmit), 1);
+        assert!(!device.slot_reusable(NetQueue::Receive, receive.token.head));
+        assert!(!device.slot_reusable(NetQueue::Transmit, transmit.token.head));
+        assert_eq!(
+            device.complete_transmit(1, UsedElement::new(transmit.token.head as u32, 0)),
+            Err(NetQueueError::ResetRequired)
+        );
+    }
+}
+
+#[test]
+fn transmit_completion_ignores_the_reserved_used_length() {
+    for reported in [0, 1, NET_HEADER_SIZE + 60, u32::MAX] {
+        let mut device = NetDeviceModel::new();
+        let submission = device.submit_transmit(60).unwrap();
+        let completion = complete_net_tx(&mut device, submission, reported);
+        assert_eq!(completion.submission, submission);
+        assert!(device.slot_reusable(NetQueue::Transmit, submission.token.head));
+    }
+}
+
+#[test]
+fn batched_and_out_of_order_used_entries_advance_one_cursor_at_a_time() {
+    let mut device = NetDeviceModel::new();
+    let submissions = [
+        device.post_receive().unwrap(),
+        device.post_receive().unwrap(),
+        device.post_receive().unwrap(),
+    ];
+
+    for submission in [submissions[2], submissions[0], submissions[1]] {
+        let completion = device
+            .complete_receive(
+                3,
+                UsedElement::new(submission.token.head as u32, 72),
+                VirtioNetHeader::received_without_offload(),
+            )
+            .unwrap();
+        assert_eq!(completion.submission, submission);
+    }
+    assert_eq!(device.used_index(NetQueue::Receive), 3);
+    assert_eq!(device.inflight(NetQueue::Receive), 0);
+}
+
+#[test]
+fn no_used_entry_is_benign_but_every_malformed_used_field_requires_device_reset() {
+    let mut no_completion = NetDeviceModel::new();
+    let active = no_completion.post_receive().unwrap();
+    assert_eq!(
+        no_completion.complete_receive(
+            0,
+            UsedElement::new(active.token.head as u32, 72),
+            VirtioNetHeader::received_without_offload(),
+        ),
+        Err(NetQueueError::NoUsedCompletion {
+            queue: NetQueue::Receive
+        })
+    );
+    assert_eq!(no_completion.state(), NetDeviceState::Active);
+    assert_eq!(
+        no_completion.active_submission(NetQueue::Receive, 0),
+        Some(active)
+    );
+
+    let cases = [
+        (
+            2,
+            UsedElement::new(0, 72),
+            NetQueueError::UsedIndexAdvancedTooFar {
+                queue: NetQueue::Receive,
+                pending: 2,
+                active: 1,
+            },
+        ),
+        (
+            1,
+            UsedElement::new(8, 72),
+            NetQueueError::UsedIdOutOfRange {
+                queue: NetQueue::Receive,
+                observed: 8,
+            },
+        ),
+        (
+            1,
+            UsedElement::new(1, 72),
+            NetQueueError::UsedIdNotActive {
+                queue: NetQueue::Receive,
+                observed: 1,
+            },
+        ),
+    ];
+    for (observed_index, used, expected) in cases {
+        let mut device = NetDeviceModel::new();
+        device.post_receive().unwrap();
+        assert_eq!(
+            device.complete_receive(
+                observed_index,
+                used,
+                VirtioNetHeader::received_without_offload(),
+            ),
+            Err(expected)
+        );
+        assert_eq!(
+            device.state(),
+            NetDeviceState::ResetRequired {
+                reason: NetResetReason::MalformedCompletion
+            }
+        );
+    }
+
+    let mut duplicate = NetDeviceModel::new();
+    let first = duplicate.post_receive().unwrap();
+    let second = duplicate.post_receive().unwrap();
+    complete_net_rx(&mut duplicate, first, 72);
+    assert_eq!(
+        duplicate.complete_receive(
+            2,
+            UsedElement::new(first.token.head as u32, 72),
+            VirtioNetHeader::received_without_offload(),
+        ),
+        Err(NetQueueError::UsedIdNotActive {
+            queue: NetQueue::Receive,
+            observed: first.token.head
+        })
+    );
+    assert_eq!(
+        duplicate.active_submission(NetQueue::Receive, second.token.head),
+        Some(second)
+    );
+}
+
+#[test]
+fn wrong_stale_and_cross_queue_tokens_never_steal_live_dma() {
+    let mut device = NetDeviceModel::new();
+    let receive = device.post_receive().unwrap();
+    let transmit = device.submit_transmit(60).unwrap();
+
+    for wrong in [
+        NetToken {
+            serial: receive.token.serial + 1,
+            ..receive.token
+        },
+        NetToken {
+            queue: NetQueue::Transmit,
+            ..receive.token
+        },
+        NetToken {
+            head: 7,
+            ..receive.token
+        },
+    ] {
+        assert_eq!(device.cancel(wrong), Err(NetQueueError::WrongToken));
+        assert_eq!(device.state(), NetDeviceState::Active);
+    }
+    let stale = NetToken {
+        epoch: receive.token.epoch - 1,
+        ..receive.token
+    };
+    assert_eq!(
+        device.timeout(stale),
+        Err(NetQueueError::StaleSession {
+            expected: receive.token.epoch,
+            observed: stale.epoch,
+        })
+    );
+    assert_eq!(
+        device.active_submission(NetQueue::Receive, receive.token.head),
+        Some(receive)
+    );
+    assert_eq!(
+        device.active_submission(NetQueue::Transmit, transmit.token.head),
+        Some(transmit)
+    );
+}
+
+#[test]
+fn reset_is_device_wide_and_requires_zero_then_reinitialization() {
+    let mut device = NetDeviceModel::new();
+    let receive = device.post_receive().unwrap();
+    let transmit = device.submit_transmit(60).unwrap();
+    assert_eq!(device.timeout(receive.token), Ok(()));
+    assert_eq!(
+        device.state(),
+        NetDeviceState::ResetRequired {
+            reason: NetResetReason::Timeout
+        }
+    );
+    assert_eq!(device.post_receive(), Err(NetQueueError::ResetRequired));
+    assert_eq!(
+        device.complete_transmit(1, UsedElement::new(transmit.token.head as u32, 0)),
+        Err(NetQueueError::ResetRequired)
+    );
+    assert!(!device.all_dma_reusable());
+    assert_eq!(
+        device.confirm_reset(STATUS_ACKNOWLEDGE),
+        Err(NetQueueError::ResetNotConfirmed {
+            observed_status: STATUS_ACKNOWLEDGE
+        })
+    );
+    assert_eq!(device.inflight(NetQueue::Receive), 1);
+    assert_eq!(device.inflight(NetQueue::Transmit), 1);
+
+    assert_eq!(device.confirm_reset(0), Ok(()));
+    assert_eq!(device.state(), NetDeviceState::ResetConfirmed);
+    assert_eq!(device.epoch(), receive.token.epoch + 1);
+    assert_eq!(device.inflight(NetQueue::Receive), 0);
+    assert_eq!(device.inflight(NetQueue::Transmit), 0);
+    assert_eq!(device.available_index(NetQueue::Receive), 0);
+    assert_eq!(device.used_index(NetQueue::Transmit), 0);
+    assert!(device.all_dma_reusable());
+    assert_eq!(
+        device.submit_transmit(60),
+        Err(NetQueueError::ReinitializeRequired)
+    );
+    assert_eq!(device.reinitialize(), Ok(()));
+    assert_eq!(device.state(), NetDeviceState::Active);
+    let fresh = device.submit_transmit(60).unwrap();
+    assert_eq!(fresh.token.epoch, receive.token.epoch + 1);
+    assert_eq!(
+        device.cancel(transmit.token),
+        Err(NetQueueError::StaleSession {
+            expected: fresh.token.epoch,
+            observed: transmit.token.epoch,
+        })
+    );
+    assert_eq!(
+        device.active_submission(NetQueue::Transmit, fresh.token.head),
+        Some(fresh)
+    );
+}
+
+#[test]
+fn terminal_network_quarantine_and_identity_exhaustion_fail_closed() {
+    let mut device = NetDeviceModel::new();
+    let receive = device.post_receive().unwrap();
+    device.quarantine(NetResetReason::ResetFailed);
+    assert_eq!(
+        device.state(),
+        NetDeviceState::Quarantined {
+            reason: NetResetReason::ResetFailed
+        }
+    );
+    assert_eq!(device.post_receive(), Err(NetQueueError::Quarantined));
+    assert_eq!(device.submit_transmit(0), Err(NetQueueError::Quarantined));
+    assert_eq!(
+        device.cancel(receive.token),
+        Err(NetQueueError::Quarantined)
+    );
+    assert_eq!(device.confirm_reset(0), Err(NetQueueError::Quarantined));
+    assert_eq!(device.reinitialize(), Err(NetQueueError::Quarantined));
+    assert!(!device.slot_reusable(NetQueue::Receive, receive.token.head));
+    device.require_reset(NetResetReason::DriverFault);
+    assert!(matches!(device.state(), NetDeviceState::Quarantined { .. }));
+
+    assert!(NetDeviceModel::at_epoch(0).is_none());
+    assert!(NetDeviceModel::at_epoch_and_serial(1, 0).is_none());
+    let mut serial = NetDeviceModel::at_epoch_and_serial(1, u64::MAX).unwrap();
+    assert_eq!(serial.post_receive(), Err(NetQueueError::SerialExhausted));
+    assert_eq!(
+        serial.state(),
+        NetDeviceState::Quarantined {
+            reason: NetResetReason::IdentityExhausted
+        }
+    );
+
+    let mut epoch = NetDeviceModel::at_epoch(u64::MAX).unwrap();
+    let active = epoch.post_receive().unwrap();
+    epoch.require_reset(NetResetReason::DriverFault);
+    assert_eq!(epoch.confirm_reset(0), Err(NetQueueError::EpochExhausted));
+    assert_eq!(epoch.epoch(), u64::MAX);
+    assert_eq!(
+        epoch.active_submission(NetQueue::Receive, active.token.head),
+        Some(active)
+    );
+    assert!(!epoch.slot_reusable(NetQueue::Receive, active.token.head));
+}
+
+#[test]
+fn network_ring_wrap_does_not_create_token_aba() {
+    let mut device = NetDeviceModel::new();
+    let first = device.post_receive().unwrap();
+    complete_net_rx(&mut device, first, 72);
+
+    for _ in 1..=u16::MAX {
+        let submission = device.post_receive().unwrap();
+        complete_net_rx(&mut device, submission, 72);
+    }
+    assert_eq!(device.available_index(NetQueue::Receive), 0);
+    assert_eq!(device.used_index(NetQueue::Receive), 0);
+
+    let current = device.post_receive().unwrap();
+    assert_eq!(current.token.head, first.token.head);
+    assert_eq!(current.available_slot, first.available_slot);
+    assert_ne!(current.token.serial, first.token.serial);
+    assert_eq!(device.cancel(first.token), Err(NetQueueError::WrongToken));
+    assert_eq!(
+        device.active_submission(NetQueue::Receive, current.token.head),
+        Some(current)
+    );
+}

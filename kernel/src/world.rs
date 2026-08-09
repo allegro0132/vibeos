@@ -18,9 +18,11 @@ use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::durable_cspace;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
+use crate::net::{Endpoint as NetEndpoint, Packet};
 use crate::store;
 use crate::sync::SpinLock;
 use crate::virtio_blk;
+use crate::virtio_net;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
@@ -85,6 +87,7 @@ enum ComponentTemplate {
     Logger,
     Guest,
     VirtioBlk,
+    VirtioNet,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -94,6 +97,13 @@ enum ComponentGrants {
     Logger { rx: Cap, console: Cap },
     Guest(Cap),
     VirtioBlk { mmio: Cap, dma: Cap, service: Cap },
+    VirtioNet {
+        mmio: Cap,
+        dma: Cap,
+        outbound: Cap,
+        inbound: Cap,
+        control: Cap,
+    },
     StoreFaultProbe(Cap),
     FaultProbe,
 }
@@ -309,6 +319,17 @@ pub struct World {
     pub block_space: Option<Cap>,
     block_mmio: Option<Cap>,
     block_dma: Option<Cap>,
+    /// init sees only these directional packet interfaces and the control
+    /// service. The MMIO/DMA roots live in the private policy CSpace below.
+    pub net_outbound: Option<Cap>,
+    pub net_inbound: Option<Cap>,
+    pub net_control: Option<Cap>,
+    net_policy: Option<Arc<Space>>,
+    net_mmio: Option<Cap>,
+    net_dma: Option<Cap>,
+    net_outbound_root: Option<Cap>,
+    net_inbound_root: Option<Cap>,
+    net_control_root: Option<Cap>,
 }
 
 impl World {
@@ -399,6 +420,55 @@ impl World {
     }
 
     fn grant_template(&self, template: ComponentTemplate, space: &Arc<Space>) -> ComponentGrants {
+        if template == ComponentTemplate::VirtioNet {
+            let policy = self
+                .net_policy
+                .as_ref()
+                .expect("network policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            return ComponentGrants::VirtioNet {
+                mmio: cap::grant(
+                    &policy,
+                    self.net_mmio.expect("network MMIO root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("network policy retains the MMIO grant root"),
+                dma: cap::grant(
+                    &policy,
+                    self.net_dma.expect("network DMA root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("network policy retains the DMA grant root"),
+                outbound: cap::grant(
+                    &policy,
+                    self.net_outbound_root
+                        .expect("network outbound endpoint root exists"),
+                    Rights::RECV,
+                    &mut target,
+                )
+                .expect("network policy retains the outbound grant root"),
+                inbound: cap::grant(
+                    &policy,
+                    self.net_inbound_root
+                        .expect("network inbound endpoint root exists"),
+                    Rights::SEND,
+                    &mut target,
+                )
+                .expect("network policy retains the inbound grant root"),
+                control: cap::grant(
+                    &policy,
+                    self.net_control_root
+                        .expect("network control root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("network policy retains the control grant root"),
+            };
+        }
+
         let init = self.spaces["init"].clone();
         let init = init.0.lock();
         let mut target = space.0.lock();
@@ -440,6 +510,9 @@ impl World {
                 )
                 .expect("init retains the block service grant root"),
             },
+            ComponentTemplate::VirtioNet => {
+                unreachable!("network grants come from the private policy CSpace")
+            }
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
                 cap::grant(
                     &init,
@@ -485,6 +558,26 @@ impl World {
                     domain,
                     &component.name,
                     virtio_blk::driver_task(space.get(), mmio, dma, service),
+                )
+            },
+            ComponentGrants::VirtioNet {
+                mmio,
+                dma,
+                outbound,
+                inbound,
+                control,
+            } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    virtio_net::driver_task(
+                        space.get(),
+                        mmio,
+                        dma,
+                        outbound,
+                        inbound,
+                        control,
+                    ),
                 )
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
@@ -827,6 +920,41 @@ pub fn start_block_supervisor() {
     });
 }
 
+/// Restart only faulted network-driver incarnations, with the same bounded
+/// exponential policy as the block driver. Cancellation remains an explicit
+/// operator decision and is never mistaken for a crash.
+pub fn start_net_supervisor() {
+    let world = world();
+    let Some(component) = world.component_named("virtio-net") else {
+        return;
+    };
+    exec::spawn("supervisor:virtio-net", async move {
+        let mut attempts = 0u32;
+        loop {
+            let (generation, join) = component.join_current();
+            let exit = join.await;
+            match exit.state() {
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("virtio-net").is_err() {
+                        return;
+                    }
+                }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => {
+                    loop {
+                        if component.snapshot().generation > generation {
+                            break;
+                        }
+                        exec::sleep_ms(100).await;
+                    }
+                }
+                exec::TaskState::Faulted | exec::TaskState::Running => return,
+            }
+        }
+    });
+}
+
 pub fn build() {
     let console = ConsoleDev::new();
     // 4096 i64s: enough for real programs, small enough that a runaway one hits
@@ -841,6 +969,11 @@ pub fn build() {
     let prog = Space::new("prog");
     let block_resources = virtio_blk::discover();
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
+    let net_resources = virtio_net::discover();
+    let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
+    let net_policy = net_resources
+        .as_ref()
+        .map(|_| Space::new("virtio-net-policy"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -922,6 +1055,86 @@ pub fn build() {
             (None, None) => (None, None, None, None),
             _ => unreachable!("block resources and CSpace are constructed together"),
         };
+    let (
+        net_outbound,
+        net_inbound,
+        net_control,
+        net_mmio_root,
+        net_dma_root,
+        net_outbound_root,
+        net_inbound_root,
+        net_control_root,
+        net_grants,
+    ) = match (net_resources, net_space.as_ref(), net_policy.as_ref()) {
+        (Some(resources), Some(driver_space), Some(policy_space)) => {
+            let outbound: Arc<NetEndpoint<Packet>> =
+                NetEndpoint::new("net-outbound", crate::virtio::SPLIT_QUEUE_SIZE as usize);
+            let inbound: Arc<NetEndpoint<Packet>> =
+                NetEndpoint::new("net-inbound", crate::virtio::SPLIT_QUEUE_SIZE as usize);
+            let mut policy = policy_space.0.lock();
+            let mmio_root = policy.mint(resources.mmio, Rights::ALL);
+            let dma_root = policy.mint(resources.dma, Rights::ALL);
+            let outbound_root = policy.mint(outbound, Rights::ALL);
+            let inbound_root = policy.mint(inbound, Rights::ALL);
+            let control_root = policy.mint(resources.control, Rights::ALL);
+
+            // init sees only typed, directional packet authority plus control;
+            // it cannot name either the transport window or stable DMA slab.
+            let init_outbound =
+                cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap();
+            let init_inbound =
+                cap::grant(&policy, inbound_root, Rights::RECV, &mut cs).unwrap();
+            let init_control = cap::grant(
+                &policy,
+                control_root,
+                Rights::READ.union(Rights::WRITE),
+                &mut cs,
+            )
+            .unwrap();
+
+            let mut target = driver_space.0.lock();
+            let grants = (
+                cap::grant(
+                    &policy,
+                    mmio_root,
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .unwrap(),
+                cap::grant(
+                    &policy,
+                    dma_root,
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .unwrap(),
+                cap::grant(&policy, outbound_root, Rights::RECV, &mut target).unwrap(),
+                cap::grant(&policy, inbound_root, Rights::SEND, &mut target).unwrap(),
+                cap::grant(
+                    &policy,
+                    control_root,
+                    Rights::READ,
+                    &mut target,
+                )
+                .unwrap(),
+            );
+            drop(target);
+            drop(policy);
+            (
+                Some(init_outbound),
+                Some(init_inbound),
+                Some(init_control),
+                Some(mmio_root),
+                Some(dma_root),
+                Some(outbound_root),
+                Some(inbound_root),
+                Some(control_root),
+                Some(grants),
+            )
+        }
+        (None, None, None) => (None, None, None, None, None, None, None, None, None),
+        _ => unreachable!("network resources and CSpaces are constructed together"),
+    };
     let (store_root, durable_cspace_root, durable_cspace_service) =
         match (block_root, store_backend.as_ref(), persistent_test.as_ref()) {
         (Some(block), Some(backend), Some(persistent)) => {
@@ -963,6 +1176,12 @@ pub fn build() {
     if let Some(space) = block_space.as_ref() {
         spaces.insert("virtio-blk", space.clone());
     }
+    if let Some(space) = net_space.as_ref() {
+        spaces.insert("virtio-net", space.clone());
+    }
+    if let Some(space) = net_policy.as_ref() {
+        spaces.insert("virtio-net-policy", space.clone());
+    }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
     }
@@ -987,6 +1206,15 @@ pub fn build() {
         block_space: c_block_space,
         block_mmio: block_mmio_root,
         block_dma: block_dma_root,
+        net_outbound,
+        net_inbound,
+        net_control,
+        net_policy,
+        net_mmio: net_mmio_root,
+        net_dma: net_dma_root,
+        net_outbound_root,
+        net_inbound_root,
+        net_control_root,
     });
 
     // Components are *handed* their handles at spawn. That is their whole
@@ -1020,6 +1248,25 @@ pub fn build() {
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::VirtioBlk),
             virtio_blk::driver_task(SpaceRef::new(&space).get(), mmio, dma, service),
+        );
+    }
+
+    if let (Some(space), Some((mmio, dma, outbound, inbound, control))) =
+        (net_space, net_grants)
+    {
+        world.spawn_component_inner(
+            "virtio-net",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::VirtioNet),
+            virtio_net::driver_task(
+                SpaceRef::new(&space).get(),
+                mmio,
+                dma,
+                outbound,
+                inbound,
+                control,
+            ),
         );
     }
 

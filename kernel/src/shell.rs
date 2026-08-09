@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use crate::cap::{CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
+use crate::net::Packet;
 use crate::world::{world, Reading, Space};
 use crate::HEAP;
 use crate::{exec, println, sbi, tty, uart};
@@ -68,6 +69,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  durable         recover a sealed capability log and tombstone");
             println!("  blk info|test   inspect or exercise the supervised block device");
+            println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  selftest        run the in-kernel test suite");
@@ -328,6 +330,8 @@ async fn run(line: &str, boot_time: u64) {
         "durable" => durable_demo(),
 
         "blk" => block_command(&rest).await,
+
+        "net" => net_command(&rest).await,
 
         "store" => store_command(&rest).await,
 
@@ -634,6 +638,194 @@ fn durable_demo() {
         after.last_sequence
     );
     println!("  authority result: stable IDs only; no path or object pointer was persisted");
+}
+
+const NET_COMMAND_TIMEOUT_MS: usize = 2_000;
+
+async fn net_command(args: &[&str]) {
+    let w = world();
+    let (Some(outbound), Some(inbound), Some(control)) =
+        (w.net_outbound, w.net_inbound, w.net_control)
+    else {
+        println!("  virtio-net: offline (no modern network transport discovered)");
+        return;
+    };
+    let init = w.spaces["init"].clone();
+
+    match args.first().copied().unwrap_or("info") {
+        "info" => match net_info(&init, control) {
+            Ok(info) if info.quarantined => {
+                println!("  virtio-net: quarantined (reset was not confirmed)")
+            }
+            Ok(info) if info.online => println!(
+                "  virtio-net: ready, queues rx=0/tx=1 size {}, header {}, features VERSION_1",
+                info.queue_size, info.header_size
+            ),
+            Ok(_) => println!("  virtio-net: offline (driver component not attached)"),
+            Err(error) => println!("  refused: {}", error),
+        },
+        "test" => match net_handshake(&init, outbound, inbound, control).await {
+            Ok((before, after)) => {
+                println!("  raw L2 HELLO -> CHALLENGE -> ACK: ok");
+                println!(
+                    "  dual-queue completion: ok (IRQ observed; rx +{}, tx +{})",
+                    after.rx_packets.saturating_sub(before.rx_packets),
+                    after.tx_packets.saturating_sub(before.tx_packets)
+                );
+            }
+            Err(error) => println!("  raw L2 handshake: failed ({})", error),
+        },
+        "fault" => {
+            let Some(component) = w.component_named("virtio-net") else {
+                println!("  network fault recovery: driver component absent");
+                return;
+            };
+            let generation_before = component.snapshot().generation;
+            let epoch_before = match net_info(&init, control) {
+                Ok(info) => info.session_epoch,
+                Err(error) => {
+                    println!("  network fault recovery: refused ({})", error);
+                    return;
+                }
+            };
+            let inject = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::WRITE);
+            if inject
+                .as_ref()
+                .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)
+                .and_then(crate::virtio_net::inject_fault_with)
+                .is_err()
+            {
+                println!("  network fault recovery: control authority denied");
+                return;
+            }
+            if let Err(error) = net_send(&init, outbound, crate::virtio_net::hello_packet()).await {
+                println!("  network fault recovery: trigger failed ({})", error);
+                return;
+            }
+
+            let mut restarted = None;
+            for _ in 0..NET_COMMAND_TIMEOUT_MS {
+                let snapshot = component.snapshot();
+                let ready = snapshot.generation > generation_before
+                    && snapshot.state == exec::TaskState::Running
+                    && net_info(&init, control).is_ok_and(|info| {
+                        info.online && info.session_epoch > epoch_before && !info.quarantined
+                    });
+                if ready {
+                    restarted = Some(snapshot.generation);
+                    break;
+                }
+                exec::sleep_ms(1).await;
+            }
+            let Some(generation_after) = restarted else {
+                println!("  network fault recovery: supervisor did not restore the driver");
+                return;
+            };
+
+            match net_handshake(&init, outbound, inbound, control).await {
+                Ok(_) => println!(
+                    "  network fault recovery: reset confirmed, generation {} -> {}, handshake ok",
+                    generation_before, generation_after
+                ),
+                Err(error) => println!(
+                    "  network fault recovery: restarted handshake failed ({})",
+                    error
+                ),
+            }
+        }
+        other => println!(
+            "  usage: net [info|test|fault] (got `{}`)",
+            other
+        ),
+    }
+}
+
+fn net_info(
+    init: &Arc<Space>,
+    control: crate::cap::Cap,
+) -> Result<crate::virtio_net::NetInfo, crate::virtio_net::NetError> {
+    let lease = init
+        .0
+        .lock()
+        .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::READ)
+        .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
+    crate::virtio_net::info_with(&lease)
+}
+
+async fn net_send(
+    init: &Arc<Space>,
+    outbound: crate::cap::Cap,
+    packet: Packet,
+) -> Result<(), crate::virtio_net::NetError> {
+    let mut pending = packet;
+    for _ in 0..NET_COMMAND_TIMEOUT_MS {
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<Endpoint<Packet>>(outbound, Rights::SEND)
+            .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
+        match lease.with(|endpoint| endpoint.try_send(pending)) {
+            Ok(()) => return Ok(()),
+            Err(packet) => pending = packet,
+        }
+        exec::sleep_ms(1).await;
+    }
+    Err(crate::virtio_net::NetError::QueueFull)
+}
+
+async fn net_receive(
+    init: &Arc<Space>,
+    inbound: crate::cap::Cap,
+) -> Result<Packet, crate::virtio_net::NetError> {
+    for _ in 0..NET_COMMAND_TIMEOUT_MS {
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<Endpoint<Packet>>(inbound, Rights::RECV)
+            .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
+        if let Some(packet) = lease.with(Endpoint::try_recv) {
+            return Ok(packet);
+        }
+        exec::sleep_ms(1).await;
+    }
+    Err(crate::virtio_net::NetError::TimedOut)
+}
+
+async fn net_handshake(
+    init: &Arc<Space>,
+    outbound: crate::cap::Cap,
+    inbound: crate::cap::Cap,
+    control: crate::cap::Cap,
+) -> Result<
+    (crate::virtio_net::NetInfo, crate::virtio_net::NetInfo),
+    crate::virtio_net::NetError,
+> {
+    let before = net_info(init, control)?;
+    if !before.online || before.quarantined {
+        return Err(crate::virtio_net::NetError::Offline);
+    }
+    net_send(init, outbound, crate::virtio_net::hello_packet()).await?;
+    let challenge = net_receive(init, inbound).await?;
+    if !crate::virtio_net::is_challenge(&challenge) {
+        return Err(crate::virtio_net::NetError::Protocol);
+    }
+    net_send(init, outbound, crate::virtio_net::ack_packet()).await?;
+
+    let tx_target = before.tx_packets.saturating_add(2);
+    for _ in 0..NET_COMMAND_TIMEOUT_MS {
+        let after = net_info(init, control)?;
+        if after.tx_packets >= tx_target
+            && after.rx_packets > before.rx_packets
+            && after.used_interrupts > before.used_interrupts
+        {
+            return Ok((before, after));
+        }
+        exec::sleep_ms(1).await;
+    }
+    Err(crate::virtio_net::NetError::TimedOut)
 }
 
 async fn block_command(args: &[&str]) {

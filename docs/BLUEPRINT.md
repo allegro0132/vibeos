@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.2 are
-complete; M5.3 lock contention work is next, and the original M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.3 are
+complete; M5.4 hart-local scheduler state is next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -234,6 +234,14 @@ reason rather than spinning forever if its work was stolen or cancelled. Logical
 hart ids bind explicitly to firmware-provided physical hartids, and only online
 physical harts receive standardized `mask=1, base=hartid` SBI calls. M5.2 keeps only
 the boot hart online; stopped secondaries retain software reasons for M5.5.
+
+M5.3 hardens the interrupt-safe lock for physical-hart ownership and records the
+complete retain/replace inventory in [SPINLOCK_AUDIT.md](SPINLOCK_AUDIT.md).
+Device handler lookup, UART receive buffering, virtio IRQ transport snapshots, and
+executor callback publication are atomic; scheduler lifecycle, wait queues, timers,
+heap accounting, capability graphs, and recovery transactions retain short audited
+locks with allocation-free contention counters. The retained `running` and
+current-task globals are the explicit M5.4 boundary, not hidden SMP state.
 
 The single-hart lifecycle has two orthogonal coordinates. Its **phase** is running,
 cancel-requested, terminal-committed, or terminal-published; its **location** is

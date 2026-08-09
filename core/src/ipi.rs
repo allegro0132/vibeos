@@ -77,7 +77,8 @@ fn physical_hart_id(hart: HartId) -> Option<usize> {
     }
 }
 
-fn current_logical_hart() -> Option<HartId> {
+/// Logical scheduler identity bound to the currently executing physical hart.
+pub fn current_logical_hart() -> Option<HartId> {
     let physical = arch::current_hart_id();
     (0..MAX_HARTS).find_map(|index| {
         let logical = HartId::new(index).expect("mailbox index is a logical hart");

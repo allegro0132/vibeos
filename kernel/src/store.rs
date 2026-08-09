@@ -327,7 +327,7 @@ impl StoreService {
             Arc::new(StoreInner {
                 backend,
                 block,
-                active: SpinLock::new(None),
+                active: SpinLock::new_recoverable(None),
                 state: SpinLock::new(RuntimeState::COLD),
             })
         });
@@ -501,9 +501,12 @@ pub unsafe fn recover_faulted_task(task: TaskId, domain: AllocationDomain) {
         return;
     };
 
-    // Safety: the executor has made a guard abandoned by this exact domain
-    // permanently unreachable. This repairs the lock itself before inspection.
-    let _ = unsafe { inner.active.recover_after_fault(domain) };
+    let task_key = crate::sync::TaskRecoveryKey::new(task.0)
+        .expect("executor TaskId zero is reserved");
+    // Safety: the executor installed this exact task key around its poll and
+    // has now detached that task forever. A same-domain task on another hart
+    // carries a different key and cannot have its guard recovered here.
+    let _ = unsafe { inner.active.recover_after_task_fault(domain, task_key) };
     let mut active = inner.active.lock();
     if active.is_some_and(|claim| claim.task == task && claim.domain == domain) {
         *active = None;

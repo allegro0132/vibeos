@@ -242,7 +242,7 @@ pub struct Space(pub SpinLock<CSpace>);
 impl Space {
     pub(crate) fn new(name: &str) -> Arc<Self> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let space = Arc::new(Space(SpinLock::new(CSpace::new(name))));
+        let space = Arc::new(Space(SpinLock::new_recoverable(CSpace::new(name))));
         system_owner.restore();
         space
     }
@@ -252,7 +252,7 @@ impl Space {
         space_id: crate::durable::SpaceId,
     ) -> Arc<Self> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let space = Arc::new(Space(SpinLock::new(CSpace::new_persistent(
+        let space = Arc::new(Space(SpinLock::new_recoverable(CSpace::new_persistent(
             name, space_id,
         ))));
         system_owner.restore();

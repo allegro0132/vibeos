@@ -7,6 +7,7 @@
 use core::fmt::{self, Write};
 
 use crate::exec::WaitQueue;
+use crate::interrupt::SpscByteRing;
 use crate::sync::SpinLock;
 
 pub const UART_BASE: usize = 0x1000_0000;
@@ -27,38 +28,20 @@ unsafe fn reg(off: usize) -> *mut u8 {
     (UART_BASE + off) as *mut u8
 }
 
-struct RxRing {
-    buf: [u8; 256],
-    head: usize,
-    tail: usize,
-}
-
-impl RxRing {
-    const fn new() -> Self {
-        Self { buf: [0; 256], head: 0, tail: 0 }
-    }
-    fn push(&mut self, b: u8) {
-        let next = (self.head + 1) % self.buf.len();
-        if next != self.tail {
-            self.buf[self.head] = b;
-            self.head = next;
-        }
-    }
-    fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail {
-            return None;
-        }
-        let b = self.buf[self.tail];
-        self.tail = (self.tail + 1) % self.buf.len();
-        Some(b)
-    }
-}
-
+// TX remains locked because foreground output, background diagnostics, and the
+// panic path can otherwise interleave bytes. It is a polled task/panic path,
+// not part of RX IRQ buffering.
 static TX: SpinLock<()> = SpinLock::new(());
-static RX: SpinLock<RxRing> = SpinLock::new(RxRing::new());
+// The PLIC UART top half is the sole producer and the shell is the sole
+// consumer. Release/Acquire indices replace the former IRQ-side SpinLock;
+// overflow drops the newest byte and increments `rx_dropped()`.
+static RX: SpscByteRing<256> = SpscByteRing::new();
 pub static RX_WAIT: WaitQueue = WaitQueue::new();
 
 pub fn init() {
+    // Safety: boot initializes UART before enabling the PLIC source or
+    // starting the sole shell consumer.
+    unsafe { RX.reset_quiescent() };
     unsafe {
         reg(LCR).write_volatile(0x80); // DLAB on
         reg(0).write_volatile(0x03); // divisor low  -> 38400 baud @ 1.8432 MHz
@@ -81,21 +64,30 @@ pub fn put(b: u8) {
 
 /// Called from the trap handler when the PLIC reports UART_IRQ.
 pub fn handle_irq() {
-    let mut woke = false;
+    let mut received = false;
     unsafe {
         while reg(LSR).read_volatile() & LSR_RX_READY != 0 {
             let b = reg(RBR).read_volatile();
-            RX.lock().push(b);
-            woke = true;
+            // Safety: the boot-hart UART top half is the ring's sole producer.
+            // Failure is a counted newest-byte drop; draining the hardware
+            // FIFO still prevents a level interrupt storm.
+            let _ = RX.push_from_producer(b);
+            received = true;
         }
     }
-    if woke {
+    if received {
         RX_WAIT.wake_all();
     }
 }
 
 pub fn try_read() -> Option<u8> {
-    RX.lock().pop()
+    // Safety: console input is owned by the one shell task.
+    unsafe { RX.pop_from_consumer() }
+}
+
+#[allow(dead_code)]
+pub fn rx_dropped() -> u64 {
+    RX.dropped()
 }
 
 /// Await one byte from the console.

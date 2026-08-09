@@ -33,6 +33,8 @@ use crate::virtio_mmio::MmioTransport;
 const RESET_POLL_BUDGET: usize = 100_000;
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
 const DMA_BYTES: usize = core::mem::size_of::<DmaSlab>();
+const INTERRUPT_STATUS_OFFSET: usize = 0x060;
+const INTERRUPT_ACK_OFFSET: usize = 0x064;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockError {
@@ -339,7 +341,7 @@ struct DriverAuthority {
     service: Revocable<BlockDevice>,
 }
 
-static CONTROL: SpinLock<DriverControl> = SpinLock::new(DriverControl {
+static CONTROL: SpinLock<DriverControl> = SpinLock::new_recoverable(DriverControl {
     transport: None,
     features: None,
     capacity: 0,
@@ -347,15 +349,14 @@ static CONTROL: SpinLock<DriverControl> = SpinLock::new(DriverControl {
     online: false,
     quarantined: false,
 });
-static AUTHORITY: SpinLock<Option<DriverAuthority>> = SpinLock::new(None);
-static REQUEST: SpinLock<RequestSlot> = SpinLock::new(RequestSlot::Empty);
+static AUTHORITY: SpinLock<Option<DriverAuthority>> = SpinLock::new_recoverable(None);
+static REQUEST: SpinLock<RequestSlot> = SpinLock::new_recoverable(RequestSlot::Empty);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static REQUEST_WAIT: WaitQueue = WaitQueue::new();
 static COMPLETION_WAIT: WaitQueue = WaitQueue::new();
 static IRQ_WAIT: WaitQueue = WaitQueue::new();
 static IRQ_CAUSES: AtomicU32 = AtomicU32::new(0);
 static USED_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
-static IRQ_TRANSPORT: SpinLock<Option<MmioTransport>> = SpinLock::new(None);
 static DRIVER_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.get());
 static DRIVER_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 static FAULT_AFTER_PUBLISH: AtomicBool = AtomicBool::new(false);
@@ -633,9 +634,11 @@ impl DriverSession {
             control.online = true;
             control.epoch
         };
-        *IRQ_TRANSPORT.lock() = Some(transport);
         let _ = plic::unregister(transport.irq());
-        if plic::register(transport.irq(), irq_top_half, 0).is_err()
+        // The PLIC's atomic callback record publishes this validated transport
+        // base together with the handler, so the top half needs no second lock
+        // or revocable snapshot.
+        if plic::register(transport.irq(), irq_top_half, transport.base()).is_err()
             || plic::enable(transport.irq()).is_err()
         {
             shutdown(transport, BlockError::DriverCancelled);
@@ -792,7 +795,6 @@ impl DriverSession {
         let _ = self.transport.acknowledge_interrupt();
         let _ = plic::unregister(self.transport.irq());
         IRQ_CAUSES.store(0, Ordering::Release);
-        *IRQ_TRANSPORT.lock() = None;
         {
             let mut control = CONTROL.lock();
             control.online = false;
@@ -818,7 +820,6 @@ impl DriverSession {
         let _ = plic::unregister(self.transport.irq());
         let _ = self.transport.acknowledge_interrupt();
         IRQ_CAUSES.store(0, Ordering::Release);
-        *IRQ_TRANSPORT.lock() = None;
         {
             let mut control = CONTROL.lock();
             control.online = false;
@@ -870,7 +871,6 @@ fn shutdown(transport: MmioTransport, reason: BlockError) {
     let reset = transport.reset(RESET_POLL_BUDGET);
     let _ = transport.acknowledge_interrupt();
     IRQ_CAUSES.store(0, Ordering::Release);
-    *IRQ_TRANSPORT.lock() = None;
     {
         let mut control = CONTROL.lock();
         control.online = false;
@@ -981,19 +981,32 @@ async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> Wa
     }
 }
 
-fn irq_top_half(_context: usize, _irq_entry: u64) {
-    let transport = *IRQ_TRANSPORT.lock();
-    if let Some(transport) = transport {
-        let causes = transport.acknowledge_interrupt();
-        if causes != 0 {
-            if virtio::InterruptCauses::from_status(causes).used_buffer() {
-                USED_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            IRQ_CAUSES.fetch_or(causes, Ordering::Release);
-            IRQ_WAIT.wake_all();
-            REQUEST_WAIT.wake_all();
+fn irq_top_half(transport_base: usize, _irq_entry: u64) {
+    let causes = acknowledge_irq_transport(transport_base);
+    if causes != 0 {
+        if virtio::InterruptCauses::from_status(causes).used_buffer() {
+            USED_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
+        IRQ_CAUSES.fetch_or(causes, Ordering::Release);
+        IRQ_WAIT.wake_all();
+        REQUEST_WAIT.wake_all();
     }
+}
+
+/// Acknowledge the two architected virtio-mmio interrupt bits from a transport
+/// base captured in the PLIC's atomic handler publication. The base can only
+/// originate from a successfully probed `MmioTransport`; no task-owned pointer
+/// or revocable object is dereferenced in the top half.
+fn acknowledge_irq_transport(transport_base: usize) -> u32 {
+    let raw = unsafe { ((transport_base + INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile() };
+    dma_fence();
+    let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
+    if causes != 0 {
+        dma_fence();
+        unsafe { ((transport_base + INTERRUPT_ACK_OFFSET) as *mut u32).write_volatile(causes) };
+        dma_fence();
+    }
+    causes
 }
 
 fn publish_request(request: PendingRequest, available_slot: u16) -> Result<(), BlockError> {
@@ -1131,7 +1144,6 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     // exact domain can never later run Drop and manufacture a second borrow.
     let _ = unsafe { CONTROL.recover_after_fault(domain) };
     let _ = unsafe { AUTHORITY.recover_after_fault(domain) };
-    let _ = unsafe { IRQ_TRANSPORT.recover_after_fault(domain) };
 
     let transport = CONTROL.lock().transport;
     if let Some(transport) = transport {

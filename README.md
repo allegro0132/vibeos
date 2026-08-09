@@ -17,6 +17,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   leaks, and the trust model.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
   workstreams, testing strategy, metrics, and the risk register.
+- **[docs/SPINLOCK_AUDIT.md](docs/SPINLOCK_AUDIT.md)** — the M5.3 complete lock
+  inventory, IRQ hot-path replacements, retained transaction boundaries, and
+  multicore measurement gates.
 - **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
@@ -312,7 +315,7 @@ net test        exchange a typed raw-L2 challenge with the localhost test peer
 net fault       fault after TX publication, reset/restart, then repeat the exchange
 rustc edit      type your own program; end it with a lone `.`
 pcspace test    exercise the three-boot persistent CSpace lifecycle
-smp queues      prove logical stealing plus the SBI/SSIP wake path
+smp queues      prove queues/IPIs and report the M5 lock audit sample
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
 cancel <name>   cooperatively stop a component (the active shell is protected)
@@ -359,7 +362,9 @@ showing rising poll counts while muted, because the components never stopped.
 
 Deliberate, not overlooked:
 
-- **Single hart.** The spinlock is real but `-smp 1` is the only tested config.
+- **Single physical hart.** Four logical run queues, lock-free IRQ data handoffs,
+  hart-owned SpinLock guards, and SBI/IPI delivery are tested, but M5.4/M5.5 still
+  gate hart-local running state and the `-smp 4` acceptance run.
 - **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
   so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
   not a strict subset, and it is what the roadmap's differential testing against
@@ -384,7 +389,9 @@ Deliberate, not overlooked:
   physical multicore execution yet.** M5.1 provides four logical ready queues
   and hart0 work stealing. M5.2 adds SBI/SSIP doorbells, atomic reason mailboxes,
   and explicit logical-to-physical hart mapping while only the boot hart is
-  online; hart-local running state and secondary boot remain gated. M4.3 restores
+  online. M5.3 removes the PLIC/UART RX/virtio data locks, hardens fault-recoverable
+  locks, and publishes their contention telemetry; hart-local running state and
+  secondary boot remain gated. M4.3 restores
   the externally constrained `persistent-test` graph. M4.5 adds one immutable
   `hello` ProgramArtifact whose source and canonical
   VIBEEXE are revalidated against the current compiler before execution, with an

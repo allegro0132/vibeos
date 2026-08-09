@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, and M5.2 are complete. M5.3 lock contention audit is next. Run
+> sequence through 3.16, M4.5, and M5.3 are complete. M5.4 hart-local scheduler state is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -478,7 +478,7 @@ recovered source/binary object with exactly the fixed persisted authority manife
 |---|---|
 | 5.1 ✅ | Per-hart run queues with work stealing |
 | 5.2 ✅ | IPI-based cross-hart wakeups (SBI `sbi_send_ipi`) |
-| 5.3 | Audit every `SpinLock` for real contention; replace the hot ones with lock-free structures |
+| 5.3 ✅ | Audit every `SpinLock` for real contention; replace the hot ones with lock-free structures |
 | 5.4 | Hart-local storage for the scheduler's `running` slot |
 | 5.5 | Boot secondary harts via SBI HSM |
 
@@ -536,6 +536,33 @@ without SBI calls and deliberately forces one boot-hart self-doorbell through re
 OpenSBI, SSIP trap acknowledgement, and executor return. Physical secondary
 execution, per-hart running state, and `-smp 4` acceptance remain gated to 5.5, 5.4,
 and the M5 final acceptance respectively.
+
+5.3 records every lock family and its retain/replace decision in
+[`SPINLOCK_AUDIT.md`](SPINLOCK_AUDIT.md). The lock itself now publishes a complete
+owner/arena/task record under a phase-plus-generation token; a stale fault
+recovery cannot ABA-unlock a later guard, conservative SYSTEM-domain cleanup must
+match the exact nonzero task key, guards are statically non-`Send`, and Drop
+verifies its acquisition hart before restoring local interrupt state.
+Allocation-free telemetry distinguishes acquisitions, observed contention, and
+fault recovery. Only stable locks named by a cleanup hook opt into provenance;
+ordinary hot locks retain the lean CAS path, keeping the committed performance
+budget green.
+
+The locks in the device-data portion of IRQ handling are removed: PLIC dispatch
+uses bounded atomic handler snapshots, UART RX is a fixed SPSC ring, virtio block
+and network callbacks carry their validated MMIO base in the same atomic handler
+publication, and executor callbacks use atomic function slots. Transactional locks
+for scheduler lifecycle, waiters, timers, heap accounting, capability graphs, and
+durable recovery remain explicit. This does not describe the complete IRQ path as
+lock-free: waiter detach and scheduler wake still use those audited boundaries.
+
+**M5.3 acceptance:** host threads race the atomic IRQ cells for 100,000 iterations,
+exercise real SpinLock contention, separate same-domain task recovery, reject
+stale-generation recovery and cross-hart guard Drop, and compile-fail a `Send`
+guard. `smp queues` exercises the target path,
+samples the retained scheduler lock, and requires zero contention on its honest
+single-hart boundary. Physical contention and the scaling decision are deliberately
+measured after M5.5 boots secondaries.
 
 **M5.5 preflight risk:** a pre-M5.5 `-smp 4` smoke run did not produce the
 shell-ready marker even though `_start` contains a non-boot-hart park branch. M5.1

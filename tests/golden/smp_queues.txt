@@ -6,5 +6,7 @@ vibe> smp queues
   smp queues: hart0 steal delta=3
   smp ipi: offline remote reasons retained without SBI calls
   smp ipi: forced boot-hart doorbell acknowledged
+  smp locks: PLIC/UART RX/virtio IRQ data handoff is lock-free
+  smp locks: scheduler sampled; single-hart contention delta=0
   smp queues: physical secondary harts gated until M5.5
 vibe> 

@@ -299,9 +299,9 @@ impl DurableCSpaceService {
             target,
             saved_program,
             state: AtomicU8::new(DurableCSpaceState::Cold as u8),
-            active: SpinLock::new(None),
+            active: SpinLock::new_recoverable(None),
             dependent_started: AtomicBool::new(false),
-            graph: crate::sync::SpinLock::new(LiveGraph::default()),
+            graph: crate::sync::SpinLock::new_recoverable(LiveGraph::default()),
         });
         {
             let mut installed = INSTALLED_DURABLE_CSPACE.lock();
@@ -973,13 +973,16 @@ pub(crate) unsafe fn recover_faulted_task(task: exec::TaskId, domain: heap::Allo
         return;
     };
 
+    let task_key = crate::sync::TaskRecoveryKey::new(task.0)
+        .expect("executor TaskId zero is reserved");
+
     // Safety: the executor detached the exact task before this hook. Repair
     // each possibly abandoned lock before taking it. The saved-program hook is
     // ordered before this one in `cleanup_faulted_task`, because quarantine of
     // a durable boot claim also fail-closes the saved-program target.
-    let _ = unsafe { inner.active.recover_after_fault(domain) };
-    let _ = unsafe { inner.target.0.recover_after_fault(domain) };
-    let _ = unsafe { inner.graph.recover_after_fault(domain) };
+    let _ = unsafe { inner.active.recover_after_task_fault(domain, task_key) };
+    let _ = unsafe { inner.target.0.recover_after_task_fault(domain, task_key) };
+    let _ = unsafe { inner.graph.recover_after_task_fault(domain, task_key) };
 
     // Keep the exact claim published until both CSpaces have been quarantined.
     // Repeating this after a partially completed cleanup is intentionally safe.

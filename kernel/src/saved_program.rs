@@ -168,9 +168,9 @@ impl SavedProgramService {
             policy_memory,
             state: AtomicU8::new(SavedProgramState::Cold as u8),
             running: AtomicBool::new(false),
-            running_owner: SpinLock::new(None),
-            active: SpinLock::new(None),
-            live: SpinLock::new(SavedProgramLive::default()),
+            running_owner: SpinLock::new_recoverable(None),
+            active: SpinLock::new_recoverable(None),
+            live: SpinLock::new_recoverable(SavedProgramLive::default()),
         });
         {
             let mut installed = INSTALLED_SAVED_PROGRAM.lock();
@@ -868,15 +868,22 @@ pub(crate) unsafe fn recover_faulted_task(task: exec::TaskId, domain: heap::Allo
         return;
     };
 
+    let task_key = crate::sync::TaskRecoveryKey::new(task.0)
+        .expect("executor TaskId zero is reserved");
+
     // Repair every saved-program lock before inspecting ownership. The durable
     // boot coordinator owns a durable claim, not a SavedActiveClaim, while it
     // installs this target and its ephemeral manifest. Consequently these
     // repairs must not be conditional on a saved operation/run claim.
-    let _ = unsafe { inner.running_owner.recover_after_fault(domain) };
-    let _ = unsafe { inner.active.recover_after_fault(domain) };
-    let _ = unsafe { inner.live.recover_after_fault(domain) };
-    let _ = unsafe { inner.target.0.recover_after_fault(domain) };
-    let _ = unsafe { inner.policy.0.recover_after_fault(domain) };
+    let _ = unsafe {
+        inner
+            .running_owner
+            .recover_after_task_fault(domain, task_key)
+    };
+    let _ = unsafe { inner.active.recover_after_task_fault(domain, task_key) };
+    let _ = unsafe { inner.live.recover_after_task_fault(domain, task_key) };
+    let _ = unsafe { inner.target.0.recover_after_task_fault(domain, task_key) };
+    let _ = unsafe { inner.policy.0.recover_after_task_fault(domain, task_key) };
 
     let mut owner = inner.running_owner.lock();
     if owner

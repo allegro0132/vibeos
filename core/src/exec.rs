@@ -17,14 +17,14 @@ use core::fmt;
 use core::future::Future;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::ipi;
 use crate::runqueue::{EnqueueError, RunQueues};
-use crate::sync::SpinLock;
+use crate::sync::{SpinLock, TaskRecoveryContext, TaskRecoveryKey};
 
 pub use crate::runqueue::{HartId, HartRunQueueStats, MAX_HARTS};
 
@@ -315,13 +315,18 @@ static CURRENT_TASK_STATUS: SpinLock<Option<Arc<TaskStatus>>> = SpinLock::new(No
 
 struct CurrentTaskScope {
     previous: Option<Arc<TaskStatus>>,
+    recovery: TaskRecoveryContext,
     active: bool,
 }
 
-fn enter_current_task(status: Arc<TaskStatus>) -> CurrentTaskScope {
+fn enter_current_task(id: TaskId, status: Arc<TaskStatus>) -> CurrentTaskScope {
     let previous = core::mem::replace(&mut *CURRENT_TASK_STATUS.lock(), Some(status));
+    let recovery = crate::sync::enter_task_recovery_context(
+        TaskRecoveryKey::new(id.0).expect("TaskId zero is reserved"),
+    );
     CurrentTaskScope {
         previous,
+        recovery,
         active: true,
     }
 }
@@ -330,6 +335,7 @@ impl CurrentTaskScope {
     fn restore(&mut self) {
         if self.active {
             *CURRENT_TASK_STATUS.lock() = self.previous.take();
+            self.recovery.restore();
             self.active = false;
         }
     }
@@ -672,36 +678,80 @@ pub type FaultCleanup = unsafe fn(TaskId, AllocationDomain);
 /// M5.1 leaves it unset; no IPI is sent.
 pub type ReadyNotifyHook = fn(HartId);
 
-static FAULT_GUARD: SpinLock<Option<FaultGuard>> = SpinLock::new(None);
-static FAULT_RECLAIMER: SpinLock<Option<FaultReclaimer>> = SpinLock::new(None);
-static FAULT_CLEANUP: SpinLock<Option<FaultCleanup>> = SpinLock::new(None);
-static READY_NOTIFY_HOOK: SpinLock<Option<ReadyNotifyHook>> = SpinLock::new(None);
+const _: () = {
+    assert!(core::mem::size_of::<FaultGuard>() == core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<FaultReclaimer>() == core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<FaultCleanup>() == core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<ReadyNotifyHook>() == core::mem::size_of::<usize>());
+};
+
+// These callbacks are installed during single-threaded kernel bootstrap.  The
+// ready notification is then read on every wake path, including interrupt
+// context, so publishing the immutable function address directly avoids
+// putting a global lock in that hot path.  Tests may replace a callback while
+// the executor is quiescent; Release/Acquire makes that replacement visible.
+static FAULT_GUARD: AtomicUsize = AtomicUsize::new(0);
+static FAULT_RECLAIMER: AtomicUsize = AtomicUsize::new(0);
+static FAULT_CLEANUP: AtomicUsize = AtomicUsize::new(0);
+static READY_NOTIFY_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+fn load_fault_guard() -> Option<FaultGuard> {
+    let address = FAULT_GUARD.load(Ordering::Acquire);
+    (address != 0).then(|| {
+        // SAFETY: the only non-zero values stored in this slot come from a
+        // `FaultGuard` function pointer in `set_fault_guard`.
+        unsafe { core::mem::transmute::<usize, FaultGuard>(address) }
+    })
+}
+
+fn load_fault_reclaimer() -> Option<FaultReclaimer> {
+    let address = FAULT_RECLAIMER.load(Ordering::Acquire);
+    (address != 0).then(|| {
+        // SAFETY: the slot is populated only by `set_fault_reclaimer`.
+        unsafe { core::mem::transmute::<usize, FaultReclaimer>(address) }
+    })
+}
+
+fn load_fault_cleanup() -> Option<FaultCleanup> {
+    let address = FAULT_CLEANUP.load(Ordering::Acquire);
+    (address != 0).then(|| {
+        // SAFETY: the slot is populated only by `set_fault_cleanup`.
+        unsafe { core::mem::transmute::<usize, FaultCleanup>(address) }
+    })
+}
+
+fn load_ready_notify_hook() -> Option<ReadyNotifyHook> {
+    let address = READY_NOTIFY_HOOK.load(Ordering::Acquire);
+    (address != 0).then(|| {
+        // SAFETY: the slot is populated only by `set_ready_notify_hook`.
+        unsafe { core::mem::transmute::<usize, ReadyNotifyHook>(address) }
+    })
+}
 
 pub fn set_fault_guard(guard: FaultGuard) {
-    *FAULT_GUARD.lock() = Some(guard);
+    FAULT_GUARD.store(guard as usize, Ordering::Release);
 }
 
 pub fn set_fault_reclaimer(reclaimer: FaultReclaimer) {
-    *FAULT_RECLAIMER.lock() = Some(reclaimer);
+    FAULT_RECLAIMER.store(reclaimer as usize, Ordering::Release);
 }
 
 pub fn set_fault_cleanup(cleanup: FaultCleanup) {
-    *FAULT_CLEANUP.lock() = Some(cleanup);
+    FAULT_CLEANUP.store(cleanup as usize, Ordering::Release);
 }
 
 pub fn set_ready_notify_hook(hook: ReadyNotifyHook) {
-    *READY_NOTIFY_HOOK.lock() = Some(hook);
+    READY_NOTIFY_HOOK.store(hook as usize, Ordering::Release);
 }
 
 fn notify_ready_hart(hart: HartId) {
-    let hook = *READY_NOTIFY_HOOK.lock();
-    if let Some(hook) = hook {
+    if let Some(hook) = load_ready_notify_hook() {
         hook(hart);
     }
 }
 
 fn notify_fault_cleanup(task: TaskId, domain: AllocationDomain) {
-    if let Some(cleanup) = *FAULT_CLEANUP.lock() {
+    if let Some(cleanup) = load_fault_cleanup() {
         // Safety: every call site has detached this exact task permanently and
         // invokes the callback before terminal publication or arena reclaim.
         unsafe { cleanup(task, domain) };
@@ -1026,7 +1076,7 @@ pub unsafe fn spawn_reclaimable_owned(
         "SYSTEM cannot be a raw-reclaimable component arena"
     );
     assert!(
-        FAULT_RECLAIMER.lock().is_some(),
+        load_fault_reclaimer().is_some(),
         "a reclaimable task needs an installed fault reclaimer"
     );
     spawn_tracked_domain(domain, current_queue_hart(), name, fut)
@@ -1131,8 +1181,8 @@ fn reclaim_task(task: Task) -> ReclaimResult {
     drain_task_registrations(&status);
     let future = unsafe { ManuallyDrop::take(&mut future) };
 
-    let guard = *FAULT_GUARD.lock();
-    let mut current_task = enter_current_task(status.clone());
+    let guard = load_fault_guard();
+    let mut current_task = enter_current_task(id, status.clone());
     // Task construction established the domain provenance; polling and Drop
     // must re-enter that exact audited domain.
     let mut owner_scope = unsafe { heap::enter_domain(domain) };
@@ -1284,7 +1334,7 @@ fn teardown_faulted_domain(
     for victim in &victims {
         notify_fault_cleanup(victim.id, domain);
     }
-    if let Some(reclaim) = *FAULT_RECLAIMER.lock() {
+    if let Some(reclaim) = load_fault_reclaimer() {
         unsafe { reclaim(domain) };
     }
     system.restore();
@@ -1600,6 +1650,14 @@ pub fn scheduler_stats() -> SchedulerStats {
     }
 }
 
+/// Allocation-free telemetry for the retained transactional scheduler lock.
+///
+/// M5.3 samples this boundary explicitly instead of claiming the scheduler is
+/// lock-free: task lifecycle and queue ownership still linearize together.
+pub fn scheduler_lock_stats() -> crate::sync::SpinLockStats {
+    SCHED.stats()
+}
+
 /// Linearizable logical queue affinity for one live task. A running task owns
 /// the executing hart; a ready or parked task owns its metadata hart.
 pub fn task_queue_owner(id: TaskId) -> Option<HartId> {
@@ -1749,9 +1807,9 @@ fn poll_once_on(hart: HartId) -> bool {
 
     // Poll behind the kernel's landing pad when one is installed, so a
     // component that panics costs its own task instead of the machine.
-    let guard = *FAULT_GUARD.lock();
+    let guard = load_fault_guard();
     let mut poll = Poll::Pending;
-    let mut current_task = enter_current_task(status.clone());
+    let mut current_task = enter_current_task(id, status.clone());
     // Tracked task domains originate only at the unsafe reclaimable spawn
     // boundary; ordinary safe tasks carry an untracked domain.
     let mut owner_scope = unsafe { heap::enter_domain(task.domain) };
@@ -1923,6 +1981,11 @@ impl WaitQueue {
     /// Number of futures currently registered on this queue.
     pub fn waiter_count(&self) -> usize {
         self.inner.lock().waiters.len()
+    }
+
+    /// Allocation-free contention telemetry for this IRQ/task handoff queue.
+    pub fn lock_stats(&self) -> crate::sync::SpinLockStats {
+        self.inner.stats()
     }
 
     /// Prepare to park until the next `wake_all`.
@@ -2315,6 +2378,11 @@ fn cleanup_owned_registration(registration: OwnedRegistration) {
 /// Number of live sleep registrations, for scheduler diagnostics and tests.
 pub fn timer_registration_count() -> usize {
     TIMERS.lock().len()
+}
+
+/// Allocation-free telemetry for the timer registry's IRQ/task lock.
+pub fn timer_lock_stats() -> crate::sync::SpinLockStats {
+    TIMERS.stats()
 }
 
 /// Called when no earlier architecture-specific trap timestamp is available.

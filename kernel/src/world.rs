@@ -17,15 +17,16 @@ use crate::cap::{self, CSpace, Cap, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
+use crate::store;
 use crate::sync::SpinLock;
 use crate::virtio_blk;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
-// The interactive compiler's conform program now charges its future envelope
-// and every transient AST/code buffer to the shell owner. Keep enough headroom
-// for that audited workload while retaining a hard component quota.
-pub const SHELL_MEMORY_BUDGET: usize = 512 * 1024;
+// The interactive compiler and bounded full-journal object recovery charge
+// their transient buffers to the shell owner. Keep the documented store
+// working-set floor plus client/future headroom while retaining a hard quota.
+pub const SHELL_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ComponentId(u64);
@@ -83,6 +84,7 @@ enum ComponentTemplate {
     Logger,
     Guest,
     VirtioBlk,
+    StoreFaultProbe,
     FaultProbe,
 }
 
@@ -91,6 +93,7 @@ enum ComponentGrants {
     Logger { rx: Cap, console: Cap },
     Guest(Cap),
     VirtioBlk { mmio: Cap, dma: Cap, service: Cap },
+    StoreFaultProbe(Cap),
     FaultProbe,
 }
 
@@ -285,6 +288,8 @@ pub struct World {
     /// init's client authority on the discovered block service. The transport
     /// and DMA roots remain private supervisor grants.
     pub block: Option<Cap>,
+    /// init's authority on the capability-addressed persistent object service.
+    pub store: Option<Cap>,
     pub block_space: Option<Cap>,
     block_mmio: Option<Cap>,
     block_dma: Option<Cap>,
@@ -419,6 +424,15 @@ impl World {
                 )
                 .expect("init retains the block service grant root"),
             },
+            ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
+                cap::grant(
+                    &init,
+                    self.store.expect("store service root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("init retains the object-store grant root"),
+            ),
             ComponentTemplate::FaultProbe => ComponentGrants::FaultProbe,
         }
     }
@@ -457,6 +471,13 @@ impl World {
                     virtio_blk::driver_task(space.get(), mmio, dma, service),
                 )
             },
+            ComponentGrants::StoreFaultProbe(service) => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    store_fault_probe_task(space, service),
+                )
+            },
             ComponentGrants::FaultProbe => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
@@ -480,6 +501,32 @@ impl World {
             Some(ComponentTemplate::FaultProbe),
             fault_probe_task(SpaceRef::new(&space), memory_budget),
         )
+    }
+
+    pub(crate) fn spawn_store_fault_probe(
+        &self,
+        name: &'static str,
+        memory_budget: usize,
+    ) -> Option<Arc<Component>> {
+        let store_root = self.store?;
+        let space = Space::new(name);
+        let service = {
+            let init = self.spaces["init"].0.lock();
+            cap::grant(
+                &init,
+                store_root,
+                Rights::READ.union(Rights::WRITE),
+                &mut space.0.lock(),
+            )
+            .expect("init retains the object-store grant root")
+        };
+        Some(self.spawn_component_inner(
+            name,
+            space.clone(),
+            memory_budget,
+            Some(ComponentTemplate::StoreFaultProbe),
+            store_fault_probe_task(SpaceRef::new(&space), service),
+        ))
     }
 
     /// Replace a terminal task incarnation while retaining stable component,
@@ -700,6 +747,9 @@ pub fn build() {
     let prog = Space::new("prog");
     let block_resources = virtio_blk::discover();
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
+    let store_backend = block_resources
+        .as_ref()
+        .map(|_| Space::new("store-backend"));
 
     // init is the root of authority: it mints the only unattenuated caps, then
     // hands out strictly weaker copies. Nothing else can widen what it gets.
@@ -772,6 +822,24 @@ pub fn build() {
             (None, None) => (None, None, None, None),
             _ => unreachable!("block resources and CSpace are constructed together"),
         };
+    let store_root = match (block_root, store_backend.as_ref()) {
+        (Some(block), Some(backend)) => {
+            // The store receives only block read/write authority in a private
+            // backend CSpace. Its public service cap discloses neither the
+            // device nor stable object identifiers.
+            let block_grant = cap::grant(
+                &cs,
+                block,
+                Rights::READ.union(Rights::WRITE),
+                &mut backend.0.lock(),
+            )
+            .unwrap();
+            let service = store::StoreService::new(backend.clone(), block_grant);
+            Some(cs.mint(service, Rights::ALL))
+        }
+        (None, None) => None,
+        _ => unreachable!("store backend exists exactly when a block device exists"),
+    };
     drop(cs);
 
     let mut spaces = BTreeMap::from([
@@ -783,6 +851,9 @@ pub fn build() {
     ]);
     if let Some(space) = block_space.as_ref() {
         spaces.insert("virtio-blk", space.clone());
+    }
+    if let Some(space) = store_backend.as_ref() {
+        spaces.insert("store-backend", space.clone());
     }
 
     let world = Arc::new(World {
@@ -796,6 +867,7 @@ pub fn build() {
         prog_memory: prog_mem,
         region: init_region,
         block: block_root,
+        store: store_root,
         block_space: c_block_space,
         block_mmio: block_mmio_root,
         block_dma: block_dma_root,
@@ -926,4 +998,25 @@ async fn fault_probe_task(space: SpaceRef, memory_budget: usize) {
     let _abandoned_cspace = space.get().0.lock();
     held.resize(memory_budget.saturating_mul(2), 0x5A);
     panic!("fault probe unexpectedly stayed within its allocation quota");
+}
+
+/// Audited M4.2 probe. It allocates the normal recovery/transaction working
+/// set, then faults after taking the store claim and before the first write.
+/// Raw teardown must reclaim both the caller arena and the abandoned claim.
+async fn store_fault_probe_task(space: SpaceRef, service: Cap) {
+    const MARKER: &[u8] = b"VIBEOS-STORE-FAULT-PROBE-v1";
+    let mut payload: Vec<u8> = (0..900)
+        .map(|index| ((index * 29 + 7) % 251) as u8)
+        .collect();
+    payload[..MARKER.len()].copy_from_slice(MARKER);
+    let kind = store::journal_object_kind(0xF042).expect("fault-probe object kind is non-zero");
+    let lease = space
+        .get()
+        .0
+        .lock()
+        .lookup_lease::<store::StoreService>(service, Rights::WRITE)
+        .expect("store fault probe receives an explicit write grant");
+    let result =
+        store::put_with_static_fault_before_write(lease, space.get(), kind, &payload).await;
+    panic!("injected store fault unexpectedly returned: {result:?}");
 }

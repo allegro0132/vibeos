@@ -24,11 +24,18 @@ static FAULT_NEXT_POLL: AtomicBool = AtomicBool::new(false);
 static FAULT_AFTER_GUARDED_CALLS: AtomicU64 = AtomicU64::new(0);
 static OWNER_SEEN_BY_FAULT_GUARD: Mutex<Option<OwnerId>> = Mutex::new(None);
 static RECLAIMED_DOMAINS: Mutex<Vec<AllocationDomain>> = Mutex::new(Vec::new());
+static CLEANED_TASKS: Mutex<Vec<(exec::TaskId, AllocationDomain)>> = Mutex::new(Vec::new());
 static FAULT_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 
 unsafe fn record_fault_reclaim(domain: AllocationDomain) {
     RECLAIMED_DOMAINS.lock().unwrap().push(domain);
 }
+
+unsafe fn record_fault_cleanup(task: exec::TaskId, domain: AllocationDomain) {
+    CLEANED_TASKS.lock().unwrap().push((task, domain));
+}
+
+unsafe fn ignore_fault_cleanup(_task: exec::TaskId, _domain: AllocationDomain) {}
 
 fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
     if FAULT_NEXT_POLL.swap(false, Ordering::SeqCst) {
@@ -410,6 +417,40 @@ fn fault_and_destructor_paths_restore_the_system_owner() {
 }
 
 #[test]
+fn an_untracked_fault_notifies_exact_task_cleanup_once() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    CLEANED_TASKS.lock().unwrap().clear();
+    exec::set_fault_cleanup(record_fault_cleanup);
+
+    let fault_domain = AllocationDomain::untracked(OwnerId::new(10_008));
+    let survivor_domain = AllocationDomain::untracked(OwnerId::new(10_009));
+    exec::set_fault_guard(fault_after_poll);
+    let faulted = exec::spawn_tracked_owned(fault_domain.owner, "cleanup-fault", async {});
+    let survivor = exec::spawn_tracked_owned(
+        survivor_domain.owner,
+        "cleanup-survivor",
+        std::future::pending::<()>(),
+    );
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(faulted.state(), TaskState::Faulted);
+    assert_eq!(survivor.state(), TaskState::Running);
+    assert_eq!(
+        CLEANED_TASKS.lock().unwrap().as_slice(),
+        &[(faulted.id(), fault_domain)]
+    );
+
+    assert!(exec::poll_once(), "the unrelated task still runs normally");
+    assert_eq!(survivor.state(), TaskState::Running);
+    assert_eq!(survivor.cancel(), CancelOutcome::Requested);
+    assert_eq!(survivor.state(), TaskState::Cancelled);
+    assert_eq!(CLEANED_TASKS.lock().unwrap().len(), 1);
+    exec::set_fault_cleanup(ignore_fault_cleanup);
+}
+
+#[test]
 fn a_reclaimable_poll_fault_skips_drop_and_invokes_the_reclaimer() {
     let _g = scheduler();
     exec::run_until_idle(BUDGET);
@@ -448,6 +489,8 @@ fn a_reclaimable_fault_detaches_every_sibling_in_the_same_arena() {
     exec::run_until_idle(BUDGET);
     exec::set_fault_reclaimer(record_fault_reclaim);
     RECLAIMED_DOMAINS.lock().unwrap().clear();
+    CLEANED_TASKS.lock().unwrap().clear();
+    exec::set_fault_cleanup(record_fault_cleanup);
 
     let domain = AllocationDomain::new(OwnerId::new(20_002), ArenaId::new(30_002));
     let primary_drops = Arc::new(AtomicU64::new(0));
@@ -484,10 +527,15 @@ fn a_reclaimable_fault_detaches_every_sibling_in_the_same_arena() {
     assert_eq!(sibling_drops.load(Ordering::SeqCst), 0);
     assert_eq!(exec::faulted_count(), faults_before + 2);
     assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    assert_eq!(
+        CLEANED_TASKS.lock().unwrap().as_slice(),
+        &[(primary.id(), domain), (sibling.id(), domain)]
+    );
     assert!(exec::task_report()
         .iter()
         .all(|task| task.id != primary.id() && task.id != sibling.id()));
     assert!(!exec::poll_once(), "a detached sibling remained ready");
+    exec::set_fault_cleanup(ignore_fault_cleanup);
 }
 
 #[test]

@@ -68,6 +68,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  durable         recover a sealed capability log and tombstone");
             println!("  blk info|test   inspect or exercise the supervised block device");
+            println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -326,6 +327,8 @@ async fn run(line: &str, boot_time: u64) {
         "durable" => durable_demo(),
 
         "blk" => block_command(&rest).await,
+
+        "store" => store_command(&rest).await,
 
         "selftest" => {
             let r = crate::selftest::run().await;
@@ -966,5 +969,191 @@ async fn block_command(args: &[&str]) {
             "  usage: blk [info|test|fault|recover|timeout|cancel|revoke] (got `{}`)",
             other
         ),
+    }
+}
+
+async fn store_command(args: &[&str]) {
+    const OBJECT_KIND: u32 = 1;
+    const MARKER: &[u8] = b"VIBEOS-STORE-OBJECT-v1";
+
+    let w = world();
+    let Some(store_cap) = w.store else {
+        println!("  object store: offline (no writable block backend)");
+        return;
+    };
+    let init = w.spaces["init"].clone();
+    match args.first().copied().unwrap_or("info") {
+        "info" => {
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ);
+            match lease.and_then(|lease| {
+                crate::store::info_with(&lease).map_err(|_| CapError::InsufficientRights)
+            }) {
+                Ok(info) => println!(
+                    "  object store: {}, {} object(s), {} of {} journal sectors used",
+                    if info.ready {
+                        "ready"
+                    } else {
+                        "recovery pending"
+                    },
+                    info.recovered_objects,
+                    info.used_sectors,
+                    crate::store::STORE_LOG_SECTORS
+                ),
+                Err(error) => println!("  refused: {}", error),
+            }
+        }
+        "fault" => store_fault_recovery().await,
+        "test" => {
+            let mut payload: Vec<u8> = (0..900)
+                .map(|index| ((index * 17 + 3) % 251) as u8)
+                .collect();
+            payload[..MARKER.len()].copy_from_slice(MARKER);
+            let object_kind = crate::store::journal_object_kind(OBJECT_KIND)
+                .expect("the acceptance object kind is non-zero");
+
+            let read_only = {
+                let mut cspace = init.0.lock();
+                cspace.derive(store_cap, Rights::READ)
+            };
+            let denied = match read_only {
+                Ok(read_only) => {
+                    let lease = init
+                        .0
+                        .lock()
+                        .lookup_lease::<crate::store::StoreService>(read_only, Rights::NONE);
+                    match lease {
+                        Ok(lease) => {
+                            crate::store::put_with(lease, init.clone(), object_kind, &payload).await
+                        }
+                        Err(_) => Err(crate::store::StoreError::PermissionDenied),
+                    }
+                }
+                Err(_) => Err(crate::store::StoreError::PermissionDenied),
+            };
+            if denied != Err(crate::store::StoreError::PermissionDenied) {
+                println!("  read-only store put: invariant failed");
+                return;
+            }
+            println!("  read-only store put: refused");
+
+            let write = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoreService>(store_cap, Rights::NONE);
+            let object_cap = match write {
+                Ok(lease) => {
+                    match crate::store::put_with(lease, init.clone(), object_kind, &payload).await {
+                        Ok(cap) => cap,
+                        Err(error) => {
+                            println!("  900-byte object commit: failed ({})", error);
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    println!("  900-byte object commit: refused ({})", error);
+                    return;
+                }
+            };
+
+            let service = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ);
+            let object = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoredObject>(object_cap, Rights::READ);
+            let read_back = match (service, object) {
+                (Ok(service), Ok(object)) => crate::store::get_with(service, object).await,
+                _ => Err(crate::store::StoreError::ObjectUnavailable),
+            };
+            if read_back.as_deref() != Ok(payload.as_slice()) {
+                println!("  900-byte object commit + disk readback: mismatch");
+                return;
+            }
+            println!("  900-byte object commit + disk readback: ok");
+
+            let retired = init.0.lock().revoke(object_cap).unwrap_or(0);
+            let denied_after_revoke = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoredObject>(object_cap, Rights::READ)
+                .is_err();
+            if retired == 0 || !denied_after_revoke {
+                println!("  object-cap revocation: invariant failed");
+                return;
+            }
+            println!("  object-cap revocation: next read refused");
+            println!("  namespace check: capability only; no path or ObjectId lookup");
+        }
+        other => println!("  usage: store [info|test|fault] (got `{}`)", other),
+    }
+}
+
+async fn store_fault_recovery() {
+    const CYCLES: usize = 4;
+    const PROBE_BUDGET: usize = crate::store::STORE_CLIENT_MEMORY_BUDGET;
+
+    let w = world();
+    let Some(store_cap) = w.store else {
+        println!("  store fault recovery: skipped (store offline)");
+        return;
+    };
+    let Some(probe) = w.spawn_store_fault_probe("store-fault-probe", PROBE_BUDGET) else {
+        println!("  store fault recovery: probe could not be created");
+        return;
+    };
+    let owner = probe.memory_owner();
+    let mut warm_remaining = None;
+    let mut warm_live = None;
+    let mut healthy = true;
+
+    for cycle in 0..CYCLES {
+        let reached_before = crate::store::fault_reached_count();
+        let (_, join) = probe.join_current();
+        let exit = join.await;
+        let snapshot = probe.snapshot();
+        let init = w.spaces["init"].clone();
+        let store_busy = init
+            .0
+            .lock()
+            .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ)
+            .ok()
+            .and_then(|lease| crate::store::info_with(&lease).ok())
+            .is_some_and(|info| info.busy);
+        healthy &= exit.state() == exec::TaskState::Faulted
+            && crate::store::fault_reached_count() == reached_before + 1
+            && snapshot.memory.live_bytes == 0
+            && HEAP.arena_stats(snapshot.arena).is_none()
+            && !store_busy;
+
+        let (live, _, remaining) = HEAP.stats();
+        if cycle == 1 {
+            warm_live = Some(live);
+            warm_remaining = Some(remaining);
+        } else if cycle > 1 {
+            healthy &= Some(remaining) == warm_remaining;
+            healthy &= warm_live.is_some_and(|baseline| live <= baseline);
+        }
+
+        if cycle + 1 != CYCLES {
+            healthy &= w.restart_component("store-fault-probe").is_ok();
+        }
+    }
+
+    healthy &= w.remove_terminal_component(probe.snapshot().id);
+    drop(probe);
+    healthy &= HEAP.account_stats(owner).is_none();
+    if healthy {
+        println!(
+            "  store fault recovery: {} raw faults, claim cleared, heap plateau",
+            CYCLES
+        );
+    } else {
+        println!("  store fault recovery: invariant failed");
     }
 }

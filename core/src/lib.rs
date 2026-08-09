@@ -16,5 +16,6 @@ pub mod durable;
 pub mod exec;
 pub mod heap;
 pub mod interrupt;
+pub mod store;
 pub mod sync;
 pub mod virtio;

@@ -19,6 +19,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   workstreams, testing strategy, metrics, and the risk register.
 - **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
+- **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
+  API, unified on-disk journal, publication boundary, and raw-media acceptance.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
@@ -79,9 +81,11 @@ ep.send(reading).await;
 from a holder — and `grant`/`derive` can only ever *shrink* rights. Amplification
 isn't policed at runtime; it's absent from the API.
 
-The system image in `world.rs` has 5 spaces wired to 1 channel, a console, and a
-bounded memory region. Four are owned by supervised components; `prog` is the
-explicitly unbound execution space used synchronously by the shell task:
+The base system image in `world.rs` has 5 spaces wired to 1 channel, a console,
+and a bounded memory region. Four are owned by supervised components; `prog` is
+the explicitly unbound execution space used synchronously by the shell task.
+When virtio-blk is discovered, private driver and store-backend spaces are added;
+the latter holds only an attenuated block `READ|WRITE` cap:
 
 | space  | holds                                    | therefore cannot          |
 |--------|------------------------------------------|---------------------------|
@@ -90,6 +94,8 @@ explicitly unbound execution space used synchronously by the shell task:
 | logger | telemetry `RECV`, console `WRITE`        | forge a reading           |
 | guest  | console `WRITE`                          | pass the console on       |
 | prog   | console `WRITE`, memory `READ|WRITE`      | reach any other resource  |
+| virtio-blk | MMIO, DMA, block service `READ|WRITE` | console or object caps    |
+| store-backend | block service `READ|WRITE`        | paths or client CSpaces   |
 
 Run `probe` in the shell to watch four attacks get refused. `revoke guest` pulls
 a live component's authority out from under it, while `cancel guest` separately
@@ -155,6 +161,8 @@ immediately. Audited World components run in per-incarnation fault arenas: a
 fault detaches the entire arena, purges its registrations, and reclaims its
 blocks without invoking the interrupted future's destructors. Ordinary tasks
 without that no-escape audit still use the conservative leak-on-fault policy.
+Both paths first notify a non-allocating exact-task fault hook after permanent
+detach, so an abandoned persistent-store claim cannot wedge later callers.
 
 ## A Rust compiler, inside the OS
 
@@ -353,9 +361,10 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **No object store or persisted live CSpace yet; no MMU, user mode, or
-  multicore.** Modern virtio-blk is real and supervised, but M4.2--M4.5 still
-  have to bind its sectors to capability-addressed objects and programs.
+- **Objects persist, live CSpaces do not yet; no MMU, user mode, or multicore.**
+  The M4.2 store commits immutable bytes to the real virtio backing device and
+  exposes them only through capabilities. M4.3 must restore exact authority
+  after reboot, and M4.5 must bind saved source/binaries to that authority.
 - **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.

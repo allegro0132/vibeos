@@ -1,0 +1,6 @@
+quiet
+store fault
+@sleep 10
+store test
+@sleep 15
+halt

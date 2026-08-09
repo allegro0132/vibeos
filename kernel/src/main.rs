@@ -26,6 +26,7 @@ mod plic;
 mod rustc;
 mod selftest;
 mod shell;
+mod store;
 mod trampoline;
 mod trap;
 mod tty;
@@ -125,6 +126,7 @@ pub extern "C" fn kmain() -> ! {
     // Install the complete fault boundary before World admits any reclaimable
     // component task. A tracked arena must never run without both hooks.
     exec::set_fault_guard(trampoline::guard_task);
+    exec::set_fault_cleanup(cleanup_faulted_task);
     exec::set_fault_reclaimer(reclaim_faulted_component);
 
     world::build();
@@ -161,6 +163,13 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         HEAP.reclaim_faulted_arena(domain.arena)
             .expect("a faulted audited arena must reclaim atomically");
     }
+}
+
+/// Repair exact-task stable state for both conservative untracked faults and
+/// audited arena faults. The executor has detached the task permanently before
+/// entering this non-allocating hook.
+unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomain) {
+    unsafe { store::recover_faulted_task(task, domain) };
 }
 
 #[panic_handler]

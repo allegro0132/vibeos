@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
-use vibeos_core::arch::{advance_time, armed_timer, reset_time, time};
+use vibeos_core::arch::{
+    advance_time, armed_timer, current_hart_id, reset_time, set_test_hart_id, time,
+};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::exec::{self, CancelOutcome, TaskExit, TaskState, WaitQueue};
 use vibeos_core::heap::{self, AllocationDomain, ArenaId, OwnerId};
@@ -49,6 +51,15 @@ fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
 fn fault_after_poll(poll: &mut dyn FnMut()) -> bool {
     poll();
     true
+}
+
+fn fault_only_hart_one(poll: &mut dyn FnMut()) -> bool {
+    if current_hart_id() == 1 {
+        true
+    } else {
+        poll();
+        false
+    }
 }
 
 fn fault_after_guarded_calls(poll: &mut dyn FnMut()) -> bool {
@@ -233,7 +244,25 @@ impl Drop for ReadyThenCancelOnDrop {
 }
 
 fn scheduler() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    set_test_hart_id(0);
+    guard
+}
+
+struct TestHartScope(usize);
+
+impl TestHartScope {
+    fn enter(hart: usize) -> Self {
+        let previous = current_hart_id();
+        set_test_hart_id(hart);
+        Self(previous)
+    }
+}
+
+impl Drop for TestHartScope {
+    fn drop(&mut self) {
+        set_test_hart_id(self.0);
+    }
 }
 
 const BUDGET: usize = 10_000;
@@ -1586,6 +1615,186 @@ fn stolen_wake_during_poll_migrates_one_ready_owner_to_hart0() {
     assert!(exec::poll_once());
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert_eq!(handle.state(), TaskState::Exited);
+}
+
+#[test]
+fn two_harts_keep_running_slots_current_tasks_and_domains_isolated() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+
+    let outer_owner = OwnerId::new(31_000);
+    let inner_owner = OwnerId::new(31_001);
+    let outer_id = Arc::new(AtomicU64::new(0));
+    let inner_id = Arc::new(AtomicU64::new(0));
+    let outer_seen_from_inner = Arc::new(AtomicU64::new(0));
+    let both_visible = Arc::new(AtomicBool::new(false));
+    let first_inner_poll = Arc::new(AtomicBool::new(true));
+
+    let inner = {
+        let _hart = TestHartScope::enter(1);
+        let inner_id = inner_id.clone();
+        let outer_id = outer_id.clone();
+        let outer_seen_from_inner = outer_seen_from_inner.clone();
+        let both_visible = both_visible.clone();
+        let first_inner_poll = first_inner_poll.clone();
+        exec::spawn_tracked_owned(inner_owner, "m54-inner-running", async move {
+            std::future::poll_fn(move |_cx| {
+                let this = exec::current_task_id().expect("hart 1 task is current");
+                assert_eq!(this.0, inner_id.load(Ordering::SeqCst));
+                assert_eq!(heap::current_owner(), inner_owner);
+
+                let outer = exec::TaskId(outer_id.load(Ordering::SeqCst));
+                let reports = exec::task_report();
+                both_visible.store(
+                    reports.iter().any(|report| report.id == outer)
+                        && reports.iter().any(|report| report.id == this),
+                    Ordering::SeqCst,
+                );
+
+                if first_inner_poll.swap(false, Ordering::SeqCst) {
+                    let _hart = TestHartScope::enter(0);
+                    let active_outer =
+                        exec::current_task_id().expect("hart 0 task remains current");
+                    outer_seen_from_inner.store(active_outer.0, Ordering::SeqCst);
+                    assert_eq!(heap::current_owner(), outer_owner);
+                    assert_eq!(
+                        exec::wake_with_disposition(this),
+                        exec::WakeDisposition::Running {
+                            hart: exec::HartId::new(1).unwrap()
+                        }
+                    );
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+        })
+    };
+    inner_id.store(inner.id().0, Ordering::SeqCst);
+
+    let outer = {
+        let outer_id = outer_id.clone();
+        exec::spawn_tracked_owned(outer_owner, "m54-outer-running", async move {
+            let this = exec::current_task_id().expect("hart 0 task is current");
+            outer_id.store(this.0, Ordering::SeqCst);
+            assert_eq!(heap::current_owner(), outer_owner);
+            {
+                let _hart = TestHartScope::enter(1);
+                assert!(exec::poll_once());
+            }
+            assert_eq!(exec::current_task_id(), Some(this));
+            assert_eq!(heap::current_owner(), outer_owner);
+        })
+    };
+
+    assert!(exec::poll_once());
+    assert_eq!(outer.state(), TaskState::Exited);
+    assert_eq!(outer_seen_from_inner.load(Ordering::SeqCst), outer.id().0);
+    assert!(both_visible.load(Ordering::SeqCst));
+    assert_eq!(inner.state(), TaskState::Running);
+    assert_eq!(
+        exec::task_queue_owner(inner.id()),
+        Some(exec::HartId::new(1).unwrap())
+    );
+
+    {
+        let _hart = TestHartScope::enter(1);
+        assert!(exec::poll_once());
+    }
+    assert_eq!(inner.state(), TaskState::Exited);
+}
+
+#[test]
+fn an_unknown_host_hart_cannot_alias_the_boot_scheduler_slot() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let task = exec::spawn_tracked("m54-unmapped-hart", async {});
+
+    {
+        let _hart = TestHartScope::enter(exec::MAX_HARTS);
+        assert_eq!(exec::current_task_id(), None);
+        assert!(std::panic::catch_unwind(exec::poll_once).is_err());
+    }
+
+    assert_eq!(task.polls(), 0);
+    assert_eq!(task.state(), TaskState::Running);
+    assert!(exec::poll_once());
+    assert_eq!(task.state(), TaskState::Exited);
+}
+
+#[test]
+fn a_remote_hart_can_cancel_the_task_running_in_another_slot() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+
+    let inner_handle = Arc::new(Mutex::new(None::<exec::TaskHandle>));
+    let outcome = Arc::new(Mutex::new(None));
+    let inner = {
+        let _hart = TestHartScope::enter(1);
+        let inner_handle = inner_handle.clone();
+        let outcome = outcome.clone();
+        exec::spawn_tracked_owned(OwnerId::new(31_011), "m54-remote-cancel", async move {
+            {
+                let _hart = TestHartScope::enter(0);
+                assert!(exec::current_task_id().is_some());
+                let handle = inner_handle.lock().unwrap().clone().unwrap();
+                *outcome.lock().unwrap() = Some(handle.cancel());
+            }
+            std::future::pending::<()>().await;
+        })
+    };
+    *inner_handle.lock().unwrap() = Some(inner.clone());
+
+    let outer = exec::spawn_tracked_owned(OwnerId::new(31_010), "m54-cancel-caller", async {
+        let this = exec::current_task_id().unwrap();
+        {
+            let _hart = TestHartScope::enter(1);
+            assert!(exec::poll_once());
+        }
+        assert_eq!(exec::current_task_id(), Some(this));
+    });
+
+    assert!(exec::poll_once());
+    assert_eq!(*outcome.lock().unwrap(), Some(CancelOutcome::Requested));
+    assert_eq!(inner.state(), TaskState::Cancelled);
+    assert_eq!(inner.polls(), 1);
+    assert_eq!(outer.state(), TaskState::Exited);
+    assert_eq!(exec::task_queue_owner(inner.id()), None);
+}
+
+#[test]
+fn a_fault_on_one_hart_does_not_detach_another_harts_running_task() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_guard(fault_only_hart_one);
+
+    let faulted = {
+        let _hart = TestHartScope::enter(1);
+        exec::spawn_tracked_owned(
+            OwnerId::new(31_021),
+            "m54-hart1-fault",
+            std::future::pending::<()>(),
+        )
+    };
+    let outer_survived = Arc::new(AtomicBool::new(false));
+    let survived = outer_survived.clone();
+    let outer = exec::spawn_tracked_owned(OwnerId::new(31_020), "m54-hart0-survivor", async move {
+        let this = exec::current_task_id().unwrap();
+        {
+            let _hart = TestHartScope::enter(1);
+            assert!(exec::poll_once());
+        }
+        assert_eq!(exec::current_task_id(), Some(this));
+        assert!(exec::task_report().iter().any(|report| report.id == this));
+        survived.store(true, Ordering::SeqCst);
+    });
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(faulted.state(), TaskState::Faulted);
+    assert_eq!(outer.state(), TaskState::Exited);
+    assert!(outer_survived.load(Ordering::SeqCst));
 }
 
 #[test]

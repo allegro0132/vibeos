@@ -171,7 +171,7 @@ reporting. Cancelling a ready or parked task detaches it and drops its future
 without another poll; cancelling the task currently running takes effect when
 that poll returns. Faults win over simultaneous cancellation, terminal states
 are absorbing, and a stale wake cannot revive a task. This is not preemption: an
-in-tree future that never yields can still wedge the single hart. Wait listeners
+in-tree future that never yields can still wedge its executor hart. Wait listeners
 carry an epoch and unique registration token, while sleeps carry a unique timer
 token; normal completion, Drop, and cancellation release those registrations
 immediately. Audited World components run in per-incarnation fault arenas: a
@@ -362,9 +362,10 @@ showing rising poll counts while muted, because the components never stopped.
 
 Deliberate, not overlooked:
 
-- **Single physical hart.** Four logical run queues, lock-free IRQ data handoffs,
-  hart-owned SpinLock guards, and SBI/IPI delivery are tested, but M5.4/M5.5 still
-  gate hart-local running state and the `-smp 4` acceptance run.
+- **Single physical hart.** Four logical run queues, per-hart running/current-task,
+  heap and fault-recovery state, lock-free IRQ data handoffs, hart-owned SpinLock
+  guards, and SBI/IPI delivery are tested, but M5.5 still gates secondary boot and
+  the `-smp 4` acceptance run.
 - **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
   so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
   not a strict subset, and it is what the roadmap's differential testing against
@@ -390,8 +391,11 @@ Deliberate, not overlooked:
   and hart0 work stealing. M5.2 adds SBI/SSIP doorbells, atomic reason mailboxes,
   and explicit logical-to-physical hart mapping while only the boot hart is
   online. M5.3 removes the PLIC/UART RX/virtio data locks, hardens fault-recoverable
-  locks, and publishes their contention telemetry; hart-local running state and
-  secondary boot remain gated. M4.3 restores
+  locks, and publishes their contention telemetry. M5.4 partitions scheduler
+  running/wake slots, current-task and allocation provenance, interrupt markers,
+  and task/program recovery state per logical hart. A validated per-hart
+  `sscratch` token keeps those lookups O(1); secondary boot remains gated.
+  M4.3 restores
   the externally constrained `persistent-test` graph. M4.5 adds one immutable
   `hello` ProgramArtifact whose source and canonical
   VIBEEXE are revalidated against the current compiler before execution, with an

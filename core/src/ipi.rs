@@ -78,12 +78,26 @@ fn physical_hart_id(hart: HartId) -> Option<usize> {
 }
 
 /// Logical scheduler identity bound to the currently executing physical hart.
+#[inline(always)]
 pub fn current_logical_hart() -> Option<HartId> {
-    let physical = arch::current_hart_id();
-    (0..MAX_HARTS).find_map(|index| {
-        let logical = HartId::new(index).expect("mailbox index is a logical hart");
-        (is_online(logical) && physical_hart_id(logical) == Some(physical)).then_some(logical)
-    })
+    if let Some(index) = arch::cached_logical_hart_index() {
+        return HartId::new(index);
+    }
+
+    // On target, a zero per-hart token means this CPU has not completed its
+    // own registration. Never borrow a controller-published mapping for a
+    // secondary that has not initialized its local stack/trap/runtime state.
+    #[cfg(target_arch = "riscv64")]
+    return None;
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let physical = arch::current_hart_id();
+        (0..MAX_HARTS).find_map(|index| {
+            let logical = HartId::new(index).expect("mailbox index is a logical hart");
+            (is_online(logical) && physical_hart_id(logical) == Some(physical)).then_some(logical)
+        })
+    }
 }
 
 /// Send one already-armed doorbell. Failure releases the armed bit while
@@ -175,36 +189,54 @@ pub fn mark_online(hart: HartId, physical_hart: usize) -> Result<OnlineDispositi
     if physical_hart == UNMAPPED_HART {
         return Err(OnlineError::InvalidPhysicalHart);
     }
-    for index in 0..MAX_HARTS {
-        if index != hart.index()
-            && ONLINE_HARTS.load(Ordering::Acquire) & (1usize << index) != 0
-            && PHYSICAL_HART_IDS[index].load(Ordering::Acquire) == physical_hart
-        {
-            return Err(OnlineError::PhysicalHartAlreadyMapped);
+    // Mapping publication and this hart's CSR token form one local
+    // registration transaction. A pending IRQ cannot observe the target
+    // halfway through its first identity install.
+    let irq = arch::irq_save();
+    let result = (|| {
+        for index in 0..MAX_HARTS {
+            if index != hart.index()
+                && ONLINE_HARTS.load(Ordering::Acquire) & (1usize << index) != 0
+                && PHYSICAL_HART_IDS[index].load(Ordering::Acquire) == physical_hart
+            {
+                return Err(OnlineError::PhysicalHartAlreadyMapped);
+            }
         }
-    }
 
-    let mapping = &PHYSICAL_HART_IDS[hart.index()];
-    if let Err(previous) = mapping.compare_exchange(
-        UNMAPPED_HART,
-        physical_hart,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        if previous != physical_hart {
-            return Err(OnlineError::LogicalHartRemapped);
+        let mapping = &PHYSICAL_HART_IDS[hart.index()];
+        if let Err(previous) = mapping.compare_exchange(
+            UNMAPPED_HART,
+            physical_hart,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            if previous != physical_hart {
+                return Err(OnlineError::LogicalHartRemapped);
+            }
         }
-    }
 
-    let bit = hart_bit(hart);
-    if ONLINE_HARTS.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
-        return Ok(OnlineDisposition::AlreadyOnline);
-    }
-    if pending_reasons(hart) == 0 {
-        Ok(OnlineDisposition::OnlineIdle)
-    } else {
-        Ok(OnlineDisposition::Pending)
-    }
+        let registering_current_hart = arch::current_hart_id() == physical_hart;
+        let bit = hart_bit(hart);
+        let already_online = ONLINE_HARTS.fetch_or(bit, Ordering::AcqRel) & bit != 0;
+        if registering_current_hart {
+            // This per-hart CSR cache turns the allocation and poll hot paths into
+            // one register read. A controller may register a stopped remote hart;
+            // that hart installs its own cache when it later repeats mark_online.
+            // Safety: the mapping conflict checks and ONLINE publication above
+            // proved that this physical hart owns exactly this logical slot.
+            unsafe { arch::cache_logical_hart_index(hart.index()) };
+        }
+        if already_online {
+            return Ok(OnlineDisposition::AlreadyOnline);
+        }
+        if pending_reasons(hart) == 0 {
+            Ok(OnlineDisposition::OnlineIdle)
+        } else {
+            Ok(OnlineDisposition::Pending)
+        }
+    })();
+    arch::irq_restore(irq);
+    result
 }
 
 pub fn is_online(hart: HartId) -> bool {

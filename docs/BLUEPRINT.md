@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.3 are
-complete; M5.4 hart-local scheduler state is next, and the original M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.4 are
+complete; M5.5 secondary-hart boot is next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -222,9 +222,9 @@ from remote queue backs in cyclic order. `wake_with_disposition` reports whether
 work was newly enqueued, already queued, running, or inactive together with its
 target hart while the original `wake` API remains intact; an allocation-free
 notification hook and idle predicate form the M5.2 IPI seam.
-Tasks in audited raw-reclaim arenas are hart-affine and non-stealable until sibling
-quiescence spans physical harts. The single `running` slot is intentionally retained
-until M5.4, and physical secondary execution remains gated until M5.5.
+Tasks in audited raw-reclaim arenas remain hart-affine and non-stealable. The
+scheduler now owns one `running`/wake slot per logical hart and checks complete-slot
+quiescence before reclaim; physical secondary execution remains gated until M5.5.
 
 M5.2 implements that seam with per-logical-hart atomic reason mailboxes. A mailbox
 also owns its kick-armed bit, so interrupt acknowledgement consumes both atomically;
@@ -240,12 +240,23 @@ complete retain/replace inventory in [SPINLOCK_AUDIT.md](SPINLOCK_AUDIT.md).
 Device handler lookup, UART receive buffering, virtio IRQ transport snapshots, and
 executor callback publication are atomic; scheduler lifecycle, wait queues, timers,
 heap accounting, capability graphs, and recovery transactions retain short audited
-locks with allocation-free contention counters. The retained `running` and
-current-task globals are the explicit M5.4 boundary, not hidden SMP state.
+locks with allocation-free contention counters.
 
-The single-hart lifecycle has two orthogonal coordinates. Its **phase** is running,
+M5.4 makes the execution ambient state explicit per logical hart: scheduler
+running/woken slots, current-task and task-recovery identity, allocation
+owner/arena and OOM diagnostics, interrupt context, nested task/program jump
+buffers, generated-program console authority, and revocation-hook state. Scope
+types are non-`Send` and validate same-hart restoration. On target, every lookup
+uses the logical-to-physical mapping registered with the IPI layer and fails stop
+if no mapping exists; only host models permit dense physical ids. The scheduler
+stores a validated `logical_index + 1` token in each hart's `sscratch` so poll
+and allocation hot paths do not rescan global topology; zero remains the
+unregistered fail-closed value. It still uses one short global lifecycle lock,
+but never holds it while polling, dropping, recovering, or reclaiming.
+
+The scheduler lifecycle has two orthogonal coordinates. Its **phase** is running,
 cancel-requested, terminal-committed, or terminal-published; its **location** is
-ready, parked, the one running slot, detached for reclamation, or gone. The runtime
+ready, parked, exactly one hart's running slot, detached for reclamation, or gone. The runtime
 and its fixed-point host model enforce these invariants:
 
 - every live future has exactly one owner, and every ready ID occurs once;
@@ -487,7 +498,7 @@ boot-static `Space`, while installing a new `TaskId`, `ArenaId`, generation, and
 grants. Slot generations survive CSpace reset, so an old `Cap` cannot alias a fresh
 grant. Sixteen target fault/restart cycles verify bounded heap growth and zero interrupted
 destructors. Reproducible builds, the lifecycle model, and the M5.1 logical queue
-model are now in place; physical execution is still single-hart. Explicit
+model and M5.4 nested-hart execution model are now in place; physical execution is still single-hart. Explicit
 resolved-cap lease semantics now complete the M3.5 sequence.
 
 Five boundaries must stay explicit:

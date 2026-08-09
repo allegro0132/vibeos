@@ -19,7 +19,12 @@ const SSTATUS_SIE: usize = 1 << 1;
 // Panicking from that interrupt must not longjmp into the interrupted task: it
 // would abandon the trap frame and falsely blame the component. The panic path
 // reads this flag before considering task-local recovery.
-static IN_INTERRUPT: AtomicBool = AtomicBool::new(false);
+static IN_INTERRUPT: [AtomicBool; exec::MAX_HARTS] =
+    [const { AtomicBool::new(false) }; exec::MAX_HARTS];
+
+fn current_hart_index() -> Option<usize> {
+    ipi::current_logical_hart().map(exec::HartId::index)
+}
 
 global_asm!(
     r#"
@@ -128,7 +133,12 @@ pub fn enable_interrupts() {
 }
 
 pub fn in_interrupt() -> bool {
-    IN_INTERRUPT.load(Ordering::Acquire)
+    // An unknown physical hart has no safe task/program landing pad. Treat it
+    // as interrupt context so the panic path fails stop instead of jumping
+    // through another hart's saved stack.
+    current_hart_index()
+        .map(|hart| IN_INTERRUPT[hart].load(Ordering::Acquire))
+        .unwrap_or(true)
 }
 
 #[no_mangle]
@@ -156,11 +166,17 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         sbi::shutdown(true);
     }
 
+    let Some(hart) = current_hart_index() else {
+        // Trap-local state cannot be addressed safely until firmware identity
+        // has been bound to one logical scheduler hart.
+        sbi::shutdown(true);
+    };
+
     // IRQ work belongs to the kernel, never to the component it interrupted.
     // This also protects future handler changes from accidentally consuming a
     // component quota. Deallocation remains owner-correct because heap headers
     // carry the allocation owner independently of this ambient scope.
-    IN_INTERRUPT.store(true, Ordering::Release);
+    IN_INTERRUPT[hart].store(true, Ordering::Release);
 
     if code == 1 {
         // SBI IPIs arrive as SSIP. Acknowledge the CSR before consuming the
@@ -168,7 +184,7 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         // concurrent publisher's fresh doorbell. No scheduler lock or poll is
         // entered from this path.
         let _ = ipi::acknowledge_current();
-        IN_INTERRUPT.store(false, Ordering::Release);
+        IN_INTERRUPT[hart].store(false, Ordering::Release);
         return;
     }
 
@@ -191,7 +207,7 @@ extern "C" fn __trap_handler(irq_entry: u64) {
     }
 
     system_owner.restore();
-    IN_INTERRUPT.store(false, Ordering::Release);
+    IN_INTERRUPT[hart].store(false, Ordering::Release);
 }
 
 fn exception_name(code: usize) -> &'static str {

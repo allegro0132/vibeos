@@ -50,6 +50,9 @@ global_asm!(
 _start:
     csrw sie, zero
     csrw sip, zero
+    // Zero is the fail-closed "no logical hart" encoding. `mark_online`
+    // installs logical_index + 1 after validating the firmware hartid.
+    csrw sscratch, zero
 
     // OpenSBI passes the hart id in a0. S-mode cannot read mhartid, so retain
     // it in tp for IRQ routing now and hart-local state from M5.4 onward.
@@ -125,9 +128,10 @@ pub extern "C" fn kmain() -> ! {
         (he - hs) / 1024
     );
 
-    trap::init();
     ipi::mark_online(exec::HartId::BOOT, sbi::current_hart_id())
         .expect("boot physical hart must have one logical scheduler identity");
+    // Install the logical identity before any trap-local state can be used.
+    trap::init();
     exec::set_ready_notify_hook(ipi::notify_ready);
     println!(
         "  traps     stvec armed, PLIC ctx S/hart0, IRQ {} enabled",

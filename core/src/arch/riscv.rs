@@ -46,6 +46,27 @@ pub fn current_hart_id() -> usize {
     hart
 }
 
+/// Logical scheduler identity cached in this hart's supervisor scratch CSR.
+///
+/// Zero means unregistered; logical ids are stored as `index + 1`. OpenSBI
+/// does not own `sscratch` after entering S-mode, and the kernel clears it in
+/// `_start` before any Rust code runs.
+#[inline(always)]
+pub fn cached_logical_hart_index() -> Option<usize> {
+    let encoded: usize;
+    unsafe { asm!("csrr {}, sscratch", out(reg) encoded, options(nostack, nomem)) };
+    encoded.checked_sub(1)
+}
+
+/// Install the current hart's already-validated logical scheduler identity.
+#[inline(always)]
+pub(crate) unsafe fn cache_logical_hart_index(index: usize) {
+    let encoded = index
+        .checked_add(1)
+        .expect("logical hart cache encoding overflowed");
+    unsafe { asm!("csrw sscratch, {}", in(reg) encoded, options(nostack, nomem)) };
+}
+
 /// Clear the receiving hart's supervisor-software pending bit.
 #[inline]
 pub fn clear_software_interrupt() {

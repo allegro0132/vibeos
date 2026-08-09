@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -311,32 +312,105 @@ impl TaskStatus {
     }
 }
 
-static CURRENT_TASK_STATUS: SpinLock<Option<Arc<TaskStatus>>> = SpinLock::new(None);
+static CURRENT_TASK_STATUS: [SpinLock<Option<Arc<TaskStatus>>>; MAX_HARTS] =
+    [const { SpinLock::new(None) }; MAX_HARTS];
+
+/// Resolve the scheduler identity of this CPU without ever aliasing an
+/// unmapped target hart onto the boot slot. Host tests use dense physical ids
+/// as their logical model when no SBI topology has been installed.
+#[inline(always)]
+fn current_scheduler_hart() -> Option<HartId> {
+    if let Some(hart) = ipi::current_logical_hart() {
+        return Some(hart);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        return HartId::new(arch::current_hart_id());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    None
+}
+
+#[inline(always)]
+fn require_current_scheduler_hart(boundary: &str) -> HartId {
+    current_scheduler_hart()
+        .unwrap_or_else(|| panic!("{boundary} requires a mapped logical scheduler hart"))
+}
+
+fn current_task_status() -> Option<Arc<TaskStatus>> {
+    let hart = current_scheduler_hart()?;
+    CURRENT_TASK_STATUS[hart.index()].lock().clone()
+}
 
 struct CurrentTaskScope {
+    slot: &'static SpinLock<Option<Arc<TaskStatus>>>,
     previous: Option<Arc<TaskStatus>>,
     recovery: TaskRecoveryContext,
     active: bool,
+    // A current-task scope changes hart-local scheduler and recovery state.
+    // Moving it to another hart could restore both slots under the wrong CPU.
+    not_send: PhantomData<*mut ()>,
 }
 
+// Compile-time negative auto-trait assertion. If `CurrentTaskScope` ever
+// becomes `Send`, type inference sees both implementations and this item no
+// longer compiles.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+    let _ = <CurrentTaskScope as AmbiguousIfSend<_>>::marker;
+};
+
 fn enter_current_task(id: TaskId, status: Arc<TaskStatus>) -> CurrentTaskScope {
-    let previous = core::mem::replace(&mut *CURRENT_TASK_STATUS.lock(), Some(status));
-    let recovery = crate::sync::enter_task_recovery_context(
-        TaskRecoveryKey::new(id.0).expect("TaskId zero is reserved"),
-    );
+    let hart = require_current_scheduler_hart("task execution");
+    // Safety: require_current_scheduler_hart resolved this CPU's exact slot.
+    unsafe { enter_current_task_on_hart(hart, id, status) }
+}
+
+unsafe fn enter_current_task_on_hart(
+    hart: HartId,
+    id: TaskId,
+    status: Arc<TaskStatus>,
+) -> CurrentTaskScope {
+    debug_assert_eq!(current_scheduler_hart(), Some(hart));
+    let slot = &CURRENT_TASK_STATUS[hart.index()];
+    let previous = core::mem::replace(&mut *slot.lock(), Some(status));
+    let recovery = unsafe {
+        crate::sync::enter_task_recovery_context_on_hart(
+            hart,
+            TaskRecoveryKey::new(id.0).expect("TaskId zero is reserved"),
+        )
+    };
     CurrentTaskScope {
+        slot,
         previous,
         recovery,
         active: true,
+        not_send: PhantomData,
     }
 }
 
 impl CurrentTaskScope {
     fn restore(&mut self) {
         if self.active {
-            *CURRENT_TASK_STATUS.lock() = self.previous.take();
-            self.recovery.restore();
+            if !self.recovery.is_current_hart() {
+                // Prevent Drop from attempting a second restore while the
+                // recovery scope reports the same hart-affinity violation.
+                self.active = false;
+                self.recovery.restore();
+                unreachable!("task recovery restore must reject the wrong hart");
+            }
+            *self.slot.lock() = self.previous.take();
             self.active = false;
+            // Safety: the physical-hart check above covers both hart-local
+            // scopes, and logical mappings are immutable once installed.
+            unsafe { self.recovery.restore_on_verified_hart() };
         }
     }
 }
@@ -351,9 +425,10 @@ impl Drop for CurrentTaskScope {
 /// after the running slot is detached and therefore return `None`, as do
 /// scheduler, interrupt, and boot boundaries.
 pub fn current_task_id() -> Option<TaskId> {
-    let status = CURRENT_TASK_STATUS.lock().clone()?;
+    let hart = current_scheduler_hart()?;
+    let status = CURRENT_TASK_STATUS[hart.index()].lock().clone()?;
     let sched = SCHED.lock();
-    sched
+    sched.harts[hart.index()]
         .running
         .as_ref()
         .filter(|running| Arc::ptr_eq(&running.status, &status))
@@ -363,7 +438,7 @@ pub fn current_task_id() -> Option<TaskId> {
 fn register_owned_for_current(
     registration: OwnedRegistration,
 ) -> Result<Option<u64>, OwnedRegistration> {
-    let status = CURRENT_TASK_STATUS.lock().clone();
+    let status = current_task_status();
     match status {
         Some(status) => status.register_owned(registration).map(Some),
         None => Ok(None),
@@ -374,7 +449,7 @@ fn disarm_owned_for_current(token: Option<u64>) {
     let Some(token) = token else {
         return;
     };
-    if let Some(status) = CURRENT_TASK_STATUS.lock().clone() {
+    if let Some(status) = current_task_status() {
         drop(status.disarm_owned(token));
     }
 }
@@ -386,9 +461,10 @@ fn disarm_owned_for_task(task: TaskId, token: Option<u64>) {
     let status = {
         let sched = SCHED.lock();
         sched
-            .running
-            .as_ref()
-            .filter(|running| running.id == task)
+            .harts
+            .iter()
+            .filter_map(|hart| hart.running.as_ref())
+            .find(|running| running.id == task)
             .map(|running| running.status.clone())
             .or_else(|| sched.tasks.get(&task).map(|task| task.status.clone()))
     };
@@ -761,17 +837,29 @@ fn notify_fault_cleanup(task: TaskId, domain: AllocationDomain) {
 struct Sched {
     tasks: BTreeMap<TaskId, Task>,
     ready: RunQueues<TaskId>,
-    /// The task being polled right now. It is lifted out of `tasks` for the
-    /// duration of the poll, so both introspection and `wake` have to look
-    /// for it here rather than in the map.
-    running: Option<RunningTask>,
-    /// Set when the running task is woken while it is being polled — by itself
-    /// (`yield_now`) or by an interrupt that lands mid-poll. Without this the
-    /// wake would be dropped and the task would never be scheduled again.
-    running_woken: bool,
+    /// Each hart owns one independently polled task. A task is lifted out of
+    /// `tasks` while its future is executing, so lifecycle and wake paths must
+    /// inspect all hart slots before treating an id as inactive.
+    harts: [HartRunState; MAX_HARTS],
     completed: u64,
     faulted: u64,
     cancelled: u64,
+}
+
+struct HartRunState {
+    running: Option<RunningTask>,
+    /// Set when this hart's running task is woken while it is being polled —
+    /// by itself (`yield_now`) or by an interrupt that lands mid-poll.
+    woken: bool,
+}
+
+impl HartRunState {
+    const fn new() -> Self {
+        Self {
+            running: None,
+            woken: false,
+        }
+    }
 }
 
 struct RunningTask {
@@ -785,12 +873,49 @@ struct RunningTask {
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     tasks: BTreeMap::new(),
     ready: RunQueues::new(),
-    running: None,
-    running_woken: false,
+    harts: [const { HartRunState::new() }; MAX_HARTS],
     completed: 0,
     faulted: 0,
     cancelled: 0,
 });
+
+impl Sched {
+    fn running_count(&self) -> usize {
+        self.harts
+            .iter()
+            .filter(|hart| hart.running.is_some())
+            .count()
+    }
+
+    fn running_tasks(&self) -> impl Iterator<Item = &RunningTask> {
+        self.harts.iter().filter_map(|hart| hart.running.as_ref())
+    }
+
+    fn running_hart_for(&self, id: TaskId) -> Option<HartId> {
+        self.harts.iter().enumerate().find_map(|(index, state)| {
+            state
+                .running
+                .as_ref()
+                .is_some_and(|running| running.id == id)
+                .then(|| HartId::new(index).expect("scheduler hart index is valid"))
+        })
+    }
+
+    fn install_running(&mut self, hart: HartId, running: RunningTask) {
+        let index = hart.index();
+        debug_assert!(
+            self.harts[index].running.is_none() && !self.harts[index].woken,
+            "dispatch requires an idle hart slot"
+        );
+        self.harts[index].running = Some(running);
+    }
+
+    fn clear_running(&mut self, hart: HartId) {
+        let index = hart.index();
+        debug_assert!(self.harts[index].running.is_some());
+        self.harts[index].running = None;
+    }
+}
 
 /// Validate the queue/future ownership projection while `SCHED` is locked.
 ///
@@ -800,7 +925,7 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
 /// appear in `Sched`; retained `TaskStatus` is their sole owner until publish.
 #[cfg(debug_assertions)]
 fn assert_sched_invariants(s: &Sched) {
-    let live = s.tasks.len() + usize::from(s.running.is_some());
+    let live = s.tasks.len() + s.running_count();
     for index in 0..MAX_HARTS {
         let hart = HartId::new(index).expect("scheduler hart index is valid");
         debug_assert!(
@@ -808,11 +933,11 @@ fn assert_sched_invariants(s: &Sched) {
             "hart {index} ready capacity {} is below live-task bound {live}",
             s.ready.capacity(hart)
         );
+        debug_assert!(
+            s.harts[index].running.is_some() || !s.harts[index].woken,
+            "hart {index} is marked woken without a running task"
+        );
     }
-    debug_assert!(
-        s.running.is_some() || !s.running_woken,
-        "running_woken is set without a running task"
-    );
 
     for (owner, id, stealable) in s.ready.entries() {
         let task = s
@@ -852,7 +977,7 @@ fn assert_sched_invariants(s: &Sched) {
                 "cancel-requested mapped task {id} is not queued for its boundary"
             );
         }
-        if let Some(running) = &s.running {
+        for running in s.running_tasks() {
             debug_assert_ne!(*id, running.id, "task {id} is mapped and running");
             debug_assert!(
                 !Arc::ptr_eq(&task.status, &running.status),
@@ -861,7 +986,16 @@ fn assert_sched_invariants(s: &Sched) {
         }
     }
 
-    if let Some(running) = &s.running {
+    for (index, state) in s.harts.iter().enumerate() {
+        let Some(running) = &state.running else {
+            continue;
+        };
+        debug_assert_eq!(
+            running.hart.index(),
+            index,
+            "running task {} is published in the wrong hart slot",
+            running.id
+        );
         debug_assert!(
             !s.ready.contains(running.id),
             "running task {} also has a ready entry",
@@ -878,6 +1012,23 @@ fn assert_sched_invariants(s: &Sched) {
             "running task {} has invalid lifecycle phase {raw}",
             running.id
         );
+        for other in s
+            .harts
+            .iter()
+            .skip(index + 1)
+            .filter_map(|hart| hart.running.as_ref())
+        {
+            debug_assert_ne!(
+                running.id, other.id,
+                "task {} occupies two running slots",
+                running.id
+            );
+            debug_assert!(
+                !Arc::ptr_eq(&running.status, &other.status),
+                "two running slots share task {} status",
+                running.id
+            );
+        }
     }
 }
 
@@ -890,9 +1041,8 @@ fn assert_status_detached(s: &Sched, status: &TaskStatus) {
         "a committed/published status still owns a mapped future"
     );
     debug_assert!(
-        !s.running
-            .as_ref()
-            .is_some_and(|running| core::ptr::eq(running.status.as_ref(), status)),
+        !s.running_tasks()
+            .any(|running| core::ptr::eq(running.status.as_ref(), status)),
         "a committed/published status still owns the running future"
     );
 }
@@ -905,10 +1055,8 @@ fn assert_arena_detached(s: &Sched, domain: AllocationDomain) {
         "fault teardown left an arena sibling in the task map"
     );
     debug_assert!(
-        !s.running
-            .as_ref()
-            .is_some_and(|running| running.domain == domain),
-        "fault teardown left its arena in the running slot"
+        !s.running_tasks().any(|running| running.domain == domain),
+        "fault teardown left its arena in a running slot"
     );
 }
 
@@ -920,7 +1068,8 @@ fn assert_active_poll(id: TaskId, domain: AllocationDomain, status: &Arc<TaskSta
         "poll is executing under the wrong allocation domain"
     );
     {
-        let current = CURRENT_TASK_STATUS.lock();
+        let hart = require_current_scheduler_hart("active poll validation");
+        let current = CURRENT_TASK_STATUS[hart.index()].lock();
         debug_assert!(
             current
                 .as_ref()
@@ -930,10 +1079,14 @@ fn assert_active_poll(id: TaskId, domain: AllocationDomain, status: &Arc<TaskSta
     }
     let s = SCHED.lock();
     assert_sched_invariants(&s);
+    let hart = require_current_scheduler_hart("active poll validation");
     debug_assert!(
-        s.running.as_ref().is_some_and(|running| {
-            running.id == id && running.domain == domain && Arc::ptr_eq(&running.status, status)
-        }),
+        s.harts[hart.index()]
+            .running
+            .as_ref()
+            .is_some_and(|running| {
+                running.id == id && running.domain == domain && Arc::ptr_eq(&running.status, status)
+            }),
         "active poll does not match the scheduler running slot"
     );
 }
@@ -978,16 +1131,16 @@ fn next_task_id() -> TaskId {
 }
 
 fn current_queue_hart() -> HartId {
-    let status = CURRENT_TASK_STATUS.lock().clone();
+    let hart = require_current_scheduler_hart("task placement");
+    let status = CURRENT_TASK_STATUS[hart.index()].lock().clone();
     let Some(status) = status else {
-        return HartId::BOOT;
+        return hart;
     };
-    SCHED
-        .lock()
+    SCHED.lock().harts[hart.index()]
         .running
         .as_ref()
         .filter(|running| Arc::ptr_eq(&running.status, &status))
-        .map_or(HartId::BOOT, |running| running.hart)
+        .map_or(hart, |running| running.hart)
 }
 
 /// Spawn a future as a task. Safe to call from inside another task.
@@ -1117,7 +1270,7 @@ fn spawn_tracked_domain(
     // Every live task can migrate to any queue after a steal and then become
     // ready at once. Reserve that upper bound in all four queues in task
     // context so an IRQ wake never allocates while holding SCHED.
-    let live_after_spawn = s.tasks.len() + 1 + usize::from(s.running.is_some());
+    let live_after_spawn = s.tasks.len() + 1 + s.running_count();
     if s.ready.reserve_live_bound(live_after_spawn).is_err() {
         drop(s);
         system.restore();
@@ -1260,14 +1413,10 @@ fn teardown_faulted_domain(
     {
         let s = SCHED.lock();
         check_sched!(&s);
-        if let Some(running) = &s.running {
-            assert!(
-                primary_task.is_some()
-                    && running.domain == domain
-                    && Arc::ptr_eq(&running.status, &primary_status),
-                "nested arena teardown cannot reclaim an active user poll"
-            );
-        }
+        assert!(
+            s.running_tasks().all(|running| running.domain != domain),
+            "fault teardown cannot reclaim a domain still running on another hart"
+        );
     }
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let mut victims = Vec::new();
@@ -1285,8 +1434,6 @@ fn teardown_faulted_domain(
 
     {
         let mut s = SCHED.lock();
-        s.running = None;
-        s.running_woken = false;
         let sibling_ids: Vec<_> = s
             .tasks
             .iter()
@@ -1384,28 +1531,49 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
         InvariantViolation,
     }
 
-    // Reclamation may enter arbitrary user Drop code. Never do that while a
-    // different user poll/Drop is already active: a destructor fault could
-    // otherwise tear down the active task's arena before its outer executor
-    // boundary regains control. Turn such cancellation into a ready request;
-    // the next top-level `poll_once` boundary performs the reclamation.
-    let user_code_active = CURRENT_TASK_STATUS.lock().is_some();
+    // Reclamation may enter arbitrary user Drop code. Never do that while this
+    // hart already owns a user poll/Drop landing pad; for tracked arenas, also
+    // require complete same-domain quiescence across every hart. Otherwise a
+    // destructor fault could tear down live arena state before the owning
+    // executor boundary regains control. Defer those cases to the target
+    // queue's next top-level `poll_once` boundary.
+    let caller_hart = current_scheduler_hart();
+    let user_code_active = current_task_status().is_some();
     let mut ready_capacity_exhausted = false;
     let mut notify_hart = None;
     let action = {
         let mut s = SCHED.lock();
         check_sched!(&s);
-        let action = if s
-            .running
-            .as_ref()
-            .is_some_and(|running| running.id == handle.id)
-        {
+        let action = if s.running_hart_for(handle.id).is_some() {
             Action::Return(requested_outcome(handle))
         } else if s.tasks.contains_key(&handle.id) {
-            // `running` covers the small dispatch/return windows before the
-            // current-task scope is installed or after it is restored, which
-            // matters if cancellation is requested from an interrupt hook.
-            if user_code_active || s.running.is_some() {
+            // The caller hart's running slot covers the small dispatch/return
+            // windows before the current-task scope is installed or after it
+            // is restored, which matters for cancellation from an IRQ hook.
+            // An unmapped caller always defers instead of borrowing a logical
+            // slot for user Drop and fault recovery.
+            let caller_running = caller_hart.map_or_else(
+                || s.running_count() != 0,
+                |hart| s.harts[hart.index()].running.is_some(),
+            );
+            let (target_domain, target_owner) = {
+                let task = s
+                    .tasks
+                    .get(&handle.id)
+                    .expect("mapped cancellation target remains present");
+                (task.domain, task.queue_owner)
+            };
+            let tracked_domain_running = target_domain.arena.is_tracked()
+                && s.running_tasks()
+                    .any(|running| running.domain == target_domain);
+            let remote_tracked_reclaim =
+                target_domain.arena.is_tracked() && caller_hart != Some(target_owner);
+            if caller_hart.is_none()
+                || user_code_active
+                || caller_running
+                || tracked_domain_running
+                || remote_tracked_reclaim
+            {
                 let outcome = requested_outcome(handle);
                 let (ready, owner, stealable) = {
                     let task = s
@@ -1517,11 +1685,10 @@ pub fn wake_with_disposition(id: TaskId) -> WakeDisposition {
     let mut s = SCHED.lock();
     check_sched!(&s);
     let mut capacity_exhausted = false;
-    let disposition = if let Some(running) = s.running.as_ref().filter(|running| running.id == id) {
-        let hart = running.hart;
-        s.running_woken = true;
-        WakeDisposition::Running { hart }
-    } else if let Some(task) = s.tasks.get(&id) {
+    // Parked/ready tasks dominate ordinary channel and timer wakes. Resolve
+    // the indexed task map first; only a detached running task requires the
+    // bounded four-slot scan.
+    let disposition = if let Some(task) = s.tasks.get(&id) {
         let owner = task.queue_owner;
         let ready = task.ready;
         let stealable = task.stealable;
@@ -1545,6 +1712,9 @@ pub fn wake_with_disposition(id: TaskId) -> WakeDisposition {
                 }
             }
         }
+    } else if let Some(hart) = s.running_hart_for(id) {
+        s.harts[hart.index()].woken = true;
+        WakeDisposition::Running { hart }
     } else {
         WakeDisposition::Inactive
     };
@@ -1568,7 +1738,7 @@ pub fn task_report() -> Vec<TaskReport> {
     {
         let s = SCHED.lock();
         check_sched!(&s);
-        let total = s.tasks.len() + usize::from(s.running.is_some());
+        let total = s.tasks.len() + s.running_count();
         if out.try_reserve(total).is_err() {
             allocation_failed = true;
         } else {
@@ -1589,21 +1759,21 @@ pub fn task_report() -> Vec<TaskReport> {
                 });
             }
             if !allocation_failed {
-                if let Some(running) = &s.running {
+                for running in s.running_tasks() {
                     let mut name = String::new();
                     if name.try_reserve(running.name.len()).is_err() {
                         allocation_failed = true;
-                    } else {
-                        name.push_str(&running.name);
-                        out.push(TaskReport {
-                            id: running.id,
-                            owner: running.domain.owner,
-                            arena: running.domain.arena,
-                            name,
-                            state: running.status.state(),
-                            polls: running.status.polls.load(Ordering::Acquire),
-                        });
+                        break;
                     }
+                    name.push_str(&running.name);
+                    out.push(TaskReport {
+                        id: running.id,
+                        owner: running.domain.owner,
+                        arena: running.domain.arena,
+                        name,
+                        state: running.status.state(),
+                        polls: running.status.polls.load(Ordering::Acquire),
+                    });
                 }
             }
         }
@@ -1662,10 +1832,7 @@ pub fn scheduler_lock_stats() -> crate::sync::SpinLockStats {
 /// the executing hart; a ready or parked task owns its metadata hart.
 pub fn task_queue_owner(id: TaskId) -> Option<HartId> {
     let s = SCHED.lock();
-    s.running
-        .as_ref()
-        .filter(|running| running.id == id)
-        .map(|running| running.hart)
+    s.running_hart_for(id)
         .or_else(|| s.tasks.get(&id).map(|task| task.queue_owner))
 }
 
@@ -1690,8 +1857,9 @@ fn waker_for(id: TaskId) -> Waker {
 /// Drive tasks forever. Sleeps the hart in `wfi` whenever nothing is runnable,
 /// which is what makes an idle VibeOS box draw no CPU.
 pub fn run() -> ! {
+    let hart = require_current_scheduler_hart("executor run loop");
     loop {
-        if poll_once() {
+        if poll_once_on(hart) {
             continue;
         }
         // Nothing was ready. "Check the queue" and "sleep" have to be one
@@ -1709,8 +1877,8 @@ pub fn run() -> ! {
         // SIE masked, observing both empty closes the queue-check/WFI race:
         // a later successful doorbell remains pending and makes WFI resume,
         // while an earlier publisher is observed by one of these checks.
-        let queue_idle = SCHED.lock().ready.hart_idle(HartId::BOOT);
-        let reasons = ipi::take_idle_reasons(HartId::BOOT);
+        let queue_idle = SCHED.lock().ready.hart_idle(hart);
+        let reasons = ipi::take_idle_reasons(hart);
         if queue_idle && reasons == 0 {
             arch::wait_for_interrupt();
         }
@@ -1722,17 +1890,23 @@ pub fn run() -> ! {
 ///
 /// Split out of `run` so tests can drive the scheduler a step at a time.
 pub fn poll_once() -> bool {
-    poll_once_on(HartId::BOOT)
+    let hart = require_current_scheduler_hart("executor poll");
+    poll_once_on(hart)
 }
 
 fn poll_once_on(hart: HartId) -> bool {
-    // The scheduler lifts its current task out of `tasks`, so recursive
-    // driving would overwrite `SCHED.running`. More importantly, an inner
-    // same-arena fault could raw-reclaim the still-executing outer future.
-    // Reject re-entry while the outer fault guard is still authoritative.
+    debug_assert_eq!(
+        current_scheduler_hart(),
+        Some(hart),
+        "a hart may only drive its own scheduler slot"
+    );
+    // Each hart lifts its current task out of `tasks`. Reject same-hart
+    // re-entry while its fault guard is authoritative, while allowing a host
+    // model (and real SMP execution) to drive a different hart concurrently.
     assert!(
-        CURRENT_TASK_STATUS.lock().is_none() && SCHED.lock().running.is_none(),
-        "the executor cannot be driven recursively from task poll or Drop"
+        CURRENT_TASK_STATUS[hart.index()].lock().is_none()
+            && SCHED.lock().harts[hart.index()].running.is_none(),
+        "a hart cannot drive the executor recursively from task poll or Drop"
     );
 
     enum Dispatch {
@@ -1744,7 +1918,9 @@ fn poll_once_on(hart: HartId) -> bool {
     // Pop, detach, and publish `running` under one lock. This is the start-poll
     // linearization point: cancellation before it detaches the task without a
     // poll; cancellation after it waits for this poll boundary.
-    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    // Safety: callers resolved `hart` from this CPU before entering this
+    // synchronous, non-migrating executor turn.
+    let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
     let dispatch = {
         let mut s = SCHED.lock();
         check_sched!(&s);
@@ -1769,14 +1945,16 @@ fn poll_once_on(hart: HartId) -> bool {
                 None => Dispatch::Invalid(task),
             }
         } else if status.raw_state() == TaskState::Running as u8 {
-            s.running = Some(RunningTask {
-                id,
+            s.install_running(
                 hart,
-                domain: task.domain,
-                name: task.name.clone(),
-                status: status.clone(),
-            });
-            s.running_woken = false;
+                RunningTask {
+                    id,
+                    hart,
+                    domain: task.domain,
+                    name: task.name.clone(),
+                    status: status.clone(),
+                },
+            );
             Dispatch::Poll(id, task, status)
         } else {
             Dispatch::Invalid(task)
@@ -1788,7 +1966,8 @@ fn poll_once_on(hart: HartId) -> bool {
         }
         dispatch
     };
-    system.restore();
+    // Safety: poll_once_on is pinned to `hart` for this complete executor turn.
+    unsafe { system.restore_on_verified_hart() };
 
     let (id, mut task, status) = match dispatch {
         Dispatch::Poll(id, task, status) => (id, task, status),
@@ -1809,10 +1988,11 @@ fn poll_once_on(hart: HartId) -> bool {
     // component that panics costs its own task instead of the machine.
     let guard = load_fault_guard();
     let mut poll = Poll::Pending;
-    let mut current_task = enter_current_task(id, status.clone());
+    // Safety: poll_once_on is pinned to `hart` for this complete turn.
+    let mut current_task = unsafe { enter_current_task_on_hart(hart, id, status.clone()) };
     // Tracked task domains originate only at the unsafe reclaimable spawn
     // boundary; ordinary safe tasks carry an untracked domain.
-    let mut owner_scope = unsafe { heap::enter_domain(task.domain) };
+    let mut owner_scope = unsafe { heap::enter_domain_on_hart(task.domain, hart) };
     check_active_poll!(id, task.domain, &status);
     let faulted = match guard {
         Some(run_guarded) => {
@@ -1836,7 +2016,9 @@ fn poll_once_on(hart: HartId) -> bool {
     // `run_guarded` may have returned through a longjmp, which bypasses Drop
     // for scopes created inside the guarded call. Restore at the executor
     // boundary before touching scheduler infrastructure or another task.
-    owner_scope.restore();
+    // Safety: CurrentTaskScope validates the same physical hart immediately
+    // below; target tasks cannot migrate during one synchronous poll.
+    unsafe { owner_scope.restore_on_verified_hart() };
     current_task.restore();
 
     if faulted {
@@ -1844,23 +2026,35 @@ fn poll_once_on(hart: HartId) -> bool {
         // section. Otherwise a wake interrupt could observe the intermediate
         // FaultCommitted + running combination that neither the model nor the
         // public ownership rules permit.
-        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        // Safety: this remains inside the same hart-pinned executor turn.
+        let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
         let claim = {
             let mut s = SCHED.lock();
-            debug_assert!(s.running.as_ref().is_some_and(|running| {
-                running.id == id
-                    && running.hart == hart
-                    && running.domain == task.domain
-                    && Arc::ptr_eq(&running.status, &status)
-            }));
-            s.running = None;
-            s.running_woken = false;
+            debug_assert!(s.harts[hart.index()]
+                .running
+                .as_ref()
+                .is_some_and(|running| {
+                    running.id == id
+                        && running.hart == hart
+                        && running.domain == task.domain
+                        && Arc::ptr_eq(&running.status, &status)
+                }));
+            s.clear_running(hart);
+            s.harts[hart.index()].woken = false;
+            if task.domain.arena.is_tracked() {
+                assert!(
+                    s.running_tasks()
+                        .all(|running| running.domain != task.domain),
+                    "a tracked fault domain is concurrently running on another hart"
+                );
+            }
             let claim = status.claim_terminal(TaskState::Faulted);
             check_sched!(&s);
             check_status_detached!(&s, status.as_ref());
             claim
         };
-        system.restore();
+        // Safety: this remains inside the same hart-pinned executor turn.
+        unsafe { system.restore_on_verified_hart() };
         let Some(claim) = claim else {
             panic!("a faulted running task could not claim its terminal state");
         };
@@ -1873,18 +2067,21 @@ fn poll_once_on(hart: HartId) -> bool {
             let domain = task.domain;
             drain_task_registrations(&status);
             core::mem::forget(task);
-            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            // Safety: this remains inside the same hart-pinned executor turn.
+            let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
             notify_fault_cleanup(id, domain);
-            system.restore();
+            // Safety: this remains inside the same hart-pinned executor turn.
+            unsafe { system.restore_on_verified_hart() };
             publish_terminal(&status, claim);
         }
         return true;
     }
 
-    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    // Safety: this remains inside the same hart-pinned executor turn.
+    let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
     let mut s = SCHED.lock();
-    s.running = None;
-    let woken = core::mem::take(&mut s.running_woken);
+    s.clear_running(hart);
+    let woken = core::mem::take(&mut s.harts[hart.index()].woken);
     if poll == Poll::Pending && !status.cancellation_requested() {
         // A cancellation cannot slip between this decision and reinsertion:
         // it also takes SCHED. A nested request was already published before
@@ -1898,7 +2095,8 @@ fn poll_once_on(hart: HartId) -> bool {
         s.tasks.insert(id, task);
         check_sched!(&s);
         drop(s);
-        system.restore();
+        // Safety: this remains inside the same hart-pinned executor turn.
+        unsafe { system.restore_on_verified_hart() };
         return true;
     }
 
@@ -1911,7 +2109,8 @@ fn poll_once_on(hart: HartId) -> bool {
     check_sched!(&s);
     check_status_detached!(&s, status.as_ref());
     drop(s);
-    system.restore();
+    // Safety: this remains inside the same hart-pinned executor turn.
+    unsafe { system.restore_on_verified_hart() };
 
     let Some(claim) = claim else {
         core::mem::forget(task);
@@ -2213,13 +2412,14 @@ impl Drop for IrqPollProbe {
 
 /// Arm the single allocation-free IRQ-to-poll profiler for the current task.
 pub fn arm_irq_poll_probe() -> Result<IrqPollProbe, IrqPollProbeError> {
-    let current_status = CURRENT_TASK_STATUS
+    let hart = current_scheduler_hart().ok_or(IrqPollProbeError::NotInTask)?;
+    let current_status = CURRENT_TASK_STATUS[hart.index()]
         .lock()
         .clone()
         .ok_or(IrqPollProbeError::NotInTask)?;
     let target = {
         let sched = SCHED.lock();
-        sched
+        sched.harts[hart.index()]
             .running
             .as_ref()
             .filter(|running| Arc::ptr_eq(&running.status, &current_status))
@@ -2506,7 +2706,12 @@ impl Future for Sleep {
         }
 
         let id = next_timer_id();
-        let task = SCHED.lock().running.as_ref().map(|running| running.id);
+        let task = current_scheduler_hart().and_then(|hart| {
+            SCHED.lock().harts[hart.index()]
+                .running
+                .as_ref()
+                .map(|running| running.id)
+        });
         let mut allocation_failed = false;
         match register_owned_for_current(OwnedRegistration::Timer { id }) {
             Ok(token) => this.owned_registration = token,

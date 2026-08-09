@@ -30,6 +30,16 @@ pub fn current_hart_id() -> usize {
     CURRENT_HART.load(Ordering::Acquire)
 }
 
+/// Host tests keep exercising the explicit mapping scan so changing the
+/// process-global hart selector cannot leave a stale per-thread cache behind.
+#[inline(always)]
+pub fn cached_logical_hart_index() -> Option<usize> {
+    None
+}
+
+#[inline(always)]
+pub(crate) unsafe fn cache_logical_hart_index(_index: usize) {}
+
 pub fn clear_software_interrupt() {
     let hart = current_hart_id();
     if hart < usize::BITS as usize {

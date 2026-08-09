@@ -4,20 +4,24 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::{Mutex, MutexGuard};
 
+use vibeos_core::arch;
 use vibeos_core::heap::{
     current_domain, current_owner, enter_domain, enter_owner, AllocationDomain, AllocationFailure,
     ArenaError, ArenaId, Heap, OwnerError, OwnerId,
 };
+use vibeos_core::runqueue::MAX_HARTS;
 
-// Allocation owner is deliberately a single-hart global. Serialize this test
-// binary so an owner-scope test cannot change the provenance seen by another
-// local Heap instance running on a host worker thread.
+// The host hart selector and ambient per-hart allocation domains are global
+// model state. Serialize this test binary so scopes cannot change the slot
+// observed by another host worker thread.
 static HEAP_TEST: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    HEAP_TEST
+    let guard = HEAP_TEST
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    arch::set_test_hart_id(0);
+    guard
 }
 
 /// Build a heap over a leaked buffer. Leaking is deliberate: generated pointers
@@ -218,6 +222,85 @@ fn domain_scopes_restore_both_owner_and_arena() {
 }
 
 #[test]
+fn owner_and_arena_scopes_are_isolated_by_hart() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let first_owner = h.create_owner(8192).unwrap();
+    let second_owner = h.create_owner(8192).unwrap();
+    let first_arena = h.create_arena(first_owner).unwrap();
+    let second_arena = h.create_arena(second_owner).unwrap();
+    let first_domain = AllocationDomain::new(first_owner, first_arena);
+    let second_domain = AllocationDomain::new(second_owner, second_arena);
+
+    arch::set_test_hart_id(0);
+    let mut first_scope = unsafe { enter_domain(first_domain) };
+    assert_eq!(current_domain(), first_domain);
+
+    arch::set_test_hart_id(1);
+    assert_eq!(
+        current_domain(),
+        AllocationDomain::SYSTEM,
+        "hart 1 must not inherit hart 0 provenance"
+    );
+    let mut second_scope = unsafe { enter_domain(second_domain) };
+    assert_eq!(current_domain(), second_domain);
+
+    arch::set_test_hart_id(0);
+    assert_eq!(
+        current_domain(),
+        first_domain,
+        "hart 1 scope updates must not overwrite hart 0"
+    );
+    arch::set_test_hart_id(1);
+    second_scope.restore();
+    assert_eq!(current_domain(), AllocationDomain::SYSTEM);
+    arch::set_test_hart_id(0);
+    assert_eq!(current_domain(), first_domain);
+    first_scope.restore();
+    assert_eq!(current_domain(), AllocationDomain::SYSTEM);
+
+    h.close_empty_arena(first_arena).unwrap();
+    h.close_empty_arena(second_arena).unwrap();
+    h.unregister_owner(first_owner).unwrap();
+    h.unregister_owner(second_owner).unwrap();
+}
+
+#[test]
+fn owner_scope_rejects_cross_hart_restore() {
+    let _serial = serial();
+    arch::set_test_hart_id(0);
+    // Installing SYSTEM leaves no poisoned provenance behind after the
+    // deliberately rejected restore, while still exercising hart affinity.
+    let scope = enter_owner(OwnerId::SYSTEM);
+    arch::set_test_hart_id(1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(scope)));
+    arch::set_test_hart_id(0);
+
+    assert!(result.is_err());
+    assert_eq!(current_domain(), AllocationDomain::SYSTEM);
+}
+
+#[test]
+fn unknown_host_hart_fails_closed() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let l = layout(16, 8);
+    arch::set_test_hart_id(MAX_HARTS);
+
+    assert!(unsafe { h.alloc(l) }.is_null());
+    assert_eq!(
+        h.last_failure(),
+        None,
+        "an unknown hart must not read another hart's diagnostic slot"
+    );
+    assert!(std::panic::catch_unwind(|| enter_owner(OwnerId::new(71))).is_err());
+    assert!(std::panic::catch_unwind(current_domain).is_err());
+
+    arch::set_test_hart_id(0);
+    assert_eq!(current_domain(), AllocationDomain::SYSTEM);
+}
+
+#[test]
 fn quotas_charge_physical_blocks_and_denial_changes_no_heap_state() {
     let _serial = serial();
     let h = heap_of(1024 * 1024);
@@ -267,6 +350,74 @@ fn quotas_charge_physical_blocks_and_denial_changes_no_heap_state() {
         charge * 2,
         "peak remains a high-water mark"
     );
+}
+
+#[test]
+fn allocation_failure_diagnostics_are_isolated_by_hart() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let l = layout(64, 8);
+    let charge = Heap::allocation_charge(l).unwrap();
+    let first_owner = OwnerId::new(50_001);
+    let second_owner = OwnerId::new(50_002);
+    h.register_owner(first_owner, charge).unwrap();
+    h.register_owner(second_owner, charge).unwrap();
+
+    arch::set_test_hart_id(0);
+    let first_ptr = {
+        let _scope = enter_owner(first_owner);
+        let pointer = unsafe { h.alloc(l) };
+        assert!(!pointer.is_null());
+        assert!(unsafe { h.alloc(l) }.is_null());
+        pointer
+    };
+    let first_failure = AllocationFailure::QuotaExceeded {
+        owner: first_owner,
+        requested_bytes: charge,
+        live_bytes: charge,
+        quota_bytes: charge,
+    };
+    assert_eq!(h.last_failure(), Some(first_failure));
+
+    arch::set_test_hart_id(1);
+    assert_eq!(
+        h.last_failure(),
+        None,
+        "hart 1 must not observe hart 0's pending OOM reason"
+    );
+    let second_ptr = {
+        let _scope = enter_owner(second_owner);
+        let pointer = unsafe { h.alloc(l) };
+        assert!(!pointer.is_null());
+        assert!(unsafe { h.alloc(l) }.is_null());
+        pointer
+    };
+    let second_failure = AllocationFailure::QuotaExceeded {
+        owner: second_owner,
+        requested_bytes: charge,
+        live_bytes: charge,
+        quota_bytes: charge,
+    };
+    assert_eq!(h.last_failure(), Some(second_failure));
+
+    arch::set_test_hart_id(0);
+    assert_eq!(h.take_last_failure(), Some(first_failure));
+    assert_eq!(h.last_failure(), None);
+    arch::set_test_hart_id(1);
+    assert_eq!(
+        h.last_failure(),
+        Some(second_failure),
+        "taking hart 0's reason must not consume hart 1's"
+    );
+    assert_eq!(h.take_last_failure(), Some(second_failure));
+
+    unsafe {
+        h.dealloc(first_ptr, l);
+        h.dealloc(second_ptr, l);
+    }
+    h.unregister_owner(first_owner).unwrap();
+    h.unregister_owner(second_owner).unwrap();
+    arch::set_test_hart_id(0);
 }
 
 #[test]

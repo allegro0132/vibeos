@@ -20,6 +20,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/SPINLOCK_AUDIT.md](docs/SPINLOCK_AUDIT.md)** — the M5.3 complete lock
   inventory, IRQ hot-path replacements, retained transaction boundaries, and
   multicore measurement gates.
+- **[docs/MMU.md](docs/MMU.md)** — the shared Sv39 map, boot publication
+  contract, mapped apertures, and integrity-hardening sequence.
 - **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
@@ -247,8 +249,9 @@ literals use the shortest stable one- or two-instruction form when possible. Bot
 passes therefore agree on layout. Branches are emitted as an inverted conditional
 over a `jal`, giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
 
-Because VibeOS has no MMU and no W^X, "load the program" is `fence.i` followed by
-transmuting the code buffer to a function pointer and calling it.
+VibeOS now has one shared Sv39 address space, but M6.1 deliberately leaves kernel
+RAM RWX. Until M6.3, "load the program" is still `fence.i` followed by transmuting
+the code buffer to a function pointer and calling it.
 
 ### And this is where it earns its place in *this* OS
 
@@ -390,8 +393,8 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **Persistent authority is deliberately fixed-shape; there is still no MMU or
-  user mode.** M5.1 provides four logical ready queues
+- **Persistent authority is deliberately fixed-shape; there is still no user
+  mode or per-process isolation.** M5.1 provides four logical ready queues
   and hart0 work stealing. M5.2 adds SBI/SSIP doorbells, atomic reason mailboxes,
   and explicit logical-to-physical hart mapping. M5.3 removes the PLIC/UART
   RX/virtio data locks, hardens fault-recoverable
@@ -402,6 +405,10 @@ Deliberate, not overlooked:
   SBI HSM, gives all four harts private 256 KiB stacks and local trap/timer state,
   routes external interrupts only through the dynamic boot-hart PLIC context,
   and runs the complete integration suite with `-smp 4`.
+  M6.1 installs one shared Sv39 identity map on all four harts, with 4 KiB RAM
+  leaves, non-executable device mappings, and deliberate holes for firmware,
+  null, and unused physical space. Type/capability confinement remains the
+  isolation boundary; this page table exists for integrity hardening.
   M4.3 restores
   the externally constrained `persistent-test` graph. M4.5 adds one immutable
   `hello` ProgramArtifact whose source and canonical

@@ -13,7 +13,7 @@ use crate::dev::ConsoleDev;
 use crate::net::Packet;
 use crate::world::{world, Reading, Space};
 use crate::HEAP;
-use crate::{exec, ipi, println, sbi, tty, uart};
+use crate::{exec, ipi, mmu, println, sbi, tty, uart};
 
 pub async fn shell_task(boot_time: u64) {
     println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
@@ -77,6 +77,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  smp queues      prove four physical executors and cross-hart wakeups");
             println!("  smp scale       compare equal serial and four-hart parallel work");
+            println!("  mmu             inspect the shared Sv39 identity map");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -368,6 +369,8 @@ async fn run(line: &str, boot_time: u64) {
             }
         }
 
+        "mmu" => mmu_status(),
+
         "selftest" => {
             let r = crate::selftest::run().await;
             // CI greps for this line, so keep the wording stable.
@@ -450,6 +453,57 @@ async fn run(line: &str, boot_time: u64) {
         }
 
         other => println!("  unknown command: {} (try `help`)", other),
+    }
+}
+
+fn mmu_status() {
+    let text = mmu::mapping(mmu_status as *const () as usize)
+        .expect("the running shell text must be mapped");
+    let plic = mmu::mapping(mmu::PLIC_START).expect("the PLIC must be mapped");
+    let uart = mmu::mapping(mmu::UART_VIRTIO_START).expect("UART/virtio must be mapped");
+    let online = crate::online_hart_mask();
+    let enabled = mmu::enabled_hart_mask();
+    println!(
+        "  mode: Sv39, ASID 0, one shared root at {:#x}",
+        mmu::root_physical()
+    );
+    println!(
+        "  harts: satp read back on mask {:#x} ({}/{} online)",
+        enabled,
+        (enabled & online).count_ones(),
+        online.count_ones()
+    );
+    println!(
+        "  kernel RAM: {:#x}..{:#x}, identity, {} KiB leaves, {}",
+        mmu::KERNEL_RAM_START,
+        mmu::KERNEL_RAM_END,
+        text.page_size / 1024,
+        permission_text(text.permissions)
+    );
+    println!(
+        "  MMIO: PLIC {} KiB leaves {}, UART/virtio {} KiB leaves {}",
+        plic.page_size / 1024,
+        permission_text(plic.permissions),
+        uart.page_size / 1024,
+        permission_text(uart.permissions)
+    );
+    println!("  unmapped: firmware prefix, null page, and unused physical space");
+}
+
+fn permission_text(permissions: vibeos_core::mmu::PagePermissions) -> &'static str {
+    use vibeos_core::mmu::PagePermissions;
+
+    match (
+        permissions.contains(PagePermissions::READ),
+        permissions.contains(PagePermissions::WRITE),
+        permissions.contains(PagePermissions::EXECUTE),
+    ) {
+        (true, true, true) => "rwx",
+        (true, true, false) => "rw-",
+        (true, false, true) => "r-x",
+        (true, false, false) => "r--",
+        (false, false, true) => "--x",
+        _ => "invalid",
     }
 }
 

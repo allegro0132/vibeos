@@ -17,7 +17,10 @@ SECTIONS {
   } > RAM
 
   .rodata : ALIGN(4K) {
+    __rodata_start = .;
     *(.rodata .rodata.*)
+    . = ALIGN(4K);
+    __rodata_end = .;
   } > RAM
 
   .data : ALIGN(4K) {
@@ -49,6 +52,14 @@ SECTIONS {
     __code_pool_start = .;
     . += 2M;
     __code_pool_end = .;
+  } > RAM
+
+  /* Authoritative capability-table snapshots use page-exclusive storage.
+     Builders are RW-NX; publication makes the complete snapshot read-only. */
+  .cap_table_pool (NOLOAD) : ALIGN(4K) {
+    __cap_table_pool_start = .;
+    . += 4M;
+    __cap_table_pool_end = .;
   } > RAM
 
   /* One fixed stack slot per logical scheduler hart. The first 4 KiB of every

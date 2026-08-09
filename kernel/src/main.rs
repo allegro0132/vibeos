@@ -22,6 +22,7 @@ pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync, virtio};
 
 mod bench;
+mod cap_table_pool;
 mod code_pool;
 mod dev;
 mod durable_cspace;
@@ -225,12 +226,30 @@ pub extern "C" fn kmain() -> ! {
         mmu::wx_remote_fence_ready(),
         "multicore W^X requires the SBI RFENCE extension"
     );
+    // Safety: cap_table_pool owns one page-exclusive region for the kernel
+    // lifetime; its hooks validate exact live runs, synchronously perform the
+    // all-hart PTE/TLB transition, and release only retired writable runs.
+    cap::set_capability_table_backend(unsafe {
+        cap::CapabilityTableBackend::new(
+            cap_table_pool::allocate_pages,
+            cap_table_pool::set_read_only,
+            cap_table_pool::release_pages,
+        )
+    });
     let (code_start, code_end) = mmu::code_pool_range();
     println!(
         "  W^X       {} KiB code pool {:#x}..{:#x}, MXR clear, RFENCE ready",
         (code_end - code_start) / 1024,
         code_start,
         code_end
+    );
+    let (rodata_start, rodata_end) = mmu::rodata_range();
+    println!(
+        "  read-only {} KiB .rodata {:#x}..{:#x}; {} KiB COW capability-table pool",
+        (rodata_end - rodata_start) / 1024,
+        rodata_start,
+        rodata_end,
+        cap_table_pool::CAP_TABLE_POOL_BYTES / 1024,
     );
 
     world::build();

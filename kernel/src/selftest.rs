@@ -287,6 +287,19 @@ fn paging(h: &mut Harness) {
         text.permissions,
         PagePermissions::READ.union(PagePermissions::EXECUTE),
     );
+    let (rodata_start, rodata_end) = crate::mmu::rodata_range();
+    h.check(
+        "linker-delimited rodata is identity-mapped read-only and non-executable",
+        [rodata_start, rodata_end - PAGE_SIZE]
+            .into_iter()
+            .all(|address| {
+                crate::mmu::mapping(address).is_some_and(|mapping| {
+                    mapping.physical == address
+                        && mapping.page_size == PAGE_SIZE
+                        && mapping.permissions == PagePermissions::READ
+                })
+            }),
+    );
     h.check(
         "multicore W^X has synchronous SBI RFENCE support",
         crate::mmu::wx_remote_fence_ready(),
@@ -1340,6 +1353,21 @@ async fn channels(h: &mut Harness) {
 fn capabilities(h: &mut Harness) {
     let w = world();
 
+    h.check(
+        "every non-empty published World capability table is page-exclusive and read-only",
+        w.spaces.values().all(|space| {
+            let cspace = space.0.lock();
+            cspace
+                .capability_table_range()
+                .is_none_or(capability_table_is_read_only)
+        }),
+    );
+    let table_pool = crate::cap_table_pool::stats();
+    h.check(
+        "capability-table pool has no writable live candidate at the self-test boundary",
+        table_pool.live_pages != 0 && table_pool.live_pages == table_pool.read_only_pages,
+    );
+
     let sensor = w.spaces["sensor"].clone();
     let sensor_cap = sensor.0.lock().list()[0].0;
     h.eq(
@@ -1424,6 +1452,29 @@ fn capabilities(h: &mut Harness) {
             .lookup_as::<Space>(w.prog_space, Rights::REVOKE)
             .is_ok(),
     );
+    h.check(
+        "mint, derive, and revoke leave init's replacement capability table read-only",
+        init.0
+            .lock()
+            .capability_table_range()
+            .is_some_and(capability_table_is_read_only),
+    );
+}
+
+fn capability_table_is_read_only(range: crate::cap::CapabilityTableRange) -> bool {
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
+
+    range.start % PAGE_SIZE == 0
+        && range.page_count != 0
+        && (0..range.page_count).all(|page| {
+            let address = range.start + page * PAGE_SIZE;
+            crate::cap_table_pool::contains(address)
+                && crate::mmu::mapping(address).is_some_and(|mapping| {
+                    mapping.physical == address
+                        && mapping.page_size == PAGE_SIZE
+                        && mapping.permissions == PagePermissions::READ
+                })
+        })
 }
 
 /// Machine code actually executing. Host tests can check what the emitter

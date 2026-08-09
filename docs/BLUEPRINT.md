@@ -2,10 +2,9 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6.1--M6.3
-are complete; M6.4 read-only data and capability tables is next, and the original
-M3 language-expansion items remain partial. The implementation is across `core`,
-`compiler`, and `kernel`.
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6 are
+complete; the original M3 language-expansion items remain partial. The
+implementation is across `core`, `compiler`, and `kernel`.
 `scripts/status.sh` derives the current host and corpus inventory, while the QEMU
 harness reports target check counts from the boot it observed. Everything
 described as *implemented* below runs today; planned work is marked as such.
@@ -373,6 +372,16 @@ Every permission change uses invalid PTEs as a break-before-make phase, two all-
 TLB shootdowns, and, when sealing, an all-hart instruction-cache fence. Generated-
 code probes retain an additional 8 KiB of mapped abort room above the stack guard.
 
+M6.4 maps linker-delimited `.rodata` R-- during boot and publishes capability-table
+snapshots R-- from a linker-reserved 4 MiB pool. A CSpace mutation constructs and
+validates a detached SYSTEM-owned `Vec<Slot>`, moves it into fresh exclusive RW-NX
+pages, completes break-before-make plus all-hart TLB shootdowns to seal those pages,
+and only then replaces the authoritative table. The retired snapshot is restored to
+RW-NX only after replacement, then its slots are dropped, its complete run is cleared,
+and its pages become reusable. Normal errors leave the old snapshot authoritative;
+an exceptional SYSTEM allocation/protection fault may conservatively leak a detached
+candidate because this synchronous commit path does not promise non-local rollback.
+
 ### 6.3 Why generated code is confined
 
 The claim: *a compiled program can do nothing but arithmetic and call the runtime
@@ -558,8 +567,13 @@ Five boundaries must stay explicit:
 1. **Capabilities constrain object access, not arbitrary trusted component code.**
    In-tree Rust components remain in the TCB and may call kernel internals directly.
    Only code accepted by the in-kernel compiler currently gets the stronger
-   confinement claim in §6.3. M6.3 protects code-page integrity inside the shared
-   S-mode address space; it does not turn that address space into a privilege boundary.
+   confinement claim in §6.3. M6.3--M6.4 protect code, `.rodata`, and published
+   capability-table bytes inside the shared S-mode address space; they do not turn
+   that address space into a privilege boundary. M6.4 freezes only the published
+   `Slot` snapshot (generation plus the live entry's rights, object pointer, and
+   derivation pointer). CSpace scalar lifecycle fields and `Derivation.alive`
+   `AtomicBool` nodes remain RW supervisor metadata, so this is not immutable storage
+   for the complete capability graph.
 2. **Cooperative scheduling is not temporal isolation.** Fuel bounds generated
    programs, but an in-tree future that never returns `Pending` can still wedge the
    hart. Cooperative cancellation takes effect only at poll boundaries; hard

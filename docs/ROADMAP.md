@@ -6,8 +6,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, M5.5, and M6.3 are complete. M6.4 read-only
-> data and capability tables is next. Run
+> sequence through 3.16, M4.5, M5.5, and M6 are complete. The original M3
+> language-expansion items remain partial. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -636,7 +636,7 @@ Not for isolation — Blueprint §9. For the things software checks do worse:
 | 6.1 ✅ | Sv39 paging with a single address space |
 | 6.2 ✅ | Guard pages below every stack (makes 2.2 defence-in-depth rather than sole defence) |
 | 6.3 ✅ | W^X for code buffers: writable while emitting, execute-only after `fence.i` |
-| 6.4 | Read-only mapping for `.rodata` and the capability tables |
+| 6.4 ✅ | Read-only mapping for `.rodata` and the capability tables |
 
 M6.1 installs one ASID-zero Sv39 root shared by every hart. It identity-maps only
 the 126 MiB kernel RAM window and only the 4 KiB device pages touched by the PLIC,
@@ -720,8 +720,36 @@ This is an integrity boundary inside one shared S-mode address space, not proces
 isolation or proof that the emitter is correct. The fixed pool is tracked by
 allocation domain but is a separate global resource rather than bytes charged to a
 component's heap quota. Audited tracked faults reclaim it; conservative untracked
-faults retain the existing leak-on-fault policy. `.rodata` and capability-table
-storage are now non-executable but remain writable until M6.4.
+faults retain the existing leak-on-fault policy.
+
+M6.4 maps the linker-delimited `.rodata` range read-only and non-executable during
+boot. Capability tables use a separate linker-reserved 4 MiB page pool. Every
+mutation first clones and edits a complete candidate `Vec<Slot>` under SYSTEM
+allocation. Commit has no `await`: it moves that candidate into a fresh, exclusively
+owned RW-NX page run, seals the complete run R-- with break-before-make and two
+all-hart `sfence.vma` phases, and only then atomically replaces the CSpace's
+authoritative table. The retired table is no longer authoritative before it returns
+to RW-NX; its `Slot` values are dropped, every byte is cleared, and the first-fit run
+may then be reused.
+
+Normal validation errors occur before publication and leave the old table
+authoritative. An exceptional fault or fail-stop during SYSTEM candidate construction
+or protection may conservatively leak that detached candidate; M6.4 does not claim
+rollback across such non-local failure. The hardware protection covers the published
+`Slot` snapshot, including its generation and live entry's rights, object pointer,
+and derivation pointer. CSpace scalar lifecycle fields and each `Derivation.alive`
+`AtomicBool` remain writable supervisor metadata. This is neither per-component
+isolation nor immutable storage for the complete capability graph.
+
+**M6.4 acceptance:** the host capability suite checks page-aligned COW replacement
+and exact allocate/protect/release backend ordering.
+In-kernel checks require the `.rodata` endpoints and every non-empty published World
+capability table to be R--, require every live pool page to be read-only, and exercise
+mint/derive/revoke plus cleared same-address reuse. The non-fatal `ro` QEMU case adds
+hart-1 lookup and post-revoke denial while checking the expected all-hart shootdowns.
+Two expected-fatal cases store into `.rodata` and a published capability table; the
+raw harness requires cause 15 and requires `stval` to equal each printed probe address
+exactly. Every QEMU boot must also publish the `.rodata`/4 MiB COW-pool marker.
 
 ---
 

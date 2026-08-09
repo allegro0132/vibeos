@@ -193,6 +193,15 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         if crate::mmu::code_pool_contains(stval) {
             crate::println!("[!] W^X code pool blocked {}", exception_name(code));
         }
+        if crate::mmu::rodata_contains(stval) {
+            crate::println!("[!] read-only .rodata blocked {}", exception_name(code));
+        }
+        if crate::cap_table_pool::contains(stval) {
+            crate::println!(
+                "[!] read-only capability table blocked {}",
+                exception_name(code)
+            );
+        }
         sbi::shutdown(true);
     }
 

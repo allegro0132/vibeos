@@ -1,0 +1,4 @@
+quiet
+net fault
+@sleep 8
+halt

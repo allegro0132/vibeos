@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16 and M4.3 are complete. M4.4 virtio-net is next. Run
+> sequence through 3.16 and M4.4 are complete. M4.5 source/binary persistence is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -386,7 +386,7 @@ claim otherwise.
 | 4.1 ✅ | virtio-blk driver as a supervised component | Modern virtio-mmio discovery, explicit MMIO/DMA/service grants, fixed SYSTEM DMA, bounded split queue, IRQ completion, timeout/reset, cancel, quarantine, and bounded fault restart. QEMU verifies the host backing sector after write+flush. |
 | 4.2 ✅ | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
 | 4.3 ✅ | Persist a CSpace | The fixed `persistent-test` SpaceId restores a typed object-capability graph only after inert preflight, external root policy, and atomic installation. Three boots prove ancestor tombstones and generation-1 slot reuse. |
-| 4.4 | virtio-net + a typed socket endpoint | `Endpoint<Packet>`, not a byte stream. |
+| 4.4 ✅ | virtio-net + a typed socket endpoint | Modern device ID 1, q0 RX/q1 TX, two fixed eight-entry queues, bounded `Endpoint<Packet>`, shared reset/quarantine, and independent raw-L2 host evidence. |
 | 4.5 | Source and binary persistence | `rustc save hello` / `run hello`. Compiled code becomes a storable object with a cap on it. |
 
 4.0 fixes the authority-store ABI before a device can make accidental bytes durable.
@@ -437,6 +437,21 @@ strict prefix cuts. See [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
 
 **M4.3 acceptance:** the three-boot fixed-space lifecycle above is green, including
 raw-media verification and tombstoned descendants staying dead.
+
+4.4 deliberately acknowledges only `VIRTIO_F_VERSION_1` and uses one pair of
+eight-entry split queues with contiguous 12-byte-header-plus-frame DMA buffers.
+Owned `Packet` values cross bounded typed endpoints; client pointers never enter a
+descriptor. RX/TX share one epoch and one reset boundary, so a timeout, malformed
+completion, or post-notify component fault quarantines both queues until status zero
+is confirmed. The unprivileged QEMU acceptance peer listens only on localhost and
+strictly verifies four-byte-length-prefixed raw Ethernet HELLO/CHALLENGE/ACK frames.
+See [VIRTIO_NET.md](VIRTIO_NET.md).
+
+**M4.4 acceptance:** the ordinary exchange matches both its guest transcript and
+canonical host frame evidence. The recovery case observes the faulted
+incarnation's abandoned HELLO, then a second HELLO and complete exchange from a
+fresh device epoch. Both focused non-update QEMU cases and the complete regression
+suite are green.
 
 **M4 final acceptance (after 4.5):** write a program at the shell, save it, reboot,
 run it — and its authority after reboot is exactly what was persisted. Source and
@@ -497,7 +512,7 @@ The continuing tracks after the partial M3 milestone are:
 | **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
 | **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
 | **Compiler** | `compiler`, `kernel/rustc`, trampoline | Resolved-cap lease semantics are complete; 3.4–3.6 remain evidence-driven language-track work rather than a persistence prerequisite |
-| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.3 durable model, virtio-blk, object store, and fixed persistent CSpace; networking is next |
+| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.4 durable model, virtio block/network, object store, and fixed persistent CSpace; source/binary persistence is next |
 | **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 
 The lifecycle track is the integration spine: a driver, persisted program, or remote

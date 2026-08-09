@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, and M4.0--M4.3 are complete; the original
-M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, and M4.0--M4.4 are complete; M4.5
+source/binary persistence is next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -97,7 +97,7 @@ byte-identical machine code). The *argument* has holes, enumerated honestly in �
    runtime            │  exec (scheduler)   heap   sync            │
                       └────────────────┼──────────────────────────┘
                       ┌────────────────┼──────────────────────────┐
-   hardware           │ trap  plic  uart  virtio-blk  sbi/linker   │
+   hardware           │ trap  plic  uart  virtio-blk/net  sbi/linker│
                       └───────────────────────────────────────────┘
                                        │
                                   OpenSBI (M-mode)
@@ -114,8 +114,8 @@ upward except through a capability it was handed.
 | `cap.rs` | ~600 | Rights, `Cap`, `CSpace`, attenuation, revocation, explicit leases | — |
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
 | `durable.rs` | ~1000 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
-| `virtio.rs` | ~950 | Pure modern virtio/block protocol and queue lifecycle model | — |
-| `kernel/virtio_*.rs` | ~1000 | MMIO transport, stable DMA, supervised block service | yes |
+| `virtio.rs` | growing | Pure modern virtio block/net protocol and queue lifecycle models | — |
+| `kernel/virtio_*.rs` | growing | MMIO transport, stable DMA, supervised block/network services | yes |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `shell.rs` | 458 | Operator interface | — |
@@ -264,6 +264,12 @@ Two things follow from *typed*:
 
 Backpressure is `await`, not `EAGAIN` — a full queue suspends the sender instead of
 returning an error the caller is free to ignore.
+
+M4.4 applies the same rule at the network boundary: the service exchanges owned
+`Packet` values of at most one Ethernet frame through `Endpoint<Packet>`. It does
+not expose the virtio DMA slab, a byte stream, an fd, or an ioctl surface. RX copies
+the device-certified prefix into a packet before descriptor reuse, while TX copies
+from the packet into stable SYSTEM DMA. See [VIRTIO_NET.md](VIRTIO_NET.md).
 
 ---
 
@@ -474,9 +480,11 @@ Five boundaries must stay explicit:
    1--8 journal, with commit-flush-before-mint and raw-backing verification. M4.3
    now restores the fixed `persistent-test` CSpace only after inert preflight,
    external root selection, ancestor-tombstone filtering, and atomic typed graph
-   installation. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md),
+   installation. M4.4 applies the same supervised, reset-before-reuse discipline
+   to two virtio-net queues behind typed packet endpoints. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md),
    [VIRTIO_BLK.md](VIRTIO_BLK.md), [OBJECT_STORE.md](OBJECT_STORE.md), and
-   [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
+   [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md), plus the network acceptance
+   contract in [VIRTIO_NET.md](VIRTIO_NET.md).
 4. **Revocation cannot retroactively erase an in-flight operation.** Console hooks
    revalidate a `Revocable` token before every write; a successful check linearizes
    that operation before an overlapping revoke. Direct generated loads and stores

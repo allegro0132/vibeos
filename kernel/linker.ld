@@ -9,8 +9,11 @@ SECTIONS {
   . = ORIGIN(RAM);
 
   .text : ALIGN(4K) {
+    __text_start = .;
     KEEP(*(.text.boot))
     *(.text .text.*)
+    . = ALIGN(4K);
+    __text_end = .;
   } > RAM
 
   .rodata : ALIGN(4K) {
@@ -38,6 +41,14 @@ SECTIONS {
     KEEP(*(.dma))
     . = ALIGN(4K);
     __dma_end = .;
+  } > RAM
+
+  /* Generated code never shares a page with heap data. Pages start RW-NX,
+     become execute-only after linking, and return to RW-NX before reuse. */
+  .code_pool (NOLOAD) : ALIGN(4K) {
+    __code_pool_start = .;
+    . += 2M;
+    __code_pool_end = .;
   } > RAM
 
   /* One fixed stack slot per logical scheduler hart. The first 4 KiB of every

@@ -6,7 +6,8 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, M5.5, and M6.2 are complete. M6.3 W^X is next. Run
+> sequence through 3.16, M4.5, M5.5, and M6.3 are complete. M6.4 read-only
+> data and capability tables is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -634,7 +635,7 @@ Not for isolation — Blueprint §9. For the things software checks do worse:
 |---|---|
 | 6.1 ✅ | Sv39 paging with a single address space |
 | 6.2 ✅ | Guard pages below every stack (makes 2.2 defence-in-depth rather than sole defence) |
-| 6.3 | W^X for code buffers: writable while emitting, execute-only after `fence.i` |
+| 6.3 ✅ | W^X for code buffers: writable while emitting, execute-only after `fence.i` |
 | 6.4 | Read-only mapping for `.rodata` and the capability tables |
 
 M6.1 installs one ASID-zero Sv39 root shared by every hart. It identity-maps only
@@ -674,6 +675,53 @@ overflow can also fault again when trap entry tries to save registers on the sam
 bad stack, so skipped-guard protection would require probing or a stronger boundary
 and reliable diagnostics or recovery would require a separate per-hart emergency
 trap stack. M6.2 claims exact guard-page enforcement, not either stronger property.
+
+M6.3 changes the default kernel-RAM leaf from RWX to RW-NX, then applies two
+deliberate exceptions: linker-delimited kernel text is R-X, and generated code is
+execute-only after sealing. Generated instructions live in a dedicated, page-aligned
+2 MiB pool rather than sharing allocator pages. The trusted compiler links directly
+into an exclusively owned `WritableCode` run while it is RW-NX; sealing consumes that
+writable view and publishes an `ExecutableCode` which exposes only its entry address,
+length, and page count. Persisted VIBEEXE still passes byte-identical recompilation
+admission before it reaches this same link-and-seal path.
+
+Every RW-NX/execute-only transition validates the complete old range before changing
+anything, installs invalid PTEs, performs local and synchronous remote `sfence.vma`,
+installs the new PTEs, and performs a second all-hart TLB shootdown. Sealing then adds
+local `fence.i` plus SBI RFENCE `remote_fence_i` before the executable object is
+published. The page-table lock covers the complete break-before-make transaction.
+The boot barrier rejects an unrepresentable physical-hart mask or missing SBI RFENCE
+support, and a failed live shootdown is fail-stop because partial permission
+publication cannot be rolled back safely. Every hart also clears and reads back
+`sstatus.MXR` before publishing paging enabled, so an execute-only leaf cannot be
+loaded through MXR.
+
+Dropping sealed code removes execute permission through the same break-before-make
+protocol, clears every byte in the page run including padding, and only then returns
+its first-fit allocation record for reuse. Allocation identities include generation
+and allocation-domain ownership. The audited fault-domain reclaimer runs only after
+all-hart task quiescence and applies the same unseal/clear/free sequence to code whose
+Rust `Drop` was skipped by `longjmp`.
+
+**M6.3 acceptance:** host tests cover exact SBI RFENCE requests and errors, local
+fence/MXR state, fail-closed sparse physical-hart mask construction, and the
+compiler's exact-length, no-write-on-error in-place linker. In-kernel checks walk
+the real PTEs for R-X text, RW-NX free pool pages, execute-only compiled pages, and
+the absence of any writable-executable RAM leaf; sixteen fault/restart cycles also
+require code-pool use to return to baseline without invoking an interrupted
+destructor. The non-fatal `wx` QEMU case seals and runs one image on the boot hart
+and hart 1, drops it, requires a zeroed same-address allocation, seals different
+code there, and obtains the new value on hart 1 without a per-run `fence.i`. Three
+expected-fatal cases require real instruction/load/store page faults (causes 12,
+13, and 15) for executing a writable page and reading or writing a sealed page;
+the raw harness requires each printed probe address to equal `stval` exactly.
+
+This is an integrity boundary inside one shared S-mode address space, not process
+isolation or proof that the emitter is correct. The fixed pool is tracked by
+allocation domain but is a separate global resource rather than bytes charged to a
+component's heap quota. Audited tracked faults reclaim it; conservative untracked
+faults retain the existing leak-on-fault policy. `.rodata` and capability-table
+storage are now non-executable but remain writable until M6.4.
 
 ---
 

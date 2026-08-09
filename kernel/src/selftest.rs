@@ -249,8 +249,8 @@ pub async fn run() -> Report {
     }
 }
 
-/// M6.1: the live kernel runs through one identity-mapped Sv39 root on every
-/// online hart. Device apertures remain writable but are never executable.
+/// M6.1--M6.3: one identity-mapped Sv39 root is active on every online hart;
+/// stack guards, W^X, execute-only code, and non-executable devices are live.
 fn paging(h: &mut Harness) {
     use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
 
@@ -262,6 +262,11 @@ fn paging(h: &mut Harness) {
         "every online hart read back the shared satp root",
         crate::mmu::enabled_hart_mask(),
         crate::online_hart_mask(),
+    );
+    h.eq(
+        "every paging-enabled hart cleared sstatus.MXR",
+        crate::mmu::mxr_cleared_hart_mask(),
+        crate::mmu::enabled_hart_mask(),
     );
     h.eq(
         "the Sv39 root is page aligned",
@@ -277,13 +282,33 @@ fn paging(h: &mut Harness) {
         text_address,
     );
     h.eq("kernel RAM uses 4 KiB leaves", text.page_size, PAGE_SIZE);
+    h.eq(
+        "kernel text is readable and executable but not writable",
+        text.permissions,
+        PagePermissions::READ.union(PagePermissions::EXECUTE),
+    );
     h.check(
-        "M6.1 kernel RAM remains readable, writable, and executable",
-        text.permissions.contains(
-            PagePermissions::READ
-                .union(PagePermissions::WRITE)
-                .union(PagePermissions::EXECUTE),
-        ),
+        "multicore W^X has synchronous SBI RFENCE support",
+        crate::mmu::wx_remote_fence_ready(),
+    );
+    let (code_start, code_end) = crate::mmu::code_pool_range();
+    h.check(
+        "free code-pool endpoints are identity-mapped RW-NX pages",
+        [code_start, code_end - PAGE_SIZE]
+            .into_iter()
+            .all(|address| {
+                crate::mmu::mapping(address).is_some_and(|mapping| {
+                    mapping.physical == address
+                        && mapping.page_size == PAGE_SIZE
+                        && mapping.permissions
+                            == PagePermissions::READ.union(PagePermissions::WRITE)
+                })
+            }),
+    );
+    h.eq(
+        "no mapped RAM page is both writable and executable",
+        crate::mmu::first_writable_executable_ram_page(),
+        None,
     );
 
     for (name, address) in [
@@ -1093,6 +1118,7 @@ async fn fault_arena_restart(h: &mut Harness) {
 
     let w = world();
     let drops_before = crate::world::fault_probe_drop_count();
+    let code_pages_before = crate::code_pool::stats().live_pages;
     let probe = w.spawn_fault_probe("selftest-fault-arena", TEST_BUDGET);
     let stable_id = probe.snapshot().id;
     let stable_owner = probe.memory_owner();
@@ -1143,6 +1169,11 @@ async fn fault_arena_restart(h: &mut Harness) {
             "raw fault reclamation returns owner live bytes to zero",
             faulted.memory.live_bytes,
             0,
+        );
+        h.eq(
+            "raw fault reclamation returns code-pool pages to baseline",
+            crate::code_pool::stats().live_pages,
+            code_pages_before,
         );
         h.eq(
             "raw fault reclamation never invokes the future destructor",
@@ -1400,6 +1431,27 @@ fn capabilities(h: &mut Harness) {
 fn compiler(h: &mut Harness) {
     let hello = crate::rustc::compile(crate::rustc::HELLO_SRC);
     h.check("hello compiles", hello.is_ok());
+    h.check(
+        "compiled code is identity-mapped with execute-only 4 KiB leaves",
+        hello.as_ref().is_ok_and(|compiled| {
+            (0..compiled.code_pages()).all(|page| {
+                let address = compiled.code_start() + page * vibeos_core::mmu::PAGE_SIZE;
+                crate::mmu::mapping(address).is_some_and(|mapping| {
+                    mapping.physical == address
+                        && mapping.page_size == vibeos_core::mmu::PAGE_SIZE
+                        && mapping.permissions == vibeos_core::mmu::PagePermissions::EXECUTE
+                })
+            })
+        }),
+    );
+    h.check(
+        "sealed code keeps the global RAM map free of writable-executable leaves",
+        crate::mmu::first_writable_executable_ram_page().is_none(),
+    );
+    h.check(
+        "released code pages are zeroed before same-address reuse",
+        crate::code_pool::reuse_zero_probe(),
+    );
     h.check(
         "the console revoke hook rejects its reserved arm state",
         !crate::rustc::arm_console_revoke_hook(usize::MAX),

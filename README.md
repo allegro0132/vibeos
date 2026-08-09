@@ -254,9 +254,20 @@ over a `jal`, giving ±1 MB of range instead of the 4 KB a bare `beq` would allo
 
 VibeOS now has one shared Sv39 address space. M6.2 leaves each 4 KiB stack guard
 invalid and maps the remaining 252 KiB in its fixed 256 KiB per-hart slot RW-NX.
-Ordinary RAM, including the heap-backed code buffer, is still RWX until M6.3, so
-"load the program" remains `fence.i` followed by transmuting that buffer to a
-function pointer and calling it.
+M6.3 makes ordinary RAM RW-NX and linker-delimited kernel text R-X. Generated
+instructions no longer live in the heap: the compiler relocates directly into an
+exclusive page run from a dedicated 2 MiB code pool while it is RW-NX, then seals
+that run execute-only before exposing its entry point. Every hart clears
+`sstatus.MXR`, so execute-only pages cannot be read as data.
+
+Sealing and unsealing use break-before-make PTE updates, local fences, and
+synchronous SBI RFENCE operations for every other online physical hart. A sealed
+buffer is never published until both TLB shootdowns and the all-hart instruction-
+cache fence complete. Drop removes execute permission, zeros the complete page run
+including padding, and only then permits same-address reuse; audited component-fault
+recovery applies that same sequence after all-hart quiescence when `longjmp` skipped
+Rust destructors. `mmu wx` demonstrates sealed execution on the boot hart and hart 1,
+zeroed same-address reuse, and different code executing remotely after reuse.
 
 ### And this is where it earns its place in *this* OS
 

@@ -8,7 +8,7 @@
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::exec;
 use crate::sync::SpinLock;
@@ -29,14 +29,20 @@ const RAM_LEVEL0_TABLES: usize = (KERNEL_RAM_END - KERNEL_RAM_START) / MEGAPAGE_
 const PLIC_ENABLE_PAGE: usize = PLIC_START + 0x2000;
 pub const PLIC_CONTEXT_START: usize = PLIC_START + 0x20_0000;
 
-const RAM_PERMISSIONS: PagePermissions = PagePermissions::READ
-    .union(PagePermissions::WRITE)
-    .union(PagePermissions::EXECUTE);
+const WRITABLE_PERMISSIONS: PagePermissions =
+    PagePermissions::READ.union(PagePermissions::WRITE);
+const TEXT_PERMISSIONS: PagePermissions =
+    PagePermissions::READ.union(PagePermissions::EXECUTE);
+const EXECUTABLE_PERMISSIONS: PagePermissions = PagePermissions::EXECUTE;
 const MMIO_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
-const STACK_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
+const STACK_PERMISSIONS: PagePermissions = WRITABLE_PERMISSIONS;
 
 extern "C" {
     static __stacks_bottom: u8;
+    static __text_start: u8;
+    static __text_end: u8;
+    static __code_pool_start: u8;
+    static __code_pool_end: u8;
 }
 
 #[repr(C, align(4096))]
@@ -88,12 +94,23 @@ static PAGE_TABLE_LOCK: SpinLock<()> = SpinLock::new(());
 static INIT_STARTED: AtomicBool = AtomicBool::new(false);
 static TABLES_READY: AtomicBool = AtomicBool::new(false);
 static ENABLED_HARTS: AtomicUsize = AtomicUsize::new(0);
+static MXR_CLEARED_HARTS: AtomicUsize = AtomicUsize::new(0);
+static WX_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_SFENCES: AtomicU64 = AtomicU64::new(0);
+static REMOTE_FENCE_I: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mapping {
     pub physical: usize,
     pub permissions: PagePermissions,
     pub page_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WxSyncStats {
+    pub transitions: u64,
+    pub remote_sfences: u64,
+    pub remote_fence_i: u64,
 }
 
 /// Build the one global address space before the boot hart starts peers.
@@ -166,10 +183,18 @@ pub fn init_boot(boot_physical_hart: usize) {
             .expect("RAM level-0 table is page aligned");
         for (page_index, entry) in level0.entries.iter_mut().enumerate() {
             let physical = base + page_index * sv39::PAGE_SIZE;
-            *entry = PageTableEntry::leaf(physical, RAM_PERMISSIONS)
+            *entry = PageTableEntry::leaf(physical, WRITABLE_PERMISSIONS)
                 .expect("identity RAM leaf is architecturally valid");
         }
     }
+
+    let (text_start, text_end) = text_range();
+    assert_page_range(text_start, text_end);
+    remap_boot_range(tables, text_start, text_end, TEXT_PERMISSIONS);
+
+    let (code_start, code_end) = code_pool_range();
+    assert_page_range(code_start, code_end);
+    remap_boot_range(tables, code_start, code_end, WRITABLE_PERMISSIONS);
 
     for logical_index in 0..exec::MAX_HARTS {
         let guard = stack_guard_page(logical_index).expect("logical stack guard is in range");
@@ -198,6 +223,11 @@ pub fn enable(logical_index: usize) {
         "Sv39 tables must be published before enabling paging"
     );
     let expected = sv39::satp(root_physical()).expect("Sv39 root is page aligned");
+    crate::sbi::clear_mxr();
+    assert!(
+        !crate::sbi::mxr_enabled(),
+        "execute-only mappings require sstatus.MXR=0"
+    );
     unsafe {
         asm!(
             "fence rw, rw",
@@ -213,11 +243,17 @@ pub fn enable(logical_index: usize) {
         expected,
         "satp readback differs from Sv39 root"
     );
-    ENABLED_HARTS.fetch_or(1usize << logical_index, Ordering::Release);
+    let bit = 1usize << logical_index;
+    MXR_CLEARED_HARTS.fetch_or(bit, Ordering::Release);
+    ENABLED_HARTS.fetch_or(bit, Ordering::Release);
 }
 
 pub fn enabled_hart_mask() -> usize {
     ENABLED_HARTS.load(Ordering::Acquire)
+}
+
+pub fn mxr_cleared_hart_mask() -> usize {
+    MXR_CLEARED_HARTS.load(Ordering::Acquire)
 }
 
 pub fn local_satp() -> usize {
@@ -258,6 +294,94 @@ pub fn stack_guard_hart(address: usize) -> Option<usize> {
     let logical_index = offset / STACK_SLOT_STRIDE;
     (logical_index < exec::MAX_HARTS && offset % STACK_SLOT_STRIDE < STACK_GUARD_SIZE)
         .then_some(logical_index)
+}
+
+pub fn text_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__text_start) as usize,
+        core::ptr::addr_of!(__text_end) as usize,
+    )
+}
+
+pub fn code_pool_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__code_pool_start) as usize,
+        core::ptr::addr_of!(__code_pool_end) as usize,
+    )
+}
+
+pub fn code_pool_contains(address: usize) -> bool {
+    let (start, end) = code_pool_range();
+    address >= start && address < end
+}
+
+pub fn wx_sync_stats() -> WxSyncStats {
+    WxSyncStats {
+        transitions: WX_TRANSITIONS.load(Ordering::Acquire),
+        remote_sfences: REMOTE_SFENCES.load(Ordering::Acquire),
+        remote_fence_i: REMOTE_FENCE_I.load(Ordering::Acquire),
+    }
+}
+
+/// The shared address space can mutate executable PTEs on a multicore machine
+/// only when firmware supplies synchronous remote TLB and I-cache fences.
+pub fn wx_remote_fence_ready() -> bool {
+    remote_hart_mask().is_some_and(|mask| {
+        mask == 0 || crate::sbi::probe_extension(crate::sbi::RFENCE_EXTENSION_ID)
+    })
+}
+
+/// Turn a private code-pool run from RW-NX into execute-only.
+///
+/// Publication happens only after break-before-make, two all-hart TLB
+/// shootdowns, and an all-hart instruction-cache fence have completed.
+pub fn seal_code(start: usize, pages: usize) {
+    transition_code(
+        start,
+        pages,
+        WRITABLE_PERMISSIONS,
+        EXECUTABLE_PERMISSIONS,
+        true,
+    );
+}
+
+/// Remove execute permission before the caller clears and releases a code run.
+pub fn unseal_code(start: usize, pages: usize) {
+    transition_code(
+        start,
+        pages,
+        EXECUTABLE_PERMISSIONS,
+        WRITABLE_PERMISSIONS,
+        false,
+    );
+}
+
+/// Scan the actual leaf PTEs under one lock. `None` is the W^X invariant.
+pub fn first_writable_executable_ram_page() -> Option<usize> {
+    if !TABLES_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let _tables = PAGE_TABLE_LOCK.lock();
+    // Safety: the lock serializes all post-boot mutations and TABLES_READY
+    // proves the complete hierarchy was published.
+    let tables = unsafe { &*TABLES.0.get() };
+    for (table_index, level0) in tables.ram_level0.iter().enumerate() {
+        for (page_index, entry) in level0.entries.iter().copied().enumerate() {
+            let permissions = entry.permissions();
+            if entry.is_valid()
+                && entry.is_leaf()
+                && permissions.contains(PagePermissions::WRITE)
+                && permissions.contains(PagePermissions::EXECUTE)
+            {
+                return Some(
+                    KERNEL_RAM_START
+                        + table_index * MEGAPAGE_SIZE
+                        + page_index * sv39::PAGE_SIZE,
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Walk the live hierarchy exactly as the hardware would for diagnostics and
@@ -302,6 +426,131 @@ fn map_page(level0: &mut PageTable, physical: usize, permissions: PagePermission
     assert_eq!(physical % sv39::PAGE_SIZE, 0);
     level0.entries[sv39::vpn_index(physical, 0)] = PageTableEntry::leaf(physical, permissions)
         .expect("identity MMIO page is architecturally valid");
+}
+
+fn assert_page_range(start: usize, end: usize) {
+    assert!(start >= KERNEL_RAM_START && end <= KERNEL_RAM_END && start < end);
+    assert_eq!(start % sv39::PAGE_SIZE, 0);
+    assert_eq!(end % sv39::PAGE_SIZE, 0);
+}
+
+fn remap_boot_range(
+    tables: &mut AddressSpace,
+    start: usize,
+    end: usize,
+    permissions: PagePermissions,
+) {
+    for address in (start..end).step_by(sv39::PAGE_SIZE) {
+        *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, permissions)
+            .expect("boot RAM permission override is valid");
+    }
+}
+
+fn transition_code(
+    start: usize,
+    pages: usize,
+    expected_permissions: PagePermissions,
+    target_permissions: PagePermissions,
+    synchronize_instructions: bool,
+) {
+    assert!(pages != 0, "W^X transition requires at least one page");
+    assert_eq!(start % sv39::PAGE_SIZE, 0, "W^X start is not page aligned");
+    let size = pages
+        .checked_mul(sv39::PAGE_SIZE)
+        .expect("W^X transition length overflowed");
+    let end = start
+        .checked_add(size)
+        .expect("W^X transition range overflowed");
+    let (pool_start, pool_end) = code_pool_range();
+    assert!(
+        start >= pool_start && end <= pool_end,
+        "W^X transition escaped the dedicated code pool"
+    );
+
+    let _page_tables = PAGE_TABLE_LOCK.lock();
+    // Safety: the page-table lock is the unique post-publication mutation
+    // authority. The code-pool allocation stays reserved across this call.
+    let tables = unsafe { &mut *TABLES.0.get() };
+
+    // Validate the complete old range before changing its first PTE. A stale,
+    // overlapping, or repeated transition therefore cannot partially apply.
+    for address in (start..end).step_by(sv39::PAGE_SIZE) {
+        let expected = PageTableEntry::leaf(address, expected_permissions)
+            .expect("expected code-pool leaf is valid");
+        assert_eq!(
+            *ram_leaf_mut(tables, address),
+            expected,
+            "code-pool PTE did not have the required old permissions"
+        );
+    }
+
+    // Break before make. Directly replacing RW with X (or vice versa) could
+    // leave one hart using a stale writable TLB entry while another already
+    // observes the executable entry.
+    for address in (start..end).step_by(sv39::PAGE_SIZE) {
+        *ram_leaf_mut(tables, address) = PageTableEntry::EMPTY;
+    }
+    publish_pte_writes();
+    synchronize_tlbs(start, size);
+
+    for address in (start..end).step_by(sv39::PAGE_SIZE) {
+        *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, target_permissions)
+            .expect("target code-pool leaf is valid");
+    }
+    publish_pte_writes();
+    synchronize_tlbs(start, size);
+    if synchronize_instructions {
+        synchronize_instruction_caches();
+    }
+    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
+}
+
+fn publish_pte_writes() {
+    unsafe { asm!("fence rw, rw", options(nostack)) };
+}
+
+fn remote_hart_mask() -> Option<usize> {
+    let mut mask = crate::ipi::online_physical_hart_mask()?;
+    let current = crate::sbi::current_hart_id();
+    if current >= usize::BITS as usize {
+        return None;
+    }
+    mask &= !(1usize << current);
+    Some(mask)
+}
+
+fn synchronize_tlbs(start: usize, size: usize) {
+    crate::sbi::local_sfence_vma(start, size);
+    let Some(remote) = remote_hart_mask() else {
+        crate::sbi::shutdown(true);
+    };
+    if remote == 0 {
+        return;
+    }
+    if !crate::sbi::probe_extension(crate::sbi::RFENCE_EXTENSION_ID)
+        || crate::sbi::remote_sfence_vma(remote, 0, start, size).is_err()
+    {
+        // A partially completed shootdown cannot be rolled back safely and a
+        // task fault catcher must not turn it into an ordinary component fault.
+        crate::sbi::shutdown(true);
+    }
+    REMOTE_SFENCES.fetch_add(1, Ordering::Release);
+}
+
+fn synchronize_instruction_caches() {
+    crate::sbi::local_fence_i();
+    let Some(remote) = remote_hart_mask() else {
+        crate::sbi::shutdown(true);
+    };
+    if remote == 0 {
+        return;
+    }
+    if !crate::sbi::probe_extension(crate::sbi::RFENCE_EXTENSION_ID)
+        || crate::sbi::remote_fence_i(remote, 0).is_err()
+    {
+        crate::sbi::shutdown(true);
+    }
+    REMOTE_FENCE_I.fetch_add(1, Ordering::Release);
 }
 
 fn ram_leaf_mut(tables: &mut AddressSpace, address: usize) -> &mut PageTableEntry {

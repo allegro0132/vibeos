@@ -1,0 +1,7 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> mmu wx fault read
+  W^X probe: read sealed 0xADDR
+[!] fatal trap: cause=13 stval=0xADDR sepc=0xADDR (load page fault)
+[!] W^X code pool blocked load page fault

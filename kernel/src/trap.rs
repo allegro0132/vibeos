@@ -190,6 +190,9 @@ extern "C" fn __trap_handler(irq_entry: u64) {
                 exception_name(code)
             );
         }
+        if crate::mmu::code_pool_contains(stval) {
+            crate::println!("[!] W^X code pool blocked {}", exception_name(code));
+        }
         sbi::shutdown(true);
     }
 

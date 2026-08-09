@@ -7,11 +7,14 @@
 //! Time is a counter the test drives by hand, so timer tests are deterministic
 //! rather than racy.
 
-use core::sync::atomic::{fence, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 use super::{HartState, IpiError};
 
 const TEST_HARTS: usize = usize::BITS as usize;
+const NO_EXTENSION: usize = usize::MAX;
+
+pub const RFENCE_EXTENSION_ID: usize = 0x52464E43;
 
 static NOW: AtomicU64 = AtomicU64::new(0);
 static NEXT_TIMER: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -27,11 +30,49 @@ static HART_START_ATTEMPTS: [AtomicU64; TEST_HARTS] = [const { AtomicU64::new(0)
 static HART_STATUS_ATTEMPTS: [AtomicU64; TEST_HARTS] = [const { AtomicU64::new(0) }; TEST_HARTS];
 static HART_START_ADDRS: [AtomicUsize; TEST_HARTS] = [const { AtomicUsize::new(0) }; TEST_HARTS];
 static HART_START_OPAQUES: [AtomicUsize; TEST_HARTS] = [const { AtomicUsize::new(0) }; TEST_HARTS];
+static RFENCE_SUPPORTED: AtomicBool = AtomicBool::new(true);
+static PROBE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static LAST_PROBED_EXTENSION: AtomicUsize = AtomicUsize::new(NO_EXTENSION);
+static REMOTE_FENCE_I_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_FENCE_I_MASK: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_FENCE_I_BASE: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_FENCE_I_ERROR: AtomicIsize = AtomicIsize::new(0);
+static REMOTE_SFENCE_VMA_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_SFENCE_VMA_MASK: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_SFENCE_VMA_BASE: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_SFENCE_VMA_START: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_SFENCE_VMA_SIZE: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_SFENCE_VMA_ERROR: AtomicIsize = AtomicIsize::new(0);
+static LOCAL_SFENCE_VMA_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_SFENCE_VMA_START: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_SFENCE_VMA_SIZE: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_FENCE_I_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static MXR_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HartStartRequest {
     pub start_addr: usize,
     pub opaque: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteFenceIRequest {
+    pub hart_mask: usize,
+    pub hart_mask_base: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteSfenceVmaRequest {
+    pub hart_mask: usize,
+    pub hart_mask_base: usize,
+    pub start: usize,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalSfenceVmaRequest {
+    pub start: usize,
+    pub size: usize,
 }
 
 pub fn irq_save() -> bool {
@@ -64,6 +105,73 @@ pub fn clear_software_interrupt() {
 
 pub fn fence_ipi() {
     fence(Ordering::SeqCst);
+}
+
+pub fn local_sfence_vma(start: usize, size: usize) {
+    LOCAL_SFENCE_VMA_START.store(start, Ordering::Relaxed);
+    LOCAL_SFENCE_VMA_SIZE.store(size, Ordering::Relaxed);
+    LOCAL_SFENCE_VMA_ATTEMPTS.fetch_add(1, Ordering::Release);
+    fence(Ordering::SeqCst);
+}
+
+pub fn local_fence_i() {
+    LOCAL_FENCE_I_ATTEMPTS.fetch_add(1, Ordering::Release);
+    fence(Ordering::SeqCst);
+}
+
+pub fn clear_mxr() {
+    MXR_ENABLED.store(false, Ordering::SeqCst);
+}
+
+pub fn mxr_enabled() -> bool {
+    MXR_ENABLED.load(Ordering::SeqCst)
+}
+
+pub fn probe_extension(extension_id: usize) -> bool {
+    LAST_PROBED_EXTENSION.store(extension_id, Ordering::Relaxed);
+    PROBE_ATTEMPTS.fetch_add(1, Ordering::Release);
+    extension_id == RFENCE_EXTENSION_ID && RFENCE_SUPPORTED.load(Ordering::Acquire)
+}
+
+pub fn remote_fence_i(hart_mask: usize, hart_mask_base: usize) -> Result<(), IpiError> {
+    REMOTE_FENCE_I_MASK.store(hart_mask, Ordering::Relaxed);
+    REMOTE_FENCE_I_BASE.store(hart_mask_base, Ordering::Relaxed);
+    REMOTE_FENCE_I_ATTEMPTS.fetch_add(1, Ordering::Release);
+    fence(Ordering::SeqCst);
+
+    if !RFENCE_SUPPORTED.load(Ordering::Acquire) {
+        return Err(IpiError::NotSupported);
+    }
+    let injected = REMOTE_FENCE_I_ERROR.load(Ordering::Acquire);
+    if injected == 0 {
+        Ok(())
+    } else {
+        Err(IpiError::from_sbi(injected))
+    }
+}
+
+pub fn remote_sfence_vma(
+    hart_mask: usize,
+    hart_mask_base: usize,
+    start: usize,
+    size: usize,
+) -> Result<(), IpiError> {
+    REMOTE_SFENCE_VMA_MASK.store(hart_mask, Ordering::Relaxed);
+    REMOTE_SFENCE_VMA_BASE.store(hart_mask_base, Ordering::Relaxed);
+    REMOTE_SFENCE_VMA_START.store(start, Ordering::Relaxed);
+    REMOTE_SFENCE_VMA_SIZE.store(size, Ordering::Relaxed);
+    REMOTE_SFENCE_VMA_ATTEMPTS.fetch_add(1, Ordering::Release);
+    fence(Ordering::SeqCst);
+
+    if !RFENCE_SUPPORTED.load(Ordering::Acquire) {
+        return Err(IpiError::NotSupported);
+    }
+    let injected = REMOTE_SFENCE_VMA_ERROR.load(Ordering::Acquire);
+    if injected == 0 {
+        Ok(())
+    } else {
+        Err(IpiError::from_sbi(injected))
+    }
 }
 
 pub fn send_ipi(hart: usize) -> Result<(), IpiError> {
@@ -169,6 +277,79 @@ pub fn set_test_hart_id(hart: usize) {
     CURRENT_HART.store(hart, Ordering::Release);
 }
 
+pub fn set_test_rfence_supported(supported: bool) {
+    RFENCE_SUPPORTED.store(supported, Ordering::Release);
+}
+
+pub fn test_probe_attempts() -> u64 {
+    PROBE_ATTEMPTS.load(Ordering::Acquire)
+}
+
+pub fn test_last_probed_extension() -> Option<usize> {
+    (test_probe_attempts() != 0).then(|| LAST_PROBED_EXTENSION.load(Ordering::Acquire))
+}
+
+pub fn set_test_remote_fence_i_error(error: Option<IpiError>) {
+    let raw = error.map_or(0, IpiError::as_sbi);
+    assert!(
+        error.is_none() || raw != 0,
+        "an injected SBI error must be nonzero"
+    );
+    REMOTE_FENCE_I_ERROR.store(raw, Ordering::Release);
+}
+
+pub fn test_remote_fence_i_attempts() -> u64 {
+    REMOTE_FENCE_I_ATTEMPTS.load(Ordering::Acquire)
+}
+
+pub fn test_last_remote_fence_i() -> Option<RemoteFenceIRequest> {
+    (test_remote_fence_i_attempts() != 0).then(|| RemoteFenceIRequest {
+        hart_mask: REMOTE_FENCE_I_MASK.load(Ordering::Acquire),
+        hart_mask_base: REMOTE_FENCE_I_BASE.load(Ordering::Acquire),
+    })
+}
+
+pub fn set_test_remote_sfence_vma_error(error: Option<IpiError>) {
+    let raw = error.map_or(0, IpiError::as_sbi);
+    assert!(
+        error.is_none() || raw != 0,
+        "an injected SBI error must be nonzero"
+    );
+    REMOTE_SFENCE_VMA_ERROR.store(raw, Ordering::Release);
+}
+
+pub fn test_remote_sfence_vma_attempts() -> u64 {
+    REMOTE_SFENCE_VMA_ATTEMPTS.load(Ordering::Acquire)
+}
+
+pub fn test_last_remote_sfence_vma() -> Option<RemoteSfenceVmaRequest> {
+    (test_remote_sfence_vma_attempts() != 0).then(|| RemoteSfenceVmaRequest {
+        hart_mask: REMOTE_SFENCE_VMA_MASK.load(Ordering::Acquire),
+        hart_mask_base: REMOTE_SFENCE_VMA_BASE.load(Ordering::Acquire),
+        start: REMOTE_SFENCE_VMA_START.load(Ordering::Acquire),
+        size: REMOTE_SFENCE_VMA_SIZE.load(Ordering::Acquire),
+    })
+}
+
+pub fn test_local_sfence_vma_attempts() -> u64 {
+    LOCAL_SFENCE_VMA_ATTEMPTS.load(Ordering::Acquire)
+}
+
+pub fn test_last_local_sfence_vma() -> Option<LocalSfenceVmaRequest> {
+    (test_local_sfence_vma_attempts() != 0).then(|| LocalSfenceVmaRequest {
+        start: LOCAL_SFENCE_VMA_START.load(Ordering::Acquire),
+        size: LOCAL_SFENCE_VMA_SIZE.load(Ordering::Acquire),
+    })
+}
+
+pub fn test_local_fence_i_attempts() -> u64 {
+    LOCAL_FENCE_I_ATTEMPTS.load(Ordering::Acquire)
+}
+
+pub fn set_test_mxr_enabled(enabled: bool) {
+    MXR_ENABLED.store(enabled, Ordering::Release);
+}
+
 /// Inject or remove an SBI send failure for one host-model hart.
 pub fn set_test_ipi_failure(hart: usize, fail: bool) {
     assert!(hart < usize::BITS as usize);
@@ -242,6 +423,24 @@ pub fn reset_ipi_test_state() {
     CURRENT_HART.store(0, Ordering::Release);
     SOFTWARE_PENDING.store(0, Ordering::Release);
     IPI_FAILURE_MASK.store(0, Ordering::Release);
+    RFENCE_SUPPORTED.store(true, Ordering::Release);
+    PROBE_ATTEMPTS.store(0, Ordering::Release);
+    LAST_PROBED_EXTENSION.store(NO_EXTENSION, Ordering::Release);
+    REMOTE_FENCE_I_ATTEMPTS.store(0, Ordering::Release);
+    REMOTE_FENCE_I_MASK.store(0, Ordering::Release);
+    REMOTE_FENCE_I_BASE.store(0, Ordering::Release);
+    REMOTE_FENCE_I_ERROR.store(0, Ordering::Release);
+    REMOTE_SFENCE_VMA_ATTEMPTS.store(0, Ordering::Release);
+    REMOTE_SFENCE_VMA_MASK.store(0, Ordering::Release);
+    REMOTE_SFENCE_VMA_BASE.store(0, Ordering::Release);
+    REMOTE_SFENCE_VMA_START.store(0, Ordering::Release);
+    REMOTE_SFENCE_VMA_SIZE.store(0, Ordering::Release);
+    REMOTE_SFENCE_VMA_ERROR.store(0, Ordering::Release);
+    LOCAL_SFENCE_VMA_ATTEMPTS.store(0, Ordering::Release);
+    LOCAL_SFENCE_VMA_START.store(0, Ordering::Release);
+    LOCAL_SFENCE_VMA_SIZE.store(0, Ordering::Release);
+    LOCAL_FENCE_I_ATTEMPTS.store(0, Ordering::Release);
+    MXR_ENABLED.store(false, Ordering::Release);
     for attempts in &IPI_ATTEMPTS {
         attempts.store(0, Ordering::Release);
     }

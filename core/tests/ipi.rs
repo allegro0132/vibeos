@@ -212,3 +212,42 @@ fn concurrent_start_preparation_preserves_unique_physical_mapping() {
     );
     assert!(!ipi::is_online(logical1) && !ipi::is_online(logical2));
 }
+
+#[test]
+fn online_physical_mask_tracks_sparse_permuted_harts_and_fails_closed() {
+    let _test_state = TEST_STATE.lock().unwrap();
+    let logical1 = HartId::new(1).unwrap();
+    let logical2 = HartId::new(2).unwrap();
+
+    ipi::reset_test_state();
+    assert_eq!(ipi::online_physical_hart_mask(), Some(0));
+
+    arch::set_test_hart_id(3);
+    assert_eq!(
+        ipi::mark_online(HartId::BOOT, 3),
+        Ok(OnlineDisposition::OnlineIdle)
+    );
+    assert_eq!(ipi::prepare_start(logical1, 7), Ok(()));
+    arch::set_test_hart_id(7);
+    assert_eq!(
+        ipi::mark_online(logical1, 7),
+        Ok(OnlineDisposition::OnlineIdle)
+    );
+    // A reserved-but-offline mapping must not leak into an RFENCE target.
+    assert_eq!(ipi::prepare_start(logical2, 1), Ok(()));
+    assert_eq!(
+        ipi::online_physical_hart_mask(),
+        Some((1usize << 3) | (1usize << 7))
+    );
+
+    // The topology layer accepts opaque SBI hart ids, but a one-word mask
+    // cannot represent this one. RFENCE callers must fail closed.
+    ipi::reset_test_state();
+    let unrepresentable = usize::BITS as usize;
+    arch::set_test_hart_id(unrepresentable);
+    assert_eq!(
+        ipi::mark_online(HartId::BOOT, unrepresentable),
+        Ok(OnlineDisposition::OnlineIdle)
+    );
+    assert_eq!(ipi::online_physical_hart_mask(), None);
+}

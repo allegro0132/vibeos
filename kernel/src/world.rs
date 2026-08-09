@@ -1417,11 +1417,16 @@ async fn guest_task(space: SpaceRef, con: Cap) {
     }
 }
 
-/// Audited target-only probe for M3.12. It leaves a live Vec and a destructor
-/// bomb behind, then quota-faults while holding the generation's CSpace lock.
-/// Restart must recover the lock and raw-reclaim the arena without running Drop.
+/// Audited target-only probe for M3.12 and M6.3. It leaves a live Vec, a sealed
+/// code-pool allocation, and a destructor bomb behind, then quota-faults while
+/// holding the generation's CSpace lock. Restart must recover the lock and both
+/// allocation domains without running Drop.
 async fn fault_probe_task(space: SpaceRef, memory_budget: usize) {
     let _must_not_drop = FaultProbeDrop;
+    let mut code = crate::code_pool::WritableCode::allocate(1)
+        .expect("fault probe must reserve one code-pool page");
+    code.words_mut()[0] = 0x0000_8067; // ret
+    let _abandoned_code = code.seal();
     let mut held = Vec::new();
     held.resize(512, 0xA5);
     let _abandoned_cspace = space.get().0.lock();

@@ -1,0 +1,10 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> mmu wx
+  W^X: N KiB pool, free/write rw-, sealed --x, MXR mask 0xADDR
+  sealed: 1 page(s) at 0xADDR, boot=41 ok, hart1=41 ok
+  reuse: zeroed yes, same-address yes, hart1=42 ok
+  shootdown: 5 transitions, 10 remote sfence, 3 remote fence.i
+vibe> halt
+  powering off.

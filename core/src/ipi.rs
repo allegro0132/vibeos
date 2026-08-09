@@ -294,6 +294,33 @@ pub fn is_online(hart: HartId) -> bool {
     ONLINE_HARTS.load(Ordering::Acquire) & hart_bit(hart) != 0
 }
 
+/// Snapshot the exact physical hart mask backing all currently online slots.
+///
+/// `None` rejects a topology that cannot fit the standardized one-word SBI
+/// hart mask, has lost an online slot's mapping, or aliases one physical hart
+/// through multiple logical identities. Registration prevents those states;
+/// retaining the checked return keeps later RFENCE callers fail-closed.
+pub fn online_physical_hart_mask() -> Option<usize> {
+    let online = ONLINE_HARTS.load(Ordering::Acquire);
+    let mut physical_mask = 0usize;
+    for index in 0..MAX_HARTS {
+        if online & (1usize << index) == 0 {
+            continue;
+        }
+        let logical = HartId::new(index).expect("online bit is a logical hart");
+        let physical = physical_hart_id(logical)?;
+        if physical >= usize::BITS as usize {
+            return None;
+        }
+        let bit = 1usize << physical;
+        if physical_mask & bit != 0 {
+            return None;
+        }
+        physical_mask |= bit;
+    }
+    Some(physical_mask)
+}
+
 /// Snapshot reason bits for diagnostics. The internal armed bit is hidden.
 pub fn pending_reasons(hart: HartId) -> usize {
     MAILBOXES[hart.index()].load(Ordering::Acquire) & REASON_MASK

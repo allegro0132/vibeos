@@ -22,6 +22,7 @@ pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync, virtio};
 
 mod bench;
+mod code_pool;
 mod dev;
 mod durable_cspace;
 mod mmu;
@@ -220,6 +221,17 @@ pub extern "C" fn kmain() -> ! {
         "  mmu       Sv39 single address space, hart mask {:#x}",
         mmu::enabled_hart_mask()
     );
+    assert!(
+        mmu::wx_remote_fence_ready(),
+        "multicore W^X requires the SBI RFENCE extension"
+    );
+    let (code_start, code_end) = mmu::code_pool_range();
+    println!(
+        "  W^X       {} KiB code pool {:#x}..{:#x}, MXR clear, RFENCE ready",
+        (code_end - code_start) / 1024,
+        code_start,
+        code_end
+    );
 
     world::build();
 
@@ -372,6 +384,7 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         virtio_blk::recover_faulted_domain(domain);
         virtio_net::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
+        code_pool::recover_faulted_domain(domain);
         HEAP.reclaim_faulted_arena(domain.arena)
             .expect("a faulted audited arena must reclaim atomically");
     }

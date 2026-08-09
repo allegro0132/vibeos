@@ -961,9 +961,8 @@ fn assert_sched_invariants(s: &Sched) {
             raw == TaskState::Running as u8 || raw == CANCEL_REQUESTED,
             "mapped task {id} has detached lifecycle phase {raw}"
         );
-        debug_assert_eq!(
-            task.stealable,
-            !task.domain.arena.is_tracked(),
+        debug_assert!(
+            !task.domain.arena.is_tracked() || !task.stealable,
             "tracked task {id} must remain hart-affine"
         );
         debug_assert_eq!(
@@ -1161,7 +1160,14 @@ pub fn spawn_on(
 
 /// Spawn a future and inherit the allocation owner active at the call site.
 pub fn spawn_tracked(name: &str, fut: impl Future<Output = ()> + Send + 'static) -> TaskHandle {
-    spawn_tracked_domain(heap::current_domain(), current_queue_hart(), name, fut)
+    let domain = heap::current_domain();
+    spawn_tracked_domain(
+        domain,
+        current_queue_hart(),
+        !domain.arena.is_tracked(),
+        name,
+        fut,
+    )
 }
 
 /// Tracked lifecycle handle with explicit logical ready-queue placement. Safe
@@ -1177,7 +1183,27 @@ pub fn spawn_tracked_on(
         !domain.arena.is_tracked(),
         "explicit remote placement cannot move a raw-reclaimable arena"
     );
-    spawn_tracked_domain(domain, hart, name, fut)
+    spawn_tracked_domain(domain, hart, true, name, fut)
+}
+
+/// Spawn an untracked task that may run only on one logical hart.
+///
+/// Ordinary tasks remain stealable through [`spawn_tracked_on`]. This narrower
+/// primitive is for work whose acceptance contract or machine-local state
+/// requires a stable hart. Raw-reclaimable component arenas continue to use
+/// [`spawn_reclaimable_owned`] so their stronger teardown contract is not
+/// confused with scheduling affinity.
+pub fn spawn_pinned_on(
+    hart: HartId,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    let domain = heap::current_domain();
+    assert!(
+        !domain.arena.is_tracked(),
+        "explicit remote placement cannot move a raw-reclaimable arena"
+    );
+    spawn_tracked_domain(domain, hart, false, name, fut)
 }
 
 /// Spawn a future under an explicit component allocation owner.
@@ -1193,6 +1219,26 @@ pub fn spawn_tracked_owned(
     spawn_tracked_domain(
         AllocationDomain::untracked(owner),
         current_queue_hart(),
+        true,
+        name,
+        fut,
+    )
+}
+
+/// Spawn an untracked owner-accounted task that remains on the current hart.
+///
+/// This is the component-facing counterpart of [`spawn_pinned_on`]. It is
+/// used for machine-local control tasks such as the UART shell, whose command
+/// execution must stay on the physical hart that owns external interrupts.
+pub fn spawn_pinned_owned(
+    owner: OwnerId,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    spawn_tracked_domain(
+        AllocationDomain::untracked(owner),
+        current_queue_hart(),
+        false,
         name,
         fut,
     )
@@ -1232,12 +1278,13 @@ pub unsafe fn spawn_reclaimable_owned(
         load_fault_reclaimer().is_some(),
         "a reclaimable task needs an installed fault reclaimer"
     );
-    spawn_tracked_domain(domain, current_queue_hart(), name, fut)
+    spawn_tracked_domain(domain, current_queue_hart(), false, name, fut)
 }
 
 fn spawn_tracked_domain(
     domain: AllocationDomain,
     queue_owner: HartId,
+    stealable: bool,
     name: &str,
     fut: impl Future<Output = ()> + Send + 'static,
 ) -> TaskHandle {
@@ -1264,7 +1311,7 @@ fn spawn_tracked_domain(
         status: status.clone(),
         queue_owner,
         ready: true,
-        stealable: !domain.arena.is_tracked(),
+        stealable,
     };
     let mut s = SCHED.lock();
     // Every live task can migrate to any queue after a steal and then become
@@ -1281,7 +1328,7 @@ fn spawn_tracked_domain(
     }
     s.tasks.insert(id, task);
     s.ready
-        .enqueue(queue_owner, id, !domain.arena.is_tracked())
+        .enqueue(queue_owner, id, stealable)
         .expect("a newly admitted task has unique reserved queue capacity");
     check_sched!(&s);
     drop(s);

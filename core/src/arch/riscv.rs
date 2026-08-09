@@ -2,12 +2,15 @@
 
 use core::arch::asm;
 
-use super::IpiError;
+use super::{HartState, IpiError};
 
 const SSTATUS_SIE: usize = 1 << 1;
 const SIP_SSIP: usize = 1 << 1;
 const SBI_EXT_IPI: usize = 0x735049;
 const SBI_EXT_IPI_SEND: usize = 0;
+const SBI_EXT_HSM: usize = 0x48534D;
+const SBI_EXT_HSM_HART_START: usize = 0;
+const SBI_EXT_HSM_HART_STATUS: usize = 2;
 
 /// Disable S-mode interrupts; returns whether they were previously enabled.
 #[inline]
@@ -87,13 +90,14 @@ pub fn time() -> u64 {
 }
 
 #[inline(always)]
-fn ecall(eid: usize, fid: usize, a0: usize, a1: usize) -> (isize, usize) {
+fn ecall(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize) -> (isize, usize) {
     let (err, val): (isize, usize);
     unsafe {
         asm!(
             "ecall",
             inlateout("a0") a0 => err,
             inlateout("a1") a1 => val,
+            in("a2") a2,
             in("a6") fid,
             in("a7") eid,
             options(nostack),
@@ -109,7 +113,7 @@ fn ecall(eid: usize, fid: usize, a0: usize, a1: usize) -> (isize, usize) {
 /// guess a legacy EID 0x04 bit-vector length: that ABI requires one word per
 /// platform hart-range and VibeOS does not parse the topology until M5.5.
 pub fn send_ipi(hart: usize) -> Result<(), IpiError> {
-    let (error, _) = ecall(SBI_EXT_IPI, SBI_EXT_IPI_SEND, 1, hart);
+    let (error, _) = ecall(SBI_EXT_IPI, SBI_EXT_IPI_SEND, 1, hart, 0);
     if error == 0 {
         Ok(())
     } else {
@@ -117,20 +121,55 @@ pub fn send_ipi(hart: usize) -> Result<(), IpiError> {
     }
 }
 
+/// Ask SBI HSM to start `hart` at the physical `start_addr`.
+///
+/// Per the HSM ABI, firmware enters the new S-mode context with `satp = 0`,
+/// interrupts disabled, `a0 = hart`, and `a1 = opaque`. The operation is
+/// asynchronous: success means the transition was accepted, not that the hart
+/// has completed VibeOS-local initialization.
+pub fn hart_start(hart: usize, start_addr: usize, opaque: usize) -> Result<(), IpiError> {
+    let (error, _) = ecall(
+        SBI_EXT_HSM,
+        SBI_EXT_HSM_HART_START,
+        hart,
+        start_addr,
+        opaque,
+    );
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(IpiError::from_sbi(error))
+    }
+}
+
+/// Return the target hart's momentary SBI HSM state.
+///
+/// Firmware may transition the hart concurrently immediately after this
+/// snapshot. VibeOS therefore uses secondary self-registration, not this
+/// status value, as the completion side of its startup handshake.
+pub fn hart_status(hart: usize) -> Result<HartState, IpiError> {
+    let (error, value) = ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STATUS, hart, 0, 0);
+    if error == 0 {
+        Ok(HartState::from_sbi(value))
+    } else {
+        Err(IpiError::from_sbi(error))
+    }
+}
+
 /// Program the next timer interrupt (SBI TIME extension).
 pub fn set_timer(stime: u64) {
-    ecall(0x54494D45, 0, stime as usize, 0);
+    ecall(0x54494D45, 0, stime as usize, 0, 0);
 }
 
 /// Legacy console putchar. Only used before the UART driver is live, and on
 /// the panic path where the driver's lock may already be held.
 pub fn legacy_putchar(c: u8) {
-    ecall(0x01, 0, c as usize, 0);
+    ecall(0x01, 0, c as usize, 0, 0);
 }
 
 /// SBI System Reset.
 pub fn shutdown(failure: bool) -> ! {
-    ecall(0x53525354, 0, 0, if failure { 1 } else { 0 });
+    ecall(0x53525354, 0, 0, if failure { 1 } else { 0 }, 0);
     loop {
         wait_for_interrupt();
     }

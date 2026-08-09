@@ -7,9 +7,11 @@
 //! Time is a counter the test drives by hand, so timer tests are deterministic
 //! rather than racy.
 
-use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
-use super::IpiError;
+use super::{HartState, IpiError};
+
+const TEST_HARTS: usize = usize::BITS as usize;
 
 static NOW: AtomicU64 = AtomicU64::new(0);
 static NEXT_TIMER: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -18,6 +20,19 @@ static SOFTWARE_PENDING: AtomicUsize = AtomicUsize::new(0);
 static IPI_FAILURE_MASK: AtomicUsize = AtomicUsize::new(0);
 static IPI_ATTEMPTS: [AtomicU64; usize::BITS as usize] =
     [const { AtomicU64::new(0) }; usize::BITS as usize];
+static HART_STATES: [AtomicUsize; TEST_HARTS] = [const { AtomicUsize::new(1) }; TEST_HARTS];
+static HART_START_ERRORS: [AtomicIsize; TEST_HARTS] = [const { AtomicIsize::new(0) }; TEST_HARTS];
+static HART_STATUS_ERRORS: [AtomicIsize; TEST_HARTS] = [const { AtomicIsize::new(0) }; TEST_HARTS];
+static HART_START_ATTEMPTS: [AtomicU64; TEST_HARTS] = [const { AtomicU64::new(0) }; TEST_HARTS];
+static HART_STATUS_ATTEMPTS: [AtomicU64; TEST_HARTS] = [const { AtomicU64::new(0) }; TEST_HARTS];
+static HART_START_ADDRS: [AtomicUsize; TEST_HARTS] = [const { AtomicUsize::new(0) }; TEST_HARTS];
+static HART_START_OPAQUES: [AtomicUsize; TEST_HARTS] = [const { AtomicUsize::new(0) }; TEST_HARTS];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HartStartRequest {
+    pub start_addr: usize,
+    pub opaque: usize,
+}
 
 pub fn irq_save() -> bool {
     false
@@ -62,6 +77,65 @@ pub fn send_ipi(hart: usize) -> Result<(), IpiError> {
     }
     SOFTWARE_PENDING.fetch_or(bit, Ordering::Release);
     Ok(())
+}
+
+/// Deterministic host model of asynchronous SBI HSM hart start.
+///
+/// A successful call transitions `Stopped` to `StartPending`. Tests explicitly
+/// advance it to `Started` when simulating firmware entering the secondary;
+/// this keeps callers from accidentally treating the SBI return as VibeOS's
+/// online acknowledgement.
+pub fn hart_start(hart: usize, start_addr: usize, opaque: usize) -> Result<(), IpiError> {
+    if hart >= TEST_HARTS {
+        return Err(IpiError::InvalidParam);
+    }
+    HART_START_ATTEMPTS[hart].fetch_add(1, Ordering::Relaxed);
+    HART_START_ADDRS[hart].store(start_addr, Ordering::Release);
+    HART_START_OPAQUES[hart].store(opaque, Ordering::Release);
+
+    let injected = HART_START_ERRORS[hart].load(Ordering::Acquire);
+    if injected != 0 {
+        return Err(IpiError::from_sbi(injected));
+    }
+
+    let state = &HART_STATES[hart];
+    loop {
+        let raw = state.load(Ordering::Acquire);
+        match HartState::from_sbi(raw) {
+            HartState::Stopped => {
+                if state
+                    .compare_exchange_weak(
+                        raw,
+                        HartState::StartPending.as_sbi(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            HartState::Started | HartState::StartPending => {
+                return Err(IpiError::AlreadyAvailable);
+            }
+            _ => return Err(IpiError::Failed),
+        }
+    }
+}
+
+pub fn hart_status(hart: usize) -> Result<HartState, IpiError> {
+    if hart >= TEST_HARTS {
+        return Err(IpiError::InvalidParam);
+    }
+    HART_STATUS_ATTEMPTS[hart].fetch_add(1, Ordering::Relaxed);
+    let injected = HART_STATUS_ERRORS[hart].load(Ordering::Acquire);
+    if injected != 0 {
+        Err(IpiError::from_sbi(injected))
+    } else {
+        Ok(HartState::from_sbi(
+            HART_STATES[hart].load(Ordering::Acquire),
+        ))
+    }
 }
 
 pub fn time() -> u64 {
@@ -117,6 +191,53 @@ pub fn test_ipi_attempts(hart: usize) -> u64 {
         .map_or(0, |attempts| attempts.load(Ordering::Acquire))
 }
 
+/// Set the firmware state returned by the host HSM status model.
+pub fn set_test_hart_state(hart: usize, state: HartState) {
+    assert!(hart < TEST_HARTS);
+    HART_STATES[hart].store(state.as_sbi(), Ordering::Release);
+}
+
+/// Inject one stable SBI error for HSM start, or clear it with `None`.
+pub fn set_test_hart_start_error(hart: usize, error: Option<IpiError>) {
+    assert!(hart < TEST_HARTS);
+    let raw = error.map_or(0, IpiError::as_sbi);
+    assert!(
+        error.is_none() || raw != 0,
+        "an injected SBI error must be nonzero"
+    );
+    HART_START_ERRORS[hart].store(raw, Ordering::Release);
+}
+
+/// Inject one stable SBI error for HSM status, or clear it with `None`.
+pub fn set_test_hart_status_error(hart: usize, error: Option<IpiError>) {
+    assert!(hart < TEST_HARTS);
+    let raw = error.map_or(0, IpiError::as_sbi);
+    assert!(
+        error.is_none() || raw != 0,
+        "an injected SBI error must be nonzero"
+    );
+    HART_STATUS_ERRORS[hart].store(raw, Ordering::Release);
+}
+
+pub fn test_hart_start_attempts(hart: usize) -> u64 {
+    HART_START_ATTEMPTS
+        .get(hart)
+        .map_or(0, |attempts| attempts.load(Ordering::Acquire))
+}
+
+pub fn test_hart_status_attempts(hart: usize) -> u64 {
+    HART_STATUS_ATTEMPTS
+        .get(hart)
+        .map_or(0, |attempts| attempts.load(Ordering::Acquire))
+}
+
+pub fn test_hart_start_request(hart: usize) -> Option<HartStartRequest> {
+    (test_hart_start_attempts(hart) != 0).then(|| HartStartRequest {
+        start_addr: HART_START_ADDRS[hart].load(Ordering::Acquire),
+        opaque: HART_START_OPAQUES[hart].load(Ordering::Acquire),
+    })
+}
+
 pub fn reset_ipi_test_state() {
     CURRENT_HART.store(0, Ordering::Release);
     SOFTWARE_PENDING.store(0, Ordering::Release);
@@ -124,4 +245,15 @@ pub fn reset_ipi_test_state() {
     for attempts in &IPI_ATTEMPTS {
         attempts.store(0, Ordering::Release);
     }
+    for hart in 0..TEST_HARTS {
+        HART_STATES[hart].store(HartState::Stopped.as_sbi(), Ordering::Release);
+        HART_START_ERRORS[hart].store(0, Ordering::Release);
+        HART_STATUS_ERRORS[hart].store(0, Ordering::Release);
+        HART_START_ATTEMPTS[hart].store(0, Ordering::Release);
+        HART_STATUS_ATTEMPTS[hart].store(0, Ordering::Release);
+        HART_START_ADDRS[hart].store(0, Ordering::Release);
+        HART_START_OPAQUES[hart].store(0, Ordering::Release);
+    }
+    // The host process models the already-running boot hart after reset.
+    HART_STATES[0].store(HartState::Started.as_sbi(), Ordering::Release);
 }

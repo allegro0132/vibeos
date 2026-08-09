@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.4 are
-complete; M5.5 secondary-hart boot is next, and the original M3 language-expansion items remain partial. The implementation is across
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, and M5.1--M5.5 are
+complete; M6.1 Sv39 paging is next, and the original M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -224,7 +224,8 @@ target hart while the original `wake` API remains intact; an allocation-free
 notification hook and idle predicate form the M5.2 IPI seam.
 Tasks in audited raw-reclaim arenas remain hart-affine and non-stealable. The
 scheduler now owns one `running`/wake slot per logical hart and checks complete-slot
-quiescence before reclaim; physical secondary execution remains gated until M5.5.
+quiescence before reclaim. M5.5 also exposes explicit non-stealable placement for
+machine-local control and acceptance tasks.
 
 M5.2 implements that seam with per-logical-hart atomic reason mailboxes. A mailbox
 also owns its kick-armed bit, so interrupt acknowledgement consumes both atomically;
@@ -234,6 +235,17 @@ reason rather than spinning forever if its work was stolen or cancelled. Logical
 hart ids bind explicitly to firmware-provided physical hartids, and only online
 physical harts receive standardized `mask=1, base=hartid` SBI calls. M5.2 keeps only
 the boot hart online; stopped secondaries retain software reasons for M5.5.
+
+M5.5 uses SBI HSM `hart_status` and asynchronous `hart_start`. The boot hart first
+reserves a unique logical/physical mapping without publishing ONLINE; each
+secondary selects its 256 KiB stack from the logical opaque value, installs `tp`,
+`sscratch`, `stvec`, and its local timer, then self-registers and publishes a ready
+bit. The firmware-selected coldboot hart always owns logical 0, so QEMU may choose
+any physical ID without repeating BSS/global initialization. Only that physical
+hart enables external interrupts, and the PLIC S-mode context is computed from its
+actual ID; secondaries enable only software and timer interrupts. Current topology
+discovery intentionally scans QEMU `virt`'s dense physical IDs `0..3`; a general
+platform port must enumerate the FDT instead of extending that assumption.
 
 M5.3 hardens the interrupt-safe lock for physical-hart ownership and records the
 complete retain/replace inventory in [SPINLOCK_AUDIT.md](SPINLOCK_AUDIT.md).
@@ -498,7 +510,7 @@ boot-static `Space`, while installing a new `TaskId`, `ArenaId`, generation, and
 grants. Slot generations survive CSpace reset, so an old `Cap` cannot alias a fresh
 grant. Sixteen target fault/restart cycles verify bounded heap growth and zero interrupted
 destructors. Reproducible builds, the lifecycle model, and the M5.1 logical queue
-model and M5.4 nested-hart execution model are now in place; physical execution is still single-hart. Explicit
+model, M5.4 nested-hart execution model, and M5.5 four-hart QEMU execution are now in place. Explicit
 resolved-cap lease semantics now complete the M3.5 sequence.
 
 Five boundaries must stay explicit:

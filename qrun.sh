@@ -14,6 +14,7 @@ pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
 (cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release) >&2
 ( sleep "$SECS"; pkill -f 'qemu-system-riscv64.*vibeos-kernel' >/dev/null 2>&1 ) &
-qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M -nographic \
+qemu-system-riscv64 -machine virt -cpu rv64 -smp 4 -m 128M \
+  -accel tcg,thread=multi -nographic \
   -bios default -kernel target/riscv64imac-unknown-none-elf/release/vibeos-kernel
 exit 0

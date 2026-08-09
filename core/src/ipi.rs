@@ -7,7 +7,7 @@
 //! The receiver clears SSIP and executes an I/O fence before that swap; this
 //! prevents a late CSR clear from erasing a concurrent publisher's new kick.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch;
 use crate::runqueue::{HartId, MAX_HARTS};
@@ -22,6 +22,11 @@ static MAILBOXES: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX
 static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
 static PHYSICAL_HART_IDS: [AtomicUsize; MAX_HARTS] =
     [const { AtomicUsize::new(UNMAPPED_HART) }; MAX_HARTS];
+// Mapping uniqueness spans the complete logical-hart table and cannot be
+// committed with one atomic RMW. This cold boot-only gate serializes the scan
+// plus reservation; callers mask local IRQs before taking it, so an interrupt
+// cannot re-enter registration while its hart owns the gate.
+static REGISTRATION_GATE: AtomicBool = AtomicBool::new(false);
 static NOTIFICATIONS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
 static DOORBELLS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
 static SEND_FAILURES: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
@@ -62,8 +67,27 @@ pub enum OnlineDisposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnlineError {
     InvalidPhysicalHart,
+    NotCurrentPhysicalHart,
     LogicalHartRemapped,
     PhysicalHartAlreadyMapped,
+}
+
+struct RegistrationGuard;
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        REGISTRATION_GATE.store(false, Ordering::Release);
+    }
+}
+
+fn lock_registration() -> RegistrationGuard {
+    while REGISTRATION_GATE
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    RegistrationGuard
 }
 
 const fn hart_bit(hart: HartId) -> usize {
@@ -75,6 +99,49 @@ fn physical_hart_id(hart: HartId) -> Option<usize> {
         UNMAPPED_HART => None,
         physical => Some(physical),
     }
+}
+
+/// Reserve one unique logical-to-physical mapping before issuing HSM start.
+///
+/// Reservation does not publish the hart as online and therefore cannot cause
+/// an IPI to target a hart whose SBI start is merely pending. Repeating the
+/// same reservation is idempotent, which lets callers retry an asynchronous
+/// startup sequence without weakening a previously validated mapping.
+pub fn prepare_start(hart: HartId, physical_hart: usize) -> Result<(), OnlineError> {
+    if physical_hart == UNMAPPED_HART {
+        return Err(OnlineError::InvalidPhysicalHart);
+    }
+    let irq = arch::irq_save();
+    let result = (|| {
+        let _registration = lock_registration();
+        bind_physical_hart(hart, physical_hart)
+    })();
+    arch::irq_restore(irq);
+    result
+}
+
+/// Bind `hart` while the global registration gate is held.
+fn bind_physical_hart(hart: HartId, physical_hart: usize) -> Result<(), OnlineError> {
+    for index in 0..MAX_HARTS {
+        if index != hart.index()
+            && PHYSICAL_HART_IDS[index].load(Ordering::Acquire) == physical_hart
+        {
+            return Err(OnlineError::PhysicalHartAlreadyMapped);
+        }
+    }
+
+    let mapping = &PHYSICAL_HART_IDS[hart.index()];
+    if let Err(previous) = mapping.compare_exchange(
+        UNMAPPED_HART,
+        physical_hart,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        if previous != physical_hart {
+            return Err(OnlineError::LogicalHartRemapped);
+        }
+    }
+    Ok(())
 }
 
 /// Logical scheduler identity bound to the currently executing physical hart.
@@ -178,11 +245,15 @@ pub fn notify_ready(hart: HartId) {
     }
 }
 
-/// Bind one logical scheduler hart to the physical hart id supplied by SBI.
+/// Bind one logical scheduler hart to the current physical hart supplied by SBI.
 ///
-/// M5.2 calls this only for the boot hart. A pending offline publication is
-/// consumed by the already-awake hart before its first WFI. Not ringing during
-/// this transition avoids a duplicate kick if a publisher races online state.
+/// HSM start is asynchronous, so the boot hart must not publish a secondary as
+/// online merely because `hart_start` returned success. The secondary calls
+/// this after installing its own stack and trap state; requiring physical
+/// self-registration makes that call the completion side of the startup
+/// handshake. A pending offline publication is then consumed by the newly
+/// awake hart before its first WFI. Not ringing during this transition avoids
+/// a duplicate kick if a publisher races online state.
 pub fn mark_online(hart: HartId, physical_hart: usize) -> Result<OnlineDisposition, OnlineError> {
     // `usize::MAX` is both our unmapped sentinel and SBI's special all-harts
     // base. Neither can identify one schedulable physical hart.
@@ -194,38 +265,18 @@ pub fn mark_online(hart: HartId, physical_hart: usize) -> Result<OnlineDispositi
     // halfway through its first identity install.
     let irq = arch::irq_save();
     let result = (|| {
-        for index in 0..MAX_HARTS {
-            if index != hart.index()
-                && ONLINE_HARTS.load(Ordering::Acquire) & (1usize << index) != 0
-                && PHYSICAL_HART_IDS[index].load(Ordering::Acquire) == physical_hart
-            {
-                return Err(OnlineError::PhysicalHartAlreadyMapped);
-            }
+        if arch::current_hart_id() != physical_hart {
+            return Err(OnlineError::NotCurrentPhysicalHart);
         }
+        let _registration = lock_registration();
+        bind_physical_hart(hart, physical_hart)?;
 
-        let mapping = &PHYSICAL_HART_IDS[hart.index()];
-        if let Err(previous) = mapping.compare_exchange(
-            UNMAPPED_HART,
-            physical_hart,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            if previous != physical_hart {
-                return Err(OnlineError::LogicalHartRemapped);
-            }
-        }
-
-        let registering_current_hart = arch::current_hart_id() == physical_hart;
         let bit = hart_bit(hart);
         let already_online = ONLINE_HARTS.fetch_or(bit, Ordering::AcqRel) & bit != 0;
-        if registering_current_hart {
-            // This per-hart CSR cache turns the allocation and poll hot paths into
-            // one register read. A controller may register a stopped remote hart;
-            // that hart installs its own cache when it later repeats mark_online.
-            // Safety: the mapping conflict checks and ONLINE publication above
-            // proved that this physical hart owns exactly this logical slot.
-            unsafe { arch::cache_logical_hart_index(hart.index()) };
-        }
+        // This per-hart CSR cache turns allocation and poll hot paths into one
+        // register read. Safety: the current-physical-hart check plus mapping
+        // conflict checks prove that this CPU owns exactly this logical slot.
+        unsafe { arch::cache_logical_hart_index(hart.index()) };
         if already_online {
             return Ok(OnlineDisposition::AlreadyOnline);
         }
@@ -312,6 +363,7 @@ pub fn retry_pending(hart: HartId) -> DoorbellDisposition {
 /// Reset global state for deterministic host integration tests.
 #[cfg(not(target_arch = "riscv64"))]
 pub fn reset_test_state() {
+    REGISTRATION_GATE.store(false, Ordering::Release);
     ONLINE_HARTS.store(0, Ordering::Release);
     for index in 0..MAX_HARTS {
         MAILBOXES[index].store(0, Ordering::Release);

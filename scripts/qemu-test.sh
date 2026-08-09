@@ -10,6 +10,11 @@ cd "$(dirname "$0")/.."
 KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
 UPDATE=0
 FILTER=""
+QEMU_SMP=${QEMU_SMP:-4}
+QEMU_ACCEL=${QEMU_ACCEL:-tcg,thread=multi}
+case "$QEMU_SMP" in
+  ''|*[!0-9]*|0) echo "qemu-test.sh: QEMU_SMP must be a positive integer" >&2; exit 1 ;;
+esac
 for arg in "$@"; do
   case "$arg" in
     --update) UPDATE=1 ;;
@@ -39,6 +44,7 @@ normalize() {
            -e 's/(panicked at [^:]+):[0-9]+:[0-9]+:/\1:LINE:COL:/' \
            -e 's/[0-9]+ KiB/N KiB/g' \
            -e 's/^  live +[0-9]+ B.*$/  live N B peak N B bump remaining N B/' \
+           -e 's/scheduler acquisitions delta=[0-9]+ contention delta=[0-9]+/scheduler acquisitions delta=N contention delta=N/' \
            -e 's/\{[0-9]+\}//g' \
            -e '/^  component:.* +running +/s/ +[0-9]+ +([0-9]+ B)$/        N    \1/' \
   | grep -a -v '^[[:space:]]*$' \
@@ -236,7 +242,8 @@ for case_file in tests/cases/*.in; do
   while [ "$boot" -le "$boots" ]; do
     feed "$case_file" > "$input_fifo" &
     FEED_PID=$!
-    set -- qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M \
+    set -- qemu-system-riscv64 -machine virt -cpu rv64 -smp "$QEMU_SMP" -m 128M \
+      -accel "$QEMU_ACCEL" \
       -nographic -bios default -kernel "$KERNEL" \
       -drive if=none,id=vibeos-test-disk,format=raw,file="$disk",cache=writeback \
       -device virtio-blk-device,drive=vibeos-test-disk,bus=virtio-mmio-bus.0,queue-size=8 \
@@ -261,6 +268,12 @@ for case_file in tests/cases/*.in; do
 
     if ! grep -a -q 'VibeOS shell ready' "$qemu_log"; then
       echo "FAIL $name: boot $boot produced no shell-ready marker"
+      boot_output_ok=0
+      fail=1
+    fi
+    if [ "$QEMU_SMP" -ge 4 ] \
+      && ! grep -a -Eq 'smp +4 hart\(s\) online' "$qemu_log"; then
+      echo "FAIL $name: boot $boot did not publish the four-hart online barrier"
       boot_output_ok=0
       fail=1
     fi
@@ -383,6 +396,18 @@ for case_file in tests/cases/*.in; do
       echo "ok   net (raw L2 HELLO/CHALLENGE/ACK verified)"
     elif [ "$name" = "net_recovery" ] && [ "$network_ok" = "1" ]; then
       echo "ok   net_recovery (faulted HELLO abandoned; fresh-epoch handshake verified)"
+    elif [ "$name" = "smp_queues" ]; then
+      lock_line=$(grep -a 'smp locks: scheduler acquisitions delta=' "$qemu_log" | tail -1 || true)
+      acquisitions=$(printf '%s\n' "$lock_line" | sed -n 's/.*acquisitions delta=\([0-9][0-9]*\).*/\1/p')
+      contention=$(printf '%s\n' "$lock_line" | sed -n 's/.*contention delta=\([0-9][0-9]*\).*/\1/p')
+      if [ -z "$acquisitions" ] || [ -z "$contention" ] \
+        || [ "$acquisitions" -eq 0 ] || [ "$contention" -eq 0 ] \
+        || [ "$contention" -gt "$acquisitions" ]; then
+        echo "FAIL smp_queues: invalid physical scheduler-lock telemetry"
+        fail=1
+      else
+        echo "ok   smp_queues ($contention contended / $acquisitions acquisitions)"
+      fi
     elif [ "$net_case" = "1" ]; then
       echo "FAIL $name: transcript matched but host network evidence failed"
       fail=1

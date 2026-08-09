@@ -31,6 +31,11 @@ SCHEMA_VERSION = 1
 METRIC_PREFIX = "VIBE_BENCH "
 META_PREFIX = "VIBE_BENCH_META "
 END_MARKER = "VIBE_BENCH_END"
+SMP_SCALE_PREFIX = "VIBE_SMP_SCALE "
+SMP_SCALE_FAILURE = "VIBE_SMP_SCALE_FAILED"
+SMP_SCALE_WORKERS = 4
+SMP_SCALE_ACCEL = "tcg,thread=multi"
+SMP_SCALE_MIN_SPEEDUP_MILLI = 1_250
 
 QEMU_MACHINE = "virt"
 QEMU_CPU = "rv64"
@@ -265,7 +270,15 @@ def build_kernel() -> None:
         raise BenchError(f"pinned kernel build failed ({channel}): {exc}") from exc
 
 
-def capture_qemu(timeout: float) -> str:
+def capture_qemu(
+    timeout: float,
+    *,
+    smp: int = QEMU_SMP,
+    accelerator: str = QEMU_ACCEL,
+    icount: str | None = QEMU_ICOUNT,
+    guest_command: bytes = b"bench\n",
+    end_pattern: str = rf"{END_MARKER} \{{[^\r\n]*\}}[\r\n]",
+) -> str:
     command = [
         "qemu-system-riscv64",
         "-machine",
@@ -273,19 +286,19 @@ def capture_qemu(timeout: float) -> str:
         "-cpu",
         QEMU_CPU,
         "-smp",
-        str(QEMU_SMP),
+        str(smp),
         "-m",
         QEMU_MEMORY,
         "-accel",
-        QEMU_ACCEL,
-        "-icount",
-        QEMU_ICOUNT,
+        accelerator,
         "-nographic",
         "-bios",
         "default",
         "-kernel",
         str(KERNEL),
     ]
+    if icount is not None:
+        command[command.index("-nographic"):command.index("-nographic")] = ["-icount", icount]
     try:
         process = subprocess.Popen(
             command,
@@ -319,13 +332,13 @@ def capture_qemu(timeout: float) -> str:
                 process.stdin.write(b"quiet\n")
                 process.stdin.flush()
                 time.sleep(0.25)
-                process.stdin.write(b"bench\n")
+                process.stdin.write(guest_command)
                 process.stdin.flush()
                 sent = True
             # Wait for the complete newline-terminated end record. Merely
             # seeing its prefix can happen between pipe writes and must not
             # truncate the JSON payload.
-            if re.search(r"VIBE_BENCH_END \{[^\r\n]*\}[\r\n]", decoded):
+            if re.search(end_pattern, decoded):
                 process.stdin.write(b"halt\n")
                 process.stdin.flush()
                 break
@@ -359,6 +372,123 @@ def capture_qemu(timeout: float) -> str:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+
+
+def parse_smp_scale(text: str) -> dict[str, int]:
+    if SMP_SCALE_FAILURE in text:
+        failure = next(
+            (line.strip() for line in text.splitlines() if SMP_SCALE_FAILURE in line),
+            SMP_SCALE_FAILURE,
+        )
+        raise BenchError(f"guest rejected SMP scaling: {failure}")
+
+    records: list[dict[str, Any]] = []
+    for raw in text.splitlines():
+        line = raw.strip().replace("\r", "")
+        position = line.find(SMP_SCALE_PREFIX)
+        if position < 0:
+            continue
+        payload = line[position + len(SMP_SCALE_PREFIX) :]
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise BenchError(f"invalid SMP scaling JSON: {payload!r}: {exc}") from exc
+        if not isinstance(decoded, dict):
+            raise BenchError("SMP scaling record must be a JSON object")
+        records.append(decoded)
+    if len(records) != 1:
+        raise BenchError(f"expected one SMP scaling record, found {len(records)}")
+
+    record = records[0]
+    version = record.get("version")
+    if (
+        record.get("schema") != "vibeos.smp-scale"
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
+    ):
+        raise BenchError("unsupported SMP scaling schema")
+    fields = ("workers", "serial_ticks", "parallel_ticks", "speedup_milli", "checksum")
+    result: dict[str, int] = {}
+    for field in fields:
+        value = record.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BenchError(f"SMP scaling record has invalid {field}: {value!r}")
+        result[field] = value
+    if result["workers"] != SMP_SCALE_WORKERS:
+        raise BenchError(
+            f"SMP scaling used {result['workers']} workers, expected {SMP_SCALE_WORKERS}"
+        )
+    if result["serial_ticks"] == 0 or result["parallel_ticks"] == 0:
+        raise BenchError("SMP scaling durations must be nonzero")
+    calculated = result["serial_ticks"] * 1_000 // result["parallel_ticks"]
+    if result["speedup_milli"] != calculated:
+        raise BenchError(
+            f"guest speedup {result['speedup_milli']} disagrees with durations ({calculated})"
+        )
+    return result
+
+
+def selftest_smp_scale_parser() -> int:
+    good = (
+        'noise\r\nVIBE_SMP_SCALE {"schema":"vibeos.smp-scale","version":1,'
+        '"workers":4,"serial_ticks":5000,"parallel_ticks":2000,'
+        '"speedup_milli":2500,"checksum":7}\r\n'
+    )
+    parsed = parse_smp_scale(good)
+    if parsed["speedup_milli"] != 2_500:
+        raise BenchError("SMP parser self-test lost the valid speedup")
+
+    rejected = (
+        "VIBE_SMP_SCALE_FAILED remote_preflight\n",
+        good + good,
+        'VIBE_SMP_SCALE {"schema":"vibeos.smp-scale","version":1,'
+        '"workers":4,"serial_ticks":5000,"parallel_ticks":2000,'
+        '"speedup_milli":2499,"checksum":7}\n',
+        'VIBE_SMP_SCALE {"schema":"vibeos.smp-scale","version":true,'
+        '"workers":4,"serial_ticks":5000,"parallel_ticks":2000,'
+        '"speedup_milli":2500,"checksum":7}\n',
+    )
+    for transcript in rejected:
+        try:
+            parse_smp_scale(transcript)
+        except BenchError:
+            continue
+        raise BenchError("SMP parser self-test accepted a malformed transcript")
+    print("ok   smp_scale_parser (valid, failure, duplicate, schema, and consistency checks)")
+    return 0
+
+
+def run_smp_scaling(args: argparse.Namespace) -> int:
+    if args.update:
+        raise BenchError("--smp-scaling has no mutable baseline; --update is invalid")
+    if args.input:
+        transcript = args.input.read_text(errors="replace")
+    else:
+        if not args.no_build:
+            build_kernel()
+        if not KERNEL.is_file():
+            raise BenchError(f"kernel image does not exist: {KERNEL}")
+        transcript = capture_qemu(
+            args.timeout,
+            smp=SMP_SCALE_WORKERS,
+            accelerator=SMP_SCALE_ACCEL,
+            icount=None,
+            guest_command=b"smp scale\n",
+            end_pattern=r"VIBE_SMP_SCALE(?:_FAILED)?[^\r\n]*[\r\n]",
+        )
+    result = parse_smp_scale(transcript)
+    speedup = result["speedup_milli"] / 1_000
+    ok = result["speedup_milli"] >= SMP_SCALE_MIN_SPEEDUP_MILLI
+    print(
+        f"{'ok  ' if ok else 'FAIL'} smp_scale: workers={result['workers']} "
+        f"serial_ticks={result['serial_ticks']} parallel_ticks={result['parallel_ticks']} "
+        f"speedup={speedup:.3f}x >= {SMP_SCALE_MIN_SPEEDUP_MILLI / 1_000:.3f}x"
+    )
+    if not ok:
+        print("SMP throughput did not demonstrate the committed minimum scaling", file=sys.stderr)
+        return 1
+    return 0
 
 
 def baseline_document(parsed: Parsed, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -471,12 +601,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update", action="store_true", help="replace the baseline explicitly")
     parser.add_argument("--no-build", action="store_true", help="reuse the existing release kernel")
     parser.add_argument("--timeout", type=float, default=180.0, help="QEMU collection timeout in seconds")
+    parser.add_argument(
+        "--smp-scaling",
+        action="store_true",
+        help="run the four-hart equal-work scaling acceptance instead of the latency baseline",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="exercise the SMP transcript parser without booting QEMU",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.selftest:
+            if args.smp_scaling or args.input or args.update:
+                raise BenchError("--selftest cannot be combined with run/input/update modes")
+            return selftest_smp_scale_parser()
+        if args.smp_scaling:
+            return run_smp_scaling(args)
         if args.input:
             if args.update:
                 raise BenchError("--update requires a fresh controlled QEMU run, not --input")

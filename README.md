@@ -41,6 +41,7 @@ cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/differential.sh    # exact-output oracle using the pinned rustc
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
+./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
 ```
 
@@ -65,7 +66,9 @@ the active compiler commit differs from the recorded pin.
 `bench` in the shell emits a versioned JSON-lines measurement set. The host
 runner fixes the machine, CPU, hart count, TCG mode, and virtual clock, records
 QEMU/toolchain metadata, and checks the committed baseline. Updating that truth
-is always explicit: `./scripts/bench.py --update`.
+is always explicit: `./scripts/bench.py --update`. The separate `--smp-scaling`
+mode uses four multithreaded TCG vCPUs, exact-hart workers, equal serial/parallel
+work, and a committed minimum `1.25x` speedup.
 
 ## The design
 
@@ -362,10 +365,11 @@ showing rising poll counts while muted, because the components never stopped.
 
 Deliberate, not overlooked:
 
-- **Single physical hart.** Four logical run queues, per-hart running/current-task,
-  heap and fault-recovery state, lock-free IRQ data handoffs, hart-owned SpinLock
-  guards, and SBI/IPI delivery are tested, but M5.5 still gates secondary boot and
-  the `-smp 4` acceptance run.
+- **Boot topology discovery is QEMU-virt-specific.** Four physical harts boot via
+  SBI HSM and may use any firmware-selected coldboot hart, but the current boot
+  scanner deliberately covers QEMU `virt`'s dense physical IDs `0..3`. The
+  logical/physical mapping itself rejects aliases and is tested with sparse IDs;
+  a general platform port still needs FDT topology enumeration.
 - **`!` is logical negation, not Rust's bitwise NOT.** The subset has no `bool`,
   so `!5` is `0` here and `-6` in real Rust. This is the one place the subset is
   not a strict subset, and it is what the roadmap's differential testing against
@@ -386,15 +390,18 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **Persistent authority is deliberately fixed-shape; no MMU, user mode, or
-  physical multicore execution yet.** M5.1 provides four logical ready queues
+- **Persistent authority is deliberately fixed-shape; there is still no MMU or
+  user mode.** M5.1 provides four logical ready queues
   and hart0 work stealing. M5.2 adds SBI/SSIP doorbells, atomic reason mailboxes,
-  and explicit logical-to-physical hart mapping while only the boot hart is
-  online. M5.3 removes the PLIC/UART RX/virtio data locks, hardens fault-recoverable
+  and explicit logical-to-physical hart mapping. M5.3 removes the PLIC/UART
+  RX/virtio data locks, hardens fault-recoverable
   locks, and publishes their contention telemetry. M5.4 partitions scheduler
   running/wake slots, current-task and allocation provenance, interrupt markers,
   and task/program recovery state per logical hart. A validated per-hart
-  `sscratch` token keeps those lookups O(1); secondary boot remains gated.
+  `sscratch` token keeps those lookups O(1). M5.5 boots three secondaries through
+  SBI HSM, gives all four harts private 256 KiB stacks and local trap/timer state,
+  routes external interrupts only through the dynamic boot-hart PLIC context,
+  and runs the complete integration suite with `-smp 4`.
   M4.3 restores
   the externally constrained `persistent-test` graph. M4.5 adds one immutable
   `hello` ProgramArtifact whose source and canonical

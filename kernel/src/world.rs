@@ -399,7 +399,11 @@ impl World {
                     )
                 }
             }
-            None => exec::spawn_tracked_owned(memory_owner, name, fut),
+            // Unsealed control tasks (currently the UART shell and one
+            // self-test survivor) stay on their creation hart. The shell is
+            // therefore also the explicit boot-hart initiator for SMP/IPI
+            // acceptance commands instead of being stealable mid-session.
+            None => exec::spawn_pinned_owned(memory_owner, name, fut),
         };
         let component = Arc::new(Component {
             id,

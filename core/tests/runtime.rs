@@ -1588,6 +1588,32 @@ fn hart0_steals_each_logical_remote_task_exactly_once() {
 }
 
 #[test]
+fn pinned_remote_task_waits_for_its_exact_hart() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let remote = exec::HartId::new(1).unwrap();
+    let observed = Arc::new(AtomicU64::new(u64::MAX));
+    let task_observed = observed.clone();
+    let handle = exec::spawn_pinned_on(remote, "pinned-logical-remote", async move {
+        task_observed.store(current_hart_id() as u64, Ordering::SeqCst);
+    });
+
+    assert!(
+        !exec::poll_once(),
+        "the boot hart must not steal explicitly pinned work"
+    );
+    assert_eq!(handle.state(), TaskState::Running);
+    assert_eq!(exec::task_queue_owner(handle.id()), Some(remote));
+
+    {
+        let _hart = TestHartScope::enter(remote.index());
+        assert!(exec::poll_once());
+    }
+    assert_eq!(observed.load(Ordering::SeqCst), remote.index() as u64);
+    assert_eq!(handle.state(), TaskState::Exited);
+}
+
+#[test]
 fn stolen_wake_during_poll_migrates_one_ready_owner_to_hart0() {
     let _g = scheduler();
     exec::run_until_idle(BUDGET);

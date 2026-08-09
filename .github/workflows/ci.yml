@@ -30,6 +30,8 @@ jobs:
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --workspace --verbose
       - name: Report repository status
         run: ./scripts/status.sh --check
+      - name: Exercise SMP benchmark transcript validation
+        run: python3 -B scripts/bench.py --selftest
 
   differential:
     name: Real-rustc differential oracle
@@ -82,3 +84,5 @@ jobs:
         run: ./scripts/qemu-test.sh
       - name: QEMU/TCG benchmark regression budget
         run: python3 scripts/bench.py --no-build
+      - name: Four-hart throughput scaling
+        run: python3 -B scripts/bench.py --no-build --smp-scaling

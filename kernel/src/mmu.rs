@@ -31,6 +31,7 @@ pub const PLIC_CONTEXT_START: usize = PLIC_START + 0x20_0000;
 
 const WRITABLE_PERMISSIONS: PagePermissions =
     PagePermissions::READ.union(PagePermissions::WRITE);
+const READ_ONLY_PERMISSIONS: PagePermissions = PagePermissions::READ;
 const TEXT_PERMISSIONS: PagePermissions =
     PagePermissions::READ.union(PagePermissions::EXECUTE);
 const EXECUTABLE_PERMISSIONS: PagePermissions = PagePermissions::EXECUTE;
@@ -41,8 +42,12 @@ extern "C" {
     static __stacks_bottom: u8;
     static __text_start: u8;
     static __text_end: u8;
+    static __rodata_start: u8;
+    static __rodata_end: u8;
     static __code_pool_start: u8;
     static __code_pool_end: u8;
+    static __cap_table_pool_start: u8;
+    static __cap_table_pool_end: u8;
 }
 
 #[repr(C, align(4096))]
@@ -96,6 +101,7 @@ static TABLES_READY: AtomicBool = AtomicBool::new(false);
 static ENABLED_HARTS: AtomicUsize = AtomicUsize::new(0);
 static MXR_CLEARED_HARTS: AtomicUsize = AtomicUsize::new(0);
 static WX_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
+static CAP_TABLE_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_SFENCES: AtomicU64 = AtomicU64::new(0);
 static REMOTE_FENCE_I: AtomicU64 = AtomicU64::new(0);
 
@@ -191,6 +197,10 @@ pub fn init_boot(boot_physical_hart: usize) {
     let (text_start, text_end) = text_range();
     assert_page_range(text_start, text_end);
     remap_boot_range(tables, text_start, text_end, TEXT_PERMISSIONS);
+
+    let (rodata_start, rodata_end) = rodata_range();
+    assert_page_range(rodata_start, rodata_end);
+    remap_boot_range(tables, rodata_start, rodata_end, READ_ONLY_PERMISSIONS);
 
     let (code_start, code_end) = code_pool_range();
     assert_page_range(code_start, code_end);
@@ -303,10 +313,29 @@ pub fn text_range() -> (usize, usize) {
     )
 }
 
+pub fn rodata_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__rodata_start) as usize,
+        core::ptr::addr_of!(__rodata_end) as usize,
+    )
+}
+
+pub fn rodata_contains(address: usize) -> bool {
+    let (start, end) = rodata_range();
+    address >= start && address < end
+}
+
 pub fn code_pool_range() -> (usize, usize) {
     (
         core::ptr::addr_of!(__code_pool_start) as usize,
         core::ptr::addr_of!(__code_pool_end) as usize,
+    )
+}
+
+pub fn capability_table_pool_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__cap_table_pool_start) as usize,
+        core::ptr::addr_of!(__cap_table_pool_end) as usize,
     )
 }
 
@@ -323,6 +352,10 @@ pub fn wx_sync_stats() -> WxSyncStats {
     }
 }
 
+pub fn capability_table_transitions() -> u64 {
+    CAP_TABLE_TRANSITIONS.load(Ordering::Acquire)
+}
+
 /// The shared address space can mutate executable PTEs on a multicore machine
 /// only when firmware supplies synchronous remote TLB and I-cache fences.
 pub fn wx_remote_fence_ready() -> bool {
@@ -336,24 +369,54 @@ pub fn wx_remote_fence_ready() -> bool {
 /// Publication happens only after break-before-make, two all-hart TLB
 /// shootdowns, and an all-hart instruction-cache fence have completed.
 pub fn seal_code(start: usize, pages: usize) {
-    transition_code(
+    transition_ram_range(
         start,
         pages,
         WRITABLE_PERMISSIONS,
         EXECUTABLE_PERMISSIONS,
         true,
+        code_pool_range(),
+        "W^X code pool",
     );
+    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
 }
 
 /// Remove execute permission before the caller clears and releases a code run.
 pub fn unseal_code(start: usize, pages: usize) {
-    transition_code(
+    transition_ram_range(
         start,
         pages,
         EXECUTABLE_PERMISSIONS,
         WRITABLE_PERMISSIONS,
         false,
+        code_pool_range(),
+        "W^X code pool",
     );
+    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
+}
+
+/// Publish or retire page-aligned capability-table backing.
+///
+/// Newly built copy-on-write tables enter as private RW-NX allocations from
+/// the dedicated pool and become read-only before their pointer is installed
+/// in a CSpace. An old table is no longer authoritative before it is restored
+/// to RW-NX for Drop and deallocation.
+pub fn set_capability_table_read_only(start: usize, pages: usize, read_only: bool) {
+    let (expected, target) = if read_only {
+        (WRITABLE_PERMISSIONS, READ_ONLY_PERMISSIONS)
+    } else {
+        (READ_ONLY_PERMISSIONS, WRITABLE_PERMISSIONS)
+    };
+    transition_ram_range(
+        start,
+        pages,
+        expected,
+        target,
+        false,
+        capability_table_pool_range(),
+        "capability table",
+    );
+    CAP_TABLE_TRANSITIONS.fetch_add(1, Ordering::Release);
 }
 
 /// Scan the actual leaf PTEs under one lock. `None` is the W^X invariant.
@@ -446,47 +509,59 @@ fn remap_boot_range(
     }
 }
 
-fn transition_code(
+fn transition_ram_range(
     start: usize,
     pages: usize,
     expected_permissions: PagePermissions,
     target_permissions: PagePermissions,
     synchronize_instructions: bool,
+    required_range: (usize, usize),
+    label: &str,
 ) {
-    assert!(pages != 0, "W^X transition requires at least one page");
-    assert_eq!(start % sv39::PAGE_SIZE, 0, "W^X start is not page aligned");
+    assert!(
+        pages != 0,
+        "{} transition requires at least one page",
+        label
+    );
+    assert_eq!(
+        start % sv39::PAGE_SIZE,
+        0,
+        "{} start is not page aligned",
+        label
+    );
     let size = pages
         .checked_mul(sv39::PAGE_SIZE)
-        .expect("W^X transition length overflowed");
+        .unwrap_or_else(|| panic!("{} transition length overflowed", label));
     let end = start
         .checked_add(size)
-        .expect("W^X transition range overflowed");
-    let (pool_start, pool_end) = code_pool_range();
+        .unwrap_or_else(|| panic!("{} transition range overflowed", label));
+    let (required_start, required_end) = required_range;
     assert!(
-        start >= pool_start && end <= pool_end,
-        "W^X transition escaped the dedicated code pool"
+        start >= required_start && end <= required_end,
+        "{} transition escaped its dedicated range",
+        label
     );
 
     let _page_tables = PAGE_TABLE_LOCK.lock();
     // Safety: the page-table lock is the unique post-publication mutation
-    // authority. The code-pool allocation stays reserved across this call.
+    // authority. The dedicated allocation stays reserved across this call.
     let tables = unsafe { &mut *TABLES.0.get() };
 
     // Validate the complete old range before changing its first PTE. A stale,
     // overlapping, or repeated transition therefore cannot partially apply.
     for address in (start..end).step_by(sv39::PAGE_SIZE) {
         let expected = PageTableEntry::leaf(address, expected_permissions)
-            .expect("expected code-pool leaf is valid");
+            .expect("expected dedicated-pool leaf is valid");
         assert_eq!(
             *ram_leaf_mut(tables, address),
             expected,
-            "code-pool PTE did not have the required old permissions"
+            "{} PTE did not have the required old permissions",
+            label
         );
     }
 
-    // Break before make. Directly replacing RW with X (or vice versa) could
-    // leave one hart using a stale writable TLB entry while another already
-    // observes the executable entry.
+    // Break before make. Directly replacing permissions could leave one hart
+    // using stale write authority while another observes the restricted leaf.
     for address in (start..end).step_by(sv39::PAGE_SIZE) {
         *ram_leaf_mut(tables, address) = PageTableEntry::EMPTY;
     }
@@ -495,14 +570,13 @@ fn transition_code(
 
     for address in (start..end).step_by(sv39::PAGE_SIZE) {
         *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, target_permissions)
-            .expect("target code-pool leaf is valid");
+            .expect("target dedicated-pool leaf is valid");
     }
     publish_pte_writes();
     synchronize_tlbs(start, size);
     if synchronize_instructions {
         synchronize_instruction_caches();
     }
-    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
 }
 
 fn publish_pte_writes() {

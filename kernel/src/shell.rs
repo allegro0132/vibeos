@@ -5,15 +5,28 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::cap::{CapError, Rights};
+use crate::cap::{CSpace, Cap, CapError, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
 use crate::net::Packet;
 use crate::world::{world, Reading, Space};
 use crate::HEAP;
-use crate::{exec, ipi, mmu, println, sbi, tty, uart};
+use crate::{exec, ipi, mmu, println, sbi, sync::SpinLock, tty, uart};
+
+struct ReadOnlyCapProbe(u64);
+
+impl Resource for ReadOnlyCapProbe {
+    fn kind(&self) -> &'static str {
+        "read-only-cap-probe"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 pub async fn shell_task(boot_time: u64) {
     println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
@@ -81,6 +94,8 @@ async fn run(line: &str, boot_time: u64) {
             println!("  mmu guard fault prove a stack guard with a real page fault");
             println!("  mmu wx          prove seal, cross-hart execute, and cleared reuse");
             println!("  mmu wx fault execute|read|write  run expected-fatal W^X probes");
+            println!("  mmu ro          prove read-only rodata and COW capability tables");
+            println!("  mmu ro fault rodata|captab  run expected-fatal write probes");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -379,7 +394,12 @@ async fn run(line: &str, boot_time: u64) {
             ["wx", "fault", "execute"] => crate::code_pool::execute_writable_probe(),
             ["wx", "fault", "read"] => crate::rustc::sealed_access_probe(false),
             ["wx", "fault", "write"] => crate::rustc::sealed_access_probe(true),
-            _ => println!("  usage: mmu [guard fault|wx [fault execute|read|write]]"),
+            ["ro"] => mmu_ro_demo().await,
+            ["ro", "fault", "rodata"] => mmu_rodata_write_probe(),
+            ["ro", "fault", "captab"] => mmu_capability_table_write_probe(),
+            _ => println!(
+                "  usage: mmu [guard fault|wx [fault execute|read|write]|ro [fault rodata|captab]]"
+            ),
         },
 
         "selftest" => {
@@ -495,6 +515,11 @@ fn mmu_status() {
         "  text: {}, writable RAM: rw-, no writable-executable leaf",
         permission_text(text.permissions)
     );
+    let rodata = mmu::mapping(mmu::rodata_range().0).expect("rodata mapping exists");
+    println!(
+        "  rodata: {}, capability tables: COW published r--",
+        permission_text(rodata.permissions)
+    );
     println!(
         "  MMIO: PLIC {} KiB leaves {}, UART/virtio {} KiB leaves {}",
         plic.page_size / 1024,
@@ -520,6 +545,16 @@ fn mmu_status() {
         crate::code_pool::CODE_POOL_BYTES / 1024,
         pool.live_pages,
         pool.sealed_pages,
+    );
+    let cap_pool = crate::cap_table_pool::stats();
+    println!(
+        "  cap-table pool: {} KiB, live pages {}",
+        crate::cap_table_pool::CAP_TABLE_POOL_BYTES / 1024,
+        if cap_pool.live_pages == cap_pool.read_only_pages {
+            "all read-only"
+        } else {
+            "FAILED writable candidate"
+        },
     );
     println!("  unmapped: firmware prefix, null page, and unused physical space");
 }
@@ -631,6 +666,190 @@ async fn run_generated_on(
         && !aborted.load(Ordering::Acquire)
         && value.load(Ordering::Acquire) != u64::MAX)
         .then(|| value.load(Ordering::Acquire) as i64)
+}
+
+async fn mmu_ro_demo() {
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
+
+    let (rodata_start, rodata_end) = mmu::rodata_range();
+    let rodata_read_only = [rodata_start, rodata_end - PAGE_SIZE]
+        .into_iter()
+        .all(|address| {
+            mmu::mapping(address).is_some_and(|mapping| {
+                mapping.physical == address
+                    && mapping.page_size == PAGE_SIZE
+                    && mapping.permissions == PagePermissions::READ
+            })
+        });
+
+    let before_transitions = mmu::capability_table_transitions();
+    let before_fences = mmu::wx_sync_stats().remote_sfences;
+    let table = Arc::new(SpinLock::new(CSpace::new("mmu-ro-probe")));
+    let (root, first_range, first_read_only, child, second_read_only) = {
+        let mut cspace = table.lock();
+        let root = cspace.mint(Arc::new(ReadOnlyCapProbe(64)), Rights::ALL);
+        let first_range = cspace
+            .capability_table_range()
+            .expect("mint must publish a capability table");
+        let first_read_only = capability_table_range_is_read_only(first_range);
+        let child = cspace
+            .derive(root, Rights::READ)
+            .expect("fixed read-only probe must derive");
+        let second_range = cspace
+            .capability_table_range()
+            .expect("derive must publish a capability table");
+        let second_read_only = capability_table_range_is_read_only(second_range);
+        (root, first_range, first_read_only, child, second_read_only)
+    };
+
+    let remote_hart = exec::HartId::new(1).expect("logical hart 1 exists");
+    let remote_value = run_cap_lookup_on(remote_hart, table.clone(), child).await;
+    let (removed, stale_denied, third_range, third_read_only) = {
+        let mut cspace = table.lock();
+        let removed = cspace
+            .revoke(root)
+            .expect("fixed read-only probe root is revocable");
+        let stale_denied = cspace
+            .lookup_as::<ReadOnlyCapProbe>(child, Rights::READ)
+            .is_err();
+        let range = cspace
+            .capability_table_range()
+            .expect("revocation retains generation slots");
+        let read_only = capability_table_range_is_read_only(range);
+        (removed, stale_denied, range, read_only)
+    };
+
+    let ranges_read_only = first_read_only && second_read_only && third_read_only;
+    let same_address_reuse = first_range.start == third_range.start;
+    let pool = crate::cap_table_pool::stats();
+    let transitions = mmu::capability_table_transitions().saturating_sub(before_transitions);
+    let remote_sfences = mmu::wx_sync_stats()
+        .remote_sfences
+        .saturating_sub(before_fences);
+    let pool_fully_published = pool.live_pages == pool.read_only_pages;
+    println!(
+        "  .rodata: {} KiB at {:#x}..{:#x}, first/last page {}",
+        (rodata_end - rodata_start) / 1024,
+        rodata_start,
+        rodata_end,
+        if rodata_read_only { "r--" } else { "FAILED" },
+    );
+    println!(
+        "  capability tables: {} KiB pool, COW publish r--, live pages {}",
+        crate::cap_table_pool::CAP_TABLE_POOL_BYTES / 1024,
+        if pool_fully_published {
+            "all read-only"
+        } else {
+            "FAILED writable candidate"
+        },
+    );
+    println!(
+        "  mutation: mint {}, derive {}, revoke {}, same-address reuse {}",
+        if first_read_only { "r--" } else { "FAILED" },
+        if second_read_only { "r--" } else { "FAILED" },
+        if third_read_only { "r--" } else { "FAILED" },
+        if same_address_reuse { "yes" } else { "NO" },
+    );
+    println!(
+        "  hart1: derived lookup={} {}, revoke removed {} and stale lookup {}",
+        remote_value.unwrap_or(u64::MAX),
+        if remote_value == Some(64) {
+            "ok"
+        } else {
+            "FAILED"
+        },
+        removed,
+        if stale_denied { "denied" } else { "FAILED" },
+    );
+    println!(
+        "  shootdown: {} table transitions, {} remote sfence, authoritative pages {}",
+        transitions,
+        remote_sfences,
+        if ranges_read_only && pool_fully_published {
+            "r--"
+        } else {
+            "FAILED"
+        },
+    );
+    if !rodata_read_only
+        || !ranges_read_only
+        || !same_address_reuse
+        || remote_value != Some(64)
+        || removed != 2
+        || !stale_denied
+        || transitions < 5
+        || remote_sfences < 10
+        || !pool_fully_published
+    {
+        println!("  read-only: FAILED acceptance invariant");
+    }
+}
+
+fn capability_table_range_is_read_only(range: crate::cap::CapabilityTableRange) -> bool {
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
+
+    range.start % PAGE_SIZE == 0
+        && range.page_count != 0
+        && (0..range.page_count).all(|page| {
+            let address = range.start + page * PAGE_SIZE;
+            crate::cap_table_pool::contains(address)
+                && mmu::mapping(address).is_some_and(|mapping| {
+                    mapping.physical == address
+                        && mapping.page_size == PAGE_SIZE
+                        && mapping.permissions == PagePermissions::READ
+                })
+        })
+}
+
+async fn run_cap_lookup_on(
+    hart: exec::HartId,
+    table: Arc<SpinLock<CSpace>>,
+    capability: Cap,
+) -> Option<u64> {
+    let value = Arc::new(AtomicU64::new(u64::MAX));
+    let observed_hart = Arc::new(AtomicUsize::new(usize::MAX));
+    let task_value = value.clone();
+    let task_hart = observed_hart.clone();
+    let handle = exec::spawn_pinned_on(hart, "ro-cap-lookup", async move {
+        task_hart.store(
+            ipi::current_logical_hart().map_or(usize::MAX, exec::HartId::index),
+            Ordering::Release,
+        );
+        let observed = table
+            .lock()
+            .lookup_as::<ReadOnlyCapProbe>(capability, Rights::READ)
+            .map_or(u64::MAX, |probe| probe.0);
+        task_value.store(observed, Ordering::Release);
+    });
+    let exit = handle.join().await;
+    (exit.state() == exec::TaskState::Exited
+        && observed_hart.load(Ordering::Acquire) == hart.index()
+        && value.load(Ordering::Acquire) != u64::MAX)
+        .then(|| value.load(Ordering::Acquire))
+}
+
+fn mmu_rodata_write_probe() -> ! {
+    let address = mmu::rodata_range().0;
+    println!("  read-only probe: write rodata {:#x}", address);
+    // Safety: this expected-fatal acceptance case deliberately stores to an
+    // R-- linker page and must take a store page fault at this exact address.
+    unsafe { (address as *mut u8).write_volatile(0x5a) };
+    panic!("read-only .rodata accepted a store")
+}
+
+fn mmu_capability_table_write_probe() -> ! {
+    let mut cspace = CSpace::new("read-only-fault-probe");
+    cspace.mint(Arc::new(ReadOnlyCapProbe(64)), Rights::ALL);
+    let range = cspace
+        .capability_table_range()
+        .expect("mint must publish a read-only table");
+    assert!(capability_table_range_is_read_only(range));
+    let address = range.start;
+    println!("  read-only probe: write capability table {:#x}", address);
+    // Safety: `cspace` keeps this authoritative table live and R--. The store
+    // must fault before it can alter the first Slot.
+    unsafe { (address as *mut u8).write_volatile(0x5a) };
+    panic!("read-only capability table accepted a store")
 }
 
 fn mmu_guard_fault() {

@@ -269,6 +269,23 @@ recovery applies that same sequence after all-hart quiescence when `longjmp` ski
 Rust destructors. `mmu wx` demonstrates sealed execution on the boot hart and hart 1,
 zeroed same-address reuse, and different code executing remotely after reuse.
 
+M6.4 also maps linker-delimited `.rodata` R-- at boot and gives capability tables a
+linker-reserved 4 MiB COW pool. Each mutation finishes a detached SYSTEM-owned
+candidate, moves it into exclusive RW-NX pages, seals them R-- with all-hart
+break-before-make shootdowns, and only then swaps the authoritative snapshot. The
+retired table returns to RW-NX only after that swap, then drops its entries, clears
+the full run, and permits same-address reuse. `mmu ro` exercises mint, derive,
+cross-hart lookup, revoke, stale-handle denial, and reuse; separate fatal probes prove
+that stores to `.rodata` and a published table fault at the exact address.
+
+This protects the published `Slot` snapshot—generation, rights, object pointer, and
+derivation pointer—not the complete capability graph. CSpace lifecycle scalars and
+the derivation nodes' `alive` atomics remain writable supervisor metadata, and the
+shared S-mode address space still provides integrity hardening rather than component
+isolation. Candidate commit is synchronous and ordinary errors preserve the old
+authoritative table; an exceptional SYSTEM allocation/protection failure may
+conservatively leak a detached candidate.
+
 ### And this is where it earns its place in *this* OS
 
 Generated machine code has no way to reach hardware. Its only output path is a

@@ -8,6 +8,9 @@
 
 extern crate alloc;
 
+#[cfg(not(target_arch = "riscv64"))]
+use alloc::alloc::{alloc, dealloc};
+use alloc::alloc::{handle_alloc_error, Layout};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -15,7 +18,10 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::mem;
+use core::ops::Deref;
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crate::durable::{
     DerivationId, DurableRights, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
@@ -24,6 +30,169 @@ use crate::durable::{
 use crate::heap::{self, OwnerId};
 
 pub const MAX_PERSISTENT_SLOTS: u32 = 4096;
+pub const CAPABILITY_TABLE_PAGE_SIZE: usize = 4096;
+
+pub type AllocateCapabilityTablePages = fn(page_count: usize) -> *mut u8;
+pub type ProtectCapabilityTablePages = fn(start: usize, page_count: usize, read_only: bool);
+pub type ReleaseCapabilityTablePages = unsafe fn(start: usize, page_count: usize);
+
+/// Target-owned page storage for published capability tables.
+///
+/// The allocator must return one writable, contiguous, 4 KiB-aligned run of
+/// exactly `page_count` pages. `set_read_only` must complete any required
+/// all-hart permission synchronization before returning. `release_pages` is
+/// called only after the run is writable again and every resident slot has
+/// been dropped.
+#[derive(Clone, Copy)]
+pub struct CapabilityTableBackend {
+    allocate_pages: AllocateCapabilityTablePages,
+    set_read_only: ProtectCapabilityTablePages,
+    release_pages: ReleaseCapabilityTablePages,
+}
+
+impl CapabilityTableBackend {
+    /// Build a backend from target-owned raw-page operations.
+    ///
+    /// # Safety
+    ///
+    /// For every non-zero request, `allocate_pages` must return null or a
+    /// unique writable run of exactly that many contiguous 4 KiB pages. A
+    /// non-null run must remain live until the matching `release_pages` call.
+    /// `set_read_only` must accept only such live, exact runs and synchronously
+    /// complete the requested permission transition on every hart before it
+    /// returns. `release_pages` must accept a retired writable run after every
+    /// resident slot has been dropped, and must release that exact run once.
+    /// All three callbacks must remain callable for the process lifetime and
+    /// be safe under the CSpace synchronization used by the target.
+    pub const unsafe fn new(
+        allocate_pages: AllocateCapabilityTablePages,
+        set_read_only: ProtectCapabilityTablePages,
+        release_pages: ReleaseCapabilityTablePages,
+    ) -> Self {
+        Self {
+            allocate_pages,
+            set_read_only,
+            release_pages,
+        }
+    }
+}
+
+const BACKEND_UNSET: u8 = 0;
+const BACKEND_INSTALLING: u8 = 1;
+const BACKEND_READY: u8 = 2;
+static CAPABILITY_TABLE_BACKEND_STATE: AtomicU8 = AtomicU8::new(BACKEND_UNSET);
+static CAPABILITY_TABLE_ALLOCATE: AtomicUsize = AtomicUsize::new(0);
+static CAPABILITY_TABLE_PROTECT: AtomicUsize = AtomicUsize::new(0);
+static CAPABILITY_TABLE_RELEASE: AtomicUsize = AtomicUsize::new(0);
+
+const _: () = {
+    assert!(mem::size_of::<AllocateCapabilityTablePages>() == mem::size_of::<usize>());
+    assert!(mem::size_of::<ProtectCapabilityTablePages>() == mem::size_of::<usize>());
+    assert!(mem::size_of::<ReleaseCapabilityTablePages>() == mem::size_of::<usize>());
+};
+
+/// Install the page backend used by every subsequently published capability
+/// table. The target must do this once, during quiescent bootstrap, before the
+/// first non-empty CSpace mutation. Existing tables retain the exact backend
+/// which allocated them, so host fallback tables cannot later be released
+/// through a newly installed backend.
+pub fn set_capability_table_backend(backend: CapabilityTableBackend) {
+    assert_eq!(
+        CAPABILITY_TABLE_BACKEND_STATE.compare_exchange(
+            BACKEND_UNSET,
+            BACKEND_INSTALLING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ),
+        Ok(BACKEND_UNSET),
+        "capability-table backend installed more than once",
+    );
+    CAPABILITY_TABLE_PROTECT.store(backend.set_read_only as usize, Ordering::Relaxed);
+    CAPABILITY_TABLE_RELEASE.store(backend.release_pages as usize, Ordering::Relaxed);
+    // The allocator address is part of the record, but BACKEND_READY is the
+    // release publication point for all three function pointers.
+    CAPABILITY_TABLE_ALLOCATE.store(backend.allocate_pages as usize, Ordering::Relaxed);
+    CAPABILITY_TABLE_BACKEND_STATE.store(BACKEND_READY, Ordering::Release);
+}
+
+fn installed_capability_table_backend() -> Option<CapabilityTableBackend> {
+    match CAPABILITY_TABLE_BACKEND_STATE.load(Ordering::Acquire) {
+        BACKEND_UNSET => None,
+        BACKEND_READY => {
+            let allocate = CAPABILITY_TABLE_ALLOCATE.load(Ordering::Relaxed);
+            let protect = CAPABILITY_TABLE_PROTECT.load(Ordering::Relaxed);
+            let release = CAPABILITY_TABLE_RELEASE.load(Ordering::Relaxed);
+            assert!(allocate != 0 && protect != 0 && release != 0);
+            Some(CapabilityTableBackend {
+                // Safety: the published words came only from the corresponding
+                // function-pointer fields accepted by the setter above.
+                allocate_pages: unsafe {
+                    mem::transmute::<usize, AllocateCapabilityTablePages>(allocate)
+                },
+                set_read_only: unsafe {
+                    mem::transmute::<usize, ProtectCapabilityTablePages>(protect)
+                },
+                release_pages: unsafe {
+                    mem::transmute::<usize, ReleaseCapabilityTablePages>(release)
+                },
+            })
+        }
+        BACKEND_INSTALLING => panic!("capability-table backend observed during installation"),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn host_allocate_capability_table_pages(page_count: usize) -> *mut u8 {
+    let layout = capability_table_page_layout(page_count);
+    // Safety: the layout is non-zero and has the exact page alignment promised
+    // by the host fallback backend.
+    unsafe { alloc(layout) }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn host_protect_capability_table_pages(_start: usize, _page_count: usize, _read_only: bool) {}
+
+#[cfg(not(target_arch = "riscv64"))]
+unsafe fn host_release_capability_table_pages(start: usize, page_count: usize) {
+    let layout = capability_table_page_layout(page_count);
+    // Safety: this exact pointer/layout pair came from the host fallback
+    // allocator and all resident Slots were dropped by CapTable first.
+    unsafe { dealloc(start as *mut u8, layout) };
+}
+
+fn capability_table_backend() -> CapabilityTableBackend {
+    if let Some(backend) = installed_capability_table_backend() {
+        return backend;
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        // Safety: the fallback allocator uses an exact 4 KiB-aligned Layout,
+        // its logical protection hook is synchronous, and release reconstructs
+        // the identical pointer/Layout pair after CapTable drops every Slot.
+        unsafe {
+            CapabilityTableBackend::new(
+                host_allocate_capability_table_pages,
+                host_protect_capability_table_pages,
+                host_release_capability_table_pages,
+            )
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        panic!("riscv64 capability tables require an installed page backend")
+    }
+}
+
+fn capability_table_page_layout(page_count: usize) -> Layout {
+    let bytes = page_count
+        .checked_mul(CAPABILITY_TABLE_PAGE_SIZE)
+        .expect("capability-table page length overflowed");
+    Layout::from_size_align(bytes, CAPABILITY_TABLE_PAGE_SIZE)
+        .expect("capability-table page layout is invalid")
+}
 
 /// Capability tables and derivation nodes are supervisor metadata. They can be
 /// mutated while a caller holds a CSpace lock, so their growth must not consume
@@ -263,16 +432,152 @@ pub trait Resource: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+#[derive(Clone)]
 struct Slot {
     generation: u64,
     entry: Option<Entry>,
     reservation: Option<u64>,
 }
 
+#[derive(Clone)]
 struct Entry {
     obj: Arc<dyn Resource>,
     rights: Rights,
     node: Arc<Derivation>,
+}
+
+/// Page range occupied by one immutable published capability table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityTableRange {
+    pub start: usize,
+    pub page_count: usize,
+    pub slot_count: usize,
+}
+
+/// Raw page-backed storage for the one authoritative slot slice.
+///
+/// No mutable slice is ever exposed. Mutations clone into an ordinary Vec,
+/// publish a separately allocated read-only table, and only then retire this
+/// backing. Keeping the allocating backend in the object makes Drop exact even
+/// if a host test installs a target-like backend after fallback tables exist.
+struct CapTable {
+    slots: NonNull<Slot>,
+    slot_count: usize,
+    page_count: usize,
+    read_only: bool,
+    backend: Option<CapabilityTableBackend>,
+}
+
+// Slot contains only Send+Sync resource/derivation Arcs and scalar metadata.
+// Exclusive mutation remains owned by CSpace; published readers see &[Slot].
+unsafe impl Send for CapTable {}
+unsafe impl Sync for CapTable {}
+
+impl CapTable {
+    const fn empty() -> Self {
+        Self {
+            slots: NonNull::dangling(),
+            slot_count: 0,
+            page_count: 0,
+            read_only: false,
+            backend: None,
+        }
+    }
+
+    fn from_slots(slots: Vec<Slot>) -> Self {
+        if slots.is_empty() {
+            return Self::empty();
+        }
+        let slot_bytes = slots
+            .len()
+            .checked_mul(mem::size_of::<Slot>())
+            .expect("capability-table slot length overflowed");
+        let page_count = slot_bytes
+            .checked_add(CAPABILITY_TABLE_PAGE_SIZE - 1)
+            .expect("capability-table page rounding overflowed")
+            / CAPABILITY_TABLE_PAGE_SIZE;
+        let backend = capability_table_backend();
+        let allocation = (backend.allocate_pages)(page_count);
+        let Some(bytes) = NonNull::new(allocation) else {
+            handle_alloc_error(capability_table_page_layout(page_count));
+        };
+        assert_eq!(
+            bytes.as_ptr() as usize % CAPABILITY_TABLE_PAGE_SIZE,
+            0,
+            "capability-table backend returned an unaligned run",
+        );
+        let destination = bytes.cast::<Slot>();
+        let slot_count = slots.len();
+        for (index, slot) in slots.into_iter().enumerate() {
+            // Safety: the backend returned `page_count` writable pages, the
+            // rounded allocation covers every Slot, and each index is written
+            // exactly once before publication.
+            unsafe { destination.as_ptr().add(index).write(slot) };
+        }
+        Self {
+            slots: destination,
+            slot_count,
+            page_count,
+            read_only: false,
+            backend: Some(backend),
+        }
+    }
+
+    fn publish_read_only(mut self) -> Self {
+        if let Some(backend) = self.backend {
+            (backend.set_read_only)(self.slots.as_ptr() as usize, self.page_count, true);
+            self.read_only = true;
+        }
+        self
+    }
+
+    fn range(&self) -> Option<CapabilityTableRange> {
+        (self.slot_count != 0).then_some(CapabilityTableRange {
+            start: self.slots.as_ptr() as usize,
+            page_count: self.page_count,
+            slot_count: self.slot_count,
+        })
+    }
+
+    fn as_slice(&self) -> &[Slot] {
+        // Safety: construction initialized exactly slot_count elements and the
+        // backing remains allocated until Drop. Published pages are immutable.
+        unsafe { core::slice::from_raw_parts(self.slots.as_ptr(), self.slot_count) }
+    }
+}
+
+impl Deref for CapTable {
+    type Target = [Slot];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl Drop for CapTable {
+    fn drop(&mut self) {
+        let Some(backend) = self.backend else {
+            debug_assert_eq!(self.slot_count, 0);
+            debug_assert_eq!(self.page_count, 0);
+            return;
+        };
+
+        // Replacement already made another sealed table authoritative. Only
+        // this retired backing is made writable for destructor bookkeeping.
+        if self.read_only {
+            (backend.set_read_only)(self.slots.as_ptr() as usize, self.page_count, false);
+            self.read_only = false;
+        }
+        // Safety: permission restoration completed, and these are precisely
+        // the initialized Slots which have not yet been dropped.
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+                self.slots.as_ptr(),
+                self.slot_count,
+            ));
+            (backend.release_pages)(self.slots.as_ptr() as usize, self.page_count);
+        }
+    }
 }
 
 /// A resolved capability that revalidates its derivation at the start of every
@@ -615,7 +920,7 @@ impl fmt::Display for PersistentInstallError {
 /// A task's capability space. Owning one *is* the task's entire authority.
 pub struct CSpace {
     pub name: String,
-    slots: Vec<Slot>,
+    slots: CapTable,
     incarnation: u64,
     persistent_space: Option<SpaceId>,
     persistent_quarantined: bool,
@@ -623,6 +928,50 @@ pub struct CSpace {
 }
 
 impl CSpace {
+    fn candidate_slots(&self, additional: usize) -> Vec<Slot> {
+        system_allocation(|| {
+            let capacity = self
+                .slots
+                .len()
+                .checked_add(additional)
+                .expect("capability-table candidate capacity overflowed");
+            let mut candidate = Vec::with_capacity(capacity);
+            candidate.extend_from_slice(self.slots.as_slice());
+            candidate
+        })
+    }
+
+    fn publish_slots(&mut self, candidate: Vec<Slot>) {
+        // The detached candidate is moved into a fresh writable page run under
+        // SYSTEM accounting. Protection completes before the pointer becomes
+        // authoritative; the old backing is retired only after replacement.
+        let next = system_allocation(|| CapTable::from_slots(candidate)).publish_read_only();
+        let retired = mem::replace(&mut self.slots, next);
+        drop(retired);
+    }
+
+    fn alloc_candidate_slot(candidate: &mut Vec<Slot>) -> u32 {
+        // A slot whose generation saturated is retired forever rather than
+        // reused, so a stale handle can never alias a fresh one.
+        if let Some(index) = candidate.iter().position(|slot| {
+            slot.entry.is_none() && slot.reservation.is_none() && slot.generation != u64::MAX
+        }) {
+            return u32::try_from(index).expect("capability slot index exceeds u32");
+        }
+        candidate.push(Slot {
+            generation: 0,
+            entry: None,
+            reservation: None,
+        });
+        u32::try_from(candidate.len() - 1).expect("capability slot index exceeds u32")
+    }
+
+    /// Physical page range of the currently published read-only slot table.
+    /// Empty CSpaces have no backing allocation until their first mutation.
+    pub fn capability_table_range(&self) -> Option<CapabilityTableRange> {
+        self.slots.range()
+    }
+
     /// Reserve the exact slot generation that a durable `GrantRecord` will
     /// name. The reservation survives ordinary allocation and space-reset
     /// attempts until it is installed or explicitly cancelled.
@@ -641,33 +990,35 @@ impl CSpace {
             .next_reservation
             .checked_add(1)
             .ok_or(PersistentInstallError::ReservationExhausted)?;
-        let index = if let Some(index) = self.slots.iter().position(|slot| {
+        let reusable = self.slots.iter().position(|slot| {
             slot.entry.is_none() && slot.reservation.is_none() && slot.generation != u64::MAX
-        }) {
-            index
-        } else {
+        });
+        if reusable.is_none() {
             if self.slots.len() >= MAX_PERSISTENT_SLOTS as usize {
                 return Err(PersistentInstallError::SlotOutOfRange);
             }
-            system_allocation(|| {
-                self.slots.push(Slot {
-                    generation: 0,
-                    entry: None,
-                    reservation: None,
-                })
+        }
+        let mut candidate = self.candidate_slots(usize::from(reusable.is_none()));
+        let index = reusable.unwrap_or_else(|| {
+            candidate.push(Slot {
+                generation: 0,
+                entry: None,
+                reservation: None,
             });
-            self.slots.len() - 1
-        };
+            candidate.len() - 1
+        });
         let token = self.next_reservation;
-        self.next_reservation = next_token;
-        self.slots[index].reservation = Some(token);
-        Ok(PendingSlotReservation {
+        candidate[index].reservation = Some(token);
+        let reservation = PendingSlotReservation {
             space,
             slot: index as u32,
-            generation: self.slots[index].generation,
+            generation: candidate[index].generation,
             incarnation: self.incarnation,
             token,
-        })
+        };
+        self.publish_slots(candidate);
+        self.next_reservation = next_token;
+        Ok(reservation)
     }
 
     /// Release a reservation after its durable append failed. Cancelling does
@@ -677,7 +1028,9 @@ impl CSpace {
         reservation: &PendingSlotReservation,
     ) -> Result<(), PersistentInstallError> {
         let index = self.validate_reservation(reservation)?;
-        self.slots[index].reservation = None;
+        let mut candidate = self.candidate_slots(0);
+        candidate[index].reservation = None;
+        self.publish_slots(candidate);
         Ok(())
     }
 
@@ -863,16 +1216,18 @@ impl CSpace {
             resource_kind: grant.resource_kind,
             rights,
         };
-        self.slots[index].entry = Some(Entry {
+        let mut candidate = self.candidate_slots(0);
+        candidate[index].entry = Some(Entry {
             obj: erased,
             rights,
             node: node.clone(),
         });
-        self.slots[index].reservation = None;
+        candidate[index].reservation = None;
         let cap = Cap {
             slot: grant.target.slot,
             generation: grant.target.generation,
         };
+        self.publish_slots(candidate);
         Ok((
             cap,
             PersistentDerivationWitness {
@@ -943,16 +1298,18 @@ impl CSpace {
             rights,
         };
         let erased: Arc<dyn Resource> = parent.object.clone();
-        self.slots[index].entry = Some(Entry {
+        let mut candidate = self.candidate_slots(0);
+        candidate[index].entry = Some(Entry {
             obj: erased,
             rights,
             node: node.clone(),
         });
-        self.slots[index].reservation = None;
+        candidate[index].reservation = None;
         let cap = Cap {
             slot: grant.target.slot,
             generation: grant.target.generation,
         };
+        self.publish_slots(candidate);
         Ok((
             cap,
             PersistentDerivationWitness {
@@ -1169,14 +1526,14 @@ impl CSpace {
             return Err(PersistentInstallError::MissingLiveGrant);
         }
 
-        self.slots = candidate;
+        self.publish_slots(candidate);
         Ok(identities)
     }
 
     pub fn new(name: &str) -> Self {
         system_allocation(|| Self {
             name: String::from(name),
-            slots: Vec::new(),
+            slots: CapTable::empty(),
             incarnation: 1,
             persistent_space: None,
             persistent_quarantined: false,
@@ -1190,7 +1547,7 @@ impl CSpace {
     pub fn new_persistent(name: &str, space: SpaceId) -> Self {
         system_allocation(|| Self {
             name: String::from(name),
-            slots: Vec::new(),
+            slots: CapTable::empty(),
             incarnation: 1,
             persistent_space: Some(space),
             persistent_quarantined: false,
@@ -1217,13 +1574,12 @@ impl CSpace {
     }
 
     /// Fail closed after durable commit succeeded but publishing the matching
-    /// live state did not. This operation performs no allocation: it marks the
-    /// CSpace permanently unavailable, kills every derivation so outstanding
-    /// revocable tokens also fail, and clears reservation tokens. Entries and
-    /// their generation numbers remain untouched until the whole CSpace is
-    /// discarded during reboot: fault cleanup must neither run resource
-    /// destructors nor allocate while its caller may hold shared locks. A
-    /// second call is an idempotent no-op.
+    /// live state did not. Authority denial commits first: the CSpace becomes
+    /// unavailable and every derivation is killed before the detached COW table
+    /// clears reservation tokens. Thus an allocation/protection failure cannot
+    /// leave live authority or make the current authoritative backing writable.
+    /// Entries and generation numbers remain retained until reboot, so this path
+    /// never invokes a resource destructor. A second call is idempotent.
     pub fn quarantine_persistent(&mut self) -> Result<usize, PersistentInstallError> {
         if self.persistent_space.is_none() {
             return Err(PersistentInstallError::NotPersistentSpace);
@@ -1232,15 +1588,20 @@ impl CSpace {
             return Ok(0);
         }
 
-        self.persistent_quarantined = true;
         let mut quarantined = 0;
-        for slot in &mut self.slots {
+        for slot in self.slots.iter() {
             if let Some(entry) = &slot.entry {
                 entry.node.kill();
                 quarantined += 1;
             }
+        }
+        self.persistent_quarantined = true;
+
+        let mut candidate = self.candidate_slots(0);
+        for slot in &mut candidate {
             slot.reservation = None;
         }
+        self.publish_slots(candidate);
         Ok(quarantined)
     }
 
@@ -1249,26 +1610,6 @@ impl CSpace {
     /// while an external transaction was being committed.
     pub const fn incarnation(&self) -> u64 {
         self.incarnation
-    }
-
-    fn alloc_slot(&mut self) -> u32 {
-        // A slot whose generation saturated is retired forever rather than
-        // reused, so a stale handle can never alias a fresh one.
-        if let Some(i) = self
-            .slots
-            .iter()
-            .position(|s| s.entry.is_none() && s.reservation.is_none() && s.generation != u64::MAX)
-        {
-            return i as u32;
-        }
-        system_allocation(|| {
-            self.slots.push(Slot {
-                generation: 0,
-                entry: None,
-                reservation: None,
-            })
-        });
-        (self.slots.len() - 1) as u32
     }
 
     fn invalidate(slot: &mut Slot) {
@@ -1280,13 +1621,16 @@ impl CSpace {
     /// Mint a fresh capability for a resource. This is the root of authority —
     /// only the code that creates a resource can do it.
     pub fn mint(&mut self, obj: Arc<dyn Resource>, rights: Rights) -> Cap {
-        let slot = self.alloc_slot();
         let node = system_allocation(Derivation::root);
-        self.slots[slot as usize].entry = Some(Entry { obj, rights, node });
-        Cap {
+        let mut candidate = self.candidate_slots(1);
+        let slot = Self::alloc_candidate_slot(&mut candidate);
+        candidate[slot as usize].entry = Some(Entry { obj, rights, node });
+        let cap = Cap {
             slot,
-            generation: self.slots[slot as usize].generation,
-        }
+            generation: candidate[slot as usize].generation,
+        };
+        self.publish_slots(candidate);
+        cap
     }
 
     /// Mint only if the caller's pre-await incarnation is still current.
@@ -1407,13 +1751,17 @@ impl CSpace {
             return Err(CapError::Amplification);
         }
         let obj = e.obj.clone();
-        let node = system_allocation(|| Derivation::child(&e.node));
-        let slot = self.alloc_slot();
-        self.slots[slot as usize].entry = Some(Entry { obj, rights, node });
-        Ok(Cap {
+        let parent = e.node.clone();
+        let node = system_allocation(|| Derivation::child(&parent));
+        let mut candidate = self.candidate_slots(1);
+        let slot = Self::alloc_candidate_slot(&mut candidate);
+        candidate[slot as usize].entry = Some(Entry { obj, rights, node });
+        let derived = Cap {
             slot,
-            generation: self.slots[slot as usize].generation,
-        })
+            generation: candidate[slot as usize].generation,
+        };
+        self.publish_slots(candidate);
+        Ok(derived)
     }
 
     /// Destroy a cap and everything derived from it. Bumping the slot
@@ -1461,7 +1809,7 @@ impl CSpace {
         }) {
             return 0;
         }
-        for slot in &self.slots {
+        for slot in self.slots.iter() {
             if let Some(e) = &slot.entry {
                 e.node.kill();
             }
@@ -1524,13 +1872,22 @@ impl CSpace {
     /// Killing a node takes effect immediately for lookups everywhere; this is
     /// the local bookkeeping that frees slots and updates `list`.
     pub fn collect(&mut self) -> usize {
+        if !self.slots.iter().any(|slot| {
+            slot.entry
+                .as_ref()
+                .is_some_and(|entry| !entry.node.is_alive())
+        }) {
+            return 0;
+        }
+        let mut candidate = self.candidate_slots(0);
         let mut killed = 0;
-        for slot in &mut self.slots {
+        for slot in &mut candidate {
             if slot.entry.as_ref().is_some_and(|e| !e.node.is_alive()) {
                 Self::invalidate(slot);
                 killed += 1;
             }
         }
+        self.publish_slots(candidate);
         killed
     }
 
@@ -1580,10 +1937,13 @@ pub fn grant(src: &CSpace, cap: Cap, rights: Rights, dst: &mut CSpace) -> Result
     let node = system_allocation(|| Derivation::child(&parent.node));
     let obj = parent.obj.clone();
 
-    let slot = dst.alloc_slot();
-    dst.slots[slot as usize].entry = Some(Entry { obj, rights, node });
-    Ok(Cap {
+    let mut candidate = dst.candidate_slots(1);
+    let slot = CSpace::alloc_candidate_slot(&mut candidate);
+    candidate[slot as usize].entry = Some(Entry { obj, rights, node });
+    let granted = Cap {
         slot,
-        generation: dst.slots[slot as usize].generation,
-    })
+        generation: candidate[slot as usize].generation,
+    };
+    dst.publish_slots(candidate);
+    Ok(granted)
 }

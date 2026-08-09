@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use vibeos_core::cap::{
     grant, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource, Rights,
-    MAX_PERSISTENT_SLOTS,
+    CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
 };
 use vibeos_core::durable::{
     DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
@@ -113,6 +113,56 @@ fn durable_grant(
         transaction_id: stable(transaction, TransactionId::new),
         prepare_sequence: transaction as u64 * 2,
         commit_sequence: transaction as u64 * 2 + 1,
+    }
+}
+
+#[test]
+fn published_capability_tables_are_page_aligned_and_replaced_by_cow() {
+    let (mut cs, widget) = space();
+    assert_eq!(cs.capability_table_range(), None);
+
+    let root = cs.mint(widget, Rights::ALL);
+    let first = cs.capability_table_range().unwrap();
+    assert_eq!(first.slot_count, 1);
+
+    let child = cs.derive(root, Rights::READ.union(Rights::REVOKE)).unwrap();
+    let second = cs.capability_table_range().unwrap();
+    assert_eq!(second.slot_count, 2);
+    assert_ne!(second.start, first.start);
+    assert_eq!(cs.lookup_as::<Widget>(root, Rights::READ).unwrap().0, "w");
+    assert_eq!(cs.lookup_as::<Widget>(child, Rights::READ).unwrap().0, "w");
+
+    assert_eq!(cs.revoke(child), Ok(1));
+    let third = cs.capability_table_range().unwrap();
+    assert_ne!(third.start, second.start);
+    assert_eq!(third.slot_count, 2, "vacant slots retain their generation");
+    assert_eq!(
+        cs.lookup(child, Rights::READ).err(),
+        Some(CapError::Invalid)
+    );
+    assert_eq!(cs.lookup_as::<Widget>(root, Rights::READ).unwrap().0, "w");
+
+    let replacement = cs.mint(Arc::new(Widget("replacement")), Rights::READ);
+    let fourth = cs.capability_table_range().unwrap();
+    assert_ne!(fourth.start, third.start);
+    assert_eq!(
+        cs.lookup(child, Rights::READ).err(),
+        Some(CapError::Invalid)
+    );
+    assert_eq!(
+        cs.lookup_as::<Widget>(replacement, Rights::READ).unwrap().0,
+        "replacement"
+    );
+
+    for range in [first, second, third, fourth] {
+        assert_eq!(range.start % CAPABILITY_TABLE_PAGE_SIZE, 0);
+        assert!(range.page_count > 0);
+        let byte_len = range
+            .page_count
+            .checked_mul(CAPABILITY_TABLE_PAGE_SIZE)
+            .unwrap();
+        assert_eq!(byte_len % CAPABILITY_TABLE_PAGE_SIZE, 0);
+        assert!(range.start.checked_add(byte_len).is_some());
     }
 }
 

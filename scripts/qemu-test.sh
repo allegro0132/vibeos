@@ -287,6 +287,11 @@ for case_file in tests/cases/*.in; do
       boot_output_ok=0
       fail=1
     fi
+    if ! grep -a -Eq 'read-only +[0-9]+ KiB \.rodata 0x[0-9a-f]+\.\.0x[0-9a-f]+; [0-9]+ KiB COW capability-table pool' "$qemu_log"; then
+      echo "FAIL $name: boot $boot did not publish the read-only data/capability-table marker"
+      boot_output_ok=0
+      fail=1
+    fi
 
     if [ "$name" = "persistent_cspace" ]; then
       printf '=== persistent CSpace boot %s ===\n' "$boot" >> "$actual"
@@ -326,6 +331,25 @@ for case_file in tests/cases/*.in; do
     if [ -z "$wx_probe" ] || [ "$wx_probe" != "$wx_stval" ] \
       || ! grep -a -q "\[!\] W\^X code pool blocked $wx_exception" "$qemu_log"; then
       echo "FAIL $name: expected W^X page-fault stval did not match the printed probe"
+      boot_output_ok=0
+      fail=1
+    fi
+  fi
+
+  ro_action=""
+  ro_marker=""
+  case "$name" in
+    rodata_write_fault)
+      ro_action="write rodata"; ro_marker="read-only \.rodata" ;;
+    cap_table_write_fault)
+      ro_action="write capability table"; ro_marker="read-only capability table" ;;
+  esac
+  if [ -n "$ro_action" ]; then
+    ro_probe=$(sed -n "s/.*read-only probe: $ro_action \(0x[0-9a-f][0-9a-f]*\).*/\1/p" "$qemu_log" | tail -1)
+    ro_stval=$(sed -n 's/.*fatal trap: cause=15 stval=\(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
+    if [ -z "$ro_probe" ] || [ "$ro_probe" != "$ro_stval" ] \
+      || ! grep -a -q "\[!\] $ro_marker blocked store page fault" "$qemu_log"; then
+      echo "FAIL $name: expected read-only store-page-fault stval did not match the printed probe"
       boot_output_ok=0
       fail=1
     fi

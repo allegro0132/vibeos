@@ -22,6 +22,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
+use crate::ipi;
 use crate::runqueue::{EnqueueError, RunQueues};
 use crate::sync::SpinLock;
 
@@ -1646,7 +1647,13 @@ pub fn run() -> ! {
         // `sstatus.SIE` -- so an interrupt arriving inside this window stays
         // pending and resumes us immediately. Unmasking then lets it be taken.
         let irq = arch::irq_save();
-        if SCHED.lock().ready.hart_idle(HartId::BOOT) {
+        // The ready queue is published before the Release mailbox bit. With
+        // SIE masked, observing both empty closes the queue-check/WFI race:
+        // a later successful doorbell remains pending and makes WFI resume,
+        // while an earlier publisher is observed by one of these checks.
+        let queue_idle = SCHED.lock().ready.hart_idle(HartId::BOOT);
+        let reasons = ipi::take_idle_reasons(HartId::BOOT);
+        if queue_idle && reasons == 0 {
             arch::wait_for_interrupt();
         }
         arch::irq_restore(irq);

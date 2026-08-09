@@ -8,8 +8,9 @@ use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::heap::OwnerId;
-use crate::{exec, heap, plic, sbi, uart};
+use crate::{exec, heap, ipi, plic, sbi, uart};
 
+const SIE_SSIE: usize = 1 << 1; // supervisor software / SBI IPI
 const SIE_STIE: usize = 1 << 5; // supervisor timer
 const SIE_SEIE: usize = 1 << 9; // supervisor external
 const SSTATUS_SIE: usize = 1 << 1;
@@ -109,7 +110,7 @@ extern "C" {
 pub fn init() {
     unsafe {
         asm!("csrw stvec, {}", in(reg) __trap_entry as *const () as usize);
-        asm!("csrs sie, {}", in(reg) SIE_STIE | SIE_SEIE);
+        asm!("csrs sie, {}", in(reg) SIE_SSIE | SIE_STIE | SIE_SEIE);
     }
     plic::init();
     plic::register(uart::UART_IRQ, uart_irq, 0)
@@ -160,6 +161,17 @@ extern "C" fn __trap_handler(irq_entry: u64) {
     // component quota. Deallocation remains owner-correct because heap headers
     // carry the allocation owner independently of this ambient scope.
     IN_INTERRUPT.store(true, Ordering::Release);
+
+    if code == 1 {
+        // SBI IPIs arrive as SSIP. Acknowledge the CSR before consuming the
+        // Release-published reason; doing it in the opposite order can clear a
+        // concurrent publisher's fresh doorbell. No scheduler lock or poll is
+        // entered from this path.
+        let _ = ipi::acknowledge_current();
+        IN_INTERRUPT.store(false, Ordering::Release);
+        return;
+    }
+
     let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
 
     match code {

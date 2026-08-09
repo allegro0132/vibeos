@@ -4,5 +4,7 @@ vibe> quiet
 vibe> smp queues
   smp queues: remote hart1..hart3 tasks each ran once
   smp queues: hart0 steal delta=3
+  smp ipi: offline remote reasons retained without SBI calls
+  smp ipi: forced boot-hart doorbell acknowledged
   smp queues: physical secondary harts gated until M5.5
 vibe> 

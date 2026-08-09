@@ -2,7 +2,12 @@
 
 use core::arch::asm;
 
+use super::IpiError;
+
 const SSTATUS_SIE: usize = 1 << 1;
+const SIP_SSIP: usize = 1 << 1;
+const SBI_EXT_IPI: usize = 0x735049;
+const SBI_EXT_IPI_SEND: usize = 0;
 
 /// Disable S-mode interrupts; returns whether they were previously enabled.
 #[inline]
@@ -29,6 +34,30 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("wfi") };
 }
 
+/// Hart identity installed in `tp` by the kernel's assembly entry path.
+///
+/// `mhartid` is not accessible from S-mode. Keeping the firmware-provided
+/// `a0` value in `tp` also gives M5.4 a register-local identity without
+/// touching shared memory.
+#[inline]
+pub fn current_hart_id() -> usize {
+    let hart: usize;
+    unsafe { asm!("mv {}, tp", out(reg) hart, options(nostack, nomem)) };
+    hart
+}
+
+/// Clear the receiving hart's supervisor-software pending bit.
+#[inline]
+pub fn clear_software_interrupt() {
+    unsafe { asm!("csrc sip, {}", in(reg) SIP_SSIP, options(nostack)) };
+}
+
+/// Order mailbox memory and the SSIP/SBI device-visible boundary.
+#[inline]
+pub fn fence_ipi() {
+    unsafe { asm!("fence iorw, iorw", options(nostack)) };
+}
+
 #[inline]
 pub fn time() -> u64 {
     let t: u64;
@@ -50,6 +79,21 @@ fn ecall(eid: usize, fid: usize, a0: usize, a1: usize) -> (isize, usize) {
         );
     }
     (err, val)
+}
+
+/// Send one supervisor IPI through the standardized SBI v0.2 IPI extension.
+///
+/// A single target is encoded as `hart_mask = 1, hart_mask_base = hart`, as
+/// required by the standardized hart-mask encoding. We deliberately do not
+/// guess a legacy EID 0x04 bit-vector length: that ABI requires one word per
+/// platform hart-range and VibeOS does not parse the topology until M5.5.
+pub fn send_ipi(hart: usize) -> Result<(), IpiError> {
+    let (error, _) = ecall(SBI_EXT_IPI, SBI_EXT_IPI_SEND, 1, hart);
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(IpiError::from_sbi(error))
+    }
 }
 
 /// Program the next timer interrupt (SBI TIME extension).

@@ -1,10 +1,11 @@
 //! One shared Sv39 address space for every kernel hart.
 //!
 //! M6 uses paging for integrity, not process isolation.  The initial map keeps
-//! kernel RAM and the three QEMU `virt` MMIO regions at identical virtual and
-//! physical addresses.  RAM uses 4 KiB leaves from the outset so later guard,
+//! kernel RAM and the selected board's MMIO regions at identical virtual and
+//! physical addresses. RAM uses 4 KiB leaves from the outset so later guard,
 //! W^X, and read-only milestones can change one page without splitting a live
-//! superpage.
+//! superpage. Separate device level-1 tables cover CV1800B's UART and PLIC,
+//! which reside in different Sv39 1 GiB root slots.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -12,15 +13,15 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::exec;
 use crate::sync::SpinLock;
-use sv39::{PagePermissions, PageTableEntry};
+use sv39::{PageAttributes, PagePermissions, PageTableEntry};
 use vibeos_core::mmu as sv39;
 
-pub const KERNEL_RAM_START: usize = 0x8020_0000;
-pub const KERNEL_RAM_END: usize = 0x8800_0000;
-pub const PLIC_START: usize = 0x0c00_0000;
-pub const PLIC_END: usize = 0x0c40_0000;
-pub const UART_VIRTIO_START: usize = 0x1000_0000;
-pub const UART_VIRTIO_END: usize = 0x1000_9000;
+pub const KERNEL_RAM_START: usize = crate::platform::RAM_START;
+pub const KERNEL_RAM_END: usize = crate::platform::RAM_END;
+pub const PLIC_START: usize = crate::platform::PLIC_BASE;
+pub const PLIC_END: usize = crate::platform::PLIC_MMIO_END;
+pub const UART_VIRTIO_START: usize = crate::platform::DEVICE_MMIO_START;
+pub const UART_VIRTIO_END: usize = crate::platform::DEVICE_MMIO_END;
 pub const STACK_GUARD_SIZE: usize = sv39::PAGE_SIZE;
 pub const STACK_SLOT_STRIDE: usize = 256 * 1024;
 
@@ -29,14 +30,28 @@ const RAM_LEVEL0_TABLES: usize = (KERNEL_RAM_END - KERNEL_RAM_START) / MEGAPAGE_
 const PLIC_ENABLE_PAGE: usize = PLIC_START + 0x2000;
 pub const PLIC_CONTEXT_START: usize = PLIC_START + 0x20_0000;
 
-const WRITABLE_PERMISSIONS: PagePermissions =
-    PagePermissions::READ.union(PagePermissions::WRITE);
+const WRITABLE_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
 const READ_ONLY_PERMISSIONS: PagePermissions = PagePermissions::READ;
-const TEXT_PERMISSIONS: PagePermissions =
-    PagePermissions::READ.union(PagePermissions::EXECUTE);
+const TEXT_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::EXECUTE);
 const EXECUTABLE_PERMISSIONS: PagePermissions = PagePermissions::EXECUTE;
 const MMIO_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
 const STACK_PERMISSIONS: PagePermissions = WRITABLE_PERMISSIONS;
+
+#[cfg(feature = "qemu-virt")]
+const RAM_ATTRIBUTES: PageAttributes = PageAttributes::NONE;
+#[cfg(feature = "qemu-virt")]
+const MMIO_ATTRIBUTES: PageAttributes = PageAttributes::NONE;
+
+// CV1800B's C906 implements the pre-standard T-Head C9xx PTE memory-type
+// extension. Match the vendor Linux port: normal RAM is shareable, cacheable,
+// and bufferable; device pages are shareable and strongly ordered.
+#[cfg(feature = "milkv-duo")]
+const RAM_ATTRIBUTES: PageAttributes = PageAttributes::THEAD_SHAREABLE
+    .union(PageAttributes::THEAD_CACHEABLE)
+    .union(PageAttributes::THEAD_BUFFERABLE);
+#[cfg(feature = "milkv-duo")]
+const MMIO_ATTRIBUTES: PageAttributes =
+    PageAttributes::THEAD_SHAREABLE.union(PageAttributes::THEAD_STRONG_ORDER);
 
 extern "C" {
     static __stacks_bottom: u8;
@@ -66,6 +81,7 @@ impl PageTable {
 #[repr(C)]
 struct AddressSpace {
     root: PageTable,
+    plic_level1: PageTable,
     devices_level1: PageTable,
     plic_control_level0: PageTable,
     plic_context_level0: PageTable,
@@ -78,6 +94,7 @@ impl AddressSpace {
     const fn empty() -> Self {
         Self {
             root: PageTable::empty(),
+            plic_level1: PageTable::empty(),
             devices_level1: PageTable::empty(),
             plic_control_level0: PageTable::empty(),
             plic_context_level0: PageTable::empty(),
@@ -130,39 +147,50 @@ pub fn init_boot(boot_physical_hart: usize) {
     assert_eq!(KERNEL_RAM_START % MEGAPAGE_SIZE, 0);
     assert_eq!(KERNEL_RAM_END % MEGAPAGE_SIZE, 0);
     assert!(
-        boot_physical_hart < exec::MAX_HARTS,
-        "dense QEMU boot hart must fit the mapped PLIC topology"
+        crate::platform::HART_IDS.contains(&boot_physical_hart),
+        "boot hart must fit the selected platform topology"
     );
 
     // Safety: no secondary is released and TABLES_READY is false, so the boot
     // hart has exclusive access to the complete table hierarchy.
     let tables = unsafe { &mut *TABLES.0.get() };
     // `_start` has already zeroed `.bss`, including TABLES. Do not assign a
-    // fresh 276 KiB `AddressSpace::empty()` here: materializing that value can
-    // create a stack temporary larger than the boot hart's 256 KiB stack.
+    // fresh `AddressSpace::empty()` here: materializing the large page-table
+    // hierarchy can create a temporary larger than the boot hart's stack.
 
     tables.root.entries[sv39::vpn_index(PLIC_START, 2)] =
-        PageTableEntry::table(table_address(&tables.devices_level1))
-            .expect("device level-1 table is page aligned");
+        PageTableEntry::table(table_address(&tables.plic_level1))
+            .expect("PLIC level-1 table is page aligned");
     tables.root.entries[sv39::vpn_index(KERNEL_RAM_START, 2)] =
         PageTableEntry::table(table_address(&tables.ram_level1))
             .expect("RAM level-1 table is page aligned");
 
     link_level0(
-        &mut tables.devices_level1,
+        &mut tables.plic_level1,
         PLIC_START,
         &tables.plic_control_level0,
     );
     link_level0(
-        &mut tables.devices_level1,
+        &mut tables.plic_level1,
         PLIC_CONTEXT_START,
         &tables.plic_context_level0,
     );
-    link_level0(
-        &mut tables.devices_level1,
-        UART_VIRTIO_START,
-        &tables.uart_virtio_level0,
-    );
+    if sv39::vpn_index(UART_VIRTIO_START, 2) == sv39::vpn_index(PLIC_START, 2) {
+        link_level0(
+            &mut tables.plic_level1,
+            megapage_base(UART_VIRTIO_START),
+            &tables.uart_virtio_level0,
+        );
+    } else {
+        tables.root.entries[sv39::vpn_index(UART_VIRTIO_START, 2)] =
+            PageTableEntry::table(table_address(&tables.devices_level1))
+                .expect("device level-1 table is page aligned");
+        link_level0(
+            &mut tables.devices_level1,
+            megapage_base(UART_VIRTIO_START),
+            &tables.uart_virtio_level0,
+        );
+    }
     map_page(
         &mut tables.plic_control_level0,
         PLIC_START,
@@ -189,7 +217,7 @@ pub fn init_boot(boot_physical_hart: usize) {
             .expect("RAM level-0 table is page aligned");
         for (page_index, entry) in level0.entries.iter_mut().enumerate() {
             let physical = base + page_index * sv39::PAGE_SIZE;
-            *entry = PageTableEntry::leaf(physical, WRITABLE_PERMISSIONS)
+            *entry = ram_leaf(physical, WRITABLE_PERMISSIONS)
                 .expect("identity RAM leaf is architecturally valid");
         }
     }
@@ -212,8 +240,8 @@ pub fn init_boot(boot_physical_hart: usize) {
         for address in
             (guard + STACK_GUARD_SIZE..guard + STACK_SLOT_STRIDE).step_by(sv39::PAGE_SIZE)
         {
-            *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, STACK_PERMISSIONS)
-                .expect("mapped kernel stack page is valid");
+            *ram_leaf_mut(tables, address) =
+                ram_leaf(address, STACK_PERMISSIONS).expect("mapped kernel stack page is valid");
         }
     }
 
@@ -282,8 +310,12 @@ pub fn root_physical() -> usize {
 }
 
 pub fn plic_s_context_page(physical_hart: usize) -> Option<usize> {
-    (physical_hart < exec::MAX_HARTS)
-        .then(|| PLIC_CONTEXT_START + (physical_hart * 2 + 1) * sv39::PAGE_SIZE)
+    crate::platform::plic_s_context(physical_hart)
+        .map(|context| PLIC_CONTEXT_START + context * sv39::PAGE_SIZE)
+}
+
+const fn megapage_base(address: usize) -> usize {
+    address & !(MEGAPAGE_SIZE - 1)
 }
 
 pub fn stack_slots_start() -> usize {
@@ -437,9 +469,7 @@ pub fn first_writable_executable_ram_page() -> Option<usize> {
                 && permissions.contains(PagePermissions::EXECUTE)
             {
                 return Some(
-                    KERNEL_RAM_START
-                        + table_index * MEGAPAGE_SIZE
-                        + page_index * sv39::PAGE_SIZE,
+                    KERNEL_RAM_START + table_index * MEGAPAGE_SIZE + page_index * sv39::PAGE_SIZE,
                 );
             }
         }
@@ -487,8 +517,9 @@ fn link_level0(level1: &mut PageTable, base: usize, level0: &PageTable) {
 
 fn map_page(level0: &mut PageTable, physical: usize, permissions: PagePermissions) {
     assert_eq!(physical % sv39::PAGE_SIZE, 0);
-    level0.entries[sv39::vpn_index(physical, 0)] = PageTableEntry::leaf(physical, permissions)
-        .expect("identity MMIO page is architecturally valid");
+    level0.entries[sv39::vpn_index(physical, 0)] =
+        PageTableEntry::leaf_with_attributes(physical, permissions, MMIO_ATTRIBUTES)
+            .expect("identity MMIO page is architecturally valid");
 }
 
 fn assert_page_range(start: usize, end: usize) {
@@ -504,8 +535,8 @@ fn remap_boot_range(
     permissions: PagePermissions,
 ) {
     for address in (start..end).step_by(sv39::PAGE_SIZE) {
-        *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, permissions)
-            .expect("boot RAM permission override is valid");
+        *ram_leaf_mut(tables, address) =
+            ram_leaf(address, permissions).expect("boot RAM permission override is valid");
     }
 }
 
@@ -550,8 +581,8 @@ fn transition_ram_range(
     // Validate the complete old range before changing its first PTE. A stale,
     // overlapping, or repeated transition therefore cannot partially apply.
     for address in (start..end).step_by(sv39::PAGE_SIZE) {
-        let expected = PageTableEntry::leaf(address, expected_permissions)
-            .expect("expected dedicated-pool leaf is valid");
+        let expected =
+            ram_leaf(address, expected_permissions).expect("expected dedicated-pool leaf is valid");
         assert_eq!(
             *ram_leaf_mut(tables, address),
             expected,
@@ -569,8 +600,8 @@ fn transition_ram_range(
     synchronize_tlbs(start, size);
 
     for address in (start..end).step_by(sv39::PAGE_SIZE) {
-        *ram_leaf_mut(tables, address) = PageTableEntry::leaf(address, target_permissions)
-            .expect("target dedicated-pool leaf is valid");
+        *ram_leaf_mut(tables, address) =
+            ram_leaf(address, target_permissions).expect("target dedicated-pool leaf is valid");
     }
     publish_pte_writes();
     synchronize_tlbs(start, size);
@@ -634,6 +665,13 @@ fn ram_leaf_mut(tables: &mut AddressSpace, address: usize) -> &mut PageTableEntr
     let table_index = offset / MEGAPAGE_SIZE;
     let page_index = offset % MEGAPAGE_SIZE / sv39::PAGE_SIZE;
     &mut tables.ram_level0[table_index].entries[page_index]
+}
+
+fn ram_leaf(
+    physical: usize,
+    permissions: PagePermissions,
+) -> Result<PageTableEntry, sv39::PteError> {
+    PageTableEntry::leaf_with_attributes(physical, permissions, RAM_ATTRIBUTES)
 }
 
 fn table_address(table: &PageTable) -> usize {

@@ -12,7 +12,6 @@ rustflags = [
   # The built-in IMAC target is integer-only (`lp64`). CSR access and fence.i
   # are still architectural kernel requirements and do not change that ABI.
   "-C", "target-feature=+zicsr,+zifencei",
-  "-C", "link-arg=-Tkernel/linker.ld",
   "-C", "link-arg=--gc-sections",
   "-C", "force-frame-pointers=yes",
 ]

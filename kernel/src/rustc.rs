@@ -430,7 +430,7 @@ pub fn run_with_authority(
     drop(memory);
 
     let ticks = sbi::time() - started_at;
-    let micros = ticks / (crate::exec::TIMEBASE_HZ / 1_000_000);
+    let micros = ticks / (crate::exec::timebase_hz() / 1_000_000);
 
     *PROG_OUT[hart].lock() = None;
     let denied = DENIED[hart].load(Ordering::SeqCst);

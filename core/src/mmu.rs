@@ -20,6 +20,16 @@ const PTE_GLOBAL: u64 = 1 << 5;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 const PTE_PERMISSION_MASK: u64 = PTE_READ | PTE_WRITE | PTE_EXECUTE | PTE_USER | PTE_GLOBAL;
+const PTE_THEAD_SECURITY: u64 = 1 << 59;
+const PTE_THEAD_SHAREABLE: u64 = 1 << 60;
+const PTE_THEAD_BUFFERABLE: u64 = 1 << 61;
+const PTE_THEAD_CACHEABLE: u64 = 1 << 62;
+const PTE_THEAD_STRONG_ORDER: u64 = 1 << 63;
+const PTE_ATTRIBUTE_MASK: u64 = PTE_THEAD_SECURITY
+    | PTE_THEAD_SHAREABLE
+    | PTE_THEAD_BUFFERABLE
+    | PTE_THEAD_CACHEABLE
+    | PTE_THEAD_STRONG_ORDER;
 const PTE_PPN_MASK: u64 = ((1u64 << 44) - 1) << 10;
 const MAX_PHYSICAL_ADDRESS: usize = 1usize << 56;
 
@@ -63,6 +73,40 @@ impl PagePermissions {
     }
 }
 
+/// Optional implementation-defined leaf attributes outside the standard
+/// Sv39 permission field.
+///
+/// Generic RISC-V hardware requires these reserved bits to remain zero. The
+/// T-Head C9xx MMU instead uses bits 59--63 for its memory type. Callers must
+/// therefore select non-empty attributes only for a matching platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageAttributes(u64);
+
+impl PageAttributes {
+    pub const NONE: Self = Self(0);
+    pub const THEAD_SECURITY: Self = Self(PTE_THEAD_SECURITY);
+    pub const THEAD_SHAREABLE: Self = Self(PTE_THEAD_SHAREABLE);
+    pub const THEAD_BUFFERABLE: Self = Self(PTE_THEAD_BUFFERABLE);
+    pub const THEAD_CACHEABLE: Self = Self(PTE_THEAD_CACHEABLE);
+    pub const THEAD_STRONG_ORDER: Self = Self(PTE_THEAD_STRONG_ORDER);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PageTableEntry(u64);
@@ -76,6 +120,14 @@ impl PageTableEntry {
     }
 
     pub fn leaf(physical: usize, permissions: PagePermissions) -> Result<Self, PteError> {
+        Self::leaf_with_attributes(physical, permissions, PageAttributes::NONE)
+    }
+
+    pub fn leaf_with_attributes(
+        physical: usize,
+        permissions: PagePermissions,
+        attributes: PageAttributes,
+    ) -> Result<Self, PteError> {
         validate_physical_page(physical)?;
         if permissions.contains(PagePermissions::WRITE)
             && !permissions.contains(PagePermissions::READ)
@@ -88,7 +140,12 @@ impl PageTableEntry {
             return Err(PteError::EmptyLeaf);
         }
         Ok(Self(
-            ppn_bits(physical) | PTE_VALID | permissions.bits() | PTE_ACCESSED | PTE_DIRTY,
+            ppn_bits(physical)
+                | PTE_VALID
+                | permissions.bits()
+                | attributes.bits()
+                | PTE_ACCESSED
+                | PTE_DIRTY,
         ))
     }
 
@@ -110,6 +167,10 @@ impl PageTableEntry {
 
     pub const fn permissions(self) -> PagePermissions {
         PagePermissions(self.0 & PTE_PERMISSION_MASK)
+    }
+
+    pub const fn attributes(self) -> PageAttributes {
+        PageAttributes(self.0 & PTE_ATTRIBUTE_MASK)
     }
 }
 

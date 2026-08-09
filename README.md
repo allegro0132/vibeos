@@ -23,6 +23,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/MMU.md](docs/MMU.md)** — the shared Sv39 map, boot publication
   contract, mapped apertures, per-hart stack guards, and integrity-hardening
   sequence.
+- **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** — single-core Milk-V Duo
+  (CV1800B) support, SDK packaging, and hardware validation checklist.
 - **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
@@ -61,10 +63,15 @@ layers and which mutations each one catches.
 ./qrun.sh 10      # run for 10 seconds, feed the shell from stdin
 ```
 
+Milk-V Duo boot images are generated with the official SDK. The deliverable image
+contains a single FAT boot partition and no Linux root filesystem. Follow
+**[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
+
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
-`nightly-2026-08-01` (including `rust-src`) in `rust-toolchain.toml`; every local
-script and CI build consumes that same file. `scripts/status.sh --check` fails if
-the active compiler commit differs from the recorded pin.
+`nightly-2026-08-01` (including `rust-src` and LLVM tools) in
+`rust-toolchain.toml`; every local script and CI build consumes that same file.
+`scripts/status.sh --check` fails if the active compiler commit differs from the
+recorded pin.
 
 `bench` in the shell emits a versioned JSON-lines measurement set. The host
 runner fixes the machine, CPU, hart count, TCG mode, and virtual clock, records

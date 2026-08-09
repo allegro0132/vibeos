@@ -1,6 +1,6 @@
 use vibeos_core::mmu::{
-    is_canonical_virtual_address, satp, vpn_index, PagePermissions, PageTableEntry, PteError,
-    ENTRIES_PER_TABLE, PAGE_SIZE, SATP_MODE_SV39,
+    is_canonical_virtual_address, satp, vpn_index, PageAttributes, PagePermissions, PageTableEntry,
+    PteError, ENTRIES_PER_TABLE, PAGE_SIZE, SATP_MODE_SV39,
 };
 
 #[test]
@@ -9,6 +9,22 @@ fn sv39_indices_select_all_three_levels() {
     assert_eq!(vpn_index(address, 0), ENTRIES_PER_TABLE - 1);
     assert_eq!(vpn_index(address, 1), ENTRIES_PER_TABLE - 1);
     assert_eq!(vpn_index(address, 2), 0xff);
+}
+
+#[test]
+fn thead_leaf_attributes_do_not_corrupt_standard_sv39_fields() {
+    let attributes = PageAttributes::THEAD_SHAREABLE
+        .union(PageAttributes::THEAD_BUFFERABLE)
+        .union(PageAttributes::THEAD_CACHEABLE);
+    let permissions = PagePermissions::READ.union(PagePermissions::WRITE);
+    let entry = PageTableEntry::leaf_with_attributes(0x8020_0000, permissions, attributes).unwrap();
+    assert_eq!(entry.bits(), 0x7000_0000_2008_00c7);
+    assert_eq!(entry.physical_address(), 0x8020_0000);
+    assert_eq!(entry.permissions(), permissions);
+    assert_eq!(entry.attributes(), attributes);
+    assert!(!entry
+        .attributes()
+        .contains(PageAttributes::THEAD_STRONG_ORDER));
 }
 
 #[test]

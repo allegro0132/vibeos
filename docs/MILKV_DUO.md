@@ -1,0 +1,266 @@
+# Milk-V Duo (CV1800B)
+
+VibeOS provides **single-core board support for the Milk-V Duo C906B**. Current
+support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
+timebase, and a FIT/SD image packaging flow based on the official Buildroot SDK.
+
+> **Hardware validation status (2026-08-10): passed.** A CV1800B board booted
+> successfully from the single-FAT image described here and entered the
+> interactive shell. Sv39, the 25 MHz timer, UART0/PLIC IRQ 44, and component
+> scheduling all worked correctly, and the hardware `selftest` reported
+> `388 passed, 0 failed`. This does not change the fact that the C906L and
+> dual-core SMP are not yet supported.
+
+## CPU model and support boundaries
+
+The official SDK does not expose the two cores as symmetric OpenSBI harts:
+
+- The C906B (hart 0) is the application core that OpenSBI exposes to the main
+  system. It is the only core currently used by VibeOS.
+- The FSBL releases the C906L separately, and the stock SDK runs FreeRTOS on it
+  by default. It is the RTOS core in an AMP/mailbox communication model, not a
+  regular SMP hart that can be started through SBI HSM.
+- VibeOS neither probes nor starts the C906L and does not claim dual-core SMP
+  support. Future support for this core should introduce an explicit
+  AMP/mailbox design rather than adding it to the existing HSM hart list.
+
+Milk-V's [official RTOS core documentation](https://milkv.io/docs/duo/getting-started/rtoscore)
+likewise describes the two cores as a main-system "big core" and a FreeRTOS
+"small core" communicating through a mailbox.
+
+## Board parameters
+
+All address ranges below are physical addresses and use an exclusive upper
+bound.
+
+| Item | Milk-V Duo configuration |
+|---|---|
+| Main core | C906B, hart 0, single core |
+| VibeOS RAM | `0x8020_0000..0x83e0_0000` (60 MiB) |
+| Start of FreeRTOS reserved region | `0x83f4_0000` |
+| UART0 | `0x0414_0000`, IRQ 44 |
+| UART registers | shift 2, 32-bit MMIO (width 4) |
+| UART clock and baud rate | 25 MHz, 115200 baud |
+| PLIC | `0x7000_0000`, hart 0 S-mode context 1 |
+| RISC-V timebase | 25 MHz |
+| virtio-mmio | 0 slots; block, object store, and virtio-net remain offline |
+
+UART0 and the PLIC occupy Sv39 root VPN2 entries 0 and 1, respectively, so they
+must use separate level-1 device page tables. The C906 also requires T-Head
+C9xx extended PTE memory attributes: normal RAM uses `SHARE|BUFFER|CACHE`, while
+MMIO uses `SHARE|STRONG_ORDER`. The QEMU platform does not set these reserved
+high bits.
+
+UART0 is a DesignWare APB UART, not an entirely unextended 16550. After taking
+over from U-Boot, the kernel must wait for `LSR.TEMT` before rewriting the LCR
+and must clear interrupts according to their IIR reason. Busy Detect `0x07` is
+cleared by reading the USR (logical register `0x1f`), while an RX timeout `0x0c`
+with an empty FIFO is cleared by one dummy RBR read. Otherwise, level-high IRQ
+44 continuously retriggers in the PLIC claim/complete loop, causing the shell
+never to be scheduled after it prints `sched`.
+
+VibeOS deliberately stops at `0x83e0_0000` and does not occupy the FreeRTOS
+region beginning at `0x83f4_0000`. Do not move the linker's upper bound directly
+to the end of the 64 MiB DRAM merely to enlarge the heap.
+
+The stock board memory map also declares an approximately 26.8 MiB ION region
+for Linux multimedia drivers, but `FREERTOS_RESERVED_ION_SIZE` is 0 in this
+configuration. VibeOS does not run those Linux drivers, so the current port uses
+the ION region as normal RAM. If custom C906L firmware accesses ION, `RAM_END`
+must be reduced accordingly; otherwise, cross-core memory corruption will
+occur.
+
+The upstream sources for these hardware parameters can be cross-checked here:
+
+- [Official duo-buildroot-sdk](https://github.com/milkv-duo/duo-buildroot-sdk)
+- [CPU, PLIC, and CLINT DTS](https://github.com/milkv-duo/duo-buildroot-sdk/blob/23eb84fecb29585dbb5728d6b7e2475ff273baac/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi#L30-L85)
+- [UART0 DTS](https://github.com/milkv-duo/duo-buildroot-sdk/blob/23eb84fecb29585dbb5728d6b7e2475ff273baac/build/boards/default/dts/cv180x/cv180x_base.dtsi#L251-L258)
+- [CV1800B Milk-V Duo memory layout](https://github.com/milkv-duo/duo-buildroot-sdk/blob/23eb84fecb29585dbb5728d6b7e2475ff273baac/build/boards/cv180x/cv1800b_milkv_duo_sd/memmap.py#L12-L80)
+
+## Building and packaging
+
+[`scripts/build-milkv-duo.sh`](../scripts/build-milkv-duo.sh) builds VibeOS.
+[`scripts/package-milkv-duo-sdk.sh`](../scripts/package-milkv-duo-sdk.sh)
+generates the FIT and packages the full-card image in the SDK's Linux/amd64
+environment. Packaging reuses the FIP, Linux runtime DTB, `mkimage`, `dumpimage`,
+and `genimage` produced by the SDK. You must therefore complete one full stock
+SDK build first. The final image itself does not contain a Linux kernel or
+rootfs.
+
+The official SDK supports Ubuntu 22.04 amd64. On macOS/Apple Silicon, the
+official amd64 Docker image can build it through architecture translation, but
+this host combination is not officially supported upstream. The Docker commands
+below specify the platform explicitly to avoid silently using the wrong
+architecture.
+
+Replace `/path/to/duo-buildroot-sdk` in the examples below with the actual
+absolute path to the SDK. The validated flashable image was built with SDK commit
+`23eb84fecb29585dbb5728d6b7e2475ff273baac` and official container digest
+`sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679`.
+Both `develop` and `latest` are mutable references. Use the commit and digest
+above to pin the source and tool inputs. FIT and FAT tooling can record build
+timestamps, so this flow does not claim byte-for-byte reproducible output;
+record the final image checksum when distributing an artifact.
+
+### 1. Build the stock SDK first
+
+Run the following directly on a native Ubuntu 22.04 amd64 host:
+
+```sh
+cd /path/to/duo-buildroot-sdk
+./build.sh milkv-duo-sd
+```
+
+On macOS/Apple Silicon, keep the source tree on a case-sensitive Linux file
+system. Do not build the Linux sources directly from a default,
+case-insensitive APFS working tree. When the SDK resides on a case-sensitive
+volume, use:
+
+```sh
+SDK=/absolute/path/to/duo-buildroot-sdk
+DUO_IMAGE=milkvtech/milkv-duo@sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679
+docker pull --platform linux/amd64 "$DUO_IMAGE"
+docker run --rm --platform linux/amd64 \
+  -v "$SDK:/home/work" \
+  "$DUO_IMAGE" \
+  /bin/bash -lc 'cd /home/work && ./build.sh milkv-duo-sd'
+```
+
+`milkv-duo-sd` is the CV1800B SD target registered on the current `develop`
+branch. Some `milkv-duo` examples in the upstream README are outdated. If a
+different revision does not recognize this target name, consult its `device/`
+directory and the target list printed by `./build.sh` with no arguments.
+
+### 2. Native Ubuntu amd64: build and package
+
+In the same Ubuntu amd64 environment as the SDK host tools, build the bare
+kernel first and then run the packaging script with complete error checking:
+
+```sh
+SDK=/absolute/path/to/duo-buildroot-sdk
+VIBEOS=/absolute/path/to/vibeos
+cd "$VIBEOS"
+./scripts/build-milkv-duo.sh "$SDK"
+./scripts/package-milkv-duo-sdk.sh "$SDK"
+```
+
+The packaging script combines the stock FIP and VibeOS FIT in an isolated
+temporary directory, invokes the SDK's `genimage` directly, and verifies the
+partition table, FAT file system, FIP, and FIT payload before publishing. It
+does not modify the SDK working tree or call the SDK's `pack_sd_image`, whose
+layout is hard-coded for two partitions. The final full-card image is
+`target/milkv-duo/vibeos-milkv-duo-sd.img`.
+
+### 3. Docker/macOS: build the kernel on the host, package in a container
+
+First generate the bare kernel from the VibeOS repository root, without an SDK
+argument:
+
+```sh
+cd /path/to/vibeos
+./scripts/build-milkv-duo.sh
+```
+
+Then mount both the SDK and VibeOS into the official container. The SDK may be
+mounted read-only during packaging. The container script generates and checks
+the FIT, runs `genimage` in isolated staging, and publishes the new image to
+VibeOS's `target/` only after the partition table and all payloads pass
+validation:
+
+```sh
+SDK=/absolute/path/to/duo-buildroot-sdk
+VIBEOS=/absolute/path/to/vibeos
+DUO_IMAGE=milkvtech/milkv-duo@sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679
+docker run --rm --platform linux/amd64 \
+  -v "$SDK:/home/work:ro" \
+  -v "$VIBEOS:/home/vibeos" \
+  "$DUO_IMAGE" \
+  /home/vibeos/scripts/package-milkv-duo-sdk.sh /home/work
+```
+
+The final flashable image is `target/milkv-duo/vibeos-milkv-duo-sd.img`.
+
+The image contains exactly one bootable, type `0x0c`, 128 MiB FAT partition. It
+has no Linux partition or ext4 rootfs. You can use read-only mounts to validate
+this MBR layout, the FIP and `boot.sd` in the FAT file system, the FIT metadata,
+and the payload CRC32 values:
+
+```sh
+DUO_IMAGE=milkvtech/milkv-duo@sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679
+docker run --rm --platform linux/amd64 \
+  -v "$SDK:/home/work:ro" \
+  -v "$VIBEOS:/home/vibeos:ro" \
+  "$DUO_IMAGE" \
+  /home/vibeos/scripts/verify-milkv-duo-image.sh /home/work
+```
+
+Keep the following layers distinct:
+
+- The SDK's `fip.bin` still provides the FSBL, OpenSBI, and U-Boot. It is not a
+  Linux rootfs.
+- `target/milkv-duo/boot.sd` is the FIT containing the VibeOS bare kernel and
+  board DTB. It is not the full-card image.
+- The packaging script only reads SDK artifacts. It does not replace the SDK's
+  `rawimages/boot.sd` or generate `rootfs.ext4`.
+
+Do not replace the FIP's `LOADER_2ND` directly with the VibeOS ELF or bare binary.
+That path uses the SDK's private BL33 header and a different jump convention.
+The supported path loads the VibeOS payload at `0x8020_0000` from the raw
+`boot.sd` FIT through U-Boot.
+
+Only the `*.img` file above is the final flashable image. Do not write the
+intermediate `boot.sd` across the entire microSD card.
+
+## Flashing and serial console
+
+Flashing overwrites the target card. Back up its data and check the selected
+device again before proceeding. This document does not execute any disk-writing
+commands automatically. Follow Milk-V's
+[official microSD flashing guide](https://milkv.io/docs/duo/getting-started/boot)
+and use a tool such as balenaEtcher or Rufus to write the final `*.img` generated
+by the packaging script. Do not use raw `dd` when the device identifier cannot
+be confirmed.
+
+Before powering on the board, connect a 3.3 V USB-to-TTL serial adapter with TX
+and RX crossed and a shared ground. Do not connect 5 V to the UART signal pins.
+Use these serial parameters:
+
+```text
+115200 baud, 8 data bits, no parity, 1 stop bit, no flow control
+```
+
+In short: **115200 8N1**.
+
+## Hardware validation checklist
+
+For the first hardware boot, preserve the full serial log and verify each item:
+
+- [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
+      native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
+      generates `target/milkv-duo/boot.sd`, with no FIT validation errors.
+- [x] The final `*.img` contains exactly one 128 MiB FAT boot partition. Its
+      `fip.bin` and `boot.sd` are byte-for-byte identical to this build, and no
+      Linux/rootfs partition exists.
+- [x] The serial console displays the FSBL, OpenSBI, U-Boot, and VibeOS banners.
+      The VibeOS platform name is Milk-V Duo/CV1800B.
+- [x] The kernel reports only one online hart and makes no attempt to probe or
+      start the C906L through HSM.
+- [x] UART input and output are stable, and the `vibe>` shell is accessible and
+      usable at 115200 8N1.
+- [x] `uptime` increases normally, and sleep/timer self-tests pass, demonstrating
+      that the 25 MHz timebase and SBI TIME path agree.
+- [x] PLIC context 1 receives UART0 IRQ 44, and continuous input neither loses
+      data nor triggers an interrupt storm.
+- [x] MMU diagnostics show the kernel in
+      `0x8020_0000..0x83e0_0000`, with no mapping or use of the FreeRTOS reserved
+      region beginning at `0x83f4_0000`.
+- [x] virtio features such as `blk info` and `net info` explicitly report
+      offline. This is expected for the current port and does not indicate a
+      boot failure.
+- [x] Run the self-tests appropriate for a single-core board configuration.
+      Preserve the full serial log before analyzing any trap, panic, or OpenSBI
+      extension error.
+
+The checklist above records one complete hardware acceptance run. It proves
+that the current image boots and supports interaction, but it must not be taken
+as a claim of production readiness or dual-core SMP support.

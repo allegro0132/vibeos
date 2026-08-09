@@ -920,7 +920,7 @@ enum WaitSignal {
 
 async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> WaitOutcome {
     let deadline = crate::sbi::time()
-        .saturating_add(REQUEST_TIMEOUT_MS.saturating_mul(exec::TIMEBASE_HZ / 1_000));
+        .saturating_add(REQUEST_TIMEOUT_MS.saturating_mul(exec::timebase_hz() / 1_000));
     loop {
         // Listener-before-check closes completion between the ring load and
         // waiter registration. A configuration-only IRQ consumes this listener
@@ -944,7 +944,7 @@ async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> Wa
         let remaining_ticks = deadline - now;
         let remaining_ms = remaining_ticks
             .saturating_mul(1_000)
-            .div_ceil(exec::TIMEBASE_HZ)
+            .div_ceil(exec::timebase_hz())
             .max(1);
         let timeout = exec::sleep_ms(remaining_ms);
         let mut irq = pin!(irq);

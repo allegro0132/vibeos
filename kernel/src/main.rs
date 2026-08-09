@@ -27,6 +27,7 @@ mod code_pool;
 mod dev;
 mod durable_cspace;
 mod mmu;
+mod platform;
 mod plic;
 mod rustc;
 mod saved_program;
@@ -48,7 +49,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const KERNEL_STACK_STRIDE: usize = 256 * 1024;
 const STACK_ABORT_RESERVE: usize = 8192;
-const SECONDARY_START_TIMEOUT_TICKS: u64 = exec::TIMEBASE_HZ * 5;
 const BOOT_HART_BIT: usize = 1;
 
 // Release/acquire publication makes the boot hart's heap, hooks, and mapping
@@ -172,14 +172,26 @@ const BANNER: &str = r#"
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    #[cfg(feature = "milkv-duo")]
+    uart::early_write("\r\n[VibeOS] entry\r\n");
+    exec::configure_timebase(platform::TIMEBASE_HZ);
     let boot_time = sbi::time();
     let boot_physical_hart = sbi::current_hart_id();
 
     mmu::init_boot(boot_physical_hart);
+    #[cfg(feature = "milkv-duo")]
+    uart::early_write("[VibeOS] page tables ready\r\n");
     mmu::enable(exec::HartId::BOOT.index());
+    #[cfg(feature = "milkv-duo")]
+    uart::early_write("[VibeOS] Sv39 enabled\r\n");
 
     uart::init();
     println!("{}", BANNER);
+    println!(
+        "  platform  {} ({} MHz timebase)",
+        platform::NAME,
+        platform::TIMEBASE_HZ / 1_000_000
+    );
 
     let (hs, he) = (
         core::ptr::addr_of!(__heap_start) as usize,
@@ -277,6 +289,17 @@ pub extern "C" fn kmain() -> ! {
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();
+    #[cfg(feature = "milkv-duo")]
+    {
+        uart::early_write("[VibeOS] interrupts enabled\r\n");
+        let (busy, phantom_timeout) = uart::dw_irq_recoveries();
+        if busy != 0 || phantom_timeout != 0 {
+            println!(
+                "  uart      recovered {} DW busy, {} phantom timeout IRQ(s)",
+                busy, phantom_timeout
+            );
+        }
+    }
     exec::run()
 }
 
@@ -288,7 +311,11 @@ fn start_secondary_harts() -> usize {
     let mut physical_for_logical = [usize::MAX; exec::MAX_HARTS];
     physical_for_logical[exec::HartId::BOOT.index()] = boot_physical_hart;
     let mut next_logical_index = 1;
-    for physical_hart in 0..exec::MAX_HARTS {
+    assert!(
+        platform::HART_IDS.contains(&boot_physical_hart),
+        "firmware boot hart is absent from the selected platform topology"
+    );
+    for &physical_hart in platform::HART_IDS {
         if physical_hart == boot_physical_hart {
             continue;
         }
@@ -335,7 +362,7 @@ fn start_secondary_harts() -> usize {
         if ready & expected == expected {
             break;
         }
-        if sbi::time().wrapping_sub(started_at) >= SECONDARY_START_TIMEOUT_TICKS {
+        if sbi::time().wrapping_sub(started_at) >= exec::timebase_hz() * 5 {
             panic!(
                 "secondary startup timed out: expected mask {:#x}, ready mask {:#x}",
                 expected, ready

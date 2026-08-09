@@ -2,8 +2,46 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> selftest
-[!] panic: panicked at kernel/src/selftest.rs:123:9:
+[!] panic: panicked at kernel/src/selftest.rs:LINE:COL:
+deliberate destructor fault from the self-test
+[!] panic: panicked at kernel/src/selftest.rs:LINE:COL:
+deliberate nested catcher fault from the self-test
+[!] panic: panicked at kernel/src/selftest.rs:LINE:COL:
 deliberate fault from the self-test
-  selftest: 56 passed, 0 failed
-  SELFTEST OK (56 checks)
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+component allocation quota exceeded
+  selftest: 388 passed, 0 failed
+  SELFTEST OK (388 checks)
 vibe> 

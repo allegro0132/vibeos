@@ -103,8 +103,10 @@ fn every_single_character_deletion_is_handled() {
 }
 
 /// Deep nesting is the classic way to blow a recursive-descent parser's stack.
-/// The kernel has 256 KiB and no guard page, and `rustc edit` accepts arbitrary
-/// console input -- so this must be *rejected*, not merely survived. A host test
+/// `rustc edit` accepts arbitrary console input on a 252 KiB usable kernel stack;
+/// M6.2's invalid 4 KiB guard faults accesses that land in that page, but does not
+/// catch a corrupted `sp` that skips over it; exhaustion is fatal, not safe parser
+/// rejection. This must therefore be *rejected*, not merely survived. A host test
 /// would pass either way on an 8 MB stack, which is exactly why the limit is
 /// asserted rather than assumed.
 #[test]

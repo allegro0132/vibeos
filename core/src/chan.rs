@@ -14,6 +14,7 @@ use core::any::Any;
 
 use crate::cap::Resource;
 use crate::exec::WaitQueue;
+use crate::heap::{self, OwnerId};
 use crate::sync::SpinLock;
 
 struct Inner<T> {
@@ -37,13 +38,26 @@ pub struct Endpoint<T: Send + 'static> {
 
 impl<T: Send + 'static> Endpoint<T> {
     pub fn new(name: &str, bound: usize) -> Arc<Self> {
-        Arc::new(Self {
+        // The endpoint and its bounded queue are shared runtime metadata, not
+        // memory that becomes invalid with whichever component created it.
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let endpoint = Arc::new(Self {
             name: String::from(name),
             bound,
-            inner: SpinLock::new(Inner { queue: VecDeque::new(), sent: 0, received: 0 }),
+            // A bounded channel never needs to grow while its queue lock is
+            // held.  Besides making the bound a physical reservation, this
+            // keeps an allocation failure from abandoning the shared lock via
+            // the task fault landing pad.
+            inner: SpinLock::new(Inner {
+                queue: VecDeque::with_capacity(bound),
+                sent: 0,
+                received: 0,
+            }),
             on_message: WaitQueue::new(),
             on_space: WaitQueue::new(),
-        })
+        });
+        system.restore();
+        endpoint
     }
 
     pub fn try_send(&self, msg: T) -> Result<(), T> {
@@ -62,11 +76,15 @@ impl<T: Send + 'static> Endpoint<T> {
     pub async fn send(&self, msg: T) {
         let mut pending = msg;
         loop {
+            // Prepare the listener before checking queue capacity. If a
+            // receiver creates space between these two operations, the
+            // listener's epoch records that wake and the await completes.
+            let space = self.on_space.wait();
             match self.try_send(pending) {
                 Ok(()) => return,
                 Err(m) => {
                     pending = m;
-                    self.on_space.wait().await;
+                    space.await;
                 }
             }
         }
@@ -83,10 +101,12 @@ impl<T: Send + 'static> Endpoint<T> {
 
     pub async fn recv(&self) -> T {
         loop {
+            // See send: listener-before-check closes the IRQ/producer race.
+            let message = self.on_message.wait();
             if let Some(m) = self.try_recv() {
                 return m;
             }
-            self.on_message.wait().await;
+            message.await;
         }
     }
 

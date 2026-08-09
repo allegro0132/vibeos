@@ -1,0 +1,10 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> net info
+  virtio-net: ready, queues rx=0/tx=1 size 8, header 12, features VERSION_1
+vibe> net test
+  raw L2 HELLO -> CHALLENGE -> ACK: ok
+  dual-queue completion: ok (IRQ observed; rx +1, tx +2)
+vibe> halt
+  powering off.

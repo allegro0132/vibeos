@@ -13,16 +13,34 @@ vibe> rustc hello
   compiled 1 fn -> 460 B of RV64 + 14 B of data in N us
   --- running natively ---
   --- exited with 0 in N us ---
-  note: output was suppressed -- `prog` holds no console capability
+  note: output was suppressed -- `prog` console authority is absent or revoked
 vibe> caps prog
+  owner unbound (generated code executes synchronously in the shell task)
   HANDLE       KIND      RIGHTS   OBJECT
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> revoke guest
   revoked 1 cap(s) in `guest`
-  (its next heartbeat will fail -- no restart, no signal)
+  (authority is gone; cancel then restart to install fresh grants)
 vibe> caps guest
+  owner component:3  task task:3  name guest  state running  reason -
+  memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> 
 [guest]  console denied: invalid or revoked capability -- guest is now mute
+vibe> ps
+  COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
+  component:1  task:1   sensor     sensor   running   -        N    65536 B
+  component:2  task:2   logger     logger   running   -        N    65536 B
+  component:3  task:3   guest      guest    exited    returned         2    65536 B
+  component:4  task:4   virtio-blk virtio-blk running   -        N    65536 B
+  component:5  task:6   shell      init     running   -        N    8388608 B
+  executor totals (including untracked tasks): 1 exited, 0 faulted, 0 cancelled
+  component allocation quotas are enforced; `mem` shows live and peak use
+  background output is muted; poll counts still rising
+vibe> caps guest
+  owner component:3  task task:3  name guest  state exited  reason returned
+  memory owner component:3  budget 65536 B  quota denials 0
+  HANDLE       KIND      RIGHTS   OBJECT
+  rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> 

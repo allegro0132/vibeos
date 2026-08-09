@@ -1,0 +1,10 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> smp queues
+  smp boot: four logical harts own four physical executors
+  smp queues: pinned hart1..hart3 tasks parked and resumed in place
+  smp ipi: boot-hart wakes reached all three remote executors
+  smp locks: PLIC/UART RX/virtio IRQ data handoff is lock-free
+  smp locks: scheduler acquisitions delta=N contention delta=N
+vibe> 

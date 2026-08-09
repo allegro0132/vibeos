@@ -1,0 +1,4 @@
+quiet
+rustc lease
+@sleep 2
+caps prog

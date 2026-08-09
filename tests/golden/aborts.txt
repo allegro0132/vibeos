@@ -41,11 +41,13 @@ vibe> rustc hello
 Hello, world!
   --- exited with 0 in N us ---
 vibe> ps
-  TASK          POLLS
-  sensor            9
-  logger            9
-  guest             3
-  shell            20
-  (0 exited, 0 faulted)
+  COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
+  component:1  task:1   sensor     sensor   running   -        N    65536 B
+  component:2  task:2   logger     logger   running   -        N    65536 B
+  component:3  task:3   guest      guest    running   -        N    65536 B
+  component:4  task:4   virtio-blk virtio-blk running   -        N    65536 B
+  component:5  task:6   shell      init     running   -        N    8388608 B
+  executor totals (including untracked tasks): 0 exited, 0 faulted, 0 cancelled
+  component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising
 vibe> 

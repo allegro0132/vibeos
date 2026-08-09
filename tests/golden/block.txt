@@ -1,0 +1,11 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> blk info
+  virtio-blk: ready, capacity 2048 sectors, queue size 8
+vibe> blk test
+  sector 7 seed: ok
+  sector 8 write + flush: ok
+  used-buffer IRQ delivery: ok
+vibe> halt
+  powering off.

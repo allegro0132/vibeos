@@ -1,0 +1,7 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> mmu guard fault
+  guard probe: hart0 store into 0xADDR
+[!] fatal trap: cause=15 stval=0xADDR sepc=0xADDR (store page fault)
+[!] stack guard: hart0 blocked store page fault

@@ -65,6 +65,8 @@ async fn run(line: &str, boot_time: u64) {
             println!("  rustc conform   compile and run the language conformance program");
             println!("  rustc lease     revoke during a run, then retry without new grants");
             println!("  rustc edit      type your own program; end it with a lone `.`");
+            println!("  rustc save hello  durably publish source + canonical VIBEEXE + authority");
+            println!("  run hello       run the recovered artifact through its persisted cap");
             println!("  chan            telemetry channel depth and totals");
             println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  durable         recover a sealed capability log and tombstone");
@@ -283,6 +285,16 @@ async fn run(line: &str, boot_time: u64) {
         }
 
         "rustc" => {
+            if rest.first().copied() == Some("save") {
+                if rest.get(1).copied() != Some(crate::program::PROGRAM_ALIAS)
+                    || rest.len() != 2
+                {
+                    println!("  usage: rustc save hello");
+                    return;
+                }
+                save_hello().await;
+                return;
+            }
             if rest.first().copied() == Some("lease") {
                 run_lease_demo().await;
                 return;
@@ -300,13 +312,21 @@ async fn run(line: &str, boot_time: u64) {
                 },
                 Some(other) => {
                     println!(
-                        "  usage: rustc [hello|demo|conform|lease|edit] (got `{}`)",
+                        "  usage: rustc [hello|demo|conform|lease|edit|save hello] (got `{}`)",
                         other
                     );
                     return;
                 }
             };
             compile_and_run(&src).await;
+        }
+
+        "run" => {
+            if rest.as_slice() != [crate::program::PROGRAM_ALIAS] {
+                println!("  usage: run hello");
+                return;
+            }
+            run_saved_hello().await;
         }
 
         "chan" => {
@@ -455,6 +475,78 @@ async fn compile_and_run(src: &str) {
 
     let out = crate::rustc::run(&compiled);
     report_run(&out);
+}
+
+async fn save_hello() {
+    let w = world();
+    let Some(service_cap) = w.saved_program else {
+        println!("  saved program: offline (no writable block backend)");
+        return;
+    };
+    let init = w.spaces["init"].clone();
+    let lease = init
+        .0
+        .lock()
+        .lookup_lease::<crate::saved_program::SavedProgramService>(service_cap, Rights::WRITE);
+    let report = match lease {
+        Ok(lease) => crate::saved_program::save_with(lease, crate::rustc::HELLO_SRC).await,
+        Err(_) => Err(crate::saved_program::SavedProgramError::PermissionDenied),
+    };
+    match report {
+        Ok(report) => {
+            println!(
+                "  saved `hello`: {} B source + {} B canonical VIBEEXE",
+                report.source_bytes, report.executable_bytes
+            );
+            println!(
+                "  durable artifact cap: slot {} generation {}, rights r",
+                report.identity.slot(), report.identity.generation()
+            );
+            println!("  authority manifest: console=w memory=rw; Store WRITE absent");
+        }
+        Err(crate::saved_program::SavedProgramError::AlreadySaved) => {
+            println!("  saved `hello`: already present; no object or grant appended");
+        }
+        Err(error) => println!("  saved `hello`: failed ({})", error),
+    }
+}
+
+async fn run_saved_hello() {
+    let w = world();
+    let Some(service_cap) = w.saved_program else {
+        println!("  saved program: offline (no readable block backend)");
+        return;
+    };
+    let init = w.spaces["init"].clone();
+    let lease = init
+        .0
+        .lock()
+        .lookup_lease::<crate::saved_program::SavedProgramService>(service_cap, Rights::READ);
+    let report = match lease {
+        Ok(lease) => crate::saved_program::run_with(lease).await,
+        Err(_) => Err(crate::saved_program::SavedProgramError::PermissionDenied),
+    };
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            println!("  run `hello`: refused ({})", error);
+            return;
+        }
+    };
+    println!(
+        "  recovered `hello`: cap slot {} generation {}, {} B source + {} B VIBEEXE",
+        report.identity.slot(),
+        report.identity.generation(),
+        report.source_bytes,
+        report.executable_bytes
+    );
+    println!(
+        "  verified current compiler match; linked {} fn -> {} B RV64 + {} B data",
+        report.funcs, report.compiled_bytes, report.data_bytes
+    );
+    println!("  authority: console=w memory=rw; Store WRITE absent");
+    println!("  --- running recovered program ---");
+    report_run(&report.outcome);
 }
 
 fn report_run(out: &crate::rustc::RunOutcome) {

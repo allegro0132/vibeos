@@ -19,13 +19,14 @@ extern crate alloc;
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, sync, virtio};
+pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, program, sync, virtio};
 
 mod bench;
 mod dev;
 mod durable_cspace;
 mod plic;
 mod rustc;
+mod saved_program;
 mod selftest;
 mod shell;
 mod store;
@@ -182,6 +183,11 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
 unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomain) {
     unsafe {
         store::recover_faulted_task(task, domain);
+        // Durable boot recovery installs and fail-closes the saved-program
+        // target. Repair all saved-program locks first so durable quarantine
+        // cannot spin on a guard abandoned by this same faulted task. Both
+        // hooks are idempotent and retain exact claims until isolation ends.
+        saved_program::recover_faulted_task(task, domain);
         durable_cspace::recover_faulted_task(task, domain);
     }
 }

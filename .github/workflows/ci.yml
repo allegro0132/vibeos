@@ -14,7 +14,8 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$toolchain"
-          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview
           {
             echo "VIBEOS_TOOLCHAIN=$toolchain"
             echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
@@ -43,7 +44,8 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$toolchain"
-          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview
           {
             echo "VIBEOS_TOOLCHAIN=$toolchain"
             echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
@@ -64,7 +66,8 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$toolchain"
-          rustup toolchain install "$toolchain" --profile minimal --component rust-src
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview
           {
             echo "VIBEOS_TOOLCHAIN=$toolchain"
             echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
@@ -80,6 +83,10 @@ jobs:
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
           qemu-system-riscv64 --version
           ld.lld --version
+      - name: Build the Milk-V Duo kernel
+        # FIT/full-card packaging still requires a prebuilt official SDK and
+        # remains part of the documented manual hardware acceptance flow.
+        run: ./scripts/build-milkv-duo.sh
       - name: Golden transcripts
         run: ./scripts/qemu-test.sh
       - name: QEMU/TCG benchmark regression budget

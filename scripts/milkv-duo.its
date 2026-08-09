@@ -1,0 +1,45 @@
+/dts-v1/;
+
+/ {
+	description = "VibeOS for Milk-V Duo";
+	#address-cells = <2>;
+
+	images {
+		kernel {
+			description = "VibeOS kernel";
+			data = /incbin/("vibeos-kernel.bin");
+			type = "kernel";
+			arch = "riscv";
+			os = "linux";
+			compression = "none";
+			load = <0x00000000 0x80200000>;
+			entry = <0x00000000 0x80200000>;
+
+			hash {
+				algo = "crc32";
+			};
+		};
+
+		fdt {
+			description = "Milk-V Duo CV1800B device tree";
+			data = /incbin/("cv1800b_milkv_duo_sd.dtb");
+			type = "flat_dt";
+			arch = "riscv";
+			compression = "none";
+
+			hash {
+				algo = "crc32";
+			};
+		};
+	};
+
+	configurations {
+		default = "config-cv1800b_milkv_duo_sd";
+
+		config-cv1800b_milkv_duo_sd {
+			description = "VibeOS Milk-V Duo boot";
+			kernel = "kernel";
+			fdt = "fdt";
+		};
+	};
+};

@@ -633,7 +633,7 @@ impl DriverSession {
                 .map_err(|_| NetError::QueueFull)?;
             publish_transmit(submission, &packet)?;
             self.tx_deadlines[submission.token.head as usize] = crate::sbi::time()
-                .saturating_add(TX_TIMEOUT_MS.saturating_mul(exec::TIMEBASE_HZ / 1_000));
+                .saturating_add(TX_TIMEOUT_MS.saturating_mul(exec::timebase_hz() / 1_000));
             published = true;
         }
         if published {

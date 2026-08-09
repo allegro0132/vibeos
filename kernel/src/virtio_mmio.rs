@@ -1,16 +1,17 @@
-//! Modern virtio-mmio transport for QEMU's RISC-V `virt` machine.
+//! Modern virtio-mmio transport for platforms which expose QEMU-style slots.
 //!
-//! The platform exposes eight 4 KiB transport windows.  Empty windows read as
-//! zero; a live modern transport has the virtio magic, version 2, and a
-//! non-zero device id.  This module deliberately contains only volatile MMIO
-//! access and transport sequencing.  Queue ownership and descriptor safety
-//! live in the supervised `virtio_blk` and `virtio_net` drivers.
+//! QEMU exposes eight 4 KiB transport windows; boards without this transport
+//! select zero slots and probing becomes a no-op. Empty windows read as zero;
+//! a live modern transport has the virtio magic, version 2, and a non-zero
+//! device id. This module deliberately contains only volatile MMIO access and
+//! transport sequencing. Queue ownership and descriptor safety live in the
+//! supervised `virtio_blk` and `virtio_net` drivers.
 
 use core::arch::asm;
 
 pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
 pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-pub const VIRTIO_MMIO_SLOTS: usize = 8;
+pub const VIRTIO_MMIO_SLOTS: usize = crate::platform::VIRTIO_MMIO_SLOTS;
 pub const VIRTIO_MMIO_FIRST_IRQ: u32 = 1;
 
 pub const VIRTIO_MAGIC: u32 = 0x7472_6976;
@@ -56,7 +57,7 @@ pub struct MmioTransport {
 }
 
 impl MmioTransport {
-    /// Inspect one of the eight architected QEMU transport windows.
+    /// Inspect one of the selected platform's architected transport windows.
     pub fn probe_slot(slot: usize) -> Option<Self> {
         if slot >= VIRTIO_MMIO_SLOTS {
             return None;

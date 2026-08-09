@@ -2,5 +2,5 @@
 # rustc-commit: ad3d0bc141a02cf446e384136d250a1f6950fed5
 [toolchain]
 channel = "nightly-2026-08-01"
-components = ["rust-src"]
+components = ["rust-src", "llvm-tools-preview"]
 profile = "minimal"

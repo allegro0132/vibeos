@@ -1,5 +1,4 @@
-//! SiFive PLIC as wired up by the QEMU `virt` machine, using the firmware-
-//! selected boot hart's S-mode context.
+//! RISC-V PLIC driver using the selected board's boot-hart S-mode context.
 //!
 //! IRQ handlers live in a small, fixed-capacity atomic registry. Registration
 //! never allocates. Dispatch takes one bounded sequence snapshot per slot and
@@ -10,7 +9,7 @@ use crate::interrupt::{AtomicIrqHandlerSlot, IrqHandlerPublication};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-pub const PLIC_BASE: usize = 0x0c00_0000;
+pub const PLIC_BASE: usize = crate::platform::PLIC_BASE;
 
 const PRIORITY: usize = PLIC_BASE;
 const ENABLE_CONTEXTS: usize = PLIC_BASE + 0x2000;
@@ -20,13 +19,13 @@ const CONTEXT_STRIDE: usize = 0x1000;
 const CLAIM_OFFSET: usize = 4;
 const UNINITIALIZED_CONTEXT: usize = usize::MAX;
 
-// QEMU virt exposes M/S context pairs for each physical hart; VibeOS routes
-// every external interrupt through the dynamically selected boot hart.
+// VibeOS routes every external interrupt through the selected boot hart. QEMU
+// has M/S pairs per hart; CV1800B's stock DT exposes S context 1 for C906B.
 static BOOT_S_CONTEXT: AtomicUsize = AtomicUsize::new(UNINITIALIZED_CONTEXT);
 
-// A PLIC context owns 0x80 bytes of enable words on QEMU `virt`: 32 words,
-// covering source IDs 0..=1023. Source zero is reserved as "no interrupt".
-const ENABLE_WORDS: usize = crate::interrupt::PLIC_ENABLE_WORDS;
+// Clear only words implemented by the selected PLIC. QEMU retains the full
+// 0x80-byte/1024-source context while CV1800B implements sources 1..=101.
+const ENABLE_WORDS: usize = (crate::platform::PLIC_MAX_IRQ as usize + 32) / 32;
 pub const MAX_HANDLERS: usize = 16;
 
 /// Allocation-free top-half callback. `context` is the value supplied during
@@ -55,10 +54,8 @@ static ENABLE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Reset the boot physical hart's S-mode PLIC context to a fully masked state.
 pub fn init(physical_hart: usize) {
-    let context = physical_hart
-        .checked_mul(2)
-        .and_then(|context| context.checked_add(1))
-        .expect("PLIC S-mode context index overflowed");
+    let context = crate::platform::plic_s_context(physical_hart)
+        .expect("boot hart has no S-mode PLIC context on the selected platform");
     BOOT_S_CONTEXT.store(context, Ordering::Release);
     let _writer = HANDLER_WRITER.lock();
     for slot in &HANDLERS {
@@ -80,6 +77,9 @@ pub fn init(physical_hart: usize) {
 /// Keeping registration and enabling separate lets callers finish device
 /// initialization before the first top half can run.
 pub fn register(irq: u32, handler: IrqHandler, context: usize) -> Result<(), RegisterError> {
+    if irq > crate::platform::PLIC_MAX_IRQ {
+        return Err(RegisterError::InvalidIrq);
+    }
     crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
 
     let _writer = HANDLER_WRITER.lock();
@@ -163,6 +163,9 @@ pub fn disable(irq: u32) -> Result<(), RegisterError> {
 }
 
 fn set_enabled(irq: u32, enabled: bool) -> Result<(), RegisterError> {
+    if irq > crate::platform::PLIC_MAX_IRQ {
+        return Err(RegisterError::InvalidIrq);
+    }
     let (word, bit) =
         crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
     let _enable = ENABLE_LOCK.lock();

@@ -29,8 +29,50 @@ use crate::sync::{SpinLock, TaskRecoveryContext, TaskRecoveryKey};
 
 pub use crate::runqueue::{HartId, HartRunQueueStats, MAX_HARTS};
 
-/// QEMU `virt` drives `mtime` at 10 MHz.
+/// Default timer frequency used by host tests and QEMU `virt`.
+///
+/// Bare-metal platforms configure the actual firmware timebase once during
+/// early boot through [`configure_timebase`]. Keeping this constant preserves
+/// deterministic host-test calculations while timer code reads the runtime
+/// value through [`timebase_hz`].
 pub const TIMEBASE_HZ: u64 = 10_000_000;
+const UNCONFIGURED_TIMEBASE_HZ: u64 = 0;
+static CONFIGURED_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(UNCONFIGURED_TIMEBASE_HZ);
+
+/// Configure the firmware timer frequency before any timer is armed.
+///
+/// Repeating the same value is harmless; changing an already configured value
+/// is rejected because outstanding deadlines would otherwise change units.
+pub fn configure_timebase(hz: u64) {
+    assert!(
+        hz >= 1_000_000,
+        "timer timebase must provide microsecond resolution"
+    );
+    let previous = CONFIGURED_TIMEBASE_HZ
+        .compare_exchange(
+            UNCONFIGURED_TIMEBASE_HZ,
+            hz,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .unwrap_or_else(|configured| configured);
+    assert!(
+        previous == UNCONFIGURED_TIMEBASE_HZ || previous == hz,
+        "timer timebase changed after configuration"
+    );
+}
+
+pub fn timebase_hz() -> u64 {
+    match CONFIGURED_TIMEBASE_HZ.compare_exchange(
+        UNCONFIGURED_TIMEBASE_HZ,
+        TIMEBASE_HZ,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => TIMEBASE_HZ,
+        Err(configured) => configured,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TaskId(pub u64);
@@ -2587,7 +2629,7 @@ fn next_timer_id() -> u64 {
 }
 
 fn arm_locked(timers: &[TimerEntry]) {
-    let heartbeat = arch::time().saturating_add(HEARTBEAT_SECS.saturating_mul(TIMEBASE_HZ));
+    let heartbeat = arch::time().saturating_add(HEARTBEAT_SECS.saturating_mul(timebase_hz()));
     let next = timers.last().map(|timer| timer.deadline);
     arch::set_timer(next.map_or(heartbeat, |deadline| deadline.min(heartbeat)));
 }
@@ -2686,7 +2728,7 @@ pub fn init_timer() {
 
 pub fn sleep_ms(ms: u64) -> Sleep {
     Sleep {
-        deadline: arch::time().saturating_add(ms.saturating_mul(TIMEBASE_HZ / 1000)),
+        deadline: arch::time().saturating_add(ms.saturating_mul(timebase_hz() / 1000)),
         registration: None,
         owned_registration: None,
     }

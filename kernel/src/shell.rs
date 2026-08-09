@@ -461,7 +461,7 @@ async fn run(line: &str, boot_time: u64) {
 
         "uptime" => {
             let ticks = sbi::time() - boot_time;
-            let ms = ticks / (exec::TIMEBASE_HZ / 1000);
+            let ms = ticks / (exec::timebase_hz() / 1000);
             println!("  up {}.{:03} s", ms / 1000, ms % 1000);
         }
 
@@ -1034,7 +1034,7 @@ async fn smp_queue_demo() {
     }
     let contention_preflight = sbi::time();
     while contention_ready.load(Ordering::Acquire) != exec::MAX_HARTS - 1
-        && sbi::time().wrapping_sub(contention_preflight) < exec::TIMEBASE_HZ
+        && sbi::time().wrapping_sub(contention_preflight) < exec::timebase_hz()
     {
         exec::yield_now().await;
     }
@@ -1160,7 +1160,7 @@ async fn smp_scale_demo() {
 
     let mut remotes_started = false;
     let preflight_started = sbi::time();
-    while sbi::time().wrapping_sub(preflight_started) < exec::TIMEBASE_HZ {
+    while sbi::time().wrapping_sub(preflight_started) < exec::timebase_hz() {
         if remote_ready.load(Ordering::Acquire) == exec::MAX_HARTS - 1 {
             remotes_started = true;
             break;
@@ -1239,7 +1239,7 @@ async fn compile_and_run(src: &str) {
             return;
         }
     };
-    let compile_us = (sbi::time() - t0) / (exec::TIMEBASE_HZ / 1_000_000);
+    let compile_us = (sbi::time() - t0) / (exec::timebase_hz() / 1_000_000);
     println!(
         "  compiled {} fn -> {} B of RV64 + {} B of data in {} us",
         compiled.funcs, compiled.bytes, compiled.data_bytes, compile_us
@@ -1341,7 +1341,7 @@ async fn run_lease_demo() {
             return;
         }
     };
-    let compile_us = (sbi::time() - t0) / (exec::TIMEBASE_HZ / 1_000_000);
+    let compile_us = (sbi::time() - t0) / (exec::timebase_hz() / 1_000_000);
     println!(
         "  compiled {} fn -> {} B of RV64 + {} B of data in {} us",
         compiled.funcs, compiled.bytes, compiled.data_bytes, compile_us

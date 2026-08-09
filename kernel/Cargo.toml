@@ -2,6 +2,12 @@
 name = "vibeos-kernel"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[features]
+default = ["qemu-virt"]
+qemu-virt = []
+milkv-duo = []
 
 # The kernel is `no_std` and cannot link a host test harness. Its tests live in
 # `selftest.rs` and run inside QEMU; `cargo test --workspace` must skip it.

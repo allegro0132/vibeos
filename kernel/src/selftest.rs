@@ -360,7 +360,7 @@ fn paging(h: &mut Harness) {
     );
     let boot_physical = sbi::current_hart_id();
     let boot_s_context = crate::mmu::plic_s_context_page(boot_physical)
-        .expect("the boot physical hart is within the dense QEMU topology");
+        .expect("the boot physical hart is within the selected platform topology");
     h.check(
         "only the boot hart's PLIC S-context is mapped",
         crate::mmu::mapping(boot_s_context).is_some(),
@@ -516,7 +516,7 @@ async fn component_restart(h: &mut Harness) {
 async fn timers(h: &mut Harness) {
     let start = sbi::time();
     exec::sleep_ms(25).await;
-    let elapsed_ms = (sbi::time() - start) / (exec::TIMEBASE_HZ / 1000);
+    let elapsed_ms = (sbi::time() - start) / (exec::timebase_hz() / 1000);
     h.check(
         "sleep_ms waits at least the requested time",
         elapsed_ms >= 25,
@@ -530,7 +530,7 @@ async fn timers(h: &mut Harness) {
     exec::sleep_ms(0).await;
     h.check(
         "sleep_ms(0) does not block",
-        sbi::time() - t0 < exec::TIMEBASE_HZ / 100,
+        sbi::time() - t0 < exec::timebase_hz() / 100,
     );
 }
 
@@ -959,7 +959,7 @@ async fn catcher_abi(h: &mut Harness) {
     }
     let timer_start = sbi::time();
     exec::sleep_ms(1).await;
-    let timer_ms = (sbi::time() - timer_start) / (exec::TIMEBASE_HZ / 1000);
+    let timer_ms = (sbi::time() - timer_start) / (exec::timebase_hz() / 1000);
     h.check(
         "timer IRQs remain live after nested non-local exits",
         timer_ms < 100,
@@ -1050,7 +1050,7 @@ async fn component_memory(h: &mut Harness) {
 
     let irq_probe_start = sbi::time();
     exec::sleep_ms(1).await;
-    let irq_probe_ms = (sbi::time() - irq_probe_start) / (exec::TIMEBASE_HZ / 1000);
+    let irq_probe_ms = (sbi::time() - irq_probe_start) / (exec::timebase_hz() / 1000);
     h.check(
         "quota fault restores interrupts skipped by longjmp",
         irq_probe_ms < 100,
@@ -1196,7 +1196,7 @@ async fn fault_arena_restart(h: &mut Harness) {
         let irq_probe_start = sbi::time();
         exec::sleep_ms(1).await;
         let irq_probe_ms =
-            (sbi::time() - irq_probe_start) / (exec::TIMEBASE_HZ / 1000);
+            (sbi::time() - irq_probe_start) / (exec::timebase_hz() / 1000);
         h.check(
             "a faulted CSpace lock does not leave interrupts masked",
             irq_probe_ms < 100,

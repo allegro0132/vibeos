@@ -70,7 +70,7 @@ pub async fn run() {
     println!(
         "VIBE_BENCH_META {{\"schema\":\"vibeos.bench.meta\",\"version\":{},\"clock\":\"riscv.rdtime\",\"timebase_hz\":{},\"target\":\"riscv64imac-unknown-none-elf\",\"profile\":\"release\",\"heap_start_live_bytes\":{}}}",
         SCHEMA_VERSION,
-        exec::TIMEBASE_HZ,
+        exec::timebase_hz(),
         heap_start.live_bytes,
     );
 
@@ -221,7 +221,7 @@ fn compiler_and_generated_code() {
             .expect("fixed benchmark source must compile");
         let elapsed = sbi::time().saturating_sub(started).max(1);
         let bytes_per_second =
-            (crate::rustc::BENCH_SRC.len() as u64).saturating_mul(exec::TIMEBASE_HZ) / elapsed;
+            (crate::rustc::BENCH_SRC.len() as u64).saturating_mul(exec::timebase_hz()) / elapsed;
         core::hint::black_box(compiled.bytes);
         throughput.push(bytes_per_second);
     }

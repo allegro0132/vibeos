@@ -40,18 +40,21 @@ SECTIONS {
     __dma_end = .;
   } > RAM
 
-  /* One fixed kernel stack per logical scheduler hart.  The bank is indexed
-     by the HSM opaque logical id before the secondary enters Rust, so no two
-     physical harts ever share a live stack. */
+  /* One fixed stack slot per logical scheduler hart. The first 4 KiB of every
+     256 KiB slot is physically reserved but left unmapped by Sv39; the
+     remaining 252 KiB is the usable downward-growing stack. Keeping the slot
+     stride at 256 KiB preserves the shift-only HSM entry path. */
   . = ALIGN(4K);
-  __stack_bottom = .;
   __stacks_bottom = .;
-  __kernel_stack_size = 256K;
-  . += 4 * 256K;
+  __stack_guard_size = 4K;
+  __kernel_stack_stride = 256K;
+  __kernel_stack_size = __kernel_stack_stride - __stack_guard_size;
+  __stack_bottom = __stacks_bottom + __stack_guard_size;
+  . += 4 * __kernel_stack_stride;
   __stacks_top = .;
 
   /* Retain the historical boot-stack top symbol for the cold entry path. */
-  __stack_top = __stack_bottom + 256K;
+  __stack_top = __stacks_bottom + __kernel_stack_stride;
 
   . = ALIGN(4K);
   __heap_start = .;

@@ -44,7 +44,7 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const KERNEL_STACK_SIZE: usize = 256 * 1024;
+const KERNEL_STACK_STRIDE: usize = 256 * 1024;
 const STACK_ABORT_RESERVE: usize = 8192;
 const SECONDARY_START_TIMEOUT_TICKS: u64 = exec::TIMEBASE_HZ * 5;
 const BOOT_HART_BIT: usize = 1;
@@ -136,15 +136,16 @@ extern "C" {
 
 /// Lowest address a compiled program's current-hart stack may reach.
 ///
-/// The four fixed stacks are contiguous above `.bss`; selecting the logical
-/// slot here keeps generated-code stack probes inside the same private stack
-/// chosen by `_secondary_start`.
+/// `__stack_bottom` is the first byte above logical hart 0's guard. Selecting
+/// the fixed slot stride keeps generated-code probes inside the same private
+/// mapped stack chosen by `_secondary_start`, with 8 KiB of mapped abort room
+/// still below the returned floor.
 pub fn stack_floor() -> usize {
     // Leave a band so the abort path itself has room to run.
     let hart =
         ipi::current_logical_hart().expect("compiled program stack requires a mapped logical hart");
     core::ptr::addr_of!(__stack_bottom) as usize
-        + hart.index() * KERNEL_STACK_SIZE
+        + hart.index() * KERNEL_STACK_STRIDE
         + STACK_ABORT_RESERVE
 }
 

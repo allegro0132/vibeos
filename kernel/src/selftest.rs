@@ -346,6 +346,56 @@ fn paging(h: &mut Harness) {
         "the diagnostic walker rejects non-canonical Sv39 addresses",
         crate::mmu::mapping(1usize << 39).is_none(),
     );
+    h.check(
+        "every logical stack guard is unmapped",
+        (0..exec::MAX_HARTS).all(|index| {
+            crate::mmu::stack_guard_page(index)
+                .is_some_and(|guard| crate::mmu::mapping(guard).is_none())
+        }),
+    );
+    h.check(
+        "every usable stack begins and ends on identity-mapped RW-NX pages",
+        (0..exec::MAX_HARTS).all(|index| {
+            let Some(start) = crate::mmu::stack_usable_start(index) else {
+                return false;
+            };
+            let end = crate::mmu::stack_guard_page(index).expect("guard exists")
+                + crate::mmu::STACK_SLOT_STRIDE
+                - PAGE_SIZE;
+            [start, end].into_iter().all(|address| {
+                crate::mmu::mapping(address).is_some_and(|mapping| {
+                    mapping.physical == address
+                        && mapping.page_size == PAGE_SIZE
+                        && mapping
+                            .permissions
+                            .contains(PagePermissions::READ.union(PagePermissions::WRITE))
+                        && !mapping.permissions.contains(PagePermissions::EXECUTE)
+                })
+            })
+        }),
+    );
+    let current_hart =
+        crate::ipi::current_logical_hart().expect("self-test runs on a registered hart");
+    h.eq(
+        "generated code retains 8 KiB of mapped abort stack above the guard",
+        crate::stack_floor(),
+        crate::mmu::stack_usable_start(current_hart.index())
+            .expect("current stack slot exists")
+            + 8192,
+    );
+    h.check(
+        "stack guards are page-aligned, evenly strided, and exclude usable bytes",
+        (0..exec::MAX_HARTS).all(|index| {
+            let guard = crate::mmu::stack_guard_page(index).expect("guard exists");
+            guard % PAGE_SIZE == 0
+                && (index == 0
+                    || guard
+                        - crate::mmu::stack_guard_page(index - 1).expect("previous guard exists")
+                        == crate::mmu::STACK_SLOT_STRIDE)
+                && crate::mmu::stack_guard_hart(guard) == Some(index)
+                && crate::mmu::stack_guard_hart(guard + crate::mmu::STACK_GUARD_SIZE).is_none()
+        }),
+    );
 }
 
 /// ROADMAP 3.12. A restart keeps the supervised identity and Space route while

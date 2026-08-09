@@ -183,6 +183,13 @@ extern "C" fn __trap_handler(irq_entry: u64) {
             sepc,
             exception_name(code)
         );
+        if let Some(hart) = crate::mmu::stack_guard_hart(stval) {
+            crate::println!(
+                "[!] stack guard: hart{} blocked {}",
+                hart,
+                exception_name(code)
+            );
+        }
         sbi::shutdown(true);
     }
 

@@ -21,7 +21,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   inventory, IRQ hot-path replacements, retained transaction boundaries, and
   multicore measurement gates.
 - **[docs/MMU.md](docs/MMU.md)** — the shared Sv39 map, boot publication
-  contract, mapped apertures, and integrity-hardening sequence.
+  contract, mapped apertures, per-hart stack guards, and integrity-hardening
+  sequence.
 - **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
@@ -130,10 +131,12 @@ a syscall or IPC costs a mode switch, a TLB flush, and a copy. That price bought
 protection from *unsafe languages*. If components are memory-safe by
 construction, you can charge a function call instead.
 
-VibeOS runs every component in one address space with no MMU and no user mode.
-The enforcement boundary is `unsafe` — of which there are ~10 uses, all in the
-hardware layer (`sbi`, `uart`, `plic`, `trap`, `heap`, `sync`) and none in the
-capability core's decision path. IPC is a queue push, not a context switch.
+VibeOS runs every component in one shared S-mode address space with no user mode
+or per-process page tables. Its shared Sv39 map enforces kernel integrity
+properties such as invalid stack guards, not component isolation. The enforcement
+boundary remains `unsafe` — of which there are ~10 uses, all in the hardware layer
+(`sbi`, `uart`, `plic`, `trap`, `heap`, `sync`) and none in the capability core's
+decision path. IPC is a queue push, not a context switch.
 
 The honest caveat: this makes the Rust compiler part of the TCB, and a component
 compiled from unsafe code could forge a `Cap` by transmuting one. v0.1 is a
@@ -249,9 +252,11 @@ literals use the shortest stable one- or two-instruction form when possible. Bot
 passes therefore agree on layout. Branches are emitted as an inverted conditional
 over a `jal`, giving ±1 MB of range instead of the 4 KB a bare `beq` would allow.
 
-VibeOS now has one shared Sv39 address space, but M6.1 deliberately leaves kernel
-RAM RWX. Until M6.3, "load the program" is still `fence.i` followed by transmuting
-the code buffer to a function pointer and calling it.
+VibeOS now has one shared Sv39 address space. M6.2 leaves each 4 KiB stack guard
+invalid and maps the remaining 252 KiB in its fixed 256 KiB per-hart slot RW-NX.
+Ordinary RAM, including the heap-backed code buffer, is still RWX until M6.3, so
+"load the program" remains `fence.i` followed by transmuting that buffer to a
+function pointer and calling it.
 
 ### And this is where it earns its place in *this* OS
 
@@ -402,13 +407,19 @@ Deliberate, not overlooked:
   running/wake slots, current-task and allocation provenance, interrupt markers,
   and task/program recovery state per logical hart. A validated per-hart
   `sscratch` token keeps those lookups O(1). M5.5 boots three secondaries through
-  SBI HSM, gives all four harts private 256 KiB stacks and local trap/timer state,
-  routes external interrupts only through the dynamic boot-hart PLIC context,
-  and runs the complete integration suite with `-smp 4`.
+  SBI HSM, gives all four harts private 256 KiB stack slots and local trap/timer
+  state, routes external interrupts only through the dynamic boot-hart PLIC
+  context, and runs the complete integration suite with `-smp 4`.
   M6.1 installs one shared Sv39 identity map on all four harts, with 4 KiB RAM
   leaves, non-executable device mappings, and deliberate holes for firmware,
-  null, and unused physical space. Type/capability confinement remains the
-  isolation boundary; this page table exists for integrity hardening.
+  null, and unused physical space. M6.2 makes the first 4 KiB of every stack slot
+  an invalid guard, maps the remaining 252 KiB RW-NX, and keeps 8 KiB of that
+  usable stack below the generated-code floor for its normal abort path. Any access
+  that lands in the guard faults, but a single-page guard does not catch a corrupted
+  `sp` that jumps over it into another mapped page and is not a recovery stack: an
+  already bad `sp` may fault recursively during trap entry before a diagnostic can
+  run. Type/capability confinement remains the isolation boundary; this page table
+  exists for integrity hardening.
   M4.3 restores
   the externally constrained `persistent-test` graph. M4.5 adds one immutable
   `hello` ProgramArtifact whose source and canonical

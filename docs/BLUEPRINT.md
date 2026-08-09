@@ -2,13 +2,14 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6.1 are
-complete; M6.2 guard pages are next, and the original M3 language-expansion items remain partial. The implementation is across
-`core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
-corpus inventory, while the QEMU harness reports target check counts from the boot
-it observed. Everything described as *implemented* below runs today; planned work
-is marked as such. Version strings in the boot banner are historical and are not
-used as the source of truth; milestone state lives in [ROADMAP.md](ROADMAP.md).
+**Status (2026-08-09):** M1, M2, M3.5, M4.0--M4.5, M5.1--M5.5, and M6.1--M6.2
+are complete; M6.3 W^X is next, and the original M3 language-expansion items
+remain partial. The implementation is across `core`, `compiler`, and `kernel`.
+`scripts/status.sh` derives the current host and corpus inventory, while the QEMU
+harness reports target check counts from the boot it observed. Everything
+described as *implemented* below runs today; planned work is marked as such.
+Version strings in the boot banner are historical and are not used as the source
+of truth; milestone state lives in [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -238,14 +239,17 @@ the boot hart online; stopped secondaries retain software reasons for M5.5.
 
 M5.5 uses SBI HSM `hart_status` and asynchronous `hart_start`. The boot hart first
 reserves a unique logical/physical mapping without publishing ONLINE; each
-secondary selects its 256 KiB stack from the logical opaque value, installs `tp`,
-`sscratch`, `stvec`, and its local timer, then self-registers and publishes a ready
-bit. The firmware-selected coldboot hart always owns logical 0, so QEMU may choose
-any physical ID without repeating BSS/global initialization. Only that physical
-hart enables external interrupts, and the PLIC S-mode context is computed from its
-actual ID; secondaries enable only software and timer interrupts. Current topology
-discovery intentionally scans QEMU `virt`'s dense physical IDs `0..3`; a general
-platform port must enumerate the FDT instead of extending that assumption.
+secondary selects its 256 KiB stack slot from the logical opaque value, installs
+`tp`, `sscratch`, `stvec`, and its local timer, then self-registers and publishes a
+ready bit. M6.2 leaves the low 4 KiB page of every slot unmapped and maps the other
+252 KiB read/write and non-executable; the 256 KiB stride and the shift-only HSM
+selection stay unchanged. The firmware-selected coldboot hart always owns logical
+0, so QEMU may choose any physical ID without repeating BSS/global initialization.
+Only that physical hart enables external interrupts, and the PLIC S-mode context
+is computed from its actual ID; secondaries enable only software and timer
+interrupts. Current topology discovery intentionally scans QEMU `virt`'s dense
+physical IDs `0..3`; a general platform port must enumerate the FDT instead of
+extending that assumption.
 
 M5.3 hardens the interrupt-safe lock for physical-hart ownership and records the
 complete retain/replace inventory in [SPINLOCK_AUDIT.md](SPINLOCK_AUDIT.md).
@@ -352,10 +356,12 @@ than speed, because the emitter is a security boundary (§6.3).
 Branches are an inverted conditional over a `jal`: ±1 MB of range instead of the
 4 KB a bare `beq` allows.
 
-M6.1 now runs this single address space through Sv39, but RAM intentionally remains
-RWX until M6.3. Loading a program is therefore still `fence.i` plus a transmute of
-the code buffer to a function pointer; the dedicated W^X transition is not yet
-claimed.
+M6.1 now runs this single address space through Sv39. M6.2 makes each stack's 4 KiB
+guard invalid and its 252 KiB usable portion RW-NX; ordinary RAM, including the
+current heap-backed code buffer, remains RWX until M6.3. Loading a program is
+therefore still `fence.i` plus a transmute of the code buffer to a function pointer;
+the dedicated W^X transition is not yet claimed. Generated-code probes keep an
+additional 8 KiB of mapped abort room above the guard.
 
 ### 6.3 Why generated code is confined
 
@@ -402,9 +408,18 @@ has three defences, and it remains the highest risk in the system:
   runs it, and requires VibeOS to produce identical bytes.
 - The front end is fuzzed against 25,000 generated inputs, every prefix and
   every single-character deletion of the samples, and rejects nesting deeper
-  than 64 — `rustc edit` reads arbitrary console input onto a 256 KiB kernel
-  stack with no guard page, so unbounded parser recursion was itself a way to
-  corrupt memory from the shell prompt.
+  than 64. `rustc edit` reads arbitrary console input on a 252 KiB usable kernel
+  stack; M6.2 now faults accesses that land in the slot's invalid 4 KiB guard,
+  while the parser limit prevents hostile input from deliberately consuming the
+  stack and entering that fatal path.
+
+The guard is deliberately a fail-stop boundary for addresses within that page, not
+an emergency stack or complete stack-clash defence. A corrupted `sp` can jump over
+one guard page into another mapped page, and trap entry saves registers on the
+current `sp`, so an actual bad-`sp` overflow may fault recursively before the
+normal diagnostic can run. Faulting accesses that land in the guard is the M6.2
+claim; skipped-guard protection needs probing or a stronger boundary, and reliable
+overflow reporting or recovery needs a separate per-hart trap stack.
 
 Because these checks exist, `!` is now Rust's bitwise complement rather than
 logical negation: a subset that disagrees with the language it claims to subset

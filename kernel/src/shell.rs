@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cap::{CapError, Rights};
 use crate::chan::Endpoint;
@@ -74,6 +75,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  pcspace test    exercise three-boot persistent authority recovery");
+            println!("  smp queues      prove logical remote queues are stolen exactly once");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -357,6 +359,14 @@ async fn run(line: &str, boot_time: u64) {
 
         "pcspace" => persistent_cspace_command(&rest).await,
 
+        "smp" => {
+            if rest.as_slice() != ["queues"] {
+                println!("  usage: smp queues");
+                return;
+            }
+            smp_queue_demo().await;
+        }
+
         "selftest" => {
             let r = crate::selftest::run().await;
             // CI greps for this line, so keep the wording stable.
@@ -439,6 +449,59 @@ async fn run(line: &str, boot_time: u64) {
         }
 
         other => println!("  unknown command: {} (try `help`)", other),
+    }
+}
+
+/// Deterministic M5.1 acceptance probe.
+///
+/// Secondary physical harts remain gated until M5.5. These untracked tasks are
+/// placed on the three logical remote queues so hart 0 must steal them.
+async fn smp_queue_demo() {
+    let before = exec::scheduler_stats();
+    let mut counters = Vec::new();
+    let mut handles = Vec::new();
+    let mut placement_ok = true;
+
+    for index in 1..exec::MAX_HARTS {
+        let hart = exec::HartId::new(index).expect("logical scheduler hart is valid");
+        let counter = Arc::new(AtomicU64::new(0));
+        let task_counter = counter.clone();
+        let handle = exec::spawn_tracked_on(hart, "smp-queue-probe", async move {
+            task_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        placement_ok &= exec::task_queue_owner(handle.id()) == Some(hart);
+        counters.push(counter);
+        handles.push(handle);
+    }
+
+    let placed = exec::scheduler_stats();
+    placement_ok &= (1..exec::MAX_HARTS)
+        .all(|index| placed.harts[index].queued == before.harts[index].queued + 1);
+
+    let mut exits_once = true;
+    for handle in &handles {
+        let exit = handle.join().await;
+        exits_once &= exit.state() == exec::TaskState::Exited && exit.polls() == 1;
+    }
+
+    let after = exec::scheduler_stats();
+    let ran_once = placement_ok
+        && exits_once
+        && counters
+            .iter()
+            .all(|counter| counter.load(Ordering::SeqCst) == 1)
+        && (1..exec::MAX_HARTS)
+            .all(|index| after.harts[index].queued == before.harts[index].queued);
+    let steals = after.harts[exec::HartId::BOOT.index()]
+        .steals
+        .saturating_sub(before.harts[exec::HartId::BOOT.index()].steals);
+
+    if ran_once && steals == (exec::MAX_HARTS - 1) as u64 {
+        println!("  smp queues: remote hart1..hart3 tasks each ran once");
+        println!("  smp queues: hart0 steal delta=3");
+        println!("  smp queues: physical secondary harts gated until M5.5");
+    } else {
+        println!("  smp queues: FAILED scheduler acceptance invariant");
     }
 }
 

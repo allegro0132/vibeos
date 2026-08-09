@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16 and M4.5 are complete. M5.1 per-hart run queues are next. Run
+> sequence through 3.16, M4.5, and M5.1 are complete. M5.2 cross-hart wakeups are next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -476,7 +476,7 @@ recovered source/binary object with exactly the fixed persisted authority manife
 
 | # | Work item |
 |---|---|
-| 5.1 | Per-hart run queues with work stealing |
+| 5.1 ✅ | Per-hart run queues with work stealing |
 | 5.2 | IPI-based cross-hart wakeups (SBI `sbi_send_ipi`) |
 | 5.3 | Audit every `SpinLock` for real contention; replace the hot ones with lock-free structures |
 | 5.4 | Hart-local storage for the scheduler's `running` slot |
@@ -487,6 +487,29 @@ scaling on a parallel benchmark. Loom or a similar model checker on the schedule
 
 **Risk:** the `running`/`running_woken` mechanism is single-hart by construction and
 will need rethinking, not porting.
+
+5.1 makes ready ownership explicit across four logical hart queues. Each enqueue,
+wake, cancel, fault, and dispatch keeps `TaskId -> queue owner` synchronized under
+the scheduler lock; hart 0 prefers local FIFO work and deterministically steals
+eligible remote work. Spawn reserves every queue for the global live-task bound, so
+an IRQ wake performs no allocation. Scheduler stats expose per-hart queued,
+dispatch, and steal counts, while `wake_with_disposition` returns the disposition
+and target hart for the M5.2 notification boundary without breaking the original
+`wake` API. Raw-reclaimable fault arenas remain hart-affine and
+non-stealable because sibling quiescence is not yet a cross-hart invariant.
+
+**M5.1 acceptance:** pure queue tests and a two-task fixed-point model cover unique
+ownership, capacity, steal, wake-during-poll, cancellation, and fault publication.
+`scripts/qemu-test.sh smp_queues` retains the one-CPU physical acceptance boundary,
+places one untracked task on each logical remote queue, and requires hart 0 to
+steal all three with each task executing exactly once. IPI delivery, hart-local
+running slots, and secondary-hart boot remain gated to 5.2, 5.4, and 5.5
+respectively.
+
+**M5.5 preflight risk:** a pre-M5.5 `-smp 4` smoke run did not produce the
+shell-ready marker even though `_start` contains a non-boot-hart park branch. M5.1
+does not hide that gap or claim parked-hart evidence; the SBI/QEMU handoff must be
+diagnosed before secondary boot is enabled or `-smp 4` becomes acceptance.
 
 ---
 
@@ -593,7 +616,7 @@ toolchain revision, build profile, sample count, and distribution (not only a mi
 | A resolved object outlives the cap that authorized it | **High** | 3.16 explicit lease semantics; operation-time revalidation for revocable devices; no “immediate” claim for raw memory without enforcement |
 | Ordinary faulted tasks leak heap | **Medium** | 3.12 reclaims only sealed World arenas after incarnation-wide teardown; generic tasks retain the sound conservative leak policy until they gain an equivalent no-escape contract |
 | Bet 2's cheap-IPC claim goes unmeasured and turns out false | High | §5 metrics in M3.5, before optimizing or scaling the design |
-| The single-hart executor design does not survive M5 | Medium | Treat 5.1 as a redesign, not a port; write the model check first |
+| Physical multicore execution races the single `running` slot | Medium | 5.1 completed the model-checked queue redesign; 5.4 must make the running slot hart-local before 5.5 boots secondaries |
 | Language features outrun confinement | Medium | M2 strictly before M3; no new syntax without an abort path |
 | Scope sprawl into POSIX compatibility | Medium | Blueprint §9 is binding |
 | A pinned toolchain becomes unavailable or its provenance drifts | Medium | 3.14 records the exact rustc commit, verifies it locally and in CI, and makes all build entry points consume the same rustup file |

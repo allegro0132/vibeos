@@ -312,6 +312,7 @@ net test        exchange a typed raw-L2 challenge with the localhost test peer
 net fault       fault after TX publication, reset/restart, then repeat the exchange
 rustc edit      type your own program; end it with a lone `.`
 pcspace test    exercise the three-boot persistent CSpace lifecycle
+smp queues      prove hart0 steals logical remote tasks exactly once
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
 cancel <name>   cooperatively stop a component (the active shell is protected)
@@ -380,7 +381,9 @@ Deliberate, not overlooked:
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
 - **Persistent authority is deliberately fixed-shape; no MMU, user mode, or
-  multicore yet.** M4.3 restores the externally constrained `persistent-test`
+  physical multicore execution yet.** M5.1 provides four logical ready queues
+  and hart0 work stealing; IPI wakeups, hart-local running state, and secondary
+  boot remain gated. M4.3 restores the externally constrained `persistent-test`
   graph. M4.5 adds one immutable `hello` ProgramArtifact whose source and canonical
   VIBEEXE are revalidated against the current compiler before execution, with an
   exact console/memory manifest. This is not a general component checkpoint,

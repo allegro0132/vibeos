@@ -1,9 +1,9 @@
 # Durable capability log v1
 
-This document is the normative M4.0 format and crash model for persistent
-authority. M4.0 defines a pure `no_std` codec and recovery verifier; it does not
-yet claim that a real block driver or a live `CSpace` is persistent. Those are
-M4.1--M4.3.
+This document is the normative M4.0/M4.2 journal format and crash model for
+persistent authority and capability-addressed objects. M4.0 defined the pure
+`no_std` authority verifier; M4.2 extends that same journal and canonical decoder
+with object records. Live `CSpace` restoration remains M4.3.
 
 The safety goal is narrower and stronger than “the file usually parses”:
 
@@ -27,11 +27,13 @@ the writer appends and flushes an `IdHighWater { exclusive_end }` record; only I
 strictly below the recovered exclusive end may appear later. High-water values
 strictly increase and never wrap. Unused reserved IDs are skipped after reboot.
 
-A durable mention consumes identity. A prepare, including an uncommitted prepare,
-prevents reuse of its derivation ID. An orphan commit also consumes both its
-transaction and derivation IDs. A tombstone may name an absent derivation, is
-retained, and makes a later attempt to introduce that same derivation ID invalid.
-Compaction must preserve these facts even after the original record is removed.
+A durable mention consumes identity. A prepare, including an uncommitted grant or
+object prepare, prevents reuse of its derivation or object ID. An orphan authority
+commit also consumes both its transaction and derivation IDs. A tombstone may name
+an absent derivation, is retained, and makes a later attempt to introduce that same
+derivation ID invalid. Compaction must preserve these facts even after the original
+record is removed. Transaction IDs cannot be reused across grant, revoke, and object
+transactions.
 
 `StoreId` is a format-time trust anchor supplied by the platform. VibeOS currently
 has no entropy source, so it must not pretend that a boot-local counter is a unique
@@ -76,6 +78,9 @@ trailer to the checksummed header.
 3. `GrantPrepare` — the proposed derivation and destination.
 4. `GrantCommit` — exact binding to a prepare.
 5. `RevokeTombstone` — a durable deletion of one derivation subtree.
+6. `ObjectPrepare` — immutable object metadata and whole-content CRC32C.
+7. `ObjectChunk` — one indexed content chunk with a fixed 360-byte data area.
+8. `ObjectCommit` — exact binding to the prepare and every chunk record.
 
 Unknown versions, kinds, flags, rights bits, non-zero padding, or malformed sealed
 records reject the whole authority store. A future deletion record must never be
@@ -106,6 +111,43 @@ derivation_id       u128
 
 `RevokeTombstone` contains one `DerivationId`. `ResourceKind` is a stable disk
 number, never a Rust `TypeId`, pointer, or display string.
+
+`ObjectPrepare` payload:
+
+```text
+object_id           u128
+object_kind         u32   // stable non-zero content-type tag
+reserved            u32 = 0
+byte_len            u64   // at most 360 * 1024 bytes in v1
+chunk_count         u32   // exactly ceil(byte_len / 360)
+content_crc32c      u32
+```
+
+`ObjectChunk` has the full 384-byte payload. `data_len` is 1 through 360; bytes
+after the named data are canonical zero padding:
+
+```text
+object_id           u128
+chunk_index         u32   // begins at zero and is strictly consecutive
+data_len            u16
+reserved            u16 = 0
+data                u8[360]
+```
+
+`ObjectCommit` payload:
+
+```text
+object_id           u128
+prepare_sequence    u64
+prepare_crc32c      u32
+chunk_count         u32
+first_chunk_seq     u64   // zero exactly when chunk_count is zero
+chunks_crc32c       u32   // CRC32C of ordered LE chunk-record CRC values
+content_crc32c      u32   // exact repeat of ObjectPrepare
+```
+
+`ObjectKind` describes immutable stored content. It is distinct from
+`ResourceKind`, which describes the live capability resource wrapping that object.
 
 ## Media and crash model
 
@@ -160,6 +202,20 @@ No CSpace or service lock may be held across asynchronous write/flush. M4.3 need
 pending slot reservation or a centralized authority transaction serializer, followed
 by generation revalidation before publication.
 
+Object put:
+
+1. Persist and flush a high-water mark covering the new `ObjectId` and
+   `TransactionId`.
+2. Append `ObjectPrepare` and every consecutive `ObjectChunk`.
+3. Append and flush the exactly bound `ObjectCommit`.
+4. Only after that flush, construct the immutable live object and publish its cap.
+
+An incomplete prepare or chunk prefix publishes no object. Recovery never reserves
+the declared object size for an incomplete transaction; it allocates only for
+validated physical chunk bytes, so allocation remains proportional to the media
+image. Objects are addressed through live capabilities, not paths or an ambient
+global `ObjectId` lookup.
+
 ## Recovery
 
 Recovery scans physical sectors in order:
@@ -169,8 +225,11 @@ Recovery scans physical sectors in order:
    strictly consecutive sequences, and match the previous sequence/CRC chain.
 3. Apply strictly increasing high-water records. Reject any ID that was not already
    reserved when its record appeared.
-4. Pair prepare/commit by transaction, prepare sequence, prepare CRC, and derivation.
-   Only a complete exact pair becomes a candidate grant.
+4. Use one transaction table across grant, revoke, and object records. Pair grant
+   prepare/commit by transaction, prepare sequence, prepare CRC, and derivation.
+   Pair object prepare/chunks/commit by transaction, object, prepare sequence/CRC,
+   exact chunk index/count/length, ordered chunk-record digest, and content CRC.
+   Only a complete exact pair becomes a candidate grant or object.
 5. Validate each candidate in commit order. Roots must exactly match an external
    `RootPolicy`. A derived parent must already exist, carry `GRANT`, and have rights
    containing the child. Object and resource kind must match every ancestor. One
@@ -180,10 +239,13 @@ Recovery scans physical sectors in order:
    generation `u64::MAX` retires the slot.
 7. Collect tombstones independently of record order, then remove every node whose
    own ID or any ancestor ID is tombstoned. A tombstone always wins.
+8. Enforce one numeric ID class map across every object, derivation, space, and
+   transaction mention, including interleaved kinds 1 through 8.
 
-Recovery returns stable IDs and live `RecoveredGrant` records, not `Arc<Resource>`.
-M4.2/M4.3 must resolve `ObjectId + ResourceKind` to a real object; missing or
-type-mismatched objects are not installed.
+Recovery returns stable IDs, immutable recovered bytes, and live `RecoveredGrant`
+records, not an ambient object namespace or automatically installed
+`Arc<Resource>`. M4.3 must resolve and install only exact type-matched objects;
+missing or type-mismatched objects are not installed.
 
 ## Crash-safety argument
 
@@ -198,9 +260,14 @@ type-mismatched objects are not installed.
    descendant record order. An acknowledged revoke cannot revive.
 4. **Identity lemma.** High-water is flushed before publication. Every published ID
    is below the recovered exclusive end, so reboot skips it rather than reusing it.
+5. **Object lemma.** No object is returned without an exact commit bound to its
+   prepare and all ordered chunks. Every strict prepare/chunk/commit prefix therefore
+   recovers the old object set; only the complete commit adds the exact bytes.
 
 The host suite enumerates all 0 through 512 prefix cuts for every record kind and
-again at grant-prepare, grant-commit, and tombstone protocol boundaries. It also
-checks CRC vectors, canonical round trips, torn holes, high-water ordering, exact
-root policy, transaction binding, rights attenuation, object/type consistency,
-cross-space ancestor tombstones, and slot-generation reuse.
+again at grant, revoke, high-water, and object protocol boundaries. It also checks
+CRC vectors, canonical round trips, torn holes, high-water ordering, exact root
+policy, transaction binding, rights attenuation, object/type consistency,
+cross-space ancestor tombstones, slot-generation reuse, interleaved kinds 1--8,
+cross-kind ID collisions, malformed chunk ordering, and incomplete-prepare memory
+amplification.

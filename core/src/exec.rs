@@ -337,6 +337,19 @@ impl Drop for CurrentTaskScope {
     }
 }
 
+/// Identity of the task whose poll is currently executing. Destructors run
+/// after the running slot is detached and therefore return `None`, as do
+/// scheduler, interrupt, and boot boundaries.
+pub fn current_task_id() -> Option<TaskId> {
+    let status = CURRENT_TASK_STATUS.lock().clone()?;
+    let sched = SCHED.lock();
+    sched
+        .running
+        .as_ref()
+        .filter(|(_, _, _, running)| Arc::ptr_eq(running, &status))
+        .map(|(id, _, _, _)| *id)
+}
+
 fn register_owned_for_current(
     registration: OwnedRegistration,
 ) -> Result<Option<u64>, OwnedRegistration> {
@@ -619,6 +632,7 @@ pub struct TaskReport {
 }
 
 struct Task {
+    id: TaskId,
     domain: AllocationDomain,
     name: Arc<str>,
     future: ManuallyDrop<Pin<Box<dyn Future<Output = ()> + Send>>>,
@@ -636,8 +650,19 @@ pub type FaultGuard = fn(&mut dyn FnMut()) -> bool;
 /// their Rust destructors. The kernel installs this alongside its heap.
 pub type FaultReclaimer = unsafe fn(AllocationDomain);
 
+/// Repair task-stable state abandoned by one exact faulted task. The executor
+/// invokes this only after that task is detached forever and before publishing
+/// `Faulted`. For a tracked arena, every abandoned sibling is reported once
+/// before the domain reclaimer runs.
+///
+/// The callback runs in the SYSTEM allocation domain and must not allocate,
+/// block, or panic. It may recover synchronization primitives owned by the
+/// exact `(TaskId, AllocationDomain)` pair.
+pub type FaultCleanup = unsafe fn(TaskId, AllocationDomain);
+
 static FAULT_GUARD: SpinLock<Option<FaultGuard>> = SpinLock::new(None);
 static FAULT_RECLAIMER: SpinLock<Option<FaultReclaimer>> = SpinLock::new(None);
+static FAULT_CLEANUP: SpinLock<Option<FaultCleanup>> = SpinLock::new(None);
 
 pub fn set_fault_guard(guard: FaultGuard) {
     *FAULT_GUARD.lock() = Some(guard);
@@ -645,6 +670,18 @@ pub fn set_fault_guard(guard: FaultGuard) {
 
 pub fn set_fault_reclaimer(reclaimer: FaultReclaimer) {
     *FAULT_RECLAIMER.lock() = Some(reclaimer);
+}
+
+pub fn set_fault_cleanup(cleanup: FaultCleanup) {
+    *FAULT_CLEANUP.lock() = Some(cleanup);
+}
+
+fn notify_fault_cleanup(task: TaskId, domain: AllocationDomain) {
+    if let Some(cleanup) = *FAULT_CLEANUP.lock() {
+        // Safety: every call site has detached this exact task permanently and
+        // invokes the callback before terminal publication or arena reclaim.
+        unsafe { cleanup(task, domain) };
+    }
 }
 
 struct Sched {
@@ -922,6 +959,7 @@ fn spawn_tracked_domain(
 
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let task = Task {
+        id,
         domain,
         name: task_name,
         future,
@@ -966,6 +1004,7 @@ fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskSta
 }
 
 struct ReclaimResult {
+    id: TaskId,
     domain: AllocationDomain,
     faulted: bool,
 }
@@ -976,6 +1015,7 @@ struct ReclaimResult {
 /// again.
 fn reclaim_task(task: Task) -> ReclaimResult {
     let Task {
+        id,
         domain,
         name,
         mut future,
@@ -1026,11 +1066,16 @@ fn reclaim_task(task: Task) -> ReclaimResult {
     drop(name);
     drop(status);
     system.restore();
-    ReclaimResult { domain, faulted }
+    ReclaimResult {
+        id,
+        domain,
+        faulted,
+    }
 }
 
 fn abandon_task_without_drop(task: Task) {
     let Task {
+        id: _,
         domain: _,
         name,
         future,
@@ -1046,6 +1091,7 @@ fn abandon_task_without_drop(task: Task) {
 }
 
 struct FaultVictim {
+    id: TaskId,
     task: Option<Task>,
     status: Arc<TaskStatus>,
     claim: TerminalClaim,
@@ -1053,6 +1099,7 @@ struct FaultVictim {
 
 fn teardown_faulted_domain(
     domain: AllocationDomain,
+    primary_id: TaskId,
     primary_task: Option<Task>,
     primary_status: Arc<TaskStatus>,
     primary_claim: TerminalClaim,
@@ -1078,6 +1125,7 @@ fn teardown_faulted_domain(
         victims.reserve(s.tasks.len() + 1);
     }
     victims.push(FaultVictim {
+        id: primary_id,
         task: primary_task,
         status: primary_status,
         claim: primary_claim,
@@ -1103,6 +1151,7 @@ fn teardown_faulted_domain(
                 .claim_terminal(TaskState::Faulted)
                 .expect("an arena sibling could not claim fault teardown");
             victims.push(FaultVictim {
+                id,
                 task: Some(task),
                 status,
                 claim,
@@ -1125,6 +1174,9 @@ fn teardown_faulted_domain(
     }
 
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    for victim in &victims {
+        notify_fault_cleanup(victim.id, domain);
+    }
     if let Some(reclaim) = *FAULT_RECLAIMER.lock() {
         unsafe { reclaim(domain) };
     }
@@ -1145,8 +1197,13 @@ fn reclaim_and_publish(task: Task, status: &Arc<TaskStatus>, claim: TerminalClai
         claim
     };
     if result.faulted && result.domain.arena.is_tracked() {
-        teardown_faulted_domain(result.domain, None, status.clone(), claim);
+        teardown_faulted_domain(result.domain, result.id, None, status.clone(), claim);
     } else {
+        if result.faulted {
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            notify_fault_cleanup(result.id, result.domain);
+            system.restore();
+        }
         publish_terminal(status, claim);
     }
 }
@@ -1518,12 +1575,16 @@ pub fn poll_once() -> bool {
         };
         if task.domain.arena.is_tracked() {
             let domain = task.domain;
-            teardown_faulted_domain(domain, Some(task), status, claim);
+            teardown_faulted_domain(domain, id, Some(task), status, claim);
         } else {
             // Ordinary tasks have no audited escape contract. Clean external
             // registrations, but conservatively leak their future allocation.
+            let domain = task.domain;
             drain_task_registrations(&status);
             core::mem::forget(task);
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            notify_fault_cleanup(id, domain);
+            system.restore();
             publish_terminal(&status, claim);
         }
         return true;

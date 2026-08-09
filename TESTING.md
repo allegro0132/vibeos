@@ -16,9 +16,9 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Capability algebra including cross-space revocation and explicit leases; durable-log canonical decoding and exhaustive prefix/flush crash recovery; modern virtio feature/status negotiation, split-ring layout, malformed completion quarantine, index wrap, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; channels and the compiler | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Capability algebra including cross-space revocation and explicit leases; unified authority/object journal decoding, exhaustive prefix/flush recovery, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio feature/status negotiation, split-ring layout, malformed completion quarantine, index wrap, and reset-before-reuse; fixed-point scheduler lifecycle model; cancellation/join boundaries; fault arenas; wait/timer registration ownership; heap quotas/provenance; channels and the compiler | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
-| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, timeout reset, cancellation, and fault restart | `tests/cases/`, `tests/golden/` |
+| Golden transcripts | End-to-end shell behaviour, including retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, timeout reset, cancellation/fault restart, and capability-addressed object commit/read/revoke | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
 | Fuzzing | Whether the front end can be made to panic | `compiler/tests/fuzz.rs` |
 | Mutation checks | Whether the above actually catch anything | ad hoc; see below |
@@ -28,6 +28,19 @@ gets a fresh raw disk, sector 7 is seeded by the host, and after `blk test` exit
 the host compares all 512 bytes of sector 8. `block_recovery` suppresses one real
 QueueNotify to exercise the timer/reset path, injects a component fault after DMA
 publication, and separately verifies cancellation plus explicit restart.
+
+The `store` case is likewise stronger than its transcript. The host first seeds
+506 valid records containing a 180,720-byte object, leaving exactly six journal
+slots. Four injected raw component faults must each reach the task/domain-bound
+pre-write hook after this dense recovery, clear the exact store claim, reclaim
+each arena, and reach a stable heap plateau. Store calls require 4 MiB of free
+caller headroom before claiming the writer; the shell and probe each have an 8 MiB
+quota. The next command commits and reads a
+deterministic 900-byte object, filling all 512 slots. After shutdown,
+`store-image.py` independently checks the fixed sectors 64--575, platform StoreId,
+canonical kinds 1--8, shared ID/transaction classes, chain/CRC/commit binding,
+and both exact payloads. Its positive interleaving and negative parity fixtures
+run before the real backing image is accepted.
 
 ## Performance baseline
 

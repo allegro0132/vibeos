@@ -355,6 +355,7 @@ impl<T: Resource> InvocationLease<T> {
 pub struct CSpace {
     pub name: String,
     slots: Vec<Slot>,
+    incarnation: u64,
 }
 
 impl CSpace {
@@ -362,7 +363,15 @@ impl CSpace {
         system_allocation(|| Self {
             name: String::from(name),
             slots: Vec::new(),
+            incarnation: 1,
         })
+    }
+
+    /// Monotonic identity of the live CSpace incarnation. Async services use
+    /// this to avoid publishing a capability into a component which restarted
+    /// while an external transaction was being committed.
+    pub const fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     fn alloc_slot(&mut self) -> u32 {
@@ -391,6 +400,19 @@ impl CSpace {
         let node = system_allocation(Derivation::root);
         self.slots[slot as usize].entry = Some(Entry { obj, rights, node });
         Cap { slot, generation: self.slots[slot as usize].generation }
+    }
+
+    /// Mint only if the caller's pre-await incarnation is still current.
+    pub fn mint_if_incarnation(
+        &mut self,
+        expected: u64,
+        obj: Arc<dyn Resource>,
+        rights: Rights,
+    ) -> Option<Cap> {
+        if self.incarnation != expected {
+            return None;
+        }
+        Some(self.mint(obj, rights))
     }
 
     fn entry(&self, cap: Cap) -> Result<&Entry, CapError> {
@@ -543,7 +565,12 @@ impl CSpace {
     /// generations. Replacing the table with `CSpace::new` would let an old
     /// `Cap { slot, generation }` alias the first grant in the new incarnation.
     pub fn reset(&mut self) -> usize {
-        self.revoke_all()
+        let killed = self.revoke_all();
+        self.incarnation = self
+            .incarnation
+            .checked_add(1)
+            .expect("CSpace incarnation space exhausted");
+        killed
     }
 
     /// Drop every slot whose derivation is dead; returns how many went.

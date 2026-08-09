@@ -537,6 +537,31 @@ fn resetting_a_space_never_revives_an_old_incarnation_handle() {
     assert!(cs.lookup(fresh, Rights::WRITE).is_ok());
 }
 
+#[test]
+fn async_publication_requires_the_same_cspace_incarnation() {
+    let mut cs = CSpace::new("publish-target");
+    let expected = cs.incarnation();
+    cs.reset();
+    assert_eq!(cs.incarnation(), expected + 1);
+
+    let stale = cs.mint_if_incarnation(
+        expected,
+        Arc::new(Widget("stale")),
+        Rights::READ,
+    );
+    assert_eq!(stale, None);
+    assert!(cs.list().is_empty());
+
+    let current = cs
+        .mint_if_incarnation(
+            cs.incarnation(),
+            Arc::new(Widget("current")),
+            Rights::READ,
+        )
+        .unwrap();
+    assert_eq!(cs.lookup_as::<Widget>(current, Rights::READ).unwrap().0, "current");
+}
+
 // --- Rights algebra ---
 
 #[test]

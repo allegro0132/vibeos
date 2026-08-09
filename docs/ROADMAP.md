@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-08):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16 and M4.1 are complete. M4.2 capability-addressed store is next. Run
+> sequence through 3.16 and M4.2 are complete. M4.3 persistent CSpace is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -384,7 +384,7 @@ claim otherwise.
 |---|---|---|
 | 4.0 ✅ | Specify the durable-capability format and crash model | Stable object/derivation/space/transaction IDs, fixed sealed records, prepare/commit grants, tombstone-first revoke, high-water allocation, and fail-closed recovery. Host tests enumerate every sector-prefix and flush boundary. |
 | 4.1 ✅ | virtio-blk driver as a supervised component | Modern virtio-mmio discovery, explicit MMIO/DMA/service grants, fixed SYSTEM DMA, bounded split queue, IRQ completion, timeout/reset, cancel, quarantine, and bounded fault restart. QEMU verifies the host backing sector after write+flush. |
-| 4.2 | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
+| 4.2 ✅ | Capability-addressed store | Objects are named by capability, not by path. `store.get(cap)` / `store.put(obj) -> cap`. Blueprint §9 forbids a path namespace; this is the alternative. |
 | 4.3 | Persist a CSpace | Save and restore a component's authority across boot from durable derivation records; a revoked ancestor's tombstone wins over every descendant record. |
 | 4.4 | virtio-net + a typed socket endpoint | `Endpoint<Packet>`, not a byte stream. |
 | 4.5 | Source and binary persistence | `rustc save hello` / `run hello`. Compiled code becomes a storable object with a cap on it. |
@@ -414,6 +414,17 @@ three times with bounded backoff, while explicit cancellation does not restart
 automatically. The `block` transcript reads a host-seeded sector, writes and flushes
 another, and the harness then compares the raw backing sector after shutdown. See
 [VIRTIO_BLK.md](VIRTIO_BLK.md).
+
+4.2 extends that same canonical journal with object prepare/chunk/commit records;
+kinds 1--8 share one decoder, high-water mark, transaction table, and numeric ID
+class map. The service scans a fixed region through an attenuated backend cap,
+flushes before publication, rereads the committed bytes, and atomically mints only
+into the pre-await CSpace incarnation. There is no path, `open(ObjectId)`, or object
+enumeration API. Repeated injected raw faults against a host-seeded 506-record
+journal prove the fixed `.bss` scratch buffer, bounded streaming recovery, and
+exact-task/domain claim cleanup remain heap-bounded; the final append fills all
+512 slots before the host independently parses the powered-off raw image. See
+[OBJECT_STORE.md](OBJECT_STORE.md).
 
 **Acceptance:** write a program at the shell, save it, reboot, run it — and its
 authority after reboot is exactly what was persisted, with revoked caps staying dead.

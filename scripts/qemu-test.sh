@@ -147,6 +147,9 @@ for case_file in tests/cases/*.in; do
   dd if=/dev/zero of="$disk" bs=512 count=2048 >/dev/null 2>&1
   marker_sector "$expected_sector" "$BLOCK_SEED_MARKER"
   dd if="$expected_sector" of="$disk" bs=512 seek=7 conv=notrunc >/dev/null 2>&1
+  if [ "$name" = "store" ]; then
+    python3 scripts/store-image.py --seed "$disk"
+  fi
   mkfifo "$input_fifo"
 
   feed "$case_file" > "$input_fifo" &
@@ -178,6 +181,13 @@ for case_file in tests/cases/*.in; do
     dd if="$disk" of="$observed_sector" bs=512 skip=8 count=1 >/dev/null 2>&1
     if ! cmp -s "$expected_sector" "$observed_sector"; then
       echo "FAIL block: raw backing sector 8 does not contain $BLOCK_WRITE_MARKER"
+      backing_ok=0
+      fail=1
+    fi
+  fi
+  if [ "$name" = "store" ]; then
+    if ! python3 scripts/store-image.py --selftest \
+      || ! python3 scripts/store-image.py "$disk"; then
       backing_ok=0
       fail=1
     fi
@@ -226,6 +236,8 @@ for case_file in tests/cases/*.in; do
       fi
     elif [ "$name" = "block" ] && [ "$backing_ok" = "1" ]; then
       echo "ok   block (raw backing sector 8 verified)"
+    elif [ "$name" = "store" ] && [ "$backing_ok" = "1" ]; then
+      echo "ok   store (raw backing journal verified)"
     else
       echo "ok   $name"
     fi

@@ -2,7 +2,7 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-08):** M1, M2, M3.5, M4.0, and M4.1 are complete; the original
+**Status (2026-08-08):** M1, M2, M3.5, and M4.0--M4.2 are complete; the original
 M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
@@ -387,10 +387,13 @@ component has live/peak/denial counters and a hard live-byte quota; exceeding it
 that task before consuming another owner's budget, while deallocation credits the
 header owner even when it runs from another component or an IRQ. Normal return and
 cancellation run Drop and return live use to the account baseline. Audited World
-components additionally receive a per-incarnation arena. A fault first quiesces every
-task in that arena, drains SYSTEM-owned runtime registrations, abandons future envelopes
-without Drop, and raw-reclaims the arena. Ordinary tasks retain the conservative leak
-policy because they have no proven allocation-escape boundary.
+components additionally receive a per-incarnation arena. After permanently detaching a
+faulted task, the executor first invokes a non-allocating cleanup hook with its exact
+`TaskId` and allocation domain so stable service claims cannot remain wedged. It then
+quiesces every task in an audited arena, drains SYSTEM-owned runtime registrations,
+abandons future envelopes without Drop, and raw-reclaims the arena. Ordinary tasks retain
+the conservative memory-leak policy because they have no proven allocation-escape boundary,
+but receive the same exact-task stable-state cleanup before `Faulted` is published.
 
 **Time.** `rdtime` at 10 MHz, SBI timer for wakeups. No monotonic-vs-wall
 distinction because there is no wall clock. Timer insertion and token removal are
@@ -467,8 +470,10 @@ Five boundaries must stay explicit:
    revoke, and high-water allocation. Recovery rejects malformed ancestry and lets
    an ancestor tombstone win over every descendant. This proves the pure crash model,
    M4.1 now supplies real supervised virtio-blk media with reset-before-DMA-reuse.
-   Object resolution and live CSpace installation remain M4.2--M4.3. See
-   [DURABLE_FORMAT.md](DURABLE_FORMAT.md) and [VIRTIO_BLK.md](VIRTIO_BLK.md).
+   M4.2 now resolves immutable bytes through object capabilities over a unified
+   kinds 1--8 journal, with commit-flush-before-mint and raw-backing verification.
+   Live CSpace installation remains M4.3. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md),
+   [VIRTIO_BLK.md](VIRTIO_BLK.md), and [OBJECT_STORE.md](OBJECT_STORE.md).
 4. **Revocation cannot retroactively erase an in-flight operation.** Console hooks
    revalidate a `Revocable` token before every write; a successful check linearizes
    that operation before an overlapping revoke. Direct generated loads and stores

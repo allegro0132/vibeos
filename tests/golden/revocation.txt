@@ -34,7 +34,7 @@ vibe> ps
   component:2  task:2   logger     logger   running   -        N    65536 B
   component:3  task:3   guest      guest    exited    returned         2    65536 B
   component:4  task:4   virtio-blk virtio-blk running   -                1    65536 B
-  component:5  task:6   shell      init     running   -        N    524288 B
+  component:5  task:6   shell      init     running   -        N    8388608 B
   executor totals (including untracked tasks): 1 exited, 0 faulted, 0 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising

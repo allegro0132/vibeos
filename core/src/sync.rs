@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::{current_hart_id, irq_restore, irq_save};
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
-use crate::runqueue::MAX_HARTS;
+use crate::runqueue::{HartId, MAX_HARTS};
 
 const PHASE_BITS: u32 = 2;
 const PHASE_MASK: u64 = (1 << PHASE_BITS) - 1;
@@ -61,6 +61,7 @@ impl TaskRecoveryKey {
     }
 }
 
+#[inline(always)]
 fn recovery_context_hart_index() -> Option<usize> {
     if let Some(logical) = crate::ipi::current_logical_hart() {
         return Some(logical.index());
@@ -97,10 +98,39 @@ pub fn enter_task_recovery_context(key: TaskRecoveryKey) -> TaskRecoveryContext 
         irq_restore(irq);
         panic!("task recovery context requires a mapped logical hart");
     };
-    let previous = TASK_RECOVERY_CONTEXTS[hart].swap(key.get(), Ordering::AcqRel);
+    let slot = &TASK_RECOVERY_CONTEXTS[hart];
+    let previous = slot.swap(key.get(), Ordering::AcqRel);
+    let physical_hart = current_hart_id();
     irq_restore(irq);
     TaskRecoveryContext {
         hart,
+        physical_hart,
+        slot,
+        installed: key,
+        previous,
+        active: true,
+        not_send: PhantomData,
+    }
+}
+
+/// Install recovery identity after the executor has already validated `hart`.
+///
+/// # Safety
+/// The current CPU must own `hart` until the returned scope is restored.
+pub(crate) unsafe fn enter_task_recovery_context_on_hart(
+    hart: HartId,
+    key: TaskRecoveryKey,
+) -> TaskRecoveryContext {
+    let irq = irq_save();
+    debug_assert_eq!(recovery_context_hart_index(), Some(hart.index()));
+    let slot = &TASK_RECOVERY_CONTEXTS[hart.index()];
+    let previous = slot.swap(key.get(), Ordering::AcqRel);
+    let physical_hart = current_hart_id();
+    irq_restore(irq);
+    TaskRecoveryContext {
+        hart: hart.index(),
+        physical_hart,
+        slot,
         installed: key,
         previous,
         active: true,
@@ -111,6 +141,8 @@ pub fn enter_task_recovery_context(key: TaskRecoveryKey) -> TaskRecoveryContext 
 /// Hart-affine scope returned by [`enter_task_recovery_context`].
 pub struct TaskRecoveryContext {
     hart: usize,
+    physical_hart: usize,
+    slot: &'static AtomicU64,
     installed: TaskRecoveryKey,
     previous: u64,
     active: bool,
@@ -118,6 +150,38 @@ pub struct TaskRecoveryContext {
 }
 
 impl TaskRecoveryContext {
+    pub(crate) fn is_current_hart(&self) -> bool {
+        current_hart_id() == self.physical_hart
+    }
+
+    fn restore_inner(&mut self) {
+        let restored = self.slot.compare_exchange(
+            self.installed.get(),
+            self.previous,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.active = false;
+        assert_eq!(
+            restored,
+            Ok(self.installed.get()),
+            "task recovery contexts restored out of LIFO order"
+        );
+    }
+
+    /// Restore after an enclosing hart-affine scope validated this CPU.
+    ///
+    /// # Safety
+    /// The caller must have independently verified the current physical hart.
+    pub(crate) unsafe fn restore_on_verified_hart(&mut self) {
+        if !self.active {
+            return;
+        }
+        let irq = irq_save();
+        self.restore_inner();
+        irq_restore(irq);
+    }
+
     /// Restore the previous exact-task identity. This is idempotent.
     pub fn restore(&mut self) {
         if !self.active {
@@ -125,31 +189,22 @@ impl TaskRecoveryContext {
         }
 
         let irq = irq_save();
-        let current_hart = recovery_context_hart_index();
-        if current_hart != Some(self.hart) {
+        let current_physical_hart = current_hart_id();
+        if current_physical_hart != self.physical_hart {
             irq_restore(irq);
             // Prevent a second panic from `Drop` while unwinding this invariant
             // violation. The original hart's context deliberately remains
             // installed so misuse cannot silently attribute another task.
             self.active = false;
             panic!(
-                "task recovery context entered on logical hart {} restored on {:?}",
-                self.hart, current_hart
+                "task recovery context entered on logical hart {} / physical hart {} restored on physical hart {}",
+                self.hart,
+                self.physical_hart,
+                current_physical_hart
             );
         }
-        let restored = TASK_RECOVERY_CONTEXTS[self.hart].compare_exchange(
-            self.installed.get(),
-            self.previous,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.restore_inner();
         irq_restore(irq);
-        self.active = false;
-        assert_eq!(
-            restored,
-            Ok(self.installed.get()),
-            "task recovery contexts restored out of LIFO order"
-        );
     }
 }
 

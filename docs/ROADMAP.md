@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, and M5.3 are complete. M5.4 hart-local scheduler state is next. Run
+> sequence through 3.16, M4.5, and M5.4 are complete. M5.5 secondary-hart boot is next. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -337,7 +337,7 @@ transcript instead of copied prose.
 pure fixed-point model exhaustively explores two tasks in the same and different
 fault arenas across wake, cancel, dispatch, pending/ready/fault, destructor fault,
 reclaim, and publication. Debug builds check the corresponding concrete scheduler
-invariants at mutation boundaries: a future has one owner, the single hart has at
+invariants at mutation boundaries: a future has one owner, each logical hart has at
 most one running slot, ready IDs are unique, and a committed terminal claim cannot
 be revived or rewritten. The RISC-V fault boundary is now a single-return
 `vibe_catch` call from Rust; its internal assembly owns both the initial save and
@@ -479,7 +479,7 @@ recovered source/binary object with exactly the fixed persisted authority manife
 | 5.1 ✅ | Per-hart run queues with work stealing |
 | 5.2 ✅ | IPI-based cross-hart wakeups (SBI `sbi_send_ipi`) |
 | 5.3 ✅ | Audit every `SpinLock` for real contention; replace the hot ones with lock-free structures |
-| 5.4 | Hart-local storage for the scheduler's `running` slot |
+| 5.4 ✅ | Hart-local storage for the scheduler's `running` slot |
 | 5.5 | Boot secondary harts via SBI HSM |
 
 **Acceptance:** `-smp 4` with the integration suite green and measurable throughput
@@ -563,6 +563,36 @@ guard. `smp queues` exercises the target path,
 samples the retained scheduler lock, and requires zero contention on its honest
 single-hart boundary. Physical contention and the scaling decision are deliberately
 measured after M5.5 boots secondaries.
+
+5.4 replaces the scheduler's singleton `running`/`running_woken` pair with one
+slot per logical hart. Dispatch, wake, cancellation, reporting, and ownership
+invariants inspect the complete slot set, while each executor may poll only the
+slot matching its exact logical identity. Current-task identity, task fault
+recovery context, allocation owner/arena provenance, allocation-failure
+diagnostics, interrupt state, nested task catchers, generated-program catchers,
+runtime console authority, and the deterministic revocation hook are likewise
+hart-local. Every scope that restores ambient state is non-`Send` and verifies
+same-hart restoration. Target code never treats a dense-looking firmware hartid
+as a logical slot: successful self-registration caches `logical_index + 1` in
+the hart's `sscratch`, while zero is a fail-closed unregistered token. One
+executor turn resolves that identity once and passes the validated slot through
+its owner/task/recovery scopes.
+
+Tracked reclaimable arenas remain home-hart and non-stealable. A fault detaches
+only its own running slot, proves no peer slot is still executing that arena,
+then removes parked/ready siblings before recovery and publication without
+holding the scheduler lock across reclaim work.
+
+**M5.4 acceptance:** host tests nest one logical hart's executor inside another
+to expose two simultaneous running slots, preserve each hart's current task and
+allocation domain, route wake and remote cancellation to the exact slot, and
+prove a fault on one hart leaves the other running task intact. Heap tests isolate
+owner/arena and OOM diagnostics, reject cross-hart scope Drop, and compile-fail a
+`Send` owner scope. The target release build plus the existing nested catcher,
+program-abort, self-test, and `smp_queues` QEMU paths remain green. Actual
+simultaneous physical execution is deliberately gated to M5.5. The fixed QEMU
+budget remains green (`ipc_roundtrip_ticks` p95 152, `irq_to_poll_ticks` p95 36)
+without widening the committed thresholds.
 
 **M5.5 preflight risk:** a pre-M5.5 `-smp 4` smoke run did not produce the
 shell-ready marker even though `_start` contains a non-boot-hart park branch. M5.1
@@ -674,7 +704,7 @@ toolchain revision, build profile, sample count, and distribution (not only a mi
 | A resolved object outlives the cap that authorized it | **High** | 3.16 explicit lease semantics; operation-time revalidation for revocable devices; no “immediate” claim for raw memory without enforcement |
 | Ordinary faulted tasks leak heap | **Medium** | 3.12 reclaims only sealed World arenas after incarnation-wide teardown; generic tasks retain the sound conservative leak policy until they gain an equivalent no-escape contract |
 | Bet 2's cheap-IPC claim goes unmeasured and turns out false | High | §5 metrics in M3.5, before optimizing or scaling the design |
-| Physical multicore execution races the single `running` slot | Medium | 5.1 completed the model-checked queue redesign; 5.4 must make the running slot hart-local before 5.5 boots secondaries |
+| Physical multicore execution exposes hidden singleton runtime state | Medium | 5.4 partitions running/current-task, heap provenance, trap, and recovery state; 5.5 must boot secondaries only after stacks and per-hart trap setup are ready |
 | Language features outrun confinement | Medium | M2 strictly before M3; no new syntax without an abort path |
 | Scope sprawl into POSIX compatibility | Medium | Blueprint §9 is binding |
 | A pinned toolchain becomes unavailable or its provenance drifts | Medium | 3.14 records the exact rustc commit, verifies it locally and in CI, and makes all build entry points consume the same rustup file |

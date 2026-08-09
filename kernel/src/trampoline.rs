@@ -370,19 +370,31 @@ use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_TASK_GUARDS: usize = 8;
-static mut TASK_JMPS: [JmpBuf; MAX_TASK_GUARDS] = [JmpBuf::ZERO; MAX_TASK_GUARDS];
-static TASK_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static mut TASK_JMPS: [[JmpBuf; MAX_TASK_GUARDS]; crate::exec::MAX_HARTS] =
+    [[JmpBuf::ZERO; MAX_TASK_GUARDS]; crate::exec::MAX_HARTS];
+static TASK_GUARD_DEPTH: [AtomicUsize; crate::exec::MAX_HARTS] =
+    [const { AtomicUsize::new(0) }; crate::exec::MAX_HARTS];
+
+fn current_task_hart() -> Option<usize> {
+    crate::ipi::current_logical_hart().map(crate::exec::HartId::index)
+}
 
 struct TaskCatch<'a> {
     f: &'a mut dyn FnMut(),
+    hart: usize,
     depth: usize,
+    hart_mismatch: bool,
 }
 
 unsafe extern "C" fn poll_task(ctx: *mut ()) {
     // Safety: guard_task keeps this context alive for the complete catch call.
     let catch = unsafe { &mut *ctx.cast::<TaskCatch<'_>>() };
+    if current_task_hart() != Some(catch.hart) {
+        catch.hart_mismatch = true;
+        return;
+    }
     // Advertise the landing pad only after vibe_catch has saved it completely.
-    TASK_GUARD_DEPTH.store(catch.depth + 1, Ordering::SeqCst);
+    TASK_GUARD_DEPTH[catch.hart].store(catch.depth + 1, Ordering::SeqCst);
     (catch.f)();
 }
 
@@ -392,7 +404,11 @@ unsafe extern "C" fn poll_task(ctx: *mut ()) {
 /// returns once with either zero (normal) or a fault status (non-local exit).
 #[inline(never)]
 pub fn guard_task(f: &mut dyn FnMut()) -> bool {
-    let depth = TASK_GUARD_DEPTH.load(Ordering::SeqCst);
+    let Some(hart) = current_task_hart() else {
+        // Without a logical identity there is no safe per-hart jump target.
+        return true;
+    };
+    let depth = TASK_GUARD_DEPTH[hart].load(Ordering::SeqCst);
     // Panicking here would be caught by the *outer* landing pad and longjmp
     // across the caller that owns this operation's terminal claim. Report a
     // synthetic fault instead so that caller can still reclaim/publish its
@@ -400,26 +416,34 @@ pub fn guard_task(f: &mut dyn FnMut()) -> bool {
     if depth >= MAX_TASK_GUARDS {
         return true;
     }
-    let mut catch = TaskCatch { f, depth };
+    let mut catch = TaskCatch {
+        f,
+        hart,
+        depth,
+        hart_mismatch: false,
+    };
     let status = unsafe {
         vibe_catch(
-            addr_of_mut!(TASK_JMPS[depth]),
+            addr_of_mut!(TASK_JMPS[hart][depth]),
             poll_task,
             (&mut catch as *mut TaskCatch<'_>).cast(),
         )
     };
     // Both the normal callback return and a non-local exit converge here. The
     // outer landing pad therefore remains armed throughout nested supervision.
-    TASK_GUARD_DEPTH.store(depth, Ordering::SeqCst);
-    status != 0
+    TASK_GUARD_DEPTH[hart].store(depth, Ordering::SeqCst);
+    status != 0 || catch.hart_mismatch || current_task_hart() != Some(hart)
 }
 
 /// Called from the panic handler. Returns only if there is no pad to jump to.
 pub fn unwind_faulted_task() {
-    let depth = TASK_GUARD_DEPTH.load(Ordering::SeqCst);
+    let Some(hart) = current_task_hart() else {
+        return;
+    };
+    let depth = TASK_GUARD_DEPTH[hart].load(Ordering::SeqCst);
     if depth == 0 {
         return;
     }
     let target = depth - 1;
-    unsafe { vibe_longjmp(addr_of_mut!(TASK_JMPS[target]), 1) }
+    unsafe { vibe_longjmp(addr_of_mut!(TASK_JMPS[hart][target]), 1) }
 }

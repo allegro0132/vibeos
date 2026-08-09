@@ -43,54 +43,69 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cap::{Cap, Revocable, Rights};
 use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
-use crate::sbi;
 use crate::sync::SpinLock;
 use crate::trampoline::{self, abort, vibe_catch, vibe_enter, vibe_longjmp, JmpBuf};
 use crate::world::{world, Space};
+use crate::{exec, ipi, sbi};
 
 /// Where a compiled program's authority lives while it runs. `None` means no
 /// program is executing and the runtime hooks refuse everything.
-static PROG_OUT: SpinLock<Option<Revocable<ConsoleDev>>> = SpinLock::new(None);
-static DENIED: AtomicBool = AtomicBool::new(false);
+static PROG_OUT: [SpinLock<Option<Revocable<ConsoleDev>>>; exec::MAX_HARTS] =
+    [const { SpinLock::new(None) }; exec::MAX_HARTS];
+static DENIED: [AtomicBool; exec::MAX_HARTS] =
+    [const { AtomicBool::new(false) }; exec::MAX_HARTS];
 
 /// Deterministic M3.16 test hook. Zero means disarmed; `usize::MAX` is the
 /// short arm transition. The target is cleared before revocation, so the hook
 /// is one-shot even if revocation itself causes more output attempts.
-static REVOKE_BEFORE_CONSOLE: AtomicUsize = AtomicUsize::new(0);
-static CONSOLE_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
-static HOOK_REVOKED_CAPS: AtomicUsize = AtomicUsize::new(0);
+static REVOKE_BEFORE_CONSOLE: [AtomicUsize; exec::MAX_HARTS] =
+    [const { AtomicUsize::new(0) }; exec::MAX_HARTS];
+static CONSOLE_OPERATIONS: [AtomicUsize; exec::MAX_HARTS] =
+    [const { AtomicUsize::new(0) }; exec::MAX_HARTS];
+static HOOK_REVOKED_CAPS: [AtomicUsize; exec::MAX_HARTS] =
+    [const { AtomicUsize::new(0) }; exec::MAX_HARTS];
+
+fn current_program_hart() -> Option<usize> {
+    ipi::current_logical_hart().map(exec::HartId::index)
+}
 
 /// Arm a one-shot revocation immediately before the selected generated-code
 /// console operation. The hook is reset by `run` on every return path.
 pub fn arm_console_revoke_hook(operation: usize) -> bool {
+    let Some(hart) = current_program_hart() else {
+        return false;
+    };
     if operation == 0
         || operation == usize::MAX
-        || REVOKE_BEFORE_CONSOLE
+        || REVOKE_BEFORE_CONSOLE[hart]
             .compare_exchange(0, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
     {
         return false;
     }
-    CONSOLE_OPERATIONS.store(0, Ordering::SeqCst);
-    HOOK_REVOKED_CAPS.store(0, Ordering::SeqCst);
-    REVOKE_BEFORE_CONSOLE.store(operation, Ordering::SeqCst);
+    CONSOLE_OPERATIONS[hart].store(0, Ordering::SeqCst);
+    HOOK_REVOKED_CAPS[hart].store(0, Ordering::SeqCst);
+    REVOKE_BEFORE_CONSOLE[hart].store(operation, Ordering::SeqCst);
     true
 }
 
-fn finish_console_revoke_hook() -> usize {
-    REVOKE_BEFORE_CONSOLE.store(0, Ordering::SeqCst);
-    CONSOLE_OPERATIONS.store(0, Ordering::SeqCst);
-    HOOK_REVOKED_CAPS.swap(0, Ordering::SeqCst)
+fn finish_console_revoke_hook(hart: usize) -> usize {
+    REVOKE_BEFORE_CONSOLE[hart].store(0, Ordering::SeqCst);
+    CONSOLE_OPERATIONS[hart].store(0, Ordering::SeqCst);
+    HOOK_REVOKED_CAPS[hart].swap(0, Ordering::SeqCst)
 }
 
 fn before_console_operation() {
-    let target = REVOKE_BEFORE_CONSOLE.load(Ordering::SeqCst);
+    let Some(hart) = current_program_hart() else {
+        return;
+    };
+    let target = REVOKE_BEFORE_CONSOLE[hart].load(Ordering::SeqCst);
     if target == 0 || target == usize::MAX {
         return;
     }
-    let operation = CONSOLE_OPERATIONS.fetch_add(1, Ordering::SeqCst) + 1;
+    let operation = CONSOLE_OPERATIONS[hart].fetch_add(1, Ordering::SeqCst) + 1;
     if operation != target
-        || REVOKE_BEFORE_CONSOLE
+        || REVOKE_BEFORE_CONSOLE[hart]
             .compare_exchange(target, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
     {
@@ -101,16 +116,19 @@ fn before_console_operation() {
     // any device operation. The hook never nests a CSpace, hook, or PROG_OUT
     // lock around a console call.
     let revoked = world().spaces["prog"].0.lock().revoke_all();
-    HOOK_REVOKED_CAPS.store(revoked, Ordering::SeqCst);
+    HOOK_REVOKED_CAPS[hart].store(revoked, Ordering::SeqCst);
 }
 
 fn console_token() -> Option<Revocable<ConsoleDev>> {
-    let token = PROG_OUT.lock().clone();
+    let hart = current_program_hart()?;
+    let token = PROG_OUT[hart].lock().clone();
     token
 }
 
 fn deny_console() {
-    DENIED.store(true, Ordering::SeqCst);
+    if let Some(hart) = current_program_hart() {
+        DENIED[hart].store(true, Ordering::SeqCst);
+    }
 }
 
 /// Called by generated code. Not `pub` to the language — the compiler emits the
@@ -134,10 +152,12 @@ extern "C" fn rt_print_str(ptr: *const u8, len: usize) {
 /// Where a failed safety check lands. The buffer is static because runtime
 /// hooks need its address; invocation inputs and results remain ordinary
 /// locals now that Rust only sees the single-return `vibe_catch` boundary.
-static mut JMP: JmpBuf = JmpBuf::ZERO;
-static ARMED: AtomicBool = AtomicBool::new(false);
+static mut JMP: [JmpBuf; exec::MAX_HARTS] = [JmpBuf::ZERO; exec::MAX_HARTS];
+static ARMED: [AtomicBool; exec::MAX_HARTS] =
+    [const { AtomicBool::new(false) }; exec::MAX_HARTS];
 
 struct ProgramCatch {
+    hart: usize,
     entry: usize,
     stack_limit: usize,
     fuel: i64,
@@ -150,9 +170,12 @@ unsafe extern "C" fn enter_program(ctx: *mut ()) {
     // Safety: run keeps this context alive for the complete catch call, and
     // entry points at the freshly emitted main function.
     let catch = unsafe { &mut *ctx.cast::<ProgramCatch>() };
+    if current_program_hart() != Some(catch.hart) {
+        sbi::shutdown(true);
+    }
     // Do not advertise the global jump target until vibe_catch has populated
     // it. This closes the stale-buffer window present in a direct setjmp call.
-    ARMED.store(true, Ordering::SeqCst);
+    ARMED[catch.hart].store(true, Ordering::SeqCst);
     catch.value = unsafe {
         vibe_enter(
             catch.entry,
@@ -162,7 +185,7 @@ unsafe extern "C" fn enter_program(ctx: *mut ()) {
             catch.region_len,
         )
     };
-    ARMED.store(false, Ordering::SeqCst);
+    ARMED[catch.hart].store(false, Ordering::SeqCst);
 }
 
 /// How many calls and loop iterations a program may execute.
@@ -175,10 +198,13 @@ pub const FUEL: i64 = 20_000_000;
 /// Called from the panic handler: if a compiled program is on the stack, treat
 /// the panic as an abort of that program. Returns if none is running.
 pub fn unwind_running_program() {
-    if !ARMED.swap(false, Ordering::SeqCst) {
+    let Some(hart) = current_program_hart() else {
+        return;
+    };
+    if !ARMED[hart].swap(false, Ordering::SeqCst) {
         return;
     }
-    unsafe { vibe_longjmp(addr_of_mut!(JMP), RUNTIME_PANICKED) }
+    unsafe { vibe_longjmp(addr_of_mut!(JMP[hart]), RUNTIME_PANICKED) }
 }
 
 /// Reason code for "the kernel panicked while this program was running". Above
@@ -187,13 +213,16 @@ const RUNTIME_PANICKED: i64 = 64;
 
 /// Called by generated code when an emitted check fails. Never returns.
 extern "C" fn rt_abort(code: i64) -> ! {
-    if !ARMED.swap(false, Ordering::SeqCst) {
+    let Some(hart) = current_program_hart() else {
+        panic!("generated code aborted on an unregistered hart");
+    };
+    if !ARMED[hart].swap(false, Ordering::SeqCst) {
         panic!(
             "generated code aborted with no landing pad: {}",
             abort::describe(code)
         );
     }
-    unsafe { vibe_longjmp(addr_of_mut!(JMP), code) }
+    unsafe { vibe_longjmp(addr_of_mut!(JMP[hart]), code) }
 }
 
 extern "C" fn rt_print_int(v: i64) {
@@ -324,6 +353,10 @@ pub fn run_with_authority(
     console_cap: Cap,
     memory_cap: Cap,
 ) -> RunOutcome {
+    let Some(hart) = current_program_hart() else {
+        // An invocation cannot borrow another hart's authority or jump target.
+        sbi::shutdown(true);
+    };
     let (console, memory_lease) = {
         let cspace = space.0.lock();
         (
@@ -351,10 +384,11 @@ pub fn run_with_authority(
         None => (0, 0),
     };
 
-    *PROG_OUT.lock() = console;
-    DENIED.store(false, Ordering::SeqCst);
+    *PROG_OUT[hart].lock() = console;
+    DENIED[hart].store(false, Ordering::SeqCst);
     let started_at = sbi::time();
     let mut catch = ProgramCatch {
+        hart,
         entry: prog.code.as_ptr() as usize,
         stack_limit: crate::stack_floor(),
         fuel: FUEL,
@@ -373,23 +407,26 @@ pub fn run_with_authority(
     let code = unsafe {
         core::arch::asm!("fence.i");
         vibe_catch(
-            addr_of_mut!(JMP),
+            addr_of_mut!(JMP[hart]),
             enter_program,
             (&mut catch as *mut ProgramCatch).cast(),
         )
     };
     // Normal and non-local paths converge here. Clear defensively even though
     // the thunk and every abort path already perform their exact transition.
-    ARMED.store(false, Ordering::SeqCst);
+    if current_program_hart() != Some(hart) {
+        sbi::shutdown(true);
+    }
+    ARMED[hart].store(false, Ordering::SeqCst);
     let value = if code == 0 { catch.value } else { -1 };
     drop(memory);
 
     let ticks = sbi::time() - started_at;
     let micros = ticks / (crate::exec::TIMEBASE_HZ / 1_000_000);
 
-    *PROG_OUT.lock() = None;
-    let denied = DENIED.load(Ordering::SeqCst);
-    let revoked_caps = finish_console_revoke_hook();
+    *PROG_OUT[hart].lock() = None;
+    let denied = DENIED[hart].load(Ordering::SeqCst);
+    let revoked_caps = finish_console_revoke_hook(hart);
     RunOutcome {
         value,
         ticks,

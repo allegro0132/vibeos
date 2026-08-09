@@ -6,11 +6,13 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt;
+use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch;
+use crate::runqueue::{HartId, MAX_HARTS};
 use crate::sync::SpinLock;
 
 const MIN_CLASS_SHIFT: usize = 4; // 16-byte minimum block
@@ -100,25 +102,57 @@ impl AllocationDomain {
     }
 }
 
-static CURRENT_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.0);
-static CURRENT_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.0);
+static CURRENT_OWNERS: [AtomicU64; MAX_HARTS] =
+    [const { AtomicU64::new(OwnerId::SYSTEM.0) }; MAX_HARTS];
+static CURRENT_ARENAS: [AtomicU64; MAX_HARTS] =
+    [const { AtomicU64::new(ArenaId::UNTRACKED.0) }; MAX_HARTS];
 
-/// Allocation owner active on the single v0.1 hart.
-pub fn current_owner() -> OwnerId {
-    OwnerId(CURRENT_OWNER.load(Ordering::SeqCst))
-}
-
-/// Allocation arena active on the single v0.1 hart.
-pub fn current_arena() -> ArenaId {
-    ArenaId(CURRENT_ARENA.load(Ordering::SeqCst))
-}
-
-/// Complete allocation identity active on the single v0.1 hart.
-pub fn current_domain() -> AllocationDomain {
-    AllocationDomain {
-        owner: current_owner(),
-        arena: current_arena(),
+#[inline(always)]
+fn allocation_context_hart_index() -> Option<usize> {
+    if let Some(logical) = crate::ipi::current_logical_hart() {
+        return Some(logical.index());
     }
+
+    // Host integration tests do not all construct an SBI topology. A dense
+    // physical id models the corresponding logical slot there. The target
+    // must never make that assumption: SBI hart ids may be sparse or permuted.
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let physical = arch::current_hart_id();
+        return (physical < MAX_HARTS).then_some(physical);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    None
+}
+
+#[inline(always)]
+fn domain_on_hart(hart: usize) -> AllocationDomain {
+    AllocationDomain {
+        owner: OwnerId(CURRENT_OWNERS[hart].load(Ordering::SeqCst)),
+        arena: ArenaId(CURRENT_ARENAS[hart].load(Ordering::SeqCst)),
+    }
+}
+
+/// Allocation owner active on the current logical hart.
+///
+/// Panics rather than borrowing another hart's provenance when the current
+/// physical hart has no logical scheduler identity.
+pub fn current_owner() -> OwnerId {
+    current_domain().owner
+}
+
+/// Allocation arena active on the current logical hart.
+pub fn current_arena() -> ArenaId {
+    current_domain().arena
+}
+
+/// Complete allocation identity active on the current logical hart.
+#[inline]
+pub fn current_domain() -> AllocationDomain {
+    let hart =
+        allocation_context_hart_index().expect("allocation context requires a mapped logical hart");
+    domain_on_hart(hart)
 }
 
 /// Enter an allocation-owner scope.
@@ -126,6 +160,7 @@ pub fn current_domain() -> AllocationDomain {
 /// Normal Rust unwinding restores through `Drop`. A target fault uses longjmp,
 /// so the executor must keep this value in its caller frame and invoke
 /// [`OwnerScope::restore`] explicitly after its landing pad returns.
+#[inline]
 pub fn enter_owner(owner: OwnerId) -> OwnerScope {
     // Untracked allocations are never eligible for arena-wide raw reclaim.
     unsafe { enter_domain(AllocationDomain::untracked(owner)) }
@@ -142,21 +177,96 @@ pub fn enter_owner(owner: OwnerId) -> OwnerScope {
 /// must obey the arena's no-escape contract and use only non-panicking cleanup;
 /// otherwise a later raw fault reclaim can invalidate safe references or enter
 /// arbitrary user code. Prefer [`enter_owner`] for ordinary untracked work.
+#[inline]
 pub unsafe fn enter_domain(domain: AllocationDomain) -> OwnerScope {
     let irq = arch::irq_save();
-    let previous = current_domain();
-    CURRENT_OWNER.store(domain.owner.0, Ordering::SeqCst);
-    CURRENT_ARENA.store(domain.arena.0, Ordering::SeqCst);
+    let Some(hart) = allocation_context_hart_index() else {
+        arch::irq_restore(irq);
+        panic!("allocation owner scope requires a mapped logical hart");
+    };
+    let owner_slot = &CURRENT_OWNERS[hart];
+    let arena_slot = &CURRENT_ARENAS[hart];
+    let previous = AllocationDomain {
+        owner: OwnerId(owner_slot.load(Ordering::SeqCst)),
+        arena: ArenaId(arena_slot.load(Ordering::SeqCst)),
+    };
+    owner_slot.store(domain.owner.0, Ordering::SeqCst);
+    arena_slot.store(domain.arena.0, Ordering::SeqCst);
+    let acquisition_physical_hart = arch::current_hart_id();
     arch::irq_restore(irq);
     OwnerScope {
+        acquisition_hart: hart,
+        acquisition_physical_hart,
+        owner_slot,
+        arena_slot,
         previous,
         active: true,
+        not_send: PhantomData,
     }
 }
 
+/// Enter an allocation scope after the executor has already resolved and
+/// validated its current logical hart.
+///
+/// Keeping that identity in the executor frame avoids repeating the topology
+/// lookup at every system/task provenance transition in one poll.
+///
+/// # Safety
+/// The current CPU must own `hart` until the returned scope is restored. For
+/// tracked domains, the public [`enter_domain`] no-escape contract also holds.
+pub(crate) unsafe fn enter_domain_on_hart(
+    domain: AllocationDomain,
+    hart: HartId,
+) -> OwnerScope {
+    let irq = arch::irq_save();
+    debug_assert_eq!(allocation_context_hart_index(), Some(hart.index()));
+    let owner_slot = &CURRENT_OWNERS[hart.index()];
+    let arena_slot = &CURRENT_ARENAS[hart.index()];
+    let previous = AllocationDomain {
+        owner: OwnerId(owner_slot.load(Ordering::SeqCst)),
+        arena: ArenaId(arena_slot.load(Ordering::SeqCst)),
+    };
+    owner_slot.store(domain.owner.0, Ordering::SeqCst);
+    arena_slot.store(domain.arena.0, Ordering::SeqCst);
+    let acquisition_physical_hart = arch::current_hart_id();
+    arch::irq_restore(irq);
+    OwnerScope {
+        acquisition_hart: hart.index(),
+        acquisition_physical_hart,
+        owner_slot,
+        arena_slot,
+        previous,
+        active: true,
+        not_send: PhantomData,
+    }
+}
+
+/// # Safety
+/// The caller must have proved that the current CPU owns `hart` for the
+/// complete scope lifetime.
+#[inline]
+pub(crate) unsafe fn enter_owner_on_hart(owner: OwnerId, hart: HartId) -> OwnerScope {
+    // Untracked SYSTEM transitions obey the same executor-validated hart
+    // contract as the task-domain transition around the poll itself.
+    unsafe { enter_domain_on_hart(AllocationDomain::untracked(owner), hart) }
+}
+
+/// A hart-affine allocation provenance scope.
+///
+/// ```compile_fail
+/// use vibeos_core::heap::{enter_owner, OwnerId};
+///
+/// fn require_send<T: Send>(_: T) {}
+/// require_send(enter_owner(OwnerId::new(7)));
+/// ```
 pub struct OwnerScope {
+    acquisition_hart: usize,
+    acquisition_physical_hart: usize,
+    owner_slot: &'static AtomicU64,
+    arena_slot: &'static AtomicU64,
     previous: AllocationDomain,
     active: bool,
+    not_send: PhantomData<*mut ()>,
 }
 
 impl OwnerScope {
@@ -168,14 +278,47 @@ impl OwnerScope {
         self.previous
     }
 
+    fn restore_inner(&mut self) {
+        self.owner_slot
+            .store(self.previous.owner.0, Ordering::SeqCst);
+        self.arena_slot
+            .store(self.previous.arena.0, Ordering::SeqCst);
+        self.active = false;
+    }
+
+    /// Restore after an enclosing executor boundary has already fixed this
+    /// poll to the scope's hart.
+    ///
+    /// # Safety
+    /// The caller must have independently verified the current physical hart.
+    pub(crate) unsafe fn restore_on_verified_hart(&mut self) {
+        if !self.active {
+            return;
+        }
+        let irq = arch::irq_save();
+        self.restore_inner();
+        arch::irq_restore(irq);
+    }
+
     /// Restore now rather than waiting for Drop. This is idempotent.
     pub fn restore(&mut self) {
         if self.active {
             let irq = arch::irq_save();
-            CURRENT_OWNER.store(self.previous.owner.0, Ordering::SeqCst);
-            CURRENT_ARENA.store(self.previous.arena.0, Ordering::SeqCst);
+            let current_physical_hart = arch::current_hart_id();
+            if current_physical_hart != self.acquisition_physical_hart {
+                arch::irq_restore(irq);
+                // Avoid a second panic from Drop while unwinding. The original
+                // hart deliberately retains its installed provenance.
+                self.active = false;
+                panic!(
+                    "allocation owner scope entered on logical hart {} / physical hart {} restored on physical hart {}",
+                    self.acquisition_hart,
+                    self.acquisition_physical_hart,
+                    current_physical_hart
+                );
+            }
+            self.restore_inner();
             arch::irq_restore(irq);
-            self.active = false;
         }
     }
 }
@@ -447,7 +590,7 @@ struct HeapInner {
     arenas: [ArenaRecord; MAX_ALLOCATION_ARENAS],
     next_owner_id: u64,
     next_arena_id: u64,
-    last_failure: Option<AllocationFailure>,
+    last_failures: [Option<AllocationFailure>; MAX_HARTS],
 }
 
 unsafe impl Send for HeapInner {}
@@ -469,7 +612,7 @@ impl Heap {
             arenas: [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS],
             next_owner_id: 1,
             next_arena_id: 1,
-            last_failure: None,
+            last_failures: [None; MAX_HARTS],
         }))
     }
 
@@ -490,7 +633,7 @@ impl Heap {
         h.arenas = [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS];
         h.next_owner_id = 1;
         h.next_arena_id = 1;
-        h.last_failure = None;
+        h.last_failures = [None; MAX_HARTS];
     }
 
     /// Global physical live/peak bytes and never-yet-used bump bytes.
@@ -768,12 +911,18 @@ impl Heap {
         find_owner(&h, owner).map(|index| h.owners[index].stats())
     }
 
+    /// Most recent allocation failure on this logical hart.
+    ///
+    /// An unmapped hart returns `None` rather than consuming a peer's reason.
     pub fn last_failure(&self) -> Option<AllocationFailure> {
-        self.0.lock().last_failure
+        let hart = allocation_context_hart_index()?;
+        self.0.lock().last_failures[hart]
     }
 
+    /// Take this logical hart's most recent allocation failure.
     pub fn take_last_failure(&self) -> Option<AllocationFailure> {
-        self.0.lock().last_failure.take()
+        let hart = allocation_context_hart_index()?;
+        self.0.lock().last_failures[hart].take()
     }
 
     /// Physical bytes charged for this layout, including allocator metadata,
@@ -782,12 +931,12 @@ impl Heap {
         allocation_plan(layout).map(|plan| plan.charge)
     }
 
-    fn record_failure(&self, owner: OwnerId, failure: AllocationFailure) {
+    fn record_failure(&self, hart: usize, owner: OwnerId, failure: AllocationFailure) {
         let mut h = self.0.lock();
         if let Some(index) = find_owner(&h, owner) {
             h.owners[index].denials = h.owners[index].denials.saturating_add(1);
         }
-        h.last_failure = Some(failure);
+        h.last_failures[hart] = Some(failure);
     }
 }
 
@@ -842,22 +991,27 @@ fn user_address(base: usize, plan: AllocationPlan, layout: Layout) -> Option<usi
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let domain = current_domain();
+        let Some(hart) = allocation_context_hart_index() else {
+            // Allocating without a registered logical hart must not borrow
+            // another hart's owner, arena, or diagnostic slot.
+            return ptr::null_mut();
+        };
+        let domain = domain_on_hart(hart);
         let owner = domain.owner;
         let Some(plan) = allocation_plan(layout) else {
-            self.record_failure(owner, AllocationFailure::LayoutOverflow { owner });
+            self.record_failure(hart, owner, AllocationFailure::LayoutOverflow { owner });
             return ptr::null_mut();
         };
 
         let mut h = self.0.lock();
         let Some(owner_index) = find_owner(&h, owner) else {
-            h.last_failure = Some(AllocationFailure::UnknownOwner { owner });
+            h.last_failures[hart] = Some(AllocationFailure::UnknownOwner { owner });
             return ptr::null_mut();
         };
 
         let arena_index = if domain.arena.is_tracked() {
             let Some(index) = find_arena(&h, domain.arena) else {
-                h.last_failure = Some(AllocationFailure::UnknownArena {
+                h.last_failures[hart] = Some(AllocationFailure::UnknownArena {
                     owner,
                     arena: domain.arena,
                 });
@@ -865,7 +1019,7 @@ unsafe impl GlobalAlloc for Heap {
             };
             let arena_owner = h.arenas[index].owner;
             if arena_owner != owner {
-                h.last_failure = Some(AllocationFailure::ArenaOwnerMismatch {
+                h.last_failures[hart] = Some(AllocationFailure::ArenaOwnerMismatch {
                     owner,
                     arena: domain.arena,
                     arena_owner,
@@ -880,7 +1034,7 @@ unsafe impl GlobalAlloc for Heap {
         let account = h.owners[owner_index];
         let Some(new_owner_live) = account.live_bytes.checked_add(plan.charge) else {
             h.owners[owner_index].denials = account.denials.saturating_add(1);
-            h.last_failure = Some(AllocationFailure::AccountingOverflow {
+            h.last_failures[hart] = Some(AllocationFailure::AccountingOverflow {
                 owner,
                 requested_bytes: plan.charge,
             });
@@ -888,7 +1042,7 @@ unsafe impl GlobalAlloc for Heap {
         };
         if owner != OwnerId::SYSTEM && new_owner_live > account.quota_bytes {
             h.owners[owner_index].denials = account.denials.saturating_add(1);
-            h.last_failure = Some(AllocationFailure::QuotaExceeded {
+            h.last_failures[hart] = Some(AllocationFailure::QuotaExceeded {
                 owner,
                 requested_bytes: plan.charge,
                 live_bytes: account.live_bytes,
@@ -898,7 +1052,7 @@ unsafe impl GlobalAlloc for Heap {
         }
         let Some(new_owner_allocations) = account.live_allocations.checked_add(1) else {
             h.owners[owner_index].denials = account.denials.saturating_add(1);
-            h.last_failure = Some(AllocationFailure::AccountingOverflow {
+            h.last_failures[hart] = Some(AllocationFailure::AccountingOverflow {
                 owner,
                 requested_bytes: plan.charge,
             });
@@ -908,7 +1062,7 @@ unsafe impl GlobalAlloc for Heap {
             let arena = h.arenas[index];
             let Some(live_bytes) = arena.live_bytes.checked_add(plan.charge) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failure = Some(AllocationFailure::AccountingOverflow {
+                h.last_failures[hart] = Some(AllocationFailure::AccountingOverflow {
                     owner,
                     requested_bytes: plan.charge,
                 });
@@ -916,7 +1070,7 @@ unsafe impl GlobalAlloc for Heap {
             };
             let Some(live_allocations) = arena.live_allocations.checked_add(1) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failure = Some(AllocationFailure::AccountingOverflow {
+                h.last_failures[hart] = Some(AllocationFailure::AccountingOverflow {
                     owner,
                     requested_bytes: plan.charge,
                 });
@@ -928,7 +1082,7 @@ unsafe impl GlobalAlloc for Heap {
         };
         let Some(new_global_live) = h.live_bytes.checked_add(plan.charge) else {
             h.owners[owner_index].denials = account.denials.saturating_add(1);
-            h.last_failure = Some(AllocationFailure::AccountingOverflow {
+            h.last_failures[hart] = Some(AllocationFailure::AccountingOverflow {
                 owner,
                 requested_bytes: plan.charge,
             });
@@ -939,7 +1093,7 @@ unsafe impl GlobalAlloc for Heap {
             let base = node.as_ptr().cast::<u8>() as usize;
             let Some(user) = user_address(base, plan, layout) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failure = Some(AllocationFailure::LayoutOverflow { owner });
+                h.last_failures[hart] = Some(AllocationFailure::LayoutOverflow { owner });
                 return ptr::null_mut();
             };
             h.free[plan.class] = unsafe { node.as_ref().next };
@@ -948,7 +1102,7 @@ unsafe impl GlobalAlloc for Heap {
             let base = h.cursor;
             let Some(next) = base.checked_add(plan.charge) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failure = Some(AllocationFailure::HeapExhausted {
+                h.last_failures[hart] = Some(AllocationFailure::HeapExhausted {
                     owner,
                     requested_bytes: plan.charge,
                 });
@@ -956,7 +1110,7 @@ unsafe impl GlobalAlloc for Heap {
             };
             if next > h.end {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failure = Some(AllocationFailure::HeapExhausted {
+                h.last_failures[hart] = Some(AllocationFailure::HeapExhausted {
                     owner,
                     requested_bytes: plan.charge,
                 });
@@ -964,7 +1118,7 @@ unsafe impl GlobalAlloc for Heap {
             }
             let Some(user) = user_address(base, plan, layout) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failure = Some(AllocationFailure::LayoutOverflow { owner });
+                h.last_failures[hart] = Some(AllocationFailure::LayoutOverflow { owner });
                 return ptr::null_mut();
             };
             h.cursor = next;
@@ -1001,7 +1155,7 @@ unsafe impl GlobalAlloc for Heap {
         }
         h.live_bytes = new_global_live;
         h.peak_bytes = h.peak_bytes.max(new_global_live);
-        h.last_failure = None;
+        h.last_failures[hart] = None;
         user as *mut u8
     }
 

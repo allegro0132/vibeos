@@ -1,10 +1,11 @@
 //! SiFive PLIC as wired up by the QEMU `virt` machine, hart 0 / S-mode context.
 //!
-//! IRQ handlers live in a small, fixed-capacity registry. Registration never
-//! allocates, and dispatch copies the handler plus its context out of the
-//! registry before invoking it. A handler can therefore register/unregister
-//! IRQs without recursively acquiring the registry lock.
+//! IRQ handlers live in a small, fixed-capacity atomic registry. Registration
+//! never allocates. Dispatch takes one bounded sequence snapshot per slot and
+//! never acquires a kernel lock before invoking component-independent top-half
+//! code.
 
+use crate::interrupt::{AtomicIrqHandlerSlot, IrqHandlerPublication};
 use crate::sync::SpinLock;
 
 pub const PLIC_BASE: usize = 0x0c00_0000;
@@ -23,13 +24,6 @@ pub const MAX_HANDLERS: usize = 16;
 /// registration; `irq_entry` is the cycle timestamp captured by trap entry.
 pub type IrqHandler = fn(context: usize, irq_entry: u64);
 
-#[derive(Clone, Copy)]
-struct HandlerSlot {
-    irq: u32,
-    handler: IrqHandler,
-    context: usize,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegisterError {
     InvalidIrq,
@@ -37,15 +31,27 @@ pub enum RegisterError {
     RegistryFull,
 }
 
-static HANDLERS: SpinLock<[Option<HandlerSlot>; MAX_HANDLERS]> =
-    SpinLock::new([None; MAX_HANDLERS]);
+const _: () = assert!(core::mem::size_of::<IrqHandler>() == core::mem::size_of::<usize>());
+
+static HANDLERS: [AtomicIrqHandlerSlot; MAX_HANDLERS] =
+    [const { AtomicIrqHandlerSlot::new() }; MAX_HANDLERS];
+// Only task-side publishers take this lock. IRQ dispatch never waits on it.
+// Besides serializing slot writers, masking local interrupts means the boot
+// hart cannot observe its own odd in-progress sequence.
+static HANDLER_WRITER: SpinLock<()> = SpinLock::new(());
 // Serializes enable-word read/modify/write operations. The lock also masks
-// local interrupts, so task-side registration cannot lose an IRQ-side mask.
+// local interrupts, so two task-side source updates cannot lose a bit. It is
+// deliberately absent from claim, dispatch, and completion.
 static ENABLE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Reset this S-mode PLIC context to a known, fully masked state.
 pub fn init() {
-    *HANDLERS.lock() = [None; MAX_HANDLERS];
+    let _writer = HANDLER_WRITER.lock();
+    for slot in &HANDLERS {
+        // Safety: HANDLER_WRITER is the sole registry writer and interrupts
+        // have not been enabled while PLIC initialization runs.
+        unsafe { slot.publish_exclusive(None) };
+    }
     let _enable = ENABLE_LOCK.lock();
     unsafe {
         (THRESHOLD_S as *mut u32).write_volatile(0);
@@ -59,21 +65,33 @@ pub fn init() {
 ///
 /// Keeping registration and enabling separate lets callers finish device
 /// initialization before the first top half can run.
-pub fn register(
-    irq: u32,
-    handler: IrqHandler,
-    context: usize,
-) -> Result<(), RegisterError> {
+pub fn register(irq: u32, handler: IrqHandler, context: usize) -> Result<(), RegisterError> {
     crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
 
-    let mut handlers = HANDLERS.lock();
-    if handlers.iter().flatten().any(|slot| slot.irq == irq) {
+    let _writer = HANDLER_WRITER.lock();
+    if HANDLERS.iter().any(|slot| {
+        slot.try_snapshot()
+            .expect("serialized handler slot cannot be updating")
+            .is_some_and(|entry| entry.irq == irq)
+    }) {
         return Err(RegisterError::AlreadyRegistered);
     }
-    let Some(slot) = handlers.iter_mut().find(|slot| slot.is_none()) else {
+    let Some(slot) = HANDLERS.iter().find(|slot| {
+        slot.try_snapshot()
+            .expect("serialized handler slot cannot be updating")
+            .is_none()
+    }) else {
         return Err(RegisterError::RegistryFull);
     };
-    *slot = Some(HandlerSlot { irq, handler, context });
+    // Safety: HANDLER_WRITER serializes every slot mutation. The Release
+    // publication makes the callback and context visible as one record.
+    unsafe {
+        slot.publish_exclusive(Some(IrqHandlerPublication {
+            irq,
+            callback: handler as usize,
+            context,
+        }))
+    };
     Ok(())
 }
 
@@ -82,36 +100,44 @@ pub fn unregister(irq: u32) -> bool {
     // Mask first. If an interrupt was already claimed, trap dispatch can still
     // observe either the old handler or no handler; both paths complete it.
     let _ = disable(irq);
-    let mut handlers = HANDLERS.lock();
-    if let Some(slot) = handlers
-        .iter_mut()
-        .find(|slot| slot.is_some_and(|entry| entry.irq == irq))
-    {
-        *slot = None;
+    let _writer = HANDLER_WRITER.lock();
+    if let Some(slot) = HANDLERS.iter().find(|slot| {
+        slot.try_snapshot()
+            .expect("serialized handler slot cannot be updating")
+            .is_some_and(|entry| entry.irq == irq)
+    }) {
+        // Safety: HANDLER_WRITER serializes every slot mutation. A dispatch
+        // which already copied the old record may still finish, matching the
+        // pre-existing mask-before-remove contract.
+        unsafe { slot.publish_exclusive(None) };
         true
     } else {
         false
     }
 }
 
-/// Invoke a registered top half. The registry lock is dropped before calling
-/// component code, so handlers never execute while a kernel lock is held.
+/// Invoke a registered top half without acquiring or spinning on a lock.
 pub fn dispatch(irq: u32, irq_entry: u64) -> bool {
-    let target = {
-        let handlers = HANDLERS.lock();
-        handlers
-            .iter()
-            .flatten()
-            .find(|slot| slot.irq == irq)
-            .map(|slot| (slot.handler, slot.context))
-    };
-
-    if let Some((handler, context)) = target {
-        handler(context, irq_entry);
-        true
-    } else {
-        false
+    let mut writer_observed = false;
+    for slot in &HANDLERS {
+        match slot.try_snapshot() {
+            Ok(Some(entry)) if entry.irq == irq => {
+                // Safety: register stored this address from `IrqHandler`, and
+                // the compile-time assertion above proves the representations
+                // have equal size on this kernel target.
+                let handler = unsafe { core::mem::transmute::<usize, IrqHandler>(entry.callback) };
+                handler(entry.context, irq_entry);
+                return true;
+            }
+            Ok(_) => {}
+            Err(_) => writer_observed = true,
+        }
     }
+
+    // Do not permanently mask a source merely because a remote publisher was
+    // between its odd/even sequence samples. Completing this claim lets a
+    // level source retrigger after the bounded publication finishes.
+    writer_observed
 }
 
 pub fn enable(irq: u32) -> Result<(), RegisterError> {

@@ -503,6 +503,11 @@ impl Heap {
         )
     }
 
+    /// Allocation-free contention telemetry for the allocator metadata lock.
+    pub fn lock_stats(&self) -> crate::sync::SpinLockStats {
+        self.0.stats()
+    }
+
     /// Read all global allocator gauges under one lock.
     pub fn snapshot(&self) -> HeapSnapshot {
         let h = self.0.lock();

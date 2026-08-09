@@ -457,6 +457,7 @@ async fn run(line: &str, boot_time: u64) {
 /// Secondary physical harts remain gated until M5.5. These untracked tasks are
 /// placed on the three logical remote queues so hart 0 must steal them.
 async fn smp_queue_demo() {
+    let scheduler_lock_before = exec::scheduler_lock_stats();
     let before = exec::scheduler_stats();
     let remote_ipi_before: Vec<_> = (1..exec::MAX_HARTS)
         .map(|index| {
@@ -525,6 +526,12 @@ async fn smp_queue_demo() {
         exec::yield_now().await;
     }
     let boot_ipi_after = ipi::stats(exec::HartId::BOOT);
+    let scheduler_lock_after = exec::scheduler_lock_stats();
+    let scheduler_lock_sampled =
+        scheduler_lock_after.acquisitions > scheduler_lock_before.acquisitions;
+    let scheduler_contention = scheduler_lock_after
+        .contended_acquisitions
+        .saturating_sub(scheduler_lock_before.contended_acquisitions);
     let self_ipi_ok = forced == ipi::DoorbellDisposition::Sent
         && local_exit.state() == exec::TaskState::Exited
         && local_exit.polls() == 1
@@ -536,11 +543,15 @@ async fn smp_queue_demo() {
         && steals == (exec::MAX_HARTS - 1) as u64
         && offline_mailboxes_ok
         && self_ipi_ok
+        && scheduler_lock_sampled
+        && scheduler_contention == 0
     {
         println!("  smp queues: remote hart1..hart3 tasks each ran once");
         println!("  smp queues: hart0 steal delta=3");
         println!("  smp ipi: offline remote reasons retained without SBI calls");
         println!("  smp ipi: forced boot-hart doorbell acknowledged");
+        println!("  smp locks: PLIC/UART RX/virtio IRQ data handoff is lock-free");
+        println!("  smp locks: scheduler sampled; single-hart contention delta=0");
         println!("  smp queues: physical secondary harts gated until M5.5");
     } else {
         println!("  smp queues: FAILED scheduler acceptance invariant");

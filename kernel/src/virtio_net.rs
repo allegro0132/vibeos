@@ -37,6 +37,8 @@ const IDLE_POLL_MS: u64 = 1;
 const QUEUE_SLOTS: usize = SPLIT_QUEUE_SIZE as usize;
 const HEADER_BYTES: usize = NET_HEADER_SIZE as usize;
 const DMA_BYTES: usize = core::mem::size_of::<DmaSlab>();
+const INTERRUPT_STATUS_OFFSET: usize = 0x060;
+const INTERRUPT_ACK_OFFSET: usize = 0x064;
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -312,7 +314,7 @@ struct DriverAuthority {
     control: Revocable<NetDevice>,
 }
 
-static CONTROL: SpinLock<DriverControl> = SpinLock::new(DriverControl {
+static CONTROL: SpinLock<DriverControl> = SpinLock::new_recoverable(DriverControl {
     transport: None,
     features: None,
     epoch: 0,
@@ -321,8 +323,7 @@ static CONTROL: SpinLock<DriverControl> = SpinLock::new(DriverControl {
     rx_inflight: 0,
     tx_inflight: 0,
 });
-static AUTHORITY: SpinLock<Option<DriverAuthority>> = SpinLock::new(None);
-static IRQ_TRANSPORT: SpinLock<Option<MmioTransport>> = SpinLock::new(None);
+static AUTHORITY: SpinLock<Option<DriverAuthority>> = SpinLock::new_recoverable(None);
 static IRQ_WAIT: WaitQueue = WaitQueue::new();
 static IRQ_CAUSES: AtomicU32 = AtomicU32::new(0);
 static USED_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -448,9 +449,10 @@ impl DriverSession {
             return None;
         }
 
-        *IRQ_TRANSPORT.lock() = Some(transport);
         let _ = plic::unregister(transport.irq());
-        if plic::register(transport.irq(), irq_top_half, 0).is_err()
+        // Publish the probed base in the PLIC's atomic callback record. The
+        // IRQ top half never locks CONTROL or a second transport snapshot.
+        if plic::register(transport.irq(), irq_top_half, transport.base()).is_err()
             || plic::enable(transport.irq()).is_err()
         {
             shutdown(transport, NetError::DriverCancelled);
@@ -701,7 +703,6 @@ impl DriverSession {
         let _ = self.transport.acknowledge_interrupt();
         let _ = plic::unregister(self.transport.irq());
         IRQ_CAUSES.store(0, Ordering::Release);
-        *IRQ_TRANSPORT.lock() = None;
         {
             let mut control = CONTROL.lock();
             control.online = false;
@@ -728,7 +729,6 @@ impl DriverSession {
         let _ = plic::unregister(self.transport.irq());
         let _ = self.transport.acknowledge_interrupt();
         IRQ_CAUSES.store(0, Ordering::Release);
-        *IRQ_TRANSPORT.lock() = None;
         {
             let mut control = CONTROL.lock();
             control.online = false;
@@ -794,7 +794,6 @@ fn shutdown(transport: MmioTransport, _reason: NetError) {
     let reset = transport.reset(RESET_POLL_BUDGET);
     let _ = transport.acknowledge_interrupt();
     IRQ_CAUSES.store(0, Ordering::Release);
-    *IRQ_TRANSPORT.lock() = None;
     {
         let mut control = CONTROL.lock();
         control.online = false;
@@ -821,7 +820,6 @@ fn quarantine_identity_exhausted(transport: MmioTransport) {
     let reset = transport.reset(RESET_POLL_BUDGET);
     let _ = transport.acknowledge_interrupt();
     IRQ_CAUSES.store(0, Ordering::Release);
-    *IRQ_TRANSPORT.lock() = None;
     if reset {
         clear_dma();
     }
@@ -907,17 +905,30 @@ async fn wait_for_work() {
     .await;
 }
 
-fn irq_top_half(_context: usize, _irq_entry: u64) {
-    if let Some(transport) = *IRQ_TRANSPORT.lock() {
-        let causes = transport.acknowledge_interrupt();
-        if causes != 0 {
-            if virtio::InterruptCauses::from_status(causes).used_buffer() {
-                USED_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            IRQ_CAUSES.fetch_or(causes, Ordering::Release);
-            IRQ_WAIT.wake_all();
+fn irq_top_half(transport_base: usize, _irq_entry: u64) {
+    let causes = acknowledge_irq_transport(transport_base);
+    if causes != 0 {
+        if virtio::InterruptCauses::from_status(causes).used_buffer() {
+            USED_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
+        IRQ_CAUSES.fetch_or(causes, Ordering::Release);
+        IRQ_WAIT.wake_all();
     }
+}
+
+/// Acknowledge the two architected virtio-mmio causes using the validated
+/// transport base captured atomically alongside this callback in the PLIC.
+/// No revocable task-owned object is touched by the IRQ top half.
+fn acknowledge_irq_transport(transport_base: usize) -> u32 {
+    let raw = unsafe { ((transport_base + INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile() };
+    dma_fence();
+    let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
+    if causes != 0 {
+        dma_fence();
+        unsafe { ((transport_base + INTERRUPT_ACK_OFFSET) as *mut u32).write_volatile(causes) };
+        dma_fence();
+    }
+    causes
 }
 
 fn publish_receive(submission: NetSubmission) -> Result<(), NetError> {
@@ -1122,7 +1133,6 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
 
     let _ = unsafe { CONTROL.recover_after_fault(domain) };
     let _ = unsafe { AUTHORITY.recover_after_fault(domain) };
-    let _ = unsafe { IRQ_TRANSPORT.recover_after_fault(domain) };
     let transport = CONTROL.lock().transport;
     if let Some(transport) = transport {
         shutdown(transport, NetError::DriverFault);

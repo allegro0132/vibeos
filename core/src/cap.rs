@@ -328,9 +328,17 @@ impl<T: Resource> Revocable<T> {
 #[must_use = "the invocation lease must remain alive for the complete invocation"]
 pub struct InvocationLease<T: Resource> {
     object: Arc<T>,
+    rights: Rights,
 }
 
 impl<T: Resource> InvocationLease<T> {
+    /// Test whether this already-resolved invocation carries a required right.
+    /// The full slot rights are retained even when lookup requested `NONE`, so
+    /// a service API can enforce its own operation-specific boundary.
+    pub const fn authorizes(&self, need: Rights) -> bool {
+        self.rights.contains(need)
+    }
+
     /// Perform work through this invocation's already-resolved authority.
     ///
     /// Unlike [`Revocable::try_with`], this intentionally does not revalidate:
@@ -418,7 +426,7 @@ impl CSpace {
         &self,
         cap: Cap,
         need: Rights,
-    ) -> Result<(Arc<T>, Arc<Derivation>), CapError> {
+    ) -> Result<(Arc<T>, Arc<Derivation>, Rights), CapError> {
         let entry = self.checked_entry(cap, need)?;
         // Upcast through the real trait-object metadata and let `Any` perform
         // the downcast. This must not trust `Resource::as_any`: safe external
@@ -426,7 +434,7 @@ impl CSpace {
         let object: Arc<dyn Any + Send + Sync> = entry.obj.clone();
         let object = Arc::downcast::<T>(object).map_err(|_| CapError::WrongType)?;
         let node = entry.node.clone();
-        Ok((object, node))
+        Ok((object, node, entry.rights))
     }
 
     /// Legacy untyped TCB resolve into an owned `Arc` lease.
@@ -445,7 +453,8 @@ impl CSpace {
     /// code that needs operation-time revocation must use `lookup_revocable`;
     /// code with explicit invocation semantics should use `lookup_lease`.
     pub fn lookup_as<T: Resource>(&self, cap: Cap, need: Rights) -> Result<Arc<T>, CapError> {
-        self.typed_parts(cap, need).map(|(object, _node)| object)
+        self.typed_parts(cap, need)
+            .map(|(object, _node, _rights)| object)
     }
 
     /// Resolve a typed operation-time token. Every call through the returned
@@ -455,7 +464,7 @@ impl CSpace {
         cap: Cap,
         need: Rights,
     ) -> Result<Revocable<T>, CapError> {
-        let (object, node) = self.typed_parts(cap, need)?;
+        let (object, node, _rights) = self.typed_parts(cap, need)?;
         Ok(Revocable { object, node })
     }
 
@@ -468,8 +477,8 @@ impl CSpace {
         cap: Cap,
         need: Rights,
     ) -> Result<InvocationLease<T>, CapError> {
-        let (object, _node) = self.typed_parts(cap, need)?;
-        Ok(InvocationLease { object })
+        let (object, _node, rights) = self.typed_parts(cap, need)?;
+        Ok(InvocationLease { object, rights })
     }
 
     /// Attenuate: produce a new cap on the same object with a *subset* of the

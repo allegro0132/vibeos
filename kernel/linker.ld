@@ -31,6 +31,15 @@ SECTIONS {
     __bss_end = .;
   } > RAM
 
+  /* Device-visible storage is stable across component arena reclamation. It
+     is explicitly initialized by the driver before use. */
+  .dma (NOLOAD) : ALIGN(4K) {
+    __dma_start = .;
+    KEEP(*(.dma))
+    . = ALIGN(4K);
+    __dma_end = .;
+  } > RAM
+
   . = ALIGN(4K);
   __stack_bottom = .;
   . += 256K;

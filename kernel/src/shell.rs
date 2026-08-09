@@ -67,6 +67,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  chan            telemetry channel depth and totals");
             println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  durable         recover a sealed capability log and tombstone");
+            println!("  blk info|test   inspect or exercise the supervised block device");
             println!("  selftest        run the in-kernel test suite");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
@@ -323,6 +324,8 @@ async fn run(line: &str, boot_time: u64) {
         "bench" => crate::bench::run().await,
 
         "durable" => durable_demo(),
+
+        "blk" => block_command(&rest).await,
 
         "selftest" => {
             let r = crate::selftest::run().await;
@@ -625,4 +628,343 @@ fn durable_demo() {
         after.last_sequence
     );
     println!("  authority result: stable IDs only; no path or object pointer was persisted");
+}
+
+async fn block_command(args: &[&str]) {
+    const SEED: &[u8] = b"VIBEOS-BLK-SECTOR-7-SEED-v1";
+    const WRITTEN: &[u8] = b"VIBEOS-BLK-SECTOR-8-WRITE-v1";
+
+    let w = world();
+    let Some(block_cap) = w.block else {
+        println!("  virtio-blk: offline (no modern block transport discovered)");
+        return;
+    };
+    let init = w.spaces["init"].clone();
+    match args.first().copied().unwrap_or("info") {
+        "info" => {
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            match lease {
+                Ok(lease) => {
+                    let Ok(info) = crate::virtio_blk::info_with(&lease) else {
+                        println!("  refused: block capability lacks read authority");
+                        return;
+                    };
+                    if info.quarantined {
+                        println!("  virtio-blk: quarantined (reset was not confirmed)");
+                    } else if info.online {
+                        println!(
+                            "  virtio-blk: ready, capacity {} sectors, queue size {}",
+                            info.capacity_sectors, info.queue_size
+                        );
+                    } else {
+                        println!("  virtio-blk: offline (driver component not attached)");
+                    }
+                }
+                Err(e) => println!("  refused: {}", e),
+            }
+        }
+        "test" => {
+            let irq_before = {
+                let lease = init
+                    .0
+                    .lock()
+                    .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                lease
+                    .as_ref()
+                    .ok()
+                    .and_then(|lease| crate::virtio_blk::info_with(lease).ok())
+                    .map_or(0, |info| info.used_interrupts)
+            };
+            let read = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let sector = match read {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            match sector {
+                Ok(sector)
+                    if sector.starts_with(SEED)
+                        && sector[SEED.len()..].iter().all(|byte| *byte == 0) =>
+                {
+                    println!("  sector 7 seed: ok")
+                }
+                Ok(_) => {
+                    println!("  sector 7 seed: mismatch");
+                    return;
+                }
+                Err(e) => {
+                    println!("  sector 7 seed: failed ({})", e);
+                    return;
+                }
+            }
+
+            let mut data = [0u8; 512];
+            data[..WRITTEN.len()].copy_from_slice(WRITTEN);
+            let write = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(
+                    block_cap,
+                    Rights::WRITE,
+                );
+            let write = match write {
+                Ok(lease) => crate::virtio_blk::write_with(lease, 8, data).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if let Err(e) = write {
+                println!("  sector 8 write + flush: failed ({})", e);
+                return;
+            }
+            let flush = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(
+                    block_cap,
+                    Rights::WRITE,
+                );
+            let flushed = match flush {
+                Ok(lease) => crate::virtio_blk::flush_with(lease).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if let Err(e) = flushed {
+                println!("  sector 8 write + flush: failed ({})", e);
+                return;
+            }
+            let verify = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let verified = match verify {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 8).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            let irq_after = {
+                let lease = init
+                    .0
+                    .lock()
+                    .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                lease
+                    .as_ref()
+                    .ok()
+                    .and_then(|lease| crate::virtio_blk::info_with(lease).ok())
+                    .map_or(irq_before, |info| info.used_interrupts)
+            };
+            match verified {
+                Ok(observed) if observed == data && irq_after > irq_before => {
+                    println!("  sector 8 write + flush: ok");
+                    println!("  used-buffer IRQ delivery: ok");
+                }
+                Ok(observed) if observed == data => {
+                    println!("  sector 8 write + flush: IRQ was not observed")
+                }
+                Ok(_) => println!("  sector 8 write + flush: readback mismatch"),
+                Err(e) => println!("  sector 8 write + flush: failed ({})", e),
+            }
+        }
+        "fault" => {
+            crate::virtio_blk::inject_fault_after_publish();
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let result = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            match result {
+                Err(crate::virtio_blk::BlockError::DriverFault) => {
+                    println!("  injected fault: device reset confirmed, DMA released")
+                }
+                Err(e) => println!("  injected fault returned: {}", e),
+                Ok(_) => println!("  injected fault was not observed"),
+            }
+        }
+        "recover" => {
+            let before = w
+                .component_named("virtio-blk")
+                .map(|component| component.snapshot().generation)
+                .unwrap_or(0);
+            crate::virtio_blk::inject_fault_after_publish();
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let fault = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if fault != Err(crate::virtio_blk::BlockError::DriverFault) {
+                println!("  fault recovery: unexpected request result");
+                return;
+            }
+            let mut restarted = false;
+            for _ in 0..200 {
+                let ready = w.component_named("virtio-blk").is_some_and(|component| {
+                    let snapshot = component.snapshot();
+                    snapshot.generation > before
+                        && snapshot.state == exec::TaskState::Running
+                        && crate::virtio_blk::is_online()
+                });
+                if ready {
+                    restarted = true;
+                    break;
+                }
+                exec::sleep_ms(1).await;
+            }
+            if !restarted {
+                println!("  fault recovery: supervisor did not restart the driver");
+                return;
+            }
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let after = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if after.is_ok_and(|sector| {
+                sector.starts_with(SEED)
+                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+            }) {
+                println!("  fault recovery: reset confirmed, fresh generation online");
+            } else {
+                println!("  fault recovery: restarted driver could not read");
+            }
+        }
+        "timeout" => {
+            let before = crate::virtio_blk::debug_waiter_counts();
+            crate::virtio_blk::inject_timeout();
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let timed_out = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let retry = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            let after = crate::virtio_blk::debug_waiter_counts();
+            let retry_matches_seed = retry.is_ok_and(|sector| {
+                sector.starts_with(SEED)
+                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+            });
+            if timed_out == Err(crate::virtio_blk::BlockError::TimedOut)
+                && retry_matches_seed
+                && before == after
+            {
+                println!("  timeout recovery: reset-before-reuse, retry ok, waiters bounded");
+            } else {
+                println!("  timeout recovery: invariant failed");
+            }
+        }
+        "cancel" => {
+            let Some(component) = w.component_named("virtio-blk") else {
+                println!("  cancellation recovery: driver component absent");
+                return;
+            };
+            let _ = component.cancel();
+            let mut cancelled = false;
+            for _ in 0..100 {
+                if component.snapshot().state == exec::TaskState::Cancelled {
+                    cancelled = true;
+                    break;
+                }
+                exec::yield_now().await;
+            }
+            if !cancelled || w.restart_component("virtio-blk").is_err() {
+                println!("  cancellation recovery: lifecycle transition failed");
+                return;
+            }
+            for _ in 0..200 {
+                if crate::virtio_blk::is_online() {
+                    break;
+                }
+                exec::sleep_ms(1).await;
+            }
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let retry = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if retry.is_ok_and(|sector| {
+                sector.starts_with(SEED)
+                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+            }) {
+                println!("  cancellation recovery: reset confirmed, explicit restart online");
+            } else {
+                println!("  cancellation recovery: restarted driver could not read");
+            }
+        }
+        "revoke" => {
+            let Some(space_cap) = w.block_space else {
+                println!("  authority revocation: driver CSpace absent");
+                return;
+            };
+            let target = init
+                .0
+                .lock()
+                .lookup_as::<Space>(space_cap, Rights::REVOKE);
+            let Ok(target) = target else {
+                println!("  authority revocation: supervisor cap denied");
+                return;
+            };
+            target.0.lock().revoke_all();
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let denied = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if denied != Err(crate::virtio_blk::BlockError::AuthorityRevoked)
+                || w.restart_component("virtio-blk").is_err()
+            {
+                println!("  authority revocation: next operation was not denied");
+                return;
+            }
+            for _ in 0..200 {
+                if crate::virtio_blk::is_online() {
+                    break;
+                }
+                exec::sleep_ms(1).await;
+            }
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+            let retry = match lease {
+                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
+                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+            };
+            if retry.is_ok_and(|sector| {
+                sector.starts_with(SEED)
+                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+            }) {
+                println!("  authority revocation: next request denied, fresh grants online");
+            } else {
+                println!("  authority revocation: explicit restart failed");
+            }
+        }
+        other => println!(
+            "  usage: blk [info|test|fault|recover|timeout|cancel|revoke] (got `{}`)",
+            other
+        ),
+    }
 }

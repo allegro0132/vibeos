@@ -111,8 +111,15 @@ pub fn init() {
         asm!("csrw stvec, {}", in(reg) __trap_entry as *const () as usize);
         asm!("csrs sie, {}", in(reg) SIE_STIE | SIE_SEIE);
     }
-    plic::init(&[uart::UART_IRQ]);
+    plic::init();
+    plic::register(uart::UART_IRQ, uart_irq, 0)
+        .expect("UART IRQ must fit in the PLIC handler registry");
+    plic::enable(uart::UART_IRQ).expect("UART IRQ must be a valid PLIC source");
     exec::init_timer();
+}
+
+fn uart_irq(_context: usize, _irq_entry: u64) {
+    uart::handle_irq();
 }
 
 pub fn enable_interrupts() {
@@ -159,8 +166,11 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         5 => exec::timer_tick_at(irq_entry),
         9 => {
             while let Some(irq) = plic::claim() {
-                if irq == uart::UART_IRQ {
-                    uart::handle_irq();
+                if !plic::dispatch(irq, irq_entry) {
+                    // A level-triggered source without a handler would
+                    // otherwise immediately retrigger forever. Mask it before
+                    // returning ownership to the PLIC.
+                    let _ = plic::disable(irq);
                 }
                 plic::complete(irq);
             }

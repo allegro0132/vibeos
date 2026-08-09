@@ -2,8 +2,8 @@
 
 Architecture and design rationale. For what to build next, see [ROADMAP.md](ROADMAP.md).
 
-**Status (2026-08-08):** M1 and M2 are complete; M3 is partial, and M3.5 has begun
-with 3.8 through 3.15 complete. The implementation is about 10,500 lines across
+**Status (2026-08-08):** M1, M2, M3.5, M4.0, and M4.1 are complete; the original
+M3 language-expansion items remain partial. The implementation is across
 `core`, `compiler`, and `kernel`. `scripts/status.sh` derives the current host and
 corpus inventory, while the QEMU harness reports target check counts from the boot
 it observed. Everything described as *implemented* below runs today; planned work
@@ -97,7 +97,7 @@ byte-identical machine code). The *argument* has holes, enumerated honestly in �
    runtime            │  exec (scheduler)   heap   sync            │
                       └────────────────┼──────────────────────────┘
                       ┌────────────────┼──────────────────────────┐
-   hardware           │  trap   plic   uart   sbi   boot/linker    │
+   hardware           │ trap  plic  uart  virtio-blk  sbi/linker   │
                       └───────────────────────────────────────────┘
                                        │
                                   OpenSBI (M-mode)
@@ -114,6 +114,8 @@ upward except through a capability it was handed.
 | `cap.rs` | ~600 | Rights, `Cap`, `CSpace`, attenuation, revocation, explicit leases | — |
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
 | `durable.rs` | ~1000 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
+| `virtio.rs` | ~950 | Pure modern virtio/block protocol and queue lifecycle model | — |
+| `kernel/virtio_*.rs` | ~1000 | MMIO transport, stable DMA, supervised block service | yes |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `shell.rs` | 458 | Operator interface | — |
@@ -460,12 +462,13 @@ Five boundaries must stay explicit:
    hart. Cooperative cancellation takes effect only at poll boundaries; hard
    containment ultimately needs instrumentation, preemption, or a
    narrower admitted component format.
-3. **Durable semantics precede durable media.** M4.0 now specifies stable typed IDs,
+3. **Durable semantics precede object publication.** M4.0 specifies stable typed IDs,
    sealed append-only derivation records, prepare/commit grants, tombstone-first
    revoke, and high-water allocation. Recovery rejects malformed ancestry and lets
    an ancestor tombstone win over every descendant. This proves the pure crash model,
-   not persistence yet: virtio-blk, object resolution, and live CSpace installation
-   remain M4.1--M4.3. See [DURABLE_FORMAT.md](DURABLE_FORMAT.md).
+   M4.1 now supplies real supervised virtio-blk media with reset-before-DMA-reuse.
+   Object resolution and live CSpace installation remain M4.2--M4.3. See
+   [DURABLE_FORMAT.md](DURABLE_FORMAT.md) and [VIRTIO_BLK.md](VIRTIO_BLK.md).
 4. **Revocation cannot retroactively erase an in-flight operation.** Console hooks
    revalidate a `Revocable` token before every write; a successful check linearizes
    that operation before an overlapping revoke. Direct generated loads and stores

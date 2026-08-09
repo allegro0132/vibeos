@@ -11,7 +11,8 @@ vibe> ps
   component:1  task:1   sensor     sensor   running   -        N    65536 B
   component:2  task:2   logger     logger   running   -        N    65536 B
   component:3  task:3   guest      guest    cancelled cancelled        1    65536 B
-  component:4  task:4   shell      init     running   -        N    524288 B
+  component:4  task:4   virtio-blk virtio-blk running   -                1    65536 B
+  component:5  task:6   shell      init     running   -        N    524288 B
   executor totals (including untracked tasks): 0 exited, 0 faulted, 1 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising
@@ -22,18 +23,19 @@ vibe> caps guest
   rights: r=read w=write s=send v=recv g=grant x=revoke
 vibe> restart guest
   restarted component:3  generation 1 -> 2
-  task task:3 -> task:5; retired 0 old cap(s), fresh grants installed
+  task task:3 -> task:7; retired 0 old cap(s), fresh grants installed
 vibe> ps
   COMPONENT    TASK     NAME       CSPACE   STATE     REASON       POLLS     BUDGET
   component:1  task:1   sensor     sensor   running   -        N    65536 B
   component:2  task:2   logger     logger   running   -        N    65536 B
-  component:3  task:5   guest      guest    running   -        N    65536 B
-  component:4  task:4   shell      init     running   -        N    524288 B
+  component:3  task:7   guest      guest    running   -        N    65536 B
+  component:4  task:4   virtio-blk virtio-blk running   -                1    65536 B
+  component:5  task:6   shell      init     running   -        N    524288 B
   executor totals (including untracked tasks): 0 exited, 0 faulted, 1 cancelled
   component allocation quotas are enforced; `mem` shows live and peak use
   background output is muted; poll counts still rising
 vibe> caps guest
-  owner component:3  task task:5  name guest  state running  reason -
+  owner component:3  task task:7  name guest  state running  reason -
   memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.1      console   -w----   ns16550a @ 0xADDR [62 bytes out]
@@ -41,7 +43,7 @@ vibe> caps guest
 vibe> restart guest
   refused: component is still running; cancel it first
 vibe> cancel guest
-  cancellation requested for component:3  task task:5; waiting for a poll boundary
+  cancellation requested for component:3  task task:7; waiting for a poll boundary
 vibe> restart shell
   refused: component has no audited restart template
 vibe> restart

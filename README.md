@@ -283,6 +283,8 @@ rustc lease     revoke during a run, then retry without new grants
 selftest        run the in-kernel test suite
 bench           emit the versioned machine-readable benchmark suite
 durable         recover a sealed capability log and tombstone
+blk info        report the supervised virtio-blk transport and capacity
+blk test        read, write, flush, read back, and verify the real backing disk
 rustc edit      type your own program; end it with a lone `.`
 probe           attempt four illegal operations, show the refusals
 revoke <space>  pull a component's authority at runtime (`guest` or `prog`)
@@ -351,6 +353,9 @@ Deliberate, not overlooked:
 - **Fuel is a fixed budget, not a deadline.** A long-running legitimate program
   is aborted at 20M calls-plus-iterations. Making it a clock needs a timer read,
   which generated code is not permitted.
-- **No durable media yet, no MMU, no user mode, no multicore.** The M4.0
-  authority format and recovery proof are complete, but virtio-blk and live
-  CSpace persistence start at M4.1.
+- **No object store or persisted live CSpace yet; no MMU, user mode, or
+  multicore.** Modern virtio-blk is real and supervised, but M4.2--M4.5 still
+  have to bind its sectors to capability-addressed objects and programs.
+- **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
+  checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
+  quarantines the slab instead of pretending revocation stopped in-flight DMA.

@@ -270,6 +270,25 @@ carrier/device-generation change, and republishes the address when a lease is
 lost or changed. From another machine on the same isolated link, run the exact
 OpenSSH gate against the announced address:
 
+If that isolated link has no DHCP server, the host can provide one ephemeral,
+single-address lease without changing its persistent network configuration.
+The following example assumes `en7` already owns `169.254.184.74/16` and serves
+only VibeOS's fixed acceptance MAC:
+
+```sh
+python3 -B scripts/milkv-dhcp-test.py \
+  --interface en7 \
+  --server-ip 169.254.184.74 \
+  --client-ip 169.254.184.75 \
+  --client-mac 02:00:00:00:00:01
+```
+
+The helper binds the named interface, keeps no lease file, ignores every other
+MAC, and advertises neither a router nor DNS. Stop it with Ctrl-C after the SSH
+gate. On a network that already supplies DHCP, do not run a second server.
+
+Then use the address printed by the board:
+
 ```sh
 ./scripts/milkv-ssh-test.sh A.B.C.D
 ```

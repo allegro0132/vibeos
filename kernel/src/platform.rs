@@ -76,7 +76,14 @@ mod selected {
     // CV1800B top, pinmux, and clock-generator pages used to take explicit
     // ownership of SDIO0 and ETH0 from the boot loader.
     pub const SOC_CONTROL_BASE: usize = 0x0300_0000;
-    pub const SOC_CONTROL_MMIO_END: usize = SOC_CONTROL_BASE + 0x3000;
+    pub const SOC_CONTROL_MMIO_END: usize = SOC_CONTROL_BASE + 0xa000;
+    // The Duo's blue user LED is driven by GPIOC24. GPIOC is outside the
+    // compact top/pinmux/clock window above even though both regions share the
+    // same Sv39 2 MiB level-0 table.
+    pub const GPIOC_BASE: usize = 0x0302_2000;
+    pub const GPIOC_MMIO_END: usize = GPIOC_BASE + 0x1000;
+    pub const EFUSE_BASE: usize = 0x0305_0000;
+    pub const EFUSE_MMIO_END: usize = EFUSE_BASE + 0x1000;
 
     pub const TIMEBASE_HZ: u64 = 25_000_000;
     // Stock Duo firmware exposes only C906B (hart 0) to OpenSBI. C906L is an

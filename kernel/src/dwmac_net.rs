@@ -43,7 +43,6 @@ const DMA_INT_ENABLE: usize = 0x101c;
 const DMA_AXI_BUS_MODE: usize = 0x1028;
 
 const DMA_SOFT_RESET: u32 = 1;
-const DMA_ATDS: u32 = 1 << 7;
 const DMA_AAL: u32 = 1 << 25;
 const DMA_START_RX: u32 = 1 << 1;
 const DMA_START_TX: u32 = 1 << 13;
@@ -64,10 +63,10 @@ const DESC_OWN: u32 = 1 << 31;
 const RX_LAST: u32 = 1 << 8;
 const RX_FIRST: u32 = 1 << 9;
 const RX_ERROR: u32 = 1 << 15;
-const RX_END_RING: u32 = 1 << 15;
-const TX_END_RING: u32 = 1 << 21;
-const TX_FIRST: u32 = 1 << 28;
-const TX_LAST: u32 = 1 << 29;
+const RX_END_RING: u32 = 1 << 25;
+const TX_END_RING: u32 = 1 << 25;
+const TX_FIRST: u32 = 1 << 29;
+const TX_LAST: u32 = 1 << 30;
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -138,6 +137,9 @@ pub struct NetInfo {
     pub tx_descriptor_status: u32,
     pub dma_status: u32,
     pub clock_enable: u32,
+    pub clock_bypass: u32,
+    pub clock_divider: u32,
+    pub ephy_control: u32,
 }
 
 pub struct MmioWindow;
@@ -199,6 +201,9 @@ impl NetDevice {
             tx_descriptor_status: tx_status(),
             dma_status: read32(DMA_STATUS),
             clock_enable: soc_read32(CLK_ENABLE_0),
+            clock_bypass: soc_read32(CLK_BYPASS_0),
+            clock_divider: soc_read32(CLK_DIV_500M_ETH0),
+            ephy_control: soc_read32(EPHY_TOP_WRAP),
         }
     }
 }
@@ -565,11 +570,14 @@ fn initialize() -> Result<(), NetError> {
     dma.rx_desc[0] = DESC_OWN;
     dma.rx_desc[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
     dma.rx_desc[2] = buffer_address(&dma.rx) as u32;
-    dma.tx_desc[0] = TX_END_RING;
+    dma.tx_desc[1] = TX_END_RING;
     dma.tx_desc[2] = buffer_address(&dma.tx) as u32;
     clean_range(dma_base(), core::mem::size_of::<DmaSlab>());
 
-    write32(DMA_BUS_MODE, DMA_ATDS | DMA_AAL | (8 << 8) | (8 << 17));
+    // The Duo device tree uses the DWMAC normal four-word descriptor format;
+    // it does not opt into snps,enh-desc. Keep ATDS clear and place TX frame
+    // control in descriptor word 1 exactly like the pinned stmmac driver.
+    write32(DMA_BUS_MODE, DMA_AAL | (8 << 8) | (8 << 17));
     write32(DMA_AXI_BUS_MODE, (1 << 12) | (1 << 1) | (1 << 2) | (1 << 3));
     write32(DMA_RX_DESC, descriptor_address(&dma.rx_desc) as u32);
     write32(DMA_TX_DESC, descriptor_address(&dma.tx_desc) as u32);
@@ -681,8 +689,8 @@ fn transmit(packet: &Packet) -> Result<(), NetError> {
         return Err(NetError::Protocol);
     }
     dma.tx[..len].copy_from_slice(packet.as_bytes());
-    dma.tx_desc[1] = len as u32;
-    dma.tx_desc[0] = TX_END_RING | TX_FIRST | TX_LAST | DESC_OWN;
+    dma.tx_desc[1] = len as u32 | TX_END_RING | TX_FIRST | TX_LAST;
+    dma.tx_desc[0] = DESC_OWN;
     clean_range(buffer_address(&dma.tx), len);
     clean_range(
         descriptor_address(&dma.tx_desc),
@@ -744,7 +752,11 @@ const CLKGEN_BASE: usize = crate::platform::SOC_CONTROL_BASE + 0x2000;
 const CLK_ENABLE_0: usize = CLKGEN_BASE;
 const CLK_BYPASS_0: usize = CLKGEN_BASE + 0x30;
 const CLK_DIV_500M_ETH0: usize = CLKGEN_BASE + 0x8c;
-const ETH0_CLOCKS: u32 = (1 << 25) | (1 << 26);
+const EPHY_BASE: usize = crate::platform::SOC_CONTROL_BASE + 0x9000;
+const EPHY_TOP_WRAP: usize = EPHY_BASE + 0x800;
+const EPHY_PAGE: usize = EPHY_BASE + 0x7c;
+const EFUSE_SHADOW: usize = crate::platform::EFUSE_BASE + 0x100;
+const ETH0_CLOCKS: u32 = (1 << 11) | (1 << 25) | (1 << 26);
 
 fn prepare_soc_hardware() {
     // The pinned CV1800B clock driver marks ETH0's 500 MHz MAC clock and
@@ -758,7 +770,203 @@ fn prepare_soc_hardware() {
         CLK_DIV_500M_ETH0,
         (soc_read32(CLK_DIV_500M_ETH0) & !(0xf << 16)) | (3 << 16) | (1 << 3),
     );
+    prepare_ephy();
     let _ = soc_read32(CLK_ENABLE_0);
+}
+
+fn prepare_ephy() {
+    // The CV1800B PHY is integrated but its analogue wave-shaping tables are
+    // not reset defaults. Linux installs this sequence in cvitek.c when the
+    // PHY is bound; a bare-metal boot must do the same before MAC traffic.
+    soc_write32(EPHY_TOP_WRAP + 4, 1); // direct APB access
+    soc_write32(EPHY_TOP_WRAP, 0x0900); // release shutdown
+    soc_write32(EPHY_TOP_WRAP, 0x0904); // release digital reset
+    delay_ms(10);
+    ephy_page(5);
+    ephy_write(0x40, 0x0c7e); // release analogue power-down and enables
+    delay_ms(1);
+    soc_write32(EPHY_TOP_WRAP, 0x0906); // release analogue reset
+
+    ephy_page(0);
+    let efuse20 = soc_read32(EFUSE_SHADOW + 0x20);
+    let efuse24 = soc_read32(EFUSE_SHADOW + 0x24);
+    let tx_tune = if efuse20 & 0x0000_0200 != 0 {
+        (efuse24 >> 24 & 0xff) | (efuse24 >> 8 & 0xff00)
+    } else {
+        0x5a5a
+    };
+    ephy_write(0x64, tx_tune);
+    let echo_current = if efuse20 & 0x0000_0100 != 0 {
+        efuse24 & 0x0000_ff00
+    } else {
+        0
+    };
+    ephy_write(0x54, echo_current);
+    let termination = if efuse20 & 0x0000_0800 != 0 {
+        ((efuse20 >> 24) & 0xf0) | ((efuse20 >> 16) & 0x0f00)
+    } else {
+        0x0bb0
+    };
+    ephy_write(0x58, (ephy_read(0x58) & !0x0ff0) | termination);
+    ephy_write(0x5c, 0x0c10);
+    ephy_write(0x68, 0x0003);
+    ephy_write(0x54, 0x0000);
+
+    ephy_write_page(
+        16,
+        &[
+            (0x68, 0x1000),
+            (0x6c, 0x3020),
+            (0x70, 0x5040),
+            (0x74, 0x7060),
+            (0x58, 0x1708),
+            (0x5c, 0x3827),
+            (0x60, 0x5748),
+            (0x64, 0x7867),
+        ],
+    );
+    ephy_write_page(
+        17,
+        &[
+            (0x40, 0x9080),
+            (0x44, 0xb0a0),
+            (0x48, 0xd0c0),
+            (0x4c, 0xf0e0),
+            (0x50, 0x9788),
+            (0x54, 0xb8a7),
+            (0x58, 0xd7c8),
+            (0x5c, 0xf8e7),
+        ],
+    );
+    ephy_page(5);
+    ephy_write(0x40, ephy_read(0x40) | 0x0001);
+    ephy_write(0x4c, ephy_read(0x4c) | 0x0820);
+    ephy_write_page(
+        10,
+        &[
+            (0x40, 0x3e00),
+            (0x44, 0x7864),
+            (0x48, 0x6470),
+            (0x4c, 0x5f62),
+            (0x50, 0x5a5a),
+            (0x54, 0x5458),
+            (0x58, 0xb23a),
+            (0x5c, 0x94a0),
+            (0x60, 0x9092),
+            (0x64, 0x8a8e),
+            (0x68, 0x8688),
+            (0x6c, 0x8484),
+            (0x70, 0x0082),
+        ],
+    );
+    ephy_write_page(
+        11,
+        &[
+            (0x40, 0x5252),
+            (0x44, 0x5252),
+            (0x48, 0x4b52),
+            (0x4c, 0x3d47),
+            (0x50, 0xaa99),
+            (0x54, 0x989e),
+            (0x58, 0x9395),
+            (0x5c, 0x9091),
+            (0x60, 0x8e8f),
+            (0x64, 0x8d8e),
+            (0x68, 0x8c8c),
+            (0x6c, 0x8b8b),
+            (0x70, 0x008a),
+        ],
+    );
+    ephy_write_page(
+        13,
+        &[
+            (0x40, 0x1e0a),
+            (0x44, 0x3862),
+            (0x48, 0x1e62),
+            (0x4c, 0x2a08),
+            (0x50, 0x244c),
+            (0x54, 0x1a44),
+            (0x58, 0x061c),
+        ],
+    );
+    ephy_write_page(
+        14,
+        &[
+            (0x40, 0x2d30),
+            (0x44, 0x3470),
+            (0x48, 0x0648),
+            (0x4c, 0x261c),
+            (0x50, 0x3160),
+            (0x54, 0x2d5e),
+        ],
+    );
+    ephy_write_page(
+        15,
+        &[
+            (0x40, 0x2922),
+            (0x44, 0x366e),
+            (0x48, 0x0752),
+            (0x4c, 0x2556),
+            (0x50, 0x2348),
+            (0x54, 0x0c30),
+        ],
+    );
+    ephy_write_page(
+        16,
+        &[
+            (0x40, 0x1e08),
+            (0x44, 0x3868),
+            (0x48, 0x1462),
+            (0x4c, 0x1a0e),
+            (0x50, 0x305e),
+            (0x54, 0x2f62),
+        ],
+    );
+    ephy_page(1);
+    ephy_write(0x68, ephy_read(0x68) & !0x0f00);
+    ephy_write_page(19, &[(0x58, 0x0012), (0x5c, 0x6848)]);
+    ephy_write_page(
+        18,
+        &[
+            (0x48, 0x0801),
+            (0x4c, 0x1717),
+            (0x5c, 0x0108),
+            (0x50, 0x3afc),
+            (0x54, 0x08d3),
+            (0x60, 0x00fb),
+        ],
+    );
+    ephy_page(0);
+    soc_write32(EPHY_TOP_WRAP, 0x090e); // start auto-negotiation
+    ephy_write(0, ephy_read(0) | 0x0100); // force full-duplex reset default
+    soc_write32(EPHY_TOP_WRAP + 4, 0); // return MII registers to MAC MDIO
+}
+
+fn ephy_write_page(page: u32, values: &[(usize, u32)]) {
+    ephy_page(page);
+    for &(offset, value) in values {
+        ephy_write(offset, value);
+    }
+}
+
+fn ephy_page(page: u32) {
+    soc_write32(EPHY_PAGE, page << 8);
+}
+
+fn ephy_read(offset: usize) -> u32 {
+    soc_read32(EPHY_BASE + offset)
+}
+
+fn ephy_write(offset: usize, value: u32) {
+    soc_write32(EPHY_BASE + offset, value);
+}
+
+fn delay_ms(milliseconds: u64) {
+    let ticks = milliseconds.saturating_mul(crate::platform::TIMEBASE_HZ) / 1_000;
+    let deadline = crate::sbi::time().saturating_add(ticks);
+    while crate::sbi::time() < deadline {
+        core::hint::spin_loop();
+    }
 }
 
 #[inline]

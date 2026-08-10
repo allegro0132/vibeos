@@ -8,7 +8,7 @@ extern crate alloc;
 
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::cap::{Cap, InvocationLease, Resource, Rights};
 use crate::exec::WaitQueue;
@@ -116,6 +116,9 @@ pub struct BlockInfo {
     pub irq: u32,
     pub used_interrupts: u64,
     pub last_error: Option<BlockError>,
+    pub last_command: u8,
+    pub interrupt_status: u32,
+    pub present_state: u32,
 }
 
 pub struct MmioWindow;
@@ -159,6 +162,9 @@ impl BlockDevice {
             irq: IRQ,
             used_interrupts: 0,
             last_error: state.last_error,
+            last_command: LAST_COMMAND.load(Ordering::Acquire) as u8,
+            interrupt_status: LAST_INTERRUPT_STATUS.load(Ordering::Acquire),
+            present_state: read32(PRESENT_STATE),
         }
     }
 }
@@ -300,6 +306,8 @@ static DRIVER_PARK: WaitQueue = WaitQueue::new();
 static IO_CLAIMED: AtomicBool = AtomicBool::new(false);
 static IO_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.get());
 static IO_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
+static LAST_COMMAND: AtomicU32 = AtomicU32::new(0);
+static LAST_INTERRUPT_STATUS: AtomicU32 = AtomicU32::new(0);
 
 fn release_io_claim() {
     IO_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
@@ -355,6 +363,7 @@ impl Card {
         reset_host()?;
         set_clock(INIT_CLOCK_HZ)?;
         write8(POWER_CONTROL, 0x0f);
+        power_on_card();
         write8(TIMEOUT_CONTROL, 0x0e);
         write32(INT_ENABLE, INT_ALL);
         write32(SIGNAL_ENABLE, 0);
@@ -428,6 +437,8 @@ impl Card {
 
     fn read_sector(&mut self, sector: u64) -> Result<[u8; 512], BlockError> {
         wait_inhibit(true)?;
+        LAST_COMMAND.store(17, Ordering::Release);
+        LAST_INTERRUPT_STATUS.store(0, Ordering::Release);
         clear_interrupts();
         write16(BLOCK_SIZE, SECTOR_SIZE as u16);
         write32(ARGUMENT, self.argument(sector)?);
@@ -449,6 +460,8 @@ impl Card {
 
     fn write_sector(&mut self, sector: u64, data: &[u8; 512]) -> Result<(), BlockError> {
         wait_inhibit(true)?;
+        LAST_COMMAND.store(24, Ordering::Release);
+        LAST_INTERRUPT_STATUS.store(0, Ordering::Release);
         clear_interrupts();
         write16(BLOCK_SIZE, SECTOR_SIZE as u16);
         write32(ARGUMENT, self.argument(sector)?);
@@ -507,17 +520,24 @@ fn prepare_soc_hardware() {
     // command state. Perform the same recoverable 3.3 V power/pad sequence as
     // the pinned CV1800B SDHCI drivers before issuing CMD0.
     write8(POWER_CONTROL, 0);
+    set_sd_pad_function(3);
+    set_sd_pad_bias(false);
     soc_write32(
         TOP_SD_PWRSW_CTRL,
         (soc_read32(TOP_SD_PWRSW_CTRL) & !0xf) | 0xe,
     );
-    set_sd_pad_function(3);
-    set_sd_pad_bias(false);
     delay_ms(30);
+}
+
+fn power_on_card() {
+    // POWER_CONTROL is written by the caller before this transition. That is
+    // the point at which PWR_EN can actually assert; the card needs the full
+    // vendor 3.3 V/pad settling delay after it, not before it.
     soc_write32(
         TOP_SD_PWRSW_CTRL,
         (soc_read32(TOP_SD_PWRSW_CTRL) & !0xf) | 0x9,
     );
+    delay_ms(1);
     set_sd_pad_function(0);
     set_sd_pad_bias(true);
     delay_ms(5);
@@ -582,7 +602,10 @@ fn reset_host() -> Result<(), BlockError> {
     write8(SOFTWARE_RESET, 1);
     poll_until(|| read8(SOFTWARE_RESET) & 1 == 0)?;
     // CV180X default-speed PHY settings used by the vendor Linux reset hook.
-    write32(VENDOR_CTRL, read32(VENDOR_CTRL) | (1 << 1));
+    write32(
+        VENDOR_CTRL,
+        read32(VENDOR_CTRL) | (1 << 1) | (1 << 8) | (1 << 9),
+    );
     write32(PHY_CONFIG, read32(PHY_CONFIG) | 1);
     write32(PHY_TX_RX_DELAY, 0x0100_0100);
     Ok(())
@@ -601,6 +624,8 @@ fn set_clock(target: u32) -> Result<(), BlockError> {
 
 fn command(index: u8, argument: u32, flags: u16) -> Result<[u32; 4], BlockError> {
     wait_inhibit(flags & CMD_DATA != 0 || flags & 3 == CMD_RESP_48_BUSY)?;
+    LAST_COMMAND.store(u32::from(index), Ordering::Release);
+    LAST_INTERRUPT_STATUS.store(0, Ordering::Release);
     clear_interrupts();
     write32(ARGUMENT, argument);
     write16(TRANSFER_MODE, 0);
@@ -632,6 +657,7 @@ fn wait_interrupt(mask: u32) -> Result<(), BlockError> {
     for _ in 0..POLL_BUDGET {
         let status = read32(INT_STATUS);
         if status & INT_ERROR != 0 {
+            LAST_INTERRUPT_STATUS.store(status, Ordering::Release);
             write32(INT_STATUS, status);
             return Err(BlockError::DeviceIo);
         }
@@ -640,6 +666,7 @@ fn wait_interrupt(mask: u32) -> Result<(), BlockError> {
         }
         core::hint::spin_loop();
     }
+    LAST_INTERRUPT_STATUS.store(read32(INT_STATUS), Ordering::Release);
     Err(BlockError::TimedOut)
 }
 

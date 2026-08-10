@@ -3,18 +3,39 @@
 set -euo pipefail
 export LC_ALL=C
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 <duo-buildroot-sdk-root>" >&2
+diagnostic=false
+sdk_arg=
+for arg in "$@"; do
+  case "$arg" in
+    --diagnostic) diagnostic=true ;;
+    -*) echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    *)
+      if [[ -n "$sdk_arg" ]]; then
+        echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2
+        exit 2
+      fi
+      sdk_arg=$arg
+      ;;
+  esac
+done
+if [[ -z "$sdk_arg" ]]; then
+  echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
-sdk_root=$(cd -- "$1" && pwd -P)
+sdk_root=$(cd -- "$sdk_arg" && pwd -P)
 
-image="$repo_root/target/milkv-duo/vibeos-milkv-duo-sd.img"
-expected_fit="$repo_root/target/milkv-duo/boot.sd"
-expected_kernel="$repo_root/target/milkv-duo/vibeos-kernel.bin"
+output_dir="$repo_root/target/milkv-duo"
+image_name="vibeos-milkv-duo-sd.img"
+if [[ "$diagnostic" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-diagnostic"
+  image_name="vibeos-milkv-duo-diagnostic-sd.img"
+fi
+image="$output_dir/$image_name"
+expected_fit="$output_dir/boot.sd"
+expected_kernel="$output_dir/vibeos-kernel.bin"
 mkimage="$sdk_root/u-boot-2021.10/build/cv1800b_milkv_duo_sd/tools/mkimage"
 dumpimage="$sdk_root/u-boot-2021.10/build/cv1800b_milkv_duo_sd/tools/dumpimage"
 expected_dtb="$sdk_root/linux_5.10/build/cv1800b_milkv_duo_sd/arch/riscv/boot/dts/cvitek/cv1800b_milkv_duo_sd.dtb"

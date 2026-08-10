@@ -5,21 +5,41 @@
 # Apple-Silicon host that normally means the official Milk-V Docker image.
 set -eo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 <duo-buildroot-sdk-root>" >&2
+diagnostic=false
+sdk_arg=
+for arg in "$@"; do
+  case "$arg" in
+    --diagnostic) diagnostic=true ;;
+    -*) echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    *)
+      if [[ -n "$sdk_arg" ]]; then
+        echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2
+        exit 2
+      fi
+      sdk_arg=$arg
+      ;;
+  esac
+done
+if [[ -z "$sdk_arg" ]]; then
+  echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
-sdk_root=$(cd -- "$1" && pwd -P)
+sdk_root=$(cd -- "$sdk_arg" && pwd -P)
 
 output_dir="$repo_root/target/milkv-duo"
+image_name="vibeos-milkv-duo-sd.img"
+if [[ "$diagnostic" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-diagnostic"
+  image_name="vibeos-milkv-duo-diagnostic-sd.img"
+fi
 kernel_bin="$output_dir/vibeos-kernel.bin"
 output_its="$output_dir/milkv-duo.its"
 output_dtb="$output_dir/cv1800b_milkv_duo_sd.dtb"
 output_fit="$output_dir/boot.sd"
-output_image="$output_dir/vibeos-milkv-duo-sd.img"
+output_image="$output_dir/$image_name"
 temp_fit="$output_dir/.boot.sd.$$.tmp"
 temp_image="$output_dir/.vibeos-milkv-duo-sd.img.$$.tmp"
 pack_dir=""
@@ -111,7 +131,11 @@ fi
 cp "$packed_image" "$temp_image"
 mv "$temp_fit" "$output_fit"
 mv "$temp_image" "$output_image"
-if ! "$script_dir/verify-milkv-duo-image.sh" "$sdk_root"; then
+verify_args=("$sdk_root")
+if [[ "$diagnostic" == true ]]; then
+  verify_args=(--diagnostic "$sdk_root")
+fi
+if ! "$script_dir/verify-milkv-duo-image.sh" "${verify_args[@]}"; then
   echo "package-milkv-duo-sdk.sh: refusing to publish an unverified SD image" >&2
   exit 1
 fi

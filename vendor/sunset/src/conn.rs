@@ -287,7 +287,7 @@ impl<CS: CliServ> Conn<CS> {
         self.kex.progress(&self.algo_conf, s)?;
 
         if !self.is_kex_sending() {
-            let event = self.channels.progress(s);
+            let event = self.channels.progress(s)?;
             if !event.is_none() {
                 // TODO better Dispatched constructor
                 return Ok(Dispatched { event, disconnect: false });

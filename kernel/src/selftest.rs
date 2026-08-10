@@ -344,6 +344,10 @@ fn paging(h: &mut Harness) {
     }
     #[cfg(feature = "milkv-duo")]
     for (name, address) in [
+        (
+            "CV1800B SoC control is identity mapped",
+            crate::platform::SOC_CONTROL_BASE,
+        ),
         ("CV1800B DWMAC is identity mapped", crate::platform::ETHERNET_BASE),
         ("CV1800B SDIO0 is identity mapped", crate::platform::SDHCI_BASE),
     ] {

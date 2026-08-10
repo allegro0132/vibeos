@@ -126,6 +126,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--interface")
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--blind-challenge",
+        action="store_true",
+        help="send CHALLENGE periodically without waiting for a captured HELLO",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -137,9 +142,14 @@ def main() -> int:
     peer = open_peer(args.interface)
     deadline = time.monotonic() + args.timeout
     hello_seen = False
+    next_blind_challenge = time.monotonic()
     try:
         print(f"READY interface={args.interface} ethertype=0x{ETHERTYPE:04x}", flush=True)
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if args.blind_challenge and now >= next_blind_challenge:
+                peer.send(CHALLENGE)
+                next_blind_challenge = now + 0.2
             packet = peer.receive()
             if packet is None:
                 continue
@@ -148,7 +158,7 @@ def main() -> int:
                 hello_seen = True
                 peer.send(CHALLENGE)
                 print("HELLO received; CHALLENGE sent", flush=True)
-            elif hello_seen and frame == ACK:
+            elif (hello_seen or args.blind_challenge) and frame == ACK:
                 print("ACK received; raw-L2 handshake PASS", flush=True)
                 return 0
     finally:

@@ -1774,10 +1774,18 @@ async fn net_command(args: &[&str]) {
                 println!("  virtio-net: quarantined (reset was not confirmed)")
             }
             #[cfg(feature = "milkv-duo")]
-            Ok(info) if info.online => println!(
-                "  dwmac: ready, polling descriptors {}, raw Ethernet header {}, RMII",
-                info.queue_size, info.header_size
-            ),
+            Ok(info) if info.online => {
+                println!(
+                    "  dwmac: ready, polling descriptors {}, raw Ethernet header {}, RMII, PHY link {}",
+                    info.queue_size,
+                    info.header_size,
+                    if info.phy_link_up { "up" } else { "down" }
+                );
+                println!(
+                    "  dwmac status: TX descriptor {:#010x}, DMA {:#010x}, clocks {:#010x}",
+                    info.tx_descriptor_status, info.dma_status, info.clock_enable
+                );
+            }
             #[cfg(feature = "qemu-virt")]
             Ok(info) if info.online => println!(
                 "  virtio-net: ready, queues rx=0/tx=1 size {}, header {}, features VERSION_1",
@@ -2023,6 +2031,12 @@ async fn block_command(args: &[&str]) {
                             info.capacity_sectors, info.queue_size
                         );
                     } else {
+                        #[cfg(feature = "milkv-duo")]
+                        match info.last_error {
+                            Some(error) => println!("  microSD: offline ({})", error),
+                            None => println!("  microSD: offline (driver component not attached)"),
+                        }
+                        #[cfg(feature = "qemu-virt")]
                         println!("  virtio-blk: offline (driver component not attached)");
                     }
                 }

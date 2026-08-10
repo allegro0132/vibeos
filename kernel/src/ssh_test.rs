@@ -39,7 +39,7 @@ const GUEST_IPV4: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY_IPV4: [u8; 4] = [10, 0, 2, 2];
 const PREFIX_LEN: u8 = 24;
 const LISTEN_PORT: u16 = 2222;
-const SSH_RANDOM_DOMAIN: u64 = 0x5649_4245_5353_4801;
+const SSH_RANDOM_DOMAIN: u64 = 0x5353_4803;
 
 const ENTROPY_RETRY_BUDGET: usize = 5_000;
 const NETWORK_RETRY_BUDGET: usize = 5_000;
@@ -61,8 +61,9 @@ impl EntropySource for OneSeed {
     type Error = ();
 
     fn try_fill_seed(&mut self, seed: &mut [u8; SEED_BYTES]) -> Result<(), Self::Error> {
-        let next = self.0.take().ok_or(())?;
+        let mut next = self.0.take().ok_or(())?;
         seed.copy_from_slice(&next);
+        wipe(&mut next);
         Ok(())
     }
 }
@@ -343,6 +344,13 @@ enum ExecutionEnd {
     Rebind(&'static str),
 }
 
+#[derive(Clone, Copy)]
+enum ExecutionCancellation {
+    Timeout,
+    Reset(&'static str),
+    Rebind(&'static str),
+}
+
 /// Serve the QEMU acceptance endpoint with one active TCP/SSH peer at a time.
 pub async fn task(
     space: &'static Space,
@@ -427,6 +435,7 @@ pub async fn task(
             }
         }
 
+        let seed = core::mem::replace(&mut connection_seed, [0; SEED_BYTES]);
         let outcome = serve_connection(
             space,
             control,
@@ -436,12 +445,9 @@ pub async fn task(
             signer_invoke,
             policy,
             &mut stack,
-            connection_seed,
+            seed,
         )
         .await;
-        // `OneSeed` consumes and ChaCha20Random erases the seed on every normal
-        // construction path. Clear our replacement slot before refilling it.
-        connection_seed = [0; SEED_BYTES];
 
         match outcome {
             ConnectionEnd::Complete(status) => {
@@ -464,25 +470,36 @@ pub async fn task(
                 connection_seed.copy_from_slice(&next_entropy.as_slice()[..SEED_BYTES]);
                 let mut next_tcp_seed = [0u8; 8];
                 next_tcp_seed.copy_from_slice(&next_entropy.as_slice()[SEED_BYTES..]);
-                let next_tcp_seed = u64::from_le_bytes(next_tcp_seed);
+                let next_tcp_seed_value = u64::from_le_bytes(next_tcp_seed);
+                wipe(&mut next_tcp_seed);
                 drop(next_entropy);
+                if connection_seed.iter().all(|byte| *byte == 0) {
+                    wipe(&mut connection_seed);
+                    crate::println!("FAIL ssh-test: trusted entropy returned an all-zero seed");
+                    return;
+                }
                 let Some((next_outbound, next_inbound)) = stack_endpoints(space, outbound, inbound)
                 else {
                     wipe(&mut connection_seed);
                     crate::println!("FAIL ssh-test: packet authority unavailable while rebinding");
                     return;
                 };
-                stack =
-                    match build_stack(space, control, next_tcp_seed, next_inbound, next_outbound)
-                        .await
-                    {
-                        Ok(stack) => stack,
-                        Err(reason) => {
-                            wipe(&mut connection_seed);
-                            crate::println!("FAIL ssh-test: {reason}");
-                            return;
-                        }
-                    };
+                stack = match build_stack(
+                    space,
+                    control,
+                    next_tcp_seed_value,
+                    next_inbound,
+                    next_outbound,
+                )
+                .await
+                {
+                    Ok(stack) => stack,
+                    Err(reason) => {
+                        wipe(&mut connection_seed);
+                        crate::println!("FAIL ssh-test: {reason}");
+                        return;
+                    }
+                };
                 bound_epoch = match device_info(space, control) {
                     Some(info) => info.session_epoch,
                     None => {
@@ -591,7 +608,15 @@ async fn wait_for_connection(
         let report = stack
             .poll_network(monotonic_ms())
             .map_err(|_| "network listener poll failed")?;
-        if report.connection_started {
+        // smoltcp considers SYN-RECEIVED an active connection, but its byte
+        // stream API cannot accept Sunset's server banner until the final ACK
+        // moves the socket to ESTABLISHED. Entering the bridge on the earlier
+        // `connection_started` edge would misread that temporary send state as
+        // a closed stream and reset every real OpenSSH connection.
+        if matches!(
+            stack.stream_status().state,
+            TcpStreamState::Established | TcpStreamState::PeerClosed
+        ) {
             return Ok(());
         }
         cooperate(
@@ -612,12 +637,14 @@ async fn serve_connection(
     signer_invoke: Cap,
     policy: Cap,
     stack: &mut StaticIpv4TcpStack,
-    seed: [u8; SEED_BYTES],
+    mut seed: [u8; SEED_BYTES],
 ) -> ConnectionEnd {
     let limits =
         RandomLimits::new(4 * 1024, 1024 * 1024).expect("SSH random limits are within hard bounds");
+    let source = OneSeed(Some(seed));
+    wipe(&mut seed);
     let inner = match ChaCha20Random::new(
-        OneSeed(Some(seed)),
+        source,
         RandomDomain::new(SSH_RANDOM_DOMAIN).expect("SSH random domain is non-zero"),
         limits,
     ) {
@@ -724,7 +751,18 @@ fn progress_protocol(
 ) -> Result<ProtocolSignal, &'static str> {
     let mut progressed = false;
     for _ in 0..MAX_SSH_PROGRESS_PER_TURN {
-        match runner.progress().map_err(|_| "SSH protocol state failed")? {
+        let event = match runner.progress() {
+            Ok(event) => event,
+            Err(error) => {
+                // This image carries only public test identities. Retaining the
+                // Sunset error category in its serial transcript makes an
+                // interoperability failure actionable without exposing key or
+                // packet contents.
+                crate::println!("ssh-test Sunset protocol error: {error:?}");
+                return Err("SSH protocol state failed");
+            }
+        };
+        match event {
             Event::None => break,
             Event::Progressed => progressed = true,
             Event::Cli(_) => return Err("server runner emitted a client event"),
@@ -935,54 +973,70 @@ async fn execute_with_network(
     let mut session = crate::vsh::Session::with_profile(crate::vsh::SessionProfile::SshExec);
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
-    let mut timed_out = false;
-    let mut cancellation: Option<(&'static str, u64)> = None;
+    let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
 
     loop {
         if let Poll::Ready(reports) = poll_once(execution.as_mut()) {
-            return match cancellation {
-                Some((reason, _)) if !timed_out => ExecutionEnd::Reset(reason),
-                _ => ExecutionEnd::Complete { reports, timed_out },
+            return match cancellation.map(|(kind, _)| kind) {
+                Some(ExecutionCancellation::Timeout) => ExecutionEnd::Complete {
+                    reports,
+                    timed_out: true,
+                },
+                Some(ExecutionCancellation::Reset(reason)) => ExecutionEnd::Reset(reason),
+                Some(ExecutionCancellation::Rebind(reason)) => ExecutionEnd::Rebind(reason),
+                None => ExecutionEnd::Complete {
+                    reports,
+                    timed_out: false,
+                },
             };
         }
 
         let now = monotonic_ms();
-        if let Some((reason, deadline)) = cancellation {
+        if let Some((kind, deadline)) = cancellation {
             if now >= deadline {
-                return ExecutionEnd::Reset(reason);
+                return match kind {
+                    ExecutionCancellation::Timeout => {
+                        ExecutionEnd::Reset("VSH exec cancellation timed out")
+                    }
+                    ExecutionCancellation::Reset(reason) => ExecutionEnd::Reset(reason),
+                    ExecutionCancellation::Rebind(reason) => ExecutionEnd::Rebind(reason),
+                };
             }
             crate::exec::yield_now().await;
             continue;
         }
         if now.saturating_sub(started) > EXEC_TIMEOUT_MS {
-            timed_out = true;
             cancel.store(true, Ordering::Release);
-            cancellation = Some(("VSH exec cancellation timed out", now + CANCEL_GRACE_MS));
+            cancellation = Some((ExecutionCancellation::Timeout, now + CANCEL_GRACE_MS));
+            continue;
         }
 
         if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
             cancel.store(true, Ordering::Release);
-            cancellation = Some((reason, now + CANCEL_GRACE_MS));
+            cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
             continue;
         }
         let wire = match bridge.drive(runner, stack, now) {
             Ok(turn) => turn,
             Err(reason) => {
                 cancel.store(true, Ordering::Release);
-                cancellation = Some((reason, now + CANCEL_GRACE_MS));
+                cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
         };
         if wire.ended {
             cancel.store(true, Ordering::Release);
-            cancellation = Some(("peer disconnected during exec", now + CANCEL_GRACE_MS));
+            cancellation = Some((
+                ExecutionCancellation::Reset("peer disconnected during exec"),
+                now + CANCEL_GRACE_MS,
+            ));
             continue;
         }
         let signal = match progress_protocol(runner, signer, space, policy, protocol) {
             Ok(signal) => signal,
             Err(reason) => {
                 cancel.store(true, Ordering::Release);
-                cancellation = Some((reason, now + CANCEL_GRACE_MS));
+                cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
         };
@@ -993,12 +1047,15 @@ async fn execute_with_network(
                 .is_some_and(|channel| runner.is_channel_closed(channel))
         {
             cancel.store(true, Ordering::Release);
-            cancellation = Some(("SSH channel closed during exec", now + CANCEL_GRACE_MS));
+            cancellation = Some((
+                ExecutionCancellation::Reset("SSH channel closed during exec"),
+                now + CANCEL_GRACE_MS,
+            ));
             continue;
         }
         if let Err(reason) = discard_channel_input(runner, protocol) {
             cancel.store(true, Ordering::Release);
-            cancellation = Some((reason, now + CANCEL_GRACE_MS));
+            cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
             continue;
         }
         cooperate(
@@ -1086,79 +1143,43 @@ async fn finish_exec(
             .drive(runner, stack, now)
             .map_err(ConnectionEnd::Reset)?;
         if wire.ended {
-            return if close_sent {
+            return if tcp_close_requested {
                 Ok(())
             } else {
                 Err(ConnectionEnd::Reset(
-                    "peer disconnected before SSH completion was sent",
+                    "peer disconnected before SSH completion was acknowledged",
                 ))
             };
         }
 
+        let completion_confirmed_before_progress =
+            close_sent && protocol.channel.is_none() && runner.is_output_drained();
         let signal = progress_protocol(runner, signer, space, policy, protocol)
             .map_err(ConnectionEnd::Reset)?;
         if matches!(signal, ProtocolSignal::Defunct) {
-            return if close_sent {
-                Ok(())
-            } else {
-                Err(ConnectionEnd::Reset(
-                    "SSH peer became defunct before completion",
-                ))
-            };
+            // `Defunct` also makes Sunset's convenience closed predicate true.
+            // It also discards any still-buffered output. Only state observed
+            // before processing that event can therefore prove both the peer's
+            // CHANNEL_CLOSE acknowledgement and a complete output drain.
+            if completion_confirmed_before_progress {
+                stack
+                    .close()
+                    .map_err(|_| ConnectionEnd::Reset("TCP close failed"))?;
+                return Ok(());
+            }
+            return Err(ConnectionEnd::Reset(
+                "SSH peer became defunct before completion was acknowledged",
+            ));
         }
         discard_channel_input(runner, protocol).map_err(ConnectionEnd::Reset)?;
 
-        let channel = protocol
-            .channel
-            .as_ref()
-            .ok_or(ConnectionEnd::Reset("accepted exec lost its channel"))?;
         let mut application_work = false;
-        if offset < output.len() {
-            match runner.write_channel(channel, ChanData::Normal, &output[offset..]) {
-                Ok(0) => {}
-                Ok(written) => {
-                    offset += written;
-                    application_work = true;
-                }
-                Err(_) => return Err(ConnectionEnd::Reset("SSH stdout channel closed")),
-            }
-        } else if !exit_sent {
-            match runner.send_exit_status(channel, status) {
-                Ok(()) => {
-                    exit_sent = true;
-                    application_work = true;
-                }
-                Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
-                Err(_) => return Err(ConnectionEnd::Reset("SSH exit-status send failed")),
-            }
-        } else if !eof_sent {
-            match runner.send_channel_eof(channel) {
-                Ok(()) => {
-                    eof_sent = true;
-                    application_work = true;
-                }
-                Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
-                Err(_) => return Err(ConnectionEnd::Reset("SSH EOF send failed")),
-            }
-        } else if !close_sent {
-            match runner.close_channel(channel) {
-                Ok(()) => {
-                    close_sent = true;
-                    application_work = true;
-                }
-                Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
-                Err(_) => return Err(ConnectionEnd::Reset("SSH channel close send failed")),
-            }
-        }
-
-        if close_sent && !tcp_close_requested && !runner.is_output_pending() {
-            stack
-                .close()
-                .map_err(|_| ConnectionEnd::Reset("TCP close failed"))?;
-            tcp_close_requested = true;
-            application_work = true;
-        }
-        if close_sent && runner.is_channel_closed(channel) {
+        if close_sent
+            && protocol
+                .channel
+                .as_ref()
+                .is_some_and(|channel| runner.is_channel_closed(channel))
+        {
             let channel = protocol
                 .channel
                 .take()
@@ -1166,6 +1187,62 @@ async fn finish_exec(
             runner
                 .channel_done(channel)
                 .map_err(|_| ConnectionEnd::Reset("SSH channel release failed"))?;
+            application_work = true;
+        }
+
+        if !close_sent {
+            let channel = protocol
+                .channel
+                .as_ref()
+                .ok_or(ConnectionEnd::Reset("accepted exec lost its channel"))?;
+            if offset < output.len() {
+                match runner.write_channel(channel, ChanData::Normal, &output[offset..]) {
+                    Ok(0) => {}
+                    Ok(written) => {
+                        offset += written;
+                        application_work = true;
+                    }
+                    Err(_) => return Err(ConnectionEnd::Reset("SSH stdout channel closed")),
+                }
+            } else if !exit_sent {
+                match runner.send_exit_status(channel, status) {
+                    Ok(()) => {
+                        exit_sent = true;
+                        application_work = true;
+                    }
+                    Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
+                    Err(_) => return Err(ConnectionEnd::Reset("SSH exit-status send failed")),
+                }
+            } else if !eof_sent {
+                match runner.send_channel_eof(channel) {
+                    Ok(()) => {
+                        eof_sent = true;
+                        application_work = true;
+                    }
+                    Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
+                    Err(_) => return Err(ConnectionEnd::Reset("SSH EOF send failed")),
+                }
+            } else {
+                match runner.close_channel(channel) {
+                    Ok(()) => {
+                        close_sent = true;
+                        application_work = true;
+                    }
+                    Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
+                    Err(_) => return Err(ConnectionEnd::Reset("SSH channel close send failed")),
+                }
+            }
+        }
+
+        if close_sent
+            && protocol.channel.is_none()
+            && !tcp_close_requested
+            && runner.is_output_drained()
+        {
+            stack
+                .close()
+                .map_err(|_| ConnectionEnd::Reset("TCP close failed"))?;
+            tcp_close_requested = true;
             application_work = true;
         }
         if tcp_close_requested && !stack.connection_active() {

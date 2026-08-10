@@ -560,6 +560,15 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         self.traf_out.is_output_pending()
     }
 
+    /// Return true only after all encoded and deferred packets have drained.
+    ///
+    /// Unlike [`Self::is_output_pending`], this also accounts for packets held
+    /// behind an in-progress key exchange. A transport must use this predicate
+    /// before closing its byte stream after protocol completion.
+    pub fn is_output_drained(&self) -> bool {
+        self.traf_out.is_fully_drained()
+    }
+
     /// Set a waker to be notified when [`output()`](Self::output) will have pending data
     pub fn set_output_waker(&mut self, waker: &Waker) {
         trace!("set_output_waker");

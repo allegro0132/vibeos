@@ -35,19 +35,20 @@ restricted vsh session component
 
 The network stack is the sole normal consumer of raw inbound packets.  The
 implemented driver boundary carries each `Packet` inside a `StampedPacket`
-bound to one boot-local `(device epoch, stack generation)` pair.  The planned
-`TcpListener` and `TcpConnection` resources shown above do not exist yet; the
-N1 acceptance component owns one smoltcp socket directly.  The stack owns no
-shell, store, key, or console authority.  The future SSH server owns only its
-TCP listener, an entropy capability, a host signing capability, the read-only
-authentication policy, and authority to ask the session factory for one of the
-predeclared command profiles.  A username is a display label; possession and
+bound to one boot-local `(device epoch, stack generation)` pair. The planned
+general `TcpListener` and `TcpConnection` resources shown above do not exist
+yet; the N1 and N4 acceptance components each own one smoltcp socket directly.
+The stack owns no shell, store, key, or console authority. The QEMU SSH
+component owns only its network grants, entropy capability, separate host-key
+read/sign grants, read-only authentication policy, and a fresh restricted VSH
+session per connection. A username is a display label; possession and
 validation of an authorized public key select the capability profile.
 
-The host private key should eventually remain behind a signer service: the SSH
-component receives `INVOKE`, not `READ`, and never obtains the key bytes.  A
-test-only QEMU image may use provisioned deterministic keys, but that image is
-not a secure deployment.
+The QEMU boundary keeps the host private key behind a signer service: the SSH
+component receives separate public-key `READ` and signing `INVOKE` grants and
+never obtains the key bytes. Its provisioned deterministic key is a public test
+fixture, not a secure deployment. Production still requires a unique device
+identity and authenticated provisioning.
 
 ## Milestones and acceptance gates
 
@@ -168,15 +169,62 @@ provisioning work is:
 
 ### N4: minimal SSH exec
 
-- Pin and audit a `no_std` SSH implementation before admitting it to the trusted
-  build.
-- Reject every algorithm and channel/request type outside the target profile.
-- Apply banner, KEX, authentication, idle, and rekey deadlines.
-- Execute one foreground command through `vsh::Session::execute_cancellable`,
-  stream bounded stdout/stderr, return `exit-status`, and propagate disconnect
-  as cancellation.
-- On teardown: cancel work, join tasks, revoke the session CSpace, release TCP
-  buffers, and remove the component allocation owner.
+The QEMU-only `ssh-test` image is the executable acceptance boundary for this
+milestone. It is intentionally separate from normal images and from N3's
+self-terminating security test. The server admits only the algorithm and
+session profile in the Target section, executes one foreground command through
+`vsh::Session::execute_ssh_cancellable`, returns the command's `exit-status`, and
+rejects shell, PTY, environment, subsystem, and additional-channel requests.
+Disconnect tears down the per-connection command/session state; a component
+fault is handled by the ordinary generation supervisor and capability-space
+reset path.
+
+The end-to-end gate is:
+
+```sh
+./scripts/qemu-ssh-test.sh
+```
+
+It requires `qemu-system-riscv64`, Python 3, `rustup`, and the OpenSSH `ssh`
+and `ssh-keygen` programs. By default it selects a free `127.0.0.1` port and
+forwards it to `10.0.2.15:2222`; an explicit
+`SSH_HOST_PORT` override remains available while the guest port stays fixed.
+QEMU user networking uses `restrict=on`, disables
+IPv6, and attaches a modern `/dev/urandom`-backed virtio-rng device. Every
+process has a bounded timeout, and the exit trap terminates and joins both QEMU
+and its timeout guard before removing the mode-0600 key files.
+
+`scripts/openssh-test-key.py --fixture accepted` and `--fixture rejected`
+produce deterministic, unencrypted OpenSSH Ed25519 client keys matching the
+binary QEMU policy. They are deliberately public test identities. The host
+peer starts with `-F /dev/null`, pins the exact expected test host key, disables
+password and keyboard-interactive fallbacks, and forces:
+
+- KEX: `curve25519-sha256` with OpenSSH strict ordering;
+- host and client key type: `ssh-ed25519`;
+- cipher: `chacha20-poly1305@openssh.com` in both directions.
+
+Readiness requires a successful, authenticated `true` through this strict
+profile; the verbose OpenSSH transcript must contain the exact negotiated
+algorithms and expected host fingerprint. The first boot must then return exact
+output for `echo vibeos-ssh-acceptance`, status 0 for `true`, and status 1 for
+`false`. The rejected key must fail public-key auth; shell, forced PTY, and
+`sftp` subsystem requests must each produce OpenSSH's request-rejected
+diagnostic. A second complete boot must pass the same authenticated readiness
+probe with the same exact host key, whose fixture fingerprint is
+`SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8`.
+
+The guest log contract checked independently from OpenSSH is:
+
+```text
+ssh-test listening on 10.0.2.15:2222
+ssh-test exec complete: status <n>
+FAIL ssh-test: <fatal reason>
+```
+
+`ssh-test connection reset: <reason>` is intentionally not a global failure:
+rejected or hostile connections may reset one connection while the single
+listener remains healthy.
 
 ### N5: hostile-input evidence
 
@@ -189,6 +237,12 @@ provisioning work is:
   prose.
 - CPU-heavy cryptographic work has a bounded cooperative-work policy so a
   single connection cannot starve network polling on the one-hart Duo target.
+
+The OpenSSH gate above supplies the authorized/rejected-key, exact exit-status,
+request-denial, strict-algorithm, and stable-host-key portion of N5. It does not
+by itself claim malformed transport fuzzing, deadline/reset coverage, resource
+exhaustion, disconnect-race coverage, or Milk-V hardware evidence; those remain
+separate acceptance work.
 
 ### N6: interactive terminal and hardware
 

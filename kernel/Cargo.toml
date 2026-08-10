@@ -13,6 +13,9 @@ legacy-shell = []
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
 tcp-echo = []
+# Test-only recovery hook used by the live stack-generation acceptance script.
+# It is never enabled by the normal TCP or eventual SSH image.
+tcp-echo-recovery-test = ["tcp-echo"]
 
 # The kernel is `no_std` and cannot link a host test harness. Its tests live in
 # `selftest.rs` and run inside QEMU; `cargo test --workspace` must skip it.

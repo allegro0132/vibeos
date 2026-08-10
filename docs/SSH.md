@@ -25,7 +25,7 @@ discipline and channel-backed output rather than the global UART TTY.
 
 ```text
 NIC driver
-  <-> bounded Endpoint<Packet>
+  <-> bounded Endpoint<StampedPacket>
 net-stack component
   <-> bounded TcpListener/TcpConnection resources
 sshd component
@@ -33,9 +33,13 @@ sshd component
 restricted vsh session component
 ```
 
-The network stack is the sole normal consumer of raw inbound packets.  It owns
-no shell, store, key, or console authority.  The SSH server owns only its TCP
-listener, an entropy capability, a host signing capability, the read-only
+The network stack is the sole normal consumer of raw inbound packets.  The
+implemented driver boundary carries each `Packet` inside a `StampedPacket`
+bound to one boot-local `(device epoch, stack generation)` pair.  The planned
+`TcpListener` and `TcpConnection` resources shown above do not exist yet; the
+N1 acceptance component owns one smoltcp socket directly.  The stack owns no
+shell, store, key, or console authority.  The future SSH server owns only its
+TCP listener, an entropy capability, a host signing capability, the read-only
 authentication policy, and authority to ask the session factory for one of the
 predeclared command profiles.  A username is a display label; possession and
 validation of an authorized public key select the capability profile.
@@ -55,8 +59,6 @@ not a secure deployment.
   fragmentation are out of scope.
 - Run QEMU with user networking and localhost-only host forwarding.  A host
   client must exchange exact bytes with the guest TCP echo service.
-- On a network-device epoch change, drain stale packets and abort every TCP
-  connection before accepting traffic from the new epoch.
 
 The N1 echo service is behind the `tcp-echo` kernel feature.  Normal images and
 the existing raw-L2 acceptance cases do not enable it.
@@ -72,32 +74,75 @@ revocation. The end-to-end byte-stream gate is:
 
 That command builds the dedicated image, binds an ephemeral localhost port,
 forwards it to `10.0.2.15:2222`, and requires an exact binary echo. This proves
-the byte-stream transport only; its TCP seed is explicitly non-cryptographic
-and the image is not an SSH server.
+the byte-stream transport only; its fixed TCP seed is explicitly
+non-cryptographic and the image is not an SSH server.
 
-One N1 hardening gate remains before the transport can be called SSH-ready:
-packets must carry both the network-device epoch and stack generation end to
-end, the driver must reject stale egress, and QEMU must exercise driver and
-stack faults during a live TCP stream. The current component observes device
-epoch changes, drains queued ingress, and rebuilds all TCP state, but that
-snapshot is not an atomic cross-hart barrier. A stack fault is therefore
-reclaimed but deliberately left terminal instead of automatically mixing a
-new stack generation with queued old egress.
+### N2: packet-session generations and live recovery
 
-### N2: entropy and identity
+The implementation now gives every driver/stack session an exact
+`PacketStamp` containing a non-zero device epoch and stack generation. Device
+attach advances the epoch, stack bind advances the generation, and checked
+counter exhaustion fails closed. A bind first makes the fence inactive and
+cannot succeed while previously admitted transmit descriptors remain in
+flight. The drivers serialize binding with ingress publication and with exact
+stamp validation plus egress DMA publication. The smoltcp adapter independently
+rejects mismatched ingress. These coordinates are restart identities, not
+random values, cryptographic authenticators, or identities that survive boot.
 
-- Add a bounded `RandomSource` capability.  QEMU uses virtio-rng; the Milk-V
-  Duo backend must use a documented and validated hardware source or fail
-  closed.
-- Provision one unique Ed25519 host identity per device and keep its public
-  fingerprint stable across reboot.
+Fault recovery unbinds a session only when the faulted allocation domain owns
+that binding. The `tcp-echo` supervisor may then restart a faulted stack and let
+the replacement bind a fresh generation; cancellation and normal exit remain
+operator decisions. The N2 QEMU gate is:
+
+```sh
+./scripts/qemu-tcp-test.sh recovery
+```
+
+That one gate is designed to exercise two live-stream transitions in order:
+
+1. Fault the TCP-stack component. The device epoch must stay equal and the
+   stack generation must advance. The retired stream must not echo after the
+   transition, a fresh stream must exchange exact bytes, and old-coordinate
+   ingress and egress packets must increment their separate rejection counts.
+2. Fault the virtio-net driver. Both the device epoch and stack generation must
+   advance after driver and stack recovery. The same retired-stream,
+   fresh-stream, and coordinate-specific stale-ingress/stale-egress assertions
+   apply to the second retired pair.
+
+This paragraph defines the acceptance gate; it does not claim that a particular
+run passed. The deterministic stale-packet and fault controls are compiled only
+by `tcp-echo-recovery-test`. They add the ambient `tcp-fault`, `tcp-release`,
+`tcp-session`, and `tcp-device-fault` controls to that test image; normal
+`tcp-echo`, default, and future SSH images do not contain them. The staged
+packets exercise the two typed-endpoint rejection paths, not a real delayed DMA
+completion or a late IRQ. The gate is QEMU/virtio-only. The analogous native
+DWMAC fence exists in source but has not been exercised by this TCP image or
+validated on Milk-V Duo hardware. N2 is therefore not a production-readiness,
+exhaustive cross-hart-interleaving, or physical-device claim.
+
+### N3: entropy and identity
+
+VibeOS currently has no trusted entropy source. Before any SSH protocol image
+is treated as secure, this milestone must:
+
+- Add a bounded, fallible `RandomSource` capability. QEMU uses virtio-rng and
+  fails closed if it cannot obtain trusted bytes. A deterministic provider is
+  permitted only in a separately identified test image.
+- Use a documented and validated Milk-V Duo hardware source or leave SSH
+  disabled on that platform. Compiling a vendor RNG API or driver is not
+  hardware validation.
+- Provision one unique Ed25519 host identity per device, keep its public
+  fingerprint stable across reboot, and leave the private seed behind a signer
+  service. The SSH component receives invocation authority, not readable key
+  bytes. A fixed test host key must never enter a production image.
 - Store authorized public keys as exact binary keys mapped to immutable
   capability profiles; do not parse an ambient `authorized_keys` pathname.
 - Define a fixed persistent `ssh-policy` graph and its update/revocation flow.
-  The current CRC-protected journal alone is not protection against malicious
-  media replacement or rollback.
+  The current CRC-protected journal detects accidental corruption but does not
+  provide private-key confidentiality, malicious-media authentication, or
+  rollback resistance.
 
-### N3: minimal SSH exec
+### N4: minimal SSH exec
 
 - Pin and audit a `no_std` SSH implementation before admitting it to the trusted
   build.
@@ -109,7 +154,7 @@ new stack generation with queued old egress.
 - On teardown: cancel work, join tasks, revoke the session CSpace, release TCP
   buffers, and remove the component allocation owner.
 
-### N4: hostile-input evidence
+### N5: hostile-input evidence
 
 - Host tests and fuzz targets cover packet/string/name-list lengths, malformed
   key exchange, authentication failures, channel windows, and disconnect races.
@@ -121,7 +166,7 @@ new stack generation with queued old egress.
 - CPU-heavy cryptographic work has a bounded cooperative-work policy so a
   single connection cannot starve network polling on the one-hart Duo target.
 
-### N5: interactive terminal and hardware
+### N6: interactive terminal and hardware
 
 - Add per-session terminal input, output, history, Ctrl-C/EOF, window changes,
   and channel backpressure.  Do not reuse the singleton UART TTY.

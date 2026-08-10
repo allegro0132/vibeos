@@ -19,6 +19,13 @@ device capabilities around each synchronous hardware turn, and resets MAC/DMA
 on normal teardown. This closes the known software drop/stall path; it does not
 replace the unchecked physical Ethernet acceptance item below.
 
+The DWMAC source also uses the same boot-local device-epoch/stack-generation
+packet fence as virtio-net. That is a source-level implementation fact, not a
+Milk-V hardware result. The `tcp-echo` feature is deliberately rejected on
+non-QEMU builds, and the N2 `qemu-tcp-test.sh recovery` gate exercises only the
+virtio backend. It neither validates DWMAC restart coordinates nor injects a
+real delayed descriptor completion or late Ethernet IRQ on the board.
+
 ## CPU model and support boundaries
 
 The official SDK does not expose the two cores as symmetric OpenSBI harts:
@@ -270,6 +277,19 @@ For the first hardware boot, preserve the full serial log and verify each item:
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B
       DWMAC online and the raw-L2 HELLO/CHALLENGE/ACK exchange succeeds.
+- [ ] A Duo-specific bounded TCP acceptance image exists and exercises a live
+      DWMAC reset/restart. The device epoch and stack generation advance as
+      required, packets from each retired coordinate are rejected in both
+      directions, and the retired TCP stream does not resume in the replacement
+      stack.
+- [ ] Delayed DWMAC DMA completion and late-IRQ cases are exercised on physical
+      hardware; the synthetic QEMU endpoint injection is not evidence for
+      either case.
+- [ ] Before enabling SSH, a documented hardware entropy source is validated
+      on the board and a unique per-device Ed25519 identity is provisioned
+      behind non-readable signing authority. Until then the Duo SSH path fails
+      closed; neither a deterministic test key nor the CRC journal satisfies
+      this item.
 - [x] Run the self-tests appropriate for a single-core board configuration.
       Preserve the full serial log before analyzing any trap, panic, or OpenSBI
       extension error.

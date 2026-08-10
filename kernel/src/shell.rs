@@ -14,7 +14,7 @@ use core::task::Poll;
 use crate::cap::{CSpace, Cap, CapError, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
-use crate::net::Packet;
+use crate::net::{Packet, PacketStamp, StampedPacket};
 use crate::world::{world, Reading, Space};
 use crate::HEAP;
 use crate::{exec, ipi, mmu, println, sbi, sync::SpinLock, tty, uart};
@@ -45,12 +45,12 @@ pub async fn shell_task(boot_time: u64) {
 }
 
 #[cfg(not(feature = "legacy-shell"))]
-pub async fn vsh_task(
-    space: Arc<Space>,
-    console: Cap,
-    mut session: crate::vsh::Session,
-) {
-    write_vsh_front(&space, console, "\nVibeOS vsh ready -- capability-native shell.\n\n");
+pub async fn vsh_task(space: Arc<Space>, console: Cap, mut session: crate::vsh::Session) {
+    write_vsh_front(
+        &space,
+        console,
+        "\nVibeOS vsh ready -- capability-native shell.\n\n",
+    );
     loop {
         tty::prompt("vsh> ");
         if let Some(line) = read_line().await {
@@ -99,10 +99,12 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let vsh_command = matches!(
         first,
         "echo" | "wc" | "false" | "deny" | "fault" | "spin" | "let" | "jobs" | "wait"
-    ) || (first == "cancel" && trimmed.split_whitespace().nth(1).is_some_and(|arg| arg.starts_with('%')));
-    if let Some(source) = explicit_vsh.or_else(|| {
-        vsh_command.then_some(trimmed)
-    }) {
+    ) || (first == "cancel"
+        && trimmed
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|arg| arg.starts_with('%')));
+    if let Some(source) = explicit_vsh.or_else(|| vsh_command.then_some(trimmed)) {
         run_vsh_source(source, vsh, None).await;
         return;
     }
@@ -354,9 +356,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         "rustc" => {
             if rest.first().copied() == Some("save") {
-                if rest.get(1).copied() != Some(crate::program::PROGRAM_ALIAS)
-                    || rest.len() != 2
-                {
+                if rest.get(1).copied() != Some(crate::program::PROGRAM_ALIAS) || rest.len() != 2 {
                     println!("  usage: rustc save hello");
                     return;
                 }
@@ -425,13 +425,11 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         "pcspace" => persistent_cspace_command(&rest).await,
 
-        "smp" => {
-            match rest.as_slice() {
-                ["queues"] => smp_queue_demo().await,
-                ["scale"] => smp_scale_demo().await,
-                _ => println!("  usage: smp queues|scale"),
-            }
-        }
+        "smp" => match rest.as_slice() {
+            ["queues"] => smp_queue_demo().await,
+            ["scale"] => smp_scale_demo().await,
+            _ => println!("  usage: smp queues|scale"),
+        },
 
         "mmu" => match rest.as_slice() {
             [] => mmu_status(),
@@ -571,15 +569,23 @@ async fn run_vsh_source(
     *vsh = session;
     let mut output = String::new();
     match result {
-        Ok(reports) => for report in reports {
-            output.push_str(&report.output);
-            if report.status != crate::vsh::Status::Success {
-                output.push_str(&alloc::format!("  vsh job %{}: {:?}\n", report.id, report.status));
+        Ok(reports) => {
+            for report in reports {
+                output.push_str(&report.output);
+                if report.status != crate::vsh::Status::Success {
+                    output.push_str(&alloc::format!(
+                        "  vsh job %{}: {:?}\n",
+                        report.id,
+                        report.status
+                    ));
+                }
             }
-        },
+        }
         Err(error) => output.push_str(&alloc::format!(
             "  vsh: {} at bytes {}..{}\n",
-            error.message, error.span.start, error.span.end
+            error.message,
+            error.span.start,
+            error.span.end
         )),
     }
     if let Some((space, console)) = front {
@@ -590,7 +596,11 @@ async fn run_vsh_source(
 }
 
 fn write_vsh_front(space: &Arc<Space>, console: Cap, text: &str) {
-    match space.0.lock().lookup_revocable::<ConsoleDev>(console, Rights::WRITE) {
+    match space
+        .0
+        .lock()
+        .lookup_revocable::<ConsoleDev>(console, Rights::WRITE)
+    {
         Ok(token) => {
             let _ = token.try_with(|console| console.write(text));
         }
@@ -627,7 +637,13 @@ pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {
         let c = component.snapshot();
         output.push_str(&alloc::format!(
             "{} {} {} {} {} {} {}\n",
-            c.id, c.task_id, c.name, c.cspace, c.state, c.polls, c.memory.budget_bytes
+            c.id,
+            c.task_id,
+            c.name,
+            c.cspace,
+            c.state,
+            c.polls,
+            c.memory.budget_bytes
         ));
     }
     Ok(output)
@@ -637,7 +653,9 @@ pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {
 pub(crate) fn vsh_caps(args: &[String]) -> Result<String, crate::vsh::Status> {
     let name = args.first().map(String::as_str).unwrap_or("vsh");
     let system = world();
-    let Some(space) = system.spaces.get(name) else { return Err(crate::vsh::Status::Unavailable) };
+    let Some(space) = system.spaces.get(name) else {
+        return Err(crate::vsh::Status::Unavailable);
+    };
     let mut output = alloc::format!("CAPABILITIES {}\n", name);
     for (_handle, kind, rights, _description) in space.0.lock().list() {
         output.push_str(&alloc::format!("{} {}\n", kind, rights));
@@ -653,8 +671,11 @@ pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
         let c = component.snapshot();
         output.push_str(&alloc::format!(
             "{} live={} peak={} budget={} denied={}\n",
-            c.name, c.memory.live_bytes, c.memory.peak_bytes,
-            c.memory.budget_bytes, c.memory.denials
+            c.name,
+            c.memory.live_bytes,
+            c.memory.peak_bytes,
+            c.memory.budget_bytes,
+            c.memory.denials
         ));
     }
     Ok(output)
@@ -818,7 +839,11 @@ async fn mmu_wx_demo() {
         "  reuse: zeroed {}, same-address {}, hart1=42 {}",
         if zeroed { "yes" } else { "NO" },
         if same_address { "yes" } else { "NO" },
-        if remote_second == Some(42) { "ok" } else { "FAILED" },
+        if remote_second == Some(42) {
+            "ok"
+        } else {
+            "FAILED"
+        },
     );
     println!(
         "  shootdown: {} transitions, {} remote sfence, {} remote fence.i",
@@ -1161,9 +1186,7 @@ async fn smp_queue_demo() {
         return;
     }
     let before_ipi: Vec<_> = (1..exec::MAX_HARTS)
-        .map(|index| {
-            ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
-        })
+        .map(|index| ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid")))
         .collect();
     for gate in &gates {
         gate.wake_all();
@@ -1180,16 +1203,16 @@ async fn smp_queue_demo() {
         exec::yield_now().await;
     }
     let after_ipi: Vec<_> = (1..exec::MAX_HARTS)
-        .map(|index| {
-            ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid"))
-        })
+        .map(|index| ipi::stats(exec::HartId::new(index).expect("logical scheduler hart is valid")))
         .collect();
-    let exact_harts = started.iter().zip(&resumed).enumerate().all(
-        |(offset, (start, resume))| {
+    let exact_harts = started
+        .iter()
+        .zip(&resumed)
+        .enumerate()
+        .all(|(offset, (start, resume))| {
             let encoded = (offset + 2) as u64;
             start.load(Ordering::SeqCst) == encoded && resume.load(Ordering::SeqCst) == encoded
-        },
-    );
+        });
     let ipis_observed = before_ipi.iter().zip(&after_ipi).all(|(before, after)| {
         after.doorbells == before.doorbells + 1
             && after.send_failures == before.send_failures
@@ -1296,8 +1319,8 @@ fn smp_work_segment(worker: usize) -> u64 {
 async fn smp_scale_demo() {
     if ipi::current_logical_hart() != Some(exec::HartId::BOOT)
         || !(0..exec::MAX_HARTS).all(|index| {
-        ipi::is_online(exec::HartId::new(index).expect("logical scheduler hart is valid"))
-    })
+            ipi::is_online(exec::HartId::new(index).expect("logical scheduler hart is valid"))
+        })
     {
         println!("VIBE_SMP_SCALE_FAILED harts_offline");
         return;
@@ -1330,22 +1353,26 @@ async fn smp_scale_demo() {
         let task_finished = finished.clone();
         let task_checksum = checksum.clone();
         let task_observed = observed.clone();
-        handles.push(exec::spawn_pinned_on(hart, "smp-scale-worker", async move {
-            task_observed[index].store(
-                ipi::current_logical_hart().map_or(0, |current| current.index() as u64 + 1),
-                Ordering::SeqCst,
-            );
-            task_ready.fetch_add(1, Ordering::AcqRel);
-            while !task_released.load(Ordering::Acquire) {
-                core::hint::spin_loop();
-            }
+        handles.push(exec::spawn_pinned_on(
+            hart,
+            "smp-scale-worker",
+            async move {
+                task_observed[index].store(
+                    ipi::current_logical_hart().map_or(0, |current| current.index() as u64 + 1),
+                    Ordering::SeqCst,
+                );
+                task_ready.fetch_add(1, Ordering::AcqRel);
+                while !task_released.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
 
-            let result = smp_work_segment(index);
-            task_checksum.fetch_xor(result, Ordering::AcqRel);
-            if task_finished.fetch_add(1, Ordering::AcqRel) + 1 == exec::MAX_HARTS {
-                task_finish.store(sbi::time(), Ordering::Release);
-            }
-        }));
+                let result = smp_work_segment(index);
+                task_checksum.fetch_xor(result, Ordering::AcqRel);
+                if task_finished.fetch_add(1, Ordering::AcqRel) + 1 == exec::MAX_HARTS {
+                    task_finish.store(sbi::time(), Ordering::Release);
+                }
+            },
+        ));
     }
 
     let mut remotes_started = false;
@@ -1386,9 +1413,10 @@ async fn smp_scale_demo() {
         .load(Ordering::Acquire)
         .saturating_sub(start_tick.load(Ordering::Acquire))
         .max(1);
-    let exact_harts = observed.iter().enumerate().all(|(index, seen)| {
-        seen.load(Ordering::SeqCst) == index as u64 + 1
-    });
+    let exact_harts = observed
+        .iter()
+        .enumerate()
+        .all(|(index, seen)| seen.load(Ordering::SeqCst) == index as u64 + 1);
     let parallel_checksum = checksum.load(Ordering::Acquire);
     if !workers_ok || !exact_harts || parallel_checksum != serial_checksum {
         println!("VIBE_SMP_SCALE_FAILED worker_invariant");
@@ -1463,7 +1491,8 @@ async fn save_hello() {
             );
             println!(
                 "  durable artifact cap: slot {} generation {}, rights r",
-                report.identity.slot(), report.identity.generation()
+                report.identity.slot(),
+                report.identity.generation()
             );
             println!("  authority manifest: console=w memory=rw; Store WRITE absent");
         }
@@ -1621,9 +1650,9 @@ fn report(what: &str, outcome: Result<(), CapError>) {
 
 fn durable_demo() {
     use crate::durable::{
-        recover, DecodeStatus, DerivationId, DurableRights, GrantFlags, GrantRecord,
-        LogRecord, ObjectId, RecordBody, RecordChain, RecoveryPolicy, ResourceKind,
-        RootPolicy, SlotIdentity, SpaceId, StoreId, TransactionId,
+        recover, DecodeStatus, DerivationId, DurableRights, GrantFlags, GrantRecord, LogRecord,
+        ObjectId, RecordBody, RecordChain, RecoveryPolicy, ResourceKind, RootPolicy, SlotIdentity,
+        SpaceId, StoreId, TransactionId,
     };
 
     let store = StoreId::new(1).unwrap();
@@ -1668,23 +1697,42 @@ fn durable_demo() {
             )
             .unwrap(),
     );
-    let roots = [RootPolicy { grant: root.clone() }];
-    let before = recover(&sectors, RecoveryPolicy { store_id: store, roots: &roots }).unwrap();
+    let roots = [RootPolicy {
+        grant: root.clone(),
+    }];
+    let before = recover(
+        &sectors,
+        RecoveryPolicy {
+            store_id: store,
+            roots: &roots,
+        },
+    )
+    .unwrap();
 
     sectors.push(
         chain
             .append(
                 Some(TransactionId::new(21).unwrap()),
-                RecordBody::RevokeTombstone { derivation_id: root.derivation_id },
+                RecordBody::RevokeTombstone {
+                    derivation_id: root.derivation_id,
+                },
             )
             .unwrap(),
     );
-    let after = recover(&sectors, RecoveryPolicy { store_id: store, roots: &roots }).unwrap();
+    let after = recover(
+        &sectors,
+        RecoveryPolicy {
+            store_id: store,
+            roots: &roots,
+        },
+    )
+    .unwrap();
 
     println!("  durable-cap v1: 512-byte LE records, CRC32C + sealed chain");
     println!(
         "  committed grant: {} live root at sequence {}",
-        before.grants.len(), before.last_sequence
+        before.grants.len(),
+        before.last_sequence
     );
     println!(
         "  tombstone recovery: {} live grants, {} retained tombstone at sequence {}",
@@ -1769,7 +1817,16 @@ async fn net_command(args: &[&str]) {
                 println!("  network fault recovery: control authority denied");
                 return;
             }
-            if let Err(error) = net_send(&init, outbound, crate::virtio_net::hello_packet()).await {
+            let stamp = match net_bind(&init, control).await {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    println!("  network fault recovery: bind failed ({})", error);
+                    return;
+                }
+            };
+            if let Err(error) =
+                net_send(&init, outbound, stamp, crate::virtio_net::hello_packet()).await
+            {
                 println!("  network fault recovery: trigger failed ({})", error);
                 return;
             }
@@ -1804,11 +1861,27 @@ async fn net_command(args: &[&str]) {
                 ),
             }
         }
-        other => println!(
-            "  usage: net [info|test|fault] (got `{}`)",
-            other
-        ),
+        other => println!("  usage: net [info|test|fault] (got `{}`)", other),
     }
+}
+
+async fn net_bind(
+    init: &Arc<Space>,
+    control: crate::cap::Cap,
+) -> Result<PacketStamp, crate::virtio_net::NetError> {
+    for _ in 0..NET_COMMAND_TIMEOUT_MS {
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::INVOKE)
+            .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
+        match crate::virtio_net::bind_stack_with(&lease) {
+            Ok(stamp) => return Ok(stamp),
+            Err(crate::virtio_net::NetError::SessionBusy) => exec::sleep_ms(1).await,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(crate::virtio_net::NetError::TimedOut)
 }
 
 fn net_info(
@@ -1826,14 +1899,15 @@ fn net_info(
 async fn net_send(
     init: &Arc<Space>,
     outbound: crate::cap::Cap,
+    stamp: PacketStamp,
     packet: Packet,
 ) -> Result<(), crate::virtio_net::NetError> {
-    let mut pending = packet;
+    let mut pending = StampedPacket::new(packet, stamp);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let lease = init
             .0
             .lock()
-            .lookup_lease::<Endpoint<Packet>>(outbound, Rights::SEND)
+            .lookup_lease::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
             .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
         match lease.with(|endpoint| endpoint.try_send(pending)) {
             Ok(()) => return Ok(()),
@@ -1847,15 +1921,18 @@ async fn net_send(
 async fn net_receive(
     init: &Arc<Space>,
     inbound: crate::cap::Cap,
+    stamp: PacketStamp,
 ) -> Result<Packet, crate::virtio_net::NetError> {
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let lease = init
             .0
             .lock()
-            .lookup_lease::<Endpoint<Packet>>(inbound, Rights::RECV)
+            .lookup_lease::<Endpoint<StampedPacket>>(inbound, Rights::RECV)
             .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
         if let Some(packet) = lease.with(Endpoint::try_recv) {
-            return Ok(packet);
+            if let Ok(packet) = packet.into_packet(stamp) {
+                return Ok(packet);
+            }
         }
         exec::sleep_ms(1).await;
     }
@@ -1867,20 +1944,18 @@ async fn net_handshake(
     outbound: crate::cap::Cap,
     inbound: crate::cap::Cap,
     control: crate::cap::Cap,
-) -> Result<
-    (crate::virtio_net::NetInfo, crate::virtio_net::NetInfo),
-    crate::virtio_net::NetError,
-> {
+) -> Result<(crate::virtio_net::NetInfo, crate::virtio_net::NetInfo), crate::virtio_net::NetError> {
     let before = net_info(init, control)?;
     if !before.online || before.quarantined {
         return Err(crate::virtio_net::NetError::Offline);
     }
-    net_send(init, outbound, crate::virtio_net::hello_packet()).await?;
-    let challenge = net_receive(init, inbound).await?;
+    let stamp = net_bind(init, control).await?;
+    net_send(init, outbound, stamp, crate::virtio_net::hello_packet()).await?;
+    let challenge = net_receive(init, inbound, stamp).await?;
     if !crate::virtio_net::is_challenge(&challenge) {
         return Err(crate::virtio_net::NetError::Protocol);
     }
-    net_send(init, outbound, crate::virtio_net::ack_packet()).await?;
+    net_send(init, outbound, stamp, crate::virtio_net::ack_packet()).await?;
 
     let tx_target = before.tx_packets.saturating_add(2);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
@@ -1980,10 +2055,7 @@ async fn block_command(args: &[&str]) {
             let write = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(
-                    block_cap,
-                    Rights::WRITE,
-                );
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::WRITE);
             let write = match write {
                 Ok(lease) => crate::virtio_blk::write_with(lease, 8, data).await,
                 Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
@@ -1995,10 +2067,7 @@ async fn block_command(args: &[&str]) {
             let flush = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(
-                    block_cap,
-                    Rights::WRITE,
-                );
+                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::WRITE);
             let flushed = match flush {
                 Ok(lease) => crate::virtio_blk::flush_with(lease).await,
                 Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
@@ -2101,8 +2170,7 @@ async fn block_command(args: &[&str]) {
                 Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
             };
             if after.is_ok_and(|sector| {
-                sector.starts_with(SEED)
-                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+                sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
             }) {
                 println!("  fault recovery: reset confirmed, fresh generation online");
             } else {
@@ -2130,8 +2198,7 @@ async fn block_command(args: &[&str]) {
             };
             let after = crate::virtio_blk::debug_waiter_counts();
             let retry_matches_seed = retry.is_ok_and(|sector| {
-                sector.starts_with(SEED)
-                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+                sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
             });
             if timed_out == Err(crate::virtio_blk::BlockError::TimedOut)
                 && retry_matches_seed
@@ -2175,8 +2242,7 @@ async fn block_command(args: &[&str]) {
                 Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
             };
             if retry.is_ok_and(|sector| {
-                sector.starts_with(SEED)
-                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+                sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
             }) {
                 println!("  cancellation recovery: reset confirmed, explicit restart online");
             } else {
@@ -2188,10 +2254,7 @@ async fn block_command(args: &[&str]) {
                 println!("  authority revocation: driver CSpace absent");
                 return;
             };
-            let target = init
-                .0
-                .lock()
-                .lookup_as::<Space>(space_cap, Rights::REVOKE);
+            let target = init.0.lock().lookup_as::<Space>(space_cap, Rights::REVOKE);
             let Ok(target) = target else {
                 println!("  authority revocation: supervisor cap denied");
                 return;
@@ -2226,8 +2289,7 @@ async fn block_command(args: &[&str]) {
                 Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
             };
             if retry.is_ok_and(|sector| {
-                sector.starts_with(SEED)
-                    && sector[SEED.len()..].iter().all(|byte| *byte == 0)
+                sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
             }) {
                 println!("  authority revocation: next request denied, fresh grants online");
             } else {
@@ -2377,10 +2439,7 @@ async fn persistent_cspace_command(args: &[&str]) {
     let lease = init
         .0
         .lock()
-        .lookup_lease::<crate::durable_cspace::DurableCSpaceService>(
-            service_cap,
-            Rights::WRITE,
-        );
+        .lookup_lease::<crate::durable_cspace::DurableCSpaceService>(service_cap, Rights::WRITE);
     let report = match lease {
         Ok(lease) => crate::durable_cspace::test_with(lease).await,
         Err(_) => Err(crate::durable_cspace::DurableCSpaceError::PermissionDenied),
@@ -2422,7 +2481,11 @@ async fn persistent_cspace_command(args: &[&str]) {
             );
             println!(
                 "  tombstone-first ancestor revoke: child {}, descendant {}",
-                if report.old_child_absent { "absent" } else { "live" },
+                if report.old_child_absent {
+                    "absent"
+                } else {
+                    "live"
+                },
                 if report.descendant_absent {
                     "absent"
                 } else {

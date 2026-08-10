@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 import socket
 import sys
 import threading
@@ -17,9 +18,22 @@ import time
 
 LOOPBACK = "127.0.0.1"
 PAYLOAD = b"VIBEOS-TCP-ECHO-v1\x00\x01\x7f\x80\xff\r\n"
+RECOVERY_BEFORE = b"VIBEOS-STACK-BEFORE-v1\x00\x80\xff"
+RECOVERY_AFTER = b"VIBEOS-STACK-AFTER-v1\x01\x81\xfe"
+RECOVERY_STALE_PROBES = (
+    b"VIBEOS-OLD-STREAM-PROBE-A-v1\x00\xff",
+    b"VIBEOS-OLD-STREAM-PROBE-B-v1\x01\xfe",
+    b"VIBEOS-OLD-STREAM-PROBE-C-v1\x02\xfd",
+)
+RECOVERY_FRESH_PROBES = (
+    b"VIBEOS-FRESH-STREAM-PROBE-A-v1\x03\xfc",
+    b"VIBEOS-FRESH-STREAM-PROBE-B-v1\x04\xfb",
+    b"VIBEOS-FRESH-STREAM-PROBE-C-v1\x05\xfa",
+)
 CONNECT_ATTEMPT_TIMEOUT = 1.0
 RETRY_INTERVAL = 0.05
 EXTRA_BYTE_SETTLE = 0.1
+RETIRED_STREAM_OBSERVATION = 6.0
 
 
 class PeerError(RuntimeError):
@@ -122,6 +136,102 @@ def exchange(port: int, timeout: float) -> int:
             time.sleep(min(RETRY_INTERVAL, remaining))
 
 
+def open_echo_stream(
+    port: int, payload: bytes, deadline: float
+) -> tuple[socket.socket, int]:
+    attempts = 0
+    last_error = "guest listener did not accept a connection"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PeerError(f"recovery connection timed out; last error: {last_error}")
+        attempts += 1
+        stream: socket.socket | None = None
+        try:
+            stream = socket.create_connection(
+                (LOOPBACK, port), timeout=min(CONNECT_ATTEMPT_TIMEOUT, remaining)
+            )
+            stream.sendall(payload)
+            observed = receive_exact(stream, len(payload), deadline)
+            if observed != payload:
+                raise PeerError(
+                    "recovery echo payload mismatch\n"
+                    f"  expected={payload.hex()}\n"
+                    f"  observed={observed.hex()}"
+                )
+            return stream, attempts
+        except PeerError:
+            if stream is not None:
+                stream.close()
+            raise
+        except (OSError, TransientExchangeError) as error:
+            if stream is not None:
+                stream.close()
+            last_error = str(error)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(RETRY_INTERVAL, remaining))
+
+
+def recovery_exchange(
+    port: int, timeout: float, ready_path: Path, continue_path: Path
+) -> tuple[int, int]:
+    deadline = time.monotonic() + timeout
+    old_stream, old_attempts = open_echo_stream(port, RECOVERY_BEFORE, deadline)
+    try:
+        ready_path.write_text("old stream ready\n", encoding="ascii")
+        while not continue_path.exists():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PeerError("timed out waiting for the stack-fault recovery marker")
+            time.sleep(min(RETRY_INTERVAL, remaining))
+
+        # Prove that the replacement stack is serving traffic before treating
+        # silence on the retired stream as fail-closed evidence, then close the
+        # fresh connection so the single guest socket is available. Alternate
+        # three never-before-used old-stream probes with short-lived exact
+        # fresh exchanges; any old-stream byte fails, while each nearby fresh
+        # success rules out listener occupancy and a globally stalled guest.
+        new_stream, new_attempts = open_echo_stream(port, RECOVERY_AFTER, deadline)
+        new_stream.close()
+
+        observation_deadline = min(
+            deadline, time.monotonic() + RETIRED_STREAM_OBSERVATION
+        )
+        for stale_probe, fresh_probe in zip(
+            RECOVERY_STALE_PROBES, RECOVERY_FRESH_PROBES, strict=True
+        ):
+            remaining = observation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise PeerError("retired-stream observation window expired early")
+            old_stream.settimeout(min(0.6, remaining))
+            retired_closed = False
+            try:
+                old_stream.sendall(stale_probe)
+                observed = old_stream.recv(4096)
+            except socket.timeout:
+                observed = b""
+            except (ConnectionError, OSError):
+                observed = b""
+                retired_closed = True
+            if observed:
+                raise PeerError(
+                    f"retired TCP stream returned data after recovery: {observed.hex()}"
+                )
+
+            fresh_deadline = min(
+                observation_deadline, time.monotonic() + CONNECT_ATTEMPT_TIMEOUT
+            )
+            fresh_stream, _ = open_echo_stream(port, fresh_probe, fresh_deadline)
+            fresh_stream.close()
+            if retired_closed:
+                break
+    finally:
+        old_stream.close()
+
+    return old_attempts, new_attempts
+
+
 def selftest() -> None:
     failures: list[Exception] = []
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -182,12 +292,23 @@ def parse_args() -> argparse.Namespace:
         help="print a currently unused loopback port and exit",
     )
     action.add_argument("--selftest", action="store_true")
+    action.add_argument("--recovery", action="store_true")
     parser.add_argument("--port", type=valid_port, help="forwarded localhost port")
     parser.add_argument(
         "--timeout",
         type=float,
         default=45.0,
         help="seconds to wait for the guest listener (default: 45)",
+    )
+    parser.add_argument(
+        "--recovery-ready",
+        type=Path,
+        help="publish readiness here after the pre-fault stream echoes",
+    )
+    parser.add_argument(
+        "--recovery-continue",
+        type=Path,
+        help="wait for this file before probing the retired stream",
     )
     return parser.parse_args()
 
@@ -206,6 +327,22 @@ def main() -> int:
             raise PeerError("echo mode requires --port")
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise PeerError("--timeout must be a finite positive number")
+        if args.recovery:
+            if args.recovery_ready is None or args.recovery_continue is None:
+                raise PeerError(
+                    "recovery mode requires --recovery-ready and --recovery-continue"
+                )
+            old_attempts, new_attempts = recovery_exchange(
+                args.port,
+                args.timeout,
+                args.recovery_ready,
+                args.recovery_continue,
+            )
+            print(
+                "tcp-peer: retired stream rejected and fresh stream echoed "
+                f"after {old_attempts}/{new_attempts} attempt(s)"
+            )
+            return 0
         attempts = exchange(args.port, args.timeout)
         print(
             f"tcp-peer: exact {len(PAYLOAD)}-byte echo received "

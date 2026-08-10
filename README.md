@@ -51,6 +51,7 @@ cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/differential.sh    # exact-output oracle using the pinned rustc
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/qemu-tcp-test.sh   # N1 static IPv4/TCP echo through host forwarding
+./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
@@ -513,6 +514,20 @@ Deliberate, not overlooked:
 - **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.
-- **Networking is raw Ethernet only.** M4.4 carries owned `Packet` values through
-  bounded typed endpoints; it does not yet provide ARP, IP, UDP/TCP, DNS, or a
-  POSIX byte-stream socket API.
+- **Networking remains deliberately feature-gated.** The ordinary images expose
+  only bounded raw-L2 service. Driver/stack queues now carry owned
+  `StampedPacket` values tied to one boot-local device epoch and stack
+  generation. The dedicated QEMU-only `tcp-echo` image adds ARP, static IPv4,
+  and one bounded TCP echo socket; it is not a general listener/connection API
+  or an SSH server, and it still provides no DHCP, DNS, IPv6, UDP, or POSIX
+  socket namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
+  stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
+  are absent from normal images and do not model delayed DMA completion or a
+  late IRQ. The native DWMAC path has not passed this gate on Milk-V Duo
+  hardware.
+- **SSH entropy and identity do not exist yet.** The next milestone is a
+  bounded, fail-closed random-source capability plus a unique per-device
+  Ed25519 identity behind a signer capability. The echo stack's fixed seed is
+  non-cryptographic, deterministic test keys are test-image-only, and the
+  CRC-protected object journal is not secure private-key storage or a rollback
+  anchor.

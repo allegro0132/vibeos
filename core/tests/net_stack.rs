@@ -11,7 +11,10 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{
     PacketSessionError, PacketSessionFence, PacketStamp, PacketStampMismatch, StampedPacket,
 };
-use vibeos_core::net_stack::{PacketDevice, StackError, StaticIpv4Config, StaticIpv4EchoStack};
+use vibeos_core::net_stack::{
+    PacketDevice, StackError, StaticIpv4Config, StaticIpv4EchoStack, StaticIpv4TcpStack,
+    TcpIoResult, TcpStreamState, MAX_TCP_STREAM_BYTES_PER_CALL, TCP_BUFFER_BYTES,
+};
 
 const SERVER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 const CLIENT_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
@@ -278,6 +281,35 @@ impl TestClient {
     }
 }
 
+fn raw_tcp_pair() -> (StaticIpv4TcpStack, TestClient) {
+    let client_to_server = Endpoint::new("raw-client-to-server", 64);
+    let server_to_client = Endpoint::new("raw-server-to-client", 64);
+    let mut space = CSpace::new("raw-test-link");
+
+    let (_, server_in) = authority(&mut space, &client_to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &server_to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &server_to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &client_to_server, Rights::SEND);
+
+    (
+        StaticIpv4TcpStack::new(server_config(), session_stamp(), server_in, server_out).unwrap(),
+        TestClient::new(client_in, client_out),
+    )
+}
+
+fn connect_raw_pair(server: &mut StaticIpv4TcpStack, client: &mut TestClient) -> u64 {
+    for now_ms in 0..2_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        if server.stream_status().state == TcpStreamState::Established && client.socket().may_send()
+        {
+            return now_ms + 1;
+        }
+    }
+    panic!("dual-smoltcp TCP handshake did not complete");
+}
+
 #[test]
 fn static_ipv4_stack_resolves_arp_and_echoes_one_tcp_connection() {
     let client_to_server = Endpoint::new("client-to-server", 32);
@@ -341,4 +373,149 @@ fn static_ipv4_stack_resolves_arp_and_echoes_one_tcp_connection() {
     assert_eq!(echoed, payload);
     assert!(server.device_stats().rx_frames > 0);
     assert!(server.device_stats().tx_frames > 0);
+}
+
+#[test]
+fn raw_tcp_stream_fragments_both_directions_and_reports_backpressure_and_eof() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let mut now_ms = connect_raw_pair(&mut server, &mut client);
+
+    assert_eq!(server.stream_status().state, TcpStreamState::Established);
+    let mut empty = [0u8; 32];
+    assert_eq!(server.try_recv(&mut empty), Ok(TcpIoResult::WouldBlock));
+
+    let upstream: Vec<u8> = (0..3_571).map(|index| (index % 239) as u8).collect();
+    let mut upstream_sent = 0;
+    let mut upstream_received = Vec::new();
+    for turn in 0..10_000 {
+        if upstream_sent < upstream.len() && client.socket().can_send() {
+            let fragment = (37 + turn % 211).min(upstream.len() - upstream_sent);
+            let sent = client
+                .socket()
+                .send_slice(&upstream[upstream_sent..upstream_sent + fragment])
+                .unwrap();
+            upstream_sent += sent;
+        }
+
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        let mut fragment = [0u8; 257];
+        match server.try_recv(&mut fragment).unwrap() {
+            TcpIoResult::Progress(received) => {
+                assert!(received <= fragment.len());
+                assert!(received <= MAX_TCP_STREAM_BYTES_PER_CALL);
+                upstream_received.extend_from_slice(&fragment[..received]);
+            }
+            TcpIoResult::WouldBlock => {}
+            TcpIoResult::Closed => panic!("server receive half closed before the payload arrived"),
+        }
+        client.poll(now_ms);
+        now_ms += 1;
+
+        if upstream_sent == upstream.len() && upstream_received.len() == upstream.len() {
+            break;
+        }
+    }
+    assert_eq!(upstream_received, upstream);
+
+    let downstream: Vec<u8> = (0..(TCP_BUFFER_BYTES + 2_731))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let mut downstream_queued = 0;
+    loop {
+        match server.try_send(&downstream[downstream_queued..]).unwrap() {
+            TcpIoResult::Progress(sent) => {
+                assert!(sent <= MAX_TCP_STREAM_BYTES_PER_CALL);
+                downstream_queued += sent;
+            }
+            TcpIoResult::WouldBlock => break,
+            TcpIoResult::Closed => panic!("server transmit half closed while established"),
+        }
+    }
+    assert_eq!(downstream_queued, TCP_BUFFER_BYTES);
+    assert_eq!(server.stream_status().writable_bytes, 0);
+    assert_eq!(
+        server.try_send(&downstream[downstream_queued..]),
+        Ok(TcpIoResult::WouldBlock)
+    );
+
+    let mut downstream_received = Vec::new();
+    for _ in 0..20_000 {
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+
+        if client.socket().can_recv() {
+            let mut fragment = [0u8; 313];
+            let received = client.socket().recv_slice(&mut fragment).unwrap();
+            downstream_received.extend_from_slice(&fragment[..received]);
+        }
+        if downstream_queued < downstream.len() {
+            match server.try_send(&downstream[downstream_queued..]).unwrap() {
+                TcpIoResult::Progress(sent) => {
+                    assert!(sent <= MAX_TCP_STREAM_BYTES_PER_CALL);
+                    downstream_queued += sent;
+                }
+                TcpIoResult::WouldBlock => {}
+                TcpIoResult::Closed => panic!("server transmit half closed before EOF"),
+            }
+        }
+
+        client.poll(now_ms);
+        now_ms += 1;
+        if downstream_queued == downstream.len()
+            && downstream_received.len() == downstream.len()
+            && server.stream_status().queued_send_bytes == 0
+        {
+            break;
+        }
+    }
+    assert_eq!(downstream_received, downstream);
+
+    client.socket().close();
+    let mut saw_eof = false;
+    for _ in 0..5_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        now_ms += 1;
+        if server.stream_status().state == TcpStreamState::PeerClosed {
+            assert_eq!(server.try_recv(&mut empty), Ok(TcpIoResult::Closed));
+            saw_eof = true;
+            break;
+        }
+    }
+    assert!(saw_eof, "server did not observe the client's FIN as EOF");
+    assert_eq!(server.close(), Ok(TcpStreamState::Closing));
+
+    let mut saw_connection_end = false;
+    for _ in 0..5_000 {
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        let report = server.poll_network(now_ms).unwrap();
+        saw_connection_end |= report.connection_ended;
+        now_ms += 1;
+        if server.stream_status().state == TcpStreamState::Listening {
+            break;
+        }
+    }
+    assert!(saw_connection_end);
+    assert_eq!(server.stream_status().state, TcpStreamState::Listening);
+}
+
+#[test]
+fn raw_tcp_reset_is_terminal_until_a_network_poll_rearms_the_listener() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let now_ms = connect_raw_pair(&mut server, &mut client);
+
+    assert_eq!(server.reset(), Ok(TcpStreamState::Reset));
+    assert_eq!(server.stream_status().state, TcpStreamState::Reset);
+    assert_eq!(server.try_send(b"stale"), Ok(TcpIoResult::Closed));
+    let mut output = [0u8; 16];
+    assert_eq!(server.try_recv(&mut output), Ok(TcpIoResult::Closed));
+
+    let report = server.poll_network(now_ms).unwrap();
+    assert!(report.connection_ended);
+    assert_eq!(server.stream_status().state, TcpStreamState::Listening);
+    client.poll(now_ms);
+    assert!(!client.socket().may_send());
 }

@@ -1,4 +1,4 @@
-//! N1 acceptance service: one static IPv4 interface and one TCP echo socket.
+//! N1 acceptance service: one configurable IPv4 interface and one TCP echo socket.
 //!
 //! This module is compiled only for the dedicated `tcp-echo` image. It keeps
 //! the protocol stack behind attenuated packet/control capabilities and is not
@@ -18,10 +18,10 @@ use crate::net::{PacketStamp, StampedPacket};
 use crate::world::Space;
 use vibeos_core::net_stack::{StackError, StaticIpv4Config, StaticIpv4EchoStack};
 
-const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
-const GUEST_IPV4: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY_IPV4: [u8; 4] = [10, 0, 2, 2];
-const PREFIX_LEN: u8 = 24;
+const GUEST_MAC: [u8; 6] = crate::net_config::DEFAULT_MAC;
+const GUEST_IPV4: [u8; 4] = crate::net_config::DEFAULT_IPV4;
+const GATEWAY_IPV4: [u8; 4] = crate::net_config::DEFAULT_GATEWAY;
+const PREFIX_LEN: u8 = crate::net_config::DEFAULT_PREFIX_LEN;
 const LISTEN_PORT: u16 = 2222;
 const TCP_TEST_SEED: u64 = 0x5649_4245_4f53_4e31;
 const IDLE_POLL_CEILING_MS: u64 = 10;
@@ -101,6 +101,7 @@ pub async fn task(space: &'static Space, outbound_cap: Cap, inbound_cap: Cap, co
     };
 
     let mut observed_epoch = None;
+    let mut observed_config_revision = 0;
     let mut stack = None;
     loop {
         #[cfg(feature = "tcp-echo-recovery-test")]
@@ -145,18 +146,25 @@ pub async fn task(space: &'static Space, outbound_cap: Cap, inbound_cap: Cap, co
                 };
             stack = Some(next);
             observed_epoch = Some(stamp.device_epoch());
+            observed_config_revision = 0;
         }
 
-        let now_ms = monotonic_ms();
-        let report = match stack
+        let active_stack = stack
             .as_mut()
-            .expect("an observed network epoch has a protocol stack")
-            .poll(now_ms)
-        {
+            .expect("an observed network epoch has a protocol stack");
+        if crate::net_config::reconcile(active_stack, &mut observed_config_revision).is_err() {
+            return;
+        }
+        let now_ms = monotonic_ms();
+        let report = match active_stack.poll(now_ms) {
             Ok(report) => report,
             Err(StackError::AuthorityRevoked) => return,
             Err(_) => return,
         };
+        crate::net_config::publish_stack_status(
+            observed_config_revision,
+            active_stack.ipv4_status(),
+        );
         #[cfg(feature = "tcp-echo-recovery-test")]
         {
             let device_stats = stack

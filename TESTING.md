@@ -6,7 +6,7 @@ Four layers, cheapest first. Run them all before pushing.
 cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/differential.sh      # verify committed output with pinned real rustc
 ./scripts/qemu-test.sh         # golden cases plus the differential oracle
-./scripts/qemu-tcp-test.sh     # N1 static IPv4/TCP echo over QEMU hostfwd
+./scripts/qemu-tcp-test.sh     # N1 static/DHCP IPv4 and TCP echo over QEMU hostfwd
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
 ./scripts/qemu-ssh-security-test.sh # N3 QEMU entropy/identity boundary gate
 ./scripts/qemu-ssh-test.sh     # N4/N5 real OpenSSH exec and rejection gate
@@ -93,7 +93,10 @@ golden; TAP, root privileges, and host network access are never used.
 `qemu-tcp-test.sh` is the separate QEMU protocol-stack harness. Its default N1
 mode builds only the `tcp-echo` image, attaches QEMU user networking, binds host
 forwarding to an ephemeral `127.0.0.1` port, and targets static guest
-`10.0.2.15:2222`. The peer sends a deterministic binary payload containing
+`10.0.2.15:2222`. Before opening the TCP peer, the harness exercises the
+Linux-style vsh command layer, verifies the initial static address, switches
+`net0` to DHCP, and requires QEMU's `10.0.2.15/24` dynamic lease. The peer then
+sends a deterministic binary payload containing
 NUL, control, and high-bit bytes, tolerates fragmented TCP reads, and accepts
 only an exact echo. Portable tests separately drive two smoltcp interfaces
 through capability-addressed packet endpoints to cover ARP, a 3,000-byte TCP

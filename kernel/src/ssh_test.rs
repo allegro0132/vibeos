@@ -3,11 +3,13 @@
 //! The transport owns no ambient authority. Packet I/O, entropy, host-key
 //! signing, and authorization are all reached through separately attenuated
 //! capabilities. Each accepted TCP connection gets fresh caller-provided
-//! randomness and at most one authenticated session channel and one `exec`.
+//! randomness and at most one authenticated session channel and one accepted
+//! start request: either bounded `exec` or an isolated PTY-backed VSH shell.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -19,13 +21,19 @@ use core::task::{Context, Poll, Waker};
 
 use sunset::{
     ChanData, ChanFail, ChanHandle, Ed25519HostSigner, Event, PubKey, Runner, ServEvent, Server,
+    TerminalSize,
 };
-use vibeos_core::cap::{Cap, Rights};
+use vibeos_core::cap::{CSpace, Cap, Rights};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
 use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_core::ssh_identity::SshEd25519PublicKey;
+use vibeos_core::sync::SpinLock;
+use vibeos_core::terminal::{
+    FrontendError, TerminalEvent, TerminalFrontend, MAX_EMIT_TEXT_BYTES,
+    MAX_INPUT_BYTES as MAX_TERMINAL_INPUT_BYTES,
+};
 
 use crate::ssh_security::{
     self, AuthorizedKeyPolicyService, AuthorizedProfile, HostPublicKeySnapshot, HostSigningService,
@@ -54,6 +62,10 @@ const MAX_CHANNEL_DISCARDS_PER_TURN: usize = 4;
 const MAX_WIRE_BYTES_PER_DIRECTION: usize = 512 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
 const WIRE_CHUNK_BYTES: usize = 1_024;
+const SHELL_PROMPT: &str = "vsh> ";
+const SHELL_OUTPUT_LIMIT_DIAGNOSTIC: &str = "  vsh: command output exceeded SSH shell limit\n";
+const SHELL_INPUT_CHUNK_BYTES: usize = 64;
+const MAX_SHELL_INPUT_ACTIONS_PER_TURN: usize = 64;
 
 struct OneSeed(Option<[u8; SEED_BYTES]>);
 
@@ -161,14 +173,44 @@ struct ProtocolState {
     authenticated: bool,
     channel: Option<ChanHandle>,
     channel_seen: bool,
-    exec_seen: bool,
+    pty: Option<TerminalSize>,
+    start_seen: bool,
 }
 
 enum ProtocolSignal {
     Idle,
     Progressed,
     Exec(String),
+    Shell,
+    Interrupt,
     Defunct,
+}
+
+enum SessionStart {
+    Exec(String),
+    Shell,
+}
+
+struct PendingInput {
+    bytes: VecDeque<u8>,
+    signal_interrupt: bool,
+}
+
+impl PendingInput {
+    fn new() -> Result<Self, &'static str> {
+        let mut bytes = VecDeque::new();
+        bytes
+            .try_reserve_exact(MAX_TERMINAL_INPUT_BYTES)
+            .map_err(|_| "SSH shell input allocation failed")?;
+        Ok(Self {
+            bytes,
+            signal_interrupt: false,
+        })
+    }
+
+    fn remaining_capacity(&self) -> usize {
+        MAX_TERMINAL_INPUT_BYTES - self.bytes.len()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -330,7 +372,8 @@ impl WireBridge {
 }
 
 enum ConnectionEnd {
-    Complete(u32),
+    ExecComplete(u32),
+    ShellComplete(u32),
     Reset(&'static str),
     Rebind(&'static str),
 }
@@ -450,8 +493,11 @@ pub async fn task(
         .await;
 
         match outcome {
-            ConnectionEnd::Complete(status) => {
+            ConnectionEnd::ExecComplete(status) => {
                 crate::println!("ssh-test exec complete: status {status}");
+            }
+            ConnectionEnd::ShellComplete(status) => {
+                crate::println!("ssh-test shell complete: status {status}");
             }
             ConnectionEnd::Reset(reason) => {
                 let _ = stack.reset();
@@ -656,9 +702,13 @@ async fn serve_connection(
     let mut signer = CapabilityHostSigner::new(space, signer_read, signer_invoke);
     let mut protocol = ProtocolState::default();
     let mut bridge = WireBridge::new();
+    let mut pending_input = match PendingInput::new() {
+        Ok(input) => input,
+        Err(reason) => return ConnectionEnd::Reset(reason),
+    };
     let started = monotonic_ms();
 
-    let command = loop {
+    let start = loop {
         let now = monotonic_ms();
         if now.saturating_sub(started) > CONNECTION_TIMEOUT_MS {
             return reset_connection(stack, "SSH connection timed out");
@@ -678,67 +728,102 @@ async fn serve_connection(
             Ok(signal) => signal,
             Err(reason) => return reset_connection(stack, reason),
         };
-        if let Err(reason) = discard_channel_input(&mut runner, &protocol) {
-            return reset_connection(stack, reason);
-        }
         match signal {
-            ProtocolSignal::Exec(command) => break command,
+            ProtocolSignal::Exec(command) => break SessionStart::Exec(command),
+            ProtocolSignal::Shell => break SessionStart::Shell,
+            ProtocolSignal::Interrupt => pending_input.signal_interrupt = true,
             ProtocolSignal::Defunct => {
-                return ConnectionEnd::Reset("SSH peer disconnected before exec")
+                return ConnectionEnd::Reset("SSH peer disconnected before session start")
             }
             ProtocolSignal::Idle | ProtocolSignal::Progressed => {}
         }
+        let input_work = if protocol.pty.is_some() {
+            match read_shell_channel_input(&mut runner, &protocol, &mut pending_input) {
+                Ok(worked) => worked,
+                Err(reason) => return reset_connection(stack, reason),
+            }
+        } else {
+            match discard_channel_input(&mut runner, &protocol) {
+                Ok(worked) => worked,
+                Err(reason) => return reset_connection(stack, reason),
+            }
+        };
         if protocol
             .channel
             .as_ref()
             .is_some_and(|channel| runner.is_channel_closed(channel))
         {
-            return ConnectionEnd::Reset("session channel closed before exec");
+            return ConnectionEnd::Reset("session channel closed before session start");
         }
         cooperate(
-            wire.worked || matches!(signal, ProtocolSignal::Progressed),
+            wire.worked || input_work || matches!(signal, ProtocolSignal::Progressed),
             wire.next_poll_delay_ms,
         )
         .await;
     };
 
-    let execution = execute_with_network(
-        &command,
-        &mut runner,
-        &mut signer,
-        space,
-        control,
-        bound_epoch,
-        policy,
-        stack,
-        &mut bridge,
-        &mut protocol,
-    )
-    .await;
-    let (reports, timed_out) = match execution {
-        ExecutionEnd::Complete { reports, timed_out } => (reports, timed_out),
-        ExecutionEnd::Reset(reason) => return reset_connection(stack, reason),
-        ExecutionEnd::Rebind(reason) => return ConnectionEnd::Rebind(reason),
-    };
-    let (output, status) = collect_execution(reports, timed_out);
-    match finish_exec(
-        &mut runner,
-        &mut signer,
-        space,
-        control,
-        bound_epoch,
-        policy,
-        stack,
-        &mut bridge,
-        &mut protocol,
-        &output,
-        status,
-    )
-    .await
-    {
-        Ok(()) => ConnectionEnd::Complete(status),
-        Err(ConnectionEnd::Reset(reason)) => reset_connection(stack, reason),
-        Err(other) => other,
+    match start {
+        SessionStart::Exec(command) => {
+            let execution = execute_with_network(
+                &command,
+                &mut runner,
+                &mut signer,
+                space,
+                control,
+                bound_epoch,
+                policy,
+                stack,
+                &mut bridge,
+                &mut protocol,
+            )
+            .await;
+            let (reports, timed_out) = match execution {
+                ExecutionEnd::Complete { reports, timed_out } => (reports, timed_out),
+                ExecutionEnd::Reset(reason) => return reset_connection(stack, reason),
+                ExecutionEnd::Rebind(reason) => return ConnectionEnd::Rebind(reason),
+            };
+            let (output, status) = collect_execution(reports, timed_out);
+            match finish_exec(
+                &mut runner,
+                &mut signer,
+                space,
+                control,
+                bound_epoch,
+                policy,
+                stack,
+                &mut bridge,
+                &mut protocol,
+                &output,
+                status,
+            )
+            .await
+            {
+                Ok(()) => ConnectionEnd::ExecComplete(status),
+                Err(ConnectionEnd::Reset(reason)) => reset_connection(stack, reason),
+                Err(other) => other,
+            }
+        }
+        SessionStart::Shell => {
+            let status = match serve_interactive_shell(
+                &mut runner,
+                &mut signer,
+                space,
+                control,
+                bound_epoch,
+                policy,
+                stack,
+                &mut bridge,
+                &mut protocol,
+                &mut pending_input,
+            )
+            .await
+            {
+                Ok(status) => status,
+                Err(ConnectionEnd::Reset(reason)) => return reset_connection(stack, reason),
+                Err(other) => return other,
+            };
+            ConnectionEnd::ShellComplete(status)
+        }
     }
 }
 
@@ -847,20 +932,24 @@ fn progress_protocol(
                     .as_ref()
                     .is_some_and(|channel| channel.num() == event.channel());
                 let mut command = None;
-                if ours && state.authenticated && !state.exec_seen {
-                    state.exec_seen = true;
+                if ours && state.authenticated && !state.start_seen {
+                    state.start_seen = true;
                     let candidate = state
                         .committed
                         .ok_or("exec arrived without a committed profile")?;
-                    if !revalidate_candidate(space, policy_cap, signer, candidate)? {
+                    if state.pty.is_none()
+                        && !revalidate_candidate(space, policy_cap, signer, candidate)?
+                    {
                         return Err("authorized profile changed before exec");
                     }
-                    let value = event
-                        .command()
-                        .map_err(|_| "exec command was not valid UTF-8")?
-                        .to_string();
-                    if crate::vsh::validate_ssh_exec(&value).is_ok() {
-                        command = Some(value);
+                    if state.pty.is_none() {
+                        let value = event
+                            .command()
+                            .map_err(|_| "exec command was not valid UTF-8")?
+                            .to_string();
+                        if crate::vsh::validate_ssh_exec(&value).is_ok() {
+                            command = Some(value);
+                        }
                     }
                 }
                 if let Some(command) = command {
@@ -873,25 +962,88 @@ fn progress_protocol(
                 progressed = true;
             }
             Event::Serv(ServEvent::SessionShell(event)) => {
+                let ours = state
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| channel.num() == event.channel());
+                let mut accept = false;
+                if ours && state.authenticated && !state.start_seen {
+                    state.start_seen = true;
+                    let candidate = state
+                        .committed
+                        .ok_or("shell arrived without a committed profile")?;
+                    if state.pty.is_some()
+                        && !revalidate_candidate(space, policy_cap, signer, candidate)?
+                    {
+                        return Err("authorized profile changed before shell");
+                    }
+                    accept = state.pty.is_some();
+                }
+                if accept {
+                    event
+                        .succeed()
+                        .map_err(|_| "shell acceptance response failed")?;
+                    return Ok(ProtocolSignal::Shell);
+                }
                 event.fail().map_err(|_| "shell rejection failed")?;
                 progressed = true;
             }
             Event::Serv(ServEvent::SessionSubsystem(event)) => {
+                let ours = state
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| channel.num() == event.channel());
+                if ours && !state.start_seen {
+                    state.start_seen = true;
+                }
                 event.fail().map_err(|_| "subsystem rejection failed")?;
                 progressed = true;
             }
             Event::Serv(ServEvent::SessionPty(event)) => {
+                let ours = state
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| channel.num() == event.channel());
+                if ours && state.authenticated && !state.start_seen && state.pty.is_none() {
+                    // Dimensions are metadata only. Never turn peer-provided
+                    // rows, columns, or pixels into allocation sizes.
+                    let size = event
+                        .metadata()
+                        .map_err(|_| "PTY metadata was invalid")?
+                        .size;
+                    event
+                        .succeed()
+                        .map_err(|_| "PTY acceptance response failed")?;
+                    state.pty = Some(size);
+                    progressed = true;
+                    continue;
+                }
                 event.fail().map_err(|_| "PTY rejection failed")?;
                 progressed = true;
             }
-            Event::Serv(ServEvent::SessionWindowChange(_event)) => {
-                // N4 remains exec-only. This no-reply notification is ignored
-                // and Sunset consumes it when the event is dropped.
+            Event::Serv(ServEvent::SessionWindowChange(event)) => {
+                let ours = state
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| channel.num() == event.channel());
+                if !ours || state.pty.is_none() {
+                    return Err("window change arrived without an accepted PTY");
+                }
+                let size = event.size().map_err(|_| "window change was invalid")?;
+                state.pty = Some(size);
                 progressed = true;
             }
-            Event::Serv(ServEvent::SessionSignal(_event)) => {
-                // Interactive per-session cancellation is introduced by N6;
-                // the exec-only acceptance image must not map this globally.
+            Event::Serv(ServEvent::SessionSignal(event)) => {
+                let ours = state
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| channel.num() == event.channel());
+                if !ours || !state.start_seen {
+                    return Err("signal arrived without an active session command");
+                }
+                if event.signal_name().map_err(|_| "signal name was invalid")? == "INT" {
+                    return Ok(ProtocolSignal::Interrupt);
+                }
                 progressed = true;
             }
             Event::Serv(ServEvent::SessionBreak(event)) => {
@@ -970,6 +1122,747 @@ fn discard_channel_input(
     Ok(discarded)
 }
 
+fn read_shell_channel_input(
+    runner: &mut Runner<'_, Server>,
+    state: &ProtocolState,
+    input: &mut PendingInput,
+) -> Result<bool, &'static str> {
+    let mut worked = false;
+    let mut chunk = [0u8; SHELL_INPUT_CHUNK_BYTES];
+    for _ in 0..MAX_CHANNEL_DISCARDS_PER_TURN {
+        let Some((number, data, ready)) = runner.read_channel_ready() else {
+            break;
+        };
+        let channel = state
+            .channel
+            .as_ref()
+            .ok_or("data arrived without an accepted session channel")?;
+        if channel.num() != number {
+            return Err("data arrived on an unowned session channel");
+        }
+        if data != ChanData::Normal {
+            return Err("extended data is not valid SSH shell input");
+        }
+        let remaining = input.remaining_capacity();
+        if ready > remaining {
+            // Leaving a partially consumed Sunset channel-data packet behind
+            // would stop protocol progress, so fail this bounded session
+            // instead of waiting forever for queue capacity that a running
+            // foreground command cannot release.
+            return Err("SSH shell input exceeded its fixed bound");
+        }
+        let length = ready.min(chunk.len());
+        let read = runner
+            .read_channel(channel, ChanData::Normal, &mut chunk[..length])
+            .map_err(|_| "failed to read SSH shell input")?;
+        if read == 0 {
+            break;
+        }
+        input.bytes.extend(&chunk[..read]);
+        worked = true;
+    }
+    Ok(worked)
+}
+
+fn flush_terminal_output(
+    runner: &mut Runner<'_, Server>,
+    state: &ProtocolState,
+    frontend: &mut TerminalFrontend,
+) -> Result<bool, &'static str> {
+    if frontend.pending_output().is_empty() {
+        return Ok(false);
+    }
+    let channel = state
+        .channel
+        .as_ref()
+        .ok_or("SSH shell lost its session channel")?;
+    match runner.write_channel(channel, ChanData::Normal, frontend.pending_output()) {
+        Ok(0) => Ok(false),
+        Ok(written) => {
+            // Acknowledge only the prefix Sunset actually accepted. A zero or
+            // failed write leaves the frontend queue byte-for-byte intact.
+            frontend
+                .consume_output(written)
+                .map_err(|_| "terminal output accounting failed")?;
+            Ok(true)
+        }
+        Err(_) => Err("SSH shell output channel closed"),
+    }
+}
+
+struct ShellTurn {
+    worked: bool,
+    next_poll_delay_ms: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_shell_turn(
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+) -> Result<ShellTurn, ConnectionEnd> {
+    validate_network_authority(space, control, bound_epoch).map_err(ConnectionEnd::Rebind)?;
+    let wire = bridge
+        .drive(runner, stack, monotonic_ms())
+        .map_err(ConnectionEnd::Reset)?;
+    if wire.ended {
+        return Err(ConnectionEnd::Reset("peer disconnected during SSH shell"));
+    }
+
+    let signal =
+        progress_protocol(runner, signer, space, policy, protocol).map_err(ConnectionEnd::Reset)?;
+    match signal {
+        ProtocolSignal::Interrupt => input.signal_interrupt = true,
+        ProtocolSignal::Defunct => {
+            return Err(ConnectionEnd::Reset("SSH shell became defunct"));
+        }
+        ProtocolSignal::Exec(_) | ProtocolSignal::Shell => {
+            return Err(ConnectionEnd::Reset(
+                "duplicate SSH session start was accepted",
+            ));
+        }
+        ProtocolSignal::Idle | ProtocolSignal::Progressed => {}
+    }
+
+    let output_work =
+        flush_terminal_output(runner, protocol, frontend).map_err(ConnectionEnd::Reset)?;
+    let input_work =
+        read_shell_channel_input(runner, protocol, input).map_err(ConnectionEnd::Reset)?;
+    if protocol
+        .channel
+        .as_ref()
+        .is_some_and(|channel| runner.is_channel_closed(channel))
+    {
+        return Err(ConnectionEnd::Reset(
+            "SSH shell channel closed unexpectedly",
+        ));
+    }
+
+    Ok(ShellTurn {
+        worked: wire.worked
+            || output_work
+            || input_work
+            || matches!(
+                signal,
+                ProtocolSignal::Progressed | ProtocolSignal::Interrupt
+            ),
+        next_poll_delay_ms: wire.next_poll_delay_ms,
+    })
+}
+
+fn terminal_error(error: FrontendError) -> &'static str {
+    match error {
+        FrontendError::Backpressure => "terminal output remained backpressured",
+        FrontendError::OutputTooLarge => "terminal output exceeded its fixed bound",
+        FrontendError::PromptTooLong => "terminal prompt exceeded its fixed bound",
+        FrontendError::AllocationFailed => "terminal allocation failed",
+        FrontendError::InvalidConsume => "terminal output accounting failed",
+        FrontendError::PromptInactive => "terminal prompt was unexpectedly inactive",
+        FrontendError::PromptActive => "terminal prompt was unexpectedly active",
+        FrontendError::OutputInProgress => "terminal output transaction was already active",
+        FrontendError::NoOutputInProgress => "terminal output transaction was not active",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn next_shell_event(
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+) -> Result<TerminalEvent, ConnectionEnd> {
+    loop {
+        let mut application_work = false;
+        if !frontend.is_at_prompt() {
+            match frontend.show_prompt(SHELL_PROMPT) {
+                Ok(()) => application_work = true,
+                Err(FrontendError::Backpressure) => {}
+                Err(error) => return Err(ConnectionEnd::Reset(terminal_error(error))),
+            }
+        }
+
+        if frontend.is_at_prompt() && input.signal_interrupt {
+            match frontend.interrupt() {
+                Ok(event) => {
+                    input.signal_interrupt = false;
+                    return Ok(event);
+                }
+                Err(FrontendError::Backpressure) => {}
+                Err(error) => return Err(ConnectionEnd::Reset(terminal_error(error))),
+            }
+        }
+
+        if frontend.is_at_prompt() && !input.signal_interrupt {
+            for _ in 0..MAX_SHELL_INPUT_ACTIONS_PER_TURN {
+                let Some(byte) = input.bytes.front().copied() else {
+                    break;
+                };
+                match frontend.input_byte(byte) {
+                    Ok(event) => {
+                        input.bytes.pop_front();
+                        application_work = true;
+                        if let Some(event) = event {
+                            return Ok(event);
+                        }
+                    }
+                    Err(FrontendError::Backpressure) => break,
+                    Err(error) => return Err(ConnectionEnd::Reset(terminal_error(error))),
+                }
+            }
+        }
+
+        let transport_eof = input.bytes.is_empty()
+            && protocol
+                .channel
+                .as_ref()
+                .is_some_and(|channel| runner.is_channel_eof(channel));
+        if frontend.is_at_prompt() && transport_eof {
+            return Ok(frontend.transport_eof());
+        }
+
+        let turn = drive_shell_turn(
+            runner,
+            signer,
+            space,
+            control,
+            bound_epoch,
+            policy,
+            stack,
+            bridge,
+            protocol,
+            input,
+            frontend,
+        )?;
+        cooperate(application_work || turn.worked, turn.next_poll_delay_ms).await;
+    }
+}
+
+fn mark_running_interrupts(
+    frontend: &mut TerminalFrontend,
+    input: &mut PendingInput,
+    cancel: &AtomicBool,
+) -> Result<bool, &'static str> {
+    if input.signal_interrupt {
+        cancel.store(true, Ordering::Release);
+        match frontend.interrupt() {
+            Ok(_) => {
+                input.signal_interrupt = false;
+                return Ok(!input.bytes.iter().any(|byte| *byte == 0x03));
+            }
+            Err(FrontendError::Backpressure) => return Ok(false),
+            Err(error) => return Err(terminal_error(error)),
+        }
+    }
+
+    let Some(position) = input
+        .bytes
+        .iter()
+        .enumerate()
+        .find_map(|(position, byte)| (*byte == 0x03).then_some(position))
+    else {
+        return Ok(true);
+    };
+    cancel.store(true, Ordering::Release);
+    match frontend.interrupt() {
+        Ok(_) => {
+            input.bytes.remove(position);
+            Ok(!input.bytes.iter().any(|byte| *byte == 0x03))
+        }
+        Err(FrontendError::Backpressure) => Ok(false),
+        Err(error) => Err(terminal_error(error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_shell_command(
+    command: &str,
+    session: &mut crate::vsh::Session,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+) -> Result<Result<Vec<crate::vsh::JobReport>, crate::vsh::Diagnostic>, ConnectionEnd> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Ordinary bytes queued after Enter remain typeahead for the next prompt.
+    // Ctrl-C is different: SSH byte ordering proves every queued byte follows
+    // the submitted line, so it must interrupt the command even when both
+    // arrived in one channel-data packet.
+    let mut execution = Box::pin(session.execute_cancellable(command, cancel.clone()));
+    let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
+
+    loop {
+        if let Some((kind, deadline)) = cancellation {
+            if let Poll::Ready(_reports) = poll_once(execution.as_mut()) {
+                return match kind {
+                    ExecutionCancellation::Reset(reason) => Err(ConnectionEnd::Reset(reason)),
+                    ExecutionCancellation::Rebind(reason) => Err(ConnectionEnd::Rebind(reason)),
+                    ExecutionCancellation::Timeout => {
+                        Err(ConnectionEnd::Reset("unexpected shell execution timeout"))
+                    }
+                };
+            }
+            if monotonic_ms() >= deadline {
+                return Err(match kind {
+                    ExecutionCancellation::Reset(reason) => ConnectionEnd::Reset(reason),
+                    ExecutionCancellation::Rebind(reason) => ConnectionEnd::Rebind(reason),
+                    ExecutionCancellation::Timeout => {
+                        ConnectionEnd::Reset("unexpected shell execution timeout")
+                    }
+                });
+            }
+            crate::exec::yield_now().await;
+            continue;
+        }
+
+        let controls_rendered = mark_running_interrupts(frontend, input, cancel.as_ref())
+            .map_err(ConnectionEnd::Reset)?;
+        if controls_rendered {
+            if let Poll::Ready(reports) = poll_once(execution.as_mut()) {
+                return Ok(reports);
+            }
+        }
+
+        let now = monotonic_ms();
+        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+            cancel.store(true, Ordering::Release);
+            cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
+            continue;
+        }
+        let wire = match bridge.drive(runner, stack, now) {
+            Ok(turn) => turn,
+            Err(reason) => {
+                cancel.store(true, Ordering::Release);
+                cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
+                continue;
+            }
+        };
+        if wire.ended {
+            cancel.store(true, Ordering::Release);
+            cancellation = Some((
+                ExecutionCancellation::Reset("peer disconnected during SSH shell command"),
+                now + CANCEL_GRACE_MS,
+            ));
+            continue;
+        }
+        let signal = match progress_protocol(runner, signer, space, policy, protocol) {
+            Ok(signal) => signal,
+            Err(reason) => {
+                cancel.store(true, Ordering::Release);
+                cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
+                continue;
+            }
+        };
+        match signal {
+            ProtocolSignal::Interrupt => {
+                input.signal_interrupt = true;
+                cancel.store(true, Ordering::Release);
+            }
+            ProtocolSignal::Defunct => {
+                cancel.store(true, Ordering::Release);
+                cancellation = Some((
+                    ExecutionCancellation::Reset("SSH shell became defunct during command"),
+                    now + CANCEL_GRACE_MS,
+                ));
+                continue;
+            }
+            ProtocolSignal::Exec(_) | ProtocolSignal::Shell => {
+                cancel.store(true, Ordering::Release);
+                cancellation = Some((
+                    ExecutionCancellation::Reset("duplicate SSH session start during command"),
+                    now + CANCEL_GRACE_MS,
+                ));
+                continue;
+            }
+            ProtocolSignal::Idle | ProtocolSignal::Progressed => {}
+        }
+        if protocol
+            .channel
+            .as_ref()
+            .is_some_and(|channel| runner.is_channel_closed(channel))
+        {
+            cancel.store(true, Ordering::Release);
+            cancellation = Some((
+                ExecutionCancellation::Reset("SSH shell channel closed during command"),
+                now + CANCEL_GRACE_MS,
+            ));
+            continue;
+        }
+        let output_work = match flush_terminal_output(runner, protocol, frontend) {
+            Ok(worked) => worked,
+            Err(reason) => {
+                cancel.store(true, Ordering::Release);
+                cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
+                continue;
+            }
+        };
+        let input_work = match read_shell_channel_input(runner, protocol, input) {
+            Ok(worked) => worked,
+            Err(reason) => {
+                cancel.store(true, Ordering::Release);
+                cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
+                continue;
+            }
+        };
+        if input.signal_interrupt || input.bytes.iter().any(|byte| *byte == 0x03) {
+            cancel.store(true, Ordering::Release);
+        }
+        cooperate(
+            wire.worked
+                || output_work
+                || input_work
+                || matches!(
+                    signal,
+                    ProtocolSignal::Progressed | ProtocolSignal::Interrupt
+                ),
+            wire.next_poll_delay_ms,
+        )
+        .await;
+    }
+}
+
+fn utf8_chunk_end(text: &str) -> usize {
+    let mut end = text.len().min(MAX_EMIT_TEXT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_shell_text(
+    mut text: &str,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+) -> Result<(), ConnectionEnd> {
+    while !text.is_empty() {
+        let end = utf8_chunk_end(text);
+        match frontend.emit_text(&text[..end]) {
+            Ok(()) => {
+                text = &text[end..];
+                continue;
+            }
+            Err(FrontendError::Backpressure) => {}
+            Err(error) => return Err(ConnectionEnd::Reset(terminal_error(error))),
+        }
+        let turn = drive_shell_turn(
+            runner,
+            signer,
+            space,
+            control,
+            bound_epoch,
+            policy,
+            stack,
+            bridge,
+            protocol,
+            input,
+            frontend,
+        )?;
+        cooperate(turn.worked, turn.next_poll_delay_ms).await;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_shell_execution(
+    result: &Result<Vec<crate::vsh::JobReport>, crate::vsh::Diagnostic>,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+) -> Result<u32, ConnectionEnd> {
+    match result {
+        Ok(reports) => {
+            let total = reports.iter().try_fold(0usize, |total, report| {
+                let total = total.checked_add(report.output.len())?;
+                if report.status == crate::vsh::Status::Success {
+                    Some(total)
+                } else {
+                    total.checked_add(
+                        alloc::format!("  vsh job %{}: {:?}\n", report.id, report.status).len(),
+                    )
+                }
+            });
+            if total.is_none_or(|total| total > MAX_EXEC_OUTPUT_BYTES) {
+                emit_shell_text(
+                    SHELL_OUTPUT_LIMIT_DIAGNOSTIC,
+                    runner,
+                    signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    bridge,
+                    protocol,
+                    input,
+                    frontend,
+                )
+                .await?;
+                return Ok(124);
+            }
+            for report in reports {
+                emit_shell_text(
+                    &report.output,
+                    runner,
+                    signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    bridge,
+                    protocol,
+                    input,
+                    frontend,
+                )
+                .await?;
+                if report.status != crate::vsh::Status::Success {
+                    let diagnostic =
+                        alloc::format!("  vsh job %{}: {:?}\n", report.id, report.status);
+                    emit_shell_text(
+                        &diagnostic,
+                        runner,
+                        signer,
+                        space,
+                        control,
+                        bound_epoch,
+                        policy,
+                        stack,
+                        bridge,
+                        protocol,
+                        input,
+                        frontend,
+                    )
+                    .await?;
+                }
+            }
+            Ok(reports
+                .last()
+                .map_or(0, |report| ssh_exit_status(report.status)))
+        }
+        Err(error) => {
+            let diagnostic = alloc::format!(
+                "  vsh: {} at bytes {}..{}\n",
+                error.message,
+                error.span.start,
+                error.span.end
+            );
+            emit_shell_text(
+                &diagnostic,
+                runner,
+                signer,
+                space,
+                control,
+                bound_epoch,
+                policy,
+                stack,
+                bridge,
+                protocol,
+                input,
+                frontend,
+            )
+            .await?;
+            Ok(2)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_shell_repl(
+    session: &mut crate::vsh::Session,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+) -> Result<u32, ConnectionEnd> {
+    let mut status = 0;
+    loop {
+        match next_shell_event(
+            runner,
+            signer,
+            space,
+            control,
+            bound_epoch,
+            policy,
+            stack,
+            bridge,
+            protocol,
+            input,
+            frontend,
+        )
+        .await?
+        {
+            TerminalEvent::Line(command) => {
+                let command = command.trim();
+                if command.is_empty() {
+                    continue;
+                }
+                if matches!(command, "exit" | "logout") {
+                    return Ok(0);
+                }
+                // VSH captures bounded command output internally. Rendering
+                // starts only after execute_cancellable has actually finished;
+                // this transport does not claim to provide live command I/O.
+                let result = execute_shell_command(
+                    command,
+                    session,
+                    runner,
+                    signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    bridge,
+                    protocol,
+                    input,
+                    frontend,
+                )
+                .await?;
+                status = render_shell_execution(
+                    &result,
+                    runner,
+                    signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    bridge,
+                    protocol,
+                    input,
+                    frontend,
+                )
+                .await?;
+            }
+            TerminalEvent::Interrupt => status = 130,
+            TerminalEvent::Eof => return Ok(status),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_interactive_shell(
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+) -> Result<u32, ConnectionEnd> {
+    let _terminal_size = protocol
+        .pty
+        .ok_or(ConnectionEnd::Reset("SSH shell started without a PTY"))?;
+    let cspace = Arc::new(SpinLock::new(CSpace::new("ssh-vsh-session")));
+    let mut session = crate::vsh::Session::with_cspace(cspace);
+    crate::shell::install_standard_vsh_commands(&mut session);
+    let mut frontend = TerminalFrontend::new();
+
+    let repl = run_shell_repl(
+        &mut session,
+        runner,
+        signer,
+        space,
+        control,
+        bound_epoch,
+        policy,
+        stack,
+        bridge,
+        protocol,
+        input,
+        &mut frontend,
+    )
+    .await;
+    // Join all foreground/background stages before the connection-local CSpace
+    // or transport is released, including every network/error exit.
+    session.shutdown().await;
+    let status = repl?;
+
+    while !frontend.pending_output().is_empty() {
+        let turn = drive_shell_turn(
+            runner,
+            signer,
+            space,
+            control,
+            bound_epoch,
+            policy,
+            stack,
+            bridge,
+            protocol,
+            input,
+            &mut frontend,
+        )?;
+        cooperate(turn.worked, turn.next_poll_delay_ms).await;
+    }
+
+    // Frontend bytes are fully drained before the common completion path sends
+    // exit-status, EOF, CLOSE, waits for peer CLOSE, and releases the channel.
+    finish_exec(
+        runner,
+        signer,
+        space,
+        control,
+        bound_epoch,
+        policy,
+        stack,
+        bridge,
+        protocol,
+        &[],
+        status,
+    )
+    .await?;
+    Ok(status)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_network(
     command: &str,
@@ -989,9 +1882,9 @@ async fn execute_with_network(
     let started = monotonic_ms();
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
 
-    loop {
+    let outcome = loop {
         if let Poll::Ready(reports) = poll_once(execution.as_mut()) {
-            return match cancellation.map(|(kind, _)| kind) {
+            break match cancellation.map(|(kind, _)| kind) {
                 Some(ExecutionCancellation::Timeout) => ExecutionEnd::Complete {
                     reports,
                     timed_out: true,
@@ -1008,7 +1901,7 @@ async fn execute_with_network(
         let now = monotonic_ms();
         if let Some((kind, deadline)) = cancellation {
             if now >= deadline {
-                return match kind {
+                break match kind {
                     ExecutionCancellation::Timeout => {
                         ExecutionEnd::Reset("VSH exec cancellation timed out")
                     }
@@ -1054,6 +1947,9 @@ async fn execute_with_network(
                 continue;
             }
         };
+        if matches!(signal, ProtocolSignal::Interrupt) {
+            cancel.store(true, Ordering::Release);
+        }
         if matches!(signal, ProtocolSignal::Defunct)
             || protocol
                 .channel
@@ -1073,11 +1969,18 @@ async fn execute_with_network(
             continue;
         }
         cooperate(
-            wire.worked || matches!(signal, ProtocolSignal::Progressed),
+            wire.worked
+                || matches!(
+                    signal,
+                    ProtocolSignal::Progressed | ProtocolSignal::Interrupt
+                ),
             wire.next_poll_delay_ms,
         )
         .await;
-    }
+    };
+    drop(execution);
+    session.shutdown().await;
+    outcome
 }
 
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
@@ -1208,7 +2111,7 @@ async fn finish_exec(
             let channel = protocol
                 .channel
                 .as_ref()
-                .ok_or(ConnectionEnd::Reset("accepted exec lost its channel"))?;
+                .ok_or(ConnectionEnd::Reset("accepted session lost its channel"))?;
             if offset < output.len() {
                 match runner.write_channel(channel, ChanData::Normal, &output[offset..]) {
                     Ok(0) => {}

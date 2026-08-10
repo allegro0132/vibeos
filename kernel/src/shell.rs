@@ -621,10 +621,14 @@ pub(crate) fn install_standard_vsh_commands(session: &mut crate::vsh::Session) {
     session.install_host_command("quiet", 0, 0, vsh_quiet);
     session.install_host_command("verbose", 0, 0, vsh_verbose);
     session.install_host_command("poweroff", 0, 0, vsh_poweroff);
+    #[cfg(feature = "tcp-echo")]
+    session.install_host_command("ip", 2, 8, crate::net_config::vsh_ip);
+    #[cfg(feature = "tcp-echo")]
+    session.install_host_command("dhclient", 0, 2, crate::net_config::vsh_dhclient);
 }
 
 pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    Ok(String::from(
+    let help = String::from(
         "  echo ...        write value arguments\n\
          \x20 wc              count stdin bytes, words, and lines\n\
          \x20 let NAME VALUE  set a session value\n\
@@ -641,7 +645,17 @@ pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
          \x20 quiet           mute background component output\n\
          \x20 verbose         restore background component output\n\
          \x20 poweroff        power off\n",
-    ))
+    );
+    #[cfg(feature = "tcp-echo")]
+    let help = {
+        let mut help = help;
+        help.push_str(
+            "  ip ...          show or configure IPv4 on net0\n\
+             \x20 dhclient [-r]  acquire or stop DHCPv4\n",
+        );
+        help
+    };
+    Ok(help)
 }
 
 pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {

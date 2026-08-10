@@ -45,6 +45,8 @@ mod code_pool;
 mod dev;
 mod durable_cspace;
 mod mmu;
+#[cfg(feature = "tcp-echo")]
+mod net_config;
 mod platform;
 mod plic;
 mod rustc;

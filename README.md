@@ -50,7 +50,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/differential.sh    # exact-output oracle using the pinned rustc
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
-./scripts/qemu-tcp-test.sh   # N1 static IPv4/TCP echo through host forwarding
+./scripts/qemu-tcp-test.sh   # N1 static/DHCP IPv4 and TCP echo through host forwarding
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
 ./scripts/qemu-ssh-security-test.sh # N3 entropy/identity capability gate
 ./scripts/qemu-ssh-test.sh   # N4/N5 real OpenSSH exec and rejection gate
@@ -377,6 +377,22 @@ verbose         restore background component output
 poweroff        power off
 ```
 
+The dedicated `tcp-echo` image additionally installs a bounded Linux-style
+IPv4 control surface. `net0` is the canonical device name and `eth0` is an
+accepted compatibility alias:
+
+```text
+ip link show
+ip -4 addr show dev net0
+ip addr replace 192.168.1.20/24 dev net0
+ip route replace default via 192.168.1.1 dev net0
+dhclient net0
+dhclient -r net0
+```
+
+Possession of each installed vsh command capability is the authority to invoke
+the operation. Images without an IPv4 stack do not install these commands.
+
 Interactive editing is shared by the default and test shells: `Up`/`Down`
 browse command history, while `Left`/`Right` move the insertion cursor.
 Backspace and insertion work in the middle of a line. Input is bounded to
@@ -520,9 +536,11 @@ Deliberate, not overlooked:
   only bounded raw-L2 service. Driver/stack queues now carry owned
   `StampedPacket` values tied to one boot-local device epoch and stack
   generation. The dedicated QEMU-only `tcp-echo` image adds ARP, static IPv4,
-  and one bounded TCP echo socket; it is not a general listener/connection API
-  or an SSH server, and it still provides no DHCP, DNS, IPv6, UDP, or POSIX
-  socket namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
+  DHCPv4, and one bounded TCP echo socket. Its vsh control plane supports one
+  interface, one IPv4 address, and one default route; it is not a general
+  listener/connection API or an SSH server, and it still provides no DNS,
+  IPv6, general UDP API, or POSIX socket namespace. `qemu-tcp-test.sh recovery`
+  defines a test-only N2 gate for
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
   are absent from normal images and do not model delayed DMA completion or a
   late IRQ. The native DWMAC path has not passed this gate on Milk-V Duo

@@ -11,6 +11,7 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{
     PacketSessionError, PacketSessionFence, PacketStamp, PacketStampMismatch, StampedPacket,
 };
+use vibeos_core::net_config::{Ipv4RuntimeStatus, StaticIpv4Address};
 use vibeos_core::net_stack::{
     PacketDevice, StackError, StaticIpv4Config, StaticIpv4EchoStack, StaticIpv4TcpStack,
     TcpIoResult, TcpStreamState, MAX_TCP_STREAM_BYTES_PER_CALL, TCP_BUFFER_BYTES,
@@ -40,6 +41,42 @@ fn session_stamp() -> PacketStamp {
 
 fn server_config() -> StaticIpv4Config {
     StaticIpv4Config::new(SERVER_MAC, SERVER_IP, 24, SERVER_PORT, 0x5eed)
+}
+
+#[test]
+fn stack_switches_between_static_unconfigured_and_dhcp_discovery() {
+    let inbound = Endpoint::new("dhcp-in", 4);
+    let outbound = Endpoint::new("dhcp-out", 4);
+    let stamp = session_stamp();
+    let mut space = CSpace::new("dhcp-stack");
+    let (_, inbound_authority) = authority(&mut space, &inbound, Rights::RECV);
+    let (_, outbound_authority) = authority(&mut space, &outbound, Rights::SEND);
+    let mut stack = StaticIpv4TcpStack::new(
+        server_config(),
+        stamp,
+        inbound_authority,
+        outbound_authority,
+    )
+    .unwrap();
+
+    stack.start_dhcp().unwrap();
+    assert_eq!(stack.ipv4_status(), Ipv4RuntimeStatus::DhcpDiscovering);
+    stack.poll_network(0).unwrap();
+    let discover = outbound.try_recv().unwrap().into_packet(stamp).unwrap();
+    let frame = discover.as_bytes();
+    assert_eq!(&frame[..6], &[0xff; 6]);
+    assert_eq!(&frame[6..12], &SERVER_MAC);
+    assert_eq!(&frame[12..14], &[0x08, 0x00]);
+    assert_eq!(&frame[26..30], &[0, 0, 0, 0]);
+    assert_eq!(&frame[30..34], &[255, 255, 255, 255]);
+    assert_eq!(&frame[34..38], &[0, 68, 0, 67]);
+
+    stack.clear_ipv4().unwrap();
+    assert_eq!(stack.ipv4_status(), Ipv4RuntimeStatus::Unconfigured);
+    let replacement =
+        StaticIpv4Address::new([198, 51, 100, 9], 24).with_default_gateway([198, 51, 100, 1]);
+    stack.configure_static_ipv4(replacement).unwrap();
+    assert_eq!(stack.ipv4_status(), Ipv4RuntimeStatus::Static(replacement));
 }
 
 #[test]

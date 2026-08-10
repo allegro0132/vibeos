@@ -1,4 +1,4 @@
-//! Portable static-IPv4 networking over VibeOS packet endpoints.
+//! Portable configurable-IPv4 networking over VibeOS packet endpoints.
 //!
 //! This module is the first protocol layer above the raw Ethernet contract in
 //! [`crate::net`].  It deliberately exposes neither file descriptors nor an
@@ -23,13 +23,14 @@ use smoltcp::iface::{
     SocketSet,
 };
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
 use crate::cap::Revocable;
 use crate::chan::Endpoint;
 use crate::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
+use crate::net_config::{Ipv4RuntimeStatus, StaticIpv4Address};
 
 /// Bytes reserved in each direction of the single TCP connection.
 pub const TCP_BUFFER_BYTES: usize = 4 * 1024;
@@ -434,7 +435,7 @@ struct NetworkPollWork {
     next_poll_delay_ms: Option<u64>,
 }
 
-/// One static IPv4 interface and one reusable passive TCP byte stream.
+/// One dynamically configurable IPv4 interface and one reusable passive TCP byte stream.
 ///
 /// The object is intentionally neither a socket table nor a file-descriptor
 /// namespace. It owns exactly one listener and accepts at most one connection.
@@ -446,6 +447,8 @@ pub struct StaticIpv4TcpStack {
     interface: Interface,
     sockets: SocketSet<'static>,
     tcp_handle: SocketHandle,
+    dhcp_handle: Option<SocketHandle>,
+    ipv4_status: Ipv4RuntimeStatus,
     last_now_ms: u64,
     connection_active: bool,
     reset_requested: bool,
@@ -497,6 +500,12 @@ impl StaticIpv4TcpStack {
             interface,
             sockets,
             tcp_handle,
+            dhcp_handle: None,
+            ipv4_status: Ipv4RuntimeStatus::Static(StaticIpv4Address {
+                address: config.ipv4_address,
+                prefix_len: config.prefix_len,
+                default_gateway: config.default_gateway,
+            }),
             last_now_ms: 0,
             connection_active: false,
             reset_requested: false,
@@ -505,6 +514,46 @@ impl StaticIpv4TcpStack {
 
     pub const fn config(&self) -> StaticIpv4Config {
         self.config
+    }
+
+    pub const fn ipv4_status(&self) -> Ipv4RuntimeStatus {
+        self.ipv4_status
+    }
+
+    /// Atomically replace the one IPv4 address and optional default route.
+    /// Any active TCP tuple is aborted before the old address disappears.
+    pub fn configure_static_ipv4(&mut self, address: StaticIpv4Address) -> Result<(), StackError> {
+        validate_ipv4_address(address.address, address.prefix_len, address.default_gateway)?;
+        self.device.revalidate_authority()?;
+        self.remove_dhcp_socket();
+        self.abort_for_reconfiguration();
+        self.install_ipv4_address(address)?;
+        self.config.ipv4_address = address.address;
+        self.config.prefix_len = address.prefix_len;
+        self.config.default_gateway = address.default_gateway;
+        self.ipv4_status = Ipv4RuntimeStatus::Static(address);
+        Ok(())
+    }
+
+    /// Remove every IPv4 address and route and stop an active DHCP client.
+    pub fn clear_ipv4(&mut self) -> Result<(), StackError> {
+        self.device.revalidate_authority()?;
+        self.remove_dhcp_socket();
+        self.abort_for_reconfiguration();
+        self.clear_interface_ipv4();
+        self.ipv4_status = Ipv4RuntimeStatus::Unconfigured;
+        Ok(())
+    }
+
+    /// Clear static configuration and begin bounded DHCPv4 discovery.
+    pub fn start_dhcp(&mut self) -> Result<(), StackError> {
+        self.device.revalidate_authority()?;
+        self.remove_dhcp_socket();
+        self.abort_for_reconfiguration();
+        self.clear_interface_ipv4();
+        self.dhcp_handle = Some(self.sockets.add(dhcpv4::Socket::new()));
+        self.ipv4_status = Ipv4RuntimeStatus::DhcpDiscovering;
+        Ok(())
     }
 
     pub fn device_stats(&self) -> PacketDeviceStats {
@@ -654,6 +703,8 @@ impl StaticIpv4TcpStack {
             }
         }
 
+        self.apply_dhcp_event()?;
+
         echoed_bytes += service(self.sockets.get_mut::<tcp::Socket>(self.tcp_handle));
         for _ in 0..MAX_EGRESS_PASSES_PER_POLL {
             let egress_result =
@@ -699,6 +750,90 @@ impl StaticIpv4TcpStack {
                 .expect("validated non-zero TCP port must remain listenable");
             self.reset_requested = false;
         }
+    }
+
+    fn abort_for_reconfiguration(&mut self) {
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).abort();
+        self.connection_active = false;
+        self.reset_requested = false;
+    }
+
+    fn remove_dhcp_socket(&mut self) {
+        if let Some(handle) = self.dhcp_handle.take() {
+            let _ = self.sockets.remove(handle);
+        }
+    }
+
+    fn clear_interface_ipv4(&mut self) {
+        self.interface
+            .update_ip_addrs(|addresses| addresses.clear());
+        self.interface.routes_mut().remove_default_ipv4_route();
+    }
+
+    fn install_ipv4_address(&mut self, address: StaticIpv4Address) -> Result<(), StackError> {
+        self.clear_interface_ipv4();
+        let ipv4 = Ipv4Addr::from(address.address);
+        self.interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::Ipv4(ipv4), address.prefix_len))
+                .expect("the interface retains room for one IPv4 address");
+        });
+        if let Some(gateway) = address.default_gateway {
+            self.interface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::from(gateway))
+                .map_err(|_| StackError::RouteTableFull)?;
+        }
+        Ok(())
+    }
+
+    fn apply_dhcp_event(&mut self) -> Result<(), StackError> {
+        enum OwnedEvent {
+            Configured(StaticIpv4Address),
+            Deconfigured,
+        }
+
+        let Some(handle) = self.dhcp_handle else {
+            return Ok(());
+        };
+        let event =
+            self.sockets
+                .get_mut::<dhcpv4::Socket>(handle)
+                .poll()
+                .map(|event| match event {
+                    dhcpv4::Event::Configured(config) => {
+                        OwnedEvent::Configured(StaticIpv4Address {
+                            address: config.address.address().octets(),
+                            prefix_len: config.address.prefix_len(),
+                            default_gateway: config.router.map(|router| router.octets()),
+                        })
+                    }
+                    dhcpv4::Event::Deconfigured => OwnedEvent::Deconfigured,
+                });
+        match event {
+            Some(OwnedEvent::Configured(address)) => {
+                validate_ipv4_address(
+                    address.address,
+                    address.prefix_len,
+                    address.default_gateway,
+                )?;
+                // A normal lease renewal reports Configured again. Preserve
+                // established TCP state when the effective address and route
+                // did not change.
+                if self.ipv4_status != Ipv4RuntimeStatus::DhcpBound(address) {
+                    self.abort_for_reconfiguration();
+                    self.install_ipv4_address(address)?;
+                }
+                self.ipv4_status = Ipv4RuntimeStatus::DhcpBound(address);
+            }
+            Some(OwnedEvent::Deconfigured) => {
+                self.abort_for_reconfiguration();
+                self.clear_interface_ipv4();
+                self.ipv4_status = Ipv4RuntimeStatus::DhcpDiscovering;
+            }
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -784,6 +919,22 @@ impl StaticIpv4EchoStack {
         self.tcp.config()
     }
 
+    pub const fn ipv4_status(&self) -> Ipv4RuntimeStatus {
+        self.tcp.ipv4_status()
+    }
+
+    pub fn configure_static_ipv4(&mut self, address: StaticIpv4Address) -> Result<(), StackError> {
+        self.tcp.configure_static_ipv4(address)
+    }
+
+    pub fn clear_ipv4(&mut self) -> Result<(), StackError> {
+        self.tcp.clear_ipv4()
+    }
+
+    pub fn start_dhcp(&mut self) -> Result<(), StackError> {
+        self.tcp.start_dhcp()
+    }
+
     pub fn device_stats(&self) -> PacketDeviceStats {
         self.tcp.device_stats()
     }
@@ -838,20 +989,30 @@ fn validate_config(config: StaticIpv4Config) -> Result<(), StackError> {
     if !ethernet.is_unicast() || config.ethernet_address == [0; 6] {
         return Err(StackError::InvalidEthernetAddress);
     }
-    if !is_unicast_ipv4(config.ipv4_address) {
-        return Err(StackError::InvalidIpv4Address);
-    }
-    if config.prefix_len > 32 {
-        return Err(StackError::InvalidPrefixLength);
-    }
-    if config
-        .default_gateway
-        .is_some_and(|gateway| !is_unicast_ipv4(gateway))
-    {
-        return Err(StackError::InvalidDefaultGateway);
-    }
+    validate_ipv4_address(
+        config.ipv4_address,
+        config.prefix_len,
+        config.default_gateway,
+    )?;
     if config.listen_port == 0 {
         return Err(StackError::InvalidListenPort);
+    }
+    Ok(())
+}
+
+fn validate_ipv4_address(
+    address: [u8; 4],
+    prefix_len: u8,
+    default_gateway: Option<[u8; 4]>,
+) -> Result<(), StackError> {
+    if !is_unicast_ipv4(address) {
+        return Err(StackError::InvalidIpv4Address);
+    }
+    if prefix_len > 32 {
+        return Err(StackError::InvalidPrefixLength);
+    }
+    if default_gateway.is_some_and(|gateway| !is_unicast_ipv4(gateway)) {
+        return Err(StackError::InvalidDefaultGateway);
     }
     Ok(())
 }

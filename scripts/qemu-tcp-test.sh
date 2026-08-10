@@ -54,9 +54,7 @@ cleanup() {
   trap - EXIT HUP INT TERM
   stop_peer
   stop_qemu
-  if [ "$TCP_TEST_MODE" = "recovery" ]; then
-    exec 3>&-
-  fi
+  exec 3>&-
   if [ -n "$TEST_TMP" ]; then
     rm -f "$QEMU_LOG" "$PEER_LOG" "$RECOVERY_READY" "$RECOVERY_CONTINUE" "$QEMU_INPUT"
     rmdir "$TEST_TMP" 2>/dev/null || true
@@ -271,6 +269,61 @@ run_recovery_phase() {
   echo "PASS tcp-$recovery_kind-recovery: epoch $epoch_before -> $epoch_after, generation $generation_before -> $generation_after, component incarnation exact, coordinate-stale RX/TX rejected"
 }
 
+run_network_config_phase() {
+  prompt_attempt=0
+  while [ "$prompt_attempt" -lt 400 ]; do
+    grep -a -F -q 'vsh> ' "$QEMU_LOG" && break
+    kill -0 "$QEMU_PID" 2>/dev/null \
+      || fail "QEMU exited before the vsh network configuration check"
+    sleep 0.05
+    prompt_attempt=$((prompt_attempt + 1))
+  done
+  grep -a -F -q 'vsh> ' "$QEMU_LOG" \
+    || fail "vsh prompt did not become ready"
+
+  printf 'ip link show\n' >&3
+  static_attempt=0
+  while [ "$static_attempt" -lt 200 ]; do
+    grep -a -F -q 'link/ether 02:00:00:00:00:01' "$QEMU_LOG" && break
+    sleep 0.05
+    static_attempt=$((static_attempt + 1))
+  done
+  grep -a -F -q 'link/ether 02:00:00:00:00:01' "$QEMU_LOG" \
+    || fail "ip link show did not report the configured interface"
+
+  printf 'ip -4 addr show dev net0\n' >&3
+  static_attempt=0
+  while [ "$static_attempt" -lt 200 ]; do
+    grep -a -F -q 'inet 10.0.2.15/24 scope global net0' "$QEMU_LOG" && break
+    sleep 0.05
+    static_attempt=$((static_attempt + 1))
+  done
+  grep -a -F -q 'inet 10.0.2.15/24 scope global net0' "$QEMU_LOG" \
+    || fail "ip addr show did not report the initial static address"
+
+  echo "$TEST_NAME: switching net0 from static IPv4 to DHCP"
+  printf 'dhclient net0\n' >&3
+  dhcp_start_attempt=0
+  while [ "$dhcp_start_attempt" -lt 200 ]; do
+    grep -a -F -q 'DHCP discovery started' "$QEMU_LOG" && break
+    sleep 0.05
+    dhcp_start_attempt=$((dhcp_start_attempt + 1))
+  done
+  grep -a -F -q 'DHCP discovery started' "$QEMU_LOG" \
+    || fail "dhclient command was not acknowledged"
+  dhcp_attempt=0
+  while [ "$dhcp_attempt" -lt 400 ]; do
+    printf 'ip -4 addr show dev net0\n' >&3
+    sleep 0.05
+    if grep -a -F -q 'inet 10.0.2.15/24 scope global dynamic net0' "$QEMU_LOG"; then
+      break
+    fi
+    dhcp_attempt=$((dhcp_attempt + 1))
+  done
+  grep -a -F -q 'inet 10.0.2.15/24 scope global dynamic net0' "$QEMU_LOG" \
+    || fail "DHCP did not acquire the QEMU user-network lease"
+}
+
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
@@ -320,10 +373,8 @@ PEER_LOG="$TEST_TMP/peer.log"
 RECOVERY_READY="$TEST_TMP/recovery-ready"
 RECOVERY_CONTINUE="$TEST_TMP/recovery-continue"
 QEMU_INPUT="$TEST_TMP/qemu-input"
-if [ "$TCP_TEST_MODE" = "recovery" ]; then
-  mkfifo "$QEMU_INPUT" || fail "cannot create QEMU input FIFO"
-  exec 3<>"$QEMU_INPUT"
-fi
+mkfifo "$QEMU_INPUT" || fail "cannot create QEMU input FIFO"
+exec 3<>"$QEMU_INPUT"
 
 dynamic_port=1
 if [ -n "$TCP_HOST_PORT" ]; then
@@ -346,11 +397,7 @@ while [ "$attempt" -le "$TCP_PORT_ATTEMPTS" ]; do
     -netdev "user,id=vibeos-tcp,net=10.0.2.0/24,host=10.0.2.2,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:${TCP_HOST_PORT}-10.0.2.15:${TCP_GUEST_PORT}" \
     -device "virtio-net-device,netdev=vibeos-tcp,bus=virtio-mmio-bus.0,mac=02:00:00:00:00:01" \
     -global virtio-mmio.force-legacy=false
-  if [ "$TCP_TEST_MODE" = "recovery" ]; then
-    "$@" <&3 >"$QEMU_LOG" 2>&1 &
-  else
-    "$@" </dev/null >"$QEMU_LOG" 2>&1 &
-  fi
+  "$@" <&3 >"$QEMU_LOG" 2>&1 &
   QEMU_PID=$!
 
   # Port-selection and QEMU binding are separate operations.  If another
@@ -376,6 +423,8 @@ while [ "$attempt" -le "$TCP_PORT_ATTEMPTS" ]; do
     echo "PASS tcp-recovery: stack generation and device epoch recovery both rejected retired traffic"
     exit 0
   fi
+
+  run_network_config_phase
 
   echo "$TEST_NAME: waiting up to ${TCP_TIMEOUT}s for an exact byte-stream echo"
   if python3 -B scripts/tcp-peer.py \

@@ -17,6 +17,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   leaks, and the trust model.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
   workstreams, testing strategy, metrics, and the risk register.
+- **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
+  Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
+  cancellation, and fail-closed admission.
 - **[docs/SPINLOCK_AUDIT.md](docs/SPINLOCK_AUDIT.md)** — the M5.3 complete lock
   inventory, IRQ hot-path replacements, retained transaction boundaries, and
   multicore measurement gates.

@@ -37,6 +37,24 @@ This is a sequencing correction, not a change of thesis. Blueprint §8.1 records
 architectural reasons. The completed M1/M2 history below remains useful evidence;
 the new execution plan starts after the M3 record.
 
+## Capability-native shell track
+
+The post-v1 shell track borrows Bash's composition syntax without adopting its
+POSIX authority model. **S0 is complete:**
+[CAPABILITY_SHELL.md](CAPABILITY_SHELL.md) freezes the surface grammar,
+capability/value separation, per-stage authority rules, atomic Job admission,
+closeable bounded-stream contract, cancellation order, resource limits, security
+invariants, and the S1--S4 acceptance gates. This is a specification milestone;
+the current `split_whitespace` shell does not yet implement those semantics.
+
+| Stage | Status | Outcome |
+|---|:---:|---|
+| S0 | ✅ | Normative capability-native shell contract and downstream acceptance gates. |
+| S1 | ⬜ | Pure bounded lexer/parser/AST, diagnostics, host tests, and fuzzing. |
+| S2 | ⬜ | `INVOKE`, Command manifests, closeable byte streams, and persistent-cap proxies. |
+| S3 | ⬜ | Atomic Job admission, dynamic stage CSpaces, supervision, cancellation, and fault teardown. |
+| S4 | ⬜ | Safe-Rust applets and `echo hello | wc > @console` vertical acceptance. |
+
 ## 0. The one thing to fix first
 
 *(Written before M1. Kept as the rationale.)*

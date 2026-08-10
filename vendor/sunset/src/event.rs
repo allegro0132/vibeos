@@ -294,9 +294,13 @@ pub enum ServEvent<'g, 'a> {
     // the same ServExecRequest.
     SessionSubsystem(ServExecRequest<'g, 'a>),
     /// Client requested a PTY for the channel.
-    ///
-    /// TODO details
     SessionPty(ServPtyRequest<'g, 'a>),
+    /// Client reported new dimensions for an accepted PTY.
+    SessionWindowChange(ServWindowChangeRequest<'g, 'a>),
+    /// Client delivered a signal to the active session command.
+    SessionSignal(ServSignalRequest<'g, 'a>),
+    /// Client requested a terminal BREAK operation.
+    SessionBreak(ServBreakRequest<'g, 'a>),
     /// Server has received one environment variable.
     /// Note: input strings are not sanitised.
     SessionEnv(ServEnvironmentRequest<'g, 'a>),
@@ -325,6 +329,9 @@ impl Debug for ServEvent<'_, '_> {
             Self::SessionExec(_) => "SessionExec",
             Self::SessionSubsystem(_) => "SessionSubsystem",
             Self::SessionPty(_) => "SessionPty",
+            Self::SessionWindowChange(_) => "SessionWindowChange",
+            Self::SessionSignal(_) => "SessionSignal",
+            Self::SessionBreak(_) => "SessionBreak",
             Self::SessionEnv(_) => "Environment",
             Self::Defunct => "Defunct",
             Self::PollAgain => "PollAgain",
@@ -800,9 +807,7 @@ impl Drop for ServExecRequest<'_, '_> {
     }
 }
 
-/// A PTY request
-///
-/// Placeholder, doesn't yet return the PTY information.
+/// A validated PTY request.
 pub struct ServPtyRequest<'g, 'a> {
     runner: &'g mut Runner<'a, Server>,
     num: ChanNum,
@@ -814,7 +819,10 @@ impl<'g, 'a> ServPtyRequest<'g, 'a> {
         Self { runner, num, done: false }
     }
 
-    // TODO return PTY information to the caller
+    /// Return validated TERM, dimensions, and encoded terminal modes.
+    pub fn metadata(&self) -> Result<channel::PtyMetadata<'_>> {
+        self.runner.fetch_pty()
+    }
 
     /// Indicate that the request succeeded.
     ///
@@ -852,6 +860,88 @@ impl Drop for ServPtyRequest<'_, '_> {
         if !self.done {
             if let Err(e) = self.runner.resume_chanreq(false) {
                 trace!("Error for shellreq: {e}")
+            }
+        }
+    }
+}
+
+/// A no-reply PTY dimension notification.
+pub struct ServWindowChangeRequest<'g, 'a> {
+    runner: &'g mut Runner<'a, Server>,
+    num: ChanNum,
+}
+
+impl<'g, 'a> ServWindowChangeRequest<'g, 'a> {
+    fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
+        Self { runner, num }
+    }
+
+    pub fn channel(&self) -> ChanNum {
+        self.num
+    }
+
+    pub fn size(&self) -> Result<channel::TerminalSize> {
+        self.runner.fetch_window_change()
+    }
+}
+
+/// A no-reply signal notification for the active session command.
+pub struct ServSignalRequest<'g, 'a> {
+    runner: &'g mut Runner<'a, Server>,
+    num: ChanNum,
+}
+
+impl<'g, 'a> ServSignalRequest<'g, 'a> {
+    fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
+        Self { runner, num }
+    }
+
+    pub fn channel(&self) -> ChanNum {
+        self.num
+    }
+
+    pub fn signal_name(&self) -> Result<&str> {
+        self.runner.fetch_signal()
+    }
+}
+
+/// A BREAK request that must be explicitly accepted or rejected.
+pub struct ServBreakRequest<'g, 'a> {
+    runner: &'g mut Runner<'a, Server>,
+    num: ChanNum,
+    done: bool,
+}
+
+impl<'g, 'a> ServBreakRequest<'g, 'a> {
+    fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
+        Self { runner, num, done: false }
+    }
+
+    pub fn channel(&self) -> ChanNum {
+        self.num
+    }
+
+    /// Return the peer-provided duration without applying it or blocking.
+    pub fn length_ms(&self) -> Result<u32> {
+        self.runner.fetch_break()
+    }
+
+    pub fn succeed(mut self) -> Result<()> {
+        self.done = true;
+        self.runner.resume_chanreq(true)
+    }
+
+    pub fn fail(mut self) -> Result<()> {
+        self.done = true;
+        self.runner.resume_chanreq(false)
+    }
+}
+
+impl Drop for ServBreakRequest<'_, '_> {
+    fn drop(&mut self) {
+        if !self.done {
+            if let Err(error) = self.runner.resume_chanreq(false) {
+                trace!("Error for break request: {error}")
             }
         }
     }
@@ -950,6 +1040,15 @@ pub(crate) enum ServEventId {
     SessionPty {
         num: ChanNum,
     },
+    SessionWindowChange {
+        num: ChanNum,
+    },
+    SessionSignal {
+        num: ChanNum,
+    },
+    SessionBreak {
+        num: ChanNum,
+    },
     Environment {
         num: ChanNum,
     },
@@ -1010,6 +1109,20 @@ impl ServEventId {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
                 Ok(ServEvent::SessionPty(ServPtyRequest::new(runner, num)))
             }
+            Self::SessionWindowChange { num } => {
+                debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
+                Ok(ServEvent::SessionWindowChange(ServWindowChangeRequest::new(
+                    runner, num,
+                )))
+            }
+            Self::SessionSignal { num } => {
+                debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
+                Ok(ServEvent::SessionSignal(ServSignalRequest::new(runner, num)))
+            }
+            Self::SessionBreak { num } => {
+                debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
+                Ok(ServEvent::SessionBreak(ServBreakRequest::new(runner, num)))
+            }
             Self::Environment { num } => {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
                 Ok(ServEvent::SessionEnv(ServEnvironmentRequest::new(runner, num)))
@@ -1022,7 +1135,10 @@ impl ServEventId {
     // Used for internal correctness checks.
     pub(crate) fn needs_resume(&self) -> bool {
         match self {
-            Self::Defunct | Self::Authenticated => false,
+            Self::Defunct
+            | Self::Authenticated
+            | Self::SessionWindowChange { .. }
+            | Self::SessionSignal { .. } => false,
             Self::Hostkeys
             | Self::FirstAuth
             | Self::PasswordAuth
@@ -1032,7 +1148,8 @@ impl ServEventId {
             | Self::SessionExec { .. }
             | Self::SessionSubsystem { .. }
             | Self::Environment { .. }
-            | Self::SessionPty { .. } => true,
+            | Self::SessionPty { .. }
+            | Self::SessionBreak { .. } => true,
         }
     }
 }
@@ -1045,5 +1162,14 @@ mod strict_auth_tests {
     fn password_enable_requests_fail_closed() {
         assert!(reject_password_enable(false).is_ok());
         assert!(matches!(reject_password_enable(true), Err(Error::BadUsage { .. })));
+    }
+
+    #[test]
+    fn interactive_request_resume_contract_is_explicit() {
+        let num = ChanNum(0);
+        assert!(ServEventId::SessionPty { num }.needs_resume());
+        assert!(ServEventId::SessionBreak { num }.needs_resume());
+        assert!(!ServEventId::SessionWindowChange { num }.needs_resume());
+        assert!(!ServEventId::SessionSignal { num }.needs_resume());
     }
 }

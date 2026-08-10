@@ -884,6 +884,20 @@ fn progress_protocol(
                 event.fail().map_err(|_| "PTY rejection failed")?;
                 progressed = true;
             }
+            Event::Serv(ServEvent::SessionWindowChange(_event)) => {
+                // N4 remains exec-only. This no-reply notification is ignored
+                // and Sunset consumes it when the event is dropped.
+                progressed = true;
+            }
+            Event::Serv(ServEvent::SessionSignal(_event)) => {
+                // Interactive per-session cancellation is introduced by N6;
+                // the exec-only acceptance image must not map this globally.
+                progressed = true;
+            }
+            Event::Serv(ServEvent::SessionBreak(event)) => {
+                event.fail().map_err(|_| "BREAK rejection failed")?;
+                progressed = true;
+            }
             Event::Serv(ServEvent::SessionEnv(event)) => {
                 event.fail().map_err(|_| "environment rejection failed")?;
                 progressed = true;

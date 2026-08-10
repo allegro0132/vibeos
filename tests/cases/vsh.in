@@ -4,3 +4,18 @@ spin
 @sleep 1
 @ctrl-c
 @sleep 1
+echo history > @console
+@text draft
+@up
+@enter
+@text echo hllo
+@left
+@left
+@left
+@text e
+@enter
+@text draft
+@up
+@up
+@down
+@enter

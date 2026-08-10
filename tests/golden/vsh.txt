@@ -5,4 +5,17 @@ vibe> echo hello | wc > @console
 1 1 6
 vibe> spin
   vsh job %2: Cancelled
+vibe> echo history > @console
+history
+vibe> draft
+vibe> echo history > @console
+history
+vibe> echo hllo
+vibe> echo hello
+hello
+vibe> draft
+vibe> echo hello
+vibe> echo history > @console
+vibe> echo hello
+hello
 vibe> 

@@ -366,6 +366,11 @@ verbose         restore background component output
 poweroff        power off
 ```
 
+Interactive editing is shared by the default and test shells: `Up`/`Down`
+browse command history, while `Left`/`Right` move the insertion cursor.
+Backspace and insertion work in the middle of a line. Input is bounded to
+4 KiB, and history to the newest 64 entries / 64 KiB.
+
 ## Test shell
 
 The following diagnostic surface exists only in `legacy-shell` builds used by
@@ -424,8 +429,9 @@ that *panics* is caught the same way and costs only its own task.
 
 Components print from tasks the shell knows nothing about, so the tty owns the
 bottom line of the screen: any asynchronous write erases the prompt, prints, and
-redraws the prompt with your partial input intact. Type `up`, let a reading land,
-finish with `time`, and you still ran `uptime`.
+redraws the prompt with your partial input and cursor position intact. Start
+typing a command, move left, let a reading land, and you can continue editing at
+the same position.
 
 `quiet` mutes the demo components; `verbose` brings them back. That is a
 rendering setting, not an authority one — muting decides what reaches the

@@ -20,7 +20,7 @@ use vibeos_core::ssh_identity::{
     HostSignerError, ProvisionedHostSeed, SshEd25519PublicKey, SshEd25519Signature,
 };
 
-/// Exact SHA-256 exchange-hash size for the sole N3/N4 key-exchange profile.
+/// Exact SHA-256 exchange-hash size for the sole acceptance key-exchange profile.
 /// A future SHA-512 profile must introduce a distinct typed operation instead
 /// of widening this signing boundary.
 pub const SSH_EXCHANGE_HASH_BYTES: usize = 32;

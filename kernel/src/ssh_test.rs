@@ -1,10 +1,14 @@
-//! QEMU-only N4 acceptance server: one bounded SSH connection at a time.
+//! Bounded SSH acceptance server: one connection at a time.
 //!
 //! The transport owns no ambient authority. Packet I/O, entropy, host-key
 //! signing, and authorization are all reached through separately attenuated
 //! capabilities. Each accepted TCP connection gets fresh caller-provided
 //! randomness and at most one authenticated session channel and one accepted
 //! start request: either bounded `exec` or an isolated PTY-backed VSH shell.
+//!
+//! QEMU obtains real transport bytes from virtio-rng. The explicitly named
+//! Milk-V hardware-acceptance feature instead uses a deterministic test-only
+//! provider and fixed identities; it proves wiring and is not secure SSH.
 
 extern crate alloc;
 
@@ -26,6 +30,8 @@ use sunset::{
 use vibeos_core::cap::{CSpace, Cap, Rights};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
+#[cfg(feature = "milkv-ssh-acceptance")]
+use vibeos_core::net_config::Ipv4RuntimeStatus;
 use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_core::ssh_identity::SshEd25519PublicKey;
@@ -39,12 +45,20 @@ use crate::ssh_security::{
     self, AuthorizedKeyPolicyService, AuthorizedProfile, HostPublicKeySnapshot, HostSigningService,
     SecurityGeneration,
 };
-use crate::virtio_rng::{self, RandomBytes, RandomError};
 use crate::world::Space;
 
+#[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+use crate::ssh_acceptance_rng as ssh_rng;
+#[cfg(feature = "qemu-virt")]
+use crate::virtio_rng as ssh_rng;
+use ssh_rng::{RandomBytes, RandomError};
+
 const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+#[cfg(feature = "qemu-virt")]
 const GUEST_IPV4: [u8; 4] = [10, 0, 2, 15];
+#[cfg(feature = "qemu-virt")]
 const GATEWAY_IPV4: [u8; 4] = [10, 0, 2, 2];
+#[cfg(feature = "qemu-virt")]
 const PREFIX_LEN: u8 = 24;
 const LISTEN_PORT: u16 = 2222;
 const SSH_RANDOM_DOMAIN: u64 = 0x5353_4803;
@@ -56,6 +70,8 @@ const EXEC_TIMEOUT_MS: u64 = 10_000;
 const CANCEL_GRACE_MS: u64 = 1_000;
 const CLOSE_TIMEOUT_MS: u64 = 5_000;
 const IDLE_POLL_CEILING_MS: u64 = 10;
+#[cfg(feature = "milkv-ssh-acceptance")]
+const DHCP_STATUS_INTERVAL_MS: u64 = 30_000;
 const MAX_SSH_PROGRESS_PER_TURN: usize = 32;
 const MAX_WIRE_IO_PER_TURN: usize = 8;
 const MAX_CHANNEL_DISCARDS_PER_TURN: usize = 4;
@@ -394,7 +410,7 @@ enum ExecutionCancellation {
     Rebind(&'static str),
 }
 
-/// Serve the QEMU acceptance endpoint with one active TCP/SSH peer at a time.
+/// Serve an explicit acceptance endpoint with one active TCP/SSH peer at a time.
 pub async fn task(
     space: &'static Space,
     outbound: Cap,
@@ -405,6 +421,11 @@ pub async fn task(
     signer_invoke: Cap,
     policy: Cap,
 ) {
+    #[cfg(feature = "milkv-ssh-acceptance")]
+    crate::println!(
+        "WARNING milkv-ssh-acceptance: deterministic entropy and fixed test keys; isolated bring-up only"
+    );
+
     let (outbound_endpoint, inbound_endpoint) = {
         let cspace = space.0.lock();
         let Ok(outbound_endpoint) =
@@ -425,7 +446,7 @@ pub async fn task(
     let initial_entropy = match fetch_entropy(space, random, SEED_BYTES + 8).await {
         Ok(entropy) => entropy,
         Err(_) => {
-            crate::println!("FAIL ssh-test: trusted entropy unavailable");
+            crate::println!("FAIL ssh-test: SSH random source unavailable");
             return;
         }
     };
@@ -433,7 +454,7 @@ pub async fn task(
     connection_seed.copy_from_slice(&initial_entropy.as_slice()[..SEED_BYTES]);
     if connection_seed.iter().all(|byte| *byte == 0) {
         wipe(&mut connection_seed);
-        crate::println!("FAIL ssh-test: trusted entropy returned an all-zero seed");
+        crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
         return;
     }
     let mut tcp_seed_bytes = [0u8; 8];
@@ -466,31 +487,47 @@ pub async fn task(
             return;
         }
     };
-    crate::println!("ssh-test listening on 10.0.2.15:2222");
+    let mut announced_ipv4 = None;
+    let mut announce_required = true;
 
     loop {
-        match wait_for_connection(space, control, bound_epoch, &mut stack).await {
-            Ok(()) => {}
-            Err(reason) => {
-                wipe(&mut connection_seed);
-                crate::println!("FAIL ssh-test: {reason}");
-                return;
+        let wait_result = if announce_required {
+            match announce_listener(space, control, bound_epoch, &mut stack, &mut announced_ipv4)
+                .await
+            {
+                Ok(()) => {
+                    announce_required = false;
+                    wait_for_connection(
+                        space,
+                        control,
+                        bound_epoch,
+                        &mut stack,
+                        &mut announced_ipv4,
+                    )
+                    .await
+                }
+                Err(reason) => Err(reason),
             }
-        }
-
-        let seed = core::mem::replace(&mut connection_seed, [0; SEED_BYTES]);
-        let outcome = serve_connection(
-            space,
-            control,
-            bound_epoch,
-            random,
-            signer_read,
-            signer_invoke,
-            policy,
-            &mut stack,
-            seed,
-        )
-        .await;
+        } else {
+            wait_for_connection(space, control, bound_epoch, &mut stack, &mut announced_ipv4).await
+        };
+        let outcome = match wait_result {
+            Ok(()) => {
+                let seed = core::mem::replace(&mut connection_seed, [0; SEED_BYTES]);
+                serve_connection(
+                    space,
+                    control,
+                    bound_epoch,
+                    signer_read,
+                    signer_invoke,
+                    policy,
+                    &mut stack,
+                    seed,
+                )
+                .await
+            }
+            Err(reason) => ConnectionEnd::Rebind(reason),
+        };
 
         match outcome {
             ConnectionEnd::ExecComplete(status) => {
@@ -506,10 +543,15 @@ pub async fn task(
             ConnectionEnd::Rebind(reason) => {
                 let _ = stack.reset();
                 crate::println!("ssh-test connection reset: {reason}");
+                wipe(&mut connection_seed);
+                announced_ipv4 = None;
+                announce_required = true;
                 let next_entropy = match fetch_entropy(space, random, SEED_BYTES + 8).await {
                     Ok(entropy) => entropy,
                     Err(_) => {
-                        crate::println!("FAIL ssh-test: trusted entropy unavailable during rebind");
+                        crate::println!(
+                            "FAIL ssh-test: SSH random source unavailable during rebind"
+                        );
                         return;
                     }
                 };
@@ -521,7 +563,7 @@ pub async fn task(
                 drop(next_entropy);
                 if connection_seed.iter().all(|byte| *byte == 0) {
                     wipe(&mut connection_seed);
-                    crate::println!("FAIL ssh-test: trusted entropy returned an all-zero seed");
+                    crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
                     return;
                 }
                 let Some((next_outbound, next_inbound)) = stack_endpoints(space, outbound, inbound)
@@ -554,7 +596,6 @@ pub async fn task(
                         return;
                     }
                 };
-                crate::println!("ssh-test listening on 10.0.2.15:2222");
                 continue;
             }
         }
@@ -571,7 +612,7 @@ pub async fn task(
         let entropy = match fetch_entropy(space, random, SEED_BYTES).await {
             Ok(entropy) => entropy,
             Err(_) => {
-                crate::println!("FAIL ssh-test: trusted entropy unavailable for next connection");
+                crate::println!("FAIL ssh-test: SSH random source unavailable for next connection");
                 return;
             }
         };
@@ -579,7 +620,7 @@ pub async fn task(
         drop(entropy);
         if connection_seed.iter().all(|byte| *byte == 0) {
             wipe(&mut connection_seed);
-            crate::println!("FAIL ssh-test: trusted entropy returned an all-zero seed");
+            crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
             return;
         }
     }
@@ -610,7 +651,14 @@ async fn build_stack(
     inbound: vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
     outbound: vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
 ) -> Result<StaticIpv4TcpStack, &'static str> {
-    for _ in 0..NETWORK_RETRY_BUDGET {
+    #[cfg(feature = "qemu-virt")]
+    let attempts = core::iter::repeat(()).take(NETWORK_RETRY_BUDGET);
+    // Physical carrier can legitimately appear long after boot. Keep this
+    // acceptance service dormant instead of permanently exiting before a
+    // cable, DHCP peer, or restarted DWMAC becomes available.
+    #[cfg(feature = "milkv-ssh-acceptance")]
+    let attempts = core::iter::repeat(());
+    for _ in attempts {
         let info = device_info(space, control).ok_or("network control authority unavailable")?;
         if info.quarantined {
             return Err("network device is quarantined");
@@ -619,8 +667,14 @@ async fn build_stack(
             crate::exec::sleep_ms(1).await;
             continue;
         }
+        #[cfg(feature = "milkv-ssh-acceptance")]
+        if !info.phy_link_up {
+            crate::exec::sleep_ms(1).await;
+            continue;
+        }
         match bind_stack(space, control) {
             Ok(stamp) => {
+                #[cfg(feature = "qemu-virt")]
                 let config = StaticIpv4Config::new(
                     GUEST_MAC,
                     GUEST_IPV4,
@@ -629,8 +683,26 @@ async fn build_stack(
                     tcp_seed ^ stamp.device_epoch(),
                 )
                 .with_default_gateway(GATEWAY_IPV4);
-                return StaticIpv4TcpStack::new(config, stamp, inbound, outbound)
-                    .map_err(|_| "static IPv4/TCP stack construction failed");
+                #[cfg(feature = "milkv-ssh-acceptance")]
+                let config = StaticIpv4Config::new(
+                    GUEST_MAC,
+                    [192, 0, 2, 1],
+                    24,
+                    LISTEN_PORT,
+                    tcp_seed ^ stamp.device_epoch(),
+                );
+                let stack = StaticIpv4TcpStack::new(config, stamp, inbound, outbound)
+                    .map_err(|_| "IPv4/TCP stack construction failed")?;
+                #[cfg(feature = "milkv-ssh-acceptance")]
+                {
+                    let mut stack = stack;
+                    stack
+                        .start_dhcp()
+                        .map_err(|_| "DHCP client initialization failed")?;
+                    return Ok(stack);
+                }
+                #[cfg(feature = "qemu-virt")]
+                return Ok(stack);
             }
             Err(
                 crate::virtio_net::NetError::Offline | crate::virtio_net::NetError::SessionBusy,
@@ -643,17 +715,58 @@ async fn build_stack(
     Err("network stack bind timed out")
 }
 
+async fn announce_listener(
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    stack: &mut StaticIpv4TcpStack,
+    announced_ipv4: &mut Option<[u8; 4]>,
+) -> Result<(), &'static str> {
+    #[cfg(feature = "qemu-virt")]
+    {
+        let _ = (space, control, bound_epoch);
+        update_listener_announcement(stack, announced_ipv4);
+        return Ok(());
+    }
+
+    #[cfg(feature = "milkv-ssh-acceptance")]
+    {
+        let mut last_status = monotonic_ms();
+        loop {
+            validate_network_authority(space, control, bound_epoch)?;
+            let report = stack
+                .poll_network(monotonic_ms())
+                .map_err(|_| "DHCP/network listener poll failed")?;
+            if update_listener_announcement(stack, announced_ipv4) {
+                return Ok(());
+            }
+            let now = monotonic_ms();
+            if now.saturating_sub(last_status) >= DHCP_STATUS_INTERVAL_MS {
+                crate::println!("milkv-ssh-acceptance waiting for a DHCP lease");
+                last_status = now;
+            }
+            cooperate(
+                report.more_work || report.ingress_frames != 0,
+                report.next_poll_delay_ms,
+            )
+            .await;
+        }
+    }
+}
+
 async fn wait_for_connection(
     space: &Space,
     control: Cap,
     bound_epoch: u64,
     stack: &mut StaticIpv4TcpStack,
+    announced_ipv4: &mut Option<[u8; 4]>,
 ) -> Result<(), &'static str> {
     loop {
         validate_network_authority(space, control, bound_epoch)?;
         let report = stack
             .poll_network(monotonic_ms())
             .map_err(|_| "network listener poll failed")?;
+        update_listener_announcement(stack, announced_ipv4);
         // smoltcp considers SYN-RECEIVED an active connection, but its byte
         // stream API cannot accept Sunset's server banner until the final ACK
         // moves the socket to ESTABLISHED. Entering the bridge on the earlier
@@ -673,12 +786,49 @@ async fn wait_for_connection(
     }
 }
 
+#[cfg(feature = "qemu-virt")]
+fn update_listener_announcement(
+    _stack: &StaticIpv4TcpStack,
+    announced_ipv4: &mut Option<[u8; 4]>,
+) -> bool {
+    if *announced_ipv4 != Some(GUEST_IPV4) {
+        crate::println!("ssh-test listening on 10.0.2.15:2222");
+        *announced_ipv4 = Some(GUEST_IPV4);
+    }
+    true
+}
+
+#[cfg(feature = "milkv-ssh-acceptance")]
+fn update_listener_announcement(
+    stack: &StaticIpv4TcpStack,
+    announced_ipv4: &mut Option<[u8; 4]>,
+) -> bool {
+    match stack.ipv4_status() {
+        Ipv4RuntimeStatus::DhcpBound(address) => {
+            if *announced_ipv4 != Some(address.address) {
+                let [a, b, c, d] = address.address;
+                crate::println!(
+                    "milkv-ssh-acceptance listening on {a}.{b}.{c}.{d}:{}",
+                    LISTEN_PORT
+                );
+                *announced_ipv4 = Some(address.address);
+            }
+            true
+        }
+        _ => {
+            if announced_ipv4.take().is_some() {
+                crate::println!("milkv-ssh-acceptance DHCP lease lost; listener unavailable");
+            }
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     space: &Space,
     control: Cap,
     bound_epoch: u64,
-    _random: Cap,
     signer_read: Cap,
     signer_invoke: Cap,
     policy: Cap,
@@ -2214,6 +2364,10 @@ fn validate_network_authority(
     if !info.online {
         return Err("network device went offline");
     }
+    #[cfg(feature = "milkv-ssh-acceptance")]
+    if !info.phy_link_up {
+        return Err("network carrier went down");
+    }
     if info.session_epoch != bound_epoch {
         return Err("network device session changed");
     }
@@ -2247,9 +2401,9 @@ async fn fetch_entropy(
         let lease = space
             .0
             .lock()
-            .lookup_lease::<virtio_rng::RandomSource>(random, Rights::READ)
+            .lookup_lease::<ssh_rng::RandomSource>(random, Rights::READ)
             .map_err(|_| RandomError::AuthorityRevoked)?;
-        match virtio_rng::bytes_with(lease, length).await {
+        match ssh_rng::bytes_with(lease, length).await {
             Ok(bytes) => return Ok(bytes),
             Err(RandomError::Offline | RandomError::Busy | RandomError::DriverRestarted) => {
                 crate::exec::sleep_ms(1).await;

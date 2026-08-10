@@ -29,7 +29,7 @@ use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
-#[cfg(feature = "ssh-test")]
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
 // their transient buffers to the shell owner. Keep the documented store
@@ -97,7 +97,7 @@ enum ComponentTemplate {
     VirtioRng,
     #[cfg(feature = "ssh-security-test")]
     SshSecurityTest,
-    #[cfg(feature = "ssh-test")]
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     SshTest,
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     Ipv4Stack,
@@ -137,7 +137,7 @@ enum ComponentGrants {
         signer_invoke: Cap,
         policy: Cap,
     },
-    #[cfg(feature = "ssh-test")]
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     SshTest {
         outbound: Cap,
         inbound: Cap,
@@ -384,19 +384,31 @@ pub struct World {
     net_outbound_root: Option<Cap>,
     net_inbound_root: Option<Cap>,
     net_control_root: Option<Cap>,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
     rng_policy: Option<Arc<Space>>,
     #[cfg(feature = "qemu-virt")]
     rng_mmio: Option<Cap>,
     #[cfg(feature = "qemu-virt")]
     rng_dma: Option<Cap>,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
     rng_source_root: Option<Cap>,
-    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    #[cfg(any(
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance"
+    ))]
     ssh_security_policy: Option<Arc<Space>>,
-    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    #[cfg(any(
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance"
+    ))]
     ssh_signer_root: Option<Cap>,
-    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    #[cfg(any(
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance"
+    ))]
     ssh_authorized_policy_root: Option<Cap>,
 }
 
@@ -492,7 +504,7 @@ impl World {
     }
 
     fn grant_template(&self, template: ComponentTemplate, space: &Arc<Space>) -> ComponentGrants {
-        #[cfg(feature = "ssh-test")]
+        #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
         if template == ComponentTemplate::SshTest {
             let mut target = space.0.lock();
             let (outbound, inbound, control) = {
@@ -801,7 +813,7 @@ impl World {
             ComponentTemplate::SshSecurityTest => {
                 unreachable!("SSH security-test grants come from private policy CSpaces")
             }
-            #[cfg(feature = "ssh-test")]
+            #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
             ComponentTemplate::SshTest => {
                 unreachable!("SSH test grants come from private policy CSpaces")
             }
@@ -896,7 +908,7 @@ impl World {
                     ),
                 )
             },
-            #[cfg(feature = "ssh-test")]
+            #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
             ComponentGrants::SshTest {
                 outbound,
                 inbound,
@@ -1389,7 +1401,7 @@ pub fn start_ipv4_stack_supervisor() {
 /// Restart only faulted SSH acceptance-server incarnations. A fresh template
 /// receives newly derived network, entropy, signer, and authorization grants;
 /// explicit cancellation remains an operator decision.
-#[cfg(feature = "ssh-test")]
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 pub fn start_ssh_test_supervisor() {
     let world = world();
     let Some(component) = world.component_named("ssh-test") else {
@@ -1449,22 +1461,32 @@ pub fn build() {
         .map(|_| Space::new("virtio-net-policy"));
     #[cfg(feature = "qemu-virt")]
     let rng_resources = virtio_rng::discover();
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    let rng_resources = Some(crate::ssh_acceptance_rng::provision());
     #[cfg(feature = "qemu-virt")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
     #[cfg(feature = "qemu-virt")]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("virtio-rng-policy"));
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    let rng_policy = rng_resources
+        .as_ref()
+        .map(|_| Space::new("ssh-acceptance-random-policy"));
     #[cfg(feature = "ssh-security-test")]
     let ssh_security_test_space = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-security-test"));
-    #[cfg(feature = "ssh-test")]
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     let ssh_test_space = net_resources
         .as_ref()
         .zip(rng_resources.as_ref())
         .map(|_| Space::new("ssh-test"));
-    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    #[cfg(any(
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance"
+    ))]
     let ssh_security_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-security-policy"));
@@ -1598,7 +1620,12 @@ pub fn build() {
             // Protocol acceptance images make their stack the sole client:
             // init must not race ingress, inject frames, or fault the device
             // underneath either TCP or SSH session state.
-            #[cfg(not(any(feature = "tcp-echo", feature = "net-shell", feature = "ssh-test")))]
+            #[cfg(not(any(
+                feature = "tcp-echo",
+                feature = "net-shell",
+                feature = "ssh-test",
+                feature = "milkv-ssh-acceptance"
+            )))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
                 Some(cap::grant(&policy, inbound_root, Rights::RECV, &mut cs).unwrap()),
@@ -1612,7 +1639,12 @@ pub fn build() {
                     .unwrap(),
                 ),
             );
-            #[cfg(any(feature = "tcp-echo", feature = "net-shell", feature = "ssh-test"))]
+            #[cfg(any(
+                feature = "tcp-echo",
+                feature = "net-shell",
+                feature = "ssh-test",
+                feature = "milkv-ssh-acceptance"
+            ))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
             let mut target = driver_space.0.lock();
@@ -1690,7 +1722,20 @@ pub fn build() {
             (None, None, None) => (None, None, None, None),
             _ => unreachable!("entropy resources and CSpaces are constructed together"),
         };
-    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
+        (Some(resources), Some(policy_space)) => {
+            let mut policy = policy_space.0.lock();
+            Some(policy.mint(resources.source, Rights::ALL))
+        }
+        (None, None) => None,
+        _ => unreachable!("acceptance entropy resource and policy are constructed together"),
+    };
+    #[cfg(any(
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance"
+    ))]
     let (ssh_signer_root, ssh_authorized_policy_root) = match ssh_security_policy.as_ref() {
         Some(security_space) => {
             let resources = crate::ssh_test_fixture::provision();
@@ -1746,7 +1791,7 @@ pub fn build() {
             .unwrap(),
         )
     });
-    #[cfg(feature = "ssh-test")]
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     let ssh_test_grants = ssh_test_space.as_ref().map(|test_space| {
         let network = net_policy
             .as_ref()
@@ -1925,15 +1970,23 @@ pub fn build() {
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("virtio-rng-policy", space.clone());
     }
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    if let Some(space) = rng_policy.as_ref() {
+        spaces.insert("ssh-acceptance-random-policy", space.clone());
+    }
     #[cfg(feature = "ssh-security-test")]
     if let Some(space) = ssh_security_test_space.as_ref() {
         spaces.insert("ssh-security-test", space.clone());
     }
-    #[cfg(feature = "ssh-test")]
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     if let Some(space) = ssh_test_space.as_ref() {
         spaces.insert("ssh-test", space.clone());
     }
-    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    #[cfg(any(
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance"
+    ))]
     if let Some(space) = ssh_security_policy.as_ref() {
         spaces.insert("ssh-security-policy", space.clone());
     }
@@ -1983,19 +2036,31 @@ pub fn build() {
         net_outbound_root,
         net_inbound_root,
         net_control_root,
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
         rng_policy,
         #[cfg(feature = "qemu-virt")]
         rng_mmio: rng_mmio_root,
         #[cfg(feature = "qemu-virt")]
         rng_dma: rng_dma_root,
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
         rng_source_root,
-        #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+        #[cfg(any(
+            feature = "ssh-security-test",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance"
+        ))]
         ssh_security_policy,
-        #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+        #[cfg(any(
+            feature = "ssh-security-test",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance"
+        ))]
         ssh_signer_root,
-        #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+        #[cfg(any(
+            feature = "ssh-security-test",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance"
+        ))]
         ssh_authorized_policy_root,
     });
 
@@ -2080,7 +2145,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "ssh-test")]
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     if let (
         Some(space),
         Some((outbound, inbound, control, random, signer_read, signer_invoke, policy)),

@@ -34,6 +34,7 @@ impl Resource for ReadOnlyCapProbe {
 pub async fn shell_task(boot_time: u64) {
     println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
     let mut vsh = crate::vsh::Session::new();
+    install_standard_vsh_commands(&mut vsh);
     loop {
         tty::prompt("vibe> ");
         if let Some(line) = read_line().await {
@@ -94,6 +95,10 @@ async fn read_line() -> Option<String> {
 
 async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let trimmed = line.trim();
+    if trimmed == "vsh" {
+        interactive_vsh(vsh).await;
+        return;
+    }
     let explicit_vsh = trimmed.strip_prefix("vsh ");
     let first = trimmed.split_whitespace().next().unwrap_or("");
     let vsh_command = matches!(
@@ -148,6 +153,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  mem             kernel heap usage");
             println!("  uptime          seconds since boot");
             println!("  echo <text>     write via init's console capability");
+            println!("  vsh             enter an interactive capability-native shell");
             println!("  vsh <list>      run a capability-native command list");
             println!("  halt            shut the machine down");
         }
@@ -531,6 +537,21 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     }
 }
 
+async fn interactive_vsh(session: &mut crate::vsh::Session) {
+    println!("\nVibeOS vsh diagnostic session -- Ctrl-C returns to `vibe>`.\n");
+    loop {
+        tty::prompt("vsh> ");
+        match read_line().await {
+            Some(line) if !line.is_empty() => run_vsh_source(&line, session, None).await,
+            Some(_) => {}
+            None => {
+                println!("  returning to diagnostic shell");
+                return;
+            }
+        }
+    }
+}
+
 async fn run_vsh_source(
     source: &str,
     vsh: &mut crate::vsh::Session,
@@ -608,7 +629,16 @@ fn write_vsh_front(space: &Arc<Space>, console: Cap, text: &str) {
     }
 }
 
-#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn install_standard_vsh_commands(session: &mut crate::vsh::Session) {
+    session.install_host_command("help", 0, 0, vsh_help);
+    session.install_host_command("ps", 0, 0, vsh_ps);
+    session.install_host_command("caps", 0, 1, vsh_caps);
+    session.install_host_command("mem", 0, 0, vsh_mem);
+    session.install_host_command("quiet", 0, 0, vsh_quiet);
+    session.install_host_command("verbose", 0, 0, vsh_verbose);
+    session.install_host_command("poweroff", 0, 0, vsh_poweroff);
+}
+
 pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
     Ok(String::from(
         "  echo ...        write value arguments\n\
@@ -630,7 +660,6 @@ pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
     ))
 }
 
-#[cfg(not(feature = "legacy-shell"))]
 pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {
     let mut output = String::from("COMPONENT TASK NAME CSPACE STATE POLLS BUDGET\n");
     for component in world().components() {
@@ -649,9 +678,13 @@ pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {
     Ok(output)
 }
 
-#[cfg(not(feature = "legacy-shell"))]
 pub(crate) fn vsh_caps(args: &[String]) -> Result<String, crate::vsh::Status> {
-    let name = args.first().map(String::as_str).unwrap_or("vsh");
+    let default_space = if cfg!(feature = "legacy-shell") {
+        "init"
+    } else {
+        "vsh"
+    };
+    let name = args.first().map(String::as_str).unwrap_or(default_space);
     let system = world();
     let Some(space) = system.spaces.get(name) else {
         return Err(crate::vsh::Status::Unavailable);
@@ -663,7 +696,6 @@ pub(crate) fn vsh_caps(args: &[String]) -> Result<String, crate::vsh::Status> {
     Ok(output)
 }
 
-#[cfg(not(feature = "legacy-shell"))]
 pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
     let (live, peak, free) = HEAP.stats();
     let mut output = alloc::format!("heap live={} peak={} remaining={}\n", live, peak, free);
@@ -681,19 +713,16 @@ pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
     Ok(output)
 }
 
-#[cfg(not(feature = "legacy-shell"))]
 pub(crate) fn vsh_quiet(_args: &[String]) -> Result<String, crate::vsh::Status> {
     tty::set_quiet(true);
     Ok(String::from("background component output muted\n"))
 }
 
-#[cfg(not(feature = "legacy-shell"))]
 pub(crate) fn vsh_verbose(_args: &[String]) -> Result<String, crate::vsh::Status> {
     tty::set_quiet(false);
     Ok(String::from("background component output restored\n"))
 }
 
-#[cfg(not(feature = "legacy-shell"))]
 pub(crate) fn vsh_poweroff(_args: &[String]) -> Result<String, crate::vsh::Status> {
     sbi::shutdown(false)
 }

@@ -24,3 +24,7 @@ echo history > @console
 @up
 @down
 @enter
+vsh
+help
+echo nested > @console
+@ctrl-c

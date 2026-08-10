@@ -5,10 +5,21 @@ set -eu
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 
-if [ "$#" -gt 1 ]; then
-  echo "usage: $0 [duo-buildroot-sdk-root]" >&2
-  exit 2
-fi
+diagnostic=false
+sdk_arg=
+for arg in "$@"; do
+  case "$arg" in
+    --diagnostic) diagnostic=true ;;
+    -*) echo "usage: $0 [--diagnostic] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
+    *)
+      if [ -n "$sdk_arg" ]; then
+        echo "usage: $0 [--diagnostic] [duo-buildroot-sdk-root]" >&2
+        exit 2
+      fi
+      sdk_arg=$arg
+      ;;
+  esac
+done
 
 toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' \
   "$repo_root/rust-toolchain.toml")
@@ -30,12 +41,12 @@ fi
 sdk_root=
 mkimage=
 sdk_dtb=
-if [ "$#" -eq 1 ]; then
-  if [ ! -d "$1" ]; then
-    echo "build-milkv-duo.sh: SDK root is not a directory: $1" >&2
+if [ -n "$sdk_arg" ]; then
+  if [ ! -d "$sdk_arg" ]; then
+    echo "build-milkv-duo.sh: SDK root is not a directory: $sdk_arg" >&2
     exit 1
   fi
-  sdk_root=$(cd -- "$1" && pwd)
+  sdk_root=$(cd -- "$sdk_arg" && pwd)
   sdk_build="$sdk_root/u-boot-2021.10/build/cv1800b_milkv_duo_sd"
   mkimage="$sdk_build/tools/mkimage"
   sdk_dtb="$sdk_root/linux_5.10/build/cv1800b_milkv_duo_sd/arch/riscv/boot/dts/cvitek/cv1800b_milkv_duo_sd.dtb"
@@ -54,16 +65,23 @@ if [ "$#" -eq 1 ]; then
   fi
 fi
 
+features=milkv-duo
+output_dir="$repo_root/target/milkv-duo"
+output_elf="$output_dir/vibeos-milkv-duo.elf"
+if [ "$diagnostic" = true ]; then
+  features=milkv-duo,legacy-shell
+  output_dir="$repo_root/target/milkv-duo-diagnostic"
+  output_elf="$output_dir/vibeos-milkv-duo-diagnostic.elf"
+fi
+
 (
   cd "$repo_root/kernel"
   RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
     rustup run "$toolchain" cargo build --release --no-default-features \
-      --features milkv-duo
+      --features "$features"
 )
 
 built_elf="$repo_root/target/riscv64imac-unknown-none-elf/release/vibeos-kernel"
-output_dir="$repo_root/target/milkv-duo"
-output_elf="$output_dir/vibeos-milkv-duo.elf"
 output_bin="$output_dir/vibeos-kernel.bin"
 
 if [ ! -f "$built_elf" ]; then

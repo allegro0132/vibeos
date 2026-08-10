@@ -197,6 +197,32 @@ docker run --rm --platform linux/amd64 \
 
 The final flashable image is `target/milkv-duo/vibeos-milkv-duo-sd.img`.
 
+### Diagnostic image
+
+Hardware acceptance uses a separate `legacy-shell` image so the production
+`vsh` command surface does not acquire block, network, fault-injection, or
+self-test authority. Build the diagnostic kernel on the host with:
+
+```sh
+./scripts/build-milkv-duo.sh --diagnostic
+```
+
+Then package it in the same SDK environment used above:
+
+```sh
+./scripts/package-milkv-duo-sdk.sh --diagnostic /path/to/duo-buildroot-sdk
+```
+
+The flashable result is
+`target/milkv-duo-diagnostic/vibeos-milkv-duo-diagnostic-sd.img`. It boots to
+the `vibe>` diagnostic prompt. Enter `vsh` for an interactive
+capability-native session and press Ctrl-C at an empty `vsh>` prompt to return;
+`vsh <list>` continues to execute one command list without changing prompts.
+The interactive diagnostic session installs the same standard host commands as
+the production vsh (`help`, `ps`, `caps`, `mem`, `quiet`, `verbose`, and
+`poweroff`) alongside the language applets and its private output capability.
+Hardware diagnostics remain in the outer `vibe>` shell.
+
 The image contains a bootable, type `0x0c`, 128 MiB FAT partition followed by a
 4 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
 rootfs. The native block backend translates the data partition's first LBA to

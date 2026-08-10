@@ -26,4 +26,27 @@ vibe> echo hello
 vibe> echo history > @console
 vibe> echo hello
 hello
+vibe> vsh
+VibeOS vsh diagnostic session -- Ctrl-C returns to `vibe>`.
+vsh> help
+  echo ...        write value arguments
+  wc              count stdin bytes, words, and lines
+  let NAME VALUE  set a session value
+  if/while        bounded control flow (`; then` / `; do`)
+  function N ...  define a value-only scoped function
+  echo "$(...)"  bounded command substitution
+  run-script @S   run a read-only manifested script
+  jobs            list session jobs
+  wait %N         join a job
+  cancel %N       cancel a job
+  ps              component lifecycle snapshots
+  caps [space]    sanitized capability summary
+  mem             bounded-memory accounts
+  quiet           mute background component output
+  verbose         restore background component output
+  poweroff        power off
+vsh> echo nested > @console
+nested
+vsh> ^C
+  returning to diagnostic shell
 vibe> 

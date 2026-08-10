@@ -323,13 +323,7 @@ pub extern "C" fn kmain() -> ! {
     {
         let space = world.spaces["vsh"].clone();
         let mut session = vsh::Session::with_cspace(space.0.clone());
-        session.install_host_command("help", 0, 0, shell::vsh_help);
-        session.install_host_command("ps", 0, 0, shell::vsh_ps);
-        session.install_host_command("caps", 0, 1, shell::vsh_caps);
-        session.install_host_command("mem", 0, 0, shell::vsh_mem);
-        session.install_host_command("quiet", 0, 0, shell::vsh_quiet);
-        session.install_host_command("verbose", 0, 0, shell::vsh_verbose);
-        session.install_host_command("poweroff", 0, 0, shell::vsh_poweroff);
+        shell::install_standard_vsh_commands(&mut session);
         #[cfg(feature = "tcp-echo-recovery-test")]
         session.install_host_command("tcp-fault", 0, 0, tcp_echo::vsh_inject_fault);
         #[cfg(feature = "tcp-echo-recovery-test")]

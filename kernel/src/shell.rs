@@ -1973,10 +1973,13 @@ async fn net_handshake(
     let tx_target = before.tx_packets.saturating_add(2);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let after = net_info(init, control)?;
-        if after.tx_packets >= tx_target
+        #[cfg(feature = "milkv-duo")]
+        let completed = after.tx_packets >= tx_target && after.rx_packets > before.rx_packets;
+        #[cfg(feature = "qemu-virt")]
+        let completed = after.tx_packets >= tx_target
             && after.rx_packets > before.rx_packets
-            && after.used_interrupts > before.used_interrupts
-        {
+            && after.used_interrupts > before.used_interrupts;
+        if completed {
             return Ok((before, after));
         }
         exec::sleep_ms(1).await;
@@ -2027,6 +2030,7 @@ async fn block_command(args: &[&str]) {
             }
         }
         "test" => {
+            #[cfg(feature = "qemu-virt")]
             let irq_before = {
                 let lease = init
                     .0
@@ -2097,6 +2101,7 @@ async fn block_command(args: &[&str]) {
                 Ok(lease) => crate::virtio_blk::read_with(lease, 8).await,
                 Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
             };
+            #[cfg(feature = "qemu-virt")]
             let irq_after = {
                 let lease = init
                     .0
@@ -2109,12 +2114,16 @@ async fn block_command(args: &[&str]) {
                     .map_or(irq_before, |info| info.used_interrupts)
             };
             match verified {
-                Ok(observed) if observed == data && irq_after > irq_before => {
-                    println!("  sector 8 write + flush: ok");
-                    println!("  used-buffer IRQ delivery: ok");
-                }
                 Ok(observed) if observed == data => {
-                    println!("  sector 8 write + flush: IRQ was not observed")
+                    println!("  sector 8 write + flush: ok");
+                    #[cfg(feature = "qemu-virt")]
+                    if irq_after > irq_before {
+                        println!("  used-buffer IRQ delivery: ok");
+                    } else {
+                        println!("  used-buffer IRQ delivery: not observed");
+                    }
+                    #[cfg(feature = "milkv-duo")]
+                    println!("  SDHCI PIO polling completion: ok");
                 }
                 Ok(_) => println!("  sector 8 write + flush: readback mismatch"),
                 Err(e) => println!("  sector 8 write + flush: failed ({})", e),

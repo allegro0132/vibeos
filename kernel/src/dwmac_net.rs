@@ -72,6 +72,7 @@ const TX_LAST: u32 = 1 << 29;
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 pub const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+const PEER_DESTINATION_MAC: [u8; 6] = [0xff; 6];
 pub const HANDSHAKE_ETHERTYPE: u16 = 0x88b5;
 const HELLO_PAYLOAD: &[u8] = b"VIBEOS-NET-HELLO-v1";
 const CHALLENGE_PAYLOAD: &[u8] = b"VIBEOS-NET-CHALLENGE-v1";
@@ -758,13 +759,13 @@ fn write32(offset: usize, value: u32) {
 }
 
 pub fn hello_packet() -> Packet {
-    handshake_packet(PEER_MAC, GUEST_MAC, HELLO_PAYLOAD)
+    handshake_packet(PEER_DESTINATION_MAC, GUEST_MAC, HELLO_PAYLOAD)
 }
 pub fn challenge_packet() -> Packet {
     handshake_packet(GUEST_MAC, PEER_MAC, CHALLENGE_PAYLOAD)
 }
 pub fn ack_packet() -> Packet {
-    handshake_packet(PEER_MAC, GUEST_MAC, ACK_PAYLOAD)
+    handshake_packet(PEER_DESTINATION_MAC, GUEST_MAC, ACK_PAYLOAD)
 }
 pub fn is_challenge(packet: &Packet) -> bool {
     packet == &challenge_packet()

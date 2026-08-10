@@ -223,6 +223,20 @@ the production vsh (`help`, `ps`, `caps`, `mem`, `quiet`, `verbose`, and
 `poweroff`) alongside the language applets and its private output capability.
 Hardware diagnostics remain in the outer `vibe>` shell.
 
+For the raw-L2 Ethernet test, connect the Ethernet IO Board directly to a host
+interface or through one switch, then start the hardware peer before entering
+`net test` on the serial console:
+
+```sh
+sudo python3 scripts/milkv-net-peer.py --interface en7
+```
+
+Replace `en7` with the actual host interface. The Milk-V acceptance image sends
+its bounded HELLO and ACK frames to the Ethernet broadcast destination so an
+ordinary host NIC can receive them, while the CHALLENGE still has the exact
+fixed peer source and guest destination checked by VibeOS. The QEMU socket peer
+and its unicast frame contract are unchanged.
+
 The image contains a bootable, type `0x0c`, 128 MiB FAT partition followed by a
 4 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
 rootfs. The native block backend translates the data partition's first LBA to

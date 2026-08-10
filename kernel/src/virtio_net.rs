@@ -19,7 +19,10 @@ use core::task::Poll;
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
-use crate::net::{Endpoint, Packet, MAX_PACKET_LEN};
+use crate::net::{
+    Endpoint, Packet, PacketSessionError, PacketSessionFence, PacketStamp, StampedPacket,
+    MAX_PACKET_LEN,
+};
 use crate::plic;
 use crate::sync::SpinLock;
 use crate::virtio::{
@@ -59,6 +62,9 @@ pub enum NetError {
     Quarantined,
     AuthorityRevoked,
     PermissionDenied,
+    SessionBusy,
+    SessionInactive,
+    IdentityExhausted,
 }
 
 impl core::fmt::Display for NetError {
@@ -73,6 +79,9 @@ impl core::fmt::Display for NetError {
             Self::Quarantined => "network DMA is quarantined after an unconfirmed reset",
             Self::AuthorityRevoked => "network capability is absent or revoked",
             Self::PermissionDenied => "network capability lacks the required right",
+            Self::SessionBusy => "the previous packet session still has transmit work in flight",
+            Self::SessionInactive => "no packet stack is bound to this device incarnation",
+            Self::IdentityExhausted => "network packet-session identity space is exhausted",
         })
     }
 }
@@ -85,10 +94,15 @@ pub struct NetInfo {
     pub header_size: u32,
     pub accepted_features: u64,
     pub session_epoch: u64,
+    pub stack_generation: u64,
     pub irq: u32,
     pub used_interrupts: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    pub stale_ingress_drops: u64,
+    pub stale_egress_drops: u64,
+    pub stale_egress_device_epoch_drops: u64,
+    pub stale_egress_stack_generation_drops: u64,
     pub resets: u64,
     pub timeouts: u64,
     pub rx_inflight: u8,
@@ -148,7 +162,7 @@ impl Resource for DmaRegion {
 }
 
 /// Client-visible control and status authority. Packet transfer itself uses
-/// the two directional `Endpoint<Packet>` capabilities.
+/// the two directional `Endpoint<StampedPacket>` capabilities.
 pub struct NetDevice;
 
 impl NetDevice {
@@ -164,11 +178,21 @@ impl NetDevice {
             queue_size: SPLIT_QUEUE_SIZE,
             header_size: NET_HEADER_SIZE,
             accepted_features: control.features.map_or(0, |features| features.accepted()),
-            session_epoch: control.epoch,
+            session_epoch: control.sessions.device_epoch(),
+            stack_generation: control
+                .sessions
+                .active_stamp()
+                .map_or(0, PacketStamp::stack_generation),
             irq: control.transport.map_or(0, MmioTransport::irq),
             used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
             rx_packets: RX_PACKET_COUNT.load(Ordering::Acquire),
             tx_packets: TX_PACKET_COUNT.load(Ordering::Acquire),
+            stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
+                .load(Ordering::Acquire),
+            stale_egress_stack_generation_drops: STALE_EGRESS_STACK_GENERATION_DROPS
+                .load(Ordering::Acquire),
             resets: RESET_COUNT.load(Ordering::Acquire),
             timeouts: TIMEOUT_COUNT.load(Ordering::Acquire),
             rx_inflight: control.rx_inflight,
@@ -214,6 +238,147 @@ pub fn inject_fault_with(lease: &InvocationLease<NetDevice>) -> Result<(), NetEr
     }
     lease.with(|_| FAULT_AFTER_PUBLISH.store(true, Ordering::Release));
     Ok(())
+}
+
+/// Establish a fresh packet-stack generation after all previously admitted
+/// transmit work has completed. The caller needs explicit control INVOKE
+/// authority; packet SEND/RECV alone cannot retarget the device session, and
+/// INVOKE does not grant the diagnostic WRITE operation used to fault a driver.
+pub fn bind_stack_with(lease: &InvocationLease<NetDevice>) -> Result<PacketStamp, NetError> {
+    if !lease.authorizes(Rights::INVOKE) {
+        return Err(NetError::PermissionDenied);
+    }
+    lease.with(|_| {
+        let mut control = CONTROL.lock();
+        if control.quarantined {
+            return Err(NetError::Quarantined);
+        }
+        if !control.online {
+            return Err(NetError::Offline);
+        }
+        let tx_inflight = usize::from(control.tx_inflight);
+        control.active_stack_domain = None;
+        match control.sessions.bind_stack(tx_inflight) {
+            Ok(stamp) => {
+                control.active_stack_domain = Some(crate::heap::current_domain());
+                Ok(stamp)
+            }
+            Err(PacketSessionError::TransmitBusy { .. }) => Err(NetError::SessionBusy),
+            Err(PacketSessionError::Inactive) => Err(NetError::SessionInactive),
+            Err(
+                PacketSessionError::DeviceEpochExhausted
+                | PacketSessionError::StackGenerationExhausted,
+            ) => {
+                control.online = false;
+                control.quarantined = true;
+                Err(NetError::IdentityExhausted)
+            }
+            Err(PacketSessionError::StampMismatch(_)) => unreachable!(),
+        }
+    })
+}
+
+/// Capture two packets under the current stamp without publishing them. The
+/// recovery test releases them only after a replacement device or stack binds,
+/// making both stale-ingress and stale-egress rejection deterministic.
+#[cfg(feature = "tcp-echo-recovery-test")]
+pub(crate) fn stage_stale_packets_for_test() -> Result<(), NetError> {
+    let control = CONTROL.lock();
+    let stamp = control
+        .sessions
+        .active_stamp()
+        .ok_or(NetError::SessionInactive)?;
+    let packet = hello_packet();
+    let mut staged = STAGED_FAULT_PACKETS.lock();
+    if staged.is_some() {
+        return Err(NetError::SessionBusy);
+    }
+    *staged = Some(StagedFaultPackets {
+        inbound: Some(StampedPacket::new(packet.clone(), stamp)),
+        outbound: Some(StampedPacket::new(packet, stamp)),
+    });
+    Ok(())
+}
+
+#[cfg(feature = "tcp-echo-recovery-test")]
+pub(crate) fn release_stale_packets_for_test() -> Result<bool, NetError> {
+    let control = CONTROL.lock();
+    let active = control
+        .sessions
+        .active_stamp()
+        .ok_or(NetError::SessionInactive)?;
+    let authority = AUTHORITY.lock();
+    let Some(authority) = authority.as_ref() else {
+        return Err(NetError::AuthorityRevoked);
+    };
+    let mut staged = STAGED_FAULT_PACKETS.lock();
+    let packets = staged.as_mut().ok_or(NetError::SessionInactive)?;
+    let old_stamp = packets
+        .inbound
+        .as_ref()
+        .or(packets.outbound.as_ref())
+        .expect("an installed stale-packet probe retains at least one frame")
+        .stamp();
+    if active == old_stamp {
+        return Err(NetError::SessionBusy);
+    }
+
+    let mut progressed = false;
+    if let Some(packet) = packets.inbound.as_ref() {
+        match authority
+            .inbound
+            .try_with(|endpoint| endpoint.try_send(packet.clone()))
+            .map_err(|_| NetError::AuthorityRevoked)?
+        {
+            Ok(()) => {
+                packets.inbound = None;
+                progressed = true;
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(packet) = packets.outbound.as_ref() {
+        match authority
+            .outbound
+            .try_with(|endpoint| endpoint.try_send(packet.clone()))
+            .map_err(|_| NetError::AuthorityRevoked)?
+        {
+            Ok(()) => {
+                packets.outbound = None;
+                progressed = true;
+            }
+            Err(_) => {}
+        }
+    }
+
+    let complete = packets.inbound.is_none() && packets.outbound.is_none();
+    if complete {
+        *staged = None;
+        Ok(true)
+    } else if progressed {
+        Ok(false)
+    } else {
+        Err(NetError::QueueFull)
+    }
+}
+
+#[cfg(feature = "tcp-echo-recovery-test")]
+pub(crate) fn packet_session_test_info() -> (u64, u64, u64, u64) {
+    let control = CONTROL.lock();
+    (
+        control.sessions.device_epoch(),
+        control
+            .sessions
+            .active_stamp()
+            .map_or(0, PacketStamp::stack_generation),
+        STALE_EGRESS_DEVICE_EPOCH_DROPS.load(Ordering::Acquire),
+        STALE_EGRESS_STACK_GENERATION_DROPS.load(Ordering::Acquire),
+    )
+}
+
+#[cfg(feature = "tcp-echo-recovery-test")]
+pub(crate) fn request_driver_fault_for_test() {
+    DRIVER_FAULT_REQUESTED.store(true, Ordering::Release);
 }
 
 pub struct NetResources {
@@ -299,7 +464,8 @@ static DMA_CLAIMED: AtomicBool = AtomicBool::new(false);
 struct DriverControl {
     transport: Option<MmioTransport>,
     features: Option<NegotiatedFeatures>,
-    epoch: u64,
+    sessions: PacketSessionFence,
+    active_stack_domain: Option<AllocationDomain>,
     online: bool,
     quarantined: bool,
     rx_inflight: u8,
@@ -309,15 +475,16 @@ struct DriverControl {
 struct DriverAuthority {
     mmio: Revocable<MmioWindow>,
     dma: Revocable<DmaRegion>,
-    outbound: Revocable<Endpoint<Packet>>,
-    inbound: Revocable<Endpoint<Packet>>,
+    outbound: Revocable<Endpoint<StampedPacket>>,
+    inbound: Revocable<Endpoint<StampedPacket>>,
     control: Revocable<NetDevice>,
 }
 
 static CONTROL: SpinLock<DriverControl> = SpinLock::new_recoverable(DriverControl {
     transport: None,
     features: None,
-    epoch: 0,
+    sessions: PacketSessionFence::new(),
+    active_stack_domain: None,
     online: false,
     quarantined: false,
     rx_inflight: 0,
@@ -329,11 +496,24 @@ static IRQ_CAUSES: AtomicU32 = AtomicU32::new(0);
 static USED_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RX_PACKET_COUNT: AtomicU64 = AtomicU64::new(0);
 static TX_PACKET_COUNT: AtomicU64 = AtomicU64::new(0);
+static STALE_INGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
+static STALE_EGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
+static STALE_EGRESS_DEVICE_EPOCH_DROPS: AtomicU64 = AtomicU64::new(0);
+static STALE_EGRESS_STACK_GENERATION_DROPS: AtomicU64 = AtomicU64::new(0);
 static RESET_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static DRIVER_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.get());
 static DRIVER_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 static FAULT_AFTER_PUBLISH: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "tcp-echo-recovery-test")]
+static DRIVER_FAULT_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "tcp-echo-recovery-test")]
+struct StagedFaultPackets {
+    inbound: Option<StampedPacket>,
+    outbound: Option<StampedPacket>,
+}
+#[cfg(feature = "tcp-echo-recovery-test")]
+static STAGED_FAULT_PACKETS: SpinLock<Option<StagedFaultPackets>> = SpinLock::new(None);
 
 /// Run one network-driver incarnation after resolving all five explicit
 /// grants. Each endpoint operation and every new hardware operation rechecks
@@ -351,8 +531,8 @@ pub async fn driver_task(
         match (
             cspace.lookup_revocable::<MmioWindow>(mmio_cap, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<DmaRegion>(dma_cap, Rights::READ.union(Rights::WRITE)),
-            cspace.lookup_revocable::<Endpoint<Packet>>(outbound_cap, Rights::RECV),
-            cspace.lookup_revocable::<Endpoint<Packet>>(inbound_cap, Rights::SEND),
+            cspace.lookup_revocable::<Endpoint<StampedPacket>>(outbound_cap, Rights::RECV),
+            cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound_cap, Rights::SEND),
             cspace.lookup_revocable::<NetDevice>(control_cap, Rights::READ),
         ) {
             (Ok(mmio), Ok(dma), Ok(outbound), Ok(inbound), Ok(control)) => Some(DriverAuthority {
@@ -376,6 +556,10 @@ pub async fn driver_task(
     };
 
     loop {
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        if DRIVER_FAULT_REQUESTED.swap(false, Ordering::AcqRel) {
+            panic!("injected virtio-net fault with a live TCP stream");
+        }
         match session.step() {
             Ok(true) => {}
             Ok(false) => wait_for_work().await,
@@ -426,16 +610,19 @@ impl DriverSession {
         };
         let epoch = {
             let mut control = CONTROL.lock();
-            let Some(epoch) = control.epoch.checked_add(1) else {
-                drop(control);
-                quarantine_identity_exhausted(transport);
-                return None;
+            let epoch = match control.sessions.attach_device() {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(control);
+                    quarantine_identity_exhausted(transport);
+                    return None;
+                }
             };
-            control.epoch = epoch;
+            control.active_stack_domain = None;
             control.transport = Some(transport);
             control.features = Some(features);
             control.online = false;
-            control.epoch
+            epoch
         };
         let mut session = Self {
             transport,
@@ -530,6 +717,11 @@ impl DriverSession {
     }
 
     fn drain_receive_completions(&mut self) -> Result<bool, NetError> {
+        // Completion consumption, session stamping, endpoint publication, RX
+        // repost, and the queue doorbell form one bounded rebind barrier. A
+        // stack bind cannot relabel a raw frame after this driver has consumed
+        // it from the used ring.
+        let control = CONTROL.lock();
         let observed = read_used_index(NetQueue::Receive);
         let mut progressed = false;
         let mut reposted = false;
@@ -545,6 +737,7 @@ impl DriverSession {
                 Err(_) => {
                     self.model
                         .require_reset(NetResetReason::MalformedCompletion);
+                    drop(control);
                     self.reset_required_transport()?;
                     return Ok(true);
                 }
@@ -560,6 +753,7 @@ impl DriverSession {
             let completion = match self.model.complete_receive(observed, used, header) {
                 Ok(completion) => completion,
                 Err(_) => {
+                    drop(control);
                     self.reset_required_transport()?;
                     return Ok(true);
                 }
@@ -567,16 +761,18 @@ impl DriverSession {
             if completion.frame_length as usize != frame_length || frame_length == 0 {
                 self.model
                     .require_reset(NetResetReason::MalformedCompletion);
+                drop(control);
                 self.reset_required_transport()?;
                 return Ok(true);
             }
             let frame = read_receive_frame(completion.submission.token.head as usize, frame_length);
             let packet =
                 Packet::copy_from(&frame[..frame_length]).map_err(|_| NetError::Protocol)?;
-            match send_inbound(packet) {
-                Ok(()) => {
+            match send_inbound(&control, packet) {
+                Ok(true) => {
                     RX_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
+                Ok(false) => {}
                 Err(NetError::AuthorityRevoked) => return Err(NetError::AuthorityRevoked),
                 // The sole producer checked capacity immediately above. If a
                 // future policy adds another producer, bounded backpressure
@@ -623,8 +819,12 @@ impl DriverSession {
 
     fn publish_transmits(&mut self) -> Result<bool, NetError> {
         let mut published = false;
+        // This guard is the stack-rebind barrier. A successful bind can only
+        // observe zero in-flight descriptors, and cannot interleave between
+        // exact stamp validation and DMA publication below.
+        let mut control = CONTROL.lock();
         while self.model.inflight(NetQueue::Transmit) < SPLIT_QUEUE_SIZE as u8 {
-            let Some(packet) = take_outbound()? else {
+            let Some(packet) = take_admitted_outbound(&mut control)? else {
                 break;
             };
             let submission = self
@@ -634,10 +834,14 @@ impl DriverSession {
             publish_transmit(submission, &packet)?;
             self.tx_deadlines[submission.token.head as usize] = crate::sbi::time()
                 .saturating_add(TX_TIMEOUT_MS.saturating_mul(exec::timebase_hz() / 1_000));
+            control.tx_inflight = self.model.inflight(NetQueue::Transmit);
             published = true;
         }
         if published {
             self.transport.notify_queue(NET_TRANSMIT_QUEUE);
+        }
+        drop(control);
+        if published {
             if FAULT_AFTER_PUBLISH.swap(false, Ordering::AcqRel) {
                 panic!("injected virtio-net fault after DMA publication");
             }
@@ -662,7 +866,12 @@ impl DriverSession {
     }
 
     fn reset_required_transport(&mut self) -> Result<(), NetError> {
-        CONTROL.lock().online = false;
+        {
+            let mut control = CONTROL.lock();
+            control.online = false;
+            control.sessions.detach_device();
+            control.active_stack_domain = None;
+        }
         let _ = plic::disable(self.transport.irq());
         if !self.transport.reset(RESET_POLL_BUDGET) {
             self.model.quarantine(NetResetReason::ResetFailed);
@@ -689,8 +898,17 @@ impl DriverSession {
                 self.transport.add_status(virtio::STATUS_DRIVER_OK);
                 self.transport.notify_queue(NET_RECEIVE_QUEUE);
                 let mut control = CONTROL.lock();
+                let epoch = control
+                    .sessions
+                    .attach_device()
+                    .map_err(|_| NetError::IdentityExhausted)?;
+                control.active_stack_domain = None;
+                if epoch != self.model.epoch() {
+                    control.sessions.detach_device();
+                    control.active_stack_domain = None;
+                    return Err(NetError::Protocol);
+                }
                 control.features = Some(features);
-                control.epoch = self.model.epoch();
                 control.online = true;
                 control.rx_inflight = self.model.inflight(NetQueue::Receive);
                 control.tx_inflight = 0;
@@ -706,6 +924,8 @@ impl DriverSession {
         {
             let mut control = CONTROL.lock();
             control.online = false;
+            control.sessions.detach_device();
+            control.active_stack_domain = None;
             control.rx_inflight = 0;
             control.tx_inflight = 0;
             if !reset {
@@ -733,6 +953,8 @@ impl DriverSession {
             let mut control = CONTROL.lock();
             control.online = false;
             control.quarantined = true;
+            control.sessions.detach_device();
+            control.active_stack_domain = None;
             control.rx_inflight = self.model.inflight(NetQueue::Receive);
             control.tx_inflight = self.model.inflight(NetQueue::Transmit);
         }
@@ -743,7 +965,6 @@ impl DriverSession {
 
     fn sync_control(&self) {
         let mut control = CONTROL.lock();
-        control.epoch = self.model.epoch();
         control.rx_inflight = self.model.inflight(NetQueue::Receive);
         control.tx_inflight = self.model.inflight(NetQueue::Transmit);
     }
@@ -797,6 +1018,8 @@ fn shutdown(transport: MmioTransport, _reason: NetError) {
     {
         let mut control = CONTROL.lock();
         control.online = false;
+        control.sessions.detach_device();
+        control.active_stack_domain = None;
         control.rx_inflight = 0;
         control.tx_inflight = 0;
         if !reset {
@@ -827,6 +1050,8 @@ fn quarantine_identity_exhausted(transport: MmioTransport) {
         let mut control = CONTROL.lock();
         control.online = false;
         control.quarantined = true;
+        control.sessions.detach_device();
+        control.active_stack_domain = None;
         control.features = None;
         control.rx_inflight = 0;
         control.tx_inflight = 0;
@@ -856,7 +1081,7 @@ fn authority_live(transport: MmioTransport) -> bool {
         && authority.control.try_with(|_| ()).is_ok()
 }
 
-fn take_outbound() -> Result<Option<Packet>, NetError> {
+fn take_outbound() -> Result<Option<StampedPacket>, NetError> {
     let authority = AUTHORITY.lock();
     let Some(authority) = authority.as_ref() else {
         return Err(NetError::AuthorityRevoked);
@@ -865,6 +1090,34 @@ fn take_outbound() -> Result<Option<Packet>, NetError> {
         .outbound
         .try_with(Endpoint::try_recv)
         .map_err(|_| NetError::AuthorityRevoked)
+}
+
+fn take_admitted_outbound(control: &mut DriverControl) -> Result<Option<Packet>, NetError> {
+    for _ in 0..QUEUE_SLOTS {
+        let Some(packet) = take_outbound()? else {
+            return Ok(None);
+        };
+        match control.sessions.accept_egress(packet) {
+            Ok(packet) => return Ok(Some(packet)),
+            Err(PacketSessionError::Inactive) => {
+                STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PacketSessionError::StampMismatch(mismatch)) => {
+                STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                if mismatch.device_epoch_changed() {
+                    STALE_EGRESS_DEVICE_EPOCH_DROPS.fetch_add(1, Ordering::Relaxed);
+                } else if mismatch.stack_generation_changed() {
+                    STALE_EGRESS_STACK_GENERATION_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(
+                PacketSessionError::DeviceEpochExhausted
+                | PacketSessionError::StackGenerationExhausted
+                | PacketSessionError::TransmitBusy { .. },
+            ) => unreachable!(),
+        }
+    }
+    Ok(None)
 }
 
 fn inbound_has_space() -> Result<bool, NetError> {
@@ -878,7 +1131,15 @@ fn inbound_has_space() -> Result<bool, NetError> {
         .map_err(|_| NetError::AuthorityRevoked)
 }
 
-fn send_inbound(packet: Packet) -> Result<(), NetError> {
+fn send_inbound(control: &DriverControl, packet: Packet) -> Result<bool, NetError> {
+    let packet = match control.sessions.stamp_ingress(packet) {
+        Ok(packet) => packet,
+        Err(PacketSessionError::Inactive) => {
+            STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        Err(_) => unreachable!(),
+    };
     let authority = AUTHORITY.lock();
     let Some(authority) = authority.as_ref() else {
         return Err(NetError::AuthorityRevoked);
@@ -887,7 +1148,10 @@ fn send_inbound(packet: Packet) -> Result<(), NetError> {
         .inbound
         .try_with(|endpoint| endpoint.try_send(packet))
         .map_err(|_| NetError::AuthorityRevoked)?
-        .map_err(|_| NetError::QueueFull)
+        .map_err(|_| NetError::QueueFull)?;
+    // Keep CONTROL held through endpoint publication so a successful rebind
+    // cannot be followed by a late frame stamped for the retired session.
+    Ok(true)
 }
 
 async fn wait_for_work() {
@@ -1125,13 +1389,23 @@ fn handshake_packet(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Pa
 /// # Safety
 /// The executor guarantees that every task in `domain` is detached forever.
 pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
+    // A stack client may fault while it owns the stable control lock. Recover
+    // only an exact abandoned guard, then retire its packet route before the
+    // executor publishes Faulted or a supervisor can start a replacement.
+    let _ = unsafe { CONTROL.recover_after_fault(domain) };
+    {
+        let mut control = CONTROL.lock();
+        if control.active_stack_domain == Some(domain) {
+            control.sessions.unbind_stack();
+            control.active_stack_domain = None;
+        }
+    }
     if DRIVER_OWNER.load(Ordering::Acquire) != domain.owner.get()
         || DRIVER_ARENA.load(Ordering::Acquire) != domain.arena.get()
     {
         return;
     }
 
-    let _ = unsafe { CONTROL.recover_after_fault(domain) };
     let _ = unsafe { AUTHORITY.recover_after_fault(domain) };
     let transport = CONTROL.lock().transport;
     if let Some(transport) = transport {

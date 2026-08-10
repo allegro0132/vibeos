@@ -26,7 +26,7 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
 use crate::cap::Revocable;
 use crate::chan::Endpoint;
-use crate::net::{Packet, MAX_PACKET_LEN};
+use crate::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
 
 /// Bytes reserved in each direction of the single TCP connection.
 pub const TCP_BUFFER_BYTES: usize = 4 * 1024;
@@ -122,6 +122,9 @@ impl fmt::Display for StackError {
 pub struct PacketDeviceStats {
     pub rx_frames: u64,
     pub tx_frames: u64,
+    pub rejected_ingress_frames: u64,
+    pub rejected_device_epoch_frames: u64,
+    pub rejected_stack_generation_frames: u64,
     pub tx_backpressure_events: u64,
     pub pending_egress: bool,
 }
@@ -134,25 +137,32 @@ pub struct PacketDeviceStats {
 /// until that packet is accepted. This preserves TCP retransmission semantics
 /// without growing an unbounded second queue.
 pub struct PacketDevice {
-    inbound: Revocable<Endpoint<Packet>>,
-    outbound: Revocable<Endpoint<Packet>>,
-    pending_egress: Option<Packet>,
+    stamp: PacketStamp,
+    inbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: Revocable<Endpoint<StampedPacket>>,
+    pending_egress: Option<StampedPacket>,
     stats: PacketDeviceStats,
     authority_revoked: bool,
 }
 
 impl PacketDevice {
     pub fn new(
-        inbound: Revocable<Endpoint<Packet>>,
-        outbound: Revocable<Endpoint<Packet>>,
+        stamp: PacketStamp,
+        inbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: Revocable<Endpoint<StampedPacket>>,
     ) -> Self {
         Self {
+            stamp,
             inbound,
             outbound,
             pending_egress: None,
             stats: PacketDeviceStats::default(),
             authority_revoked: false,
         }
+    }
+
+    pub const fn stamp(&self) -> PacketStamp {
+        self.stamp
     }
 
     /// Revalidate both directional authorities at a cooperative-call boundary.
@@ -164,7 +174,7 @@ impl PacketDevice {
             self.authority_revoked = true;
             return Err(StackError::AuthorityRevoked);
         }
-        Ok(())
+        self.authority_result()
     }
 
     /// Try once to publish a frame retained after endpoint backpressure.
@@ -238,8 +248,9 @@ impl phy::RxToken for PacketRxToken {
 
 /// A transmit token borrowing only the adapter's one-packet pending slot.
 pub struct PacketTxToken<'a> {
-    outbound: Revocable<Endpoint<Packet>>,
-    pending_egress: &'a mut Option<Packet>,
+    stamp: PacketStamp,
+    outbound: Revocable<Endpoint<StampedPacket>>,
+    pending_egress: &'a mut Option<StampedPacket>,
     stats: &'a mut PacketDeviceStats,
     authority_revoked: &'a mut bool,
 }
@@ -257,8 +268,11 @@ impl phy::TxToken for PacketTxToken<'_> {
 
         let mut frame = [0u8; MAX_PACKET_LEN];
         let result = f(&mut frame[..len]);
-        let packet = Packet::copy_from(&frame[..len])
-            .expect("smoltcp emitted an empty or oversized Ethernet frame");
+        let packet = StampedPacket::new(
+            Packet::copy_from(&frame[..len])
+                .expect("smoltcp emitted an empty or oversized Ethernet frame"),
+            self.stamp,
+        );
         match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
@@ -299,10 +313,28 @@ impl phy::Device for PacketDevice {
                 return None;
             }
         };
+        let packet = match packet.into_packet(self.stamp) {
+            Ok(packet) => packet,
+            Err(mismatch) => {
+                self.stats.rejected_ingress_frames =
+                    self.stats.rejected_ingress_frames.saturating_add(1);
+                if mismatch.device_epoch_changed() {
+                    self.stats.rejected_device_epoch_frames =
+                        self.stats.rejected_device_epoch_frames.saturating_add(1);
+                } else if mismatch.stack_generation_changed() {
+                    self.stats.rejected_stack_generation_frames = self
+                        .stats
+                        .rejected_stack_generation_frames
+                        .saturating_add(1);
+                }
+                return None;
+            }
+        };
         self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
         Some((
             PacketRxToken(packet),
             PacketTxToken {
+                stamp: self.stamp,
                 outbound: self.outbound.clone(),
                 pending_egress: &mut self.pending_egress,
                 stats: &mut self.stats,
@@ -316,6 +348,7 @@ impl phy::Device for PacketDevice {
             return None;
         }
         Some(PacketTxToken {
+            stamp: self.stamp,
             outbound: self.outbound.clone(),
             pending_egress: &mut self.pending_egress,
             stats: &mut self.stats,
@@ -358,12 +391,13 @@ pub struct StaticIpv4EchoStack {
 impl StaticIpv4EchoStack {
     pub fn new(
         config: StaticIpv4Config,
-        inbound: Revocable<Endpoint<Packet>>,
-        outbound: Revocable<Endpoint<Packet>>,
+        stamp: PacketStamp,
+        inbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: Revocable<Endpoint<StampedPacket>>,
     ) -> Result<Self, StackError> {
         validate_config(config)?;
 
-        let mut device = PacketDevice::new(inbound, outbound);
+        let mut device = PacketDevice::new(stamp, inbound, outbound);
         device.revalidate_authority()?;
         let ethernet_address = EthernetAddress(config.ethernet_address);
         let mut interface_config = InterfaceConfig::new(ethernet_address.into());

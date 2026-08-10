@@ -286,6 +286,8 @@ pub extern "C" fn kmain() -> ! {
     let world = world::world();
     world::start_block_supervisor();
     world::start_net_supervisor();
+    #[cfg(feature = "tcp-echo")]
+    world::start_tcp_echo_supervisor();
     #[cfg(feature = "legacy-shell")]
     world.spawn_component(
         "shell",
@@ -304,6 +306,14 @@ pub extern "C" fn kmain() -> ! {
         session.install_host_command("quiet", 0, 0, shell::vsh_quiet);
         session.install_host_command("verbose", 0, 0, shell::vsh_verbose);
         session.install_host_command("poweroff", 0, 0, shell::vsh_poweroff);
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        session.install_host_command("tcp-fault", 0, 0, tcp_echo::vsh_inject_fault);
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        session.install_host_command("tcp-device-fault", 0, 0, tcp_echo::vsh_inject_driver_fault);
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        session.install_host_command("tcp-release", 0, 0, tcp_echo::vsh_release_stale);
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        session.install_host_command("tcp-session", 0, 0, tcp_echo::vsh_session_info);
         world.spawn_component(
             "vsh",
             space.clone(),

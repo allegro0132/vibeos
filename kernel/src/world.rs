@@ -18,7 +18,7 @@ use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::durable_cspace;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
-use crate::net::{Endpoint as NetEndpoint, Packet};
+use crate::net::{Endpoint as NetEndpoint, StampedPacket};
 use crate::saved_program;
 use crate::store;
 use crate::sync::SpinLock;
@@ -97,9 +97,16 @@ enum ComponentTemplate {
 
 enum ComponentGrants {
     Sensor(Cap),
-    Logger { rx: Cap, console: Cap },
+    Logger {
+        rx: Cap,
+        console: Cap,
+    },
     Guest(Cap),
-    VirtioBlk { mmio: Cap, dma: Cap, service: Cap },
+    VirtioBlk {
+        mmio: Cap,
+        dma: Cap,
+        service: Cap,
+    },
     VirtioNet {
         mmio: Cap,
         dma: Cap,
@@ -250,19 +257,18 @@ pub struct Space(pub Arc<SpinLock<CSpace>>);
 impl Space {
     pub(crate) fn new(name: &str) -> Arc<Self> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let space = Arc::new(Space(Arc::new(SpinLock::new_recoverable(CSpace::new(name)))));
+        let space = Arc::new(Space(Arc::new(SpinLock::new_recoverable(CSpace::new(
+            name,
+        )))));
         system_owner.restore();
         space
     }
 
-    pub(crate) fn new_persistent(
-        name: &str,
-        space_id: crate::durable::SpaceId,
-    ) -> Arc<Self> {
+    pub(crate) fn new_persistent(name: &str, space_id: crate::durable::SpaceId) -> Arc<Self> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let space = Arc::new(Space(Arc::new(SpinLock::new_recoverable(CSpace::new_persistent(
-            name, space_id,
-        )))));
+        let space = Arc::new(Space(Arc::new(SpinLock::new_recoverable(
+            CSpace::new_persistent(name, space_id),
+        ))));
         system_owner.restore();
         space
     }
@@ -479,8 +485,7 @@ impl World {
                 .expect("network policy retains the inbound grant root"),
                 control: cap::grant(
                     &policy,
-                    self.net_control_root
-                        .expect("network control root exists"),
+                    self.net_control_root.expect("network control root exists"),
                     Rights::READ,
                     &mut target,
                 )
@@ -515,9 +520,8 @@ impl World {
                 .expect("network policy retains the inbound grant root"),
                 control: cap::grant(
                     &policy,
-                    self.net_control_root
-                        .expect("network control root exists"),
-                    Rights::READ,
+                    self.net_control_root.expect("network control root exists"),
+                    Rights::READ.union(Rights::INVOKE),
                     &mut target,
                 )
                 .expect("network policy retains the control grant root"),
@@ -629,14 +633,7 @@ impl World {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    virtio_net::driver_task(
-                        space.get(),
-                        mmio,
-                        dma,
-                        outbound,
-                        inbound,
-                        control,
-                    ),
+                    virtio_net::driver_task(space.get(), mmio, dma, outbound, inbound, control),
                 )
             },
             #[cfg(feature = "tcp-echo")]
@@ -859,14 +856,20 @@ impl World {
             if !owns_domain {
                 continue;
             }
-            assert!(!recovered, "an allocation domain must identify one component");
+            assert!(
+                !recovered,
+                "an allocation domain must identify one component"
+            );
             // Safety: the exact current incarnation was found above, and the
             // executor contract supplied by this method's caller makes it
             // terminal before this direct lock-state recovery.
             let _ = unsafe { component.space.0.recover_after_fault(domain) };
             recovered = true;
         }
-        assert!(recovered, "faulted allocation domain has no component owner");
+        assert!(
+            recovered,
+            "faulted allocation domain has no component owner"
+        );
     }
 }
 
@@ -887,15 +890,16 @@ pub fn start_block_supervisor() {
     let durable_cspace = world.durable_cspace_service.clone();
     exec::spawn("supervisor:virtio-blk", async move {
         let mut attempts = 0u32;
-        let mut recovery_operation = durable_cspace.as_ref().and_then(|service| {
-            match service.begin_boot_recovery() {
-                Ok(operation) => Some(operation),
-                Err(_) => {
-                    service.fail_closed();
-                    None
-                }
-            }
-        });
+        let mut recovery_operation =
+            durable_cspace
+                .as_ref()
+                .and_then(|service| match service.begin_boot_recovery() {
+                    Ok(operation) => Some(operation),
+                    Err(_) => {
+                        service.fail_closed();
+                        None
+                    }
+                });
         let mut recovery_pending = recovery_operation.is_some();
 
         // Reuse the pre-existing supervisor task instead of consuming new
@@ -925,8 +929,9 @@ pub fn start_block_supervisor() {
                             }
                             recovery_pending = false;
                         }
-                        Err(_) if service.state()
-                            == durable_cspace::DurableCSpaceState::WaitingBlock => {}
+                        Err(_)
+                            if service.state()
+                                == durable_cspace::DurableCSpaceState::WaitingBlock => {}
                         Err(_) => {
                             recovery_operation
                                 .take()
@@ -1013,14 +1018,46 @@ pub fn start_net_supervisor() {
                         return;
                     }
                 }
-                exec::TaskState::Cancelled | exec::TaskState::Exited => {
-                    loop {
-                        if component.snapshot().generation > generation {
-                            break;
-                        }
-                        exec::sleep_ms(100).await;
+                exec::TaskState::Cancelled | exec::TaskState::Exited => loop {
+                    if component.snapshot().generation > generation {
+                        break;
+                    }
+                    exec::sleep_ms(100).await;
+                },
+                exec::TaskState::Faulted | exec::TaskState::Running => return,
+            }
+        }
+    });
+}
+
+/// Restart only faulted TCP-stack incarnations. Stack generations are rebound
+/// by the fresh task before it consumes ingress, so cancellation remains an
+/// operator decision while an audited fault can safely recover service.
+#[cfg(feature = "tcp-echo")]
+pub fn start_tcp_echo_supervisor() {
+    let world = world();
+    let Some(component) = world.component_named("tcp-echo") else {
+        return;
+    };
+    exec::spawn("supervisor:tcp-echo", async move {
+        let mut attempts = 0u32;
+        loop {
+            let (generation, join) = component.join_current();
+            let exit = join.await;
+            match exit.state() {
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("tcp-echo").is_err() {
+                        return;
                     }
                 }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => loop {
+                    if component.snapshot().generation > generation {
+                        break;
+                    }
+                    exec::sleep_ms(100).await;
+                },
                 exec::TaskState::Faulted | exec::TaskState::Running => return,
             }
         }
@@ -1045,9 +1082,9 @@ pub fn build() {
     let saved_program_policy = block_resources
         .as_ref()
         .map(|_| Space::new("saved-program-policy"));
-    let saved_program_space = block_resources.as_ref().map(|_| {
-        Space::new_persistent("saved-program", crate::program::program_space_id())
-    });
+    let saved_program_space = block_resources
+        .as_ref()
+        .map(|_| Space::new_persistent("saved-program", crate::program::program_space_id()));
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
     let net_resources = virtio_net::discover();
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
@@ -1059,12 +1096,9 @@ pub fn build() {
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
-    let persistent_test = block_resources.as_ref().map(|_| {
-        Space::new_persistent(
-            "persistent-test",
-            durable_cspace::persistent_space_id(),
-        )
-    });
+    let persistent_test = block_resources
+        .as_ref()
+        .map(|_| Space::new_persistent("persistent-test", durable_cspace::persistent_space_id()));
 
     // A saved program's ephemeral boot-resource authority is rooted in an
     // explicit supervisor-only CSpace. The canonical artifact manifest permits
@@ -1148,7 +1182,12 @@ pub fn build() {
                     .unwrap(),
                 );
                 drop(target);
-                (Some(service_root), Some(mmio_root), Some(dma_root), Some(grants))
+                (
+                    Some(service_root),
+                    Some(mmio_root),
+                    Some(dma_root),
+                    Some(grants),
+                )
             }
             (None, None) => (None, None, None, None),
             _ => unreachable!("block resources and CSpace are constructed together"),
@@ -1165,16 +1204,16 @@ pub fn build() {
         net_grants,
     ) = match (net_resources, net_space.as_ref(), net_policy.as_ref()) {
         (Some(resources), Some(driver_space), Some(policy_space)) => {
-            let outbound: Arc<NetEndpoint<Packet>> =
+            let outbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-outbound", crate::virtio::SPLIT_QUEUE_SIZE as usize);
-            let inbound: Arc<NetEndpoint<Packet>> =
+            let inbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-inbound", crate::virtio::SPLIT_QUEUE_SIZE as usize);
             let mut policy = policy_space.0.lock();
             let mmio_root = policy.mint(resources.mmio, Rights::ALL);
             let dma_root = policy.mint(resources.dma, Rights::ALL);
             let outbound_root = policy.mint(outbound, Rights::ALL);
             let inbound_root = policy.mint(inbound, Rights::ALL);
-            let control_root = policy.mint(resources.control, Rights::ALL);
+            let control_root = policy.mint(resources.control, Rights::ALL_VOLATILE);
 
             // Diagnostic images expose the directional raw-L2 API to init.
             // The TCP acceptance image makes the protocol stack the sole
@@ -1188,7 +1227,7 @@ pub fn build() {
                     cap::grant(
                         &policy,
                         control_root,
-                        Rights::READ.union(Rights::WRITE),
+                        Rights::READ.union(Rights::WRITE).union(Rights::INVOKE),
                         &mut cs,
                     )
                     .unwrap(),
@@ -1215,13 +1254,7 @@ pub fn build() {
                 .unwrap(),
                 cap::grant(&policy, outbound_root, Rights::RECV, &mut target).unwrap(),
                 cap::grant(&policy, inbound_root, Rights::SEND, &mut target).unwrap(),
-                cap::grant(
-                    &policy,
-                    control_root,
-                    Rights::READ,
-                    &mut target,
-                )
-                .unwrap(),
+                cap::grant(&policy, control_root, Rights::READ, &mut target).unwrap(),
             );
             drop(target);
             drop(policy);
@@ -1254,22 +1287,27 @@ pub fn build() {
             Some((
                 cap::grant(&policy, outbound, Rights::SEND, &mut target).unwrap(),
                 cap::grant(&policy, inbound, Rights::RECV, &mut target).unwrap(),
-                cap::grant(&policy, control, Rights::READ, &mut target).unwrap(),
+                cap::grant(
+                    &policy,
+                    control,
+                    Rights::READ.union(Rights::INVOKE),
+                    &mut target,
+                )
+                .unwrap(),
             ))
         }
         (None, None, None, None, None) => None,
         _ => unreachable!("TCP echo grants exist exactly when a network device exists"),
     };
-    let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) =
-        match (
-            block_root,
-            store_backend.as_ref(),
-            persistent_test.as_ref(),
-            saved_program_space.as_ref(),
-            saved_program_policy.as_ref(),
-            saved_console_policy,
-            saved_memory_policy,
-        ) {
+    let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) = match (
+        block_root,
+        store_backend.as_ref(),
+        persistent_test.as_ref(),
+        saved_program_space.as_ref(),
+        saved_program_policy.as_ref(),
+        saved_console_policy,
+        saved_memory_policy,
+    ) {
         (
             Some(block),
             Some(backend),
@@ -1304,10 +1342,7 @@ pub fn build() {
                 persistent.clone(),
                 saved.clone(),
             );
-            let durable_cap = cs.mint(
-                durable.clone(),
-                Rights::READ.union(Rights::WRITE),
-            );
+            let durable_cap = cs.mint(durable.clone(), Rights::READ.union(Rights::WRITE));
             let saved_cap = cs.mint(saved, Rights::READ.union(Rights::WRITE));
             (
                 Some(store_cap),
@@ -1421,9 +1456,7 @@ pub fn build() {
         );
     }
 
-    if let (Some(space), Some((mmio, dma, outbound, inbound, control))) =
-        (net_space, net_grants)
-    {
+    if let (Some(space), Some((mmio, dma, outbound, inbound, control))) = (net_space, net_grants) {
         world.spawn_component_inner(
             "virtio-net",
             space.clone(),
@@ -1441,20 +1474,13 @@ pub fn build() {
     }
 
     #[cfg(feature = "tcp-echo")]
-    if let (Some(space), Some((outbound, inbound, control))) =
-        (tcp_echo_space, tcp_echo_grants)
-    {
+    if let (Some(space), Some((outbound, inbound, control))) = (tcp_echo_space, tcp_echo_grants) {
         world.spawn_component_inner(
             "tcp-echo",
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::TcpEcho),
-            crate::tcp_echo::task(
-                SpaceRef::new(&space).get(),
-                outbound,
-                inbound,
-                control,
-            ),
+            crate::tcp_echo::task(SpaceRef::new(&space).get(), outbound, inbound, control),
         );
     }
 

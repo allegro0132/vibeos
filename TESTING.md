@@ -7,6 +7,7 @@ cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/differential.sh      # verify committed output with pinned real rustc
 ./scripts/qemu-test.sh         # golden cases plus the differential oracle
 ./scripts/qemu-tcp-test.sh     # N1 static IPv4/TCP echo over QEMU hostfwd
+./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
 ./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
@@ -23,7 +24,7 @@ and transcript counts from the tree. Target checks are not guessed from source:
 
 | Layer | What it covers | Where |
 |---|---|---|
-| Host unit tests | Sv39 PTE/satp encoding and invalid-leaf rejection; SBI RFENCE request/error handling, local fence/MXR state, and exact online physical-hart masks; capability algebra including page-aligned COW table replacement and exact backend callback ordering, cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and no-write-on-error in-place relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; fixed-point scheduler lifecycle, four-queue ownership, per-hart running/current-task/domain state, and IPI lost-wakeup models; work stealing, wake/remote-cancel/fault boundaries and cross-hart fault survival; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; atomic IRQ publication, SPSC byte ordering, SpinLock contention/generation recovery/hart ownership; fault arenas; wait/timer registration ownership; per-hart heap provenance and OOM diagnostics; typed channels; bounded vsh parsing, Jobs, scripting, substitutions, and exact script manifests; and the compiler | `core/tests/`, `compiler/tests/` |
+| Host unit tests | Sv39 PTE/satp encoding and invalid-leaf rejection; SBI RFENCE request/error handling, local fence/MXR state, and exact online physical-hart masks; capability algebra including page-aligned COW table replacement and exact backend callback ordering, cross-space revocation, explicit leases, persistent witnesses, atomic recovered-graph installation, and tombstoned slot generations; unified authority/object journal decoding, partitioned global root selection, exhaustive prefix/flush recovery, canonical ProgramArtifact/VIBEEXE decoding and no-write-on-error in-place relocation, cross-kind ID/transaction collisions, and allocation-amplification inputs; modern virtio block/net feature negotiation, descriptor direction, RX length/header validation, exact tokens, multi-flight queue wrap, device-wide reset/quarantine, and reset-before-reuse; non-zero packet-session coordinates, fail-closed identity exhaustion, in-flight-TX rebind refusal, stale device/stack stamp rejection, fresh traffic after stale ingress, and rebound-driver rejection of stamped egress; fixed-point scheduler lifecycle, four-queue ownership, per-hart running/current-task/domain state, and IPI lost-wakeup models; work stealing, wake/remote-cancel/fault boundaries and cross-hart fault survival; reason coalescing, stale SSIP, offline/online handoff, physical hart mapping, and send-failure retry; atomic IRQ publication, SPSC byte ordering, SpinLock contention/generation recovery/hart ownership; fault arenas; wait/timer registration ownership; per-hart heap provenance and OOM diagnostics; typed channels; bounded vsh parsing, Jobs, scripting, substitutions, and exact script manifests; and the compiler | `core/tests/`, `compiler/tests/` |
 | In-kernel self-test | Live Sv39 identity/permission walks plus all-hart `satp` and MXR readback; R-X kernel text, R-- `.rodata` endpoints, RW-NX free code/capability-pool pages, execute-only compiled pages, every non-empty published capability table and all live table-pool pages R--, and a full RAM scan excluding writable-executable leaves; invalid per-hart stack guards, endpoint RW-NX stack mappings, fixed slot stride, and the 8 KiB generated-code abort reserve; zeroed same-address code and capability-table reuse; real timer interrupts and wakeups, cancellation cleanup, sixteen fault/restart cycles with bounded heap and code-pool use and no interrupted Drop, normal/abort release of exclusive generated-memory claims, component allocation isolation/reclaim, `ComponentId`/`TaskId`/CSpace binding, retained fault state, the live capability graph, and machine code actually executing | `kernel/src/selftest.rs`, via `selftest` in the shell |
 | Golden transcripts | End-to-end shell behaviour, including arrow-key history and mid-line editing; the live shared page-table, stack-guard, strict W^X, and read-only data/table reports; sealed local/cross-hart execution, COW capability mutation, cross-hart lookup/revoke, and zeroed same-address reuse; expected-fatal real guard-page, W^X instruction/load/store, `.rodata` store, and capability-table store faults; retained cancelled state, revoke-during-invocation lease boundaries, durable-log recovery, real virtio-blk read/write/flush, virtio-net raw-L2 exchange and fault recovery, timeout reset, cancellation/fault restart, capability-addressed object commit/read/revoke, three boots of one persistent CSpace, and two boots of a saved source/VIBEEXE artifact against the same disk | `tests/cases/`, `tests/golden/` |
 | Differential vs real rustc | Whether generated code computes the *right answer* | `tests/programs/`, `scripts/differential.sh` |
@@ -87,14 +88,35 @@ then requires a second HELLO plus the complete exchange after the shared device
 epoch advances. A canonical evidence file is checked separately from the guest
 golden; TAP, root privileges, and host network access are never used.
 
-`qemu-tcp-test.sh` is the separate N1 protocol-stack gate. It builds only the
-`tcp-echo` image, attaches QEMU user networking, binds host forwarding to an
-ephemeral `127.0.0.1` port, and targets static guest `10.0.2.15:2222`. The peer
-sends a deterministic binary payload containing NUL, control, and high-bit
-bytes, tolerates fragmented TCP reads, and accepts only an exact echo. Portable
-tests separately drive two smoltcp interfaces through capability-addressed
-packet endpoints to cover ARP, a 3,000-byte TCP exchange, endpoint pressure,
-and operation-time revocation.
+`qemu-tcp-test.sh` is the separate QEMU protocol-stack harness. Its default N1
+mode builds only the `tcp-echo` image, attaches QEMU user networking, binds host
+forwarding to an ephemeral `127.0.0.1` port, and targets static guest
+`10.0.2.15:2222`. The peer sends a deterministic binary payload containing
+NUL, control, and high-bit bytes, tolerates fragmented TCP reads, and accepts
+only an exact echo. Portable tests separately drive two smoltcp interfaces
+through capability-addressed packet endpoints to cover ARP, a 3,000-byte TCP
+exchange, endpoint pressure, and operation-time revocation.
+
+The `recovery` mode defines the N2 acceptance gate in that same harness. It
+keeps a live TCP stream while first faulting the stack and then faulting the
+virtio-net driver. After the stack fault it requires the same device epoch and
+a greater stack generation; after the driver fault it requires both coordinates
+to advance. At each transition the retired stream must not echo a post-fault
+nonce, a fresh stream must echo exact bytes, and packets staged with that
+transition's retired coordinate must increment separate stale-ingress and
+stale-egress rejection counts. Silence, EOF, or reset is sufficient for the
+retired-stream assertion; the gate does not require a clean TCP close or RST.
+
+The fault, session-reporting, and stale-packet controls are compiled only by
+the `tcp-echo-recovery-test` feature. They are ambient vsh commands in that
+acceptance image and are absent from normal `tcp-echo`, default, and future SSH
+images. The injected stale frames enter the typed endpoints after replacement
+binding; they are deterministic evidence for the stack-ingress and
+driver-egress checks, not an emulation of a delayed DMA completion or late IRQ.
+The harness is QEMU/virtio-only and provides no Milk-V Duo DWMAC hardware
+evidence. This document describes the gate and its blind spots; it does not
+assert that the current run passed, nor does it test an entropy source, host
+key, or SSH protocol.
 
 The QEMU harness now defaults every integration case to four multithreaded TCG
 vCPUs and requires the boot-time `4 hart(s) online` barrier, shared Sv39
@@ -255,6 +277,8 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-test.sh conform       # run one case
 ./scripts/qemu-test.sh net           # raw L2 exchange plus host evidence
 ./scripts/qemu-test.sh net_recovery  # post-publish fault and fresh-epoch retry
+./scripts/qemu-tcp-test.sh           # independent N1 hostfwd byte-stream gate
+./scripts/qemu-tcp-test.sh recovery  # independent N2 stack/driver recovery gate
 ./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
 ./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
 ./scripts/qemu-test.sh guard_page   # expected-fatal store-page-fault + exact stval

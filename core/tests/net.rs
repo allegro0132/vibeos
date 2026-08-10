@@ -8,8 +8,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use vibeos_core::cap::{CSpace, CapError, Rights};
 use vibeos_core::net::{
     directional, recv_only, send_only, DuplexEndpoint, Endpoint, Packet, PacketBufferTooSmall,
-    PacketEndpoint, PacketError, RecvEndpoint, SendEndpoint, MAX_ETHERNET_FRAME_LEN,
-    MAX_PACKET_LEN,
+    PacketEndpoint, PacketError, PacketSessionError, PacketSessionFence, PacketStamp,
+    PacketStampError, PacketStampMismatch, RecvEndpoint, SendEndpoint, StampedPacket,
+    MAX_ETHERNET_FRAME_LEN, MAX_PACKET_LEN,
 };
 
 fn frame(len: usize) -> Vec<u8> {
@@ -76,6 +77,137 @@ fn packet_storage_is_exactly_payload_plus_u16_length() {
         size_of::<Packet>(),
         MAX_ETHERNET_FRAME_LEN + size_of::<u16>()
     );
+}
+
+#[test]
+fn packet_stamp_requires_both_nonzero_coordinates_and_never_wraps() {
+    assert_eq!(
+        PacketStamp::new(0, 1),
+        Err(PacketStampError::ZeroDeviceEpoch)
+    );
+    assert_eq!(
+        PacketStamp::new(1, 0),
+        Err(PacketStampError::ZeroStackGeneration)
+    );
+
+    let stamp = PacketStamp::new(7, 11).unwrap();
+    assert_eq!(stamp.device_epoch(), 7);
+    assert_eq!(stamp.stack_generation(), 11);
+    assert_eq!(
+        stamp.next_device_epoch().unwrap(),
+        PacketStamp::new(8, 11).unwrap()
+    );
+    assert_eq!(
+        stamp.next_stack_generation().unwrap(),
+        PacketStamp::new(7, 12).unwrap()
+    );
+    assert_eq!(
+        PacketStamp::new(u64::MAX, 1).unwrap().next_device_epoch(),
+        Err(PacketStampError::DeviceEpochExhausted)
+    );
+    assert_eq!(
+        PacketStamp::new(1, u64::MAX)
+            .unwrap()
+            .next_stack_generation(),
+        Err(PacketStampError::StackGenerationExhausted)
+    );
+}
+
+#[test]
+fn stamped_packet_releases_payload_only_to_the_exact_session() {
+    let expected = PacketStamp::new(3, 5).unwrap();
+    let stale_device = PacketStamp::new(2, 5).unwrap();
+    let stale_stack = PacketStamp::new(3, 4).unwrap();
+    let packet = Packet::copy_from(&frame(64)).unwrap();
+
+    let device_mismatch = PacketStampMismatch {
+        expected,
+        observed: stale_device,
+    };
+    assert!(device_mismatch.device_epoch_changed());
+    assert!(!device_mismatch.stack_generation_changed());
+    let stack_mismatch = PacketStampMismatch {
+        expected,
+        observed: stale_stack,
+    };
+    assert!(!stack_mismatch.device_epoch_changed());
+    assert!(stack_mismatch.stack_generation_changed());
+
+    let sealed = StampedPacket::new(packet.clone(), expected);
+    assert_eq!(sealed.stamp(), expected);
+    assert_eq!(sealed.into_packet(expected), Ok(packet.clone()));
+    assert_eq!(
+        StampedPacket::new(packet.clone(), stale_device).into_packet(expected),
+        Err(device_mismatch)
+    );
+    assert_eq!(
+        StampedPacket::new(packet, stale_stack).into_packet(expected),
+        Err(stack_mismatch)
+    );
+}
+
+#[test]
+fn packet_session_fence_invalidates_stale_frames_across_every_rebind() {
+    let mut fence = PacketSessionFence::new();
+    assert_eq!(fence.bind_stack(0), Err(PacketSessionError::Inactive));
+    assert_eq!(fence.attach_device(), Ok(1));
+    let first = fence.bind_stack(0).unwrap();
+    assert_eq!(first, PacketStamp::new(1, 1).unwrap());
+
+    let stale_egress = StampedPacket::new(Packet::copy_from(&frame(60)).unwrap(), first);
+    assert_eq!(
+        fence.bind_stack(2),
+        Err(PacketSessionError::TransmitBusy { in_flight: 2 })
+    );
+    assert_eq!(fence.active_stamp(), None);
+    assert_eq!(
+        fence.stamp_ingress(Packet::copy_from(&frame(61)).unwrap()),
+        Err(PacketSessionError::Inactive)
+    );
+
+    let second = fence.bind_stack(0).unwrap();
+    assert_eq!(second, PacketStamp::new(1, 2).unwrap());
+    assert_eq!(
+        fence.accept_egress(stale_egress),
+        Err(PacketSessionError::StampMismatch(PacketStampMismatch {
+            expected: second,
+            observed: first,
+        }))
+    );
+    let fresh = fence
+        .stamp_ingress(Packet::copy_from(&frame(62)).unwrap())
+        .unwrap();
+    assert_eq!(fresh.stamp(), second);
+
+    assert_eq!(fence.attach_device(), Ok(2));
+    assert_eq!(fence.active_stamp(), None);
+    assert_eq!(
+        fence.accept_egress(fresh),
+        Err(PacketSessionError::Inactive)
+    );
+    let third = fence.bind_stack(0).unwrap();
+    assert_eq!(third, PacketStamp::new(2, 3).unwrap());
+}
+
+#[test]
+fn packet_session_fence_overflow_is_terminal_for_the_attempted_binding() {
+    let mut epoch_exhausted = PacketSessionFence::from_history(u64::MAX, 9);
+    assert_eq!(
+        epoch_exhausted.attach_device(),
+        Err(PacketSessionError::DeviceEpochExhausted)
+    );
+    assert!(!epoch_exhausted.device_attached());
+    assert_eq!(epoch_exhausted.active_stamp(), None);
+    assert_eq!(epoch_exhausted.device_epoch(), u64::MAX);
+
+    let mut generation_exhausted = PacketSessionFence::from_history(40, u64::MAX);
+    assert_eq!(generation_exhausted.attach_device(), Ok(41));
+    assert_eq!(
+        generation_exhausted.bind_stack(0),
+        Err(PacketSessionError::StackGenerationExhausted)
+    );
+    assert_eq!(generation_exhausted.active_stamp(), None);
+    assert_eq!(generation_exhausted.stack_generation(), u64::MAX);
 }
 
 #[test]
@@ -146,9 +278,10 @@ fn slice_conversion_and_clone_preserve_value_semantics() {
 #[test]
 fn bidirectional_packet_endpoint_preserves_frames_and_bound() {
     let endpoint: Arc<PacketEndpoint> = DuplexEndpoint::new("packet-duplex", 2);
-    let first = Packet::copy_from(&frame(60)).unwrap();
-    let second = Packet::copy_from(&frame(1_514)).unwrap();
-    let rejected = Packet::copy_from(&frame(1)).unwrap();
+    let stamp = PacketStamp::new(1, 1).unwrap();
+    let first = StampedPacket::copy_from(&frame(60), stamp).unwrap();
+    let second = StampedPacket::copy_from(&frame(1_514), stamp).unwrap();
+    let rejected = StampedPacket::copy_from(&frame(1), stamp).unwrap();
 
     endpoint.try_send(first.clone()).unwrap();
     endpoint.try_send(second.clone()).unwrap();

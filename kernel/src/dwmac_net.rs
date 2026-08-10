@@ -13,7 +13,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
-use crate::net::{Endpoint, Packet, MAX_PACKET_LEN};
+use crate::net::{
+    Endpoint, Packet, PacketSessionError, PacketSessionFence, PacketStamp, StampedPacket,
+    MAX_PACKET_LEN,
+};
 use crate::sync::SpinLock;
 use crate::world::Space;
 
@@ -85,6 +88,9 @@ pub enum NetError {
     Quarantined,
     AuthorityRevoked,
     PermissionDenied,
+    SessionBusy,
+    SessionInactive,
+    IdentityExhausted,
 }
 
 impl core::fmt::Display for NetError {
@@ -99,6 +105,9 @@ impl core::fmt::Display for NetError {
             Self::Quarantined => "Ethernet DMA is quarantined",
             Self::AuthorityRevoked => "Ethernet capability is absent or revoked",
             Self::PermissionDenied => "Ethernet capability lacks the required right",
+            Self::SessionBusy => "the previous packet session still has transmit work in flight",
+            Self::SessionInactive => "no packet stack is bound to this Ethernet incarnation",
+            Self::IdentityExhausted => "Ethernet packet-session identity space is exhausted",
         })
     }
 }
@@ -111,10 +120,15 @@ pub struct NetInfo {
     pub header_size: u32,
     pub accepted_features: u64,
     pub session_epoch: u64,
+    pub stack_generation: u64,
     pub irq: u32,
     pub used_interrupts: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    pub stale_ingress_drops: u64,
+    pub stale_egress_drops: u64,
+    pub stale_egress_device_epoch_drops: u64,
+    pub stale_egress_stack_generation_drops: u64,
     pub resets: u64,
     pub timeouts: u64,
     pub rx_inflight: u8,
@@ -157,15 +171,25 @@ impl NetDevice {
             queue_size: 1,
             header_size: 0,
             accepted_features: 0,
-            session_epoch: state.epoch,
+            session_epoch: state.sessions.device_epoch(),
+            stack_generation: state
+                .sessions
+                .active_stamp()
+                .map_or(0, PacketStamp::stack_generation),
             irq: IRQ,
             used_interrupts: 0,
             rx_packets: RX_PACKETS.load(Ordering::Acquire),
             tx_packets: TX_PACKETS.load(Ordering::Acquire),
+            stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
+                .load(Ordering::Acquire),
+            stale_egress_stack_generation_drops: STALE_EGRESS_STACK_GENERATION_DROPS
+                .load(Ordering::Acquire),
             resets: RESETS.load(Ordering::Acquire),
             timeouts: TIMEOUTS.load(Ordering::Acquire),
             rx_inflight: u8::from(state.online),
-            tx_inflight: u8::from(tx_owned()),
+            tx_inflight: u8::from(state.tx_inflight),
         }
     }
 }
@@ -214,18 +238,60 @@ pub fn inject_fault_with(lease: &InvocationLease<NetDevice>) -> Result<(), NetEr
     Ok(())
 }
 
+pub fn bind_stack_with(lease: &InvocationLease<NetDevice>) -> Result<PacketStamp, NetError> {
+    if !lease.authorizes(Rights::INVOKE) {
+        return Err(NetError::PermissionDenied);
+    }
+    lease.with(|_| {
+        let mut state = CONTROL.lock();
+        if state.quarantined {
+            return Err(NetError::Quarantined);
+        }
+        if !state.online {
+            return Err(NetError::Offline);
+        }
+        let tx_inflight = usize::from(state.tx_inflight);
+        state.active_stack_domain = None;
+        match state.sessions.bind_stack(tx_inflight) {
+            Ok(stamp) => {
+                state.active_stack_domain = Some(crate::heap::current_domain());
+                Ok(stamp)
+            }
+            Err(PacketSessionError::TransmitBusy { .. }) => Err(NetError::SessionBusy),
+            Err(PacketSessionError::Inactive) => Err(NetError::SessionInactive),
+            Err(
+                PacketSessionError::DeviceEpochExhausted
+                | PacketSessionError::StackGenerationExhausted,
+            ) => {
+                state.online = false;
+                state.quarantined = true;
+                Err(NetError::IdentityExhausted)
+            }
+            Err(PacketSessionError::StampMismatch(_)) => unreachable!(),
+        }
+    })
+}
+
 struct Control {
     online: bool,
     quarantined: bool,
-    epoch: u64,
+    sessions: PacketSessionFence,
+    active_stack_domain: Option<AllocationDomain>,
+    tx_inflight: bool,
 }
 static CONTROL: SpinLock<Control> = SpinLock::new_recoverable(Control {
     online: false,
     quarantined: false,
-    epoch: 0,
+    sessions: PacketSessionFence::new(),
+    active_stack_domain: None,
+    tx_inflight: false,
 });
 static RX_PACKETS: AtomicU64 = AtomicU64::new(0);
 static TX_PACKETS: AtomicU64 = AtomicU64::new(0);
+static STALE_INGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
+static STALE_EGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
+static STALE_EGRESS_DEVICE_EPOCH_DROPS: AtomicU64 = AtomicU64::new(0);
+static STALE_EGRESS_STACK_GENERATION_DROPS: AtomicU64 = AtomicU64::new(0);
 static RESETS: AtomicU64 = AtomicU64::new(0);
 static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static FAULT: AtomicBool = AtomicBool::new(false);
@@ -265,8 +331,8 @@ pub async fn driver_task(
         (
             cspace.lookup_revocable::<MmioWindow>(mmio, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<DmaRegion>(dma, Rights::READ.union(Rights::WRITE)),
-            cspace.lookup_revocable::<Endpoint<Packet>>(outbound, Rights::RECV),
-            cspace.lookup_revocable::<Endpoint<Packet>>(inbound, Rights::SEND),
+            cspace.lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::RECV),
+            cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::SEND),
             cspace.lookup_revocable::<NetDevice>(control, Rights::READ),
         )
     };
@@ -281,7 +347,13 @@ pub async fn driver_task(
     if with_device_authority(&mmio, &dma, &control, || {
         initialize()?;
         let mut state = CONTROL.lock();
-        state.epoch = state.epoch.checked_add(1).expect("DWMAC epoch exhausted");
+        if state.sessions.attach_device().is_err() {
+            state.online = false;
+            state.quarantined = true;
+            return Err(NetError::IdentityExhausted);
+        }
+        state.active_stack_domain = None;
+        state.tx_inflight = false;
         state.online = true;
         state.quarantined = false;
         Ok(())
@@ -338,8 +410,8 @@ fn with_device_authority<R>(
 }
 
 fn driver_turn(
-    outbound: &Revocable<Endpoint<Packet>>,
-    inbound: &Revocable<Endpoint<Packet>>,
+    outbound: &Revocable<Endpoint<StampedPacket>>,
+    inbound: &Revocable<Endpoint<StampedPacket>>,
     pending_tx: &mut Option<Packet>,
     tx_deadline: &mut u64,
     link_poll: &mut u16,
@@ -348,42 +420,54 @@ fn driver_turn(
     // sole TX descriptor accepts it. Descriptor ownership is ordinary
     // backpressure until the bounded hardware deadline: retain the packet and
     // do not dequeue a second one while DMA is using the descriptor.
-    if pending_tx.is_none() {
-        if let Some(packet) = take_outbound(outbound)? {
-            *pending_tx = Some(packet);
-            *tx_deadline = crate::sbi::time().saturating_add(tx_timeout_ticks());
+    {
+        // Binding and DMA publication share CONTROL. Marking the pending/raw
+        // descriptor reservation before releasing this guard prevents a new
+        // generation from becoming active between stamp validation and OWN.
+        let mut state = CONTROL.lock();
+        let descriptor_busy = tx_owned();
+        state.tx_inflight = descriptor_busy || pending_tx.is_some();
+        if pending_tx.is_none() && !descriptor_busy {
+            if let Some(packet) = take_admitted_outbound(outbound, &state.sessions)? {
+                *pending_tx = Some(packet);
+                *tx_deadline = crate::sbi::time().saturating_add(tx_timeout_ticks());
+                state.tx_inflight = true;
+            }
         }
-    }
-    if let Some(packet) = pending_tx.as_ref() {
-        match transmit(packet) {
-            Ok(()) => {
-                *pending_tx = None;
-                *tx_deadline = 0;
+        if let Some(packet) = pending_tx.as_ref() {
+            match transmit(packet) {
+                Ok(()) => {
+                    *pending_tx = None;
+                    *tx_deadline = 0;
+                    state.tx_inflight = true;
+                }
+                Err(NetError::QueueFull) if crate::sbi::time() < *tx_deadline => {}
+                Err(NetError::QueueFull) => {
+                    TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    panic!("CV1800B DWMAC TX descriptor timed out");
+                }
+                Err(NetError::Protocol) => {
+                    // A safely constructed Packet always fits the DMA buffer.
+                    state.online = false;
+                    return Err(NetError::Protocol);
+                }
+                Err(error) => return Err(error),
             }
-            Err(NetError::QueueFull) if crate::sbi::time() < *tx_deadline => {}
-            Err(NetError::QueueFull) => {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                panic!("CV1800B DWMAC TX descriptor timed out");
-            }
-            Err(NetError::Protocol) => {
-                // A safely constructed Packet always fits the DMA buffer. Stop
-                // this incarnation rather than consuming every later packet.
-                CONTROL.lock().online = false;
-                return Err(NetError::Protocol);
-            }
-            Err(error) => return Err(error),
         }
-    }
 
-    if let Some(packet) = receive() {
-        match send_inbound(inbound, packet) {
-            Ok(()) => {
-                RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        // Keep the same rebind barrier from descriptor consumption through
+        // exact session stamping, endpoint publication, and RX rearm. A stack
+        // restart cannot relabel a raw frame after the driver consumes it.
+        if let Some(packet) = receive() {
+            match send_inbound(inbound, &state.sessions, packet) {
+                Ok(()) => {
+                    RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+                }
+                // RX has already consumed and rearmed its sole descriptor, so
+                // bounded client pressure drops this one frame.
+                Err(NetError::QueueFull) => {}
+                Err(error) => return Err(error),
             }
-            // RX has already consumed and rearmed its sole descriptor, so
-            // bounded client pressure drops this one frame.
-            Err(NetError::QueueFull) => {}
-            Err(error) => return Err(error),
         }
     }
     *link_poll = link_poll.wrapping_add(1);
@@ -398,13 +482,54 @@ fn tx_timeout_ticks() -> u64 {
     TX_TIMEOUT_MS.saturating_mul(crate::exec::timebase_hz()) / 1_000
 }
 
-fn take_outbound(outbound: &Revocable<Endpoint<Packet>>) -> Result<Option<Packet>, NetError> {
+fn take_outbound(
+    outbound: &Revocable<Endpoint<StampedPacket>>,
+) -> Result<Option<StampedPacket>, NetError> {
     outbound
         .try_with(Endpoint::try_recv)
         .map_err(|_| NetError::AuthorityRevoked)
 }
 
-fn send_inbound(inbound: &Revocable<Endpoint<Packet>>, packet: Packet) -> Result<(), NetError> {
+fn take_admitted_outbound(
+    outbound: &Revocable<Endpoint<StampedPacket>>,
+    sessions: &PacketSessionFence,
+) -> Result<Option<Packet>, NetError> {
+    for _ in 0..crate::virtio::SPLIT_QUEUE_SIZE {
+        let Some(packet) = take_outbound(outbound)? else {
+            return Ok(None);
+        };
+        match sessions.accept_egress(packet) {
+            Ok(packet) => return Ok(Some(packet)),
+            Err(PacketSessionError::Inactive) => {
+                STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(PacketSessionError::StampMismatch(mismatch)) => {
+                STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                if mismatch.device_epoch_changed() {
+                    STALE_EGRESS_DEVICE_EPOCH_DROPS.fetch_add(1, Ordering::Relaxed);
+                } else if mismatch.stack_generation_changed() {
+                    STALE_EGRESS_STACK_GENERATION_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(_) => unreachable!(),
+        }
+    }
+    Ok(None)
+}
+
+fn send_inbound(
+    inbound: &Revocable<Endpoint<StampedPacket>>,
+    sessions: &PacketSessionFence,
+    packet: Packet,
+) -> Result<(), NetError> {
+    let packet = match sessions.stamp_ingress(packet) {
+        Ok(packet) => packet,
+        Err(PacketSessionError::Inactive) => {
+            STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(_) => unreachable!(),
+    };
     inbound
         .try_with(|endpoint| endpoint.try_send(packet))
         .map_err(|_| NetError::AuthorityRevoked)?
@@ -672,7 +797,10 @@ fn shutdown_driver() {
     }
     let mut state = CONTROL.lock();
     state.online = false;
-    state.quarantined = !reset;
+    state.quarantined |= !reset;
+    state.sessions.detach_device();
+    state.active_stack_domain = None;
+    state.tx_inflight = false;
     DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
     DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
 }
@@ -681,6 +809,13 @@ fn shutdown_driver() {
 /// The executor guarantees that the faulting domain can never resume.
 pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     let _ = unsafe { CONTROL.recover_after_fault(domain) };
+    {
+        let mut state = CONTROL.lock();
+        if state.active_stack_domain == Some(domain) {
+            state.sessions.unbind_stack();
+            state.active_stack_domain = None;
+        }
+    }
     if DRIVER_OWNER.load(Ordering::Acquire) != domain.owner.get()
         || DRIVER_ARENA.load(Ordering::Acquire) != domain.arena.get()
     {

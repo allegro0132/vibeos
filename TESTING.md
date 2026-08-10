@@ -8,6 +8,7 @@ cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/qemu-test.sh         # golden cases plus the differential oracle
 ./scripts/qemu-tcp-test.sh     # N1 static IPv4/TCP echo over QEMU hostfwd
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
+./scripts/qemu-ssh-security-test.sh # N3 QEMU entropy/identity boundary gate
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
 ./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
@@ -117,6 +118,18 @@ The harness is QEMU/virtio-only and provides no Milk-V Duo DWMAC hardware
 evidence. This document describes the gate and its blind spots; it does not
 assert that the current run passed, nor does it test an entropy source, host
 key, or SSH protocol.
+
+`qemu-ssh-security-test.sh` is the separate N3 security-boundary gate. It boots
+the explicitly marked test-identity image twice with QEMU's `/dev/urandom`-
+backed modern virtio-rng device. Each boot must complete one bounded capability
+request, separate equal seed material into distinct ChaCha20 stream domains,
+enforce independent READ and INVOKE signer grants, accept one exact binary
+client key, and reject another. The host key must remain stable while a signed
+transport-sample marker must differ between boots. That marker is a freshness
+smoke test for the wired QEMU transport, not an entropy-quality proof. The
+fixed identities and generation are test-only; this gate does not provide
+per-device provisioning, authenticated persistence, rollback resistance, a
+Milk-V hardware source, or an SSH wire protocol.
 
 The QEMU harness now defaults every integration case to four multithreaded TCG
 vCPUs and requires the boot-time `4 hart(s) online` barrier, shared Sv39

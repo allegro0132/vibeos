@@ -37,6 +37,7 @@ fn modern_mmio_constants_match_virtio_1_2() {
     assert_eq!(MMIO_MAGIC_VALUE, 0x7472_6976);
     assert_eq!(MMIO_VERSION_MODERN, 2);
     assert_eq!(DEVICE_ID_BLOCK, 2);
+    assert_eq!(DEVICE_ID_ENTROPY, 4);
     assert_eq!(MMIO_MAGIC_VALUE_OFFSET, 0x000);
     assert_eq!(MMIO_DEVICE_FEATURES_OFFSET, 0x010);
     assert_eq!(MMIO_DRIVER_FEATURES_OFFSET, 0x020);
@@ -205,6 +206,58 @@ fn negotiation_requires_version_one_and_selects_only_supported_features() {
     assert_eq!(negotiated.accepted() & unknown, 0);
     assert!(negotiated.read_only());
     assert!(negotiated.supports_flush());
+}
+
+#[test]
+fn entropy_identity_and_feature_profile_are_exact() {
+    assert_eq!(ENTROPY_QUEUE, 0);
+    assert_eq!(ENTROPY_MAX_REQUEST, 256);
+    let valid = MmioIdentity {
+        magic: MMIO_MAGIC_VALUE,
+        version: MMIO_VERSION_MODERN,
+        device_id: DEVICE_ID_ENTROPY,
+        vendor_id: 0x554d_4551,
+    };
+    assert_eq!(probe_modern_entropy(valid), Ok(()));
+    assert_eq!(
+        probe_modern_entropy(MmioIdentity {
+            device_id: DEVICE_ID_NETWORK,
+            ..valid
+        }),
+        Err(ProbeError::NotEntropyDevice {
+            observed: DEVICE_ID_NETWORK
+        })
+    );
+    assert_eq!(
+        negotiate_entropy_features(0),
+        Err(FeatureError::MissingVersion1)
+    );
+
+    let unknown = 1u64 << 48;
+    let offered = VIRTIO_F_VERSION_1
+        | VIRTIO_RING_F_INDIRECT_DESC
+        | VIRTIO_RING_F_EVENT_IDX
+        | VIRTIO_F_ACCESS_PLATFORM
+        | VIRTIO_F_RING_PACKED
+        | unknown;
+    let selected = negotiate_entropy_features(offered).unwrap();
+    assert_eq!(selected.accepted(), VIRTIO_F_VERSION_1);
+    assert_eq!(
+        selected.rejected(),
+        VIRTIO_RING_F_INDIRECT_DESC
+            | VIRTIO_RING_F_EVENT_IDX
+            | VIRTIO_F_ACCESS_PLATFORM
+            | VIRTIO_F_RING_PACKED
+    );
+    assert_eq!(selected.accepted() & unknown, 0);
+
+    let mut init = ModernInit::new();
+    init.acknowledge().unwrap();
+    init.declare_driver().unwrap();
+    assert_eq!(
+        init.select_entropy_features(offered).unwrap().accepted(),
+        VIRTIO_F_VERSION_1
+    );
 }
 
 #[test]

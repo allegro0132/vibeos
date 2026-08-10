@@ -687,6 +687,38 @@ fn fault_reclaim_returns_every_block_to_its_size_class() {
 }
 
 #[test]
+fn fault_reclaim_scrubs_payload_before_same_address_reuse() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(16 * 1024).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let l = layout(96, 16);
+    let abandoned = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { h.alloc(l) }
+    };
+    assert!(!abandoned.is_null());
+    unsafe { abandoned.write_bytes(0xa5, l.size()) };
+
+    unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    let replacement_arena = h.create_arena(owner).unwrap();
+    let replacement = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, replacement_arena)) };
+        unsafe { h.alloc(l) }
+    };
+    assert_eq!(replacement, abandoned, "the scrubbed block is reused");
+    let reused = unsafe { core::slice::from_raw_parts(replacement, l.size()) };
+    assert!(
+        reused.iter().all(|byte| *byte == 0),
+        "raw fault recovery must not expose the abandoned payload"
+    );
+
+    unsafe { h.dealloc(replacement, l) };
+    h.close_empty_arena(replacement_arena).unwrap();
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
 fn busy_or_active_arenas_block_close_and_owner_unregister() {
     let _serial = serial();
     let h = heap_of(64 * 1024);

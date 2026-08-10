@@ -5,7 +5,7 @@
 //! a live modern transport has the virtio magic, version 2, and a non-zero
 //! device id. This module deliberately contains only volatile MMIO access and
 //! transport sequencing. Queue ownership and descriptor safety live in the
-//! supervised `virtio_blk` and `virtio_net` drivers.
+//! supervised `virtio_blk`, `virtio_net`, and `virtio_rng` drivers.
 
 use core::arch::asm;
 
@@ -18,6 +18,7 @@ pub const VIRTIO_MAGIC: u32 = 0x7472_6976;
 pub const VIRTIO_MODERN_VERSION: u32 = 2;
 pub const VIRTIO_DEVICE_NETWORK: u32 = 1;
 pub const VIRTIO_DEVICE_BLOCK: u32 = 2;
+pub const VIRTIO_DEVICE_ENTROPY: u32 = 4;
 
 const MAGIC_VALUE: usize = 0x000;
 const VERSION: usize = 0x004;
@@ -90,6 +91,14 @@ impl MmioTransport {
         (0..VIRTIO_MMIO_SLOTS)
             .filter_map(Self::probe_slot)
             .find(|transport| transport.device_id() == VIRTIO_DEVICE_NETWORK)
+    }
+
+    /// Find the first modern virtio entropy transport. Other device types and
+    /// legacy (version 1) transports are deliberately skipped.
+    pub fn scan_entropy() -> Option<Self> {
+        (0..VIRTIO_MMIO_SLOTS)
+            .filter_map(Self::probe_slot)
+            .find(|transport| transport.device_id() == VIRTIO_DEVICE_ENTROPY)
     }
 
     pub const fn base(self) -> usize {

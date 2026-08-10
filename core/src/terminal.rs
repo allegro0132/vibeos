@@ -304,6 +304,7 @@ pub enum FrontendError {
     PromptTooLong,
     AllocationFailed,
     InvalidConsume,
+    PromptInactive,
     PromptActive,
     OutputInProgress,
     NoOutputInProgress,
@@ -329,7 +330,7 @@ pub struct TerminalFrontend {
     state: FrontendState,
     last_text_was_cr: bool,
     last_text_ended_line: bool,
-    async_output_had_text: bool,
+    output_had_text: bool,
 }
 
 impl TerminalFrontend {
@@ -342,28 +343,47 @@ impl TerminalFrontend {
             state: FrontendState::Inactive,
             last_text_was_cr: false,
             last_text_ended_line: false,
-            async_output_had_text: false,
+            output_had_text: false,
         }
     }
 
     /// Queue a fresh prompt after all output already pending for this session.
+    /// An inactive prompt never clears the current row; a partial command line
+    /// is terminated first so later prompt redraws cannot erase that output.
     pub fn show_prompt(&mut self, prompt: &str) -> Result<(), FrontendError> {
         if prompt.len() > MAX_PROMPT_BYTES
             || !prompt.bytes().all(|byte| (0x20..0x7f).contains(&byte))
         {
             return Err(FrontendError::PromptTooLong);
         }
+        if self.state == FrontendState::PromptSuspended {
+            return Err(FrontendError::OutputInProgress);
+        }
+        let replace_visible = self.state == FrontendState::PromptVisible;
+        let separator = if self.state == FrontendState::Inactive {
+            self.output_line_separator()
+        } else {
+            b""
+        };
         self.prompt
             .try_reserve(prompt.len())
             .map_err(|_| FrontendError::AllocationFailed)?;
-        self.prepare_append(ERASE_LINE.len() + prompt.len())?;
+        let additional =
+            separator.len() + prompt.len() + if replace_visible { ERASE_LINE.len() } else { 0 };
+        self.prepare_append(additional)?;
 
         self.prompt.clear();
         self.prompt.push_str(prompt);
         self.line.reset_line();
-        self.at_prompt = true;
+        self.state = FrontendState::PromptVisible;
         self.last_text_was_cr = false;
-        self.append_raw(ERASE_LINE);
+        self.last_text_ended_line = false;
+        self.output_had_text = false;
+        if replace_visible {
+            self.append_raw(ERASE_LINE);
+        } else {
+            self.append_raw(separator);
+        }
         self.append_raw(prompt.as_bytes());
         Ok(())
     }
@@ -372,18 +392,22 @@ impl TerminalFrontend {
     /// state and pending output logically unchanged, so the exact byte may be
     /// retried after draining.
     pub fn input_byte(&mut self, byte: u8) -> Result<Option<TerminalEvent>, FrontendError> {
+        if byte == 0x03 {
+            return self.interrupt().map(Some);
+        }
+
+        if self.state == FrontendState::PromptSuspended {
+            return Err(FrontendError::OutputInProgress);
+        }
+
         if byte == 0x04 {
-            if !self.at_prompt || self.line.input().is_empty() {
+            if self.state == FrontendState::Inactive || self.line.input().is_empty() {
                 return Ok(Some(self.finish_eof()));
             }
             return Ok(None);
         }
 
-        if byte == 0x03 {
-            return self.interrupt().map(Some);
-        }
-
-        if !self.at_prompt {
+        if self.state == FrontendState::Inactive {
             return Ok(None);
         }
 
@@ -398,12 +422,17 @@ impl TerminalFrontend {
     /// is also used for an SSH `signal` request, so it has the same atomic
     /// backpressure contract as [`Self::input_byte`].
     pub fn interrupt(&mut self) -> Result<TerminalEvent, FrontendError> {
-        self.prepare_append(b"^C\r\n".len())?;
+        let separator = self.output_line_separator();
+        let additional = separator.len() + b"^C\r\n".len();
+        self.prepare_control_append(additional)?;
         let InputAction::Event(event) = self.line.interrupt() else {
             unreachable!()
         };
-        self.at_prompt = false;
+        self.state = FrontendState::Inactive;
         self.last_text_was_cr = false;
+        self.last_text_ended_line = true;
+        self.output_had_text = true;
+        self.append_raw(separator);
         self.append_raw(b"^C\r\n");
         Ok(event)
     }
@@ -413,38 +442,67 @@ impl TerminalFrontend {
         self.finish_eof()
     }
 
-    /// Queue asynchronous UTF-8 output. Bare LF is rendered as CRLF, matching
-    /// the physical UART and a terminal with output newline processing. If a
-    /// prompt is active it is erased and redrawn as one atomic queue append.
+    /// Erase an active prompt before a possibly multi-chunk asynchronous output
+    /// transaction. Input remains owned by this session but is backpressured
+    /// until [`Self::finish_async_output`] redraws it exactly once.
+    pub fn begin_async_output(&mut self) -> Result<(), FrontendError> {
+        match self.state {
+            FrontendState::Inactive => return Err(FrontendError::PromptInactive),
+            FrontendState::PromptSuspended => return Err(FrontendError::OutputInProgress),
+            FrontendState::PromptVisible => {}
+        }
+        self.prepare_append(ERASE_LINE.len())?;
+        self.append_raw(ERASE_LINE);
+        self.state = FrontendState::PromptSuspended;
+        self.last_text_was_cr = false;
+        self.last_text_ended_line = false;
+        self.output_had_text = false;
+        Ok(())
+    }
+
+    /// Queue one UTF-8 output chunk. Bare LF is rendered as CRLF, matching the
+    /// physical UART and a terminal with output newline processing. Foreground
+    /// output is accepted while no prompt is active; asynchronous output first
+    /// requires [`Self::begin_async_output`].
     pub fn emit_text(&mut self, text: &str) -> Result<(), FrontendError> {
         if text.is_empty() {
             return Ok(());
         }
+        if self.state == FrontendState::PromptVisible {
+            return Err(FrontendError::PromptActive);
+        }
         if text.len() > MAX_EMIT_TEXT_BYTES {
             return Err(FrontendError::OutputTooLarge);
         }
-        let continues_text = !self.at_prompt && self.last_text_was_cr;
+        let continues_text = self.last_text_was_cr;
         let text_len = terminal_text_len(text.as_bytes(), continues_text)?;
-        let redraw_len = if self.at_prompt {
-            ERASE_LINE.len() + self.redraw_contents_len()
-        } else {
-            0
-        };
-        let additional = text_len
-            .checked_add(redraw_len)
+        self.prepare_append(text_len)?;
+        self.append_terminal_text(text.as_bytes(), continues_text);
+        self.last_text_was_cr = text.as_bytes().last() == Some(&b'\r');
+        self.last_text_ended_line = text.as_bytes().last() == Some(&b'\n');
+        self.output_had_text = true;
+        Ok(())
+    }
+
+    /// Finish asynchronous output and restore the saved prompt/input/cursor.
+    /// A partial final line is terminated first so a later erase cannot destroy
+    /// the output that preceded the prompt.
+    pub fn finish_async_output(&mut self) -> Result<(), FrontendError> {
+        if self.state != FrontendState::PromptSuspended {
+            return Err(FrontendError::NoOutputInProgress);
+        }
+        let separator = self.output_line_separator();
+        let additional = separator
+            .len()
+            .checked_add(self.redraw_contents_len())
             .ok_or(FrontendError::OutputTooLarge)?;
         self.prepare_append(additional)?;
-
-        if self.at_prompt {
-            self.append_raw(ERASE_LINE);
-        }
-        self.append_terminal_text(text.as_bytes(), continues_text);
-        if self.at_prompt {
-            self.append_redraw_contents();
-            self.last_text_was_cr = false;
-        } else {
-            self.last_text_was_cr = text.as_bytes().last() == Some(&b'\r');
-        }
+        self.append_raw(separator);
+        self.append_redraw_contents();
+        self.state = FrontendState::PromptVisible;
+        self.last_text_was_cr = false;
+        self.last_text_ended_line = false;
+        self.output_had_text = false;
         Ok(())
     }
 
@@ -478,15 +536,18 @@ impl TerminalFrontend {
     }
 
     pub fn is_at_prompt(&self) -> bool {
-        self.at_prompt
+        self.state != FrontendState::Inactive
+    }
+
+    pub fn is_async_output_active(&self) -> bool {
+        self.state == FrontendState::PromptSuspended
     }
 
     fn finish_eof(&mut self) -> TerminalEvent {
         let InputAction::Event(event) = self.line.transport_eof() else {
             unreachable!()
         };
-        self.at_prompt = false;
-        self.last_text_was_cr = false;
+        self.state = FrontendState::Inactive;
         event
     }
 
@@ -520,8 +581,10 @@ impl TerminalFrontend {
                 None
             }
             InputAction::Event(event) => {
-                self.at_prompt = false;
+                self.state = FrontendState::Inactive;
                 self.last_text_was_cr = false;
+                self.last_text_ended_line = !matches!(&event, TerminalEvent::Eof);
+                self.output_had_text = !matches!(&event, TerminalEvent::Eof);
                 match event {
                     TerminalEvent::Line(_) => self.append_raw(b"\r\n"),
                     TerminalEvent::Interrupt => self.append_raw(b"^C\r\n"),
@@ -534,6 +597,16 @@ impl TerminalFrontend {
 
     fn redraw_contents_len(&self) -> usize {
         self.prompt.len() + self.line.input().len() + cursor_left_len(self.line.cursor_tail_chars())
+    }
+
+    fn output_line_separator(&self) -> &'static [u8] {
+        if !self.output_had_text || self.last_text_ended_line {
+            b""
+        } else if self.last_text_was_cr {
+            b"\n"
+        } else {
+            b"\r\n"
+        }
     }
 
     fn append_redraw_contents(&mut self) {
@@ -580,13 +653,30 @@ impl TerminalFrontend {
     }
 
     fn prepare_append(&mut self, additional: usize) -> Result<(), FrontendError> {
-        if additional > MAX_PENDING_OUTPUT_BYTES {
+        self.prepare_append_with_limit(
+            additional,
+            MAX_REGULAR_PENDING_OUTPUT_BYTES,
+            CONTROL_OUTPUT_RESERVE_BYTES,
+        )
+    }
+
+    fn prepare_control_append(&mut self, additional: usize) -> Result<(), FrontendError> {
+        self.prepare_append_with_limit(additional, MAX_PENDING_OUTPUT_BYTES, 0)
+    }
+
+    fn prepare_append_with_limit(
+        &mut self,
+        additional: usize,
+        limit: usize,
+        physical_reserve: usize,
+    ) -> Result<(), FrontendError> {
+        if additional > limit {
             return Err(FrontendError::OutputTooLarge);
         }
         if self
             .pending_len()
             .checked_add(additional)
-            .is_none_or(|total| total > MAX_PENDING_OUTPUT_BYTES)
+            .is_none_or(|total| total > limit)
         {
             return Err(FrontendError::Backpressure);
         }
@@ -596,8 +686,11 @@ impl TerminalFrontend {
             self.output.truncate(self.pending_len());
             self.output_start = 0;
         }
+        let reserve = additional
+            .checked_add(physical_reserve)
+            .ok_or(FrontendError::OutputTooLarge)?;
         self.output
-            .try_reserve(additional)
+            .try_reserve(reserve)
             .map_err(|_| FrontendError::AllocationFailed)
     }
 }

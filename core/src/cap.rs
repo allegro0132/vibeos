@@ -217,8 +217,17 @@ impl Rights {
     pub const GRANT: Rights = Rights(1 << 4);
     /// May destroy this cap and every cap derived from it.
     pub const REVOKE: Rights = Rights(1 << 5);
+    /// May invoke an audited volatile Command resource.
+    ///
+    /// This bit is deliberately outside the durable-v1 rights mask. Command
+    /// capabilities are boot-local authority; persisted program artifacts use
+    /// the separately reviewed READ/loader path.
+    pub const INVOKE: Rights = Rights(1 << 6);
 
+    /// All durable-v1 rights. Kept stable so generic resource roots do not
+    /// accidentally gain command invocation authority.
     pub const ALL: Rights = Rights(0b11_1111);
+    pub const ALL_VOLATILE: Rights = Rights(0b111_1111);
 
     pub const fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
@@ -240,6 +249,7 @@ impl Rights {
     }
 
     pub const fn durable(self) -> DurableRights {
+        assert!(!self.contains(Self::INVOKE), "INVOKE is not durable-v1 authority");
         match DurableRights::from_bits(self.0) {
             Some(rights) => rights,
             None => unreachable!(),
@@ -279,6 +289,7 @@ impl fmt::Display for Rights {
                 "-"
             })?;
         }
+        if self.contains(Rights::INVOKE) { f.write_str("i")?; }
         Ok(())
     }
 }
@@ -802,6 +813,10 @@ pub struct PersistentDerivationWitness<T: Resource> {
 impl<T: Resource> PersistentDerivationWitness<T> {
     pub const fn identity(&self) -> PersistentCapIdentity {
         self.identity
+    }
+
+    pub(crate) fn into_revocable(self) -> Revocable<T> {
+        Revocable { object: self.object, node: self.node }
     }
 }
 

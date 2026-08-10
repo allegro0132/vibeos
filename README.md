@@ -66,6 +66,10 @@ layers and which mutations each one catches.
 ./qrun.sh 10      # run for 10 seconds, feed the shell from stdin
 ```
 
+Normal images boot directly into `vsh>` with a dedicated CSpace. The broad
+diagnostic shell is compiled only with the `legacy-shell` test feature; the
+QEMU golden and benchmark harnesses select that feature explicitly.
+
 Milk-V Duo boot images are generated with the official SDK. The deliverable image
 contains a single FAT boot partition and no Linux root filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
@@ -344,7 +348,26 @@ its process owns. Here, authority is not a property of the code.
 
 ~10,500 Rust lines across `core`, `compiler`, and `kernel` (2026-08-08 snapshot).
 
-## Shell
+## Default vsh
+
+```text
+help            capability-native command summary
+echo ...        write value arguments
+wc              count stdin bytes, words, and lines
+let NAME VALUE  set a session value
+jobs            list background Jobs
+wait %N         join a Job
+cancel %N       cancel a Job
+ps              component lifecycle snapshots
+caps [space]    sanitized capability summary
+mem             bounded-memory accounts
+poweroff        power off
+```
+
+## Test shell
+
+The following diagnostic surface exists only in `legacy-shell` builds used by
+the integration and benchmark harnesses:
 
 ```
 ps              component identities, lifecycle, and poll counts

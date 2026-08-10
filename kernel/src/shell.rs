@@ -6,7 +6,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::future::{poll_fn, Future};
+use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::task::Poll;
 
 use crate::cap::{CSpace, Cap, CapError, Resource, Rights};
 use crate::chan::Endpoint;
@@ -30,11 +33,29 @@ impl Resource for ReadOnlyCapProbe {
 
 pub async fn shell_task(boot_time: u64) {
     println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
+    let mut vsh = crate::vsh::Session::new();
     loop {
         tty::prompt("vibe> ");
         if let Some(line) = read_line().await {
             if !line.is_empty() {
-                run(&line, boot_time).await;
+                run(&line, boot_time, &mut vsh).await;
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub async fn vsh_task(
+    space: Arc<Space>,
+    console: Cap,
+    mut session: crate::vsh::Session,
+) {
+    write_vsh_front(&space, console, "\nVibeOS vsh ready -- capability-native shell.\n\n");
+    loop {
+        tty::prompt("vsh> ");
+        if let Some(line) = read_line().await {
+            if !line.is_empty() {
+                run_vsh_source(&line, &mut session, Some((&space, console))).await;
             }
         }
     }
@@ -60,7 +81,20 @@ async fn read_line() -> Option<String> {
     }
 }
 
-async fn run(line: &str, boot_time: u64) {
+async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
+    let trimmed = line.trim();
+    let explicit_vsh = trimmed.strip_prefix("vsh ");
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    let vsh_command = matches!(
+        first,
+        "echo" | "wc" | "false" | "deny" | "fault" | "spin" | "let" | "jobs" | "wait"
+    ) || (first == "cancel" && trimmed.split_whitespace().nth(1).is_some_and(|arg| arg.starts_with('%')));
+    if let Some(source) = explicit_vsh.or_else(|| {
+        vsh_command.then_some(trimmed)
+    }) {
+        run_vsh_source(source, vsh, None).await;
+        return;
+    }
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else { return };
     let rest: Vec<&str> = parts.collect();
@@ -101,6 +135,7 @@ async fn run(line: &str, boot_time: u64) {
             println!("  mem             kernel heap usage");
             println!("  uptime          seconds since boot");
             println!("  echo <text>     write via init's console capability");
+            println!("  vsh <list>      run a capability-native command list");
             println!("  halt            shut the machine down");
         }
 
@@ -196,7 +231,7 @@ async fn run(line: &str, boot_time: u64) {
                     desc
                 );
             }
-            println!("  rights: r=read w=write s=send v=recv g=grant x=revoke");
+            println!("  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke");
         }
 
         "probe" => probe().await,
@@ -485,6 +520,132 @@ async fn run(line: &str, boot_time: u64) {
 
         other => println!("  unknown command: {} (try `help`)", other),
     }
+}
+
+async fn run_vsh_source(
+    source: &str,
+    vsh: &mut crate::vsh::Session,
+    front: Option<(&Arc<Space>, Cap)>,
+) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(SpinLock::new(None));
+    let completed_task = completed.clone();
+    let cancel_task = cancel.clone();
+    let source = String::from(source);
+    let mut session = core::mem::take(vsh);
+    let handle = exec::spawn_tracked("vsh-foreground", async move {
+        let result = session.execute_cancellable(&source, cancel_task).await;
+        *completed_task.lock() = Some((session, result));
+    });
+    loop {
+        let mut join = pin!(handle.join());
+        let mut input = pin!(uart::read_byte());
+        let event = poll_fn(|cx| {
+            if let Poll::Ready(exit) = join.as_mut().poll(cx) {
+                return Poll::Ready(Ok(exit));
+            }
+            input.as_mut().poll(cx).map(Err)
+        })
+        .await;
+        match event {
+            Ok(_) => break,
+            Err(0x03) => cancel.store(true, Ordering::Release),
+            Err(_) => {}
+        }
+    }
+    let (session, result) = completed
+        .lock()
+        .take()
+        .expect("vsh foreground published no result");
+    *vsh = session;
+    let mut output = String::new();
+    match result {
+        Ok(reports) => for report in reports {
+            output.push_str(&report.output);
+            if report.status != crate::vsh::Status::Success {
+                output.push_str(&alloc::format!("  vsh job %{}: {:?}\n", report.id, report.status));
+            }
+        },
+        Err(error) => output.push_str(&alloc::format!(
+            "  vsh: {} at bytes {}..{}\n",
+            error.message, error.span.start, error.span.end
+        )),
+    }
+    if let Some((space, console)) = front {
+        write_vsh_front(space, console, &output);
+    } else if !output.is_empty() {
+        crate::uart::_print(format_args!("{}", output));
+    }
+}
+
+fn write_vsh_front(space: &Arc<Space>, console: Cap, text: &str) {
+    match space.0.lock().lookup_revocable::<ConsoleDev>(console, Rights::WRITE) {
+        Ok(token) => {
+            let _ = token.try_with(|console| console.write(text));
+        }
+        Err(_) => tty::cancel(),
+    }
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    Ok(String::from(
+        "  echo ...        write value arguments\n\
+         \x20 wc              count stdin bytes, words, and lines\n\
+         \x20 let NAME VALUE  set a session value\n\
+         \x20 jobs            list session jobs\n\
+         \x20 wait %N         join a job\n\
+         \x20 cancel %N       cancel a job\n\
+         \x20 ps              component lifecycle snapshots\n\
+         \x20 caps [space]    sanitized capability summary\n\
+         \x20 mem             bounded-memory accounts\n\
+         \x20 poweroff        power off\n",
+    ))
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    let mut output = String::from("COMPONENT TASK NAME CSPACE STATE POLLS BUDGET\n");
+    for component in world().components() {
+        let c = component.snapshot();
+        output.push_str(&alloc::format!(
+            "{} {} {} {} {} {} {}\n",
+            c.id, c.task_id, c.name, c.cspace, c.state, c.polls, c.memory.budget_bytes
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_caps(args: &[String]) -> Result<String, crate::vsh::Status> {
+    let name = args.first().map(String::as_str).unwrap_or("vsh");
+    let system = world();
+    let Some(space) = system.spaces.get(name) else { return Err(crate::vsh::Status::Unavailable) };
+    let mut output = alloc::format!("CAPABILITIES {}\n", name);
+    for (_handle, kind, rights, _description) in space.0.lock().list() {
+        output.push_str(&alloc::format!("{} {}\n", kind, rights));
+    }
+    Ok(output)
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    let (live, peak, free) = HEAP.stats();
+    let mut output = alloc::format!("heap live={} peak={} remaining={}\n", live, peak, free);
+    for component in world().components() {
+        let c = component.snapshot();
+        output.push_str(&alloc::format!(
+            "{} live={} peak={} budget={} denied={}\n",
+            c.name, c.memory.live_bytes, c.memory.peak_bytes,
+            c.memory.budget_bytes, c.memory.denials
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_poweroff(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    sbi::shutdown(false)
 }
 
 fn mmu_status() {

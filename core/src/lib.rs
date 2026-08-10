@@ -24,3 +24,4 @@ pub mod runqueue;
 pub mod store;
 pub mod sync;
 pub mod virtio;
+pub mod vsh;

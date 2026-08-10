@@ -1,0 +1,6 @@
+quiet
+echo hello | wc > @console
+spin
+@sleep 1
+@ctrl-c
+@sleep 1

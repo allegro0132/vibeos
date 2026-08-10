@@ -11,6 +11,11 @@ cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/status.sh            # derive current test/corpus counts on the host
 ```
 
+Normal `run.sh`/`qrun.sh` builds boot the least-authority `vsh` component. The
+golden and benchmark runners explicitly build the kernel with
+`--features legacy-shell`; production/default images therefore do not expose
+the broad diagnostic command dispatcher.
+
 `status.sh` lists runnable and ignored host tests separately and derives corpus
 and transcript counts from the tree. Target checks are not guessed from source:
 `./scripts/qemu-test.sh selftest` reports the count observed in that QEMU run.

@@ -12,6 +12,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![cfg_attr(not(feature = "legacy-shell"), allow(dead_code))]
 
 extern crate alloc;
 
@@ -19,7 +20,7 @@ extern crate alloc;
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync, virtio};
+pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync, virtio, vsh};
 
 mod bench;
 mod cap_table_pool;
@@ -185,6 +186,8 @@ pub extern "C" fn kmain() -> ! {
     uart::early_write("\r\n[VibeOS] entry\r\n");
     exec::configure_timebase(platform::TIMEBASE_HZ);
     let boot_time = sbi::time();
+    #[cfg(not(feature = "legacy-shell"))]
+    let _ = boot_time;
     let boot_physical_hart = sbi::current_hart_id();
 
     mmu::init_boot(boot_physical_hart);
@@ -278,12 +281,29 @@ pub extern "C" fn kmain() -> ! {
     let world = world::world();
     world::start_block_supervisor();
     world::start_net_supervisor();
+    #[cfg(feature = "legacy-shell")]
     world.spawn_component(
         "shell",
         world.spaces["init"].clone(),
         world::SHELL_MEMORY_BUDGET,
         shell::shell_task(boot_time),
     );
+    #[cfg(not(feature = "legacy-shell"))]
+    {
+        let space = world.spaces["vsh"].clone();
+        let mut session = vsh::Session::with_cspace(space.0.clone());
+        session.install_host_command("help", 0, 0, shell::vsh_help);
+        session.install_host_command("ps", 0, 0, shell::vsh_ps);
+        session.install_host_command("caps", 0, 1, shell::vsh_caps);
+        session.install_host_command("mem", 0, 0, shell::vsh_mem);
+        session.install_host_command("poweroff", 0, 0, shell::vsh_poweroff);
+        world.spawn_component(
+            "vsh",
+            space.clone(),
+            world::SHELL_MEMORY_BUDGET,
+            shell::vsh_task(space, world.vsh_console, session),
+        );
+    }
     let typed_channels = if world.net_outbound.is_some() {
         "3 typed channels"
     } else {

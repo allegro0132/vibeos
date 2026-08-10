@@ -44,16 +44,18 @@ POSIX authority model. **S0 is complete:**
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md) freezes the surface grammar,
 capability/value separation, per-stage authority rules, atomic Job admission,
 closeable bounded-stream contract, cancellation order, resource limits, security
-invariants, and the S1--S4 acceptance gates. This is a specification milestone;
-the current `split_whitespace` shell does not yet implement those semantics.
+invariants, and the S1--S4 acceptance gates. The portable `vsh` module now
+implements those gates; the legacy diagnostic commands remain available beside
+the capability-native command table only in explicit `legacy-shell` test
+builds. Normal images boot a separately supervised `vsh` CSpace/component.
 
 | Stage | Status | Outcome |
 |---|:---:|---|
 | S0 | ✅ | Normative capability-native shell contract and downstream acceptance gates. |
-| S1 | ⬜ | Pure bounded lexer/parser/AST, diagnostics, host tests, and fuzzing. |
-| S2 | ⬜ | `INVOKE`, Command manifests, closeable byte streams, and persistent-cap proxies. |
-| S3 | ⬜ | Atomic Job admission, dynamic stage CSpaces, supervision, cancellation, and fault teardown. |
-| S4 | ⬜ | Safe-Rust applets and `echo hello | wc > @console` vertical acceptance. |
+| S1 | ✅ | Pure bounded lexer/parser/AST, span diagnostics, limits, and host corpus tests. |
+| S2 | ✅ | Volatile `INVOKE`, immutable manifests, closeable streams, and ephemeral persistent-cap proxies. |
+| S3 | ✅ | Atomic Job admission, dynamic stage CSpaces/tasks, background supervision, join/cancel, and fail-fast teardown. |
+| S4 | ✅ | Safe-Rust `echo`/`wc`, host negative acceptance, and QEMU `echo hello \| wc > @console` plus foreground Ctrl-C. |
 
 ## 0. The one thing to fix first
 

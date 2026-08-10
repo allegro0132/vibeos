@@ -237,12 +237,12 @@ impl Component {
 
 /// A capability space is itself a resource. Holding a cap on a space with
 /// `REVOKE` is what lets a supervisor claw authority back from a component.
-pub struct Space(pub SpinLock<CSpace>);
+pub struct Space(pub Arc<SpinLock<CSpace>>);
 
 impl Space {
     pub(crate) fn new(name: &str) -> Arc<Self> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let space = Arc::new(Space(SpinLock::new_recoverable(CSpace::new(name))));
+        let space = Arc::new(Space(Arc::new(SpinLock::new_recoverable(CSpace::new(name)))));
         system_owner.restore();
         space
     }
@@ -252,9 +252,9 @@ impl Space {
         space_id: crate::durable::SpaceId,
     ) -> Arc<Self> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let space = Arc::new(Space(SpinLock::new_recoverable(CSpace::new_persistent(
+        let space = Arc::new(Space(Arc::new(SpinLock::new_recoverable(CSpace::new_persistent(
             name, space_id,
-        ))));
+        )))));
         system_owner.restore();
         space
     }
@@ -300,6 +300,8 @@ pub struct World {
     components: SpinLock<BTreeMap<ComponentId, Arc<Component>>>,
     /// init's handles onto everything it created.
     pub console: Cap,
+    #[cfg(not(feature = "legacy-shell"))]
+    pub vsh_console: Cap,
     pub telemetry: Cap,
     pub guest_space: Cap,
     /// The space compiled programs run with, and init's handle on it.
@@ -752,7 +754,8 @@ impl World {
     }
 
     /// Resolve a CSpace to its owning component by object identity, not by two
-    /// strings that merely happen to match. `shell` intentionally owns `init`.
+    /// strings that merely happen to match. The test shell owns `init`; the
+    /// default `vsh` component owns the separate least-authority `vsh` space.
     pub fn component_for_space(&self, space: &Arc<Space>) -> Option<Arc<Component>> {
         self.components()
             .into_iter()
@@ -972,6 +975,8 @@ pub fn build() {
     let telemetry: Arc<Endpoint<Reading>> = Endpoint::new("telemetry", 8);
 
     let init = Space::new("init");
+    #[cfg(not(feature = "legacy-shell"))]
+    let vsh = Space::new("vsh");
     let sensor = Space::new("sensor");
     let logger = Space::new("logger");
     let guest = Space::new("guest");
@@ -1017,6 +1022,8 @@ pub fn build() {
     // hands out strictly weaker copies. Nothing else can widen what it gets.
     let mut cs = init.0.lock();
     let c_console = cs.mint(console.clone(), Rights::ALL);
+    #[cfg(not(feature = "legacy-shell"))]
+    let vsh_console = cap::grant(&cs, c_console, Rights::WRITE, &mut vsh.0.lock()).unwrap();
     let c_telemetry = cs.mint(telemetry.clone(), Rights::ALL);
     let c_guest_space = cs.mint(guest.clone(), Rights::READ.union(Rights::REVOKE));
     let c_prog_space = cs.mint(prog.clone(), Rights::READ.union(Rights::REVOKE));
@@ -1232,6 +1239,8 @@ pub fn build() {
         ("guest", guest.clone()),
         ("prog", prog),
     ]);
+    #[cfg(not(feature = "legacy-shell"))]
+    spaces.insert("vsh", vsh);
     if let Some(space) = block_space.as_ref() {
         spaces.insert("virtio-blk", space.clone());
     }
@@ -1258,6 +1267,8 @@ pub fn build() {
         spaces,
         components: SpinLock::new(BTreeMap::new()),
         console: c_console,
+        #[cfg(not(feature = "legacy-shell"))]
+        vsh_console,
         telemetry: c_telemetry,
         guest_space: c_guest_space,
         prog_space: c_prog_space,

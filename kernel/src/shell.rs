@@ -75,6 +75,17 @@ async fn read_line() -> Option<String> {
                 tty::cancel();
                 return None;
             }
+            0x1b => {
+                if uart::read_byte().await == b'[' {
+                    match uart::read_byte().await {
+                        b'A' => tty::history_previous(),
+                        b'B' => tty::history_next(),
+                        b'C' => tty::move_right(),
+                        b'D' => tty::move_left(),
+                        _ => {}
+                    }
+                }
+            }
             b if (0x20..0x7f).contains(&b) => tty::type_char(b as char),
             _ => {}
         }

@@ -52,7 +52,8 @@ normalize() {
   | grep -a -v '^OpenSBI' || true
 }
 
-# Feed a case file to the shell. Lines starting with @sleep pause instead.
+# Feed a case file to the shell. Directive lines can pause or send raw editing
+# input without an implicit newline.
 # PACE is per line; the UART ring and the line discipline keep up easily, but
 # the shell has to be polled between lines.
 PACE=${PACE:-0.2}
@@ -62,6 +63,12 @@ feed() {
     case "$line" in
       '@sleep '*) sleep "${line#@sleep }" ;;
       '@ctrl-c') printf '\003'; sleep "$PACE" ;;
+      '@up') printf '\033[A'; sleep "$PACE" ;;
+      '@down') printf '\033[B'; sleep "$PACE" ;;
+      '@right') printf '\033[C'; sleep "$PACE" ;;
+      '@left') printf '\033[D'; sleep "$PACE" ;;
+      '@enter') printf '\n'; sleep "$PACE" ;;
+      '@text '*) printf '%s' "${line#@text }"; sleep "$PACE" ;;
       *) printf '%s\n' "$line"; sleep "$PACE" ;;
     esac
   done < "$1"

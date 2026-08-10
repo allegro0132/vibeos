@@ -1,6 +1,7 @@
 use vibeos_core::terminal::{
     FrontendError, InputAction, LineDiscipline, TerminalEvent, TerminalFrontend,
     MAX_EMIT_TEXT_BYTES, MAX_INPUT_BYTES, MAX_PENDING_OUTPUT_BYTES, MAX_PROMPT_BYTES,
+    MAX_REGULAR_PENDING_OUTPUT_BYTES,
 };
 
 fn feed(line: &mut LineDiscipline, bytes: &[u8]) -> Vec<InputAction> {
@@ -16,6 +17,20 @@ fn take_output(frontend: &mut TerminalFrontend) -> Vec<u8> {
 fn feed_frontend(frontend: &mut TerminalFrontend, bytes: &[u8]) {
     for byte in bytes {
         assert_eq!(frontend.input_byte(*byte), Ok(None));
+    }
+}
+
+fn emit_async(frontend: &mut TerminalFrontend, text: &str) {
+    frontend.begin_async_output().unwrap();
+    frontend.emit_text(text).unwrap();
+    frontend.finish_async_output().unwrap();
+}
+
+fn fill_regular_output(frontend: &mut TerminalFrontend) {
+    while frontend.pending_len() < MAX_REGULAR_PENDING_OUTPUT_BYTES {
+        let remaining = MAX_REGULAR_PENDING_OUTPUT_BYTES - frontend.pending_len();
+        let chunk_len = remaining.min(MAX_EMIT_TEXT_BYTES);
+        frontend.emit_text(&"x".repeat(chunk_len)).unwrap();
     }
 }
 
@@ -145,7 +160,7 @@ fn frontend_renders_exact_editing_and_control_bytes() {
     let mut terminal = TerminalFrontend::new();
 
     terminal.show_prompt("vsh> ").unwrap();
-    assert_eq!(take_output(&mut terminal), b"\r\x1b[2Kvsh> ");
+    assert_eq!(take_output(&mut terminal), b"vsh> ");
 
     feed_frontend(&mut terminal, b"abc");
     assert_eq!(take_output(&mut terminal), b"abc");
@@ -177,6 +192,9 @@ fn frontend_renders_exact_editing_and_control_bytes() {
     take_output(&mut terminal);
     feed_frontend(&mut terminal, b"discard");
     take_output(&mut terminal);
+    assert_eq!(terminal.input_byte(0x04), Ok(None));
+    assert_eq!(terminal.input(), "discard");
+    assert!(terminal.pending_output().is_empty());
     assert_eq!(terminal.interrupt(), Ok(TerminalEvent::Interrupt));
     assert_eq!(terminal.input(), "");
     assert_eq!(take_output(&mut terminal), b"^C\r\n");
@@ -197,7 +215,7 @@ fn frontend_preserves_editing_state_around_async_output() {
     feed_frontend(&mut terminal, b"\x1b[D\x1b[D");
     assert_eq!(take_output(&mut terminal), b"\x1b[D\x1b[D");
 
-    terminal.emit_text("job\nready\r\n").unwrap();
+    emit_async(&mut terminal, "job\nready\r\n");
     assert_eq!(terminal.input(), "abcd");
     assert_eq!(terminal.cursor_tail_chars(), 2);
     assert_eq!(
@@ -220,13 +238,79 @@ fn frontend_preserves_editing_state_around_async_output() {
 }
 
 #[test]
+fn frontend_streams_one_async_transaction_across_chunks_and_drains() {
+    let mut terminal = TerminalFrontend::new();
+    terminal.show_prompt("vsh> ").unwrap();
+    take_output(&mut terminal);
+    feed_frontend(&mut terminal, b"abcd\x1b[D\x1b[D");
+    take_output(&mut terminal);
+
+    assert_eq!(terminal.emit_text("hel"), Err(FrontendError::PromptActive));
+    assert!(terminal.pending_output().is_empty());
+
+    let mut wire = Vec::new();
+    terminal.begin_async_output().unwrap();
+    assert!(terminal.is_async_output_active());
+    wire.extend(take_output(&mut terminal));
+    assert_eq!(
+        terminal.input_byte(b'X'),
+        Err(FrontendError::OutputInProgress)
+    );
+    assert_eq!(terminal.input(), "abcd");
+
+    terminal.emit_text("hel\r").unwrap();
+    wire.extend(take_output(&mut terminal));
+    terminal.emit_text("\nlo").unwrap();
+    wire.extend(take_output(&mut terminal));
+    terminal.finish_async_output().unwrap();
+    wire.extend(take_output(&mut terminal));
+
+    assert_eq!(wire, b"\r\x1b[2Khel\r\nlo\r\nvsh> abcd\x1b[2D");
+    assert!(!terminal.is_async_output_active());
+    assert_eq!(terminal.input(), "abcd");
+    assert_eq!(terminal.cursor_tail_chars(), 2);
+}
+
+#[test]
+fn frontend_preserves_partial_output_before_prompt_and_across_eof() {
+    let mut terminal = TerminalFrontend::new();
+    terminal.emit_text("partial").unwrap();
+    terminal.show_prompt("vsh> ").unwrap();
+    assert_eq!(take_output(&mut terminal), b"partial\r\nvsh> ");
+
+    feed_frontend(&mut terminal, b"one");
+    assert!(matches!(
+        terminal.input_byte(b'\r'),
+        Ok(Some(TerminalEvent::Line(_)))
+    ));
+    take_output(&mut terminal);
+    terminal.show_prompt("vsh> ").unwrap();
+    take_output(&mut terminal);
+    feed_frontend(&mut terminal, b"\x1b[A");
+    assert_eq!(terminal.input(), "one");
+    assert_eq!(take_output(&mut terminal), b"\r\x1b[2Kvsh> one");
+
+    let input_before = terminal.input().to_owned();
+    assert_eq!(
+        terminal.show_prompt("bad\n"),
+        Err(FrontendError::PromptTooLong)
+    );
+    assert_eq!(terminal.input(), input_before);
+    assert!(terminal.pending_output().is_empty());
+
+    let mut eof = TerminalFrontend::new();
+    eof.emit_text("split\r").unwrap();
+    assert_eq!(eof.transport_eof(), TerminalEvent::Eof);
+    eof.emit_text("\ntail").unwrap();
+    assert_eq!(take_output(&mut eof), b"split\r\ntail");
+}
+
+#[test]
 fn frontend_backpressure_is_atomic_and_retryable() {
     let mut output = TerminalFrontend::new();
     let chunk = "x".repeat(MAX_EMIT_TEXT_BYTES);
-    for _ in 0..(MAX_PENDING_OUTPUT_BYTES / MAX_EMIT_TEXT_BYTES) {
-        output.emit_text(&chunk).unwrap();
-    }
-    assert_eq!(output.pending_len(), MAX_PENDING_OUTPUT_BYTES);
+    fill_regular_output(&mut output);
+    assert_eq!(output.pending_len(), MAX_REGULAR_PENDING_OUTPUT_BYTES);
     let snapshot = output.pending_output().to_vec();
     assert_eq!(output.emit_text("y"), Err(FrontendError::Backpressure));
     assert_eq!(output.pending_output(), snapshot);
@@ -238,8 +322,18 @@ fn frontend_backpressure_is_atomic_and_retryable() {
 
     output.consume_output(1).unwrap();
     output.emit_text("y").unwrap();
-    assert_eq!(output.pending_len(), MAX_PENDING_OUTPUT_BYTES);
+    assert_eq!(output.pending_len(), MAX_REGULAR_PENDING_OUTPUT_BYTES);
     assert_eq!(output.pending_output().last(), Some(&b'y'));
+    let full_regular = output.pending_output().to_vec();
+    assert_eq!(
+        output.show_prompt("vsh> "),
+        Err(FrontendError::Backpressure)
+    );
+    assert_eq!(output.pending_output(), full_regular);
+    assert!(!output.is_at_prompt());
+    assert_eq!(output.interrupt(), Ok(TerminalEvent::Interrupt));
+    assert_eq!(output.pending_len(), MAX_PENDING_OUTPUT_BYTES);
+    assert!(output.pending_output().ends_with(b"\r\n^C\r\n"));
 
     let mut input = TerminalFrontend::new();
     input.show_prompt("vsh> ").unwrap();
@@ -247,7 +341,7 @@ fn frontend_backpressure_is_atomic_and_retryable() {
     feed_frontend(&mut input, b"ab");
     take_output(&mut input);
     for _ in 0..4 {
-        input.emit_text(&chunk).unwrap();
+        emit_async(&mut input, &chunk);
     }
     let pending = input.pending_output().to_vec();
     assert_eq!(input.input_byte(0x1b), Err(FrontendError::Backpressure));
@@ -262,7 +356,7 @@ fn frontend_backpressure_is_atomic_and_retryable() {
 }
 
 #[test]
-fn frontend_bounds_prompts_chunks_and_maximum_redraw() {
+fn frontend_bounds_prompts_chunks_and_maximum_redraw_encoding() {
     let mut terminal = TerminalFrontend::new();
     assert_eq!(
         terminal.show_prompt(&"p".repeat(MAX_PROMPT_BYTES + 1)),
@@ -299,9 +393,7 @@ fn frontend_bounds_prompts_chunks_and_maximum_redraw() {
     assert_eq!(terminal.input_byte(b'z'), Ok(None));
     assert_eq!(take_output(&mut terminal), b"\x07");
 
-    terminal
-        .emit_text(&"\n".repeat(MAX_EMIT_TEXT_BYTES))
-        .unwrap();
+    emit_async(&mut terminal, &"\n".repeat(MAX_EMIT_TEXT_BYTES));
     assert!(terminal.pending_len() < MAX_PENDING_OUTPUT_BYTES);
     assert!(terminal.pending_output().starts_with(b"\r\x1b[2K\r\n"));
     assert!(terminal.pending_output().ends_with(b"\x1b[2048D"));
@@ -345,7 +437,7 @@ fn frontend_instances_do_not_share_state_or_backpressure() {
 
     let chunk = "x".repeat(MAX_EMIT_TEXT_BYTES);
     for _ in 0..4 {
-        first.emit_text(&chunk).unwrap();
+        emit_async(&mut first, &chunk);
     }
     assert_eq!(first.input_byte(b'!'), Err(FrontendError::Backpressure));
     assert_eq!(first.input(), "private");

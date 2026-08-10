@@ -5,21 +5,27 @@ support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
 timebase, native microSD/DWMAC backends, and a FIT/SD image packaging flow based
 on the official Buildroot SDK.
 
-> **Base-port hardware validation status (2026-08-10): passed.** A CV1800B board booted
-> successfully from the earlier single-FAT image and entered the
-> interactive shell. Sv39, the 25 MHz timer, UART0/PLIC IRQ 44, and component
-> scheduling all worked correctly, and the hardware `selftest` reported
-> `388 passed, 0 failed`. The native Ethernet IO Board path has since acquired
-> DHCP and passed eight fresh physical TCP streams; native microSD data I/O in
-> the new two-partition image remains unchecked below. The C906L and dual-core
-> SMP are not supported.
+> **Base-port and explicit SSH/VSH hardware validation status (2026-08-11):
+> passed within the documented boundaries.** A CV1800B board booted
+> successfully and entered the interactive shell. Sv39, the 25 MHz timer,
+> UART0/PLIC IRQ 44, and component scheduling all worked correctly, and the
+> earlier hardware `selftest` reported `388 passed, 0 failed`. The native
+> Ethernet IO Board path acquired DHCP and passed eight fresh physical TCP
+> streams. The deliberately insecure SSH acceptance image subsequently passed
+> 11 complete OpenSSH/VSH gates, representing at least 110 independent SSH
+> sessions. Native microSD data I/O in the new two-partition image remains
+> unchecked below. The C906L and dual-core SMP are not supported.
 
-The DWMAC software path now retains a dequeued packet while its sole TX
-descriptor is busy, faults after a bounded two-second stall, revalidates all
-device capabilities around each synchronous hardware turn, and resets MAC/DMA
-on normal teardown. The physical DHCP/TCP baseline below exercises ordinary
-traffic through that path. It does not yet cover driver restart coordinates,
-delayed DMA completion, late IRQs, or long-duration link stress.
+The DWMAC software path gives its normal RX and TX descriptors separate 64-byte
+non-coherent cache lines and observes device-written state with the C906
+invalidate operation rather than clean-plus-invalidate, preventing stale CPU
+`OWN` state from overwriting a DMA completion. It also retains a dequeued packet
+while its sole TX descriptor is busy, faults after a bounded two-second stall,
+revalidates all device capabilities around each synchronous hardware turn, and
+resets MAC/DMA on normal teardown. The physical DHCP/TCP and SSH baselines below
+exercise ordinary bidirectional traffic through that path. They do not yet
+cover driver restart coordinates, deliberately delayed DMA completion, late
+IRQs, or long-duration link stress.
 
 The production image enables the `net-shell` feature. Its supervised IPv4 stack
 exclusively owns the DWMAC packet endpoints, starts DHCPv4 automatically, and
@@ -305,6 +311,32 @@ session including editing, Ctrl-C, backspace, Ctrl-D, and listener rearm. A
 pass combined with the matching warning and address from that board boot is
 physical remote-login evidence for this explicit test image only.
 
+#### Physical SSH/VSH result (2026-08-11)
+
+The acceptance artifact built from commit `be3d790` had SHA-256
+`cfcf0f789ea460f1dcd362115103371eeccf69fba3e8d14ed75b76515e349837`.
+U-Boot loaded its 693848-byte FIT and reported `Decompressing 672352 bytes` for
+the kernel. The same UART boot then printed the explicit insecurity warning and
+announced `milkv-ssh-acceptance listening on 169.254.184.75:2222` after the
+interface-bound DHCP peer assigned the lease.
+
+The physical host ran the complete gate 11 times without rebooting the board.
+Each gate creates at least ten non-multiplexed OpenSSH processes: six valid
+authenticated sessions, one rejected-key session, and three authenticated
+sessions whose invalid request is denied. This supplied at least 110 independent
+TCP/SSH sessions, including 11 real forced-PTY interactive VSH sessions. Every
+gate pinned host fingerprint
+`SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8`, forced the documented
+algorithm suite, and printed its final PASS marker.
+
+The matching UART log contained 44 successful status-0 exec completions, 11
+intentional status-1 exec completions, and 11 status-0 interactive shell
+completions. It contained no SSH completion-drain timeout, DWMAC TX timeout,
+kernel panic, or driver fault. A concurrent packet capture reported 5503 packets
+captured with zero kernel drops. This closes the explicit insecure
+remote-login gate; it does not satisfy the hardware-entropy, unique-identity,
+production SSH, driver-restart, or deliberately delayed-DMA requirements.
+
 ### Diagnostic image
 
 Hardware acceptance uses a separate `legacy-shell` image. The production vsh
@@ -431,7 +463,7 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
       native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
       generates `target/milkv-duo/boot.sd`, with no FIT validation errors.
-- [ ] The final `*.img` contains a 128 MiB FAT boot partition and a 4 MiB raw
+- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 4 MiB raw
       VibeOS data partition. Its `fip.bin` and `boot.sd` are byte-for-byte
       identical to this build, and no Linux/rootfs partition exists.
 - [x] The serial console displays the FSBL, OpenSBI, U-Boot, and VibeOS banners.
@@ -468,15 +500,17 @@ For the first hardware boot, preserve the full serial log and verify each item:
       closed in production; the explicitly insecure `milkv-ssh-acceptance`
       image, a deterministic test key, and the CRC journal do not satisfy this
       item.
-- [ ] Flash the explicit SSH acceptance image on an isolated link and run
+- [x] Flash the explicit SSH acceptance image on an isolated link and run
       `scripts/milkv-ssh-test.sh ADDRESS`. Preserve the serial warning,
       announced address, OpenSSH transcript, interactive VSH result, and final
-      PASS marker. This item must not be reported as production SSH readiness.
+      PASS marker. The 2026-08-11 run passed 11 complete gates (at least 110
+      independent sessions) with the evidence recorded above. This item must
+      not be reported as production SSH readiness.
 - [x] Run the self-tests appropriate for a single-core board configuration.
       Preserve the full serial log before analyzing any trap, panic, or OpenSBI
       extension error.
 
-Checked base-port items above record the earlier hardware acceptance run;
-unchecked storage/network items apply to this new implementation and require a
-fresh board log. Neither status is a claim of production readiness or dual-core
-SMP support.
+Checked base-port items include the earlier hardware acceptance run and the
+explicit 2026-08-11 SSH/VSH run. Unchecked storage, raw-network, recovery, and
+fault-injection items still require dedicated fresh board evidence. Neither
+status is a claim of production readiness or dual-core SMP support.

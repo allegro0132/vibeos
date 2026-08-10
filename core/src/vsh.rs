@@ -1374,6 +1374,15 @@ struct BackgroundJob {
     report: Arc<SpinLock<Option<JobReport>>>,
 }
 
+impl BackgroundJob {
+    fn request_cancel(&self) {
+        self.control.fail(Status::Cancelled);
+        for stage in &self.stages {
+            let _ = stage.cancel();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FunctionDef {
     params: Vec<String>,
@@ -1659,6 +1668,31 @@ impl Session {
     }
     /// Acceptance hook for the same supervisor path used by foreground Ctrl-C.
     pub fn cancel_next_job_for_test(&mut self) { self.cancel_next_job = true; }
+
+    /// Cancel and join every background Job owned by this session.
+    ///
+    /// This is idempotent. Connection-oriented frontends should await it before
+    /// releasing their transport so no stage or Job supervisor can outlive the
+    /// session that admitted it.
+    pub async fn shutdown(&mut self) {
+        self.request_shutdown();
+        let jobs = core::mem::take(&mut self.jobs);
+        for (_, job) in jobs {
+            for stage in &job.stages {
+                let _ = stage.join().await;
+            }
+            let _ = job.supervisor.join().await;
+        }
+    }
+
+    fn request_shutdown(&mut self) {
+        if let Some(cancel) = self.external_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        for job in self.jobs.values() {
+            job.request_cancel();
+        }
+    }
 
     pub async fn execute(&mut self, source: &str) -> Result<Vec<JobReport>, Diagnostic> {
         if self.profile == SessionProfile::SshExec {
@@ -2822,6 +2856,15 @@ fn close_stage_outputs(stage: &PlannedStage, status: Status) {
         {
             stream.close_write(reason);
         }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Drop cannot await the Job supervisors, but requesting cancellation
+        // ensures their retained handles observe terminal stage state and can
+        // finish their ordinary cleanup path when the executor next runs.
+        self.request_shutdown();
     }
 }
 

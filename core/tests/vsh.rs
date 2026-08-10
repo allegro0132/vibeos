@@ -57,6 +57,52 @@ fn execute_ssh(
     (session, report)
 }
 
+fn live_background_tasks() -> Vec<exec::TaskReport> {
+    exec::task_report()
+        .into_iter()
+        .filter(|task| matches!(task.name.as_str(), "vsh-stage" | "vsh-job-supervisor"))
+        .collect()
+}
+
+fn assert_background_tasks_running(expected: usize) {
+    let tasks = live_background_tasks();
+    assert_eq!(
+        tasks.iter().filter(|task| task.name == "vsh-stage").count(),
+        expected,
+        "background Jobs published the wrong number of live stages"
+    );
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|task| task.name == "vsh-job-supervisor")
+            .count(),
+        expected,
+        "background Jobs published the wrong number of live supervisors"
+    );
+}
+
+fn assert_no_background_tasks() {
+    let tasks = live_background_tasks();
+    assert!(tasks.is_empty(), "background tasks survived: {tasks:?}");
+}
+
+fn shutdown_session(mut session: Session) {
+    let task = exec::spawn_tracked("vsh-shutdown-test", async move {
+        session.shutdown().await;
+        session.shutdown().await;
+    });
+    exec::run_until_idle(100_000);
+    assert!(task.try_exit().is_some(), "vsh shutdown did not terminate");
+}
+
+fn drop_session(session: Session) {
+    let task = exec::spawn_tracked("vsh-drop-test", async move {
+        drop(session);
+    });
+    exec::run_until_idle(100_000);
+    assert!(task.try_exit().is_some(), "vsh drop task did not terminate");
+}
+
 #[test]
 fn parser_preserves_capability_value_separation_and_quotes() {
     let ast = vsh::parse("echo '$x' \"$x\" @console > @console && wc").unwrap();
@@ -182,6 +228,34 @@ fn background_cancel_joins_and_releases_the_job() {
     assert!(cancelled.unwrap().is_empty());
     let (_session, waited) = execute(session, "wait %1");
     assert_eq!(waited.unwrap()[0].status, Status::Cancelled);
+}
+
+#[test]
+fn shutdown_cancels_and_joins_all_background_tasks() {
+    let _serial = SERIAL.lock().unwrap();
+    assert_no_background_tasks();
+    let (session, admitted) = execute(Session::new(), "spin &");
+    assert_eq!(admitted.unwrap()[0].output, "[%1]\n");
+    let (session, admitted) = execute(session, "spin &");
+    assert_eq!(admitted.unwrap()[0].output, "[%2]\n");
+    assert_background_tasks_running(2);
+
+    shutdown_session(session);
+
+    assert_no_background_tasks();
+}
+
+#[test]
+fn dropping_session_cancels_all_background_tasks() {
+    let _serial = SERIAL.lock().unwrap();
+    assert_no_background_tasks();
+    let (session, admitted) = execute(Session::new(), "spin &");
+    assert_eq!(admitted.unwrap()[0].output, "[%1]\n");
+    assert_background_tasks_running(1);
+
+    drop_session(session);
+
+    assert_no_background_tasks();
 }
 
 #[test]

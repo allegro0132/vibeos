@@ -9,15 +9,17 @@ on the official Buildroot SDK.
 > successfully from the earlier single-FAT image and entered the
 > interactive shell. Sv39, the 25 MHz timer, UART0/PLIC IRQ 44, and component
 > scheduling all worked correctly, and the hardware `selftest` reported
-> `388 passed, 0 failed`. Native microSD data I/O and Ethernet IO Board support
-> compile successfully but remain unchecked below until the new two-partition
-> image is exercised on hardware. The C906L and dual-core SMP are not supported.
+> `388 passed, 0 failed`. The native Ethernet IO Board path has since acquired
+> DHCP and passed eight fresh physical TCP streams; native microSD data I/O in
+> the new two-partition image remains unchecked below. The C906L and dual-core
+> SMP are not supported.
 
 The DWMAC software path now retains a dequeued packet while its sole TX
 descriptor is busy, faults after a bounded two-second stall, revalidates all
 device capabilities around each synchronous hardware turn, and resets MAC/DMA
-on normal teardown. This closes the known software drop/stall path; it does not
-replace the unchecked physical Ethernet acceptance item below.
+on normal teardown. The physical DHCP/TCP baseline below exercises ordinary
+traffic through that path. It does not yet cover driver restart coordinates,
+delayed DMA completion, late IRQs, or long-duration link stress.
 
 The production image enables the `net-shell` feature. Its supervised IPv4 stack
 exclusively owns the DWMAC packet endpoints, starts DHCPv4 automatically, and
@@ -226,6 +228,59 @@ dhclient -r net0
 clears the local IPv4 configuration; smoltcp does not currently emit a DHCP
 RELEASE packet.
 
+### Explicit SSH/VSH hardware acceptance image (insecure)
+
+The physical remote-login gate uses a deliberately separate
+`milkv-ssh-acceptance` image. It proves DWMAC, DHCP, the SSH wire protocol, and
+interactive per-session VSH on the board, but it is **not a secure deployment**:
+the image embeds public fixed host/client identities and a deterministic random
+provider whose sequence repeats after every reboot. Never expose it to an
+untrusted network, send secrets through it, or distribute it as a production
+image. The normal `milkv-duo,net-shell` image remains SSH-disabled until real
+hardware entropy and per-device identity provisioning exist.
+
+Build its bare kernel on the host:
+
+```sh
+./scripts/build-milkv-duo.sh --ssh-acceptance
+```
+
+Package it in the same validated SDK environment described above:
+
+```sh
+./scripts/package-milkv-duo-sdk.sh --ssh-acceptance /path/to/duo-buildroot-sdk
+```
+
+For the macOS/container flow, pass `--ssh-acceptance` before `/home/work` in
+the existing `docker run` command. The final flashable artifact is:
+
+```text
+target/milkv-duo-ssh-acceptance/vibeos-milkv-duo-ssh-acceptance-sd.img
+```
+
+After boot, the serial console prints an unmistakable insecurity warning and
+then publishes the current lease as:
+
+```text
+milkv-ssh-acceptance listening on A.B.C.D:2222
+```
+
+The service waits indefinitely for late carrier or DHCP, rebinds after a
+carrier/device-generation change, and republishes the address when a lease is
+lost or changed. From another machine on the same isolated link, run the exact
+OpenSSH gate against the announced address:
+
+```sh
+./scripts/milkv-ssh-test.sh A.B.C.D
+```
+
+The script generates mode-0600 accepted and rejected fixture keys in a private
+temporary directory, pins the exact public test host fingerprint and algorithm
+suite, checks exec status and denial paths, and drives a real forced-PTY VSH
+session including editing, Ctrl-C, backspace, Ctrl-D, and listener rearm. A
+pass combined with the matching warning and address from that board boot is
+physical remote-login evidence for this explicit test image only.
+
 ### Diagnostic image
 
 Hardware acceptance uses a separate `legacy-shell` image. The production vsh
@@ -386,8 +441,13 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [ ] Before enabling SSH, a documented hardware entropy source is validated
       on the board and a unique per-device Ed25519 identity is provisioned
       behind non-readable signing authority. Until then the Duo SSH path fails
-      closed; neither a deterministic test key nor the CRC journal satisfies
-      this item.
+      closed in production; the explicitly insecure `milkv-ssh-acceptance`
+      image, a deterministic test key, and the CRC journal do not satisfy this
+      item.
+- [ ] Flash the explicit SSH acceptance image on an isolated link and run
+      `scripts/milkv-ssh-test.sh ADDRESS`. Preserve the serial warning,
+      announced address, OpenSSH transcript, interactive VSH result, and final
+      PASS marker. This item must not be reported as production SSH readiness.
 - [x] Run the self-tests appropriate for a single-core board configuration.
       Preserve the full serial log before analyzing any trap, panic, or OpenSBI
       extension error.

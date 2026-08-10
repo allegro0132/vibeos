@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Create a deterministic, unencrypted OpenSSH Ed25519 test key.
 
-The named accepted/rejected fixtures match the QEMU-only VibeOS SSH policy.
+The named accepted/rejected fixtures match explicit VibeOS SSH test policies.
 Callers may instead supply both a 32-byte seed and its trusted 32-byte public
 key. This utility intentionally does not implement Ed25519 arithmetic and never
 prints either private value. Every generated identity is test-only.
@@ -30,9 +30,9 @@ NONE_BLOCK_BYTES = 8
 MAX_COMMENT_BYTES = 1_024
 HEX_32_BYTES = re.compile(r"[0-9a-fA-F]{64}\Z")
 
-# These identities match the QEMU-only SSH fixture policy. They are public test
-# vectors, not device provisioning material, and must never be used outside an
-# acceptance image.
+# These identities match the explicit SSH fixture policies. They are public
+# test vectors, not device provisioning material, and must never be used
+# outside an acceptance image.
 FIXTURES = {
     "accepted": (
         "b6" * 32,
@@ -309,7 +309,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fixture",
         choices=sorted(FIXTURES),
-        help="generate the named QEMU-only accepted or rejected test identity",
+        help="generate the named accepted or rejected test identity",
     )
     parser.add_argument("--seed", help="exactly 64 hex characters (never printed)")
     parser.add_argument(

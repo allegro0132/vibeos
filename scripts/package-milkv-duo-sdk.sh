@@ -82,6 +82,18 @@ mkdir -p "$pack_dir/input/rawimages" "$pack_dir/root" "$pack_dir/output" "$pack_
 cp "$sdk_fip" "$pack_dir/input/fip.bin"
 cp "$temp_fit" "$pack_dir/input/rawimages/boot.sd"
 cmp "$temp_fit" "$pack_dir/input/rawimages/boot.sd"
+python3 - "$pack_dir/input/vibe-data.bin" <<'PY'
+import sys
+
+path = sys.argv[1]
+sector_size = 512
+seed = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
+with open(path, "wb") as data:
+    data.truncate(4 * 1024 * 1024)
+with open(path, "r+b") as data:
+    data.seek(7 * sector_size)
+    data.write(seed)
+PY
 
 "$genimage" \
   --config "$script_dir/milkv-duo-genimage.cfg" \

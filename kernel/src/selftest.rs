@@ -342,6 +342,20 @@ fn paging(h: &mut Harness) {
                 && !device.permissions.contains(PagePermissions::EXECUTE),
         );
     }
+    #[cfg(feature = "milkv-duo")]
+    for (name, address) in [
+        ("CV1800B DWMAC is identity mapped", crate::platform::ETHERNET_BASE),
+        ("CV1800B SDIO0 is identity mapped", crate::platform::SDHCI_BASE),
+    ] {
+        let device = crate::mmu::mapping(address).expect("native device MMIO is mapped");
+        h.eq(name, device.physical, address);
+        h.eq("native MMIO uses 4 KiB leaves", device.page_size, PAGE_SIZE);
+        h.check(
+            "native MMIO is readable and writable but not executable",
+            device.permissions.contains(PagePermissions::READ.union(PagePermissions::WRITE))
+                && !device.permissions.contains(PagePermissions::EXECUTE),
+        );
+    }
     h.check(
         "the null page is absent from the shared address space",
         crate::mmu::mapping(0).is_none(),

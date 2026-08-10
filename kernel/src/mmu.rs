@@ -86,6 +86,8 @@ struct AddressSpace {
     plic_control_level0: PageTable,
     plic_context_level0: PageTable,
     uart_virtio_level0: PageTable,
+    #[cfg(feature = "milkv-duo")]
+    sdhci_level0: PageTable,
     ram_level1: PageTable,
     ram_level0: [PageTable; RAM_LEVEL0_TABLES],
 }
@@ -99,6 +101,8 @@ impl AddressSpace {
             plic_control_level0: PageTable::empty(),
             plic_context_level0: PageTable::empty(),
             uart_virtio_level0: PageTable::empty(),
+            #[cfg(feature = "milkv-duo")]
+            sdhci_level0: PageTable::empty(),
             ram_level1: PageTable::empty(),
             ram_level0: [const { PageTable::empty() }; RAM_LEVEL0_TABLES],
         }
@@ -208,6 +212,32 @@ pub fn init_boot(boot_physical_hart: usize) {
     );
     for physical in (UART_VIRTIO_START..UART_VIRTIO_END).step_by(sv39::PAGE_SIZE) {
         map_page(&mut tables.uart_virtio_level0, physical, MMIO_PERMISSIONS);
+    }
+    #[cfg(feature = "milkv-duo")]
+    {
+        // Ethernet shares UART0's 2 MiB level-0 table. SDIO0 resides in the
+        // next 2 MiB window and therefore needs its own level-0 table.
+        debug_assert_eq!(
+            megapage_base(crate::platform::ETHERNET_BASE),
+            megapage_base(UART_VIRTIO_START)
+        );
+        for physical in (crate::platform::ETHERNET_BASE
+            ..crate::platform::ETHERNET_MMIO_END)
+            .step_by(sv39::PAGE_SIZE)
+        {
+            map_page(&mut tables.uart_virtio_level0, physical, MMIO_PERMISSIONS);
+        }
+        link_level0(
+            &mut tables.devices_level1,
+            megapage_base(crate::platform::SDHCI_BASE),
+            &tables.sdhci_level0,
+        );
+        for physical in
+            (crate::platform::SDHCI_BASE..crate::platform::SDHCI_MMIO_END)
+                .step_by(sv39::PAGE_SIZE)
+        {
+            map_page(&mut tables.sdhci_level0, physical, MMIO_PERMISSIONS);
+        }
     }
 
     for (table_index, level0) in tables.ram_level0.iter_mut().enumerate() {

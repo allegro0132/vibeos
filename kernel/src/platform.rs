@@ -64,8 +64,17 @@ mod selected {
     pub const DEVICE_MMIO_START: usize = UART_BASE;
     pub const DEVICE_MMIO_END: usize = UART_BASE + 0x1000;
 
+    // CV1800B device-tree values from the SDK revision pinned by
+    // docs/MILKV_DUO.md. The Ethernet IO Board is wired to the SoC's internal
+    // PHY through this RMII DWMAC instance; the boot microSD uses SDIO0.
+    pub const ETHERNET_BASE: usize = 0x0407_0000;
+    pub const ETHERNET_MMIO_END: usize = ETHERNET_BASE + 0x1_0000;
+    pub const ETHERNET_IRQ: u32 = 31;
+    pub const SDHCI_BASE: usize = 0x0431_0000;
+    pub const SDHCI_MMIO_END: usize = SDHCI_BASE + 0x1000;
+    pub const SDHCI_IRQ: u32 = 36;
+
     pub const TIMEBASE_HZ: u64 = 25_000_000;
-    pub const VIRTIO_MMIO_SLOTS: usize = 0;
     // Stock Duo firmware exposes only C906B (hart 0) to OpenSBI. C906L is an
     // AMP core released independently by the FSBL and must not be HSM-probed.
     pub const HART_IDS: &[usize] = &[0];

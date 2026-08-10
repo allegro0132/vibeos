@@ -2,14 +2,16 @@
 
 VibeOS provides **single-core board support for the Milk-V Duo C906B**. Current
 support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
-timebase, and a FIT/SD image packaging flow based on the official Buildroot SDK.
+timebase, native microSD/DWMAC backends, and a FIT/SD image packaging flow based
+on the official Buildroot SDK.
 
-> **Hardware validation status (2026-08-10): passed.** A CV1800B board booted
-> successfully from the single-FAT image described here and entered the
+> **Base-port hardware validation status (2026-08-10): passed.** A CV1800B board booted
+> successfully from the earlier single-FAT image and entered the
 > interactive shell. Sv39, the 25 MHz timer, UART0/PLIC IRQ 44, and component
 > scheduling all worked correctly, and the hardware `selftest` reported
-> `388 passed, 0 failed`. This does not change the fact that the C906L and
-> dual-core SMP are not yet supported.
+> `388 passed, 0 failed`. Native microSD data I/O and Ethernet IO Board support
+> compile successfully but remain unchecked below until the new two-partition
+> image is exercised on hardware. The C906L and dual-core SMP are not supported.
 
 ## CPU model and support boundaries
 
@@ -43,7 +45,9 @@ bound.
 | UART clock and baud rate | 25 MHz, 115200 baud |
 | PLIC | `0x7000_0000`, hart 0 S-mode context 1 |
 | RISC-V timebase | 25 MHz |
-| virtio-mmio | 0 slots; block, object store, and virtio-net remain offline |
+| virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
+| microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
+| Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
 
 UART0 and the PLIC occupy Sv39 root VPN2 entries 0 and 1, respectively, so they
 must use separate level-1 device page tables. The C906 also requires T-Head
@@ -180,10 +184,12 @@ docker run --rm --platform linux/amd64 \
 
 The final flashable image is `target/milkv-duo/vibeos-milkv-duo-sd.img`.
 
-The image contains exactly one bootable, type `0x0c`, 128 MiB FAT partition. It
-has no Linux partition or ext4 rootfs. You can use read-only mounts to validate
-this MBR layout, the FIP and `boot.sd` in the FAT file system, the FIT metadata,
-and the payload CRC32 values:
+The image contains a bootable, type `0x0c`, 128 MiB FAT partition followed by a
+4 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
+rootfs. The native block backend translates the data partition's first LBA to
+logical sector zero, so shell block tests and the persistent journal cannot
+overwrite FAT, `fip.bin`, or `boot.sd`. You can use read-only mounts to validate
+the MBR layout, payloads, FIT metadata, and CRC32 values:
 
 ```sh
 DUO_IMAGE=milkvtech/milkv-duo@sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679
@@ -238,9 +244,9 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
       native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
       generates `target/milkv-duo/boot.sd`, with no FIT validation errors.
-- [x] The final `*.img` contains exactly one 128 MiB FAT boot partition. Its
-      `fip.bin` and `boot.sd` are byte-for-byte identical to this build, and no
-      Linux/rootfs partition exists.
+- [ ] The final `*.img` contains a 128 MiB FAT boot partition and a 4 MiB raw
+      VibeOS data partition. Its `fip.bin` and `boot.sd` are byte-for-byte
+      identical to this build, and no Linux/rootfs partition exists.
 - [x] The serial console displays the FSBL, OpenSBI, U-Boot, and VibeOS banners.
       The VibeOS platform name is Milk-V Duo/CV1800B.
 - [x] The kernel reports only one online hart and makes no attempt to probe or
@@ -254,13 +260,15 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [x] MMU diagnostics show the kernel in
       `0x8020_0000..0x83e0_0000`, with no mapping or use of the FreeRTOS reserved
       region beginning at `0x83f4_0000`.
-- [x] virtio features such as `blk info` and `net info` explicitly report
-      offline. This is expected for the current port and does not indicate a
-      boot failure.
+- [ ] `blk info` reports the SD data partition online; `blk test` survives a
+      reboot without changing either boot payload.
+- [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B
+      DWMAC online and the raw-L2 HELLO/CHALLENGE/ACK exchange succeeds.
 - [x] Run the self-tests appropriate for a single-core board configuration.
       Preserve the full serial log before analyzing any trap, panic, or OpenSBI
       extension error.
 
-The checklist above records one complete hardware acceptance run. It proves
-that the current image boots and supports interaction, but it must not be taken
-as a claim of production readiness or dual-core SMP support.
+Checked base-port items above record the earlier hardware acceptance run;
+unchecked storage/network items apply to this new implementation and require a
+fresh board log. Neither status is a claim of production readiness or dual-core
+SMP support.

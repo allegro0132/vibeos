@@ -354,9 +354,9 @@ rustc lease     revoke during a run, then retry without new grants
 selftest        run the in-kernel test suite
 bench           emit the versioned machine-readable benchmark suite
 durable         recover a sealed capability log and tombstone
-blk info        report the supervised virtio-blk transport and capacity
+blk info        report the supervised block backend and capacity
 blk test        read, write, flush, read back, and verify the real backing disk
-net info        report the supervised modern virtio-net transport and queue state
+net info        report the supervised network backend and queue state
 net test        exchange a typed raw-L2 challenge with the localhost test peer
 net fault       fault after TX publication, reset/restart, then repeat the exchange
 rustc edit      type your own program; end it with a lone `.`

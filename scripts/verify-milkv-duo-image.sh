@@ -73,10 +73,11 @@ for index in range(4):
     if boot or part_type or start or size:
         partitions.append((index + 1, boot, part_type, start, size))
 
-if len(partitions) != 1 or partitions[0][0] != 1:
-    fail(f"expected exactly MBR partition 1, got {partitions!r}")
+if len(partitions) != 2 or partitions[0][0] != 1 or partitions[1][0] != 2:
+    fail(f"expected MBR boot and VibeOS data partitions, got {partitions!r}")
 
 _, p1_boot, p1_type, p1_start, p1_size = partitions[0]
+_, p2_boot, p2_type, p2_start, p2_size = partitions[1]
 if p1_boot != 0x80:
     fail(f"partition 1 boot flag is 0x{p1_boot:02x}, expected 0x80")
 if p1_type != 0x0C:
@@ -87,17 +88,47 @@ if p1_size != expected_boot_sectors:
     fail(f"boot partition has {p1_size} sectors, expected {expected_boot_sectors}")
 if p1_start == 0:
     fail("boot partition starts at sector zero")
+if p2_boot != 0:
+    fail(f"partition 2 boot flag is 0x{p2_boot:02x}, expected 0")
+if p2_type != 0xDA:
+    fail(f"partition 2 type is 0x{p2_type:02x}, expected raw VibeOS data 0xda")
+if p2_start != p1_start + p1_size:
+    fail(f"data partition starts at {p2_start}, expected {p1_start + p1_size}")
+expected_data_sectors = 4 * 1024 * 1024 // sector_size
+if p2_size != expected_data_sectors:
+    fail(f"data partition has {p2_size} sectors, expected {expected_data_sectors}")
 
 image_bytes = os.path.getsize(path)
-required_bytes = (p1_start + p1_size) * sector_size
+required_bytes = (p2_start + p2_size) * sector_size
 if required_bytes != image_bytes:
-    fail(f"single-partition image should be exactly {required_bytes} bytes, got {image_bytes}")
+    fail(f"two-partition image should be exactly {required_bytes} bytes, got {image_bytes}")
 
 print(f"image bytes: {image_bytes}", file=sys.stderr)
 print(f"partition 1: start={p1_start} sectors={p1_size} type=0x{p1_type:02x} bootable", file=sys.stderr)
+print(f"partition 2: start={p2_start} sectors={p2_size} type=0x{p2_type:02x} raw data", file=sys.stderr)
 print(p1_start)
 PY
 )
+
+python3 - "$image" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+sector_size = 512
+seed = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
+with open(path, "rb") as image_file:
+    mbr = image_file.read(sector_size)
+    p2_start = struct.unpack_from("<I", mbr, 446 + 16 + 8)[0]
+    image_file.seek((p2_start + 7) * sector_size)
+    sector7 = image_file.read(sector_size)
+    image_file.seek((p2_start + 8) * sector_size)
+    sector8 = image_file.read(sector_size)
+if not sector7.startswith(seed) or any(sector7[len(seed):]):
+    raise SystemExit("verify-milkv-duo-image.sh: data sector 7 seed is not canonical")
+if any(sector8):
+    raise SystemExit("verify-milkv-duo-image.sh: data sector 8 is not initially zero")
+PY
 
 echo "== FAT boot partition =="
 fat_image="${image}@@$((p1_start * 512))"
@@ -173,4 +204,4 @@ print(f"{zlib.crc32(data) & 0xffffffff:08x}")' \
 
 verify_crc32 /images/kernel "$temp_dir/kernel.bin"
 verify_crc32 /images/fdt "$temp_dir/fdt.dtb"
-echo "PASS: single FAT MBR image, FIP, FIT metadata, and payload CRC32 hashes are valid"
+echo "PASS: FAT boot + raw data MBR image, FIP, FIT metadata, and payload CRC32 hashes are valid"

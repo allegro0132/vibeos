@@ -361,6 +361,8 @@ cancel %N       cancel a Job
 ps              component lifecycle snapshots
 caps [space]    sanitized capability summary
 mem             bounded-memory accounts
+quiet           mute background component output
+verbose         restore background component output
 poweroff        power off
 ```
 

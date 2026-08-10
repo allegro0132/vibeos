@@ -50,6 +50,12 @@ sdk_dtb="$sdk_root/linux_5.10/build/cv1800b_milkv_duo_sd/arch/riscv/boot/dts/cvi
 sdk_output="$sdk_root/install/soc_cv1800b_milkv_duo_sd"
 sdk_fip="$sdk_output/fip.bin"
 genimage="$sdk_root/buildroot-2021.05/output/milkv-duo-sd_musl_riscv64/host/bin/genimage"
+if [[ ! -f "$genimage" ]]; then
+  # Buildroot's per-package directory mode keeps host tools under the package
+  # staging tree instead of merging them into output/host.
+  genimage="$sdk_root/buildroot-2021.05/output/milkv-duo-sd_musl_riscv64/per-package/host-genimage/host/bin/genimage"
+fi
+genimage_lib=$(cd -- "$(dirname -- "$genimage")/../lib" && pwd -P)
 
 published=false
 mkdir -p "$output_dir"
@@ -115,7 +121,7 @@ with open(path, "r+b") as data:
     data.write(seed)
 PY
 
-"$genimage" \
+LD_LIBRARY_PATH="$genimage_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$genimage" \
   --config "$script_dir/milkv-duo-genimage.cfg" \
   --rootpath "$pack_dir/root" \
   --tmppath "$pack_dir/tmp" \

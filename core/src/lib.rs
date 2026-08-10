@@ -19,6 +19,7 @@ pub mod interrupt;
 pub mod ipi;
 pub mod mmu;
 pub mod net;
+pub mod net_config;
 pub mod net_stack;
 pub mod program;
 pub mod random;

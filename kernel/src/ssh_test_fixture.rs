@@ -1,5 +1,5 @@
-//! Fixed identity and authorization material shared by the QEMU-only N3/N4
-//! acceptance images.
+//! Fixed identity and authorization material shared by the QEMU N3/N4 images
+//! and the explicitly insecure Milk-V hardware-acceptance image.
 //!
 //! This module is never compiled into a normal image. Its deterministic host
 //! seed exists only so acceptance can verify a stable OpenSSH fingerprint;

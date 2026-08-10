@@ -25,6 +25,11 @@ ssh-security-test = []
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
 ssh-test = ["dep:sunset"]
+# Explicitly insecure physical bring-up image. It reuses the fixed SSH test
+# identities and a deterministic acceptance-only random service so DWMAC,
+# DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
+# and provisioning path exists. Never enable this feature in a production image.
+milkv-ssh-acceptance = ["dep:sunset"]
 
 # The kernel is `no_std` and cannot link a host test harness. Its tests live in
 # `selftest.rs` and run inside QEMU; `cargo test --workspace` must skip it.

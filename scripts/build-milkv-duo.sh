@@ -6,20 +6,27 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 
 diagnostic=false
+ssh_acceptance=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
     --diagnostic) diagnostic=true ;;
-    -*) echo "usage: $0 [--diagnostic] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
+    --ssh-acceptance) ssh_acceptance=true ;;
+    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
     *)
       if [ -n "$sdk_arg" ]; then
-        echo "usage: $0 [--diagnostic] [duo-buildroot-sdk-root]" >&2
+        echo "usage: $0 [--diagnostic|--ssh-acceptance] [duo-buildroot-sdk-root]" >&2
         exit 2
       fi
       sdk_arg=$arg
       ;;
   esac
 done
+
+if [ "$diagnostic" = true ] && [ "$ssh_acceptance" = true ]; then
+  echo "build-milkv-duo.sh: --diagnostic and --ssh-acceptance are mutually exclusive" >&2
+  exit 2
+fi
 
 toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' \
   "$repo_root/rust-toolchain.toml")
@@ -72,6 +79,10 @@ if [ "$diagnostic" = true ]; then
   features=milkv-duo,legacy-shell
   output_dir="$repo_root/target/milkv-duo-diagnostic"
   output_elf="$output_dir/vibeos-milkv-duo-diagnostic.elf"
+elif [ "$ssh_acceptance" = true ]; then
+  features=milkv-duo,milkv-ssh-acceptance
+  output_dir="$repo_root/target/milkv-duo-ssh-acceptance"
+  output_elf="$output_dir/vibeos-milkv-duo-ssh-acceptance.elf"
 fi
 
 (

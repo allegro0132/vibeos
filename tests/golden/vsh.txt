@@ -5,6 +5,14 @@ vibe> echo hello | wc > @console
 1 1 6
 vibe> spin
   vsh job %2: Cancelled
+vibe> vsh if false; then echo hidden > @console; else echo branch > @console; fi
+branch
+vibe> vsh function greet who { echo "hello $who" > @console; }
+vibe> vsh greet VibeOS
+hello VibeOS
+vibe> vsh echo "sub=$(echo inner)" > @console
+sub=inner
+vibe> vsh while false; do echo hidden > @console; done
 vibe> echo history > @console
 history
 vibe> draft

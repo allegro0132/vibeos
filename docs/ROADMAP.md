@@ -40,11 +40,11 @@ the new execution plan starts after the M3 record.
 ## Capability-native shell track
 
 The post-v1 shell track borrows Bash's composition syntax without adopting its
-POSIX authority model. **S0 is complete:**
+POSIX authority model. **S0--S5 are complete:**
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md) freezes the surface grammar,
 capability/value separation, per-stage authority rules, atomic Job admission,
 closeable bounded-stream contract, cancellation order, resource limits, security
-invariants, and the S1--S4 acceptance gates. The portable `vsh` module now
+invariants, and the downstream acceptance gates. The portable `vsh` module now
 implements those gates; the legacy diagnostic commands remain available beside
 the capability-native command table only in explicit `legacy-shell` test
 builds. Normal images boot a separately supervised `vsh` CSpace/component.
@@ -56,6 +56,7 @@ builds. Normal images boot a separately supervised `vsh` CSpace/component.
 | S2 | ✅ | Volatile `INVOKE`, immutable manifests, closeable streams, and ephemeral persistent-cap proxies. |
 | S3 | ✅ | Atomic Job admission, dynamic stage CSpaces/tasks, background supervision, join/cancel, and fail-fast teardown. |
 | S4 | ✅ | Safe-Rust `echo`/`wc`, host negative acceptance, and QEMU `echo hello \| wc > @console` plus foreground Ctrl-C. |
+| S5 | ✅ | Bounded `if`/`while`, scoped value-only functions, command substitution, and immutable exact-manifest script artifacts. |
 
 ## 0. The one thing to fix first
 

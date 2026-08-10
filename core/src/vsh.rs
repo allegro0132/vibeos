@@ -1,17 +1,21 @@
-//! Capability-native shell parser, planner, streams, and first audited applets.
+//! Capability-native shell parser, planner, streams, audited applets, and
+//! bounded scripting.
 //!
 //! This module is intentionally portable: the kernel supplies the interactive
 //! line editor, while parsing and Job execution are exercised on the host.
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
@@ -19,8 +23,10 @@ use crate::exec::{self, TaskHandle, TaskState, WaitQueue};
 use crate::sync::SpinLock;
 
 pub const MAX_INPUT_BYTES: usize = 4 * 1024;
+pub const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 pub const MAX_TOKENS: usize = 256;
 pub const MAX_AST_NODES: usize = 512;
+pub const MAX_PARSER_NESTING: usize = 32;
 pub const MAX_PIPELINE_STAGES: usize = 16;
 pub const MAX_ARGS: usize = 128;
 pub const MAX_EXPANDED_BYTES: usize = 16 * 1024;
@@ -31,6 +37,11 @@ pub const STREAM_BUFFER_CHUNKS: usize = 8;
 pub const MAX_CAPTURED_OUTPUT: usize = 64 * 1024;
 pub const DEFAULT_STAGE_MEMORY: usize = 256 * 1024;
 pub const MAX_STAGE_MEMORY: usize = 2 * 1024 * 1024;
+pub const MAX_FUNCTIONS: usize = 64;
+pub const MAX_FUNCTION_CALL_DEPTH: usize = 32;
+pub const MAX_LOOP_ITERATIONS: usize = 256;
+pub const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 8;
+pub const MAX_SCRIPT_CALL_DEPTH: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -57,6 +68,10 @@ impl Diagnostic {
 pub enum WordPart {
     Literal(String),
     Value(String),
+    Command {
+        source: String,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,7 +134,29 @@ pub struct ListItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Script {
-    pub items: Vec<ListItem>,
+    pub statements: Vec<Statement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Statement {
+    Command(ListItem),
+    If {
+        condition: AndOrAst,
+        then_branch: Script,
+        else_branch: Option<Script>,
+        span: Span,
+    },
+    While {
+        condition: AndOrAst,
+        body: Script,
+        span: Span,
+    },
+    Function {
+        name: String,
+        params: Vec<String>,
+        body: Script,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +169,8 @@ enum Operator {
     In,
     Out,
     Err,
+    LeftBrace,
+    RightBrace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +193,7 @@ fn is_name_continue(b: u8) -> bool {
     is_name_start(b) || b.is_ascii_digit() || b == b'-'
 }
 fn is_delimiter(b: u8) -> bool {
-    b.is_ascii_whitespace() || b"|&;<>".contains(&b)
+    b.is_ascii_whitespace() || b"|&;<>{}".contains(&b)
 }
 
 fn push_literal(parts: &mut Vec<WordPart>, text: &str) {
@@ -168,18 +207,38 @@ fn push_literal(parts: &mut Vec<WordPart>, text: &str) {
     }
 }
 
-fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
-    if source.len() > MAX_INPUT_BYTES {
+fn lex(source: &str, max_input_bytes: usize) -> Result<Vec<Token>, Diagnostic> {
+    if source.len() > max_input_bytes {
         return Err(Diagnostic::new(
-            MAX_INPUT_BYTES,
+            max_input_bytes,
             source.len(),
-            "input exceeds 4 KiB",
+            "source exceeds its byte limit",
         ));
     }
     let bytes = source.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if bytes[i] == b'\n' || bytes[i] == b'\r' {
+            let start = i;
+            if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            if !out.last().is_some_and(|token: &Token| {
+                matches!(
+                    token.kind,
+                    TokenKind::Op(Operator::Semi | Operator::Background)
+                )
+            }) {
+                out.push(Token {
+                    kind: TokenKind::Op(Operator::Semi),
+                    span: Span { start, end: i },
+                });
+            }
+            continue;
+        }
         if bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
@@ -194,6 +253,8 @@ fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
             b';' => (Some(Operator::Semi), 1),
             b'<' => (Some(Operator::In), 1),
             b'>' => (Some(Operator::Out), 1),
+            b'{' => (Some(Operator::LeftBrace), 1),
+            b'}' => (Some(Operator::RightBrace), 1),
             _ => (None, 0),
         };
         if let Some(op) = op {
@@ -276,6 +337,19 @@ fn lex_word(source: &str, i: &mut usize) -> Result<Word, Diagnostic> {
             literal.clear();
             let value_start = *i;
             *i += 1;
+            if bytes.get(*i) == Some(&b'(') {
+                *i += 1;
+                let command_start = *i;
+                let command_end = scan_command_substitution(source, i, value_start)?;
+                parts.push(WordPart::Command {
+                    source: source[command_start..command_end].to_string(),
+                    span: Span {
+                        start: value_start,
+                        end: *i,
+                    },
+                });
+                continue;
+            }
             let braced = bytes.get(*i) == Some(&b'{');
             if braced {
                 *i += 1;
@@ -318,20 +392,94 @@ fn lex_word(source: &str, i: &mut usize) -> Result<Word, Diagnostic> {
     })
 }
 
+fn scan_command_substitution(
+    source: &str,
+    at: &mut usize,
+    substitution_start: usize,
+) -> Result<usize, Diagnostic> {
+    let bytes = source.as_bytes();
+    let mut depth = 1usize;
+    let mut quote = 0u8;
+    while *at < bytes.len() {
+        let b = bytes[*at];
+        if b == b'\\' && quote != b'\'' {
+            *at += 1;
+            if *at >= bytes.len() {
+                return Err(Diagnostic::new(
+                    substitution_start,
+                    *at,
+                    "unterminated command substitution",
+                ));
+            }
+            *at += 1;
+            continue;
+        }
+        if quote == 0 && (b == b'\'' || b == b'"') {
+            quote = b;
+            *at += 1;
+            continue;
+        }
+        if quote != 0 && b == quote {
+            quote = 0;
+            *at += 1;
+            continue;
+        }
+        if quote == 0 && b == b'$' && bytes.get(*at + 1) == Some(&b'(') {
+            depth += 1;
+            *at += 2;
+            continue;
+        }
+        if quote == 0 && b == b')' {
+            depth -= 1;
+            let end = *at;
+            *at += 1;
+            if depth == 0 {
+                return Ok(end);
+            }
+            continue;
+        }
+        *at += 1;
+    }
+    Err(Diagnostic::new(
+        substitution_start,
+        *at,
+        "unterminated command substitution",
+    ))
+}
+
 pub fn parse(source: &str) -> Result<Script, Diagnostic> {
-    let tokens = lex(source)?;
-    Parser {
+    parse_with_limit(source, MAX_INPUT_BYTES)
+}
+
+pub fn parse_script(source: &str) -> Result<Script, Diagnostic> {
+    parse_with_limit(source, MAX_SCRIPT_BYTES)
+}
+
+fn parse_with_limit(source: &str, max_input_bytes: usize) -> Result<Script, Diagnostic> {
+    let tokens = lex(source, max_input_bytes)?;
+    let mut parser = Parser {
         tokens,
         at: 0,
         nodes: 0,
+        nesting: 0,
+    };
+    let script = parser.block(&[], false)?;
+    if parser.at != parser.tokens.len() {
+        let span = parser.tokens[parser.at].span;
+        return Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "unexpected closing syntax",
+        ));
     }
-    .script()
+    Ok(script)
 }
 
 struct Parser {
     tokens: Vec<Token>,
     at: usize,
     nodes: usize,
+    nesting: usize,
 }
 impl Parser {
     fn bump_node(&mut self, span: Span) -> Result<(), Diagnostic> {
@@ -356,25 +504,242 @@ impl Parser {
         self.at += 1;
         Some(t)
     }
-    fn script(mut self) -> Result<Script, Diagnostic> {
-        let mut items = Vec::new();
-        while self.at < self.tokens.len() {
-            let command = self.and_or()?;
-            let background = if self.peek_op(Operator::Background) {
-                self.at += 1;
-                true
-            } else if self.peek_op(Operator::Semi) {
-                self.at += 1;
-                false
-            } else {
-                false
-            };
-            items.push(ListItem {
-                command,
-                background,
-            });
+
+    fn peek_keyword(&self, keyword: &str) -> bool {
+        self.tokens.get(self.at).is_some_and(|token| match &token.kind {
+            TokenKind::Word(Word { parts, .. }) => {
+                matches!(parts.as_slice(), [WordPart::Literal(word)] if word == keyword)
+            }
+            _ => false,
+        })
+    }
+
+    fn take_keyword(&mut self, keyword: &str) -> Result<Token, Diagnostic> {
+        if self.peek_keyword(keyword) {
+            return Ok(self.take().unwrap());
         }
-        Ok(Script { items })
+        let span = self
+            .tokens
+            .get(self.at)
+            .map(|token| token.span)
+            .unwrap_or(Span { start: 0, end: 0 });
+        Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "expected scripting keyword",
+        ))
+    }
+
+    fn block(
+        &mut self,
+        stop_keywords: &[&str],
+        stop_at_right_brace: bool,
+    ) -> Result<Script, Diagnostic> {
+        let mut statements = Vec::new();
+        while self.at < self.tokens.len() {
+            while self.peek_op(Operator::Semi) {
+                self.at += 1;
+            }
+            if self.at >= self.tokens.len()
+                || stop_keywords.iter().any(|keyword| self.peek_keyword(keyword))
+                || (stop_at_right_brace && self.peek_op(Operator::RightBrace))
+            {
+                break;
+            }
+            if self.peek_op(Operator::RightBrace)
+                || ["then", "else", "fi", "do", "done"]
+                    .iter()
+                    .any(|keyword| self.peek_keyword(keyword))
+            {
+                let span = self.tokens[self.at].span;
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "unexpected closing keyword",
+                ));
+            }
+
+            let statement = if self.peek_keyword("if") {
+                self.if_statement()?
+            } else if self.peek_keyword("while") {
+                self.while_statement()?
+            } else if self.peek_keyword("function") {
+                self.function_statement()?
+            } else {
+                Statement::Command(self.command_statement()?)
+            };
+            let span = statement_span(&statement);
+            self.bump_node(span)?;
+            let background_separator =
+                matches!(&statement, Statement::Command(item) if item.background);
+            statements.push(statement);
+
+            if self.peek_op(Operator::Semi) {
+                self.at += 1;
+            } else if background_separator {
+                continue;
+            } else if self.at < self.tokens.len()
+                && !stop_keywords.iter().any(|keyword| self.peek_keyword(keyword))
+                && !(stop_at_right_brace && self.peek_op(Operator::RightBrace))
+            {
+                let span = self.tokens[self.at].span;
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "expected command separator",
+                ));
+            }
+        }
+        Ok(Script { statements })
+    }
+
+    fn command_statement(&mut self) -> Result<ListItem, Diagnostic> {
+        let command = self.and_or()?;
+        let background = if self.peek_op(Operator::Background) {
+            self.at += 1;
+            true
+        } else {
+            false
+        };
+        Ok(ListItem {
+            command,
+            background,
+        })
+    }
+
+    fn enter_nesting(&mut self, span: Span) -> Result<(), Diagnostic> {
+        self.nesting += 1;
+        if self.nesting > MAX_PARSER_NESTING {
+            self.nesting -= 1;
+            Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "parser nesting limit exceeded",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn if_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.take_keyword("if")?.span.start;
+        self.enter_nesting(Span { start, end: start + 2 })?;
+        let result = (|| {
+            let condition = self.and_or()?;
+            if !self.peek_op(Operator::Semi) {
+                return Err(Diagnostic::new(start, condition.first.span.end, "if condition must end with `;`"));
+            }
+            self.at += 1;
+            self.take_keyword("then")?;
+            if self.peek_op(Operator::Semi) {
+                self.at += 1;
+            }
+            let then_branch = self.block(&["else", "fi"], false)?;
+            let else_branch = if self.peek_keyword("else") {
+                self.at += 1;
+                if self.peek_op(Operator::Semi) {
+                    self.at += 1;
+                }
+                Some(self.block(&["fi"], false)?)
+            } else {
+                None
+            };
+            let end = self.take_keyword("fi")?.span.end;
+            Ok(Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                span: Span { start, end },
+            })
+        })();
+        self.nesting -= 1;
+        result
+    }
+
+    fn while_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.take_keyword("while")?.span.start;
+        self.enter_nesting(Span { start, end: start + 5 })?;
+        let result = (|| {
+            let condition = self.and_or()?;
+            if !self.peek_op(Operator::Semi) {
+                return Err(Diagnostic::new(start, condition.first.span.end, "while condition must end with `;`"));
+            }
+            self.at += 1;
+            self.take_keyword("do")?;
+            if self.peek_op(Operator::Semi) {
+                self.at += 1;
+            }
+            let body = self.block(&["done"], false)?;
+            let end = self.take_keyword("done")?.span.end;
+            Ok(Statement::While {
+                condition,
+                body,
+                span: Span { start, end },
+            })
+        })();
+        self.nesting -= 1;
+        result
+    }
+
+    fn function_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.take_keyword("function")?.span.start;
+        self.enter_nesting(Span { start, end: start + 8 })?;
+        let result = (|| {
+            let name_token = self.take().ok_or_else(|| {
+                Diagnostic::new(start, start + 8, "function requires a name")
+            })?;
+            let name = plain_word_name(&name_token).ok_or_else(|| {
+                Diagnostic::new(
+                    name_token.span.start,
+                    name_token.span.end,
+                    "function name must be a literal identifier",
+                )
+            })?;
+            let mut params = Vec::new();
+            while !self.peek_op(Operator::LeftBrace) {
+                let token = self.take().ok_or_else(|| {
+                    Diagnostic::new(start, name_token.span.end, "function requires `{` body")
+                })?;
+                let param = plain_word_name(&token).ok_or_else(|| {
+                    Diagnostic::new(
+                        token.span.start,
+                        token.span.end,
+                        "function parameter must be a literal identifier",
+                    )
+                })?;
+                if params.iter().any(|existing| existing == &param) {
+                    return Err(Diagnostic::new(
+                        token.span.start,
+                        token.span.end,
+                        "duplicate function parameter",
+                    ));
+                }
+                params.push(param);
+                if params.len() > MAX_ARGS {
+                    return Err(Diagnostic::new(
+                        token.span.start,
+                        token.span.end,
+                        "function parameter limit exceeded",
+                    ));
+                }
+            }
+            self.at += 1;
+            let body = self.block(&[], true)?;
+            let end = self
+                .take()
+                .filter(|token| token.kind == TokenKind::Op(Operator::RightBrace))
+                .ok_or_else(|| Diagnostic::new(start, name_token.span.end, "unterminated function body"))?
+                .span
+                .end;
+            Ok(Statement::Function {
+                name,
+                params,
+                body,
+                span: Span { start, end },
+            })
+        })();
+        self.nesting -= 1;
+        result
     }
     fn and_or(&mut self) -> Result<AndOrAst, Diagnostic> {
         let first = self.pipeline()?;
@@ -500,24 +865,23 @@ impl Parser {
     }
 }
 
-fn expand(word: &Word, values: &BTreeMap<String, String>) -> Result<String, Diagnostic> {
-    let mut out = String::new();
-    for part in &word.parts {
-        match part {
-            WordPart::Literal(s) => out.push_str(s),
-            WordPart::Value(name) => {
-                out.push_str(values.get(name).map(String::as_str).unwrap_or(""))
-            }
-        }
-        if out.len() > MAX_BINDING_BYTES {
-            return Err(Diagnostic::new(
-                word.span.start,
-                word.span.end,
-                "expanded word exceeds 4 KiB",
-            ));
-        }
+fn plain_word_name(token: &Token) -> Option<String> {
+    let TokenKind::Word(word) = &token.kind else {
+        return None;
+    };
+    let [WordPart::Literal(name)] = word.parts.as_slice() else {
+        return None;
+    };
+    valid_name(name).then(|| name.clone())
+}
+
+fn statement_span(statement: &Statement) -> Span {
+    match statement {
+        Statement::Command(item) => item.command.first.span,
+        Statement::If { span, .. }
+        | Statement::While { span, .. }
+        | Statement::Function { span, .. } => *span,
     }
-    Ok(out)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -569,6 +933,7 @@ pub struct CommandManifest {
 enum Applet {
     Echo,
     Wc,
+    True,
     False,
     Deny,
     Fault,
@@ -587,6 +952,90 @@ impl Resource for Command {
     fn describe(&self) -> String {
         format!("{} ABI {}", self.manifest.name, self.manifest.abi)
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptRequirement {
+    pub label: String,
+    pub resource_kind: String,
+    pub rights: Rights,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptManifest {
+    pub name: String,
+    pub abi: u16,
+    pub requirements: Vec<ScriptRequirement>,
+}
+
+pub struct ScriptArtifact {
+    source: String,
+    script: Script,
+    manifest: ScriptManifest,
+}
+
+impl ScriptArtifact {
+    pub fn new(source: &str, manifest: ScriptManifest) -> Result<Arc<Self>, Diagnostic> {
+        if manifest.abi != 1 || !valid_name(&manifest.name) {
+            return Err(Diagnostic::new(0, source.len(), "invalid script manifest"));
+        }
+        let script = parse_script(source)?;
+        let used = collect_script_requirements(&script)?;
+        let mut declared = BTreeMap::new();
+        for requirement in &manifest.requirements {
+            if !valid_name(&requirement.label)
+                || requirement.rights.contains(Rights::GRANT)
+                || requirement.rights.contains(Rights::REVOKE)
+                || requirement.rights.contains(Rights::INVOKE)
+                || declared
+                    .insert(
+                        requirement.label.clone(),
+                        (requirement.resource_kind.clone(), requirement.rights),
+                    )
+                    .is_some()
+            {
+                return Err(Diagnostic::new(
+                    0,
+                    source.len(),
+                    "invalid script authority requirement",
+                ));
+            }
+        }
+        if used != declared {
+            return Err(Diagnostic::new(
+                0,
+                source.len(),
+                "script authority manifest is not exact",
+            ));
+        }
+        Ok(Arc::new(Self {
+            source: source.to_string(),
+            script,
+            manifest,
+        }))
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub const fn manifest(&self) -> &ScriptManifest {
+        &self.manifest
+    }
+}
+
+impl Resource for ScriptArtifact {
+    fn kind(&self) -> &'static str {
+        "script-artifact"
+    }
+
+    fn describe(&self) -> String {
+        format!("{} script ABI {}", self.manifest.name, self.manifest.abi)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -820,6 +1269,12 @@ struct BackgroundJob {
     report: Arc<SpinLock<Option<JobReport>>>,
 }
 
+#[derive(Clone)]
+struct FunctionDef {
+    params: Vec<String>,
+    body: Script,
+}
+
 #[derive(Clone, Debug)]
 pub struct StageReport {
     pub task: exec::TaskId,
@@ -834,17 +1289,44 @@ pub struct JobReport {
     pub peak_pipe_depth: usize,
 }
 
+type VshFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct BlockOutcome {
+    reports: Vec<JobReport>,
+    status: Status,
+}
+
+impl BlockOutcome {
+    fn success() -> Self {
+        Self {
+            reports: Vec::new(),
+            status: Status::Success,
+        }
+    }
+
+    fn append(mut self, next: Self) -> Self {
+        self.reports.extend(next.reports);
+        self.status = next.status;
+        self
+    }
+}
+
 pub struct Session {
     cspace: Arc<SpinLock<CSpace>>,
     commands: BTreeMap<String, Cap>,
     capabilities: BTreeMap<String, Cap>,
     values: BTreeMap<String, String>,
+    functions: BTreeMap<String, FunctionDef>,
     console: Arc<OutputSink>,
     next_job: AtomicU64,
     revoke_next_job: Option<Cap>,
     cancel_next_job: bool,
     jobs: BTreeMap<u64, BackgroundJob>,
     external_cancel: Option<Arc<AtomicBool>>,
+    function_depth: usize,
+    substitution_depth: usize,
+    script_depth: usize,
+    active_script_caps: Option<BTreeSet<String>>,
 }
 
 impl Session {
@@ -865,15 +1347,21 @@ impl Session {
             commands: BTreeMap::new(),
             capabilities,
             values: BTreeMap::new(),
+            functions: BTreeMap::new(),
             console,
             next_job: AtomicU64::new(1),
             revoke_next_job: None,
             cancel_next_job: false,
             jobs: BTreeMap::new(),
             external_cancel: None,
+            function_depth: 0,
+            substitution_depth: 0,
+            script_depth: 0,
+            active_script_caps: None,
         };
         session.install("echo", Applet::Echo, 0, MAX_ARGS, StreamMode::Closed, true);
         session.install("wc", Applet::Wc, 0, 0, StreamMode::Required, false);
+        session.install("true", Applet::True, 0, 0, StreamMode::Closed, false);
         session.install("false", Applet::False, 0, 0, StreamMode::Closed, false);
         session.install("deny", Applet::Deny, 0, 0, StreamMode::Closed, false);
         session.install("fault", Applet::Fault, 0, 0, StreamMode::Closed, false);
@@ -969,6 +1457,31 @@ impl Session {
         self.capabilities.insert(name.to_string(), cap);
         Ok(cap)
     }
+
+    /// Supervisor-only installation of one immutable, already parsed script.
+    /// Shell text can hold only the resulting READ capability; it cannot
+    /// replace the source or authority manifest in place.
+    pub fn install_script(
+        &mut self,
+        label: &str,
+        source: &str,
+        manifest: ScriptManifest,
+    ) -> Result<Cap, Diagnostic> {
+        if !valid_name(label) || self.capabilities.len() >= 256 {
+            return Err(Diagnostic::new(
+                0,
+                label.len(),
+                "script binding rejected",
+            ));
+        }
+        let artifact = ScriptArtifact::new(source, manifest)?;
+        let cap = self.cspace.lock().mint(
+            artifact,
+            Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+        );
+        self.capabilities.insert(label.to_string(), cap);
+        Ok(cap)
+    }
     /// Replace a visible command with a non-delegable child. This is useful to
     /// prove that admission checks GRANT before executing any earlier stage.
     pub fn attenuate_command_for_test(&mut self, name: &str) -> bool {
@@ -1004,30 +1517,7 @@ impl Session {
 
     pub async fn execute(&mut self, source: &str) -> Result<Vec<JobReport>, Diagnostic> {
         let script = parse(source)?;
-        let mut reports = Vec::new();
-        for item in script.items {
-            if let Some(special) = self.special_form(&item, source).await? {
-                reports.extend(special);
-                continue;
-            }
-            if item.background && !item.command.rest.is_empty() {
-                return Err(Diagnostic::new(0, source.len(), "background conditional lists are not supported"));
-            }
-            let Some(mut report) = self.run_pipeline(&item.command.first, item.background).await? else { continue };
-            let mut status = report.status; reports.push(report);
-            for (condition, pipeline) in item.command.rest {
-                let run = match condition {
-                    Condition::And => status.succeeded(),
-                    Condition::Or => !status.succeeded(),
-                };
-                if run {
-                    report = self.run_pipeline(&pipeline, false).await?.unwrap();
-                    status = report.status;
-                    reports.push(report);
-                }
-            }
-        }
-        Ok(reports)
+        Ok(self.execute_block(&script, true).await?.reports)
     }
 
     pub async fn execute_cancellable(&mut self, source: &str, cancel: Arc<AtomicBool>) -> Result<Vec<JobReport>, Diagnostic> {
@@ -1037,41 +1527,451 @@ impl Session {
         result
     }
 
-    async fn special_form(&mut self, item: &ListItem, _source: &str) -> Result<Option<Vec<JobReport>>, Diagnostic> {
+    fn execute_block<'a>(
+        &'a mut self,
+        script: &'a Script,
+        allow_background: bool,
+    ) -> VshFuture<'a, Result<BlockOutcome, Diagnostic>> {
+        Box::pin(async move {
+            let mut outcome = BlockOutcome::success();
+            for statement in &script.statements {
+                let next = match statement {
+                    Statement::Command(item) => {
+                        if item.background && !allow_background {
+                            return Err(Diagnostic::new(
+                                item.command.first.span.start,
+                                item.command.first.span.end,
+                                "background job is not allowed in this scope",
+                            ));
+                        }
+                        if let Some(special) = self.special_form(item).await? {
+                            special
+                        } else {
+                            self.execute_and_or(&item.command, item.background).await?
+                        }
+                    }
+                    Statement::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        let mut condition_outcome = self.execute_and_or(condition, false).await?;
+                        let status = condition_outcome.status;
+                        suppress_control_condition_statuses(&mut condition_outcome.reports);
+                        if severe(status) {
+                            condition_outcome
+                        } else if status.succeeded() {
+                            condition_outcome.append(self.execute_block(then_branch, false).await?)
+                        } else if let Some(else_branch) = else_branch {
+                            condition_outcome.append(self.execute_block(else_branch, false).await?)
+                        } else {
+                            condition_outcome.status = Status::Success;
+                            condition_outcome
+                        }
+                    }
+                    Statement::While {
+                        condition, body, ..
+                    } => {
+                        let mut loop_outcome = BlockOutcome::success();
+                        let mut completed_iterations = 0usize;
+                        loop {
+                            if completed_iterations >= MAX_LOOP_ITERATIONS {
+                                loop_outcome.status = Status::BudgetExceeded;
+                                loop_outcome.reports.push(control_report(Status::BudgetExceeded));
+                                break;
+                            }
+                            let mut condition_outcome = self.execute_and_or(condition, false).await?;
+                            let condition_status = condition_outcome.status;
+                            suppress_control_condition_statuses(&mut condition_outcome.reports);
+                            loop_outcome.reports.extend(condition_outcome.reports);
+                            if severe(condition_status) {
+                                loop_outcome.status = condition_status;
+                                break;
+                            }
+                            if !condition_status.succeeded() {
+                                if completed_iterations == 0 {
+                                    loop_outcome.status = Status::Success;
+                                }
+                                break;
+                            }
+                            let body_outcome = self.execute_block(body, false).await?;
+                            loop_outcome.status = body_outcome.status;
+                            loop_outcome.reports.extend(body_outcome.reports);
+                            completed_iterations += 1;
+                            exec::yield_now().await;
+                            if severe(loop_outcome.status) {
+                                break;
+                            }
+                        }
+                        loop_outcome
+                    }
+                    Statement::Function {
+                        name,
+                        params,
+                        body,
+                        span,
+                    } => {
+                        if is_special_form(name) || self.commands.contains_key(name) {
+                            return Err(Diagnostic::new(
+                                span.start,
+                                span.end,
+                                "function cannot shadow a command or special form",
+                            ));
+                        }
+                        if !self.functions.contains_key(name)
+                            && self.functions.len() >= MAX_FUNCTIONS
+                        {
+                            return Err(Diagnostic::new(
+                                span.start,
+                                span.end,
+                                "function limit exceeded",
+                            ));
+                        }
+                        self.functions.insert(
+                            name.clone(),
+                            FunctionDef {
+                                params: params.clone(),
+                                body: body.clone(),
+                            },
+                        );
+                        BlockOutcome::success()
+                    }
+                };
+                outcome.reports.extend(next.reports);
+                outcome.status = next.status;
+            }
+            Ok(outcome)
+        })
+    }
+
+    async fn execute_and_or(
+        &mut self,
+        command: &AndOrAst,
+        background: bool,
+    ) -> Result<BlockOutcome, Diagnostic> {
+        if background && !command.rest.is_empty() {
+            return Err(Diagnostic::new(
+                command.first.span.start,
+                command.first.span.end,
+                "background conditional lists are not supported",
+            ));
+        }
+        let mut outcome = self.run_pipeline_or_function(&command.first, background).await?;
+        let mut status = outcome.status;
+        for (condition, pipeline) in &command.rest {
+            let run = match condition {
+                Condition::And => status.succeeded(),
+                Condition::Or => !status.succeeded(),
+            };
+            if run {
+                let next = self.run_pipeline_or_function(pipeline, false).await?;
+                status = next.status;
+                outcome = outcome.append(next);
+            }
+        }
+        outcome.status = status;
+        Ok(outcome)
+    }
+
+    async fn run_pipeline_or_function(
+        &mut self,
+        pipeline: &PipelineAst,
+        background: bool,
+    ) -> Result<BlockOutcome, Diagnostic> {
+        if pipeline.commands.len() == 1 {
+            if let Some(name) = literal_word(&pipeline.commands[0].name) {
+                if self.functions.contains_key(name) {
+                    if background {
+                        return Err(Diagnostic::new(
+                            pipeline.span.start,
+                            pipeline.span.end,
+                            "function call must be foreground",
+                        ));
+                    }
+                    return self.run_function(name, &pipeline.commands[0]).await;
+                }
+            }
+        } else if pipeline.commands.iter().any(|command| {
+            literal_word(&command.name).is_some_and(|name| self.functions.contains_key(name))
+        }) {
+            return Err(Diagnostic::new(
+                pipeline.span.start,
+                pipeline.span.end,
+                "functions cannot be pipeline stages",
+            ));
+        }
+        let report = self.run_pipeline(pipeline, background).await?.unwrap();
+        Ok(BlockOutcome {
+            status: report.status,
+            reports: vec![report],
+        })
+    }
+
+    fn run_function<'a>(
+        &'a mut self,
+        name: &'a str,
+        command: &'a CommandAst,
+    ) -> VshFuture<'a, Result<BlockOutcome, Diagnostic>> {
+        Box::pin(async move {
+            if self.function_depth >= MAX_FUNCTION_CALL_DEPTH {
+                return Ok(BlockOutcome {
+                    status: Status::BudgetExceeded,
+                    reports: vec![control_report(Status::BudgetExceeded)],
+                });
+            }
+            if !command.redirects.is_empty() {
+                return Err(Diagnostic::new(
+                    command.span.start,
+                    command.span.end,
+                    "function call redirection is not supported",
+                ));
+            }
+            let definition = self.functions.get(name).cloned().unwrap();
+            if command.args.len() != definition.params.len() {
+                return Err(Diagnostic::new(
+                    command.span.start,
+                    command.span.end,
+                    "function argument count mismatch",
+                ));
+            }
+            let mut arguments = Vec::new();
+            for argument in &command.args {
+                let Argument::Word(word) = argument else {
+                    let span = match argument {
+                        Argument::Capability { span, .. } => *span,
+                        _ => unreachable!(),
+                    };
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "function arguments are values, not capabilities",
+                    ));
+                };
+                arguments.push(self.expand_word(word).await?);
+            }
+
+            let saved_values = self.values.clone();
+            let saved_functions = self.functions.clone();
+            for (param, value) in definition.params.iter().zip(arguments) {
+                self.set_value(param, &value)?;
+            }
+            self.function_depth += 1;
+            let result = self.execute_block(&definition.body, false).await;
+            self.function_depth -= 1;
+            self.values = saved_values;
+            self.functions = saved_functions;
+            result
+        })
+    }
+
+    async fn special_form(&mut self, item: &ListItem) -> Result<Option<BlockOutcome>, Diagnostic> {
         if !item.command.rest.is_empty() || item.command.first.commands.len() != 1 { return Ok(None); }
         let command = &item.command.first.commands[0];
-        let name = expand(&command.name, &self.values)?;
-        if !matches!(name.as_str(), "let" | "jobs" | "wait" | "cancel") { return Ok(None); }
+        let Some(name) = literal_word(&command.name) else { return Ok(None); };
+        if !is_special_form(name) { return Ok(None); }
         if item.background { return Err(Diagnostic::new(command.span.start, command.span.end, "special form must be foreground")); }
         if !command.redirects.is_empty() { return Err(Diagnostic::new(command.span.start, command.span.end, "special form cannot redirect")); }
+        if name == "run-script" {
+            let [Argument::Capability { name: label, span }] = command.args.as_slice() else {
+                return Err(Diagnostic::new(command.span.start, command.span.end, "usage: run-script @SCRIPT"));
+            };
+            if self
+                .active_script_caps
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(label))
+            {
+                return Err(Diagnostic::new(span.start, span.end, "script capability is outside the authority manifest"));
+            }
+            let cap = self.capabilities.get(label).copied().ok_or_else(|| {
+                Diagnostic::new(span.start, span.end, "unknown script capability")
+            })?;
+            let artifact = self
+                .cspace
+                .lock()
+                .lookup_as::<ScriptArtifact>(cap, Rights::READ)
+                .map_err(|_| Diagnostic::new(span.start, span.end, "script capability is not readable"))?;
+            return Ok(Some(self.execute_artifact(artifact, *span).await?));
+        }
         let mut args = Vec::new();
-        for arg in &command.args { match arg { Argument::Word(word) => args.push(expand(word, &self.values)?), Argument::Capability { span, .. } => return Err(Diagnostic::new(span.start, span.end, "special form requires value arguments")) } }
-        match name.as_str() {
+        for arg in &command.args { match arg { Argument::Word(word) => args.push(self.expand_word(word).await?), Argument::Capability { span, .. } => return Err(Diagnostic::new(span.start, span.end, "special form requires value arguments")) } }
+        match name {
             "let" => {
                 if args.len() != 2 { return Err(Diagnostic::new(command.span.start, command.span.end, "usage: let NAME VALUE")); }
-                self.set_value(&args[0], &args[1])?; Ok(Some(Vec::new()))
+                self.set_value(&args[0], &args[1])?; Ok(Some(BlockOutcome::success()))
             }
             "jobs" => {
                 if !args.is_empty() { return Err(Diagnostic::new(command.span.start, command.span.end, "usage: jobs")); }
                 let mut output = String::new();
                 for (id, job) in &self.jobs { let state = if job.supervisor.try_exit().is_some() { "done" } else { "running" }; output.push_str(&format!("%{id} {state}\n")); }
-                Ok(Some(vec![JobReport { id: 0, status: Status::Success, stages: Vec::new(), output, peak_pipe_depth: 0 }]))
+                Ok(Some(BlockOutcome { status: Status::Success, reports: vec![JobReport { id: 0, status: Status::Success, stages: Vec::new(), output, peak_pipe_depth: 0 }] }))
             }
             "wait" => {
                 let id = parse_job_id(&args, command.span)?;
                 let job = self.jobs.remove(&id).ok_or_else(|| Diagnostic::new(command.span.start, command.span.end, "unknown job"))?;
                 let _ = job.supervisor.join().await;
                 let report = job.report.lock().take().ok_or_else(|| Diagnostic::new(command.span.start, command.span.end, "job report unavailable"))?;
-                Ok(Some(vec![report]))
+                Ok(Some(BlockOutcome { status: report.status, reports: vec![report] }))
             }
             "cancel" => {
                 let id = parse_job_id(&args, command.span)?;
                 let job = self.jobs.get(&id).ok_or_else(|| Diagnostic::new(command.span.start, command.span.end, "unknown job"))?;
                 job.control.fail(Status::Cancelled); for stage in &job.stages { let _ = stage.cancel(); }
-                Ok(Some(Vec::new()))
+                Ok(Some(BlockOutcome::success()))
             }
             _ => unreachable!(),
         }
+    }
+
+    fn execute_artifact<'a>(
+        &'a mut self,
+        artifact: Arc<ScriptArtifact>,
+        span: Span,
+    ) -> VshFuture<'a, Result<BlockOutcome, Diagnostic>> {
+        Box::pin(async move {
+            if self.script_depth >= MAX_SCRIPT_CALL_DEPTH {
+                return Ok(BlockOutcome {
+                    status: Status::BudgetExceeded,
+                    reports: vec![control_report(Status::BudgetExceeded)],
+                });
+            }
+            let mut allowed = BTreeSet::new();
+            for requirement in &artifact.manifest.requirements {
+                if self
+                    .active_script_caps
+                    .as_ref()
+                    .is_some_and(|parent| !parent.contains(&requirement.label))
+                {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "nested script authority exceeds caller manifest",
+                    ));
+                }
+                let cap = self
+                    .capabilities
+                    .get(&requirement.label)
+                    .copied()
+                    .ok_or_else(|| {
+                        Diagnostic::new(
+                            span.start,
+                            span.end,
+                            "script authority requirement is unavailable",
+                        )
+                    })?;
+                let object = self
+                    .cspace
+                    .lock()
+                    .lookup(cap, requirement.rights)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            span.start,
+                            span.end,
+                            "script authority requirement is denied",
+                        )
+                    })?;
+                if object.kind() != requirement.resource_kind {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "script authority requirement has wrong resource kind",
+                    ));
+                }
+                allowed.insert(requirement.label.clone());
+            }
+
+            let saved_values = core::mem::take(&mut self.values);
+            let saved_functions = core::mem::take(&mut self.functions);
+            let saved_allowed = self.active_script_caps.replace(allowed);
+            self.script_depth += 1;
+            let result = self.execute_block(&artifact.script, false).await;
+            self.script_depth -= 1;
+            self.values = saved_values;
+            self.functions = saved_functions;
+            self.active_script_caps = saved_allowed;
+            result
+        })
+    }
+
+    fn expand_word<'a>(
+        &'a mut self,
+        word: &'a Word,
+    ) -> VshFuture<'a, Result<String, Diagnostic>> {
+        Box::pin(async move {
+            let mut out = String::new();
+            for part in &word.parts {
+                match part {
+                    WordPart::Literal(value) => out.push_str(value),
+                    WordPart::Value(name) => {
+                        out.push_str(self.values.get(name).map(String::as_str).unwrap_or(""));
+                    }
+                    WordPart::Command { source, span } => {
+                        out.push_str(&self.command_substitution(source, *span).await?);
+                    }
+                }
+                if out.len() > MAX_BINDING_BYTES {
+                    return Err(Diagnostic::new(
+                        word.span.start,
+                        word.span.end,
+                        "expanded word exceeds 4 KiB",
+                    ));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn command_substitution<'a>(
+        &'a mut self,
+        source: &'a str,
+        span: Span,
+    ) -> VshFuture<'a, Result<String, Diagnostic>> {
+        Box::pin(async move {
+            if self.substitution_depth >= MAX_COMMAND_SUBSTITUTION_DEPTH {
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "command substitution nesting limit exceeded",
+                ));
+            }
+            let script = parse(source).map_err(|_| {
+                Diagnostic::new(span.start, span.end, "invalid command substitution")
+            })?;
+            let saved_values = self.values.clone();
+            let saved_functions = self.functions.clone();
+            self.substitution_depth += 1;
+            let result = self.execute_block(&script, false).await;
+            self.substitution_depth -= 1;
+            self.values = saved_values;
+            self.functions = saved_functions;
+            let outcome = result?;
+            if !outcome.status.succeeded() {
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "command substitution failed",
+                ));
+            }
+            let mut output = String::new();
+            for report in outcome.reports {
+                if output
+                    .len()
+                    .checked_add(report.output.len())
+                    .is_none_or(|bytes| bytes > MAX_CAPTURED_OUTPUT)
+                {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "command substitution output exceeds 64 KiB",
+                    ));
+                }
+                output.push_str(&report.output);
+            }
+            while output.ends_with('\n') {
+                output.pop();
+            }
+            Ok(output)
+        })
     }
 
     async fn run_pipeline(&mut self, ast: &PipelineAst, background: bool) -> Result<Option<JobReport>, Diagnostic> {
@@ -1093,7 +1993,7 @@ impl Session {
         }
         let mut stages = Vec::new();
         for (index, command_ast) in ast.commands.iter().enumerate() {
-            let command_name = expand(&command_ast.name, &self.values)?;
+            let command_name = self.expand_word(&command_ast.name).await?;
             let command_source = self.commands.get(&command_name).copied().ok_or_else(|| {
                 Diagnostic::new(
                     command_ast.name.span.start,
@@ -1126,7 +2026,7 @@ impl Session {
             for arg in &command_ast.args {
                 match arg {
                     Argument::Word(word) => {
-                        let value = expand(word, &self.values)?;
+                        let value = self.expand_word(word).await?;
                         expanded_bytes =
                             expanded_bytes.checked_add(value.len()).ok_or_else(|| {
                                 Diagnostic::new(
@@ -1207,6 +2107,17 @@ impl Session {
             let mut stderr = LocalIo::Sink(cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage)
                 .map_err(|_| Diagnostic::new(command_ast.span.start, command_ast.span.end, "default stderr cannot be delegated"))?);
             for redirect in &command_ast.redirects {
+                if self
+                    .active_script_caps
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&redirect.target))
+                {
+                    return Err(Diagnostic::new(
+                        redirect.span.start,
+                        redirect.span.end,
+                        "capability is outside the script authority manifest",
+                    ));
+                }
                 let source = self
                     .capabilities
                     .get(&redirect.target)
@@ -1335,7 +2246,7 @@ impl Session {
             job.fail(Status::Cancelled);
             for (handle, _, _) in &running { let _ = handle.cancel(); }
         }
-        if let Some(cancel) = self.external_cancel.take() {
+        if let Some(cancel) = self.external_cancel.clone() {
             let control = job.clone();
             let handles: Vec<_> = running.iter().map(|(handle, _, _)| handle.clone()).collect();
             exec::spawn("vsh-ctrl-c", async move {
@@ -1355,6 +2266,196 @@ impl Session {
         }
         Ok(Some(finish_job(id, running, admission, job, pipes, self.console.clone()).await))
     }
+}
+
+fn literal_word(word: &Word) -> Option<&str> {
+    let [WordPart::Literal(value)] = word.parts.as_slice() else {
+        return None;
+    };
+    Some(value)
+}
+
+fn is_special_form(name: &str) -> bool {
+    matches!(name, "let" | "jobs" | "wait" | "cancel" | "run-script")
+}
+
+fn control_report(status: Status) -> JobReport {
+    JobReport {
+        id: 0,
+        status,
+        stages: Vec::new(),
+        output: String::new(),
+        peak_pipe_depth: 0,
+    }
+}
+
+fn suppress_control_condition_statuses(reports: &mut [JobReport]) {
+    for report in reports {
+        if !severe(report.status) {
+            report.status = Status::Success;
+        }
+    }
+}
+
+fn collect_script_requirements(
+    script: &Script,
+) -> Result<BTreeMap<String, (String, Rights)>, Diagnostic> {
+    let mut requirements = BTreeMap::new();
+    collect_block_requirements(script, &mut requirements, 0)?;
+    Ok(requirements)
+}
+
+fn collect_block_requirements(
+    script: &Script,
+    requirements: &mut BTreeMap<String, (String, Rights)>,
+    substitution_depth: usize,
+) -> Result<(), Diagnostic> {
+    for statement in &script.statements {
+        match statement {
+            Statement::Command(item) => {
+                collect_and_or_requirements(
+                    &item.command,
+                    requirements,
+                    substitution_depth,
+                )?;
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_and_or_requirements(condition, requirements, substitution_depth)?;
+                collect_block_requirements(then_branch, requirements, substitution_depth)?;
+                if let Some(else_branch) = else_branch {
+                    collect_block_requirements(else_branch, requirements, substitution_depth)?;
+                }
+            }
+            Statement::While {
+                condition, body, ..
+            } => {
+                collect_and_or_requirements(condition, requirements, substitution_depth)?;
+                collect_block_requirements(body, requirements, substitution_depth)?;
+            }
+            Statement::Function { body, .. } => {
+                collect_block_requirements(body, requirements, substitution_depth)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_and_or_requirements(
+    command: &AndOrAst,
+    requirements: &mut BTreeMap<String, (String, Rights)>,
+    substitution_depth: usize,
+) -> Result<(), Diagnostic> {
+    collect_pipeline_requirements(&command.first, requirements, substitution_depth)?;
+    for (_, pipeline) in &command.rest {
+        collect_pipeline_requirements(pipeline, requirements, substitution_depth)?;
+    }
+    Ok(())
+}
+
+fn collect_pipeline_requirements(
+    pipeline: &PipelineAst,
+    requirements: &mut BTreeMap<String, (String, Rights)>,
+    substitution_depth: usize,
+) -> Result<(), Diagnostic> {
+    for command in &pipeline.commands {
+        collect_word_requirements(&command.name, requirements, substitution_depth)?;
+        let command_name = literal_word(&command.name);
+        for argument in &command.args {
+            match argument {
+                Argument::Word(word) => {
+                    collect_word_requirements(word, requirements, substitution_depth)?;
+                }
+                Argument::Capability { name, span } if command_name == Some("run-script") => {
+                    merge_script_requirement(
+                        requirements,
+                        name,
+                        "script-artifact",
+                        Rights::READ,
+                        *span,
+                    )?;
+                }
+                Argument::Capability { span, .. } => {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "script capability argument has no manifest contract",
+                    ));
+                }
+            }
+        }
+        for redirect in &command.redirects {
+            let (kind, rights) = match redirect.kind {
+                RedirectKind::Stdin => ("byte-stream", Rights::RECV),
+                RedirectKind::Stdout | RedirectKind::Stderr => {
+                    ("byte-sink", Rights::WRITE)
+                }
+            };
+            merge_script_requirement(
+                requirements,
+                &redirect.target,
+                kind,
+                rights,
+                redirect.span,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_word_requirements(
+    word: &Word,
+    requirements: &mut BTreeMap<String, (String, Rights)>,
+    substitution_depth: usize,
+) -> Result<(), Diagnostic> {
+    for part in &word.parts {
+        if let WordPart::Command { source, span } = part {
+            if substitution_depth >= MAX_COMMAND_SUBSTITUTION_DEPTH {
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "command substitution nesting limit exceeded",
+                ));
+            }
+            let nested = parse(source).map_err(|_| {
+                Diagnostic::new(span.start, span.end, "invalid command substitution")
+            })?;
+            collect_block_requirements(&nested, requirements, substitution_depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn merge_script_requirement(
+    requirements: &mut BTreeMap<String, (String, Rights)>,
+    label: &str,
+    resource_kind: &str,
+    rights: Rights,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    match requirements.get_mut(label) {
+        Some((kind, held)) if kind == resource_kind => {
+            *held = held.union(rights);
+        }
+        Some(_) => {
+            return Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "one script capability is used as incompatible resource kinds",
+            ));
+        }
+        None => {
+            requirements.insert(
+                label.to_string(),
+                (resource_kind.to_string(), rights),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_job_id(args: &[String], span: Span) -> Result<u64, Diagnostic> {
@@ -1457,6 +2558,7 @@ async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
             )
             .await
         }
+        Applet::True => Status::Success,
         Applet::False => Status::Returned(1),
         Applet::Deny => Status::Denied,
         Applet::Fault => Status::Faulted,

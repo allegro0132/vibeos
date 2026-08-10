@@ -106,6 +106,29 @@ check_boot_log() {
   fi
 }
 
+wait_for_log_count() {
+  pattern=$1
+  minimum=$2
+  label=$3
+  remaining=$SSH_COMMAND_TIMEOUT
+  while :; do
+    kill -0 "$QEMU_PID" 2>/dev/null \
+      || fail "QEMU exited while waiting for $label"
+    if grep -a -E -q "$SSH_FAILURE_LOG_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a component-fatal SSH error while waiting for $label"
+    fi
+    count=$(grep -a -E -c "$pattern" "$QEMU_LOG" || true)
+    if [ "$count" -ge "$minimum" ]; then
+      return
+    fi
+    if [ "$remaining" -eq 0 ]; then
+      fail "$label"
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+}
+
 start_qemu() {
   boot=$1
   QEMU_LOG="$TEST_TMP/qemu-$boot.log"
@@ -245,6 +268,12 @@ python3 -B scripts/openssh-test-key.py \
 start_qemu 1
 run_peer 1 functional "$KNOWN_HOSTS_ONE" "$HOST_KEY_ONE"
 
+wait_for_log_count 'ssh-test exec complete: status 0' 4 \
+  "boot 1 did not complete readiness true plus authorized echo/true and post-shell true commands"
+wait_for_log_count 'ssh-test exec complete: status 1' 1 \
+  "boot 1 did not publish the authorized false exit status"
+wait_for_log_count 'ssh-test shell complete: status 0' 1 \
+  "boot 1 did not publish the successful interactive shell completion"
 status_zero_count=$(grep -a -E -c 'ssh-test exec complete: status 0' "$QEMU_LOG" || true)
 status_one_count=$(grep -a -E -c 'ssh-test exec complete: status 1' "$QEMU_LOG" || true)
 shell_status_zero_count=$(grep -a -F -c 'ssh-test shell complete: status 0' "$QEMU_LOG" || true)
@@ -258,6 +287,8 @@ stop_qemu
 
 start_qemu 2
 run_peer 2 scan "$KNOWN_HOSTS_TWO" "$HOST_KEY_TWO"
+wait_for_log_count 'ssh-test exec complete: status 0' 1 \
+  "boot 2 did not complete its strict authenticated readiness command"
 status_zero_count=$(grep -a -E -c 'ssh-test exec complete: status 0' "$QEMU_LOG" || true)
 [ "$status_zero_count" -ge 1 ] \
   || fail "boot 2 did not complete its strict authenticated readiness command"

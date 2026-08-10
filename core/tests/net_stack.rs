@@ -316,6 +316,42 @@ impl TestClient {
     fn socket(&mut self) -> &mut tcp::Socket<'static> {
         self.sockets.get_mut(self.tcp_handle)
     }
+
+    fn reconnect(&mut self, local_port: u16) {
+        self.sockets
+            .get_mut::<tcp::Socket>(self.tcp_handle)
+            .connect(
+                self.interface.context(),
+                (
+                    IpAddress::v4(SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3]),
+                    SERVER_PORT,
+                ),
+                local_port,
+            )
+            .unwrap();
+    }
+
+    fn open_connection(&mut self, local_port: u16) -> SocketHandle {
+        let receive = tcp::SocketBuffer::new(vec![0; 4096]);
+        let transmit = tcp::SocketBuffer::new(vec![0; 4096]);
+        let handle = self.sockets.add(tcp::Socket::new(receive, transmit));
+        self.sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(
+                self.interface.context(),
+                (
+                    IpAddress::v4(SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3]),
+                    SERVER_PORT,
+                ),
+                local_port,
+            )
+            .unwrap();
+        handle
+    }
+
+    fn socket_by_handle(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {
+        self.sockets.get_mut(handle)
+    }
 }
 
 fn raw_tcp_pair() -> (StaticIpv4TcpStack, TestClient) {
@@ -537,6 +573,190 @@ fn raw_tcp_stream_fragments_both_directions_and_reports_backpressure_and_eof() {
     }
     assert!(saw_connection_end);
     assert_eq!(server.stream_status().state, TcpStreamState::Listening);
+}
+
+#[test]
+fn server_close_acknowledges_a_late_payload_and_fin_before_relisten() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let mut now_ms = connect_raw_pair(&mut server, &mut client);
+
+    // Exercise the close ordering observed with the physical OpenSSH peer:
+    // the server sends FIN first, then the client sends one final 60-byte SSH
+    // transport record together with its FIN.
+    assert_eq!(server.close(), Ok(TcpStreamState::Closing));
+    for _ in 0..1_000 {
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        now_ms += 1;
+        if client.socket().state() == tcp::State::CloseWait {
+            break;
+        }
+    }
+    assert_eq!(client.socket().state(), tcp::State::CloseWait);
+
+    let final_record = [0x5au8; 60];
+    assert_eq!(
+        client.socket().send_slice(&final_record).unwrap(),
+        final_record.len()
+    );
+    client.socket().close();
+
+    let mut received = Vec::new();
+    for _ in 0..1_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        let mut fragment = [0u8; 128];
+        match server.try_recv(&mut fragment).unwrap() {
+            TcpIoResult::Progress(length) => received.extend_from_slice(&fragment[..length]),
+            TcpIoResult::WouldBlock | TcpIoResult::Closed => {}
+        }
+        client.poll(now_ms);
+        now_ms += 1;
+        if client.socket().state() == tcp::State::Closed {
+            break;
+        }
+    }
+
+    assert_eq!(received, final_record);
+    assert_eq!(
+        client.socket().state(),
+        tcp::State::Closed,
+        "the delayed ACK for the final payload+FIN was lost"
+    );
+    assert_eq!(server.stream_status().state, TcpStreamState::Closing);
+    assert!(!server.is_listening(), "TIME-WAIT was reset into LISTEN early");
+
+    // Once the old tuple's close timer really expires, the reusable socket may
+    // become a passive listener again.
+    for _ in 0..11_000 {
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        now_ms += 1;
+        if server.is_listening() {
+            break;
+        }
+    }
+    assert_eq!(server.stream_status().state, TcpStreamState::Listening);
+}
+
+#[test]
+fn peer_first_close_rearms_quickly_and_accepts_a_second_connection() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let mut now_ms = connect_raw_pair(&mut server, &mut client);
+    let final_record = [0xa5u8; 60];
+
+    assert_eq!(
+        client.socket().send_slice(&final_record).unwrap(),
+        final_record.len()
+    );
+    client.socket().close();
+
+    let mut received = Vec::new();
+    for _ in 0..100 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        let mut fragment = [0u8; 128];
+        match server.try_recv(&mut fragment).unwrap() {
+            TcpIoResult::Progress(length) => received.extend_from_slice(&fragment[..length]),
+            TcpIoResult::WouldBlock | TcpIoResult::Closed => {}
+        }
+        client.poll(now_ms);
+        now_ms += 1;
+        if server.stream_status().state == TcpStreamState::PeerClosed
+            && received.len() == final_record.len()
+        {
+            break;
+        }
+    }
+    assert_eq!(received, final_record);
+    assert_eq!(server.stream_status().state, TcpStreamState::PeerClosed);
+
+    // This is the SSH server's intended passive-close path: CloseWait ->
+    // LastAck -> Closed -> Listen, with no server-side TIME-WAIT delay.
+    assert_eq!(server.close(), Ok(TcpStreamState::Closing));
+    let close_started = now_ms;
+    for _ in 0..100 {
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        now_ms += 1;
+        if server.is_listening() {
+            break;
+        }
+    }
+    assert!(server.is_listening());
+    assert!(
+        now_ms - close_started < 100,
+        "passive close took {} ms",
+        now_ms - close_started
+    );
+
+    // A real host opens the next SSH command on a fresh socket while the old
+    // active closer remains in TIME-WAIT. Reuse the test socket only after
+    // discarding that client-local state, then choose a new source port.
+    client.socket().abort();
+    client.reconnect(49_153);
+    for _ in 0..2_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        now_ms += 1;
+        if server.stream_status().state == TcpStreamState::Established
+            && client.socket().may_send()
+        {
+            break;
+        }
+    }
+    assert_eq!(server.stream_status().state, TcpStreamState::Established);
+    assert!(client.socket().may_send());
+}
+
+#[test]
+fn final_ack_and_queued_next_syn_keep_distinct_connection_edges() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let mut now_ms = connect_raw_pair(&mut server, &mut client);
+
+    client.socket().close();
+    for _ in 0..100 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        now_ms += 1;
+        if server.stream_status().state == TcpStreamState::PeerClosed {
+            break;
+        }
+    }
+    assert_eq!(server.stream_status().state, TcpStreamState::PeerClosed);
+    assert_eq!(server.close(), Ok(TcpStreamState::Closing));
+
+    // Queue the old tuple's final ACK and a fresh socket's SYN before giving
+    // the server another ingress turn.
+    server.poll_network(now_ms).unwrap();
+    client.poll(now_ms);
+    assert_eq!(client.socket().state(), tcp::State::TimeWait);
+    let second = client.open_connection(49_153);
+    client.poll(now_ms);
+
+    let ended = server.poll_network(now_ms).unwrap();
+    assert!(ended.connection_ended);
+    assert!(ended.more_work, "the queued next SYN was not retained");
+    assert_eq!(server.stream_status().state, TcpStreamState::Listening);
+    now_ms += 1;
+
+    for _ in 0..2_000 {
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        now_ms += 1;
+        if server.stream_status().state == TcpStreamState::Established
+            && client.socket_by_handle(second).may_send()
+        {
+            break;
+        }
+    }
+    assert_eq!(server.stream_status().state, TcpStreamState::Established);
+    assert!(client.socket_by_handle(second).may_send());
 }
 
 #[test]

@@ -699,6 +699,13 @@ impl StaticIpv4TcpStack {
                 | PollIngressSingleResult::SocketStateChanged => {
                     ingress_frames += 1;
                     echoed_bytes += service(self.sockets.get_mut::<tcp::Socket>(self.tcp_handle));
+                    // Preserve the boundary between two users of the single
+                    // passive socket. If this frame ended the old active
+                    // tuple, leave any already-queued SYN for the next poll;
+                    // the end-of-turn rearm below will install LISTEN first.
+                    if was_active && !self.connection_active() {
+                        break;
+                    }
                 }
             }
         }
@@ -744,7 +751,11 @@ impl StaticIpv4TcpStack {
 
     fn ensure_listening(&mut self) {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        if !socket.is_open() {
+        // `is_open()` is also false in TIME-WAIT. Re-listening there would
+        // reset smoltcp's delayed-ACK/close timer and can strand a peer whose
+        // final payload and FIN arrived together. Only CLOSED has finished
+        // the old tuple and is safe to reuse as the passive listener.
+        if socket.state() == tcp::State::Closed {
             socket
                 .listen(self.config.listen_port)
                 .expect("validated non-zero TCP port must remain listenable");

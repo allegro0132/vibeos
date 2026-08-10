@@ -290,8 +290,13 @@ gate. On a network that already supplies DHCP, do not run a second server.
 Then use the address printed by the board:
 
 ```sh
-./scripts/milkv-ssh-test.sh A.B.C.D
+SSH_BIND_ADDRESS=169.254.184.74 \
+  ./scripts/milkv-ssh-test.sh 169.254.184.75
 ```
+
+`SSH_BIND_ADDRESS` prevents a multi-homed host from selecting an unrelated
+source address for this direct link. Leave it unset on an ordinary LAN where
+the host route already selects the intended interface address.
 
 The script generates mode-0600 accepted and rejected fixture keys in a private
 temporary directory, pins the exact public test host fingerprint and algorithm

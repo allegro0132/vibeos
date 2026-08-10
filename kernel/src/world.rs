@@ -89,6 +89,8 @@ enum ComponentTemplate {
     Guest,
     VirtioBlk,
     VirtioNet,
+    #[cfg(feature = "tcp-echo")]
+    TcpEcho,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -101,6 +103,12 @@ enum ComponentGrants {
     VirtioNet {
         mmio: Cap,
         dma: Cap,
+        outbound: Cap,
+        inbound: Cap,
+        control: Cap,
+    },
+    #[cfg(feature = "tcp-echo")]
+    TcpEcho {
         outbound: Cap,
         inbound: Cap,
         control: Cap,
@@ -480,6 +488,42 @@ impl World {
             };
         }
 
+        #[cfg(feature = "tcp-echo")]
+        if template == ComponentTemplate::TcpEcho {
+            let policy = self
+                .net_policy
+                .as_ref()
+                .expect("network policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            return ComponentGrants::TcpEcho {
+                outbound: cap::grant(
+                    &policy,
+                    self.net_outbound_root
+                        .expect("network outbound endpoint root exists"),
+                    Rights::SEND,
+                    &mut target,
+                )
+                .expect("network policy retains the outbound grant root"),
+                inbound: cap::grant(
+                    &policy,
+                    self.net_inbound_root
+                        .expect("network inbound endpoint root exists"),
+                    Rights::RECV,
+                    &mut target,
+                )
+                .expect("network policy retains the inbound grant root"),
+                control: cap::grant(
+                    &policy,
+                    self.net_control_root
+                        .expect("network control root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("network policy retains the control grant root"),
+            };
+        }
+
         let init = self.spaces["init"].clone();
         let init = init.0.lock();
         let mut target = space.0.lock();
@@ -523,6 +567,10 @@ impl World {
             },
             ComponentTemplate::VirtioNet => {
                 unreachable!("network grants come from the private policy CSpace")
+            }
+            #[cfg(feature = "tcp-echo")]
+            ComponentTemplate::TcpEcho => {
+                unreachable!("TCP echo grants come from the private policy CSpace")
             }
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
                 cap::grant(
@@ -589,6 +637,18 @@ impl World {
                         inbound,
                         control,
                     ),
+                )
+            },
+            #[cfg(feature = "tcp-echo")]
+            ComponentGrants::TcpEcho {
+                outbound,
+                inbound,
+                control,
+            } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    crate::tcp_echo::task(space.get(), outbound, inbound, control),
                 )
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
@@ -994,6 +1054,8 @@ pub fn build() {
     let net_policy = net_resources
         .as_ref()
         .map(|_| Space::new("virtio-net-policy"));
+    #[cfg(feature = "tcp-echo")]
+    let tcp_echo_space = net_resources.as_ref().map(|_| Space::new("tcp-echo"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -1114,19 +1176,26 @@ pub fn build() {
             let inbound_root = policy.mint(inbound, Rights::ALL);
             let control_root = policy.mint(resources.control, Rights::ALL);
 
-            // init sees only typed, directional packet authority plus control;
-            // it cannot name either the transport window or stable DMA slab.
-            let init_outbound =
-                cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap();
-            let init_inbound =
-                cap::grant(&policy, inbound_root, Rights::RECV, &mut cs).unwrap();
-            let init_control = cap::grant(
-                &policy,
-                control_root,
-                Rights::READ.union(Rights::WRITE),
-                &mut cs,
-            )
-            .unwrap();
+            // Diagnostic images expose the directional raw-L2 API to init.
+            // The TCP acceptance image makes the protocol stack the sole
+            // client: init must not race ingress, inject frames, or fault the
+            // device underneath a future SSH boundary.
+            #[cfg(not(feature = "tcp-echo"))]
+            let (init_outbound, init_inbound, init_control) = (
+                Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
+                Some(cap::grant(&policy, inbound_root, Rights::RECV, &mut cs).unwrap()),
+                Some(
+                    cap::grant(
+                        &policy,
+                        control_root,
+                        Rights::READ.union(Rights::WRITE),
+                        &mut cs,
+                    )
+                    .unwrap(),
+                ),
+            );
+            #[cfg(feature = "tcp-echo")]
+            let (init_outbound, init_inbound, init_control) = (None, None, None);
 
             let mut target = driver_space.0.lock();
             let grants = (
@@ -1157,9 +1226,9 @@ pub fn build() {
             drop(target);
             drop(policy);
             (
-                Some(init_outbound),
-                Some(init_inbound),
-                Some(init_control),
+                init_outbound,
+                init_inbound,
+                init_control,
                 Some(mmio_root),
                 Some(dma_root),
                 Some(outbound_root),
@@ -1170,6 +1239,26 @@ pub fn build() {
         }
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
+    };
+    #[cfg(feature = "tcp-echo")]
+    let tcp_echo_grants = match (
+        net_policy.as_ref(),
+        tcp_echo_space.as_ref(),
+        net_outbound_root,
+        net_inbound_root,
+        net_control_root,
+    ) {
+        (Some(policy_space), Some(stack_space), Some(outbound), Some(inbound), Some(control)) => {
+            let policy = policy_space.0.lock();
+            let mut target = stack_space.0.lock();
+            Some((
+                cap::grant(&policy, outbound, Rights::SEND, &mut target).unwrap(),
+                cap::grant(&policy, inbound, Rights::RECV, &mut target).unwrap(),
+                cap::grant(&policy, control, Rights::READ, &mut target).unwrap(),
+            ))
+        }
+        (None, None, None, None, None) => None,
+        _ => unreachable!("TCP echo grants exist exactly when a network device exists"),
     };
     let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) =
         match (
@@ -1249,6 +1338,10 @@ pub fn build() {
     }
     if let Some(space) = net_policy.as_ref() {
         spaces.insert("virtio-net-policy", space.clone());
+    }
+    #[cfg(feature = "tcp-echo")]
+    if let Some(space) = tcp_echo_space.as_ref() {
+        spaces.insert("tcp-echo", space.clone());
     }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
@@ -1340,6 +1433,24 @@ pub fn build() {
                 SpaceRef::new(&space).get(),
                 mmio,
                 dma,
+                outbound,
+                inbound,
+                control,
+            ),
+        );
+    }
+
+    #[cfg(feature = "tcp-echo")]
+    if let (Some(space), Some((outbound, inbound, control))) =
+        (tcp_echo_space, tcp_echo_grants)
+    {
+        world.spawn_component_inner(
+            "tcp-echo",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::TcpEcho),
+            crate::tcp_echo::task(
+                SpaceRef::new(&space).get(),
                 outbound,
                 inbound,
                 control,

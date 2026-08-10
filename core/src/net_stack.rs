@@ -4,9 +4,12 @@
 //! [`crate::net`].  It deliberately exposes neither file descriptors nor an
 //! ambient NIC. A supervisor resolves two directional packet capabilities as
 //! operation-time [`Revocable`] tokens and hands them to
-//! [`StaticIpv4EchoStack`]. Calling
-//! [`StaticIpv4EchoStack::poll`] with a monotonic millisecond timestamp then
-//! advances ARP, IPv4, and one passive TCP connection by a bounded amount.
+//! [`StaticIpv4TcpStack`]. Calling [`StaticIpv4TcpStack::poll_network`] with a
+//! monotonic millisecond timestamp advances ARP, IPv4, and one passive TCP
+//! connection by a bounded amount. Application byte-stream work is explicit
+//! and separately bounded through [`StaticIpv4TcpStack::try_recv`] and
+//! [`StaticIpv4TcpStack::try_send`]. [`StaticIpv4EchoStack`] remains as the N1
+//! acceptance adapter over that byte-stream API.
 
 extern crate alloc;
 
@@ -36,7 +39,9 @@ pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 8;
 pub const MAX_EGRESS_PASSES_PER_POLL: usize = 8;
 /// Bound application work independently from packet parsing work.
 pub const MAX_ECHO_CHUNKS_PER_POLL: usize = 4;
-const ECHO_CHUNK_BYTES: usize = 1_024;
+/// At most this many application bytes are copied by one stream I/O call.
+pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 1_024;
+const ECHO_CHUNK_BYTES: usize = MAX_TCP_STREAM_BYTES_PER_CALL;
 const TCP_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Static policy for the first IPv4/TCP service.
@@ -365,20 +370,77 @@ impl phy::Device for PacketDevice {
     }
 }
 
+/// Coarse state of the one reusable passive TCP stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpStreamState {
+    /// No connection is active and the socket is accepting one peer.
+    Listening,
+    /// A TCP handshake is in progress.
+    Handshake,
+    /// Both halves of the byte stream are open.
+    Established,
+    /// The peer sent FIN; buffered receive bytes remain readable and the local
+    /// transmit half may still be writable.
+    PeerClosed,
+    /// A graceful local close is progressing through the TCP state machine.
+    Closing,
+    /// [`StaticIpv4TcpStack::reset`] discarded the current stream. The next
+    /// network poll rearms the listener after emitting any required reset.
+    Reset,
+    /// The socket is closed between a terminal transition and listener rearm.
+    Closed,
+}
+
+/// Result of one non-blocking, bounded byte-stream operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpIoResult {
+    /// Bytes were copied. Empty input or output slices yield `Progress(0)`.
+    Progress(usize),
+    /// The stream half is open, but its bounded buffer cannot currently make progress.
+    WouldBlock,
+    /// The requested stream half is closed or there is no active connection.
+    Closed,
+}
+
+/// Snapshot of bounded application-facing TCP queues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpStreamStatus {
+    pub state: TcpStreamState,
+    pub readable_bytes: usize,
+    pub queued_send_bytes: usize,
+    pub writable_bytes: usize,
+}
+
+/// Report from one bounded network-only protocol turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PollReport {
+pub struct TcpPollReport {
     pub ingress_frames: usize,
-    pub echoed_bytes: usize,
     pub connection_started: bool,
     pub connection_ended: bool,
+    /// More packet/timer work is immediately runnable. Application readability
+    /// and writability are reported separately by [`TcpStreamStatus`].
     pub more_work: bool,
     /// Advisory delay before the next timer-driven poll. Incoming packets should
     /// always trigger an earlier poll.
     pub next_poll_delay_ms: Option<u64>,
 }
 
-/// One static IPv4 interface and one reusable passive TCP echo socket.
-pub struct StaticIpv4EchoStack {
+struct NetworkPollWork {
+    ingress_frames: usize,
+    application_bytes: usize,
+    connection_started: bool,
+    connection_ended: bool,
+    more_network_work: bool,
+    next_poll_delay_ms: Option<u64>,
+}
+
+/// One static IPv4 interface and one reusable passive TCP byte stream.
+///
+/// The object is intentionally neither a socket table nor a file-descriptor
+/// namespace. It owns exactly one listener and accepts at most one connection.
+/// Network progress happens only in [`Self::poll_network`]; application calls
+/// copy at most [`MAX_TCP_STREAM_BYTES_PER_CALL`] bytes and never poll packets.
+pub struct StaticIpv4TcpStack {
     config: StaticIpv4Config,
     device: PacketDevice,
     interface: Interface,
@@ -386,9 +448,10 @@ pub struct StaticIpv4EchoStack {
     tcp_handle: SocketHandle,
     last_now_ms: u64,
     connection_active: bool,
+    reset_requested: bool,
 }
 
-impl StaticIpv4EchoStack {
+impl StaticIpv4TcpStack {
     pub fn new(
         config: StaticIpv4Config,
         stamp: PacketStamp,
@@ -436,6 +499,7 @@ impl StaticIpv4EchoStack {
             tcp_handle,
             last_now_ms: 0,
             connection_active: false,
+            reset_requested: false,
         })
     }
 
@@ -457,8 +521,105 @@ impl StaticIpv4EchoStack {
         self.sockets.get::<tcp::Socket>(self.tcp_handle).is_active()
     }
 
-    /// Advance ARP, IPv4, TCP, and the echo application by bounded work.
-    pub fn poll(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
+    /// Describe the application-visible stream without advancing the network.
+    pub fn stream_status(&self) -> TcpStreamStatus {
+        let socket = self.sockets.get::<tcp::Socket>(self.tcp_handle);
+        if self.reset_requested {
+            return TcpStreamStatus {
+                state: TcpStreamState::Reset,
+                readable_bytes: 0,
+                queued_send_bytes: 0,
+                writable_bytes: 0,
+            };
+        }
+
+        TcpStreamStatus {
+            state: stream_state(socket.state()),
+            readable_bytes: socket.recv_queue(),
+            queued_send_bytes: socket.send_queue(),
+            writable_bytes: if socket.may_send() {
+                socket.send_capacity().saturating_sub(socket.send_queue())
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Copy one bounded receive fragment without polling the network.
+    pub fn try_recv(&mut self, output: &mut [u8]) -> Result<TcpIoResult, StackError> {
+        self.device.revalidate_authority()?;
+        if self.reset_requested {
+            return Ok(TcpIoResult::Closed);
+        }
+        if output.is_empty() {
+            return Ok(TcpIoResult::Progress(0));
+        }
+
+        let length = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        match socket.recv_slice(&mut output[..length]) {
+            Ok(0) => Ok(TcpIoResult::WouldBlock),
+            Ok(received) => Ok(TcpIoResult::Progress(received)),
+            Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => Ok(TcpIoResult::Closed),
+        }
+    }
+
+    /// Copy one bounded transmit fragment without polling the network.
+    pub fn try_send(&mut self, input: &[u8]) -> Result<TcpIoResult, StackError> {
+        self.device.revalidate_authority()?;
+        if self.reset_requested {
+            return Ok(TcpIoResult::Closed);
+        }
+        if input.is_empty() {
+            return Ok(TcpIoResult::Progress(0));
+        }
+
+        let length = input.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        match socket.send_slice(&input[..length]) {
+            Ok(0) => Ok(TcpIoResult::WouldBlock),
+            Ok(sent) => Ok(TcpIoResult::Progress(sent)),
+            Err(tcp::SendError::InvalidState) => Ok(TcpIoResult::Closed),
+        }
+    }
+
+    /// Gracefully close the transmit half without polling the network.
+    pub fn close(&mut self) -> Result<TcpStreamState, StackError> {
+        self.device.revalidate_authority()?;
+        self.reset_requested = false;
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).close();
+        Ok(self.stream_status().state)
+    }
+
+    /// Abort the current connection and discard its application buffers.
+    ///
+    /// smoltcp emits the reset during the next network poll; until then the
+    /// synthetic [`TcpStreamState::Reset`] prevents stale buffered data from
+    /// being exposed through the application API.
+    pub fn reset(&mut self) -> Result<TcpStreamState, StackError> {
+        self.device.revalidate_authority()?;
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).abort();
+        self.reset_requested = true;
+        Ok(TcpStreamState::Reset)
+    }
+
+    /// Advance only ARP, IPv4, and TCP by a bounded amount.
+    pub fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, StackError> {
+        let work = self.poll_with_application(now_ms, |_| 0)?;
+        Ok(TcpPollReport {
+            ingress_frames: work.ingress_frames,
+            connection_started: work.connection_started,
+            connection_ended: work.connection_ended,
+            more_work: work.more_network_work,
+            next_poll_delay_ms: work.next_poll_delay_ms,
+        })
+    }
+
+    fn poll_with_application(
+        &mut self,
+        now_ms: u64,
+        mut service: impl FnMut(&mut tcp::Socket<'static>) -> usize,
+    ) -> Result<NetworkPollWork, StackError> {
         let now = checked_instant(self.last_now_ms, now_ms)?;
         self.device.revalidate_authority()?;
         self.last_now_ms = now_ms;
@@ -469,7 +630,11 @@ impl StaticIpv4EchoStack {
         let mut egress_budget_exhausted = true;
 
         self.interface.poll_maintenance(now);
-        self.ensure_listening();
+        // A locally requested abort must remain CLOSED for one dispatch pass so
+        // smoltcp can emit its RST before `listen()` clears the old tuple.
+        if !self.reset_requested {
+            self.ensure_listening();
+        }
 
         for _ in 0..MAX_INGRESS_FRAMES_PER_POLL {
             let ingress_result =
@@ -484,12 +649,12 @@ impl StaticIpv4EchoStack {
                 PollIngressSingleResult::PacketProcessed
                 | PollIngressSingleResult::SocketStateChanged => {
                     ingress_frames += 1;
-                    echoed_bytes += self.service_echo();
+                    echoed_bytes += service(self.sockets.get_mut::<tcp::Socket>(self.tcp_handle));
                 }
             }
         }
 
-        echoed_bytes += self.service_echo();
+        echoed_bytes += service(self.sockets.get_mut::<tcp::Socket>(self.tcp_handle));
         for _ in 0..MAX_EGRESS_PASSES_PER_POLL {
             let egress_result =
                 self.interface
@@ -505,11 +670,10 @@ impl StaticIpv4EchoStack {
 
         let active = self.connection_active();
         self.connection_active = active;
-        let more_work = ingress_budget_exhausted
+        let more_network_work = ingress_budget_exhausted
             || egress_budget_exhausted
-            || self.echo_has_immediate_work()
             || self.device.has_immediate_work()?;
-        let next_poll_delay_ms = if more_work {
+        let next_poll_delay_ms = if more_network_work {
             Some(0)
         } else {
             self.interface
@@ -517,19 +681,14 @@ impl StaticIpv4EchoStack {
                 .map(|delay| delay.total_millis())
         };
 
-        Ok(PollReport {
+        Ok(NetworkPollWork {
             ingress_frames,
-            echoed_bytes,
+            application_bytes: echoed_bytes,
             connection_started: !was_active && active,
             connection_ended: was_active && !active,
-            more_work,
+            more_network_work,
             next_poll_delay_ms,
         })
-    }
-
-    /// Kernel-facing spelling for one bounded state-machine turn.
-    pub fn step(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
-        self.poll(now_ms)
     }
 
     fn ensure_listening(&mut self) {
@@ -538,43 +697,128 @@ impl StaticIpv4EchoStack {
             socket
                 .listen(self.config.listen_port)
                 .expect("validated non-zero TCP port must remain listenable");
+            self.reset_requested = false;
         }
     }
+}
 
-    fn echo_has_immediate_work(&self) -> bool {
-        let socket = self.sockets.get::<tcp::Socket>(self.tcp_handle);
-        socket.can_recv()
-            && socket.can_send()
-            && socket.recv_queue() != 0
-            && socket.send_queue() < socket.send_capacity()
+fn stream_state(state: tcp::State) -> TcpStreamState {
+    match state {
+        tcp::State::Listen => TcpStreamState::Listening,
+        tcp::State::SynSent | tcp::State::SynReceived => TcpStreamState::Handshake,
+        tcp::State::Established => TcpStreamState::Established,
+        tcp::State::CloseWait => TcpStreamState::PeerClosed,
+        tcp::State::FinWait1
+        | tcp::State::FinWait2
+        | tcp::State::Closing
+        | tcp::State::LastAck
+        | tcp::State::TimeWait => TcpStreamState::Closing,
+        tcp::State::Closed => TcpStreamState::Closed,
+    }
+}
+
+fn echo_has_immediate_work(socket: &tcp::Socket<'_>) -> bool {
+    socket.can_recv()
+        && socket.can_send()
+        && socket.recv_queue() != 0
+        && socket.send_queue() < socket.send_capacity()
+}
+
+fn service_echo(socket: &mut tcp::Socket<'_>) -> usize {
+    let mut echoed = 0;
+    let mut scratch = [0u8; ECHO_CHUNK_BYTES];
+
+    for _ in 0..MAX_ECHO_CHUNKS_PER_POLL {
+        let free = socket.send_capacity().saturating_sub(socket.send_queue());
+        let available = socket.recv_queue();
+        let length = free.min(available).min(scratch.len());
+        if length == 0 || !socket.can_recv() || !socket.can_send() {
+            break;
+        }
+        let received = socket
+            .recv_slice(&mut scratch[..length])
+            .expect("can_recv guaranteed a readable TCP socket");
+        let sent = socket
+            .send_slice(&scratch[..received])
+            .expect("reserved transmit capacity guaranteed a writable TCP socket");
+        debug_assert_eq!(sent, received);
+        echoed += sent;
     }
 
-    fn service_echo(&mut self) -> usize {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        let mut echoed = 0;
-        let mut scratch = [0u8; ECHO_CHUNK_BYTES];
+    if !socket.may_recv() && socket.may_send() {
+        socket.close();
+    }
+    echoed
+}
 
-        for _ in 0..MAX_ECHO_CHUNKS_PER_POLL {
-            let free = socket.send_capacity().saturating_sub(socket.send_queue());
-            let available = socket.recv_queue();
-            let length = free.min(available).min(scratch.len());
-            if length == 0 || !socket.can_recv() || !socket.can_send() {
-                break;
-            }
-            let received = socket
-                .recv_slice(&mut scratch[..length])
-                .expect("can_recv guaranteed a readable TCP socket");
-            let sent = socket
-                .send_slice(&scratch[..received])
-                .expect("reserved transmit capacity guaranteed a writable TCP socket");
-            debug_assert_eq!(sent, received);
-            echoed += sent;
-        }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PollReport {
+    pub ingress_frames: usize,
+    pub echoed_bytes: usize,
+    pub connection_started: bool,
+    pub connection_ended: bool,
+    pub more_work: bool,
+    /// Advisory delay before the next timer-driven poll. Incoming packets should
+    /// always trigger an earlier poll.
+    pub next_poll_delay_ms: Option<u64>,
+}
 
-        if !socket.may_recv() && socket.may_send() {
-            socket.close();
-        }
-        echoed
+/// Compatibility echo service implemented over [`StaticIpv4TcpStack`].
+pub struct StaticIpv4EchoStack {
+    tcp: StaticIpv4TcpStack,
+}
+
+impl StaticIpv4EchoStack {
+    pub fn new(
+        config: StaticIpv4Config,
+        stamp: PacketStamp,
+        inbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: Revocable<Endpoint<StampedPacket>>,
+    ) -> Result<Self, StackError> {
+        Ok(Self {
+            tcp: StaticIpv4TcpStack::new(config, stamp, inbound, outbound)?,
+        })
+    }
+
+    pub const fn config(&self) -> StaticIpv4Config {
+        self.tcp.config()
+    }
+
+    pub fn device_stats(&self) -> PacketDeviceStats {
+        self.tcp.device_stats()
+    }
+
+    pub fn is_listening(&self) -> bool {
+        self.tcp.is_listening()
+    }
+
+    pub fn connection_active(&self) -> bool {
+        self.tcp.connection_active()
+    }
+
+    /// Advance ARP, IPv4, TCP, and the compatibility echo application.
+    pub fn poll(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
+        let work = self.tcp.poll_with_application(now_ms, service_echo)?;
+        let echo_ready =
+            echo_has_immediate_work(self.tcp.sockets.get::<tcp::Socket>(self.tcp.tcp_handle));
+        let more_work = work.more_network_work || echo_ready;
+        Ok(PollReport {
+            ingress_frames: work.ingress_frames,
+            echoed_bytes: work.application_bytes,
+            connection_started: work.connection_started,
+            connection_ended: work.connection_ended,
+            more_work,
+            next_poll_delay_ms: if more_work {
+                Some(0)
+            } else {
+                work.next_poll_delay_ms
+            },
+        })
+    }
+
+    /// Kernel-facing spelling for one bounded state-machine turn.
+    pub fn step(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
+        self.poll(now_ms)
     }
 }
 

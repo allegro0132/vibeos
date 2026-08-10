@@ -1,10 +1,11 @@
 use std::any::Any;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use vibeos_core::cap::{Resource, Rights};
 use vibeos_core::exec;
 use vibeos_core::vsh::{
-    self, ScriptManifest, ScriptRequirement, Session, Statement, Status,
+    self, ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement, Status,
 };
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -25,6 +26,32 @@ fn execute(
     });
     exec::run_until_idle(100_000);
     assert!(task.try_exit().is_some(), "vsh task did not terminate");
+    let session = session.lock().unwrap().take().unwrap();
+    let report = result.lock().unwrap().take().unwrap();
+    (session, report)
+}
+
+fn execute_ssh(
+    session: Session,
+    source: &'static str,
+) -> (Session, Result<Vec<vsh::JobReport>, vsh::Diagnostic>) {
+    let result = Arc::new(Mutex::new(None));
+    let result_task = result.clone();
+    let session = Arc::new(Mutex::new(Some(session)));
+    let session_task = session.clone();
+    let task = exec::spawn_tracked("vsh-ssh-test", async move {
+        let mut owned = session_task.lock().unwrap().take().unwrap();
+        let report = owned
+            .execute_ssh_cancellable(source, Arc::new(AtomicBool::new(false)))
+            .await;
+        *session_task.lock().unwrap() = Some(owned);
+        *result_task.lock().unwrap() = Some(report);
+    });
+    exec::run_until_idle(100_000);
+    assert!(
+        task.try_exit().is_some(),
+        "restricted vsh task did not terminate"
+    );
     let session = session.lock().unwrap().take().unwrap();
     let report = result.lock().unwrap().take().unwrap();
     (session, report)
@@ -367,5 +394,116 @@ fn s5_nested_script_cannot_launder_ambient_authority() {
     assert_eq!(
         result.unwrap_err().message,
         "nested script authority exceeds caller manifest"
+    );
+}
+
+#[test]
+fn ssh_exec_profile_installs_only_the_explicit_command_allowlist() {
+    let _serial = SERIAL.lock().unwrap();
+    let session = Session::with_profile(SessionProfile::SshExec);
+    let (session, reports) = execute_ssh(session, "echo restricted");
+    assert_eq!(reports.unwrap()[0].output, "restricted\n");
+
+    let (session, reports) = execute_ssh(session, "true");
+    assert_eq!(reports.unwrap()[0].status, Status::Success);
+    let (session, reports) = execute_ssh(session, "false");
+    assert_eq!(reports.unwrap()[0].status, Status::Returned(1));
+
+    for source in ["wc", "deny", "fault", "spin", "jobs", "let x y"] {
+        assert_eq!(
+            vsh::validate_ssh_exec(source).unwrap_err().message,
+            "command is outside the SSH exec profile"
+        );
+    }
+
+    // The profile is enforced by Session::execute too, so a trusted caller
+    // cannot accidentally bypass it by selecting the general entry point.
+    let (_session, result) = execute(session, "fault");
+    assert_eq!(
+        result.unwrap_err().message,
+        "command is outside the SSH exec profile"
+    );
+}
+
+#[test]
+fn ssh_exec_validation_rejects_every_non_simple_form() {
+    let rejected = [
+        ("", "SSH exec requires exactly one command"),
+        (
+            "echo one; echo two",
+            "SSH exec requires exactly one command",
+        ),
+        (
+            "echo one\necho two",
+            "SSH exec requires exactly one command",
+        ),
+        ("echo one | true", "SSH exec pipelines are not allowed"),
+        ("echo one &", "SSH exec background jobs are not allowed"),
+        (
+            "true && echo hidden",
+            "SSH exec conditional lists are not allowed",
+        ),
+        (
+            "false || echo hidden",
+            "SSH exec conditional lists are not allowed",
+        ),
+        (
+            "if true; then echo hidden; fi",
+            "SSH exec scripting syntax is not allowed",
+        ),
+        (
+            "while false; do true; done",
+            "SSH exec scripting syntax is not allowed",
+        ),
+        (
+            "function hidden { true; }",
+            "SSH exec scripting syntax is not allowed",
+        ),
+        ("echo $(true)", "SSH exec substitution is not allowed"),
+        ("echo $value", "SSH exec substitution is not allowed"),
+        ("$command", "SSH exec command name must be literal"),
+        ("echo hi > @console", "SSH exec redirection is not allowed"),
+        (
+            "echo @console",
+            "SSH exec capability arguments are not allowed",
+        ),
+        (
+            "true unexpected",
+            "command argument count rejected by SSH exec profile",
+        ),
+    ];
+    for (source, message) in rejected {
+        assert_eq!(vsh::validate_ssh_exec(source).unwrap_err().message, message);
+    }
+}
+
+#[test]
+fn ssh_exec_literal_input_is_bounded_and_remains_literal() {
+    let _serial = SERIAL.lock().unwrap();
+    let session = Session::with_profile(SessionProfile::SshExec);
+    let (_session, reports) = execute_ssh(session, "echo '$x $(false) | ; >'");
+    assert_eq!(reports.unwrap()[0].output, "$x $(false) | ; >\n");
+
+    let at_limit = format!(
+        "echo {}",
+        "a".repeat(vsh::SSH_EXEC_MAX_INPUT_BYTES - "echo ".len())
+    );
+    assert_eq!(at_limit.len(), vsh::SSH_EXEC_MAX_INPUT_BYTES);
+    assert!(vsh::validate_ssh_exec(&at_limit).is_ok());
+
+    let over_limit = format!("{at_limit}a");
+    assert_eq!(
+        vsh::validate_ssh_exec(&over_limit).unwrap_err().message,
+        "source exceeds its byte limit"
+    );
+}
+
+#[test]
+fn ssh_exec_api_rejects_an_interactive_session() {
+    let _serial = SERIAL.lock().unwrap();
+    let (_session, result) = execute_ssh(Session::new(), "true");
+    assert_eq!(
+        result.unwrap_err().message,
+        "session does not use the SSH exec profile"
     );
 }

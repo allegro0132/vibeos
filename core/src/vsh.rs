@@ -42,6 +42,9 @@ pub const MAX_FUNCTION_CALL_DEPTH: usize = 32;
 pub const MAX_LOOP_ITERATIONS: usize = 256;
 pub const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 8;
 pub const MAX_SCRIPT_CALL_DEPTH: usize = 8;
+/// Maximum command-string size accepted by the deliberately small SSH `exec`
+/// profile. The general interactive shell retains [`MAX_INPUT_BYTES`].
+pub const SSH_EXEC_MAX_INPUT_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -453,6 +456,108 @@ pub fn parse(source: &str) -> Result<Script, Diagnostic> {
 
 pub fn parse_script(source: &str) -> Result<Script, Diagnostic> {
     parse_with_limit(source, MAX_SCRIPT_BYTES)
+}
+
+/// Validate the command language admitted by an SSH `exec` request.
+///
+/// This profile accepts one foreground invocation of `echo`, `true`, or
+/// `false`. Words may use quoting and escaping to produce literals, but no
+/// shell value/capability expansion or command substitution is performed.
+pub fn validate_ssh_exec(source: &str) -> Result<(), Diagnostic> {
+    let script = parse_with_limit(source, SSH_EXEC_MAX_INPUT_BYTES)?;
+    let item = match script.statements.as_slice() {
+        [Statement::Command(item)] => item,
+        [Statement::If { span, .. }
+        | Statement::While { span, .. }
+        | Statement::Function { span, .. }] => {
+            return Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "SSH exec scripting syntax is not allowed",
+            ));
+        }
+        _ => {
+            return Err(Diagnostic::new(
+                0,
+                source.len(),
+                "SSH exec requires exactly one command",
+            ));
+        }
+    };
+
+    if item.background {
+        return Err(Diagnostic::new(
+            item.command.first.span.start,
+            item.command.first.span.end,
+            "SSH exec background jobs are not allowed",
+        ));
+    }
+    if !item.command.rest.is_empty() {
+        return Err(Diagnostic::new(
+            item.command.first.span.start,
+            item.command.first.span.end,
+            "SSH exec conditional lists are not allowed",
+        ));
+    }
+    let [command] = item.command.first.commands.as_slice() else {
+        return Err(Diagnostic::new(
+            item.command.first.span.start,
+            item.command.first.span.end,
+            "SSH exec pipelines are not allowed",
+        ));
+    };
+    if !command.redirects.is_empty() {
+        return Err(Diagnostic::new(
+            command.span.start,
+            command.span.end,
+            "SSH exec redirection is not allowed",
+        ));
+    }
+    let Some(name) = literal_word(&command.name) else {
+        return Err(Diagnostic::new(
+            command.name.span.start,
+            command.name.span.end,
+            "SSH exec command name must be literal",
+        ));
+    };
+    if !matches!(name, "echo" | "true" | "false") {
+        return Err(Diagnostic::new(
+            command.name.span.start,
+            command.name.span.end,
+            "command is outside the SSH exec profile",
+        ));
+    }
+    for argument in &command.args {
+        match argument {
+            Argument::Word(word)
+                if word
+                    .parts
+                    .iter()
+                    .all(|part| matches!(part, WordPart::Literal(_))) => {}
+            Argument::Word(word) => {
+                return Err(Diagnostic::new(
+                    word.span.start,
+                    word.span.end,
+                    "SSH exec substitution is not allowed",
+                ));
+            }
+            Argument::Capability { span, .. } => {
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "SSH exec capability arguments are not allowed",
+                ));
+            }
+        }
+    }
+    if matches!(name, "true" | "false") && !command.args.is_empty() {
+        return Err(Diagnostic::new(
+            command.span.start,
+            command.span.end,
+            "command argument count rejected by SSH exec profile",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_with_limit(source: &str, max_input_bytes: usize) -> Result<Script, Diagnostic> {
@@ -1327,14 +1432,37 @@ pub struct Session {
     substitution_depth: usize,
     script_depth: usize,
     active_script_caps: Option<BTreeSet<String>>,
+    profile: SessionProfile,
+}
+
+/// Commands and syntax made available when constructing a shell session.
+///
+/// `SshExec` is intentionally not an interactive shell with features removed
+/// after parsing. It starts with only three command capabilities and also
+/// validates every execution at the `Session` boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionProfile {
+    Interactive,
+    SshExec,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self::with_cspace(Arc::new(SpinLock::new(CSpace::new("vsh"))))
+        Self::with_profile(SessionProfile::Interactive)
+    }
+
+    pub fn with_profile(profile: SessionProfile) -> Self {
+        Self::with_cspace_profile(Arc::new(SpinLock::new(CSpace::new("vsh"))), profile)
     }
 
     pub fn with_cspace(cspace: Arc<SpinLock<CSpace>>) -> Self {
+        Self::with_cspace_profile(cspace, SessionProfile::Interactive)
+    }
+
+    /// Build a session with an explicit command/syntax profile. The SSH
+    /// component should pass its per-connection CSpace with `SshExec` rather
+    /// than deriving an interactive session and deleting names afterward.
+    pub fn with_cspace_profile(cspace: Arc<SpinLock<CSpace>>, profile: SessionProfile) -> Self {
         let console = OutputSink::new();
         let console_cap = cspace.lock().mint(
             console.clone(),
@@ -1358,14 +1486,17 @@ impl Session {
             substitution_depth: 0,
             script_depth: 0,
             active_script_caps: None,
+            profile,
         };
         session.install("echo", Applet::Echo, 0, MAX_ARGS, StreamMode::Closed, true);
-        session.install("wc", Applet::Wc, 0, 0, StreamMode::Required, false);
         session.install("true", Applet::True, 0, 0, StreamMode::Closed, false);
         session.install("false", Applet::False, 0, 0, StreamMode::Closed, false);
-        session.install("deny", Applet::Deny, 0, 0, StreamMode::Closed, false);
-        session.install("fault", Applet::Fault, 0, 0, StreamMode::Closed, false);
-        session.install("spin", Applet::Spin, 0, 0, StreamMode::Closed, false);
+        if profile == SessionProfile::Interactive {
+            session.install("wc", Applet::Wc, 0, 0, StreamMode::Required, false);
+            session.install("deny", Applet::Deny, 0, 0, StreamMode::Closed, false);
+            session.install("fault", Applet::Fault, 0, 0, StreamMode::Closed, false);
+            session.install("spin", Applet::Spin, 0, 0, StreamMode::Closed, false);
+        }
         session
     }
     fn install(
@@ -1409,7 +1540,21 @@ impl Session {
         max_args: usize,
         command: fn(&[String]) -> Result<String, Status>,
     ) {
-        self.install(name, Applet::Host(command), min_args, max_args, StreamMode::Closed, false);
+        // A restricted session's allowlist covers both the visible names and
+        // the audited applets behind them. In particular, trusted setup code
+        // must not be able to replace `echo` with a wider host callback while
+        // retaining an allowlisted spelling.
+        if self.profile == SessionProfile::SshExec {
+            return;
+        }
+        self.install(
+            name,
+            Applet::Host(command),
+            min_args,
+            max_args,
+            StreamMode::Closed,
+            false,
+        );
     }
     pub fn set_value(&mut self, name: &str, value: &str) -> Result<(), Diagnostic> {
         if !valid_name(name) {
@@ -1516,6 +1661,9 @@ impl Session {
     pub fn cancel_next_job_for_test(&mut self) { self.cancel_next_job = true; }
 
     pub async fn execute(&mut self, source: &str) -> Result<Vec<JobReport>, Diagnostic> {
+        if self.profile == SessionProfile::SshExec {
+            validate_ssh_exec(source)?;
+        }
         let script = parse(source)?;
         Ok(self.execute_block(&script, true).await?.reports)
     }
@@ -1525,6 +1673,26 @@ impl Session {
         let result = self.execute(source).await;
         self.external_cancel = None;
         result
+    }
+
+    /// Validate and execute exactly one foreground command from the SSH
+    /// profile. Execution deliberately continues through `execute_cancellable`
+    /// so disconnect and supervisor cancellation use the ordinary Job teardown
+    /// path.
+    pub async fn execute_ssh_cancellable(
+        &mut self,
+        source: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<JobReport>, Diagnostic> {
+        if self.profile != SessionProfile::SshExec {
+            return Err(Diagnostic::new(
+                0,
+                source.len(),
+                "session does not use the SSH exec profile",
+            ));
+        }
+        validate_ssh_exec(source)?;
+        self.execute_cancellable(source, cancel).await
     }
 
     fn execute_block<'a>(

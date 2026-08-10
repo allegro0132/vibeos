@@ -525,9 +525,11 @@ Deliberate, not overlooked:
   are absent from normal images and do not model delayed DMA completion or a
   late IRQ. The native DWMAC path has not passed this gate on Milk-V Duo
   hardware.
-- **SSH entropy and identity do not exist yet.** The next milestone is a
-  bounded, fail-closed random-source capability plus a unique per-device
-  Ed25519 identity behind a signer capability. The echo stack's fixed seed is
-  non-cryptographic, deterministic test keys are test-image-only, and the
-  CRC-protected object journal is not secure private-key storage or a rollback
-  anchor.
+- **The QEMU SSH security foundation is not production provisioning.** A
+  bounded, fail-closed virtio-rng capability now feeds a domain-separated,
+  zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator
+  blocks before reuse. An opaque Ed25519 signer and immutable binary-key policy
+  are exercised only by the explicit `ssh-security-test` image. Its fixed host
+  and client keys are visibly marked test fixtures. Unique per-device identity,
+  authenticated persistent policy updates, rollback resistance, and a validated
+  Milk-V Duo entropy source remain absent, so non-test SSH stays disabled there.

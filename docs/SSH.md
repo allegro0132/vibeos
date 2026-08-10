@@ -1,8 +1,8 @@
 # Capability-native SSH plan
 
 This document defines the staged path from VibeOS's raw Ethernet transport to a
-minimal SSH server.  It is an implementation plan, not a claim that SSH is
-already available.
+minimal SSH server. Completed transport/security-foundation gates are called
+out explicitly; no section claims the SSH wire protocol before N4 passes.
 
 ## Target
 
@@ -122,12 +122,36 @@ exhaustive cross-hart-interleaving, or physical-device claim.
 
 ### N3: entropy and identity
 
-VibeOS currently has no trusted entropy source. Before any SSH protocol image
-is treated as secure, this milestone must:
+The QEMU security foundation is now implemented:
 
-- Add a bounded, fallible `RandomSource` capability. QEMU uses virtio-rng and
-  fails closed if it cannot obtain trusted bytes. A deterministic provider is
-  permitted only in a separately identified test image.
+- A modern virtio-rng driver exposes only a bounded, fallible `RandomSource`
+  capability. Its fixed SYSTEM DMA slab never contains a client pointer;
+  short completions accumulate to an exact result, and malformed completion,
+  timeout, reset, cancellation, attach-fault, and restart paths either confirm
+  device reset before reuse or permanently quarantine the slab.
+- Portable consumers use a pinned RustCrypto ChaCha20 RNG with independent
+  non-zero stream domains, request/reseed ceilings, repeated-seed detection,
+  terminal fail-closed state, and zeroizing Drop. Raw fault recovery scrubs
+  complete tracked-arena blocks before they enter the allocator free list.
+- The host seed remains inside an opaque Ed25519 signer. Public-key READ and
+  fixed 32-byte exchange-hash INVOKE are separate capabilities. Authorized
+  client keys are exact validated 32-byte values mapped through an immutable,
+  bounded capability-profile table.
+- The `ssh-security-test` feature is QEMU-only and visibly embeds fixed host and
+  client fixtures. Its component receives only random READ, signer READ or
+  signer INVOKE through separate handles, and policy READ. The two-boot gate is:
+
+```sh
+./scripts/qemu-ssh-security-test.sh
+```
+
+The gate requires a stable test host key and a different signed virtio-rng
+transport-sample marker on each boot. This is wiring/freshness evidence, not a
+statistical proof of entropy quality or a secure deployment.
+
+Before any production SSH image is treated as secure, the remaining platform
+provisioning work is:
+
 - Use a documented and validated Milk-V Duo hardware source or leave SSH
   disabled on that platform. Compiling a vendor RNG API or driver is not
   hardware validation.

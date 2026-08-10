@@ -24,6 +24,8 @@ use crate::store;
 use crate::sync::SpinLock;
 use crate::virtio_blk;
 use crate::virtio_net;
+#[cfg(feature = "qemu-virt")]
+use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
@@ -89,6 +91,10 @@ enum ComponentTemplate {
     Guest,
     VirtioBlk,
     VirtioNet,
+    #[cfg(feature = "qemu-virt")]
+    VirtioRng,
+    #[cfg(feature = "ssh-security-test")]
+    SshSecurityTest,
     #[cfg(feature = "tcp-echo")]
     TcpEcho,
     StoreFaultProbe,
@@ -113,6 +119,19 @@ enum ComponentGrants {
         outbound: Cap,
         inbound: Cap,
         control: Cap,
+    },
+    #[cfg(feature = "qemu-virt")]
+    VirtioRng {
+        mmio: Cap,
+        dma: Cap,
+        source: Cap,
+    },
+    #[cfg(feature = "ssh-security-test")]
+    SshSecurityTest {
+        random: Cap,
+        signer_read: Cap,
+        signer_invoke: Cap,
+        policy: Cap,
     },
     #[cfg(feature = "tcp-echo")]
     TcpEcho {
@@ -351,6 +370,20 @@ pub struct World {
     net_outbound_root: Option<Cap>,
     net_inbound_root: Option<Cap>,
     net_control_root: Option<Cap>,
+    #[cfg(feature = "qemu-virt")]
+    rng_policy: Option<Arc<Space>>,
+    #[cfg(feature = "qemu-virt")]
+    rng_mmio: Option<Cap>,
+    #[cfg(feature = "qemu-virt")]
+    rng_dma: Option<Cap>,
+    #[cfg(feature = "qemu-virt")]
+    rng_source_root: Option<Cap>,
+    #[cfg(feature = "ssh-security-test")]
+    ssh_security_policy: Option<Arc<Space>>,
+    #[cfg(feature = "ssh-security-test")]
+    ssh_signer_root: Option<Cap>,
+    #[cfg(feature = "ssh-security-test")]
+    ssh_authorized_policy_root: Option<Cap>,
 }
 
 impl World {
@@ -445,6 +478,92 @@ impl World {
     }
 
     fn grant_template(&self, template: ComponentTemplate, space: &Arc<Space>) -> ComponentGrants {
+        #[cfg(feature = "ssh-security-test")]
+        if template == ComponentTemplate::SshSecurityTest {
+            let mut target = space.0.lock();
+            let random = {
+                let policy = self
+                    .rng_policy
+                    .as_ref()
+                    .expect("entropy policy CSpace exists")
+                    .0
+                    .lock();
+                cap::grant(
+                    &policy,
+                    self.rng_source_root
+                        .expect("entropy source grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("entropy policy retains the source grant root")
+            };
+            let policy = self
+                .ssh_security_policy
+                .as_ref()
+                .expect("SSH security policy CSpace exists")
+                .0
+                .lock();
+            return ComponentGrants::SshSecurityTest {
+                random,
+                signer_read: cap::grant(
+                    &policy,
+                    self.ssh_signer_root.expect("SSH signer grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("SSH policy retains the signer grant root"),
+                signer_invoke: cap::grant(
+                    &policy,
+                    self.ssh_signer_root.expect("SSH signer grant root exists"),
+                    Rights::INVOKE,
+                    &mut target,
+                )
+                .expect("SSH policy retains the signer grant root"),
+                policy: cap::grant(
+                    &policy,
+                    self.ssh_authorized_policy_root
+                        .expect("SSH authorized-policy grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("SSH policy retains the authorized-key grant root"),
+            };
+        }
+
+        #[cfg(feature = "qemu-virt")]
+        if template == ComponentTemplate::VirtioRng {
+            let policy = self
+                .rng_policy
+                .as_ref()
+                .expect("entropy policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            return ComponentGrants::VirtioRng {
+                mmio: cap::grant(
+                    &policy,
+                    self.rng_mmio.expect("entropy MMIO root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("entropy policy retains the MMIO grant root"),
+                dma: cap::grant(
+                    &policy,
+                    self.rng_dma.expect("entropy DMA root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("entropy policy retains the DMA grant root"),
+                source: cap::grant(
+                    &policy,
+                    self.rng_source_root
+                        .expect("entropy source grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("entropy policy retains the source grant root"),
+            };
+        }
+
         if template == ComponentTemplate::VirtioNet {
             let policy = self
                 .net_policy
@@ -572,6 +691,14 @@ impl World {
             ComponentTemplate::VirtioNet => {
                 unreachable!("network grants come from the private policy CSpace")
             }
+            #[cfg(feature = "qemu-virt")]
+            ComponentTemplate::VirtioRng => {
+                unreachable!("entropy grants come from the private policy CSpace")
+            }
+            #[cfg(feature = "ssh-security-test")]
+            ComponentTemplate::SshSecurityTest => {
+                unreachable!("SSH security-test grants come from private policy CSpaces")
+            }
             #[cfg(feature = "tcp-echo")]
             ComponentTemplate::TcpEcho => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
@@ -634,6 +761,33 @@ impl World {
                     domain,
                     &component.name,
                     virtio_net::driver_task(space.get(), mmio, dma, outbound, inbound, control),
+                )
+            },
+            #[cfg(feature = "qemu-virt")]
+            ComponentGrants::VirtioRng { mmio, dma, source } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    virtio_rng::driver_task(space.get(), mmio, dma, source),
+                )
+            },
+            #[cfg(feature = "ssh-security-test")]
+            ComponentGrants::SshSecurityTest {
+                random,
+                signer_read,
+                signer_invoke,
+                policy,
+            } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    crate::ssh_security_test::task(
+                        space.get(),
+                        random,
+                        signer_read,
+                        signer_invoke,
+                        policy,
+                    ),
                 )
             },
             #[cfg(feature = "tcp-echo")]
@@ -1030,6 +1184,40 @@ pub fn start_net_supervisor() {
     });
 }
 
+/// Restart only faulted entropy-driver incarnations. A failed or unconfirmed
+/// device reset remains quarantined inside the driver and cannot be converted
+/// into synthetic output by the supervisor.
+#[cfg(feature = "qemu-virt")]
+pub fn start_rng_supervisor() {
+    let world = world();
+    let Some(component) = world.component_named("virtio-rng") else {
+        return;
+    };
+    exec::spawn("supervisor:virtio-rng", async move {
+        let mut attempts = 0u32;
+        loop {
+            let (generation, join) = component.join_current();
+            let exit = join.await;
+            match exit.state() {
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("virtio-rng").is_err() {
+                        return;
+                    }
+                }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => loop {
+                    if component.snapshot().generation > generation {
+                        break;
+                    }
+                    exec::sleep_ms(100).await;
+                },
+                exec::TaskState::Faulted | exec::TaskState::Running => return,
+            }
+        }
+    });
+}
+
 /// Restart only faulted TCP-stack incarnations. Stack generations are rebound
 /// by the fresh task before it consumes ingress, so cancellation remains an
 /// operator decision while an audited fault can safely recover service.
@@ -1091,6 +1279,22 @@ pub fn build() {
     let net_policy = net_resources
         .as_ref()
         .map(|_| Space::new("virtio-net-policy"));
+    #[cfg(feature = "qemu-virt")]
+    let rng_resources = virtio_rng::discover();
+    #[cfg(feature = "qemu-virt")]
+    let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
+    #[cfg(feature = "qemu-virt")]
+    let rng_policy = rng_resources
+        .as_ref()
+        .map(|_| Space::new("virtio-rng-policy"));
+    #[cfg(feature = "ssh-security-test")]
+    let ssh_security_test_space = rng_resources
+        .as_ref()
+        .map(|_| Space::new("ssh-security-test"));
+    #[cfg(feature = "ssh-security-test")]
+    let ssh_security_policy = rng_resources
+        .as_ref()
+        .map(|_| Space::new("ssh-security-policy"));
     #[cfg(feature = "tcp-echo")]
     let tcp_echo_space = net_resources.as_ref().map(|_| Space::new("tcp-echo"));
     let store_backend = block_resources
@@ -1273,6 +1477,81 @@ pub fn build() {
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
     };
+    #[cfg(feature = "qemu-virt")]
+    let (rng_mmio_root, rng_dma_root, rng_source_root, rng_grants) =
+        match (rng_resources, rng_space.as_ref(), rng_policy.as_ref()) {
+            (Some(resources), Some(driver_space), Some(policy_space)) => {
+                let mut policy = policy_space.0.lock();
+                let mmio_root = policy.mint(resources.mmio, Rights::ALL);
+                let dma_root = policy.mint(resources.dma, Rights::ALL);
+                let source_root = policy.mint(resources.source, Rights::ALL);
+                let mut target = driver_space.0.lock();
+                let grants = (
+                    cap::grant(
+                        &policy,
+                        mmio_root,
+                        Rights::READ.union(Rights::WRITE),
+                        &mut target,
+                    )
+                    .unwrap(),
+                    cap::grant(
+                        &policy,
+                        dma_root,
+                        Rights::READ.union(Rights::WRITE),
+                        &mut target,
+                    )
+                    .unwrap(),
+                    cap::grant(&policy, source_root, Rights::READ, &mut target).unwrap(),
+                );
+                drop(target);
+                drop(policy);
+                (
+                    Some(mmio_root),
+                    Some(dma_root),
+                    Some(source_root),
+                    Some(grants),
+                )
+            }
+            (None, None, None) => (None, None, None, None),
+            _ => unreachable!("entropy resources and CSpaces are constructed together"),
+        };
+    #[cfg(feature = "ssh-security-test")]
+    let (ssh_signer_root, ssh_authorized_policy_root, ssh_security_test_grants) = match (
+        ssh_security_test_space.as_ref(),
+        ssh_security_policy.as_ref(),
+        rng_policy.as_ref(),
+        rng_source_root,
+    ) {
+        (Some(test_space), Some(security_space), Some(entropy_space), Some(random_root)) => {
+            let resources = crate::ssh_security_test::provision();
+            let mut security = security_space.0.lock();
+            let signer_root = security.mint(resources.signer, Rights::ALL_VOLATILE);
+            let authorized_policy_root = security.mint(resources.policy, Rights::ALL);
+            let mut target = test_space.0.lock();
+            let random = cap::grant(
+                &entropy_space.0.lock(),
+                random_root,
+                Rights::READ,
+                &mut target,
+            )
+            .unwrap();
+            let signer_read =
+                cap::grant(&security, signer_root, Rights::READ, &mut target).unwrap();
+            let signer_invoke =
+                cap::grant(&security, signer_root, Rights::INVOKE, &mut target).unwrap();
+            let policy =
+                cap::grant(&security, authorized_policy_root, Rights::READ, &mut target).unwrap();
+            drop(target);
+            drop(security);
+            (
+                Some(signer_root),
+                Some(authorized_policy_root),
+                Some((random, signer_read, signer_invoke, policy)),
+            )
+        }
+        (None, None, None, None) => (None, None, None),
+        _ => unreachable!("SSH security test requires the complete entropy policy graph"),
+    };
     #[cfg(feature = "tcp-echo")]
     let tcp_echo_grants = match (
         net_policy.as_ref(),
@@ -1374,6 +1653,22 @@ pub fn build() {
     if let Some(space) = net_policy.as_ref() {
         spaces.insert("virtio-net-policy", space.clone());
     }
+    #[cfg(feature = "qemu-virt")]
+    if let Some(space) = rng_space.as_ref() {
+        spaces.insert("virtio-rng", space.clone());
+    }
+    #[cfg(feature = "qemu-virt")]
+    if let Some(space) = rng_policy.as_ref() {
+        spaces.insert("virtio-rng-policy", space.clone());
+    }
+    #[cfg(feature = "ssh-security-test")]
+    if let Some(space) = ssh_security_test_space.as_ref() {
+        spaces.insert("ssh-security-test", space.clone());
+    }
+    #[cfg(feature = "ssh-security-test")]
+    if let Some(space) = ssh_security_policy.as_ref() {
+        spaces.insert("ssh-security-policy", space.clone());
+    }
     #[cfg(feature = "tcp-echo")]
     if let Some(space) = tcp_echo_space.as_ref() {
         spaces.insert("tcp-echo", space.clone());
@@ -1420,6 +1715,20 @@ pub fn build() {
         net_outbound_root,
         net_inbound_root,
         net_control_root,
+        #[cfg(feature = "qemu-virt")]
+        rng_policy,
+        #[cfg(feature = "qemu-virt")]
+        rng_mmio: rng_mmio_root,
+        #[cfg(feature = "qemu-virt")]
+        rng_dma: rng_dma_root,
+        #[cfg(feature = "qemu-virt")]
+        rng_source_root,
+        #[cfg(feature = "ssh-security-test")]
+        ssh_security_policy,
+        #[cfg(feature = "ssh-security-test")]
+        ssh_signer_root,
+        #[cfg(feature = "ssh-security-test")]
+        ssh_authorized_policy_root,
     });
 
     // Components are *handed* their handles at spawn. That is their whole
@@ -1469,6 +1778,36 @@ pub fn build() {
                 outbound,
                 inbound,
                 control,
+            ),
+        );
+    }
+
+    #[cfg(feature = "qemu-virt")]
+    if let (Some(space), Some((mmio, dma, source))) = (rng_space, rng_grants) {
+        world.spawn_component_inner(
+            "virtio-rng",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::VirtioRng),
+            virtio_rng::driver_task(SpaceRef::new(&space).get(), mmio, dma, source),
+        );
+    }
+
+    #[cfg(feature = "ssh-security-test")]
+    if let (Some(space), Some((random, signer_read, signer_invoke, policy))) =
+        (ssh_security_test_space, ssh_security_test_grants)
+    {
+        world.spawn_component_inner(
+            "ssh-security-test",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::SshSecurityTest),
+            crate::ssh_security_test::task(
+                SpaceRef::new(&space).get(),
+                random,
+                signer_read,
+                signer_invoke,
+                policy,
             ),
         );
     }

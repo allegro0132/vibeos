@@ -815,6 +815,11 @@ impl Heap {
 
     /// Raw-reclaim every allocation belonging to a faulted incarnation.
     ///
+    /// Every complete size-class block is scrubbed before it enters a free
+    /// list. This is required because fault recovery deliberately skips Rust
+    /// `Drop`; a replacement component must never inherit secret or ordinary
+    /// payload bytes abandoned by the faulted incarnation.
+    ///
     /// # Safety
     /// The caller must have permanently quiesced every task in `arena`, raw
     /// deallocated their future envelopes, removed runtime registrations, and
@@ -840,10 +845,19 @@ impl Heap {
         let mut allocations = 0usize;
         let mut bytes = 0usize;
         while let Some(header_ptr) = node {
-            if allocations >= record.live_allocations {
+            let header_address = header_ptr.as_ptr() as usize;
+            let Some(last_header_start) = h.cursor.checked_sub(size_of::<AllocationHeader>())
+            else {
+                return Err(ArenaError::CorruptList);
+            };
+            if allocations >= record.live_allocations
+                || header_address < h.start
+                || header_address > last_header_start
+                || header_address % align_of::<AllocationHeader>() != 0
+            {
                 return Err(ArenaError::CorruptList);
             }
-            let header = unsafe { header_ptr.as_ref() };
+            let header = unsafe { &*header_ptr.as_ptr() };
             if header.magic != HEADER_MAGIC
                 || header.owner != record.owner
                 || header.arena != arena
@@ -852,8 +866,23 @@ impl Heap {
             {
                 return Err(ArenaError::CorruptList);
             }
+            let block_bytes = class_size(header.class);
+            let Some(block_end) = header.base.checked_add(block_bytes) else {
+                return Err(ArenaError::CorruptList);
+            };
+            let Some(header_end) = header_address.checked_add(size_of::<AllocationHeader>()) else {
+                return Err(ArenaError::CorruptList);
+            };
+            if header.base < h.start
+                || header.base % MIN_CLASS_SIZE != 0
+                || block_end > h.cursor
+                || header_address < header.base
+                || header_end > block_end
+            {
+                return Err(ArenaError::CorruptList);
+            }
             bytes = bytes
-                .checked_add(class_size(header.class))
+                .checked_add(block_bytes)
                 .ok_or(ArenaError::CorruptList)?;
             allocations += 1;
             previous = Some(header_ptr);
@@ -881,6 +910,7 @@ impl Heap {
             let base = header.base;
             let class = header.class;
             unsafe {
+                zero_block_before_reuse(base, class_size(class));
                 header_ptr.as_ptr().write(AllocationHeader {
                     magic: FREED_MAGIC,
                     ..header
@@ -938,6 +968,19 @@ impl Heap {
         }
         h.last_failures[hart] = Some(failure);
     }
+}
+
+/// Clear one allocator-owned block after all references into its arena have
+/// been quiesced and before the block becomes reusable.
+///
+/// Volatile stores plus a compiler fence keep this security boundary from
+/// being optimized away. Free-list metadata is written only after the scrub.
+unsafe fn zero_block_before_reuse(base: usize, bytes: usize) {
+    let pointer = base as *mut u8;
+    for offset in 0..bytes {
+        unsafe { ptr::write_volatile(pointer.add(offset), 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 fn find_owner(h: &HeapInner, owner: OwnerId) -> Option<usize> {

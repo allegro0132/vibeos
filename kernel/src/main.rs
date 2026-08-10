@@ -16,6 +16,8 @@
 
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
+#[cfg(all(feature = "ssh-security-test", not(feature = "qemu-virt")))]
+compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 
 extern crate alloc;
 
@@ -37,6 +39,10 @@ mod rustc;
 mod saved_program;
 mod selftest;
 mod shell;
+#[cfg(feature = "ssh-security-test")]
+mod ssh_security;
+#[cfg(feature = "ssh-security-test")]
+mod ssh_security_test;
 mod store;
 #[cfg(feature = "tcp-echo")]
 mod tcp_echo;
@@ -56,6 +62,8 @@ mod virtio_net;
 #[cfg(feature = "milkv-duo")]
 #[path = "dwmac_net.rs"]
 mod virtio_net;
+#[cfg(feature = "qemu-virt")]
+mod virtio_rng;
 mod world;
 
 use core::arch::global_asm;
@@ -286,6 +294,8 @@ pub extern "C" fn kmain() -> ! {
     let world = world::world();
     world::start_block_supervisor();
     world::start_net_supervisor();
+    #[cfg(feature = "qemu-virt")]
+    world::start_rng_supervisor();
     #[cfg(feature = "tcp-echo")]
     world::start_tcp_echo_supervisor();
     #[cfg(feature = "legacy-shell")]
@@ -475,6 +485,8 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         // visible to safe lifecycle callers.
         virtio_blk::recover_faulted_domain(domain);
         virtio_net::recover_faulted_domain(domain);
+        #[cfg(feature = "qemu-virt")]
+        virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
         code_pool::recover_faulted_domain(domain);
         HEAP.reclaim_faulted_arena(domain.arena)

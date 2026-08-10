@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chacha20 = { version = "=0.10.1", default-features = false, features = ["rng", "zeroize"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 smoltcp = { version = "=0.13.1", default-features = false, features = [
     "alloc",
     "medium-ethernet",
@@ -11,3 +13,5 @@ smoltcp = { version = "=0.13.1", default-features = false, features = [
     "socket-tcp",
     "socket-tcp-reno",
 ] }
+subtle = { version = "=2.6.1", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false }

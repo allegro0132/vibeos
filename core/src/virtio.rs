@@ -37,6 +37,7 @@ pub const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 pub const MMIO_VERSION_MODERN: u32 = 2;
 pub const DEVICE_ID_NETWORK: u32 = 1;
 pub const DEVICE_ID_BLOCK: u32 = 2;
+pub const DEVICE_ID_ENTROPY: u32 = 4;
 
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
 pub const STATUS_DRIVER: u32 = 2;
@@ -119,10 +120,21 @@ pub const NET_DRIVER_REJECTED_FEATURES: u64 = VIRTIO_NET_F_CSUM
     | VIRTIO_F_ACCESS_PLATFORM
     | VIRTIO_F_RING_PACKED;
 
+/// Virtio entropy devices define no device-specific feature bits.  This
+/// split-ring driver therefore acknowledges only the mandatory modern
+/// transport bit and leaves every optional ring/platform mode clear.
+pub const ENTROPY_DRIVER_FEATURES: u64 = VIRTIO_F_VERSION_1;
+pub const ENTROPY_DRIVER_REJECTED_FEATURES: u64 = VIRTIO_RING_F_INDIRECT_DESC
+    | VIRTIO_RING_F_EVENT_IDX
+    | VIRTIO_F_ACCESS_PLATFORM
+    | VIRTIO_F_RING_PACKED;
+
 pub const SPLIT_QUEUE_SIZE: u16 = 8;
 pub const NET_QUEUE_SIZE: u16 = SPLIT_QUEUE_SIZE;
 pub const NET_RECEIVE_QUEUE: u16 = 0;
 pub const NET_TRANSMIT_QUEUE: u16 = 1;
+pub const ENTROPY_QUEUE: u16 = 0;
+pub const ENTROPY_MAX_REQUEST: u32 = 256;
 pub const NET_HEADER_SIZE: u32 = 12;
 pub const NET_MAX_FRAME_SIZE: u32 = crate::net::MAX_PACKET_LEN as u32;
 pub const NET_RECEIVE_BUFFER_SIZE: u32 = NET_HEADER_SIZE + NET_MAX_FRAME_SIZE;
@@ -158,6 +170,7 @@ pub enum ProbeError {
     UnsupportedVersion { observed: u32 },
     NotBlockDevice { observed: u32 },
     NotNetworkDevice { observed: u32 },
+    NotEntropyDevice { observed: u32 },
 }
 
 /// Accept only the non-legacy block transport described by Virtio 1.2.
@@ -204,6 +217,31 @@ pub const fn probe_modern_net(identity: MmioIdentity) -> Result<(), ProbeError> 
     }
     if identity.device_id != DEVICE_ID_NETWORK {
         return Err(ProbeError::NotNetworkDevice {
+            observed: identity.device_id,
+        });
+    }
+    Ok(())
+}
+
+/// Accept only a non-legacy Virtio entropy transport (device ID 4).
+pub const fn probe_modern_entropy(identity: MmioIdentity) -> Result<(), ProbeError> {
+    if identity.magic != MMIO_MAGIC_VALUE {
+        return Err(ProbeError::BadMagic {
+            observed: identity.magic,
+        });
+    }
+    if identity.version == 1 {
+        return Err(ProbeError::LegacyTransport {
+            observed: identity.version,
+        });
+    }
+    if identity.version != MMIO_VERSION_MODERN {
+        return Err(ProbeError::UnsupportedVersion {
+            observed: identity.version,
+        });
+    }
+    if identity.device_id != DEVICE_ID_ENTROPY {
+        return Err(ProbeError::NotEntropyDevice {
             observed: identity.device_id,
         });
     }
@@ -341,6 +379,19 @@ pub const fn negotiate_net_features(offered: u64) -> Result<NegotiatedFeatures, 
     })
 }
 
+/// Negotiate the feature-minimal modern entropy profile.
+pub const fn negotiate_entropy_features(offered: u64) -> Result<NegotiatedFeatures, FeatureError> {
+    if offered & VIRTIO_F_VERSION_1 == 0 {
+        return Err(FeatureError::MissingVersion1);
+    }
+
+    Ok(NegotiatedFeatures {
+        offered,
+        accepted: offered & ENTROPY_DRIVER_FEATURES,
+        rejected: offered & ENTROPY_DRIVER_REJECTED_FEATURES,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitPhase {
     Reset,
@@ -433,6 +484,24 @@ impl ModernInit {
     pub fn select_net_features(&mut self, offered: u64) -> Result<NegotiatedFeatures, InitError> {
         self.require_phase(InitPhase::Driver)?;
         let features = match negotiate_net_features(offered) {
+            Ok(features) => features,
+            Err(FeatureError::MissingVersion1) => {
+                self.fail();
+                return Err(InitError::MissingVersion1);
+            }
+        };
+        self.features = Some(features);
+        self.phase = InitPhase::FeaturesSelected;
+        Ok(features)
+    }
+
+    /// Select the modern entropy profile instead of the block profile.
+    pub fn select_entropy_features(
+        &mut self,
+        offered: u64,
+    ) -> Result<NegotiatedFeatures, InitError> {
+        self.require_phase(InitPhase::Driver)?;
+        let features = match negotiate_entropy_features(offered) {
             Ok(features) => features,
             Err(FeatureError::MissingVersion1) => {
                 self.fail();

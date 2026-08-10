@@ -115,6 +115,7 @@ pub struct BlockInfo {
     pub session_epoch: u64,
     pub irq: u32,
     pub used_interrupts: u64,
+    pub last_error: Option<BlockError>,
 }
 
 pub struct MmioWindow;
@@ -157,6 +158,7 @@ impl BlockDevice {
             session_epoch: state.epoch,
             irq: IRQ,
             used_interrupts: 0,
+            last_error: state.last_error,
         }
     }
 }
@@ -284,6 +286,7 @@ struct HostState {
     epoch: u64,
     online: bool,
     quarantined: bool,
+    last_error: Option<BlockError>,
 }
 
 static HOST: SpinLock<HostState> = SpinLock::new_recoverable(HostState {
@@ -291,6 +294,7 @@ static HOST: SpinLock<HostState> = SpinLock::new_recoverable(HostState {
     epoch: 0,
     online: false,
     quarantined: false,
+    last_error: None,
 });
 static DRIVER_PARK: WaitQueue = WaitQueue::new();
 static IO_CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -327,10 +331,12 @@ pub async fn driver_task(space: &'static Space, mmio: Cap, dma: Cap, service: Ca
                 state.card = Some(card);
                 state.online = true;
                 state.quarantined = false;
+                state.last_error = None;
             }
-            Err(_) => {
+            Err(error) => {
                 state.card = None;
                 state.online = false;
+                state.last_error = Some(error);
             }
         }
     }
@@ -345,6 +351,7 @@ pub async fn driver_task(space: &'static Space, mmio: Cap, dma: Cap, service: Ca
 
 impl Card {
     fn initialize() -> Result<Self, BlockError> {
+        prepare_soc_hardware();
         reset_host()?;
         set_clock(INIT_CLOCK_HZ)?;
         write8(POWER_CONTROL, 0x0f);
@@ -477,6 +484,96 @@ impl Card {
         }
         Err(BlockError::TimedOut)
     }
+}
+
+const TOP_BASE: usize = crate::platform::SOC_CONTROL_BASE;
+const PINMUX_BASE: usize = TOP_BASE + 0x1000;
+const CLKGEN_BASE: usize = TOP_BASE + 0x2000;
+const TOP_SD_PWRSW_CTRL: usize = TOP_BASE + 0x1f4;
+const CLK_ENABLE_0: usize = CLKGEN_BASE;
+const CLK_BYPASS_0: usize = CLKGEN_BASE + 0x30;
+const CLK_DIV_SD0: usize = CLKGEN_BASE + 0x70;
+const SD0_CLOCKS: u32 = (1 << 18) | (1 << 19) | (1 << 20);
+
+fn prepare_soc_hardware() {
+    // Match the clock ownership that the pinned CV1800B clock driver marks
+    // critical: AXI4-SD0, SD0, and its 100 kHz reference. The vendor SD
+    // divider value selects FPLL/4 = 375 MHz as the SDHCI source clock.
+    soc_write32(CLK_ENABLE_0, soc_read32(CLK_ENABLE_0) | SD0_CLOCKS);
+    soc_write32(CLK_BYPASS_0, soc_read32(CLK_BYPASS_0) & !(1 << 6));
+    soc_write32(CLK_DIV_SD0, 0x0004_0009);
+
+    // A component restart must recover a card left in any U-Boot or failed
+    // command state. Perform the same recoverable 3.3 V power/pad sequence as
+    // the pinned CV1800B SDHCI drivers before issuing CMD0.
+    write8(POWER_CONTROL, 0);
+    soc_write32(
+        TOP_SD_PWRSW_CTRL,
+        (soc_read32(TOP_SD_PWRSW_CTRL) & !0xf) | 0xe,
+    );
+    set_sd_pad_function(3);
+    set_sd_pad_bias(false);
+    delay_ms(30);
+    soc_write32(
+        TOP_SD_PWRSW_CTRL,
+        (soc_read32(TOP_SD_PWRSW_CTRL) & !0xf) | 0x9,
+    );
+    set_sd_pad_function(0);
+    set_sd_pad_bias(true);
+    delay_ms(5);
+}
+
+fn set_sd_pad_function(data_function: u8) {
+    // CD and PWR_EN always retain their SDIO0 functions. CLK/CMD/DAT switch
+    // temporarily to GPIO while power is removed.
+    soc_write8(PINMUX_BASE + 0x18, 0);
+    soc_write8(PINMUX_BASE + 0x1c, 0);
+    for offset in [0x00, 0x04, 0x08, 0x0c, 0x10, 0x14] {
+        soc_write8(PINMUX_BASE + offset, data_function);
+    }
+}
+
+fn set_sd_pad_bias(online: bool) {
+    set_pad_pull(PINMUX_BASE + 0x900, true);
+    set_pad_pull(PINMUX_BASE + 0x904, false);
+    set_pad_pull(PINMUX_BASE + 0xa00, false);
+    for offset in [0xa04, 0xa08, 0xa0c, 0xa10, 0xa14] {
+        set_pad_pull(PINMUX_BASE + offset, online);
+    }
+}
+
+fn set_pad_pull(address: usize, pull_up: bool) {
+    let mut value = soc_read8(address) & !((1 << 2) | (1 << 3));
+    value |= if pull_up { 1 << 2 } else { 1 << 3 };
+    soc_write8(address, value);
+}
+
+fn delay_ms(milliseconds: u64) {
+    let ticks = milliseconds.saturating_mul(crate::platform::TIMEBASE_HZ) / 1_000;
+    let deadline = crate::sbi::time().saturating_add(ticks);
+    while crate::sbi::time() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn soc_read8(address: usize) -> u8 {
+    unsafe { (address as *const u8).read_volatile() }
+}
+
+#[inline]
+fn soc_write8(address: usize, value: u8) {
+    unsafe { (address as *mut u8).write_volatile(value) }
+}
+
+#[inline]
+fn soc_read32(address: usize) -> u32 {
+    unsafe { (address as *const u32).read_volatile() }
+}
+
+#[inline]
+fn soc_write32(address: usize, value: u32) {
+    unsafe { (address as *mut u32).write_volatile(value) }
 }
 
 fn reset_host() -> Result<(), BlockError> {

@@ -73,6 +73,10 @@ mod selected {
     pub const SDHCI_BASE: usize = 0x0431_0000;
     pub const SDHCI_MMIO_END: usize = SDHCI_BASE + 0x1000;
     pub const SDHCI_IRQ: u32 = 36;
+    // CV1800B top, pinmux, and clock-generator pages used to take explicit
+    // ownership of SDIO0 and ETH0 from the boot loader.
+    pub const SOC_CONTROL_BASE: usize = 0x0300_0000;
+    pub const SOC_CONTROL_MMIO_END: usize = SOC_CONTROL_BASE + 0x3000;
 
     pub const TIMEBASE_HZ: u64 = 25_000_000;
     // Stock Duo firmware exposes only C906B (hart 0) to OpenSBI. C906L is an

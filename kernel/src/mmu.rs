@@ -88,6 +88,8 @@ struct AddressSpace {
     uart_virtio_level0: PageTable,
     #[cfg(feature = "milkv-duo")]
     sdhci_level0: PageTable,
+    #[cfg(feature = "milkv-duo")]
+    soc_control_level0: PageTable,
     ram_level1: PageTable,
     ram_level0: [PageTable; RAM_LEVEL0_TABLES],
 }
@@ -103,6 +105,8 @@ impl AddressSpace {
             uart_virtio_level0: PageTable::empty(),
             #[cfg(feature = "milkv-duo")]
             sdhci_level0: PageTable::empty(),
+            #[cfg(feature = "milkv-duo")]
+            soc_control_level0: PageTable::empty(),
             ram_level1: PageTable::empty(),
             ram_level0: [const { PageTable::empty() }; RAM_LEVEL0_TABLES],
         }
@@ -237,6 +241,21 @@ pub fn init_boot(boot_physical_hart: usize) {
                 .step_by(sv39::PAGE_SIZE)
         {
             map_page(&mut tables.sdhci_level0, physical, MMIO_PERMISSIONS);
+        }
+        link_level0(
+            &mut tables.devices_level1,
+            megapage_base(crate::platform::SOC_CONTROL_BASE),
+            &tables.soc_control_level0,
+        );
+        for physical in (crate::platform::SOC_CONTROL_BASE
+            ..crate::platform::SOC_CONTROL_MMIO_END)
+            .step_by(sv39::PAGE_SIZE)
+        {
+            map_page(
+                &mut tables.soc_control_level0,
+                physical,
+                MMIO_PERMISSIONS,
+            );
         }
     }
 

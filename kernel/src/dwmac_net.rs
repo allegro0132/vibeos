@@ -134,6 +134,10 @@ pub struct NetInfo {
     pub timeouts: u64,
     pub rx_inflight: u8,
     pub tx_inflight: u8,
+    pub phy_link_up: bool,
+    pub tx_descriptor_status: u32,
+    pub dma_status: u32,
+    pub clock_enable: u32,
 }
 
 pub struct MmioWindow;
@@ -191,6 +195,10 @@ impl NetDevice {
             timeouts: TIMEOUTS.load(Ordering::Acquire),
             rx_inflight: u8::from(state.online),
             tx_inflight: u8::from(state.tx_inflight),
+            phy_link_up: PHY_LINK_UP.load(Ordering::Acquire),
+            tx_descriptor_status: tx_status(),
+            dma_status: read32(DMA_STATUS),
+            clock_enable: soc_read32(CLK_ENABLE_0),
         }
     }
 }
@@ -296,6 +304,7 @@ static STALE_EGRESS_STACK_GENERATION_DROPS: AtomicU64 = AtomicU64::new(0);
 static RESETS: AtomicU64 = AtomicU64::new(0);
 static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static FAULT: AtomicBool = AtomicBool::new(false);
+static PHY_LINK_UP: AtomicBool = AtomicBool::new(false);
 static DRIVER_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.get());
 static DRIVER_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 
@@ -538,6 +547,7 @@ fn send_inbound(
 }
 
 fn initialize() -> Result<(), NetError> {
+    prepare_soc_hardware();
     write32(DMA_BUS_MODE, read32(DMA_BUS_MODE) | DMA_SOFT_RESET);
     for _ in 0..RESET_BUDGET {
         if read32(DMA_BUS_MODE) & DMA_SOFT_RESET == 0 {
@@ -596,11 +606,19 @@ fn update_phy_link() {
     // BMSR twice because its link bit is latch-low, then select the best common
     // advertised mode. If no cable is present, retain the safe 100/full MAC
     // default and retry periodically without taking the interface offline.
-    let Some(_) = mdio_read(1) else { return };
-    let Some(status) = mdio_read(1) else { return };
+    let Some(_) = mdio_read(1) else {
+        PHY_LINK_UP.store(false, Ordering::Release);
+        return;
+    };
+    let Some(status) = mdio_read(1) else {
+        PHY_LINK_UP.store(false, Ordering::Release);
+        return;
+    };
     if status & (1 << 2) == 0 {
+        PHY_LINK_UP.store(false, Ordering::Release);
         return;
     }
+    PHY_LINK_UP.store(true, Ordering::Release);
     let control = mdio_read(0).unwrap_or(0);
     let (fast, full) = if control & (1 << 12) != 0 && status & (1 << 5) != 0 {
         let partner = mdio_read(5).unwrap_or(0);
@@ -713,6 +731,46 @@ fn tx_owned() -> bool {
     dma.tx_desc[0] & DESC_OWN != 0
 }
 
+fn tx_status() -> u32 {
+    let dma = unsafe { &*DMA.0.get() };
+    invalidate_range(
+        descriptor_address(&dma.tx_desc),
+        core::mem::size_of_val(&dma.tx_desc),
+    );
+    dma.tx_desc[0]
+}
+
+const CLKGEN_BASE: usize = crate::platform::SOC_CONTROL_BASE + 0x2000;
+const CLK_ENABLE_0: usize = CLKGEN_BASE;
+const CLK_BYPASS_0: usize = CLKGEN_BASE + 0x30;
+const CLK_DIV_500M_ETH0: usize = CLKGEN_BASE + 0x8c;
+const ETH0_CLOCKS: u32 = (1 << 25) | (1 << 26);
+
+fn prepare_soc_hardware() {
+    // The pinned CV1800B clock driver marks ETH0's 500 MHz MAC clock and
+    // AXI4 clock critical. U-Boot does not instantiate Ethernet for this
+    // image, so take ownership explicitly instead of depending on reset
+    // defaults left by an earlier firmware stage.
+    soc_write32(CLK_ENABLE_0, soc_read32(CLK_ENABLE_0) | ETH0_CLOCKS);
+    soc_write32(CLK_BYPASS_0, soc_read32(CLK_BYPASS_0) & !(1 << 9));
+    // Bit 3 is the vendor clock driver's divider-update strobe.
+    soc_write32(
+        CLK_DIV_500M_ETH0,
+        (soc_read32(CLK_DIV_500M_ETH0) & !(0xf << 16)) | (3 << 16) | (1 << 3),
+    );
+    let _ = soc_read32(CLK_ENABLE_0);
+}
+
+#[inline]
+fn soc_read32(address: usize) -> u32 {
+    unsafe { (address as *const u32).read_volatile() }
+}
+
+#[inline]
+fn soc_write32(address: usize, value: u32) {
+    unsafe { (address as *mut u32).write_volatile(value) }
+}
+
 fn dma_base() -> usize {
     DMA.0.get() as usize
 }
@@ -802,6 +860,7 @@ fn shutdown_driver() {
     state.sessions.detach_device();
     state.active_stack_domain = None;
     state.tx_inflight = false;
+    PHY_LINK_UP.store(false, Ordering::Release);
     DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
     DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
 }

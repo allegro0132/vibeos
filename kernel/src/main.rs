@@ -14,6 +14,9 @@
 #![feature(alloc_error_handler)]
 #![cfg_attr(not(feature = "legacy-shell"), allow(dead_code))]
 
+#[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
+compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
+
 extern crate alloc;
 
 // The portable half of the kernel lives in `vibeos-core` so it can be tested on
@@ -35,6 +38,8 @@ mod saved_program;
 mod selftest;
 mod shell;
 mod store;
+#[cfg(feature = "tcp-echo")]
+mod tcp_echo;
 mod trampoline;
 mod trap;
 mod tty;

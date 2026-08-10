@@ -6,6 +6,7 @@ Four layers, cheapest first. Run them all before pushing.
 cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/differential.sh      # verify committed output with pinned real rustc
 ./scripts/qemu-test.sh         # golden cases plus the differential oracle
+./scripts/qemu-tcp-test.sh     # N1 static IPv4/TCP echo over QEMU hostfwd
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
 ./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
@@ -85,6 +86,15 @@ HELLO exposed before an injected component fault, withholds its response, and
 then requires a second HELLO plus the complete exchange after the shared device
 epoch advances. A canonical evidence file is checked separately from the guest
 golden; TAP, root privileges, and host network access are never used.
+
+`qemu-tcp-test.sh` is the separate N1 protocol-stack gate. It builds only the
+`tcp-echo` image, attaches QEMU user networking, binds host forwarding to an
+ephemeral `127.0.0.1` port, and targets static guest `10.0.2.15:2222`. The peer
+sends a deterministic binary payload containing NUL, control, and high-bit
+bytes, tolerates fragmented TCP reads, and accepts only an exact echo. Portable
+tests separately drive two smoltcp interfaces through capability-addressed
+packet endpoints to cover ARP, a 3,000-byte TCP exchange, endpoint pressure,
+and operation-time revocation.
 
 The QEMU harness now defaults every integration case to four multithreaded TCG
 vCPUs and requires the boot-time `4 hart(s) online` barrier, shared Sv39

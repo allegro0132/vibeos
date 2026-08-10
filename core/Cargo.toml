@@ -2,3 +2,12 @@
 name = "vibeos-core"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+smoltcp = { version = "=0.13.1", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-tcp-reno",
+] }

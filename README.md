@@ -40,6 +40,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   restored least authority.
 - **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
+- **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw
+  Ethernet through bounded TCP to a public-key-only SSH `exec` service.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
@@ -48,6 +50,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/differential.sh    # exact-output oracle using the pinned rustc
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
+./scripts/qemu-tcp-test.sh   # N1 static IPv4/TCP echo through host forwarding
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin

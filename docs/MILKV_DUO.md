@@ -13,6 +13,12 @@ on the official Buildroot SDK.
 > compile successfully but remain unchecked below until the new two-partition
 > image is exercised on hardware. The C906L and dual-core SMP are not supported.
 
+The DWMAC software path now retains a dequeued packet while its sole TX
+descriptor is busy, faults after a bounded two-second stall, revalidates all
+device capabilities around each synchronous hardware turn, and resets MAC/DMA
+on normal teardown. This closes the known software drop/stall path; it does not
+replace the unchecked physical Ethernet acceptance item below.
+
 ## CPU model and support boundaries
 
 The official SDK does not expose the two cores as symmetric OpenSBI harts:

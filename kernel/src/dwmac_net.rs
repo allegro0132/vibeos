@@ -11,7 +11,7 @@ use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::cap::{Cap, InvocationLease, Resource, Rights};
+use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::net::{Endpoint, Packet, MAX_PACKET_LEN};
 use crate::sync::SpinLock;
@@ -21,6 +21,7 @@ const BASE: usize = crate::platform::ETHERNET_BASE;
 const IRQ: u32 = crate::platform::ETHERNET_IRQ;
 const DMA_BUFFER_LEN: usize = 1_536;
 const RESET_BUDGET: usize = 2_000_000;
+const TX_TIMEOUT_MS: u64 = 2_000;
 
 const GMAC_CONTROL: usize = 0x0000;
 const GMAC_FRAME_FILTER: usize = 0x0004;
@@ -269,7 +270,7 @@ pub async fn driver_task(
             cspace.lookup_revocable::<NetDevice>(control, Rights::READ),
         )
     };
-    let (Ok(_mmio), Ok(_dma), Ok(outbound), Ok(inbound), Ok(_control)) = authority else {
+    let (Ok(mmio), Ok(dma), Ok(outbound), Ok(inbound), Ok(control)) = authority else {
         return;
     };
 
@@ -277,41 +278,137 @@ pub async fn driver_task(
     DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
     DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
 
-    if initialize().is_err() {
-        return;
-    }
-    {
+    if with_device_authority(&mmio, &dma, &control, || {
+        initialize()?;
         let mut state = CONTROL.lock();
         state.epoch = state.epoch.checked_add(1).expect("DWMAC epoch exhausted");
         state.online = true;
         state.quarantined = false;
+        Ok(())
+    })
+    .is_err()
+    {
+        shutdown_driver();
+        return;
     }
+    let _session = DriverSession;
 
+    let mut pending_tx = None;
+    let mut tx_deadline = 0;
     let mut link_poll = 0u16;
     loop {
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
-        if let Ok(Some(packet)) = outbound.try_with(Endpoint::try_recv) {
-            if transmit(&packet).is_err() {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if let Some(packet) = receive() {
-            if inbound
-                .try_with(|endpoint| endpoint.try_send(packet))
-                .is_ok_and(|result| result.is_ok())
-            {
-                RX_PACKETS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        link_poll = link_poll.wrapping_add(1);
-        if link_poll >= 1_000 {
-            link_poll = 0;
-            update_phy_link();
+        if with_device_authority(&mmio, &dma, &control, || {
+            driver_turn(
+                &outbound,
+                &inbound,
+                &mut pending_tx,
+                &mut tx_deadline,
+                &mut link_poll,
+            )
+        })
+        .is_err()
+        {
+            return;
         }
         crate::exec::sleep_ms(1).await;
     }
+}
+
+struct DriverSession;
+
+impl Drop for DriverSession {
+    fn drop(&mut self) {
+        shutdown_driver();
+    }
+}
+
+fn with_device_authority<R>(
+    mmio: &Revocable<MmioWindow>,
+    dma: &Revocable<DmaRegion>,
+    control: &Revocable<NetDevice>,
+    operation: impl FnOnce() -> Result<R, NetError>,
+) -> Result<R, NetError> {
+    match mmio.try_with(|_| dma.try_with(|_| control.try_with(|_| operation()))) {
+        Ok(Ok(Ok(result))) => result,
+        _ => Err(NetError::AuthorityRevoked),
+    }
+}
+
+fn driver_turn(
+    outbound: &Revocable<Endpoint<Packet>>,
+    inbound: &Revocable<Endpoint<Packet>>,
+    pending_tx: &mut Option<Packet>,
+    tx_deadline: &mut u64,
+    link_poll: &mut u16,
+) -> Result<(), NetError> {
+    // Once a packet leaves the bounded endpoint, this task owns it until the
+    // sole TX descriptor accepts it. Descriptor ownership is ordinary
+    // backpressure until the bounded hardware deadline: retain the packet and
+    // do not dequeue a second one while DMA is using the descriptor.
+    if pending_tx.is_none() {
+        if let Some(packet) = take_outbound(outbound)? {
+            *pending_tx = Some(packet);
+            *tx_deadline = crate::sbi::time().saturating_add(tx_timeout_ticks());
+        }
+    }
+    if let Some(packet) = pending_tx.as_ref() {
+        match transmit(packet) {
+            Ok(()) => {
+                *pending_tx = None;
+                *tx_deadline = 0;
+            }
+            Err(NetError::QueueFull) if crate::sbi::time() < *tx_deadline => {}
+            Err(NetError::QueueFull) => {
+                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                panic!("CV1800B DWMAC TX descriptor timed out");
+            }
+            Err(NetError::Protocol) => {
+                // A safely constructed Packet always fits the DMA buffer. Stop
+                // this incarnation rather than consuming every later packet.
+                CONTROL.lock().online = false;
+                return Err(NetError::Protocol);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(packet) = receive() {
+        match send_inbound(inbound, packet) {
+            Ok(()) => {
+                RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+            }
+            // RX has already consumed and rearmed its sole descriptor, so
+            // bounded client pressure drops this one frame.
+            Err(NetError::QueueFull) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    *link_poll = link_poll.wrapping_add(1);
+    if *link_poll >= 1_000 {
+        *link_poll = 0;
+        update_phy_link();
+    }
+    Ok(())
+}
+
+fn tx_timeout_ticks() -> u64 {
+    TX_TIMEOUT_MS.saturating_mul(crate::exec::timebase_hz()) / 1_000
+}
+
+fn take_outbound(outbound: &Revocable<Endpoint<Packet>>) -> Result<Option<Packet>, NetError> {
+    outbound
+        .try_with(Endpoint::try_recv)
+        .map_err(|_| NetError::AuthorityRevoked)
+}
+
+fn send_inbound(inbound: &Revocable<Endpoint<Packet>>, packet: Packet) -> Result<(), NetError> {
+    inbound
+        .try_with(|endpoint| endpoint.try_send(packet))
+        .map_err(|_| NetError::AuthorityRevoked)?
+        .map_err(|_| NetError::QueueFull)
 }
 
 fn initialize() -> Result<(), NetError> {
@@ -557,16 +654,7 @@ fn handshake_packet(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Pa
     Packet::copy_from(&frame).expect("fixed handshake packet is valid")
 }
 
-/// # Safety
-/// The executor guarantees that the faulting domain can never resume.
-pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
-    let _ = unsafe { CONTROL.recover_after_fault(domain) };
-    if DRIVER_OWNER.load(Ordering::Acquire) != domain.owner.get()
-        || DRIVER_ARENA.load(Ordering::Acquire) != domain.arena.get()
-    {
-        return;
-    }
-
+fn shutdown_driver() {
     write32(DMA_INT_ENABLE, 0);
     write32(DMA_CONTROL, 0);
     write32(
@@ -587,6 +675,18 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     state.quarantined = !reset;
     DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
     DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
+}
+
+/// # Safety
+/// The executor guarantees that the faulting domain can never resume.
+pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
+    let _ = unsafe { CONTROL.recover_after_fault(domain) };
+    if DRIVER_OWNER.load(Ordering::Acquire) != domain.owner.get()
+        || DRIVER_ARENA.load(Ordering::Acquire) != domain.arena.get()
+    {
+        return;
+    }
+    shutdown_driver();
 }
 
 #[allow(dead_code)]

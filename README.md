@@ -55,6 +55,7 @@ cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/qemu-ssh-security-test.sh # N3 entropy/identity capability gate
 ./scripts/qemu-ssh-test.sh   # N4/N5 real OpenSSH exec and rejection gate
 python3 -B scripts/milkv-tcp-test.py ADDRESS # physical Duo TCP/rearm gate
+python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/milkv-ssh-test.sh ADDRESS # explicit insecure physical SSH/VSH gate
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance

@@ -259,7 +259,7 @@ def build_kernel() -> None:
     env["RUSTDOC"] = rustup_which(channel, "rustdoc")
     try:
         subprocess.run(
-            ["rustup", "run", channel, "cargo", "build", "--release"],
+            ["rustup", "run", channel, "cargo", "build", "--release", "--features", "legacy-shell"],
             # Cargo discovers target/build-std settings from the invocation
             # directory; the bare-metal configuration lives under kernel/.
             cwd=ROOT / "kernel",

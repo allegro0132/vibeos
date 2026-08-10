@@ -30,7 +30,7 @@ fi
 pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
 (cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
-  rustup run "$toolchain" cargo build --release) >&2
+  rustup run "$toolchain" cargo build --release --features legacy-shell) >&2
 
 # Strip everything that legitimately varies between runs: timings, addresses,
 # heap sizes, and the terminal control codes the line discipline emits.
@@ -61,6 +61,7 @@ feed() {
   while IFS= read -r line; do
     case "$line" in
       '@sleep '*) sleep "${line#@sleep }" ;;
+      '@ctrl-c') printf '\003'; sleep "$PACE" ;;
       *) printf '%s\n' "$line"; sleep "$PACE" ;;
     esac
   done < "$1"

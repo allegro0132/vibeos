@@ -1,0 +1,8 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> echo hello | wc > @console
+1 1 6
+vibe> spin
+  vsh job %2: Cancelled
+vibe> 

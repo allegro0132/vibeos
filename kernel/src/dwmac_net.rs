@@ -1,8 +1,10 @@
 //! Polling CV1800B DWMAC backend for the Milk-V Duo Ethernet IO Board.
 //!
-//! The first revision uses one enhanced RX descriptor and one enhanced TX
-//! descriptor. Packet transport remains the same bounded, capability-addressed
-//! raw-L2 interface used by the QEMU virtio-net backend.
+//! The minimal profile uses one normal RX descriptor and one normal TX
+//! descriptor. Each descriptor occupies its own non-coherent cache line even
+//! though the device consumes only the first four words. Packet transport
+//! remains the same bounded, capability-addressed raw-L2 interface used by the
+//! QEMU virtio-net backend.
 
 extern crate alloc;
 
@@ -22,6 +24,7 @@ use crate::world::Space;
 
 const BASE: usize = crate::platform::ETHERNET_BASE;
 const IRQ: u32 = crate::platform::ETHERNET_IRQ;
+const DMA_CACHE_LINE_BYTES: usize = 64;
 const DMA_BUFFER_LEN: usize = 1_536;
 const RESET_BUDGET: usize = 2_000_000;
 const TX_TIMEOUT_MS: u64 = 2_000;
@@ -161,7 +164,10 @@ impl Resource for DmaRegion {
         "dma-region"
     }
     fn describe(&self) -> String {
-        format!("DWMAC stable two-descriptor slab @ {:#x}", dma_base())
+        format!(
+            "DWMAC stable cache-isolated two-descriptor slab @ {:#x}",
+            dma_base()
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -313,21 +319,42 @@ static PHY_LINK_UP: AtomicBool = AtomicBool::new(false);
 static DRIVER_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.get());
 static DRIVER_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct DmaDescriptorSlot {
+    // CV1800B uses the legacy normal four-word descriptor format. The explicit
+    // 64-byte slot prevents a cache operation for one DMA direction from
+    // writing back stale ownership state for the other direction.
+    words: [u32; 16],
+}
+impl DmaDescriptorSlot {
+    const ZERO: Self = Self { words: [0; 16] };
+}
+
 #[repr(C, align(64))]
 struct DmaSlab {
-    rx_desc: [u32; 8],
-    tx_desc: [u32; 8],
+    rx_desc: DmaDescriptorSlot,
+    tx_desc: DmaDescriptorSlot,
     rx: [u8; DMA_BUFFER_LEN],
     tx: [u8; DMA_BUFFER_LEN],
 }
 impl DmaSlab {
     const ZERO: Self = Self {
-        rx_desc: [0; 8],
-        tx_desc: [0; 8],
+        rx_desc: DmaDescriptorSlot::ZERO,
+        tx_desc: DmaDescriptorSlot::ZERO,
         rx: [0; DMA_BUFFER_LEN],
         tx: [0; DMA_BUFFER_LEN],
     };
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<DmaDescriptorSlot>() == DMA_CACHE_LINE_BYTES);
+    assert!(core::mem::align_of::<DmaDescriptorSlot>() == DMA_CACHE_LINE_BYTES);
+    assert!(core::mem::offset_of!(DmaSlab, rx_desc) % DMA_CACHE_LINE_BYTES == 0);
+    assert!(core::mem::offset_of!(DmaSlab, tx_desc) % DMA_CACHE_LINE_BYTES == 0);
+    assert!(core::mem::offset_of!(DmaSlab, rx) % DMA_CACHE_LINE_BYTES == 0);
+    assert!(core::mem::offset_of!(DmaSlab, tx) % DMA_CACHE_LINE_BYTES == 0);
+};
 struct StableDma(UnsafeCell<DmaSlab>);
 unsafe impl Sync for StableDma {}
 #[link_section = ".dma"]
@@ -440,12 +467,24 @@ fn driver_turn(
         // descriptor reservation before releasing this guard prevents a new
         // generation from becoming active between stamp validation and OWN.
         let mut state = CONTROL.lock();
+        let now = crate::sbi::time();
         let descriptor_busy = tx_owned();
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
-        if pending_tx.is_none() && !descriptor_busy {
+        if descriptor_busy {
+            // The deadline covers DMA ownership after publication as well as
+            // software waiting to publish. A corrupted or stalled OWN bit must
+            // restart the supervised driver instead of wedging TX forever.
+            if *tx_deadline == 0 {
+                *tx_deadline = now.saturating_add(tx_timeout_ticks());
+            } else if now >= *tx_deadline {
+                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                panic!("CV1800B DWMAC TX descriptor timed out");
+            }
+        } else if pending_tx.is_none() {
+            *tx_deadline = 0;
             if let Some(packet) = take_admitted_outbound(outbound, &state.sessions)? {
                 *pending_tx = Some(packet);
-                *tx_deadline = crate::sbi::time().saturating_add(tx_timeout_ticks());
+                *tx_deadline = now.saturating_add(tx_timeout_ticks());
                 state.tx_inflight = true;
             }
         }
@@ -453,10 +492,9 @@ fn driver_turn(
             match transmit(packet) {
                 Ok(()) => {
                     *pending_tx = None;
-                    *tx_deadline = 0;
                     state.tx_inflight = true;
                 }
-                Err(NetError::QueueFull) if crate::sbi::time() < *tx_deadline => {}
+                Err(NetError::QueueFull) if now < *tx_deadline => {}
                 Err(NetError::QueueFull) => {
                     TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     panic!("CV1800B DWMAC TX descriptor timed out");
@@ -567,11 +605,11 @@ fn initialize() -> Result<(), NetError> {
 
     let dma = unsafe { &mut *DMA.0.get() };
     *dma = DmaSlab::ZERO;
-    dma.rx_desc[0] = DESC_OWN;
-    dma.rx_desc[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
-    dma.rx_desc[2] = buffer_address(&dma.rx) as u32;
-    dma.tx_desc[1] = TX_END_RING;
-    dma.tx_desc[2] = buffer_address(&dma.tx) as u32;
+    dma.rx_desc.words[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
+    dma.rx_desc.words[2] = buffer_address(&dma.rx) as u32;
+    dma.rx_desc.words[0] = DESC_OWN;
+    dma.tx_desc.words[1] = TX_END_RING;
+    dma.tx_desc.words[2] = buffer_address(&dma.tx) as u32;
     clean_range(dma_base(), core::mem::size_of::<DmaSlab>());
 
     // The Duo device tree uses the DWMAC normal four-word descriptor format;
@@ -681,7 +719,7 @@ fn transmit(packet: &Packet) -> Result<(), NetError> {
         descriptor_address(&dma.tx_desc),
         core::mem::size_of_val(&dma.tx_desc),
     );
-    if dma.tx_desc[0] & DESC_OWN != 0 {
+    if dma.tx_desc.words[0] & DESC_OWN != 0 {
         return Err(NetError::QueueFull);
     }
     let len = packet.len();
@@ -689,8 +727,8 @@ fn transmit(packet: &Packet) -> Result<(), NetError> {
         return Err(NetError::Protocol);
     }
     dma.tx[..len].copy_from_slice(packet.as_bytes());
-    dma.tx_desc[1] = len as u32 | TX_END_RING | TX_FIRST | TX_LAST;
-    dma.tx_desc[0] = DESC_OWN;
+    dma.tx_desc.words[1] = len as u32 | TX_END_RING | TX_FIRST | TX_LAST;
+    dma.tx_desc.words[0] = DESC_OWN;
     clean_range(buffer_address(&dma.tx), len);
     clean_range(
         descriptor_address(&dma.tx_desc),
@@ -707,7 +745,7 @@ fn receive() -> Option<Packet> {
         descriptor_address(&dma.rx_desc),
         core::mem::size_of_val(&dma.rx_desc),
     );
-    let status = dma.rx_desc[0];
+    let status = dma.rx_desc.words[0];
     if status & DESC_OWN != 0 {
         return None;
     }
@@ -720,8 +758,8 @@ fn receive() -> Option<Packet> {
     } else {
         None
     };
-    dma.rx_desc[0] = DESC_OWN;
-    dma.rx_desc[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
+    dma.rx_desc.words[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
+    dma.rx_desc.words[0] = DESC_OWN;
     clean_range(
         descriptor_address(&dma.rx_desc),
         core::mem::size_of_val(&dma.rx_desc),
@@ -736,7 +774,7 @@ fn tx_owned() -> bool {
         descriptor_address(&dma.tx_desc),
         core::mem::size_of_val(&dma.tx_desc),
     );
-    dma.tx_desc[0] & DESC_OWN != 0
+    dma.tx_desc.words[0] & DESC_OWN != 0
 }
 
 fn tx_status() -> u32 {
@@ -745,7 +783,7 @@ fn tx_status() -> u32 {
         descriptor_address(&dma.tx_desc),
         core::mem::size_of_val(&dma.tx_desc),
     );
-    dma.tx_desc[0]
+    dma.tx_desc.words[0]
 }
 
 const CLKGEN_BASE: usize = crate::platform::SOC_CONTROL_BASE + 0x2000;
@@ -982,33 +1020,39 @@ fn soc_write32(address: usize, value: u32) {
 fn dma_base() -> usize {
     DMA.0.get() as usize
 }
-fn descriptor_address(value: &[u32; 8]) -> usize {
-    value.as_ptr() as usize
+fn descriptor_address(value: &DmaDescriptorSlot) -> usize {
+    value.words.as_ptr() as usize
 }
 fn buffer_address(value: &[u8; DMA_BUFFER_LEN]) -> usize {
     value.as_ptr() as usize
 }
 
 fn clean_range(start: usize, size: usize) {
-    cache_range(start, size, 0x0295_000b);
+    cache_range(start, size, true);
 }
 fn invalidate_range(start: usize, size: usize) {
-    cache_range(start, size, 0x02b5_000b);
+    cache_range(start, size, false);
 }
-fn cache_range(start: usize, size: usize, instruction: u32) {
-    let mut line = start & !63;
-    let end = start.saturating_add(size).saturating_add(63) & !63;
+fn cache_range(start: usize, size: usize, clean: bool) {
+    let mut line = start & !(DMA_CACHE_LINE_BYTES - 1);
+    let end = start
+        .saturating_add(size)
+        .saturating_add(DMA_CACHE_LINE_BYTES - 1)
+        & !(DMA_CACHE_LINE_BYTES - 1);
     while line < end {
         // T-Head C9xx cache operations encode the address in a0. Use the raw
-        // instruction words documented by Milk-V's pinned FSBL source.
+        // instruction words documented by Milk-V's pinned FSBL source. DMA
+        // reads require dcache.cpa (clean); DMA writes require dcache.ipa
+        // (invalidate). dcache.cipa (0x02b5000b) is deliberately not used for
+        // device-written state because its clean phase can restore stale OWN.
         unsafe {
-            if instruction == 0x0295_000b {
+            if clean {
                 core::arch::asm!(".long 0x0295000b", in("a0") line, options(nostack));
             } else {
-                core::arch::asm!(".long 0x02b5000b", in("a0") line, options(nostack));
+                core::arch::asm!(".long 0x02a5000b", in("a0") line, options(nostack));
             }
         }
-        line += 64;
+        line += DMA_CACHE_LINE_BYTES;
     }
     unsafe {
         core::arch::asm!(".long 0x0190000b", options(nostack));

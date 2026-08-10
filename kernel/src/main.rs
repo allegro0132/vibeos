@@ -296,6 +296,8 @@ pub extern "C" fn kmain() -> ! {
         session.install_host_command("ps", 0, 0, shell::vsh_ps);
         session.install_host_command("caps", 0, 1, shell::vsh_caps);
         session.install_host_command("mem", 0, 0, shell::vsh_mem);
+        session.install_host_command("quiet", 0, 0, shell::vsh_quiet);
+        session.install_host_command("verbose", 0, 0, shell::vsh_verbose);
         session.install_host_command("poweroff", 0, 0, shell::vsh_poweroff);
         world.spawn_component(
             "vsh",

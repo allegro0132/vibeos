@@ -599,6 +599,8 @@ pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
          \x20 ps              component lifecycle snapshots\n\
          \x20 caps [space]    sanitized capability summary\n\
          \x20 mem             bounded-memory accounts\n\
+         \x20 quiet           mute background component output\n\
+         \x20 verbose         restore background component output\n\
          \x20 poweroff        power off\n",
     ))
 }
@@ -641,6 +643,18 @@ pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
         ));
     }
     Ok(output)
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_quiet(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    tty::set_quiet(true);
+    Ok(String::from("background component output muted\n"))
+}
+
+#[cfg(not(feature = "legacy-shell"))]
+pub(crate) fn vsh_verbose(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    tty::set_quiet(false);
+    Ok(String::from("background component output restored\n"))
 }
 
 #[cfg(not(feature = "legacy-shell"))]

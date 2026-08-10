@@ -4,22 +4,29 @@ set -euo pipefail
 export LC_ALL=C
 
 diagnostic=false
+ssh_acceptance=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
     --diagnostic) diagnostic=true ;;
-    -*) echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    --ssh-acceptance) ssh_acceptance=true ;;
+    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2
+        echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2
         exit 2
       fi
       sdk_arg=$arg
       ;;
   esac
 done
+if [[ "$diagnostic" == true && "$ssh_acceptance" == true ]]; then
+  echo "verify-milkv-duo-image.sh: --diagnostic and --ssh-acceptance are mutually exclusive" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2
+  exit 2
+fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
@@ -32,6 +39,9 @@ image_name="vibeos-milkv-duo-sd.img"
 if [[ "$diagnostic" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-diagnostic"
   image_name="vibeos-milkv-duo-diagnostic-sd.img"
+elif [[ "$ssh_acceptance" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-ssh-acceptance"
+  image_name="vibeos-milkv-duo-ssh-acceptance-sd.img"
 fi
 image="$output_dir/$image_name"
 expected_fit="$output_dir/boot.sd"

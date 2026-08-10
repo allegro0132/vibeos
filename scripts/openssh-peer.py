@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the QEMU-only VibeOS SSH acceptance image with real OpenSSH.
+"""Drive an explicit VibeOS SSH acceptance image with real OpenSSH.
 
 The peer preloads the exact Ed25519 test host key, waits for a strict,
 authenticated ``true`` exec, and then exercises the deliberately small SSH

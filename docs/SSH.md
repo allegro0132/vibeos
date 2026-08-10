@@ -6,7 +6,7 @@ out explicitly; no section claims the SSH wire protocol before N4 passes.
 
 ## Target
 
-The current QEMU-only target is deliberately smaller than a Unix `sshd`:
+The current acceptance target is deliberately smaller than a Unix `sshd`:
 
 - QEMU `virt`, static IPv4, one TCP listener and one concurrent connection;
 - public-key authentication only;
@@ -22,9 +22,10 @@ The current QEMU-only target is deliberately smaller than a Unix `sshd`:
   are rejected.
 
 The interactive path now uses per-connection line discipline and
-channel-backed output rather than the global UART TTY. This is QEMU acceptance
-only: remote SSH login to a physical Milk-V Duo has not been completed or
-validated.
+channel-backed output rather than the global UART TTY. QEMU validates this
+securely wired test boundary. A separate, visibly insecure Milk-V image now
+makes the same protocol path available for physical bring-up, but remote login
+to the board has not yet been completed or validated.
 
 ## Component and authority topology
 
@@ -43,18 +44,18 @@ implemented driver boundary carries each `Packet` inside a `StampedPacket`
 bound to one boot-local `(device epoch, stack generation)` pair. The planned
 general `TcpListener` and `TcpConnection` resources shown above do not exist
 yet; the N1 and N4 acceptance components each own one smoltcp socket directly.
-The stack owns no shell, store, key, or console authority. The QEMU SSH
+The stack owns no shell, store, key, or console authority. The acceptance SSH
 component owns only its network grants, entropy capability, separate host-key
 read/sign grants, read-only authentication policy, and a fresh restricted VSH
 session with the appropriate exec or interactive profile per connection. A
 username is a display label; possession and
 validation of an authorized public key select the capability profile.
 
-The QEMU boundary keeps the host private key behind a signer service: the SSH
-component receives separate public-key `READ` and signing `INVOKE` grants and
-never obtains the key bytes. Its provisioned deterministic key is a public test
-fixture, not a secure deployment. Production still requires a unique device
-identity and authenticated provisioning.
+The acceptance boundary keeps the host private key behind a signer service:
+the SSH component receives separate public-key `READ` and signing `INVOKE`
+grants and never obtains the key bytes. Its provisioned deterministic key is a
+public test fixture, not a secure deployment. Production still requires a
+unique device identity and authenticated provisioning.
 
 ## Milestones and acceptance gates
 
@@ -240,6 +241,40 @@ FAIL ssh-test: <fatal reason>
 rejected or hostile connections may reset one connection while the single
 listener remains healthy.
 
+#### Explicit Milk-V hardware bring-up gate
+
+`milkv-ssh-acceptance` compiles the same bounded Sunset/session/VSH path for the
+native DWMAC backend and DHCP. It is intentionally mutually exclusive with the
+production `net-shell` image and every QEMU acceptance feature. Its component
+still receives only packet SEND/RECV, network READ/INVOKE, random READ, separate
+host-key READ/sign INVOKE, and immutable authorization-policy READ grants; init
+does not receive the raw packet endpoints.
+
+This image is deliberately cryptographically unsafe. It reuses the public test
+host and client identities and substitutes a deterministic capability-scoped
+random provider whose sequence repeats after reboot. The feature name, boot
+warning, output directory, and documentation all preserve that distinction.
+It may be used only on an isolated bring-up link with non-secret traffic, and a
+successful run must never be cited as entropy, identity-provisioning, or
+production-SSH evidence.
+
+Build/package it and run the physical OpenSSH peer with:
+
+```sh
+./scripts/build-milkv-duo.sh --ssh-acceptance
+./scripts/package-milkv-duo-sdk.sh --ssh-acceptance /path/to/duo-buildroot-sdk
+./scripts/milkv-ssh-test.sh ADDRESS
+```
+
+The board waits for carrier and DHCP rather than exiting if the cable is late,
+publishes `milkv-ssh-acceptance listening on ADDRESS:2222` over UART, rebinds
+after recoverable device/link changes, and republishes lease changes. The host
+gate reuses the same exact host fingerprint, forced algorithms, authorized and
+rejected fixture keys, exec statuses, negative request policy, and real
+interactive PTY/VSH sequence as the QEMU gate. Until that command passes
+against a flashed board, the existence of the image is not physical SSH/VSH
+acceptance evidence.
+
 ### N5: hostile-input evidence
 
 - Host tests and fuzz targets cover packet/string/name-list lengths, malformed
@@ -262,10 +297,10 @@ coverage, or Milk-V hardware evidence; those remain separate acceptance work.
 
 The QEMU per-session terminal now covers input, output, history, Ctrl-C/EOF,
 window-change metadata, and channel backpressure without reusing the singleton
-UART TTY. The hardware half of this milestone remains open: the native DWMAC
-queue/backpressure path still needs physical stress, followed by raw-L2, TCP,
-and remote SSH/VSH acceptance on a Milk-V Duo Ethernet IO Board. A successful
-QEMU gate must not be reported as Milk-V remote-login completion.
+UART TTY. A physical Duo has passed carrier, DHCP, and eight fresh exact-echo
+TCP streams. Driver-reset, delayed-DMA/late-IRQ stress and remote SSH/VSH on the
+explicit acceptance image remain open. A successful QEMU gate or physical TCP
+gate must not be reported as Milk-V remote-login completion.
 
 SFTP/SCP remains out of scope until VibeOS has a capability-native file or
 directory service whose semantics can be exposed without inventing a POSIX path

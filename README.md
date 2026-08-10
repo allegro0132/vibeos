@@ -55,6 +55,7 @@ cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/qemu-ssh-security-test.sh # N3 entropy/identity capability gate
 ./scripts/qemu-ssh-test.sh   # N4/N5 real OpenSSH exec and rejection gate
 python3 -B scripts/milkv-tcp-test.py ADDRESS # physical Duo TCP/rearm gate
+./scripts/milkv-ssh-test.sh ADDRESS # explicit insecure physical SSH/VSH gate
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
@@ -78,7 +79,8 @@ diagnostic shell is compiled only with the `legacy-shell` test feature; the
 QEMU golden and benchmark harnesses select that feature explicitly.
 
 Milk-V Duo boot images are generated with the official SDK. The deliverable image
-contains a single FAT boot partition and no Linux root filesystem. Follow
+contains a FAT boot partition plus a raw VibeOS data partition and no Linux root
+filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
 
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
@@ -544,16 +546,18 @@ Deliberate, not overlooked:
   namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
   are absent from normal images and do not model delayed DMA completion or a
-  late IRQ. The native DWMAC DHCP/IP path compiles into the SD image but has not
-  passed a live-board acceptance gate.
-- **The QEMU SSH security foundation is not production provisioning.** A
+  late IRQ. The native DWMAC DHCP/IP path has passed carrier, lease acquisition,
+  and eight fresh exact-echo TCP streams on a live board; restart coordinates,
+  delayed completion, late IRQ, and long-duration stress remain open.
+- **The SSH acceptance foundation is not production provisioning.** A
   bounded, fail-closed virtio-rng capability now feeds a domain-separated,
   zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator
   blocks before reuse. An opaque Ed25519 signer and immutable binary-key policy
-  are exercised only by the explicit `ssh-security-test` and `ssh-test` images.
-  The latter is a localhost-only, public-key-only OpenSSH acceptance image: it
-  permits the restricted `echo`/`true`/`false` exec profile and rejects shell,
-  PTY, and subsystem requests. Both images visibly embed fixed host and client
-  fixtures. Unique per-device identity, authenticated persistent policy updates,
+  are exercised by the explicit `ssh-security-test`, `ssh-test`, and
+  `milkv-ssh-acceptance` images. The SSH images permit a restricted exec profile
+  and one PTY-backed interactive VSH session while rejecting unsupported request
+  combinations and subsystems. They visibly embed fixed host/client fixtures;
+  the Milk-V bring-up image also uses deterministic reboot-repeating random
+  bytes. Unique per-device identity, authenticated persistent policy updates,
   rollback resistance, and a validated Milk-V Duo entropy source remain absent,
-  so non-test SSH stays disabled there.
+  so production SSH stays disabled there.

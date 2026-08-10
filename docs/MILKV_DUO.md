@@ -321,6 +321,30 @@ Use these serial parameters:
 
 In short: **115200 8N1**.
 
+### Physical IPv4/TCP gate
+
+On the serial `vsh>` prompt, obtain the address assigned to the production
+image and confirm that carrier is present:
+
+```text
+ip link show
+ip -4 addr show dev net0
+```
+
+From another machine on the same link, pass that address to the bounded host
+peer. The peer opens a fresh TCP stream for every round and requires the exact
+binary payload back from port 2222:
+
+```sh
+python3 -B scripts/milkv-tcp-test.py ADDRESS
+```
+
+The address is intentionally not hard-coded: DHCP may assign a different one
+after a reboot or on another network. On 2026-08-10, a physical Duo connected
+through host interface `en7` reported `UP,LOWER_UP` and the dynamic address
+`169.254.184.75/16`; eight consecutive fresh streams passed the exact-echo
+gate. This is DWMAC/IPv4/TCP evidence only and does not claim SSH availability.
+
 ## Hardware validation checklist
 
 For the first hardware boot, preserve the full serial log and verify each item:
@@ -348,9 +372,11 @@ For the first hardware boot, preserve the full serial log and verify each item:
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B
       DWMAC online and the raw-L2 HELLO/CHALLENGE/ACK exchange succeeds.
-- [ ] The production image reports `LOWER_UP`, acquires and renews a DHCP lease,
-      `ip addr`/`ip route` display the applied configuration, and a fresh TCP
-      stream reaches the bounded listener through the assigned address.
+- [x] The production image reports `LOWER_UP`, acquires a DHCP lease, and
+      `ip addr` displays the applied configuration. Eight fresh TCP streams
+      reached the bounded listener through the assigned address and returned
+      exact binary echoes. Lease renewal still belongs to the longer-duration
+      network stress gate.
 - [ ] A live DWMAC reset/restart advances the device epoch and stack generation;
       packets from each retired coordinate are rejected in both directions,
       and the retired TCP stream does not resume in the replacement stack.

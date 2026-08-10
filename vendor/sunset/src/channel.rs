@@ -568,8 +568,8 @@ impl Channels {
             };
             result?;
 
-            if success && matches!(r.req, ChannelReqType::Exec(_)) {
-                self.get_mut(num)?.exec_accepted = true;
+            if success {
+                self.get_mut(num)?.accept_server_request(&r.req);
             }
             Ok(())
         } else {
@@ -584,7 +584,8 @@ impl Channels {
         s: &mut TrafSend,
     ) -> Result<()> {
         let ch = self.get_mut(num)?;
-        if !ch.exec_accepted || ch.sent_exit_status || ch.sent_eof || ch.sent_close {
+        if !ch.start_accepted || ch.sent_exit_status || ch.sent_eof || ch.sent_close
+        {
             return error::BadUsage.fail();
         }
         s.send(ChannelRequest {
@@ -631,6 +632,46 @@ impl Channels {
                     ChannelReqType::Subsystem(packets::Subsystem { subsystem: command }),
                 ..
             }) => Ok(*command),
+            _ => Error::bug(),
+        }
+    }
+
+    pub fn fetch_pty<'p>(&self, p: &Packet<'p>) -> Result<PtyMetadata<'p>> {
+        match p {
+            Packet::ChannelRequest(ChannelRequest {
+                req: ChannelReqType::Pty(pty),
+                ..
+            }) => PtyMetadata::try_from(pty),
+            _ => Error::bug(),
+        }
+    }
+
+    pub fn fetch_window_change(&self, p: &Packet<'_>) -> Result<TerminalSize> {
+        match p {
+            Packet::ChannelRequest(ChannelRequest {
+                req: ChannelReqType::WinChange(window),
+                ..
+            }) => Ok(TerminalSize::from(window)),
+            _ => Error::bug(),
+        }
+    }
+
+    pub fn fetch_signal<'p>(&self, p: &Packet<'p>) -> Result<&'p str> {
+        match p {
+            Packet::ChannelRequest(ChannelRequest {
+                req: ChannelReqType::Signal(signal),
+                ..
+            }) => Ok(signal.sig),
+            _ => Error::bug(),
+        }
+    }
+
+    pub fn fetch_break(&self, p: &Packet<'_>) -> Result<u32> {
+        match p {
+            Packet::ChannelRequest(ChannelRequest {
+                req: ChannelReqType::Break(request),
+                ..
+            }) => Ok(request.length),
             _ => Error::bug(),
         }
     }
@@ -690,19 +731,101 @@ pub struct Pty {
     pub modes: Vec<ModePair, { termmodes::NUM_MODES }>,
 }
 
+/// Informational dimensions from a PTY or window-change request.
+///
+/// Zero fields are valid SSH values and are left for the terminal owner to
+/// interpret. Consumers must not use these peer-controlled values directly as
+/// allocation sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub cols: u32,
+    pub rows: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+impl From<&packets::WinChange> for TerminalSize {
+    fn from(window: &packets::WinChange) -> Self {
+        Self {
+            cols: window.cols,
+            rows: window.rows,
+            pixel_width: window.width,
+            pixel_height: window.height,
+        }
+    }
+}
+
+/// Validated, borrowed PTY metadata from the current server request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyMetadata<'a> {
+    pub term: &'a str,
+    pub size: TerminalSize,
+    pub modes: &'a [u8],
+}
+
+const MAX_TERMINAL_MODE_BYTES: usize = 1 + 159 * 5;
+const MAX_SIGNAL_NAME_BYTES: usize = 64;
+
+fn validate_terminal_modes(mut modes: &[u8]) -> Result<()> {
+    if modes.is_empty() || modes.len() > MAX_TERMINAL_MODE_BYTES {
+        return error::SSHProto.fail();
+    }
+    loop {
+        let Some((&opcode, tail)) = modes.split_first() else {
+            return error::SSHProto.fail();
+        };
+        if opcode == 0 {
+            return if tail.is_empty() { Ok(()) } else { error::SSHProto.fail() };
+        }
+        if opcode >= 160 {
+            // RFC 4254 reserves these opcodes and requires parsing to stop.
+            return Ok(());
+        }
+        let Some(argument) = tail.get(..4) else {
+            return error::SSHProto.fail();
+        };
+        let _ = u32::from_be_bytes(argument.try_into().unwrap());
+        modes = &tail[4..];
+    }
+}
+
+impl<'a> TryFrom<&packets::PtyReq<'a>> for PtyMetadata<'a> {
+    type Error = Error;
+
+    fn try_from(pty: &packets::PtyReq<'a>) -> Result<Self> {
+        let term = pty.term.to_ascii()?;
+        if term.is_empty()
+            || term.len() > MAX_TERM
+            || !term.as_bytes().iter().all(|byte| byte.is_ascii_graphic())
+        {
+            return error::SSHProto.fail();
+        }
+        validate_terminal_modes(pty.modes.0)?;
+        Ok(Self {
+            term,
+            size: TerminalSize {
+                cols: pty.cols,
+                rows: pty.rows,
+                pixel_width: pty.width,
+                pixel_height: pty.height,
+            },
+            modes: pty.modes.0,
+        })
+    }
+}
+
 impl TryFrom<&packets::PtyReq<'_>> for Pty {
     type Error = Error;
     fn try_from(p: &packets::PtyReq) -> Result<Self, Self::Error> {
         debug!("TODO implement pty modes");
-        // SSHProto error is returned when TERM is too long. The caller will catch that.
-        let term =
-            p.term.to_ascii()?.try_into().map_err(|_| error::SSHProto.build())?;
+        let metadata = PtyMetadata::try_from(p)?;
+        let term = metadata.term.try_into().map_err(|_| error::SSHProto.build())?;
         Ok(Pty {
             term,
-            cols: p.cols,
-            rows: p.rows,
-            width: p.width,
-            height: p.height,
+            cols: metadata.size.cols,
+            rows: metadata.size.rows,
+            width: metadata.size.pixel_width,
+            height: metadata.size.pixel_height,
             modes: Vec::new(),
         })
     }
@@ -737,7 +860,7 @@ impl Req<'_> {
                     rows: pty.rows,
                     width: pty.width,
                     height: pty.height,
-                    modes: BinString(&[]),
+                    modes: BinString(&[0]),
                 })
             }
             Req::Exec(cmd) => {
@@ -809,8 +932,10 @@ enum ChanState {
 pub(crate) struct Channel {
     ty: ChanType,
     state: ChanState,
-    exec_seen: bool,
-    exec_accepted: bool,
+    pty_seen: bool,
+    pty_accepted: bool,
+    start_seen: bool,
+    start_accepted: bool,
     sent_exit_status: bool,
     sent_eof: bool,
     sent_close: bool,
@@ -848,8 +973,10 @@ impl Channel {
         Channel {
             ty,
             state: ChanState::Opening,
-            exec_seen: false,
-            exec_accepted: false,
+            pty_seen: false,
+            pty_accepted: false,
+            start_seen: false,
+            start_accepted: false,
             sent_exit_status: false,
             sent_close: false,
             sent_eof: false,
@@ -974,13 +1101,10 @@ impl Channel {
         match r {
             Ok(_) | Err(Error::Bug) => r,
             Err(_) => {
-                // Most errors just send an error response, no failure.
+                // A required failure reply is itself protocol state. Never
+                // silently lose it under output backpressure.
                 if p.want_reply {
-                    let num = self.send_num();
-                    debug_assert!(num.is_ok());
-                    if let Ok(num) = num {
-                        let _ = s.send(packets::ChannelFailure { num });
-                    }
+                    s.send(packets::ChannelFailure { num: self.send_num()? })?;
                 }
                 Ok(DispatchEvent::None)
             }
@@ -997,13 +1121,43 @@ impl Channel {
 
         let num = self.num();
         match &p.req {
-            ChannelReqType::Exec(_) if !self.exec_seen => {
-                self.exec_seen = true;
+            ChannelReqType::Pty(pty) if !self.pty_seen && !self.start_seen => {
+                PtyMetadata::try_from(pty)?;
+                self.pty_seen = true;
+                Ok(DispatchEvent::ServEvent(ServEventId::SessionPty { num }))
+            }
+            ChannelReqType::Shell if !self.start_seen => {
+                self.start_seen = true;
+                Ok(DispatchEvent::ServEvent(ServEventId::SessionShell { num }))
+            }
+            ChannelReqType::Exec(_) if !self.start_seen => {
+                self.start_seen = true;
                 Ok(DispatchEvent::ServEvent(ServEventId::SessionExec { num }))
+            }
+            ChannelReqType::Subsystem(_) if !self.start_seen => {
+                // A rejected program-start request still consumes the single
+                // start slot so pipelined shell/exec requests cannot race it.
+                self.start_seen = true;
+                Err(Error::SSHProtoUnsupported)
+            }
+            ChannelReqType::WinChange(_) if self.pty_accepted && !p.want_reply => {
+                Ok(DispatchEvent::ServEvent(ServEventId::SessionWindowChange {
+                    num,
+                }))
+            }
+            ChannelReqType::Signal(signal)
+                if self.start_accepted
+                    && !p.want_reply
+                    && signal.sig.len() <= MAX_SIGNAL_NAME_BYTES =>
+            {
+                Ok(DispatchEvent::ServEvent(ServEventId::SessionSignal { num }))
+            }
+            ChannelReqType::Break(_) if self.start_accepted && self.pty_accepted => {
+                Ok(DispatchEvent::ServEvent(ServEventId::SessionBreak { num }))
             }
             _ => {
                 if let ChannelReqType::Unknown(u) = &p.req {
-                    warn!("Unknown channel req type \"{}\"", u)
+                    warn!("Unknown channel request name ({} bytes)", u.0.len())
                 } else {
                     // OK unwrap: tested for Unknown
                     warn!(
@@ -1013,6 +1167,16 @@ impl Channel {
                 };
                 Err(Error::SSHProtoUnsupported)
             }
+        }
+    }
+
+    fn accept_server_request(&mut self, request: &ChannelReqType<'_>) {
+        match request {
+            ChannelReqType::Pty(_) => self.pty_accepted = true,
+            ChannelReqType::Shell | ChannelReqType::Exec(_) => {
+                self.start_accepted = true;
+            }
+            _ => {}
         }
     }
 
@@ -1296,8 +1460,23 @@ impl<'g> CliSessionExit<'g> {
 mod strict_server_tests {
     use super::*;
 
+    fn pty_request<'a>(modes: &'a [u8]) -> ChannelRequest<'a> {
+        ChannelRequest {
+            num: 0,
+            want_reply: true,
+            req: ChannelReqType::Pty(packets::PtyReq {
+                term: "xterm-256color".into(),
+                cols: 80,
+                rows: 24,
+                width: 640,
+                height: 480,
+                modes: BinString(modes),
+            }),
+        }
+    }
+
     #[test]
-    fn server_accepts_exactly_one_exec_request() {
+    fn server_admits_exactly_one_start_request() {
         let mut channel = Channel::new(ChanNum(0), ChanType::Session);
         let exec = ChannelRequest {
             num: 0,
@@ -1321,8 +1500,214 @@ mod strict_server_tests {
         assert!(matches!(
             Channel::new(ChanNum(0), ChanType::Session)
                 .dispatch_server_request(&shell),
+            Ok(DispatchEvent::ServEvent(ServEventId::SessionShell {
+                num: ChanNum(0)
+            }))
+        ));
+
+        let mut subsystem_channel = Channel::new(ChanNum(0), ChanType::Session);
+        let subsystem = ChannelRequest {
+            num: 0,
+            want_reply: true,
+            req: ChannelReqType::Subsystem(packets::Subsystem {
+                subsystem: "sftp".into(),
+            }),
+        };
+        assert!(matches!(
+            subsystem_channel.dispatch_server_request(&subsystem),
             Err(Error::SSHProtoUnsupported)
         ));
+        assert!(matches!(
+            subsystem_channel.dispatch_server_request(&shell),
+            Err(Error::SSHProtoUnsupported)
+        ));
+    }
+
+    #[test]
+    fn interactive_requests_follow_accepted_pty_and_start_state() {
+        let modes = [1, 0, 0, 0, 3, 0];
+        let pty = pty_request(&modes);
+        let mut channel = Channel::new(ChanNum(0), ChanType::Session);
+
+        assert!(matches!(
+            channel.dispatch_server_request(&pty),
+            Ok(DispatchEvent::ServEvent(ServEventId::SessionPty {
+                num: ChanNum(0)
+            }))
+        ));
+        assert!(channel.pty_seen);
+        assert!(!channel.pty_accepted);
+        assert!(matches!(
+            channel.dispatch_server_request(&pty),
+            Err(Error::SSHProtoUnsupported)
+        ));
+
+        let window = ChannelRequest {
+            num: 0,
+            want_reply: false,
+            req: ChannelReqType::WinChange(packets::WinChange {
+                cols: 132,
+                rows: 43,
+                width: 0,
+                height: u32::MAX,
+            }),
+        };
+        assert!(matches!(
+            channel.dispatch_server_request(&window),
+            Err(Error::SSHProtoUnsupported)
+        ));
+        channel.accept_server_request(&pty.req);
+        assert!(channel.pty_accepted);
+        assert!(matches!(
+            channel.dispatch_server_request(&window),
+            Ok(DispatchEvent::ServEvent(ServEventId::SessionWindowChange {
+                num: ChanNum(0)
+            }))
+        ));
+
+        let invalid_reply_window = ChannelRequest { want_reply: true, ..window };
+        assert!(matches!(
+            channel.dispatch_server_request(&invalid_reply_window),
+            Err(Error::SSHProtoUnsupported)
+        ));
+
+        let shell =
+            ChannelRequest { num: 0, want_reply: true, req: ChannelReqType::Shell };
+        assert!(matches!(
+            channel.dispatch_server_request(&shell),
+            Ok(DispatchEvent::ServEvent(ServEventId::SessionShell {
+                num: ChanNum(0)
+            }))
+        ));
+
+        let signal = ChannelRequest {
+            num: 0,
+            want_reply: false,
+            req: ChannelReqType::Signal(packets::Signal { sig: "INT" }),
+        };
+        let terminal_break = ChannelRequest {
+            num: 0,
+            want_reply: true,
+            req: ChannelReqType::Break(packets::Break { length: u32::MAX }),
+        };
+        assert!(matches!(
+            channel.dispatch_server_request(&signal),
+            Err(Error::SSHProtoUnsupported)
+        ));
+        assert!(matches!(
+            channel.dispatch_server_request(&terminal_break),
+            Err(Error::SSHProtoUnsupported)
+        ));
+
+        channel.accept_server_request(&shell.req);
+        assert!(channel.start_accepted);
+        assert!(matches!(
+            channel.dispatch_server_request(&signal),
+            Ok(DispatchEvent::ServEvent(ServEventId::SessionSignal {
+                num: ChanNum(0)
+            }))
+        ));
+        assert!(matches!(
+            channel.dispatch_server_request(&terminal_break),
+            Ok(DispatchEvent::ServEvent(ServEventId::SessionBreak {
+                num: ChanNum(0)
+            }))
+        ));
+
+        let reply_seeking_signal = ChannelRequest { want_reply: true, ..signal };
+        assert!(matches!(
+            channel.dispatch_server_request(&reply_seeking_signal),
+            Err(Error::SSHProtoUnsupported)
+        ));
+        let long_signal = "I".repeat(MAX_SIGNAL_NAME_BYTES + 1);
+        let long_signal = ChannelRequest {
+            num: 0,
+            want_reply: false,
+            req: ChannelReqType::Signal(packets::Signal { sig: &long_signal }),
+        };
+        assert!(matches!(
+            channel.dispatch_server_request(&long_signal),
+            Err(Error::SSHProtoUnsupported)
+        ));
+    }
+
+    #[test]
+    fn pty_metadata_is_bounded_and_preserves_exact_fields() {
+        let modes = [1, 0, 0, 0, 3, 0];
+        let request = pty_request(&modes);
+        let ChannelReqType::Pty(pty) = &request.req else { unreachable!() };
+        let metadata = PtyMetadata::try_from(pty).unwrap();
+        assert_eq!(metadata.term, "xterm-256color");
+        assert_eq!(
+            metadata.size,
+            TerminalSize { cols: 80, rows: 24, pixel_width: 640, pixel_height: 480 }
+        );
+        assert_eq!(metadata.modes, modes);
+
+        for invalid in [&[][..], &[1, 0, 0][..], &[1, 0, 0, 0, 3][..], &[0, 1][..]] {
+            let request = pty_request(invalid);
+            let ChannelReqType::Pty(pty) = &request.req else { unreachable!() };
+            assert!(PtyMetadata::try_from(pty).is_err());
+        }
+
+        let reserved_stop = pty_request(&[160, 0xff, 0xff]);
+        let ChannelReqType::Pty(pty) = &reserved_stop.req else { unreachable!() };
+        assert!(PtyMetadata::try_from(pty).is_ok());
+
+        let invalid_term = packets::PtyReq {
+            term: "bad term".into(),
+            cols: 0,
+            rows: 0,
+            width: 0,
+            height: 0,
+            modes: BinString(&[0]),
+        };
+        assert!(PtyMetadata::try_from(&invalid_term).is_err());
+    }
+
+    #[test]
+    fn interactive_payload_accessors_preserve_wire_values() {
+        let channels = Channels::new(false);
+        let modes = [53, 0, 0, 0, 1, 0];
+        let pty: Packet = pty_request(&modes).into();
+        assert_eq!(channels.fetch_pty(&pty).unwrap().modes, modes);
+
+        let window: Packet = ChannelRequest {
+            num: 0,
+            want_reply: false,
+            req: ChannelReqType::WinChange(packets::WinChange {
+                cols: 0,
+                rows: u32::MAX,
+                width: 1,
+                height: 2,
+            }),
+        }
+        .into();
+        assert_eq!(
+            channels.fetch_window_change(&window).unwrap(),
+            TerminalSize {
+                cols: 0,
+                rows: u32::MAX,
+                pixel_width: 1,
+                pixel_height: 2,
+            }
+        );
+
+        let signal: Packet = ChannelRequest {
+            num: 0,
+            want_reply: false,
+            req: ChannelReqType::Signal(packets::Signal { sig: "INT" }),
+        }
+        .into();
+        assert_eq!(channels.fetch_signal(&signal).unwrap(), "INT");
+
+        let terminal_break: Packet = ChannelRequest {
+            num: 0,
+            want_reply: true,
+            req: ChannelReqType::Break(packets::Break { length: u32::MAX }),
+        }
+        .into();
+        assert_eq!(channels.fetch_break(&terminal_break).unwrap(), u32::MAX);
     }
 
     #[test]

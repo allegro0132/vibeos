@@ -56,7 +56,7 @@ pub use sshwire::TextString;
 
 pub use auth::AuthSigMsg;
 pub use channel::{ChanData, ChanNum, CliSessionExit, CliSessionOpener};
-pub use channel::{ChanOpened, Pty, SessionCommand};
+pub use channel::{ChanOpened, Pty, PtyMetadata, SessionCommand, TerminalSize};
 pub use error::{Error, Result};
 pub use packets::{PubKey, Signature};
 pub use sign::{Ed25519HostSigner, KeyType, OwnedSig, SignKey};

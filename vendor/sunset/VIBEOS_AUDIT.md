@@ -26,10 +26,14 @@ following security properties part of Sunset's protocol state machine:
 5. Server authentication is public-key-only, accepts only exact Ed25519 wire
    encodings, locks the username on the first attempt, and enforces a bounded
    attempt count. Password and unauthenticated success paths fail closed.
-6. A connection accepts one session channel and one `exec` request. Shell, PTY,
-   subsystem, environment, forwarding, and later session requests are rejected.
-7. Exec completion is ordered as channel data, exit status, EOF, and close. The
-   completion packets are retry-safe under bounded output backpressure.
+6. A connection accepts one session channel, at most one validated PTY request
+   before at most one shell or `exec` start, and never reuses a rejected start
+   slot. Subsystem, environment, forwarding, and later session requests remain
+   rejected. Window and signal notifications are surfaced only after their PTY
+   or command has been accepted; BREAK additionally requires an explicit
+   application response. The N4 VibeOS service still rejects shell and PTY.
+7. Command completion is ordered as channel data, exit status, EOF, and close.
+   The completion packets are retry-safe under bounded output backpressure.
 8. Peer disconnect is terminal and consumes the input packet once.
 
 The default feature set is empty. VibeOS builds the library with

@@ -911,6 +911,9 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
                 | DispatchEvent::ServEvent(ServEventId::SessionExec { .. })
                 | DispatchEvent::ServEvent(ServEventId::SessionSubsystem { .. })
                 | DispatchEvent::ServEvent(ServEventId::SessionPty { .. })
+                | DispatchEvent::ServEvent(ServEventId::SessionWindowChange { .. })
+                | DispatchEvent::ServEvent(ServEventId::SessionSignal { .. })
+                | DispatchEvent::ServEvent(ServEventId::SessionBreak { .. })
                 | DispatchEvent::ServEvent(ServEventId::Environment { .. })
         ));
     }
@@ -932,6 +935,34 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         let (payload, _seq) = self.traf_in.payload().trap()?;
         let p = self.conn.packet(payload)?;
         self.conn.channels.fetch_servcommand(&p)
+    }
+
+    pub(crate) fn fetch_pty(&self) -> Result<channel::PtyMetadata<'_>> {
+        Self::check_chanreq(&self.resume_event);
+        let (payload, _seq) = self.traf_in.payload().trap()?;
+        let p = self.conn.packet(payload)?;
+        self.conn.channels.fetch_pty(&p)
+    }
+
+    pub(crate) fn fetch_window_change(&self) -> Result<channel::TerminalSize> {
+        Self::check_chanreq(&self.resume_event);
+        let (payload, _seq) = self.traf_in.payload().trap()?;
+        let p = self.conn.packet(payload)?;
+        self.conn.channels.fetch_window_change(&p)
+    }
+
+    pub(crate) fn fetch_signal(&self) -> Result<&str> {
+        Self::check_chanreq(&self.resume_event);
+        let (payload, _seq) = self.traf_in.payload().trap()?;
+        let p = self.conn.packet(payload)?;
+        self.conn.channels.fetch_signal(&p)
+    }
+
+    pub(crate) fn fetch_break(&self) -> Result<u32> {
+        Self::check_chanreq(&self.resume_event);
+        let (payload, _seq) = self.traf_in.payload().trap()?;
+        let p = self.conn.packet(payload)?;
+        self.conn.channels.fetch_break(&p)
     }
 
     pub(crate) fn fetch_env_name(&self) -> Result<TextString<'_>> {

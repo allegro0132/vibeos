@@ -18,6 +18,14 @@
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
 #[cfg(all(feature = "ssh-security-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
+#[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
+compile_error!("feature `ssh-test` is the QEMU-only N4 acceptance image");
+#[cfg(all(feature = "ssh-test", feature = "tcp-echo"))]
+compile_error!("features `ssh-test` and `tcp-echo` are mutually exclusive acceptance images");
+#[cfg(all(feature = "ssh-test", feature = "ssh-security-test"))]
+compile_error!(
+    "features `ssh-test` and `ssh-security-test` are mutually exclusive acceptance images"
+);
 
 extern crate alloc;
 
@@ -39,10 +47,14 @@ mod rustc;
 mod saved_program;
 mod selftest;
 mod shell;
-#[cfg(feature = "ssh-security-test")]
+#[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
 mod ssh_security;
 #[cfg(feature = "ssh-security-test")]
 mod ssh_security_test;
+#[cfg(feature = "ssh-test")]
+mod ssh_test;
+#[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+mod ssh_test_fixture;
 mod store;
 #[cfg(feature = "tcp-echo")]
 mod tcp_echo;
@@ -298,6 +310,8 @@ pub extern "C" fn kmain() -> ! {
     world::start_rng_supervisor();
     #[cfg(feature = "tcp-echo")]
     world::start_tcp_echo_supervisor();
+    #[cfg(feature = "ssh-test")]
+    world::start_ssh_test_supervisor();
     #[cfg(feature = "legacy-shell")]
     world.spawn_component(
         "shell",

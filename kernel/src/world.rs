@@ -29,6 +29,8 @@ use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
+#[cfg(feature = "ssh-test")]
+const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
 // their transient buffers to the shell owner. Keep the documented store
 // working-set floor plus client/future headroom while retaining a hard quota.
@@ -95,6 +97,8 @@ enum ComponentTemplate {
     VirtioRng,
     #[cfg(feature = "ssh-security-test")]
     SshSecurityTest,
+    #[cfg(feature = "ssh-test")]
+    SshTest,
     #[cfg(feature = "tcp-echo")]
     TcpEcho,
     StoreFaultProbe,
@@ -128,6 +132,16 @@ enum ComponentGrants {
     },
     #[cfg(feature = "ssh-security-test")]
     SshSecurityTest {
+        random: Cap,
+        signer_read: Cap,
+        signer_invoke: Cap,
+        policy: Cap,
+    },
+    #[cfg(feature = "ssh-test")]
+    SshTest {
+        outbound: Cap,
+        inbound: Cap,
+        control: Cap,
         random: Cap,
         signer_read: Cap,
         signer_invoke: Cap,
@@ -378,11 +392,11 @@ pub struct World {
     rng_dma: Option<Cap>,
     #[cfg(feature = "qemu-virt")]
     rng_source_root: Option<Cap>,
-    #[cfg(feature = "ssh-security-test")]
+    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
     ssh_security_policy: Option<Arc<Space>>,
-    #[cfg(feature = "ssh-security-test")]
+    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
     ssh_signer_root: Option<Cap>,
-    #[cfg(feature = "ssh-security-test")]
+    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
     ssh_authorized_policy_root: Option<Cap>,
 }
 
@@ -478,6 +492,94 @@ impl World {
     }
 
     fn grant_template(&self, template: ComponentTemplate, space: &Arc<Space>) -> ComponentGrants {
+        #[cfg(feature = "ssh-test")]
+        if template == ComponentTemplate::SshTest {
+            let mut target = space.0.lock();
+            let (outbound, inbound, control) = {
+                let policy = self
+                    .net_policy
+                    .as_ref()
+                    .expect("network policy CSpace exists")
+                    .0
+                    .lock();
+                (
+                    cap::grant(
+                        &policy,
+                        self.net_outbound_root
+                            .expect("network outbound endpoint root exists"),
+                        Rights::SEND,
+                        &mut target,
+                    )
+                    .expect("network policy retains the outbound grant root"),
+                    cap::grant(
+                        &policy,
+                        self.net_inbound_root
+                            .expect("network inbound endpoint root exists"),
+                        Rights::RECV,
+                        &mut target,
+                    )
+                    .expect("network policy retains the inbound grant root"),
+                    cap::grant(
+                        &policy,
+                        self.net_control_root.expect("network control root exists"),
+                        Rights::READ.union(Rights::INVOKE),
+                        &mut target,
+                    )
+                    .expect("network policy retains the control grant root"),
+                )
+            };
+            let random = {
+                let policy = self
+                    .rng_policy
+                    .as_ref()
+                    .expect("entropy policy CSpace exists")
+                    .0
+                    .lock();
+                cap::grant(
+                    &policy,
+                    self.rng_source_root
+                        .expect("entropy source grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("entropy policy retains the source grant root")
+            };
+            let security = self
+                .ssh_security_policy
+                .as_ref()
+                .expect("SSH security policy CSpace exists")
+                .0
+                .lock();
+            return ComponentGrants::SshTest {
+                outbound,
+                inbound,
+                control,
+                random,
+                signer_read: cap::grant(
+                    &security,
+                    self.ssh_signer_root.expect("SSH signer grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("SSH policy retains the signer grant root"),
+                signer_invoke: cap::grant(
+                    &security,
+                    self.ssh_signer_root.expect("SSH signer grant root exists"),
+                    Rights::INVOKE,
+                    &mut target,
+                )
+                .expect("SSH policy retains the signer grant root"),
+                policy: cap::grant(
+                    &security,
+                    self.ssh_authorized_policy_root
+                        .expect("SSH authorized-policy grant root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("SSH policy retains the authorized-key grant root"),
+            };
+        }
+
         #[cfg(feature = "ssh-security-test")]
         if template == ComponentTemplate::SshSecurityTest {
             let mut target = space.0.lock();
@@ -699,6 +801,10 @@ impl World {
             ComponentTemplate::SshSecurityTest => {
                 unreachable!("SSH security-test grants come from private policy CSpaces")
             }
+            #[cfg(feature = "ssh-test")]
+            ComponentTemplate::SshTest => {
+                unreachable!("SSH test grants come from private policy CSpaces")
+            }
             #[cfg(feature = "tcp-echo")]
             ComponentTemplate::TcpEcho => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
@@ -783,6 +889,31 @@ impl World {
                     &component.name,
                     crate::ssh_security_test::task(
                         space.get(),
+                        random,
+                        signer_read,
+                        signer_invoke,
+                        policy,
+                    ),
+                )
+            },
+            #[cfg(feature = "ssh-test")]
+            ComponentGrants::SshTest {
+                outbound,
+                inbound,
+                control,
+                random,
+                signer_read,
+                signer_invoke,
+                policy,
+            } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    crate::ssh_test::task(
+                        space.get(),
+                        outbound,
+                        inbound,
+                        control,
                         random,
                         signer_read,
                         signer_invoke,
@@ -1252,6 +1383,40 @@ pub fn start_tcp_echo_supervisor() {
     });
 }
 
+/// Restart only faulted SSH acceptance-server incarnations. A fresh template
+/// receives newly derived network, entropy, signer, and authorization grants;
+/// explicit cancellation remains an operator decision.
+#[cfg(feature = "ssh-test")]
+pub fn start_ssh_test_supervisor() {
+    let world = world();
+    let Some(component) = world.component_named("ssh-test") else {
+        return;
+    };
+    exec::spawn("supervisor:ssh-test", async move {
+        let mut attempts = 0u32;
+        loop {
+            let (generation, join) = component.join_current();
+            let exit = join.await;
+            match exit.state() {
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("ssh-test").is_err() {
+                        return;
+                    }
+                }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => loop {
+                    if component.snapshot().generation > generation {
+                        break;
+                    }
+                    exec::sleep_ms(100).await;
+                },
+                exec::TaskState::Faulted | exec::TaskState::Running => return,
+            }
+        }
+    });
+}
+
 pub fn build() {
     let console = ConsoleDev::new();
     // 4096 i64s: enough for real programs, small enough that a runaway one hits
@@ -1291,7 +1456,12 @@ pub fn build() {
     let ssh_security_test_space = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-security-test"));
-    #[cfg(feature = "ssh-security-test")]
+    #[cfg(feature = "ssh-test")]
+    let ssh_test_space = net_resources
+        .as_ref()
+        .zip(rng_resources.as_ref())
+        .map(|_| Space::new("ssh-test"));
+    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
     let ssh_security_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-security-policy"));
@@ -1420,10 +1590,10 @@ pub fn build() {
             let control_root = policy.mint(resources.control, Rights::ALL_VOLATILE);
 
             // Diagnostic images expose the directional raw-L2 API to init.
-            // The TCP acceptance image makes the protocol stack the sole
-            // client: init must not race ingress, inject frames, or fault the
-            // device underneath a future SSH boundary.
-            #[cfg(not(feature = "tcp-echo"))]
+            // Protocol acceptance images make their stack the sole client:
+            // init must not race ingress, inject frames, or fault the device
+            // underneath either TCP or SSH session state.
+            #[cfg(not(any(feature = "tcp-echo", feature = "ssh-test")))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
                 Some(cap::grant(&policy, inbound_root, Rights::RECV, &mut cs).unwrap()),
@@ -1437,7 +1607,7 @@ pub fn build() {
                     .unwrap(),
                 ),
             );
-            #[cfg(feature = "tcp-echo")]
+            #[cfg(any(feature = "tcp-echo", feature = "ssh-test"))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
             let mut target = driver_space.0.lock();
@@ -1515,43 +1685,132 @@ pub fn build() {
             (None, None, None) => (None, None, None, None),
             _ => unreachable!("entropy resources and CSpaces are constructed together"),
         };
-    #[cfg(feature = "ssh-security-test")]
-    let (ssh_signer_root, ssh_authorized_policy_root, ssh_security_test_grants) = match (
-        ssh_security_test_space.as_ref(),
-        ssh_security_policy.as_ref(),
-        rng_policy.as_ref(),
-        rng_source_root,
-    ) {
-        (Some(test_space), Some(security_space), Some(entropy_space), Some(random_root)) => {
-            let resources = crate::ssh_security_test::provision();
+    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
+    let (ssh_signer_root, ssh_authorized_policy_root) = match ssh_security_policy.as_ref() {
+        Some(security_space) => {
+            let resources = crate::ssh_test_fixture::provision();
             let mut security = security_space.0.lock();
             let signer_root = security.mint(resources.signer, Rights::ALL_VOLATILE);
             let authorized_policy_root = security.mint(resources.policy, Rights::ALL);
-            let mut target = test_space.0.lock();
-            let random = cap::grant(
-                &entropy_space.0.lock(),
-                random_root,
+            (Some(signer_root), Some(authorized_policy_root))
+        }
+        None => (None, None),
+    };
+    #[cfg(feature = "ssh-security-test")]
+    let ssh_security_test_grants = ssh_security_test_space.as_ref().map(|test_space| {
+        let entropy = rng_policy
+            .as_ref()
+            .expect("SSH security test requires the entropy policy")
+            .0
+            .lock();
+        let security = ssh_security_policy
+            .as_ref()
+            .expect("SSH security test requires the security policy")
+            .0
+            .lock();
+        let mut target = test_space.0.lock();
+        (
+            cap::grant(
+                &entropy,
+                rng_source_root.expect("SSH security test requires the entropy root"),
                 Rights::READ,
                 &mut target,
             )
-            .unwrap();
-            let signer_read =
-                cap::grant(&security, signer_root, Rights::READ, &mut target).unwrap();
-            let signer_invoke =
-                cap::grant(&security, signer_root, Rights::INVOKE, &mut target).unwrap();
-            let policy =
-                cap::grant(&security, authorized_policy_root, Rights::READ, &mut target).unwrap();
-            drop(target);
-            drop(security);
-            (
-                Some(signer_root),
-                Some(authorized_policy_root),
-                Some((random, signer_read, signer_invoke, policy)),
+            .unwrap(),
+            cap::grant(
+                &security,
+                ssh_signer_root.expect("SSH security test requires the signer root"),
+                Rights::READ,
+                &mut target,
             )
-        }
-        (None, None, None, None) => (None, None, None),
-        _ => unreachable!("SSH security test requires the complete entropy policy graph"),
-    };
+            .unwrap(),
+            cap::grant(
+                &security,
+                ssh_signer_root.expect("SSH security test requires the signer root"),
+                Rights::INVOKE,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &security,
+                ssh_authorized_policy_root
+                    .expect("SSH security test requires the authorized-policy root"),
+                Rights::READ,
+                &mut target,
+            )
+            .unwrap(),
+        )
+    });
+    #[cfg(feature = "ssh-test")]
+    let ssh_test_grants = ssh_test_space.as_ref().map(|test_space| {
+        let network = net_policy
+            .as_ref()
+            .expect("SSH test requires the network policy")
+            .0
+            .lock();
+        let entropy = rng_policy
+            .as_ref()
+            .expect("SSH test requires the entropy policy")
+            .0
+            .lock();
+        let security = ssh_security_policy
+            .as_ref()
+            .expect("SSH test requires the security policy")
+            .0
+            .lock();
+        let mut target = test_space.0.lock();
+        (
+            cap::grant(
+                &network,
+                net_outbound_root.expect("SSH test requires the outbound root"),
+                Rights::SEND,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &network,
+                net_inbound_root.expect("SSH test requires the inbound root"),
+                Rights::RECV,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &network,
+                net_control_root.expect("SSH test requires the network control root"),
+                Rights::READ.union(Rights::INVOKE),
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &entropy,
+                rng_source_root.expect("SSH test requires the entropy root"),
+                Rights::READ,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &security,
+                ssh_signer_root.expect("SSH test requires the signer root"),
+                Rights::READ,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &security,
+                ssh_signer_root.expect("SSH test requires the signer root"),
+                Rights::INVOKE,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &security,
+                ssh_authorized_policy_root.expect("SSH test requires the authorized-policy root"),
+                Rights::READ,
+                &mut target,
+            )
+            .unwrap(),
+        )
+    });
     #[cfg(feature = "tcp-echo")]
     let tcp_echo_grants = match (
         net_policy.as_ref(),
@@ -1665,7 +1924,11 @@ pub fn build() {
     if let Some(space) = ssh_security_test_space.as_ref() {
         spaces.insert("ssh-security-test", space.clone());
     }
-    #[cfg(feature = "ssh-security-test")]
+    #[cfg(feature = "ssh-test")]
+    if let Some(space) = ssh_test_space.as_ref() {
+        spaces.insert("ssh-test", space.clone());
+    }
+    #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
     if let Some(space) = ssh_security_policy.as_ref() {
         spaces.insert("ssh-security-policy", space.clone());
     }
@@ -1723,11 +1986,11 @@ pub fn build() {
         rng_dma: rng_dma_root,
         #[cfg(feature = "qemu-virt")]
         rng_source_root,
-        #[cfg(feature = "ssh-security-test")]
+        #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
         ssh_security_policy,
-        #[cfg(feature = "ssh-security-test")]
+        #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
         ssh_signer_root,
-        #[cfg(feature = "ssh-security-test")]
+        #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
         ssh_authorized_policy_root,
     });
 
@@ -1804,6 +2067,30 @@ pub fn build() {
             Some(ComponentTemplate::SshSecurityTest),
             crate::ssh_security_test::task(
                 SpaceRef::new(&space).get(),
+                random,
+                signer_read,
+                signer_invoke,
+                policy,
+            ),
+        );
+    }
+
+    #[cfg(feature = "ssh-test")]
+    if let (
+        Some(space),
+        Some((outbound, inbound, control, random, signer_read, signer_invoke, policy)),
+    ) = (ssh_test_space, ssh_test_grants)
+    {
+        world.spawn_component_inner(
+            "ssh-test",
+            space.clone(),
+            SSH_TEST_MEMORY_BUDGET,
+            Some(ComponentTemplate::SshTest),
+            crate::ssh_test::task(
+                SpaceRef::new(&space).get(),
+                outbound,
+                inbound,
+                control,
                 random,
                 signer_read,
                 signer_invoke,

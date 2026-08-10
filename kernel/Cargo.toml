@@ -19,6 +19,9 @@ tcp-echo-recovery-test = ["tcp-echo"]
 # Dedicated N3 acceptance image. It exercises the real virtio-rng capability,
 # a test-only provisioned host signer, and an immutable binary auth policy.
 ssh-security-test = []
+# Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
+# and retains its no-std surface with allocation support for connection state.
+ssh-test = ["dep:sunset"]
 
 # The kernel is `no_std` and cannot link a host test harness. Its tests live in
 # `selftest.rs` and run inside QEMU; `cargo test --workspace` must skip it.
@@ -30,3 +33,4 @@ test = false
 [dependencies]
 vibeos-core = { path = "../core" }
 vibeos-rustc = { path = "../compiler" }
+sunset = { path = "../vendor/sunset", default-features = false, features = ["alloc"], optional = true }

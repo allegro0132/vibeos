@@ -9,6 +9,7 @@ cargo test --workspace         # fast portable tests, no QEMU
 ./scripts/qemu-tcp-test.sh     # N1 static IPv4/TCP echo over QEMU hostfwd
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
 ./scripts/qemu-ssh-security-test.sh # N3 QEMU entropy/identity boundary gate
+./scripts/qemu-ssh-test.sh     # N4/N5 real OpenSSH exec and rejection gate
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
 ./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
@@ -130,6 +131,33 @@ smoke test for the wired QEMU transport, not an entropy-quality proof. The
 fixed identities and generation are test-only; this gate does not provide
 per-device provisioning, authenticated persistence, rollback resistance, a
 Milk-V hardware source, or an SSH wire protocol.
+
+`qemu-ssh-test.sh` is the separate N4/N5 wire-level gate. It builds only the
+QEMU `ssh-test` image, forwards a dynamically selected localhost port to the
+fixed guest listener at `10.0.2.15:2222`. Readiness is not an open-port check:
+the peer preloads the exact test host key and retries an authenticated `true`
+exec through the real OpenSSH client. It validates the verbose transcript's
+exact host fingerprint (`SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8`)
+and negotiated profile. An explicit `SSH_HOST_PORT` override is available. The
+peer forces `curve25519-sha256`, `ssh-ed25519`, and
+`chacha20-poly1305@openssh.com` with an empty host ssh config (`-F /dev/null`).
+It requires exact `echo` output, exit status 0 from `true`, exit status 1 from
+`false`, denial of the deterministic rejected key, and explicit rejection of
+shell, PTY, and subsystem requests. A second complete QEMU boot must pass the
+same strict authenticated probe with the same exact host key.
+`scripts/openssh-test-key.py` creates both client fixtures with mode 0600 and
+never prints their private material.
+
+The serial side is an independent assertion: a successful boot must print
+`ssh-test listening on 10.0.2.15:2222`; completed authorized commands print
+`ssh-test exec complete: status <n>`; and `FAIL ssh-test:` is fatal. A
+`ssh-test connection reset: <reason>` line is connection-local diagnostic
+output and is expected for hostile or deliberately rejected probes. The gate
+uses QEMU user networking with `restrict=on`, IPv6 disabled, and an
+`/dev/urandom`-backed virtio-rng device. Its fixed identities are public test
+vectors, not production provisioning or Milk-V Duo evidence. It also does not
+replace the malformed-packet fuzzing, resource-exhaustion, deadline, reset, and
+disconnect-race work listed for the complete N5 milestone.
 
 The QEMU harness now defaults every integration case to four multithreaded TCG
 vCPUs and requires the boot-time `4 hart(s) online` barrier, shared Sv39
@@ -292,6 +320,8 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-test.sh net_recovery  # post-publish fault and fresh-epoch retry
 ./scripts/qemu-tcp-test.sh           # independent N1 hostfwd byte-stream gate
 ./scripts/qemu-tcp-test.sh recovery  # independent N2 stack/driver recovery gate
+./scripts/qemu-ssh-security-test.sh  # independent N3 entropy/identity gate
+./scripts/qemu-ssh-test.sh           # independent N4/N5 OpenSSH wire gate
 ./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
 ./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
 ./scripts/qemu-test.sh guard_page   # expected-fatal store-page-fault + exact stval

@@ -52,6 +52,8 @@ cargo test --workspace       # fast portable tests, no QEMU
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/qemu-tcp-test.sh   # N1 static IPv4/TCP echo through host forwarding
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
+./scripts/qemu-ssh-security-test.sh # N3 entropy/identity capability gate
+./scripts/qemu-ssh-test.sh   # N4/N5 real OpenSSH exec and rejection gate
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
@@ -529,7 +531,10 @@ Deliberate, not overlooked:
   bounded, fail-closed virtio-rng capability now feeds a domain-separated,
   zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator
   blocks before reuse. An opaque Ed25519 signer and immutable binary-key policy
-  are exercised only by the explicit `ssh-security-test` image. Its fixed host
-  and client keys are visibly marked test fixtures. Unique per-device identity,
-  authenticated persistent policy updates, rollback resistance, and a validated
-  Milk-V Duo entropy source remain absent, so non-test SSH stays disabled there.
+  are exercised only by the explicit `ssh-security-test` and `ssh-test` images.
+  The latter is a localhost-only, public-key-only OpenSSH acceptance image: it
+  permits the restricted `echo`/`true`/`false` exec profile and rejects shell,
+  PTY, and subsystem requests. Both images visibly embed fixed host and client
+  fixtures. Unique per-device identity, authenticated persistent policy updates,
+  rollback resistance, and a validated Milk-V Duo entropy source remain absent,
+  so non-test SSH stays disabled there.

@@ -584,6 +584,11 @@ impl<'a> TrafOut<'a> {
         matches!(self.state, TxState::Write { .. })
     }
 
+    /// Return true only when neither encoded bytes nor retryable packets remain.
+    pub fn is_fully_drained(&self) -> bool {
+        matches!(self.state, TxState::Idle) && self.deferred_packets.is_empty()
+    }
+
     /// Returns payload space available to send a packet. Returns 0 if not ready or full
     pub fn send_allowed(&self, keys: &KeyState) -> usize {
         if !self.deferred_packets.is_empty() {
@@ -887,5 +892,33 @@ mod strict_exec_tests {
             DeferredPacket::try_from(packet),
             Err(Error::SSHProtoUnsupported)
         ));
+    }
+
+    #[test]
+    fn deferred_completion_is_not_reported_as_fully_drained() {
+        let mut buffer = [0u8; 256];
+        let mut output = TrafOut::new(&mut buffer);
+        assert!(output.is_fully_drained());
+
+        output
+            .deferred_packets
+            .push_back(DeferredPacket::ChannelClose(packets::ChannelClose {
+                num: 9,
+            }))
+            .unwrap();
+        assert!(!output.is_output_pending());
+        assert!(!output.is_fully_drained());
+    }
+
+    #[test]
+    fn closing_with_pending_output_is_not_reported_as_fully_drained() {
+        let mut buffer = [0u8; 256];
+        let mut output = TrafOut::new(&mut buffer);
+        output.send_version().unwrap();
+        assert!(output.is_output_pending());
+
+        output.close();
+        assert!(output.closed());
+        assert!(!output.is_fully_drained());
     }
 }

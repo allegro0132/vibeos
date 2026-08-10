@@ -27,16 +27,27 @@ struct ControlState {
     desired: NetworkConfiguration,
     applied_revision: u64,
     runtime: Ipv4RuntimeStatus,
+    carrier_up: bool,
 }
+
+#[cfg(feature = "qemu-virt")]
+const BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
+    link_up: true,
+    method: Ipv4Method::Static(DEFAULT_STATIC),
+};
+
+#[cfg(feature = "milkv-duo")]
+const BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
+    link_up: true,
+    method: Ipv4Method::Dhcp,
+};
 
 static CONTROL: SpinLock<ControlState> = SpinLock::new(ControlState {
     revision: 1,
-    desired: NetworkConfiguration {
-        link_up: true,
-        method: Ipv4Method::Static(DEFAULT_STATIC),
-    },
+    desired: BOOT_CONFIGURATION,
     applied_revision: 0,
     runtime: Ipv4RuntimeStatus::Unconfigured,
+    carrier_up: false,
 });
 
 pub fn vsh_ip(args: &[String]) -> Result<String, Status> {
@@ -134,6 +145,10 @@ pub fn publish_stack_status(observed_revision: u64, status: Ipv4RuntimeStatus) {
     publish_runtime(observed_revision, status);
 }
 
+pub fn publish_carrier(carrier_up: bool) {
+    CONTROL.lock().carrier_up = carrier_up;
+}
+
 fn update(change: impl FnOnce(&mut NetworkConfiguration)) {
     let mut control = CONTROL.lock();
     change(&mut control.desired);
@@ -151,7 +166,7 @@ fn publish_runtime(revision: u64, status: Ipv4RuntimeStatus) {
 fn show_link() -> String {
     let control = *CONTROL.lock();
     let (flags, state) = if control.desired.link_up {
-        if control.applied_revision == control.revision {
+        if control.applied_revision == control.revision && control.carrier_up {
             ("UP,LOWER_UP", "UP")
         } else {
             ("UP", "UNKNOWN")

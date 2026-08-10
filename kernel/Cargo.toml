@@ -13,6 +13,9 @@ legacy-shell = []
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
 tcp-echo = []
+# Production Milk-V Duo IPv4 control plane. It owns the raw packet endpoints,
+# starts in DHCP mode, and exposes only capability-admitted ip/dhclient commands.
+net-shell = []
 # Test-only recovery hook used by the live stack-generation acceptance script.
 # It is never enabled by the normal TCP or eventual SSH image.
 tcp-echo-recovery-test = ["tcp-echo"]

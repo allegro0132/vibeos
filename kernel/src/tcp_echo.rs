@@ -1,8 +1,8 @@
-//! N1 acceptance service: one configurable IPv4 interface and one TCP echo socket.
+//! Supervised configurable IPv4 interface and one bounded TCP echo socket.
 //!
-//! This module is compiled only for the dedicated `tcp-echo` image. It keeps
-//! the protocol stack behind attenuated packet/control capabilities and is not
-//! part of the eventual SSH security boundary.
+//! QEMU compiles it for the dedicated `tcp-echo` acceptance image. Milk-V Duo
+//! compiles the same capability-confined stack for its production `net-shell`
+//! image, starting in DHCP mode.
 
 #[cfg(feature = "tcp-echo-recovery-test")]
 extern crate alloc;
@@ -25,6 +25,11 @@ const PREFIX_LEN: u8 = crate::net_config::DEFAULT_PREFIX_LEN;
 const LISTEN_PORT: u16 = 2222;
 const TCP_TEST_SEED: u64 = 0x5649_4245_4f53_4e31;
 const IDLE_POLL_CEILING_MS: u64 = 10;
+
+#[cfg(feature = "tcp-echo")]
+pub const COMPONENT_NAME: &str = "tcp-echo";
+#[cfg(feature = "net-shell")]
+pub const COMPONENT_NAME: &str = "net-stack";
 
 #[cfg(feature = "tcp-echo-recovery-test")]
 static FAULT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -72,7 +77,7 @@ pub(crate) fn vsh_session_info(_args: &[String]) -> Result<String, crate::vsh::S
     let ingress_stack = REJECTED_STACK_GENERATION_INGRESS.load(Ordering::Acquire);
     let world = crate::world::world();
     let stack_component = world
-        .component_named("tcp-echo")
+        .component_named(COMPONENT_NAME)
         .map_or(0, |component| component.snapshot().generation);
     let driver_component = world
         .component_named("virtio-net")
@@ -112,6 +117,10 @@ pub async fn task(space: &'static Space, outbound_cap: Cap, inbound_cap: Cap, co
         let Some(info) = device_info(space, control_cap) else {
             return;
         };
+        #[cfg(feature = "qemu-virt")]
+        crate::net_config::publish_carrier(info.online);
+        #[cfg(feature = "milkv-duo")]
+        crate::net_config::publish_carrier(info.online && info.phy_link_up);
         if info.quarantined {
             return;
         }

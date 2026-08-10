@@ -46,8 +46,8 @@ impl Channels {
         let chan = Channel::new(num, (&ty).into());
         let p = packets::ChannelOpen {
             sender_num: num.0,
-            initial_window: chan.recv.window as u32,
-            max_packet: chan.recv.max_packet as u32,
+            initial_window: chan.recv.window,
+            max_packet: chan.recv.max_packet,
             ty,
         }
         .into();
@@ -114,7 +114,11 @@ impl Channels {
         if remove_now {
             self.remove_any(num)?;
         } else {
-            self.get_mut(num)?.app_done = true;
+            let ch = self.get_mut(num)?;
+            ch.app_done = true;
+            // Once the application has released the channel there is no
+            // consumer to benefit from granting the peer more input credit.
+            ch.pending_adjust = 0;
         }
         Ok(())
     }
@@ -133,6 +137,7 @@ impl Channels {
             self.ch[num.0 as usize] = None;
         } else if !matches!(ch.state, ChanState::RecvClose) {
             ch.state = ChanState::PendingDone;
+            ch.pending_adjust = 0;
             trace!("not removing channel {}, not finished", num);
         } else {
             trace!("retaining closed channel {} until application done", num);
@@ -157,8 +162,8 @@ impl Channels {
         let mut chan = Channel::new(num, (&co.ty).into());
         chan.send = Some(ChanDir {
             num: co.sender_num,
-            max_packet: co.max_packet as usize,
-            window: co.initial_window as usize,
+            max_packet: co.max_packet,
+            window: co.initial_window,
         });
         chan.state = ChanState::InOpen;
 
@@ -182,7 +187,10 @@ impl Channels {
 
         let ch = self.get_mut(num)?;
         let send = ch.send.as_mut().trap()?;
-        if data.len() > send.max_packet || data.len() > send.window {
+        let Ok(data_len) = u32::try_from(data.len()) else {
+            return Error::bug_msg("channel data length exceeds uint32");
+        };
+        if data_len > send.max_packet || data_len > send.window {
             trace!(
                 "data len {}, max {}, window {}",
                 data.len(),
@@ -191,7 +199,7 @@ impl Channels {
             );
             return Error::bug();
         }
-        send.window -= data.len();
+        send.window -= data_len;
         trace!("send_data: new window {}", send.window);
         if send.window == 0 {
             debug!("ch {num} send window empty");
@@ -219,8 +227,8 @@ impl Channels {
         s: &mut TrafSend,
     ) -> Result<()> {
         let ch = self.get_mut(num)?;
-        ch.finished_input(len);
-        ch.check_send_window_adjust(s);
+        ch.finished_input(len)?;
+        ch.check_send_window_adjust(s)?;
         Ok(())
     }
 
@@ -240,16 +248,16 @@ impl Channels {
         self.get(num).is_ok_and(|c| c.valid_send(dt))
     }
 
-    pub fn progress(&mut self, s: &mut TrafSend) -> DispatchEvent {
+    pub fn progress(&mut self, s: &mut TrafSend) -> Result<DispatchEvent> {
         for ch in self.ch.iter_mut().filter_map(|c| c.as_mut()) {
-            ch.check_send_window_adjust(s);
+            ch.check_send_window_adjust(s)?;
 
             if ch.open_confirmed {
                 ch.open_confirmed = false;
                 match ch.ty {
                     ChanType::Session => {
-                        return DispatchEvent::CliEvent(CliEventId::SessionOpened(
-                            ch.num(),
+                        return Ok(DispatchEvent::CliEvent(
+                            CliEventId::SessionOpened(ch.num()),
                         ));
                     }
                     ChanType::Tcp => {
@@ -258,7 +266,7 @@ impl Channels {
                 }
             }
         }
-        DispatchEvent::None
+        Ok(DispatchEvent::None)
     }
 
     /// Wake the channel with a ready input data packet.
@@ -431,8 +439,8 @@ impl Channels {
 
                         ch.send = Some(ChanDir {
                             num: p.sender_num,
-                            max_packet: p.max_packet as usize,
-                            window: p.initial_window as usize,
+                            max_packet: p.max_packet,
+                            window: p.initial_window,
                         });
 
                         // A future progress() will notify the application.
@@ -459,17 +467,17 @@ impl Channels {
             }
             Packet::ChannelWindowAdjust(p) => {
                 let chan = self.get_mut(ChanNum(p.num))?;
-                let send = chan.send.as_mut().trap()?;
-                send.window = send.window.saturating_add(p.adjust as usize);
-                debug!("ch {} new window +{} = {}", p.num, p.adjust, send.window);
+                chan.adjust_send_window(p.adjust)?;
                 // Wake any writers that might have been blocked.
                 chan.wake_write(is_client);
             }
             Packet::ChannelData(p) => {
-                let ch = self.get(ChanNum(p.num))?;
-                if ch.app_done {
-                    trace!("Ignoring data for done channel");
-                } else if let Some(len) = NonZeroUsize::new(p.data.0.len()) {
+                let ch = self.get_mut(ChanNum(p.num))?;
+                let data_len = p.data.0.len();
+                ch.accept_input(data_len)?;
+                if ch.app_done || ch.sent_close {
+                    trace!("Ignoring data for closed application channel");
+                } else if let Some(len) = NonZeroUsize::new(data_len) {
                     // TODO check we are expecting input
                     let di =
                         DataIn { num: ChanNum(p.num), dt: ChanData::Normal, len };
@@ -480,14 +488,16 @@ impl Channels {
             }
             Packet::ChannelDataExt(p) => {
                 let ch = self.get_mut(ChanNum(p.num))?;
-                if ch.app_done {
-                    trace!("Ignoring data for done channel");
+                let data_len = p.data.0.len();
+                ch.accept_input(data_len)?;
+                if ch.app_done || ch.sent_close {
+                    trace!("Ignoring data for closed application channel");
                 } else if !is_client || p.code != sshnames::SSH_EXTENDED_DATA_STDERR
                 {
                     // Discard the data, sunset can't handle this
                     debug!("Ignoring unexpected dt data, code {}", p.code);
-                    ch.finished_input(p.data.0.len());
-                } else if let Some(len) = NonZeroUsize::new(p.data.0.len()) {
+                    ch.finished_input(data_len)?;
+                } else if let Some(len) = NonZeroUsize::new(data_len) {
                     // TODO check we are expecting input and dt is valid.
                     let di =
                         DataIn { num: ChanNum(p.num), dt: ChanData::Stderr, len };
@@ -618,6 +628,7 @@ impl Channels {
         }
         s.send(packets::ChannelClose { num: ch.send_num()? })?;
         ch.sent_close = true;
+        ch.pending_adjust = 0;
         Ok(())
     }
 
@@ -907,8 +918,8 @@ struct ChanDir {
     /// `u32` rather than `ChanNum` because it can also be used
     /// for the sender-side number
     num: u32,
-    max_packet: usize,
-    window: usize,
+    max_packet: u32,
+    window: u32,
 }
 
 #[derive(Debug)]
@@ -945,9 +956,9 @@ pub(crate) struct Channel {
     send: Option<ChanDir>,
 
     /// Accumulated bytes for the next window adjustment (inbound data direction)
-    pending_adjust: usize,
+    pending_adjust: u32,
 
-    full_window: usize,
+    full_window: u32,
 
     /// Set when Open Confirmation is received.
     ///
@@ -1077,8 +1088,8 @@ impl Channel {
         let p = packets::ChannelOpenConfirmation {
             num: self.send_num()?,
             sender_num: self.recv.num,
-            initial_window: self.recv.window as u32,
-            max_packet: self.recv.max_packet as u32,
+            initial_window: self.recv.window,
+            max_packet: self.recv.max_packet,
         }
         .into();
         Ok(p)
@@ -1090,6 +1101,17 @@ impl Channel {
         s: &mut TrafSend,
         is_client: bool,
     ) -> Result<DispatchEvent> {
+        if matches!(self.state, ChanState::RecvClose | ChanState::PendingDone) {
+            // CHANNEL_CLOSE is terminal. Do not surface a late request to the
+            // application or emit a reply after the close exchange.
+            return error::SSHProto.fail();
+        }
+        if self.sent_close {
+            // A peer request can cross our CLOSE in flight. Ignore it without
+            // emitting an application event or a post-CLOSE failure reply.
+            return Ok(DispatchEvent::None);
+        }
+
         let r = match (is_client, self.app_done) {
             // Reject requests if the application has closed
             // the channel. ChannelEOF is arbitrary.
@@ -1213,14 +1235,25 @@ impl Channel {
     }
 
     fn handle_eof(&mut self, is_client: bool) -> Result<()> {
+        match self.state {
+            ChanState::RecvClose => {
+                // CLOSE is terminal for the receive direction. A late EOF
+                // must never make the channel appear open again.
+                self.pending_adjust = 0;
+                return Ok(());
+            }
+            ChanState::Normal => {}
+            _ => return error::SSHProto.fail(),
+        }
+
         // Wake readers on EOF
         self.wake_read(ChanData::Normal, is_client);
         if is_client {
             self.wake_read(ChanData::Stderr, is_client);
         }
 
+        self.pending_adjust = 0;
         self.state = ChanState::RecvEof;
-        // todo!();
         Ok(())
     }
 
@@ -1238,12 +1271,59 @@ impl Channel {
         }
         self.wake_write(is_client);
 
+        self.pending_adjust = 0;
         self.state = ChanState::RecvClose;
         Ok(())
     }
 
-    fn finished_input(&mut self, len: usize) {
-        self.pending_adjust = self.pending_adjust.saturating_add(len)
+    /// Debit one inbound data packet from the single receive window shared by
+    /// normal and extended data. The peer controls `len`, so every check is
+    /// performed before mutating the advertised credit.
+    fn accept_input(&mut self, len: usize) -> Result<()> {
+        let Ok(len) = u32::try_from(len) else {
+            return error::SSHProto.fail();
+        };
+        if !matches!(self.state, ChanState::Normal)
+            || len > self.recv.max_packet
+            || len > self.recv.window
+        {
+            return error::SSHProto.fail();
+        }
+        self.recv.window -= len;
+        Ok(())
+    }
+
+    /// Apply peer-granted send credit without exceeding SSH's uint32 window.
+    fn adjust_send_window(&mut self, adjust: u32) -> Result<()> {
+        if matches!(self.state, ChanState::RecvClose | ChanState::PendingDone) {
+            return error::SSHProto.fail();
+        }
+        let send = self.send.as_mut().trap()?;
+        let Some(window) = send.window.checked_add(adjust) else {
+            return error::SSHProto.fail();
+        };
+        send.window = window;
+        debug!("ch {} new window +{} = {}", self.recv.num, adjust, send.window);
+        Ok(())
+    }
+
+    /// Mark an accepted packet as consumed by the application. Credit remains
+    /// unavailable to the peer until its WINDOW_ADJUST is successfully queued.
+    fn finished_input(&mut self, len: usize) -> Result<()> {
+        let Ok(len) = u32::try_from(len) else {
+            return Error::bug_msg("channel input credit exceeds uint32");
+        };
+        let Some(debited) = self.full_window.checked_sub(self.recv.window) else {
+            return Error::bug_msg("receive window exceeds its configured maximum");
+        };
+        let Some(unread) = debited.checked_sub(self.pending_adjust) else {
+            return Error::bug_msg("pending receive adjustment exceeds debit");
+        };
+        if len > unread {
+            return Error::bug_msg("application credited unread channel data");
+        }
+        self.pending_adjust += len;
+        Ok(())
     }
 
     fn have_recv_eof(&self) -> bool {
@@ -1259,7 +1339,7 @@ impl Channel {
         if self.sent_eof || self.sent_close {
             return None;
         }
-        let r = self.send.as_ref().map(|s| usize::min(s.window, s.max_packet));
+        let r = self.send.as_ref().map(|s| s.window.min(s.max_packet) as usize);
         trace!("send_allowed {r:?}");
         r
     }
@@ -1270,23 +1350,72 @@ impl Channel {
         !self.sent_eof && !self.sent_close
     }
 
-    /// Send a window adjust packet if required.
-    fn check_send_window_adjust(&mut self, s: &mut TrafSend) {
-        if self.pending_adjust > self.full_window / 2 {
-            let adjust = self.pending_adjust as u32;
-            let Some(sdir) = self.send.as_mut() else {
-                return;
-            };
-            let num = sdir.num;
-            let p = packets::ChannelWindowAdjust { num, adjust };
-            match s.send(p) {
-                Ok(()) => self.pending_adjust = 0,
-                Err(Error::BusySend { .. }) => {
-                    // Do nothing, the adjustment will be sent later.
-                }
-                Err(e) => debug_assert!(false, "Window adjust send failed {e:?}"),
-            }
+    /// Return the adjustment and resulting receive window when a replenishment
+    /// is both necessary and valid. No local credit is restored here.
+    fn pending_window_adjust(&self) -> Result<Option<(u32, u32)>> {
+        if !matches!(self.state, ChanState::Normal)
+            || self.app_done
+            || self.sent_close
+            || self.pending_adjust <= self.full_window / 2
+        {
+            return Ok(None);
         }
+
+        let Some(window) = self.recv.window.checked_add(self.pending_adjust) else {
+            return Error::bug_msg("receive window adjustment overflow");
+        };
+        if window > self.full_window {
+            return Error::bug_msg("receive window adjustment exceeds maximum");
+        }
+        Ok(Some((self.pending_adjust, window)))
+    }
+
+    /// Commit exactly the adjustment that was queued for transmission.
+    fn commit_window_adjust(&mut self, adjust: u32, window: u32) -> Result<()> {
+        if self.pending_adjust != adjust
+            || self.recv.window.checked_add(adjust) != Some(window)
+            || window > self.full_window
+        {
+            return Error::bug_msg(
+                "receive window adjustment changed before commit",
+            );
+        }
+        self.recv.window = window;
+        self.pending_adjust = 0;
+        Ok(())
+    }
+
+    fn try_send_window_adjust<F>(
+        &mut self,
+        output_closed: bool,
+        mut send: F,
+    ) -> Result<()>
+    where
+        F: FnMut(packets::ChannelWindowAdjust) -> Result<()>,
+    {
+        if output_closed {
+            return Ok(());
+        }
+        let Some((adjust, window)) = self.pending_window_adjust()? else {
+            return Ok(());
+        };
+        let num = self.send.as_ref().trap()?.num;
+        let p = packets::ChannelWindowAdjust { num, adjust };
+        match send(p) {
+            Ok(()) => self.commit_window_adjust(adjust, window)?,
+            Err(Error::BusySend { .. }) => {
+                // Do nothing, the adjustment will be sent later.
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// Send a window adjust packet if required. A full output buffer leaves
+    /// both pending and available credit untouched for a later retry.
+    fn check_send_window_adjust(&mut self, s: &mut TrafSend) -> Result<()> {
+        let output_closed = s.is_output_closed();
+        self.try_send_window_adjust(output_closed, |packet| s.send(packet))
     }
 }
 
@@ -1459,6 +1588,19 @@ impl<'g> CliSessionExit<'g> {
 #[cfg(test)]
 mod strict_server_tests {
     use super::*;
+    use crate::encrypt::KeyState;
+    use crate::random::tests::TestRandom;
+    use crate::traffic::TrafOut;
+
+    fn normal_channel(window: u32, max_packet: u32) -> Channel {
+        let mut channel = Channel::new(ChanNum(0), ChanType::Session);
+        channel.state = ChanState::Normal;
+        channel.recv.window = window;
+        channel.recv.max_packet = max_packet;
+        channel.full_window = window;
+        channel.send = Some(ChanDir { num: 7, max_packet: u32::MAX, window: 1 });
+        channel
+    }
 
     fn pty_request<'a>(modes: &'a [u8]) -> ChannelRequest<'a> {
         ChannelRequest {
@@ -1727,5 +1869,253 @@ mod strict_server_tests {
                 ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED
             ))
         ));
+    }
+
+    #[test]
+    fn receive_window_is_shared_bounded_and_restored_only_on_commit() {
+        let mut channel = normal_channel(10, 6);
+
+        // Normal and extended data both use this single debit path.
+        channel.accept_input(6).unwrap();
+        assert_eq!(channel.recv.window, 4);
+        channel.accept_input(4).unwrap();
+        assert_eq!(channel.recv.window, 0);
+        assert!(matches!(channel.accept_input(1), Err(Error::SSHProto { .. })));
+        assert_eq!(channel.recv.window, 0);
+
+        let mut too_large = normal_channel(10, 6);
+        assert!(matches!(too_large.accept_input(7), Err(Error::SSHProto { .. })));
+        assert_eq!(too_large.recv.window, 10);
+        too_large.accept_input(0).unwrap();
+        assert_eq!(too_large.recv.window, 10);
+
+        let mut consumed = normal_channel(10, 10);
+        consumed.accept_input(6).unwrap();
+        consumed.finished_input(6).unwrap();
+        assert_eq!(consumed.recv.window, 4);
+        assert_eq!(consumed.pending_adjust, 6);
+
+        let (adjust, restored) = consumed.pending_window_adjust().unwrap().unwrap();
+        assert_eq!((adjust, restored), (6, 10));
+        // Merely deciding to send an adjustment does not expose credit.
+        assert_eq!(consumed.recv.window, 4);
+        consumed.commit_window_adjust(adjust, restored).unwrap();
+        assert_eq!(consumed.recv.window, 10);
+        assert_eq!(consumed.pending_adjust, 0);
+        assert_eq!(consumed.pending_window_adjust().unwrap(), None);
+    }
+
+    #[test]
+    fn normal_and_extended_packets_share_the_dispatch_receive_window() {
+        let mut channels = Channels::new(false);
+        channels.ch[0] = Some(normal_channel(10, 10));
+
+        let mut output_buf = [0; 64];
+        let mut output = TrafOut::new(&mut output_buf);
+        output.close();
+        let mut keys = KeyState::new_cleartext();
+        let mut random = TestRandom::new(0x71);
+        let mut sender = output.sender(&mut keys, &mut random);
+
+        let normal = Packet::ChannelData(packets::ChannelData {
+            num: 0,
+            data: BinString(b"normal"),
+        });
+        assert!(matches!(
+            channels.dispatch_inner(normal, &mut sender).unwrap(),
+            DispatchEvent::Data(DataIn {
+                num: ChanNum(0),
+                dt: ChanData::Normal,
+                ..
+            })
+        ));
+        assert_eq!(channels.get(ChanNum(0)).unwrap().recv.window, 4);
+
+        let extended = Packet::ChannelDataExt(packets::ChannelDataExt {
+            num: 0,
+            code: sshnames::SSH_EXTENDED_DATA_STDERR,
+            data: BinString(b"ext!"),
+        });
+        assert!(channels.dispatch_inner(extended, &mut sender).unwrap().is_none());
+        let channel = channels.get(ChanNum(0)).unwrap();
+        assert_eq!(channel.recv.window, 0);
+        assert_eq!(channel.pending_adjust, 4);
+
+        let overflow = Packet::ChannelData(packets::ChannelData {
+            num: 0,
+            data: BinString(b"x"),
+        });
+        assert!(matches!(
+            channels.dispatch_inner(overflow, &mut sender),
+            Err(Error::SSHProto { .. })
+        ));
+        assert_eq!(channels.get(ChanNum(0)).unwrap().recv.window, 0);
+    }
+
+    #[test]
+    fn window_adjust_busy_and_closed_paths_preserve_credit_for_retry() {
+        let mut channel = normal_channel(10, 10);
+        channel.accept_input(6).unwrap();
+        channel.finished_input(6).unwrap();
+
+        let mut attempted = false;
+        channel
+            .try_send_window_adjust(true, |_| {
+                attempted = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!attempted);
+        assert_eq!((channel.recv.window, channel.pending_adjust), (4, 6));
+
+        channel
+            .try_send_window_adjust(false, |_| {
+                Err(Error::BusySend {
+                    packet: packets::MessageNumber::SSH_MSG_CHANNEL_WINDOW_ADJUST,
+                    unsupported: true,
+                })
+            })
+            .unwrap();
+        assert_eq!((channel.recv.window, channel.pending_adjust), (4, 6));
+
+        let mut sent = None;
+        channel
+            .try_send_window_adjust(false, |packet| {
+                sent = Some((packet.num, packet.adjust));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent, Some((7, 6)));
+        assert_eq!((channel.recv.window, channel.pending_adjust), (10, 0));
+    }
+
+    #[test]
+    fn duplicate_application_credit_is_rejected_without_mutation() {
+        let mut channel = normal_channel(10, 10);
+        channel.accept_input(6).unwrap();
+        channel.finished_input(6).unwrap();
+
+        let rejected =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                channel.finished_input(1)
+            }));
+        if let Ok(result) = rejected {
+            assert!(matches!(result, Err(Error::Bug)));
+        }
+        assert_eq!((channel.recv.window, channel.pending_adjust), (4, 6));
+    }
+
+    #[test]
+    fn peer_window_adjust_rejects_uint32_overflow_atomically() {
+        let mut channel = normal_channel(10, 10);
+        let send = channel.send.as_mut().unwrap();
+        send.window = u32::MAX;
+
+        assert!(matches!(
+            channel.adjust_send_window(1),
+            Err(Error::SSHProto { .. })
+        ));
+        assert_eq!(channel.send.as_ref().unwrap().window, u32::MAX);
+
+        // An adjustment sent before the peer observed our CLOSE can cross it
+        // on the wire and remains valid for the peer's independent direction.
+        channel.sent_close = true;
+        channel.send.as_mut().unwrap().window = 1;
+        channel.adjust_send_window(1).unwrap();
+        assert_eq!(channel.send.as_ref().unwrap().window, 2);
+
+        channel.send.as_mut().unwrap().window = u32::MAX - 1;
+        channel.adjust_send_window(1).unwrap();
+        assert_eq!(channel.send.as_ref().unwrap().window, u32::MAX);
+        assert!(matches!(
+            channel.adjust_send_window(1),
+            Err(Error::SSHProto { .. })
+        ));
+        assert_eq!(channel.send.as_ref().unwrap().window, u32::MAX);
+    }
+
+    #[test]
+    fn eof_and_close_are_monotonic_and_retire_receive_credit() {
+        let mut eof = normal_channel(10, 10);
+        eof.accept_input(6).unwrap();
+        eof.finished_input(6).unwrap();
+        eof.handle_eof(false).unwrap();
+        assert!(matches!(eof.state, ChanState::RecvEof));
+        assert_eq!(eof.pending_adjust, 0);
+        assert_eq!(eof.pending_window_adjust().unwrap(), None);
+        assert!(matches!(eof.accept_input(1), Err(Error::SSHProto { .. })));
+
+        let mut closed = normal_channel(10, 10);
+        closed.state = ChanState::RecvClose;
+        closed.pending_adjust = 6;
+        closed.handle_eof(false).unwrap();
+        assert!(matches!(closed.state, ChanState::RecvClose));
+        assert!(closed.is_closed());
+        assert_eq!(closed.pending_adjust, 0);
+        assert!(matches!(closed.accept_input(1), Err(Error::SSHProto { .. })));
+        assert!(matches!(closed.adjust_send_window(1), Err(Error::SSHProto { .. })));
+    }
+
+    #[test]
+    fn close_then_request_never_reaches_the_application_or_output() {
+        let mut channels = Channels::new(false);
+        let mut channel = normal_channel(10, 10);
+        channel.state = ChanState::RecvClose;
+        channels.ch[0] = Some(channel);
+
+        let mut output_buf = [0; 64];
+        let mut output = TrafOut::new(&mut output_buf);
+        let mut keys = KeyState::new_cleartext();
+        let mut random = TestRandom::new(0x72);
+        let mut sender = output.sender(&mut keys, &mut random);
+        let shell = Packet::ChannelRequest(ChannelRequest {
+            num: 0,
+            want_reply: true,
+            req: ChannelReqType::Shell,
+        });
+
+        assert!(matches!(
+            channels.dispatch_inner(shell, &mut sender),
+            Err(Error::SSHProto { .. })
+        ));
+        assert!(!channels.get(ChanNum(0)).unwrap().start_seen);
+
+        let mut crossed = Channels::new(false);
+        let mut channel = normal_channel(10, 10);
+        channel.sent_close = true;
+        crossed.ch[0] = Some(channel);
+        let shell = Packet::ChannelRequest(ChannelRequest {
+            num: 0,
+            want_reply: true,
+            req: ChannelReqType::Shell,
+        });
+        assert!(crossed.dispatch_inner(shell, &mut sender).unwrap().is_none());
+        assert!(!crossed.get(ChanNum(0)).unwrap().start_seen);
+
+        let data = Packet::ChannelData(packets::ChannelData {
+            num: 0,
+            data: BinString(b"x"),
+        });
+        assert!(crossed.dispatch_inner(data, &mut sender).unwrap().is_none());
+        let channel = crossed.get(ChanNum(0)).unwrap();
+        assert_eq!(channel.recv.window, 9);
+        assert_eq!(channel.pending_adjust, 0);
+        assert!(output.output_buf().is_empty());
+    }
+
+    #[test]
+    fn application_done_retires_pending_receive_credit() {
+        let mut channels = Channels::new(false);
+        let mut channel = normal_channel(10, 10);
+        channel.accept_input(6).unwrap();
+        channel.finished_input(6).unwrap();
+        channels.ch[0] = Some(channel);
+
+        channels.done(ChanNum(0)).unwrap();
+        let channel = channels.get(ChanNum(0)).unwrap();
+        assert!(channel.app_done);
+        assert_eq!(channel.recv.window, 4);
+        assert_eq!(channel.pending_adjust, 0);
+        assert_eq!(channel.pending_window_adjust().unwrap(), None);
     }
 }

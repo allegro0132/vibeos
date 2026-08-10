@@ -103,10 +103,12 @@ enum RxState {
         chan: ChanNum,
         /// Normal or Stderr
         dt: ChanData,
-        /// read index of channel data. should transition to Idle once `idx==len`
+        /// Absolute read index of channel data in `buf`.
         idx: usize,
-        /// length of channel data
-        len: usize,
+        /// Absolute end index of channel data in `buf`.
+        end: usize,
+        /// Channel payload length, excluding SSH packet headers.
+        data_len: usize,
     },
 }
 
@@ -256,9 +258,9 @@ impl<'a> TrafIn<'a> {
     /// Returns `(channel, dt, length)`
     pub fn read_channel_ready(&self) -> Option<(ChanNum, ChanData, usize)> {
         match self.state {
-            RxState::InChannelData { chan, dt, idx, len } => {
-                debug_assert!(len > idx);
-                let rem = len - idx;
+            RxState::InChannelData { chan, dt, idx, end, .. } => {
+                debug_assert!(end > idx);
+                let rem = end - idx;
                 Some((chan, dt, rem))
             }
             _ => None,
@@ -271,13 +273,28 @@ impl<'a> TrafIn<'a> {
         di: channel::DataIn,
     ) -> Result<(ChanNum, ChanData)> {
         match self.state {
-            RxState::InPayload { .. } => {
-                let idx = SSH_PAYLOAD_START + di.dt.packet_offset();
+            RxState::InPayload { len: payload_len, .. } => {
+                let Some(payload_end) = SSH_PAYLOAD_START.checked_add(payload_len)
+                else {
+                    return error::SSHProto.fail();
+                };
+                let Some(idx) = SSH_PAYLOAD_START.checked_add(di.dt.packet_offset())
+                else {
+                    return error::SSHProto.fail();
+                };
+                let data_len = di.len.get();
+                let Some(end) = idx.checked_add(data_len) else {
+                    return error::SSHProto.fail();
+                };
+                if payload_end > self.buf.len() || end > payload_end {
+                    return error::SSHProto.fail();
+                }
                 self.state = RxState::InChannelData {
                     chan: di.num,
                     dt: di.dt,
                     idx,
-                    len: idx + di.len.get(),
+                    end,
+                    data_len,
                 };
                 Ok((di.num, di.dt))
             }
@@ -285,8 +302,8 @@ impl<'a> TrafIn<'a> {
         }
     }
 
-    // Returns the length returned, and an Option<len> indicating whether the whole
-    // data packet has been completed, or None if some is still pending.
+    // Returns the length copied, and the total channel payload length exactly once
+    // when the packet is completed. The latter excludes SSH packet headers.
     pub fn read_channel(
         &mut self,
         chan: ChanNum,
@@ -294,18 +311,22 @@ impl<'a> TrafIn<'a> {
         buf: &mut [u8],
     ) -> (usize, Option<usize>) {
         match self.state {
-            RxState::InChannelData { chan: c, dt: e, ref mut idx, len }
-                if (c, e) == (chan, dt) =>
-            {
-                debug_assert!(len > *idx);
-                let wlen = (len - *idx).min(buf.len());
+            RxState::InChannelData {
+                chan: c,
+                dt: e,
+                ref mut idx,
+                end,
+                data_len,
+            } if (c, e) == (chan, dt) => {
+                debug_assert!(end > *idx);
+                let wlen = (end - *idx).min(buf.len());
                 buf[..wlen].copy_from_slice(&self.buf[*idx..*idx + wlen]);
                 *idx += wlen;
 
-                if *idx == len {
+                if *idx == end {
                     // all done.
                     self.state = RxState::Idle;
-                    (wlen, Some(len))
+                    (wlen, Some(data_len))
                 } else {
                     (wlen, None)
                 }
@@ -314,26 +335,26 @@ impl<'a> TrafIn<'a> {
         }
     }
 
-    // Returns (length, complete: Option<len: usize>>, Option(dt))
+    // Returns (length copied, total payload length on completion, data type).
     pub fn read_channel_either(
         &mut self,
         chan: ChanNum,
         buf: &mut [u8],
     ) -> (usize, Option<usize>, ChanData) {
         match self.state {
-            RxState::InChannelData { chan: c, dt, ref mut idx, len }
+            RxState::InChannelData { chan: c, dt, ref mut idx, end, data_len }
                 if c == chan =>
             {
-                debug_assert!(len > *idx);
-                let wlen = (len - *idx).min(buf.len());
+                debug_assert!(end > *idx);
+                let wlen = (end - *idx).min(buf.len());
                 buf[..wlen].copy_from_slice(&self.buf[*idx..*idx + wlen]);
                 // info!("idx {} += wlen {} = {}", *idx, wlen, *idx+wlen);
                 *idx += wlen;
 
-                if *idx == len {
+                if *idx == end {
                     // all done.
                     self.state = RxState::Idle;
-                    (wlen, Some(len), dt)
+                    (wlen, Some(data_len), dt)
                 } else {
                     (wlen, None, dt)
                 }
@@ -342,12 +363,12 @@ impl<'a> TrafIn<'a> {
         }
     }
 
-    /// Returns the length of data discarded
+    /// Returns the total channel payload length once, excluding SSH packet headers.
     pub fn discard_read_channel(&mut self, chan: ChanNum) -> usize {
         match self.state {
-            RxState::InChannelData { chan: c, len, .. } if c == chan => {
+            RxState::InChannelData { chan: c, data_len, .. } if c == chan => {
                 self.state = RxState::Idle;
-                len
+                data_len
             }
             _ => 0,
         }
@@ -726,6 +747,11 @@ impl<'s, 'a> TrafSend<'s, 'a> {
         self.keys.is_rekey_needed()
     }
 
+    /// Whether the transport output has been closed and would discard packets.
+    pub fn is_output_closed(&self) -> bool {
+        self.out.closed()
+    }
+
     /// Set TrafOut to start draining output.
     ///
     /// Only one caller/area should be using set_drain_output() at a time.
@@ -854,7 +880,151 @@ impl<'a> TryFrom<Packet<'a>> for DeferredPacket {
 
 #[cfg(test)]
 mod strict_exec_tests {
+    use core::num::NonZeroUsize;
+
     use super::*;
+
+    fn stage_channel_data(
+        input: &mut TrafIn<'_>,
+        chan: ChanNum,
+        dt: ChanData,
+        data: &[u8],
+    ) {
+        let data_start = SSH_PAYLOAD_START + dt.packet_offset();
+        input.buf[data_start..data_start + data.len()].copy_from_slice(data);
+        input.state =
+            RxState::InPayload { len: dt.packet_offset() + data.len(), seq: 0 };
+
+        let ready = input
+            .set_read_channel_data(channel::DataIn {
+                num: chan,
+                dt,
+                len: NonZeroUsize::new(data.len()).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(ready, (chan, dt));
+    }
+
+    #[test]
+    fn normal_channel_data_fragmentation_credits_payload_once() {
+        let chan = ChanNum(3);
+        let data = b"hello";
+        let mut storage = [0xa5; 64];
+        let mut input = TrafIn::new(&mut storage);
+        stage_channel_data(&mut input, chan, ChanData::Normal, data);
+
+        assert_eq!(
+            input.read_channel_ready(),
+            Some((chan, ChanData::Normal, data.len()))
+        );
+
+        let mut first = [0; 2];
+        assert_eq!(
+            input.read_channel(chan, ChanData::Normal, &mut first),
+            (2, None)
+        );
+        assert_eq!(&first, b"he");
+        assert_eq!(input.read_channel_ready(), Some((chan, ChanData::Normal, 3)));
+
+        let mut rest = [0; 8];
+        let (read, credited) = input.read_channel(chan, ChanData::Normal, &mut rest);
+        assert_eq!(read, 3);
+        assert_eq!(&rest[..read], b"llo");
+        assert_eq!(credited, Some(data.len()));
+        assert_ne!(
+            credited,
+            Some(SSH_PAYLOAD_START + ChanData::Normal.packet_offset() + data.len())
+        );
+
+        assert_eq!(input.read_channel(chan, ChanData::Normal, &mut rest), (0, None));
+        assert_eq!(input.discard_read_channel(chan), 0);
+    }
+
+    #[test]
+    fn stderr_channel_data_fragmentation_credits_payload_once() {
+        let chan = ChanNum(7);
+        let data = b"error";
+        let mut storage = [0xa5; 64];
+        let mut input = TrafIn::new(&mut storage);
+        stage_channel_data(&mut input, chan, ChanData::Stderr, data);
+
+        let mut first = [0; 1];
+        assert_eq!(
+            input.read_channel_either(chan, &mut first),
+            (1, None, ChanData::Stderr)
+        );
+        assert_eq!(&first, b"e");
+
+        let mut rest = [0; 8];
+        let (read, credited, dt) = input.read_channel_either(chan, &mut rest);
+        assert_eq!(read, 4);
+        assert_eq!(&rest[..read], b"rror");
+        assert_eq!(dt, ChanData::Stderr);
+        assert_eq!(credited, Some(data.len()));
+        assert_ne!(
+            credited,
+            Some(SSH_PAYLOAD_START + ChanData::Stderr.packet_offset() + data.len())
+        );
+
+        assert_eq!(
+            input.read_channel_either(chan, &mut rest),
+            (0, None, ChanData::Normal)
+        );
+        assert_eq!(input.discard_read_channel(chan), 0);
+    }
+
+    #[test]
+    fn partial_read_then_discard_credits_full_payload_once() {
+        let chan = ChanNum(11);
+        let data = b"discard";
+        let mut storage = [0xa5; 64];
+        let mut input = TrafIn::new(&mut storage);
+        stage_channel_data(&mut input, chan, ChanData::Normal, data);
+
+        let mut prefix = [0; 3];
+        assert_eq!(
+            input.read_channel(chan, ChanData::Normal, &mut prefix),
+            (3, None)
+        );
+        assert_eq!(&prefix, b"dis");
+
+        assert_eq!(input.discard_read_channel(chan), data.len());
+        assert_eq!(input.discard_read_channel(chan), 0);
+        assert_eq!(input.read_channel_ready(), None);
+    }
+
+    #[test]
+    fn channel_data_bounds_are_checked_before_state_transition() {
+        let chan = ChanNum(13);
+        let dt = ChanData::Normal;
+        let payload_len = dt.packet_offset() + 2;
+        let mut storage = [0xa5; 64];
+        let mut input = TrafIn::new(&mut storage);
+        input.state = RxState::InPayload { len: payload_len, seq: 17 };
+
+        let result = input.set_read_channel_data(channel::DataIn {
+            num: chan,
+            dt,
+            len: NonZeroUsize::new(3).unwrap(),
+        });
+        assert!(matches!(result, Err(Error::SSHProto { .. })));
+        assert!(matches!(
+            &input.state,
+            RxState::InPayload { len, seq: 17 } if *len == payload_len
+        ));
+
+        input.state = RxState::InPayload { len: usize::MAX, seq: 18 };
+        let result = input.set_read_channel_data(channel::DataIn {
+            num: chan,
+            dt,
+            len: NonZeroUsize::new(usize::MAX).unwrap(),
+        });
+        assert!(matches!(result, Err(Error::SSHProto { .. })));
+        assert!(matches!(
+            input.state,
+            RxState::InPayload { len: usize::MAX, seq: 18 }
+        ));
+    }
 
     #[test]
     fn exit_status_survives_deferred_output() {

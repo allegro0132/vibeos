@@ -1,6 +1,6 @@
 // TODO
-pub const DEFAULT_WINDOW: usize = 1000;
-pub const DEFAULT_MAX_PACKET: usize = 1000;
+pub const DEFAULT_WINDOW: u32 = 1000;
+pub const DEFAULT_MAX_PACKET: u32 = 1000;
 
 /// Maximum SSH packet size, from RFC4253.
 ///

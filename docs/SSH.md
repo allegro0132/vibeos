@@ -271,9 +271,19 @@ publishes `milkv-ssh-acceptance listening on ADDRESS:2222` over UART, rebinds
 after recoverable device/link changes, and republishes lease changes. The host
 gate reuses the same exact host fingerprint, forced algorithms, authorized and
 rejected fixture keys, exec statuses, negative request policy, and real
-interactive PTY/VSH sequence as the QEMU gate. Until that command passes
-against a flashed board, the existence of the image is not physical SSH/VSH
-acceptance evidence.
+interactive PTY/VSH sequence as the QEMU gate.
+
+On 2026-08-11, a physical CV1800B Duo running the acceptance image built from
+commit `be3d790` acquired `169.254.184.75` and passed 11 complete gates without
+a reboot. One gate creates at least ten independent, non-multiplexed OpenSSH
+connections, so the run covered at least 110 sessions, including 11 forced-PTY
+VSH sessions, 11 rejected keys, and 33 denied invalid requests. The UART log
+showed 44 status-0 exec completions, 11 intentional status-1 completions, 11
+successful interactive shells, and no completion-drain timeout, DWMAC timeout,
+panic, or driver fault. The pinned host fingerprint was
+`SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8`. This is physical SSH/VSH
+acceptance evidence for the explicitly insecure image only; it is not entropy,
+identity-provisioning, or production-SSH evidence.
 
 ### N5: hostile-input evidence
 
@@ -295,12 +305,13 @@ coverage, or Milk-V hardware evidence; those remain separate acceptance work.
 
 ### N6: interactive terminal and hardware
 
-The QEMU per-session terminal now covers input, output, history, Ctrl-C/EOF,
+The QEMU per-session terminal covers input, output, history, Ctrl-C/EOF,
 window-change metadata, and channel backpressure without reusing the singleton
-UART TTY. A physical Duo has passed carrier, DHCP, and eight fresh exact-echo
-TCP streams. Driver-reset, delayed-DMA/late-IRQ stress and remote SSH/VSH on the
-explicit acceptance image remain open. A successful QEMU gate or physical TCP
-gate must not be reported as Milk-V remote-login completion.
+UART TTY. A physical Duo has passed carrier, DHCP, eight fresh exact-echo TCP
+streams, and the explicit acceptance-image SSH/VSH run recorded above.
+Driver-reset, delayed-DMA/late-IRQ stress, hardware entropy, and production
+identity provisioning remain open. The explicit acceptance result must not be
+reported as production SSH readiness.
 
 SFTP/SCP remains out of scope until VibeOS has a capability-native file or
 directory service whose semantics can be exposed without inventing a POSIX path

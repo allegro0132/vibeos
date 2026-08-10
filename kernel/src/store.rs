@@ -281,6 +281,16 @@ impl StoreInner {
             last_sequence: checkpoint.previous_sequence,
         };
     }
+
+    fn install_unformatted_recovery(&self, used_sectors: usize) {
+        *self.state.lock() = RuntimeState {
+            ready: true,
+            used_sectors,
+            recovered_objects: 0,
+            id_high_water: 0,
+            last_sequence: 0,
+        };
+    }
 }
 
 /// Clears the single-operation claim on every ordinary return, error, or async
@@ -400,6 +410,9 @@ impl AuthorityJournal {
             if let Some(preflight) = snapshot.preflight.as_ref() {
                 self.inner
                     .install_recovery(preflight, snapshot.used_sectors);
+            } else {
+                self.inner
+                    .install_unformatted_recovery(snapshot.used_sectors);
             }
             Ok(snapshot)
         }

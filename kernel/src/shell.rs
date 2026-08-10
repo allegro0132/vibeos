@@ -604,6 +604,10 @@ pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
         "  echo ...        write value arguments\n\
          \x20 wc              count stdin bytes, words, and lines\n\
          \x20 let NAME VALUE  set a session value\n\
+         \x20 if/while        bounded control flow (`; then` / `; do`)\n\
+         \x20 function N ...  define a value-only scoped function\n\
+         \x20 echo \"$(...)\"  bounded command substitution\n\
+         \x20 run-script @S   run a read-only manifested script\n\
          \x20 jobs            list session jobs\n\
          \x20 wait %N         join a job\n\
          \x20 cancel %N       cancel a job\n\

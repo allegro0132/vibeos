@@ -355,6 +355,11 @@ help            capability-native command summary
 echo ...        write value arguments
 wc              count stdin bytes, words, and lines
 let NAME VALUE  set a session value
+if/then/else/fi bounded conditional execution
+while/do/done   loop with a fixed iteration budget
+function N ...  define a scoped, value-only function
+$(...)          bounded command substitution
+run-script @S   run a read-only script with an exact authority manifest
 jobs            list background Jobs
 wait %N         join a Job
 cancel %N       cancel a Job
@@ -370,6 +375,13 @@ Interactive editing is shared by the default and test shells: `Up`/`Down`
 browse command history, while `Left`/`Right` move the insertion cursor.
 Backspace and insertion work in the middle of a line. Input is bounded to
 4 KiB, and history to the newest 64 entries / 64 KiB.
+
+Functions store syntax and value-parameter names, never resolved capability
+handles. A syntactic `@name` in a function is resolved again when called.
+Command substitution runs in an isolated value/function scope, removes trailing
+newlines, and is capped at 64 KiB of output. Immutable script artifacts are
+limited to 64 KiB and run only after every syntactic capability use exactly
+matches their manifest.
 
 ## Test shell
 

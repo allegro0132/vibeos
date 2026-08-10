@@ -34,7 +34,7 @@ behaviour.
   stop/resume.
 - File descriptors, `PATH`, a current working directory, pathname lookup, or a
   global command namespace.
-- Globbing, `eval`, `source`, aliases, heredocs, traps, or command substitution.
+- Globbing, `eval`, `source`, aliases, heredocs, or traps.
 - Loading arbitrary ELF or treating in-tree applets as untrusted code.
 - Persisting a live Job, its CSpaces, streams, or task state.
 
@@ -56,8 +56,8 @@ components and therefore remain in the trusted build.
 - **Capability binding**: a session-local reference to an existing CSpace slot,
   addressed as `@name`.
 - **Special form**: syntax evaluated by the shell because it changes shell
-  state, such as `let`, `jobs`, `wait`, and `cancel`. It is not a pipeline
-  command.
+  state, such as `let`, `jobs`, `wait`, `cancel`, and `run-script`. It is not a
+  pipeline command.
 
 The parser and planner are trusted input-processing code but receive no implicit
 device or store references. Command implementations remain in the TCB for v0.1.
@@ -95,9 +95,8 @@ CAP_REF      := "@" NAME
 NAME         := [A-Za-z_][A-Za-z0-9_-]*
 ```
 
-Parenthesised lexical scopes, shell functions, `if`, and `while` are reserved
-for the scripting milestone and MUST be rejected in v0.1 rather than accepted
-with partial semantics.
+S1--S4 implement this base grammar. S5 adds the bounded scripting forms in
+Section 3.6 without changing capability-reference tokenization.
 
 ### 3.2 Quoting and expansion
 
@@ -183,6 +182,40 @@ rule.
 
 `jobs`, `wait %N`, and `cancel %N` use session-local, monotonically allocated
 Job IDs. IDs MUST NOT be silently reused during a session.
+
+### 3.6 Bounded scripting extension (S5)
+
+S5 adds these forms:
+
+```text
+if AND_OR ; then SCRIPT (else SCRIPT)? fi
+while AND_OR ; do SCRIPT done
+function NAME NAME* { SCRIPT }
+$(SCRIPT)
+run-script @SCRIPT
+```
+
+- `if` and `while` conditions use typed command status. A fault, denial,
+  cancellation, or budget failure is propagated rather than treated as false.
+- `while` is capped at 256 completed iterations and yields after each body.
+- Functions are foreground-only and cannot be pipeline stages in S5. Parameters
+  are value-only, calls are capped at 32 nested frames, and definitions cannot
+  shadow commands or special forms.
+- A function stores syntax and parameter names, never a resolved capability.
+  Any syntactic `@name` is resolved from the current permitted capability set
+  at invocation, so function definition is not capability capture.
+- Command substitution executes in an isolated value/function scope, rejects
+  background Jobs, is capped at eight nested substitutions and 64 KiB of
+  captured output, and removes trailing newlines. Its result remains one value
+  argument and is never re-lexed.
+- `run-script` accepts one explicit READ capability to an immutable
+  `ScriptArtifact`. Artifacts are capped at 64 KiB and bind parsed source to an
+  exact ABI-1 authority manifest. Missing, extra, wrong-kind, or over-righted
+  manifest entries fail before execution.
+- Artifact value and function bindings are local to the invocation. An artifact
+  can use only syntactic capability labels present in its manifest; nested
+  script calls are capped at eight, and an inner artifact's requirements must
+  be a subset of its caller's allowed capability labels.
 
 ## 4. Command and authority model
 
@@ -401,6 +434,12 @@ reject smaller inputs under memory pressure but MUST NOT silently exceed them.
 | Stream chunk | 1 KiB |
 | Buffered chunks per pipe | 8 |
 | Future captured command output | 64 KiB |
+| Stored script source | 64 KiB |
+| Functions per session | 64 |
+| Function call depth | 32 |
+| Completed iterations per `while` | 256 |
+| Command-substitution depth | 8 |
+| Nested script-artifact calls | 8 |
 
 Command manifests declare stage memory needs; boot policy supplies the ceiling.
 The initial default applet budget is 256 KiB and no stage may receive more than
@@ -458,3 +497,10 @@ terminal cleanup. Negative acceptance must additionally show that an unknown
 later command, a forged textual `@name`, a wrong resource kind, missing `GRANT`,
 mid-pipeline revocation, stage fault, and Ctrl-C all fail closed while the shell
 survives.
+
+S5 delivers the Section 3.6 scripting extension. Host acceptance must cover AST
+shape and malformed terminators, local function/value scope, recursion and loop
+budgets, command-substitution isolation and failure, exact script manifests,
+authority revocation after function definition, and script bindings that do not
+escape an artifact invocation. QEMU acceptance exercises `if`, `while`, a
+function call, and command substitution through the real console path.

@@ -4,6 +4,11 @@ spin
 @sleep 1
 @ctrl-c
 @sleep 1
+vsh if false; then echo hidden > @console; else echo branch > @console; fi
+vsh function greet who { echo "hello $who" > @console; }
+vsh greet VibeOS
+vsh echo "sub=$(echo inner)" > @console
+vsh while false; do echo hidden > @console; done
 echo history > @console
 @text draft
 @up

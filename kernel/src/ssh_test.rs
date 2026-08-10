@@ -529,6 +529,7 @@ pub async fn task(
             Err(reason) => ConnectionEnd::Rebind(reason),
         };
 
+        let mut rebind_reason = None;
         match outcome {
             ConnectionEnd::ExecComplete(status) => {
                 crate::println!("ssh-test exec complete: status {status}");
@@ -543,72 +544,75 @@ pub async fn task(
             ConnectionEnd::Rebind(reason) => {
                 let _ = stack.reset();
                 crate::println!("ssh-test connection reset: {reason}");
-                wipe(&mut connection_seed);
-                announced_ipv4 = None;
-                announce_required = true;
-                let next_entropy = match fetch_entropy(space, random, SEED_BYTES + 8).await {
-                    Ok(entropy) => entropy,
-                    Err(_) => {
-                        crate::println!(
-                            "FAIL ssh-test: SSH random source unavailable during rebind"
-                        );
-                        return;
-                    }
-                };
-                connection_seed.copy_from_slice(&next_entropy.as_slice()[..SEED_BYTES]);
-                let mut next_tcp_seed = [0u8; 8];
-                next_tcp_seed.copy_from_slice(&next_entropy.as_slice()[SEED_BYTES..]);
-                let next_tcp_seed_value = u64::from_le_bytes(next_tcp_seed);
-                wipe(&mut next_tcp_seed);
-                drop(next_entropy);
-                if connection_seed.iter().all(|byte| *byte == 0) {
-                    wipe(&mut connection_seed);
-                    crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
-                    return;
-                }
-                let Some((next_outbound, next_inbound)) = stack_endpoints(space, outbound, inbound)
-                else {
-                    wipe(&mut connection_seed);
-                    crate::println!("FAIL ssh-test: packet authority unavailable while rebinding");
-                    return;
-                };
-                stack = match build_stack(
-                    space,
-                    control,
-                    next_tcp_seed_value,
-                    next_inbound,
-                    next_outbound,
-                )
-                .await
-                {
-                    Ok(stack) => stack,
-                    Err(reason) => {
-                        wipe(&mut connection_seed);
-                        crate::println!("FAIL ssh-test: {reason}");
-                        return;
-                    }
-                };
-                bound_epoch = match device_info(space, control) {
-                    Some(info) => info.session_epoch,
-                    None => {
-                        wipe(&mut connection_seed);
-                        crate::println!("FAIL ssh-test: network control authority unavailable");
-                        return;
-                    }
-                };
-                continue;
+                rebind_reason = Some(reason);
             }
         }
 
-        // Rearm the reusable listener and prepare fresh connection-local
-        // randomness before admitting another peer.
-        for _ in 0..MAX_WIRE_IO_PER_TURN {
-            let _ = stack.poll_network(monotonic_ms());
-            if stack.is_listening() {
-                break;
+        if rebind_reason.is_none() {
+            if let Err(reason) = rearm_listener(&mut stack).await {
+                let _ = stack.reset();
+                crate::println!("ssh-test connection reset: {reason}");
+                rebind_reason = Some(reason);
             }
-            crate::exec::yield_now().await;
         }
+
+        if rebind_reason.is_some() {
+            wipe(&mut connection_seed);
+            announced_ipv4 = None;
+            announce_required = true;
+            let next_entropy = match fetch_entropy(space, random, SEED_BYTES + 8).await {
+                Ok(entropy) => entropy,
+                Err(_) => {
+                    crate::println!("FAIL ssh-test: SSH random source unavailable during rebind");
+                    return;
+                }
+            };
+            connection_seed.copy_from_slice(&next_entropy.as_slice()[..SEED_BYTES]);
+            let mut next_tcp_seed = [0u8; 8];
+            next_tcp_seed.copy_from_slice(&next_entropy.as_slice()[SEED_BYTES..]);
+            let next_tcp_seed_value = u64::from_le_bytes(next_tcp_seed);
+            wipe(&mut next_tcp_seed);
+            drop(next_entropy);
+            if connection_seed.iter().all(|byte| *byte == 0) {
+                wipe(&mut connection_seed);
+                crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
+                return;
+            }
+            let Some((next_outbound, next_inbound)) = stack_endpoints(space, outbound, inbound)
+            else {
+                wipe(&mut connection_seed);
+                crate::println!("FAIL ssh-test: packet authority unavailable while rebinding");
+                return;
+            };
+            stack = match build_stack(
+                space,
+                control,
+                next_tcp_seed_value,
+                next_inbound,
+                next_outbound,
+            )
+            .await
+            {
+                Ok(stack) => stack,
+                Err(reason) => {
+                    wipe(&mut connection_seed);
+                    crate::println!("FAIL ssh-test: {reason}");
+                    return;
+                }
+            };
+            bound_epoch = match device_info(space, control) {
+                Some(info) => info.session_epoch,
+                None => {
+                    wipe(&mut connection_seed);
+                    crate::println!("FAIL ssh-test: network control authority unavailable");
+                    return;
+                }
+            };
+            continue;
+        }
+
+        // Prepare fresh connection-local randomness only after the old TCP
+        // tuple has definitely returned to the passive listener.
         let entropy = match fetch_entropy(space, random, SEED_BYTES).await {
             Ok(entropy) => entropy,
             Err(_) => {
@@ -777,6 +781,43 @@ async fn wait_for_connection(
             TcpStreamState::Established | TcpStreamState::PeerClosed
         ) {
             return Ok(());
+        }
+        cooperate(
+            report.more_work || report.ingress_frames != 0,
+            report.next_poll_delay_ms,
+        )
+        .await;
+    }
+}
+
+async fn rearm_listener(stack: &mut StaticIpv4TcpStack) -> Result<(), &'static str> {
+    let started = monotonic_ms();
+    loop {
+        // A successfully completed connection may already have rearmed the
+        // passive socket. Do not poll in that state: an immediately queued SYN
+        // belongs to the next fresh SSH Runner and connection entropy.
+        if stack.is_listening() {
+            return Ok(());
+        }
+        let now = monotonic_ms();
+        let report = stack
+            .poll_network(now)
+            .map_err(|_| "network listener rearm poll failed")?;
+        if stack.is_listening() {
+            return Ok(());
+        }
+        if now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
+            stack
+                .reset()
+                .map_err(|_| "TCP listener fallback reset failed")?;
+            stack
+                .poll_network(now)
+                .map_err(|_| "TCP listener fallback reset poll failed")?;
+            return if stack.is_listening() {
+                Ok(())
+            } else {
+                Err("TCP listener did not rearm after fallback reset")
+            };
         }
         cooperate(
             report.more_work || report.ingress_frames != 0,
@@ -2218,7 +2259,6 @@ async fn finish_exec(
     let mut exit_sent = false;
     let mut eof_sent = false;
     let mut close_sent = false;
-    let mut tcp_close_requested = false;
 
     loop {
         let now = monotonic_ms();
@@ -2232,13 +2272,9 @@ async fn finish_exec(
             .drive(runner, stack, now)
             .map_err(ConnectionEnd::Reset)?;
         if wire.ended {
-            return if tcp_close_requested {
-                Ok(())
-            } else {
-                Err(ConnectionEnd::Reset(
-                    "peer disconnected before SSH completion was acknowledged",
-                ))
-            };
+            return Err(ConnectionEnd::Reset(
+                "peer disconnected before SSH completion was acknowledged",
+            ));
         }
 
         let completion_confirmed_before_progress =
@@ -2251,10 +2287,7 @@ async fn finish_exec(
             // before processing that event can therefore prove both the peer's
             // CHANNEL_CLOSE acknowledgement and a complete output drain.
             if completion_confirmed_before_progress {
-                stack
-                    .close()
-                    .map_err(|_| ConnectionEnd::Reset("TCP close failed"))?;
-                return Ok(());
+                return finish_tcp_after_ssh(space, control, bound_epoch, stack, started).await;
             }
             return Err(ConnectionEnd::Reset(
                 "SSH peer became defunct before completion was acknowledged",
@@ -2324,19 +2357,8 @@ async fn finish_exec(
             }
         }
 
-        if close_sent
-            && protocol.channel.is_none()
-            && !tcp_close_requested
-            && runner.is_output_drained()
-        {
-            stack
-                .close()
-                .map_err(|_| ConnectionEnd::Reset("TCP close failed"))?;
-            tcp_close_requested = true;
-            application_work = true;
-        }
-        if tcp_close_requested && !stack.connection_active() {
-            return Ok(());
+        if close_sent && protocol.channel.is_none() && runner.is_output_drained() {
+            return finish_tcp_after_ssh(space, control, bound_epoch, stack, started).await;
         }
 
         cooperate(
@@ -2344,6 +2366,62 @@ async fn finish_exec(
             wire.next_poll_delay_ms,
         )
         .await;
+    }
+}
+
+async fn finish_tcp_after_ssh(
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    stack: &mut StaticIpv4TcpStack,
+    started: u64,
+) -> Result<(), ConnectionEnd> {
+    let mut discard = [0u8; WIRE_CHUNK_BYTES];
+    let mut close_requested = false;
+
+    loop {
+        let now = monotonic_ms();
+        if now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
+            return Err(ConnectionEnd::Reset("SSH completion drain timed out"));
+        }
+        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+            return Err(ConnectionEnd::Rebind(reason));
+        }
+        let network = stack
+            .poll_network(now)
+            .map_err(|_| ConnectionEnd::Reset("network stack poll failed during TCP close"))?;
+        if stack.is_listening() {
+            return Ok(());
+        }
+
+        // OpenSSH sends a final encrypted disconnect record before FIN. Once
+        // SSH completion is acknowledged that record has no application
+        // meaning. Drain it to release bounded receive capacity while TCP
+        // retains the old tuple long enough to acknowledge every byte.
+        let mut worked = network.more_work || network.ingress_frames != 0;
+        for _ in 0..MAX_WIRE_IO_PER_TURN {
+            match stack
+                .try_recv(&mut discard)
+                .map_err(|_| ConnectionEnd::Reset("TCP close receive authority failed"))?
+            {
+                TcpIoResult::Progress(0) | TcpIoResult::WouldBlock => break,
+                TcpIoResult::Progress(_) => worked = true,
+                TcpIoResult::Closed => break,
+            }
+        }
+
+        // Let the peer close first. CLOSE-WAIT -> LAST-ACK -> CLOSED avoids
+        // server-side TIME-WAIT and permits the single passive socket to rearm
+        // immediately without discarding a delayed ACK for payload+FIN.
+        if !close_requested && stack.stream_status().state == TcpStreamState::PeerClosed {
+            stack
+                .close()
+                .map_err(|_| ConnectionEnd::Reset("TCP close failed"))?;
+            close_requested = true;
+            worked = true;
+        }
+
+        cooperate(worked, network.next_poll_delay_ms).await;
     }
 }
 

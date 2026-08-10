@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import math
 import os
 from pathlib import Path
@@ -93,8 +94,9 @@ def _base_ssh_command(
     identity: Path,
     known_hosts: Path,
     connect_timeout: int,
+    bind_address: str | None,
 ) -> list[str]:
-    return [
+    command = [
         ssh,
         "-4",
         "-F",
@@ -127,8 +129,11 @@ def _base_ssh_command(
         f"-oConnectTimeout={connect_timeout}",
         "-oServerAliveInterval=2",
         "-oServerAliveCountMax=1",
-        f"{user}@{host}",
     ]
+    if bind_address is not None:
+        command.extend(("-b", bind_address))
+    command.append(f"{user}@{host}")
+    return command
 
 
 def run_ssh(
@@ -139,6 +144,7 @@ def run_ssh(
     user: str,
     identity: Path,
     known_hosts: Path,
+    bind_address: str | None,
     command_timeout: float,
     before_destination: list[str],
     remote_command: list[str],
@@ -147,7 +153,7 @@ def run_ssh(
 ) -> subprocess.CompletedProcess[bytes]:
     connect_timeout = max(1, min(10, math.ceil(command_timeout)))
     command = _base_ssh_command(
-        ssh, host, port, user, identity, known_hosts, connect_timeout
+        ssh, host, port, user, identity, known_hosts, connect_timeout, bind_address
     )
     destination = command.pop()
     if verbose:
@@ -248,6 +254,7 @@ def wait_for_strict_ready_ssh(
     user: str,
     accepted_key: Path,
     known_hosts: Path,
+    bind_address: str | None,
     ready_timeout: float,
     command_timeout: float,
 ) -> None:
@@ -279,6 +286,7 @@ def wait_for_strict_ready_ssh(
                 user,
                 accepted_key,
                 known_hosts,
+                bind_address,
                 attempt_timeout,
                 ["-T"],
                 ["true"],
@@ -317,6 +325,7 @@ def run_acceptance(
     accepted_key: Path,
     rejected_key: Path,
     known_hosts: Path,
+    bind_address: str | None,
     command_timeout: float,
 ) -> None:
     def invoke(
@@ -339,6 +348,7 @@ def run_acceptance(
             user,
             identity,
             known_hosts,
+            bind_address,
             command_timeout,
             before_destination,
             remote_command,
@@ -421,6 +431,7 @@ def selftest() -> None:
         Path("accepted"),
         Path("known_hosts"),
         3,
+        None,
     )
     for required in (
         "-oHostKeyAlgorithms=ssh-ed25519",
@@ -430,6 +441,18 @@ def selftest() -> None:
     ):
         if required not in command:
             raise PeerError(f"OpenSSH command omitted {required}")
+    bound_command = _base_ssh_command(
+        "ssh",
+        "192.0.2.1",
+        2222,
+        "vibe",
+        Path("accepted"),
+        Path("known_hosts"),
+        3,
+        "192.0.2.2",
+    )
+    if bound_command[-3:] != ["-b", "192.0.2.2", "vibe@192.0.2.1"]:
+        raise PeerError("OpenSSH command omitted the explicit source address")
 
     debug = "\n".join(
         (
@@ -458,6 +481,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rejected-key", type=Path)
     parser.add_argument("--known-hosts", type=Path)
     parser.add_argument("--host-key-output", type=Path)
+    parser.add_argument(
+        "--bind-address",
+        help="force OpenSSH to use this local IPv4 source address",
+    )
     parser.add_argument("--ready-timeout", type=float, default=45.0)
     parser.add_argument("--command-timeout", type=float, default=15.0)
     parser.add_argument(
@@ -497,6 +524,18 @@ def main() -> int:
                 raise PeerError(f"{label} must be a finite positive number")
         if arguments.known_hosts is None or arguments.host_key_output is None:
             raise PeerError("--known-hosts and --host-key-output are required")
+        if arguments.bind_address is not None:
+            try:
+                bind_address = ipaddress.IPv4Address(arguments.bind_address)
+            except ipaddress.AddressValueError as error:
+                raise PeerError("--bind-address must be an IPv4 address") from error
+            if (
+                bind_address.is_loopback
+                or bind_address.is_unspecified
+                or bind_address.is_multicast
+                or bind_address.is_reserved
+            ):
+                raise PeerError("--bind-address must be a non-loopback unicast IPv4 address")
         if arguments.accepted_key is None:
             raise PeerError("strict readiness requires --accepted-key")
         if not arguments.scan_only and arguments.rejected_key is None:
@@ -518,6 +557,7 @@ def main() -> int:
             arguments.user,
             arguments.accepted_key,
             arguments.known_hosts,
+            arguments.bind_address,
             arguments.ready_timeout,
             arguments.command_timeout,
         )
@@ -539,6 +579,7 @@ def main() -> int:
                 arguments.accepted_key,
                 arguments.rejected_key,
                 arguments.known_hosts,
+                arguments.bind_address,
                 arguments.command_timeout,
             )
             print(

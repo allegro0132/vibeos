@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 
 SSH_READY_TIMEOUT=${SSH_READY_TIMEOUT:-45}
 SSH_COMMAND_TIMEOUT=${SSH_COMMAND_TIMEOUT:-15}
+SSH_BIND_ADDRESS=${SSH_BIND_ADDRESS:-}
 
 TEST_TMP=""
 ACCEPTED_KEY=""
@@ -32,6 +33,7 @@ unsupported-request rejection.
 Environment:
   SSH_READY_TIMEOUT    Readiness deadline in seconds (default: 45)
   SSH_COMMAND_TIMEOUT  Per-command deadline in seconds (default: 15)
+  SSH_BIND_ADDRESS     Optional local IPv4 source address for a direct link
 EOF
 }
 
@@ -90,6 +92,21 @@ if (
     raise SystemExit(1)
 ' "$SSH_HOST" || usage_error "TARGET_IPV4 must be a non-loopback unicast IPv4 address"
 
+if [ -n "$SSH_BIND_ADDRESS" ]; then
+  python3 -B -c '
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit(1)
+if address.is_loopback or address.is_unspecified or address.is_multicast or address.is_reserved:
+    raise SystemExit(1)
+' "$SSH_BIND_ADDRESS" \
+    || usage_error "SSH_BIND_ADDRESS must be a non-loopback unicast IPv4 address"
+fi
+
 python3 -B -c '
 import sys
 
@@ -129,7 +146,7 @@ python3 -B scripts/openssh-test-key.py \
 
 echo "WARNING milkv-ssh-test: fixed identities and deterministic guest random data; isolated bring-up only" >&2
 echo "milkv-ssh-test: probing $SSH_HOST:$SSH_PORT with the pinned test identity"
-python3 -B scripts/openssh-peer.py \
+set -- python3 -B scripts/openssh-peer.py \
   --host "$SSH_HOST" \
   --port "$SSH_PORT" \
   --accepted-key "$ACCEPTED_KEY" \
@@ -137,7 +154,11 @@ python3 -B scripts/openssh-peer.py \
   --known-hosts "$KNOWN_HOSTS" \
   --host-key-output "$HOST_KEY" \
   --ready-timeout "$SSH_READY_TIMEOUT" \
-  --command-timeout "$SSH_COMMAND_TIMEOUT" \
+  --command-timeout "$SSH_COMMAND_TIMEOUT"
+if [ -n "$SSH_BIND_ADDRESS" ]; then
+  set -- "$@" --bind-address "$SSH_BIND_ADDRESS"
+fi
+"$@" \
   || fail "OpenSSH peer gate failed for $SSH_HOST:$SSH_PORT"
 
 echo "PASS milkv-ssh-test: OpenSSH/VSH endpoint gate passed on $SSH_HOST:$SSH_PORT"

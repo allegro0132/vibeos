@@ -65,7 +65,7 @@ if [ -n "$sdk_arg" ]; then
   fi
 fi
 
-features=milkv-duo
+features=milkv-duo,net-shell
 output_dir="$repo_root/target/milkv-duo"
 output_elf="$output_dir/vibeos-milkv-duo.elf"
 if [ "$diagnostic" = true ]; then

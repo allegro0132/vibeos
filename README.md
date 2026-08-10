@@ -377,9 +377,9 @@ verbose         restore background component output
 poweroff        power off
 ```
 
-The dedicated `tcp-echo` image additionally installs a bounded Linux-style
-IPv4 control surface. `net0` is the canonical device name and `eth0` is an
-accepted compatibility alias:
+The dedicated QEMU `tcp-echo` image and the production Milk-V Duo image install
+a bounded Linux-style IPv4 control surface. `net0` is the canonical device name
+and `eth0` is an accepted compatibility alias. Milk-V Duo starts in DHCP mode:
 
 ```text
 ip link show
@@ -532,19 +532,19 @@ Deliberate, not overlooked:
 - **No IOMMU.** The fixed DMA slab is capability-addressed in software, but the
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.
-- **Networking remains deliberately feature-gated.** The ordinary images expose
+- **Networking remains deliberately feature-gated.** Diagnostic images expose
   only bounded raw-L2 service. Driver/stack queues now carry owned
   `StampedPacket` values tied to one boot-local device epoch and stack
-  generation. The dedicated QEMU-only `tcp-echo` image adds ARP, static IPv4,
-  DHCPv4, and one bounded TCP echo socket. Its vsh control plane supports one
-  interface, one IPv4 address, and one default route; it is not a general
-  listener/connection API or an SSH server, and it still provides no DNS,
-  IPv6, general UDP API, or POSIX socket namespace. `qemu-tcp-test.sh recovery`
-  defines a test-only N2 gate for
+  generation. The dedicated QEMU `tcp-echo` image and Milk-V Duo production
+  `net-shell` image add ARP, static IPv4, DHCPv4, and one bounded TCP echo
+  socket. Their vsh control plane supports one interface, one IPv4 address, and
+  one default route; it is not a general listener/connection API or an SSH
+  server, and it still provides no DNS, IPv6, general UDP API, or POSIX socket
+  namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
   are absent from normal images and do not model delayed DMA completion or a
-  late IRQ. The native DWMAC path has not passed this gate on Milk-V Duo
-  hardware.
+  late IRQ. The native DWMAC DHCP/IP path compiles into the SD image but has not
+  passed a live-board acceptance gate.
 - **The QEMU SSH security foundation is not production provisioning.** A
   bounded, fail-closed virtio-rng capability now feeds a domain-separated,
   zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator

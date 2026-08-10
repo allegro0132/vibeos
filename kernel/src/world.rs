@@ -99,8 +99,8 @@ enum ComponentTemplate {
     SshSecurityTest,
     #[cfg(feature = "ssh-test")]
     SshTest,
-    #[cfg(feature = "tcp-echo")]
-    TcpEcho,
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    Ipv4Stack,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -147,8 +147,8 @@ enum ComponentGrants {
         signer_invoke: Cap,
         policy: Cap,
     },
-    #[cfg(feature = "tcp-echo")]
-    TcpEcho {
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    Ipv4Stack {
         outbound: Cap,
         inbound: Cap,
         control: Cap,
@@ -714,15 +714,15 @@ impl World {
             };
         }
 
-        #[cfg(feature = "tcp-echo")]
-        if template == ComponentTemplate::TcpEcho {
+        #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+        if template == ComponentTemplate::Ipv4Stack {
             let policy = self
                 .net_policy
                 .as_ref()
                 .expect("network policy CSpace exists");
             let policy = policy.0.lock();
             let mut target = space.0.lock();
-            return ComponentGrants::TcpEcho {
+            return ComponentGrants::Ipv4Stack {
                 outbound: cap::grant(
                     &policy,
                     self.net_outbound_root
@@ -805,8 +805,8 @@ impl World {
             ComponentTemplate::SshTest => {
                 unreachable!("SSH test grants come from private policy CSpaces")
             }
-            #[cfg(feature = "tcp-echo")]
-            ComponentTemplate::TcpEcho => {
+            #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+            ComponentTemplate::Ipv4Stack => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
             }
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
@@ -921,8 +921,8 @@ impl World {
                     ),
                 )
             },
-            #[cfg(feature = "tcp-echo")]
-            ComponentGrants::TcpEcho {
+            #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+            ComponentGrants::Ipv4Stack {
                 outbound,
                 inbound,
                 control,
@@ -1352,13 +1352,13 @@ pub fn start_rng_supervisor() {
 /// Restart only faulted TCP-stack incarnations. Stack generations are rebound
 /// by the fresh task before it consumes ingress, so cancellation remains an
 /// operator decision while an audited fault can safely recover service.
-#[cfg(feature = "tcp-echo")]
-pub fn start_tcp_echo_supervisor() {
+#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+pub fn start_ipv4_stack_supervisor() {
     let world = world();
-    let Some(component) = world.component_named("tcp-echo") else {
+    let Some(component) = world.component_named(crate::tcp_echo::COMPONENT_NAME) else {
         return;
     };
-    exec::spawn("supervisor:tcp-echo", async move {
+    exec::spawn("supervisor:ipv4-stack", async move {
         let mut attempts = 0u32;
         loop {
             let (generation, join) = component.join_current();
@@ -1367,7 +1367,10 @@ pub fn start_tcp_echo_supervisor() {
                 exec::TaskState::Faulted if attempts < 3 => {
                     exec::sleep_ms(10u64 << attempts).await;
                     attempts += 1;
-                    if world.restart_component("tcp-echo").is_err() {
+                    if world
+                        .restart_component(crate::tcp_echo::COMPONENT_NAME)
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1465,8 +1468,10 @@ pub fn build() {
     let ssh_security_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-security-policy"));
-    #[cfg(feature = "tcp-echo")]
-    let tcp_echo_space = net_resources.as_ref().map(|_| Space::new("tcp-echo"));
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    let tcp_echo_space = net_resources
+        .as_ref()
+        .map(|_| Space::new(crate::tcp_echo::COMPONENT_NAME));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -1593,7 +1598,7 @@ pub fn build() {
             // Protocol acceptance images make their stack the sole client:
             // init must not race ingress, inject frames, or fault the device
             // underneath either TCP or SSH session state.
-            #[cfg(not(any(feature = "tcp-echo", feature = "ssh-test")))]
+            #[cfg(not(any(feature = "tcp-echo", feature = "net-shell", feature = "ssh-test")))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
                 Some(cap::grant(&policy, inbound_root, Rights::RECV, &mut cs).unwrap()),
@@ -1607,7 +1612,7 @@ pub fn build() {
                     .unwrap(),
                 ),
             );
-            #[cfg(any(feature = "tcp-echo", feature = "ssh-test"))]
+            #[cfg(any(feature = "tcp-echo", feature = "net-shell", feature = "ssh-test"))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
             let mut target = driver_space.0.lock();
@@ -1811,7 +1816,7 @@ pub fn build() {
             .unwrap(),
         )
     });
-    #[cfg(feature = "tcp-echo")]
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_grants = match (
         net_policy.as_ref(),
         tcp_echo_space.as_ref(),
@@ -1932,9 +1937,9 @@ pub fn build() {
     if let Some(space) = ssh_security_policy.as_ref() {
         spaces.insert("ssh-security-policy", space.clone());
     }
-    #[cfg(feature = "tcp-echo")]
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     if let Some(space) = tcp_echo_space.as_ref() {
-        spaces.insert("tcp-echo", space.clone());
+        spaces.insert(crate::tcp_echo::COMPONENT_NAME, space.clone());
     }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
@@ -2099,13 +2104,13 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "tcp-echo")]
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     if let (Some(space), Some((outbound, inbound, control))) = (tcp_echo_space, tcp_echo_grants) {
         world.spawn_component_inner(
-            "tcp-echo",
+            crate::tcp_echo::COMPONENT_NAME,
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
-            Some(ComponentTemplate::TcpEcho),
+            Some(ComponentTemplate::Ipv4Stack),
             crate::tcp_echo::task(SpaceRef::new(&space).get(), outbound, inbound, control),
         );
     }

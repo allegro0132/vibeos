@@ -16,6 +16,10 @@
 
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
+#[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
+compile_error!("feature `net-shell` is the Milk-V Duo production IPv4 image");
+#[cfg(all(feature = "net-shell", feature = "tcp-echo"))]
+compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 images");
 #[cfg(all(feature = "ssh-security-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 #[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
@@ -45,7 +49,7 @@ mod code_pool;
 mod dev;
 mod durable_cspace;
 mod mmu;
-#[cfg(feature = "tcp-echo")]
+#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
 mod net_config;
 mod platform;
 mod plic;
@@ -62,7 +66,7 @@ mod ssh_test;
 #[cfg(any(feature = "ssh-security-test", feature = "ssh-test"))]
 mod ssh_test_fixture;
 mod store;
-#[cfg(feature = "tcp-echo")]
+#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
 mod tcp_echo;
 mod trampoline;
 mod trap;
@@ -332,8 +336,8 @@ pub extern "C" fn kmain() -> ! {
     world::start_net_supervisor();
     #[cfg(feature = "qemu-virt")]
     world::start_rng_supervisor();
-    #[cfg(feature = "tcp-echo")]
-    world::start_tcp_echo_supervisor();
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    world::start_ipv4_stack_supervisor();
     #[cfg(feature = "ssh-test")]
     world::start_ssh_test_supervisor();
     #[cfg(feature = "legacy-shell")]

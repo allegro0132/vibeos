@@ -19,12 +19,14 @@ device capabilities around each synchronous hardware turn, and resets MAC/DMA
 on normal teardown. This closes the known software drop/stall path; it does not
 replace the unchecked physical Ethernet acceptance item below.
 
-The DWMAC source also uses the same boot-local device-epoch/stack-generation
-packet fence as virtio-net. That is a source-level implementation fact, not a
-Milk-V hardware result. The `tcp-echo` feature is deliberately rejected on
-non-QEMU builds, and the N2 `qemu-tcp-test.sh recovery` gate exercises only the
-virtio backend. It neither validates DWMAC restart coordinates nor injects a
-real delayed descriptor completion or late Ethernet IRQ on the board.
+The production image enables the `net-shell` feature. Its supervised IPv4 stack
+exclusively owns the DWMAC packet endpoints, starts DHCPv4 automatically, and
+admits `ip`/`dhclient` only through vsh command capabilities. The DWMAC source
+uses the same boot-local device-epoch/stack-generation packet fence as
+virtio-net. These are source-level implementation facts, not a Milk-V hardware
+result. The N2 `qemu-tcp-test.sh recovery` gate still exercises only the virtio
+backend; it neither validates DWMAC restart coordinates nor injects a real
+delayed descriptor completion or late Ethernet IRQ on the board.
 
 ## CPU model and support boundaries
 
@@ -208,11 +210,29 @@ docker run --rm --platform linux/amd64 \
 
 The final flashable image is `target/milkv-duo/vibeos-milkv-duo-sd.img`.
 
+On first boot with the Ethernet IO Board connected, the production image starts
+DHCP automatically. The bounded operator surface is:
+
+```text
+ip link show
+ip -4 addr show dev net0
+ip addr replace 192.168.1.20/24 dev net0
+ip route replace default via 192.168.1.1 dev net0
+dhclient net0
+dhclient -r net0
+```
+
+`eth0` is accepted as an alias for `net0`. `dhclient -r` stops the client and
+clears the local IPv4 configuration; smoltcp does not currently emit a DHCP
+RELEASE packet.
+
 ### Diagnostic image
 
-Hardware acceptance uses a separate `legacy-shell` image so the production
-`vsh` command surface does not acquire block, network, fault-injection, or
-self-test authority. Build the diagnostic kernel on the host with:
+Hardware acceptance uses a separate `legacy-shell` image. The production vsh
+receives only the `ip` and `dhclient` command capabilities; it does not receive
+raw packet, block, fault-injection, or self-test authority. The diagnostic image
+instead retains the raw-L2 test surface and does not start the DHCP/IP stack.
+Build the diagnostic kernel on the host with:
 
 ```sh
 ./scripts/build-milkv-duo.sh --diagnostic
@@ -328,11 +348,12 @@ For the first hardware boot, preserve the full serial log and verify each item:
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B
       DWMAC online and the raw-L2 HELLO/CHALLENGE/ACK exchange succeeds.
-- [ ] A Duo-specific bounded TCP acceptance image exists and exercises a live
-      DWMAC reset/restart. The device epoch and stack generation advance as
-      required, packets from each retired coordinate are rejected in both
-      directions, and the retired TCP stream does not resume in the replacement
-      stack.
+- [ ] The production image reports `LOWER_UP`, acquires and renews a DHCP lease,
+      `ip addr`/`ip route` display the applied configuration, and a fresh TCP
+      stream reaches the bounded listener through the assigned address.
+- [ ] A live DWMAC reset/restart advances the device epoch and stack generation;
+      packets from each retired coordinate are rejected in both directions,
+      and the retired TCP stream does not resume in the replacement stack.
 - [ ] Delayed DWMAC DMA completion and late-IRQ cases are exercised on physical
       hardware; the synthetic QEMU endpoint injection is not evidence for
       either case.

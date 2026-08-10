@@ -38,8 +38,17 @@ mod trampoline;
 mod trap;
 mod tty;
 mod uart;
+#[cfg(feature = "qemu-virt")]
 mod virtio_blk;
+#[cfg(feature = "milkv-duo")]
+#[path = "sdhci_blk.rs"]
+mod virtio_blk;
+#[cfg(feature = "qemu-virt")]
 mod virtio_mmio;
+#[cfg(feature = "qemu-virt")]
+mod virtio_net;
+#[cfg(feature = "milkv-duo")]
+#[path = "dwmac_net.rs"]
 mod virtio_net;
 mod world;
 

@@ -1522,6 +1522,12 @@ async fn net_command(args: &[&str]) {
             Ok(info) if info.quarantined => {
                 println!("  virtio-net: quarantined (reset was not confirmed)")
             }
+            #[cfg(feature = "milkv-duo")]
+            Ok(info) if info.online => println!(
+                "  dwmac: ready, polling descriptors {}, raw Ethernet header {}, RMII",
+                info.queue_size, info.header_size
+            ),
+            #[cfg(feature = "qemu-virt")]
             Ok(info) if info.online => println!(
                 "  virtio-net: ready, queues rx=0/tx=1 size {}, header {}, features VERSION_1",
                 info.queue_size, info.header_size
@@ -1532,6 +1538,13 @@ async fn net_command(args: &[&str]) {
         "test" => match net_handshake(&init, outbound, inbound, control).await {
             Ok((before, after)) => {
                 println!("  raw L2 HELLO -> CHALLENGE -> ACK: ok");
+                #[cfg(feature = "milkv-duo")]
+                println!(
+                    "  DWMAC polling completion: ok (rx +{}, tx +{})",
+                    after.rx_packets.saturating_sub(before.rx_packets),
+                    after.tx_packets.saturating_sub(before.tx_packets)
+                );
+                #[cfg(feature = "qemu-virt")]
                 println!(
                     "  dual-queue completion: ok (IRQ observed; rx +{}, tx +{})",
                     after.rx_packets.saturating_sub(before.rx_packets),
@@ -1718,6 +1731,12 @@ async fn block_command(args: &[&str]) {
                     if info.quarantined {
                         println!("  virtio-blk: quarantined (reset was not confirmed)");
                     } else if info.online {
+                        #[cfg(feature = "milkv-duo")]
+                        println!(
+                            "  microSD: ready, data partition {} sectors, PIO depth {}",
+                            info.capacity_sectors, info.queue_size
+                        );
+                        #[cfg(feature = "qemu-virt")]
                         println!(
                             "  virtio-blk: ready, capacity {} sectors, queue size {}",
                             info.capacity_sectors, info.queue_size

@@ -610,9 +610,10 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
 
         let len = len.min(buf.len());
 
-        let p = self.conn.channels.send_data(chan.0, dt, &buf[..len])?;
+        let p = self.conn.channels.prepare_send_data(chan.0, dt, &buf[..len])?;
         trace!("send_packet ch {:?} dt {:?} {}", chan.0, dt, len);
         self.traf_out.send_packet(p, &mut self.keys, self.random)?;
+        self.conn.channels.commit_send_data(chan.0, len)?;
         self.wake();
         Ok(len)
     }

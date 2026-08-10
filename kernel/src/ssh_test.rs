@@ -1186,6 +1186,7 @@ fn flush_terminal_output(
                 .map_err(|_| "terminal output accounting failed")?;
             Ok(true)
         }
+        Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => Ok(false),
         Err(_) => Err("SSH shell output channel closed"),
     }
 }
@@ -1287,6 +1288,15 @@ async fn next_shell_event(
     frontend: &mut TerminalFrontend,
 ) -> Result<TerminalEvent, ConnectionEnd> {
     loop {
+        let transport_eof = input.bytes.is_empty()
+            && protocol
+                .channel
+                .as_ref()
+                .is_some_and(|channel| runner.is_channel_eof(channel));
+        if transport_eof {
+            return Ok(frontend.transport_eof());
+        }
+
         let mut application_work = false;
         if !frontend.is_at_prompt() {
             match frontend.show_prompt(SHELL_PROMPT) {
@@ -1324,15 +1334,6 @@ async fn next_shell_event(
                     Err(error) => return Err(ConnectionEnd::Reset(terminal_error(error))),
                 }
             }
-        }
-
-        let transport_eof = input.bytes.is_empty()
-            && protocol
-                .channel
-                .as_ref()
-                .is_some_and(|channel| runner.is_channel_eof(channel));
-        if frontend.is_at_prompt() && transport_eof {
-            return Ok(frontend.transport_eof());
         }
 
         let turn = drive_shell_turn(
@@ -1411,6 +1412,7 @@ async fn execute_shell_command(
     // arrived in one channel-data packet.
     let mut execution = Box::pin(session.execute_cancellable(command, cancel.clone()));
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
+    let mut transport_eof_deadline = None;
 
     loop {
         if let Some((kind, deadline)) = cancellation {
@@ -1445,6 +1447,11 @@ async fn execute_shell_command(
         }
 
         let now = monotonic_ms();
+        if transport_eof_deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(ConnectionEnd::Reset(
+                "VSH shell transport EOF cancellation timed out",
+            ));
+        }
         if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
             cancel.store(true, Ordering::Release);
             cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
@@ -1525,6 +1532,21 @@ async fn execute_shell_command(
                 continue;
             }
         };
+        if protocol
+            .channel
+            .as_ref()
+            .is_some_and(|channel| runner.is_channel_eof(channel))
+        {
+            // Once transport EOF is observed, no later control byte can
+            // arrive. Always bound foreground teardown even when earlier
+            // typeahead remains queued. With no earlier bytes to preserve,
+            // request cancellation immediately; otherwise give a finite job
+            // the grace interval to complete without misreading piped input.
+            transport_eof_deadline.get_or_insert(now + CANCEL_GRACE_MS);
+            if input.bytes.is_empty() {
+                cancel.store(true, Ordering::Release);
+            }
+        }
         if input.signal_interrupt || input.bytes.iter().any(|byte| *byte == 0x03) {
             cancel.store(true, Ordering::Release);
         }
@@ -2119,6 +2141,7 @@ async fn finish_exec(
                         offset += written;
                         application_work = true;
                     }
+                    Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
                     Err(_) => return Err(ConnectionEnd::Reset("SSH stdout channel closed")),
                 }
             } else if !exit_sent {

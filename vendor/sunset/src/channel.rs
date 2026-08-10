@@ -172,21 +172,24 @@ impl Channels {
         Ok(ch.as_mut().unwrap())
     }
 
-    /// Returns the channel data packet to send.
+    /// Prepare a channel data packet without consuming the peer's send window.
     ///
-    /// Caller has already checked valid length with send_allowed(), and
+    /// The caller must enqueue the returned packet first, then call
+    /// [`Self::commit_send_data`]. This keeps a recoverable transport-output
+    /// failure from consuming window credit for bytes that were never queued.
+    /// Caller has already checked valid length with send_allowed() and
     /// validated `dt`.
     /// Don't call with zero length data.
-    pub(crate) fn send_data<'b>(
-        &mut self,
+    pub(crate) fn prepare_send_data<'b>(
+        &self,
         num: ChanNum,
         dt: ChanData,
         data: &'b [u8],
     ) -> Result<Packet<'b>> {
         debug_assert!(!data.is_empty());
 
-        let ch = self.get_mut(num)?;
-        let send = ch.send.as_mut().trap()?;
+        let ch = self.get(num)?;
+        let send = ch.send.as_ref().trap()?;
         let Ok(data_len) = u32::try_from(data.len()) else {
             return Error::bug_msg("channel data length exceeds uint32");
         };
@@ -198,11 +201,6 @@ impl Channels {
                 send.window
             );
             return Error::bug();
-        }
-        send.window -= data_len;
-        trace!("send_data: new window {}", send.window);
-        if send.window == 0 {
-            debug!("ch {num} send window empty");
         }
 
         let data = BinString(data);
@@ -217,6 +215,28 @@ impl Channels {
         };
 
         Ok(p)
+    }
+
+    /// Commit peer-window credit only after the prepared packet was queued.
+    pub(crate) fn commit_send_data(
+        &mut self,
+        num: ChanNum,
+        data_len: usize,
+    ) -> Result<()> {
+        let Ok(data_len) = u32::try_from(data_len) else {
+            return Error::bug_msg("channel data length exceeds uint32");
+        };
+        let ch = self.get_mut(num)?;
+        let send = ch.send.as_mut().trap()?;
+        if data_len == 0 || data_len > send.max_packet || data_len > send.window {
+            return Error::bug_msg("prepared channel data changed before commit");
+        }
+        send.window -= data_len;
+        trace!("send_data: new window {}", send.window);
+        if send.window == 0 {
+            debug!("ch {num} send window empty");
+        }
+        Ok(())
     }
 
     /// Informs the channel layer that an incoming packet has been read out.
@@ -2032,6 +2052,38 @@ mod strict_server_tests {
             Err(Error::SSHProto { .. })
         ));
         assert_eq!(channel.send.as_ref().unwrap().window, u32::MAX);
+    }
+
+    #[test]
+    fn outbound_data_consumes_window_only_after_queue_commit() {
+        let mut channels = Channels::new(false);
+        let mut channel = normal_channel(10, 10);
+        channel.send.as_mut().unwrap().window = 10;
+        channel.send.as_mut().unwrap().max_packet = 10;
+        channels.ch[0] = Some(channel);
+
+        let packet = channels
+            .prepare_send_data(ChanNum(0), ChanData::Normal, b"four")
+            .unwrap();
+        assert!(matches!(packet, Packet::ChannelData(_)));
+        assert_eq!(
+            channels.get(ChanNum(0)).unwrap().send.as_ref().unwrap().window,
+            10
+        );
+
+        // A failed transport enqueue simply drops the prepared packet. Retrying
+        // prepares the same bytes against the same peer credit.
+        drop(packet);
+        let retry = channels
+            .prepare_send_data(ChanNum(0), ChanData::Normal, b"four")
+            .unwrap();
+        assert!(matches!(retry, Packet::ChannelData(_)));
+        drop(retry);
+        channels.commit_send_data(ChanNum(0), 4).unwrap();
+        assert_eq!(
+            channels.get(ChanNum(0)).unwrap().send.as_ref().unwrap().window,
+            6
+        );
     }
 
     #[test]

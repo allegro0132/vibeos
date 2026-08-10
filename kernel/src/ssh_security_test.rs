@@ -1,62 +1,25 @@
 //! QEMU-only N3 acceptance component.
 //!
-//! Every fixed secret in this module is compiled only by
-//! `ssh-security-test`. The image prints an explicit test-identity marker and
-//! must never be treated as a provisioned SSH deployment.
+//! Fixed identity material lives in the shared QEMU-only fixture module. The
+//! image prints an explicit test-identity marker and must never be treated as
+//! a provisioned SSH deployment.
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
 use core::fmt::Write;
 
 use vibeos_core::cap::{Cap, Rights};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
-use vibeos_core::ssh_identity::{
-    AuthorizedKeyEntry, CapabilityProfileId, HostSigner, ProvisionedHostSeed, SshEd25519PublicKey,
-};
 
-use crate::ssh_security::{
-    self, AuthorizedKeyPolicyService, HostSigningService, SecurityGeneration,
+use crate::ssh_security::{self, AuthorizedKeyPolicyService, HostSigningService};
+use crate::ssh_test_fixture::{
+    public_key_from_seed, REJECTED_CLIENT_SEED, TEST_CLIENT_SEED, TEST_PROFILE,
 };
 use crate::virtio_rng::{self, RandomBytes, RandomError};
 use crate::world::Space;
 
-const TEST_HOST_SEED: [u8; SEED_BYTES] = [0xa5; SEED_BYTES];
-const TEST_CLIENT_SEED: [u8; SEED_BYTES] = [0xb6; SEED_BYTES];
-const REJECTED_CLIENT_SEED: [u8; SEED_BYTES] = [0xc7; SEED_BYTES];
-const TEST_PROFILE: u32 = 1;
 const ENTROPY_RETRY_BUDGET: usize = 5_000;
-
-pub struct TestSecurityResources {
-    pub signer: Arc<HostSigningService>,
-    pub policy: Arc<AuthorizedKeyPolicyService>,
-}
-
-pub fn provision() -> TestSecurityResources {
-    let generation = SecurityGeneration::new(1).expect("test generation is non-zero");
-    let host_seed = ProvisionedHostSeed::from_trusted_bytes(TEST_HOST_SEED)
-        .expect("test host seed is an explicit non-zero fixture");
-    let signer = HostSigningService::from_provisioned_seed(host_seed, generation)
-        .expect("test host seed derives a strong Ed25519 identity");
-    let client_key = public_key_from_seed(TEST_CLIENT_SEED);
-    let entries: Box<[AuthorizedKeyEntry]> = Box::new([AuthorizedKeyEntry::new(
-        client_key,
-        CapabilityProfileId::new(TEST_PROFILE).expect("test profile is non-zero"),
-    )]);
-    let policy = AuthorizedKeyPolicyService::new(entries, generation)
-        .expect("the fixed binary test policy is valid");
-    TestSecurityResources { signer, policy }
-}
-
-fn public_key_from_seed(seed: [u8; SEED_BYTES]) -> SshEd25519PublicKey {
-    HostSigner::from_provisioned_seed(
-        ProvisionedHostSeed::from_trusted_bytes(seed).expect("test client seed is non-zero"),
-    )
-    .expect("test client seed derives a strong Ed25519 identity")
-    .public_key()
-}
 
 struct OneSeed(Option<[u8; SEED_BYTES]>);
 

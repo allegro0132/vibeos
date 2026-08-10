@@ -1130,6 +1130,7 @@ dependencies = [
 name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
+ "sunset",
  "vibeos-core",
  "vibeos-rustc",
 ]

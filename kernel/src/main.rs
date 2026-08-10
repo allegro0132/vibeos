@@ -33,7 +33,9 @@ extern crate alloc;
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync, virtio, vsh};
+pub use vibeos_core::{
+    cap, chan, durable, exec, heap, interrupt, ipi, program, sync, terminal, virtio, vsh,
+};
 
 mod bench;
 mod cap_table_pool;

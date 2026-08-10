@@ -1,245 +1,144 @@
-//! Console line discipline.
+//! UART adapter for the transport-independent per-session line discipline.
 //!
-//! VibeOS components print whenever they like, from tasks the shell knows
-//! nothing about. Without arbitration that output lands in the middle of
-//! whatever you are typing. The tty owns the bottom line of the screen: any
-//! asynchronous write erases the prompt, prints, and redraws the prompt with
-//! your partial input intact.
-//!
-//! `quiet` is a console setting, not an authority question — muting chatter is
-//! about what gets rendered, not about who is allowed to speak. Taking a
-//! component's voice away is what `revoke` is for.
+//! The physical console retains one global renderer because it has one UART
+//! transport. SSH sessions will own separate `LineDiscipline` instances and
+//! must never enter this adapter or mutate its prompt, history, or quiet state.
 
-extern crate alloc;
-
-use alloc::collections::VecDeque;
-use alloc::string::String;
 use core::fmt::{self, Write};
 
+use crate::heap;
 use crate::sync::SpinLock;
-use crate::{heap, uart};
+use crate::terminal::{InputAction, LineDiscipline, TerminalEvent};
+use crate::uart;
 
-struct Tty {
+struct ConsoleTty {
     prompt: &'static str,
-    input: String,
-    cursor: usize,
-    history: VecDeque<String>,
-    history_bytes: usize,
-    history_index: Option<usize>,
-    draft: String,
-    /// True while the shell is waiting at a prompt, i.e. the last line on
-    /// screen is ours to redraw.
-    at_prompt: bool,
-    /// Suppress background chatter from the demo components.
+    line: LineDiscipline,
+    /// Suppress background chatter from demo components. This is a physical
+    /// UART rendering preference, not authority and not shell-session state.
     quiet: bool,
+    /// True while the console owns the bottom line and may redraw it around
+    /// asynchronous output.
+    at_prompt: bool,
 }
 
-static TTY: SpinLock<Tty> = SpinLock::new(Tty {
+static TTY: SpinLock<ConsoleTty> = SpinLock::new(ConsoleTty {
     prompt: "",
-    input: String::new(),
-    cursor: 0,
-    history: VecDeque::new(),
-    history_bytes: 0,
-    history_index: None,
-    draft: String::new(),
-    at_prompt: false,
+    line: LineDiscipline::new(),
     quiet: false,
+    at_prompt: false,
 });
 
-fn raw(s: &str) {
-    let _ = uart::Console.write_str(s);
+fn raw(text: &str) {
+    let _ = uart::Console.write_str(text);
 }
 
-/// Erase the current line, leaving the cursor at column 0.
 fn erase_line() {
     raw("\r\x1b[2K");
 }
 
-const MAX_INPUT_BYTES: usize = 4 * 1024;
-const MAX_HISTORY_ENTRIES: usize = 64;
-const MAX_HISTORY_BYTES: usize = 64 * 1024;
-
-fn redraw(t: &Tty) {
-    erase_line();
-    raw(t.prompt);
-    raw(&t.input);
-    let tail = t.input[t.cursor..].chars().count();
+fn redraw_contents(tty: &ConsoleTty) {
+    raw(tty.prompt);
+    raw(tty.line.input());
+    let tail = tty.line.cursor_tail_chars();
     if tail != 0 {
-        let _ = write!(uart::Console, "\x1b[{}D", tail);
+        let _ = write!(uart::Console, "\x1b[{tail}D");
     }
 }
 
-/// Print. `background` marks output that `quiet` may drop.
-pub fn emit(args: fmt::Arguments, background: bool) {
-    let t = TTY.lock();
-    if background && t.quiet {
+fn redraw(tty: &ConsoleTty) {
+    erase_line();
+    redraw_contents(tty);
+}
+
+fn apply_input(tty: &mut ConsoleTty, action: InputAction) -> Option<TerminalEvent> {
+    match action {
+        InputAction::None => None,
+        InputAction::Echo(character) => {
+            let _ = uart::Console.write_char(character);
+            None
+        }
+        InputAction::Bell => {
+            raw("\x07");
+            None
+        }
+        InputAction::BackspaceTail => {
+            raw("\x08 \x08");
+            None
+        }
+        InputAction::MoveLeft => {
+            raw("\x1b[D");
+            None
+        }
+        InputAction::MoveRight => {
+            raw("\x1b[C");
+            None
+        }
+        InputAction::Redraw => {
+            redraw(tty);
+            None
+        }
+        InputAction::Event(event) => {
+            tty.at_prompt = false;
+            match event {
+                TerminalEvent::Line(_) => raw("\n"),
+                TerminalEvent::Interrupt => raw("^C\n"),
+                TerminalEvent::Eof => {}
+            }
+            Some(event)
+        }
+    }
+}
+
+/// Print to UART, redrawing an active console prompt around the output.
+/// `background` marks output that the console's `quiet` setting may drop.
+pub fn emit(args: fmt::Arguments<'_>, background: bool) {
+    let tty = TTY.lock();
+    if background && tty.quiet {
         return;
     }
-    if t.at_prompt {
+    if tty.at_prompt {
         erase_line();
     }
     let _ = uart::Console.write_fmt(args);
-    if t.at_prompt {
-        raw(t.prompt);
-        raw(&t.input);
-        let tail = t.input[t.cursor..].chars().count();
-        if tail != 0 {
-            let _ = write!(uart::Console, "\x1b[{}D", tail);
-        }
+    if tty.at_prompt {
+        redraw_contents(&tty);
     }
 }
 
-/// Start a fresh prompt and take ownership of the bottom line.
-pub fn prompt(p: &'static str) {
-    let mut t = TTY.lock();
-    t.prompt = p;
-    t.input.clear();
-    t.cursor = 0;
-    t.history_index = None;
-    t.draft.clear();
-    t.at_prompt = true;
+/// Start a fresh prompt on the physical UART console.
+pub fn prompt(prompt: &'static str) {
+    let mut tty = TTY.lock();
+    tty.prompt = prompt;
+    tty.line.reset_line();
+    tty.at_prompt = true;
     erase_line();
-    raw(p);
+    raw(prompt);
 }
 
-pub fn type_char(c: char) {
-    let mut t = TTY.lock();
-    if t.input.len().saturating_add(c.len_utf8()) > MAX_INPUT_BYTES {
-        raw("\x07");
-        return;
-    }
-    // The line buffer is shared TTY state and grows while its lock is held.
-    // Charge that growth to kernel infrastructure so a shell quota fault
-    // cannot longjmp past the guard and permanently wedge input.
+/// Feed one UART byte into the physical console's line discipline.
+pub fn input_byte(byte: u8) -> Option<TerminalEvent> {
+    let mut tty = TTY.lock();
+    // Input and history buffers may grow while the console lock is held. Charge
+    // that growth to kernel infrastructure so a shell quota fault cannot
+    // abandon the guard and wedge the physical console. A future SSH adapter
+    // instead runs in, and is charged to, its connection component.
     let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
-    let cursor = t.cursor;
-    let appended = cursor == t.input.len();
-    t.input.insert(cursor, c);
-    t.cursor += c.len_utf8();
-    t.history_index = None;
-    t.draft.clear();
+    let action = tty.line.feed_byte(byte);
+    let event = apply_input(&mut tty, action);
     system.restore();
-    if appended {
-        let mut encoded = [0; 4];
-        raw(c.encode_utf8(&mut encoded));
-    } else {
-        redraw(&t);
-    }
+    event
 }
 
-pub fn backspace() {
-    let mut t = TTY.lock();
-    if t.cursor == 0 { return; }
-    let removed_from_end = t.cursor == t.input.len();
-    let previous = t.input[..t.cursor]
-        .char_indices()
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    t.input.remove(previous);
-    t.cursor = previous;
-    t.history_index = None;
-    t.draft.clear();
-    if removed_from_end {
-        raw("\x08 \x08");
-    } else {
-        redraw(&t);
-    }
-}
-
-pub fn move_left() {
-    let mut t = TTY.lock();
-    if t.cursor == 0 { return; }
-    t.cursor = t.input[..t.cursor]
-        .char_indices()
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    raw("\x1b[D");
-}
-
-pub fn move_right() {
-    let mut t = TTY.lock();
-    if t.cursor == t.input.len() { return; }
-    let width = t.input[t.cursor..].chars().next().map(char::len_utf8).unwrap_or(0);
-    t.cursor += width;
-    raw("\x1b[C");
-}
-
-pub fn history_previous() {
-    let mut t = TTY.lock();
-    if t.history.is_empty() { return; }
-    let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
-    let index = match t.history_index {
-        Some(0) => 0,
-        Some(index) => index - 1,
-        None => {
-            t.draft = t.input.clone();
-            t.history.len() - 1
-        }
-    };
-    t.history_index = Some(index);
-    t.input = t.history[index].clone();
-    t.cursor = t.input.len();
-    system.restore();
-    redraw(&t);
-}
-
-pub fn history_next() {
-    let mut t = TTY.lock();
-    let Some(index) = t.history_index else { return; };
-    let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
-    if index + 1 < t.history.len() {
-        let next = index + 1;
-        t.history_index = Some(next);
-        t.input = t.history[next].clone();
-    } else {
-        t.history_index = None;
-        t.input = core::mem::take(&mut t.draft);
-    }
-    t.cursor = t.input.len();
-    system.restore();
-    redraw(&t);
-}
-
-/// Hand the line back: returns what was typed and releases the bottom line so
-/// ordinary output scrolls normally again.
-pub fn submit() -> String {
-    let mut t = TTY.lock();
-    t.at_prompt = false;
-    raw("\n");
-    let line = core::mem::take(&mut t.input);
-    t.cursor = 0;
-    t.history_index = None;
-    t.draft.clear();
-    if !line.is_empty() && t.history.back().is_none_or(|last| last != &line) {
-        let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
-        while t.history.len() >= MAX_HISTORY_ENTRIES
-            || t.history_bytes.saturating_add(line.len()) > MAX_HISTORY_BYTES
-        {
-            let Some(oldest) = t.history.pop_front() else { break; };
-            t.history_bytes -= oldest.len();
-        }
-        t.history_bytes += line.len();
-        t.history.push_back(line.clone());
-        system.restore();
-    }
-    line
-}
-
-/// Abandon the current input (Ctrl-C).
+/// Abandon an active physical-console prompt.
 pub fn cancel() {
-    let mut t = TTY.lock();
-    t.at_prompt = false;
-    t.input.clear();
-    t.cursor = 0;
-    t.history_index = None;
-    t.draft.clear();
-    raw("^C\n");
+    let mut tty = TTY.lock();
+    let action = tty.line.interrupt();
+    let _ = apply_input(&mut tty, action);
 }
 
-pub fn set_quiet(q: bool) {
-    TTY.lock().quiet = q;
+pub fn set_quiet(quiet: bool) {
+    TTY.lock().quiet = quiet;
 }
 
 pub fn is_quiet() -> bool {

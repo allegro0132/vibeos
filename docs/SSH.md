@@ -6,20 +6,25 @@ out explicitly; no section claims the SSH wire protocol before N4 passes.
 
 ## Target
 
-The first usable target is deliberately smaller than a Unix `sshd`:
+The current QEMU-only target is deliberately smaller than a Unix `sshd`:
 
 - QEMU `virt`, static IPv4, one TCP listener and one concurrent connection;
 - public-key authentication only;
 - `curve25519-sha256`, `ssh-ed25519`, and
   `chacha20-poly1305@openssh.com`, with strict key exchange required;
-- one SSH `session` channel carrying an `exec` request;
-- command execution through a separately constructed, least-authority
-  `vsh::Session`;
-- no password authentication, PTY, interactive shell, SFTP/SCP, forwarding,
-  agent/X11 requests, environment mutation, or compression.
+- one SSH `session` channel carrying either a no-PTY `exec` request or a
+  PTY-backed interactive shell;
+- command execution through a separately constructed, profile-specific
+  `vsh::Session`, with a fresh capability space and terminal frontend for every
+  interactive connection;
+- no password authentication, SFTP/SCP, forwarding, agent/X11 requests,
+  environment mutation, or compression. Shell without PTY and exec with PTY
+  are rejected.
 
-An interactive terminal is a later stage.  It must use per-connection line
-discipline and channel-backed output rather than the global UART TTY.
+The interactive path now uses per-connection line discipline and
+channel-backed output rather than the global UART TTY. This is QEMU acceptance
+only: remote SSH login to a physical Milk-V Duo has not been completed or
+validated.
 
 ## Component and authority topology
 
@@ -41,7 +46,8 @@ yet; the N1 and N4 acceptance components each own one smoltcp socket directly.
 The stack owns no shell, store, key, or console authority. The QEMU SSH
 component owns only its network grants, entropy capability, separate host-key
 read/sign grants, read-only authentication policy, and a fresh restricted VSH
-session per connection. A username is a display label; possession and
+session with the appropriate exec or interactive profile per connection. A
+username is a display label; possession and
 validation of an authorized public key select the capability profile.
 
 The QEMU boundary keeps the host private key behind a signer service: the SSH
@@ -167,17 +173,20 @@ provisioning work is:
   provide private-key confidentiality, malicious-media authentication, or
   rollback resistance.
 
-### N4: minimal SSH exec
+### N4: minimal SSH exec and interactive VSH
 
 The QEMU-only `ssh-test` image is the executable acceptance boundary for this
 milestone. It is intentionally separate from normal images and from N3's
 self-terminating security test. The server admits only the algorithm and
-session profile in the Target section, executes one foreground command through
-`vsh::Session::execute_ssh_cancellable`, returns the command's `exit-status`, and
-rejects shell, PTY, environment, subsystem, and additional-channel requests.
-Disconnect tears down the per-connection command/session state; a component
-fault is handled by the ordinary generation supervisor and capability-space
-reset path.
+session profiles in the Target section. A no-PTY `exec` executes one bounded
+foreground command through `vsh::Session::execute_ssh_cancellable`. A PTY plus
+`shell` request creates a fresh interactive `vsh::Session`, capability space,
+and terminal frontend with prompt editing, backspace, Ctrl-C, Ctrl-D,
+connection-local typeahead, and bounded channel backpressure. Both paths return
+an `exit-status`; shell without PTY, exec with PTY, environment, subsystem, and
+additional-channel requests are rejected. Disconnect tears down and joins the
+per-connection command/session state; a component fault is handled by the
+ordinary generation supervisor and capability-space reset path.
 
 The end-to-end gate is:
 
@@ -208,10 +217,14 @@ Readiness requires a successful, authenticated `true` through this strict
 profile; the verbose OpenSSH transcript must contain the exact negotiated
 algorithms and expected host fingerprint. The first boot must then return exact
 output for `echo vibeos-ssh-acceptance`, status 0 for `true`, and status 1 for
-`false`. The rejected key must fail public-key auth; shell, forced PTY, and
-`sftp` subsystem requests must each produce OpenSSH's request-rejected
-diagnostic. A second complete boot must pass the same authenticated readiness
-probe with the same exact host key, whose fixture fingerprint is
+`false`. A real forced-PTY OpenSSH shell sends editing, Ctrl-C, backspace,
+command, and Ctrl-D bytes and must receive the exact prompt/echo/output stream;
+the gate then executes another no-PTY `true` to prove listener rearm after the
+clean shell exit. The rejected key must fail public-key auth; shell without
+PTY, exec with PTY, and the `sftp` subsystem must each produce OpenSSH's
+request-rejected diagnostic. A second complete boot must pass the same
+authenticated readiness probe with the same exact host key, whose fixture
+fingerprint is
 `SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8`.
 
 The guest log contract checked independently from OpenSSH is:
@@ -219,6 +232,7 @@ The guest log contract checked independently from OpenSSH is:
 ```text
 ssh-test listening on 10.0.2.15:2222
 ssh-test exec complete: status <n>
+ssh-test shell complete: status <n>
 FAIL ssh-test: <fatal reason>
 ```
 
@@ -238,18 +252,20 @@ listener remains healthy.
 - CPU-heavy cryptographic work has a bounded cooperative-work policy so a
   single connection cannot starve network polling on the one-hart Duo target.
 
-The OpenSSH gate above supplies the authorized/rejected-key, exact exit-status,
-request-denial, strict-algorithm, and stable-host-key portion of N5. It does not
-by itself claim malformed transport fuzzing, deadline/reset coverage, resource
-exhaustion, disconnect-race coverage, or Milk-V hardware evidence; those remain
-separate acceptance work.
+The OpenSSH gate above supplies the authorized/rejected-key, exact exec and
+interactive-terminal output/status, request-denial, strict-algorithm, and
+stable-host-key portion of N5. It does not by itself claim malformed transport
+fuzzing, deadline/reset coverage, resource exhaustion, disconnect-race
+coverage, or Milk-V hardware evidence; those remain separate acceptance work.
 
 ### N6: interactive terminal and hardware
 
-- Add per-session terminal input, output, history, Ctrl-C/EOF, window changes,
-  and channel backpressure.  Do not reuse the singleton UART TTY.
-- Fix and stress the native DWMAC queue/backpressure path, then complete raw-L2,
-  TCP, and SSH acceptance on a physical Milk-V Duo Ethernet IO Board.
+The QEMU per-session terminal now covers input, output, history, Ctrl-C/EOF,
+window-change metadata, and channel backpressure without reusing the singleton
+UART TTY. The hardware half of this milestone remains open: the native DWMAC
+queue/backpressure path still needs physical stress, followed by raw-L2, TCP,
+and remote SSH/VSH acceptance on a Milk-V Duo Ethernet IO Board. A successful
+QEMU gate must not be reported as Milk-V remote-login completion.
 
 SFTP/SCP remains out of scope until VibeOS has a capability-native file or
 directory service whose semantics can be exposed without inventing a POSIX path

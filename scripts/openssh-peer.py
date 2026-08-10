@@ -3,7 +3,8 @@
 
 The peer preloads the exact Ed25519 test host key, waits for a strict,
 authenticated ``true`` exec, and then exercises the deliberately small SSH
-surface. It never weakens host-key checking during readiness or acceptance.
+surface, including its PTY-backed interactive VSH. It never weakens host-key
+checking during readiness or acceptance.
 """
 
 from __future__ import annotations
@@ -30,6 +31,13 @@ TEST_HOST_PUBLIC = bytes.fromhex(
 KEX_ALGORITHM = "curve25519-sha256"
 CIPHER = "chacha20-poly1305@openssh.com"
 ECHO_PAYLOAD = "vibeos-ssh-acceptance"
+INTERACTIVE_INPUT = b"discard\x03echo vibeos-vsh-interactivX\x7fe\r\x04"
+INTERACTIVE_OUTPUT = (
+    b"vsh> discard^C\r\n"
+    b"vsh> echo vibeos-vsh-interactivX\x08 \x08e\r\n"
+    b"vibeos-vsh-interactive\r\n"
+    b"vsh> "
+)
 TEST_HOST_FINGERPRINT = "SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8"
 
 
@@ -135,6 +143,7 @@ def run_ssh(
     before_destination: list[str],
     remote_command: list[str],
     verbose: bool = False,
+    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     connect_timeout = max(1, min(10, math.ceil(command_timeout)))
     command = _base_ssh_command(
@@ -149,6 +158,15 @@ def run_ssh(
     command.append(destination)
     command.extend(remote_command)
     try:
+        if input_bytes is not None:
+            return subprocess.run(
+                command,
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=command_timeout,
+            )
         return subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -307,6 +325,7 @@ def run_acceptance(
         before_destination: list[str],
         remote_command: list[str],
         verbose: bool = False,
+        input_bytes: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         # The guest deliberately owns one socket. Give its bounded network poll
         # a moment to observe the preceding FIN/RST and re-enter LISTEN before
@@ -323,7 +342,8 @@ def run_acceptance(
             command_timeout,
             before_destination,
             remote_command,
-            verbose,
+            verbose=verbose,
+            input_bytes=input_bytes,
         )
 
     echo = invoke(
@@ -342,22 +362,37 @@ def run_acceptance(
     false_result = invoke("authorized false", accepted_key, ["-T"], ["false"])
     require_result("authorized false", false_result, {1}, b"")
 
+    interactive = invoke(
+        "interactive PTY shell",
+        accepted_key,
+        ["-tt"],
+        [],
+        input_bytes=INTERACTIVE_INPUT,
+    )
+    require_result("interactive PTY shell", interactive, {0}, INTERACTIVE_OUTPUT)
+
+    post_shell_true = invoke(
+        "post-shell authorized true", accepted_key, ["-T"], ["true"]
+    )
+    require_result("post-shell authorized true", post_shell_true, {0}, b"")
+
     rejected = invoke("rejected public key", rejected_key, ["-T"], ["true"])
     require_result(
         "rejected public key", rejected, {255}, b"", r"permission denied.*publickey"
     )
 
-    shell = invoke("interactive shell", accepted_key, ["-T"], [])
+    shell = invoke("shell without PTY", accepted_key, ["-T"], [])
     require_result(
-        "interactive shell", shell, {255}, b"", r"shell request failed.*channel"
+        "shell without PTY", shell, {255}, b"", r"shell request failed.*channel"
     )
 
-    pty = invoke("PTY request", accepted_key, ["-tt"], ["true"])
+    pty_exec = invoke("exec with PTY", accepted_key, ["-tt"], ["true"])
     require_result(
-        "PTY request",
-        pty,
-        {0, 255},
-        stderr_pattern=r"pty allocation request failed.*channel",
+        "exec with PTY",
+        pty_exec,
+        {255},
+        b"",
+        r"exec request failed.*channel",
     )
 
     subsystem = invoke("subsystem request", accepted_key, ["-T", "-s"], ["sftp"])
@@ -507,8 +542,8 @@ def main() -> int:
                 arguments.command_timeout,
             )
             print(
-                "PASS openssh-peer: forced crypto, authorized exec statuses, rejected key, "
-                "and shell/PTY/subsystem denial"
+                "PASS openssh-peer: forced crypto, authorized exec statuses, interactive "
+                "PTY/shell, rejected key, and invalid request denial"
             )
         return 0
     except (OSError, PeerError, subprocess.SubprocessError) as error:

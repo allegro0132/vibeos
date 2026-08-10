@@ -247,10 +247,13 @@ run_peer 1 functional "$KNOWN_HOSTS_ONE" "$HOST_KEY_ONE"
 
 status_zero_count=$(grep -a -E -c 'ssh-test exec complete: status 0' "$QEMU_LOG" || true)
 status_one_count=$(grep -a -E -c 'ssh-test exec complete: status 1' "$QEMU_LOG" || true)
-[ "$status_zero_count" -ge 3 ] \
-  || fail "boot 1 did not complete readiness true plus authorized echo/true commands"
+shell_status_zero_count=$(grep -a -F -c 'ssh-test shell complete: status 0' "$QEMU_LOG" || true)
+[ "$status_zero_count" -ge 4 ] \
+  || fail "boot 1 did not complete readiness true plus authorized echo/true and post-shell true commands"
 [ "$status_one_count" -ge 1 ] \
   || fail "boot 1 did not publish the authorized false exit status"
+[ "$shell_status_zero_count" -eq 1 ] \
+  || fail "boot 1 did not publish exactly one successful interactive shell completion"
 stop_qemu
 
 start_qemu 2
@@ -264,4 +267,4 @@ cmp -s "$HOST_KEY_ONE" "$HOST_KEY_TWO" \
   || fail "the deterministic SSH host identity changed across QEMU boots"
 
 RESULT_REPORTED=1
-echo "PASS qemu-ssh-test: exact test host key stable across boots; OpenSSH forced curve25519/Ed25519/ChaCha20-Poly1305; exec/auth/request policy enforced"
+echo "PASS qemu-ssh-test: exact test host key stable across boots; OpenSSH forced curve25519/Ed25519/ChaCha20-Poly1305; interactive PTY/shell, exec/auth, and request policy enforced"

@@ -1785,6 +1785,10 @@ async fn net_command(args: &[&str]) {
                     "  dwmac status: TX descriptor {:#010x}, DMA {:#010x}, clocks {:#010x}",
                     info.tx_descriptor_status, info.dma_status, info.clock_enable
                 );
+                println!(
+                    "  dwmac SoC: bypass {:#010x}, ETH divider {:#010x}, EPHY {:#010x}",
+                    info.clock_bypass, info.clock_divider, info.ephy_control
+                );
             }
             #[cfg(feature = "qemu-virt")]
             Ok(info) if info.online => println!(
@@ -2033,7 +2037,13 @@ async fn block_command(args: &[&str]) {
                     } else {
                         #[cfg(feature = "milkv-duo")]
                         match info.last_error {
-                            Some(error) => println!("  microSD: offline ({})", error),
+                            Some(error) => {
+                                println!("  microSD: offline ({})", error);
+                                println!(
+                                    "  SDHCI status: last CMD{}, interrupt {:#010x}, present {:#010x}",
+                                    info.last_command, info.interrupt_status, info.present_state
+                                );
+                            }
                             None => println!("  microSD: offline (driver component not attached)"),
                         }
                         #[cfg(feature = "qemu-virt")]

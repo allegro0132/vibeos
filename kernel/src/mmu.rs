@@ -257,6 +257,24 @@ pub fn init_boot(boot_physical_hart: usize) {
                 MMIO_PERMISSIONS,
             );
         }
+        for physical in (crate::platform::GPIOC_BASE..crate::platform::GPIOC_MMIO_END)
+            .step_by(sv39::PAGE_SIZE)
+        {
+            map_page(
+                &mut tables.soc_control_level0,
+                physical,
+                MMIO_PERMISSIONS,
+            );
+        }
+        for physical in (crate::platform::EFUSE_BASE..crate::platform::EFUSE_MMIO_END)
+            .step_by(sv39::PAGE_SIZE)
+        {
+            map_page(
+                &mut tables.soc_control_level0,
+                physical,
+                MMIO_PERMISSIONS,
+            );
+        }
     }
 
     for (table_index, level0) in tables.ram_level0.iter_mut().enumerate() {

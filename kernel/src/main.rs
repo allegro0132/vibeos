@@ -38,6 +38,8 @@ pub use vibeos_core::{
 };
 
 mod bench;
+#[cfg(feature = "milkv-duo")]
+mod board_led;
 mod cap_table_pool;
 mod code_pool;
 mod dev;
@@ -224,12 +226,30 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "milkv-duo")]
     uart::early_write("[VibeOS] Sv39 enabled\r\n");
 
+    #[cfg(feature = "milkv-duo")]
+    let blue_led = board_led::init();
+    #[cfg(feature = "milkv-duo")]
+    uart::early_write(if blue_led.on() {
+        "[VibeOS] blue status LED on\r\n"
+    } else {
+        "[VibeOS] blue status LED readback failed\r\n"
+    });
+
     uart::init();
     println!("{}", BANNER);
     println!(
         "  platform  {} ({} MHz timebase)",
         platform::NAME,
         platform::TIMEBASE_HZ / 1_000_000
+    );
+    #[cfg(feature = "milkv-duo")]
+    println!(
+        "  led       blue GPIOC24 {} (pinmux {:#x}, dir {:#010x}, data {:#010x}, input {:#010x})",
+        if blue_led.on() { "on" } else { "FAILED" },
+        blue_led.pinmux,
+        blue_led.direction,
+        blue_led.data,
+        blue_led.external,
     );
 
     let (hs, he) = (

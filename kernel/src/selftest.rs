@@ -348,6 +348,18 @@ fn paging(h: &mut Harness) {
             "CV1800B SoC control is identity mapped",
             crate::platform::SOC_CONTROL_BASE,
         ),
+        (
+            "CV1800B EPHY is identity mapped",
+            crate::platform::SOC_CONTROL_BASE + 0x9000,
+        ),
+        (
+            "CV1800B eFuse shadow is identity mapped",
+            crate::platform::EFUSE_BASE,
+        ),
+        (
+            "CV1800B GPIOC is identity mapped",
+            crate::platform::GPIOC_BASE,
+        ),
         ("CV1800B DWMAC is identity mapped", crate::platform::ETHERNET_BASE),
         ("CV1800B SDIO0 is identity mapped", crate::platform::SDHCI_BASE),
     ] {

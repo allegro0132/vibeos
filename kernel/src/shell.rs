@@ -68,27 +68,11 @@ pub async fn vsh_task(space: Arc<Space>, console: Cap, mut session: crate::vsh::
 /// mid-keystroke redraws the prompt and whatever has been typed so far.
 async fn read_line() -> Option<String> {
     loop {
-        let b = uart::read_byte().await;
-        match b {
-            b'\r' | b'\n' => return Some(tty::submit()),
-            0x7f | 0x08 => tty::backspace(),
-            0x03 => {
-                tty::cancel();
-                return None;
-            }
-            0x1b => {
-                if uart::read_byte().await == b'[' {
-                    match uart::read_byte().await {
-                        b'A' => tty::history_previous(),
-                        b'B' => tty::history_next(),
-                        b'C' => tty::move_right(),
-                        b'D' => tty::move_left(),
-                        _ => {}
-                    }
-                }
-            }
-            b if (0x20..0x7f).contains(&b) => tty::type_char(b as char),
-            _ => {}
+        match tty::input_byte(uart::read_byte().await) {
+            None => {}
+            Some(crate::terminal::TerminalEvent::Line(line)) => return Some(line),
+            Some(crate::terminal::TerminalEvent::Interrupt) => return None,
+            Some(crate::terminal::TerminalEvent::Eof) => return None,
         }
     }
 }

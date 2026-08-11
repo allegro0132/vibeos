@@ -15,11 +15,11 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use vibeos_core::cap::{InvocationLease, Resource, Rights};
-use vibeos_core::random::{
+use vibeos_core::sync::SpinLock;
+use vibeos_random::{
     ChaCha20Random, EntropySource, RandomDomain, RandomError as CoreRandomError, RandomLimits,
     SEED_BYTES,
 };
-use vibeos_core::sync::SpinLock;
 use zeroize::Zeroize;
 
 /// Match the bounded request surface consumed by the SSH acceptance component.

@@ -10,6 +10,8 @@
 //! equal seeds without inventing a local KDF. Requests and epochs are bounded,
 //! and a request is either filled completely or left untouched.
 
+#![no_std]
+
 use core::fmt;
 use core::num::NonZeroU64;
 

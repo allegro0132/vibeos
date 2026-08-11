@@ -14,8 +14,8 @@ use core::pin::Pin;
 use core::sync::atomic::Ordering;
 
 use vibeos_core::cap::{CSpace, Cap, Rights};
-use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_core::sync::SpinLock;
+use vibeos_random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_ssh_identity::{
     AuthorizedKeyPolicyService, AuthorizedProfile, HostPublicKeySnapshot, HostSignatureResult,
     HostSigningInvocationError, HostSigningService, SSH_EXCHANGE_HASH_BYTES,

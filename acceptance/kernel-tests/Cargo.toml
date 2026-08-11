@@ -18,6 +18,7 @@ milkv-ssh-acceptance = ["ssh-test-fixture", "dep:zeroize"]
 
 [dependencies]
 vibeos-core = { path = "../../core" }
+vibeos-random = { path = "../../random" }
 vibeos-rustc = { path = "../../compiler" }
 vibeos-ssh-identity = { path = "../../services/ssh-identity", optional = true }
 zeroize = { version = "=1.9.0", default-features = false, optional = true }

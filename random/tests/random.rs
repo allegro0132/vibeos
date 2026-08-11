@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use vibeos_core::random::{
+use vibeos_random::{
     ChaCha20Random, EntropySource, RandomDomain, RandomError, RandomLimits, RandomSource,
     MAX_BYTES_PER_EPOCH, MAX_REQUEST_BYTES,
 };

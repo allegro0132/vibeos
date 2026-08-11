@@ -605,11 +605,13 @@ Deliberate, not overlooked:
 - **Networking remains deliberately feature-gated.** Diagnostic images expose
   only bounded raw-L2 service. Driver/stack queues now carry owned
   `StampedPacket` values tied to one boot-local device epoch and stack
-  generation. The dedicated QEMU `tcp-echo` image and Milk-V Duo production
-  `net-shell` image add ARP, static IPv4, DHCPv4, and one bounded TCP echo
-  socket. Their vsh control plane supports one interface, one IPv4 address, and
-  one default route; it is not a general listener/connection API or an SSH
-  server, and it still provides no DNS, IPv6, general UDP API, or POSIX socket
+  generation. One independent `net-stack` component owns the sole smoltcp
+  interface, ARP, one IPv4 address, one default route, and DHCPv4. Bounded
+  `TcpListener` capability frontends give each service exclusive authority over
+  its own port and generation-bound connections; SSH no longer owns the IPv4
+  stack. The shared core supports eight listeners and has a two-port isolation
+  test, while current image policy wires one service listener per image. It
+  still provides no DNS resolver, IPv6, general UDP API, or POSIX socket
   namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
   are absent from normal images and do not model delayed DMA completion or a

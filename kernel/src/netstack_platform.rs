@@ -9,6 +9,7 @@ use alloc::{format, string::String};
 use vibeos_core::cap::{Cap, Rights};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::StampedPacket;
+use vibeos_net_api::TcpListener;
 use vibeos_netstack::{NetworkBindError, NetworkInfo, Platform};
 
 use crate::world::Space;
@@ -76,11 +77,26 @@ impl Platform for NetstackPlatform {
             phy_link_up: crate::net_device::carrier_up(&info),
         })
     }
+
+    fn tcp_listener(&self, listener: Cap) -> Option<vibeos_core::cap::Revocable<TcpListener>> {
+        self.space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::INVOKE)
+            .ok()
+    }
 }
 
-pub async fn task(space: &'static Space, outbound: Cap, inbound: Cap, control: Cap) {
+pub async fn task(space: &'static Space, outbound: Cap, inbound: Cap, control: Cap, listener: Cap) {
     let platform = NetstackPlatform::new(space);
-    vibeos_netstack::task(&platform, outbound, inbound, control).await;
+    vibeos_netstack::task(
+        &platform,
+        outbound,
+        inbound,
+        control,
+        vibeos_netstack::one_tcp_listener(listener),
+    )
+    .await;
 }
 
 /// Test-image-only stack fault trigger. Hardware staging remains kernel-only.

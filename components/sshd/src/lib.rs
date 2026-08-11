@@ -34,6 +34,7 @@ use vibeos_core::cap::{CSpace, Cap, Revocable};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
 use vibeos_core::sync::SpinLock;
+use vibeos_net_api::{TcpConnectionToken, TcpListenerSnapshot};
 pub use vibeos_net_protocol::{
     command::{
         parse_dhclient_command, parse_ip_command, DhclientCommand, IpCommand, Ipv4Method,
@@ -41,7 +42,10 @@ pub use vibeos_net_protocol::{
     },
     Ipv4RuntimeStatus, StaticIpv4Address,
 };
-use vibeos_net_protocol::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
+use vibeos_net_protocol::{
+    StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpPollReport, TcpStreamState,
+    TcpStreamStatus,
+};
 use vibeos_random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
 use vibeos_vsh::terminal::{
@@ -175,6 +179,37 @@ pub trait Platform: Sync {
     )>;
     fn bind_stack(&self, control: Cap) -> Result<PacketStamp, NetworkBindError>;
     fn network_info(&self, control: Cap) -> Option<NetworkInfo>;
+    fn tcp_listener_snapshot(&self, _listener: Cap) -> Option<TcpListenerSnapshot> {
+        None
+    }
+    fn tcp_accept(&self, _listener: Cap) -> Result<Option<TcpConnectionToken>, ()> {
+        Err(())
+    }
+    fn tcp_recv(
+        &self,
+        _listener: Cap,
+        _connection: TcpConnectionToken,
+        _output: &mut [u8],
+    ) -> Result<TcpIoResult, ()> {
+        Err(())
+    }
+    fn tcp_send(
+        &self,
+        _listener: Cap,
+        _connection: TcpConnectionToken,
+        _input: &[u8],
+    ) -> Result<TcpIoResult, ()> {
+        Err(())
+    }
+    fn tcp_close(&self, _listener: Cap, _connection: TcpConnectionToken) -> Result<(), ()> {
+        Err(())
+    }
+    fn tcp_reset(&self, _listener: Cap, _connection: TcpConnectionToken) -> Result<(), ()> {
+        Err(())
+    }
+    fn network_ipv4_status(&self, _listener: Cap) -> Option<Ipv4RuntimeStatus> {
+        None
+    }
     fn entropy<'a>(
         &'a self,
         random: Cap,
@@ -423,6 +458,159 @@ struct WireBridge {
     sent: usize,
 }
 
+trait TcpTransport: Send {
+    fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, ()>;
+    fn stream_status(&self) -> TcpStreamStatus;
+    fn try_recv(&mut self, output: &mut [u8]) -> Result<TcpIoResult, ()>;
+    fn try_send(&mut self, input: &[u8]) -> Result<TcpIoResult, ()>;
+    fn close(&mut self) -> Result<TcpStreamState, ()>;
+    fn reset(&mut self) -> Result<TcpStreamState, ()>;
+    fn is_listening(&self) -> bool;
+    fn ipv4_status(&self) -> Ipv4RuntimeStatus;
+}
+
+impl TcpTransport for StaticIpv4TcpStack {
+    fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, ()> {
+        StaticIpv4TcpStack::poll_network(self, now_ms).map_err(|_| ())
+    }
+
+    fn stream_status(&self) -> TcpStreamStatus {
+        StaticIpv4TcpStack::stream_status(self)
+    }
+
+    fn try_recv(&mut self, output: &mut [u8]) -> Result<TcpIoResult, ()> {
+        StaticIpv4TcpStack::try_recv(self, output).map_err(|_| ())
+    }
+
+    fn try_send(&mut self, input: &[u8]) -> Result<TcpIoResult, ()> {
+        StaticIpv4TcpStack::try_send(self, input).map_err(|_| ())
+    }
+
+    fn close(&mut self) -> Result<TcpStreamState, ()> {
+        StaticIpv4TcpStack::close(self).map_err(|_| ())
+    }
+
+    fn reset(&mut self) -> Result<TcpStreamState, ()> {
+        StaticIpv4TcpStack::reset(self).map_err(|_| ())
+    }
+
+    fn is_listening(&self) -> bool {
+        StaticIpv4TcpStack::is_listening(self)
+    }
+
+    fn ipv4_status(&self) -> Ipv4RuntimeStatus {
+        StaticIpv4TcpStack::ipv4_status(self)
+    }
+}
+
+struct CapabilityTcpTransport<'a> {
+    space: &'a Space,
+    listener: Cap,
+    connection: Option<TcpConnectionToken>,
+    ipv4_status: Ipv4RuntimeStatus,
+}
+
+impl<'a> CapabilityTcpTransport<'a> {
+    fn new(space: &'a Space, listener: Cap, ipv4_status: Ipv4RuntimeStatus) -> Result<Self, ()> {
+        let snapshot = space.tcp_listener_snapshot(listener).ok_or(())?;
+        Ok(Self {
+            space,
+            listener,
+            connection: None,
+            ipv4_status,
+        })
+    }
+
+    fn snapshot(&self) -> Option<TcpListenerSnapshot> {
+        self.space.tcp_listener_snapshot(self.listener)
+    }
+}
+
+impl TcpTransport for CapabilityTcpTransport<'_> {
+    fn poll_network(&mut self, _now_ms: u64) -> Result<TcpPollReport, ()> {
+        let mut snapshot = self.snapshot().ok_or(())?;
+        let mut connection_started = false;
+        if self.connection.is_none()
+            && matches!(
+                snapshot.state,
+                TcpStreamState::Established | TcpStreamState::PeerClosed
+            )
+        {
+            self.connection = self.space.tcp_accept(self.listener)?;
+            connection_started = self.connection.is_some();
+            snapshot = self.snapshot().ok_or(())?;
+        }
+        let connection_ended = self.connection.is_some()
+            && matches!(
+                snapshot.state,
+                TcpStreamState::Listening | TcpStreamState::Reset | TcpStreamState::Closed
+            );
+        if connection_ended {
+            self.connection = None;
+        }
+        Ok(TcpPollReport {
+            ingress_frames: 0,
+            connection_started,
+            connection_ended,
+            more_work: snapshot.readable_bytes != 0
+                || (snapshot.queued_send_bytes != 0 && snapshot.writable_bytes != 0),
+            next_poll_delay_ms: Some(IDLE_POLL_CEILING_MS),
+        })
+    }
+
+    fn stream_status(&self) -> TcpStreamStatus {
+        self.snapshot().map_or(
+            TcpStreamStatus {
+                state: TcpStreamState::Closed,
+                readable_bytes: 0,
+                queued_send_bytes: 0,
+                writable_bytes: 0,
+            },
+            |snapshot| TcpStreamStatus {
+                state: snapshot.state,
+                readable_bytes: snapshot.readable_bytes,
+                queued_send_bytes: snapshot.queued_send_bytes,
+                writable_bytes: snapshot.writable_bytes,
+            },
+        )
+    }
+
+    fn try_recv(&mut self, output: &mut [u8]) -> Result<TcpIoResult, ()> {
+        let connection = self.connection.ok_or(())?;
+        self.space.tcp_recv(self.listener, connection, output)
+    }
+
+    fn try_send(&mut self, input: &[u8]) -> Result<TcpIoResult, ()> {
+        let connection = self.connection.ok_or(())?;
+        self.space.tcp_send(self.listener, connection, input)
+    }
+
+    fn close(&mut self) -> Result<TcpStreamState, ()> {
+        if let Some(connection) = self.connection {
+            self.space.tcp_close(self.listener, connection)?;
+        }
+        Ok(TcpStreamState::Closing)
+    }
+
+    fn reset(&mut self) -> Result<TcpStreamState, ()> {
+        if let Some(connection) = self.connection {
+            self.space.tcp_reset(self.listener, connection)?;
+        }
+        Ok(TcpStreamState::Reset)
+    }
+
+    fn is_listening(&self) -> bool {
+        self.snapshot()
+            .is_some_and(|snapshot| snapshot.state == TcpStreamState::Listening)
+    }
+
+    fn ipv4_status(&self) -> Ipv4RuntimeStatus {
+        self.space
+            .network_ipv4_status(self.listener)
+            .unwrap_or(self.ipv4_status)
+    }
+}
+
 impl WireBridge {
     fn new() -> Self {
         Self {
@@ -438,7 +626,7 @@ impl WireBridge {
     fn drive(
         &mut self,
         runner: &mut Runner<'_, Server>,
-        stack: &mut StaticIpv4TcpStack,
+        stack: &mut dyn TcpTransport,
         now_ms: u64,
     ) -> Result<WireTurn, &'static str> {
         let network = stack
@@ -844,6 +1032,115 @@ pub async fn task(
     }
 }
 
+/// Serve SSH through a pre-authorized TCP listener owned by the independent
+/// netstack component. This entry point receives no packet endpoint, device
+/// control capability, address configuration authority, or TCP seed.
+pub async fn capability_task(
+    space: &Space,
+    service_policy: SshServicePolicy,
+    listener: Cap,
+    random: Cap,
+    signer_read: Cap,
+    signer_invoke: Cap,
+    authorization_policy: Cap,
+) {
+    let ipv4_status = match service_policy.ipv4 {
+        Ipv4Policy::Static(address) => Ipv4RuntimeStatus::Static(address),
+        Ipv4Policy::Dhcp { .. } => Ipv4RuntimeStatus::DhcpDiscovering,
+    };
+    let mut stack = match CapabilityTcpTransport::new(space, listener, ipv4_status) {
+        Ok(stack) => stack,
+        Err(()) => {
+            component_log!(space, "FAIL ssh-test: TCP listener authority unavailable");
+            return;
+        }
+    };
+    let mut announced_ipv4 = None;
+    if let Err(reason) = announce_listener(
+        space,
+        listener,
+        0,
+        &mut stack,
+        &mut announced_ipv4,
+        service_policy,
+    )
+    .await
+    {
+        component_log!(space, "FAIL ssh-test: {reason}");
+        return;
+    }
+
+    loop {
+        let entropy = match fetch_entropy(space, random, SEED_BYTES).await {
+            Ok(entropy) => entropy,
+            Err(_) => {
+                component_log!(space, "FAIL ssh-test: SSH random source unavailable");
+                return;
+            }
+        };
+        let mut connection_seed = [0u8; SEED_BYTES];
+        connection_seed.copy_from_slice(entropy.as_slice());
+        drop(entropy);
+        if connection_seed.iter().all(|byte| *byte == 0) {
+            wipe(&mut connection_seed);
+            component_log!(
+                space,
+                "FAIL ssh-test: SSH random source returned an all-zero seed"
+            );
+            return;
+        }
+
+        if let Err(reason) = wait_for_connection(
+            space,
+            listener,
+            0,
+            &mut stack,
+            &mut announced_ipv4,
+            service_policy,
+        )
+        .await
+        {
+            wipe(&mut connection_seed);
+            component_log!(space, "ssh-test listener unavailable: {reason}");
+            return;
+        }
+
+        let outcome = serve_connection(
+            space,
+            listener,
+            0,
+            signer_read,
+            signer_invoke,
+            authorization_policy,
+            &mut stack,
+            connection_seed,
+            false,
+        )
+        .await;
+        match outcome {
+            ConnectionEnd::ExecComplete(status) => {
+                component_log!(space, "ssh-test exec complete: status {status}");
+            }
+            ConnectionEnd::ShellComplete(status) => {
+                component_log!(space, "ssh-test shell complete: status {status}");
+            }
+            ConnectionEnd::Reset(reason) | ConnectionEnd::Rebind(reason) => {
+                let _ = stack.reset();
+                component_log!(space, "ssh-test connection reset: {reason}");
+            }
+        }
+
+        if space.security_policy_changed() {
+            component_log!(space, "SSH security policy changed; restarting listener");
+            return;
+        }
+        if let Err(reason) = rearm_listener(&mut stack).await {
+            component_log!(space, "ssh-test listener rearm failed: {reason}");
+            return;
+        }
+    }
+}
+
 fn stack_endpoints(
     space: &Space,
     outbound: Cap,
@@ -932,7 +1229,7 @@ async fn announce_listener(
     space: &Space,
     control: Cap,
     bound_epoch: u64,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     announced_ipv4: &mut Option<[u8; 4]>,
     policy: SshServicePolicy,
 ) -> Result<(), &'static str> {
@@ -968,7 +1265,7 @@ async fn wait_for_connection(
     space: &Space,
     control: Cap,
     bound_epoch: u64,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     announced_ipv4: &mut Option<[u8; 4]>,
     policy: SshServicePolicy,
 ) -> Result<(), &'static str> {
@@ -997,7 +1294,7 @@ async fn wait_for_connection(
     }
 }
 
-async fn rearm_listener(stack: &mut StaticIpv4TcpStack) -> Result<(), &'static str> {
+async fn rearm_listener(stack: &mut dyn TcpTransport) -> Result<(), &'static str> {
     let started = monotonic_ms();
     loop {
         // A successfully completed connection may already have rearmed the
@@ -1036,7 +1333,7 @@ async fn rearm_listener(stack: &mut StaticIpv4TcpStack) -> Result<(), &'static s
 
 fn update_listener_announcement(
     space: &Space,
-    stack: &StaticIpv4TcpStack,
+    stack: &dyn TcpTransport,
     announced_ipv4: &mut Option<[u8; 4]>,
     policy: SshServicePolicy,
 ) -> bool {
@@ -1083,7 +1380,7 @@ async fn serve_connection(
     signer_read: Cap,
     signer_invoke: Cap,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     mut seed: [u8; SEED_BYTES],
     require_carrier: bool,
 ) -> ConnectionEnd {
@@ -1291,7 +1588,7 @@ async fn execute_stream_with_network(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     require_carrier: bool,
@@ -1777,7 +2074,7 @@ fn drive_shell_turn(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -1856,7 +2153,7 @@ async fn next_shell_event(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -1976,7 +2273,7 @@ async fn execute_shell_command(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -2161,7 +2458,7 @@ async fn emit_shell_text(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -2206,7 +2503,7 @@ async fn render_shell_execution(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -2323,7 +2620,7 @@ async fn run_shell_repl(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -2408,7 +2705,7 @@ async fn serve_interactive_shell(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
@@ -2494,7 +2791,7 @@ async fn execute_with_network(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     require_carrier: bool,
@@ -2665,7 +2962,7 @@ async fn finish_exec(
     control: Cap,
     bound_epoch: u64,
     policy: Cap,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     output: &[u8],
@@ -2809,7 +3106,7 @@ async fn finish_tcp_after_ssh(
     space: &Space,
     control: Cap,
     bound_epoch: u64,
-    stack: &mut StaticIpv4TcpStack,
+    stack: &mut dyn TcpTransport,
     started: u64,
     require_carrier: bool,
 ) -> Result<(), ConnectionEnd> {
@@ -2864,7 +3161,7 @@ async fn finish_tcp_after_ssh(
     }
 }
 
-fn reset_connection(stack: &mut StaticIpv4TcpStack, reason: &'static str) -> ConnectionEnd {
+fn reset_connection(stack: &mut dyn TcpTransport, reason: &'static str) -> ConnectionEnd {
     let _ = stack.reset();
     ConnectionEnd::Reset(reason)
 }
@@ -2880,6 +3177,9 @@ fn validate_network_authority(
     }
     if space.ipv4_configuration_changed() {
         return Err("SSH IPv4 configuration changed");
+    }
+    if space.tcp_listener_snapshot(control).is_some() {
+        return Ok(());
     }
     let info = device_info(space, control).ok_or("network control authority was revoked")?;
     if info.quarantined {

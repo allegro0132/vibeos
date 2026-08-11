@@ -39,6 +39,12 @@ use vibeos_kernel_acceptance::ssh_security_test::{
     feature = "milkv-ssh-acceptance",
     feature = "milkv-ssh"
 ))]
+use vibeos_net_api::{TcpConnectionToken, TcpIoResult, TcpListener, TcpListenerSnapshot};
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use vibeos_ssh_identity::SshEd25519PublicKey;
 #[cfg(any(
     feature = "ssh-test",
@@ -47,8 +53,8 @@ use vibeos_ssh_identity::SshEd25519PublicKey;
 ))]
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
-    Ipv4RuntimeStatus, NetworkBindError, NetworkConfiguration, NetworkInfo,
-    Platform as SshdPlatform, PlatformFuture, SecretBytes, SshServicePolicy, StaticIpv4Address,
+    Ipv4RuntimeStatus, NetworkBindError, NetworkInfo, Platform as SshdPlatform, PlatformFuture,
+    SecretBytes, SshServicePolicy, StaticIpv4Address,
 };
 
 #[cfg(any(
@@ -177,14 +183,105 @@ impl SshdPlatform for SshPlatform {
             .ok()?;
         let info = crate::net_device::info_with(&lease).ok()?;
         let phy_link_up = crate::net_device::carrier_up(&info);
-        #[cfg(feature = "milkv-ssh")]
-        crate::ssh_network_config::publish_carrier(phy_link_up);
         Some(NetworkInfo {
             online: info.online,
             quarantined: info.quarantined,
             session_epoch: info.session_epoch,
             phy_link_up,
         })
+    }
+
+    fn tcp_listener_snapshot(&self, listener: Cap) -> Option<TcpListenerSnapshot> {
+        let listener = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::READ)
+            .ok()?;
+        listener.try_with(TcpListener::snapshot).ok()
+    }
+
+    fn tcp_accept(&self, listener: Cap) -> Result<Option<TcpConnectionToken>, ()> {
+        let listener = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::RECV)
+            .map_err(|_| ())?;
+        listener.try_with(TcpListener::try_accept).map_err(|_| ())
+    }
+
+    fn tcp_recv(
+        &self,
+        listener: Cap,
+        connection: TcpConnectionToken,
+        output: &mut [u8],
+    ) -> Result<TcpIoResult, ()> {
+        let listener = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::READ)
+            .map_err(|_| ())?;
+        listener
+            .try_with(|listener| listener.try_recv(connection, output))
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
+
+    fn tcp_send(
+        &self,
+        listener: Cap,
+        connection: TcpConnectionToken,
+        input: &[u8],
+    ) -> Result<TcpIoResult, ()> {
+        let listener = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::WRITE)
+            .map_err(|_| ())?;
+        listener
+            .try_with(|listener| listener.try_send(connection, input))
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
+
+    fn tcp_close(&self, listener: Cap, connection: TcpConnectionToken) -> Result<(), ()> {
+        let listener = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::INVOKE)
+            .map_err(|_| ())?;
+        listener
+            .try_with(|listener| listener.request_close(connection))
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
+
+    fn tcp_reset(&self, listener: Cap, connection: TcpConnectionToken) -> Result<(), ()> {
+        let listener = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::INVOKE)
+            .map_err(|_| ())?;
+        listener
+            .try_with(|listener| listener.request_reset(connection))
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
+
+    fn network_ipv4_status(&self, listener: Cap) -> Option<Ipv4RuntimeStatus> {
+        let listener_authority = self
+            .space
+            .0
+            .lock()
+            .lookup_revocable::<TcpListener>(listener, Rights::READ)
+            .ok()?;
+        listener_authority.try_with(|_| ()).ok()?;
+        Some(vibeos_netstack::config::runtime_status())
     }
 
     fn entropy<'a>(
@@ -314,26 +411,6 @@ impl SshdPlatform for SshPlatform {
         }
     }
 
-    #[cfg(feature = "milkv-ssh")]
-    fn ipv4_configuration(&self, fallback: Ipv4Policy) -> (u64, NetworkConfiguration) {
-        crate::ssh_network_config::snapshot(fallback)
-    }
-
-    #[cfg(feature = "milkv-ssh")]
-    fn acknowledge_ipv4_configuration(&self, revision: u64, status: Ipv4RuntimeStatus) {
-        crate::ssh_network_config::acknowledge(revision, status);
-    }
-
-    #[cfg(feature = "milkv-ssh")]
-    fn publish_ipv4_status(&self, status: Ipv4RuntimeStatus) {
-        crate::ssh_network_config::publish_status(status);
-    }
-
-    #[cfg(feature = "milkv-ssh")]
-    fn ipv4_configuration_changed(&self) -> bool {
-        crate::ssh_network_config::changed()
-    }
-
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool) {
         if onboarding {
             #[cfg(feature = "milkv-ssh")]
@@ -359,6 +436,40 @@ impl SshdPlatform for SshPlatform {
     fn log(&self, args: fmt::Arguments<'_>) {
         crate::uart::_print(format_args!("{args}\n"));
     }
+}
+
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
+pub async fn capability_task(
+    space: &'static Space,
+    listener: Cap,
+    random: Cap,
+    signer_read: Cap,
+    signer_invoke: Cap,
+    policy: Cap,
+) {
+    let platform = SshPlatform::new(space);
+    #[cfg(feature = "milkv-ssh-acceptance")]
+    crate::uart::_print(format_args!(
+        "WARNING milkv-ssh-acceptance: deterministic entropy and fixed test keys; isolated bring-up only\n"
+    ));
+    #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
+    crate::uart::_print(format_args!(
+        "WARNING milkv-jitterentropy-ssh-probe: fixed SSH fixtures; raw deltas are qualification evidence only\n"
+    ));
+    vibeos_sshd::capability_task(
+        &platform,
+        SSH_SERVICE_POLICY,
+        listener,
+        random,
+        signer_read,
+        signer_invoke,
+        policy,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -401,17 +512,7 @@ pub async fn task(
 }
 
 #[cfg(feature = "milkv-ssh")]
-pub async fn provisioned_task(
-    space: &'static Space,
-    outbound: Cap,
-    inbound: Cap,
-    control: Cap,
-    random: Cap,
-) {
-    crate::ssh_network_config::initialize(
-        SSH_SERVICE_POLICY.ipv4,
-        SSH_SERVICE_POLICY.ethernet_address,
-    );
+pub async fn provisioned_task(space: &'static Space, listener: Cap, random: Cap) {
     let mut provisioning_failure_reported = false;
     loop {
         match crate::ssh_provisioning::ensure_host_key().await {
@@ -429,10 +530,7 @@ pub async fn provisioned_task(
                         crate::uart::_print(format_args!(
                             "SSH host identity verified; starting DHCP SSH on port 22\n"
                         ));
-                        task(
-                            space, outbound, inbound, control, random, read, invoke, policy,
-                        )
-                        .await;
+                        capability_task(space, listener, random, read, invoke, policy).await;
                     }
                     Err(()) => crate::uart::_print(format_args!(
                         "SSH configuration invalid; refusing to listen\n"

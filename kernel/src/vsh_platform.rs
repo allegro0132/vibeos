@@ -8,7 +8,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use vibeos_core::cap::{Cap, Rights};
-use vibeos_vsh::{AsyncCommandSpec, CommandSpec, InputEvent, Platform, Session, Status};
+#[cfg(feature = "milkv-ssh")]
+use vibeos_vsh::AsyncCommandSpec;
+use vibeos_vsh::{CommandSpec, InputEvent, Platform, Session, Status};
 
 use crate::dev::ConsoleDev;
 use crate::world::{world, Space};
@@ -93,12 +95,16 @@ pub fn install_standard_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, QEMU_COMMANDS);
     #[cfg(feature = "milkv-duo")]
     vibeos_vsh::install_commands(session, MILKV_USB_COMMANDS);
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
     vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
-    vibeos_vsh::install_commands(session, SSH_NETWORK_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
@@ -116,7 +122,7 @@ pub fn install_remote_commands(session: &mut Session) {
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
-    vibeos_vsh::install_commands(session, SSH_NETWORK_COMMANDS);
+    vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
@@ -145,22 +151,6 @@ const SSH_PROVISIONING_COMMANDS: &[CommandSpec] = &[
         min_args: 2,
         max_args: 4,
         handler: crate::ssh_provisioning::vsh_authorize,
-    },
-];
-
-#[cfg(feature = "milkv-ssh")]
-const SSH_NETWORK_COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "ip",
-        min_args: 2,
-        max_args: 8,
-        handler: crate::ssh_network_config::vsh_ip,
-    },
-    CommandSpec {
-        name: "dhclient",
-        min_args: 0,
-        max_args: 2,
-        handler: crate::ssh_network_config::vsh_dhclient,
     },
 ];
 
@@ -259,7 +249,13 @@ const MILKV_USB_COMMANDS: &[CommandSpec] = &[CommandSpec {
     handler: vsh_lsusb,
 }];
 
-#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+#[cfg(any(
+    feature = "tcp-echo",
+    feature = "net-shell",
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 const NETWORK_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ip",

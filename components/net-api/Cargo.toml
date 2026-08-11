@@ -1,0 +1,7 @@
+[package]
+name = "vibeos-net-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-core = { path = "../../core" }

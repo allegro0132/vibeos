@@ -36,7 +36,7 @@ compile_error!("feature `milkv-ssh` is the Milk-V Duo production SSH image");
         feature = "ssh-test"
     )
 ))]
-compile_error!("feature `milkv-ssh` must exclusively own the IPv4 stack");
+compile_error!("feature `milkv-ssh` cannot be combined with another IPv4 image policy");
 #[cfg(all(feature = "milkv-jitterentropy-probe", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-jitterentropy-probe` is the Milk-V Duo hardware probe image");
 #[cfg(all(feature = "milkv-jitterentropy-ssh-probe", not(feature = "milkv-duo")))]
@@ -57,7 +57,7 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "feature `milkv-ssh-acceptance` must exclusively own the IPv4 stack and SSH test policy"
+    "feature `milkv-ssh-acceptance` cannot be combined with another IPv4 or SSH test image policy"
 );
 #[cfg(all(
     feature = "milkv-jitterentropy-probe",
@@ -108,6 +108,14 @@ mod jitterentropy_random;
 mod legacy_shell;
 mod mmu;
 #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+mod net_echo_platform;
+#[cfg(any(
+    feature = "tcp-echo",
+    feature = "net-shell",
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 mod netstack_platform;
 #[cfg(feature = "qemu-virt")]
 mod pci;
@@ -120,8 +128,6 @@ mod saved_program;
 mod selftest;
 #[cfg(feature = "milkv-ssh")]
 mod ssh_key_format;
-#[cfg(feature = "milkv-ssh")]
-mod ssh_network_config;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
@@ -496,7 +502,13 @@ pub extern "C" fn kmain() -> ! {
     if dwc2_host::info().is_some() {
         exec::spawn("usb-hid", dwc2_host::service_task());
     }
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     world::start_ssh_test_supervisor();

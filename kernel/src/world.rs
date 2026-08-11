@@ -106,8 +106,16 @@ enum ComponentTemplate {
     SshSecurityTest,
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     SshTest,
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
     Ipv4Stack,
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    TcpEcho,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -146,19 +154,28 @@ enum ComponentGrants {
     },
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     SshTest {
-        outbound: Cap,
-        inbound: Cap,
-        control: Cap,
+        listener: Cap,
         random: Cap,
         signer_read: Cap,
         signer_invoke: Cap,
         policy: Cap,
     },
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
     Ipv4Stack {
         outbound: Cap,
         inbound: Cap,
         control: Cap,
+        listener: Cap,
+    },
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    TcpEcho {
+        listener: Cap,
     },
     StoreFaultProbe(Cap),
     FaultProbe,
@@ -392,6 +409,14 @@ pub struct World {
     net_inbound_root: Option<Cap>,
     net_control_root: Option<Cap>,
     #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
+    tcp_listener_root: Option<Cap>,
+    #[cfg(any(
         feature = "qemu-virt",
         feature = "milkv-ssh-acceptance",
         feature = "milkv-ssh"
@@ -522,38 +547,24 @@ impl World {
         #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
         if template == ComponentTemplate::SshTest {
             let mut target = space.0.lock();
-            let (outbound, inbound, control) = {
+            let listener = {
                 let policy = self
                     .net_policy
                     .as_ref()
                     .expect("network policy CSpace exists")
                     .0
                     .lock();
-                (
-                    cap::grant(
-                        &policy,
-                        self.net_outbound_root
-                            .expect("network outbound endpoint root exists"),
-                        Rights::SEND,
-                        &mut target,
-                    )
-                    .expect("network policy retains the outbound grant root"),
-                    cap::grant(
-                        &policy,
-                        self.net_inbound_root
-                            .expect("network inbound endpoint root exists"),
-                        Rights::RECV,
-                        &mut target,
-                    )
-                    .expect("network policy retains the inbound grant root"),
-                    cap::grant(
-                        &policy,
-                        self.net_control_root.expect("network control root exists"),
-                        Rights::READ.union(Rights::INVOKE),
-                        &mut target,
-                    )
-                    .expect("network policy retains the control grant root"),
+                cap::grant(
+                    &policy,
+                    self.tcp_listener_root
+                        .expect("SSH TCP listener frontend root exists"),
+                    Rights::READ
+                        .union(Rights::WRITE)
+                        .union(Rights::RECV)
+                        .union(Rights::INVOKE),
+                    &mut target,
                 )
+                .expect("network policy retains the SSH listener root")
             };
             let random = {
                 let policy = self
@@ -578,9 +589,7 @@ impl World {
                 .0
                 .lock();
             return ComponentGrants::SshTest {
-                outbound,
-                inbound,
-                control,
+                listener,
                 random,
                 signer_read: cap::grant(
                     &security,
@@ -599,11 +608,11 @@ impl World {
                 policy: cap::grant(
                     &security,
                     self.ssh_authorized_policy_root
-                        .expect("SSH authorized-policy grant root exists"),
+                        .expect("SSH authorization grant root exists"),
                     Rights::READ,
                     &mut target,
                 )
-                .expect("SSH policy retains the authorized-key grant root"),
+                .expect("SSH policy retains the authorization grant root"),
             };
         }
 
@@ -741,7 +750,13 @@ impl World {
             };
         }
 
-        #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+        #[cfg(any(
+            feature = "tcp-echo",
+            feature = "net-shell",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh"
+        ))]
         if template == ComponentTemplate::Ipv4Stack {
             let policy = self
                 .net_policy
@@ -773,6 +788,37 @@ impl World {
                     &mut target,
                 )
                 .expect("network policy retains the control grant root"),
+                listener: cap::grant(
+                    &policy,
+                    self.tcp_listener_root
+                        .expect("TCP listener frontend root exists"),
+                    Rights::INVOKE,
+                    &mut target,
+                )
+                .expect("network policy retains the listener frontend root"),
+            };
+        }
+
+        #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+        if template == ComponentTemplate::TcpEcho {
+            let policy = self
+                .net_policy
+                .as_ref()
+                .expect("network policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            return ComponentGrants::TcpEcho {
+                listener: cap::grant(
+                    &policy,
+                    self.tcp_listener_root
+                        .expect("TCP listener frontend root exists"),
+                    Rights::READ
+                        .union(Rights::WRITE)
+                        .union(Rights::RECV)
+                        .union(Rights::INVOKE),
+                    &mut target,
+                )
+                .expect("network policy retains the listener frontend root"),
             };
         }
 
@@ -832,9 +878,19 @@ impl World {
             ComponentTemplate::SshTest => {
                 unreachable!("SSH test grants come from private policy CSpaces")
             }
-            #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+            #[cfg(any(
+                feature = "tcp-echo",
+                feature = "net-shell",
+                feature = "ssh-test",
+                feature = "milkv-ssh-acceptance",
+                feature = "milkv-ssh"
+            ))]
             ComponentTemplate::Ipv4Stack => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
+            }
+            #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+            ComponentTemplate::TcpEcho => {
+                unreachable!("TCP echo app grants come from the private policy CSpace")
             }
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
                 cap::grant(
@@ -925,9 +981,7 @@ impl World {
             },
             #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
             ComponentGrants::SshTest {
-                outbound,
-                inbound,
-                control,
+                listener,
                 random,
                 signer_read,
                 signer_invoke,
@@ -936,11 +990,9 @@ impl World {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    crate::ssh_platform::task(
+                    crate::ssh_platform::capability_task(
                         space.get(),
-                        outbound,
-                        inbound,
-                        control,
+                        listener,
                         random,
                         signer_read,
                         signer_invoke,
@@ -948,16 +1000,37 @@ impl World {
                     ),
                 )
             },
-            #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+            #[cfg(any(
+                feature = "tcp-echo",
+                feature = "net-shell",
+                feature = "ssh-test",
+                feature = "milkv-ssh-acceptance",
+                feature = "milkv-ssh"
+            ))]
             ComponentGrants::Ipv4Stack {
                 outbound,
                 inbound,
                 control,
+                listener,
             } => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    crate::netstack_platform::task(space.get(), outbound, inbound, control),
+                    crate::netstack_platform::task(
+                        space.get(),
+                        outbound,
+                        inbound,
+                        control,
+                        listener,
+                    ),
+                )
+            },
+            #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+            ComponentGrants::TcpEcho { listener } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    crate::net_echo_platform::task(space.get(), listener),
                 )
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
@@ -1379,7 +1452,13 @@ pub fn start_rng_supervisor() {
 /// Restart only faulted TCP-stack incarnations. Stack generations are rebound
 /// by the fresh task before it consumes ingress, so cancellation remains an
 /// operator decision while an audited fault can safely recover service.
-#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+#[cfg(any(
+    feature = "tcp-echo",
+    feature = "net-shell",
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 pub fn start_ipv4_stack_supervisor() {
     let world = world();
     let Some(component) = world.component_named(crate::netstack_platform::COMPONENT_NAME) else {
@@ -1516,10 +1595,20 @@ pub fn build() {
     let ssh_security_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-security-policy"));
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    let tcp_echo_space = net_resources
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
+    let ipv4_stack_space = net_resources
         .as_ref()
         .map(|_| Space::new(crate::netstack_platform::COMPONENT_NAME));
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    let tcp_echo_app_space = net_resources
+        .as_ref()
+        .map(|_| Space::new("tcp-echo-service"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -1712,6 +1801,37 @@ pub fn build() {
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
     };
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
+    let tcp_listener_root = net_policy.as_ref().map(|policy_space| {
+        let listener_label = if cfg!(any(
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh"
+        )) {
+            "sshd"
+        } else {
+            "tcp-echo"
+        };
+        #[cfg(feature = "milkv-ssh")]
+        let listen_port = 22;
+        #[cfg(not(feature = "milkv-ssh"))]
+        let listen_port = 2222;
+        let listener = vibeos_net_api::TcpListener::new(
+            listener_label,
+            vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero"),
+            listen_port,
+            vibeos_net_api::DEFAULT_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::DEFAULT_TCP_FRONTEND_BUFFER_BYTES,
+        )
+        .expect("the image TCP listener policy is valid");
+        policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
+    });
     #[cfg(feature = "qemu-virt")]
     let (rng_mmio_root, rng_dma_root, rng_source_root, rng_grants) =
         match (rng_resources, rng_space.as_ref(), rng_policy.as_ref()) {
@@ -1848,22 +1968,11 @@ pub fn build() {
         (
             cap::grant(
                 &network,
-                net_outbound_root.expect("SSH test requires the outbound root"),
-                Rights::SEND,
-                &mut target,
-            )
-            .unwrap(),
-            cap::grant(
-                &network,
-                net_inbound_root.expect("SSH test requires the inbound root"),
-                Rights::RECV,
-                &mut target,
-            )
-            .unwrap(),
-            cap::grant(
-                &network,
-                net_control_root.expect("SSH test requires the network control root"),
-                Rights::READ.union(Rights::INVOKE),
+                tcp_listener_root.expect("SSH test requires its listener root"),
+                Rights::READ
+                    .union(Rights::WRITE)
+                    .union(Rights::RECV)
+                    .union(Rights::INVOKE),
                 &mut target,
             )
             .unwrap(),
@@ -1876,14 +1985,14 @@ pub fn build() {
             .unwrap(),
             cap::grant(
                 &security,
-                ssh_signer_root.expect("SSH test requires the signer root"),
+                ssh_signer_root.expect("SSH security test requires the signer root"),
                 Rights::READ,
                 &mut target,
             )
             .unwrap(),
             cap::grant(
                 &security,
-                ssh_signer_root.expect("SSH test requires the signer root"),
+                ssh_signer_root.expect("SSH security test requires the signer root"),
                 Rights::INVOKE,
                 &mut target,
             )
@@ -1913,22 +2022,11 @@ pub fn build() {
         (
             cap::grant(
                 &network,
-                net_outbound_root.expect("SSH outbound root"),
-                Rights::SEND,
-                &mut target,
-            )
-            .unwrap(),
-            cap::grant(
-                &network,
-                net_inbound_root.expect("SSH inbound root"),
-                Rights::RECV,
-                &mut target,
-            )
-            .unwrap(),
-            cap::grant(
-                &network,
-                net_control_root.expect("SSH control root"),
-                Rights::READ.union(Rights::INVOKE),
+                tcp_listener_root.expect("SSH listener root"),
+                Rights::READ
+                    .union(Rights::WRITE)
+                    .union(Rights::RECV)
+                    .union(Rights::INVOKE),
                 &mut target,
             )
             .unwrap(),
@@ -1941,15 +2039,29 @@ pub fn build() {
             .unwrap(),
         )
     });
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    let tcp_echo_grants = match (
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
+    let ipv4_stack_grants = match (
         net_policy.as_ref(),
-        tcp_echo_space.as_ref(),
+        ipv4_stack_space.as_ref(),
         net_outbound_root,
         net_inbound_root,
         net_control_root,
+        tcp_listener_root,
     ) {
-        (Some(policy_space), Some(stack_space), Some(outbound), Some(inbound), Some(control)) => {
+        (
+            Some(policy_space),
+            Some(stack_space),
+            Some(outbound),
+            Some(inbound),
+            Some(control),
+            Some(listener),
+        ) => {
             let policy = policy_space.0.lock();
             let mut target = stack_space.0.lock();
             Some((
@@ -1962,10 +2074,36 @@ pub fn build() {
                     &mut target,
                 )
                 .unwrap(),
+                cap::grant(&policy, listener, Rights::INVOKE, &mut target).unwrap(),
             ))
         }
-        (None, None, None, None, None) => None,
-        _ => unreachable!("TCP echo grants exist exactly when a network device exists"),
+        (None, None, None, None, None, None) => None,
+        _ => unreachable!("IPv4 stack grants exist exactly when a network device exists"),
+    };
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    let tcp_echo_app_grant = match (
+        net_policy.as_ref(),
+        tcp_echo_app_space.as_ref(),
+        tcp_listener_root,
+    ) {
+        (Some(policy_space), Some(app_space), Some(listener)) => {
+            let policy = policy_space.0.lock();
+            let mut target = app_space.0.lock();
+            Some(
+                cap::grant(
+                    &policy,
+                    listener,
+                    Rights::READ
+                        .union(Rights::WRITE)
+                        .union(Rights::RECV)
+                        .union(Rights::INVOKE),
+                    &mut target,
+                )
+                .unwrap(),
+            )
+        }
+        (None, None, None) => None,
+        _ => unreachable!("TCP echo app grant exists exactly with its listener"),
     };
     let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) = match (
         block_root,
@@ -2078,9 +2216,19 @@ pub fn build() {
     if let Some(space) = ssh_security_policy.as_ref() {
         spaces.insert("ssh-security-policy", space.clone());
     }
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    if let Some(space) = tcp_echo_space.as_ref() {
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
+    if let Some(space) = ipv4_stack_space.as_ref() {
         spaces.insert(crate::netstack_platform::COMPONENT_NAME, space.clone());
+    }
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    if let Some(space) = tcp_echo_app_space.as_ref() {
+        spaces.insert("tcp-echo-service", space.clone());
     }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
@@ -2124,6 +2272,14 @@ pub fn build() {
         net_outbound_root,
         net_inbound_root,
         net_control_root,
+        #[cfg(any(
+            feature = "tcp-echo",
+            feature = "net-shell",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh"
+        ))]
+        tcp_listener_root,
         #[cfg(any(
             feature = "qemu-virt",
             feature = "milkv-ssh-acceptance",
@@ -2242,21 +2398,17 @@ pub fn build() {
     }
 
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
-    if let (
-        Some(space),
-        Some((outbound, inbound, control, random, signer_read, signer_invoke, policy)),
-    ) = (ssh_test_space, ssh_test_grants)
+    if let (Some(space), Some((listener, random, signer_read, signer_invoke, policy))) =
+        (ssh_test_space, ssh_test_grants)
     {
         world.spawn_component_inner(
             "ssh-test",
             space.clone(),
             SSH_TEST_MEMORY_BUDGET,
             Some(ComponentTemplate::SshTest),
-            crate::ssh_platform::task(
+            crate::ssh_platform::capability_task(
                 SpaceRef::new(&space).get(),
-                outbound,
-                inbound,
-                control,
+                listener,
                 random,
                 signer_read,
                 signer_invoke,
@@ -2266,32 +2418,49 @@ pub fn build() {
     }
 
     #[cfg(feature = "milkv-ssh")]
-    if let (Some(space), Some((outbound, inbound, control, random))) =
-        (ssh_production_space, ssh_production_grants)
-    {
+    if let (Some(space), Some((listener, random))) = (ssh_production_space, ssh_production_grants) {
         world.spawn_component_inner(
             "sshd",
             space.clone(),
             SSH_PRODUCTION_MEMORY_BUDGET,
             None,
-            crate::ssh_platform::provisioned_task(
-                SpaceRef::new(&space).get(),
-                outbound,
-                inbound,
-                control,
-                random,
-            ),
+            crate::ssh_platform::provisioned_task(SpaceRef::new(&space).get(), listener, random),
         );
     }
 
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    if let (Some(space), Some((outbound, inbound, control))) = (tcp_echo_space, tcp_echo_grants) {
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
+    if let (Some(space), Some((outbound, inbound, control, listener))) =
+        (ipv4_stack_space, ipv4_stack_grants)
+    {
         world.spawn_component_inner(
             crate::netstack_platform::COMPONENT_NAME,
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::Ipv4Stack),
-            crate::netstack_platform::task(SpaceRef::new(&space).get(), outbound, inbound, control),
+            crate::netstack_platform::task(
+                SpaceRef::new(&space).get(),
+                outbound,
+                inbound,
+                control,
+                listener,
+            ),
+        );
+    }
+
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    if let (Some(space), Some(listener)) = (tcp_echo_app_space, tcp_echo_app_grant) {
+        world.spawn_component_inner(
+            "tcp-echo-service",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::TcpEcho),
+            crate::net_echo_platform::task(SpaceRef::new(&space).get(), listener),
         );
     }
 

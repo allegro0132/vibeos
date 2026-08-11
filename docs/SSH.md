@@ -54,8 +54,8 @@ restricted vsh session component
 The source boundary now matches this topology. `components/sshd` is a separate
 `no_std` crate containing the Sunset protocol runner, authentication state,
 TCP/session loop, and restricted VSH frontend. `kernel/src/ssh_platform.rs` is
-the thin adapter which resolves packet, network-control, entropy, host-signer,
-authorization-policy, command-registry, and diagnostic operations through the
+the thin adapter which resolves listener operations, entropy, host-signer,
+authorization-policy, command-registry, and diagnostics through the
 component's granted capabilities. `world.rs` remains responsible only for the
 CSpace manifest, component lifecycle, restart template, and grant wiring.
 Opt-in fixtures, the deliberately insecure Milk-V bring-up RNG, and the
@@ -69,16 +69,22 @@ image and runs in the shared S-mode address space. Moving it out of the TCB
 requires the future admitted-code/loader boundary described in `BLUEPRINT.md`;
 moving the Rust source alone does not make hostile native code safe.
 
-The network stack is the sole normal consumer of raw inbound packets.  The
-implemented driver boundary carries each `Packet` inside a `StampedPacket`
-bound to one boot-local `(device epoch, stack generation)` pair. The planned
-general `TcpListener` and `TcpConnection` resources shown above do not exist
-yet; the N1 and N4 acceptance components each own one smoltcp socket directly.
-The stack owns no shell, store, key, or console authority. The acceptance SSH
-component owns only its network grants, entropy capability, separate host-key
+The independent network stack is the sole normal consumer of raw inbound
+packets and the only owner of the image's `smoltcp::Interface`, address set,
+route table, and DHCP client. The driver boundary carries each `Packet` inside
+a `StampedPacket` bound to one boot-local `(device epoch, stack generation)`
+pair. `components/net-api` provides bounded `TcpListener` resources and
+generation-bound `TcpConnectionToken` values without exposing smoltcp objects.
+The stack can bind up to eight image-policy listeners and rejects duplicate
+ports. Each service receives only the listener capability for its own port.
+
+The stack owns no shell, store, key, or console authority. The SSH component
+owns only its TCP listener operations, entropy capability, separate host-key
 read/sign grants, read-only authentication policy, and a fresh restricted VSH
-session with the appropriate exec or interactive profile per connection. A
-username is a display label; possession and
+session with the appropriate exec or interactive profile per connection. It
+does not receive raw packet endpoints, network-device control, the shared
+interface, DHCP state mutation authority, or a TCP seed. A username is a
+display label; possession and
 validation of an authorized public key select the capability profile.
 
 The acceptance boundary keeps the host private key behind a signer service:
@@ -276,11 +282,12 @@ listener remains healthy.
 #### Explicit Milk-V hardware bring-up gate
 
 `milkv-ssh-acceptance` compiles the same bounded Sunset/session/VSH path for the
-native DWMAC backend and DHCP. It is intentionally mutually exclusive with the
-production `net-shell` image and every QEMU acceptance feature. Its component
-still receives only packet SEND/RECV, network READ/INVOKE, random READ, separate
-host-key READ/sign INVOKE, and immutable authorization-policy READ grants; init
-does not receive the raw packet endpoints.
+native DWMAC backend and the independent DHCP Netstack. It is intentionally
+mutually exclusive with the production `net-shell` image and every QEMU
+acceptance feature. The SSH component receives listener READ/WRITE/RECV/INVOKE,
+random READ, separate host-key READ/sign INVOKE, and immutable
+authorization-policy READ grants. Only `net-stack` receives packet SEND/RECV
+and network READ/INVOKE; init and SSH receive neither raw endpoint.
 
 This image is deliberately cryptographically unsafe. It reuses the public test
 host and client identities and substitutes a deterministic capability-scoped

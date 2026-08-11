@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 
-use vibeos_net_protocol::{Ipv4RuntimeStatus, StackError, StaticIpv4Address, StaticIpv4EchoStack};
+use vibeos_net_protocol::{Ipv4RuntimeStatus, SharedIpv4TcpStack, StackError, StaticIpv4Address};
 
 use crate::command::{
     parse_dhclient_command, parse_ip_command, DhclientCommand, IpCommand, Ipv4Method,
@@ -19,7 +19,7 @@ pub const DEFAULT_IPV4: [u8; 4] = [10, 0, 2, 15];
 pub const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 pub const DEFAULT_PREFIX_LEN: u8 = 24;
 
-#[cfg(feature = "tcp-echo")]
+#[cfg(feature = "static-service")]
 const DEFAULT_STATIC: StaticIpv4Address =
     StaticIpv4Address::new(DEFAULT_IPV4, DEFAULT_PREFIX_LEN).with_default_gateway(DEFAULT_GATEWAY);
 
@@ -37,13 +37,13 @@ struct ControlState {
 /// The echo acceptance image uses the deterministic SLIRP address expected by
 /// its test harness. The interactive shell image starts DHCP and is free to run
 /// on any board whose platform adapter implements the packet contract.
-#[cfg(feature = "tcp-echo")]
+#[cfg(feature = "static-service")]
 const BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::Static(DEFAULT_STATIC),
 };
 
-#[cfg(feature = "net-shell")]
+#[cfg(feature = "dhcp-service")]
 const BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::Dhcp,
@@ -122,7 +122,7 @@ pub fn vsh_dhclient(args: &[String]) -> Result<String, Status> {
 }
 
 pub fn reconcile(
-    stack: &mut StaticIpv4EchoStack,
+    stack: &mut SharedIpv4TcpStack,
     observed_revision: &mut u64,
 ) -> Result<(), StackError> {
     let (revision, desired) = {
@@ -154,6 +154,15 @@ pub fn publish_stack_status(observed_revision: u64, status: Ipv4RuntimeStatus) {
 
 pub fn publish_carrier(carrier_up: bool) {
     CONTROL.lock().carrier_up = carrier_up;
+}
+
+/// Return the address state published by the independently running stack.
+///
+/// This is deliberately observation-only: services may use it to announce the
+/// address on which their listener is reachable, but changing address policy
+/// remains confined to the separate network-management command capability.
+pub fn runtime_status() -> Ipv4RuntimeStatus {
+    CONTROL.lock().runtime
 }
 
 fn update(change: impl FnOnce(&mut NetworkConfiguration)) {

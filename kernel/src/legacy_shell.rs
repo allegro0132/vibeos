@@ -1651,11 +1651,11 @@ async fn net_command(args: &[&str]) {
             let inject = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::WRITE);
+                .lookup_lease::<crate::net_device::NetDevice>(control, Rights::WRITE);
             if inject
                 .as_ref()
-                .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)
-                .and_then(crate::virtio_net::inject_fault_with)
+                .map_err(|_| crate::net_device::NetError::AuthorityRevoked)
+                .and_then(crate::net_device::inject_fault_with)
                 .is_err()
             {
                 println!("  network fault recovery: control authority denied");
@@ -1669,7 +1669,7 @@ async fn net_command(args: &[&str]) {
                 }
             };
             if let Err(error) =
-                net_send(&init, outbound, stamp, crate::virtio_net::hello_packet()).await
+                net_send(&init, outbound, stamp, crate::net_device::hello_packet()).await
             {
                 println!("  network fault recovery: trigger failed ({})", error);
                 return;
@@ -1712,32 +1712,32 @@ async fn net_command(args: &[&str]) {
 async fn net_bind(
     init: &Arc<Space>,
     control: crate::cap::Cap,
-) -> Result<PacketStamp, crate::virtio_net::NetError> {
+) -> Result<PacketStamp, crate::net_device::NetError> {
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let lease = init
             .0
             .lock()
-            .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::INVOKE)
-            .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
-        match crate::virtio_net::bind_stack_with(&lease) {
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
+            .map_err(|_| crate::net_device::NetError::AuthorityRevoked)?;
+        match crate::net_device::bind_stack_with(&lease) {
             Ok(stamp) => return Ok(stamp),
-            Err(crate::virtio_net::NetError::SessionBusy) => exec::sleep_ms(1).await,
+            Err(crate::net_device::NetError::SessionBusy) => exec::sleep_ms(1).await,
             Err(error) => return Err(error),
         }
     }
-    Err(crate::virtio_net::NetError::TimedOut)
+    Err(crate::net_device::NetError::TimedOut)
 }
 
 fn net_info(
     init: &Arc<Space>,
     control: crate::cap::Cap,
-) -> Result<crate::virtio_net::NetInfo, crate::virtio_net::NetError> {
+) -> Result<crate::net_device::NetInfo, crate::net_device::NetError> {
     let lease = init
         .0
         .lock()
-        .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::READ)
-        .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
-    crate::virtio_net::info_with(&lease)
+        .lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
+        .map_err(|_| crate::net_device::NetError::AuthorityRevoked)?;
+    crate::net_device::info_with(&lease)
 }
 
 async fn net_send(
@@ -1745,34 +1745,34 @@ async fn net_send(
     outbound: crate::cap::Cap,
     stamp: PacketStamp,
     packet: Packet,
-) -> Result<(), crate::virtio_net::NetError> {
+) -> Result<(), crate::net_device::NetError> {
     let mut pending = StampedPacket::new(packet, stamp);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let lease = init
             .0
             .lock()
             .lookup_lease::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
-            .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
+            .map_err(|_| crate::net_device::NetError::AuthorityRevoked)?;
         match lease.with(|endpoint| endpoint.try_send(pending)) {
             Ok(()) => return Ok(()),
             Err(packet) => pending = packet,
         }
         exec::sleep_ms(1).await;
     }
-    Err(crate::virtio_net::NetError::QueueFull)
+    Err(crate::net_device::NetError::QueueFull)
 }
 
 async fn net_receive(
     init: &Arc<Space>,
     inbound: crate::cap::Cap,
     stamp: PacketStamp,
-) -> Result<Packet, crate::virtio_net::NetError> {
+) -> Result<Packet, crate::net_device::NetError> {
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let lease = init
             .0
             .lock()
             .lookup_lease::<Endpoint<StampedPacket>>(inbound, Rights::RECV)
-            .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
+            .map_err(|_| crate::net_device::NetError::AuthorityRevoked)?;
         if let Some(packet) = lease.with(Endpoint::try_recv) {
             if let Ok(packet) = packet.into_packet(stamp) {
                 return Ok(packet);
@@ -1780,7 +1780,7 @@ async fn net_receive(
         }
         exec::sleep_ms(1).await;
     }
-    Err(crate::virtio_net::NetError::TimedOut)
+    Err(crate::net_device::NetError::TimedOut)
 }
 
 async fn net_handshake(
@@ -1788,18 +1788,18 @@ async fn net_handshake(
     outbound: crate::cap::Cap,
     inbound: crate::cap::Cap,
     control: crate::cap::Cap,
-) -> Result<(crate::virtio_net::NetInfo, crate::virtio_net::NetInfo), crate::virtio_net::NetError> {
+) -> Result<(crate::net_device::NetInfo, crate::net_device::NetInfo), crate::net_device::NetError> {
     let before = net_info(init, control)?;
     if !before.online || before.quarantined {
-        return Err(crate::virtio_net::NetError::Offline);
+        return Err(crate::net_device::NetError::Offline);
     }
     let stamp = net_bind(init, control).await?;
-    net_send(init, outbound, stamp, crate::virtio_net::hello_packet()).await?;
+    net_send(init, outbound, stamp, crate::net_device::hello_packet()).await?;
     let challenge = net_receive(init, inbound, stamp).await?;
-    if !crate::virtio_net::is_challenge(&challenge) {
-        return Err(crate::virtio_net::NetError::Protocol);
+    if !crate::net_device::is_challenge(&challenge) {
+        return Err(crate::net_device::NetError::Protocol);
     }
-    net_send(init, outbound, stamp, crate::virtio_net::ack_packet()).await?;
+    net_send(init, outbound, stamp, crate::net_device::ack_packet()).await?;
 
     let tx_target = before.tx_packets.saturating_add(2);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
@@ -1815,7 +1815,7 @@ async fn net_handshake(
         }
         exec::sleep_ms(1).await;
     }
-    Err(crate::virtio_net::NetError::TimedOut)
+    Err(crate::net_device::NetError::TimedOut)
 }
 
 async fn block_command(args: &[&str]) {
@@ -1833,10 +1833,10 @@ async fn block_command(args: &[&str]) {
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             match lease {
                 Ok(lease) => {
-                    let Ok(info) = crate::virtio_blk::info_with(&lease) else {
+                    let Ok(info) = crate::block_device::info_with(&lease) else {
                         println!("  refused: block capability lacks read authority");
                         return;
                     };
@@ -1878,20 +1878,20 @@ async fn block_command(args: &[&str]) {
                 let lease = init
                     .0
                     .lock()
-                    .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                    .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
                 lease
                     .as_ref()
                     .ok()
-                    .and_then(|lease| crate::virtio_blk::info_with(lease).ok())
+                    .and_then(|lease| crate::block_device::info_with(lease).ok())
                     .map_or(0, |info| info.used_interrupts)
             };
             let read = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let sector = match read {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             match sector {
                 Ok(sector)
@@ -1915,10 +1915,10 @@ async fn block_command(args: &[&str]) {
             let write = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::WRITE);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::WRITE);
             let write = match write {
-                Ok(lease) => crate::virtio_blk::write_with(lease, 8, data).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::write_with(lease, 8, data).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             if let Err(e) = write {
                 println!("  sector 8 write + flush: failed ({})", e);
@@ -1927,10 +1927,10 @@ async fn block_command(args: &[&str]) {
             let flush = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::WRITE);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::WRITE);
             let flushed = match flush {
-                Ok(lease) => crate::virtio_blk::flush_with(lease).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::flush_with(lease).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             if let Err(e) = flushed {
                 println!("  sector 8 write + flush: failed ({})", e);
@@ -1939,21 +1939,21 @@ async fn block_command(args: &[&str]) {
             let verify = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let verified = match verify {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 8).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 8).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             #[cfg(feature = "qemu-virt")]
             let irq_after = {
                 let lease = init
                     .0
                     .lock()
-                    .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                    .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
                 lease
                     .as_ref()
                     .ok()
-                    .and_then(|lease| crate::virtio_blk::info_with(lease).ok())
+                    .and_then(|lease| crate::block_device::info_with(lease).ok())
                     .map_or(irq_before, |info| info.used_interrupts)
             };
             match verified {
@@ -1973,17 +1973,17 @@ async fn block_command(args: &[&str]) {
             }
         }
         "fault" => {
-            crate::virtio_blk::inject_fault_after_publish();
+            crate::block_device::inject_fault_after_publish();
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let result = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             match result {
-                Err(crate::virtio_blk::BlockError::DriverFault) => {
+                Err(crate::block_device::BlockError::DriverFault) => {
                     println!("  injected fault: device reset confirmed, DMA released")
                 }
                 Err(e) => println!("  injected fault returned: {}", e),
@@ -1995,16 +1995,16 @@ async fn block_command(args: &[&str]) {
                 .component_named("virtio-blk")
                 .map(|component| component.snapshot().generation)
                 .unwrap_or(0);
-            crate::virtio_blk::inject_fault_after_publish();
+            crate::block_device::inject_fault_after_publish();
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let fault = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
-            if fault != Err(crate::virtio_blk::BlockError::DriverFault) {
+            if fault != Err(crate::block_device::BlockError::DriverFault) {
                 println!("  fault recovery: unexpected request result");
                 return;
             }
@@ -2014,7 +2014,7 @@ async fn block_command(args: &[&str]) {
                     let snapshot = component.snapshot();
                     snapshot.generation > before
                         && snapshot.state == exec::TaskState::Running
-                        && crate::virtio_blk::is_online()
+                        && crate::block_device::is_online()
                 });
                 if ready {
                     restarted = true;
@@ -2029,10 +2029,10 @@ async fn block_command(args: &[&str]) {
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let after = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             if after.is_ok_and(|sector| {
                 sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
@@ -2043,29 +2043,29 @@ async fn block_command(args: &[&str]) {
             }
         }
         "timeout" => {
-            let before = crate::virtio_blk::debug_waiter_counts();
-            crate::virtio_blk::inject_timeout();
+            let before = crate::block_device::debug_waiter_counts();
+            crate::block_device::inject_timeout();
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let timed_out = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let retry = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
-            let after = crate::virtio_blk::debug_waiter_counts();
+            let after = crate::block_device::debug_waiter_counts();
             let retry_matches_seed = retry.is_ok_and(|sector| {
                 sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
             });
-            if timed_out == Err(crate::virtio_blk::BlockError::TimedOut)
+            if timed_out == Err(crate::block_device::BlockError::TimedOut)
                 && retry_matches_seed
                 && before == after
             {
@@ -2093,7 +2093,7 @@ async fn block_command(args: &[&str]) {
                 return;
             }
             for _ in 0..200 {
-                if crate::virtio_blk::is_online() {
+                if crate::block_device::is_online() {
                     break;
                 }
                 exec::sleep_ms(1).await;
@@ -2101,10 +2101,10 @@ async fn block_command(args: &[&str]) {
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let retry = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             if retry.is_ok_and(|sector| {
                 sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)
@@ -2128,19 +2128,19 @@ async fn block_command(args: &[&str]) {
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let denied = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
-            if denied != Err(crate::virtio_blk::BlockError::AuthorityRevoked)
+            if denied != Err(crate::block_device::BlockError::AuthorityRevoked)
                 || w.restart_component("virtio-blk").is_err()
             {
                 println!("  authority revocation: next operation was not denied");
                 return;
             }
             for _ in 0..200 {
-                if crate::virtio_blk::is_online() {
+                if crate::block_device::is_online() {
                     break;
                 }
                 exec::sleep_ms(1).await;
@@ -2148,10 +2148,10 @@ async fn block_command(args: &[&str]) {
             let lease = init
                 .0
                 .lock()
-                .lookup_lease::<crate::virtio_blk::BlockDevice>(block_cap, Rights::READ);
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
             let retry = match lease {
-                Ok(lease) => crate::virtio_blk::read_with(lease, 7).await,
-                Err(_) => Err(crate::virtio_blk::BlockError::AuthorityRevoked),
+                Ok(lease) => crate::block_device::read_with(lease, 7).await,
+                Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
             if retry.is_ok_and(|sector| {
                 sector.starts_with(SEED) && sector[SEED.len()..].iter().all(|byte| *byte == 0)

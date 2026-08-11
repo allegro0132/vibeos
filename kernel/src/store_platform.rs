@@ -10,7 +10,7 @@ use vibeos_object_store::{
     BackendError, BackendInfo, Platform, PublicationTarget, StoreService, StoredObject,
 };
 
-use crate::virtio_blk::{self, BlockDevice, BlockError};
+use crate::block_device::{self, BlockDevice, BlockError};
 use crate::world::Space;
 
 struct StorePlatform {
@@ -37,7 +37,7 @@ impl StorePlatform {
 
 impl Platform for StorePlatform {
     fn info(&self) -> Result<BackendInfo, BackendError> {
-        let info = virtio_blk::info_with(&self.lease(Rights::READ)?).map_err(map_block_error)?;
+        let info = block_device::info_with(&self.lease(Rights::READ)?).map_err(map_block_error)?;
         Ok(BackendInfo {
             capacity_sectors: info.capacity_sectors,
             read_only: info.read_only,
@@ -48,7 +48,7 @@ impl Platform for StorePlatform {
     fn read_sector(&self, sector: u64) -> vibeos_object_store::BackendFuture<'_, [u8; 512]> {
         Box::pin(async move {
             let lease = self.lease(Rights::READ)?;
-            virtio_blk::read_with(lease, sector)
+            block_device::read_with(lease, sector)
                 .await
                 .map_err(map_block_error)
         })
@@ -61,7 +61,7 @@ impl Platform for StorePlatform {
     ) -> vibeos_object_store::BackendFuture<'_, ()> {
         Box::pin(async move {
             let lease = self.lease(Rights::WRITE)?;
-            virtio_blk::write_with(lease, sector, bytes)
+            block_device::write_with(lease, sector, bytes)
                 .await
                 .map_err(map_block_error)
         })
@@ -70,7 +70,9 @@ impl Platform for StorePlatform {
     fn flush(&self) -> vibeos_object_store::BackendFuture<'_, ()> {
         Box::pin(async move {
             let lease = self.lease(Rights::WRITE)?;
-            virtio_blk::flush_with(lease).await.map_err(map_block_error)
+            block_device::flush_with(lease)
+                .await
+                .map_err(map_block_error)
         })
     }
 

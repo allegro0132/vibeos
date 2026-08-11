@@ -32,11 +32,17 @@ use vibeos_core::store as object_codec;
 use crate::saved_program::{self, SavedProgramService, TrustedProgram};
 use crate::store::{AuthorityJournal, AuthoritySnapshot, StoreError, StoredObject};
 use crate::world::Space;
-use crate::{exec, heap, sync::SpinLock, virtio_blk};
+use crate::{block_device, exec, heap, sync::SpinLock};
 
-pub use vibeos_authority_store::{DurableCSpaceError, DurableCSpaceInfo, DurableCSpaceState, PersistentTestPhase, PersistentTestReport};
-use vibeos_authority_store::{persistent_object_kind, stored_object_resource_kind, CHILD_RIGHTS, CHILD_SLOT, GRANDCHILD_RIGHTS, GRANDCHILD_SLOT, MARKER, PERSISTENT_SPACE_ID_RAW, ROOT_RIGHTS, ROOT_SLOT};
 pub(crate) use vibeos_authority_store::persistent_space_id;
+use vibeos_authority_store::{
+    persistent_object_kind, stored_object_resource_kind, CHILD_RIGHTS, CHILD_SLOT,
+    GRANDCHILD_RIGHTS, GRANDCHILD_SLOT, MARKER, PERSISTENT_SPACE_ID_RAW, ROOT_RIGHTS, ROOT_SLOT,
+};
+pub use vibeos_authority_store::{
+    DurableCSpaceError, DurableCSpaceInfo, DurableCSpaceState, PersistentTestPhase,
+    PersistentTestReport,
+};
 
 #[derive(Default)]
 struct LiveGraph {
@@ -238,7 +244,7 @@ impl DurableCSpaceService {
     }
 
     pub(crate) async fn recover_after_block_online(&self) -> Result<(), DurableCSpaceError> {
-        if !virtio_blk::is_online() {
+        if !block_device::is_online() {
             return Err(StoreError::Backend(crate::store::BackendError::Offline).into());
         }
         self.transition(
@@ -856,8 +862,8 @@ pub(crate) unsafe fn recover_faulted_task(task: exec::TaskId, domain: heap::Allo
         return;
     };
 
-    let task_key = crate::sync::TaskRecoveryKey::new(task.0)
-        .expect("executor TaskId zero is reserved");
+    let task_key =
+        crate::sync::TaskRecoveryKey::new(task.0).expect("executor TaskId zero is reserved");
 
     // Safety: the executor detached the exact task before this hook. Repair
     // each possibly abandoned lock before taking it. The saved-program hook is

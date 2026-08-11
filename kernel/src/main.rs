@@ -111,6 +111,12 @@ mod ssh_security_test;
 ))]
 mod ssh_test_fixture;
 pub use vibeos_object_store as store;
+mod block_device;
+#[cfg(feature = "milkv-duo")]
+mod dwmac_net;
+mod net_device;
+#[cfg(feature = "milkv-duo")]
+mod sdhci_blk;
 mod store_platform;
 mod trampoline;
 mod trap;
@@ -118,15 +124,9 @@ mod tty;
 mod uart;
 #[cfg(feature = "qemu-virt")]
 mod virtio_blk;
-#[cfg(feature = "milkv-duo")]
-#[path = "sdhci_blk.rs"]
-mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
 mod virtio_mmio;
 #[cfg(feature = "qemu-virt")]
-mod virtio_net;
-#[cfg(feature = "milkv-duo")]
-#[path = "dwmac_net.rs"]
 mod virtio_net;
 #[cfg(feature = "qemu-virt")]
 mod virtio_rng;
@@ -590,8 +590,8 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         // Repair component-stable synchronization state while the exact
         // faulting incarnation is still identifiable and before Faulted is
         // visible to safe lifecycle callers.
-        virtio_blk::recover_faulted_domain(domain);
-        virtio_net::recover_faulted_domain(domain);
+        block_device::recover_faulted_domain(domain);
+        net_device::recover_faulted_domain(domain);
         #[cfg(feature = "qemu-virt")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);

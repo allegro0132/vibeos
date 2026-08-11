@@ -50,13 +50,13 @@ impl Platform for NetstackPlatform {
             .space
             .0
             .lock()
-            .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::INVOKE)
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
             .map_err(|_| NetworkBindError::Denied)?;
-        crate::virtio_net::bind_stack_with(&lease).map_err(|error| match error {
-            crate::virtio_net::NetError::Offline => NetworkBindError::Offline,
-            crate::virtio_net::NetError::SessionBusy => NetworkBindError::SessionBusy,
-            crate::virtio_net::NetError::AuthorityRevoked
-            | crate::virtio_net::NetError::PermissionDenied => NetworkBindError::Denied,
+        crate::net_device::bind_stack_with(&lease).map_err(|error| match error {
+            crate::net_device::NetError::Offline => NetworkBindError::Offline,
+            crate::net_device::NetError::SessionBusy => NetworkBindError::SessionBusy,
+            crate::net_device::NetError::AuthorityRevoked
+            | crate::net_device::NetError::PermissionDenied => NetworkBindError::Denied,
             _ => NetworkBindError::Failed,
         })
     }
@@ -66,9 +66,9 @@ impl Platform for NetstackPlatform {
             .space
             .0
             .lock()
-            .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::READ)
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
             .ok()?;
-        let info = crate::virtio_net::info_with(&lease).ok()?;
+        let info = crate::net_device::info_with(&lease).ok()?;
         Some(NetworkInfo {
             online: info.online,
             quarantined: info.quarantined,
@@ -89,7 +89,7 @@ pub async fn task(space: &'static Space, outbound: Cap, inbound: Cap, control: C
 /// Test-image-only stack fault trigger. Hardware staging remains kernel-only.
 #[cfg(feature = "tcp-echo-recovery-test")]
 pub(crate) fn vsh_inject_fault(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    if let Err(error) = crate::virtio_net::stage_stale_packets_for_test() {
+    if let Err(error) = crate::net_device::stage_stale_packets_for_test() {
         return Ok(format!("tcp-echo fault staging failed: {error}"));
     }
     vibeos_netstack::request_fault_for_test();
@@ -99,16 +99,16 @@ pub(crate) fn vsh_inject_fault(_args: &[String]) -> Result<String, crate::vsh::S
 /// Test-image-only driver fault trigger. It is absent from production images.
 #[cfg(feature = "tcp-echo-recovery-test")]
 pub(crate) fn vsh_inject_driver_fault(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    if let Err(error) = crate::virtio_net::stage_stale_packets_for_test() {
+    if let Err(error) = crate::net_device::stage_stale_packets_for_test() {
         return Ok(format!("tcp-echo driver fault staging failed: {error}"));
     }
-    crate::virtio_net::request_driver_fault_for_test();
+    crate::net_device::request_driver_fault_for_test();
     Ok(String::from("tcp-echo driver fault requested"))
 }
 
 #[cfg(feature = "tcp-echo-recovery-test")]
 pub(crate) fn vsh_release_stale(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    match crate::virtio_net::release_stale_packets_for_test() {
+    match crate::net_device::release_stale_packets_for_test() {
         Ok(true) => Ok(String::from("tcp-echo stale release complete")),
         Ok(false) => Ok(String::from("tcp-echo stale release partial")),
         Err(error) => Ok(format!("tcp-echo stale release failed: {error}")),
@@ -118,7 +118,7 @@ pub(crate) fn vsh_release_stale(_args: &[String]) -> Result<String, crate::vsh::
 #[cfg(feature = "tcp-echo-recovery-test")]
 pub(crate) fn vsh_session_info(_args: &[String]) -> Result<String, crate::vsh::Status> {
     let (epoch, generation, egress_device, egress_stack) =
-        crate::virtio_net::packet_session_test_info();
+        crate::net_device::packet_session_test_info();
     let (ingress_device, ingress_stack) = vibeos_netstack::rejected_ingress_for_test();
     let world = crate::world::world();
     let stack_component = world

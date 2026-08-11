@@ -5,7 +5,7 @@ use vibeos_durable_format::{
     ObjectId, RecoveryError as AuthorityRecoveryError, RecoveryPolicy as AuthorityRecoveryPolicy,
     ResourceKind, RootPolicy, SlotIdentity, SpaceId, StoreId, TransactionId,
 };
-use vibeos_core::store::{
+use vibeos_object_store::{
     encode_object_transaction, preview_object_transaction, recover, ChainCheckpoint, DecodeError,
     DecodeStatus, EncodeError, ObjectChunk, ObjectCommit, ObjectKind, ObjectMetadata, RecordBody,
     RecordChain, RecoveredStore, RecoveryError, RecoveryPolicy, StoreRecord, CHUNK_DATA_SIZE,
@@ -54,7 +54,7 @@ fn grant(derivation: u128, object_id: u128, space_id: u128, slot: u32) -> GrantR
     }
 }
 
-fn decode(bytes: &[u8; RECORD_SIZE]) -> vibeos_core::store::DecodedRecord {
+fn decode(bytes: &[u8; RECORD_SIZE]) -> vibeos_object_store::DecodedRecord {
     let DecodeStatus::Valid(decoded) = StoreRecord::decode(bytes).unwrap() else {
         panic!("fresh record was not valid")
     };
@@ -124,7 +124,7 @@ impl TestLog {
         &mut self,
         transaction_id: Option<TransactionId>,
         body: RecordBody,
-    ) -> vibeos_core::store::DecodedRecord {
+    ) -> vibeos_object_store::DecodedRecord {
         let bytes = self.chain.append(transaction_id, body).unwrap();
         let decoded = decode(&bytes);
         self.sectors.push(bytes);

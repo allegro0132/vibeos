@@ -28,7 +28,7 @@ use vibeos_durable_format::{
     TransactionId,
 };
 use vibeos_core::program::{self as program_model, RootPolicyPartition};
-use vibeos_core::store as object_codec;
+use vibeos_object_store as object_codec;
 
 use crate::saved_program::{self, SavedProgramService, TrustedProgram};
 use crate::store::{AuthorityJournal, AuthoritySnapshot, StoreError, StoredObject};

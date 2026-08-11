@@ -1,22 +1,11 @@
-//! Capability-addressed object transactions over the unified durable journal.
-//!
-//! Object and authority recovery deliberately share `durable`'s single
-//! semantic pass. This compatibility view publishes only committed immutable
-//! object bytes; it never creates an ambient `ObjectId -> object` namespace.
-
-extern crate alloc;
+//! Canonical encoding for capability-addressed object transactions.
 
 use alloc::vec::Vec;
 
-use vibeos_durable_format::{
-    crc32c, preflight_recovery, Crc32cDigest, ObjectId, StoreId, TransactionId,
-};
-pub use vibeos_durable_format::{
-    ChainCheckpoint, DecodeError, DecodeStatus, DecodedRecord, EncodeError,
-    LogRecord as StoreRecord, ObjectChunk, ObjectCommit, ObjectKind, ObjectMetadata, RecordBody,
-    RecordChain, RecoveredObject, RecoveryError, CHUNK_DATA_SIZE, CRC_OFFSET, FORMAT_VERSION,
-    HEADER_LEN, MAX_OBJECT_CHUNKS, MAX_OBJECT_SIZE, PAYLOAD_CAPACITY, PAYLOAD_OFFSET, RECORD_SIZE,
-    SEAL_OFFSET,
+use crate::{
+    crc32c, Crc32cDigest, DecodeStatus, EncodeError, LogRecord, ObjectChunk, ObjectCommit,
+    ObjectId, ObjectKind, ObjectMetadata, RecordBody, RecordChain, TransactionId, CHUNK_DATA_SIZE,
+    MAX_OBJECT_SIZE, RECORD_SIZE,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +48,7 @@ pub fn encode_object_transaction(
         }),
     )?;
     let DecodeStatus::Valid(decoded_prepare) =
-        StoreRecord::decode(&prepare).expect("freshly encoded prepare must decode")
+        LogRecord::decode(&prepare).expect("freshly encoded prepare must decode")
     else {
         unreachable!()
     };
@@ -78,7 +67,7 @@ pub fn encode_object_transaction(
             }),
         )?;
         let DecodeStatus::Valid(decoded_chunk) =
-            StoreRecord::decode(&chunk).expect("freshly encoded chunk must decode")
+            LogRecord::decode(&chunk).expect("freshly encoded chunk must decode")
         else {
             unreachable!()
         };
@@ -121,49 +110,4 @@ pub fn preview_object_transaction(
         bytes,
     )?;
     Ok((transaction, next_chain))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecoveryPolicy {
-    pub store_id: StoreId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveredStore {
-    pub store_id: StoreId,
-    pub id_high_water: u128,
-    /// Deliberately a flat recovery result, not an ambient ObjectId lookup API.
-    pub objects: Vec<RecoveredObject>,
-    pub last_sequence: u64,
-    pub last_crc32c: u32,
-}
-
-impl RecoveredStore {
-    pub fn chain_checkpoint(&self) -> Result<ChainCheckpoint, RecoveryError> {
-        Ok(ChainCheckpoint {
-            next_sequence: self
-                .last_sequence
-                .checked_add(1)
-                .ok_or(RecoveryError::SequenceOverflow)?,
-            previous_sequence: self.last_sequence,
-            previous_crc32c: self.last_crc32c,
-        })
-    }
-}
-
-/// Recover the object-only compatibility view through the exact same semantic
-/// pass used by durable authority preflight. Root candidates remain inert.
-pub fn recover(
-    sectors: &[[u8; RECORD_SIZE]],
-    policy: RecoveryPolicy,
-) -> Result<RecoveredStore, RecoveryError> {
-    let preflight = preflight_recovery(sectors, policy.store_id)?;
-    let recovered = RecoveredStore {
-        store_id: preflight.store_id(),
-        id_high_water: preflight.id_high_water(),
-        last_sequence: preflight.last_sequence(),
-        last_crc32c: preflight.last_crc32c(),
-        objects: preflight.into_objects(),
-    };
-    Ok(recovered)
 }

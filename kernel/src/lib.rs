@@ -64,11 +64,11 @@ extern crate alloc;
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, exec, heap, interrupt, ipi, program, sync};
+#[cfg(feature = "qemu-virt")]
+pub use vibeos_driver_virtio_core as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_vsh as vsh;
 pub use vibeos_vsh::terminal;
-#[cfg(feature = "qemu-virt")]
-pub use vibeos_driver_virtio_core as virtio;
 
 mod bench_platform;
 #[cfg(feature = "milkv-duo")]
@@ -94,25 +94,19 @@ mod rustc;
 mod saved_program;
 #[path = "selftest_platform.rs"]
 mod selftest;
-#[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
-mod ssh_acceptance_rng;
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-security-test",
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance"
+))]
 mod ssh_platform;
+pub use vibeos_object_store as store;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance"
 ))]
 pub use vibeos_ssh_identity as ssh_security;
-#[cfg(feature = "ssh-security-test")]
-mod ssh_security_test;
-#[cfg(any(
-    feature = "ssh-security-test",
-    feature = "ssh-test",
-    feature = "milkv-ssh-acceptance"
-))]
-mod ssh_test_fixture;
-pub use vibeos_object_store as store;
 mod block_device;
 #[cfg(feature = "milkv-duo")]
 mod dwmac_net;

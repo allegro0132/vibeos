@@ -401,13 +401,14 @@ its process owns. Here, authority is not a property of the code.
 | `components/sshd/` | capability-confined SSH protocol and VSH session component (`no_std`) |
 | `kernel/src/ssh_platform.rs` | thin kernel-private adapter for SSH capabilities and services |
 | `services/ssh-identity/` | trusted host signing and immutable authorized-key capability services (`no_std`) |
+| `acceptance/kernel-tests/src/ssh_*` | opt-in SSH security assertions, fixed test identities, and insecure Milk-V bring-up RNG |
 | `services/object-store/` | capability-addressed journal, recovery, transactions, and stored-object resources (`no_std`) |
 | `kernel/src/store_platform.rs` | thin block capability, CSpace publication, and heap-accounting adapter |
 | `services/program-store/` | canonical saved-program artifact validation and recovered graph authorization (`no_std`) |
 | `kernel/src/program_store_platform.rs` | compiler, execution, CSpace publication, and fault-recovery adapter |
 | `services/authority-store/` | persistent CSpace policy, stable identities, rights, and service contract (`no_std`) |
 | `kernel/src/authority_store_platform.rs` | atomic CSpace installation and exact-task recovery adapter |
-| `acceptance/kernel-tests/` | guest self-test harness and machine-readable benchmark scenarios (`no_std`, host-checkable) |
+| `acceptance/kernel-tests/` | guest self-test harness, SSH acceptance policy, and machine-readable benchmark scenarios (`no_std`, host-checkable) |
 | `kernel/src/selftest_platform.rs`, `kernel/src/bench_platform.rs` | hardware test cases and kernel capability adapters |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |

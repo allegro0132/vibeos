@@ -899,7 +899,7 @@ impl World {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    crate::ssh_security_test::task(
+                    crate::ssh_platform::security_test_task(
                         space.get(),
                         random,
                         signer_read,
@@ -1462,7 +1462,7 @@ pub fn build() {
     #[cfg(feature = "qemu-virt")]
     let rng_resources = virtio_rng::discover();
     #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
-    let rng_resources = Some(crate::ssh_acceptance_rng::provision());
+    let rng_resources = Some(vibeos_kernel_acceptance::ssh_acceptance_rng::provision());
     #[cfg(feature = "qemu-virt")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
     #[cfg(feature = "qemu-virt")]
@@ -1738,7 +1738,7 @@ pub fn build() {
     ))]
     let (ssh_signer_root, ssh_authorized_policy_root) = match ssh_security_policy.as_ref() {
         Some(security_space) => {
-            let resources = crate::ssh_test_fixture::provision();
+            let resources = vibeos_kernel_acceptance::ssh_test_fixture::provision();
             let mut security = security_space.0.lock();
             let signer_root = security.mint(resources.signer, Rights::ALL_VOLATILE);
             let authorized_policy_root = security.mint(resources.policy, Rights::ALL);
@@ -2135,7 +2135,7 @@ pub fn build() {
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::SshSecurityTest),
-            crate::ssh_security_test::task(
+            crate::ssh_platform::security_test_task(
                 SpaceRef::new(&space).get(),
                 random,
                 signer_read,

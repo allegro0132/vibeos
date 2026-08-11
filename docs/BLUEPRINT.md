@@ -127,15 +127,16 @@ upward except through a capability it was handed.
 | `kernel/vsh_platform.rs` | small | Console capability plus hardware and management command adapters | — |
 | `kernel/legacy_shell.rs` | large, gated | Diagnostic acceptance commands retained only by `legacy-shell` images | yes |
 | `components/sshd` | growing | Capability-confined SSH protocol, authentication, sessions, and VSH frontend | 1 (secret wipe) |
-| `kernel/ssh_platform.rs` | small | Kernel-private network, entropy, signer, policy, command, and log adapters for `sshd` | — |
+| `kernel/ssh_platform.rs` | small | Kernel-private network, entropy, timer, command, log, and shutdown adapters for SSH/acceptance | — |
 | `services/ssh-identity` | small, trusted | Opaque host signer and immutable binary authorized-key capability policy | — |
+| `acceptance/kernel-tests/src/ssh_*` | small, gated | Portable SSH security assertions, fixed identities, and insecure hardware bring-up RNG | — |
 | `services/object-store` | growing | Capability-addressed journal recovery, object transactions, and immutable object resources | 1 (fixed scratch buffer) |
 | `kernel/store_platform.rs` | small | Block-capability, CSpace publication, and heap-accounting adapter | — |
 | `services/program-store` | small, trusted | Canonical program artifact and recovered authority-graph policy | — |
 | `kernel/program_store_platform.rs` | growing | Compiler, execution, CSpace publication, and exact-task cleanup adapter | — |
 | `services/authority-store` | small, trusted | Persistent-space identities, rights, lifecycle contract, and root policy | — |
 | `kernel/authority_store_platform.rs` | growing | Atomic recovered-graph installation, publication, and fault cleanup adapter | — |
-| `acceptance/kernel-tests` | small | Guest acceptance harness and benchmark policy/scenarios | — |
+| `acceptance/kernel-tests` | small | Guest acceptance harness plus feature-gated SSH and benchmark policy/scenarios | — |
 | `kernel/selftest_platform.rs`, `kernel/bench_platform.rs` | growing / small | Hardware cases and kernel capability adapters for guest acceptance | yes / — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |

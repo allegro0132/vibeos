@@ -767,6 +767,7 @@ dependencies = [
  "jitterentropy-rs",
  "vibeos-authority-store",
  "vibeos-core",
+ "vibeos-kernel-acceptance",
  "vibeos-netstack",
  "vibeos-object-store",
  "vibeos-program-store",
@@ -774,6 +775,14 @@ dependencies = [
  "vibeos-ssh-identity",
  "vibeos-sshd",
  "vibeos-vsh",
+]
+
+[[package]]
+name = "vibeos-kernel-acceptance"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-rustc",
 ]
 
 [[package]]

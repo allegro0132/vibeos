@@ -392,8 +392,9 @@ its process owns. Here, authority is not a property of the code.
 | `kernel/src/program_store_platform.rs` | compiler, execution, CSpace publication, and fault-recovery adapter |
 | `services/authority-store/` | persistent CSpace policy, stable identities, rights, and service contract (`no_std`) |
 | `kernel/src/authority_store_platform.rs` | atomic CSpace installation and exact-task recovery adapter |
+| `acceptance/kernel-tests/` | guest self-test harness and machine-readable benchmark scenarios (`no_std`, host-checkable) |
+| `kernel/src/selftest_platform.rs`, `kernel/src/bench_platform.rs` | hardware test cases and kernel capability adapters |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |
-| `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |
 
 ~10,500 Rust lines across `core`, `compiler`, and `kernel` (2026-08-08 snapshot).

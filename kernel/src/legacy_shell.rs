@@ -389,7 +389,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             }
         }
 
-        "bench" => crate::bench::run().await,
+        "bench" => crate::bench_platform::run().await,
 
         "durable" => durable_demo(),
 

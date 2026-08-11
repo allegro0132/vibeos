@@ -1,4 +1,4 @@
-//! In-kernel self-test.
+//! Kernel platform adapter and hardware cases for the acceptance self-test.
 //!
 //! Host unit tests cover logic; these cover the things a host cannot fake —
 //! real timer interrupts, real wakeups from a trap handler, the live capability
@@ -9,8 +9,6 @@
 
 extern crate alloc;
 
-use alloc::format;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::task::Wake;
 use alloc::vec::Vec;
@@ -26,15 +24,8 @@ use crate::trampoline::{self, CatchThunk, JmpBuf};
 use crate::world::{world, Space};
 use crate::{exec, heap, println, sbi};
 
-pub struct Report {
-    pub passed: usize,
-    pub failed: usize,
-}
-
-struct Harness {
-    passed: usize,
-    failures: Vec<String>,
-}
+use vibeos_kernel_acceptance::Harness;
+pub use vibeos_kernel_acceptance::Report;
 
 struct PanicOnDrop;
 
@@ -196,30 +187,8 @@ fn nested_task_fault_guard(
     crate::trampoline::guard_task(&mut body)
 }
 
-impl Harness {
-    fn check(&mut self, name: &str, ok: bool) {
-        if ok {
-            self.passed += 1;
-        } else {
-            self.failures.push(String::from(name));
-        }
-    }
-
-    fn eq<T: PartialEq + core::fmt::Debug>(&mut self, name: &str, got: T, want: T) {
-        if got == want {
-            self.passed += 1;
-        } else {
-            self.failures
-                .push(format!("{} (got {:?}, want {:?})", name, got, want));
-        }
-    }
-}
-
 pub async fn run() -> Report {
-    let mut h = Harness {
-        passed: 0,
-        failures: Vec::new(),
-    };
+    let mut h = Harness::default();
 
     paging(&mut h);
     timers(&mut h).await;
@@ -235,18 +204,15 @@ pub async fn run() -> Report {
     capabilities(&mut h);
     compiler(&mut h);
 
-    for f in &h.failures {
+    for f in h.failures() {
         println!("  FAIL  {}", f);
     }
+    let report = h.report();
     println!(
         "  selftest: {} passed, {} failed",
-        h.passed,
-        h.failures.len()
+        report.passed, report.failed
     );
-    Report {
-        passed: h.passed,
-        failed: h.failures.len(),
-    }
+    report
 }
 
 /// M6.1--M6.3: one identity-mapped Sv39 root is active on every online hart;
@@ -360,15 +326,23 @@ fn paging(h: &mut Harness) {
             "CV1800B GPIOC is identity mapped",
             crate::platform::GPIOC_BASE,
         ),
-        ("CV1800B DWMAC is identity mapped", crate::platform::ETHERNET_BASE),
-        ("CV1800B SDIO0 is identity mapped", crate::platform::SDHCI_BASE),
+        (
+            "CV1800B DWMAC is identity mapped",
+            crate::platform::ETHERNET_BASE,
+        ),
+        (
+            "CV1800B SDIO0 is identity mapped",
+            crate::platform::SDHCI_BASE,
+        ),
     ] {
         let device = crate::mmu::mapping(address).expect("native device MMIO is mapped");
         h.eq(name, device.physical, address);
         h.eq("native MMIO uses 4 KiB leaves", device.page_size, PAGE_SIZE);
         h.check(
             "native MMIO is readable and writable but not executable",
-            device.permissions.contains(PagePermissions::READ.union(PagePermissions::WRITE))
+            device
+                .permissions
+                .contains(PagePermissions::READ.union(PagePermissions::WRITE))
                 && !device.permissions.contains(PagePermissions::EXECUTE),
         );
     }
@@ -447,8 +421,7 @@ fn paging(h: &mut Harness) {
     h.eq(
         "generated code retains 8 KiB of mapped abort stack above the guard",
         crate::stack_floor(),
-        crate::mmu::stack_usable_start(current_hart.index())
-            .expect("current stack slot exists")
+        crate::mmu::stack_usable_start(current_hart.index()).expect("current stack slot exists")
             + 8192,
     );
     h.check(
@@ -1178,11 +1151,7 @@ async fn fault_arena_restart(h: &mut Harness) {
             before.generation,
             cycle as u64 + 1,
         );
-        h.eq(
-            "fault restart retains ComponentId",
-            before.id,
-            stable_id,
-        );
+        h.eq("fault restart retains ComponentId", before.id, stable_id);
         h.eq(
             "fault restart retains OwnerId",
             probe.memory_owner(),
@@ -1225,8 +1194,7 @@ async fn fault_arena_restart(h: &mut Harness) {
         );
         let irq_probe_start = sbi::time();
         exec::sleep_ms(1).await;
-        let irq_probe_ms =
-            (sbi::time() - irq_probe_start) / (exec::timebase_hz() / 1000);
+        let irq_probe_ms = (sbi::time() - irq_probe_start) / (exec::timebase_hz() / 1000);
         h.check(
             "a faulted CSpace lock does not leave interrupts masked",
             irq_probe_ms < 100,
@@ -1552,14 +1520,8 @@ fn compiler(h: &mut Harness) {
     let leases = {
         let cspace = w.spaces["prog"].0.lock();
         (
-            cspace.lookup_lease::<MemoryRegion>(
-                w.prog_memory,
-                Rights::READ.union(Rights::WRITE),
-            ),
-            cspace.lookup_lease::<MemoryRegion>(
-                w.prog_memory,
-                Rights::READ.union(Rights::WRITE),
-            ),
+            cspace.lookup_lease::<MemoryRegion>(w.prog_memory, Rights::READ.union(Rights::WRITE)),
+            cspace.lookup_lease::<MemoryRegion>(w.prog_memory, Rights::READ.union(Rights::WRITE)),
         )
     };
     if let (Ok(first), Ok(second)) = leases {
@@ -1575,7 +1537,10 @@ fn compiler(h: &mut Harness) {
             !memory_region.invocation_claimed(),
         );
     } else {
-        h.check("the program memory region permits one invocation claim", false);
+        h.check(
+            "the program memory region permits one invocation claim",
+            false,
+        );
         h.check("dropping a memory invocation releases its claim", false);
     }
 

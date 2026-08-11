@@ -220,6 +220,30 @@ pub struct PciHostDescription {
     pub intx_first_irq: u32,
 }
 
+/// Synopsys DWMAC instance plus board-level clock/PHY wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DwmacDescription {
+    pub registers: AddressRange,
+    pub irq: u32,
+    pub soc_control: AddressRange,
+    pub efuse: AddressRange,
+    pub phy_address: u8,
+    pub dma_address_bits: u8,
+    pub cache_line_bytes: usize,
+}
+
+/// SDHCI instance plus board-level pinmux and source-clock wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SdhciDescription {
+    pub registers: AddressRange,
+    pub irq: u32,
+    pub soc_control: AddressRange,
+    pub source_clock_hz: u32,
+    pub bus_width: u8,
+    pub init_clock_hz: u32,
+    pub data_clock_hz: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoardInfo {
     pub name: &'static str,
@@ -229,6 +253,8 @@ pub struct BoardInfo {
     pub console: ConsoleCapabilities,
     pub virtio_mmio: Option<VirtioMmioDescription>,
     pub pci: Option<PciHostDescription>,
+    pub dwmac: Option<DwmacDescription>,
+    pub sdhci: Option<SdhciDescription>,
 }
 
 /// Compile-time board contract consumed by architecture and kernel setup.

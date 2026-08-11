@@ -97,6 +97,8 @@ impl BoardContract for Board {
         console: CONSOLE_CAPABILITIES,
         virtio_mmio: Some(VIRTIO_MMIO),
         pci: Some(PCI),
+        dwmac: None,
+        sdhci: None,
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;

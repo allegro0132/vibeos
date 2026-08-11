@@ -755,6 +755,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-blob-format"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-bsp-milkv-duo"
 version = "0.1.0"
 dependencies = [

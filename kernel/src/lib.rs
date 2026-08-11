@@ -115,6 +115,8 @@ pub use vibeos_ssh_identity as ssh_security;
 mod block_device;
 #[cfg(feature = "milkv-duo")]
 mod dwmac_net;
+#[cfg(feature = "milkv-duo")]
+mod dwc2_host;
 mod net_device;
 #[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
@@ -364,6 +366,34 @@ pub extern "C" fn kmain() -> ! {
                 info.addressed_devices,
             );
         }
+    }
+    #[cfg(feature = "milkv-duo")]
+    match dwc2_host::init() {
+        Ok(info) => println!(
+            "  usb       DWC2 {:#06x} @ {:#x}, IRQ {}, {} channel(s), port {}",
+            info.release,
+            platform::USB_BASE,
+            info.irq,
+            info.host_channels,
+            if dwc2_host::connected() {
+                "connected"
+            } else {
+                "powered/waiting"
+            },
+        ),
+        Err(error) => println!("  usb       DWC2 bring-up FAILED: {:?}", error),
+    }
+    #[cfg(feature = "milkv-duo")]
+    if let Some(usb) = dwc2_host::telemetry() {
+        println!(
+            "  usb regs  clocks {:#010x}/{:#010x}, role {:#010x}, GUSBCFG {:#010x}, HPRT {:#010x}, PHY14 {:#010x}",
+            usb.clock_enable_1,
+            usb.clock_enable_2,
+            usb.role_override,
+            usb.gusbcfg,
+            usb.hprt0,
+            usb.phy_utmi_control,
+        );
     }
     assert!(
         mmu::wx_remote_fence_ready(),

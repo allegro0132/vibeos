@@ -54,6 +54,7 @@ does not combine both board features into one kernel archive.
 | `drivers/virtio-net` | RX/TX split queues, fixed DMA slab, feature handshake, completion validation and reset boundary | Packet sessions, network identity, IRQ routing, scheduling and supervisor policy |
 | `drivers/virtio-rng` | Synchronous entropy queue, fixed DMA slab and completion validation | Random capability policy, deadlines, scheduling, interrupts and restart policy |
 | `drivers/xhci` | XHCI and USB protocol state using caller-provided permanent DMA storage | PCI discovery, bus mastering, PLIC routing, synchronization and input/storage publication |
+| `drivers/dwc2-host` | CV1800B USB clocks/role wiring, DWC2 identity/reset and root-port power bring-up | USB transfers/enumeration, PLIC routing, DMA storage, hotplug and class capability publication |
 | `drivers/dwmac-net` | CV1800B DWMAC registers, clock/ePHY/MDIO setup, cache maintenance and fixed RX/TX DMA storage | Network capabilities and sessions, MAC policy, supervision and interrupt policy |
 | `drivers/milkv-duo-led` | CV1800B pad mux, GPIO output sequencing and status readback for the board LED | Boot-status policy and diagnostic reporting |
 | `drivers/sdhci-blk` | CV1800B clock/pad/power setup, SD discovery and 512-byte PIO sector I/O | Block capabilities, locking, supervision and logical partition mapping |

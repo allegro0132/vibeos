@@ -3,9 +3,10 @@
 //! Board support description for the Milk-V Duo (CV1800B).
 
 use vibeos_hal::{
-    AddressRange, Board as BoardContract, BoardInfo, ConsoleCapabilities, DwmacDescription,
-    IdentityMapping, MemoryAttributes, MemoryRegion, MmuDescription, PlicDescription,
-    SdhciDescription, StatusLedDescription, UartDescription, UartQuirks, UartVariant,
+    AddressRange, Board as BoardContract, BoardInfo, ConsoleCapabilities, Dwc2Description,
+    DwmacDescription, IdentityMapping, MemoryAttributes, MemoryRegion, MmuDescription,
+    PlicDescription, SdhciDescription, StatusLedDescription, UartDescription, UartQuirks,
+    UartVariant,
 };
 
 pub const NAME: &str = "Milk-V Duo (CV1800B)";
@@ -28,6 +29,11 @@ pub const ETHERNET_IRQ: u32 = 31;
 pub const SDHCI_BASE: usize = 0x0431_0000;
 pub const SDHCI_MMIO_END: usize = SDHCI_BASE + 0x1000;
 pub const SDHCI_IRQ: u32 = 36;
+pub const USB_BASE: usize = 0x0434_0000;
+pub const USB_MMIO_END: usize = USB_BASE + 0x1_0000;
+pub const USB_PHY_BASE: usize = 0x0300_6000;
+pub const USB_PHY_END: usize = USB_PHY_BASE + 0x58;
+pub const USB_IRQ: u32 = 30;
 pub const SOC_CONTROL_BASE: usize = 0x0300_0000;
 pub const SOC_CONTROL_MMIO_END: usize = SOC_CONTROL_BASE + 0xa000;
 pub const GPIOC_BASE: usize = 0x0302_2000;
@@ -53,6 +59,13 @@ pub const SDHCI: SdhciDescription = SdhciDescription {
     init_clock_hz: 400_000,
     data_clock_hz: 25_000_000,
 };
+pub const DWC2: Dwc2Description = Dwc2Description {
+    registers: AddressRange::new(USB_BASE, USB_MMIO_END),
+    phy: AddressRange::new(USB_PHY_BASE, USB_PHY_END),
+    irq: USB_IRQ,
+    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
+    dma_address_bits: 32,
+};
 pub const STATUS_LED: StatusLedDescription = StatusLedDescription {
     gpio: AddressRange::new(GPIOC_BASE, GPIOC_MMIO_END),
     pinmux: AddressRange::new(SOC_CONTROL_BASE + 0x1000, SOC_CONTROL_BASE + 0x2000),
@@ -76,6 +89,7 @@ pub const MEMORY_MAP: &[MemoryRegion] = &[
     MemoryRegion::mmio("Ethernet", ETHERNET_BASE, ETHERNET_MMIO_END),
     MemoryRegion::mmio("UART", DEVICE_MMIO_START, DEVICE_MMIO_END),
     MemoryRegion::mmio("SDHCI", SDHCI_BASE, SDHCI_MMIO_END),
+    MemoryRegion::mmio("USB DWC2", USB_BASE, USB_MMIO_END),
     MemoryRegion::mmio("PLIC", PLIC_BASE, PLIC_MMIO_END),
 ];
 
@@ -83,6 +97,7 @@ pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
     IdentityMapping::pages("Ethernet", ETHERNET_BASE, ETHERNET_MMIO_END),
     IdentityMapping::pages("UART", DEVICE_MMIO_START, DEVICE_MMIO_END),
     IdentityMapping::pages("SDHCI", SDHCI_BASE, SDHCI_MMIO_END),
+    IdentityMapping::pages("USB DWC2", USB_BASE, USB_MMIO_END),
     IdentityMapping::pages("SoC control", SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
     IdentityMapping::pages("GPIOC", GPIOC_BASE, GPIOC_MMIO_END),
     IdentityMapping::pages("eFuse", EFUSE_BASE, EFUSE_MMIO_END),
@@ -122,6 +137,7 @@ impl BoardContract for Board {
         pci: None,
         dwmac: Some(DWMAC),
         sdhci: Some(SDHCI),
+        dwc2: Some(DWC2),
         status_led: Some(STATUS_LED),
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
@@ -155,6 +171,7 @@ mod tests {
         assert_eq!(<Board as BoardContract>::INFO.console, CONSOLE_CAPABILITIES);
         assert_eq!(<Board as BoardContract>::INFO.dwmac, Some(DWMAC));
         assert_eq!(<Board as BoardContract>::INFO.sdhci, Some(SDHCI));
+        assert_eq!(<Board as BoardContract>::INFO.dwc2, Some(DWC2));
         assert_eq!(<Board as BoardContract>::INFO.status_led, Some(STATUS_LED));
         assert_eq!(<Board as BoardContract>::HART_IDS, &[0]);
         assert_eq!(plic_s_context(0), Some(1));

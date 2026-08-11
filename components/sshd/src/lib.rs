@@ -34,10 +34,14 @@ use vibeos_core::cap::{CSpace, Cap, Revocable};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
 use vibeos_core::sync::SpinLock;
-pub use vibeos_net_protocol::StaticIpv4Address;
-use vibeos_net_protocol::{
-    Ipv4RuntimeStatus, StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState,
+pub use vibeos_net_protocol::{
+    command::{
+        parse_dhclient_command, parse_ip_command, DhclientCommand, IpCommand, Ipv4Method,
+        NetworkConfiguration, PRIMARY_INTERFACE,
+    },
+    Ipv4RuntimeStatus, StaticIpv4Address,
 };
+use vibeos_net_protocol::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
 use vibeos_vsh::terminal::{
@@ -198,6 +202,24 @@ pub trait Platform: Sync {
         None
     }
     fn security_policy_changed(&self) -> bool {
+        false
+    }
+    fn ipv4_configuration(&self, fallback: Ipv4Policy) -> (u64, NetworkConfiguration) {
+        let method = match fallback {
+            Ipv4Policy::Static(address) => Ipv4Method::Static(address),
+            Ipv4Policy::Dhcp { .. } => Ipv4Method::Dhcp,
+        };
+        (
+            0,
+            NetworkConfiguration {
+                link_up: true,
+                method,
+            },
+        )
+    }
+    fn acknowledge_ipv4_configuration(&self, _revision: u64, _status: Ipv4RuntimeStatus) {}
+    fn publish_ipv4_status(&self, _status: Ipv4RuntimeStatus) {}
+    fn ipv4_configuration_changed(&self) -> bool {
         false
     }
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool);
@@ -861,7 +883,11 @@ async fn build_stack(
         }
         match bind_stack(space, control) {
             Ok(stamp) => {
-                let address = policy.ipv4.initial_address();
+                let (revision, desired) = space.ipv4_configuration(policy.ipv4);
+                let address = match desired.method {
+                    Ipv4Method::Static(address) => address,
+                    Ipv4Method::None | Ipv4Method::Dhcp => policy.ipv4.initial_address(),
+                };
                 let mut config = StaticIpv4Config::new(
                     policy.ethernet_address,
                     address.address,
@@ -874,11 +900,24 @@ async fn build_stack(
                 }
                 let mut stack = StaticIpv4TcpStack::new(config, stamp, inbound, outbound)
                     .map_err(|_| "IPv4/TCP stack construction failed")?;
-                if matches!(policy.ipv4, Ipv4Policy::Dhcp { .. }) {
+                if !desired.link_up {
                     stack
-                        .start_dhcp()
-                        .map_err(|_| "DHCP client initialization failed")?;
+                        .clear_ipv4()
+                        .map_err(|_| "IPv4 link-down setup failed")?;
+                } else {
+                    match desired.method {
+                        Ipv4Method::None => stack
+                            .clear_ipv4()
+                            .map_err(|_| "IPv4 unconfigured setup failed")?,
+                        Ipv4Method::Static(address) => stack
+                            .configure_static_ipv4(address)
+                            .map_err(|_| "static IPv4 setup failed")?,
+                        Ipv4Method::Dhcp => stack
+                            .start_dhcp()
+                            .map_err(|_| "DHCP client initialization failed")?,
+                    }
                 }
+                space.acknowledge_ipv4_configuration(revision, stack.ipv4_status());
                 return Ok(stack);
             }
             Err(NetworkBindError::Offline | NetworkBindError::SessionBusy) => {
@@ -897,8 +936,7 @@ async fn announce_listener(
     announced_ipv4: &mut Option<[u8; 4]>,
     policy: SshServicePolicy,
 ) -> Result<(), &'static str> {
-    if matches!(policy.ipv4, Ipv4Policy::Static(_)) {
-        update_listener_announcement(space, stack, announced_ipv4, policy);
+    if update_listener_announcement(space, stack, announced_ipv4, policy) {
         return Ok(());
     }
 
@@ -1002,12 +1040,13 @@ fn update_listener_announcement(
     announced_ipv4: &mut Option<[u8; 4]>,
     policy: SshServicePolicy,
 ) -> bool {
-    let address = match policy.ipv4 {
-        Ipv4Policy::Static(address) => Some(address.address),
-        Ipv4Policy::Dhcp { .. } => match stack.ipv4_status() {
-            Ipv4RuntimeStatus::DhcpBound(address) => Some(address.address),
-            _ => None,
-        },
+    let status = stack.ipv4_status();
+    space.publish_ipv4_status(status);
+    let address = match status {
+        Ipv4RuntimeStatus::Static(address) | Ipv4RuntimeStatus::DhcpBound(address) => {
+            Some(address.address)
+        }
+        Ipv4RuntimeStatus::Unconfigured | Ipv4RuntimeStatus::DhcpDiscovering => None,
     };
     match address {
         Some(address) => {
@@ -2838,6 +2877,9 @@ fn validate_network_authority(
 ) -> Result<(), &'static str> {
     if space.security_policy_changed() {
         return Err("SSH security policy changed");
+    }
+    if space.ipv4_configuration_changed() {
+        return Err("SSH IPv4 configuration changed");
     }
     let info = device_info(space, control).ok_or("network control authority was revoked")?;
     if info.quarantined {

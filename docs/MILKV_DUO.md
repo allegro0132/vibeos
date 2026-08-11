@@ -2,8 +2,8 @@
 
 VibeOS provides **single-core board support for the Milk-V Duo C906B**. Current
 support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
-timebase, native microSD/DWMAC backends, and a FIT/SD image packaging flow based
-on the official Buildroot SDK.
+timebase, native microSD/DWMAC backends, initial DWC2 USB host bring-up, and a
+FIT/SD image packaging flow based on the official Buildroot SDK.
 
 The separate `--jitterentropy-probe` image loads the exactly pinned
 `jitterentropy-rs` 0.1.1 crate against `rdtime` and exposes conditioned smoke
@@ -79,6 +79,7 @@ bound.
 | virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
 | microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
 | Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
+| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up only |
 | Blue status LED | active-high GPIOC24; `drivers/milkv-duo-led` configures and verifies it after enabling Sv39 |
 
 The Duo USB & Ethernet IO Board V1.11 does not route the RJ45 LED terminals to
@@ -108,6 +109,27 @@ never to be scheduled after it prints `sched`.
 VibeOS deliberately stops at `0x83e0_0000` and does not occupy the FreeRTOS
 region beginning at `0x83f4_0000`. Do not move the linker's upper bound directly
 to the end of the 64 MiB DRAM merely to enlarge the heap.
+
+## USB host bring-up status
+
+The Milk-V image now maps the CV1800B DWC2 core, enables its AXI/APB/125 MHz/
+33 kHz/12 MHz clocks, selects host role through TOP register `0x0300_0048`,
+validates the Synopsys core ID, performs a bounded core reset, and powers the
+single root port. A successful boot prints a line like:
+
+```text
+usb       DWC2 0xNNNN @ 0x4340000, IRQ 30, N channel(s), port powered/waiting
+```
+
+This is the controller bring-up boundary, not complete USB support. Interrupts
+and DMA remain disabled, and the current Milk-V path does not enumerate devices
+or publish HID/storage capabilities. The next layer must add control/bulk/
+interrupt transfers, descriptor enumeration, hub/hotplug handling, and class
+drivers before `usb info`, keyboard input, or USB storage can be claimed on the
+physical board. The official SDK describes the same core/PHY ranges and IRQ in
+[`cv180x_base.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x/cv180x_base.dtsi)
+and
+[`cv180x_base_riscv.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi).
 
 The stock board memory map also declares an approximately 26.8 MiB ION region
 for Linux multimedia drivers, but `FREERTOS_RESERVED_ION_SIZE` is 0 in this
@@ -487,6 +509,11 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [x] MMU diagnostics show the kernel in
       `0x8020_0000..0x83e0_0000`, with no mapping or use of the FreeRTOS reserved
       region beginning at `0x83f4_0000`.
+- [ ] The boot log reports the DWC2 release, IRQ 30, host-channel count and a
+      powered root port without a reset/host-mode timeout. Preserve the full
+      UART log as the first physical USB bring-up artifact.
+- [ ] A low/full/high-speed USB device enumerates on the physical OTG port;
+      disconnect/reconnect, HID input, and storage I/O remain later gates.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

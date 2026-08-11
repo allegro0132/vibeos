@@ -99,6 +99,7 @@ impl BoardContract for Board {
         pci: Some(PCI),
         dwmac: None,
         sdhci: None,
+        dwc2: None,
         status_led: None,
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;

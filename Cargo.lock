@@ -773,6 +773,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-dwc2-host"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-driver-dwmac-net"
 version = "0.1.0"
 dependencies = [
@@ -876,6 +883,7 @@ dependencies = [
  "vibeos-bsp-milkv-duo",
  "vibeos-bsp-qemu-virt",
  "vibeos-core",
+ "vibeos-driver-dwc2-host",
  "vibeos-driver-dwmac-net",
  "vibeos-driver-milkv-duo-led",
  "vibeos-driver-pci",

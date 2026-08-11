@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["durable-format", "random", "runtime/riscv", "core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "drivers/dwmac-net", "drivers/milkv-duo-led", "drivers/pci", "drivers/sdhci-blk", "drivers/virtio-blk", "drivers/virtio-core", "drivers/virtio-mmio", "drivers/virtio-net", "drivers/virtio-rng", "drivers/xhci", "components/net-protocol", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/object-store", "services/program-store", "services/ssh-identity", "policy/image", "acceptance/kernel-tests", "kernel", "firmware/qemu-virt", "firmware/milkv-duo"]
+members = ["durable-format", "random", "runtime/riscv", "core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "drivers/dwmac-net", "drivers/dwc2-host", "drivers/milkv-duo-led", "drivers/pci", "drivers/sdhci-blk", "drivers/virtio-blk", "drivers/virtio-core", "drivers/virtio-mmio", "drivers/virtio-net", "drivers/virtio-rng", "drivers/xhci", "components/net-protocol", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/object-store", "services/program-store", "services/ssh-identity", "policy/image", "acceptance/kernel-tests", "kernel", "firmware/qemu-virt", "firmware/milkv-duo"]
 exclude = ["vendor/sunset"]
 
 [profile.dev]

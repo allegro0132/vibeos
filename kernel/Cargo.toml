@@ -7,7 +7,7 @@ autobins = false
 [features]
 default = ["qemu-virt", "qemu-default-image"]
 qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
-milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-milkv-duo-led", "dep:vibeos-driver-sdhci-blk"]
+milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-dwc2-host", "dep:vibeos-driver-milkv-duo-led", "dep:vibeos-driver-sdhci-blk"]
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
@@ -63,6 +63,7 @@ vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }
 vibeos-driver-dwmac-net = { path = "../drivers/dwmac-net", optional = true }
+vibeos-driver-dwc2-host = { path = "../drivers/dwc2-host", optional = true }
 vibeos-driver-milkv-duo-led = { path = "../drivers/milkv-duo-led", optional = true }
 vibeos-driver-pci = { path = "../drivers/pci", optional = true }
 vibeos-driver-sdhci-blk = { path = "../drivers/sdhci-blk", optional = true }

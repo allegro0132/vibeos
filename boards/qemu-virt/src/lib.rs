@@ -99,6 +99,7 @@ impl BoardContract for Board {
         pci: Some(PCI),
         dwmac: None,
         sdhci: None,
+        status_led: None,
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;
@@ -134,6 +135,7 @@ mod tests {
             Some(VIRTIO_MMIO)
         );
         assert_eq!(<Board as BoardContract>::INFO.pci, Some(PCI));
+        assert_eq!(<Board as BoardContract>::INFO.status_led, None);
         assert_eq!(<Board as BoardContract>::HART_IDS, &[0, 1, 2, 3]);
         assert_eq!(plic_s_context(3), Some(7));
         assert!(MEMORY_MAP.iter().all(|region| !region.range.is_empty()));

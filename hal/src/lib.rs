@@ -244,6 +244,18 @@ pub struct SdhciDescription {
     pub data_clock_hz: u32,
 }
 
+/// One GPIO-backed board status LED and its pad-mux wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusLedDescription {
+    pub gpio: AddressRange,
+    pub pinmux: AddressRange,
+    pub pinmux_register_offset: usize,
+    pub pinmux_function_mask: u32,
+    pub pinmux_gpio_function: u32,
+    pub gpio_bit: u8,
+    pub active_high: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoardInfo {
     pub name: &'static str,
@@ -255,6 +267,7 @@ pub struct BoardInfo {
     pub pci: Option<PciHostDescription>,
     pub dwmac: Option<DwmacDescription>,
     pub sdhci: Option<SdhciDescription>,
+    pub status_led: Option<StatusLedDescription>,
 }
 
 /// Compile-time board contract consumed by architecture and kernel setup.

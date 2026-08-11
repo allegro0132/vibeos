@@ -151,7 +151,11 @@ impl BoardContract for Board {
 }
 
 pub const fn plic_s_context(physical_hart: usize) -> Option<usize> {
-    if physical_hart == 0 { Some(1) } else { None }
+    if physical_hart == 0 {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

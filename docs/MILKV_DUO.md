@@ -86,7 +86,7 @@ bound.
 | virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
 | microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
 | Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
-| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration and HID boot keyboards |
+| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration and HID boot/report keyboards |
 | Blue status LED | active-high GPIOC24; `drivers/milkv-duo-led` configures and verifies it after enabling Sv39 |
 
 The Duo USB & Ethernet IO Board V1.11 does not route the RJ45 LED terminals to
@@ -137,12 +137,14 @@ official SDK sequence.
 The driver now also enables buffer DMA with explicit C906 cache maintenance,
 resets an attached root-port device, runs endpoint-zero SETUP/DATA/STATUS
 transactions, assigns address 1, and reads the complete device descriptor. It
-then scans the configuration tree for a HID Boot Keyboard interface, selects
-the configuration and boot protocol, and polls its interrupt-IN endpoint at the
-advertised interval. Newly pressed keys use the same ASCII, control-key and
-ANSI-arrow translation as the QEMU xHCI console and feed the kernel console
-input queue. The boot log prints speed, VID:PID, USB version, endpoint-zero
-packet size, and the selected HID interface/endpoint. A resident polling task
+then scans the configuration tree for HID interfaces. Boot keyboards are
+switched to the fixed boot protocol; report-protocol keyboards expose their HID
+report descriptor so supported array and NKRO layouts can be selected. The
+driver polls the chosen interrupt-IN endpoint at its advertised interval.
+Newly pressed keys use the same ASCII, control-key and ANSI-arrow translation
+as the QEMU xHCI console and feed the kernel console input queue. The boot log
+prints speed, VID:PID, USB version, endpoint-zero packet size, keyboard protocol,
+and the selected HID interface/endpoint. A resident polling task
 detects root-port disconnect and reconnect transitions, clears stale device
 state, and repeats enumeration and HID configuration after reinsertion. USB
 storage remains absent. The official SDK describes the same core/PHY ranges and
@@ -158,8 +160,10 @@ Authenticated SSH sessions install the same shared VSH command profile, so
 `lsusb` and other read-only platform diagnostics are available over either
 transport. The default-password onboarding profile remains deliberately
 restricted until a public key is authorized.
-For a usable keyboard it also prints `HID boot-keyboard` with the selected
-interface and interrupt-IN endpoint. `connected, not enumerated` distinguishes
+For a usable keyboard it also prints `HID keyboard protocol=Boot` or
+`protocol=Report` with the selected interface and interrupt-IN endpoint. It
+also reports each interface class tuple and the HID report-descriptor length.
+`connected, not enumerated` distinguishes
 an electrical connection from successful USB protocol enumeration.
 For a directly attached high-speed hub it also configures hub power, resets the
 first connected downstream port, and reports that child's negotiated speed and
@@ -173,6 +177,15 @@ and complete-split transactions. Endpoint-zero traffic is divided into one
 max-packet transaction at a time with software PID toggling, while NYET causes
 a bounded complete-split retry. The first child receives address 2 and appears
 as a separate `lsusb` row with its parent hub and port.
+
+On 2026-08-12, the physical report-protocol gate enumerated an Apple
+`05ac:0220` Full-Speed keyboard behind the `05e3:0610` high-speed hub. `lsusb`
+reported interface 2, interrupt-IN endpoint `0x83`, maximum packet size 32 and
+a 1 ms interval, and retrieved all 238 report-descriptor bytes. The descriptor
+advertised both Report ID 1's five-key array and Report ID 2's 104-key NKRO
+bitmap. Typing `hidtest123` on that keyboard produced the exact ten-byte VSH
+command and the expected `unknown command at bytes 0..10` response, with no
+missing, duplicated or reordered key.
 
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after
@@ -587,8 +600,9 @@ gate. This is DWMAC/IPv4/TCP evidence only and does not claim SSH availability.
 For the first hardware boot, preserve the full serial log and verify each item.
 For the USB HID gate, build `./scripts/build-milkv-duo.sh --diagnostic`, capture
 UART0 at 115200 8N1 to a file, and boot with the USB keyboard disconnected.
-After the `vibe>` prompt appears, attach the keyboard and run `lsusb` through
-UART first. Continue only if it reports the device ID and `HID boot-keyboard`.
+After the `vsh>` prompt appears, attach the keyboard and run `lsusb` through
+UART first. Continue only if it reports the device ID and `HID keyboard
+protocol=Boot` or `protocol=Report`.
 Then type `uptime` on the USB keyboard, unplug it, wait for the disconnect
 diagnostic, reconnect it, confirm `lsusb` again through UART, and type `uptime`
 again on the USB keyboard. The two echoed `uptime` commands are the evidence
@@ -626,12 +640,13 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       the attached Genesys Logic high-speed hub as `05e3:0610` without a
       reset/host-mode timeout; Hub downstream traversal remains part of the
       HID gate below.
-- [ ] A low/full/high-speed USB device completes address and device-descriptor
-      enumeration on the physical OTG port. A HID Boot Keyboard is configured,
-      reports its interrupt-IN endpoint, and can type commands into `vibe>`;
-      disconnect/reconnect repeats enumeration and restores input. Preserve the
-      UART log and pass `scripts/check-milkv-usb-hid-log.sh`; storage I/O remains
-      a later gate.
+- [x] A Full-Speed USB HID device behind the high-speed hub completes address,
+      configuration and report-descriptor enumeration on the physical OTG port.
+      The Apple `05ac:0220` report keyboard is configured on interface 2 / endpoint
+      `0x83`, and `hidtest123` reaches `vsh>` exactly through USB input.
+- [ ] Disconnect/reconnect repeats hub-child enumeration and restores keyboard
+      input. Preserve the UART log and pass `scripts/check-milkv-usb-hid-log.sh`;
+      storage I/O remains a later gate.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

@@ -42,11 +42,11 @@ fi
 require 'usb +DWC2 .*IRQ 30' 'DWC2 host-controller banner'
 require_count 'usb dev +(addr|hotplug addr) [1-9][0-9]*, (Low|Full|High)' 2 \
   'successful device enumeration'
-require_count 'usb hid +(boot keyboard|attached boot keyboard)' 2 \
-  'HID boot-keyboard configuration'
+require_count 'usb hid +((attached )?(Boot|Report)|attached boot|boot) keyboard' 2 \
+  'HID keyboard configuration'
 require 'usb hid +device disconnected; waiting for reconnect' \
   'disconnect transition'
-require_count 'vibe> *uptime' 2 'keyboard-entered uptime command'
+require_count '(vibe|vsh)> *uptime' 2 'keyboard-entered uptime command'
 require_count 'up [0-9]+\.[0-9][0-9][0-9] s' 2 'uptime command response'
 
 echo "PASS milkv-usb-hid: enumerate, type, disconnect, reconnect, and type again"

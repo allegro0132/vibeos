@@ -3,7 +3,6 @@
 # QEMU stays in the foreground so it keeps our stdin (the shell's input).
 set -eu
 cd "$(dirname "$0")"
-./scripts/prepare-jitterentropy-rs.sh
 SECS=${1:-8}
 toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
 if [ -z "$toolchain" ] || ! command -v rustup >/dev/null 2>&1; then

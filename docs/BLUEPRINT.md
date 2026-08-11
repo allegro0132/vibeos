@@ -127,6 +127,10 @@ upward except through a capability it was handed.
 | `services/ssh-identity` | small, trusted | Opaque host signer and immutable binary authorized-key capability policy | — |
 | `services/object-store` | growing | Capability-addressed journal recovery, object transactions, and immutable object resources | 1 (fixed scratch buffer) |
 | `kernel/store_platform.rs` | small | Block-capability, CSpace publication, and heap-accounting adapter | — |
+| `services/program-store` | small, trusted | Canonical program artifact and recovered authority-graph policy | — |
+| `kernel/program_store_platform.rs` | growing | Compiler, execution, CSpace publication, and exact-task cleanup adapter | — |
+| `services/authority-store` | small, trusted | Persistent-space identities, rights, lifecycle contract, and root policy | — |
+| `kernel/authority_store_platform.rs` | growing | Atomic recovered-graph installation, publication, and fault cleanup adapter | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `kernel/legacy_shell.rs` | large, gated | Diagnostic operator and hardware acceptance interface | yes |

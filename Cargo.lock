@@ -742,6 +742,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vibeos-authority-store"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-object-store",
+]
+
+[[package]]
 name = "vibeos-core"
 version = "0.1.0"
 dependencies = [
@@ -757,9 +765,11 @@ name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
  "jitterentropy-rs",
+ "vibeos-authority-store",
  "vibeos-core",
  "vibeos-netstack",
  "vibeos-object-store",
+ "vibeos-program-store",
  "vibeos-rustc",
  "vibeos-ssh-identity",
  "vibeos-sshd",
@@ -778,6 +788,15 @@ name = "vibeos-object-store"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+]
+
+[[package]]
+name = "vibeos-program-store"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-object-store",
+ "vibeos-rustc",
 ]
 
 [[package]]

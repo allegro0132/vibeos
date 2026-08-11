@@ -1,5 +1,11 @@
 # Persistent CSpace
 
+The stable persistent-space identity, exact rights policy, lifecycle contract,
+and public report/error types live in `services/authority-store`. Atomic CSpace
+reservation and graph installation, block-online coordination, and exact-task
+fault quarantine remain explicit kernel duties in
+`kernel/src/authority_store_platform.rs`.
+
 M4.3 restores one capability space from the same append-only journal that stores
 immutable objects. It is deliberately a narrow end-to-end slice, not a general
 checkpoint subsystem: the only admitted target is the boot-registered

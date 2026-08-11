@@ -388,6 +388,10 @@ its process owns. Here, authority is not a property of the code.
 | `services/ssh-identity/` | trusted host signing and immutable authorized-key capability services (`no_std`) |
 | `services/object-store/` | capability-addressed journal, recovery, transactions, and stored-object resources (`no_std`) |
 | `kernel/src/store_platform.rs` | thin block capability, CSpace publication, and heap-accounting adapter |
+| `services/program-store/` | canonical saved-program artifact validation and recovered graph authorization (`no_std`) |
+| `kernel/src/program_store_platform.rs` | compiler, execution, CSpace publication, and fault-recovery adapter |
+| `services/authority-store/` | persistent CSpace policy, stable identities, rights, and service contract (`no_std`) |
+| `kernel/src/authority_store_platform.rs` | atomic CSpace installation and exact-task recovery adapter |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |

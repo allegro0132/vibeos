@@ -1,3 +1,5 @@
+//! Kernel CSpace publication and fault-recovery adapter for authority-store.
+//!
 //! Persistent capability-space lifecycle over the unified object journal.
 //!
 //! Only the boot-registered `persistent-test` SpaceId is admitted. Journal
@@ -20,9 +22,9 @@ use vibeos_core::cap::{
     PersistentResourceWitness, Resource, Rights,
 };
 use vibeos_core::durable::{
-    self, DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, ObjectKind,
-    RecoveredGrant, RecoveredSlot, RecoveredStore, ResourceKind, RootConstraint,
-    RootRightsConstraint, SlotIdentity, SpaceId, TransactionId,
+    self, DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant,
+    RecoveredSlot, RecoveredStore, RootConstraint, RootRightsConstraint, SlotIdentity,
+    TransactionId,
 };
 use vibeos_core::program::{self as program_model, RootPolicyPartition};
 use vibeos_core::store as object_codec;
@@ -32,128 +34,9 @@ use crate::store::{AuthorityJournal, AuthoritySnapshot, StoreError, StoredObject
 use crate::world::Space;
 use crate::{exec, heap, sync::SpinLock, virtio_blk};
 
-const PERSISTENT_SPACE_ID_RAW: u128 = 0x5053;
-const STORED_OBJECT_RESOURCE_KIND_RAW: u32 = 0x5354_4f52;
-const PERSISTENT_OBJECT_KIND_RAW: u32 = 0x4353_5043;
-const ROOT_SLOT: u32 = 0;
-const CHILD_SLOT: u32 = 1;
-const GRANDCHILD_SLOT: u32 = 2;
-const ROOT_RIGHTS: DurableRights = DurableRights::READ
-    .union(DurableRights::GRANT)
-    .union(DurableRights::REVOKE);
-const CHILD_RIGHTS: DurableRights = DurableRights::READ.union(DurableRights::GRANT);
-const GRANDCHILD_RIGHTS: DurableRights = DurableRights::READ;
-const MARKER: &[u8] = b"VIBEOS-PERSISTENT-CSPACE-v1";
-
-pub(crate) const fn persistent_space_id() -> SpaceId {
-    match SpaceId::new(PERSISTENT_SPACE_ID_RAW) {
-        Some(id) => id,
-        None => unreachable!(),
-    }
-}
-
-fn stored_object_resource_kind() -> ResourceKind {
-    ResourceKind::new(STORED_OBJECT_RESOURCE_KIND_RAW)
-        .expect("the StoredObject durable resource kind is non-zero")
-}
-
-fn persistent_object_kind() -> ObjectKind {
-    ObjectKind::new(PERSISTENT_OBJECT_KIND_RAW)
-        .expect("the persistent-test object kind is non-zero")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DurableCSpaceState {
-    Cold = 0,
-    WaitingBlock = 1,
-    Recovering = 2,
-    Ready = 3,
-    FailedClosed = 4,
-}
-
-impl DurableCSpaceState {
-    fn from_raw(raw: u8) -> Self {
-        match raw {
-            0 => Self::Cold,
-            1 => Self::WaitingBlock,
-            2 => Self::Recovering,
-            3 => Self::Ready,
-            _ => Self::FailedClosed,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PersistentTestPhase {
-    Boot1Created,
-    Boot2Revoked,
-    Boot3Reused,
-    AlreadyComplete,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PersistentTestReport {
-    pub phase: PersistentTestPhase,
-    pub root_slot: u32,
-    pub root_generation: u64,
-    pub child_slot: u32,
-    pub old_child_generation: u64,
-    pub child_generation: u64,
-    pub read_ok: bool,
-    pub old_child_absent: bool,
-    pub descendant_absent: bool,
-    pub no_store_write: bool,
-    pub dependent_started: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DurableCSpaceInfo {
-    pub state: DurableCSpaceState,
-    pub live_grants: usize,
-    pub tombstones: usize,
-    pub dependent_started: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DurableCSpaceError {
-    PermissionDenied,
-    Busy,
-    OutsideTask,
-    FailedClosed,
-    Store(StoreError),
-    IdExhausted,
-    Encode,
-    RootPolicy,
-    Install,
-    UnexpectedGraph,
-}
-
-impl core::fmt::Display for DurableCSpaceError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Store(error) => write!(f, "durable CSpace journal failed: {error}"),
-            _ => f.write_str(match self {
-                Self::PermissionDenied => "durable CSpace service lacks WRITE",
-                Self::Busy => "durable CSpace operation already active",
-                Self::OutsideTask => "durable CSpace operations require an executor task",
-                Self::FailedClosed => "durable CSpace recovery failed closed",
-                Self::IdExhausted => "durable stable ID space exhausted",
-                Self::Encode => "durable authority record encoding failed",
-                Self::RootPolicy => "durable root policy did not match exactly",
-                Self::Install => "durable CSpace publication revalidation failed",
-                Self::UnexpectedGraph => "durable CSpace graph has an unexpected shape",
-                Self::Store(_) => unreachable!(),
-            }),
-        }
-    }
-}
-
-impl From<StoreError> for DurableCSpaceError {
-    fn from(error: StoreError) -> Self {
-        Self::Store(error)
-    }
-}
+pub use vibeos_authority_store::{DurableCSpaceError, DurableCSpaceInfo, DurableCSpaceState, PersistentTestPhase, PersistentTestReport};
+use vibeos_authority_store::{persistent_object_kind, stored_object_resource_kind, CHILD_RIGHTS, CHILD_SLOT, GRANDCHILD_RIGHTS, GRANDCHILD_SLOT, MARKER, PERSISTENT_SPACE_ID_RAW, ROOT_RIGHTS, ROOT_SLOT};
+pub(crate) use vibeos_authority_store::persistent_space_id;
 
 #[derive(Default)]
 struct LiveGraph {

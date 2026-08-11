@@ -489,7 +489,7 @@ pub extern "C" fn kmain() -> ! {
         exec::spawn("usb-host", xhci::service_task());
     }
     #[cfg(feature = "milkv-duo")]
-    if dwc2_host::keyboard_ready() {
+    if dwc2_host::info().is_some() {
         exec::spawn("usb-hid", dwc2_host::service_task());
     }
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]

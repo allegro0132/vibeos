@@ -1,6 +1,6 @@
 //! Kernel composition for the fixed CV1800B DWC2 host controller.
 
-use crate::sync::SpinLock;
+use crate::{println, sync::SpinLock};
 use vibeos_driver_dwc2_host::{Controller, DeviceInfo, Error, HidKeyboardInfo, Info, Telemetry};
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
@@ -31,6 +31,10 @@ pub fn connected() -> bool {
         .is_some_and(Controller::connected)
 }
 
+pub fn info() -> Option<Info> {
+    CONTROLLER.lock().as_ref().map(Controller::info)
+}
+
 pub fn enumerate_device() -> Result<Option<DeviceInfo>, Error> {
     CONTROLLER
         .lock()
@@ -47,25 +51,79 @@ pub fn configure_hid_keyboard() -> Result<Option<HidKeyboardInfo>, Error> {
         .configure_hid_keyboard()
 }
 
-pub fn keyboard_ready() -> bool {
-    CONTROLLER
+pub async fn service_task() {
+    let mut was_connected = CONTROLLER
         .lock()
         .as_ref()
-        .is_some_and(|controller| controller.keyboard().is_some())
-}
-
-pub async fn service_task() {
+        .is_some_and(|controller| controller.connected() && controller.device().is_some());
     loop {
+        let connected = CONTROLLER
+            .lock()
+            .as_ref()
+            .is_some_and(Controller::connected);
+        if connected && !was_connected {
+            let attached = {
+                let mut guard = CONTROLLER.lock();
+                match guard.as_mut() {
+                    Some(controller) => {
+                        controller
+                            .enumerate_device()
+                            .and_then(|device| match device {
+                                Some(device) => controller
+                                    .configure_hid_keyboard()
+                                    .map(|keyboard| Some((device, keyboard))),
+                                None => Ok(None),
+                            })
+                    }
+                    None => Err(Error::NoDevice),
+                }
+            };
+            match attached {
+                Ok(Some((device, keyboard))) => {
+                    println!(
+                        "  usb dev   hotplug addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
+                        device.address,
+                        device.speed,
+                        device.vendor_id,
+                        device.product_id,
+                        device.usb_version,
+                        device.max_packet_size_0,
+                    );
+                    match keyboard {
+                        Some(keyboard) => println!(
+                            "  usb hid   attached boot keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                            keyboard.interface,
+                            keyboard.endpoint_in & 0x0f,
+                            keyboard.max_packet_size,
+                            keyboard.interval_ms,
+                        ),
+                        None => println!(
+                            "  usb hid   attached device has no boot keyboard interface"
+                        ),
+                    }
+                }
+                Ok(None) => println!("  usb hid   device disconnected during hotplug enumeration"),
+                Err(error) => println!("  usb hid   hotplug enumeration FAILED: {:?}", error),
+            }
+            was_connected = true;
+        } else if !connected && was_connected {
+            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                let _ = controller.enumerate_device();
+            }
+            println!("  usb hid   device disconnected; waiting for reconnect");
+            was_connected = false;
+        }
+
         let (input, interval_ms) = {
             let mut guard = CONTROLLER.lock();
             match guard.as_mut() {
-                Some(controller) => (
+                Some(controller) if controller.keyboard().is_some() => (
                     controller.poll_keyboard(),
                     controller
                         .keyboard()
                         .map_or(10, |keyboard| keyboard.interval_ms),
                 ),
-                None => (Err(Error::NoDevice), 10),
+                _ => (Err(Error::NoDevice), 100),
             }
         };
         if let Ok(input) = input {

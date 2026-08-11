@@ -11,7 +11,7 @@ use vibeos_core::cap::{Cap, Rights};
 use vibeos_vsh::{AsyncCommandSpec, CommandSpec, InputEvent, Platform, Session, Status};
 
 use crate::dev::ConsoleDev;
-use crate::world::{world, Space};
+use crate::world::{Space, world};
 
 pub struct VshPlatform {
     front: Option<(Arc<Space>, Cap)>,
@@ -93,6 +93,8 @@ pub fn install_standard_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
+    #[cfg(feature = "milkv-ssh")]
+    vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
 }
 
 /// Install commands admitted to an authenticated public-key SSH session.
@@ -107,6 +109,8 @@ pub fn install_remote_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
+    #[cfg(feature = "milkv-ssh")]
+    vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }
 
 /// The default password receives only the commands needed to replace itself
@@ -115,6 +119,7 @@ pub fn install_remote_commands(session: &mut Session) {
 pub fn install_ssh_onboarding_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
+    vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }
 
 #[cfg(feature = "milkv-ssh")]
@@ -139,6 +144,24 @@ const SSH_OBJECT_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
     min_args: 1,
     max_args: 1,
     handler: crate::ssh_provisioning::vsh_keycat,
+}];
+
+/// Physical UART may remove authorization state; SSH sessions may not reopen
+/// the globally known onboarding password.
+#[cfg(feature = "milkv-ssh")]
+const SSH_UART_MUTATION_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
+    name: "rm",
+    min_args: 1,
+    max_args: 1,
+    handler: crate::ssh_provisioning::vsh_rm_uart,
+}];
+
+#[cfg(feature = "milkv-ssh")]
+const SSH_REMOTE_MUTATION_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
+    name: "rm",
+    min_args: 1,
+    max_args: 1,
+    handler: crate::ssh_provisioning::vsh_rm,
 }];
 
 const BASE_COMMANDS: &[CommandSpec] = &[

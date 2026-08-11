@@ -165,6 +165,9 @@ For a directly attached high-speed hub it also configures hub power, resets the
 first connected downstream port, and reports that child's negotiated speed and
 raw port status. This provides the topology needed to select native high-speed
 transactions or USB 2.0 split transactions before assigning the child address.
+On 2026-08-12, UART and an authenticated SSH PTY returned the same physical
+topology: hub `05e3:0610`, four ports, with a connected, enabled and powered
+Full-Speed child on port 1 (`wPortStatus = 0x0103`).
 
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after

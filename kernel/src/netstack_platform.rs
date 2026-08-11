@@ -73,10 +73,7 @@ impl Platform for NetstackPlatform {
             online: info.online,
             quarantined: info.quarantined,
             session_epoch: info.session_epoch,
-            #[cfg(feature = "qemu-virt")]
-            phy_link_up: true,
-            #[cfg(feature = "milkv-duo")]
-            phy_link_up: info.phy_link_up,
+            phy_link_up: crate::net_device::carrier_up(&info),
         })
     }
 }

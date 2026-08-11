@@ -155,7 +155,7 @@ pub fn help(_args: &[String]) -> Result<String, Status> {
          \x20 verbose         restore background component output\n\
          \x20 poweroff        power off\n",
     );
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "pci-usb-help")]
     let help = {
         let mut help = help;
         help.push_str(

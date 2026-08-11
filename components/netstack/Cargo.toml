@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["qemu-virt", "tcp-echo"]
-qemu-virt = []
-milkv-duo = []
+default = ["tcp-echo"]
 tcp-echo = []
 net-shell = []
 tcp-echo-recovery-test = ["tcp-echo"]

@@ -31,3 +31,19 @@ pub(crate) use crate::virtio_net::{
     packet_session_test_info, release_stale_packets_for_test, request_driver_fault_for_test,
     stage_stale_packets_for_test,
 };
+
+/// Report whether the selected device's physical carrier is usable.
+///
+/// VirtIO does not expose a separate PHY signal in the supported transport,
+/// while DWMAC publishes the actual PHY state. Keeping that distinction here
+/// prevents service adapters from depending on a board-specific `NetInfo`
+/// layout.
+#[cfg(feature = "qemu-virt")]
+pub const fn carrier_up(_info: &NetInfo) -> bool {
+    true
+}
+
+#[cfg(feature = "milkv-duo")]
+pub const fn carrier_up(info: &NetInfo) -> bool {
+    info.phy_link_up
+}

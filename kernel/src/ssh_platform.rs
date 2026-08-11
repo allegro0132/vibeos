@@ -14,8 +14,9 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::net::StampedPacket;
 use vibeos_core::ssh_identity::SshEd25519PublicKey;
 use vibeos_sshd::{
-    AuthorizedProfile, HostPublicKeySnapshot, HostSignatureResult, NetworkBindError, NetworkInfo,
-    Platform, PlatformFuture, SecretBytes,
+    AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
+    NetworkBindError, NetworkInfo, Platform, PlatformFuture, SecretBytes, SshServicePolicy,
+    StaticIpv4Address,
 };
 
 use crate::ssh_security::{AuthorizedKeyPolicyService, HostSigningService};
@@ -28,6 +29,32 @@ use crate::virtio_rng as ssh_rng;
 use ssh_rng::RandomError;
 
 const ENTROPY_RETRY_BUDGET: usize = 5_000;
+
+#[cfg(feature = "ssh-test")]
+const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
+    ethernet_address: [0x02, 0, 0, 0, 0, 1],
+    listen_port: 2222,
+    ipv4: Ipv4Policy::Static(
+        StaticIpv4Address::new([10, 0, 2, 15], 24).with_default_gateway([10, 0, 2, 2]),
+    ),
+    require_carrier: false,
+    bind_retry: BindRetry::Attempts(5_000),
+    status_interval_ms: 0,
+    listener_label: "ssh-test",
+};
+
+#[cfg(feature = "milkv-ssh-acceptance")]
+const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
+    ethernet_address: [0x02, 0, 0, 0, 0, 1],
+    listen_port: 2222,
+    ipv4: Ipv4Policy::Dhcp {
+        bootstrap: StaticIpv4Address::new([192, 0, 2, 1], 24),
+    },
+    require_carrier: true,
+    bind_retry: BindRetry::Forever,
+    status_interval_ms: 30_000,
+    listener_label: "milkv-ssh-acceptance",
+};
 
 struct SshPlatform {
     space: &'static Space,
@@ -86,10 +113,7 @@ impl Platform for SshPlatform {
             online: info.online,
             quarantined: info.quarantined,
             session_epoch: info.session_epoch,
-            #[cfg(feature = "qemu-virt")]
-            phy_link_up: true,
-            #[cfg(feature = "milkv-ssh-acceptance")]
-            phy_link_up: info.phy_link_up,
+            phy_link_up: crate::net_device::carrier_up(&info),
         })
     }
 
@@ -193,8 +217,13 @@ pub async fn task(
     policy: Cap,
 ) {
     let platform = SshPlatform::new(space);
+    #[cfg(feature = "milkv-ssh-acceptance")]
+    crate::uart::_print(format_args!(
+        "WARNING milkv-ssh-acceptance: deterministic entropy and fixed test keys; isolated bring-up only\n"
+    ));
     vibeos_sshd::task(
         &platform,
+        SSH_SERVICE_POLICY,
         outbound,
         inbound,
         control,

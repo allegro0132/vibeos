@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["qemu-virt"]
-qemu-virt = []
+default = ["pci-usb-help"]
+pci-usb-help = []
 network = []
 
 [dependencies]

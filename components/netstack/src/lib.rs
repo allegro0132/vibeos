@@ -1,12 +1,17 @@
 //! Capability-confined configurable IPv4 stack and bounded TCP echo service.
 //!
-//! QEMU compiles it for the dedicated `tcp-echo` acceptance image. Milk-V Duo
-//! compiles the same capability-confined stack for its production `net-shell`
-//! image, starting in DHCP mode.
+//! The image selects either the dedicated `tcp-echo` policy or the interactive
+//! `net-shell` policy. Hardware-specific link state is supplied through
+//! [`Platform`], so this component does not depend on a board selection.
 
 #![no_std]
 
 extern crate alloc;
+
+#[cfg(all(feature = "tcp-echo", feature = "net-shell"))]
+compile_error!("select exactly one netstack service policy: `tcp-echo` or `net-shell`");
+#[cfg(not(any(feature = "tcp-echo", feature = "net-shell")))]
+compile_error!("select a netstack service policy: `tcp-echo` or `net-shell`");
 
 #[cfg(feature = "tcp-echo-recovery-test")]
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -106,9 +111,6 @@ pub async fn task(space: &Space, outbound_cap: Cap, inbound_cap: Cap, control_ca
         let Some(info) = device_info(space, control_cap) else {
             return;
         };
-        #[cfg(feature = "qemu-virt")]
-        config::publish_carrier(info.online);
-        #[cfg(feature = "milkv-duo")]
         config::publish_carrier(info.online && info.phy_link_up);
         if info.quarantined {
             return;

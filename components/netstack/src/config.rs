@@ -18,7 +18,7 @@ pub const DEFAULT_IPV4: [u8; 4] = [10, 0, 2, 15];
 pub const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 pub const DEFAULT_PREFIX_LEN: u8 = 24;
 
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "tcp-echo")]
 const DEFAULT_STATIC: StaticIpv4Address =
     StaticIpv4Address::new(DEFAULT_IPV4, DEFAULT_PREFIX_LEN).with_default_gateway(DEFAULT_GATEWAY);
 
@@ -31,13 +31,18 @@ struct ControlState {
     carrier_up: bool,
 }
 
-#[cfg(feature = "qemu-virt")]
+/// Image-selected boot policy for the network service.
+///
+/// The echo acceptance image uses the deterministic SLIRP address expected by
+/// its test harness. The interactive shell image starts DHCP and is free to run
+/// on any board whose platform adapter implements the packet contract.
+#[cfg(feature = "tcp-echo")]
 const BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::Static(DEFAULT_STATIC),
 };
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "net-shell")]
 const BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::Dhcp,

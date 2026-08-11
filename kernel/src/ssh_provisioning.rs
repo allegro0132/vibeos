@@ -527,6 +527,78 @@ pub fn vsh_authorize(args: &[String]) -> Result<String, Status> {
     Ok(String::from("ssh-authorize: persisting client key...\n"))
 }
 
+fn vsh_rm_inner(args: Vec<String>, physical_uart: bool) -> vibeos_vsh::AsyncCommandFuture {
+    alloc::boxed::Box::pin(async move {
+        let target = args.first().map(String::as_str).ok_or(Status::Usage)?;
+        let remove_client_key = target == "ssh-client-key";
+        let remove_authorization = target == "ssh-authorized-keys" && physical_uart;
+        if !remove_client_key && !remove_authorization {
+            return Err(Status::Usage);
+        }
+        if UPDATE_BUSY.swap(true, Ordering::AcqRel) {
+            return Ok(String::from("SSH provisioning is busy\n"));
+        }
+        let result = async {
+            let mut config = load()
+                .await?
+                .ok_or(crate::block_device::BlockError::DeviceIo)?;
+            if !config.has_host() {
+                return Err(crate::block_device::BlockError::Protocol);
+            }
+            config.generation = config
+                .generation
+                .checked_add(1)
+                .ok_or(crate::block_device::BlockError::Protocol)?;
+            if remove_client_key {
+                erase(&mut config.client_seed);
+                config.client_public = [0; 32];
+                config.flags &= !FLAG_CLIENT_KEYPAIR;
+            } else {
+                config.client_keys = [[0; 32]; MAX_CLIENT_KEYS];
+                config.key_count = 0;
+                config.flags &= !FLAG_CLIENT;
+            }
+            store(config).await?;
+            let verified = load()
+                .await?
+                .ok_or(crate::block_device::BlockError::DeviceIo)?;
+            if (remove_client_key && verified.flags & FLAG_CLIENT_KEYPAIR != 0)
+                || (remove_authorization
+                    && (verified.flags & FLAG_CLIENT != 0 || verified.key_count != 0))
+            {
+                return Err(crate::block_device::BlockError::DeviceIo);
+            }
+            Ok(())
+        }
+        .await;
+        UPDATE_BUSY.store(false, Ordering::Release);
+        match result {
+            Ok(()) => {
+                if remove_authorization {
+                    ONBOARDING_ACTIVE.store(true, Ordering::Release);
+                    POLICY_CHANGED.store(true, Ordering::Release);
+                    Ok(String::from(
+                        "removed ssh-authorized-keys; password onboarding enabled\n",
+                    ))
+                } else {
+                    Ok(String::from("removed ssh-client-key and public half\n"))
+                }
+            }
+            Err(_) => Err(Status::Unavailable),
+        }
+    })
+}
+
+/// Remove only objects that cannot reopen password authentication.
+pub fn vsh_rm(args: Vec<String>) -> vibeos_vsh::AsyncCommandFuture {
+    vsh_rm_inner(args, false)
+}
+
+/// The physical UART additionally admits removal of the authorized-key set.
+pub fn vsh_rm_uart(args: Vec<String>) -> vibeos_vsh::AsyncCommandFuture {
+    vsh_rm_inner(args, true)
+}
+
 pub fn install_services(
     space: &crate::world::Space,
     config: Config,

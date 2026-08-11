@@ -9,4 +9,5 @@ default = []
 [dependencies]
 vibeos-core = { path = "../../core" }
 vibeos-ssh-identity = { path = "../../services/ssh-identity" }
+vibeos-vsh = { path = "../vsh", default-features = false }
 sunset = { path = "../../vendor/sunset", default-features = false, features = ["alloc"] }

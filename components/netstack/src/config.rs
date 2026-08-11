@@ -11,7 +11,7 @@ use vibeos_core::net_config::{
 };
 use vibeos_core::net_stack::{StackError, StaticIpv4EchoStack};
 use vibeos_core::sync::SpinLock;
-use vibeos_core::vsh::Status;
+use vibeos_vsh::Status;
 
 pub const DEFAULT_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 pub const DEFAULT_IPV4: [u8; 4] = [10, 0, 2, 15];

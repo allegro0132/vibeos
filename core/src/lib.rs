@@ -26,5 +26,3 @@ pub mod random;
 pub mod runqueue;
 pub mod store;
 pub mod sync;
-pub mod terminal;
-pub mod vsh;

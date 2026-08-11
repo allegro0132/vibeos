@@ -1,7 +1,7 @@
 //! Deterministic host fuzz corpus for the pure vsh parser. This deliberately
 //! uses no scheduler or capabilities, so failures reduce to one input string.
 
-use vibeos_core::vsh;
+use vibeos_vsh as vsh;
 
 #[test]
 fn bounded_parser_survives_generated_operator_quote_and_reference_corpus() {

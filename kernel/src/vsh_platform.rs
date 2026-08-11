@@ -8,8 +8,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use vibeos_core::cap::{Cap, Rights};
-use vibeos_core::vsh::{Session, Status};
-use vibeos_vsh::{CommandSpec, InputEvent, Platform};
+use vibeos_vsh::{CommandSpec, InputEvent, Platform, Session, Status};
 
 use crate::dev::ConsoleDev;
 use crate::world::{world, Space};

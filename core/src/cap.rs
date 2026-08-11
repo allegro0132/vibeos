@@ -815,8 +815,11 @@ impl<T: Resource> PersistentDerivationWitness<T> {
         self.identity
     }
 
-    pub(crate) fn into_revocable(self) -> Revocable<T> {
-        Revocable { object: self.object, node: self.node }
+    fn into_revocable(self) -> Revocable<T> {
+        Revocable {
+            object: self.object,
+            node: self.node,
+        }
     }
 }
 
@@ -1148,6 +1151,17 @@ impl CSpace {
             node,
             marker: PhantomData,
         })
+    }
+
+    /// Resolve only a durable capability into an operation-time token.
+    /// Ephemeral capabilities are rejected even when their type and rights
+    /// match, and every operation still revalidates the durable ancestry.
+    pub fn lookup_persistent_revocable<T: Resource>(
+        &self,
+        cap: Cap,
+        need: Rights,
+    ) -> Result<Revocable<T>, CapError> {
+        Ok(self.persistent_witness::<T>(cap, need)?.into_revocable())
     }
 
     /// Reconstitute a typed witness from a previously returned exact identity.

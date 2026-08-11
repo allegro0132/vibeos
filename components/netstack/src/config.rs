@@ -1,4 +1,4 @@
-//! Capability-admitted vsh control plane for the single IPv4 stack.
+//! Capability-admitted control plane for the single IPv4 stack.
 
 extern crate alloc;
 
@@ -18,6 +18,7 @@ pub const DEFAULT_IPV4: [u8; 4] = [10, 0, 2, 15];
 pub const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 pub const DEFAULT_PREFIX_LEN: u8 = 24;
 
+#[cfg(feature = "qemu-virt")]
 const DEFAULT_STATIC: StaticIpv4Address =
     StaticIpv4Address::new(DEFAULT_IPV4, DEFAULT_PREFIX_LEN).with_default_gateway(DEFAULT_GATEWAY);
 

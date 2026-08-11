@@ -443,13 +443,14 @@ pub extern "C" fn kmain() -> ! {
                 );
                 match dwc2_host::configure_hid_keyboard() {
                     Ok(Some(keyboard)) => println!(
-                        "  usb hid   boot keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                        "  usb hid   {:?} keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                        keyboard.protocol,
                         keyboard.interface,
                         keyboard.endpoint_in & 0x0f,
                         keyboard.max_packet_size,
                         keyboard.interval_ms,
                     ),
-                    Ok(None) => println!("  usb hid   no boot keyboard interface"),
+                    Ok(None) => println!("  usb hid   no supported keyboard interface"),
                     Err(error) => println!("  usb hid   configuration FAILED: {:?}", error),
                 }
             }

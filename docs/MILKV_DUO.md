@@ -157,6 +157,10 @@ addressed device's VID:PID, speed, USB version and endpoint-zero packet size.
 For a usable keyboard it also prints `HID boot-keyboard` with the selected
 interface and interrupt-IN endpoint. `connected, not enumerated` distinguishes
 an electrical connection from successful USB protocol enumeration.
+For a directly attached high-speed hub it also configures hub power, resets the
+first connected downstream port, and reports that child's negotiated speed and
+raw port status. This provides the topology needed to select native high-speed
+transactions or USB 2.0 split transactions before assigning the child address.
 
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after

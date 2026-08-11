@@ -59,8 +59,9 @@ compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualific
 
 extern crate alloc;
 
-// The portable half of the kernel lives in `vibeos-core` so it can be tested on
-// the host. Re-exported under the names the rest of the tree already uses.
+// Portable kernel logic lives in `vibeos-core`; the bare SBI seam lives in the
+// RISC-V runtime. Re-export both under the names the rest of the tree uses.
+#[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, exec, heap, interrupt, ipi, sync};
@@ -69,6 +70,8 @@ pub use vibeos_driver_virtio_core as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_program_store as program;
 pub use vibeos_random as random;
+#[cfg(all(target_arch = "riscv64", target_os = "none"))]
+pub use vibeos_runtime_riscv as sbi;
 pub use vibeos_vsh as vsh;
 pub use vibeos_vsh::terminal;
 

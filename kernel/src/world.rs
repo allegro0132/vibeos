@@ -1915,7 +1915,7 @@ pub fn build() {
                 &mut backend.0.lock(),
             )
             .unwrap();
-            let service = store::StoreService::new(backend.clone(), block_grant);
+            let service = crate::store_platform::new_service(backend.clone(), block_grant);
             let journal = service.authority_journal();
             let store_cap = cs.mint(service, Rights::ALL);
             let saved = saved_program::SavedProgramService::new(

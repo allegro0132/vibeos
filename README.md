@@ -42,15 +42,25 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw
   Ethernet through bounded TCP to a public-key-only SSH `exec` service.
-- **[docs/JITTERENTROPY.md](docs/JITTERENTROPY.md)** — the pinned upstream
-  Jitterentropy port, isolated Duo probe image, raw-data collection procedure,
-  and fail-closed production admission gate.
+- **[docs/JITTERENTROPY.md](docs/JITTERENTROPY.md)** — the pinned Rust crate,
+  isolated Duo smoke probe, currently unavailable raw-noise assessment, and
+  fail-closed production admission gate.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
 
+Initialize the pinned Sunset fork after cloning the repository:
+
 ```sh
-cargo test --workspace       # fast portable tests, no QEMU
+git submodule update --init --recursive
+```
+
+```sh
+cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
+cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
+  --no-default-features --features alloc # audited Sunset fork tests
+cargo check -p vibeos-sshd --features qemu-virt
+cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 ./scripts/differential.sh    # exact-output oracle using the pinned rustc
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/qemu-tcp-test.sh   # N1 static/DHCP IPv4 and TCP echo through host forwarding
@@ -98,7 +108,7 @@ contains a FAT boot partition plus a raw VibeOS data partition and no Linux root
 filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
 The optional Jitterentropy probe loads the exactly pinned `jitterentropy-rs`
-crate from crates.io; no Git submodule or separate C compiler is required.
+crate from crates.io; it needs no additional submodule or separate C compiler.
 
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
 `nightly-2026-08-01` (including `rust-src` and LLVM tools) in
@@ -368,6 +378,8 @@ its process owns. Here, authority is not a property of the code.
 | `uart.rs`, `plic.rs`, `sbi.rs`, `dev.rs` | hardware |
 | `compiler/` | lexer, parser, RV64 code generator (its own crate, host-testable) |
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
+| `components/sshd/` | capability-confined SSH protocol and VSH session component (`no_std`) |
+| `kernel/src/ssh_platform.rs` | thin kernel-private adapter for SSH capabilities and services |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["core", "compiler", "kernel", "vendor/sunset"]
+members = ["core", "compiler", "components/sshd", "kernel"]
+exclude = ["vendor/sunset"]
 
 [profile.dev]
 panic = "abort"

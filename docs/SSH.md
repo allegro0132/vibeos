@@ -27,6 +27,18 @@ securely wired test boundary. A separate, visibly insecure Milk-V image now
 makes the same protocol path available for physical bring-up, but remote login
 to the board has not yet been completed or validated.
 
+## Sunset provenance
+
+`vendor/sunset` is a Git submodule of
+`git@github.com:allegro0132/sunset.git`, pinned to VibeOS patch commit
+`539cbe6be4356f82a5fce6203b897fd5373a4481` based on upstream tag
+`sunset-0.6.0`. The fork is required because the crates.io API does not expose
+VibeOS's caller-owned fallible RNG, external host signer, fail-closed
+authentication profile, interactive admission state, or bounded channel
+flow-control contract. See
+[`VIBEOS_AUDIT.md`](../vendor/sunset/VIBEOS_AUDIT.md) for the exact security
+delta and update procedure.
+
 ## Component and authority topology
 
 ```text
@@ -38,6 +50,20 @@ sshd component
   <-> authenticated principal policy
 restricted vsh session component
 ```
+
+The source boundary now matches this topology. `components/sshd` is a separate
+`no_std` crate containing the Sunset protocol runner, authentication state,
+TCP/session loop, and restricted VSH frontend. `kernel/src/ssh_platform.rs` is
+the thin adapter which resolves packet, network-control, entropy, host-signer,
+authorization-policy, command-registry, and diagnostic operations through the
+component's granted capabilities. `world.rs` remains responsible only for the
+CSpace manifest, component lifecycle, restart template, and grant wiring.
+
+This crate boundary is an architectural dependency boundary, not a new CPU
+privilege boundary. The component is still linked into the single trusted
+image and runs in the shared S-mode address space. Moving it out of the TCB
+requires the future admitted-code/loader boundary described in `BLUEPRINT.md`;
+moving the Rust source alone does not make hostile native code safe.
 
 The network stack is the sole normal consumer of raw inbound packets.  The
 implemented driver boundary carries each `Packet` inside a `StampedPacket`

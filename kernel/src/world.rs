@@ -921,7 +921,7 @@ impl World {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    crate::ssh_test::task(
+                    crate::ssh_platform::task(
                         space.get(),
                         outbound,
                         inbound,
@@ -2156,7 +2156,7 @@ pub fn build() {
             space.clone(),
             SSH_TEST_MEMORY_BUDGET,
             Some(ComponentTemplate::SshTest),
-            crate::ssh_test::task(
+            crate::ssh_platform::task(
                 SpaceRef::new(&space).get(),
                 outbound,
                 inbound,

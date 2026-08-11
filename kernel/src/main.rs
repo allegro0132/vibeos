@@ -103,7 +103,7 @@ mod ssh_security;
 #[cfg(feature = "ssh-security-test")]
 mod ssh_security_test;
 #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
-mod ssh_test;
+mod ssh_platform;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",

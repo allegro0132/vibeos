@@ -6,7 +6,6 @@ use alloc::{format, string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vibeos_core::cap::Rights;
-use vibeos_core::sync::SpinLock;
 use vibeos_ssh_identity::{
     AuthorizedKeyEntry, AuthorizedKeyPolicyService, CapabilityProfileId, HostSigningService,
     ProvisionedHostSeed, SecurityGeneration, SshEd25519PublicKey,
@@ -29,7 +28,6 @@ static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
 static ONBOARDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static POLICY_CHANGED: AtomicBool = AtomicBool::new(false);
 static POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
-static CLIENT_KEYPAIR: SpinLock<Option<ClientKeyPair>> = SpinLock::new(None);
 
 pub const DEFAULT_USERNAME: &str = "vibe";
 pub const DEFAULT_PASSWORD: &str = "vibeos";
@@ -156,17 +154,6 @@ fn decode(bytes: &[u8; 512]) -> Option<Config> {
         client_seed,
         client_public,
     })
-}
-
-struct ClientKeyPair {
-    seed: [u8; 32],
-    public: [u8; 32],
-}
-
-impl Drop for ClientKeyPair {
-    fn drop(&mut self) {
-        erase(&mut self.seed);
-    }
 }
 
 fn derive_public_key(seed: &[u8; 32]) -> Result<SshEd25519PublicKey, ()> {
@@ -425,11 +412,6 @@ pub async fn ensure_host_key() -> Result<Config, crate::block_device::BlockError
 }
 
 pub fn vsh_keygen(_args: &[String]) -> Result<String, Status> {
-    if CLIENT_KEYPAIR.lock().is_some() {
-        return Ok(String::from(
-            "ssh-keygen: client key already exists; use cat ssh-client-key or cat ssh-client-key.pub\n",
-        ));
-    }
     if UPDATE_BUSY.swap(true, Ordering::AcqRel) {
         return Ok(String::from("SSH provisioning is busy\n"));
     }
@@ -464,7 +446,8 @@ pub fn vsh_keygen(_args: &[String]) -> Result<String, Status> {
         .await;
         match result {
             Ok(()) => {
-                *CLIENT_KEYPAIR.lock() = Some(ClientKeyPair { seed, public });
+                let mut seed = seed;
+                erase(&mut seed);
                 crate::uart::_print(format_args!(
                     "ssh-keygen: client keypair persisted; it was not authorized\n"
                 ));
@@ -482,17 +465,24 @@ pub fn vsh_keygen(_args: &[String]) -> Result<String, Status> {
     ))
 }
 
-pub fn vsh_keycat(args: &[String]) -> Result<String, Status> {
-    let keypair = CLIENT_KEYPAIR.lock();
-    let keypair = keypair.as_ref().ok_or(Status::Unavailable)?;
-    match args.first().map(String::as_str) {
-        Some("ssh-client-key.pub") => Ok(crate::ssh_key_format::openssh_public(&keypair.public)),
-        Some("ssh-client-key") => Ok(crate::ssh_key_format::openssh_private(
-            &keypair.seed,
-            &keypair.public,
-        )),
-        _ => Err(Status::Usage),
-    }
+pub fn vsh_keycat(args: Vec<String>) -> vibeos_vsh::AsyncCommandFuture {
+    alloc::boxed::Box::pin(async move {
+        let config = load().await.map_err(|_| Status::Unavailable)?;
+        let config = config.ok_or(Status::Unavailable)?;
+        if config.flags & FLAG_CLIENT_KEYPAIR == 0 {
+            return Err(Status::Unavailable);
+        }
+        match args.first().map(String::as_str) {
+            Some("ssh-client-key.pub") => {
+                Ok(crate::ssh_key_format::openssh_public(&config.client_public))
+            }
+            Some("ssh-client-key") => Ok(crate::ssh_key_format::openssh_private(
+                &config.client_seed,
+                &config.client_public,
+            )),
+            _ => Err(Status::Usage),
+        }
+    })
 }
 
 pub fn vsh_authorize(args: &[String]) -> Result<String, Status> {
@@ -566,14 +556,6 @@ pub fn install_services(
     let signer_read = cs.mint(signer.clone(), Rights::READ);
     let signer_invoke = cs.mint(signer, Rights::INVOKE);
     let policy = cs.mint(policy, Rights::READ);
-    *CLIENT_KEYPAIR.lock() = if config.flags & FLAG_CLIENT_KEYPAIR != 0 {
-        Some(ClientKeyPair {
-            seed: config.client_seed,
-            public: config.client_public,
-        })
-    } else {
-        None
-    };
     POLICY_GENERATION.store(config.generation, Ordering::Release);
     ONBOARDING_ACTIVE.store(!config.complete(), Ordering::Release);
     POLICY_CHANGED.store(false, Ordering::Release);

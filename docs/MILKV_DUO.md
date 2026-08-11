@@ -289,9 +289,11 @@ accepted on UART.
 
 The board-side `ssh-keygen` command instead creates an independent client key
 pair and never authorizes it. `cat ssh-client-key.pub` prints its OpenSSH public
-key and `cat ssh-client-key` prints its unencrypted OpenSSH private key. Anyone
-who can read that private-key output can use the key, so transfer it over an
-authenticated session and protect it immediately.
+key and `cat ssh-client-key` prints its unencrypted OpenSSH private key. Each
+`cat` invocation asynchronously reads and validates the latest SSH object-store
+version; these two names are an explicit allowlist, not a general object-ID or
+path namespace. Anyone who can read that private-key output can use the key, so
+transfer it over an authenticated session and protect it immediately.
 
 The host seed, authorized public keys, onboarding-complete state, and optional
 device-generated client key pair are stored on the microSD without encryption;

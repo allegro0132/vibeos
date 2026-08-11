@@ -18,6 +18,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::future::{poll_fn, Future};
 use core::pin::{pin, Pin};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,8 @@ use vibeos_core::sync::SpinLock;
 
 pub type ReadByteFuture<'a> = Pin<Box<dyn Future<Output = u8> + Send + 'a>>;
 pub type CommandHandler = fn(&[String]) -> Result<String, Status>;
+pub type AsyncCommandFuture = Pin<Box<dyn Future<Output = Result<String, Status>> + Send>>;
+pub type AsyncCommandHandler = fn(Vec<String>) -> AsyncCommandFuture;
 
 pub enum InputEvent {
     Line(String),
@@ -50,11 +53,30 @@ pub struct CommandSpec {
     pub handler: CommandHandler,
 }
 
+#[derive(Clone, Copy)]
+pub struct AsyncCommandSpec {
+    pub name: &'static str,
+    pub min_args: usize,
+    pub max_args: usize,
+    pub handler: AsyncCommandHandler,
+}
+
 /// Install audited commands selected by boot policy. Registration happens in
 /// this component; kernel code supplies only the capability-service adapters.
 pub fn install_commands(session: &mut Session, commands: &[CommandSpec]) {
     for command in commands {
         session.install_host_command(
+            command.name,
+            command.min_args,
+            command.max_args,
+            command.handler,
+        );
+    }
+}
+
+pub fn install_async_commands(session: &mut Session, commands: &[AsyncCommandSpec]) {
+    for command in commands {
+        session.install_async_host_command(
             command.name,
             command.min_args,
             command.max_args,

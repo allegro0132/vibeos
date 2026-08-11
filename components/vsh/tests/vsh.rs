@@ -128,6 +128,24 @@ fn s4_vertical_echo_wc_pipeline() {
     assert!(reports[0].peak_pipe_depth <= vsh::STREAM_BUFFER_CHUNKS);
 }
 
+fn async_object_read(args: Vec<String>) -> vsh::AsyncCommandFuture {
+    Box::pin(async move {
+        exec::yield_now().await;
+        Ok(format!("object:{}\n", args.join(",")))
+    })
+}
+
+#[test]
+fn async_host_command_waits_for_object_read_and_captures_output() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    session.install_async_host_command("cat", 1, 1, async_object_read);
+    let (_session, reports) = execute(session, "cat ssh-client-key");
+    let reports = reports.unwrap();
+    assert_eq!(reports[0].status, Status::Success);
+    assert_eq!(reports[0].output, "object:ssh-client-key\n");
+}
+
 #[test]
 fn unknown_later_stage_executes_nothing() {
     let _serial = SERIAL.lock().unwrap();

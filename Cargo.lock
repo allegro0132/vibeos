@@ -783,6 +783,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-milkv-duo-led"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-driver-pci"
 version = "0.1.0"
 dependencies = [
@@ -869,6 +876,7 @@ dependencies = [
  "vibeos-bsp-qemu-virt",
  "vibeos-core",
  "vibeos-driver-dwmac-net",
+ "vibeos-driver-milkv-duo-led",
  "vibeos-driver-pci",
  "vibeos-driver-sdhci-blk",
  "vibeos-driver-virtio-blk",

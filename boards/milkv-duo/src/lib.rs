@@ -5,7 +5,7 @@
 use vibeos_hal::{
     AddressRange, Board as BoardContract, BoardInfo, ConsoleCapabilities, DwmacDescription,
     IdentityMapping, MemoryAttributes, MemoryRegion, MmuDescription, PlicDescription,
-    SdhciDescription, UartDescription, UartQuirks, UartVariant,
+    SdhciDescription, StatusLedDescription, UartDescription, UartQuirks, UartVariant,
 };
 
 pub const NAME: &str = "Milk-V Duo (CV1800B)";
@@ -52,6 +52,15 @@ pub const SDHCI: SdhciDescription = SdhciDescription {
     bus_width: 1,
     init_clock_hz: 400_000,
     data_clock_hz: 25_000_000,
+};
+pub const STATUS_LED: StatusLedDescription = StatusLedDescription {
+    gpio: AddressRange::new(GPIOC_BASE, GPIOC_MMIO_END),
+    pinmux: AddressRange::new(SOC_CONTROL_BASE + 0x1000, SOC_CONTROL_BASE + 0x2000),
+    pinmux_register_offset: 0x12c,
+    pinmux_function_mask: 0x7,
+    pinmux_gpio_function: 3,
+    gpio_bit: 24,
+    active_high: true,
 };
 pub const HART_IDS: &[usize] = &[0];
 pub const CONSOLE_CAPABILITIES: ConsoleCapabilities = ConsoleCapabilities {
@@ -113,6 +122,7 @@ impl BoardContract for Board {
         pci: None,
         dwmac: Some(DWMAC),
         sdhci: Some(SDHCI),
+        status_led: Some(STATUS_LED),
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;
@@ -145,6 +155,7 @@ mod tests {
         assert_eq!(<Board as BoardContract>::INFO.console, CONSOLE_CAPABILITIES);
         assert_eq!(<Board as BoardContract>::INFO.dwmac, Some(DWMAC));
         assert_eq!(<Board as BoardContract>::INFO.sdhci, Some(SDHCI));
+        assert_eq!(<Board as BoardContract>::INFO.status_led, Some(STATUS_LED));
         assert_eq!(<Board as BoardContract>::HART_IDS, &[0]);
         assert_eq!(plic_s_context(0), Some(1));
         assert_eq!(plic_s_context(1), None);

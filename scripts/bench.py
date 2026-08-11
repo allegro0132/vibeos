@@ -23,7 +23,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-KERNEL = ROOT / "target/riscv64imac-unknown-none-elf/release/vibeos-kernel"
+KERNEL = ROOT / "target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt"
 BASELINE = ROOT / "benchmarks/qemu-tcg-rv64.json"
 TOOLCHAIN_FILE = ROOT / "rust-toolchain.toml"
 SCHEMA = "vibeos.bench"
@@ -261,8 +261,8 @@ def build_kernel() -> None:
         subprocess.run(
             ["rustup", "run", channel, "cargo", "build", "--release", "--features", "legacy-shell"],
             # Cargo discovers target/build-std settings from the invocation
-            # directory; the bare-metal configuration lives under kernel/.
-            cwd=ROOT / "kernel",
+            # directory; final-link configuration belongs to the firmware.
+            cwd=ROOT / "firmware/qemu-virt",
             env=env,
             check=True,
         )

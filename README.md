@@ -56,11 +56,13 @@ git submodule update --init --recursive
 ```
 
 ```sh
-cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
+cargo test --workspace \
+  --exclude vibeos-kernel \
+  --exclude vibeos-firmware-qemu-virt \
+  --exclude vibeos-firmware-milkv-duo # portable tests, no firmware link
 cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
-cargo check -p vibeos-sshd --features qemu-virt
-cargo check -p vibeos-sshd --features milkv-ssh-acceptance
+cargo check -p vibeos-sshd # board-neutral SSH component
 ./scripts/differential.sh    # exact-output oracle using the pinned rustc
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/qemu-tcp-test.sh   # N1 static/DHCP IPv4 and TCP echo through host forwarding
@@ -93,6 +95,11 @@ layers and which mutations each one catches.
 Normal images boot directly into `vsh>` with a dedicated CSpace. The broad
 diagnostic shell is compiled only with the `legacy-shell` test feature; the
 QEMU golden and benchmark harnesses select that feature explicitly.
+
+Board selection and final linking live in `firmware/qemu-virt` and
+`firmware/milkv-duo`. Build from one firmware directory at a time so Cargo
+loads `firmware/.cargo/config.toml` and never unifies mutually exclusive board
+features into one kernel archive.
 
 The QEMU `virt` port also owns its generic PCI ECAM host: it discovers type-0
 functions, sizes and assigns 32/64-bit BARs, enables bus mastering per driver,

@@ -114,7 +114,7 @@ forward as a small integrity slice, but per-process isolation remains a non-goal
 
 | # | Work item | Notes |
 |---|---|---|
-| 1.1 ✅ | Split into three crates | `vibeos-core` (no_std lib: cap, chan, exec, heap, sync), `vibeos-rustc` (no_std lib: the compiler), `vibeos-kernel` (bin). |
+| 1.1 ✅ | Split runtime and firmware crates | `vibeos-core` and `vibeos-rustc` are portable no_std libraries; `vibeos-kernel` is a board-selected no_std archive; `firmware/qemu-virt` and `firmware/milkv-duo` own entry symbols and final linking. |
 | 1.1a ✅ | Extract an `arch` shim | `cap`, `chan`, and the compiler are already pure and will build for the host as-is. `sync`, `heap`, and `exec` are not: they contain RISC-V `csr`/`wfi` inline asm. Put interrupt enable/disable, `wfi`, and `rdtime` behind a small trait with a no-op host implementation. Without this, the most bug-prone code in the tree (the scheduler) stays untestable off-target. |
 | 1.2 ✅ | Host unit tests for `cap` | Attenuation, cascading revoke, generation staleness, `WrongType`, every `CapError` variant. This is the security core; it should have the densest tests in the tree. |
 | 1.3 ✅ | Host unit tests for `lex`/`parse` | Golden ASTs, and every diagnostic string asserted — error messages are a UI. |

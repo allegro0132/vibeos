@@ -2,7 +2,7 @@
 name = "vibeos-kernel"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
+autobins = false
 
 [features]
 default = ["qemu-virt"]
@@ -35,13 +35,14 @@ milkv-ssh-acceptance = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity"]
 # until the Rust rewrite's validation and independent review gates have passed.
 milkv-jitterentropy-probe = ["legacy-shell", "dep:jitterentropy"]
 
-# The kernel is `no_std` and cannot link a host test harness. Its hardware cases
-# live in `selftest_platform.rs` and run inside QEMU; portable acceptance policy
-# lives in `acceptance/kernel-tests`.
-[[bin]]
-name = "vibeos-kernel"
-path = "src/main.rs"
+# The kernel is a reusable `no_std` archive selected and linked by a board
+# firmware package. Its hardware cases live in `selftest_platform.rs` and run
+# inside QEMU; portable acceptance policy lives in `acceptance/kernel-tests`.
+[lib]
+name = "vibeos_kernel"
+path = "src/lib.rs"
 test = false
+bench = false
 
 [dependencies]
 vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }

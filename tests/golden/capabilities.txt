@@ -30,20 +30,20 @@ vibe> caps init
   cap:11.0     object-store rwsvgx   capability-addressed object store (recovery pending)
   cap:12.0     durable-cspace rw----   persistent-test CSpace [Ready, 0 live grants, 0 tombstones]
   cap:13.0     saved-program rw----   fixed saved program `hello` [ReadyEmpty, artifact absent, authority console=w memory=rw]
-  rights: r=read w=write s=send v=recv g=grant x=revoke
+  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> caps logger
   owner component:2  task task:2  name logger  state running  reason -
   memory owner component:2  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      endpoint  ---v--   telemetry [0/8 sent=0 recv=0]
   cap:1.0      console   -w----   ns16550a @ 0xADDR [0 bytes out]
-  rights: r=read w=write s=send v=recv g=grant x=revoke
+  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> caps sensor
   owner component:1  task task:1  name sensor  state running  reason -
   memory owner component:1  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.0      endpoint  --s---   telemetry [0/8 sent=0 recv=0]
-  rights: r=read w=write s=send v=recv g=grant x=revoke
+  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> probe
   REFUSED  sensor tries to RECV on the channel it publishes to
            reason: insufficient rights

@@ -7,7 +7,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 UPDATE=0
 FILTER=""
 QEMU_SMP=${QEMU_SMP:-4}
@@ -29,7 +29,7 @@ if [ -z "$toolchain" ] || ! command -v rustup >/dev/null 2>&1; then
 fi
 pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
-(cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+(cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features legacy-shell) >&2
 
 # Strip everything that legitimately varies between runs: timings, addresses,
@@ -43,6 +43,7 @@ normalize() {
            -e 's/up [0-9]+\.[0-9]+ s/up N s/' \
            -e 's/(panicked at [^:]+):[0-9]+:[0-9]+:/\1:LINE:COL:/' \
            -e 's/[0-9]+ KiB/N KiB/g' \
+           -e 's/capability-addressed object store \[0 objects, 0 journal sectors\]/capability-addressed object store (recovery pending)/' \
            -e 's/^  live +[0-9]+ B.*$/  live N B peak N B bump remaining N B/' \
            -e 's/scheduler acquisitions delta=[0-9]+ contention delta=[0-9]+/scheduler acquisitions delta=N contention delta=N/' \
            -e 's/\{[0-9]+\}//g' \

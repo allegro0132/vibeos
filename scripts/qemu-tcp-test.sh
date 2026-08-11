@@ -11,7 +11,7 @@ case "$TCP_TEST_MODE" in
   *) echo "usage: $0 [echo|recovery]" >&2; exit 2 ;;
 esac
 
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 QEMU_SMP=${QEMU_SMP:-4}
 QEMU_ACCEL=${QEMU_ACCEL:-tcg,thread=multi}
@@ -362,7 +362,7 @@ if ! python3 -B scripts/tcp-peer.py --selftest >/dev/null; then
 fi
 
 echo "$TEST_NAME: building kernel feature $TCP_FEATURE"
-if ! (cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+if ! (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features "$TCP_FEATURE") >&2; then
   fail "kernel build failed"
 fi

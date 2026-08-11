@@ -78,32 +78,32 @@ if [ -n "$sdk_arg" ]; then
   fi
 fi
 
-features=milkv-duo,net-shell
+features=net-shell
 output_dir="$repo_root/target/milkv-duo"
 output_elf="$output_dir/vibeos-milkv-duo.elf"
 if [ "$diagnostic" = true ]; then
-  features=milkv-duo,legacy-shell
+  features=legacy-shell
   output_dir="$repo_root/target/milkv-duo-diagnostic"
   output_elf="$output_dir/vibeos-milkv-duo-diagnostic.elf"
 elif [ "$ssh_acceptance" = true ]; then
-  features=milkv-duo,milkv-ssh-acceptance
+  features=milkv-ssh-acceptance
   output_dir="$repo_root/target/milkv-duo-ssh-acceptance"
   output_elf="$output_dir/vibeos-milkv-duo-ssh-acceptance.elf"
 elif [ "$jitterentropy_probe" = true ]; then
-  features=milkv-duo,milkv-jitterentropy-probe
+  features=milkv-jitterentropy-probe
   output_dir="$repo_root/target/milkv-duo-jitterentropy-probe"
   output_elf="$output_dir/vibeos-milkv-duo-jitterentropy-probe.elf"
 fi
 
 (
-  cd "$repo_root/kernel"
+  cd "$repo_root/firmware/milkv-duo"
   RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
     rustup run "$toolchain" cargo build --release --no-default-features \
       --features "$features"
 )
 
-built_elf="$repo_root/target/riscv64imac-unknown-none-elf/release/vibeos-kernel"
-output_bin="$output_dir/vibeos-kernel.bin"
+built_elf="$repo_root/target/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
+output_bin="$output_dir/vibeos-milkv-duo.bin"
 
 if [ ! -f "$built_elf" ]; then
   echo "build-milkv-duo.sh: kernel ELF not found after build: $built_elf" >&2

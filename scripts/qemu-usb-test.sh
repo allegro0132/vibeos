@@ -5,7 +5,7 @@ set -eu
 cd "$(dirname "$0")/.."
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 QEMU_SMP=${QEMU_SMP:-1}
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 SEED='VIBEOS-USB-SECTOR-7-SEED-v1'
 WRITE='VIBEOS-USB-SECTOR-8-WRITE-v1'
 
@@ -21,7 +21,7 @@ fi
 
 pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
-(cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+(cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features legacy-shell) >&2
 
 work=$(mktemp -d)

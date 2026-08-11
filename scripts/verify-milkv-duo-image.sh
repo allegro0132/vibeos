@@ -54,7 +54,7 @@ elif [[ "$jitterentropy_probe" == true ]]; then
 fi
 image="$output_dir/$image_name"
 expected_fit="$output_dir/boot.sd"
-expected_kernel="$output_dir/vibeos-kernel.bin"
+expected_kernel="$output_dir/vibeos-milkv-duo.bin"
 mkimage="$sdk_root/u-boot-2021.10/build/cv1800b_milkv_duo_sd/tools/mkimage"
 dumpimage="$sdk_root/u-boot-2021.10/build/cv1800b_milkv_duo_sd/tools/dumpimage"
 expected_dtb="$sdk_root/linux_5.10/build/cv1800b_milkv_duo_sd/arch/riscv/boot/dts/cvitek/cv1800b_milkv_duo_sd.dtb"

@@ -1,0 +1,22 @@
+[package]
+name = "vibeos-firmware-qemu-virt"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+legacy-shell = ["vibeos-kernel/legacy-shell"]
+tcp-echo = ["vibeos-kernel/tcp-echo"]
+tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
+ssh-security-test = ["vibeos-kernel/ssh-security-test"]
+ssh-test = ["vibeos-kernel/ssh-test"]
+
+[[bin]]
+name = "vibeos-qemu-virt"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vibeos-kernel = { path = "../../kernel", default-features = false, features = ["qemu-virt"] }

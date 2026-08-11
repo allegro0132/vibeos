@@ -91,6 +91,8 @@ pub fn install_standard_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, BASE_COMMANDS);
     #[cfg(feature = "qemu-virt")]
     vibeos_vsh::install_commands(session, QEMU_COMMANDS);
+    #[cfg(feature = "milkv-duo")]
+    vibeos_vsh::install_commands(session, MILKV_USB_COMMANDS);
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
@@ -248,6 +250,14 @@ const QEMU_COMMANDS: &[CommandSpec] = &[
         handler: vsh_usb,
     },
 ];
+
+#[cfg(feature = "milkv-duo")]
+const MILKV_USB_COMMANDS: &[CommandSpec] = &[CommandSpec {
+    name: "lsusb",
+    min_args: 0,
+    max_args: 0,
+    handler: vsh_lsusb,
+}];
 
 #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
 const NETWORK_COMMANDS: &[CommandSpec] = &[
@@ -412,6 +422,55 @@ pub(crate) fn vsh_usb(args: &[String]) -> Result<String, Status> {
         }
         _ => Err(Status::Usage),
     }
+}
+
+#[cfg(feature = "milkv-duo")]
+fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
+    let Some(snapshot) = crate::dwc2_host::snapshot() else {
+        return Ok(String::from("DWC2 offline\n"));
+    };
+    let port = if snapshot.connected {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    let mut output = format!(
+        "Bus 001 DWC2 release={:#06x} irq={} channels={} port={} hprt={:#010x}\n",
+        snapshot.info.release,
+        snapshot.info.irq,
+        snapshot.info.host_channels,
+        port,
+        snapshot.telemetry.hprt0,
+    );
+    let Some(device) = snapshot.device else {
+        output.push_str(if snapshot.connected {
+            "Bus 001 Device --- connected, not enumerated\n"
+        } else {
+            "Bus 001 Device --- none\n"
+        });
+        return Ok(output);
+    };
+    output.push_str(&format!(
+        "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={}\n",
+        device.address,
+        device.vendor_id,
+        device.product_id,
+        device.speed,
+        device.usb_version,
+        device.device_class,
+        device.max_packet_size_0,
+    ));
+    match snapshot.keyboard {
+        Some(keyboard) => output.push_str(&format!(
+            "  HID boot-keyboard interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            keyboard.interface,
+            keyboard.endpoint_in,
+            keyboard.max_packet_size,
+            keyboard.interval_ms,
+        )),
+        None => output.push_str("  HID boot-keyboard not configured\n"),
+    }
+    Ok(output)
 }
 
 fn vsh_quiet(_args: &[String]) -> Result<String, Status> {

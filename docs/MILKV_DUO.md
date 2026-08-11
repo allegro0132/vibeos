@@ -143,6 +143,13 @@ IRQ in
 and
 [`cv180x_base_riscv.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi).
 
+The physical UART VSH exposes `lsusb` for live diagnosis. It reports the DWC2
+release, IRQ, channel count, root-port state and raw `HPRT`, followed by the
+addressed device's VID:PID, speed, USB version and endpoint-zero packet size.
+For a usable keyboard it also prints `HID boot-keyboard` with the selected
+interface and interrupt-IN endpoint. `connected, not enumerated` distinguishes
+an electrical connection from successful USB protocol enumeration.
+
 The stock board memory map also declares an approximately 26.8 MiB ION region
 for Linux multimedia drivers, but `FREERTOS_RESERVED_ION_SIZE` is 0 in this
 configuration. VibeOS does not run those Linux drivers, so the current port uses
@@ -549,9 +556,11 @@ gate. This is DWMAC/IPv4/TCP evidence only and does not claim SSH availability.
 For the first hardware boot, preserve the full serial log and verify each item.
 For the USB HID gate, build `./scripts/build-milkv-duo.sh --diagnostic`, capture
 UART0 at 115200 8N1 to a file, and boot with the USB keyboard disconnected.
-After the `vibe>` prompt appears, attach the keyboard, type `uptime`, unplug it,
-wait for the disconnect diagnostic, reconnect it, and type `uptime` again. Do
-not type either command through UART: the two echoed commands are the evidence
+After the `vibe>` prompt appears, attach the keyboard and run `lsusb` through
+UART first. Continue only if it reports the device ID and `HID boot-keyboard`.
+Then type `uptime` on the USB keyboard, unplug it, wait for the disconnect
+diagnostic, reconnect it, confirm `lsusb` again through UART, and type `uptime`
+again on the USB keyboard. The two echoed `uptime` commands are the evidence
 that HID reached the console input queue. Analyze the preserved log with:
 
 ```sh

@@ -5,6 +5,15 @@ use vibeos_driver_dwc2_host::{Controller, DeviceInfo, Error, HidKeyboardInfo, In
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Snapshot {
+    pub info: Info,
+    pub connected: bool,
+    pub device: Option<DeviceInfo>,
+    pub keyboard: Option<HidKeyboardInfo>,
+    pub telemetry: Telemetry,
+}
+
 pub fn init() -> Result<Info, Error> {
     let mut published = CONTROLLER.lock();
     if let Some(controller) = published.as_ref() {
@@ -33,6 +42,16 @@ pub fn connected() -> bool {
 
 pub fn info() -> Option<Info> {
     CONTROLLER.lock().as_ref().map(Controller::info)
+}
+
+pub fn snapshot() -> Option<Snapshot> {
+    CONTROLLER.lock().as_ref().map(|controller| Snapshot {
+        info: controller.info(),
+        connected: controller.connected(),
+        device: controller.device(),
+        keyboard: controller.keyboard(),
+        telemetry: controller.telemetry(),
+    })
 }
 
 pub fn enumerate_device() -> Result<Option<DeviceInfo>, Error> {

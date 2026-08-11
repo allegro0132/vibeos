@@ -63,13 +63,13 @@ impl Platform for SshPlatform {
             .space
             .0
             .lock()
-            .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::INVOKE)
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
             .map_err(|_| NetworkBindError::Denied)?;
-        crate::virtio_net::bind_stack_with(&lease).map_err(|error| match error {
-            crate::virtio_net::NetError::Offline => NetworkBindError::Offline,
-            crate::virtio_net::NetError::SessionBusy => NetworkBindError::SessionBusy,
-            crate::virtio_net::NetError::AuthorityRevoked
-            | crate::virtio_net::NetError::PermissionDenied => NetworkBindError::Denied,
+        crate::net_device::bind_stack_with(&lease).map_err(|error| match error {
+            crate::net_device::NetError::Offline => NetworkBindError::Offline,
+            crate::net_device::NetError::SessionBusy => NetworkBindError::SessionBusy,
+            crate::net_device::NetError::AuthorityRevoked
+            | crate::net_device::NetError::PermissionDenied => NetworkBindError::Denied,
             _ => NetworkBindError::Failed,
         })
     }
@@ -79,9 +79,9 @@ impl Platform for SshPlatform {
             .space
             .0
             .lock()
-            .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::READ)
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
             .ok()?;
-        let info = crate::virtio_net::info_with(&lease).ok()?;
+        let info = crate::net_device::info_with(&lease).ok()?;
         Some(NetworkInfo {
             online: info.online,
             quarantined: info.quarantined,

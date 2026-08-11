@@ -13,17 +13,17 @@ use core::fmt;
 use core::future::Future;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::block_device;
 use crate::cap::{self, CSpace, Cap, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryRegion};
 use crate::durable_cspace;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::net::{Endpoint as NetEndpoint, StampedPacket};
+use crate::net_device;
 use crate::saved_program;
 use crate::store;
 use crate::sync::SpinLock;
-use crate::virtio_blk;
-use crate::virtio_net;
 #[cfg(feature = "qemu-virt")]
 use crate::virtio_rng;
 use crate::{exec, HEAP};
@@ -91,8 +91,8 @@ enum ComponentTemplate {
     Sensor,
     Logger,
     Guest,
-    VirtioBlk,
-    VirtioNet,
+    BlockDriver,
+    NetDriver,
     #[cfg(feature = "qemu-virt")]
     VirtioRng,
     #[cfg(feature = "ssh-security-test")]
@@ -112,12 +112,12 @@ enum ComponentGrants {
         console: Cap,
     },
     Guest(Cap),
-    VirtioBlk {
+    BlockDriver {
         mmio: Cap,
         dma: Cap,
         service: Cap,
     },
-    VirtioNet {
+    NetDriver {
         mmio: Cap,
         dma: Cap,
         outbound: Cap,
@@ -678,14 +678,14 @@ impl World {
             };
         }
 
-        if template == ComponentTemplate::VirtioNet {
+        if template == ComponentTemplate::NetDriver {
             let policy = self
                 .net_policy
                 .as_ref()
                 .expect("network policy CSpace exists");
             let policy = policy.0.lock();
             let mut target = space.0.lock();
-            return ComponentGrants::VirtioNet {
+            return ComponentGrants::NetDriver {
                 mmio: cap::grant(
                     &policy,
                     self.net_mmio.expect("network MMIO root exists"),
@@ -779,7 +779,7 @@ impl World {
                 cap::grant(&init, self.console, Rights::WRITE, &mut target)
                     .expect("init retains the console grant root"),
             ),
-            ComponentTemplate::VirtioBlk => ComponentGrants::VirtioBlk {
+            ComponentTemplate::BlockDriver => ComponentGrants::BlockDriver {
                 mmio: cap::grant(
                     &init,
                     self.block_mmio.expect("block MMIO root exists"),
@@ -802,7 +802,7 @@ impl World {
                 )
                 .expect("init retains the block service grant root"),
             },
-            ComponentTemplate::VirtioNet => {
+            ComponentTemplate::NetDriver => {
                 unreachable!("network grants come from the private policy CSpace")
             }
             #[cfg(feature = "qemu-virt")]
@@ -861,14 +861,14 @@ impl World {
             ComponentGrants::Guest(console) => unsafe {
                 exec::spawn_reclaimable_owned(domain, &component.name, guest_task(space, console))
             },
-            ComponentGrants::VirtioBlk { mmio, dma, service } => unsafe {
+            ComponentGrants::BlockDriver { mmio, dma, service } => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    virtio_blk::driver_task(space.get(), mmio, dma, service),
+                    block_device::driver_task(space.get(), mmio, dma, service),
                 )
             },
-            ComponentGrants::VirtioNet {
+            ComponentGrants::NetDriver {
                 mmio,
                 dma,
                 outbound,
@@ -878,7 +878,7 @@ impl World {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    virtio_net::driver_task(space.get(), mmio, dma, outbound, inbound, control),
+                    net_device::driver_task(space.get(), mmio, dma, outbound, inbound, control),
                 )
             },
             #[cfg(feature = "qemu-virt")]
@@ -1207,7 +1207,7 @@ pub fn start_block_supervisor() {
         while recovery_pending {
             let snapshot = component.snapshot();
             match snapshot.state {
-                exec::TaskState::Running if virtio_blk::is_online() => {
+                exec::TaskState::Running if block_device::is_online() => {
                     let service = durable_cspace
                         .as_ref()
                         .expect("a pending durable recovery has a service");
@@ -1446,7 +1446,7 @@ pub fn build() {
     let logger = Space::new("logger");
     let guest = Space::new("guest");
     let prog = Space::new("prog");
-    let block_resources = virtio_blk::discover();
+    let block_resources = block_device::discover();
     let saved_program_policy = block_resources
         .as_ref()
         .map(|_| Space::new("saved-program-policy"));
@@ -1454,7 +1454,7 @@ pub fn build() {
         .as_ref()
         .map(|_| Space::new_persistent("saved-program", crate::program::program_space_id()));
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
-    let net_resources = virtio_net::discover();
+    let net_resources = net_device::discover();
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
     let net_policy = net_resources
         .as_ref()
@@ -2093,8 +2093,8 @@ pub fn build() {
             "virtio-blk",
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
-            Some(ComponentTemplate::VirtioBlk),
-            virtio_blk::driver_task(SpaceRef::new(&space).get(), mmio, dma, service),
+            Some(ComponentTemplate::BlockDriver),
+            block_device::driver_task(SpaceRef::new(&space).get(), mmio, dma, service),
         );
     }
 
@@ -2103,8 +2103,8 @@ pub fn build() {
             "virtio-net",
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
-            Some(ComponentTemplate::VirtioNet),
-            virtio_net::driver_task(
+            Some(ComponentTemplate::NetDriver),
+            net_device::driver_task(
                 SpaceRef::new(&space).get(),
                 mmio,
                 dma,

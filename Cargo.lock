@@ -775,7 +775,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-dwmac-net"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-driver-pci"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
+name = "vibeos-driver-sdhci-blk"
 version = "0.1.0"
 dependencies = [
  "vibeos-hal",
@@ -844,7 +859,9 @@ dependencies = [
  "vibeos-bsp-milkv-duo",
  "vibeos-bsp-qemu-virt",
  "vibeos-core",
+ "vibeos-driver-dwmac-net",
  "vibeos-driver-pci",
+ "vibeos-driver-sdhci-blk",
  "vibeos-driver-virtio-blk",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",

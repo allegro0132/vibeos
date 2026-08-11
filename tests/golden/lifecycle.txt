@@ -20,7 +20,7 @@ vibe> caps guest
   owner component:3  task task:3  name guest  state cancelled  reason cancelled
   memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
-  rights: r=read w=write s=send v=recv g=grant x=revoke
+  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> restart guest
   restarted component:3  generation 1 -> 2
   task task:3 -> task:7; retired 0 old cap(s), fresh grants installed
@@ -39,7 +39,7 @@ vibe> caps guest
   memory owner component:3  budget 65536 B  quota denials 0
   HANDLE       KIND      RIGHTS   OBJECT
   cap:0.1      console   -w----   ns16550a @ 0xADDR [62 bytes out]
-  rights: r=read w=write s=send v=recv g=grant x=revoke
+  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> restart guest
   refused: component is still running; cancel it first
 vibe> cancel guest

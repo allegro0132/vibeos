@@ -75,7 +75,10 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if ! run_cargo test --workspace --exclude vibeos-sshd -- --list --format terse \
+if ! run_cargo test --workspace \
+  --exclude vibeos-kernel \
+  --exclude vibeos-firmware-qemu-virt \
+  --exclude vibeos-firmware-milkv-duo -- --list --format terse \
   >"$tmpdir/host-tests" 2>"$tmpdir/cargo.stderr"; then
   sed -n '1,40p' "$tmpdir/cargo.stderr" >&2
   echo "status: cargo could not enumerate host tests" >&2
@@ -88,7 +91,10 @@ if ! run_cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   echo "status: cargo could not enumerate Sunset host tests" >&2
   exit 1
 fi
-if ! run_cargo test --workspace --exclude vibeos-sshd -- --list --ignored --format terse \
+if ! run_cargo test --workspace \
+  --exclude vibeos-kernel \
+  --exclude vibeos-firmware-qemu-virt \
+  --exclude vibeos-firmware-milkv-duo -- --list --ignored --format terse \
   >"$tmpdir/ignored-tests" 2>"$tmpdir/cargo-ignored.stderr"; then
   sed -n '1,40p' "$tmpdir/cargo-ignored.stderr" >&2
   echo "status: cargo could not enumerate ignored host tests" >&2

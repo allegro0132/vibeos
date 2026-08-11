@@ -4,7 +4,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 QEMU_SMP=${QEMU_SMP:-4}
 QEMU_ACCEL=${QEMU_ACCEL:-tcg,thread=multi}
@@ -245,7 +245,7 @@ python3 -B scripts/openssh-peer.py --selftest >/dev/null \
   || fail "OpenSSH peer self-test failed"
 
 echo "ssh-test: building the explicit QEMU test-identity image"
-if ! (cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+if ! (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features ssh-test) >&2; then
   fail "kernel build failed"
 fi

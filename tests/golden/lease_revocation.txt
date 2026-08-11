@@ -14,5 +14,5 @@ lease-visible
 vibe> caps prog
   owner unbound (generated code executes synchronously in the shell task)
   HANDLE       KIND      RIGHTS   OBJECT
-  rights: r=read w=write s=send v=recv g=grant x=revoke
+  rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> 

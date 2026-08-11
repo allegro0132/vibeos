@@ -1,6 +1,7 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/* The first Duo profile admits 60 MiB to the S-mode firmware image. */
 MEMORY {
   RAM (rwxa) : ORIGIN = 0x80200000, LENGTH = 60M
 }

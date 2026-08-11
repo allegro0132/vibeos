@@ -1,6 +1,7 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/* QEMU virt exposes 128 MiB; OpenSBI occupies the first 2 MiB. */
 MEMORY {
   RAM (rwxa) : ORIGIN = 0x80200000, LENGTH = 126M
 }

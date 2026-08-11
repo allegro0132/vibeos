@@ -39,11 +39,13 @@ pub(crate) use crate::virtio_net::{
 /// prevents service adapters from depending on a board-specific `NetInfo`
 /// layout.
 #[cfg(feature = "qemu-virt")]
+#[allow(dead_code)]
 pub const fn carrier_up(_info: &NetInfo) -> bool {
     true
 }
 
 #[cfg(feature = "milkv-duo")]
+#[allow(dead_code)]
 pub const fn carrier_up(info: &NetInfo) -> bool {
     info.phy_link_up
 }

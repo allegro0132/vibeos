@@ -1,0 +1,21 @@
+[package]
+name = "vibeos-firmware-milkv-duo"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = ["net-shell"]
+net-shell = ["vibeos-kernel/net-shell"]
+legacy-shell = ["vibeos-kernel/legacy-shell"]
+milkv-ssh-acceptance = ["vibeos-kernel/milkv-ssh-acceptance"]
+milkv-jitterentropy-probe = ["vibeos-kernel/milkv-jitterentropy-probe"]
+
+[[bin]]
+name = "vibeos-milkv-duo"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vibeos-kernel = { path = "../../kernel", default-features = false, features = ["milkv-duo"] }

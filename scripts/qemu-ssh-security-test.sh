@@ -4,7 +4,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-kernel
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 QEMU_ACCEL=${QEMU_ACCEL:-tcg}
 SSH_SECURITY_TIMEOUT=${SSH_SECURITY_TIMEOUT:-20}
@@ -54,7 +54,7 @@ pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc) \
   || fail "cannot locate rustdoc for $toolchain"
 
 echo "ssh-security-test: building the explicit test-identity image"
-(cd kernel && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+(cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features ssh-security-test) >&2 \
   || fail "kernel build failed"
 

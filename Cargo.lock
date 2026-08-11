@@ -775,6 +775,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-firmware-milkv-duo"
+version = "0.1.0"
+dependencies = [
+ "vibeos-kernel",
+]
+
+[[package]]
+name = "vibeos-firmware-qemu-virt"
+version = "0.1.0"
+dependencies = [
+ "vibeos-kernel",
+]
+
+[[package]]
 name = "vibeos-hal"
 version = "0.1.0"
 

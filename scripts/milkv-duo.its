@@ -7,7 +7,7 @@
 	images {
 		kernel {
 			description = "VibeOS kernel";
-			data = /incbin/("vibeos-kernel.bin");
+			data = /incbin/("vibeos-milkv-duo.bin");
 			type = "kernel";
 			arch = "riscv";
 			os = "linux";

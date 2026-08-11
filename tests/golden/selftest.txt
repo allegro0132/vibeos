@@ -8,39 +8,39 @@ deliberate destructor fault from the self-test
 deliberate nested catcher fault from the self-test
 [!] panic: panicked at kernel/src/selftest_platform.rs:LINE:COL:
 deliberate fault from the self-test
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-[!] panic: panicked at kernel/src/main.rs:LINE:COL:
+[!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
   selftest: 388 passed, 0 failed
   SELFTEST OK (388 checks)

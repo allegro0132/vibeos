@@ -54,7 +54,7 @@ elif [[ "$jitterentropy_probe" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-jitterentropy-probe"
   image_name="vibeos-milkv-duo-jitterentropy-probe-sd.img"
 fi
-kernel_bin="$output_dir/vibeos-kernel.bin"
+kernel_bin="$output_dir/vibeos-milkv-duo.bin"
 output_its="$output_dir/milkv-duo.its"
 output_dtb="$output_dir/cv1800b_milkv_duo_sd.dtb"
 output_fit="$output_dir/boot.sd"

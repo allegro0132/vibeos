@@ -10,7 +10,6 @@
 //!      switch.
 
 #![no_std]
-#![no_main]
 #![feature(alloc_error_handler)]
 #![cfg_attr(not(feature = "legacy-shell"), allow(dead_code))]
 
@@ -154,8 +153,8 @@ global_asm!(
     r#"
 .option norvc
 .section .text.boot
-.global _start
-_start:
+.global vibeos_kernel_start
+vibeos_kernel_start:
     csrw sie, zero
     csrw sip, zero
     // Zero is the fail-closed "no logical hart" encoding. `mark_online`

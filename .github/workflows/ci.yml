@@ -26,22 +26,18 @@ jobs:
           rustup run "$toolchain" rustc -Vv
           rustup run "$toolchain" cargo -V
       - name: Test the portable core, compiler, and Sunset fork
-        # The kernel binary is no_std and has `test = false`; its tests run
-        # inside QEMU in the job below.
+        # The kernel archive and final firmware binaries are no_std; their
+        # tests run inside QEMU in the job below.
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --workspace \
-              --exclude vibeos-sshd --verbose
+              --exclude vibeos-kernel \
+              --exclude vibeos-firmware-qemu-virt \
+              --exclude vibeos-firmware-milkv-duo --verbose
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
             rustup run "$VIBEOS_TOOLCHAIN" cargo test \
               --manifest-path vendor/sunset/Cargo.toml -p sunset \
               --no-default-features --features alloc --verbose
-          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
-            rustup run "$VIBEOS_TOOLCHAIN" cargo check -p vibeos-sshd \
-              --features qemu-virt
-          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
-            rustup run "$VIBEOS_TOOLCHAIN" cargo check -p vibeos-sshd \
-              --features milkv-ssh-acceptance
       - name: Report repository status
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
@@ -104,6 +100,10 @@ jobs:
         # FIT/full-card packaging still requires a prebuilt official SDK and
         # remains part of the documented manual hardware acceptance flow.
         run: ./scripts/build-milkv-duo.sh
+      - name: Build the Milk-V Duo diagnostic image
+        run: ./scripts/build-milkv-duo.sh --diagnostic
+      - name: Build the Milk-V Duo SSH acceptance image
+        run: ./scripts/build-milkv-duo.sh --ssh-acceptance
       - name: Build the Milk-V Duo Jitterentropy probe
         run: ./scripts/build-milkv-duo.sh --jitterentropy-probe
       - name: Golden transcripts

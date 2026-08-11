@@ -418,6 +418,22 @@ pub extern "C" fn kmain() -> ! {
             usb.phy_utmi_control,
         );
     }
+    #[cfg(feature = "milkv-duo")]
+    if dwc2_host::connected() {
+        match dwc2_host::enumerate_device() {
+            Ok(Some(device)) => println!(
+                "  usb dev   addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
+                device.address,
+                device.speed,
+                device.vendor_id,
+                device.product_id,
+                device.usb_version,
+                device.max_packet_size_0,
+            ),
+            Ok(None) => println!("  usb dev   disconnected during enumeration"),
+            Err(error) => println!("  usb dev   enumeration FAILED: {:?}", error),
+        }
+    }
     assert!(
         mmu::wx_remote_fence_ready(),
         "multicore W^X requires the SBI RFENCE extension"

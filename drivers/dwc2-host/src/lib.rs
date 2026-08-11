@@ -5,7 +5,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{compiler_fence, AtomicBool, Ordering},
+};
 use vibeos_hal::Dwc2Description;
 
 const TOP_USB_ROLE: usize = 0x48;
@@ -28,20 +31,64 @@ const GHWCFG4: usize = 0x050;
 const GSNPSID: usize = 0x040;
 const HCFG: usize = 0x400;
 const HPRT0: usize = 0x440;
+const HC_BASE: usize = 0x500;
+const HC_STRIDE: usize = 0x20;
+const HCCHAR: usize = 0x00;
+const HCSPLT: usize = 0x04;
+const HCINT: usize = 0x08;
+const HCINTMSK: usize = 0x0c;
+const HCTSIZ: usize = 0x10;
+const HCDMA: usize = 0x14;
 
 const GAHBCFG_GLOBAL_INTERRUPT: u32 = 1;
+const GAHBCFG_BURST_INCR4: u32 = 3 << 1;
+const GAHBCFG_DMA_ENABLE: u32 = 1 << 5;
 const GUSBCFG_FORCE_HOST: u32 = 1 << 29;
 const GUSBCFG_FORCE_DEVICE: u32 = 1 << 30;
 const GRSTCTL_CORE_SOFT_RESET: u32 = 1;
 const GRSTCTL_AHB_IDLE: u32 = 1 << 31;
+const GRSTCTL_RX_FIFO_FLUSH: u32 = 1 << 4;
+const GRSTCTL_TX_FIFO_FLUSH: u32 = 1 << 5;
+const GRSTCTL_TX_FIFO_ALL: u32 = 0x10 << 6;
 const GINTSTS_CURRENT_MODE_HOST: u32 = 1;
 const HPRT_CONNECT: u32 = 1;
+const HPRT_ENABLE: u32 = 1 << 2;
+const HPRT_RESET: u32 = 1 << 8;
 const HPRT_CHANGE_BITS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
 const HPRT_POWER: u32 = 1 << 12;
+const HPRT_SPEED_SHIFT: u32 = 17;
+const HPRT_SPEED_MASK: u32 = 0x3 << HPRT_SPEED_SHIFT;
+
+const HCCHAR_ENDPOINT_SHIFT: u32 = 11;
+const HCCHAR_DIRECTION_IN: u32 = 1 << 15;
+const HCCHAR_LOW_SPEED: u32 = 1 << 17;
+const HCCHAR_TYPE_SHIFT: u32 = 18;
+const HCCHAR_ADDRESS_SHIFT: u32 = 22;
+const HCCHAR_DISABLE: u32 = 1 << 30;
+const HCCHAR_ENABLE: u32 = 1 << 31;
+const HCTSIZ_PACKET_SHIFT: u32 = 19;
+const HCTSIZ_PID_SHIFT: u32 = 29;
+const HCINT_TRANSFER_COMPLETE: u32 = 1;
+const HCINT_CHANNEL_HALTED: u32 = 1 << 1;
+const HCINT_STALL: u32 = 1 << 3;
+const HCINT_NAK: u32 = 1 << 4;
+const HCINT_ERRORS: u32 = (1 << 2) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10);
+
 const REGISTER_TIMEOUT_MS: u64 = 10;
 const HOST_MODE_TIMEOUT_MS: u64 = 110;
+const TRANSFER_TIMEOUT_MS: u64 = 250;
+const DMA_BYTES: usize = 1_024;
+const MAX_NAK_RETRIES: usize = 32;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
+
+#[repr(C, align(64))]
+struct DmaBuffer(UnsafeCell<[u8; DMA_BYTES]>);
+
+unsafe impl Sync for DmaBuffer {}
+
+#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
+static DMA: DmaBuffer = DmaBuffer(UnsafeCell::new([0; DMA_BYTES]));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -51,6 +98,60 @@ pub enum Error {
     AhbIdleTimedOut,
     CoreResetTimedOut,
     HostModeTimedOut,
+    UnsupportedDma(u8),
+    DmaAddressTooWide,
+    NoDevice,
+    PortResetTimedOut,
+    BufferTooSmall,
+    InvalidDescriptor,
+    TransferTimedOut,
+    TransferFailed(u32),
+    Stalled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Speed {
+    High,
+    Full,
+    Low,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub address: u8,
+    pub speed: Speed,
+    pub usb_version: u16,
+    pub device_class: u8,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub max_packet_size_0: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetupPacket {
+    pub request_type: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub length: u16,
+}
+
+impl SetupPacket {
+    pub const fn to_bytes(self) -> [u8; 8] {
+        let value = self.value.to_le_bytes();
+        let index = self.index.to_le_bytes();
+        let length = self.length.to_le_bytes();
+        [
+            self.request_type,
+            self.request,
+            value[0],
+            value[1],
+            index[0],
+            index[1],
+            length[0],
+            length[1],
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +180,12 @@ pub struct Telemetry {
 pub struct Controller {
     description: Dwc2Description,
     info: Info,
+    timebase_hz: u64,
+    time: fn() -> u64,
+    device_address: u8,
+    endpoint_zero_max_packet: u16,
+    speed: Speed,
+    device: Option<DeviceInfo>,
 }
 
 impl Controller {
@@ -218,18 +325,48 @@ impl Controller {
         let hwcfg2 = unsafe { core_read(description, GHWCFG2) };
         let hwcfg3 = unsafe { core_read(description, GHWCFG3) };
         let hwcfg4 = unsafe { core_read(description, GHWCFG4) };
+        let dma_architecture = ((hwcfg2 >> 3) & 0x3) as u8;
+        if dma_architecture == 0 {
+            return Err(Error::UnsupportedDma(dma_architecture));
+        }
+        let dma_address = DMA.0.get() as usize;
+        if dma_address > u32::MAX as usize
+            || dma_address.saturating_add(DMA_BYTES) > (1usize << description.dma_address_bits)
+        {
+            return Err(Error::DmaAddressTooWide);
+        }
+        unsafe {
+            let ahbcfg = core_read(description, GAHBCFG);
+            core_write(
+                description,
+                GAHBCFG,
+                (ahbcfg & !0x1e) | GAHBCFG_BURST_INCR4 | GAHBCFG_DMA_ENABLE,
+            );
+        }
+        flush_fifos(description, timebase_hz, time)?;
+
+        let host_channels = host_channel_count(hwcfg2);
+        for channel in 0..host_channels {
+            halt_channel(description, channel, timebase_hz, time)?;
+        }
         Ok(Self {
             description,
             info: Info {
                 core_id,
                 release: core_id as u16,
                 irq: description.irq,
-                host_channels: host_channel_count(hwcfg2),
+                host_channels,
                 dynamic_fifo: hwcfg2 & (1 << 19) != 0,
-                dma_architecture: ((hwcfg2 >> 3) & 0x3) as u8,
+                dma_architecture,
                 fifo_depth_words: (hwcfg3 >> 16) as u16,
                 dedicated_fifos: hwcfg4 & (1 << 25) != 0,
             },
+            timebase_hz,
+            time,
+            device_address: 0,
+            endpoint_zero_max_packet: 8,
+            speed: Speed::Full,
+            device: None,
         })
     }
 
@@ -250,6 +387,265 @@ impl Controller {
             hprt0: unsafe { core_read(self.description, HPRT0) },
             phy_utmi_control: unsafe { phy_read(self.description, 0x14) },
         }
+    }
+
+    pub const fn device(&self) -> Option<DeviceInfo> {
+        self.device
+    }
+
+    /// Reset the directly attached root-port device and complete USB address
+    /// and device-descriptor enumeration through endpoint zero.
+    pub fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {
+        if !self.connected() {
+            self.device = None;
+            self.device_address = 0;
+            return Ok(None);
+        }
+
+        self.reset_port()?;
+        self.speed = port_speed(unsafe { core_read(self.description, HPRT0) })?;
+        self.device_address = 0;
+        self.endpoint_zero_max_packet = match self.speed {
+            Speed::High => 64,
+            Speed::Full | Speed::Low => 8,
+        };
+
+        let mut descriptor = [0u8; 18];
+        let prefix = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 1 << 8,
+            index: 0,
+            length: 8,
+        };
+        if self.control_transfer(prefix, &mut descriptor[..8])? != 8
+            || descriptor[0] != 18
+            || descriptor[1] != 1
+            || !matches!(descriptor[7], 8 | 16 | 32 | 64)
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.endpoint_zero_max_packet = u16::from(descriptor[7]);
+
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 5,
+                value: 1,
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.device_address = 1;
+        delay_ms(self.timebase_hz, self.time, 2);
+
+        let full = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 1 << 8,
+            index: 0,
+            length: descriptor.len() as u16,
+        };
+        if self.control_transfer(full, &mut descriptor)? != descriptor.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        let info = parse_device_descriptor(descriptor, self.speed, self.device_address)?;
+        self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
+        self.device = Some(info);
+        Ok(Some(info))
+    }
+
+    /// Execute one USB control request on the currently addressed endpoint 0.
+    /// The returned length is the actual data-stage byte count.
+    pub fn control_transfer(
+        &mut self,
+        setup: SetupPacket,
+        data: &mut [u8],
+    ) -> Result<usize, Error> {
+        let length = usize::from(setup.length);
+        if length > data.len() || length > DMA_BYTES {
+            return Err(Error::BufferTooSmall);
+        }
+        let direction_in = setup.request_type & 0x80 != 0;
+        unsafe { dma_bytes()[..8].copy_from_slice(&setup.to_bytes()) };
+        self.channel_transfer(
+            self.device_address,
+            0,
+            false,
+            EndpointType::Control,
+            DataPid::Setup,
+            8,
+        )?;
+
+        let actual = if length == 0 {
+            0
+        } else {
+            if !direction_in {
+                unsafe { dma_bytes()[..length].copy_from_slice(&data[..length]) };
+            }
+            let actual = self.channel_transfer(
+                self.device_address,
+                0,
+                direction_in,
+                EndpointType::Control,
+                DataPid::Data1,
+                length,
+            )?;
+            if direction_in {
+                unsafe { data[..actual].copy_from_slice(&dma_bytes()[..actual]) };
+            }
+            actual
+        };
+
+        self.channel_transfer(
+            self.device_address,
+            0,
+            length == 0 || !direction_in,
+            EndpointType::Control,
+            DataPid::Data1,
+            0,
+        )?;
+        Ok(actual)
+    }
+
+    fn reset_port(&mut self) -> Result<(), Error> {
+        if !self.connected() {
+            return Err(Error::NoDevice);
+        }
+        unsafe {
+            let port = core_read(self.description, HPRT0);
+            core_write(
+                self.description,
+                HPRT0,
+                (port & !HPRT_CHANGE_BITS) | HPRT_POWER | HPRT_RESET,
+            );
+        }
+        delay_ms(self.timebase_hz, self.time, 60);
+        unsafe {
+            let port = core_read(self.description, HPRT0);
+            core_write(
+                self.description,
+                HPRT0,
+                (port & !(HPRT_CHANGE_BITS | HPRT_RESET)) | HPRT_POWER,
+            );
+        }
+        delay_ms(self.timebase_hz, self.time, 20);
+        if !self.connected() {
+            return Err(Error::NoDevice);
+        }
+        wait_for(
+            self.description,
+            HPRT0,
+            HPRT_ENABLE,
+            true,
+            HOST_MODE_TIMEOUT_MS,
+            self.timebase_hz,
+            self.time,
+        )
+        .map_err(|_| Error::PortResetTimedOut)
+    }
+
+    fn channel_transfer(
+        &mut self,
+        address: u8,
+        endpoint: u8,
+        direction_in: bool,
+        endpoint_type: EndpointType,
+        pid: DataPid,
+        length: usize,
+    ) -> Result<usize, Error> {
+        if length > DMA_BYTES || endpoint > 15 || address > 127 {
+            return Err(Error::BufferTooSmall);
+        }
+        let max_packet = usize::from(self.endpoint_zero_max_packet);
+        let packet_count = if length == 0 {
+            1
+        } else {
+            length.div_ceil(max_packet)
+        };
+        let dma_address = DMA.0.get() as usize;
+
+        for _ in 0..MAX_NAK_RETRIES {
+            if direction_in {
+                invalidate_range(
+                    self.description.cache_line_bytes,
+                    dma_address,
+                    length.max(1),
+                );
+            } else {
+                clean_range(
+                    self.description.cache_line_bytes,
+                    dma_address,
+                    length.max(1),
+                );
+            }
+
+            let channel = 0;
+            unsafe {
+                channel_write(self.description, channel, HCINTMSK, 0);
+                channel_write(self.description, channel, HCINT, u32::MAX);
+                channel_write(self.description, channel, HCSPLT, 0);
+                channel_write(self.description, channel, HCDMA, dma_address as u32);
+                channel_write(
+                    self.description,
+                    channel,
+                    HCTSIZ,
+                    length as u32
+                        | (packet_count as u32) << HCTSIZ_PACKET_SHIFT
+                        | (pid as u32) << HCTSIZ_PID_SHIFT,
+                );
+                let mut character = self.endpoint_zero_max_packet as u32
+                    | u32::from(endpoint) << HCCHAR_ENDPOINT_SHIFT
+                    | (endpoint_type as u32) << HCCHAR_TYPE_SHIFT
+                    | u32::from(address) << HCCHAR_ADDRESS_SHIFT
+                    | HCCHAR_ENABLE;
+                if direction_in {
+                    character |= HCCHAR_DIRECTION_IN;
+                }
+                if self.speed == Speed::Low {
+                    character |= HCCHAR_LOW_SPEED;
+                }
+                channel_write(self.description, channel, HCCHAR, character);
+            }
+
+            let started = (self.time)();
+            let timeout = ticks_for_ms(self.timebase_hz, TRANSFER_TIMEOUT_MS);
+            loop {
+                let status = unsafe { channel_read(self.description, channel, HCINT) };
+                if status & HCINT_CHANNEL_HALTED != 0 {
+                    unsafe { channel_write(self.description, channel, HCINT, status) };
+                    if status & HCINT_TRANSFER_COMPLETE != 0 {
+                        let remaining =
+                            unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff }
+                                as usize;
+                        let actual = length.saturating_sub(remaining);
+                        if direction_in {
+                            invalidate_range(
+                                self.description.cache_line_bytes,
+                                dma_address,
+                                actual.max(1),
+                            );
+                        }
+                        return Ok(actual);
+                    }
+                    if status & HCINT_STALL != 0 {
+                        return Err(Error::Stalled);
+                    }
+                    if status & HCINT_NAK != 0 && status & HCINT_ERRORS == 0 {
+                        delay_ms(self.timebase_hz, self.time, 1);
+                        break;
+                    }
+                    return Err(Error::TransferFailed(status));
+                }
+                if (self.time)().wrapping_sub(started) >= timeout {
+                    let _ = halt_channel(self.description, channel, self.timebase_hz, self.time);
+                    return Err(Error::TransferTimedOut);
+                }
+                core::hint::spin_loop();
+            }
+        }
+        Err(Error::TransferFailed(HCINT_NAK))
     }
 
     /// Quiesce the host core and release software ownership. Clock gates stay
@@ -277,11 +673,164 @@ impl Drop for Controller {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum EndpointType {
+    Control = 0,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum DataPid {
+    Data1 = 2,
+    Setup = 3,
+}
+
+fn parse_device_descriptor(
+    descriptor: [u8; 18],
+    speed: Speed,
+    address: u8,
+) -> Result<DeviceInfo, Error> {
+    if descriptor[0] != 18 || descriptor[1] != 1 || !matches!(descriptor[7], 8 | 16 | 32 | 64) {
+        return Err(Error::InvalidDescriptor);
+    }
+    Ok(DeviceInfo {
+        address,
+        speed,
+        usb_version: u16::from_le_bytes([descriptor[2], descriptor[3]]),
+        device_class: descriptor[4],
+        vendor_id: u16::from_le_bytes([descriptor[8], descriptor[9]]),
+        product_id: u16::from_le_bytes([descriptor[10], descriptor[11]]),
+        max_packet_size_0: descriptor[7],
+    })
+}
+
+fn port_speed(port: u32) -> Result<Speed, Error> {
+    match (port & HPRT_SPEED_MASK) >> HPRT_SPEED_SHIFT {
+        0 => Ok(Speed::High),
+        1 => Ok(Speed::Full),
+        2 => Ok(Speed::Low),
+        _ => Err(Error::InvalidDescriptor),
+    }
+}
+
+fn flush_fifos(
+    description: Dwc2Description,
+    timebase_hz: u64,
+    time: fn() -> u64,
+) -> Result<(), Error> {
+    unsafe {
+        core_write(
+            description,
+            GRSTCTL,
+            GRSTCTL_TX_FIFO_FLUSH | GRSTCTL_TX_FIFO_ALL,
+        )
+    };
+    wait_for(
+        description,
+        GRSTCTL,
+        GRSTCTL_TX_FIFO_FLUSH,
+        false,
+        REGISTER_TIMEOUT_MS,
+        timebase_hz,
+        time,
+    )
+    .map_err(|_| Error::CoreResetTimedOut)?;
+    unsafe { core_write(description, GRSTCTL, GRSTCTL_RX_FIFO_FLUSH) };
+    wait_for(
+        description,
+        GRSTCTL,
+        GRSTCTL_RX_FIFO_FLUSH,
+        false,
+        REGISTER_TIMEOUT_MS,
+        timebase_hz,
+        time,
+    )
+    .map_err(|_| Error::CoreResetTimedOut)
+}
+
+fn halt_channel(
+    description: Dwc2Description,
+    channel: u8,
+    timebase_hz: u64,
+    time: fn() -> u64,
+) -> Result<(), Error> {
+    let character = unsafe { channel_read(description, channel, HCCHAR) };
+    if character & HCCHAR_ENABLE == 0 {
+        unsafe { channel_write(description, channel, HCINT, u32::MAX) };
+        return Ok(());
+    }
+    unsafe {
+        channel_write(
+            description,
+            channel,
+            HCCHAR,
+            character | HCCHAR_ENABLE | HCCHAR_DISABLE,
+        )
+    };
+    let started = time();
+    let timeout = ticks_for_ms(timebase_hz, REGISTER_TIMEOUT_MS);
+    while unsafe { channel_read(description, channel, HCCHAR) } & HCCHAR_ENABLE != 0 {
+        if time().wrapping_sub(started) >= timeout {
+            return Err(Error::TransferTimedOut);
+        }
+        core::hint::spin_loop();
+    }
+    unsafe { channel_write(description, channel, HCINT, u32::MAX) };
+    Ok(())
+}
+
+fn ticks_for_ms(timebase_hz: u64, milliseconds: u64) -> u64 {
+    (timebase_hz.saturating_mul(milliseconds).saturating_add(999) / 1_000).max(1)
+}
+
+fn delay_ms(timebase_hz: u64, time: fn() -> u64, milliseconds: u64) {
+    let started = time();
+    let duration = ticks_for_ms(timebase_hz, milliseconds);
+    while time().wrapping_sub(started) < duration {
+        core::hint::spin_loop();
+    }
+}
+
+unsafe fn dma_bytes() -> &'static mut [u8; DMA_BYTES] {
+    unsafe { &mut *DMA.0.get() }
+}
+
+fn clean_range(line: usize, start: usize, size: usize) {
+    cache_range(line, start, size, true)
+}
+
+fn invalidate_range(line: usize, start: usize, size: usize) {
+    cache_range(line, start, size, false)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn cache_range(bytes: usize, start: usize, size: usize, clean: bool) {
+    let mut line = start & !(bytes - 1);
+    let end = start.saturating_add(size).saturating_add(bytes - 1) & !(bytes - 1);
+    while line < end {
+        unsafe {
+            if clean {
+                core::arch::asm!(".long 0x0295000b", in("a0") line, options(nostack));
+            } else {
+                core::arch::asm!(".long 0x02a5000b", in("a0") line, options(nostack));
+            }
+        }
+        line += bytes;
+    }
+    unsafe { core::arch::asm!(".long 0x0190000b", options(nostack)) };
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn cache_range(_: usize, _: usize, _: usize, _: bool) {
+    compiler_fence(Ordering::SeqCst);
+}
+
 pub const fn validate_description(description: Dwc2Description) -> bool {
     range_contains(
         description.registers.start,
         description.registers.end,
-        HPRT0 + 4,
+        HC_BASE + 16 * HC_STRIDE,
     ) && range_contains(description.phy.start, description.phy.end, 0x18)
         && range_contains(
             description.soc_control.start,
@@ -290,6 +839,7 @@ pub const fn validate_description(description: Dwc2Description) -> bool {
         )
         && description.irq != 0
         && description.dma_address_bits == 32
+        && description.cache_line_bytes == 64
 }
 
 const fn range_contains(start: usize, end: usize, bytes: usize) -> bool {
@@ -326,6 +876,25 @@ fn wait_for(
             return Err(());
         }
         core::hint::spin_loop();
+    }
+}
+
+unsafe fn channel_read(description: Dwc2Description, channel: u8, offset: usize) -> u32 {
+    unsafe {
+        core_read(
+            description,
+            HC_BASE + usize::from(channel) * HC_STRIDE + offset,
+        )
+    }
+}
+
+unsafe fn channel_write(description: Dwc2Description, channel: u8, offset: usize, value: u32) {
+    unsafe {
+        core_write(
+            description,
+            HC_BASE + usize::from(channel) * HC_STRIDE + offset,
+            value,
+        )
     }
 }
 
@@ -368,6 +937,7 @@ mod tests {
         irq: 30,
         soc_control: AddressRange::new(0x0300_0000, 0x0300_a000),
         dma_address_bits: 32,
+        cache_line_bytes: 64,
     };
 
     #[test]
@@ -387,5 +957,32 @@ mod tests {
         assert!(!is_dwc2_core_id(0x5533_0000));
         assert_eq!(host_channel_count(0), 1);
         assert_eq!(host_channel_count(15 << 14), 16);
+    }
+
+    #[test]
+    fn setup_packet_and_device_descriptor_are_little_endian() {
+        assert_eq!(
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: 0x0100,
+                index: 0x0203,
+                length: 18,
+            }
+            .to_bytes(),
+            [0x80, 6, 0, 1, 3, 2, 18, 0]
+        );
+
+        let descriptor = [
+            18, 1, 0x10, 0x02, 0, 0, 0, 64, 0x34, 0x12, 0x78, 0x56, 0, 1, 0, 0, 0, 1,
+        ];
+        let info = parse_device_descriptor(descriptor, Speed::High, 1).unwrap();
+        assert_eq!(info.usb_version, 0x0210);
+        assert_eq!(info.vendor_id, 0x1234);
+        assert_eq!(info.product_id, 0x5678);
+        assert_eq!(info.max_packet_size_0, 64);
+        assert_eq!(port_speed(0), Ok(Speed::High));
+        assert_eq!(port_speed(1 << HPRT_SPEED_SHIFT), Ok(Speed::Full));
+        assert_eq!(port_speed(2 << HPRT_SPEED_SHIFT), Ok(Speed::Low));
     }
 }

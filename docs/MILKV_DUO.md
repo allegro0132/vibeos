@@ -84,7 +84,7 @@ bound.
 | virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
 | microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
 | Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
-| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up only |
+| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up plus EP0 enumeration |
 | Blue status LED | active-high GPIOC24; `drivers/milkv-duo-led` configures and verifies it after enabling Sv39 |
 
 The Duo USB & Ethernet IO Board V1.11 does not route the RJ45 LED terminals to
@@ -126,12 +126,13 @@ single root port. A successful boot prints a line like:
 usb       DWC2 0xNNNN @ 0x4340000, IRQ 30, N channel(s), port powered/waiting
 ```
 
-This is the controller bring-up boundary, not complete USB support. Interrupts
-and DMA remain disabled, and the current Milk-V path does not enumerate devices
-or publish HID/storage capabilities. The next layer must add control/bulk/
-interrupt transfers, descriptor enumeration, hub/hotplug handling, and class
-drivers before `usb info`, keyboard input, or USB storage can be claimed on the
-physical board. The official SDK describes the same core/PHY ranges and IRQ in
+The driver now also enables buffer DMA with explicit C906 cache maintenance,
+resets an attached root-port device, runs endpoint-zero SETUP/DATA/STATUS
+transactions, assigns address 1, and reads the complete device descriptor. It
+prints speed, VID:PID, USB version, and endpoint-zero packet size at boot.
+Interrupt endpoints, class configuration and hotplug remain absent, so this is
+not yet HID/storage support. The official SDK describes the same core/PHY
+ranges and IRQ in
 [`cv180x_base.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x/cv180x_base.dtsi)
 and
 [`cv180x_base_riscv.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi).
@@ -552,8 +553,9 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [ ] The boot log reports the DWC2 release, IRQ 30, host-channel count and a
       powered root port without a reset/host-mode timeout. Preserve the full
       UART log as the first physical USB bring-up artifact.
-- [ ] A low/full/high-speed USB device enumerates on the physical OTG port;
-      disconnect/reconnect, HID input, and storage I/O remain later gates.
+- [ ] A low/full/high-speed USB device completes address and device-descriptor
+      enumeration on the physical OTG port; disconnect/reconnect, HID input,
+      and storage I/O remain later gates.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

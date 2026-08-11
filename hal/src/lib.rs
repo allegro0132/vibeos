@@ -262,6 +262,7 @@ pub struct Dwc2Description {
     pub irq: u32,
     pub soc_control: AddressRange,
     pub dma_address_bits: u8,
+    pub cache_line_bytes: usize,
 }
 
 /// One GPIO-backed board status LED and its pad-mux wiring.

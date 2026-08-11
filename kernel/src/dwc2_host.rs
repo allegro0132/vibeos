@@ -1,7 +1,7 @@
 //! Kernel composition for the fixed CV1800B DWC2 host controller.
 
 use crate::sync::SpinLock;
-use vibeos_driver_dwc2_host::{Controller, Error, Info, Telemetry};
+use vibeos_driver_dwc2_host::{Controller, DeviceInfo, Error, Info, Telemetry};
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
 
@@ -29,6 +29,14 @@ pub fn connected() -> bool {
         .lock()
         .as_ref()
         .is_some_and(Controller::connected)
+}
+
+pub fn enumerate_device() -> Result<Option<DeviceInfo>, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .enumerate_device()
 }
 
 pub fn telemetry() -> Option<Telemetry> {

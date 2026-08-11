@@ -6,6 +6,8 @@
 //! support crate describes address ranges and device wiring through [`Board`];
 //! drivers consume the smaller device-specific descriptions.
 
+pub mod arch;
+
 /// Largest Ethernet frame handled by the network interface contract,
 /// excluding the four-byte frame check sequence supplied and consumed by the
 /// device.

@@ -156,6 +156,12 @@ For a usable keyboard it also prints `HID boot-keyboard` with the selected
 interface and interrupt-IN endpoint. `connected, not enumerated` distinguishes
 an electrical connection from successful USB protocol enumeration.
 
+The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
+(`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after
+enabling all five USB clocks. Host role selection powers VBUS before the DWC2
+core reset; omitting the UTMI pulse leaves `GRSTCTL.CSFTRST` stuck on physical
+hardware even though the APB register window and Synopsys core ID are readable.
+
 The stock board memory map also declares an approximately 26.8 MiB ION region
 for Linux multimedia drivers, but `FREERTOS_RESERVED_ION_SIZE` is 0 in this
 configuration. VibeOS does not run those Linux drivers, so the current port uses

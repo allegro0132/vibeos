@@ -24,7 +24,6 @@ pub mod net_stack;
 pub mod program;
 pub mod random;
 pub mod runqueue;
-pub mod ssh_identity;
 pub mod store;
 pub mod sync;
 pub mod terminal;

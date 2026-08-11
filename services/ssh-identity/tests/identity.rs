@@ -1,16 +1,12 @@
 //! Host tests for the minimal SSH identity and binary authorization boundary.
-//!
-//! The module is included by path until `vibeos-core` wires the implementation
-//! into `lib.rs`. Including it here also makes the explicitly test-only signer
-//! available under this integration test crate's `cfg(test)`.
 
-#[path = "../src/ssh_identity.rs"]
-mod ssh_identity;
+#[path = "../src/identity.rs"]
+mod identity;
 
 use core::mem;
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use ssh_identity::{
+use identity::{
     AuthorizedKeyEntry, AuthorizedKeyPolicy, AuthorizedKeyPolicyError, CapabilityProfileId,
     DeterministicTestHostSigner, HostSigner, ProvisionedHostSeed, ProvisionedHostSeedError,
     PublicKeyError, SshEd25519PublicKey, ED25519_PRIVATE_SEED_BYTES, SSH_ED25519_PUBLIC_KEY_BYTES,

@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+subtle = { version = "=2.6.1", default-features = false }
 vibeos-core = { path = "../../core" }
+zeroize = { version = "=1.9.0", default-features = false }

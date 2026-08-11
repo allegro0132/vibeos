@@ -37,7 +37,7 @@ use vibeos_core::net_config::Ipv4RuntimeStatus;
 pub use vibeos_core::net_config::StaticIpv4Address;
 use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
-use vibeos_core::ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
+use vibeos_ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
 use vibeos_core::sync::SpinLock;
 use vibeos_core::terminal::{
     FrontendError, TerminalEvent, TerminalFrontend, MAX_EMIT_TEXT_BYTES,

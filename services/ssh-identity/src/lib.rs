@@ -16,11 +16,10 @@ use core::fmt;
 use core::num::NonZeroU64;
 
 use vibeos_core::cap::{InvocationLease, Resource, Rights};
-use vibeos_core::ssh_identity::{
-    AuthorizedKeyEntry, AuthorizedKeyPolicy,
-    AuthorizedKeyPolicyError as CoreAuthorizedKeyPolicyError, CapabilityProfileId, HostSigner,
-    HostSignerError, ProvisionedHostSeed, SshEd25519PublicKey, SshEd25519Signature,
-};
+
+mod identity;
+
+pub use identity::*;
 
 /// Exact SHA-256 exchange-hash size for the sole acceptance key-exchange profile.
 /// A future SHA-512 profile must introduce a distinct typed operation instead
@@ -105,7 +104,7 @@ impl HostSigningService {
 
     /// Consume an opaque production or explicitly-marked test seed at the
     /// provisioning boundary, then erase its temporary owned copy through the
-    /// core `HostSigner` constructor.
+    /// service `HostSigner` constructor.
     pub fn from_provisioned_seed(
         seed: ProvisionedHostSeed,
         generation: SecurityGeneration,
@@ -179,10 +178,10 @@ pub enum AuthorizedKeyProvisionError {
     DuplicateKey { first: usize, second: usize },
 }
 
-impl From<CoreAuthorizedKeyPolicyError> for AuthorizedKeyProvisionError {
-    fn from(error: CoreAuthorizedKeyPolicyError) -> Self {
+impl From<AuthorizedKeyPolicyError> for AuthorizedKeyProvisionError {
+    fn from(error: AuthorizedKeyPolicyError) -> Self {
         match error {
-            CoreAuthorizedKeyPolicyError::DuplicateKey { first, second } => {
+            AuthorizedKeyPolicyError::DuplicateKey { first, second } => {
                 Self::DuplicateKey { first, second }
             }
         }
@@ -279,7 +278,7 @@ impl Resource for AuthorizedKeyPolicyService {
 
 /// Resolve one exact 32-byte `ssh-ed25519` key under READ authority.
 ///
-/// The core policy scans the whole bounded table using its constant-time key
+/// The identity policy scans the whole bounded table using its constant-time key
 /// comparison and selection primitives. Usernames and textual key encodings
 /// are deliberately absent from this boundary.
 pub fn profile_for_with(

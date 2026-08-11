@@ -775,6 +775,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-pci"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
+name = "vibeos-driver-virtio-mmio"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
@@ -801,6 +816,8 @@ dependencies = [
  "vibeos-bsp-milkv-duo",
  "vibeos-bsp-qemu-virt",
  "vibeos-core",
+ "vibeos-driver-pci",
+ "vibeos-driver-virtio-mmio",
  "vibeos-hal",
  "vibeos-kernel-acceptance",
  "vibeos-netstack",

@@ -6,7 +6,7 @@ autobins = false
 
 [features]
 default = ["qemu-virt"]
-qemu-virt = ["dep:vibeos-bsp-qemu-virt", "vibeos-vsh/pci-usb-help"]
+qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-mmio", "vibeos-vsh/pci-usb-help"]
 milkv-duo = ["dep:vibeos-bsp-milkv-duo"]
 legacy-shell = []
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
@@ -48,6 +48,8 @@ bench = false
 vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
 vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-core = { path = "../core" }
+vibeos-driver-pci = { path = "../drivers/pci", optional = true }
+vibeos-driver-virtio-mmio = { path = "../drivers/virtio-mmio", optional = true }
 vibeos-hal = { path = "../hal" }
 vibeos-rustc = { path = "../compiler" }
 vibeos-authority-store = { path = "../services/authority-store" }

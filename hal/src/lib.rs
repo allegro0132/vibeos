@@ -202,6 +202,24 @@ pub struct PlicDescription {
     pub max_irq: u32,
 }
 
+/// One bank of modern VirtIO MMIO transport windows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioMmioDescription {
+    pub registers: AddressRange,
+    pub stride: usize,
+    pub slots: usize,
+    pub first_irq: u32,
+}
+
+/// PCI host bridge apertures and legacy INTx routing base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciHostDescription {
+    pub ecam: AddressRange,
+    pub io: AddressRange,
+    pub mmio: AddressRange,
+    pub intx_first_irq: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoardInfo {
     pub name: &'static str,
@@ -209,6 +227,8 @@ pub struct BoardInfo {
     pub uart: UartDescription,
     pub plic: PlicDescription,
     pub console: ConsoleCapabilities,
+    pub virtio_mmio: Option<VirtioMmioDescription>,
+    pub pci: Option<PciHostDescription>,
 }
 
 /// Compile-time board contract consumed by architecture and kernel setup.

@@ -124,7 +124,7 @@ mod uart;
 #[cfg(feature = "qemu-virt")]
 mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
-mod virtio_mmio;
+use vibeos_driver_virtio_mmio as virtio_mmio;
 #[cfg(feature = "qemu-virt")]
 mod virtio_net;
 #[cfg(feature = "qemu-virt")]

@@ -91,6 +91,8 @@ impl BoardContract for Board {
             max_irq: PLIC_MAX_IRQ,
         },
         console: CONSOLE_CAPABILITIES,
+        virtio_mmio: None,
+        pci: None,
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;

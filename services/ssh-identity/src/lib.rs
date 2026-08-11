@@ -1,9 +1,11 @@
-//! Capability boundaries for the minimal SSH server's long-lived secrets.
+//! Trusted capability service for the minimal SSH server's long-lived secrets.
 //!
 //! This module does not parse OpenSSH text, usernames, paths, or configuration
 //! files. Bootstrap provisions an opaque Ed25519 signer and an immutable table
 //! of exact binary public keys. Components can then receive separately scoped
 //! capabilities for public-key discovery, host signing, and authorization.
+
+#![no_std]
 
 extern crate alloc;
 
@@ -28,7 +30,7 @@ pub const SSH_EXCHANGE_HASH_BYTES: usize = 32;
 /// Maximum number of exact binary client keys in one provisioned policy.
 ///
 /// Provisioning is trusted, but a fixed bound keeps the full-scan lookup and
-/// duplicate validation predictable in the no-std kernel.
+/// duplicate validation predictable in the no-std service.
 pub const MAX_AUTHORIZED_KEY_ENTRIES: usize = 32;
 
 /// Non-zero incarnation of provisioned SSH security material.

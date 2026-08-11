@@ -124,6 +124,7 @@ upward except through a capability it was handed.
 | `kernel/legacy_shell.rs` | large, gated | Diagnostic acceptance commands retained only by `legacy-shell` images | yes |
 | `components/sshd` | growing | Capability-confined SSH protocol, authentication, sessions, and VSH frontend | 1 (secret wipe) |
 | `kernel/ssh_platform.rs` | small | Kernel-private network, entropy, signer, policy, command, and log adapters for `sshd` | — |
+| `services/ssh-identity` | small, trusted | Opaque host signer and immutable binary authorized-key capability policy | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `shell.rs` | 458 | Operator interface | — |

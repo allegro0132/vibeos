@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "compiler", "components/netstack", "components/sshd", "components/vsh", "kernel"]
+members = ["core", "compiler", "components/netstack", "components/sshd", "components/vsh", "services/ssh-identity", "kernel"]
 exclude = ["vendor/sunset"]
 
 [profile.dev]

@@ -12,13 +12,13 @@ legacy-shell = []
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
-tcp-echo = []
+tcp-echo = ["dep:vibeos-netstack", "vibeos-netstack/qemu-virt", "vibeos-netstack/tcp-echo"]
 # Production Milk-V Duo IPv4 control plane. It owns the raw packet endpoints,
 # starts in DHCP mode, and exposes only capability-admitted ip/dhclient commands.
-net-shell = []
+net-shell = ["dep:vibeos-netstack", "vibeos-netstack/milkv-duo", "vibeos-netstack/net-shell"]
 # Test-only recovery hook used by the live stack-generation acceptance script.
 # It is never enabled by the normal TCP or eventual SSH image.
-tcp-echo-recovery-test = ["tcp-echo"]
+tcp-echo-recovery-test = ["tcp-echo", "vibeos-netstack/tcp-echo-recovery-test"]
 # Dedicated N3 acceptance image. It exercises the real virtio-rng capability,
 # a test-only provisioned host signer, and an immutable binary auth policy.
 ssh-security-test = []
@@ -45,5 +45,6 @@ test = false
 [dependencies]
 vibeos-core = { path = "../core" }
 vibeos-rustc = { path = "../compiler" }
+vibeos-netstack = { path = "../components/netstack", default-features = false, optional = true }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", version = "=0.1.1", default-features = false, features = ["alloc"], optional = true }

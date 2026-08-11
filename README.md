@@ -378,6 +378,8 @@ its process owns. Here, authority is not a property of the code.
 | `uart.rs`, `plic.rs`, `sbi.rs`, `dev.rs` | hardware |
 | `compiler/` | lexer, parser, RV64 code generator (its own crate, host-testable) |
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
+| `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |
+| `kernel/src/netstack_platform.rs` | thin packet/network-control adapter plus recovery-only test hooks |
 | `components/sshd/` | capability-confined SSH protocol and VSH session component (`no_std`) |
 | `kernel/src/ssh_platform.rs` | thin kernel-private adapter for SSH capabilities and services |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |

@@ -80,8 +80,6 @@ mod durable_cspace;
 #[cfg(feature = "milkv-jitterentropy-probe")]
 mod jitterentropy_probe;
 mod mmu;
-#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-mod net_config;
 mod platform;
 #[cfg(feature = "qemu-virt")]
 mod pci;
@@ -112,7 +110,7 @@ mod ssh_platform;
 mod ssh_test_fixture;
 mod store;
 #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-mod tcp_echo;
+mod netstack_platform;
 mod trampoline;
 mod trap;
 mod tty;
@@ -423,13 +421,13 @@ pub extern "C" fn kmain() -> ! {
         let mut session = vsh::Session::with_cspace(space.0.clone());
         shell::install_standard_vsh_commands(&mut session);
         #[cfg(feature = "tcp-echo-recovery-test")]
-        session.install_host_command("tcp-fault", 0, 0, tcp_echo::vsh_inject_fault);
+        session.install_host_command("tcp-fault", 0, 0, netstack_platform::vsh_inject_fault);
         #[cfg(feature = "tcp-echo-recovery-test")]
-        session.install_host_command("tcp-device-fault", 0, 0, tcp_echo::vsh_inject_driver_fault);
+        session.install_host_command("tcp-device-fault", 0, 0, netstack_platform::vsh_inject_driver_fault);
         #[cfg(feature = "tcp-echo-recovery-test")]
-        session.install_host_command("tcp-release", 0, 0, tcp_echo::vsh_release_stale);
+        session.install_host_command("tcp-release", 0, 0, netstack_platform::vsh_release_stale);
         #[cfg(feature = "tcp-echo-recovery-test")]
-        session.install_host_command("tcp-session", 0, 0, tcp_echo::vsh_session_info);
+        session.install_host_command("tcp-session", 0, 0, netstack_platform::vsh_session_info);
         world.spawn_component(
             "vsh",
             space.clone(),

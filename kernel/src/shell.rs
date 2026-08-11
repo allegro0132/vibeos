@@ -649,9 +649,9 @@ pub(crate) fn install_standard_vsh_commands(session: &mut crate::vsh::Session) {
     session.install_host_command("verbose", 0, 0, vsh_verbose);
     session.install_host_command("poweroff", 0, 0, vsh_poweroff);
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    session.install_host_command("ip", 2, 8, crate::net_config::vsh_ip);
+    session.install_host_command("ip", 2, 8, crate::netstack_platform::vsh_ip);
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    session.install_host_command("dhclient", 0, 2, crate::net_config::vsh_dhclient);
+    session.install_host_command("dhclient", 0, 2, crate::netstack_platform::vsh_dhclient);
 }
 
 pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {

@@ -942,7 +942,7 @@ impl World {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    crate::tcp_echo::task(space.get(), outbound, inbound, control),
+                    crate::netstack_platform::task(space.get(), outbound, inbound, control),
                 )
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
@@ -1367,7 +1367,7 @@ pub fn start_rng_supervisor() {
 #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
 pub fn start_ipv4_stack_supervisor() {
     let world = world();
-    let Some(component) = world.component_named(crate::tcp_echo::COMPONENT_NAME) else {
+    let Some(component) = world.component_named(crate::netstack_platform::COMPONENT_NAME) else {
         return;
     };
     exec::spawn("supervisor:ipv4-stack", async move {
@@ -1380,7 +1380,7 @@ pub fn start_ipv4_stack_supervisor() {
                     exec::sleep_ms(10u64 << attempts).await;
                     attempts += 1;
                     if world
-                        .restart_component(crate::tcp_echo::COMPONENT_NAME)
+                        .restart_component(crate::netstack_platform::COMPONENT_NAME)
                         .is_err()
                     {
                         return;
@@ -1493,7 +1493,7 @@ pub fn build() {
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_space = net_resources
         .as_ref()
-        .map(|_| Space::new(crate::tcp_echo::COMPONENT_NAME));
+        .map(|_| Space::new(crate::netstack_platform::COMPONENT_NAME));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -1992,7 +1992,7 @@ pub fn build() {
     }
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     if let Some(space) = tcp_echo_space.as_ref() {
-        spaces.insert(crate::tcp_echo::COMPONENT_NAME, space.clone());
+        spaces.insert(crate::netstack_platform::COMPONENT_NAME, space.clone());
     }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
@@ -2172,11 +2172,11 @@ pub fn build() {
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     if let (Some(space), Some((outbound, inbound, control))) = (tcp_echo_space, tcp_echo_grants) {
         world.spawn_component_inner(
-            crate::tcp_echo::COMPONENT_NAME,
+            crate::netstack_platform::COMPONENT_NAME,
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::Ipv4Stack),
-            crate::tcp_echo::task(SpaceRef::new(&space).get(), outbound, inbound, control),
+            crate::netstack_platform::task(SpaceRef::new(&space).get(), outbound, inbound, control),
         );
     }
 

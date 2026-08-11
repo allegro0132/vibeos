@@ -53,6 +53,15 @@ through `RECV` and transmit only through `SEND`. There is no fd, pathname,
 ambient NIC lookup, or ioctl. M4.4 is raw Ethernet transport only; it does not
 claim an ARP, IP, UDP, TCP, DNS, or POSIX-socket implementation.
 
+The configurable ARP/IPv4/TCP consumer now lives in the independent
+`components/netstack` `no_std` crate. Its protocol loop and `ip`/`dhclient`
+control state can name only packet and network-control capabilities passed to
+the component. `kernel/src/netstack_platform.rs` is the thin adapter which
+resolves those handles against the component CSpace; direct driver fault and
+stale-packet controls remain compiled only into the N2 recovery image. This is
+a source/dependency boundary inside the shared S-mode image, not hardware
+isolation from the kernel or driver.
+
 ## Queue lifecycle and DMA safety
 
 RX and TX have independent wrapping `u16` available/used indices but share one

@@ -25,8 +25,22 @@ compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image
 compile_error!("feature `ssh-test` is the QEMU-only N4 acceptance image");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
+#[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
+compile_error!("feature `milkv-ssh` is the Milk-V Duo production SSH image");
+#[cfg(all(
+    feature = "milkv-ssh",
+    any(
+        feature = "net-shell",
+        feature = "milkv-ssh-acceptance",
+        feature = "tcp-echo",
+        feature = "ssh-test"
+    )
+))]
+compile_error!("feature `milkv-ssh` must exclusively own the IPv4 stack");
 #[cfg(all(feature = "milkv-jitterentropy-probe", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-jitterentropy-probe` is the Milk-V Duo hardware probe image");
+#[cfg(all(feature = "milkv-jitterentropy-ssh-probe", not(feature = "milkv-duo")))]
+compile_error!("feature `milkv-jitterentropy-ssh-probe` is a Milk-V Duo qualification image");
 #[cfg(all(feature = "ssh-test", feature = "tcp-echo"))]
 compile_error!("features `ssh-test` and `tcp-echo` are mutually exclusive acceptance images");
 #[cfg(all(feature = "ssh-test", feature = "ssh-security-test"))]
@@ -83,8 +97,13 @@ mod code_pool;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
-#[cfg(feature = "milkv-jitterentropy-probe")]
+#[cfg(any(
+    feature = "milkv-jitterentropy-probe",
+    feature = "milkv-jitterentropy-ssh-probe"
+))]
 mod jitterentropy_probe;
+#[cfg(feature = "milkv-ssh")]
+mod jitterentropy_random;
 #[cfg(feature = "legacy-shell")]
 mod legacy_shell;
 mod mmu;
@@ -102,14 +121,18 @@ mod selftest;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
-    feature = "milkv-ssh-acceptance"
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
 ))]
 mod ssh_platform;
+#[cfg(feature = "milkv-ssh")]
+mod ssh_provisioning;
 pub use vibeos_object_store as store;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
-    feature = "milkv-ssh-acceptance"
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
 ))]
 pub use vibeos_ssh_identity as ssh_security;
 mod block_device;

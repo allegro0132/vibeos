@@ -9,32 +9,58 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use core::fmt;
 
 use vibeos_core::cap::{Cap, Rights};
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use vibeos_core::chan::Endpoint;
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use vibeos_core::net::StampedPacket;
 #[cfg(feature = "ssh-security-test")]
 use vibeos_kernel_acceptance::ssh_security_test::{
     Platform as SecurityTestPlatform, PlatformFuture as SecurityPlatformFuture,
     SecretBytes as SecuritySecretBytes,
 };
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use vibeos_ssh_identity::SshEd25519PublicKey;
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
     NetworkBindError, NetworkInfo, Platform as SshdPlatform, PlatformFuture, SecretBytes,
     SshServicePolicy, StaticIpv4Address,
 };
 
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 use crate::ssh_security::{AuthorizedKeyPolicyService, HostSigningService};
 use crate::world::Space;
 
+#[cfg(feature = "milkv-ssh")]
+use crate::jitterentropy_random as ssh_rng;
 #[cfg(feature = "qemu-virt")]
 use crate::virtio_rng as ssh_rng;
 use ssh_rng::RandomError;
@@ -69,19 +95,44 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     listener_label: "milkv-ssh-acceptance",
 };
 
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(feature = "milkv-ssh")]
+const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
+    ethernet_address: [0x02, 0, 0, 0, 0, 1],
+    listen_port: 22,
+    ipv4: Ipv4Policy::Dhcp {
+        bootstrap: StaticIpv4Address::new([192, 0, 2, 1], 24),
+    },
+    require_carrier: true,
+    bind_retry: BindRetry::Forever,
+    status_interval_ms: 30_000,
+    listener_label: "sshd",
+};
+
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 struct SshPlatform {
     space: &'static Space,
 }
 
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 impl SshPlatform {
     const fn new(space: &'static Space) -> Self {
         Self { space }
     }
 }
 
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 impl SshdPlatform for SshPlatform {
     fn packet_endpoints(
         &self,
@@ -206,7 +257,15 @@ impl SshdPlatform for SshPlatform {
         let profile = crate::ssh_security::profile_for_with(&lease, key).map_err(|_| ())?;
         Ok(profile
             .filter(|profile| {
-                profile.profile.get() == vibeos_kernel_acceptance::ssh_test_fixture::TEST_PROFILE
+                #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+                {
+                    profile.profile.get()
+                        == vibeos_kernel_acceptance::ssh_test_fixture::TEST_PROFILE
+                }
+                #[cfg(feature = "milkv-ssh")]
+                {
+                    profile.profile.get() == crate::ssh_provisioning::PROFILE
+                }
             })
             .map(|profile| AuthorizedProfile {
                 generation: profile.generation.get(),
@@ -215,7 +274,20 @@ impl SshdPlatform for SshPlatform {
     }
 
     fn install_standard_vsh_commands(&self, session: &mut vibeos_vsh::Session) {
-        crate::vsh_platform::install_standard_commands(session);
+        crate::vsh_platform::install_remote_commands(session);
+    }
+
+    #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
+    fn accepts_streaming_exec(&self, command: &str) -> bool {
+        crate::jitterentropy_probe::accepts_ssh_stream(command)
+    }
+
+    #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
+    fn open_streaming_exec(
+        &self,
+        command: &str,
+    ) -> Option<Result<vibeos_sshd::StreamingExecBox, u32>> {
+        crate::jitterentropy_probe::open_ssh_stream(command)
     }
 
     fn log(&self, args: fmt::Arguments<'_>) {
@@ -224,7 +296,11 @@ impl SshdPlatform for SshPlatform {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
 pub async fn task(
     space: &'static Space,
     outbound: Cap,
@@ -240,6 +316,10 @@ pub async fn task(
     crate::uart::_print(format_args!(
         "WARNING milkv-ssh-acceptance: deterministic entropy and fixed test keys; isolated bring-up only\n"
     ));
+    #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
+    crate::uart::_print(format_args!(
+        "WARNING milkv-jitterentropy-ssh-probe: fixed SSH fixtures; raw deltas are qualification evidence only\n"
+    ));
     vibeos_sshd::task(
         &platform,
         SSH_SERVICE_POLICY,
@@ -252,6 +332,43 @@ pub async fn task(
         policy,
     )
     .await;
+}
+
+#[cfg(feature = "milkv-ssh")]
+pub async fn provisioned_task(
+    space: &'static Space,
+    outbound: Cap,
+    inbound: Cap,
+    control: Cap,
+    random: Cap,
+) {
+    crate::uart::_print(format_args!(
+        "SSH provisioning: run ssh-keygen, then ssh-authorize add <64-hex-ed25519-key> on UART\n"
+    ));
+    loop {
+        match crate::ssh_provisioning::load().await {
+            Ok(Some(config)) if config.complete() => {
+                match crate::ssh_provisioning::install_services(space, config) {
+                    Ok((read, invoke, policy)) => {
+                        crate::uart::_print(format_args!(
+                            "SSH provisioning verified; starting DHCP SSH on port 22\n"
+                        ));
+                        task(
+                            space, outbound, inbound, control, random, read, invoke, policy,
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(()) => crate::uart::_print(format_args!(
+                        "SSH configuration invalid; refusing to listen\n"
+                    )),
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        crate::exec::sleep_ms(1000).await;
+    }
 }
 
 #[cfg(feature = "ssh-security-test")]

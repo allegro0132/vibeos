@@ -5,11 +5,13 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = ["net-shell"]
+default = ["milkv-ssh"]
 net-shell = ["vibeos-kernel/net-shell"]
+milkv-ssh = ["vibeos-kernel/milkv-ssh"]
 legacy-shell = ["vibeos-kernel/legacy-shell"]
 milkv-ssh-acceptance = ["vibeos-kernel/milkv-ssh-acceptance"]
 milkv-jitterentropy-probe = ["vibeos-kernel/milkv-jitterentropy-probe"]
+milkv-jitterentropy-ssh-probe = ["vibeos-kernel/milkv-jitterentropy-ssh-probe"]
 
 [[bin]]
 name = "vibeos-milkv-duo"

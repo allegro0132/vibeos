@@ -90,6 +90,13 @@ pub async fn run_legacy_source(source: &str, session: &mut Session) {
 }
 
 pub fn install_standard_commands(session: &mut Session) {
+    install_shared_commands(session);
+    #[cfg(feature = "milkv-ssh")]
+    vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
+}
+
+/// Install commands shared by the physical console and authenticated SSH.
+fn install_shared_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, BASE_COMMANDS);
     #[cfg(feature = "qemu-virt")]
     vibeos_vsh::install_commands(session, QEMU_COMMANDS);
@@ -107,8 +114,6 @@ pub fn install_standard_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
-    vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
 }
 
 /// Install commands admitted to an authenticated public-key SSH session.
@@ -118,13 +123,7 @@ pub fn install_standard_commands(session: &mut Session) {
     feature = "milkv-ssh"
 ))]
 pub fn install_remote_commands(session: &mut Session) {
-    vibeos_vsh::install_commands(session, BASE_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
-    vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
-    vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
-    vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
+    install_shared_commands(session);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }

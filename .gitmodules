@@ -1,0 +1,4 @@
+[submodule "vendor/sunset"]
+	path = vendor/sunset
+	url = git@github.com:allegro0132/sunset.git
+	branch = codex/vibeos-0.6.0

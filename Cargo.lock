@@ -894,6 +894,7 @@ dependencies = [
  "vibeos-object-store",
  "vibeos-program-store",
  "vibeos-random",
+ "vibeos-runtime-riscv",
  "vibeos-rustc",
  "vibeos-ssh-identity",
  "vibeos-sshd",

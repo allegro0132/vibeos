@@ -6,9 +6,9 @@
 //! randomness and at most one authenticated session channel and one accepted
 //! start request: either bounded `exec` or an isolated PTY-backed VSH shell.
 //!
-//! QEMU obtains real transport bytes from virtio-rng. The explicitly named
-//! Milk-V hardware-acceptance feature instead uses a deterministic test-only
-//! provider and fixed identities; it proves wiring and is not secure SSH.
+//! Image-specific addressing, carrier, and retry choices are supplied through
+//! [`SshServicePolicy`]. Entropy and identity provisioning remain kernel-image
+//! responsibilities behind explicit capabilities.
 
 #![no_std]
 
@@ -33,8 +33,8 @@ use sunset::{
 use vibeos_core::cap::{CSpace, Cap, Revocable};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
-#[cfg(feature = "milkv-ssh-acceptance")]
 use vibeos_core::net_config::Ipv4RuntimeStatus;
+pub use vibeos_core::net_config::StaticIpv4Address;
 use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_core::ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
@@ -63,6 +63,41 @@ pub enum NetworkBindError {
     SessionBusy,
     Denied,
     Failed,
+}
+
+/// How the SSH image obtains its service address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv4Policy {
+    Static(StaticIpv4Address),
+    Dhcp { bootstrap: StaticIpv4Address },
+}
+
+impl Ipv4Policy {
+    const fn initial_address(self) -> StaticIpv4Address {
+        match self {
+            Self::Static(address) => address,
+            Self::Dhcp { bootstrap } => bootstrap,
+        }
+    }
+}
+
+/// Limit applied while waiting to bind the packet service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindRetry {
+    Attempts(usize),
+    Forever,
+}
+
+/// Image-selected network policy for one SSH service instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SshServicePolicy {
+    pub ethernet_address: [u8; 6],
+    pub listen_port: u16,
+    pub ipv4: Ipv4Policy,
+    pub require_carrier: bool,
+    pub bind_retry: BindRetry,
+    pub status_interval_ms: u64,
+    pub listener_label: &'static str,
 }
 
 /// Public half of one provisioned host-signing service incarnation.
@@ -152,25 +187,13 @@ macro_rules! component_log {
     };
 }
 
-const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
-#[cfg(feature = "qemu-virt")]
-const GUEST_IPV4: [u8; 4] = [10, 0, 2, 15];
-#[cfg(feature = "qemu-virt")]
-const GATEWAY_IPV4: [u8; 4] = [10, 0, 2, 2];
-#[cfg(feature = "qemu-virt")]
-const PREFIX_LEN: u8 = 24;
-const LISTEN_PORT: u16 = 2222;
 const SSH_RANDOM_DOMAIN: u64 = 0x5353_4803;
 
-#[cfg(feature = "qemu-virt")]
-const NETWORK_RETRY_BUDGET: usize = 5_000;
 const CONNECTION_TIMEOUT_MS: u64 = 60_000;
 const EXEC_TIMEOUT_MS: u64 = 10_000;
 const CANCEL_GRACE_MS: u64 = 1_000;
 const CLOSE_TIMEOUT_MS: u64 = 5_000;
 const IDLE_POLL_CEILING_MS: u64 = 10;
-#[cfg(feature = "milkv-ssh-acceptance")]
-const DHCP_STATUS_INTERVAL_MS: u64 = 30_000;
 const MAX_SSH_PROGRESS_PER_TURN: usize = 32;
 const MAX_WIRE_IO_PER_TURN: usize = 8;
 const MAX_CHANNEL_DISCARDS_PER_TURN: usize = 4;
@@ -504,19 +527,15 @@ enum ExecutionCancellation {
 /// Serve an explicit acceptance endpoint with one active TCP/SSH peer at a time.
 pub async fn task(
     space: &Space,
+    service_policy: SshServicePolicy,
     outbound: Cap,
     inbound: Cap,
     control: Cap,
     random: Cap,
     signer_read: Cap,
     signer_invoke: Cap,
-    policy: Cap,
+    authorization_policy: Cap,
 ) {
-    #[cfg(feature = "milkv-ssh-acceptance")]
-    component_log!(space,
-        "WARNING milkv-ssh-acceptance: deterministic entropy and fixed test keys; isolated bring-up only"
-    );
-
     let (outbound_endpoint, inbound_endpoint) = match space.packet_endpoints(outbound, inbound) {
         Some(endpoints) => endpoints,
         None => {
@@ -554,6 +573,7 @@ pub async fn task(
         tcp_seed,
         inbound_endpoint,
         outbound_endpoint,
+        service_policy,
     )
     .await
     {
@@ -580,8 +600,15 @@ pub async fn task(
 
     loop {
         let wait_result = if announce_required {
-            match announce_listener(space, control, bound_epoch, &mut stack, &mut announced_ipv4)
-                .await
+            match announce_listener(
+                space,
+                control,
+                bound_epoch,
+                &mut stack,
+                &mut announced_ipv4,
+                service_policy,
+            )
+            .await
             {
                 Ok(()) => {
                     announce_required = false;
@@ -591,13 +618,22 @@ pub async fn task(
                         bound_epoch,
                         &mut stack,
                         &mut announced_ipv4,
+                        service_policy,
                     )
                     .await
                 }
                 Err(reason) => Err(reason),
             }
         } else {
-            wait_for_connection(space, control, bound_epoch, &mut stack, &mut announced_ipv4).await
+            wait_for_connection(
+                space,
+                control,
+                bound_epoch,
+                &mut stack,
+                &mut announced_ipv4,
+                service_policy,
+            )
+            .await
         };
         let outcome = match wait_result {
             Ok(()) => {
@@ -608,9 +644,10 @@ pub async fn task(
                     bound_epoch,
                     signer_read,
                     signer_invoke,
-                    policy,
+                    authorization_policy,
                     &mut stack,
                     seed,
+                    service_policy.require_carrier,
                 )
                 .await
             }
@@ -687,6 +724,7 @@ pub async fn task(
                 next_tcp_seed_value,
                 next_inbound,
                 next_outbound,
+                service_policy,
             )
             .await
             {
@@ -753,15 +791,14 @@ async fn build_stack(
     tcp_seed: u64,
     inbound: Revocable<Endpoint<StampedPacket>>,
     outbound: Revocable<Endpoint<StampedPacket>>,
+    policy: SshServicePolicy,
 ) -> Result<StaticIpv4TcpStack, &'static str> {
-    #[cfg(feature = "qemu-virt")]
-    let attempts = core::iter::repeat(()).take(NETWORK_RETRY_BUDGET);
-    // Physical carrier can legitimately appear long after boot. Keep this
-    // acceptance service dormant instead of permanently exiting before a
-    // cable, DHCP peer, or restarted DWMAC becomes available.
-    #[cfg(feature = "milkv-ssh-acceptance")]
-    let attempts = core::iter::repeat(());
-    for _ in attempts {
+    let mut attempts = 0usize;
+    loop {
+        if matches!(policy.bind_retry, BindRetry::Attempts(limit) if attempts >= limit) {
+            return Err("network stack bind timed out");
+        }
+        attempts = attempts.saturating_add(1);
         let info = device_info(space, control).ok_or("network control authority unavailable")?;
         if info.quarantined {
             return Err("network device is quarantined");
@@ -770,41 +807,30 @@ async fn build_stack(
             vibeos_core::exec::sleep_ms(1).await;
             continue;
         }
-        #[cfg(feature = "milkv-ssh-acceptance")]
-        if !info.phy_link_up {
+        if policy.require_carrier && !info.phy_link_up {
             vibeos_core::exec::sleep_ms(1).await;
             continue;
         }
         match bind_stack(space, control) {
             Ok(stamp) => {
-                #[cfg(feature = "qemu-virt")]
-                let config = StaticIpv4Config::new(
-                    GUEST_MAC,
-                    GUEST_IPV4,
-                    PREFIX_LEN,
-                    LISTEN_PORT,
-                    tcp_seed ^ stamp.device_epoch(),
-                )
-                .with_default_gateway(GATEWAY_IPV4);
-                #[cfg(feature = "milkv-ssh-acceptance")]
-                let config = StaticIpv4Config::new(
-                    GUEST_MAC,
-                    [192, 0, 2, 1],
-                    24,
-                    LISTEN_PORT,
+                let address = policy.ipv4.initial_address();
+                let mut config = StaticIpv4Config::new(
+                    policy.ethernet_address,
+                    address.address,
+                    address.prefix_len,
+                    policy.listen_port,
                     tcp_seed ^ stamp.device_epoch(),
                 );
-                let stack = StaticIpv4TcpStack::new(config, stamp, inbound, outbound)
+                if let Some(gateway) = address.default_gateway {
+                    config = config.with_default_gateway(gateway);
+                }
+                let mut stack = StaticIpv4TcpStack::new(config, stamp, inbound, outbound)
                     .map_err(|_| "IPv4/TCP stack construction failed")?;
-                #[cfg(feature = "milkv-ssh-acceptance")]
-                {
-                    let mut stack = stack;
+                if matches!(policy.ipv4, Ipv4Policy::Dhcp { .. }) {
                     stack
                         .start_dhcp()
                         .map_err(|_| "DHCP client initialization failed")?;
-                    return Ok(stack);
                 }
-                #[cfg(feature = "qemu-virt")]
                 return Ok(stack);
             }
             Err(NetworkBindError::Offline | NetworkBindError::SessionBusy) => {
@@ -813,7 +839,6 @@ async fn build_stack(
             Err(_) => return Err("network stack bind failed"),
         }
     }
-    Err("network stack bind timed out")
 }
 
 async fn announce_listener(
@@ -822,36 +847,34 @@ async fn announce_listener(
     bound_epoch: u64,
     stack: &mut StaticIpv4TcpStack,
     announced_ipv4: &mut Option<[u8; 4]>,
+    policy: SshServicePolicy,
 ) -> Result<(), &'static str> {
-    #[cfg(feature = "qemu-virt")]
-    {
-        let _ = (space, control, bound_epoch);
-        update_listener_announcement(space, stack, announced_ipv4);
+    if matches!(policy.ipv4, Ipv4Policy::Static(_)) {
+        update_listener_announcement(space, stack, announced_ipv4, policy);
         return Ok(());
     }
 
-    #[cfg(feature = "milkv-ssh-acceptance")]
-    {
-        let mut last_status = monotonic_ms();
-        loop {
-            validate_network_authority(space, control, bound_epoch)?;
-            let report = stack
-                .poll_network(monotonic_ms())
-                .map_err(|_| "DHCP/network listener poll failed")?;
-            if update_listener_announcement(space, stack, announced_ipv4) {
-                return Ok(());
-            }
-            let now = monotonic_ms();
-            if now.saturating_sub(last_status) >= DHCP_STATUS_INTERVAL_MS {
-                component_log!(space, "milkv-ssh-acceptance waiting for a DHCP lease");
-                last_status = now;
-            }
-            cooperate(
-                report.more_work || report.ingress_frames != 0,
-                report.next_poll_delay_ms,
-            )
-            .await;
+    let mut last_status = monotonic_ms();
+    loop {
+        validate_network_authority(space, control, bound_epoch, policy.require_carrier)?;
+        let report = stack
+            .poll_network(monotonic_ms())
+            .map_err(|_| "DHCP/network listener poll failed")?;
+        if update_listener_announcement(space, stack, announced_ipv4, policy) {
+            return Ok(());
         }
+        let now = monotonic_ms();
+        if policy.status_interval_ms != 0
+            && now.saturating_sub(last_status) >= policy.status_interval_ms
+        {
+            component_log!(space, "{} waiting for a DHCP lease", policy.listener_label);
+            last_status = now;
+        }
+        cooperate(
+            report.more_work || report.ingress_frames != 0,
+            report.next_poll_delay_ms,
+        )
+        .await;
     }
 }
 
@@ -861,13 +884,14 @@ async fn wait_for_connection(
     bound_epoch: u64,
     stack: &mut StaticIpv4TcpStack,
     announced_ipv4: &mut Option<[u8; 4]>,
+    policy: SshServicePolicy,
 ) -> Result<(), &'static str> {
     loop {
-        validate_network_authority(space, control, bound_epoch)?;
+        validate_network_authority(space, control, bound_epoch, policy.require_carrier)?;
         let report = stack
             .poll_network(monotonic_ms())
             .map_err(|_| "network listener poll failed")?;
-        update_listener_announcement(space, stack, announced_ipv4);
+        update_listener_announcement(space, stack, announced_ipv4, policy);
         // smoltcp considers SYN-RECEIVED an active connection, but its byte
         // stream API cannot accept Sunset's server banner until the final ACK
         // moves the socket to ESTABLISHED. Entering the bridge on the earlier
@@ -924,43 +948,39 @@ async fn rearm_listener(stack: &mut StaticIpv4TcpStack) -> Result<(), &'static s
     }
 }
 
-#[cfg(feature = "qemu-virt")]
-fn update_listener_announcement(
-    space: &Space,
-    _stack: &StaticIpv4TcpStack,
-    announced_ipv4: &mut Option<[u8; 4]>,
-) -> bool {
-    if *announced_ipv4 != Some(GUEST_IPV4) {
-        component_log!(space, "ssh-test listening on 10.0.2.15:2222");
-        *announced_ipv4 = Some(GUEST_IPV4);
-    }
-    true
-}
-
-#[cfg(feature = "milkv-ssh-acceptance")]
 fn update_listener_announcement(
     space: &Space,
     stack: &StaticIpv4TcpStack,
     announced_ipv4: &mut Option<[u8; 4]>,
+    policy: SshServicePolicy,
 ) -> bool {
-    match stack.ipv4_status() {
-        Ipv4RuntimeStatus::DhcpBound(address) => {
-            if *announced_ipv4 != Some(address.address) {
-                let [a, b, c, d] = address.address;
+    let address = match policy.ipv4 {
+        Ipv4Policy::Static(address) => Some(address.address),
+        Ipv4Policy::Dhcp { .. } => match stack.ipv4_status() {
+            Ipv4RuntimeStatus::DhcpBound(address) => Some(address.address),
+            _ => None,
+        },
+    };
+    match address {
+        Some(address) => {
+            if *announced_ipv4 != Some(address) {
+                let [a, b, c, d] = address;
                 component_log!(
                     space,
-                    "milkv-ssh-acceptance listening on {a}.{b}.{c}.{d}:{}",
-                    LISTEN_PORT
+                    "{} listening on {a}.{b}.{c}.{d}:{}",
+                    policy.listener_label,
+                    policy.listen_port
                 );
-                *announced_ipv4 = Some(address.address);
+                *announced_ipv4 = Some(address);
             }
             true
         }
-        _ => {
+        None => {
             if announced_ipv4.take().is_some() {
                 component_log!(
                     space,
-                    "milkv-ssh-acceptance DHCP lease lost; listener unavailable"
+                    "{} DHCP lease lost; listener unavailable",
+                    policy.listener_label
                 );
             }
             false
@@ -978,6 +998,7 @@ async fn serve_connection(
     policy: Cap,
     stack: &mut StaticIpv4TcpStack,
     mut seed: [u8; SEED_BYTES],
+    require_carrier: bool,
 ) -> ConnectionEnd {
     let limits =
         RandomLimits::new(4 * 1024, 1024 * 1024).expect("SSH random limits are within hard bounds");
@@ -1007,7 +1028,9 @@ async fn serve_connection(
         if now.saturating_sub(started) > CONNECTION_TIMEOUT_MS {
             return reset_connection(stack, "SSH connection timed out");
         }
-        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+        if let Err(reason) =
+            validate_network_authority(space, control, bound_epoch, require_carrier)
+        {
             return ConnectionEnd::Rebind(reason);
         }
         let wire = match bridge.drive(&mut runner, stack, now) {
@@ -1069,6 +1092,7 @@ async fn serve_connection(
                 stack,
                 &mut bridge,
                 &mut protocol,
+                require_carrier,
             )
             .await;
             let (reports, timed_out) = match execution {
@@ -1089,6 +1113,7 @@ async fn serve_connection(
                 &mut protocol,
                 &output,
                 status,
+                require_carrier,
             )
             .await
             {
@@ -1109,6 +1134,7 @@ async fn serve_connection(
                 &mut bridge,
                 &mut protocol,
                 &mut pending_input,
+                require_carrier,
             )
             .await
             {
@@ -1497,8 +1523,10 @@ fn drive_shell_turn(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
+    require_carrier: bool,
 ) -> Result<ShellTurn, ConnectionEnd> {
-    validate_network_authority(space, control, bound_epoch).map_err(ConnectionEnd::Rebind)?;
+    validate_network_authority(space, control, bound_epoch, require_carrier)
+        .map_err(ConnectionEnd::Rebind)?;
     let wire = bridge
         .drive(runner, stack, monotonic_ms())
         .map_err(ConnectionEnd::Reset)?;
@@ -1574,6 +1602,7 @@ async fn next_shell_event(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
+    require_carrier: bool,
 ) -> Result<TerminalEvent, ConnectionEnd> {
     loop {
         let transport_eof = input.bytes.is_empty()
@@ -1636,6 +1665,7 @@ async fn next_shell_event(
             protocol,
             input,
             frontend,
+            require_carrier,
         )?;
         cooperate(application_work || turn.worked, turn.next_poll_delay_ms).await;
     }
@@ -1692,6 +1722,7 @@ async fn execute_shell_command(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
+    require_carrier: bool,
 ) -> Result<Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>, ConnectionEnd> {
     let cancel = Arc::new(AtomicBool::new(false));
     // Ordinary bytes queued after Enter remain typeahead for the next prompt.
@@ -1740,7 +1771,9 @@ async fn execute_shell_command(
                 "VSH shell transport EOF cancellation timed out",
             ));
         }
-        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+        if let Err(reason) =
+            validate_network_authority(space, control, bound_epoch, require_carrier)
+        {
             cancel.store(true, Ordering::Release);
             cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
             continue;
@@ -1874,6 +1907,7 @@ async fn emit_shell_text(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
+    require_carrier: bool,
 ) -> Result<(), ConnectionEnd> {
     while !text.is_empty() {
         let end = utf8_chunk_end(text);
@@ -1897,6 +1931,7 @@ async fn emit_shell_text(
             protocol,
             input,
             frontend,
+            require_carrier,
         )?;
         cooperate(turn.worked, turn.next_poll_delay_ms).await;
     }
@@ -1917,6 +1952,7 @@ async fn render_shell_execution(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
+    require_carrier: bool,
 ) -> Result<u32, ConnectionEnd> {
     match result {
         Ok(reports) => {
@@ -1944,6 +1980,7 @@ async fn render_shell_execution(
                     protocol,
                     input,
                     frontend,
+                    require_carrier,
                 )
                 .await?;
                 return Ok(124);
@@ -1962,6 +1999,7 @@ async fn render_shell_execution(
                     protocol,
                     input,
                     frontend,
+                    require_carrier,
                 )
                 .await?;
                 if report.status != vibeos_core::vsh::Status::Success {
@@ -1980,6 +2018,7 @@ async fn render_shell_execution(
                         protocol,
                         input,
                         frontend,
+                        require_carrier,
                     )
                     .await?;
                 }
@@ -2008,6 +2047,7 @@ async fn render_shell_execution(
                 protocol,
                 input,
                 frontend,
+                require_carrier,
             )
             .await?;
             Ok(2)
@@ -2029,6 +2069,7 @@ async fn run_shell_repl(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
+    require_carrier: bool,
 ) -> Result<u32, ConnectionEnd> {
     let mut status = 0;
     loop {
@@ -2044,6 +2085,7 @@ async fn run_shell_repl(
             protocol,
             input,
             frontend,
+            require_carrier,
         )
         .await?
         {
@@ -2072,6 +2114,7 @@ async fn run_shell_repl(
                     protocol,
                     input,
                     frontend,
+                    require_carrier,
                 )
                 .await?;
                 status = render_shell_execution(
@@ -2087,6 +2130,7 @@ async fn run_shell_repl(
                     protocol,
                     input,
                     frontend,
+                    require_carrier,
                 )
                 .await?;
             }
@@ -2108,6 +2152,7 @@ async fn serve_interactive_shell(
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
+    require_carrier: bool,
 ) -> Result<u32, ConnectionEnd> {
     let _terminal_size = protocol
         .pty
@@ -2130,6 +2175,7 @@ async fn serve_interactive_shell(
         protocol,
         input,
         &mut frontend,
+        require_carrier,
     )
     .await;
     // Join all foreground/background stages before the connection-local CSpace
@@ -2150,6 +2196,7 @@ async fn serve_interactive_shell(
             protocol,
             input,
             &mut frontend,
+            require_carrier,
         )?;
         cooperate(turn.worked, turn.next_poll_delay_ms).await;
     }
@@ -2168,6 +2215,7 @@ async fn serve_interactive_shell(
         protocol,
         &[],
         status,
+        require_carrier,
     )
     .await?;
     Ok(status)
@@ -2185,6 +2233,7 @@ async fn execute_with_network(
     stack: &mut StaticIpv4TcpStack,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
+    require_carrier: bool,
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut session =
@@ -2229,7 +2278,9 @@ async fn execute_with_network(
             continue;
         }
 
-        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+        if let Err(reason) =
+            validate_network_authority(space, control, bound_epoch, require_carrier)
+        {
             cancel.store(true, Ordering::Release);
             cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
             continue;
@@ -2351,6 +2402,7 @@ async fn finish_exec(
     protocol: &mut ProtocolState,
     output: &[u8],
     status: u32,
+    require_carrier: bool,
 ) -> Result<(), ConnectionEnd> {
     let started = monotonic_ms();
     let mut offset = 0usize;
@@ -2363,7 +2415,9 @@ async fn finish_exec(
         if now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
             return Err(ConnectionEnd::Reset("SSH completion drain timed out"));
         }
-        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+        if let Err(reason) =
+            validate_network_authority(space, control, bound_epoch, require_carrier)
+        {
             return Err(ConnectionEnd::Rebind(reason));
         }
         let wire = bridge
@@ -2385,7 +2439,15 @@ async fn finish_exec(
             // before processing that event can therefore prove both the peer's
             // CHANNEL_CLOSE acknowledgement and a complete output drain.
             if completion_confirmed_before_progress {
-                return finish_tcp_after_ssh(space, control, bound_epoch, stack, started).await;
+                return finish_tcp_after_ssh(
+                    space,
+                    control,
+                    bound_epoch,
+                    stack,
+                    started,
+                    require_carrier,
+                )
+                .await;
             }
             return Err(ConnectionEnd::Reset(
                 "SSH peer became defunct before completion was acknowledged",
@@ -2456,7 +2518,15 @@ async fn finish_exec(
         }
 
         if close_sent && protocol.channel.is_none() && runner.is_output_drained() {
-            return finish_tcp_after_ssh(space, control, bound_epoch, stack, started).await;
+            return finish_tcp_after_ssh(
+                space,
+                control,
+                bound_epoch,
+                stack,
+                started,
+                require_carrier,
+            )
+            .await;
         }
 
         cooperate(
@@ -2473,6 +2543,7 @@ async fn finish_tcp_after_ssh(
     bound_epoch: u64,
     stack: &mut StaticIpv4TcpStack,
     started: u64,
+    require_carrier: bool,
 ) -> Result<(), ConnectionEnd> {
     let mut discard = [0u8; WIRE_CHUNK_BYTES];
     let mut close_requested = false;
@@ -2482,7 +2553,9 @@ async fn finish_tcp_after_ssh(
         if now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
             return Err(ConnectionEnd::Reset("SSH completion drain timed out"));
         }
-        if let Err(reason) = validate_network_authority(space, control, bound_epoch) {
+        if let Err(reason) =
+            validate_network_authority(space, control, bound_epoch, require_carrier)
+        {
             return Err(ConnectionEnd::Rebind(reason));
         }
         let network = stack
@@ -2532,6 +2605,7 @@ fn validate_network_authority(
     space: &Space,
     control: Cap,
     bound_epoch: u64,
+    require_carrier: bool,
 ) -> Result<(), &'static str> {
     let info = device_info(space, control).ok_or("network control authority was revoked")?;
     if info.quarantined {
@@ -2540,8 +2614,7 @@ fn validate_network_authority(
     if !info.online {
         return Err("network device went offline");
     }
-    #[cfg(feature = "milkv-ssh-acceptance")]
-    if !info.phy_link_up {
+    if require_carrier && !info.phy_link_up {
         return Err("network carrier went down");
     }
     if info.session_epoch != bound_epoch {

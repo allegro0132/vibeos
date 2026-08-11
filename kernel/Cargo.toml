@@ -6,16 +6,16 @@ build = "build.rs"
 
 [features]
 default = ["qemu-virt"]
-qemu-virt = ["dep:vibeos-bsp-qemu-virt", "vibeos-vsh/qemu-virt"]
+qemu-virt = ["dep:vibeos-bsp-qemu-virt", "vibeos-vsh/pci-usb-help"]
 milkv-duo = ["dep:vibeos-bsp-milkv-duo"]
 legacy-shell = []
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
-tcp-echo = ["dep:vibeos-netstack", "vibeos-netstack/qemu-virt", "vibeos-netstack/tcp-echo", "vibeos-vsh/network"]
+tcp-echo = ["dep:vibeos-netstack", "vibeos-netstack/tcp-echo", "vibeos-vsh/network"]
 # Production Milk-V Duo IPv4 control plane. It owns the raw packet endpoints,
 # starts in DHCP mode, and exposes only capability-admitted ip/dhclient commands.
-net-shell = ["dep:vibeos-netstack", "vibeos-netstack/milkv-duo", "vibeos-netstack/net-shell", "vibeos-vsh/network"]
+net-shell = ["dep:vibeos-netstack", "vibeos-netstack/net-shell", "vibeos-vsh/network"]
 # Test-only recovery hook used by the live stack-generation acceptance script.
 # It is never enabled by the normal TCP or eventual SSH image.
 tcp-echo-recovery-test = ["tcp-echo", "vibeos-netstack/tcp-echo-recovery-test"]
@@ -24,12 +24,12 @@ tcp-echo-recovery-test = ["tcp-echo", "vibeos-netstack/tcp-echo-recovery-test"]
 ssh-security-test = ["dep:vibeos-ssh-identity"]
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
-ssh-test = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity", "vibeos-sshd/qemu-virt"]
+ssh-test = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity"]
 # Explicitly insecure physical bring-up image. It reuses the fixed SSH test
 # identities and a deterministic acceptance-only random service so DWMAC,
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
-milkv-ssh-acceptance = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity", "vibeos-sshd/milkv-ssh-acceptance"]
+milkv-ssh-acceptance = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity"]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.

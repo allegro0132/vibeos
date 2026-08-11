@@ -5,8 +5,6 @@ edition = "2021"
 
 [features]
 default = []
-qemu-virt = []
-milkv-ssh-acceptance = []
 
 [dependencies]
 vibeos-core = { path = "../../core" }

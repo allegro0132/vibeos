@@ -1,0 +1,12 @@
+[package]
+name = "vibeos-vsh"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["qemu-virt"]
+qemu-virt = []
+network = []
+
+[dependencies]
+vibeos-core = { path = "../../core" }

@@ -380,6 +380,9 @@ its process owns. Here, authority is not a property of the code.
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |
 | `kernel/src/netstack_platform.rs` | thin packet/network-control adapter plus recovery-only test hooks |
+| `components/vsh/` | capability-native interactive loop, foreground cancellation, rendering, and command registration (`no_std`) |
+| `kernel/src/vsh_platform.rs` | console capability and hardware/management command adapters |
+| `kernel/src/legacy_shell.rs` | feature-gated diagnostic and hardware acceptance shell |
 | `components/sshd/` | capability-confined SSH protocol and VSH session component (`no_std`) |
 | `kernel/src/ssh_platform.rs` | thin kernel-private adapter for SSH capabilities and services |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |

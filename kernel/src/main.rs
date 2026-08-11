@@ -56,9 +56,7 @@ compile_error!(
         feature = "milkv-ssh-acceptance"
     )
 ))]
-compile_error!(
-    "feature `milkv-jitterentropy-probe` is an isolated UART qualification image"
-);
+compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualification image");
 
 extern crate alloc;
 
@@ -79,19 +77,22 @@ mod dev;
 mod durable_cspace;
 #[cfg(feature = "milkv-jitterentropy-probe")]
 mod jitterentropy_probe;
+#[cfg(feature = "legacy-shell")]
+mod legacy_shell;
 mod mmu;
-mod platform;
+#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+mod netstack_platform;
 #[cfg(feature = "qemu-virt")]
 mod pci;
-#[cfg(feature = "qemu-virt")]
-mod xhci;
+mod platform;
 mod plic;
 mod rustc;
 mod saved_program;
 mod selftest;
-mod shell;
 #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
 mod ssh_acceptance_rng;
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+mod ssh_platform;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
@@ -100,8 +101,6 @@ mod ssh_acceptance_rng;
 mod ssh_security;
 #[cfg(feature = "ssh-security-test")]
 mod ssh_security_test;
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
-mod ssh_platform;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
@@ -109,8 +108,6 @@ mod ssh_platform;
 ))]
 mod ssh_test_fixture;
 mod store;
-#[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-mod netstack_platform;
 mod trampoline;
 mod trap;
 mod tty;
@@ -129,7 +126,10 @@ mod virtio_net;
 mod virtio_net;
 #[cfg(feature = "qemu-virt")]
 mod virtio_rng;
+mod vsh_platform;
 mod world;
+#[cfg(feature = "qemu-virt")]
+mod xhci;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -413,17 +413,22 @@ pub extern "C" fn kmain() -> ! {
         "shell",
         world.spaces["init"].clone(),
         world::SHELL_MEMORY_BUDGET,
-        shell::shell_task(boot_time),
+        legacy_shell::shell_task(boot_time),
     );
     #[cfg(not(feature = "legacy-shell"))]
     {
         let space = world.spaces["vsh"].clone();
         let mut session = vsh::Session::with_cspace(space.0.clone());
-        shell::install_standard_vsh_commands(&mut session);
+        vsh_platform::install_standard_commands(&mut session);
         #[cfg(feature = "tcp-echo-recovery-test")]
         session.install_host_command("tcp-fault", 0, 0, netstack_platform::vsh_inject_fault);
         #[cfg(feature = "tcp-echo-recovery-test")]
-        session.install_host_command("tcp-device-fault", 0, 0, netstack_platform::vsh_inject_driver_fault);
+        session.install_host_command(
+            "tcp-device-fault",
+            0,
+            0,
+            netstack_platform::vsh_inject_driver_fault,
+        );
         #[cfg(feature = "tcp-echo-recovery-test")]
         session.install_host_command("tcp-release", 0, 0, netstack_platform::vsh_release_stale);
         #[cfg(feature = "tcp-echo-recovery-test")]
@@ -432,7 +437,7 @@ pub extern "C" fn kmain() -> ! {
             "vsh",
             space.clone(),
             world::SHELL_MEMORY_BUDGET,
-            shell::vsh_task(space, world.vsh_console, session),
+            vsh_platform::task(space, world.vsh_console, session),
         );
     }
     let typed_channels = if world.net_outbound.is_some() {

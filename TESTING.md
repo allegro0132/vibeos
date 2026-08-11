@@ -20,7 +20,8 @@ cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
 ```
 
-Normal `run.sh`/`qrun.sh` builds boot the least-authority `vsh` component. The
+Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
+`components/vsh` frontend through `kernel/src/vsh_platform.rs`. The
 golden and benchmark runners explicitly build the kernel with
 `--features legacy-shell`; production/default images therefore do not expose
 the broad diagnostic command dispatcher.

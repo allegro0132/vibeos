@@ -107,7 +107,8 @@ mod ssh_security_test;
     feature = "milkv-ssh-acceptance"
 ))]
 mod ssh_test_fixture;
-mod store;
+pub use vibeos_object_store as store;
+mod store_platform;
 mod trampoline;
 mod trap;
 mod tty;

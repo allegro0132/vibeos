@@ -759,6 +759,7 @@ dependencies = [
  "jitterentropy-rs",
  "vibeos-core",
  "vibeos-netstack",
+ "vibeos-object-store",
  "vibeos-rustc",
  "vibeos-ssh-identity",
  "vibeos-sshd",
@@ -767,6 +768,13 @@ dependencies = [
 
 [[package]]
 name = "vibeos-netstack"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+]
+
+[[package]]
+name = "vibeos-object-store"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",

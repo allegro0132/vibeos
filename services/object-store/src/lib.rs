@@ -7,28 +7,30 @@
 //! The unified durable journal is bounded to sectors 64..576 so recovery work
 //! cannot grow with the remainder of the block device.
 
+#![no_std]
+
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::UnsafeCell;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use vibeos_core::durable::{
-    self as authority, ChainCheckpoint, DecodeStatus, ObjectId, RecordBody, StoreId,
-    TransactionId,
+    self as authority, ChainCheckpoint, DecodeStatus, ObjectId, RecordBody, StoreId, TransactionId,
 };
 use vibeos_core::store as journal;
 
-use crate::cap::{Cap, CapError, InvocationLease, Resource, Rights};
-use crate::exec::{self, TaskId};
-use crate::heap::{self, AllocationDomain, OwnerId};
-use crate::sync::SpinLock;
-use crate::virtio_blk::{self, BlockDevice, BlockError};
-use crate::world::Space;
+use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
+use vibeos_core::exec::{self, TaskId};
+use vibeos_core::heap::{self, AllocationDomain, OwnerId};
+use vibeos_core::sync::SpinLock;
 
 /// The persistent journal is isolated from the block-driver acceptance sectors
 /// and deliberately bounded so boot-time recovery cannot monopolize the hart.
@@ -54,6 +56,77 @@ const FIRST_ALLOCATABLE_ID: u128 = 1;
 
 const STORED_OBJECT_RIGHTS: Rights = Rights::READ.union(Rights::GRANT).union(Rights::REVOKE);
 
+pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendError {
+    Offline,
+    QueueFull,
+    OutOfRange,
+    ReadOnly,
+    FlushUnsupported,
+    TimedOut,
+    DriverCancelled,
+    DriverFault,
+    DriverRestarted,
+    DeviceIo,
+    Unsupported,
+    Protocol,
+    Quarantined,
+    AuthorityRevoked,
+    PermissionDenied,
+}
+
+impl core::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Offline => "block device is offline",
+            Self::QueueFull => "block request queue is full",
+            Self::OutOfRange => "sector is outside the device capacity",
+            Self::ReadOnly => "block device is read-only",
+            Self::FlushUnsupported => "block device does not support flush",
+            Self::TimedOut => "block request timed out",
+            Self::DriverCancelled => "block driver was cancelled",
+            Self::DriverFault => "block driver faulted",
+            Self::DriverRestarted => "block driver session restarted",
+            Self::DeviceIo => "block device reported an I/O error",
+            Self::Unsupported => "block device rejected the operation",
+            Self::Protocol => "block device returned a malformed completion",
+            Self::Quarantined => "block DMA is quarantined after an unconfirmed reset",
+            Self::AuthorityRevoked => "block capability is absent or revoked",
+            Self::PermissionDenied => "block capability lacks the required right",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendInfo {
+    pub capacity_sectors: u64,
+    pub read_only: bool,
+    pub supports_flush: bool,
+}
+
+/// Block and memory-accounting surface required by the object service.
+pub trait Platform: Send + Sync {
+    fn info(&self) -> Result<BackendInfo, BackendError>;
+    fn read_sector(&self, sector: u64) -> BackendFuture<'_, [u8; 512]>;
+    fn write_sector(&self, sector: u64, bytes: [u8; 512]) -> BackendFuture<'_, ()>;
+    fn flush(&self) -> BackendFuture<'_, ()>;
+    fn has_working_headroom(&self, required: usize) -> bool;
+}
+
+/// Exact CSpace incarnation into which a newly committed object may be
+/// published. The trait intentionally offers no lookup by stable object ID.
+pub trait PublicationTarget: Send + Sync {
+    fn incarnation(&self) -> u64;
+    fn publish(
+        &self,
+        expected_incarnation: u64,
+        object: Arc<StoredObject>,
+        rights: Rights,
+    ) -> Option<Cap>;
+}
+
 fn store_id() -> StoreId {
     StoreId::new(STORE_ID_RAW).expect("the fixed object-store ID is non-zero")
 }
@@ -69,7 +142,7 @@ pub enum StoreError {
     PermissionDenied,
     Busy,
     BackendAuthority,
-    Backend(BlockError),
+    Backend(BackendError),
     DeviceTooSmall,
     ReadOnly,
     FlushUnsupported,
@@ -118,8 +191,8 @@ impl core::fmt::Display for StoreError {
     }
 }
 
-impl From<BlockError> for StoreError {
-    fn from(error: BlockError) -> Self {
+impl From<BackendError> for StoreError {
+    fn from(error: BackendError) -> Self {
         Self::Backend(error)
     }
 }
@@ -201,10 +274,7 @@ impl StableScratch {
 static STORE_SCRATCH: StableScratch = StableScratch::new();
 
 struct StoreInner {
-    /// Dedicated backend CSpace.  It should contain only the attenuated block
-    /// grant supplied at construction time.
-    backend: Arc<Space>,
-    block: Cap,
+    platform: Arc<dyn Platform>,
     active: SpinLock<Option<ActiveClaim>>,
     state: SpinLock<RuntimeState>,
 }
@@ -265,11 +335,7 @@ impl StoreInner {
         }
     }
 
-    fn install_recovery(
-        &self,
-        recovered: &authority::RecoveryPreflight,
-        used_sectors: usize,
-    ) {
+    fn install_recovery(&self, recovered: &authority::RecoveryPreflight, used_sectors: usize) {
         let checkpoint = recovered
             .chain_checkpoint()
             .expect("a successful recovery has a usable checkpoint");
@@ -332,11 +398,10 @@ pub struct StoreService {
 }
 
 impl StoreService {
-    pub fn new(backend: Arc<Space>, block: Cap) -> Arc<Self> {
+    pub fn new(platform: Arc<dyn Platform>) -> Arc<Self> {
         let inner = system_allocation(|| {
             Arc::new(StoreInner {
-                backend,
-                block,
+                platform,
                 active: SpinLock::new_recoverable(None),
                 state: SpinLock::new(RuntimeState::COLD),
             })
@@ -360,7 +425,7 @@ impl StoreService {
     /// is deliberately not a capability operation: only the separately
     /// constructed durable-CSpace service receives a handle, and no caller can
     /// use it as an ambient ObjectId lookup namespace.
-    pub(crate) fn authority_journal(&self) -> AuthorityJournal {
+    pub fn authority_journal(&self) -> AuthorityJournal {
         AuthorityJournal {
             inner: self.inner.clone(),
         }
@@ -370,22 +435,22 @@ impl StoreService {
 /// One inert view of the shared journal. Authority is still absent: callers
 /// must apply external root constraints and construct typed resource witnesses
 /// before installing anything into a CSpace.
-pub(crate) struct AuthoritySnapshot {
-    pub(crate) formatted: bool,
-    pub(crate) checkpoint: ChainCheckpoint,
-    pub(crate) used_sectors: usize,
-    pub(crate) preflight: Option<authority::RecoveryPreflight>,
+pub struct AuthoritySnapshot {
+    pub formatted: bool,
+    pub checkpoint: ChainCheckpoint,
+    pub used_sectors: usize,
+    pub preflight: Option<authority::RecoveryPreflight>,
 }
 
 impl AuthoritySnapshot {
-    pub(crate) fn id_high_water(&self) -> u128 {
+    pub fn id_high_water(&self) -> u128 {
         self.preflight
             .as_ref()
             .map(authority::RecoveryPreflight::id_high_water)
             .unwrap_or(0)
     }
 
-    pub(crate) fn chain(&self) -> Result<authority::RecordChain, StoreError> {
+    pub fn chain(&self) -> Result<authority::RecordChain, StoreError> {
         authority::RecordChain::from_checkpoint(store_id(), self.checkpoint)
             .map_err(|_| StoreError::Corrupt)
     }
@@ -395,12 +460,12 @@ impl AuthoritySnapshot {
 /// Each operation rescans media and compares the caller's checkpoint before
 /// writing, so no stale preview can fork the sequence/CRC chain.
 #[derive(Clone)]
-pub(crate) struct AuthorityJournal {
+pub struct AuthorityJournal {
     inner: Arc<StoreInner>,
 }
 
 impl AuthorityJournal {
-    pub(crate) async fn recover(&self) -> Result<AuthoritySnapshot, StoreError> {
+    pub async fn recover(&self) -> Result<AuthoritySnapshot, StoreError> {
         ensure_working_headroom()?;
         let operation = self.inner.begin()?;
         let result = async {
@@ -427,7 +492,7 @@ impl AuthorityJournal {
     /// Append an already-previewed sequence after checking that physical media
     /// still has the checkpoint against which it was encoded. Every record is
     /// written and flushed independently, preserving the v1 prefix model.
-    pub(crate) async fn append(
+    pub async fn append(
         &self,
         expected: ChainCheckpoint,
         records: &[[u8; journal::RECORD_SIZE]],
@@ -464,10 +529,7 @@ impl AuthorityJournal {
             if verified.checkpoint != final_checkpoint {
                 return Err(StoreError::ObjectMismatch);
             }
-            let preflight = verified
-                .preflight
-                .as_ref()
-                .ok_or(StoreError::Corrupt)?;
+            let preflight = verified.preflight.as_ref().ok_or(StoreError::Corrupt)?;
             self.inner
                 .install_recovery(preflight, verified.used_sectors);
             Ok(verified)
@@ -483,10 +545,7 @@ impl AuthorityJournal {
     /// Read one restored object through a live typed capability. The durable
     /// service gets journal access but still cannot bypass CSpace authority by
     /// naming an ObjectId directly.
-    pub(crate) async fn read(
-        &self,
-        object: InvocationLease<StoredObject>,
-    ) -> Result<Vec<u8>, StoreError> {
+    pub async fn read(&self, object: InvocationLease<StoredObject>) -> Result<Vec<u8>, StoreError> {
         if !object.authorizes(Rights::READ) {
             return Err(StoreError::PermissionDenied);
         }
@@ -514,8 +573,8 @@ pub unsafe fn recover_faulted_task(task: TaskId, domain: AllocationDomain) {
         return;
     };
 
-    let task_key = crate::sync::TaskRecoveryKey::new(task.0)
-        .expect("executor TaskId zero is reserved");
+    let task_key =
+        vibeos_core::sync::TaskRecoveryKey::new(task.0).expect("executor TaskId zero is reserved");
     // Safety: the executor installed this exact task key around its poll and
     // has now detached that task forever. A same-domain task on another hart
     // carries a different key and cannot have its guard recovered here.
@@ -558,7 +617,7 @@ pub struct StoredObject {
 }
 
 impl StoredObject {
-    pub(crate) fn from_recovered(object: &authority::RecoveredObject) -> Arc<Self> {
+    pub fn from_recovered(object: &authority::RecoveredObject) -> Arc<Self> {
         system_allocation(|| {
             Arc::new(Self {
                 store_id: store_id(),
@@ -601,7 +660,7 @@ pub fn info_with(lease: &InvocationLease<StoreService>) -> Result<StoreInfo, Sto
 /// which initiated the operation.
 pub async fn put_with(
     lease: InvocationLease<StoreService>,
-    target: Arc<Space>,
+    target: Arc<dyn PublicationTarget>,
     object_kind: journal::ObjectKind,
     bytes: &[u8],
 ) -> Result<Cap, StoreError> {
@@ -611,9 +670,9 @@ pub async fn put_with(
 /// Sealed acceptance entry point. The fault target is carried inside this one
 /// future rather than in global state, so an earlier error/fault/cancellation
 /// cannot leave an injection armed for a different invocation.
-pub(crate) async fn put_with_static_fault_before_write(
+pub async fn put_with_static_fault_before_write(
     lease: InvocationLease<StoreService>,
-    target: &'static Space,
+    target: &'static dyn PublicationTarget,
     object_kind: journal::ObjectKind,
     bytes: &[u8],
 ) -> Result<Cap, StoreError> {
@@ -638,7 +697,7 @@ pub(crate) async fn put_with_static_fault_before_write(
 
 async fn put_to_space(
     lease: InvocationLease<StoreService>,
-    target: &Space,
+    target: &dyn PublicationTarget,
     object_kind: journal::ObjectKind,
     bytes: &[u8],
     fault_target: Option<FaultTarget>,
@@ -654,7 +713,7 @@ async fn put_to_space(
     // Snapshot the destination before the first await.  Publication uses the
     // same-incarnation primitive after commit, so restart cannot redirect a
     // successful transaction into a fresh authority domain.
-    let target_incarnation = target.0.lock().incarnation();
+    let target_incarnation = target.incarnation();
     let inner = lease.with(|service| service.inner.clone());
     let operation = inner.begin()?;
 
@@ -664,7 +723,9 @@ async fn put_to_space(
     let recovered = recover_scan(&scan);
     let (mut chain, old_high_water, format_record) = match recovered {
         Ok(recovered) => {
-            let checkpoint = recovered.chain_checkpoint().map_err(|_| StoreError::Corrupt)?;
+            let checkpoint = recovered
+                .chain_checkpoint()
+                .map_err(|_| StoreError::Corrupt)?;
             let chain = journal::RecordChain::from_checkpoint(store_id(), checkpoint)
                 .map_err(|_| StoreError::Corrupt)?;
             inner.install_recovery(&recovered, scan.next_physical);
@@ -763,11 +824,7 @@ async fn put_to_space(
             commit_sequence,
         })
     });
-    let published =
-        target
-            .0
-            .lock()
-            .mint_if_incarnation(target_incarnation, object, STORED_OBJECT_RIGHTS);
+    let published = target.publish(target_incarnation, object, STORED_OBJECT_RIGHTS);
     operation.finish();
     published.ok_or(StoreError::PublicationTargetRestarted)
 }
@@ -888,8 +945,8 @@ fn validate_preview(
     let mut previous_sequence = before.checkpoint.previous_sequence;
     let mut previous_crc32c = before.checkpoint.previous_crc32c;
     for (index, bytes) in records.iter().enumerate() {
-        let DecodeStatus::Valid(decoded) = authority::LogRecord::decode(bytes)
-            .map_err(|_| StoreError::Corrupt)?
+        let DecodeStatus::Valid(decoded) =
+            authority::LogRecord::decode(bytes).map_err(|_| StoreError::Corrupt)?
         else {
             return Err(StoreError::Corrupt);
         };
@@ -941,9 +998,8 @@ async fn append_record(
     flush(inner).await
 }
 
-fn backend_info(inner: &StoreInner) -> Result<virtio_blk::BlockInfo, StoreError> {
-    let lease = backend_lease(inner, Rights::READ)?;
-    Ok(virtio_blk::info_with(&lease)?)
+fn backend_info(inner: &StoreInner) -> Result<BackendInfo, StoreError> {
+    Ok(inner.platform.info()?)
 }
 
 fn validate_writable_backend(inner: &StoreInner) -> Result<(), StoreError> {
@@ -958,32 +1014,15 @@ fn validate_writable_backend(inner: &StoreInner) -> Result<(), StoreError> {
 }
 
 async fn read_sector(inner: &StoreInner, sector: u64) -> Result<[u8; 512], StoreError> {
-    let lease = backend_lease(inner, Rights::READ)?;
-    Ok(virtio_blk::read_with(lease, sector).await?)
+    Ok(inner.platform.read_sector(sector).await?)
 }
 
 async fn write_sector(inner: &StoreInner, sector: u64, bytes: [u8; 512]) -> Result<(), StoreError> {
-    let lease = backend_lease(inner, Rights::WRITE)?;
-    Ok(virtio_blk::write_with(lease, sector, bytes).await?)
+    Ok(inner.platform.write_sector(sector, bytes).await?)
 }
 
 async fn flush(inner: &StoreInner) -> Result<(), StoreError> {
-    let lease = backend_lease(inner, Rights::WRITE)?;
-    Ok(virtio_blk::flush_with(lease).await?)
-}
-
-fn backend_lease(
-    inner: &StoreInner,
-    need: Rights,
-) -> Result<InvocationLease<BlockDevice>, StoreError> {
-    let cspace = inner.backend.0.lock();
-    cspace
-        .lookup_lease::<BlockDevice>(inner.block, need)
-        .map_err(map_cap_error)
-}
-
-fn map_cap_error(_error: CapError) -> StoreError {
-    StoreError::BackendAuthority
+    Ok(inner.platform.flush().await?)
 }
 
 fn map_encode_error(error: journal::EncodeError) -> StoreError {
@@ -995,11 +1034,11 @@ fn map_encode_error(error: journal::EncodeError) -> StoreError {
 }
 
 fn ensure_working_headroom() -> Result<(), StoreError> {
-    let domain = heap::current_domain();
-    let stats = crate::HEAP
-        .account_stats(domain.owner)
-        .ok_or(StoreError::InsufficientMemory)?;
-    if stats.quota_bytes.saturating_sub(stats.live_bytes) < STORE_WORKING_HEADROOM {
+    let installed = INSTALLED_STORE.lock();
+    let Some(inner) = installed.as_ref() else {
+        return Err(StoreError::BackendAuthority);
+    };
+    if !inner.platform.has_working_headroom(STORE_WORKING_HEADROOM) {
         return Err(StoreError::InsufficientMemory);
     }
     Ok(())

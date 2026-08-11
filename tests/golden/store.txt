@@ -2,13 +2,13 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> store fault
-[!] panic: panicked at kernel/src/store.rs:LINE:COL:
+[!] panic: panicked at services/object-store/src/lib.rs:LINE:COL:
 injected object-store fault before durable write
-[!] panic: panicked at kernel/src/store.rs:LINE:COL:
+[!] panic: panicked at services/object-store/src/lib.rs:LINE:COL:
 injected object-store fault before durable write
-[!] panic: panicked at kernel/src/store.rs:LINE:COL:
+[!] panic: panicked at services/object-store/src/lib.rs:LINE:COL:
 injected object-store fault before durable write
-[!] panic: panicked at kernel/src/store.rs:LINE:COL:
+[!] panic: panicked at services/object-store/src/lib.rs:LINE:COL:
 injected object-store fault before durable write
   store fault recovery: 4 raw faults, claim cleared, heap plateau
 vibe> store test

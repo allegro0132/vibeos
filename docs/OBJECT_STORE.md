@@ -5,6 +5,13 @@ introducing a filesystem namespace. An object has a stable on-media identity,
 but that number is private store metadata: clients can reach the object only by
 holding a live `StoredObject` capability.
 
+The transaction, recovery, and resource implementation is compiled as the
+independent `services/object-store` `no_std` crate. It sees block I/O and CSpace
+publication only through narrow `Platform` and `PublicationTarget` traits.
+`kernel/src/store_platform.rs` resolves the attenuated block capability, maps
+driver errors, checks allocation headroom, and performs same-incarnation CSpace
+publication; stable object IDs never cross that adapter as lookup authority.
+
 The public operation boundary is deliberately small:
 
 ```text

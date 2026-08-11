@@ -356,7 +356,7 @@ impl DurableCSpaceService {
 
     pub(crate) async fn recover_after_block_online(&self) -> Result<(), DurableCSpaceError> {
         if !virtio_blk::is_online() {
-            return Err(StoreError::Backend(virtio_blk::BlockError::Offline).into());
+            return Err(StoreError::Backend(crate::store::BackendError::Offline).into());
         }
         self.transition(
             DurableCSpaceState::WaitingBlock,
@@ -954,9 +954,9 @@ fn retryable_boot_recovery_error(error: &DurableCSpaceError) -> bool {
         error,
         DurableCSpaceError::Store(StoreError::Busy | StoreError::JournalChanged)
             | DurableCSpaceError::Store(StoreError::Backend(
-                virtio_blk::BlockError::Offline
-                    | virtio_blk::BlockError::DriverFault
-                    | virtio_blk::BlockError::DriverRestarted
+                crate::store::BackendError::Offline
+                    | crate::store::BackendError::DriverFault
+                    | crate::store::BackendError::DriverRestarted
             ))
     )
 }

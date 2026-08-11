@@ -125,9 +125,11 @@ upward except through a capability it was handed.
 | `components/sshd` | growing | Capability-confined SSH protocol, authentication, sessions, and VSH frontend | 1 (secret wipe) |
 | `kernel/ssh_platform.rs` | small | Kernel-private network, entropy, signer, policy, command, and log adapters for `sshd` | — |
 | `services/ssh-identity` | small, trusted | Opaque host signer and immutable binary authorized-key capability policy | — |
+| `services/object-store` | growing | Capability-addressed journal recovery, object transactions, and immutable object resources | 1 (fixed scratch buffer) |
+| `kernel/store_platform.rs` | small | Block-capability, CSpace publication, and heap-accounting adapter | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
-| `shell.rs` | 458 | Operator interface | — |
+| `kernel/legacy_shell.rs` | large, gated | Diagnostic operator and hardware acceptance interface | yes |
 | `tty.rs` | 110 | Console line discipline, quiet | — |
 | `dev.rs` | 102 | Devices and bounded memory as capability-guarded resources | — |
 | `compiler/` | 2454 | Lexer, parser, type checker, RV64 code generator | — |

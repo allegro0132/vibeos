@@ -373,7 +373,7 @@ its process owns. Here, authority is not a property of the code.
 |---|---|
 | `world.rs` | the system image: spaces, components, wiring |
 | `dev.rs` | console and memory-region resources |
-| `shell.rs` | interactive shell (`probe`, `revoke`, `caps`, `ps`, …) |
+| `kernel/src/legacy_shell.rs` | feature-gated diagnostic shell (`probe`, `revoke`, `caps`, `ps`, …) |
 | `trap.rs` | S-mode trap entry, IRQ → waker |
 | `uart.rs`, `plic.rs`, `sbi.rs`, `dev.rs` | hardware |
 | `compiler/` | lexer, parser, RV64 code generator (its own crate, host-testable) |
@@ -386,6 +386,8 @@ its process owns. Here, authority is not a property of the code.
 | `components/sshd/` | capability-confined SSH protocol and VSH session component (`no_std`) |
 | `kernel/src/ssh_platform.rs` | thin kernel-private adapter for SSH capabilities and services |
 | `services/ssh-identity/` | trusted host signing and immutable authorized-key capability services (`no_std`) |
+| `services/object-store/` | capability-addressed journal, recovery, transactions, and stored-object resources (`no_std`) |
+| `kernel/src/store_platform.rs` | thin block capability, CSpace publication, and heap-accounting adapter |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |

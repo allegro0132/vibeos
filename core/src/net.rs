@@ -14,16 +14,10 @@ use core::fmt;
 use core::num::NonZeroU64;
 
 pub use crate::chan::Endpoint;
+pub use vibeos_hal::{MAX_ETHERNET_FRAME_LEN, MAX_PACKET_LEN};
 
 /// The bidirectional typed endpoint object before its interface is narrowed.
 pub type DuplexEndpoint<T> = Endpoint<T>;
-
-/// Largest Ethernet frame handled by the M4.4 network interface, excluding
-/// the four-byte frame check sequence supplied and consumed by the device.
-pub const MAX_PACKET_LEN: usize = 1_514;
-
-/// Descriptive alias for [`MAX_PACKET_LEN`].
-pub const MAX_ETHERNET_FRAME_LEN: usize = MAX_PACKET_LEN;
 
 /// An owned Ethernet frame with fixed, allocation-free storage.
 ///

@@ -9,7 +9,6 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
-use vibeos_core::net::MAX_PACKET_LEN;
 use vibeos_driver_virtio_core as virtio;
 use vibeos_driver_virtio_core::{
     AvailableRing, Descriptor, ModernInit, NegotiatedFeatures, NetDeviceModel, NetDeviceState,
@@ -17,6 +16,7 @@ use vibeos_driver_virtio_core::{
     NET_HEADER_SIZE, NET_RECEIVE_QUEUE, NET_TRANSMIT_QUEUE, SPLIT_QUEUE_SIZE, VIRTIO_F_VERSION_1,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
+use vibeos_hal::MAX_PACKET_LEN;
 
 const _: () = assert!(MAX_PACKET_LEN as u32 == virtio::NET_MAX_FRAME_SIZE);
 

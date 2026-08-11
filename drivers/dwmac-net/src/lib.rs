@@ -10,8 +10,7 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use vibeos_core::net::MAX_PACKET_LEN;
-use vibeos_hal::DwmacDescription;
+use vibeos_hal::{DwmacDescription, MAX_PACKET_LEN};
 
 const DMA_BUFFER_LEN: usize = 1_536;
 const RESET_BUDGET: usize = 2_000_000;

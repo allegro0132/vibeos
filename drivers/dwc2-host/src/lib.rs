@@ -19,6 +19,11 @@ const USB_CLOCKS_ENABLE_1: u32 = 0xf000_0000;
 const USB_CLOCKS_ENABLE_2: u32 = 1;
 const USB_ROLE_MASK: u32 = 0xc0;
 const USB_ROLE_HOST: u32 = 0x40;
+const USB_VBUS_POWER: u32 = 1 << 1;
+
+const PHY_UTMI_CONTROL: usize = 0x14;
+const PHY_UTMI_RESET: u32 = 0x18b;
+const PHY_UTMI_RESET_SETTLE_US: u64 = 100;
 
 const GAHBCFG: usize = 0x008;
 const GUSBCFG: usize = 0x00c;
@@ -270,10 +275,19 @@ impl Controller {
             soc_write(
                 description,
                 TOP_USB_ROLE,
-                (old_role & !USB_ROLE_MASK) | USB_ROLE_HOST,
+                (old_role & !USB_ROLE_MASK) | USB_ROLE_HOST | USB_VBUS_POWER,
             );
+
+            // CV1800B's wrapper requires its UTMI state machine to be reset
+            // after the five USB clocks are enabled. This is the same pulse
+            // used by the vendor FSBL before it touches the DWC2 core.
+            let old_utmi = phy_read(description, PHY_UTMI_CONTROL);
+            phy_write(description, PHY_UTMI_CONTROL, PHY_UTMI_RESET);
+            compiler_fence(Ordering::SeqCst);
+            phy_write(description, PHY_UTMI_CONTROL, old_utmi);
         }
         compiler_fence(Ordering::SeqCst);
+        delay_us(timebase_hz, time, PHY_UTMI_RESET_SETTLE_US);
 
         let result = unsafe { Self::initialize_core(description, timebase_hz, time) };
         match result {
@@ -1209,6 +1223,18 @@ fn delay_ms(timebase_hz: u64, time: fn() -> u64, milliseconds: u64) {
     }
 }
 
+fn delay_us(timebase_hz: u64, time: fn() -> u64, microseconds: u64) {
+    let started = time();
+    let duration = (timebase_hz
+        .saturating_mul(microseconds)
+        .saturating_add(999_999)
+        / 1_000_000)
+        .max(1);
+    while time().wrapping_sub(started) < duration {
+        core::hint::spin_loop();
+    }
+}
+
 unsafe fn dma_bytes() -> &'static mut [u8; DMA_BYTES] {
     unsafe { &mut *DMA.0.get() }
 }
@@ -1329,6 +1355,10 @@ unsafe fn core_write(description: Dwc2Description, offset: usize, value: u32) {
 
 unsafe fn phy_read(description: Dwc2Description, offset: usize) -> u32 {
     unsafe { read32(description.phy.start + offset) }
+}
+
+unsafe fn phy_write(description: Dwc2Description, offset: usize, value: u32) {
+    unsafe { write32(description.phy.start + offset, value) }
 }
 
 unsafe fn soc_read(description: Dwc2Description, offset: usize) -> u32 {

@@ -7,6 +7,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+./scripts/prepare-jitterentropy-rs.sh
 KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 UPDATE=0
 FILTER=""

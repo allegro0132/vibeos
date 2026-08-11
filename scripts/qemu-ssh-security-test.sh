@@ -3,6 +3,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+./scripts/prepare-jitterentropy-rs.sh
 
 KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}

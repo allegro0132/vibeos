@@ -101,7 +101,7 @@ vibeos-random = { path = "../random" }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
-jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
+jitterentropy = { package = "jitterentropy-rs", path = "../target/vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 vibeos-runtime-riscv = { path = "../runtime/riscv" }

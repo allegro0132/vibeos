@@ -154,6 +154,10 @@ and
 The physical UART VSH exposes `lsusb` for live diagnosis. It reports the DWC2
 release, IRQ, channel count, root-port state and raw `HPRT`, followed by the
 addressed device's VID:PID, speed, USB version and endpoint-zero packet size.
+Authenticated SSH sessions install the same shared VSH command profile, so
+`lsusb` and other read-only platform diagnostics are available over either
+transport. The default-password onboarding profile remains deliberately
+restricted until a public key is authorized.
 For a usable keyboard it also prints `HID boot-keyboard` with the selected
 interface and interrupt-IN endpoint. `connected, not enumerated` distinguishes
 an electrical connection from successful USB protocol enumeration.

@@ -969,6 +969,7 @@ dependencies = [
 name = "vibeos-object-store"
 version = "0.1.0"
 dependencies = [
+ "vibeos-blob-format",
  "vibeos-core",
  "vibeos-durable-format",
 ]

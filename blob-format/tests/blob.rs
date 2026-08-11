@@ -1,5 +1,5 @@
 use vibeos_blob_format::{
-    encode_blob, sha256, verify_proof, BlobError, BlobView, HEADER_SIZE, LEAF_SIZE,
+    encode_blob, encoded_len, sha256, verify_proof, BlobError, BlobView, HEADER_SIZE, LEAF_SIZE,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -185,4 +185,22 @@ fn canonical_root_is_a_stable_format_vector() {
         hex(&root),
         "f1ff81f0ff37bdb402131e37e9ef5c2a456bee4a6baf74dafff3ef70683438be"
     );
+}
+
+#[test]
+fn encoded_length_preflight_is_exact_across_tree_boundaries() {
+    for len in [
+        0,
+        1,
+        LEAF_SIZE,
+        LEAF_SIZE + 1,
+        LEAF_SIZE * 2,
+        LEAF_SIZE * 3 + 1,
+        LEAF_SIZE * 8,
+    ] {
+        assert_eq!(
+            encoded_len(len).unwrap(),
+            encode_blob(1, &vec![0; len]).unwrap().len()
+        );
+    }
 }

@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+vibeos-blob-format = { path = "../../blob-format" }
 vibeos-core = { path = "../../core" }
 vibeos-durable-format = { path = "../../durable-format" }

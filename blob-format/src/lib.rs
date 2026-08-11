@@ -343,6 +343,21 @@ pub fn encode_blob(object_kind: u32, bytes: &[u8]) -> Result<Vec<u8>, BlobError>
     Ok(encoded)
 }
 
+/// Exact encoded size for a canonical blob carrying `byte_len` content bytes.
+/// Callers can enforce a backend limit before allocating the encoded object.
+pub fn encoded_len(byte_len: usize) -> Result<usize, BlobError> {
+    let geometry = Geometry::for_len(byte_len)?;
+    HEADER_SIZE
+        .checked_add(byte_len)
+        .and_then(|size| {
+            geometry
+                .node_count
+                .checked_mul(HASH_SIZE)
+                .and_then(|tree_len| size.checked_add(tree_len))
+        })
+        .ok_or(BlobError::LengthOverflow)
+}
+
 pub fn verify_proof(
     descriptor: BlobDescriptor,
     chunk: &[u8],

@@ -39,7 +39,7 @@ use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, 
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
 use vibeos_core::sync::SpinLock;
-use vibeos_core::terminal::{
+use vibeos_vsh::terminal::{
     FrontendError, TerminalEvent, TerminalFrontend, MAX_EMIT_TEXT_BYTES,
     MAX_INPUT_BYTES as MAX_TERMINAL_INPUT_BYTES,
 };
@@ -175,7 +175,7 @@ pub trait Platform: Sync {
         policy: Cap,
         key: &SshEd25519PublicKey,
     ) -> Result<Option<AuthorizedProfile>, ()>;
-    fn install_standard_vsh_commands(&self, session: &mut vibeos_core::vsh::Session);
+    fn install_standard_vsh_commands(&self, session: &mut vibeos_vsh::Session);
     fn log(&self, args: fmt::Arguments<'_>);
 }
 
@@ -510,7 +510,7 @@ enum ConnectionEnd {
 
 enum ExecutionEnd {
     Complete {
-        reports: Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>,
+        reports: Result<Vec<vibeos_vsh::JobReport>, vibeos_vsh::Diagnostic>,
         timed_out: bool,
     },
     Reset(&'static str),
@@ -1267,7 +1267,7 @@ fn progress_protocol(
                             .command()
                             .map_err(|_| "exec command was not valid UTF-8")?
                             .to_string();
-                        if vibeos_core::vsh::validate_ssh_exec(&value).is_ok() {
+                        if vibeos_vsh::validate_ssh_exec(&value).is_ok() {
                             command = Some(value);
                         }
                     }
@@ -1710,7 +1710,7 @@ fn mark_running_interrupts(
 #[allow(clippy::too_many_arguments)]
 async fn execute_shell_command(
     command: &str,
-    session: &mut vibeos_core::vsh::Session,
+    session: &mut vibeos_vsh::Session,
     runner: &mut Runner<'_, Server>,
     signer: &mut CapabilityHostSigner<'_>,
     space: &Space,
@@ -1723,7 +1723,7 @@ async fn execute_shell_command(
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
     require_carrier: bool,
-) -> Result<Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>, ConnectionEnd> {
+) -> Result<Result<Vec<vibeos_vsh::JobReport>, vibeos_vsh::Diagnostic>, ConnectionEnd> {
     let cancel = Arc::new(AtomicBool::new(false));
     // Ordinary bytes queued after Enter remain typeahead for the next prompt.
     // Ctrl-C is different: SSH byte ordering proves every queued byte follows
@@ -1940,7 +1940,7 @@ async fn emit_shell_text(
 
 #[allow(clippy::too_many_arguments)]
 async fn render_shell_execution(
-    result: &Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>,
+    result: &Result<Vec<vibeos_vsh::JobReport>, vibeos_vsh::Diagnostic>,
     runner: &mut Runner<'_, Server>,
     signer: &mut CapabilityHostSigner<'_>,
     space: &Space,
@@ -1958,7 +1958,7 @@ async fn render_shell_execution(
         Ok(reports) => {
             let total = reports.iter().try_fold(0usize, |total, report| {
                 let total = total.checked_add(report.output.len())?;
-                if report.status == vibeos_core::vsh::Status::Success {
+                if report.status == vibeos_vsh::Status::Success {
                     Some(total)
                 } else {
                     total.checked_add(
@@ -2002,7 +2002,7 @@ async fn render_shell_execution(
                     require_carrier,
                 )
                 .await?;
-                if report.status != vibeos_core::vsh::Status::Success {
+                if report.status != vibeos_vsh::Status::Success {
                     let diagnostic =
                         alloc::format!("  vsh job %{}: {:?}\n", report.id, report.status);
                     emit_shell_text(
@@ -2057,7 +2057,7 @@ async fn render_shell_execution(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_shell_repl(
-    session: &mut vibeos_core::vsh::Session,
+    session: &mut vibeos_vsh::Session,
     runner: &mut Runner<'_, Server>,
     signer: &mut CapabilityHostSigner<'_>,
     space: &Space,
@@ -2158,7 +2158,7 @@ async fn serve_interactive_shell(
         .pty
         .ok_or(ConnectionEnd::Reset("SSH shell started without a PTY"))?;
     let cspace = Arc::new(SpinLock::new(CSpace::new("ssh-vsh-session")));
-    let mut session = vibeos_core::vsh::Session::with_cspace(cspace);
+    let mut session = vibeos_vsh::Session::with_cspace(cspace);
     space.install_standard_vsh_commands(&mut session);
     let mut frontend = TerminalFrontend::new();
 
@@ -2237,7 +2237,7 @@ async fn execute_with_network(
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut session =
-        vibeos_core::vsh::Session::with_profile(vibeos_core::vsh::SessionProfile::SshExec);
+        vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
@@ -2351,7 +2351,7 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 }
 
 fn collect_execution(
-    reports: Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>,
+    reports: Result<Vec<vibeos_vsh::JobReport>, vibeos_vsh::Diagnostic>,
     timed_out: bool,
 ) -> (Vec<u8>, u32) {
     if timed_out {
@@ -2376,16 +2376,16 @@ fn collect_execution(
     (output, status)
 }
 
-fn ssh_exit_status(status: vibeos_core::vsh::Status) -> u32 {
+fn ssh_exit_status(status: vibeos_vsh::Status) -> u32 {
     match status {
-        vibeos_core::vsh::Status::Success => 0,
-        vibeos_core::vsh::Status::Returned(status) => status.into(),
-        vibeos_core::vsh::Status::Usage => 2,
-        vibeos_core::vsh::Status::Unavailable => 127,
-        vibeos_core::vsh::Status::Denied => 126,
-        vibeos_core::vsh::Status::BudgetExceeded => 124,
-        vibeos_core::vsh::Status::Faulted => 125,
-        vibeos_core::vsh::Status::Cancelled => 130,
+        vibeos_vsh::Status::Success => 0,
+        vibeos_vsh::Status::Returned(status) => status.into(),
+        vibeos_vsh::Status::Usage => 2,
+        vibeos_vsh::Status::Unavailable => 127,
+        vibeos_vsh::Status::Denied => 126,
+        vibeos_vsh::Status::BudgetExceeded => 124,
+        vibeos_vsh::Status::Faulted => 125,
+        vibeos_vsh::Status::Cancelled => 130,
     }
 }
 

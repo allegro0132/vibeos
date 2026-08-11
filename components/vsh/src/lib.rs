@@ -1,13 +1,18 @@
 //! Capability-native interactive shell frontend.
 //!
-//! Parsing, planning, and job execution live in `vibeos-core::vsh`. This
-//! component owns the interactive loop, foreground cancellation, report
+//! This component owns parsing, planning, job execution, terminal line
+//! discipline, the interactive loop, foreground cancellation, report
 //! rendering, and declarative command registration. The kernel supplies only
 //! byte-oriented console operations and capability-backed command adapters.
 
 #![no_std]
 
 extern crate alloc;
+
+mod engine;
+pub mod terminal;
+
+pub use engine::*;
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -19,7 +24,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
 use vibeos_core::sync::SpinLock;
-use vibeos_core::vsh::{Session, Status};
 
 pub type ReadByteFuture<'a> = Pin<Box<dyn Future<Output = u8> + Send + 'a>>;
 pub type CommandHandler = fn(&[String]) -> Result<String, Status>;

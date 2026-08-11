@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use vibeos_core::cap::{Resource, Rights};
 use vibeos_core::exec;
-use vibeos_core::vsh::{
-    self, ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement, Status,
-};
+use vibeos_vsh as vsh;
+use vibeos_vsh::{ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement, Status};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 

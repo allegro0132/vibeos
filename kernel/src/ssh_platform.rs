@@ -196,7 +196,7 @@ impl Platform for SshPlatform {
             }))
     }
 
-    fn install_standard_vsh_commands(&self, session: &mut vibeos_core::vsh::Session) {
+    fn install_standard_vsh_commands(&self, session: &mut vibeos_vsh::Session) {
         crate::vsh_platform::install_standard_commands(session);
     }
 

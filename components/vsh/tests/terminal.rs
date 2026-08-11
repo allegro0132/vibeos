@@ -1,4 +1,4 @@
-use vibeos_core::terminal::{
+use vibeos_vsh::terminal::{
     FrontendError, InputAction, LineDiscipline, TerminalEvent, TerminalFrontend,
     MAX_EMIT_TEXT_BYTES, MAX_INPUT_BYTES, MAX_PENDING_OUTPUT_BYTES, MAX_PROMPT_BYTES,
     MAX_REGULAR_PENDING_OUTPUT_BYTES,

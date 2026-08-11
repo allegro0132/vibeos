@@ -825,9 +825,13 @@ fn committed_root_and_child_install_with_exact_identity_and_attenuation() {
     let (child_cap, child) = cs
         .install_reserved_child(&child_reservation, &root, &child_record)
         .unwrap();
+    let child_token = cs
+        .lookup_persistent_revocable::<Widget>(child_cap, Rights::READ)
+        .unwrap();
 
     assert_eq!(child.identity().rights(), Rights::READ);
     assert_eq!(child.identity().target(), child_record.target);
+    assert_eq!(child_token.try_with(|widget| widget.0), Ok("durable"));
     assert_eq!(
         cs.lookup_persistent_identity::<Widget>(child.identity(), Rights::READ)
             .unwrap()
@@ -862,6 +866,11 @@ fn committed_root_and_child_install_with_exact_identity_and_attenuation() {
         cs.lookup_persistent_identity::<Widget>(child.identity(), Rights::READ)
             .err(),
         Some(CapError::Invalid)
+    );
+    assert_eq!(
+        child_token.try_with(|widget| widget.0),
+        Err(CapError::Invalid),
+        "a previously resolved durable token must revalidate revocation"
     );
     let reused = cs.reserve_persistent_slot(incarnation).unwrap();
     assert_eq!(reused.target().slot, 1);
@@ -1065,6 +1074,11 @@ fn recovery_refuses_generation_rollback_and_ephemeral_identity() {
     let ephemeral = cs.mint(Arc::new(Widget("ephemeral")), Rights::ALL);
     assert_eq!(
         cs.persistent_witness::<Widget>(ephemeral, Rights::READ)
+            .err(),
+        Some(CapError::NotPersistent)
+    );
+    assert_eq!(
+        cs.lookup_persistent_revocable::<Widget>(ephemeral, Rights::READ)
             .err(),
         Some(CapError::NotPersistent)
     );

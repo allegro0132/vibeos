@@ -18,9 +18,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
-use crate::exec::{self, TaskHandle, TaskState, WaitQueue};
-use crate::sync::SpinLock;
+use vibeos_core::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
+use vibeos_core::exec::{self, TaskHandle, TaskState, WaitQueue};
+use vibeos_core::sync::SpinLock;
 
 pub const MAX_INPUT_BYTES: usize = 4 * 1024;
 pub const MAX_SCRIPT_BYTES: usize = 64 * 1024;
@@ -1325,7 +1325,7 @@ impl<T: Resource> Resource for PersistentProxy<T> {
 /// or an object-identity registry entry.
 pub fn install_persistent_proxy<T: Resource>(source: &CSpace, cap: Cap, rights: Rights, stage: &mut CSpace) -> Result<Cap, CapError> {
     if rights.contains(Rights::GRANT) || rights.contains(Rights::REVOKE) || rights.contains(Rights::INVOKE) { return Err(CapError::Amplification); }
-    let parent = source.persistent_witness::<T>(cap, rights)?.into_revocable();
+    let parent = source.lookup_persistent_revocable::<T>(cap, rights)?;
     Ok(stage.mint(Arc::new(PersistentProxy { parent, rights }), rights))
 }
 

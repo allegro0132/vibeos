@@ -909,6 +909,7 @@ name = "vibeos-netstack"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-vsh",
 ]
 
 [[package]]
@@ -948,6 +949,7 @@ dependencies = [
  "sunset",
  "vibeos-core",
  "vibeos-ssh-identity",
+ "vibeos-vsh",
 ]
 
 [[package]]

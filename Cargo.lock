@@ -787,6 +787,7 @@ dependencies = [
  "vibeos-bsp-milkv-duo",
  "vibeos-bsp-qemu-virt",
  "vibeos-core",
+ "vibeos-hal",
  "vibeos-kernel-acceptance",
  "vibeos-netstack",
  "vibeos-object-store",

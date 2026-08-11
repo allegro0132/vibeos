@@ -41,6 +41,84 @@ pub struct MemoryRegion {
     pub kind: MemoryKind,
 }
 
+/// Architecture-visible memory type to encode in identity-map leaves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryAttributes {
+    /// Standard RISC-V PTEs without vendor memory-type bits.
+    Standard,
+    /// T-Head C9xx shareable, cacheable, bufferable normal memory.
+    THeadNormal,
+    /// T-Head C9xx shareable, strongly ordered device memory.
+    THeadDevice,
+}
+
+/// Leaf size used for an early identity mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingGranularity {
+    Page4K,
+    Megapage2M,
+    Gigapage1G,
+}
+
+impl MappingGranularity {
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::Page4K => 4 * 1024,
+            Self::Megapage2M => 2 * 1024 * 1024,
+            Self::Gigapage1G => 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// One board-owned MMIO aperture mapped at identical virtual and physical
+/// addresses during early boot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentityMapping {
+    pub name: &'static str,
+    pub range: AddressRange,
+    pub granularity: MappingGranularity,
+}
+
+impl IdentityMapping {
+    pub const fn new(
+        name: &'static str,
+        start: usize,
+        end: usize,
+        granularity: MappingGranularity,
+    ) -> Self {
+        Self {
+            name,
+            range: AddressRange::new(start, end),
+            granularity,
+        }
+    }
+
+    pub const fn pages(name: &'static str, start: usize, end: usize) -> Self {
+        Self::new(name, start, end, MappingGranularity::Page4K)
+    }
+
+    pub const fn megapages(name: &'static str, start: usize, end: usize) -> Self {
+        Self::new(name, start, end, MappingGranularity::Megapage2M)
+    }
+
+    pub const fn gigapages(name: &'static str, start: usize, end: usize) -> Self {
+        Self::new(name, start, end, MappingGranularity::Gigapage1G)
+    }
+}
+
+/// Complete board contract for constructing the allocation-free boot address
+/// space. The table counts include the two sparse PLIC windows maintained by
+/// the kernel (control/enable and supervisor contexts).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmuDescription {
+    pub ram: AddressRange,
+    pub ram_attributes: MemoryAttributes,
+    pub mmio_attributes: MemoryAttributes,
+    pub identity_mappings: &'static [IdentityMapping],
+    pub device_level1_tables: usize,
+    pub device_level0_tables: usize,
+}
+
 impl MemoryRegion {
     pub const fn ram(name: &'static str, start: usize, end: usize) -> Self {
         Self {
@@ -68,13 +146,54 @@ impl MemoryRegion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UartVariant {
+    Ns16550,
+    DesignWareApb,
+}
+
+impl UartVariant {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ns16550 => "ns16550a",
+            Self::DesignWareApb => "dw-apb-uart",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UartQuirks {
+    pub busy_detect: bool,
+    pub phantom_rx_timeout: bool,
+}
+
+impl UartQuirks {
+    pub const NONE: Self = Self {
+        busy_detect: false,
+        phantom_rx_timeout: false,
+    };
+
+    pub const DESIGNWARE_APB: Self = Self {
+        busy_detect: true,
+        phantom_rx_timeout: true,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsoleCapabilities {
+    pub early_uart: bool,
+    pub usb_keyboard_input: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UartDescription {
+    pub variant: UartVariant,
     pub registers: AddressRange,
     pub irq: u32,
     pub register_shift: usize,
     pub register_width: usize,
     pub clock_hz: u32,
     pub baud: u32,
+    pub quirks: UartQuirks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,12 +208,14 @@ pub struct BoardInfo {
     pub timebase_hz: u64,
     pub uart: UartDescription,
     pub plic: PlicDescription,
+    pub console: ConsoleCapabilities,
 }
 
 /// Compile-time board contract consumed by architecture and kernel setup.
 pub trait Board {
     const INFO: BoardInfo;
     const MEMORY_MAP: &'static [MemoryRegion];
+    const MMU: MmuDescription;
     const HART_IDS: &'static [usize];
 
     /// Return the supervisor PLIC context for an OpenSBI-visible physical hart.

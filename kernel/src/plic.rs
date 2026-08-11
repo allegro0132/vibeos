@@ -8,8 +8,10 @@
 use crate::interrupt::{AtomicIrqHandlerSlot, IrqHandlerPublication};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use vibeos_hal::Board as BoardContract;
 
-pub const PLIC_BASE: usize = crate::platform::PLIC_BASE;
+const PLIC: vibeos_hal::PlicDescription = <crate::platform::Board as BoardContract>::INFO.plic;
+pub const PLIC_BASE: usize = PLIC.registers.start;
 
 const PRIORITY: usize = PLIC_BASE;
 const ENABLE_CONTEXTS: usize = PLIC_BASE + 0x2000;
@@ -25,7 +27,7 @@ static BOOT_S_CONTEXT: AtomicUsize = AtomicUsize::new(UNINITIALIZED_CONTEXT);
 
 // Clear only words implemented by the selected PLIC. QEMU retains the full
 // 0x80-byte/1024-source context while CV1800B implements sources 1..=101.
-const ENABLE_WORDS: usize = (crate::platform::PLIC_MAX_IRQ as usize + 32) / 32;
+const ENABLE_WORDS: usize = (PLIC.max_irq as usize + 32) / 32;
 pub const MAX_HANDLERS: usize = 16;
 
 /// Allocation-free top-half callback. `context` is the value supplied during
@@ -54,7 +56,7 @@ static ENABLE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Reset the boot physical hart's S-mode PLIC context to a fully masked state.
 pub fn init(physical_hart: usize) {
-    let context = crate::platform::plic_s_context(physical_hart)
+    let context = <crate::platform::Board as BoardContract>::plic_s_context(physical_hart)
         .expect("boot hart has no S-mode PLIC context on the selected platform");
     BOOT_S_CONTEXT.store(context, Ordering::Release);
     let _writer = HANDLER_WRITER.lock();
@@ -77,7 +79,7 @@ pub fn init(physical_hart: usize) {
 /// Keeping registration and enabling separate lets callers finish device
 /// initialization before the first top half can run.
 pub fn register(irq: u32, handler: IrqHandler, context: usize) -> Result<(), RegisterError> {
-    if irq > crate::platform::PLIC_MAX_IRQ {
+    if irq > PLIC.max_irq {
         return Err(RegisterError::InvalidIrq);
     }
     crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
@@ -163,7 +165,7 @@ pub fn disable(irq: u32) -> Result<(), RegisterError> {
 }
 
 fn set_enabled(irq: u32, enabled: bool) -> Result<(), RegisterError> {
-    if irq > crate::platform::PLIC_MAX_IRQ {
+    if irq > PLIC.max_irq {
         return Err(RegisterError::InvalidIrq);
     }
     let (word, bit) =

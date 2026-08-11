@@ -47,6 +47,7 @@ test = false
 vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
 vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-core = { path = "../core" }
+vibeos-hal = { path = "../hal" }
 vibeos-rustc = { path = "../compiler" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }

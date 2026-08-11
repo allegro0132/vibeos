@@ -5,15 +5,19 @@
 //! parked on `Uart::read_byte()`.
 
 use core::fmt::{self, Write};
-#[cfg(feature = "milkv-duo")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::exec::WaitQueue;
 use crate::interrupt::SpscByteRing;
 use crate::sync::SpinLock;
+use vibeos_hal::Board as BoardContract;
 
-pub const UART_BASE: usize = crate::platform::UART_BASE;
-pub const UART_IRQ: u32 = crate::platform::UART_IRQ;
+const BOARD_INFO: vibeos_hal::BoardInfo = <crate::platform::Board as BoardContract>::INFO;
+const UART: vibeos_hal::UartDescription = BOARD_INFO.uart;
+const CONSOLE: vibeos_hal::ConsoleCapabilities = BOARD_INFO.console;
+
+pub const UART_BASE: usize = UART.registers.start;
+pub const UART_IRQ: u32 = UART.irq;
 
 const RBR: usize = 0; // read: receive buffer
 const THR: usize = 0; // write: transmit holding
@@ -22,30 +26,25 @@ const IIR: usize = 2; // read: interrupt identification
 const FCR: usize = 2; // FIFO control
 const LCR: usize = 3; // line control
 const LSR: usize = 5; // line status
-#[cfg(feature = "milkv-duo")]
 const DW_USR: usize = 0x1f; // DesignWare UART status register
 
 const LSR_RX_READY: u8 = 1 << 0;
-#[cfg(feature = "milkv-duo")]
 const LSR_BREAK: u8 = 1 << 4;
 const LSR_TX_IDLE: u8 = 1 << 5;
 const LSR_TX_EMPTY: u8 = 1 << 6;
 const IIR_NO_INTERRUPT: u8 = 1 << 0;
-#[cfg(feature = "milkv-duo")]
 const IIR_BUSY: u8 = 0x07;
-#[cfg(feature = "milkv-duo")]
 const IIR_RX_TIMEOUT: u8 = 0x0c;
-#[cfg(feature = "milkv-duo")]
 const DW_USR_BUSY: u8 = 1 << 0;
 
 #[inline]
 fn reg_address(off: usize) -> usize {
-    UART_BASE + (off << crate::platform::UART_REG_SHIFT)
+    UART_BASE + (off << UART.register_shift)
 }
 
 #[inline]
 unsafe fn read_reg(off: usize) -> u8 {
-    match crate::platform::UART_REG_WIDTH {
+    match UART.register_width {
         1 => unsafe { (reg_address(off) as *const u8).read_volatile() },
         4 => unsafe { (reg_address(off) as *const u32).read_volatile() as u8 },
         _ => unreachable!("unsupported UART register width"),
@@ -54,7 +53,7 @@ unsafe fn read_reg(off: usize) -> u8 {
 
 #[inline]
 unsafe fn write_reg(off: usize, value: u8) {
-    match crate::platform::UART_REG_WIDTH {
+    match UART.register_width {
         1 => unsafe { (reg_address(off) as *mut u8).write_volatile(value) },
         4 => unsafe { (reg_address(off) as *mut u32).write_volatile(u32::from(value)) },
         _ => unreachable!("unsupported UART register width"),
@@ -72,23 +71,20 @@ static RX: SpscByteRing<256> = SpscByteRing::new();
 // The XHCI service is the sole producer and the shell remains the sole
 // consumer. A second SPSC ring preserves the UART IRQ ring's one-producer
 // contract while exposing one merged physical-console input stream.
-#[cfg(feature = "qemu-virt")]
 static USB_RX: SpscByteRing<256> = SpscByteRing::new();
 pub static RX_WAIT: WaitQueue = WaitQueue::new();
-#[cfg(feature = "milkv-duo")]
 static DW_BUSY_IRQS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "milkv-duo")]
 static DW_PHANTOM_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     // Safety: boot initializes UART before enabling the PLIC source or
     // starting the sole shell consumer.
     unsafe { RX.reset_quiescent() };
-    #[cfg(feature = "qemu-virt")]
-    unsafe { USB_RX.reset_quiescent() };
-    let baud_divisor = (u64::from(crate::platform::UART_CLOCK_HZ)
-        + u64::from(crate::platform::UART_BAUD) * 8)
-        / (u64::from(crate::platform::UART_BAUD) * 16);
+    if CONSOLE.usb_keyboard_input {
+        unsafe { USB_RX.reset_quiescent() };
+    }
+    let baud_divisor =
+        (u64::from(UART.clock_hz) + u64::from(UART.baud) * 8) / (u64::from(UART.baud) * 16);
     assert!(
         (1..=u16::MAX as u64).contains(&baud_divisor),
         "UART baud divisor is out of range"
@@ -101,17 +97,17 @@ pub fn init() {
         while read_reg(LSR) & LSR_TX_EMPTY == 0 {
             core::hint::spin_loop();
         }
-        #[cfg(feature = "milkv-duo")]
-        while read_reg(DW_USR) & DW_USR_BUSY != 0 {
-            core::hint::spin_loop();
+        if UART.quirks.busy_detect {
+            while read_reg(DW_USR) & DW_USR_BUSY != 0 {
+                core::hint::spin_loop();
+            }
         }
         write_reg(LCR, 0x80); // DLAB on
         write_reg(0, baud_divisor as u8);
         write_reg(1, (baud_divisor >> 8) as u8);
         write_reg(LCR, 0x03); // 8N1, DLAB off
         write_reg(FCR, 0x07); // enable + clear FIFOs
-        #[cfg(feature = "milkv-duo")]
-        {
+        if UART.quirks.busy_detect {
             // Reading USR clears any busy-detect condition inherited from the
             // firmware or raised during the line-control transition above.
             let _ = read_reg(DW_USR);
@@ -127,8 +123,10 @@ pub fn init() {
 /// still be localized from the serial log. It is used only on the boot hart
 /// before secondary harts or the executor can introduce another console
 /// writer; one final marker may be emitted immediately after enabling IRQs.
-#[cfg(feature = "milkv-duo")]
 pub fn early_write(text: &str) {
+    if !CONSOLE.early_uart {
+        return;
+    }
     for byte in text.bytes() {
         unsafe {
             while read_reg(LSR) & LSR_TX_IDLE == 0 {
@@ -161,8 +159,7 @@ pub fn handle_irq() {
     let mut received = false;
     unsafe {
         let iir = read_reg(IIR);
-        #[cfg(feature = "milkv-duo")]
-        if iir & 0x3f == IIR_BUSY {
+        if UART.quirks.busy_detect && iir & 0x3f == IIR_BUSY {
             // DW APB busy detect is cleared only by reading USR. Merely
             // completing the level-triggered PLIC claim would immediately
             // reclaim IRQ 44 forever and starve the executor.
@@ -173,8 +170,7 @@ pub fn handle_irq() {
         if iir & IIR_NO_INTERRUPT != 0 {
             return;
         }
-        #[cfg(feature = "milkv-duo")]
-        if iir & 0x3f == IIR_RX_TIMEOUT {
+        if UART.quirks.phantom_rx_timeout && iir & 0x3f == IIR_RX_TIMEOUT {
             let status = read_reg(LSR);
             if status & (LSR_RX_READY | LSR_BREAK) == 0 {
                 // DesignWare can assert RX timeout with an empty FIFO. Its
@@ -198,7 +194,6 @@ pub fn handle_irq() {
     }
 }
 
-#[cfg(feature = "milkv-duo")]
 pub fn dw_irq_recoveries() -> (u64, u64) {
     (
         DW_BUSY_IRQS.load(Ordering::Relaxed),
@@ -210,24 +205,26 @@ pub fn try_read() -> Option<u8> {
     // Safety: console input is owned by the one shell task.
     unsafe {
         RX.pop_from_consumer().or_else(|| {
-            #[cfg(feature = "qemu-virt")]
-            {
-                USB_RX.pop_from_consumer()
-            }
-            #[cfg(not(feature = "qemu-virt"))]
-            {
-                None
-            }
+            CONSOLE
+                .usb_keyboard_input
+                .then(|| USB_RX.pop_from_consumer())
+                .flatten()
         })
     }
 }
 
 /// Inject one byte from the sole USB keyboard service. Overflow drops the
 /// newest byte, matching the physical UART receive policy.
-#[cfg(feature = "qemu-virt")]
 pub fn inject_usb_input(byte: u8) {
+    if !CONSOLE.usb_keyboard_input {
+        return;
+    }
     let _ = unsafe { USB_RX.push_from_producer(byte) };
     RX_WAIT.wake_all();
+}
+
+pub const fn variant_name() -> &'static str {
+    UART.variant.name()
 }
 
 #[allow(dead_code)]

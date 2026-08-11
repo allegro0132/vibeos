@@ -78,13 +78,22 @@ const HCINT_TRANSFER_COMPLETE: u32 = 1;
 const HCINT_CHANNEL_HALTED: u32 = 1 << 1;
 const HCINT_STALL: u32 = 1 << 3;
 const HCINT_NAK: u32 = 1 << 4;
+const HCINT_ACK: u32 = 1 << 5;
+const HCINT_NYET: u32 = 1 << 6;
 const HCINT_ERRORS: u32 = (1 << 2) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10);
+
+const HCSPLT_PORT_MASK: u32 = 0x7f;
+const HCSPLT_HUB_ADDRESS_SHIFT: u32 = 7;
+const HCSPLT_TRANSACTION_ALL: u32 = 3 << 14;
+const HCSPLT_COMPLETE: u32 = 1 << 16;
+const HCSPLT_ENABLE: u32 = 1 << 31;
 
 const REGISTER_TIMEOUT_MS: u64 = 10;
 const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
 const DMA_BYTES: usize = 1_024;
 const MAX_NAK_RETRIES: usize = 32;
+const MAX_COMPLETE_SPLIT_RETRIES: usize = 16;
 const HID_REPORT_BYTES: usize = 8;
 const HID_INPUT_BYTES: usize = 18;
 const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
@@ -162,6 +171,12 @@ pub struct HubInfo {
     pub active_port: Option<u8>,
     pub child_speed: Option<Speed>,
     pub port_status: u16,
+}
+
+#[derive(Clone, Copy)]
+struct SplitTarget {
+    hub_address: u8,
+    port: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,7 +264,9 @@ pub struct Controller {
     endpoint_zero_max_packet: u16,
     speed: Speed,
     device: Option<DeviceInfo>,
+    child: Option<DeviceInfo>,
     hub: Option<HubInfo>,
+    split: Option<SplitTarget>,
     keyboard: Option<HidKeyboardInfo>,
     keyboard_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
@@ -476,7 +493,9 @@ impl Controller {
             endpoint_zero_max_packet: 8,
             speed: Speed::Full,
             device: None,
+            child: None,
             hub: None,
+            split: None,
             keyboard: None,
             keyboard_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
@@ -506,6 +525,10 @@ impl Controller {
         self.device
     }
 
+    pub const fn child(&self) -> Option<DeviceInfo> {
+        self.child
+    }
+
     pub const fn keyboard(&self) -> Option<HidKeyboardInfo> {
         self.keyboard
     }
@@ -519,13 +542,16 @@ impl Controller {
     pub fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {
         if !self.connected() {
             self.device = None;
+            self.child = None;
             self.hub = None;
+            self.split = None;
             self.keyboard = None;
             self.device_address = 0;
             return Ok(None);
         }
 
         self.reset_port()?;
+        self.split = None;
         self.speed = port_speed(unsafe { core_read(self.description, HPRT0) })?;
         self.device_address = 0;
         self.endpoint_zero_max_packet = match self.speed {
@@ -576,6 +602,7 @@ impl Controller {
         let info = parse_device_descriptor(descriptor, self.speed, self.device_address)?;
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
         self.device = Some(info);
+        self.child = None;
         self.hub = None;
         self.keyboard = None;
         Ok(Some(info))
@@ -584,7 +611,11 @@ impl Controller {
     /// Select the first HID boot-keyboard interface exposed by the addressed
     /// device and put it into the fixed eight-byte boot report protocol.
     pub fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
-        if self.device.is_none() || !self.connected() {
+        let Some(target) = self.child.or(self.device) else {
+            self.keyboard = None;
+            return Ok(None);
+        };
+        if !self.connected() {
             self.keyboard = None;
             return Ok(None);
         }
@@ -616,10 +647,7 @@ impl Controller {
             parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
         let Some(keyboard) = keyboard else {
             self.keyboard = None;
-            if self
-                .device
-                .is_some_and(|device| device.device_class == USB_CLASS_HUB)
-            {
+            if self.child.is_none() && target.device_class == USB_CLASS_HUB {
                 self.control_transfer(
                     SetupPacket {
                         request_type: 0,
@@ -630,7 +658,11 @@ impl Controller {
                     },
                     &mut [],
                 )?;
-                self.hub = Some(self.configure_hub()?);
+                let hub = self.configure_hub()?;
+                self.hub = Some(hub);
+                if self.enumerate_hub_child(hub)?.is_some() {
+                    return self.configure_hid_keyboard();
+                }
             }
             return Ok(None);
         };
@@ -656,7 +688,6 @@ impl Controller {
             &mut [],
         )?;
         self.keyboard = Some(keyboard);
-        self.hub = None;
         self.keyboard_pid = DataPid::Data0;
         self.keyboard_last = [0; HID_REPORT_BYTES];
         Ok(Some(keyboard))
@@ -747,6 +778,68 @@ impl Controller {
             return Err(Error::InvalidDescriptor);
         }
         Ok(u16::from_le_bytes([status[0], status[1]]))
+    }
+
+    fn enumerate_hub_child(&mut self, hub: HubInfo) -> Result<Option<DeviceInfo>, Error> {
+        let (Some(port), Some(speed)) = (hub.active_port, hub.child_speed) else {
+            self.child = None;
+            return Ok(None);
+        };
+        self.split = (speed != Speed::High).then_some(SplitTarget {
+            hub_address: hub.address,
+            port,
+        });
+        self.speed = speed;
+        self.device_address = 0;
+        self.endpoint_zero_max_packet = match speed {
+            Speed::High => 64,
+            Speed::Full | Speed::Low => 8,
+        };
+
+        let mut descriptor = [0u8; 18];
+        let prefix = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 1 << 8,
+            index: 0,
+            length: 8,
+        };
+        if self.control_transfer(prefix, &mut descriptor[..8])? != 8
+            || descriptor[0] != 18
+            || descriptor[1] != 1
+            || !matches!(descriptor[7], 8 | 16 | 32 | 64)
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.endpoint_zero_max_packet = u16::from(descriptor[7]);
+
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 5,
+                value: 2,
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.device_address = 2;
+        delay_ms(self.timebase_hz, self.time, 2);
+
+        let full = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 1 << 8,
+            index: 0,
+            length: descriptor.len() as u16,
+        };
+        if self.control_transfer(full, &mut descriptor)? != descriptor.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        let info = parse_device_descriptor(descriptor, speed, self.device_address)?;
+        self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
+        self.child = Some(info);
+        Ok(Some(info))
     }
 
     /// Poll one interrupt-IN boot report and return bytes for newly pressed
@@ -897,6 +990,19 @@ impl Controller {
         if length > DMA_BYTES || endpoint > 15 || address > 127 || max_packet == 0 {
             return Err(Error::BufferTooSmall);
         }
+        if let Some(split) = self.split {
+            return self.split_channel_transfer(
+                split,
+                address,
+                endpoint,
+                direction_in,
+                endpoint_type,
+                pid,
+                length,
+                max_packet,
+                nak_retries,
+            );
+        }
         let packet_bytes = usize::from(max_packet);
         let packet_count = if length == 0 {
             1
@@ -987,6 +1093,228 @@ impl Controller {
         Err(Error::Nak)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn split_channel_transfer(
+        &mut self,
+        split: SplitTarget,
+        address: u8,
+        endpoint: u8,
+        direction_in: bool,
+        endpoint_type: EndpointType,
+        mut pid: DataPid,
+        length: usize,
+        max_packet: u16,
+        nak_retries: usize,
+    ) -> Result<usize, Error> {
+        if length == 0 {
+            self.split_packet_transfer(
+                split,
+                address,
+                endpoint,
+                direction_in,
+                endpoint_type,
+                pid,
+                0,
+                max_packet,
+                0,
+                nak_retries,
+            )?;
+            return Ok(0);
+        }
+
+        let mut transferred = 0;
+        while transferred < length {
+            let requested = (length - transferred).min(usize::from(max_packet));
+            let actual = self.split_packet_transfer(
+                split,
+                address,
+                endpoint,
+                direction_in,
+                endpoint_type,
+                pid,
+                requested,
+                max_packet,
+                transferred,
+                nak_retries,
+            )?;
+            transferred += actual;
+            if actual < requested {
+                break;
+            }
+            pid = pid.toggled();
+        }
+        Ok(transferred)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_packet_transfer(
+        &mut self,
+        split: SplitTarget,
+        address: u8,
+        endpoint: u8,
+        direction_in: bool,
+        endpoint_type: EndpointType,
+        pid: DataPid,
+        requested: usize,
+        max_packet: u16,
+        dma_offset: usize,
+        nak_retries: usize,
+    ) -> Result<usize, Error> {
+        let start_length = if direction_in && requested != 0 {
+            usize::from(max_packet)
+        } else {
+            requested
+        };
+        if dma_offset.saturating_add(start_length.max(1)) > DMA_BYTES {
+            return Err(Error::BufferTooSmall);
+        }
+
+        for _ in 0..nak_retries {
+            let (start_status, _) = self.run_split_channel(
+                split,
+                false,
+                address,
+                endpoint,
+                direction_in,
+                endpoint_type,
+                pid,
+                start_length,
+                max_packet,
+                dma_offset,
+            )?;
+            if start_status & HCINT_STALL != 0 {
+                return Err(Error::Stalled);
+            }
+            if start_status & HCINT_NAK != 0 && start_status & HCINT_ERRORS == 0 {
+                delay_ms(self.timebase_hz, self.time, 1);
+                continue;
+            }
+            if start_status & HCINT_ACK == 0 || start_status & HCINT_ERRORS != 0 {
+                return Err(Error::TransferFailed(start_status));
+            }
+
+            // A complete split for control/bulk/interrupt traffic is valid
+            // from the second microframe after the start split.
+            delay_us(self.timebase_hz, self.time, 250);
+            for _ in 0..MAX_COMPLETE_SPLIT_RETRIES {
+                let complete_length = if direction_in { start_length } else { 0 };
+                let (status, actual) = self.run_split_channel(
+                    split,
+                    true,
+                    address,
+                    endpoint,
+                    direction_in,
+                    endpoint_type,
+                    pid,
+                    complete_length,
+                    max_packet,
+                    dma_offset,
+                )?;
+                if status & HCINT_TRANSFER_COMPLETE != 0 {
+                    return Ok(if direction_in {
+                        actual.min(requested)
+                    } else {
+                        requested
+                    });
+                }
+                if status & HCINT_STALL != 0 {
+                    return Err(Error::Stalled);
+                }
+                if status & HCINT_NYET != 0 && status & HCINT_ERRORS == 0 {
+                    delay_us(self.timebase_hz, self.time, 125);
+                    continue;
+                }
+                if status & HCINT_NAK != 0 && status & HCINT_ERRORS == 0 {
+                    delay_ms(self.timebase_hz, self.time, 1);
+                    break;
+                }
+                return Err(Error::TransferFailed(status));
+            }
+        }
+        Err(Error::Nak)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_split_channel(
+        &mut self,
+        split: SplitTarget,
+        complete: bool,
+        address: u8,
+        endpoint: u8,
+        direction_in: bool,
+        endpoint_type: EndpointType,
+        pid: DataPid,
+        length: usize,
+        max_packet: u16,
+        dma_offset: usize,
+    ) -> Result<(u32, usize), Error> {
+        let dma_address = DMA.0.get() as usize + dma_offset;
+        if direction_in {
+            invalidate_range(
+                self.description.cache_line_bytes,
+                dma_address,
+                length.max(1),
+            );
+        } else {
+            clean_range(
+                self.description.cache_line_bytes,
+                dma_address,
+                length.max(1),
+            );
+        }
+
+        let channel = 0;
+        let split_control = split_control(split, complete);
+        unsafe {
+            channel_write(self.description, channel, HCINTMSK, 0);
+            channel_write(self.description, channel, HCINT, u32::MAX);
+            channel_write(self.description, channel, HCSPLT, split_control);
+            channel_write(self.description, channel, HCDMA, dma_address as u32);
+            channel_write(
+                self.description,
+                channel,
+                HCTSIZ,
+                length as u32 | 1 << HCTSIZ_PACKET_SHIFT | (pid as u32) << HCTSIZ_PID_SHIFT,
+            );
+            let mut character = u32::from(max_packet)
+                | u32::from(endpoint) << HCCHAR_ENDPOINT_SHIFT
+                | (endpoint_type as u32) << HCCHAR_TYPE_SHIFT
+                | u32::from(address) << HCCHAR_ADDRESS_SHIFT
+                | HCCHAR_ENABLE;
+            if endpoint_type == EndpointType::Interrupt {
+                character |= 3 << 20;
+            }
+            if direction_in {
+                character |= HCCHAR_DIRECTION_IN;
+            }
+            if self.speed == Speed::Low {
+                character |= HCCHAR_LOW_SPEED;
+            }
+            channel_write(self.description, channel, HCCHAR, character);
+        }
+
+        let started = (self.time)();
+        let timeout = ticks_for_ms(self.timebase_hz, TRANSFER_TIMEOUT_MS);
+        loop {
+            let status = unsafe { channel_read(self.description, channel, HCINT) };
+            if status & HCINT_CHANNEL_HALTED != 0 {
+                unsafe { channel_write(self.description, channel, HCINT, status) };
+                let remaining =
+                    unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff } as usize;
+                let actual = length.saturating_sub(remaining);
+                if direction_in && actual != 0 {
+                    invalidate_range(self.description.cache_line_bytes, dma_address, actual);
+                }
+                return Ok((status, actual));
+            }
+            if (self.time)().wrapping_sub(started) >= timeout {
+                let _ = halt_channel(self.description, channel, self.timebase_hz, self.time);
+                return Err(Error::TransferTimedOut);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// Quiesce the host core and release software ownership. Clock gates stay
     /// enabled because other firmware may subsequently take over the OTG port.
     pub fn shutdown(self) {
@@ -1012,7 +1340,7 @@ impl Drop for Controller {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u32)]
 enum EndpointType {
     Control = 0,
@@ -1057,6 +1385,14 @@ const fn hub_port_speed(status: u16) -> Speed {
     } else {
         Speed::Full
     }
+}
+
+const fn split_control(target: SplitTarget, complete: bool) -> u32 {
+    HCSPLT_ENABLE
+        | HCSPLT_TRANSACTION_ALL
+        | (target.hub_address as u32) << HCSPLT_HUB_ADDRESS_SHIFT
+        | (target.port as u32) & HCSPLT_PORT_MASK
+        | if complete { HCSPLT_COMPLETE } else { 0 }
 }
 
 fn parse_hid_keyboard_configuration(
@@ -1573,6 +1909,12 @@ mod tests {
         assert_eq!(hub_port_speed(USB_PORT_STAT_LOW_SPEED), Speed::Low);
         assert_eq!(hub_port_speed(USB_PORT_STAT_HIGH_SPEED), Speed::High);
         assert_eq!(hub_port_speed(USB_PORT_STAT_ENABLE), Speed::Full);
+        let target = SplitTarget {
+            hub_address: 1,
+            port: 1,
+        };
+        assert_eq!(split_control(target, false), 0x8000_c081);
+        assert_eq!(split_control(target, true), 0x8001_c081);
     }
 
     #[test]

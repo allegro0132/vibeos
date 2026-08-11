@@ -168,6 +168,11 @@ transactions or USB 2.0 split transactions before assigning the child address.
 On 2026-08-12, UART and an authenticated SSH PTY returned the same physical
 topology: hub `05e3:0610`, four ports, with a connected, enabled and powered
 Full-Speed child on port 1 (`wPortStatus = 0x0103`).
+Full/Low-Speed children behind a high-speed hub use bounded DWC2 start-split
+and complete-split transactions. Endpoint-zero traffic is divided into one
+max-packet transaction at a time with software PID toggling, while NYET causes
+a bounded complete-split retry. The first child receives address 2 and appears
+as a separate `lsusb` row with its parent hub and port.
 
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after

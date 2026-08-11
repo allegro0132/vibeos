@@ -467,6 +467,19 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             )),
         }
     }
+    if let Some(child) = snapshot.child {
+        output.push_str(&format!(
+            "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} parent=001 port={}\n",
+            child.address,
+            child.vendor_id,
+            child.product_id,
+            child.speed,
+            child.usb_version,
+            child.device_class,
+            child.max_packet_size_0,
+            snapshot.hub.and_then(|hub| hub.active_port).unwrap_or(0),
+        ));
+    }
     match snapshot.keyboard {
         Some(keyboard) => output.push_str(&format!(
             "  HID boot-keyboard interface={} endpoint={:#04x} mps={} interval={}ms\n",

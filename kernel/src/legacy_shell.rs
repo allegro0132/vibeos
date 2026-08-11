@@ -103,6 +103,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  blk info|test   inspect or exercise the supervised block device");
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
+            println!("  blob test       commit and verify a two-leaf Merkle blob");
             println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  smp queues      prove four physical executors and cross-hart wakeups");
             println!("  smp scale       compare equal serial and four-hart parallel work");
@@ -403,6 +404,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         "net" => net_command(&rest).await,
 
         "store" => store_command(&rest).await,
+
+        "blob" => blob_command(&rest).await,
 
         "pcspace" => persistent_cspace_command(&rest).await,
 
@@ -2302,6 +2305,106 @@ async fn store_command(args: &[&str]) {
         }
         other => println!("  usage: store [info|test|fault] (got `{}`)", other),
     }
+}
+
+async fn blob_command(args: &[&str]) {
+    const OBJECT_KIND: u32 = 0x424c_4f42;
+    const BYTE_LEN: usize = 4_203;
+    const MARKER: &[u8] = b"VIBEOS-MERKLE-BLOB-v1";
+
+    if args.first().copied().unwrap_or("test") != "test" {
+        println!("  usage: blob test");
+        return;
+    }
+    let w = world();
+    let Some(store_cap) = w.store else {
+        println!("  BlobFS: offline (no writable block backend)");
+        return;
+    };
+    let init = w.spaces["init"].clone();
+    let mut payload: Vec<u8> = (0..BYTE_LEN)
+        .map(|index| ((index * 29 + 7) % 251) as u8)
+        .collect();
+    payload[..MARKER.len()].copy_from_slice(MARKER);
+    let object_kind = crate::store::journal_object_kind(OBJECT_KIND)
+        .expect("the BlobFS acceptance kind is non-zero");
+
+    let write = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store_cap, Rights::NONE);
+    let publication = match write {
+        Ok(lease) => crate::store::put_blob_with(lease, init.clone(), object_kind, &payload).await,
+        Err(_) => Err(crate::store::BlobStoreError::Store(
+            crate::store::StoreError::PermissionDenied,
+        )),
+    };
+    let publication = match publication {
+        Ok(publication) => publication,
+        Err(error) => {
+            println!("  BlobFS commit: failed ({})", error);
+            return;
+        }
+    };
+
+    let service = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ);
+    let object = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+    let read_back = match (service, object) {
+        (Ok(service), Ok(object)) => crate::store::get_blob_with(service, object).await,
+        _ => Err(crate::store::BlobStoreError::Store(
+            crate::store::StoreError::ObjectUnavailable,
+        )),
+    };
+    let Ok(read_back) = read_back else {
+        println!("  BlobFS full verification: failed");
+        return;
+    };
+    if read_back.bytes != payload || read_back.descriptor != publication.descriptor {
+        println!("  BlobFS full verification: mismatch");
+        return;
+    }
+    println!(
+        "  BlobFS commit + full verification: {} bytes, {} leaves",
+        read_back.bytes.len(),
+        read_back.descriptor.leaf_count
+    );
+
+    let service = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ);
+    let object = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+    let tail = match (service, object) {
+        (Ok(service), Ok(object)) => crate::store::get_blob_chunk_with(service, object, 1).await,
+        _ => Err(crate::store::BlobStoreError::Store(
+            crate::store::StoreError::ObjectUnavailable,
+        )),
+    };
+    let Ok(tail) = tail else {
+        println!("  BlobFS chunk proof: failed");
+        return;
+    };
+    if tail.bytes != payload[crate::store::blob_leaf_size()..]
+        || tail.descriptor.root != publication.descriptor.root
+    {
+        println!("  BlobFS chunk proof: mismatch");
+        return;
+    }
+    println!(
+        "  BlobFS chunk proof: leaf 1, {} bytes, {} sibling(s), root bound",
+        tail.bytes.len(),
+        tail.proof.siblings.len()
+    );
+    println!("  BlobFS namespace: immutable capability; no path lookup");
 }
 
 async fn persistent_cspace_command(args: &[&str]) {

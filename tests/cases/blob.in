@@ -1,0 +1,4 @@
+quiet
+blob test
+@sleep 15
+halt

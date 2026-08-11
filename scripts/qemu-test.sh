@@ -401,6 +401,13 @@ for case_file in tests/cases/*.in; do
       fail=1
     fi
   fi
+  if [ "$name" = "blob" ]; then
+    if ! python3 -B scripts/blob-image.py --selftest \
+      || ! python3 -B scripts/blob-image.py "$disk"; then
+      backing_ok=0
+      fail=1
+    fi
+  fi
   if [ "$name" = "persistent_cspace" ]; then
     if ! python3 scripts/persistent-cspace-image.py --selftest \
       || ! python3 scripts/persistent-cspace-image.py "$disk"; then

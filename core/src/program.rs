@@ -15,7 +15,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::durable::{
+use vibeos_durable_format::{
     DerivationId, DurableRights, ObjectKind, RecoveredGrant, RecoveryError, RecoveryPreflight,
     ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint, SpaceId, MAX_OBJECT_SIZE,
 };

@@ -10,7 +10,7 @@ use vibeos_core::cap::{
     grant, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource, Rights,
     CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
 };
-use vibeos_core::durable::{
+use vibeos_durable_format::{
     DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
     ResourceKind, SlotIdentity, SpaceId, TransactionId,
 };

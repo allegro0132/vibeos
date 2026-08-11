@@ -2,7 +2,7 @@
 
 #![no_std]
 
-use vibeos_core::durable::{DurableRights, ObjectKind, ResourceKind, SpaceId};
+use vibeos_durable_format::{DurableRights, ObjectKind, ResourceKind, SpaceId};
 use vibeos_object_store::StoreError;
 
 pub const PERSISTENT_SPACE_ID_RAW: u128 = 0x5053;

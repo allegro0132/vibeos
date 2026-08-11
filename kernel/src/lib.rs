@@ -63,7 +63,8 @@ extern crate alloc;
 // the host. Re-exported under the names the rest of the tree already uses.
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, durable, exec, heap, interrupt, ipi, program, sync};
+pub use vibeos_core::{cap, chan, exec, heap, interrupt, ipi, program, sync};
+pub use vibeos_durable_format as durable;
 pub use vibeos_vsh as vsh;
 pub use vibeos_vsh::terminal;
 #[cfg(feature = "qemu-virt")]

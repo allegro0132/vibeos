@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-vibeos-core = { path = "../../core" }
+vibeos-durable-format = { path = "../../durable-format" }
 vibeos-object-store = { path = "../object-store" }

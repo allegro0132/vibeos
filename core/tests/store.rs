@@ -1,6 +1,6 @@
 //! M4.2 capability-addressed object codec and crash-recovery tests.
 
-use vibeos_core::durable::{
+use vibeos_durable_format::{
     crc32c, recover as recover_authority, DerivationId, DurableRights, GrantFlags, GrantRecord,
     ObjectId, RecoveryError as AuthorityRecoveryError, RecoveryPolicy as AuthorityRecoveryPolicy,
     ResourceKind, RootPolicy, SlotIdentity, SpaceId, StoreId, TransactionId,
@@ -80,7 +80,7 @@ fn recover_store(sectors: &[[u8; RECORD_SIZE]]) -> Result<RecoveredStore, Recove
 fn recover_authority_with(
     sectors: &[[u8; RECORD_SIZE]],
     roots: &[GrantRecord],
-) -> Result<vibeos_core::durable::RecoveredStore, AuthorityRecoveryError> {
+) -> Result<vibeos_durable_format::RecoveredStore, AuthorityRecoveryError> {
     let roots: Vec<_> = roots
         .iter()
         .cloned()

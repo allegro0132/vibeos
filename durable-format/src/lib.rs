@@ -5,6 +5,8 @@
 //! media, plus the recovery validation which prevents a crash image from
 //! amplifying authority.
 
+#![no_std]
+
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -840,7 +842,9 @@ impl RecordChain {
         })
     }
 
-    pub(crate) fn ensure_capacity(&self, record_count: u64) -> Result<(), EncodeError> {
+    /// Verify that appending `record_count` records cannot overflow the stable
+    /// sequence space without advancing this chain.
+    pub fn ensure_capacity(&self, record_count: u64) -> Result<(), EncodeError> {
         self.next_sequence
             .checked_add(record_count)
             .ok_or(EncodeError::SequenceOverflow)
@@ -1804,16 +1808,17 @@ fn expected_chunk_len(byte_len: usize, index: u32, count: u32) -> usize {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct Crc32cDigest {
+/// Incremental CRC32C state used by canonical multi-record transactions.
+pub struct Crc32cDigest {
     state: u32,
 }
 
 impl Crc32cDigest {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self { state: !0 }
     }
 
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
+    pub fn update(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.state ^= *byte as u32;
             for _ in 0..8 {
@@ -1823,7 +1828,7 @@ impl Crc32cDigest {
         }
     }
 
-    pub(crate) const fn finish(self) -> u32 {
+    pub const fn finish(self) -> u32 {
         !self.state
     }
 }

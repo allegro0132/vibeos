@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use vibeos_core::cap::{
     Cap, InvocationLease, PendingSlotReservation, PersistentCapIdentity, Resource, Rights,
 };
-use vibeos_core::durable::{
+use vibeos_durable_format::{
     DerivationId, GrantFlags, GrantRecord, ObjectId, SlotIdentity, TransactionId,
 };
 use vibeos_core::program::{
@@ -546,11 +546,11 @@ impl SavedProgramService {
         if !snapshot.formatted {
             records.push(
                 chain
-                    .append(None, vibeos_core::durable::RecordBody::Format)
+                    .append(None, vibeos_durable_format::RecordBody::Format)
                     .map_err(|_| SavedProgramError::Encode)?,
             );
         }
-        let (high_water, next) = vibeos_core::durable::preview_id_high_water(&chain, exclusive_end)
+        let (high_water, next) = vibeos_durable_format::preview_id_high_water(&chain, exclusive_end)
             .map_err(|_| SavedProgramError::Encode)?;
         records.extend(high_water.records);
         chain = next;
@@ -573,7 +573,7 @@ impl SavedProgramService {
             resource_kind: program::stored_object_resource_kind(),
             flags: GrantFlags::ROOT,
         };
-        let (grant_records, _next) = vibeos_core::durable::preview_grant_transaction(
+        let (grant_records, _next) = vibeos_durable_format::preview_grant_transaction(
             &chain,
             grant_transaction,
             grant.clone(),

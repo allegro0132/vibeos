@@ -46,6 +46,7 @@ const GAHBCFG_DMA_ENABLE: u32 = 1 << 5;
 const GUSBCFG_FORCE_HOST: u32 = 1 << 29;
 const GUSBCFG_FORCE_DEVICE: u32 = 1 << 30;
 const GRSTCTL_CORE_SOFT_RESET: u32 = 1;
+const GRSTCTL_CORE_SOFT_RESET_DONE: u32 = 1 << 29;
 const GRSTCTL_AHB_IDLE: u32 = 1 << 31;
 const GRSTCTL_RX_FIFO_FLUSH: u32 = 1 << 4;
 const GRSTCTL_TX_FIFO_FLUSH: u32 = 1 << 5;
@@ -81,6 +82,7 @@ const DMA_BYTES: usize = 1_024;
 const MAX_NAK_RETRIES: usize = 32;
 const HID_REPORT_BYTES: usize = 8;
 const HID_INPUT_BYTES: usize = 18;
+const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
@@ -319,20 +321,45 @@ impl Controller {
             core_write(
                 description,
                 GUSBCFG,
-                (usb_config & !GUSBCFG_FORCE_DEVICE) | GUSBCFG_FORCE_HOST,
+                usb_config & !(GUSBCFG_FORCE_DEVICE | GUSBCFG_FORCE_HOST),
             );
-            core_write(description, GRSTCTL, GRSTCTL_CORE_SOFT_RESET);
+            core_write(
+                description,
+                GRSTCTL,
+                core_read(description, GRSTCTL) | GRSTCTL_CORE_SOFT_RESET,
+            );
         }
-        wait_for(
-            description,
-            GRSTCTL,
-            GRSTCTL_CORE_SOFT_RESET,
-            false,
-            REGISTER_TIMEOUT_MS,
-            timebase_hz,
-            time,
-        )
-        .map_err(|_| Error::CoreResetTimedOut)?;
+        if reset_uses_done_handshake(core_id) {
+            wait_for(
+                description,
+                GRSTCTL,
+                GRSTCTL_CORE_SOFT_RESET_DONE,
+                true,
+                REGISTER_TIMEOUT_MS,
+                timebase_hz,
+                time,
+            )
+            .map_err(|_| Error::CoreResetTimedOut)?;
+            unsafe {
+                let reset = core_read(description, GRSTCTL);
+                core_write(
+                    description,
+                    GRSTCTL,
+                    (reset & !GRSTCTL_CORE_SOFT_RESET) | GRSTCTL_CORE_SOFT_RESET_DONE,
+                );
+            }
+        } else {
+            wait_for(
+                description,
+                GRSTCTL,
+                GRSTCTL_CORE_SOFT_RESET,
+                false,
+                REGISTER_TIMEOUT_MS,
+                timebase_hz,
+                time,
+            )
+            .map_err(|_| Error::CoreResetTimedOut)?;
+        }
         wait_for(
             description,
             GRSTCTL,
@@ -343,6 +370,14 @@ impl Controller {
             time,
         )
         .map_err(|_| Error::AhbIdleTimedOut)?;
+        unsafe {
+            let usb_config = core_read(description, GUSBCFG);
+            core_write(
+                description,
+                GUSBCFG,
+                (usb_config & !GUSBCFG_FORCE_DEVICE) | GUSBCFG_FORCE_HOST,
+            );
+        }
         wait_for(
             description,
             GINTSTS,
@@ -1235,6 +1270,10 @@ const fn is_dwc2_core_id(id: u32) -> bool {
     id & 0xffff_0000 == 0x4f54_0000
 }
 
+const fn reset_uses_done_handshake(id: u32) -> bool {
+    id as u16 >= DWC2_CORE_REVISION_4_20A
+}
+
 const fn host_channel_count(hwcfg2: u32) -> u8 {
     (((hwcfg2 >> 14) & 0xf) + 1) as u8
 }
@@ -1337,6 +1376,9 @@ mod tests {
     fn recognizes_synopsys_otg_ids_and_decodes_channels() {
         assert!(is_dwc2_core_id(0x4f54_280a));
         assert!(!is_dwc2_core_id(0x5533_0000));
+        assert!(!reset_uses_done_handshake(0x4f54_400a));
+        assert!(reset_uses_done_handshake(0x4f54_420a));
+        assert!(reset_uses_done_handshake(0x4f54_450a));
         assert_eq!(host_channel_count(0), 1);
         assert_eq!(host_channel_count(15 << 14), 16);
     }

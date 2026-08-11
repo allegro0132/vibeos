@@ -77,11 +77,21 @@ layers and which mutations each one catches.
 ```sh
 ./run.sh          # interactive; exit with Ctrl-A then X
 ./qrun.sh 10      # run for 10 seconds, feed the shell from stdin
+./scripts/qemu-usb-test.sh  # PCI/XHCI, USB keyboard, storage, and hotplug
 ```
 
 Normal images boot directly into `vsh>` with a dedicated CSpace. The broad
 diagnostic shell is compiled only with the `legacy-shell` test feature; the
 QEMU golden and benchmark harnesses select that feature explicitly.
+
+The QEMU `virt` port also owns its generic PCI ECAM host: it discovers type-0
+functions, sizes and assigns 32/64-bit BARs, enables bus mastering per driver,
+and routes INTx through the PLIC. The XHCI driver uses that interface for USB
+enumeration, interrupt-driven HID boot keyboards, and Bulk-Only/SCSI mass
+storage. `usb info`, `usb read N`, and the destructive CI-only `usb test`
+diagnostic expose the live devices. The acceptance script types its commands
+through `usb-kbd`, hot-unplugs/replugs that keyboard, and verifies the guest's
+USB-storage write directly in the host backing image.
 
 Milk-V Duo boot images are generated with the official SDK. The deliverable image
 contains a FAT boot partition plus a raw VibeOS data partition and no Linux root

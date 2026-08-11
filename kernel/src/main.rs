@@ -83,6 +83,10 @@ mod mmu;
 #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
 mod net_config;
 mod platform;
+#[cfg(feature = "qemu-virt")]
+mod pci;
+#[cfg(feature = "qemu-virt")]
+mod xhci;
 mod plic;
 mod rustc;
 mod saved_program;
@@ -340,6 +344,27 @@ pub extern "C" fn kmain() -> ! {
         "  mmu       Sv39 single address space, hart mask {:#x}",
         mmu::enabled_hart_mask()
     );
+    #[cfg(feature = "qemu-virt")]
+    {
+        let functions = pci::init().expect("QEMU PCI resource assignment must succeed");
+        println!(
+            "  pci       {} function(s), ECAM {:#x}, MMIO {:#x}..{:#x}",
+            functions,
+            platform::PCI_ECAM_START,
+            platform::PCI_MMIO_START,
+            platform::PCI_MMIO_END,
+        );
+        if let Some(info) = xhci::init().expect("QEMU XHCI initialization must succeed") {
+            println!(
+                "  usb       XHCI {:#06x} @ {:#x}, {} slot(s), {} port(s), {} device(s)",
+                info.version,
+                info.mmio_base,
+                info.max_slots,
+                info.max_ports,
+                info.addressed_devices,
+            );
+        }
+    }
     assert!(
         mmu::wx_remote_fence_ready(),
         "multicore W^X requires the SBI RFENCE extension"
@@ -377,6 +402,10 @@ pub extern "C" fn kmain() -> ! {
     world::start_net_supervisor();
     #[cfg(feature = "qemu-virt")]
     world::start_rng_supervisor();
+    #[cfg(feature = "qemu-virt")]
+    if xhci::info().is_some() {
+        exec::spawn("usb-host", xhci::service_task());
+    }
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]

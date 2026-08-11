@@ -69,6 +69,11 @@ static TX: SpinLock<()> = SpinLock::new(());
 // consumer. Release/Acquire indices replace the former IRQ-side SpinLock;
 // overflow drops the newest byte and increments `rx_dropped()`.
 static RX: SpscByteRing<256> = SpscByteRing::new();
+// The XHCI service is the sole producer and the shell remains the sole
+// consumer. A second SPSC ring preserves the UART IRQ ring's one-producer
+// contract while exposing one merged physical-console input stream.
+#[cfg(feature = "qemu-virt")]
+static USB_RX: SpscByteRing<256> = SpscByteRing::new();
 pub static RX_WAIT: WaitQueue = WaitQueue::new();
 #[cfg(feature = "milkv-duo")]
 static DW_BUSY_IRQS: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +84,8 @@ pub fn init() {
     // Safety: boot initializes UART before enabling the PLIC source or
     // starting the sole shell consumer.
     unsafe { RX.reset_quiescent() };
+    #[cfg(feature = "qemu-virt")]
+    unsafe { USB_RX.reset_quiescent() };
     let baud_divisor = (u64::from(crate::platform::UART_CLOCK_HZ)
         + u64::from(crate::platform::UART_BAUD) * 8)
         / (u64::from(crate::platform::UART_BAUD) * 16);
@@ -201,7 +208,26 @@ pub fn dw_irq_recoveries() -> (u64, u64) {
 
 pub fn try_read() -> Option<u8> {
     // Safety: console input is owned by the one shell task.
-    unsafe { RX.pop_from_consumer() }
+    unsafe {
+        RX.pop_from_consumer().or_else(|| {
+            #[cfg(feature = "qemu-virt")]
+            {
+                USB_RX.pop_from_consumer()
+            }
+            #[cfg(not(feature = "qemu-virt"))]
+            {
+                None
+            }
+        })
+    }
+}
+
+/// Inject one byte from the sole USB keyboard service. Overflow drops the
+/// newest byte, matching the physical UART receive policy.
+#[cfg(feature = "qemu-virt")]
+pub fn inject_usb_input(byte: u8) {
+    let _ = unsafe { USB_RX.push_from_producer(byte) };
+    RX_WAIT.wake_all();
 }
 
 #[allow(dead_code)]

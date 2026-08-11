@@ -86,6 +86,8 @@ struct AddressSpace {
     plic_control_level0: PageTable,
     plic_context_level0: PageTable,
     uart_virtio_level0: PageTable,
+    #[cfg(feature = "qemu-virt")]
+    pci_io_level0: PageTable,
     #[cfg(feature = "milkv-duo")]
     sdhci_level0: PageTable,
     #[cfg(feature = "milkv-duo")]
@@ -103,6 +105,8 @@ impl AddressSpace {
             plic_control_level0: PageTable::empty(),
             plic_context_level0: PageTable::empty(),
             uart_virtio_level0: PageTable::empty(),
+            #[cfg(feature = "qemu-virt")]
+            pci_io_level0: PageTable::empty(),
             #[cfg(feature = "milkv-duo")]
             sdhci_level0: PageTable::empty(),
             #[cfg(feature = "milkv-duo")]
@@ -216,6 +220,40 @@ pub fn init_boot(boot_physical_hart: usize) {
     );
     for physical in (UART_VIRTIO_START..UART_VIRTIO_END).step_by(sv39::PAGE_SIZE) {
         map_page(&mut tables.uart_virtio_level0, physical, MMIO_PERMISSIONS);
+    }
+    #[cfg(feature = "qemu-virt")]
+    {
+        // The complete ECAM is architected as one 256 MiB identity aperture.
+        // Two-MiB leaves avoid dedicating 128 level-0 page tables merely to
+        // discover functions on secondary buses.
+        for physical in (crate::platform::PCI_ECAM_START..crate::platform::PCI_ECAM_END)
+            .step_by(MEGAPAGE_SIZE)
+        {
+            map_megapage(&mut tables.plic_level1, physical, MMIO_PERMISSIONS);
+        }
+
+        // PCI port I/O is memory mapped by GPEX. Keep it page-granular because
+        // the surrounding 2 MiB window is not part of the host aperture.
+        link_level0(
+            &mut tables.plic_level1,
+            megapage_base(crate::platform::PCI_IO_START),
+            &tables.pci_io_level0,
+        );
+        for physical in (crate::platform::PCI_IO_START..crate::platform::PCI_IO_END)
+            .step_by(sv39::PAGE_SIZE)
+        {
+            map_page(&mut tables.pci_io_level0, physical, MMIO_PERMISSIONS);
+        }
+
+        // 0x4000_0000 is both 1 GiB aligned and exactly one root entry below
+        // RAM. A gigapage leaf covers every 32-bit BAR without allocating more
+        // page-table memory or permitting access to the RAM root entry.
+        let pci_mmio = crate::platform::PCI_MMIO_START;
+        assert_eq!(pci_mmio % (1usize << 30), 0);
+        assert_eq!(crate::platform::PCI_MMIO_END - pci_mmio, 1usize << 30);
+        tables.root.entries[sv39::vpn_index(pci_mmio, 2)] =
+            PageTableEntry::leaf_with_attributes(pci_mmio, MMIO_PERMISSIONS, MMIO_ATTRIBUTES)
+                .expect("PCI MMIO gigapage is architecturally valid");
     }
     #[cfg(feature = "milkv-duo")]
     {
@@ -587,6 +625,14 @@ fn map_page(level0: &mut PageTable, physical: usize, permissions: PagePermission
     level0.entries[sv39::vpn_index(physical, 0)] =
         PageTableEntry::leaf_with_attributes(physical, permissions, MMIO_ATTRIBUTES)
             .expect("identity MMIO page is architecturally valid");
+}
+
+#[cfg(feature = "qemu-virt")]
+fn map_megapage(level1: &mut PageTable, physical: usize, permissions: PagePermissions) {
+    assert_eq!(physical % MEGAPAGE_SIZE, 0);
+    level1.entries[sv39::vpn_index(physical, 1)] =
+        PageTableEntry::leaf_with_attributes(physical, permissions, MMIO_ATTRIBUTES)
+            .expect("identity MMIO megapage is architecturally valid");
 }
 
 fn assert_page_range(start: usize, end: usize) {

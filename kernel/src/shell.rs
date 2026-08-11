@@ -126,6 +126,10 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  smp queues      prove four physical executors and cross-hart wakeups");
             println!("  smp scale       compare equal serial and four-hart parallel work");
+            #[cfg(feature = "qemu-virt")]
+            println!("  pci             list discovered PCI functions and assigned BARs");
+            #[cfg(feature = "qemu-virt")]
+            println!("  usb info|read|test  inspect XHCI devices or exercise USB storage");
             println!("  mmu             inspect the shared Sv39 integrity map");
             println!("  mmu guard fault prove a stack guard with a real page fault");
             println!("  mmu wx          prove seal, cross-hart execute, and cleared reuse");
@@ -425,6 +429,17 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             _ => println!("  usage: smp queues|scale"),
         },
 
+        #[cfg(feature = "qemu-virt")]
+        "pci" => pci_status(),
+        #[cfg(feature = "qemu-virt")]
+        "usb" => {
+            let args = rest.iter().map(|arg| String::from(*arg)).collect::<Vec<_>>();
+            match vsh_usb(&args) {
+                Ok(output) => crate::print!("{}", output),
+                Err(status) => println!("  usb: {:?}", status),
+            }
+        }
+
         "mmu" => match rest.as_slice() {
             [] => mmu_status(),
             ["guard", "fault"] => mmu_guard_fault(),
@@ -637,6 +652,10 @@ pub(crate) fn install_standard_vsh_commands(session: &mut crate::vsh::Session) {
     session.install_host_command("ps", 0, 0, vsh_ps);
     session.install_host_command("caps", 0, 1, vsh_caps);
     session.install_host_command("mem", 0, 0, vsh_mem);
+    #[cfg(feature = "qemu-virt")]
+    session.install_host_command("pci", 0, 0, vsh_pci);
+    #[cfg(feature = "qemu-virt")]
+    session.install_host_command("usb", 0, 2, vsh_usb);
     session.install_host_command("quiet", 0, 0, vsh_quiet);
     session.install_host_command("verbose", 0, 0, vsh_verbose);
     session.install_host_command("poweroff", 0, 0, vsh_poweroff);
@@ -661,6 +680,10 @@ pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
          \x20 ps              component lifecycle snapshots\n\
          \x20 caps [space]    sanitized capability summary\n\
          \x20 mem             bounded-memory accounts\n\
+         \x20 pci             list discovered PCI functions\n\
+         \x20 usb info        list XHCI USB devices\n\
+         \x20 usb read N      read one USB-storage sector\n\
+         \x20 usb test        destructive CI test of sectors 7 and 8\n\
          \x20 quiet           mute background component output\n\
          \x20 verbose         restore background component output\n\
          \x20 poweroff        power off\n",
@@ -728,6 +751,103 @@ pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
         ));
     }
     Ok(output)
+}
+
+#[cfg(feature = "qemu-virt")]
+pub(crate) fn vsh_pci(_args: &[String]) -> Result<String, crate::vsh::Status> {
+    let mut output = String::from("BDF VID:DID CLASS IRQ BARS\n");
+    for function in crate::pci::functions() {
+        output.push_str(&alloc::format!(
+            "{} {:04x}:{:04x} {:06x} {}",
+            function.address,
+            function.vendor_id,
+            function.device_id,
+            function.class_code(),
+            function
+                .interrupt_line
+                .map_or(String::from("-"), |irq| alloc::format!("{}", irq)),
+        ));
+        for bar in function.bars {
+            if let Some(address) = bar.address() {
+                output.push_str(&alloc::format!(" {:#x}/{}", address, bar.size()));
+            }
+        }
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "qemu-virt")]
+fn pci_status() {
+    crate::print!("{}", vsh_pci(&[]).expect("PCI listing is infallible"));
+}
+
+#[cfg(feature = "qemu-virt")]
+pub(crate) fn vsh_usb(args: &[String]) -> Result<String, crate::vsh::Status> {
+    use crate::xhci::DeviceKind;
+
+    match args.first().map(String::as_str).unwrap_or("info") {
+        "info" => {
+            let Some(controller) = crate::xhci::info() else {
+                return Ok(String::from("XHCI offline\n"));
+            };
+            let mut output = alloc::format!(
+                "XHCI {:#06x} @ {:#x}: {} ports, {} connected, {} addressed\n",
+                controller.version,
+                controller.mmio_base,
+                controller.max_ports,
+                controller.connected_ports,
+                controller.addressed_devices,
+            );
+            for device in crate::xhci::devices() {
+                let kind = match device.kind {
+                    DeviceKind::HidKeyboard => "hid-keyboard",
+                    DeviceKind::MassStorage => "mass-storage",
+                    DeviceKind::Unsupported => "unsupported",
+                };
+                output.push_str(&alloc::format!(
+                    "port {} slot {} speed {} {:04x}:{:04x} {}",
+                    device.port,
+                    device.slot,
+                    device.speed,
+                    device.vendor_id,
+                    device.product_id,
+                    kind,
+                ));
+                if device.kind == DeviceKind::MassStorage {
+                    output.push_str(&alloc::format!(" {} sectors", device.capacity_sectors));
+                }
+                output.push('\n');
+            }
+            Ok(output)
+        }
+        "read" => {
+            let sector = args
+                .get(1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(crate::vsh::Status::Usage)?;
+            let bytes = crate::xhci::read_sector(sector).map_err(|_| crate::vsh::Status::Unavailable)?;
+            let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(32).min(32);
+            Ok(alloc::format!(
+                "usb sector {}: {}\n",
+                sector,
+                String::from_utf8_lossy(&bytes[..end]),
+            ))
+        }
+        "test" => {
+            const SEED: &[u8] = b"VIBEOS-USB-SECTOR-7-SEED-v1";
+            const MARKER: &[u8] = b"VIBEOS-USB-SECTOR-8-WRITE-v1";
+            let seed = crate::xhci::read_sector(7).map_err(|_| crate::vsh::Status::Unavailable)?;
+            if !seed.starts_with(SEED) { return Err(crate::vsh::Status::Faulted); }
+            let mut write = [0u8; 512];
+            write[..MARKER.len()].copy_from_slice(MARKER);
+            crate::xhci::write_sector(8, &write).map_err(|_| crate::vsh::Status::Unavailable)?;
+            let observed = crate::xhci::read_sector(8).map_err(|_| crate::vsh::Status::Unavailable)?;
+            if observed != write { return Err(crate::vsh::Status::Faulted); }
+            Ok(String::from("USB STORAGE TEST OK (sector 7 read, sector 8 write/read)\n"))
+        }
+        _ => Err(crate::vsh::Status::Usage),
+    }
 }
 
 pub(crate) fn vsh_quiet(_args: &[String]) -> Result<String, crate::vsh::Status> {

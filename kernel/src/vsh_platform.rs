@@ -480,6 +480,30 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             snapshot.hub.and_then(|hub| hub.active_port).unwrap_or(0),
         ));
     }
+    if let Some(configuration) = snapshot.configuration {
+        output.push_str(&format!(
+            "  Configuration {} length={} interfaces={}\n",
+            configuration.value, configuration.total_length, configuration.declared_interfaces,
+        ));
+        for interface in configuration.interfaces.into_iter().flatten() {
+            output.push_str(&format!(
+                "    Interface {} alt={} class={:#04x} subclass={:#04x} protocol={:#04x}",
+                interface.number,
+                interface.alternate,
+                interface.class,
+                interface.subclass,
+                interface.protocol,
+            ));
+            if let Some(endpoint) = interface.interrupt_in {
+                output.push_str(&format!(
+                    " interrupt-in={:#04x} mps={} interval={}\n",
+                    endpoint, interface.max_packet_size, interface.interval,
+                ));
+            } else {
+                output.push_str("\n");
+            }
+        }
+    }
     match snapshot.keyboard {
         Some(keyboard) => output.push_str(&format!(
             "  HID boot-keyboard interface={} endpoint={:#04x} mps={} interval={}ms\n",

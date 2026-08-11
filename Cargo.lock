@@ -782,11 +782,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-driver-virtio-mmio",
+]
+
+[[package]]
 name = "vibeos-driver-virtio-mmio"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
  "vibeos-hal",
+]
+
+[[package]]
+name = "vibeos-driver-virtio-net"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-driver-virtio-mmio",
+]
+
+[[package]]
+name = "vibeos-driver-virtio-rng"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-driver-virtio-mmio",
 ]
 
 [[package]]
@@ -821,7 +845,10 @@ dependencies = [
  "vibeos-bsp-qemu-virt",
  "vibeos-core",
  "vibeos-driver-pci",
+ "vibeos-driver-virtio-blk",
  "vibeos-driver-virtio-mmio",
+ "vibeos-driver-virtio-net",
+ "vibeos-driver-virtio-rng",
  "vibeos-driver-xhci",
  "vibeos-hal",
  "vibeos-kernel-acceptance",

@@ -19,8 +19,7 @@ use vibeos_hal::{Board as BoardContract, MappingGranularity, MemoryAttributes};
 
 pub const KERNEL_RAM_START: usize = crate::platform::MMU.ram.start;
 pub const KERNEL_RAM_END: usize = crate::platform::MMU.ram.end;
-const PLIC: vibeos_hal::PlicDescription =
-    <crate::platform::Board as BoardContract>::INFO.plic;
+const PLIC: vibeos_hal::PlicDescription = <crate::platform::Board as BoardContract>::INFO.plic;
 pub const PLIC_START: usize = PLIC.registers.start;
 pub const PLIC_END: usize = PLIC.registers.end;
 // Compatibility aliases used by the existing in-kernel acceptance suite. The

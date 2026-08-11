@@ -74,7 +74,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let word = &src[start..i];
             if i < b.len() && b[i] == b'!' {
                 i += 1;
-                out.push(Token { tok: Tok::Macro(word.to_string()), line });
+                out.push(Token {
+                    tok: Tok::Macro(word.to_string()),
+                    line,
+                });
                 continue;
             }
             let tok = match word {
@@ -107,7 +110,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 i += 1;
             }
-            out.push(Token { tok: Tok::Int(v), line });
+            out.push(Token {
+                tok: Tok::Int(v),
+                line,
+            });
             continue;
         }
 
@@ -152,7 +158,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            out.push(Token { tok: Tok::Str(s), line });
+            out.push(Token {
+                tok: Tok::Str(s),
+                line,
+            });
             continue;
         }
 
@@ -167,12 +176,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         match matched {
             Some(p) => {
                 i += p.len();
-                out.push(Token { tok: Tok::Punct(p), line });
+                out.push(Token {
+                    tok: Tok::Punct(p),
+                    line,
+                });
             }
-            None => return Err(format!("line {}: unexpected character `{}`", line, c as char)),
+            None => {
+                return Err(format!(
+                    "line {}: unexpected character `{}`",
+                    line, c as char
+                ))
+            }
         }
     }
 
-    out.push(Token { tok: Tok::Eof, line });
+    out.push(Token {
+        tok: Tok::Eof,
+        line,
+    });
     Ok(out)
 }

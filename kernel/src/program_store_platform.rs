@@ -15,7 +15,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use vibeos_core::cap::{
     Cap, InvocationLease, PendingSlotReservation, PersistentCapIdentity, Resource, Rights,
@@ -26,8 +26,8 @@ use vibeos_durable_format::{
 use vibeos_object_store as object_codec;
 use vibeos_program_store as program;
 use vibeos_program_store::{
-    ProgramArtifact, PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS,
-    PROGRAM_ROOT_SLOT, PROGRAM_SPACE_ID_RAW,
+    PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS, PROGRAM_ROOT_SLOT,
+    PROGRAM_SPACE_ID_RAW, ProgramArtifact,
 };
 
 use crate::store::{AuthorityJournal, StoredObject};
@@ -36,7 +36,7 @@ use crate::world::Space;
 use crate::{cap, exec, heap};
 
 pub use vibeos_program_store::{
-    authorize_recovered, SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram,
+    SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram, authorize_recovered,
 };
 
 pub struct SavedProgramService {
@@ -553,8 +553,9 @@ impl SavedProgramService {
                     .map_err(|_| SavedProgramError::Encode)?,
             );
         }
-        let (high_water, next) = vibeos_durable_format::preview_id_high_water(&chain, exclusive_end)
-            .map_err(|_| SavedProgramError::Encode)?;
+        let (high_water, next) =
+            vibeos_durable_format::preview_id_high_water(&chain, exclusive_end)
+                .map_err(|_| SavedProgramError::Encode)?;
         records.extend(high_water.records);
         chain = next;
         let (object, next) = object_codec::preview_object_transaction(
@@ -700,8 +701,8 @@ pub(crate) unsafe fn recover_faulted_task(task: exec::TaskId, domain: heap::Allo
         return;
     };
 
-    let task_key = crate::sync::TaskRecoveryKey::new(task.0)
-        .expect("executor TaskId zero is reserved");
+    let task_key =
+        crate::sync::TaskRecoveryKey::new(task.0).expect("executor TaskId zero is reserved");
 
     // Repair every saved-program lock before inspecting ownership. The durable
     // boot coordinator owns a durable claim, not a SavedActiveClaim, while it

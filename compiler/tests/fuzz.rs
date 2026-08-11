@@ -12,7 +12,12 @@
 use vibeos_rustc::{compile_at, Runtime};
 
 fn rt() -> Runtime {
-    Runtime { print_str: 0, print_int: 0, print_bool: 0, abort: 0 }
+    Runtime {
+        print_str: 0,
+        print_int: 0,
+        print_bool: 0,
+        abort: 0,
+    }
 }
 
 /// Must return, whatever it is handed.
@@ -38,10 +43,58 @@ impl Rng {
 }
 
 const TOKENS: &[&str] = &[
-    "fn", "main", "(", ")", "{", "}", ";", ",", ":", "i64", "->", "let", "mut", "=", "if",
-    "else", "while", "return", "println!", "print!", "\"{}\"", "\"a\"", "1", "0", "-", "+",
-    "*", "/", "%", "<", ">", "==", "!=", "<=", ">=", "&&", "||", "!", "x", "f", "//c\n",
-    "\\", "\"", "{", "@", "\n", " ", "999999999999999999999", "_", "{{", "}}", "{:?}",
+    "fn",
+    "main",
+    "(",
+    ")",
+    "{",
+    "}",
+    ";",
+    ",",
+    ":",
+    "i64",
+    "->",
+    "let",
+    "mut",
+    "=",
+    "if",
+    "else",
+    "while",
+    "return",
+    "println!",
+    "print!",
+    "\"{}\"",
+    "\"a\"",
+    "1",
+    "0",
+    "-",
+    "+",
+    "*",
+    "/",
+    "%",
+    "<",
+    ">",
+    "==",
+    "!=",
+    "<=",
+    ">=",
+    "&&",
+    "||",
+    "!",
+    "x",
+    "f",
+    "//c\n",
+    "\\",
+    "\"",
+    "{",
+    "@",
+    "\n",
+    " ",
+    "999999999999999999999",
+    "_",
+    "{{",
+    "}}",
+    "{:?}",
 ];
 
 #[test]
@@ -111,7 +164,11 @@ fn every_single_character_deletion_is_handled() {
 /// asserted rather than assumed.
 #[test]
 fn deeply_nested_input_is_rejected_rather_than_recursed() {
-    let shallow = format!("fn main() {{ let x = {}1{}; }}", "(".repeat(8), ")".repeat(8));
+    let shallow = format!(
+        "fn main() {{ let x = {}1{}; }}",
+        "(".repeat(8),
+        ")".repeat(8)
+    );
     assert!(
         compile_at(&shallow, 0, 0, &rt()).is_ok(),
         "ordinary nesting still works"
@@ -134,7 +191,10 @@ fn deeply_nested_input_is_rejected_rather_than_recursed() {
         "if 1 < 2 { ".repeat(512),
         "} else { 0 }".repeat(512)
     );
-    assert!(compile_at(&ifs, 0, 0, &rt()).is_err(), "deep if-chains rejected");
+    assert!(
+        compile_at(&ifs, 0, 0, &rt()).is_err(),
+        "deep if-chains rejected"
+    );
 }
 
 /// Unbalanced delimiters in every combination, the shape most likely to walk
@@ -154,8 +214,13 @@ fn unbalanced_delimiters_are_rejected_cleanly() {
 #[test]
 fn extreme_literals_are_handled() {
     for lit in [
-        "0", "9223372036854775807", "9223372036854775808", "18446744073709551616",
-        "99999999999999999999999999999999", "0000000000000000001", "1_______0",
+        "0",
+        "9223372036854775807",
+        "9223372036854775808",
+        "18446744073709551616",
+        "99999999999999999999999999999999",
+        "0000000000000000001",
+        "1_______0",
     ] {
         survives(&format!("fn main() -> i64 {{ {lit} }}"));
     }

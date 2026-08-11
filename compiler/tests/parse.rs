@@ -32,7 +32,13 @@ fn block(b: &Block) -> String {
 
 fn stmt(s: &Stmt) -> String {
     match s {
-        Stmt::Let { name, mutable, init, declared, .. } => format!(
+        Stmt::Let {
+            name,
+            mutable,
+            init,
+            declared,
+            ..
+        } => format!(
             "(let{}{} {} {})",
             if *mutable { "-mut" } else { "" },
             declared.map(|t| format!(":{t}")).unwrap_or_default(),
@@ -40,7 +46,9 @@ fn stmt(s: &Stmt) -> String {
             expr(init)
         ),
         Stmt::Assign { name, value, .. } => format!("(= {} {})", name, expr(value)),
-        Stmt::IndexAssign { name, index, value, .. } => {
+        Stmt::IndexAssign {
+            name, index, value, ..
+        } => {
             format!("(=[] {} {} {})", name, expr(index), expr(value))
         }
         Stmt::Expr(e) => format!("(expr {})", expr(e)),
@@ -55,7 +63,11 @@ fn stmt(s: &Stmt) -> String {
                     PrintPart::Val(e, _) => expr(e),
                 })
                 .collect();
-            format!("({} {})", if *newline { "println" } else { "print" }, ps.join(" "))
+            format!(
+                "({} {})",
+                if *newline { "println" } else { "print" },
+                ps.join(" ")
+            )
         }
     }
 }
@@ -116,7 +128,10 @@ fn unary_binds_tighter_than_binary() {
 
 #[test]
 fn if_is_an_expression_with_a_block_value() {
-    assert_eq!(body("let x = if 1 { 2 } else { 3 };"), "((let x (if 1 ((tail 2)) ((tail 3)))))");
+    assert_eq!(
+        body("let x = if 1 { 2 } else { 3 };"),
+        "((let x (if 1 ((tail 2)) ((tail 3)))))"
+    );
 }
 
 #[test]
@@ -150,7 +165,10 @@ fn calls_parse_with_trailing_commas_and_no_args() {
 fn function_signatures_record_parameter_and_return_types() {
     let p = parse("fn f(a: i64, b: i64) -> i64 { a } fn main() {}").unwrap();
     let f = &p.funcs[0];
-    assert_eq!(f.params, vec![("a".to_string(), Ty::I64), ("b".to_string(), Ty::I64)]);
+    assert_eq!(
+        f.params,
+        vec![("a".to_string(), Ty::I64), ("b".to_string(), Ty::I64)]
+    );
     assert_eq!(f.ret, Ty::I64);
 }
 
@@ -158,10 +176,16 @@ fn function_signatures_record_parameter_and_return_types() {
 
 #[test]
 fn a_format_string_splits_into_literal_and_value_parts() {
-    assert_eq!(body(r#"println!("a {} b {} c", 1, 2);"#), r#"((println "a " 1 " b " 2 " c"))"#);
+    assert_eq!(
+        body(r#"println!("a {} b {} c", 1, 2);"#),
+        r#"((println "a " 1 " b " 2 " c"))"#
+    );
     assert_eq!(body(r#"println!("{}", 1);"#), "((println 1))");
     assert_eq!(body(r#"println!("plain");"#), r#"((println "plain"))"#);
-    assert_eq!(body(r#"print!("no newline");"#), r#"((print "no newline"))"#);
+    assert_eq!(
+        body(r#"print!("no newline");"#),
+        r#"((print "no newline"))"#
+    );
 }
 
 #[test]
@@ -194,7 +218,10 @@ fn unsupported_syntax_says_what_is_supported() {
         err("fn main() { let x: u8 = 1; }"),
         "line 1: expected a type (`i64` or `bool`), found `u8`"
     );
-    assert_eq!(err(r#"fn main() { format!("x"); }"#), "line 1: unsupported macro `format!`");
+    assert_eq!(
+        err(r#"fn main() { format!("x"); }"#),
+        "line 1: unsupported macro `format!`"
+    );
     assert_eq!(
         err(r#"fn main() { println!("{:?}", 1); }"#),
         "line 1: only the empty format specifier `{}` is supported"
@@ -207,12 +234,24 @@ fn unsupported_syntax_says_what_is_supported() {
 
 #[test]
 fn structural_errors_point_at_the_offending_token() {
-    assert_eq!(err("fn main() { let x = ; }"), "line 1: expected an expression, found `;`");
-    assert_eq!(err("fn main() { let = 1; }"), "line 1: expected an identifier, found `=`");
+    assert_eq!(
+        err("fn main() { let x = ; }"),
+        "line 1: expected an expression, found `;`"
+    );
+    assert_eq!(
+        err("fn main() { let = 1; }"),
+        "line 1: expected an identifier, found `=`"
+    );
     assert_eq!(err("fn main() {"), "line 1: unclosed block");
-    assert_eq!(err("fn main() { 1 }\nfn"), "line 2: expected an identifier, found end of input");
+    assert_eq!(
+        err("fn main() { 1 }\nfn"),
+        "line 2: expected an identifier, found end of input"
+    );
     // Keywords render as written, not as their internal Debug name.
-    assert_eq!(err("fn main() { 1 }\nfn fn"), "line 2: expected an identifier, found `fn`");
+    assert_eq!(
+        err("fn main() { 1 }\nfn fn"),
+        "line 2: expected an identifier, found `fn`"
+    );
 }
 
 #[test]
@@ -223,7 +262,6 @@ fn the_parser_never_panics_on_truncated_input() {
         let _ = parse(&full[..n]);
     }
 }
-
 
 // --- arrays ---
 
@@ -236,7 +274,10 @@ fn arrays_are_declared_indexed_and_assigned() {
     );
     assert_eq!(body("x = a[1];"), "((= x (index a 1)))");
     assert_eq!(body("a[1] = 2;"), "((=[] a 1 2))");
-    assert_eq!(body("a[i + 1] = a[i] * 2;"), "((=[] a (Add i 1) (Mul (index a i) 2)))");
+    assert_eq!(
+        body("a[i + 1] = a[i] * 2;"),
+        "((=[] a (Add i 1) (Mul (index a i) 2)))"
+    );
 }
 
 /// `a[i]` and `a[i] = v` differ only after a balanced bracket, so the parser

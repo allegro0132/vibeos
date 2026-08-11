@@ -5,8 +5,8 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use crate::sync::SpinLock;
+use alloc::vec::Vec;
 
 pub use vibeos_driver_pci::{Bar, Function};
 

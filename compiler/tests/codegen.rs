@@ -18,7 +18,9 @@ fn rt() -> Runtime {
 }
 
 fn emit(src: &str) -> Vec<u32> {
-    compile_at(src, 0x8000_0000, 0x8010_0000, &rt()).unwrap().code
+    compile_at(src, 0x8000_0000, 0x8010_0000, &rt())
+        .unwrap()
+        .code
 }
 
 fn err(src: &str) -> String {
@@ -45,7 +47,11 @@ fn every_function_returns_through_a_canonical_ret() {
 fn the_prologue_claims_a_frame_and_saves_ra_and_s0() {
     let code = emit("fn main() {}");
     // low 20 bits: opcode 0x13 | rd=sp(2)<<7 | funct3=0 | rs1=sp(2)<<15
-    assert_eq!(code[0] & 0x000f_ffff, 0x0001_0113, "opens with addi sp, sp, imm");
+    assert_eq!(
+        code[0] & 0x000f_ffff,
+        0x0001_0113,
+        "opens with addi sp, sp, imm"
+    );
     assert_eq!(code[0] >> 20, 0xff0, "frame of 16 bytes");
     // The safety checks sit between the frame claim and the saves, so search
     // rather than index.
@@ -65,7 +71,10 @@ fn known_words_for_each_instruction_format() {
     assert!(has(0x0062_83b3), "add t2, t0, t1  (R-type)");
     assert!(has(0x0003_8293), "mv t0, t2  (addi with imm 0)");
     assert!(has(0x0000_8067), "ret (I-type, jump)");
-    assert!(has(0x0001_3283) || has(0x0001_3303), "ld from sp (I-type, load)");
+    assert!(
+        has(0x0001_3283) || has(0x0001_3303),
+        "ld from sp (I-type, load)"
+    );
 }
 
 #[test]
@@ -86,10 +95,12 @@ fn the_stack_pointer_moves_in_16_byte_steps() {
 /// Position varies with how many safety checks precede it, so search for the
 /// shape rather than assuming an offset.
 fn first_li64_into(code: &[u32], rd: u32) -> Option<Vec<u32>> {
-    code.windows(11).find(|w| {
-        w.iter().all(|x| x & 0x7f == 0x13 && (x >> 7) & 0x1f == rd)
-            && (w[0] >> 15) & 0x1f == 0 // starts from x0
-    }).map(|w| w.to_vec())
+    code.windows(11)
+        .find(|w| {
+            w.iter().all(|x| x & 0x7f == 0x13 && (x >> 7) & 0x1f == rd) && (w[0] >> 15) & 0x1f == 0
+            // starts from x0
+        })
+        .map(|w| w.to_vec())
 }
 
 fn simulate_li64(code: &[u32], rd: u32) -> u64 {
@@ -157,7 +168,10 @@ fn negation_is_folded_for_literals_and_emitted_for_values() {
     assert!(!folded.contains(&0x4050_02b3), "a literal needs no `sub`");
 
     let emitted = emit("fn main() -> i64 { let a = 42; -a }");
-    assert!(emitted.contains(&0x4050_02b3), "expected `sub t0, zero, t0`");
+    assert!(
+        emitted.contains(&0x4050_02b3),
+        "expected `sub t0, zero, t0`"
+    );
 }
 
 /// Literal arithmetic is folded away entirely, which is both faster and closer
@@ -167,9 +181,16 @@ fn literal_arithmetic_is_folded() {
     let code = emit("fn main() -> i64 { 2 + 3 * 4 }");
     // The whole expression collapses to one constant, so no OP arithmetic and
     // no overflow checks survive.
-    assert!(!code.iter().any(|w| w & 0x7f == OP && (w >> 12) & 7 == 0 && w >> 25 == 0
-        && (w >> 7) & 0x1f == T2), "no add/sub into the scratch register");
-    assert!(code.contains(&((14u32 << 20) | (T0 << 7) | OP_IMM)), "folded to addi t0, zero, 14");
+    assert!(
+        !code
+            .iter()
+            .any(|w| w & 0x7f == OP && (w >> 12) & 7 == 0 && w >> 25 == 0 && (w >> 7) & 0x1f == T2),
+        "no add/sub into the scratch register"
+    );
+    assert!(
+        code.contains(&((14u32 << 20) | (T0 << 7) | OP_IMM)),
+        "folded to addi t0, zero, 14"
+    );
 }
 
 #[test]
@@ -190,7 +211,11 @@ fn constants_cost_only_what_their_value_needs() {
     let one = emit("fn main() -> i64 { 1 }").len();
     let million = emit("fn main() -> i64 { 1000000 }").len();
     let huge = emit("fn main() -> i64 { 1234567890123 }").len();
-    assert_eq!(million, one + 1, "a 32-bit constant costs one more instruction");
+    assert_eq!(
+        million,
+        one + 1,
+        "a 32-bit constant costs one more instruction"
+    );
     assert_eq!(huge, one + 10, "a 64-bit constant costs the fixed eleven");
 }
 
@@ -199,7 +224,10 @@ fn constants_cost_only_what_their_value_needs() {
 #[test]
 fn address_materialization_is_a_fixed_length() {
     let a = compile_at(samples::HELLO, 0, 0, &rt()).unwrap().code.len();
-    let b = compile_at(samples::HELLO, 0x8000_0000, 0x9fff_0000, &rt()).unwrap().code.len();
+    let b = compile_at(samples::HELLO, 0x8000_0000, 0x9fff_0000, &rt())
+        .unwrap()
+        .code
+        .len();
     assert_eq!(a, b);
 }
 
@@ -209,7 +237,10 @@ fn address_materialization_is_a_fixed_length() {
 fn code_length_is_independent_of_the_load_address() {
     for src in [samples::HELLO, samples::DEMO, samples::CONFORMANCE] {
         let a = compile_at(src, 0, 0, &rt()).unwrap().code.len();
-        let b = compile_at(src, 0x8000_0000, 0x9abc_def0, &rt()).unwrap().code.len();
+        let b = compile_at(src, 0x8000_0000, 0x9abc_def0, &rt())
+            .unwrap()
+            .code
+            .len();
         assert_eq!(a, b, "pass 1 and pass 2 must agree on layout");
     }
 }
@@ -225,17 +256,29 @@ fn compilation_is_deterministic() {
 fn the_entry_point_is_the_first_instruction() {
     // `main` is emitted first so the buffer's address is the entry point.
     let code = emit("fn helper() -> i64 { 1 }\nfn main() -> i64 { helper() }");
-    assert_eq!(code[0] & 0x000f_ffff, 0x0001_0113, "opens with main's frame claim");
+    assert_eq!(
+        code[0] & 0x000f_ffff,
+        0x0001_0113,
+        "opens with main's frame claim"
+    );
 }
 
 #[test]
 fn string_literals_are_interned_once() {
     let img = compile_at(
         r#"fn main() { println!("dup"); println!("dup"); }"#,
-        0, 0, &rt(),
-    ).unwrap();
+        0,
+        0,
+        &rt(),
+    )
+    .unwrap();
     // "dup" (3) + "\n" (1); the second use must not add another copy.
-    assert_eq!(img.data.len(), 4, "data was {:?}", String::from_utf8_lossy(&img.data));
+    assert_eq!(
+        img.data.len(),
+        4,
+        "data was {:?}",
+        String::from_utf8_lossy(&img.data)
+    );
 }
 
 // --- the confinement audit, as a test ---
@@ -361,7 +404,10 @@ fn the_region_cursor_is_only_ever_the_granted_base_plus_an_offset() {
                 "instruction {i} ({w:08x}) writes t5 without deriving it from s3"
             );
         }
-        assert!(writes > 0, "a program using arrays must form region addresses");
+        assert!(
+            writes > 0,
+            "a program using arrays must form region addresses"
+        );
     }
 }
 
@@ -436,20 +482,22 @@ fn every_computed_call_target_is_a_function_or_a_runtime_hook() {
         let mut checked = 0;
         for (i, w) in code.iter().enumerate() {
             // jalr ra, t0, 0
-            let is_call = w & 0x7f == JALR
-                && (w >> 7) & 0x1f == RA
-                && (w >> 15) & 0x1f == T0;
+            let is_call = w & 0x7f == JALR && (w >> 7) & 0x1f == RA && (w >> 15) & 0x1f == T0;
             if !is_call || i < 11 {
                 continue;
             }
             let run: Vec<u32> = code[i - 11..i].to_vec();
-            if !run.iter().all(|x| x & 0x7f == OP_IMM && (x >> 7) & 0x1f == T0) {
+            if !run
+                .iter()
+                .all(|x| x & 0x7f == OP_IMM && (x >> 7) & 0x1f == T0)
+            {
                 continue; // not the fixed address form; nothing to recover
             }
             let target = simulate_li64(&run, T0);
-            let is_hook =
-                target == rt.print_str || target == rt.print_int
-                    || target == rt.print_bool || target == rt.abort;
+            let is_hook = target == rt.print_str
+                || target == rt.print_int
+                || target == rt.print_bool
+                || target == rt.abort;
             assert!(
                 is_hook || code_range.contains(&target),
                 "call at {i} targets {target:#x}, which is neither this program's \
@@ -465,7 +513,10 @@ fn every_computed_call_target_is_a_function_or_a_runtime_hook() {
 
 #[test]
 fn scope_and_mutability_are_enforced() {
-    assert_eq!(err("fn main() { y; }"), "line 1: cannot find value `y` in this scope");
+    assert_eq!(
+        err("fn main() { y; }"),
+        "line 1: cannot find value `y` in this scope"
+    );
     assert_eq!(
         err("fn main() { let x = 1; x = 2; }"),
         "line 1: cannot assign twice to immutable variable `x` (declare it `let mut`)"
@@ -483,7 +534,10 @@ fn a_variable_leaves_scope_at_the_end_of_its_block() {
 
 #[test]
 fn calls_are_checked_for_existence_and_arity() {
-    assert_eq!(err("fn main() { nope(); }"), "line 1: cannot find function `nope`");
+    assert_eq!(
+        err("fn main() { nope(); }"),
+        "line 1: cannot find function `nope`"
+    );
     assert_eq!(
         err("fn f(a: i64) -> i64 { a }\nfn main() { f(1, 2); }"),
         "line 2: `f` takes 1 argument(s) but 2 were supplied"
@@ -505,11 +559,16 @@ fn duplicate_definitions_and_bad_main_are_rejected() {
 
 #[test]
 fn resource_limits_are_diagnosed_rather_than_miscompiled() {
-    let many = (0..300).map(|i| format!("let v{i} = {i};")).collect::<String>();
+    let many = (0..300)
+        .map(|i| format!("let v{i} = {i};"))
+        .collect::<String>();
     let msg = err(&format!("fn main() {{ {many} }}"));
     assert!(msg.contains("at most 252 are supported"), "{msg}");
 
-    let params = (0..9).map(|i| format!("p{i}: i64")).collect::<Vec<_>>().join(", ");
+    let params = (0..9)
+        .map(|i| format!("p{i}: i64"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let msg = err(&format!("fn f({params}) -> i64 {{ p0 }}\nfn main() {{}}"));
     assert!(msg.contains("at most 8 parameters"), "{msg}");
 }
@@ -534,7 +593,10 @@ fn samples_compile() {
 fn every_function_probes_the_stack() {
     // bgeu sp, s1, +8 : rs1=sp(2) rs2=s1(9) funct3=7
     let probe = 0x0091_7463u32;
-    for src in ["fn main() {}", "fn f(a: i64) -> i64 { a }\nfn main() { f(1); }"] {
+    for src in [
+        "fn main() {}",
+        "fn f(a: i64) -> i64 { a }\nfn main() { f(1); }",
+    ] {
         let code = emit(src);
         let funcs = code.iter().filter(|w| **w == 0x0000_8067).count();
         assert_eq!(
@@ -611,8 +673,14 @@ fn dividing_by_a_literal_zero_is_a_compile_error() {
 fn arithmetic_is_overflow_checked() {
     let add = emit("fn main() -> i64 { let a = 1; let b = 2; a + b }");
     assert!(add.contains(&0x0062_83b3), "add into a scratch register");
-    assert!(add.contains(&0x0053_ce33), "xor t3, t2, t0 for the sign test");
-    assert!(add.contains(&0x0063_ceb3), "xor t4, t2, t1 for the sign test");
+    assert!(
+        add.contains(&0x0053_ce33),
+        "xor t3, t2, t0 for the sign test"
+    );
+    assert!(
+        add.contains(&0x0063_ceb3),
+        "xor t4, t2, t1 for the sign test"
+    );
 
     let mul = emit("fn main() -> i64 { let a = 1; let b = 2; a * b }");
     assert!(mul.contains(&0x0262_9e33), "mulh t3, t0, t1");

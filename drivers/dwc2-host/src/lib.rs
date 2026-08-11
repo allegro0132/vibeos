@@ -7,7 +7,7 @@
 
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{compiler_fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering, compiler_fence},
 };
 use vibeos_hal::Dwc2Description;
 
@@ -79,6 +79,8 @@ const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
 const DMA_BYTES: usize = 1_024;
 const MAX_NAK_RETRIES: usize = 32;
+const HID_REPORT_BYTES: usize = 8;
+const HID_INPUT_BYTES: usize = 18;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
@@ -107,6 +109,7 @@ pub enum Error {
     TransferTimedOut,
     TransferFailed(u32),
     Stalled,
+    Nak,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +128,40 @@ pub struct DeviceInfo {
     pub vendor_id: u16,
     pub product_id: u16,
     pub max_packet_size_0: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HidKeyboardInfo {
+    pub interface: u8,
+    pub endpoint_in: u8,
+    pub max_packet_size: u16,
+    pub interval_ms: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HidInputBatch {
+    bytes: [u8; HID_INPUT_BYTES],
+    length: usize,
+}
+
+impl HidInputBatch {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; HID_INPUT_BYTES],
+            length: 0,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.length < self.bytes.len() {
+            self.bytes[self.length] = byte;
+            self.length += 1;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +223,9 @@ pub struct Controller {
     endpoint_zero_max_packet: u16,
     speed: Speed,
     device: Option<DeviceInfo>,
+    keyboard: Option<HidKeyboardInfo>,
+    keyboard_pid: DataPid,
+    keyboard_last: [u8; HID_REPORT_BYTES],
 }
 
 impl Controller {
@@ -367,6 +407,9 @@ impl Controller {
             endpoint_zero_max_packet: 8,
             speed: Speed::Full,
             device: None,
+            keyboard: None,
+            keyboard_pid: DataPid::Data0,
+            keyboard_last: [0; HID_REPORT_BYTES],
         })
     }
 
@@ -393,11 +436,16 @@ impl Controller {
         self.device
     }
 
+    pub const fn keyboard(&self) -> Option<HidKeyboardInfo> {
+        self.keyboard
+    }
+
     /// Reset the directly attached root-port device and complete USB address
     /// and device-descriptor enumeration through endpoint zero.
     pub fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {
         if !self.connected() {
             self.device = None;
+            self.keyboard = None;
             self.device_address = 0;
             return Ok(None);
         }
@@ -453,7 +501,106 @@ impl Controller {
         let info = parse_device_descriptor(descriptor, self.speed, self.device_address)?;
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
         self.device = Some(info);
+        self.keyboard = None;
         Ok(Some(info))
+    }
+
+    /// Select the first HID boot-keyboard interface exposed by the addressed
+    /// device and put it into the fixed eight-byte boot report protocol.
+    pub fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
+        if self.device.is_none() || !self.connected() {
+            self.keyboard = None;
+            return Ok(None);
+        }
+
+        let mut header = [0u8; 9];
+        let request = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 2 << 8,
+            index: 0,
+            length: header.len() as u16,
+        };
+        if self.control_transfer(request, &mut header)? != header.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if total < header.len() || total > DMA_BYTES {
+            return Err(Error::InvalidDescriptor);
+        }
+        let mut descriptors = [0u8; DMA_BYTES];
+        let request = SetupPacket {
+            length: total as u16,
+            ..request
+        };
+        if self.control_transfer(request, &mut descriptors[..total])? != total {
+            return Err(Error::InvalidDescriptor);
+        }
+        let (configuration, keyboard) =
+            parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
+        let Some(keyboard) = keyboard else {
+            self.keyboard = None;
+            return Ok(None);
+        };
+
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x21,
+                request: 11,
+                value: 0,
+                index: u16::from(keyboard.interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.keyboard = Some(keyboard);
+        self.keyboard_pid = DataPid::Data0;
+        self.keyboard_last = [0; HID_REPORT_BYTES];
+        Ok(Some(keyboard))
+    }
+
+    /// Poll one interrupt-IN boot report and return bytes for newly pressed
+    /// keys. A USB NAK is normal idle state and produces an empty batch.
+    pub fn poll_keyboard(&mut self) -> Result<HidInputBatch, Error> {
+        let keyboard = self.keyboard.ok_or(Error::NoDevice)?;
+        if !self.connected() {
+            self.keyboard = None;
+            return Err(Error::NoDevice);
+        }
+        let result = self.channel_transfer(
+            self.device_address,
+            keyboard.endpoint_in & 0x0f,
+            true,
+            EndpointType::Interrupt,
+            self.keyboard_pid,
+            HID_REPORT_BYTES,
+            keyboard.max_packet_size,
+            1,
+        );
+        let actual = match result {
+            Ok(actual) => actual,
+            Err(Error::Nak) => return Ok(HidInputBatch::new()),
+            Err(error) => return Err(error),
+        };
+        if actual < HID_REPORT_BYTES {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.keyboard_pid = self.keyboard_pid.toggled();
+        let mut report = [0u8; HID_REPORT_BYTES];
+        unsafe { report.copy_from_slice(&dma_bytes()[..HID_REPORT_BYTES]) };
+        let input = decode_hid_report(report, self.keyboard_last);
+        self.keyboard_last = report;
+        Ok(input)
     }
 
     /// Execute one USB control request on the currently addressed endpoint 0.
@@ -476,6 +623,8 @@ impl Controller {
             EndpointType::Control,
             DataPid::Setup,
             8,
+            self.endpoint_zero_max_packet,
+            MAX_NAK_RETRIES,
         )?;
 
         let actual = if length == 0 {
@@ -491,6 +640,8 @@ impl Controller {
                 EndpointType::Control,
                 DataPid::Data1,
                 length,
+                self.endpoint_zero_max_packet,
+                MAX_NAK_RETRIES,
             )?;
             if direction_in {
                 unsafe { data[..actual].copy_from_slice(&dma_bytes()[..actual]) };
@@ -505,6 +656,8 @@ impl Controller {
             EndpointType::Control,
             DataPid::Data1,
             0,
+            self.endpoint_zero_max_packet,
+            MAX_NAK_RETRIES,
         )?;
         Ok(actual)
     }
@@ -546,6 +699,10 @@ impl Controller {
         .map_err(|_| Error::PortResetTimedOut)
     }
 
+    // Keep the USB transaction tuple visible at the MMIO boundary; grouping
+    // these fields would only hide which values are programmed into HCCHAR and
+    // HCTSIZ for each control or interrupt transfer.
+    #[allow(clippy::too_many_arguments)]
     fn channel_transfer(
         &mut self,
         address: u8,
@@ -554,19 +711,21 @@ impl Controller {
         endpoint_type: EndpointType,
         pid: DataPid,
         length: usize,
+        max_packet: u16,
+        nak_retries: usize,
     ) -> Result<usize, Error> {
-        if length > DMA_BYTES || endpoint > 15 || address > 127 {
+        if length > DMA_BYTES || endpoint > 15 || address > 127 || max_packet == 0 {
             return Err(Error::BufferTooSmall);
         }
-        let max_packet = usize::from(self.endpoint_zero_max_packet);
+        let packet_bytes = usize::from(max_packet);
         let packet_count = if length == 0 {
             1
         } else {
-            length.div_ceil(max_packet)
+            length.div_ceil(packet_bytes)
         };
         let dma_address = DMA.0.get() as usize;
 
-        for _ in 0..MAX_NAK_RETRIES {
+        for _ in 0..nak_retries {
             if direction_in {
                 invalidate_range(
                     self.description.cache_line_bytes,
@@ -595,7 +754,7 @@ impl Controller {
                         | (packet_count as u32) << HCTSIZ_PACKET_SHIFT
                         | (pid as u32) << HCTSIZ_PID_SHIFT,
                 );
-                let mut character = self.endpoint_zero_max_packet as u32
+                let mut character = u32::from(max_packet)
                     | u32::from(endpoint) << HCCHAR_ENDPOINT_SHIFT
                     | (endpoint_type as u32) << HCCHAR_TYPE_SHIFT
                     | u32::from(address) << HCCHAR_ADDRESS_SHIFT
@@ -645,7 +804,7 @@ impl Controller {
                 core::hint::spin_loop();
             }
         }
-        Err(Error::TransferFailed(HCINT_NAK))
+        Err(Error::Nak)
     }
 
     /// Quiesce the host core and release software ownership. Clock gates stay
@@ -677,13 +836,236 @@ impl Drop for Controller {
 #[repr(u32)]
 enum EndpointType {
     Control = 0,
+    Interrupt = 3,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 enum DataPid {
+    Data0 = 0,
     Data1 = 2,
     Setup = 3,
+}
+
+impl DataPid {
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Data0 => Self::Data1,
+            Self::Data1 => Self::Data0,
+            Self::Setup => Self::Setup,
+        }
+    }
+}
+
+fn parse_hid_keyboard_configuration(
+    descriptors: &[u8],
+    speed: Speed,
+) -> Result<(u8, Option<HidKeyboardInfo>), Error> {
+    if descriptors.len() < 9 || descriptors[0] != 9 || descriptors[1] != 2 || descriptors[5] == 0 {
+        return Err(Error::InvalidDescriptor);
+    }
+    let declared = usize::from(u16::from_le_bytes([descriptors[2], descriptors[3]]));
+    if declared != descriptors.len() {
+        return Err(Error::InvalidDescriptor);
+    }
+
+    let mut offset = 0;
+    let mut interface = None;
+    while offset < descriptors.len() {
+        if descriptors.len() - offset < 2 {
+            return Err(Error::InvalidDescriptor);
+        }
+        let length = usize::from(descriptors[offset]);
+        if length < 2 || length > descriptors.len() - offset {
+            return Err(Error::InvalidDescriptor);
+        }
+        match descriptors[offset + 1] {
+            4 if length >= 9 => {
+                interface = (descriptors[offset + 5] == 3
+                    && descriptors[offset + 6] == 1
+                    && descriptors[offset + 7] == 1)
+                    .then_some(descriptors[offset + 2]);
+            }
+            5 if length >= 7 => {
+                let address = descriptors[offset + 2];
+                let attributes = descriptors[offset + 3];
+                let max_packet =
+                    u16::from_le_bytes([descriptors[offset + 4], descriptors[offset + 5]]) & 0x07ff;
+                if address & 0x80 != 0
+                    && attributes & 0x03 == 3
+                    && max_packet >= HID_REPORT_BYTES as u16
+                    && usize::from(max_packet) <= DMA_BYTES
+                {
+                    if let Some(interface) = interface {
+                        return Ok((
+                            descriptors[5],
+                            Some(HidKeyboardInfo {
+                                interface,
+                                endpoint_in: address,
+                                max_packet_size: max_packet,
+                                interval_ms: hid_poll_interval_ms(speed, descriptors[offset + 6]),
+                            }),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        offset += length;
+    }
+    Ok((descriptors[5], None))
+}
+
+fn hid_poll_interval_ms(speed: Speed, interval: u8) -> u16 {
+    match speed {
+        Speed::High => {
+            let exponent = interval.clamp(1, 16) - 1;
+            let microframes = 1u32 << exponent;
+            microframes.div_ceil(8) as u16
+        }
+        Speed::Full | Speed::Low => interval.max(1) as u16,
+    }
+}
+
+fn decode_hid_report(
+    report: [u8; HID_REPORT_BYTES],
+    previous: [u8; HID_REPORT_BYTES],
+) -> HidInputBatch {
+    let mut input = HidInputBatch::new();
+    for key in report[2..].iter().copied().filter(|key| *key > 3) {
+        if previous[2..].contains(&key) {
+            continue;
+        }
+        let (bytes, length) = hid_key_bytes(key, report[0]);
+        for byte in &bytes[..length] {
+            input.push(*byte);
+        }
+    }
+    input
+}
+
+fn hid_key_bytes(key: u8, modifiers: u8) -> ([u8; 3], usize) {
+    let shift = modifiers & ((1 << 1) | (1 << 5)) != 0;
+    let control = modifiers & ((1 << 0) | (1 << 4)) != 0;
+    if (4..=29).contains(&key) {
+        let letter = key - 4;
+        if control {
+            return ([letter + 1, 0, 0], 1);
+        }
+        return ([if shift { b'A' } else { b'a' } + letter, 0, 0], 1);
+    }
+    if (30..=39).contains(&key) {
+        let index = (key - 30) as usize;
+        return (
+            [
+                if shift {
+                    b"!@#$%^&*()"[index]
+                } else {
+                    b"1234567890"[index]
+                },
+                0,
+                0,
+            ],
+            1,
+        );
+    }
+    let byte = match key {
+        40 => b'\n',
+        41 => 0x1b,
+        42 | 76 => 0x7f,
+        43 => b'\t',
+        44 => b' ',
+        45 => {
+            if shift {
+                b'_'
+            } else {
+                b'-'
+            }
+        }
+        46 => {
+            if shift {
+                b'+'
+            } else {
+                b'='
+            }
+        }
+        47 => {
+            if shift {
+                b'{'
+            } else {
+                b'['
+            }
+        }
+        48 => {
+            if shift {
+                b'}'
+            } else {
+                b']'
+            }
+        }
+        49 => {
+            if shift {
+                b'|'
+            } else {
+                b'\\'
+            }
+        }
+        50 => {
+            if shift {
+                b'~'
+            } else {
+                b'#'
+            }
+        }
+        51 => {
+            if shift {
+                b':'
+            } else {
+                b';'
+            }
+        }
+        52 => {
+            if shift {
+                b'"'
+            } else {
+                b'\''
+            }
+        }
+        53 => {
+            if shift {
+                b'~'
+            } else {
+                b'`'
+            }
+        }
+        54 => {
+            if shift {
+                b'<'
+            } else {
+                b','
+            }
+        }
+        55 => {
+            if shift {
+                b'>'
+            } else {
+                b'.'
+            }
+        }
+        56 => {
+            if shift {
+                b'?'
+            } else {
+                b'/'
+            }
+        }
+        79 => return ([0x1b, b'[', b'C'], 3),
+        80 => return ([0x1b, b'[', b'D'], 3),
+        81 => return ([0x1b, b'[', b'B'], 3),
+        82 => return ([0x1b, b'[', b'A'], 3),
+        _ => return ([0; 3], 0),
+    };
+    ([byte, 0, 0], 1)
 }
 
 fn parse_device_descriptor(
@@ -984,5 +1366,41 @@ mod tests {
         assert_eq!(port_speed(0), Ok(Speed::High));
         assert_eq!(port_speed(1 << HPRT_SPEED_SHIFT), Ok(Speed::Full));
         assert_eq!(port_speed(2 << HPRT_SPEED_SHIFT), Ok(Speed::Low));
+    }
+
+    #[test]
+    fn finds_boot_keyboard_interface_and_interrupt_endpoint() {
+        let descriptors = [
+            9, 2, 34, 0, 1, 2, 0, 0x80, 50, // configuration
+            9, 4, 3, 0, 1, 3, 1, 1, 0, // HID boot-keyboard interface
+            9, 0x21, 0x11, 1, 0, 1, 0x22, 63, 0, // HID descriptor
+            7, 5, 0x81, 3, 8, 0, 10, // interrupt IN endpoint
+        ];
+        let (configuration, keyboard) =
+            parse_hid_keyboard_configuration(&descriptors, Speed::Full).unwrap();
+        assert_eq!(configuration, 2);
+        assert_eq!(
+            keyboard,
+            Some(HidKeyboardInfo {
+                interface: 3,
+                endpoint_in: 0x81,
+                max_packet_size: 8,
+                interval_ms: 10,
+            })
+        );
+        assert_eq!(hid_poll_interval_ms(Speed::High, 4), 1);
+        assert_eq!(hid_poll_interval_ms(Speed::High, 7), 8);
+    }
+
+    #[test]
+    fn boot_reports_emit_only_new_keys_with_terminal_translation() {
+        let first = decode_hid_report([2, 0, 4, 30, 0, 0, 0, 0], [0; 8]);
+        assert_eq!(first.as_slice(), b"A!");
+
+        let held = decode_hid_report([2, 0, 4, 30, 79, 0, 0, 0], [2, 0, 4, 30, 0, 0, 0, 0]);
+        assert_eq!(held.as_slice(), b"\x1b[C");
+
+        let control = decode_hid_report([1, 0, 6, 0, 0, 0, 0, 0], [0; 8]);
+        assert_eq!(control.as_slice(), &[3]);
     }
 }

@@ -668,9 +668,7 @@ fn fault_reclaim_returns_every_block_to_its_size_class() {
 
     let replacement_arena = h.create_arena(owner).unwrap();
     let replacements = {
-        let _scope = unsafe {
-            enter_domain(AllocationDomain::new(owner, replacement_arena))
-        };
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, replacement_arena)) };
         unsafe { [h.alloc(l), h.alloc(l), h.alloc(l)] }
     };
     for pointer in pointers {

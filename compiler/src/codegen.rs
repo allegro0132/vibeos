@@ -275,7 +275,8 @@ impl Codegen {
             let site = self.relocation_site()?;
             let offset = u32::try_from(addr)
                 .map_err(|_| "generated string table exceeds the executable ABI".to_string())?;
-            self.relocations.push(Relocation::data_address(site, offset));
+            self.relocations
+                .push(Relocation::data_address(site, offset));
             self.li64(A0, 0);
         } else {
             self.li64(A0, addr);
@@ -286,7 +287,8 @@ impl Codegen {
     fn call_runtime(&mut self, import: RuntimeImport, addr: u64) -> CResult<()> {
         if self.relocatable {
             let site = self.relocation_site()?;
-            self.relocations.push(Relocation::runtime_call(site, import));
+            self.relocations
+                .push(Relocation::runtime_call(site, import));
             self.call_abs(0);
         } else {
             self.call_abs(addr);
@@ -305,7 +307,8 @@ impl Codegen {
             let target_word = u32::try_from(byte_offset / 4)
                 .map_err(|_| "generated function table exceeds the executable ABI".to_string())?;
             let site = self.relocation_site()?;
-            self.relocations.push(Relocation::code_call(site, target_word));
+            self.relocations
+                .push(Relocation::code_call(site, target_word));
             self.call_abs(0);
         } else {
             self.call_abs(addr);
@@ -418,16 +421,17 @@ fn is_leaf(block: &Block) -> bool {
             Expr::Index(_, i, _) => expr_leaf(i),
             Expr::Neg(a) | Expr::Not(a) | Expr::BitNot(a) => expr_leaf(a),
             Expr::Bin(_, a, b, _) => expr_leaf(a) && expr_leaf(b),
-            Expr::If(c, t, e, _) => {
-                expr_leaf(c) && is_leaf(t) && e.as_ref().map_or(true, is_leaf)
-            }
+            Expr::If(c, t, e, _) => expr_leaf(c) && is_leaf(t) && e.as_ref().map_or(true, is_leaf),
             _ => true,
         }
     }
     block.stmts.iter().all(|st| match st {
         Stmt::While(..) => false,
         // An array initializer emits a fill loop.
-        Stmt::Let { init: Expr::ArrayRepeat(..), .. } => false,
+        Stmt::Let {
+            init: Expr::ArrayRepeat(..),
+            ..
+        } => false,
         Stmt::IndexAssign { index, value, .. } => expr_leaf(index) && expr_leaf(value),
         // A print is a call into the runtime; charge for it.
         Stmt::Print { .. } => false,
@@ -448,9 +452,7 @@ fn count_lets(block: &Block) -> u32 {
             Expr::Call(_, args, _) => args.iter().map(expr_lets).sum(),
             Expr::Index(_, i, _) => expr_lets(i),
             Expr::ArrayRepeat(v, _, _) => expr_lets(v),
-            Expr::If(c, t, e, _) => {
-                expr_lets(c) + count_lets(t) + e.as_ref().map_or(0, count_lets)
-            }
+            Expr::If(c, t, e, _) => expr_lets(c) + count_lets(t) + e.as_ref().map_or(0, count_lets),
             _ => 0,
         }
     }
@@ -570,7 +572,12 @@ pub(crate) fn compile_relocatable(
     prog: &Program,
     str_offsets: BTreeMap<String, u64>,
 ) -> CResult<(Vec<u32>, Vec<Relocation>)> {
-    let runtime = Runtime { print_str: 0, print_int: 0, print_bool: 0, abort: 0 };
+    let runtime = Runtime {
+        print_str: 0,
+        print_int: 0,
+        print_bool: 0,
+        abort: 0,
+    };
     compile_impl(prog, 0, str_offsets, &runtime, true)
 }
 
@@ -671,11 +678,19 @@ impl Codegen {
         // Spill incoming arguments into their frame slots.
         for (n, (p, _)) in f.params.iter().enumerate() {
             if n >= 8 {
-                return Err(format!("line {}: at most 8 parameters are supported", f.line));
+                return Err(format!(
+                    "line {}: at most 8 parameters are supported",
+                    f.line
+                ));
             }
             let slot = self.next_slot;
             self.next_slot += 1;
-            self.scope.push(Scope { name: p.clone(), slot, mutable: false, array: None });
+            self.scope.push(Scope {
+                name: p.clone(),
+                slot,
+                mutable: false,
+                array: None,
+            });
             let off = 16 + 8 * slot as i32;
             self.emit(sd(A0 + n as u32, S0, off));
         }
@@ -714,7 +729,12 @@ impl Codegen {
 
     fn stmt(&mut self, st: &Stmt) -> CResult<()> {
         match st {
-            Stmt::Let { name, mutable, init: Expr::ArrayRepeat(value, n, _), .. } => {
+            Stmt::Let {
+                name,
+                mutable,
+                init: Expr::ArrayRepeat(value, n, _),
+                ..
+            } => {
                 let base = self.next_region;
                 let len = *n;
                 self.next_region = self.next_region.saturating_add(len);
@@ -738,7 +758,12 @@ impl Codegen {
                     array: Some((base, len)),
                 });
             }
-            Stmt::Let { name, mutable, init, .. } => {
+            Stmt::Let {
+                name,
+                mutable,
+                init,
+                ..
+            } => {
                 self.expr(init)?;
                 self.pop(T0);
                 let slot = self.next_slot;
@@ -753,7 +778,10 @@ impl Codegen {
             }
             Stmt::Assign { name, value, line } => {
                 let Some(v) = self.lookup(name) else {
-                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                    return Err(format!(
+                        "line {}: cannot find value `{}` in this scope",
+                        line, name
+                    ));
                 };
                 if !v.mutable {
                     return Err(format!(
@@ -766,7 +794,12 @@ impl Codegen {
                 self.pop(T0);
                 self.emit(sd(T0, S0, off));
             }
-            Stmt::IndexAssign { name, index, value, line } => {
+            Stmt::IndexAssign {
+                name,
+                index,
+                value,
+                line,
+            } => {
                 let (base, len) = self.array_of(name, *line)?;
                 self.expr(index)?;
                 self.expr(value)?;
@@ -852,7 +885,10 @@ impl Codegen {
             }
             Expr::Var(name, line) => {
                 let Some(v) = self.lookup(name) else {
-                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                    return Err(format!(
+                        "line {}: cannot find value `{}` in this scope",
+                        line, name
+                    ));
                 };
                 let off = 16 + 8 * v.slot as i32;
                 self.emit(ld(T0, S0, off));
@@ -902,7 +938,11 @@ impl Codegen {
                     if let Expr::Int(0) = **bb {
                         return Err(format!(
                             "this operation will panic at runtime: attempt to {} by zero",
-                            if *op == BinOp::Div { "divide" } else { "calculate the remainder" }
+                            if *op == BinOp::Div {
+                                "divide"
+                            } else {
+                                "calculate the remainder"
+                            }
                         ));
                     }
                 }
@@ -948,9 +988,7 @@ impl Codegen {
                 self.push(T0);
             }
             Expr::ArrayRepeat(..) => {
-                return Err(
-                    "an array literal may only initialise a `let` binding".to_string()
-                )
+                return Err("an array literal may only initialise a `let` binding".to_string())
             }
             Expr::If(cond, then, els, _) => {
                 self.expr(cond)?;

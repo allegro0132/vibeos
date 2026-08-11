@@ -36,13 +36,21 @@ type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Self { toks, pos: 0, depth: 0 }
+        Self {
+            toks,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn descend(&mut self) -> PResult<()> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return Err(format!("line {}: expression nests more than {} deep", self.line(), MAX_DEPTH));
+            return Err(format!(
+                "line {}: expression nests more than {} deep",
+                self.line(),
+                MAX_DEPTH
+            ));
         }
         Ok(())
     }
@@ -80,7 +88,12 @@ impl Parser {
         if self.eat(p) {
             Ok(())
         } else {
-            Err(format!("line {}: expected `{}`, found {}", self.line(), p, self.describe()))
+            Err(format!(
+                "line {}: expected `{}`, found {}",
+                self.line(),
+                p,
+                self.describe()
+            ))
         }
     }
 
@@ -161,7 +174,11 @@ impl Parser {
     fn func(&mut self) -> PResult<Func> {
         let line = self.line();
         if !matches!(self.peek(), Tok::Fn) {
-            return Err(format!("line {}: expected `fn`, found {}", line, self.describe()));
+            return Err(format!(
+                "line {}: expected `fn`, found {}",
+                line,
+                self.describe()
+            ));
         }
         self.bump();
         let name = self.ident()?;
@@ -181,7 +198,13 @@ impl Parser {
         }
         let ret = if self.eat("->") { self.ty()? } else { Ty::Unit };
         let body = self.block()?;
-        Ok(Func { name, params, ret, body, line })
+        Ok(Func {
+            name,
+            params,
+            ret,
+            body,
+            line,
+        })
     }
 
     fn ty(&mut self) -> PResult<Ty> {
@@ -263,11 +286,21 @@ impl Parser {
                         true
                     };
                     let name = self.ident()?;
-                    let declared = if self.eat(":") { Some(self.ty()?) } else { None };
+                    let declared = if self.eat(":") {
+                        Some(self.ty()?)
+                    } else {
+                        None
+                    };
                     self.expect("=")?;
                     let init = self.expr()?;
                     self.expect(";")?;
-                    stmts.push(Stmt::Let { name, mutable, declared, init, line });
+                    stmts.push(Stmt::Let {
+                        name,
+                        mutable,
+                        declared,
+                        init,
+                        line,
+                    });
                 }
                 Tok::Return => {
                     self.bump();
@@ -289,16 +322,15 @@ impl Parser {
                     self.bump();
                     let parts = self.print_args()?;
                     self.expect(";")?;
-                    stmts.push(Stmt::Print { parts, newline: m == "println" });
+                    stmts.push(Stmt::Print {
+                        parts,
+                        newline: m == "println",
+                    });
                 }
-                Tok::Macro(m) => {
-                    return Err(format!("line {}: unsupported macro `{}!`", line, m))
-                }
+                Tok::Macro(m) => return Err(format!("line {}: unsupported macro `{}!`", line, m)),
                 // `ident = expr;` is an assignment; anything else starting with
                 // an identifier is an expression.
-                Tok::Ident(name)
-                    if matches!(self.toks[self.pos + 1].tok, Tok::Punct("=")) =>
-                {
+                Tok::Ident(name) if matches!(self.toks[self.pos + 1].tok, Tok::Punct("=")) => {
                     self.bump();
                     self.bump();
                     let value = self.expr()?;
@@ -318,15 +350,18 @@ impl Parser {
                     self.expect("=")?;
                     let value = self.expr()?;
                     self.expect(";")?;
-                    stmts.push(Stmt::IndexAssign { name, index, value, line });
+                    stmts.push(Stmt::IndexAssign {
+                        name,
+                        index,
+                        value,
+                        line,
+                    });
                 }
                 _ => {
                     let e = self.expr()?;
                     if self.eat(";") {
                         stmts.push(Stmt::Expr(e));
-                    } else if matches!(e, Expr::If(..))
-                        && !matches!(self.peek(), Tok::Punct("}"))
-                    {
+                    } else if matches!(e, Expr::If(..)) && !matches!(self.peek(), Tok::Punct("}")) {
                         // As in real Rust: a block-like expression in statement
                         // position takes no semicolon. Without this, an `if`
                         // parses only as a block's final expression, so any `if`
@@ -480,7 +515,10 @@ impl Parser {
                     // `else if` chains desugar into a block holding one if.
                     if matches!(self.peek(), Tok::If) {
                         let nested = self.primary()?;
-                        Some(Block { stmts: Vec::new(), tail: Some(Box::new(nested)) })
+                        Some(Block {
+                            stmts: Vec::new(),
+                            tail: Some(Box::new(nested)),
+                        })
                     } else {
                         Some(self.block()?)
                     }
@@ -542,7 +580,11 @@ impl Parser {
                 self.expect(")")?;
                 Ok(e)
             }
-            _ => Err(format!("line {}: expected an expression, found {}", line, self.describe())),
+            _ => Err(format!(
+                "line {}: expected an expression, found {}",
+                line,
+                self.describe()
+            )),
         }
     }
 }

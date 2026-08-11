@@ -39,15 +39,23 @@ pub fn check(prog: &Program) -> TResult<Program> {
         if sigs
             .insert(
                 f.name.clone(),
-                Signature { params: f.params.iter().map(|(_, t)| *t).collect(), ret: f.ret },
+                Signature {
+                    params: f.params.iter().map(|(_, t)| *t).collect(),
+                    ret: f.ret,
+                },
             )
             .is_some()
         {
-            return Err(format!("line {}: function `{}` is defined twice", f.line, f.name));
+            return Err(format!(
+                "line {}: function `{}` is defined twice",
+                f.line, f.name
+            ));
         }
     }
 
-    let main = sigs.get("main").ok_or_else(|| "no `main` function found".to_string())?;
+    let main = sigs
+        .get("main")
+        .ok_or_else(|| "no `main` function found".to_string())?;
     if !main.params.is_empty() {
         return Err("`main` must take no arguments".to_string());
     }
@@ -56,7 +64,11 @@ pub fn check(prog: &Program) -> TResult<Program> {
     for f in &prog.funcs {
         let mut c = Checker {
             sigs: BTreeMap::new(),
-            scope: f.params.iter().map(|(n, t)| (n.clone(), *t, false)).collect(),
+            scope: f
+                .params
+                .iter()
+                .map(|(n, t)| (n.clone(), *t, false))
+                .collect(),
             ret: f.ret,
         };
         // Cheaper than cloning signatures per function.
@@ -70,7 +82,11 @@ pub fn check(prog: &Program) -> TResult<Program> {
 
 impl Checker {
     fn lookup(&self, name: &str) -> Option<(Ty, bool)> {
-        self.scope.iter().rev().find(|(n, _, _)| n == name).map(|(_, t, m)| (*t, *m))
+        self.scope
+            .iter()
+            .rev()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, t, m)| (*t, *m))
     }
 
     /// Check a block. `expect` is the type its value must have, when it has one.
@@ -108,7 +124,13 @@ impl Checker {
 
     fn stmt(&mut self, st: &Stmt) -> TResult<Stmt> {
         Ok(match st {
-            Stmt::Let { name, mutable, declared, init, line } => {
+            Stmt::Let {
+                name,
+                mutable,
+                declared,
+                init,
+                line,
+            } => {
                 let (init, t) = self.expr(init)?;
                 if let Some(d) = declared {
                     // A `let` is the one place an array type may be written, so
@@ -138,11 +160,20 @@ impl Checker {
                     ));
                 }
                 self.scope.push((name.clone(), t, *mutable));
-                Stmt::Let { name: name.clone(), mutable: *mutable, declared: *declared, init, line: *line }
+                Stmt::Let {
+                    name: name.clone(),
+                    mutable: *mutable,
+                    declared: *declared,
+                    init,
+                    line: *line,
+                }
             }
             Stmt::Assign { name, value, line } => {
                 let Some((want, mutable)) = self.lookup(name) else {
-                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                    return Err(format!(
+                        "line {}: cannot find value `{}` in this scope",
+                        line, name
+                    ));
                 };
                 if !mutable {
                     return Err(format!(
@@ -152,11 +183,23 @@ impl Checker {
                 }
                 let (value, t) = self.expr(value)?;
                 self.unify(want, t, *line, &format!("assignment to `{}`", name))?;
-                Stmt::Assign { name: name.clone(), value, line: *line }
+                Stmt::Assign {
+                    name: name.clone(),
+                    value,
+                    line: *line,
+                }
             }
-            Stmt::IndexAssign { name, index, value, line } => {
+            Stmt::IndexAssign {
+                name,
+                index,
+                value,
+                line,
+            } => {
                 let Some((t, mutable)) = self.lookup(name) else {
-                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                    return Err(format!(
+                        "line {}: cannot find value `{}` in this scope",
+                        line, name
+                    ));
                 };
                 let Ty::Array(_) = t else {
                     return Err(format!(
@@ -173,8 +216,18 @@ impl Checker {
                 let (index, ti) = self.expr(index)?;
                 self.unify(Ty::I64, ti, *line, "array index")?;
                 let (value, tv) = self.expr(value)?;
-                self.unify(Ty::I64, tv, *line, &format!("element assigned to `{}`", name))?;
-                Stmt::IndexAssign { name: name.clone(), index, value, line: *line }
+                self.unify(
+                    Ty::I64,
+                    tv,
+                    *line,
+                    &format!("element assigned to `{}`", name),
+                )?;
+                Stmt::IndexAssign {
+                    name: name.clone(),
+                    index,
+                    value,
+                    line: *line,
+                }
             }
             Stmt::Expr(e) => Stmt::Expr(self.expr(e)?.0),
             Stmt::While(cond, body, line) => {
@@ -209,9 +262,9 @@ impl Checker {
                                 }
                                 Ty::Array(_) => {
                                     return Err(format!(
-                                        "`{}` cannot be formatted with `{{}}`; print elements instead",
-                                        t
-                                    ))
+                                    "`{}` cannot be formatted with `{{}}`; print elements instead",
+                                    t
+                                ))
                                 }
                                 _ => {}
                             }
@@ -219,7 +272,10 @@ impl Checker {
                         }
                     });
                 }
-                Stmt::Print { parts: out, newline: *newline }
+                Stmt::Print {
+                    parts: out,
+                    newline: *newline,
+                }
             }
         })
     }
@@ -230,7 +286,10 @@ impl Checker {
             Expr::Bool(b) => (Expr::Bool(*b), Ty::Bool),
             Expr::Var(name, line) => {
                 let Some((t, _)) = self.lookup(name) else {
-                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                    return Err(format!(
+                        "line {}: cannot find value `{}` in this scope",
+                        line, name
+                    ));
                 };
                 (Expr::Var(name.clone(), *line), t)
             }
@@ -278,8 +337,18 @@ impl Checker {
                     }
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => (Ty::I64, Ty::Bool),
                 };
-                self.unify(want, ta, line, &format!("left operand of `{}`", op_name(*op)))?;
-                self.unify(want, tb, line, &format!("right operand of `{}`", op_name(*op)))?;
+                self.unify(
+                    want,
+                    ta,
+                    line,
+                    &format!("left operand of `{}`", op_name(*op)),
+                )?;
+                self.unify(
+                    want,
+                    tb,
+                    line,
+                    &format!("right operand of `{}`", op_name(*op)),
+                )?;
                 // Fold constants here rather than emitting code for them. Real
                 // rustc reports literal arithmetic that overflows as an error
                 // rather than a runtime panic, and so does this.
@@ -289,7 +358,12 @@ impl Checker {
                     }
                 }
                 (
-                    Expr::Bin(*op, alloc::boxed::Box::new(a), alloc::boxed::Box::new(b), line),
+                    Expr::Bin(
+                        *op,
+                        alloc::boxed::Box::new(a),
+                        alloc::boxed::Box::new(b),
+                        line,
+                    ),
                     out,
                 )
             }
@@ -317,7 +391,10 @@ impl Checker {
             }
             Expr::Index(name, idx, line) => {
                 let Some((t, _)) = self.lookup(name) else {
-                    return Err(format!("line {}: cannot find value `{}` in this scope", line, name));
+                    return Err(format!(
+                        "line {}: cannot find value `{}` in this scope",
+                        line, name
+                    ));
                 };
                 let Ty::Array(_) = t else {
                     return Err(format!(
@@ -327,7 +404,10 @@ impl Checker {
                 };
                 let (idx, ti) = self.expr(idx)?;
                 self.unify(Ty::I64, ti, *line, "array index")?;
-                (Expr::Index(name.clone(), alloc::boxed::Box::new(idx), *line), Ty::I64)
+                (
+                    Expr::Index(name.clone(), alloc::boxed::Box::new(idx), *line),
+                    Ty::I64,
+                )
             }
             Expr::ArrayRepeat(v, n, line) => {
                 let (v, tv) = self.expr(v)?;
@@ -354,7 +434,10 @@ impl Checker {
                     }
                     None => {
                         let then_c = self.block(then, Some(Ty::Unit), line)?;
-                        (Expr::If(alloc::boxed::Box::new(cond), then_c, None, line), Ty::Unit)
+                        (
+                            Expr::If(alloc::boxed::Box::new(cond), then_c, None, line),
+                            Ty::Unit,
+                        )
                     }
                 }
             }
@@ -372,7 +455,11 @@ impl Checker {
     fn unify(&self, want: Ty, got: Ty, line: u32, what: &str) -> TResult<()> {
         if want == got {
             if matches!(want, Ty::Array(_)) {
-                let where_ = if line > 0 { format!("line {}: ", line) } else { String::new() };
+                let where_ = if line > 0 {
+                    format!("line {}: ", line)
+                } else {
+                    String::new()
+                };
                 return Err(format!(
                     "{}arrays cannot be passed, returned or assigned as values yet; \
                      index them instead",
@@ -381,8 +468,15 @@ impl Checker {
             }
             return Ok(());
         }
-        let where_ = if line > 0 { format!("line {}: ", line) } else { String::new() };
-        Err(format!("{}mismatched types: {} expects `{}`, found `{}`", where_, what, want, got))
+        let where_ = if line > 0 {
+            format!("line {}: ", line)
+        } else {
+            String::new()
+        };
+        Err(format!(
+            "{}mismatched types: {} expects `{}`, found `{}`",
+            where_, what, want, got
+        ))
     }
 }
 

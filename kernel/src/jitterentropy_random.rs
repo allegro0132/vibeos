@@ -6,7 +6,7 @@ use alloc::{string::String, sync::Arc};
 use core::{
     any::Any,
     ptr,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 
 use jitterentropy::{EntropyCollector, EntropyCollectorBuilder, Flags, Timer};

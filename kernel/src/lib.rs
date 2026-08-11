@@ -137,9 +137,9 @@ pub use vibeos_object_store as store;
 pub use vibeos_ssh_identity as ssh_security;
 mod block_device;
 #[cfg(feature = "milkv-duo")]
-mod dwmac_net;
-#[cfg(feature = "milkv-duo")]
 mod dwc2_host;
+#[cfg(feature = "milkv-duo")]
+mod dwmac_net;
 mod net_device;
 #[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
@@ -421,15 +421,28 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "milkv-duo")]
     if dwc2_host::connected() {
         match dwc2_host::enumerate_device() {
-            Ok(Some(device)) => println!(
-                "  usb dev   addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
-                device.address,
-                device.speed,
-                device.vendor_id,
-                device.product_id,
-                device.usb_version,
-                device.max_packet_size_0,
-            ),
+            Ok(Some(device)) => {
+                println!(
+                    "  usb dev   addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
+                    device.address,
+                    device.speed,
+                    device.vendor_id,
+                    device.product_id,
+                    device.usb_version,
+                    device.max_packet_size_0,
+                );
+                match dwc2_host::configure_hid_keyboard() {
+                    Ok(Some(keyboard)) => println!(
+                        "  usb hid   boot keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                        keyboard.interface,
+                        keyboard.endpoint_in & 0x0f,
+                        keyboard.max_packet_size,
+                        keyboard.interval_ms,
+                    ),
+                    Ok(None) => println!("  usb hid   no boot keyboard interface"),
+                    Err(error) => println!("  usb hid   configuration FAILED: {:?}", error),
+                }
+            }
             Ok(None) => println!("  usb dev   disconnected during enumeration"),
             Err(error) => println!("  usb dev   enumeration FAILED: {:?}", error),
         }
@@ -474,6 +487,10 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "qemu-virt")]
     if xhci::info().is_some() {
         exec::spawn("usb-host", xhci::service_task());
+    }
+    #[cfg(feature = "milkv-duo")]
+    if dwc2_host::keyboard_ready() {
+        exec::spawn("usb-hid", dwc2_host::service_task());
     }
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     world::start_ipv4_stack_supervisor();

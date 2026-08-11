@@ -21,7 +21,7 @@ use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
 use crate::trampoline::{self, CatchThunk, JmpBuf};
-use crate::world::{world, Space};
+use crate::world::{Space, world};
 use crate::{exec, heap, println, sbi};
 
 use vibeos_kernel_acceptance::Harness;
@@ -218,7 +218,7 @@ pub async fn run() -> Report {
 /// M6.1--M6.3: one identity-mapped Sv39 root is active on every online hart;
 /// stack guards, W^X, execute-only code, and non-executable devices are live.
 fn paging(h: &mut Harness) {
-    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
+    use vibeos_core::mmu::{PAGE_SIZE, PagePermissions};
 
     h.check(
         "the current hart has Sv39 enabled",
@@ -1460,7 +1460,7 @@ fn capabilities(h: &mut Harness) {
 }
 
 fn capability_table_is_read_only(range: crate::cap::CapabilityTableRange) -> bool {
-    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
+    use vibeos_core::mmu::{PAGE_SIZE, PagePermissions};
 
     range.start % PAGE_SIZE == 0
         && range.page_count != 0
@@ -1590,7 +1590,10 @@ fn compiler(h: &mut Harness) {
     // execution -- a host test can prove the check was *emitted*, only this can
     // prove it fires and that the shell survives it.
     let aborts: [(&str, &str); 6] = [
-        ("fn main() -> i64 { let z = 0; 1 / z }", "attempt to divide by zero"),
+        (
+            "fn main() -> i64 { let z = 0; 1 / z }",
+            "attempt to divide by zero",
+        ),
         (
             "fn main() -> i64 { let z = 0; 1 % z }",
             "attempt to calculate the remainder with a divisor of zero",
@@ -1609,7 +1612,10 @@ fn compiler(h: &mut Harness) {
             "fn main() -> i64 { let mut i = 0; while i >= 0 { i = i + 0; } i }",
             "exceeded execution budget",
         ),
-        ("fn f(n: i64) -> i64 { f(n) }\nfn main() -> i64 { f(0) }", "stack overflow"),
+        (
+            "fn f(n: i64) -> i64 { f(n) }\nfn main() -> i64 { f(0) }",
+            "stack overflow",
+        ),
     ];
     for (src, want) in aborts {
         match crate::rustc::compile(src) {

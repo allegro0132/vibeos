@@ -19,6 +19,34 @@ const SBI_EXT_RFENCE_REMOTE_FENCE_I: usize = 0;
 const SBI_EXT_RFENCE_REMOTE_SFENCE_VMA: usize = 1;
 const PAGE_SIZE: usize = 4096;
 
+const fn ipi_error_from_sbi(error: isize) -> IpiError {
+    match error {
+        -1 => IpiError::Failed,
+        -2 => IpiError::NotSupported,
+        -3 => IpiError::InvalidParam,
+        -4 => IpiError::Denied,
+        -5 => IpiError::InvalidAddress,
+        -6 => IpiError::AlreadyAvailable,
+        -7 => IpiError::AlreadyStarted,
+        -8 => IpiError::AlreadyStopped,
+        -9 => IpiError::NoSharedMemory,
+        other => IpiError::Unknown(other),
+    }
+}
+
+const fn hart_state_from_sbi(value: usize) -> HartState {
+    match value {
+        0 => HartState::Started,
+        1 => HartState::Stopped,
+        2 => HartState::StartPending,
+        3 => HartState::StopPending,
+        4 => HartState::Suspended,
+        5 => HartState::SuspendPending,
+        6 => HartState::ResumePending,
+        other => HartState::Unknown(other),
+    }
+}
+
 /// Disable S-mode interrupts; returns whether they were previously enabled.
 #[inline]
 pub fn irq_save() -> bool {
@@ -182,7 +210,7 @@ pub fn remote_fence_i(hart_mask: usize, hart_mask_base: usize) -> Result<(), Ipi
     if error == 0 {
         Ok(())
     } else {
-        Err(IpiError::from_sbi(error))
+        Err(ipi_error_from_sbi(error))
     }
 }
 
@@ -204,7 +232,7 @@ pub fn remote_sfence_vma(
     if error == 0 {
         Ok(())
     } else {
-        Err(IpiError::from_sbi(error))
+        Err(ipi_error_from_sbi(error))
     }
 }
 
@@ -219,7 +247,7 @@ pub fn send_ipi(hart: usize) -> Result<(), IpiError> {
     if error == 0 {
         Ok(())
     } else {
-        Err(IpiError::from_sbi(error))
+        Err(ipi_error_from_sbi(error))
     }
 }
 
@@ -241,7 +269,7 @@ pub fn hart_start(hart: usize, start_addr: usize, opaque: usize) -> Result<(), I
     if error == 0 {
         Ok(())
     } else {
-        Err(IpiError::from_sbi(error))
+        Err(ipi_error_from_sbi(error))
     }
 }
 
@@ -253,9 +281,9 @@ pub fn hart_start(hart: usize, start_addr: usize, opaque: usize) -> Result<(), I
 pub fn hart_status(hart: usize) -> Result<HartState, IpiError> {
     let (error, value) = ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STATUS, hart, 0, 0, 0);
     if error == 0 {
-        Ok(HartState::from_sbi(value))
+        Ok(hart_state_from_sbi(value))
     } else {
-        Err(IpiError::from_sbi(error))
+        Err(ipi_error_from_sbi(error))
     }
 }
 

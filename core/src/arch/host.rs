@@ -9,10 +9,66 @@
 
 use core::sync::atomic::{fence, AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
-use super::{HartState, IpiError};
+use vibeos_hal::arch::{HartState, IpiError};
 
 const TEST_HARTS: usize = usize::BITS as usize;
 const NO_EXTENSION: usize = usize::MAX;
+
+const fn model_error_from_raw(error: isize) -> IpiError {
+    match error {
+        -1 => IpiError::Failed,
+        -2 => IpiError::NotSupported,
+        -3 => IpiError::InvalidParam,
+        -4 => IpiError::Denied,
+        -5 => IpiError::InvalidAddress,
+        -6 => IpiError::AlreadyAvailable,
+        -7 => IpiError::AlreadyStarted,
+        -8 => IpiError::AlreadyStopped,
+        -9 => IpiError::NoSharedMemory,
+        other => IpiError::Unknown(other),
+    }
+}
+
+const fn model_error_as_raw(error: IpiError) -> isize {
+    match error {
+        IpiError::Failed => -1,
+        IpiError::NotSupported => -2,
+        IpiError::InvalidParam => -3,
+        IpiError::Denied => -4,
+        IpiError::InvalidAddress => -5,
+        IpiError::AlreadyAvailable => -6,
+        IpiError::AlreadyStarted => -7,
+        IpiError::AlreadyStopped => -8,
+        IpiError::NoSharedMemory => -9,
+        IpiError::Unknown(other) => other,
+    }
+}
+
+const fn model_hart_state_from_raw(value: usize) -> HartState {
+    match value {
+        0 => HartState::Started,
+        1 => HartState::Stopped,
+        2 => HartState::StartPending,
+        3 => HartState::StopPending,
+        4 => HartState::Suspended,
+        5 => HartState::SuspendPending,
+        6 => HartState::ResumePending,
+        other => HartState::Unknown(other),
+    }
+}
+
+const fn model_hart_state_as_raw(state: HartState) -> usize {
+    match state {
+        HartState::Started => 0,
+        HartState::Stopped => 1,
+        HartState::StartPending => 2,
+        HartState::StopPending => 3,
+        HartState::Suspended => 4,
+        HartState::SuspendPending => 5,
+        HartState::ResumePending => 6,
+        HartState::Unknown(other) => other,
+    }
+}
 
 pub const RFENCE_EXTENSION_ID: usize = 0x52464E43;
 
@@ -146,7 +202,7 @@ pub fn remote_fence_i(hart_mask: usize, hart_mask_base: usize) -> Result<(), Ipi
     if injected == 0 {
         Ok(())
     } else {
-        Err(IpiError::from_sbi(injected))
+        Err(model_error_from_raw(injected))
     }
 }
 
@@ -170,7 +226,7 @@ pub fn remote_sfence_vma(
     if injected == 0 {
         Ok(())
     } else {
-        Err(IpiError::from_sbi(injected))
+        Err(model_error_from_raw(injected))
     }
 }
 
@@ -203,18 +259,18 @@ pub fn hart_start(hart: usize, start_addr: usize, opaque: usize) -> Result<(), I
 
     let injected = HART_START_ERRORS[hart].load(Ordering::Acquire);
     if injected != 0 {
-        return Err(IpiError::from_sbi(injected));
+        return Err(model_error_from_raw(injected));
     }
 
     let state = &HART_STATES[hart];
     loop {
         let raw = state.load(Ordering::Acquire);
-        match HartState::from_sbi(raw) {
+        match model_hart_state_from_raw(raw) {
             HartState::Stopped => {
                 if state
                     .compare_exchange_weak(
                         raw,
-                        HartState::StartPending.as_sbi(),
+                        model_hart_state_as_raw(HartState::StartPending),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
@@ -238,9 +294,9 @@ pub fn hart_status(hart: usize) -> Result<HartState, IpiError> {
     HART_STATUS_ATTEMPTS[hart].fetch_add(1, Ordering::Relaxed);
     let injected = HART_STATUS_ERRORS[hart].load(Ordering::Acquire);
     if injected != 0 {
-        Err(IpiError::from_sbi(injected))
+        Err(model_error_from_raw(injected))
     } else {
-        Ok(HartState::from_sbi(
+        Ok(model_hart_state_from_raw(
             HART_STATES[hart].load(Ordering::Acquire),
         ))
     }
@@ -290,7 +346,7 @@ pub fn test_last_probed_extension() -> Option<usize> {
 }
 
 pub fn set_test_remote_fence_i_error(error: Option<IpiError>) {
-    let raw = error.map_or(0, IpiError::as_sbi);
+    let raw = error.map_or(0, model_error_as_raw);
     assert!(
         error.is_none() || raw != 0,
         "an injected SBI error must be nonzero"
@@ -310,7 +366,7 @@ pub fn test_last_remote_fence_i() -> Option<RemoteFenceIRequest> {
 }
 
 pub fn set_test_remote_sfence_vma_error(error: Option<IpiError>) {
-    let raw = error.map_or(0, IpiError::as_sbi);
+    let raw = error.map_or(0, model_error_as_raw);
     assert!(
         error.is_none() || raw != 0,
         "an injected SBI error must be nonzero"
@@ -375,13 +431,13 @@ pub fn test_ipi_attempts(hart: usize) -> u64 {
 /// Set the firmware state returned by the host HSM status model.
 pub fn set_test_hart_state(hart: usize, state: HartState) {
     assert!(hart < TEST_HARTS);
-    HART_STATES[hart].store(state.as_sbi(), Ordering::Release);
+    HART_STATES[hart].store(model_hart_state_as_raw(state), Ordering::Release);
 }
 
 /// Inject one stable SBI error for HSM start, or clear it with `None`.
 pub fn set_test_hart_start_error(hart: usize, error: Option<IpiError>) {
     assert!(hart < TEST_HARTS);
-    let raw = error.map_or(0, IpiError::as_sbi);
+    let raw = error.map_or(0, model_error_as_raw);
     assert!(
         error.is_none() || raw != 0,
         "an injected SBI error must be nonzero"
@@ -392,7 +448,7 @@ pub fn set_test_hart_start_error(hart: usize, error: Option<IpiError>) {
 /// Inject one stable SBI error for HSM status, or clear it with `None`.
 pub fn set_test_hart_status_error(hart: usize, error: Option<IpiError>) {
     assert!(hart < TEST_HARTS);
-    let raw = error.map_or(0, IpiError::as_sbi);
+    let raw = error.map_or(0, model_error_as_raw);
     assert!(
         error.is_none() || raw != 0,
         "an injected SBI error must be nonzero"
@@ -445,7 +501,10 @@ pub fn reset_ipi_test_state() {
         attempts.store(0, Ordering::Release);
     }
     for hart in 0..TEST_HARTS {
-        HART_STATES[hart].store(HartState::Stopped.as_sbi(), Ordering::Release);
+        HART_STATES[hart].store(
+            model_hart_state_as_raw(HartState::Stopped),
+            Ordering::Release,
+        );
         HART_START_ERRORS[hart].store(0, Ordering::Release);
         HART_STATUS_ERRORS[hart].store(0, Ordering::Release);
         HART_START_ATTEMPTS[hart].store(0, Ordering::Release);
@@ -454,5 +513,8 @@ pub fn reset_ipi_test_state() {
         HART_START_OPAQUES[hart].store(0, Ordering::Release);
     }
     // The host process models the already-running boot hart after reset.
-    HART_STATES[0].store(HartState::Started.as_sbi(), Ordering::Release);
+    HART_STATES[0].store(
+        model_hart_state_as_raw(HartState::Started),
+        Ordering::Release,
+    );
 }

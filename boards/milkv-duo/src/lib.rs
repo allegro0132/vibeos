@@ -65,6 +65,7 @@ pub const DWC2: Dwc2Description = Dwc2Description {
     irq: USB_IRQ,
     soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
     dma_address_bits: 32,
+    cache_line_bytes: 64,
 };
 pub const STATUS_LED: StatusLedDescription = StatusLedDescription {
     gpio: AddressRange::new(GPIOC_BASE, GPIOC_MMIO_END),

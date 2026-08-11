@@ -1066,6 +1066,7 @@ enum Applet {
     Fault,
     Spin,
     Host(fn(&[String]) -> Result<String, Status>),
+    AsyncHost(fn(Vec<String>) -> crate::AsyncCommandFuture),
 }
 
 pub struct Command {
@@ -1606,6 +1607,26 @@ impl Session {
         self.install(
             name,
             Applet::Host(command),
+            min_args,
+            max_args,
+            StreamMode::Closed,
+            false,
+        );
+    }
+
+    pub fn install_async_host_command(
+        &mut self,
+        name: &'static str,
+        min_args: usize,
+        max_args: usize,
+        command: fn(Vec<String>) -> crate::AsyncCommandFuture,
+    ) {
+        if self.profile == SessionProfile::SshExec {
+            return;
+        }
+        self.install(
+            name,
+            Applet::AsyncHost(command),
             min_args,
             max_args,
             StreamMode::Closed,
@@ -2993,6 +3014,11 @@ async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
             Status::Cancelled
         }
         Applet::Host(command) => match command(&stage.args) {
+            Ok(output) if output.is_empty() => Status::Success,
+            Ok(output) => write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await,
+            Err(status) => status,
+        },
+        Applet::AsyncHost(command) => match command(stage.args.clone()).await {
             Ok(output) if output.is_empty() => Status::Success,
             Ok(output) => write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await,
             Err(status) => status,

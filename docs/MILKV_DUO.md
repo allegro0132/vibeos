@@ -126,6 +126,12 @@ single root port. A successful boot prints a line like:
 usb       DWC2 0xNNNN @ 0x4340000, IRQ 30, N channel(s), port powered/waiting
 ```
 
+CV1800B's DWC2 revision uses the 4.20a-or-newer reset protocol: hardware raises
+`GRSTCTL.CSRST_DONE` instead of clearing `CSRST` itself, after which software
+clears `CSRST` and acknowledges `CSRST_DONE`. The driver selects this handshake
+from `GSNPSID` and only forces host mode after the core reset, matching the
+official SDK sequence.
+
 The driver now also enables buffer DMA with explicit C906 cache maintenance,
 resets an attached root-port device, runs endpoint-zero SETUP/DATA/STATUS
 transactions, assigns address 1, and reads the complete device descriptor. It

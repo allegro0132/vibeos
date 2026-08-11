@@ -385,6 +385,7 @@ its process owns. Here, authority is not a property of the code.
 | `kernel/src/legacy_shell.rs` | feature-gated diagnostic and hardware acceptance shell |
 | `components/sshd/` | capability-confined SSH protocol and VSH session component (`no_std`) |
 | `kernel/src/ssh_platform.rs` | thin kernel-private adapter for SSH capabilities and services |
+| `services/ssh-identity/` | trusted host signing and immutable authorized-key capability services (`no_std`) |
 | `rustc.rs` | wires the compiler to the capability system and to hardware |
 | `selftest.rs` | in-kernel test suite |
 | `arch/` | the seam between portable logic and the machine (riscv + host shim) |

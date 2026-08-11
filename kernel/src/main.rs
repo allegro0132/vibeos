@@ -98,7 +98,7 @@ mod ssh_platform;
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance"
 ))]
-mod ssh_security;
+pub use vibeos_ssh_identity as ssh_security;
 #[cfg(feature = "ssh-security-test")]
 mod ssh_security_test;
 #[cfg(any(

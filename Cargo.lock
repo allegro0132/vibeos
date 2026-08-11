@@ -760,6 +760,7 @@ dependencies = [
  "vibeos-core",
  "vibeos-netstack",
  "vibeos-rustc",
+ "vibeos-ssh-identity",
  "vibeos-sshd",
  "vibeos-vsh",
 ]
@@ -774,6 +775,13 @@ dependencies = [
 [[package]]
 name = "vibeos-rustc"
 version = "0.1.0"
+
+[[package]]
+name = "vibeos-ssh-identity"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+]
 
 [[package]]
 name = "vibeos-sshd"

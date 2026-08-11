@@ -21,15 +21,15 @@ net-shell = ["dep:vibeos-netstack", "vibeos-netstack/milkv-duo", "vibeos-netstac
 tcp-echo-recovery-test = ["tcp-echo", "vibeos-netstack/tcp-echo-recovery-test"]
 # Dedicated N3 acceptance image. It exercises the real virtio-rng capability,
 # a test-only provisioned host signer, and an immutable binary auth policy.
-ssh-security-test = []
+ssh-security-test = ["dep:vibeos-ssh-identity"]
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
-ssh-test = ["dep:vibeos-sshd", "vibeos-sshd/qemu-virt"]
+ssh-test = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity", "vibeos-sshd/qemu-virt"]
 # Explicitly insecure physical bring-up image. It reuses the fixed SSH test
 # identities and a deterministic acceptance-only random service so DWMAC,
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
-milkv-ssh-acceptance = ["dep:vibeos-sshd", "vibeos-sshd/milkv-ssh-acceptance"]
+milkv-ssh-acceptance = ["dep:vibeos-sshd", "dep:vibeos-ssh-identity", "vibeos-sshd/milkv-ssh-acceptance"]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.
@@ -47,5 +47,6 @@ vibeos-core = { path = "../core" }
 vibeos-rustc = { path = "../compiler" }
 vibeos-netstack = { path = "../components/netstack", default-features = false, optional = true }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
+vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
 jitterentropy = { package = "jitterentropy-rs", version = "=0.1.1", default-features = false, features = ["alloc"], optional = true }

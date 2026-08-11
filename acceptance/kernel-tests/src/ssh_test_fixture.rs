@@ -8,19 +8,20 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use vibeos_core::random::SEED_BYTES;
 use vibeos_ssh_identity::{
     AuthorizedKeyEntry, AuthorizedKeyPolicyService, CapabilityProfileId, HostSigner,
     HostSigningService, ProvisionedHostSeed, SecurityGeneration, SshEd25519PublicKey,
+    ED25519_PRIVATE_SEED_BYTES,
 };
 
-const TEST_HOST_SEED: [u8; SEED_BYTES] = [0xa5; SEED_BYTES];
+const TEST_HOST_SEED: [u8; ED25519_PRIVATE_SEED_BYTES] = [0xa5; ED25519_PRIVATE_SEED_BYTES];
 pub const TEST_HOST_PUBLIC_KEY_BYTES: [u8; 32] = [
     0x29, 0xe5, 0x83, 0x3a, 0x91, 0x5a, 0x64, 0x29, 0xa4, 0xe3, 0xa7, 0x94, 0x84, 0x75, 0xc3, 0x38,
     0xef, 0x43, 0x6e, 0xb8, 0x2b, 0xe8, 0x9c, 0x92, 0xf0, 0x59, 0x70, 0x44, 0x03, 0xdb, 0x9d, 0x55,
 ];
-pub const TEST_CLIENT_SEED: [u8; SEED_BYTES] = [0xb6; SEED_BYTES];
-pub const REJECTED_CLIENT_SEED: [u8; SEED_BYTES] = [0xc7; SEED_BYTES];
+pub const TEST_CLIENT_SEED: [u8; ED25519_PRIVATE_SEED_BYTES] = [0xb6; ED25519_PRIVATE_SEED_BYTES];
+pub const REJECTED_CLIENT_SEED: [u8; ED25519_PRIVATE_SEED_BYTES] =
+    [0xc7; ED25519_PRIVATE_SEED_BYTES];
 pub const TEST_PROFILE: u32 = 1;
 
 pub struct TestSecurityResources {
@@ -54,7 +55,7 @@ pub fn test_host_public_key() -> SshEd25519PublicKey {
     public
 }
 
-pub fn public_key_from_seed(seed: [u8; SEED_BYTES]) -> SshEd25519PublicKey {
+pub fn public_key_from_seed(seed: [u8; ED25519_PRIVATE_SEED_BYTES]) -> SshEd25519PublicKey {
     HostSigner::from_provisioned_seed(
         ProvisionedHostSeed::from_trusted_bytes(seed).expect("test identity seed is non-zero"),
     )

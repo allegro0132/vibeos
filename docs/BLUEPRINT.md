@@ -116,6 +116,7 @@ upward except through a capability it was handed.
 | `cap.rs` | ~600 | Rights, `Cap`, `CSpace`, attenuation, revocation, explicit leases | — |
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
 | `durable-format/` | ~1800 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
+| `random/` | ~400 | Bounded ChaCha20 DRBG, domain separation, reseeding, and entropy-source contract | — |
 | `drivers/virtio-core` | growing | Board-neutral modern VirtIO protocol and queue lifecycle models | — |
 | `hal`, `boards/*` | small | Typed hardware contracts and board-specific descriptions, without device policy | — |
 | `drivers/*` | growing | Board-independent register/protocol engines and explicitly owned DMA storage | yes |

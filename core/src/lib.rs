@@ -18,6 +18,5 @@ pub mod interrupt;
 pub mod ipi;
 pub mod mmu;
 pub mod net;
-pub mod random;
 pub mod runqueue;
 pub mod sync;

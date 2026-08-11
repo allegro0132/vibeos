@@ -68,6 +68,7 @@ pub use vibeos_core::{cap, chan, exec, heap, interrupt, ipi, sync};
 pub use vibeos_driver_virtio_core as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_program_store as program;
+pub use vibeos_random as random;
 pub use vibeos_vsh as vsh;
 pub use vibeos_vsh::terminal;
 

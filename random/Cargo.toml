@@ -1,0 +1,9 @@
+[package]
+name = "vibeos-random"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chacha20 = { version = "=0.10.1", default-features = false, features = ["rng", "zeroize"] }
+subtle = { version = "=2.6.1", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false }

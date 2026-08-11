@@ -80,6 +80,7 @@ vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }
 vibeos-netstack = { path = "../components/netstack", default-features = false, optional = true }
 vibeos-object-store = { path = "../services/object-store" }
 vibeos-program-store = { path = "../services/program-store" }
+vibeos-random = { path = "../random" }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }

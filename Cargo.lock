@@ -767,11 +767,8 @@ dependencies = [
 name = "vibeos-core"
 version = "0.1.0"
 dependencies = [
- "chacha20 0.10.1",
- "subtle",
  "vibeos-durable-format",
  "vibeos-hal",
- "zeroize",
 ]
 
 [[package]]
@@ -895,6 +892,7 @@ dependencies = [
  "vibeos-netstack",
  "vibeos-object-store",
  "vibeos-program-store",
+ "vibeos-random",
  "vibeos-rustc",
  "vibeos-ssh-identity",
  "vibeos-sshd",
@@ -906,6 +904,7 @@ name = "vibeos-kernel-acceptance"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-random",
  "vibeos-rustc",
  "vibeos-ssh-identity",
  "zeroize",
@@ -947,6 +946,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-random"
+version = "0.1.0"
+dependencies = [
+ "chacha20 0.10.1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "vibeos-rustc"
 version = "0.1.0"
 
@@ -967,6 +975,7 @@ dependencies = [
  "sunset",
  "vibeos-core",
  "vibeos-net-protocol",
+ "vibeos-random",
  "vibeos-ssh-identity",
  "vibeos-vsh",
 ]

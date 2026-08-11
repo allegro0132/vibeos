@@ -11,7 +11,7 @@ use vibeos_core::cap::{Cap, Rights};
 use vibeos_vsh::{CommandSpec, InputEvent, Platform, Session, Status};
 
 use crate::dev::ConsoleDev;
-use crate::world::{world, Space};
+use crate::world::{Space, world};
 
 pub struct VshPlatform {
     front: Option<(Arc<Space>, Cap)>,

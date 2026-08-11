@@ -79,14 +79,32 @@ pub enum PrintPart {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    Let { name: String, mutable: bool, declared: Option<Ty>, init: Expr, line: u32 },
-    Assign { name: String, value: Expr, line: u32 },
+    Let {
+        name: String,
+        mutable: bool,
+        declared: Option<Ty>,
+        init: Expr,
+        line: u32,
+    },
+    Assign {
+        name: String,
+        value: Expr,
+        line: u32,
+    },
     /// `a[i] = value`.
-    IndexAssign { name: String, index: Expr, value: Expr, line: u32 },
+    IndexAssign {
+        name: String,
+        index: Expr,
+        value: Expr,
+        line: u32,
+    },
     Expr(Expr),
     While(Expr, Block, u32),
     Return(Option<Expr>),
-    Print { parts: Vec<PrintPart>, newline: bool },
+    Print {
+        parts: Vec<PrintPart>,
+        newline: bool,
+    },
 }
 
 /// A block evaluates to its trailing expression, or to `0` if it has none.

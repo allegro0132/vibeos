@@ -79,7 +79,7 @@ pub const STATUS_LED: StatusLedDescription = StatusLedDescription {
 pub const HART_IDS: &[usize] = &[0];
 pub const CONSOLE_CAPABILITIES: ConsoleCapabilities = ConsoleCapabilities {
     early_uart: true,
-    usb_keyboard_input: false,
+    usb_keyboard_input: true,
 };
 
 pub const MEMORY_MAP: &[MemoryRegion] = &[
@@ -151,11 +151,7 @@ impl BoardContract for Board {
 }
 
 pub const fn plic_s_context(physical_hart: usize) -> Option<usize> {
-    if physical_hart == 0 {
-        Some(1)
-    } else {
-        None
-    }
+    if physical_hart == 0 { Some(1) } else { None }
 }
 
 #[cfg(test)]

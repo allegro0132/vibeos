@@ -11,7 +11,10 @@ fn messages_come_back_in_order() {
     for i in 0..5 {
         assert!(ep.try_send(i).is_ok());
     }
-    assert_eq!((0..5).map(|_| ep.try_recv().unwrap()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    assert_eq!(
+        (0..5).map(|_| ep.try_recv().unwrap()).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
     assert_eq!(ep.try_recv(), None);
 }
 
@@ -46,14 +49,18 @@ fn rights_pick_the_direction() {
     let tx = producer.mint(ep.clone(), Rights::SEND);
     let rx = consumer.mint(ep.clone(), Rights::RECV);
 
-    assert!(producer.lookup_as::<Endpoint<u32>>(tx, Rights::SEND).is_ok());
+    assert!(producer
+        .lookup_as::<Endpoint<u32>>(tx, Rights::SEND)
+        .is_ok());
     assert_eq!(
         producer.lookup_as::<Endpoint<u32>>(tx, Rights::RECV).err(),
         Some(CapError::InsufficientRights),
         "a producer cannot read the channel it publishes to"
     );
 
-    assert!(consumer.lookup_as::<Endpoint<u32>>(rx, Rights::RECV).is_ok());
+    assert!(consumer
+        .lookup_as::<Endpoint<u32>>(rx, Rights::RECV)
+        .is_ok());
     assert_eq!(
         consumer.lookup_as::<Endpoint<u32>>(rx, Rights::SEND).err(),
         Some(CapError::InsufficientRights),

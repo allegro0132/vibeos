@@ -207,7 +207,10 @@ fn parent_revocation_and_ctrl_c_path_fail_closed() {
 #[test]
 fn value_and_job_special_forms_are_session_local() {
     let _serial = SERIAL.lock().unwrap();
-    let (session, reports) = execute(Session::new(), "let greeting hello; echo $greeting > @console");
+    let (session, reports) = execute(
+        Session::new(),
+        "let greeting hello; echo $greeting > @console",
+    );
     assert_eq!(reports.unwrap()[0].output, "hello\n");
 
     let (session, admitted) = execute(session, "echo hello | wc > @console &");
@@ -264,7 +267,10 @@ fn s5_parser_builds_control_function_and_substitution_nodes() {
     )
     .unwrap();
     assert_eq!(script.statements.len(), 2);
-    let Statement::Function { name, params, body, .. } = &script.statements[0] else {
+    let Statement::Function {
+        name, params, body, ..
+    } = &script.statements[0]
+    else {
         panic!("expected function definition");
     };
     assert_eq!(name, "greet");
@@ -277,10 +283,7 @@ fn s5_parser_builds_control_function_and_substitution_nodes() {
     assert!(vsh::parse("function bad x x { true; }").is_err());
     assert!(vsh::parse("echo $(echo no").is_err());
 
-    let multiline = vsh::parse_script(
-        "if false\nthen\n  echo no\nelse\n  echo yes\nfi\n",
-    )
-    .unwrap();
+    let multiline = vsh::parse_script("if false\nthen\n  echo no\nelse\n  echo yes\nfi\n").unwrap();
     assert!(matches!(multiline.statements[0], Statement::If { .. }));
 }
 
@@ -292,7 +295,10 @@ fn s5_if_while_and_function_scopes_are_bounded_and_local() {
         "if false; then echo hidden > @console; else echo branch > @console; fi; while false; do echo hidden > @console; done; function greet who { let prefix hello; echo \"$prefix $who\" > @console; }; greet VibeOS",
     );
     let reports = reports.unwrap();
-    let output: String = reports.iter().map(|report| report.output.as_str()).collect();
+    let output: String = reports
+        .iter()
+        .map(|report| report.output.as_str())
+        .collect();
     assert_eq!(output, "branch\nhello VibeOS\n");
     assert_eq!(reports.last().unwrap().status, Status::Success);
 
@@ -318,11 +324,11 @@ fn s5_while_iteration_budget_returns_typed_failure() {
 #[test]
 fn s5_function_recursion_and_capability_revalidation_fail_closed() {
     let _serial = SERIAL.lock().unwrap();
-    let (_session, reports) = execute(
-        Session::new(),
-        "function recurse { recurse; }; recurse",
+    let (_session, reports) = execute(Session::new(), "function recurse { recurse; }; recurse");
+    assert_eq!(
+        reports.unwrap().last().unwrap().status,
+        Status::BudgetExceeded
     );
-    assert_eq!(reports.unwrap().last().unwrap().status, Status::BudgetExceeded);
 
     let (mut session, defined) = execute(
         Session::new(),
@@ -331,7 +337,10 @@ fn s5_function_recursion_and_capability_revalidation_fail_closed() {
     assert!(defined.unwrap().is_empty());
     assert!(session.revoke_capability("console"));
     let (_session, denied) = execute(session, "speak");
-    assert_eq!(denied.unwrap_err().message, "default stdout cannot be delegated");
+    assert_eq!(
+        denied.unwrap_err().message,
+        "default stdout cannot be delegated"
+    );
 }
 
 #[test]

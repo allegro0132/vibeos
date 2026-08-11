@@ -53,10 +53,7 @@ pub trait StreamingExec: Send {
     /// Produce one bounded stdout chunk, or `None` with the SSH exit status.
     /// A producer may return `Pending` to let the SSH transport and TCP stack
     /// make progress between hardware acquisition steps.
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Vec<u8>>, u32>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Option<Vec<u8>>, u32>>;
 }
 
 #[cfg(feature = "qualification-stream")]
@@ -1126,7 +1123,9 @@ async fn serve_connection(
                     .await
                     {
                         Ok(status) => status,
-                        Err(ConnectionEnd::Reset(reason)) => return reset_connection(stack, reason),
+                        Err(ConnectionEnd::Reset(reason)) => {
+                            return reset_connection(stack, reason)
+                        }
                         Err(other) => return other,
                     },
                     Err(status) => status,
@@ -1427,18 +1426,16 @@ fn progress_protocol(
                             .command()
                             .map_err(|_| "exec command was not valid UTF-8")?
                             .to_string();
-                        if vibeos_vsh::validate_ssh_exec(&value).is_ok()
-                            || {
-                                #[cfg(feature = "qualification-stream")]
-                                {
-                                    space.accepts_streaming_exec(&value)
-                                }
-                                #[cfg(not(feature = "qualification-stream"))]
-                                {
-                                    false
-                                }
+                        if vibeos_vsh::validate_ssh_exec(&value).is_ok() || {
+                            #[cfg(feature = "qualification-stream")]
+                            {
+                                space.accepts_streaming_exec(&value)
                             }
-                        {
+                            #[cfg(not(feature = "qualification-stream"))]
+                            {
+                                false
+                            }
+                        } {
                             command = Some(value);
                         }
                     }
@@ -2407,8 +2404,7 @@ async fn execute_with_network(
     require_carrier: bool,
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut session =
-        vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+    let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;

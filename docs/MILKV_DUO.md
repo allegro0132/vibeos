@@ -2,7 +2,7 @@
 
 VibeOS provides **single-core board support for the Milk-V Duo C906B**. Current
 support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
-timebase, native microSD/DWMAC backends, initial DWC2 USB host bring-up, and a
+timebase, native microSD/DWMAC backends, DWC2 USB host and HID keyboard input, and a
 FIT/SD image packaging flow based on the official Buildroot SDK.
 
 The separate `--jitterentropy-probe` image loads the exactly pinned
@@ -84,7 +84,7 @@ bound.
 | virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
 | microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
 | Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
-| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up plus EP0 enumeration |
+| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration and HID boot keyboards |
 | Blue status LED | active-high GPIOC24; `drivers/milkv-duo-led` configures and verifies it after enabling Sv39 |
 
 The Duo USB & Ethernet IO Board V1.11 does not route the RJ45 LED terminals to
@@ -129,10 +129,14 @@ usb       DWC2 0xNNNN @ 0x4340000, IRQ 30, N channel(s), port powered/waiting
 The driver now also enables buffer DMA with explicit C906 cache maintenance,
 resets an attached root-port device, runs endpoint-zero SETUP/DATA/STATUS
 transactions, assigns address 1, and reads the complete device descriptor. It
-prints speed, VID:PID, USB version, and endpoint-zero packet size at boot.
-Interrupt endpoints, class configuration and hotplug remain absent, so this is
-not yet HID/storage support. The official SDK describes the same core/PHY
-ranges and IRQ in
+then scans the configuration tree for a HID Boot Keyboard interface, selects
+the configuration and boot protocol, and polls its interrupt-IN endpoint at the
+advertised interval. Newly pressed keys use the same ASCII, control-key and
+ANSI-arrow translation as the QEMU xHCI console and feed the kernel console
+input queue. The boot log prints speed, VID:PID, USB version, endpoint-zero
+packet size, and the selected HID interface/endpoint. Hotplug recovery and USB
+storage remain absent. The official SDK describes the same core/PHY ranges and
+IRQ in
 [`cv180x_base.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x/cv180x_base.dtsi)
 and
 [`cv180x_base_riscv.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi).
@@ -554,8 +558,9 @@ For the first hardware boot, preserve the full serial log and verify each item:
       powered root port without a reset/host-mode timeout. Preserve the full
       UART log as the first physical USB bring-up artifact.
 - [ ] A low/full/high-speed USB device completes address and device-descriptor
-      enumeration on the physical OTG port; disconnect/reconnect, HID input,
-      and storage I/O remain later gates.
+      enumeration on the physical OTG port. A HID Boot Keyboard is configured,
+      reports its interrupt-IN endpoint, and can type commands into `vibe>`;
+      disconnect/reconnect recovery and storage I/O remain later gates.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

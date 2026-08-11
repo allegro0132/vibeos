@@ -254,7 +254,9 @@ pub fn vsh_authorize(args: &[String]) -> Result<String, Status> {
         }
         .await;
         match result {
-            Ok(()) => crate::uart::_print(format_args!("ssh-authorize: client key persisted; SSH will start when configuration is complete\n")),
+            Ok(()) => crate::uart::_print(format_args!(
+                "ssh-authorize: client key persisted; SSH will start when configuration is complete\n"
+            )),
             Err(error) => crate::uart::_print(format_args!("ssh-authorize failed: {error}\n")),
         }
         UPDATE_BUSY.store(false, Ordering::Release);

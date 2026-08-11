@@ -122,7 +122,10 @@ impl<T: Send + 'static> Resource for Endpoint<T> {
     }
     fn describe(&self) -> String {
         let (sent, recv, depth) = self.stats();
-        format!("{} [{}/{} sent={} recv={}]", self.name, depth, self.bound, sent, recv)
+        format!(
+            "{} [{}/{} sent={} recv={}]",
+            self.name, depth, self.bound, sent, recv
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self

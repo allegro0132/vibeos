@@ -214,10 +214,7 @@ pub unsafe fn enter_domain(domain: AllocationDomain) -> OwnerScope {
 /// # Safety
 /// The current CPU must own `hart` until the returned scope is restored. For
 /// tracked domains, the public [`enter_domain`] no-escape contract also holds.
-pub(crate) unsafe fn enter_domain_on_hart(
-    domain: AllocationDomain,
-    hart: HartId,
-) -> OwnerScope {
+pub(crate) unsafe fn enter_domain_on_hart(domain: AllocationDomain, hart: HartId) -> OwnerScope {
     let irq = arch::irq_save();
     debug_assert_eq!(allocation_context_hart_index(), Some(hart.index()));
     let owner_slot = &CURRENT_OWNERS[hart.index()];

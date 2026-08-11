@@ -43,16 +43,15 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::cap::{Cap, Revocable, Rights};
 use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
 use crate::sync::SpinLock;
-use crate::trampoline::{self, abort, vibe_catch, vibe_enter, vibe_longjmp, JmpBuf};
-use crate::world::{world, Space};
+use crate::trampoline::{self, JmpBuf, abort, vibe_catch, vibe_enter, vibe_longjmp};
+use crate::world::{Space, world};
 use crate::{exec, ipi, sbi};
 
 /// Where a compiled program's authority lives while it runs. `None` means no
 /// program is executing and the runtime hooks refuse everything.
 static PROG_OUT: [SpinLock<Option<Revocable<ConsoleDev>>>; exec::MAX_HARTS] =
     [const { SpinLock::new(None) }; exec::MAX_HARTS];
-static DENIED: [AtomicBool; exec::MAX_HARTS] =
-    [const { AtomicBool::new(false) }; exec::MAX_HARTS];
+static DENIED: [AtomicBool; exec::MAX_HARTS] = [const { AtomicBool::new(false) }; exec::MAX_HARTS];
 
 /// Deterministic M3.16 test hook. Zero means disarmed; `usize::MAX` is the
 /// short arm transition. The target is cleared before revocation, so the hook
@@ -152,8 +151,7 @@ extern "C" fn rt_print_str(ptr: *const u8, len: usize) {
 /// hooks need its address; invocation inputs and results remain ordinary
 /// locals now that Rust only sees the single-return `vibe_catch` boundary.
 static mut JMP: [JmpBuf; exec::MAX_HARTS] = [JmpBuf::ZERO; exec::MAX_HARTS];
-static ARMED: [AtomicBool; exec::MAX_HARTS] =
-    [const { AtomicBool::new(false) }; exec::MAX_HARTS];
+static ARMED: [AtomicBool; exec::MAX_HARTS] = [const { AtomicBool::new(false) }; exec::MAX_HARTS];
 
 struct ProgramCatch {
     hart: usize,
@@ -372,10 +370,7 @@ pub fn run_with_authority(
             cspace
                 .lookup_revocable::<ConsoleDev>(console_cap, Rights::WRITE)
                 .ok(),
-            cspace.lookup_lease::<MemoryRegion>(
-                memory_cap,
-                Rights::READ.union(Rights::WRITE),
-            ),
+            cspace.lookup_lease::<MemoryRegion>(memory_cap, Rights::READ.union(Rights::WRITE)),
         )
     };
 

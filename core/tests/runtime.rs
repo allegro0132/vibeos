@@ -144,9 +144,8 @@ impl Future for RegisteredDropBombFuture {
         assert!(Pin::new(&mut this.sleep).poll(cx).is_pending());
         assert!(Pin::new(&mut this.join).poll(cx).is_pending());
         if this.probe.is_none() {
-            this.probe = Some(
-                exec::arm_irq_poll_probe().expect("the registered task owns the probe slot"),
-            );
+            this.probe =
+                Some(exec::arm_irq_poll_probe().expect("the registered task owns the probe slot"));
         }
         Poll::Pending
     }
@@ -743,10 +742,8 @@ fn nested_cancel_keeps_a_different_domain_running_across_destructor_fault() {
     exec::set_fault_guard(fault_once_then_passthrough);
     RECLAIMED_DOMAINS.lock().unwrap().clear();
 
-    let victim_domain =
-        AllocationDomain::new(OwnerId::new(20_007), ArenaId::new(30_007));
-    let actor_domain =
-        AllocationDomain::new(OwnerId::new(20_008), ArenaId::new(30_008));
+    let victim_domain = AllocationDomain::new(OwnerId::new(20_007), ArenaId::new(30_007));
+    let actor_domain = AllocationDomain::new(OwnerId::new(20_008), ArenaId::new(30_008));
     let victim_drops = Arc::new(AtomicU64::new(0));
     let victim = unsafe {
         exec::spawn_reclaimable_owned(
@@ -769,22 +766,18 @@ fn nested_cancel_keeps_a_different_domain_running_across_destructor_fault() {
     let running_visible_inside = running_visible.clone();
     let victim_inside = victim.clone();
     let actor = unsafe {
-        exec::spawn_reclaimable_owned(
-            actor_domain,
-            "nested-cancel-other-actor",
-            async move {
-                let _drop_guard = actor_drop_guard;
-                assert_eq!(victim_inside.cancel(), CancelOutcome::Requested);
-                let actor_id = actor_handle_inside.lock().unwrap().as_ref().unwrap().id();
-                running_visible_inside.store(
-                    exec::task_report().iter().any(|task| task.id == actor_id),
-                    Ordering::SeqCst,
-                );
-                stage_inside.store(1, Ordering::SeqCst);
-                exec::yield_now().await;
-                stage_inside.store(2, Ordering::SeqCst);
-            },
-        )
+        exec::spawn_reclaimable_owned(actor_domain, "nested-cancel-other-actor", async move {
+            let _drop_guard = actor_drop_guard;
+            assert_eq!(victim_inside.cancel(), CancelOutcome::Requested);
+            let actor_id = actor_handle_inside.lock().unwrap().as_ref().unwrap().id();
+            running_visible_inside.store(
+                exec::task_report().iter().any(|task| task.id == actor_id),
+                Ordering::SeqCst,
+            );
+            stage_inside.store(1, Ordering::SeqCst);
+            exec::yield_now().await;
+            stage_inside.store(2, Ordering::SeqCst);
+        })
     };
     *actor_handle.lock().unwrap() = Some(actor.clone());
 
@@ -800,7 +793,10 @@ fn nested_cancel_keeps_a_different_domain_running_across_destructor_fault() {
     assert_eq!(victim_drops.load(Ordering::SeqCst), 1);
     assert_eq!(actor.state(), TaskState::Running);
     assert!(exec::task_report().iter().any(|task| task.id == actor.id()));
-    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[victim_domain]);
+    assert_eq!(
+        RECLAIMED_DOMAINS.lock().unwrap().as_slice(),
+        &[victim_domain]
+    );
 
     assert!(exec::poll_once());
     assert_eq!(actor.state(), TaskState::Exited);
@@ -827,7 +823,9 @@ fn a_task_cannot_reenter_the_executor_and_overwrite_running_state() {
     assert!(rejected.load(Ordering::SeqCst));
     assert_eq!(handle.state(), TaskState::Exited);
     assert_eq!(handle.polls(), 1);
-    assert!(exec::task_report().iter().all(|task| task.id != handle.id()));
+    assert!(exec::task_report()
+        .iter()
+        .all(|task| task.id != handle.id()));
 }
 
 #[test]
@@ -1960,7 +1958,11 @@ fn an_irq_poll_probe_ignores_another_timer_owned_by_the_same_task() {
             earlier.as_mut().poll(cx)
         })
         .await;
-        assert_eq!(probe.sample(), None, "the unrelated timer poisoned the probe");
+        assert_eq!(
+            probe.sample(),
+            None,
+            "the unrelated timer poisoned the probe"
+        );
         measured.await;
         task_observed.store(
             probe.finish().expect("the bound timer IRQ was observed"),

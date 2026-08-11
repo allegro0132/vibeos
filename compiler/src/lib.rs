@@ -27,10 +27,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 pub use image::{
-    ImageMetadata, RelocatableImage, Relocation, RelocationKind, RelocationTarget,
-    RuntimeBinding, RuntimeImport, COMPILER_ABI_VERSION, IMAGE_FORMAT_VERSION,
-    IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_ENCODED_IMAGE_BYTES, RUNTIME_ABI_VERSION,
-    TARGET_ABI_RV64IM_LP64_V1,
+    ImageMetadata, RelocatableImage, Relocation, RelocationKind, RelocationTarget, RuntimeBinding,
+    RuntimeImport, COMPILER_ABI_VERSION, IMAGE_FORMAT_VERSION, IMAGE_HEADER_LEN, IMAGE_MAGIC,
+    MAX_ENCODED_IMAGE_BYTES, RUNTIME_ABI_VERSION, TARGET_ABI_RV64IM_LP64_V1,
 };
 
 /// Everything a compiled program needs in memory before it can run.

@@ -16,19 +16,19 @@ pub const FRONTEND_QUEUE_DEPTH: usize = crate::platform::NETWORK_FRONTEND.queue_
 #[cfg(feature = "milkv-duo")]
 #[allow(unused_imports)]
 pub use crate::dwmac_net::{
-    ack_packet, bind_stack_with, challenge_packet, debug_waiter_count, discover, driver_task,
-    hello_packet, info_with, inject_fault_with, is_challenge, recover_faulted_domain, DmaRegion,
-    MmioWindow, NetDevice, NetError, NetInfo, NetResources, GUEST_MAC, HANDSHAKE_ETHERTYPE,
-    HANDSHAKE_FRAME_LEN, PEER_MAC,
+    DmaRegion, GUEST_MAC, HANDSHAKE_ETHERTYPE, HANDSHAKE_FRAME_LEN, MmioWindow, NetDevice,
+    NetError, NetInfo, NetResources, PEER_MAC, ack_packet, bind_stack_with, challenge_packet,
+    debug_waiter_count, discover, driver_task, hello_packet, info_with, inject_fault_with,
+    is_challenge, recover_faulted_domain,
 };
 
 #[cfg(feature = "qemu-virt")]
 #[allow(unused_imports)]
 pub use crate::virtio_net::{
-    ack_packet, bind_stack_with, challenge_packet, debug_waiter_count, discover, driver_task,
-    hello_packet, info_with, inject_fault_with, is_challenge, recover_faulted_domain, DmaRegion,
-    MmioWindow, NetDevice, NetError, NetInfo, NetResources, GUEST_MAC, HANDSHAKE_ETHERTYPE,
-    HANDSHAKE_FRAME_LEN, PEER_MAC,
+    DmaRegion, GUEST_MAC, HANDSHAKE_ETHERTYPE, HANDSHAKE_FRAME_LEN, MmioWindow, NetDevice,
+    NetError, NetInfo, NetResources, PEER_MAC, ack_packet, bind_stack_with, challenge_packet,
+    debug_waiter_count, discover, driver_task, hello_packet, info_with, inject_fault_with,
+    is_challenge, recover_faulted_domain,
 };
 
 #[cfg(feature = "tcp-echo-recovery-test")]

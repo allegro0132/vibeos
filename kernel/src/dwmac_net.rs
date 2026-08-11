@@ -16,8 +16,8 @@ use vibeos_driver_dwmac_net::{Engine, Error as HardwareError};
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::net::{
-    Endpoint, Packet, PacketSessionError, PacketSessionFence, PacketStamp, StampedPacket,
-    MAX_PACKET_LEN,
+    Endpoint, MAX_PACKET_LEN, Packet, PacketSessionError, PacketSessionFence, PacketStamp,
+    StampedPacket,
 };
 use crate::sync::SpinLock;
 use crate::world::Space;

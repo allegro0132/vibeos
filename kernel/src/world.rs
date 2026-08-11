@@ -26,7 +26,7 @@ use crate::store;
 use crate::sync::SpinLock;
 #[cfg(feature = "qemu-virt")]
 use crate::virtio_rng;
-use crate::{exec, HEAP};
+use crate::{HEAP, exec};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 #[cfg(feature = "milkv-ssh")]

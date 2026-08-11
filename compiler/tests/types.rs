@@ -8,7 +8,12 @@
 use vibeos_rustc::{compile_at, Runtime};
 
 fn rt() -> Runtime {
-    Runtime { print_str: 1, print_int: 2, print_bool: 3, abort: 4 }
+    Runtime {
+        print_str: 1,
+        print_int: 2,
+        print_bool: 3,
+        abort: 4,
+    }
 }
 
 fn check(src: &str) -> Result<(), String> {
@@ -170,7 +175,10 @@ fn bang_dispatches_on_the_operand_type() {
 
 #[test]
 fn unit_cannot_be_stored_compared_or_printed() {
-    assert_eq!(err("fn f() { }\nfn main() { let x = f(); }"), "line 2: `x` cannot have type `()`");
+    assert_eq!(
+        err("fn f() { }\nfn main() { let x = f(); }"),
+        "line 2: `x` cannot have type `()`"
+    );
     assert_eq!(
         err("fn f() { }\nfn main() { println!(\"{}\", f()); }"),
         "`()` cannot be formatted with `{}`"

@@ -71,10 +71,7 @@ impl Diagnostic {
 pub enum WordPart {
     Literal(String),
     Value(String),
-    Command {
-        source: String,
-        span: Span,
-    },
+    Command { source: String, span: Span },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -611,12 +608,14 @@ impl Parser {
     }
 
     fn peek_keyword(&self, keyword: &str) -> bool {
-        self.tokens.get(self.at).is_some_and(|token| match &token.kind {
-            TokenKind::Word(Word { parts, .. }) => {
-                matches!(parts.as_slice(), [WordPart::Literal(word)] if word == keyword)
-            }
-            _ => false,
-        })
+        self.tokens
+            .get(self.at)
+            .is_some_and(|token| match &token.kind {
+                TokenKind::Word(Word { parts, .. }) => {
+                    matches!(parts.as_slice(), [WordPart::Literal(word)] if word == keyword)
+                }
+                _ => false,
+            })
     }
 
     fn take_keyword(&mut self, keyword: &str) -> Result<Token, Diagnostic> {
@@ -646,7 +645,9 @@ impl Parser {
                 self.at += 1;
             }
             if self.at >= self.tokens.len()
-                || stop_keywords.iter().any(|keyword| self.peek_keyword(keyword))
+                || stop_keywords
+                    .iter()
+                    .any(|keyword| self.peek_keyword(keyword))
                 || (stop_at_right_brace && self.peek_op(Operator::RightBrace))
             {
                 break;
@@ -684,7 +685,9 @@ impl Parser {
             } else if background_separator {
                 continue;
             } else if self.at < self.tokens.len()
-                && !stop_keywords.iter().any(|keyword| self.peek_keyword(keyword))
+                && !stop_keywords
+                    .iter()
+                    .any(|keyword| self.peek_keyword(keyword))
                 && !(stop_at_right_brace && self.peek_op(Operator::RightBrace))
             {
                 let span = self.tokens[self.at].span;
@@ -728,11 +731,18 @@ impl Parser {
 
     fn if_statement(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.take_keyword("if")?.span.start;
-        self.enter_nesting(Span { start, end: start + 2 })?;
+        self.enter_nesting(Span {
+            start,
+            end: start + 2,
+        })?;
         let result = (|| {
             let condition = self.and_or()?;
             if !self.peek_op(Operator::Semi) {
-                return Err(Diagnostic::new(start, condition.first.span.end, "if condition must end with `;`"));
+                return Err(Diagnostic::new(
+                    start,
+                    condition.first.span.end,
+                    "if condition must end with `;`",
+                ));
             }
             self.at += 1;
             self.take_keyword("then")?;
@@ -763,11 +773,18 @@ impl Parser {
 
     fn while_statement(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.take_keyword("while")?.span.start;
-        self.enter_nesting(Span { start, end: start + 5 })?;
+        self.enter_nesting(Span {
+            start,
+            end: start + 5,
+        })?;
         let result = (|| {
             let condition = self.and_or()?;
             if !self.peek_op(Operator::Semi) {
-                return Err(Diagnostic::new(start, condition.first.span.end, "while condition must end with `;`"));
+                return Err(Diagnostic::new(
+                    start,
+                    condition.first.span.end,
+                    "while condition must end with `;`",
+                ));
             }
             self.at += 1;
             self.take_keyword("do")?;
@@ -788,11 +805,14 @@ impl Parser {
 
     fn function_statement(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.take_keyword("function")?.span.start;
-        self.enter_nesting(Span { start, end: start + 8 })?;
+        self.enter_nesting(Span {
+            start,
+            end: start + 8,
+        })?;
         let result = (|| {
-            let name_token = self.take().ok_or_else(|| {
-                Diagnostic::new(start, start + 8, "function requires a name")
-            })?;
+            let name_token = self
+                .take()
+                .ok_or_else(|| Diagnostic::new(start, start + 8, "function requires a name"))?;
             let name = plain_word_name(&name_token).ok_or_else(|| {
                 Diagnostic::new(
                     name_token.span.start,
@@ -833,7 +853,9 @@ impl Parser {
             let end = self
                 .take()
                 .filter(|token| token.kind == TokenKind::Op(Operator::RightBrace))
-                .ok_or_else(|| Diagnostic::new(start, name_token.span.end, "unterminated function body"))?
+                .ok_or_else(|| {
+                    Diagnostic::new(start, name_token.span.end, "unterminated function body")
+                })?
                 .span
                 .end;
             Ok(Statement::Function {
@@ -1194,7 +1216,8 @@ impl ByteStream {
                 }
                 if state.queue.len() < STREAM_BUFFER_CHUNKS {
                     state.queue.push_back(pending.take().unwrap());
-                    self.peak_depth.fetch_max(state.queue.len(), Ordering::Relaxed);
+                    self.peak_depth
+                        .fetch_max(state.queue.len(), Ordering::Relaxed);
                     drop(state);
                     self.readable.wake_all();
                     return Ok(());
@@ -1251,7 +1274,9 @@ impl ByteStream {
     pub fn depth(&self) -> usize {
         self.state.lock().queue.len()
     }
-    pub fn peak_depth(&self) -> usize { self.peak_depth.load(Ordering::Relaxed) }
+    pub fn peak_depth(&self) -> usize {
+        self.peak_depth.load(Ordering::Relaxed)
+    }
 }
 impl Resource for ByteStream {
     fn kind(&self) -> &'static str {
@@ -1311,20 +1336,38 @@ impl<T: Resource> PersistentProxy<T> {
     pub fn try_with<R>(&self, operation: impl FnOnce(&T) -> R) -> Result<R, CapError> {
         self.parent.try_with(operation)
     }
-    pub const fn rights(&self) -> Rights { self.rights }
+    pub const fn rights(&self) -> Rights {
+        self.rights
+    }
 }
 
 impl<T: Resource> Resource for PersistentProxy<T> {
-    fn kind(&self) -> &'static str { "persistent-proxy" }
-    fn describe(&self) -> String { format!("ephemeral {} proxy", self.rights) }
-    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> &'static str {
+        "persistent-proxy"
+    }
+    fn describe(&self) -> String {
+        format!("ephemeral {} proxy", self.rights)
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Trusted admission broker for persistent resources. Generic `grant` remains
 /// fail-closed; this creates a fresh volatile proxy rather than a durable child
 /// or an object-identity registry entry.
-pub fn install_persistent_proxy<T: Resource>(source: &CSpace, cap: Cap, rights: Rights, stage: &mut CSpace) -> Result<Cap, CapError> {
-    if rights.contains(Rights::GRANT) || rights.contains(Rights::REVOKE) || rights.contains(Rights::INVOKE) { return Err(CapError::Amplification); }
+pub fn install_persistent_proxy<T: Resource>(
+    source: &CSpace,
+    cap: Cap,
+    rights: Rights,
+    stage: &mut CSpace,
+) -> Result<Cap, CapError> {
+    if rights.contains(Rights::GRANT)
+        || rights.contains(Rights::REVOKE)
+        || rights.contains(Rights::INVOKE)
+    {
+        return Err(CapError::Amplification);
+    }
     let parent = source.lookup_persistent_revocable::<T>(cap, rights)?;
     Ok(stage.mint(Arc::new(PersistentProxy { parent, rights }), rights))
 }
@@ -1365,7 +1408,11 @@ struct PlannedStage {
     _stderr: LocalIo,
     result: Arc<SpinLock<Option<Status>>>,
 }
-type RunningStage = (TaskHandle, Arc<SpinLock<Option<Status>>>, Arc<SpinLock<CSpace>>);
+type RunningStage = (
+    TaskHandle,
+    Arc<SpinLock<Option<Status>>>,
+    Arc<SpinLock<CSpace>>,
+);
 
 struct BackgroundJob {
     supervisor: TaskHandle,
@@ -1586,7 +1633,8 @@ impl Session {
                 "invalid capability binding name",
             ));
         }
-        self.cspace.lock()
+        self.cspace
+            .lock()
             .rights_of(cap)
             .map_err(|_| Diagnostic::new(0, name.len(), "invalid capability"))?;
         self.capabilities.insert(name.to_string(), cap);
@@ -1622,11 +1670,7 @@ impl Session {
         manifest: ScriptManifest,
     ) -> Result<Cap, Diagnostic> {
         if !valid_name(label) || self.capabilities.len() >= 256 {
-            return Err(Diagnostic::new(
-                0,
-                label.len(),
-                "script binding rejected",
-            ));
+            return Err(Diagnostic::new(0, label.len(), "script binding rejected"));
         }
         let artifact = ScriptArtifact::new(source, manifest)?;
         let cap = self.cspace.lock().mint(
@@ -1663,11 +1707,16 @@ impl Session {
     /// Acceptance hook modelling an asynchronous parent revocation after a Job
     /// is published but before its next resource operation.
     pub fn revoke_during_next_job_for_test(&mut self, name: &str) -> bool {
-        let Some(cap) = self.capabilities.get(name).copied() else { return false; };
-        self.revoke_next_job = Some(cap); true
+        let Some(cap) = self.capabilities.get(name).copied() else {
+            return false;
+        };
+        self.revoke_next_job = Some(cap);
+        true
     }
     /// Acceptance hook for the same supervisor path used by foreground Ctrl-C.
-    pub fn cancel_next_job_for_test(&mut self) { self.cancel_next_job = true; }
+    pub fn cancel_next_job_for_test(&mut self) {
+        self.cancel_next_job = true;
+    }
 
     /// Cancel and join every background Job owned by this session.
     ///
@@ -1702,7 +1751,11 @@ impl Session {
         Ok(self.execute_block(&script, true).await?.reports)
     }
 
-    pub async fn execute_cancellable(&mut self, source: &str, cancel: Arc<AtomicBool>) -> Result<Vec<JobReport>, Diagnostic> {
+    pub async fn execute_cancellable(
+        &mut self,
+        source: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<JobReport>, Diagnostic> {
         self.external_cancel = Some(cancel);
         let result = self.execute(source).await;
         self.external_cancel = None;
@@ -1780,10 +1833,13 @@ impl Session {
                         loop {
                             if completed_iterations >= MAX_LOOP_ITERATIONS {
                                 loop_outcome.status = Status::BudgetExceeded;
-                                loop_outcome.reports.push(control_report(Status::BudgetExceeded));
+                                loop_outcome
+                                    .reports
+                                    .push(control_report(Status::BudgetExceeded));
                                 break;
                             }
-                            let mut condition_outcome = self.execute_and_or(condition, false).await?;
+                            let mut condition_outcome =
+                                self.execute_and_or(condition, false).await?;
                             let condition_status = condition_outcome.status;
                             suppress_control_condition_statuses(&mut condition_outcome.reports);
                             loop_outcome.reports.extend(condition_outcome.reports);
@@ -1859,7 +1915,9 @@ impl Session {
                 "background conditional lists are not supported",
             ));
         }
-        let mut outcome = self.run_pipeline_or_function(&command.first, background).await?;
+        let mut outcome = self
+            .run_pipeline_or_function(&command.first, background)
+            .await?;
         let mut status = outcome.status;
         for (condition, pipeline) in &command.rest {
             let run = match condition {
@@ -1968,22 +2026,48 @@ impl Session {
     }
 
     async fn special_form(&mut self, item: &ListItem) -> Result<Option<BlockOutcome>, Diagnostic> {
-        if !item.command.rest.is_empty() || item.command.first.commands.len() != 1 { return Ok(None); }
+        if !item.command.rest.is_empty() || item.command.first.commands.len() != 1 {
+            return Ok(None);
+        }
         let command = &item.command.first.commands[0];
-        let Some(name) = literal_word(&command.name) else { return Ok(None); };
-        if !is_special_form(name) { return Ok(None); }
-        if item.background { return Err(Diagnostic::new(command.span.start, command.span.end, "special form must be foreground")); }
-        if !command.redirects.is_empty() { return Err(Diagnostic::new(command.span.start, command.span.end, "special form cannot redirect")); }
+        let Some(name) = literal_word(&command.name) else {
+            return Ok(None);
+        };
+        if !is_special_form(name) {
+            return Ok(None);
+        }
+        if item.background {
+            return Err(Diagnostic::new(
+                command.span.start,
+                command.span.end,
+                "special form must be foreground",
+            ));
+        }
+        if !command.redirects.is_empty() {
+            return Err(Diagnostic::new(
+                command.span.start,
+                command.span.end,
+                "special form cannot redirect",
+            ));
+        }
         if name == "run-script" {
             let [Argument::Capability { name: label, span }] = command.args.as_slice() else {
-                return Err(Diagnostic::new(command.span.start, command.span.end, "usage: run-script @SCRIPT"));
+                return Err(Diagnostic::new(
+                    command.span.start,
+                    command.span.end,
+                    "usage: run-script @SCRIPT",
+                ));
             };
             if self
                 .active_script_caps
                 .as_ref()
                 .is_some_and(|allowed| !allowed.contains(label))
             {
-                return Err(Diagnostic::new(span.start, span.end, "script capability is outside the authority manifest"));
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "script capability is outside the authority manifest",
+                ));
             }
             let cap = self.capabilities.get(label).copied().ok_or_else(|| {
                 Diagnostic::new(span.start, span.end, "unknown script capability")
@@ -1992,33 +2076,91 @@ impl Session {
                 .cspace
                 .lock()
                 .lookup_as::<ScriptArtifact>(cap, Rights::READ)
-                .map_err(|_| Diagnostic::new(span.start, span.end, "script capability is not readable"))?;
+                .map_err(|_| {
+                    Diagnostic::new(span.start, span.end, "script capability is not readable")
+                })?;
             return Ok(Some(self.execute_artifact(artifact, *span).await?));
         }
         let mut args = Vec::new();
-        for arg in &command.args { match arg { Argument::Word(word) => args.push(self.expand_word(word).await?), Argument::Capability { span, .. } => return Err(Diagnostic::new(span.start, span.end, "special form requires value arguments")) } }
+        for arg in &command.args {
+            match arg {
+                Argument::Word(word) => args.push(self.expand_word(word).await?),
+                Argument::Capability { span, .. } => {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "special form requires value arguments",
+                    ))
+                }
+            }
+        }
         match name {
             "let" => {
-                if args.len() != 2 { return Err(Diagnostic::new(command.span.start, command.span.end, "usage: let NAME VALUE")); }
-                self.set_value(&args[0], &args[1])?; Ok(Some(BlockOutcome::success()))
+                if args.len() != 2 {
+                    return Err(Diagnostic::new(
+                        command.span.start,
+                        command.span.end,
+                        "usage: let NAME VALUE",
+                    ));
+                }
+                self.set_value(&args[0], &args[1])?;
+                Ok(Some(BlockOutcome::success()))
             }
             "jobs" => {
-                if !args.is_empty() { return Err(Diagnostic::new(command.span.start, command.span.end, "usage: jobs")); }
+                if !args.is_empty() {
+                    return Err(Diagnostic::new(
+                        command.span.start,
+                        command.span.end,
+                        "usage: jobs",
+                    ));
+                }
                 let mut output = String::new();
-                for (id, job) in &self.jobs { let state = if job.supervisor.try_exit().is_some() { "done" } else { "running" }; output.push_str(&format!("%{id} {state}\n")); }
-                Ok(Some(BlockOutcome { status: Status::Success, reports: vec![JobReport { id: 0, status: Status::Success, stages: Vec::new(), output, peak_pipe_depth: 0 }] }))
+                for (id, job) in &self.jobs {
+                    let state = if job.supervisor.try_exit().is_some() {
+                        "done"
+                    } else {
+                        "running"
+                    };
+                    output.push_str(&format!("%{id} {state}\n"));
+                }
+                Ok(Some(BlockOutcome {
+                    status: Status::Success,
+                    reports: vec![JobReport {
+                        id: 0,
+                        status: Status::Success,
+                        stages: Vec::new(),
+                        output,
+                        peak_pipe_depth: 0,
+                    }],
+                }))
             }
             "wait" => {
                 let id = parse_job_id(&args, command.span)?;
-                let job = self.jobs.remove(&id).ok_or_else(|| Diagnostic::new(command.span.start, command.span.end, "unknown job"))?;
+                let job = self.jobs.remove(&id).ok_or_else(|| {
+                    Diagnostic::new(command.span.start, command.span.end, "unknown job")
+                })?;
                 let _ = job.supervisor.join().await;
-                let report = job.report.lock().take().ok_or_else(|| Diagnostic::new(command.span.start, command.span.end, "job report unavailable"))?;
-                Ok(Some(BlockOutcome { status: report.status, reports: vec![report] }))
+                let report = job.report.lock().take().ok_or_else(|| {
+                    Diagnostic::new(
+                        command.span.start,
+                        command.span.end,
+                        "job report unavailable",
+                    )
+                })?;
+                Ok(Some(BlockOutcome {
+                    status: report.status,
+                    reports: vec![report],
+                }))
             }
             "cancel" => {
                 let id = parse_job_id(&args, command.span)?;
-                let job = self.jobs.get(&id).ok_or_else(|| Diagnostic::new(command.span.start, command.span.end, "unknown job"))?;
-                job.control.fail(Status::Cancelled); for stage in &job.stages { let _ = stage.cancel(); }
+                let job = self.jobs.get(&id).ok_or_else(|| {
+                    Diagnostic::new(command.span.start, command.span.end, "unknown job")
+                })?;
+                job.control.fail(Status::Cancelled);
+                for stage in &job.stages {
+                    let _ = stage.cancel();
+                }
                 Ok(Some(BlockOutcome::success()))
             }
             _ => unreachable!(),
@@ -2095,10 +2237,7 @@ impl Session {
         })
     }
 
-    fn expand_word<'a>(
-        &'a mut self,
-        word: &'a Word,
-    ) -> VshFuture<'a, Result<String, Diagnostic>> {
+    fn expand_word<'a>(&'a mut self, word: &'a Word) -> VshFuture<'a, Result<String, Diagnostic>> {
         Box::pin(async move {
             let mut out = String::new();
             for part in &word.parts {
@@ -2176,7 +2315,11 @@ impl Session {
         })
     }
 
-    async fn run_pipeline(&mut self, ast: &PipelineAst, background: bool) -> Result<Option<JobReport>, Diagnostic> {
+    async fn run_pipeline(
+        &mut self,
+        ast: &PipelineAst,
+        background: bool,
+    ) -> Result<Option<JobReport>, Diagnostic> {
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
         let mut admission = CSpace::new("vsh-admission");
         let mut pipes = Vec::new();
@@ -2263,14 +2406,19 @@ impl Session {
                 ));
             }
             let mut stage = CSpace::new(&format!("vsh-job-{id}-stage-{index}"));
-            let command = cap::grant(&self.cspace.lock(), command_source, Rights::INVOKE, &mut stage)
-                .map_err(|_| {
-                    Diagnostic::new(
-                        command_ast.span.start,
-                        command_ast.span.end,
-                        "missing GRANT on command",
-                    )
-                })?;
+            let command = cap::grant(
+                &self.cspace.lock(),
+                command_source,
+                Rights::INVOKE,
+                &mut stage,
+            )
+            .map_err(|_| {
+                Diagnostic::new(
+                    command_ast.span.start,
+                    command_ast.span.end,
+                    "missing GRANT on command",
+                )
+            })?;
             let stdin = if index > 0 {
                 LocalIo::Stream(
                     cap::grant(&admission, roots[index - 1], Rights::RECV, &mut stage).map_err(
@@ -2300,14 +2448,32 @@ impl Session {
                 )
             } else {
                 let console = self.capabilities["console"];
-                LocalIo::Sink(cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage)
-                    .map_err(|_| Diagnostic::new(command_ast.span.start, command_ast.span.end, "default stdout cannot be delegated"))?)
+                LocalIo::Sink(
+                    cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage).map_err(
+                        |_| {
+                            Diagnostic::new(
+                                command_ast.span.start,
+                                command_ast.span.end,
+                                "default stdout cannot be delegated",
+                            )
+                        },
+                    )?,
+                )
             };
             let mut stdin = stdin;
             let mut stdout = stdout;
             let console = self.capabilities["console"];
-            let mut stderr = LocalIo::Sink(cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage)
-                .map_err(|_| Diagnostic::new(command_ast.span.start, command_ast.span.end, "default stderr cannot be delegated"))?);
+            let mut stderr = LocalIo::Sink(
+                cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage).map_err(
+                    |_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "default stderr cannot be delegated",
+                        )
+                    },
+                )?,
+            );
             for redirect in &command_ast.redirects {
                 if self
                     .active_script_caps
@@ -2333,13 +2499,17 @@ impl Session {
                     })?;
                 match redirect.kind {
                     RedirectKind::Stdin => {
-                        let object = self.cspace.lock().lookup(source, Rights::RECV).map_err(|_| {
-                            Diagnostic::new(
-                                redirect.span.start,
-                                redirect.span.end,
-                                "input capability lacks required rights",
-                            )
-                        })?;
+                        let object =
+                            self.cspace
+                                .lock()
+                                .lookup(source, Rights::RECV)
+                                .map_err(|_| {
+                                    Diagnostic::new(
+                                        redirect.span.start,
+                                        redirect.span.end,
+                                        "input capability lacks required rights",
+                                    )
+                                })?;
                         if object.kind() != "byte-stream" {
                             return Err(Diagnostic::new(
                                 redirect.span.start,
@@ -2348,25 +2518,28 @@ impl Session {
                             ));
                         }
                         stdin = LocalIo::Stream(
-                            cap::grant(&self.cspace.lock(), source, Rights::RECV, &mut stage).map_err(
-                                |_| {
+                            cap::grant(&self.cspace.lock(), source, Rights::RECV, &mut stage)
+                                .map_err(|_| {
                                     Diagnostic::new(
                                         redirect.span.start,
                                         redirect.span.end,
                                         "input capability cannot be delegated",
                                     )
-                                },
-                            )?,
+                                })?,
                         );
                     }
                     RedirectKind::Stdout | RedirectKind::Stderr => {
-                        let object = self.cspace.lock().lookup(source, Rights::WRITE).map_err(|_| {
-                            Diagnostic::new(
-                                redirect.span.start,
-                                redirect.span.end,
-                                "output capability lacks required rights",
-                            )
-                        })?;
+                        let object =
+                            self.cspace
+                                .lock()
+                                .lookup(source, Rights::WRITE)
+                                .map_err(|_| {
+                                    Diagnostic::new(
+                                        redirect.span.start,
+                                        redirect.span.end,
+                                        "output capability lacks required rights",
+                                    )
+                                })?;
                         if object.kind() != "byte-sink" {
                             return Err(Diagnostic::new(
                                 redirect.span.start,
@@ -2375,15 +2548,14 @@ impl Session {
                             ));
                         }
                         let local = LocalIo::Sink(
-                            cap::grant(&self.cspace.lock(), source, Rights::WRITE, &mut stage).map_err(
-                                |_| {
+                            cap::grant(&self.cspace.lock(), source, Rights::WRITE, &mut stage)
+                                .map_err(|_| {
                                     Diagnostic::new(
                                         redirect.span.start,
                                         redirect.span.end,
                                         "output capability cannot be delegated",
                                     )
-                                },
-                            )?,
+                                })?,
                         );
                         if redirect.kind == RedirectKind::Stdout {
                             stdout = local;
@@ -2443,30 +2615,66 @@ impl Session {
             });
             running.push((handle, result, cspace));
         }
-        if let Some(cap) = self.revoke_next_job.take() { let _ = self.cspace.lock().revoke(cap); }
+        if let Some(cap) = self.revoke_next_job.take() {
+            let _ = self.cspace.lock().revoke(cap);
+        }
         if core::mem::take(&mut self.cancel_next_job) {
             job.fail(Status::Cancelled);
-            for (handle, _, _) in &running { let _ = handle.cancel(); }
+            for (handle, _, _) in &running {
+                let _ = handle.cancel();
+            }
         }
         if let Some(cancel) = self.external_cancel.clone() {
             let control = job.clone();
-            let handles: Vec<_> = running.iter().map(|(handle, _, _)| handle.clone()).collect();
+            let handles: Vec<_> = running
+                .iter()
+                .map(|(handle, _, _)| handle.clone())
+                .collect();
             exec::spawn("vsh-ctrl-c", async move {
-                while control.live.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) { exec::yield_now().await; }
-                if cancel.load(Ordering::Acquire) { control.fail(Status::Cancelled); for handle in &handles { let _ = handle.cancel(); } }
+                while control.live.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                    exec::yield_now().await;
+                }
+                if cancel.load(Ordering::Acquire) {
+                    control.fail(Status::Cancelled);
+                    for handle in &handles {
+                        let _ = handle.cancel();
+                    }
+                }
             });
         }
         if background {
-            let report = Arc::new(SpinLock::new(None)); let report_task = report.clone();
-            let handles = running.iter().map(|(handle, _, _)| handle.clone()).collect();
-            let control = job.clone(); let console = self.console.clone();
+            let report = Arc::new(SpinLock::new(None));
+            let report_task = report.clone();
+            let handles = running
+                .iter()
+                .map(|(handle, _, _)| handle.clone())
+                .collect();
+            let control = job.clone();
+            let console = self.console.clone();
             let supervisor = exec::spawn_tracked("vsh-job-supervisor", async move {
-                *report_task.lock() = Some(finish_job(id, running, admission, job, pipes, console).await);
+                *report_task.lock() =
+                    Some(finish_job(id, running, admission, job, pipes, console).await);
             });
-            self.jobs.insert(id, BackgroundJob { supervisor, stages: handles, control, report });
-            return Ok(Some(JobReport { id, status: Status::Success, stages: Vec::new(), output: format!("[%{id}]\n"), peak_pipe_depth: 0 }));
+            self.jobs.insert(
+                id,
+                BackgroundJob {
+                    supervisor,
+                    stages: handles,
+                    control,
+                    report,
+                },
+            );
+            return Ok(Some(JobReport {
+                id,
+                status: Status::Success,
+                stages: Vec::new(),
+                output: format!("[%{id}]\n"),
+                peak_pipe_depth: 0,
+            }));
         }
-        Ok(Some(finish_job(id, running, admission, job, pipes, self.console.clone()).await))
+        Ok(Some(
+            finish_job(id, running, admission, job, pipes, self.console.clone()).await,
+        ))
     }
 }
 
@@ -2515,11 +2723,7 @@ fn collect_block_requirements(
     for statement in &script.statements {
         match statement {
             Statement::Command(item) => {
-                collect_and_or_requirements(
-                    &item.command,
-                    requirements,
-                    substitution_depth,
-                )?;
+                collect_and_or_requirements(&item.command, requirements, substitution_depth)?;
             }
             Statement::If {
                 condition,
@@ -2593,17 +2797,9 @@ fn collect_pipeline_requirements(
         for redirect in &command.redirects {
             let (kind, rights) = match redirect.kind {
                 RedirectKind::Stdin => ("byte-stream", Rights::RECV),
-                RedirectKind::Stdout | RedirectKind::Stderr => {
-                    ("byte-sink", Rights::WRITE)
-                }
+                RedirectKind::Stdout | RedirectKind::Stderr => ("byte-sink", Rights::WRITE),
             };
-            merge_script_requirement(
-                requirements,
-                &redirect.target,
-                kind,
-                rights,
-                redirect.span,
-            )?;
+            merge_script_requirement(requirements, &redirect.target, kind, rights, redirect.span)?;
         }
     }
     Ok(())
@@ -2651,31 +2847,57 @@ fn merge_script_requirement(
             ));
         }
         None => {
-            requirements.insert(
-                label.to_string(),
-                (resource_kind.to_string(), rights),
-            );
+            requirements.insert(label.to_string(), (resource_kind.to_string(), rights));
         }
     }
     Ok(())
 }
 
 fn parse_job_id(args: &[String], span: Span) -> Result<u64, Diagnostic> {
-    if args.len() != 1 || !args[0].starts_with('%') { return Err(Diagnostic::new(span.start, span.end, "job id must be %N")); }
-    args[0][1..].parse().map_err(|_| Diagnostic::new(span.start, span.end, "invalid job id"))
+    if args.len() != 1 || !args[0].starts_with('%') {
+        return Err(Diagnostic::new(span.start, span.end, "job id must be %N"));
+    }
+    args[0][1..]
+        .parse()
+        .map_err(|_| Diagnostic::new(span.start, span.end, "invalid job id"))
 }
 
-async fn finish_job(id: u64, running: Vec<RunningStage>, mut admission: CSpace, job: JobControl, pipes: Vec<Arc<ByteStream>>, console: Arc<OutputSink>) -> JobReport {
+async fn finish_job(
+    id: u64,
+    running: Vec<RunningStage>,
+    mut admission: CSpace,
+    job: JobControl,
+    pipes: Vec<Arc<ByteStream>>,
+    console: Arc<OutputSink>,
+) -> JobReport {
     let mut stage_reports = Vec::new();
     for (handle, result, cspace) in &running {
         let exit = handle.join().await;
-        let status = if exit.state() == TaskState::Faulted { Status::Faulted } else if exit.state() == TaskState::Cancelled { Status::Cancelled } else { (*result.lock()).unwrap_or(Status::Faulted) };
-        stage_reports.push(StageReport { task: handle.id(), status });
-        if severe(status) { job.fail(status); }
+        let status = if exit.state() == TaskState::Faulted {
+            Status::Faulted
+        } else if exit.state() == TaskState::Cancelled {
+            Status::Cancelled
+        } else {
+            (*result.lock()).unwrap_or(Status::Faulted)
+        };
+        stage_reports.push(StageReport {
+            task: handle.id(),
+            status,
+        });
+        if severe(status) {
+            job.fail(status);
+        }
         cspace.lock().revoke_all();
     }
-    admission.revoke_all(); job.live.store(false, Ordering::Release);
-    JobReport { id, status: aggregate(&stage_reports), stages: stage_reports, output: console.take_string(), peak_pipe_depth: pipes.iter().map(|p| p.peak_depth()).max().unwrap_or(0) }
+    admission.revoke_all();
+    job.live.store(false, Ordering::Release);
+    JobReport {
+        id,
+        status: aggregate(&stage_reports),
+        stages: stage_reports,
+        output: console.take_string(),
+        peak_pipe_depth: pipes.iter().map(|p| p.peak_depth()).max().unwrap_or(0),
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -2765,7 +2987,9 @@ async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
         Applet::Deny => Status::Denied,
         Applet::Fault => Status::Faulted,
         Applet::Spin => {
-            while job.live.load(Ordering::Acquire) { exec::yield_now().await; }
+            while job.live.load(Ordering::Acquire) {
+                exec::yield_now().await;
+            }
             Status::Cancelled
         }
         Applet::Host(command) => match command(&stage.args) {

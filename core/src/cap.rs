@@ -23,11 +23,11 @@ use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
+use crate::heap::{self, OwnerId};
 use vibeos_durable_format::{
     DerivationId, DurableRights, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
     ResourceKind, SlotIdentity, SpaceId,
 };
-use crate::heap::{self, OwnerId};
 
 pub const MAX_PERSISTENT_SLOTS: u32 = 4096;
 pub const CAPABILITY_TABLE_PAGE_SIZE: usize = 4096;
@@ -249,7 +249,10 @@ impl Rights {
     }
 
     pub const fn durable(self) -> DurableRights {
-        assert!(!self.contains(Self::INVOKE), "INVOKE is not durable-v1 authority");
+        assert!(
+            !self.contains(Self::INVOKE),
+            "INVOKE is not durable-v1 authority"
+        );
         match DurableRights::from_bits(self.0) {
             Some(rights) => rights,
             None => unreachable!(),
@@ -289,7 +292,9 @@ impl fmt::Display for Rights {
                 "-"
             })?;
         }
-        if self.contains(Rights::INVOKE) { f.write_str("i")?; }
+        if self.contains(Rights::INVOKE) {
+            f.write_str("i")?;
+        }
         Ok(())
     }
 }

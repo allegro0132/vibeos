@@ -16,8 +16,15 @@ fn keywords_are_not_identifiers() {
     assert_eq!(
         toks("fn let mut if else while return i64"),
         vec![
-            Tok::Fn, Tok::Let, Tok::Mut, Tok::If, Tok::Else,
-            Tok::While, Tok::Return, Tok::I64, Tok::Eof
+            Tok::Fn,
+            Tok::Let,
+            Tok::Mut,
+            Tok::If,
+            Tok::Else,
+            Tok::While,
+            Tok::Return,
+            Tok::I64,
+            Tok::Eof
         ]
     );
 }
@@ -40,10 +47,18 @@ fn two_character_punctuation_wins_over_one() {
     assert_eq!(
         toks("-> == != <= >= && || < > = ! -"),
         vec![
-            Tok::Punct("->"), Tok::Punct("=="), Tok::Punct("!="),
-            Tok::Punct("<="), Tok::Punct(">="), Tok::Punct("&&"),
-            Tok::Punct("||"), Tok::Punct("<"), Tok::Punct(">"),
-            Tok::Punct("="), Tok::Punct("!"), Tok::Punct("-"),
+            Tok::Punct("->"),
+            Tok::Punct("=="),
+            Tok::Punct("!="),
+            Tok::Punct("<="),
+            Tok::Punct(">="),
+            Tok::Punct("&&"),
+            Tok::Punct("||"),
+            Tok::Punct("<"),
+            Tok::Punct(">"),
+            Tok::Punct("="),
+            Tok::Punct("!"),
+            Tok::Punct("-"),
             Tok::Eof
         ]
     );

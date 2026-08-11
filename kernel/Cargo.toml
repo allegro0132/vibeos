@@ -6,8 +6,8 @@ build = "build.rs"
 
 [features]
 default = ["qemu-virt"]
-qemu-virt = ["vibeos-vsh/qemu-virt"]
-milkv-duo = []
+qemu-virt = ["dep:vibeos-bsp-qemu-virt", "vibeos-vsh/qemu-virt"]
+milkv-duo = ["dep:vibeos-bsp-milkv-duo"]
 legacy-shell = []
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
 # listener. This is deliberately separate from the eventual SSH feature so a
@@ -44,6 +44,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
+vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-rustc = { path = "../compiler" }
 vibeos-authority-store = { path = "../services/authority-store" }

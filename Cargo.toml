@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "compiler", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/object-store", "services/program-store", "services/ssh-identity", "acceptance/kernel-tests", "kernel"]
+members = ["core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/object-store", "services/program-store", "services/ssh-identity", "acceptance/kernel-tests", "kernel"]
 exclude = ["vendor/sunset"]
 
 [profile.dev]

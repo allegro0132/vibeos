@@ -750,6 +750,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-bsp-milkv-duo"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
+name = "vibeos-bsp-qemu-virt"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-core"
 version = "0.1.0"
 dependencies = [
@@ -761,11 +775,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-hal"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
  "jitterentropy-rs",
  "vibeos-authority-store",
+ "vibeos-bsp-milkv-duo",
+ "vibeos-bsp-qemu-virt",
  "vibeos-core",
  "vibeos-kernel-acceptance",
  "vibeos-netstack",

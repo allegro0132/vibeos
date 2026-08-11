@@ -24,12 +24,12 @@ tcp-echo-recovery-test = ["tcp-echo"]
 ssh-security-test = []
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
-ssh-test = ["dep:sunset"]
+ssh-test = ["dep:vibeos-sshd", "vibeos-sshd/qemu-virt"]
 # Explicitly insecure physical bring-up image. It reuses the fixed SSH test
 # identities and a deterministic acceptance-only random service so DWMAC,
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
-milkv-ssh-acceptance = ["dep:sunset"]
+milkv-ssh-acceptance = ["dep:vibeos-sshd", "vibeos-sshd/milkv-ssh-acceptance"]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.
@@ -45,5 +45,5 @@ test = false
 [dependencies]
 vibeos-core = { path = "../core" }
 vibeos-rustc = { path = "../compiler" }
-sunset = { path = "../vendor/sunset", default-features = false, features = ["alloc"], optional = true }
+vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", version = "=0.1.1", default-features = false, features = ["alloc"], optional = true }

@@ -1,0 +1,13 @@
+[package]
+name = "vibeos-sshd"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+qemu-virt = []
+milkv-ssh-acceptance = []
+
+[dependencies]
+vibeos-core = { path = "../../core" }
+sunset = { path = "../../vendor/sunset", default-features = false, features = ["alloc"] }

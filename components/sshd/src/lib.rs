@@ -1,4 +1,4 @@
-//! Bounded SSH acceptance server: one connection at a time.
+//! Capability-confined SSH server component: one connection at a time.
 //!
 //! The transport owns no ambient authority. Packet I/O, entropy, host-key
 //! signing, and authorization are all reached through separately attenuated
@@ -10,6 +10,8 @@
 //! Milk-V hardware-acceptance feature instead uses a deterministic test-only
 //! provider and fixed identities; it proves wiring and is not secure SSH.
 
+#![no_std]
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -18,6 +20,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
+use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -27,31 +30,127 @@ use sunset::{
     ChanData, ChanFail, ChanHandle, Ed25519HostSigner, Event, PubKey, Runner, ServEvent, Server,
     TerminalSize,
 };
-use vibeos_core::cap::{CSpace, Cap, Rights};
+use vibeos_core::cap::{CSpace, Cap, Revocable};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
 #[cfg(feature = "milkv-ssh-acceptance")]
 use vibeos_core::net_config::Ipv4RuntimeStatus;
 use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
-use vibeos_core::ssh_identity::SshEd25519PublicKey;
+use vibeos_core::ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
 use vibeos_core::sync::SpinLock;
 use vibeos_core::terminal::{
     FrontendError, TerminalEvent, TerminalFrontend, MAX_EMIT_TEXT_BYTES,
     MAX_INPUT_BYTES as MAX_TERMINAL_INPUT_BYTES,
 };
 
-use crate::ssh_security::{
-    self, AuthorizedKeyPolicyService, AuthorizedProfile, HostPublicKeySnapshot, HostSigningService,
-    SecurityGeneration,
-};
-use crate::world::Space;
+/// Boxed kernel-service operation used at the narrow component/platform seam.
+pub type PlatformFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-#[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
-use crate::ssh_acceptance_rng as ssh_rng;
-#[cfg(feature = "qemu-virt")]
-use crate::virtio_rng as ssh_rng;
-use ssh_rng::{RandomBytes, RandomError};
+/// Platform-neutral status needed to supervise one TCP stack binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkInfo {
+    pub online: bool,
+    pub quarantined: bool,
+    pub session_epoch: u64,
+    pub phy_link_up: bool,
+}
+
+/// Stable error classes exposed by the network control capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkBindError {
+    Offline,
+    SessionBusy,
+    Denied,
+    Failed,
+}
+
+/// Public half of one provisioned host-signing service incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostPublicKeySnapshot {
+    pub generation: u64,
+    pub public_key: SshEd25519PublicKey,
+}
+
+/// Result of invoking the opaque host signer for one exchange hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostSignatureResult {
+    pub generation: u64,
+    pub signature: [u8; 64],
+}
+
+/// Authorization decision retained and revalidated across SSH state changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorizedProfile {
+    pub generation: u64,
+    pub profile: CapabilityProfileId,
+}
+
+/// Owned entropy which is scrubbed before its component allocation is freed.
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ()> {
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(bytes.len()).map_err(|_| ())?;
+        owned.extend_from_slice(bytes);
+        Ok(Self(owned))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+/// All privileged services consumed by the SSH component.
+///
+/// The implementation lives in the kernel image and resolves each operation
+/// through the exact capability supplied to this component. Protocol and
+/// session code cannot name a device, key, policy, or console directly.
+pub trait Platform: Sync {
+    fn packet_endpoints(
+        &self,
+        outbound: Cap,
+        inbound: Cap,
+    ) -> Option<(
+        Revocable<Endpoint<StampedPacket>>,
+        Revocable<Endpoint<StampedPacket>>,
+    )>;
+    fn bind_stack(&self, control: Cap) -> Result<PacketStamp, NetworkBindError>;
+    fn network_info(&self, control: Cap) -> Option<NetworkInfo>;
+    fn entropy<'a>(
+        &'a self,
+        random: Cap,
+        length: usize,
+    ) -> PlatformFuture<'a, Result<SecretBytes, ()>>;
+    fn host_public_key(&self, read: Cap) -> Result<HostPublicKeySnapshot, ()>;
+    fn sign_exchange_hash(
+        &self,
+        invoke: Cap,
+        exchange_hash: &[u8; 32],
+    ) -> Result<HostSignatureResult, ()>;
+    fn authorized_profile(
+        &self,
+        policy: Cap,
+        key: &SshEd25519PublicKey,
+    ) -> Result<Option<AuthorizedProfile>, ()>;
+    fn install_standard_vsh_commands(&self, session: &mut vibeos_core::vsh::Session);
+    fn log(&self, args: fmt::Arguments<'_>);
+}
+
+type Space = dyn Platform;
+
+macro_rules! component_log {
+    ($platform:expr, $($arg:tt)*) => {
+        $platform.log(format_args!($($arg)*))
+    };
+}
 
 const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 #[cfg(feature = "qemu-virt")]
@@ -63,7 +162,7 @@ const PREFIX_LEN: u8 = 24;
 const LISTEN_PORT: u16 = 2222;
 const SSH_RANDOM_DOMAIN: u64 = 0x5353_4803;
 
-const ENTROPY_RETRY_BUDGET: usize = 5_000;
+#[cfg(feature = "qemu-virt")]
 const NETWORK_RETRY_BUDGET: usize = 5_000;
 const CONNECTION_TIMEOUT_MS: u64 = 60_000;
 const EXEC_TIMEOUT_MS: u64 = 10_000;
@@ -117,7 +216,7 @@ struct CapabilityHostSigner<'a> {
     space: &'a Space,
     read: Cap,
     invoke: Cap,
-    generation: Cell<Option<SecurityGeneration>>,
+    generation: Cell<Option<u64>>,
 }
 
 impl<'a> CapabilityHostSigner<'a> {
@@ -131,14 +230,10 @@ impl<'a> CapabilityHostSigner<'a> {
     }
 
     fn snapshot(&self) -> Result<HostPublicKeySnapshot, &'static str> {
-        let lease = self
+        let snapshot = self
             .space
-            .0
-            .lock()
-            .lookup_lease::<HostSigningService>(self.read, Rights::READ)
+            .host_public_key(self.read)
             .map_err(|_| "host public-key authority was revoked")?;
-        let snapshot =
-            ssh_security::public_key_with(&lease).map_err(|_| "host public-key read was denied")?;
         match self.generation.get() {
             Some(generation) if generation != snapshot.generation => {
                 Err("host signer generation changed")
@@ -161,18 +256,14 @@ impl Ed25519HostSigner for CapabilityHostSigner<'_> {
 
     fn sign_exchange_hash(&mut self, exchange_hash: &[u8; 32]) -> sunset::Result<[u8; 64]> {
         let public = self.snapshot().map_err(|_| sunset::Error::BadSig)?;
-        let lease = self
+        let signed = self
             .space
-            .0
-            .lock()
-            .lookup_lease::<HostSigningService>(self.invoke, Rights::INVOKE)
+            .sign_exchange_hash(self.invoke, exchange_hash)
             .map_err(|_| sunset::Error::BadSig)?;
-        let signed =
-            ssh_security::sign_with(&lease, exchange_hash).map_err(|_| sunset::Error::BadSig)?;
         if signed.generation != public.generation {
             return Err(sunset::Error::BadSig);
         }
-        Ok(signed.signature.to_bytes())
+        Ok(signed.signature)
     }
 }
 
@@ -396,7 +487,7 @@ enum ConnectionEnd {
 
 enum ExecutionEnd {
     Complete {
-        reports: Result<Vec<crate::vsh::JobReport>, crate::vsh::Diagnostic>,
+        reports: Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>,
         timed_out: bool,
     },
     Reset(&'static str),
@@ -412,7 +503,7 @@ enum ExecutionCancellation {
 
 /// Serve an explicit acceptance endpoint with one active TCP/SSH peer at a time.
 pub async fn task(
-    space: &'static Space,
+    space: &Space,
     outbound: Cap,
     inbound: Cap,
     control: Cap,
@@ -422,31 +513,22 @@ pub async fn task(
     policy: Cap,
 ) {
     #[cfg(feature = "milkv-ssh-acceptance")]
-    crate::println!(
+    component_log!(space,
         "WARNING milkv-ssh-acceptance: deterministic entropy and fixed test keys; isolated bring-up only"
     );
 
-    let (outbound_endpoint, inbound_endpoint) = {
-        let cspace = space.0.lock();
-        let Ok(outbound_endpoint) =
-            cspace.lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
-        else {
-            crate::println!("FAIL ssh-test: outbound packet authority unavailable");
+    let (outbound_endpoint, inbound_endpoint) = match space.packet_endpoints(outbound, inbound) {
+        Some(endpoints) => endpoints,
+        None => {
+            component_log!(space, "FAIL ssh-test: packet authority unavailable");
             return;
-        };
-        let Ok(inbound_endpoint) =
-            cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV)
-        else {
-            crate::println!("FAIL ssh-test: inbound packet authority unavailable");
-            return;
-        };
-        (outbound_endpoint, inbound_endpoint)
+        }
     };
 
     let initial_entropy = match fetch_entropy(space, random, SEED_BYTES + 8).await {
         Ok(entropy) => entropy,
         Err(_) => {
-            crate::println!("FAIL ssh-test: SSH random source unavailable");
+            component_log!(space, "FAIL ssh-test: SSH random source unavailable");
             return;
         }
     };
@@ -454,7 +536,10 @@ pub async fn task(
     connection_seed.copy_from_slice(&initial_entropy.as_slice()[..SEED_BYTES]);
     if connection_seed.iter().all(|byte| *byte == 0) {
         wipe(&mut connection_seed);
-        crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
+        component_log!(
+            space,
+            "FAIL ssh-test: SSH random source returned an all-zero seed"
+        );
         return;
     }
     let mut tcp_seed_bytes = [0u8; 8];
@@ -475,7 +560,7 @@ pub async fn task(
         Ok(stack) => stack,
         Err(reason) => {
             wipe(&mut connection_seed);
-            crate::println!("FAIL ssh-test: {reason}");
+            component_log!(space, "FAIL ssh-test: {reason}");
             return;
         }
     };
@@ -483,7 +568,10 @@ pub async fn task(
         Some(info) => info.session_epoch,
         None => {
             wipe(&mut connection_seed);
-            crate::println!("FAIL ssh-test: network control authority unavailable");
+            component_log!(
+                space,
+                "FAIL ssh-test: network control authority unavailable"
+            );
             return;
         }
     };
@@ -532,18 +620,18 @@ pub async fn task(
         let mut rebind_reason = None;
         match outcome {
             ConnectionEnd::ExecComplete(status) => {
-                crate::println!("ssh-test exec complete: status {status}");
+                component_log!(space, "ssh-test exec complete: status {status}");
             }
             ConnectionEnd::ShellComplete(status) => {
-                crate::println!("ssh-test shell complete: status {status}");
+                component_log!(space, "ssh-test shell complete: status {status}");
             }
             ConnectionEnd::Reset(reason) => {
                 let _ = stack.reset();
-                crate::println!("ssh-test connection reset: {reason}");
+                component_log!(space, "ssh-test connection reset: {reason}");
             }
             ConnectionEnd::Rebind(reason) => {
                 let _ = stack.reset();
-                crate::println!("ssh-test connection reset: {reason}");
+                component_log!(space, "ssh-test connection reset: {reason}");
                 rebind_reason = Some(reason);
             }
         }
@@ -551,7 +639,7 @@ pub async fn task(
         if rebind_reason.is_none() {
             if let Err(reason) = rearm_listener(&mut stack).await {
                 let _ = stack.reset();
-                crate::println!("ssh-test connection reset: {reason}");
+                component_log!(space, "ssh-test connection reset: {reason}");
                 rebind_reason = Some(reason);
             }
         }
@@ -563,7 +651,10 @@ pub async fn task(
             let next_entropy = match fetch_entropy(space, random, SEED_BYTES + 8).await {
                 Ok(entropy) => entropy,
                 Err(_) => {
-                    crate::println!("FAIL ssh-test: SSH random source unavailable during rebind");
+                    component_log!(
+                        space,
+                        "FAIL ssh-test: SSH random source unavailable during rebind"
+                    );
                     return;
                 }
             };
@@ -575,13 +666,19 @@ pub async fn task(
             drop(next_entropy);
             if connection_seed.iter().all(|byte| *byte == 0) {
                 wipe(&mut connection_seed);
-                crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
+                component_log!(
+                    space,
+                    "FAIL ssh-test: SSH random source returned an all-zero seed"
+                );
                 return;
             }
             let Some((next_outbound, next_inbound)) = stack_endpoints(space, outbound, inbound)
             else {
                 wipe(&mut connection_seed);
-                crate::println!("FAIL ssh-test: packet authority unavailable while rebinding");
+                component_log!(
+                    space,
+                    "FAIL ssh-test: packet authority unavailable while rebinding"
+                );
                 return;
             };
             stack = match build_stack(
@@ -596,7 +693,7 @@ pub async fn task(
                 Ok(stack) => stack,
                 Err(reason) => {
                     wipe(&mut connection_seed);
-                    crate::println!("FAIL ssh-test: {reason}");
+                    component_log!(space, "FAIL ssh-test: {reason}");
                     return;
                 }
             };
@@ -604,7 +701,10 @@ pub async fn task(
                 Some(info) => info.session_epoch,
                 None => {
                     wipe(&mut connection_seed);
-                    crate::println!("FAIL ssh-test: network control authority unavailable");
+                    component_log!(
+                        space,
+                        "FAIL ssh-test: network control authority unavailable"
+                    );
                     return;
                 }
             };
@@ -616,7 +716,10 @@ pub async fn task(
         let entropy = match fetch_entropy(space, random, SEED_BYTES).await {
             Ok(entropy) => entropy,
             Err(_) => {
-                crate::println!("FAIL ssh-test: SSH random source unavailable for next connection");
+                component_log!(
+                    space,
+                    "FAIL ssh-test: SSH random source unavailable for next connection"
+                );
                 return;
             }
         };
@@ -624,7 +727,10 @@ pub async fn task(
         drop(entropy);
         if connection_seed.iter().all(|byte| *byte == 0) {
             wipe(&mut connection_seed);
-            crate::println!("FAIL ssh-test: SSH random source returned an all-zero seed");
+            component_log!(
+                space,
+                "FAIL ssh-test: SSH random source returned an all-zero seed"
+            );
             return;
         }
     }
@@ -635,25 +741,18 @@ fn stack_endpoints(
     outbound: Cap,
     inbound: Cap,
 ) -> Option<(
-    vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
-    vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
+    Revocable<Endpoint<StampedPacket>>,
+    Revocable<Endpoint<StampedPacket>>,
 )> {
-    let cspace = space.0.lock();
-    let outbound = cspace
-        .lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
-        .ok()?;
-    let inbound = cspace
-        .lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV)
-        .ok()?;
-    Some((outbound, inbound))
+    space.packet_endpoints(outbound, inbound)
 }
 
 async fn build_stack(
     space: &Space,
     control: Cap,
     tcp_seed: u64,
-    inbound: vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
-    outbound: vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
+    inbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: Revocable<Endpoint<StampedPacket>>,
 ) -> Result<StaticIpv4TcpStack, &'static str> {
     #[cfg(feature = "qemu-virt")]
     let attempts = core::iter::repeat(()).take(NETWORK_RETRY_BUDGET);
@@ -668,12 +767,12 @@ async fn build_stack(
             return Err("network device is quarantined");
         }
         if !info.online {
-            crate::exec::sleep_ms(1).await;
+            vibeos_core::exec::sleep_ms(1).await;
             continue;
         }
         #[cfg(feature = "milkv-ssh-acceptance")]
         if !info.phy_link_up {
-            crate::exec::sleep_ms(1).await;
+            vibeos_core::exec::sleep_ms(1).await;
             continue;
         }
         match bind_stack(space, control) {
@@ -708,10 +807,8 @@ async fn build_stack(
                 #[cfg(feature = "qemu-virt")]
                 return Ok(stack);
             }
-            Err(
-                crate::virtio_net::NetError::Offline | crate::virtio_net::NetError::SessionBusy,
-            ) => {
-                crate::exec::sleep_ms(1).await;
+            Err(NetworkBindError::Offline | NetworkBindError::SessionBusy) => {
+                vibeos_core::exec::sleep_ms(1).await;
             }
             Err(_) => return Err("network stack bind failed"),
         }
@@ -729,7 +826,7 @@ async fn announce_listener(
     #[cfg(feature = "qemu-virt")]
     {
         let _ = (space, control, bound_epoch);
-        update_listener_announcement(stack, announced_ipv4);
+        update_listener_announcement(space, stack, announced_ipv4);
         return Ok(());
     }
 
@@ -741,12 +838,12 @@ async fn announce_listener(
             let report = stack
                 .poll_network(monotonic_ms())
                 .map_err(|_| "DHCP/network listener poll failed")?;
-            if update_listener_announcement(stack, announced_ipv4) {
+            if update_listener_announcement(space, stack, announced_ipv4) {
                 return Ok(());
             }
             let now = monotonic_ms();
             if now.saturating_sub(last_status) >= DHCP_STATUS_INTERVAL_MS {
-                crate::println!("milkv-ssh-acceptance waiting for a DHCP lease");
+                component_log!(space, "milkv-ssh-acceptance waiting for a DHCP lease");
                 last_status = now;
             }
             cooperate(
@@ -770,7 +867,7 @@ async fn wait_for_connection(
         let report = stack
             .poll_network(monotonic_ms())
             .map_err(|_| "network listener poll failed")?;
-        update_listener_announcement(stack, announced_ipv4);
+        update_listener_announcement(space, stack, announced_ipv4);
         // smoltcp considers SYN-RECEIVED an active connection, but its byte
         // stream API cannot accept Sunset's server banner until the final ACK
         // moves the socket to ESTABLISHED. Entering the bridge on the earlier
@@ -829,11 +926,12 @@ async fn rearm_listener(stack: &mut StaticIpv4TcpStack) -> Result<(), &'static s
 
 #[cfg(feature = "qemu-virt")]
 fn update_listener_announcement(
+    space: &Space,
     _stack: &StaticIpv4TcpStack,
     announced_ipv4: &mut Option<[u8; 4]>,
 ) -> bool {
     if *announced_ipv4 != Some(GUEST_IPV4) {
-        crate::println!("ssh-test listening on 10.0.2.15:2222");
+        component_log!(space, "ssh-test listening on 10.0.2.15:2222");
         *announced_ipv4 = Some(GUEST_IPV4);
     }
     true
@@ -841,6 +939,7 @@ fn update_listener_announcement(
 
 #[cfg(feature = "milkv-ssh-acceptance")]
 fn update_listener_announcement(
+    space: &Space,
     stack: &StaticIpv4TcpStack,
     announced_ipv4: &mut Option<[u8; 4]>,
 ) -> bool {
@@ -848,7 +947,8 @@ fn update_listener_announcement(
         Ipv4RuntimeStatus::DhcpBound(address) => {
             if *announced_ipv4 != Some(address.address) {
                 let [a, b, c, d] = address.address;
-                crate::println!(
+                component_log!(
+                    space,
                     "milkv-ssh-acceptance listening on {a}.{b}.{c}.{d}:{}",
                     LISTEN_PORT
                 );
@@ -858,7 +958,10 @@ fn update_listener_announcement(
         }
         _ => {
             if announced_ipv4.take().is_some() {
-                crate::println!("milkv-ssh-acceptance DHCP lease lost; listener unavailable");
+                component_log!(
+                    space,
+                    "milkv-ssh-acceptance DHCP lease lost; listener unavailable"
+                );
             }
             false
         }
@@ -1034,7 +1137,7 @@ fn progress_protocol(
                 // Sunset error category in its serial transcript makes an
                 // interoperability failure actionable without exposing key or
                 // packet contents.
-                crate::println!("ssh-test Sunset protocol error: {error:?}");
+                component_log!(space, "ssh-test Sunset protocol error: {error:?}");
                 return Err("SSH protocol state failed");
             }
         };
@@ -1138,7 +1241,7 @@ fn progress_protocol(
                             .command()
                             .map_err(|_| "exec command was not valid UTF-8")?
                             .to_string();
-                        if crate::vsh::validate_ssh_exec(&value).is_ok() {
+                        if vibeos_core::vsh::validate_ssh_exec(&value).is_ok() {
                             command = Some(value);
                         }
                     }
@@ -1261,19 +1364,13 @@ fn authorize(
     key: SshEd25519PublicKey,
 ) -> Result<Option<AuthCandidate>, &'static str> {
     let host = signer.snapshot()?;
-    let lease = space
-        .0
-        .lock()
-        .lookup_lease::<AuthorizedKeyPolicyService>(policy_cap, Rights::READ)
-        .map_err(|_| "authorized-key policy authority was revoked")?;
-    let profile = ssh_security::profile_for_with(&lease, &key)
+    let profile = space
+        .authorized_profile(policy_cap, &key)
         .map_err(|_| "authorized-key policy lookup failed")?;
     let Some(profile) = profile else {
         return Ok(None);
     };
-    if profile.generation != host.generation
-        || profile.profile.get() != crate::ssh_test_fixture::TEST_PROFILE
-    {
+    if profile.generation != host.generation {
         return Ok(None);
     }
     Ok(Some(AuthCandidate { key, profile }))
@@ -1583,7 +1680,7 @@ fn mark_running_interrupts(
 #[allow(clippy::too_many_arguments)]
 async fn execute_shell_command(
     command: &str,
-    session: &mut crate::vsh::Session,
+    session: &mut vibeos_core::vsh::Session,
     runner: &mut Runner<'_, Server>,
     signer: &mut CapabilityHostSigner<'_>,
     space: &Space,
@@ -1595,7 +1692,7 @@ async fn execute_shell_command(
     protocol: &mut ProtocolState,
     input: &mut PendingInput,
     frontend: &mut TerminalFrontend,
-) -> Result<Result<Vec<crate::vsh::JobReport>, crate::vsh::Diagnostic>, ConnectionEnd> {
+) -> Result<Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>, ConnectionEnd> {
     let cancel = Arc::new(AtomicBool::new(false));
     // Ordinary bytes queued after Enter remain typeahead for the next prompt.
     // Ctrl-C is different: SSH byte ordering proves every queued byte follows
@@ -1625,7 +1722,7 @@ async fn execute_shell_command(
                     }
                 });
             }
-            crate::exec::yield_now().await;
+            vibeos_core::exec::yield_now().await;
             continue;
         }
 
@@ -1808,7 +1905,7 @@ async fn emit_shell_text(
 
 #[allow(clippy::too_many_arguments)]
 async fn render_shell_execution(
-    result: &Result<Vec<crate::vsh::JobReport>, crate::vsh::Diagnostic>,
+    result: &Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>,
     runner: &mut Runner<'_, Server>,
     signer: &mut CapabilityHostSigner<'_>,
     space: &Space,
@@ -1825,7 +1922,7 @@ async fn render_shell_execution(
         Ok(reports) => {
             let total = reports.iter().try_fold(0usize, |total, report| {
                 let total = total.checked_add(report.output.len())?;
-                if report.status == crate::vsh::Status::Success {
+                if report.status == vibeos_core::vsh::Status::Success {
                     Some(total)
                 } else {
                     total.checked_add(
@@ -1867,7 +1964,7 @@ async fn render_shell_execution(
                     frontend,
                 )
                 .await?;
-                if report.status != crate::vsh::Status::Success {
+                if report.status != vibeos_core::vsh::Status::Success {
                     let diagnostic =
                         alloc::format!("  vsh job %{}: {:?}\n", report.id, report.status);
                     emit_shell_text(
@@ -1920,7 +2017,7 @@ async fn render_shell_execution(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_shell_repl(
-    session: &mut crate::vsh::Session,
+    session: &mut vibeos_core::vsh::Session,
     runner: &mut Runner<'_, Server>,
     signer: &mut CapabilityHostSigner<'_>,
     space: &Space,
@@ -2016,8 +2113,8 @@ async fn serve_interactive_shell(
         .pty
         .ok_or(ConnectionEnd::Reset("SSH shell started without a PTY"))?;
     let cspace = Arc::new(SpinLock::new(CSpace::new("ssh-vsh-session")));
-    let mut session = crate::vsh::Session::with_cspace(cspace);
-    crate::shell::install_standard_vsh_commands(&mut session);
+    let mut session = vibeos_core::vsh::Session::with_cspace(cspace);
+    space.install_standard_vsh_commands(&mut session);
     let mut frontend = TerminalFrontend::new();
 
     let repl = run_shell_repl(
@@ -2090,7 +2187,8 @@ async fn execute_with_network(
     protocol: &mut ProtocolState,
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut session = crate::vsh::Session::with_profile(crate::vsh::SessionProfile::SshExec);
+    let mut session =
+        vibeos_core::vsh::Session::with_profile(vibeos_core::vsh::SessionProfile::SshExec);
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
@@ -2122,7 +2220,7 @@ async fn execute_with_network(
                     ExecutionCancellation::Rebind(reason) => ExecutionEnd::Rebind(reason),
                 };
             }
-            crate::exec::yield_now().await;
+            vibeos_core::exec::yield_now().await;
             continue;
         }
         if now.saturating_sub(started) > EXEC_TIMEOUT_MS {
@@ -2202,7 +2300,7 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 }
 
 fn collect_execution(
-    reports: Result<Vec<crate::vsh::JobReport>, crate::vsh::Diagnostic>,
+    reports: Result<Vec<vibeos_core::vsh::JobReport>, vibeos_core::vsh::Diagnostic>,
     timed_out: bool,
 ) -> (Vec<u8>, u32) {
     if timed_out {
@@ -2227,16 +2325,16 @@ fn collect_execution(
     (output, status)
 }
 
-fn ssh_exit_status(status: crate::vsh::Status) -> u32 {
+fn ssh_exit_status(status: vibeos_core::vsh::Status) -> u32 {
     match status {
-        crate::vsh::Status::Success => 0,
-        crate::vsh::Status::Returned(status) => status.into(),
-        crate::vsh::Status::Usage => 2,
-        crate::vsh::Status::Unavailable => 127,
-        crate::vsh::Status::Denied => 126,
-        crate::vsh::Status::BudgetExceeded => 124,
-        crate::vsh::Status::Faulted => 125,
-        crate::vsh::Status::Cancelled => 130,
+        vibeos_core::vsh::Status::Success => 0,
+        vibeos_core::vsh::Status::Returned(status) => status.into(),
+        vibeos_core::vsh::Status::Usage => 2,
+        vibeos_core::vsh::Status::Unavailable => 127,
+        vibeos_core::vsh::Status::Denied => 126,
+        vibeos_core::vsh::Status::BudgetExceeded => 124,
+        vibeos_core::vsh::Status::Faulted => 125,
+        vibeos_core::vsh::Status::Cancelled => 130,
     }
 }
 
@@ -2452,60 +2550,32 @@ fn validate_network_authority(
     Ok(())
 }
 
-fn bind_stack(space: &Space, control: Cap) -> Result<PacketStamp, crate::virtio_net::NetError> {
-    let lease = space
-        .0
-        .lock()
-        .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::INVOKE)
-        .map_err(|_| crate::virtio_net::NetError::AuthorityRevoked)?;
-    crate::virtio_net::bind_stack_with(&lease)
+fn bind_stack(space: &Space, control: Cap) -> Result<PacketStamp, NetworkBindError> {
+    space.bind_stack(control)
 }
 
-fn device_info(space: &Space, control: Cap) -> Option<crate::virtio_net::NetInfo> {
-    let lease = space
-        .0
-        .lock()
-        .lookup_lease::<crate::virtio_net::NetDevice>(control, Rights::READ)
-        .ok()?;
-    crate::virtio_net::info_with(&lease).ok()
+fn device_info(space: &Space, control: Cap) -> Option<NetworkInfo> {
+    space.network_info(control)
 }
 
-async fn fetch_entropy(
-    space: &Space,
-    random: Cap,
-    length: usize,
-) -> Result<RandomBytes, RandomError> {
-    for _ in 0..ENTROPY_RETRY_BUDGET {
-        let lease = space
-            .0
-            .lock()
-            .lookup_lease::<ssh_rng::RandomSource>(random, Rights::READ)
-            .map_err(|_| RandomError::AuthorityRevoked)?;
-        match ssh_rng::bytes_with(lease, length).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(RandomError::Offline | RandomError::Busy | RandomError::DriverRestarted) => {
-                crate::exec::sleep_ms(1).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(RandomError::TimedOut)
+async fn fetch_entropy(space: &Space, random: Cap, length: usize) -> Result<SecretBytes, ()> {
+    space.entropy(random, length).await
 }
 
 async fn cooperate(worked: bool, next_poll_delay_ms: Option<u64>) {
     if worked {
-        crate::exec::yield_now().await;
+        vibeos_core::exec::yield_now().await;
     } else {
         let delay = next_poll_delay_ms
             .unwrap_or(IDLE_POLL_CEILING_MS)
             .clamp(1, IDLE_POLL_CEILING_MS);
-        crate::exec::sleep_ms(delay).await;
+        vibeos_core::exec::sleep_ms(delay).await;
     }
 }
 
 fn monotonic_ms() -> u64 {
-    let hz = crate::exec::timebase_hz();
-    crate::sbi::time().saturating_mul(1_000) / hz
+    let hz = vibeos_core::exec::timebase_hz();
+    vibeos_core::arch::time().saturating_mul(1_000) / hz
 }
 
 fn wipe(bytes: &mut [u8]) {

@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -23,12 +25,23 @@ jobs:
           } >> "$GITHUB_ENV"
           rustup run "$toolchain" rustc -Vv
           rustup run "$toolchain" cargo -V
-      - name: Test the portable core and the compiler
+      - name: Test the portable core, compiler, and Sunset fork
         # The kernel binary is no_std and has `test = false`; its tests run
         # inside QEMU in the job below.
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
-            rustup run "$VIBEOS_TOOLCHAIN" cargo test --workspace --verbose
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --workspace \
+              --exclude vibeos-sshd --verbose
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test \
+              --manifest-path vendor/sunset/Cargo.toml -p sunset \
+              --no-default-features --features alloc --verbose
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo check -p vibeos-sshd \
+              --features qemu-virt
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo check -p vibeos-sshd \
+              --features milkv-ssh-acceptance
       - name: Report repository status
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
@@ -40,6 +53,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -62,6 +77,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"

@@ -3,7 +3,11 @@
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh
-cargo test --workspace         # fast portable tests, no QEMU
+cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
+cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
+  --no-default-features --features alloc # audited Sunset fork tests
+cargo check -p vibeos-sshd --features qemu-virt
+cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 ./scripts/differential.sh      # verify committed output with pinned real rustc
 ./scripts/qemu-test.sh         # golden cases plus the differential oracle
 ./scripts/qemu-usb-test.sh     # PCI/XHCI HID, BOT/SCSI, INTx, and hotplug

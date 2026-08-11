@@ -117,6 +117,8 @@ upward except through a capability it was handed.
 | `durable.rs` | ~1000 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
 | `virtio.rs` | growing | Pure modern virtio block/net protocol and queue lifecycle models | — |
 | `kernel/virtio_*.rs` | growing | MMIO transport, stable DMA, supervised block/network services | yes |
+| `components/sshd` | growing | Capability-confined SSH protocol, authentication, sessions, and VSH frontend | 1 (secret wipe) |
+| `kernel/ssh_platform.rs` | small | Kernel-private network, entropy, signer, policy, command, and log adapters for `sshd` | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `shell.rs` | 458 | Operator interface | — |

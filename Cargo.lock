@@ -769,6 +769,7 @@ version = "0.1.0"
 dependencies = [
  "vibeos-durable-format",
  "vibeos-hal",
+ "vibeos-runtime-riscv",
 ]
 
 [[package]]
@@ -952,6 +953,13 @@ dependencies = [
  "chacha20 0.10.1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "vibeos-runtime-riscv"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
 ]
 
 [[package]]

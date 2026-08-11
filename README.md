@@ -394,6 +394,7 @@ its process owns. Here, authority is not a property of the code.
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
 | `durable-format/` | zero-dependency sealed-log codec, stable IDs, and fail-closed recovery (`no_std`) |
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
+| `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |
 | `kernel/src/netstack_platform.rs` | thin packet/network-control adapter plus recovery-only test hooks |
 | `components/vsh/` | capability-native interactive loop, foreground cancellation, rendering, and command registration (`no_std`) |

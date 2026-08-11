@@ -121,14 +121,15 @@ pub async fn service_task() {
                     );
                     match keyboard {
                         Some(keyboard) => println!(
-                            "  usb hid   attached boot keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                            "  usb hid   attached {:?} keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                            keyboard.protocol,
                             keyboard.interface,
                             keyboard.endpoint_in & 0x0f,
                             keyboard.max_packet_size,
                             keyboard.interval_ms,
                         ),
                         None => println!(
-                            "  usb hid   attached device has no boot keyboard interface"
+                            "  usb hid   attached device has no supported keyboard interface"
                         ),
                     }
                 }

@@ -95,6 +95,7 @@ const DMA_BYTES: usize = 1_024;
 const MAX_NAK_RETRIES: usize = 32;
 const MAX_COMPLETE_SPLIT_RETRIES: usize = 16;
 const HID_REPORT_BYTES: usize = 8;
+const APPLE_NKRO_REPORT_BYTES: usize = 15;
 const HID_INPUT_BYTES: usize = 18;
 const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
 const USB_CLASS_HUB: u8 = 9;
@@ -162,6 +163,13 @@ pub struct HidKeyboardInfo {
     pub endpoint_in: u8,
     pub max_packet_size: u16,
     pub interval_ms: u16,
+    pub protocol: HidKeyboardProtocol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HidKeyboardProtocol {
+    Boot,
+    Report,
 }
 
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
@@ -215,6 +223,12 @@ pub struct HubInfo {
 struct SplitTarget {
     hub_address: u8,
     port: u8,
+}
+
+#[derive(Clone, Copy)]
+enum KeyboardLayout {
+    Boot,
+    AppleReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,8 +322,10 @@ pub struct Controller {
     configuration: Option<ConfigurationInfo>,
     report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
+    keyboard_layout: KeyboardLayout,
     keyboard_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
+    keyboard_nkro_last: [u8; APPLE_NKRO_REPORT_BYTES],
 }
 
 impl Controller {
@@ -539,8 +555,10 @@ impl Controller {
             configuration: None,
             report_descriptor: None,
             keyboard: None,
+            keyboard_layout: KeyboardLayout::Boot,
             keyboard_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
+            keyboard_nkro_last: [0; APPLE_NKRO_REPORT_BYTES],
         })
     }
 
@@ -662,8 +680,8 @@ impl Controller {
         Ok(Some(info))
     }
 
-    /// Select the first HID boot-keyboard interface exposed by the addressed
-    /// device and put it into the fixed eight-byte boot report protocol.
+    /// Select a supported HID keyboard interface exposed by the addressed
+    /// device and configure its boot or report protocol input layout.
     pub fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
         let Some(target) = self.child.or(self.device) else {
             self.keyboard = None;
@@ -760,8 +778,21 @@ impl Controller {
                     bytes,
                     length,
                 });
+                if is_apple_report_keyboard_descriptor(&bytes[..length]) {
+                    self.keyboard = Some(HidKeyboardInfo {
+                        interface: interface.number,
+                        endpoint_in: interface.interrupt_in.unwrap_or(0),
+                        max_packet_size: interface.max_packet_size,
+                        interval_ms: hid_poll_interval_ms(self.speed, interface.interval),
+                        protocol: HidKeyboardProtocol::Report,
+                    });
+                    self.keyboard_layout = KeyboardLayout::AppleReport;
+                    self.keyboard_pid = DataPid::Data0;
+                    self.keyboard_last = [0; HID_REPORT_BYTES];
+                    self.keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
+                }
             }
-            return Ok(None);
+            return Ok(self.keyboard);
         };
 
         self.control_transfer(
@@ -785,8 +816,10 @@ impl Controller {
             &mut [],
         )?;
         self.keyboard = Some(keyboard);
+        self.keyboard_layout = KeyboardLayout::Boot;
         self.keyboard_pid = DataPid::Data0;
         self.keyboard_last = [0; HID_REPORT_BYTES];
+        self.keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
         Ok(Some(keyboard))
     }
 
@@ -939,8 +972,8 @@ impl Controller {
         Ok(Some(info))
     }
 
-    /// Poll one interrupt-IN boot report and return bytes for newly pressed
-    /// keys. A USB NAK is normal idle state and produces an empty batch.
+    /// Poll one interrupt-IN keyboard report and return bytes for newly
+    /// pressed keys. A USB NAK is normal idle state and produces an empty batch.
     pub fn poll_keyboard(&mut self) -> Result<HidInputBatch, Error> {
         let keyboard = self.keyboard.ok_or(Error::NoDevice)?;
         if !self.connected() {
@@ -953,7 +986,7 @@ impl Controller {
             true,
             EndpointType::Interrupt,
             self.keyboard_pid,
-            HID_REPORT_BYTES,
+            usize::from(keyboard.max_packet_size),
             keyboard.max_packet_size,
             1,
         );
@@ -962,15 +995,41 @@ impl Controller {
             Err(Error::Nak) => return Ok(HidInputBatch::new()),
             Err(error) => return Err(error),
         };
-        if actual < HID_REPORT_BYTES {
-            return Err(Error::InvalidDescriptor);
-        }
         self.keyboard_pid = self.keyboard_pid.toggled();
-        let mut report = [0u8; HID_REPORT_BYTES];
-        unsafe { report.copy_from_slice(&dma_bytes()[..HID_REPORT_BYTES]) };
-        let input = decode_hid_report(report, self.keyboard_last);
-        self.keyboard_last = report;
-        Ok(input)
+        match self.keyboard_layout {
+            KeyboardLayout::Boot => {
+                if actual < HID_REPORT_BYTES {
+                    return Err(Error::InvalidDescriptor);
+                }
+                let mut report = [0u8; HID_REPORT_BYTES];
+                unsafe { report.copy_from_slice(&dma_bytes()[..HID_REPORT_BYTES]) };
+                let input = decode_hid_report(report, self.keyboard_last);
+                self.keyboard_last = report;
+                Ok(input)
+            }
+            KeyboardLayout::AppleReport => {
+                let report = unsafe { &dma_bytes()[..actual] };
+                match report.first() {
+                    Some(1) if report.len() >= 9 => {
+                        let mut normalized = [0; HID_REPORT_BYTES];
+                        normalized[0] = report[1];
+                        normalized[2..7].copy_from_slice(&report[3..8]);
+                        let input = decode_hid_report(normalized, self.keyboard_last);
+                        self.keyboard_last = normalized;
+                        Ok(input)
+                    }
+                    Some(2) if report.len() >= APPLE_NKRO_REPORT_BYTES => {
+                        let mut current = [0; APPLE_NKRO_REPORT_BYTES];
+                        current.copy_from_slice(&report[..APPLE_NKRO_REPORT_BYTES]);
+                        let input = decode_apple_nkro_report(current, self.keyboard_nkro_last);
+                        self.keyboard_nkro_last = current;
+                        Ok(input)
+                    }
+                    Some(_) => Ok(HidInputBatch::new()),
+                    None => Err(Error::InvalidDescriptor),
+                }
+            }
+        }
     }
 
     /// Execute one USB control request on the currently addressed endpoint 0.
@@ -1589,6 +1648,7 @@ fn parse_hid_keyboard_configuration(
                                 endpoint_in: address,
                                 max_packet_size: max_packet,
                                 interval_ms: hid_poll_interval_ms(speed, descriptors[offset + 6]),
+                                protocol: HidKeyboardProtocol::Boot,
                             });
                         }
                     }
@@ -1599,6 +1659,25 @@ fn parse_hid_keyboard_configuration(
         offset += length;
     }
     Ok((configuration, keyboard))
+}
+
+fn is_apple_report_keyboard_descriptor(descriptor: &[u8]) -> bool {
+    const ARRAY_REPORT: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15,
+        0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+        0x95, 0x05, 0x75, 0x08,
+    ];
+    const NKRO_REPORT: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x02, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15,
+        0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x19, 0x00, 0x29, 0x67, 0x95, 0x68,
+        0x81, 0x02,
+    ];
+    descriptor
+        .windows(ARRAY_REPORT.len())
+        .any(|window| window == ARRAY_REPORT)
+        && descriptor
+            .windows(NKRO_REPORT.len())
+            .any(|window| window == NKRO_REPORT)
 }
 
 fn hid_poll_interval_ms(speed: Speed, interval: u8) -> u16 {
@@ -1622,6 +1701,25 @@ fn decode_hid_report(
             continue;
         }
         let (bytes, length) = hid_key_bytes(key, report[0]);
+        for byte in &bytes[..length] {
+            input.push(*byte);
+        }
+    }
+    input
+}
+
+fn decode_apple_nkro_report(
+    report: [u8; APPLE_NKRO_REPORT_BYTES],
+    previous: [u8; APPLE_NKRO_REPORT_BYTES],
+) -> HidInputBatch {
+    let mut input = HidInputBatch::new();
+    for key in 4u8..=103 {
+        let byte = 2 + usize::from(key / 8);
+        let mask = 1 << (key % 8);
+        if report[byte] & mask == 0 || previous[byte] & mask != 0 {
+            continue;
+        }
+        let (bytes, length) = hid_key_bytes(key, report[1]);
         for byte in &bytes[..length] {
             input.push(*byte);
         }
@@ -2125,6 +2223,7 @@ mod tests {
                 endpoint_in: 0x81,
                 max_packet_size: 8,
                 interval_ms: 10,
+                protocol: HidKeyboardProtocol::Boot,
             })
         );
         assert_eq!(hid_poll_interval_ms(Speed::High, 4), 1);
@@ -2141,5 +2240,35 @@ mod tests {
 
         let control = decode_hid_report([1, 0, 6, 0, 0, 0, 0, 0], [0; 8]);
         assert_eq!(control.as_slice(), &[3]);
+    }
+
+    #[test]
+    fn apple_report_keyboard_layout_and_nkro_reports_are_supported() {
+        let mut descriptor = [0; 96];
+        let array = [
+            0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08,
+            0x81, 0x01, 0x95, 0x05, 0x75, 0x08,
+        ];
+        let nkro = [
+            0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x02, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x19, 0x00, 0x29, 0x67,
+            0x95, 0x68, 0x81, 0x02,
+        ];
+        descriptor[..array.len()].copy_from_slice(&array);
+        descriptor[48..48 + nkro.len()].copy_from_slice(&nkro);
+        assert!(is_apple_report_keyboard_descriptor(&descriptor));
+
+        let mut report = [0; APPLE_NKRO_REPORT_BYTES];
+        report[0] = 2;
+        report[1] = 2;
+        report[2] |= 1 << 4;
+        assert_eq!(
+            decode_apple_nkro_report(report, [0; APPLE_NKRO_REPORT_BYTES]).as_slice(),
+            b"A"
+        );
+        assert!(decode_apple_nkro_report(report, report)
+            .as_slice()
+            .is_empty());
     }
 }

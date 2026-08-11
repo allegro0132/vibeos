@@ -524,13 +524,14 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     }
     match snapshot.keyboard {
         Some(keyboard) => output.push_str(&format!(
-            "  HID boot-keyboard interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            "  HID keyboard protocol={:?} interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            keyboard.protocol,
             keyboard.interface,
             keyboard.endpoint_in,
             keyboard.max_packet_size,
             keyboard.interval_ms,
         )),
-        None => output.push_str("  HID boot-keyboard not configured\n"),
+        None => output.push_str("  HID keyboard not configured\n"),
     }
     Ok(output)
 }

@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use vibeos_core::cap::{PersistentCapIdentity, PersistentResourceWitness, Rights};
-use vibeos_core::durable::{
+use vibeos_durable_format::{
     GrantFlags, RecoveredGrant, RecoveredObject, RecoveredSlot, RecoveredStore,
 };
 use vibeos_core::program::{self, ProgramArtifact, PROGRAM_ROOT_RIGHTS, PROGRAM_ROOT_SLOT};

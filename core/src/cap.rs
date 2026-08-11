@@ -23,7 +23,7 @@ use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-use crate::durable::{
+use vibeos_durable_format::{
     DerivationId, DurableRights, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
     ResourceKind, SlotIdentity, SpaceId,
 };

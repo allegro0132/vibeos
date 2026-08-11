@@ -1,4 +1,4 @@
-use vibeos_core::durable::{
+use vibeos_durable_format::{
     preflight_recovery, preview_grant_transaction, DerivationId, DurableRights, GrantFlags,
     GrantRecord, ObjectId, ObjectKind, RecordBody, RecordChain, RecoveredGrant, RecoveryError,
     ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint, SlotIdentity, SpaceId, StoreId,
@@ -266,7 +266,7 @@ fn test_recovered_grant(
 }
 
 fn two_root_preflight() -> (
-    vibeos_core::durable::RecoveryPreflight,
+    vibeos_durable_format::RecoveryPreflight,
     RootConstraint,
     RootConstraint,
 ) {

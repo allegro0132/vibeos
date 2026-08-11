@@ -8,8 +8,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::durable::{crc32c, preflight_recovery, Crc32cDigest, ObjectId, StoreId, TransactionId};
-pub use crate::durable::{
+use vibeos_durable_format::{
+    crc32c, preflight_recovery, Crc32cDigest, ObjectId, StoreId, TransactionId,
+};
+pub use vibeos_durable_format::{
     ChainCheckpoint, DecodeError, DecodeStatus, DecodedRecord, EncodeError,
     LogRecord as StoreRecord, ObjectChunk, ObjectCommit, ObjectKind, ObjectMetadata, RecordBody,
     RecordChain, RecoveredObject, RecoveryError, CHUNK_DATA_SIZE, CRC_OFFSET, FORMAT_VERSION,

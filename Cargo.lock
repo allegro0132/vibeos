@@ -745,7 +745,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vibeos-authority-store"
 version = "0.1.0"
 dependencies = [
- "vibeos-core",
+ "vibeos-durable-format",
  "vibeos-object-store",
 ]
 
@@ -769,6 +769,7 @@ version = "0.1.0"
 dependencies = [
  "chacha20 0.10.1",
  "subtle",
+ "vibeos-durable-format",
  "vibeos-hal",
  "zeroize",
 ]
@@ -843,6 +844,10 @@ name = "vibeos-driver-xhci"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-durable-format"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
@@ -883,6 +888,7 @@ dependencies = [
  "vibeos-driver-virtio-net",
  "vibeos-driver-virtio-rng",
  "vibeos-driver-xhci",
+ "vibeos-durable-format",
  "vibeos-hal",
  "vibeos-image-policy",
  "vibeos-kernel-acceptance",
@@ -925,6 +931,7 @@ name = "vibeos-object-store"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-durable-format",
 ]
 
 [[package]]
@@ -932,6 +939,7 @@ name = "vibeos-program-store"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-durable-format",
  "vibeos-object-store",
  "vibeos-rustc",
 ]

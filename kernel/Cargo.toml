@@ -50,6 +50,7 @@ bench = false
 vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
 vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-core = { path = "../core" }
+vibeos-durable-format = { path = "../durable-format" }
 vibeos-driver-dwmac-net = { path = "../drivers/dwmac-net", optional = true }
 vibeos-driver-milkv-duo-led = { path = "../drivers/milkv-duo-led", optional = true }
 vibeos-driver-pci = { path = "../drivers/pci", optional = true }

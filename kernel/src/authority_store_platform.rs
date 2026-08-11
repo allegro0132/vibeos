@@ -21,8 +21,9 @@ use vibeos_core::cap::{
     InvocationLease, PendingSlotReservation, PersistentCapIdentity, PersistentDerivationWitness,
     PersistentResourceWitness, Resource, Rights,
 };
-use vibeos_core::durable::{
-    self, DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant,
+use vibeos_durable_format as durable;
+use vibeos_durable_format::{
+    DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant,
     RecoveredSlot, RecoveredStore, RootConstraint, RootRightsConstraint, SlotIdentity,
     TransactionId,
 };

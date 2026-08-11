@@ -22,7 +22,9 @@ pub struct ConsoleDev {
 
 impl ConsoleDev {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { bytes: AtomicU64::new(0) })
+        Arc::new(Self {
+            bytes: AtomicU64::new(0),
+        })
     }
 
     pub fn write(&self, s: &str) {
@@ -43,13 +45,17 @@ impl Resource for ConsoleDev {
         "console"
     }
     fn describe(&self) -> String {
-        format!("ns16550a @ {:#x} [{} bytes out]", uart::UART_BASE, self.bytes.load(Ordering::Relaxed))
+        format!(
+            "{} @ {:#x} [{} bytes out]",
+            uart::variant_name(),
+            uart::UART_BASE,
+            self.bytes.load(Ordering::Relaxed)
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
-
 
 /// A fixed slice of memory a component may be granted.
 ///

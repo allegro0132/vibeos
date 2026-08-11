@@ -264,7 +264,6 @@ const BANNER: &str = r#"
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    #[cfg(feature = "milkv-duo")]
     uart::early_write("\r\n[VibeOS] entry\r\n");
     exec::configure_timebase(platform::TIMEBASE_HZ);
     let boot_time = sbi::time();
@@ -273,10 +272,8 @@ pub extern "C" fn kmain() -> ! {
     let boot_physical_hart = sbi::current_hart_id();
 
     mmu::init_boot(boot_physical_hart);
-    #[cfg(feature = "milkv-duo")]
     uart::early_write("[VibeOS] page tables ready\r\n");
     mmu::enable(exec::HartId::BOOT.index());
-    #[cfg(feature = "milkv-duo")]
     uart::early_write("[VibeOS] Sv39 enabled\r\n");
 
     #[cfg(feature = "milkv-duo")]
@@ -458,16 +455,13 @@ pub extern "C" fn kmain() -> ! {
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();
-    #[cfg(feature = "milkv-duo")]
-    {
-        uart::early_write("[VibeOS] interrupts enabled\r\n");
-        let (busy, phantom_timeout) = uart::dw_irq_recoveries();
-        if busy != 0 || phantom_timeout != 0 {
-            println!(
-                "  uart      recovered {} DW busy, {} phantom timeout IRQ(s)",
-                busy, phantom_timeout
-            );
-        }
+    uart::early_write("[VibeOS] interrupts enabled\r\n");
+    let (busy, phantom_timeout) = uart::dw_irq_recoveries();
+    if busy != 0 || phantom_timeout != 0 {
+        println!(
+            "  uart      recovered {} DW busy, {} phantom timeout IRQ(s)",
+            busy, phantom_timeout
+        );
     }
     exec::run()
 }

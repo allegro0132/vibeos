@@ -3,7 +3,9 @@
 //! Board support description for QEMU's RISC-V `virt` machine.
 
 use vibeos_hal::{
-    AddressRange, Board as BoardContract, BoardInfo, MemoryRegion, PlicDescription, UartDescription,
+    AddressRange, Board as BoardContract, BoardInfo, ConsoleCapabilities, IdentityMapping,
+    MemoryAttributes, MemoryRegion, MmuDescription, PlicDescription, UartDescription, UartQuirks,
+    UartVariant,
 };
 
 pub const NAME: &str = "QEMU virt";
@@ -30,6 +32,10 @@ pub const PCI_INTX_FIRST_IRQ: u32 = 32;
 pub const TIMEBASE_HZ: u64 = 10_000_000;
 pub const VIRTIO_MMIO_SLOTS: usize = 8;
 pub const HART_IDS: &[usize] = &[0, 1, 2, 3];
+pub const CONSOLE_CAPABILITIES: ConsoleCapabilities = ConsoleCapabilities {
+    early_uart: false,
+    usb_keyboard_input: true,
+};
 
 pub const MEMORY_MAP: &[MemoryRegion] = &[
     MemoryRegion::ram("kernel RAM", RAM_START, RAM_END),
@@ -40,6 +46,22 @@ pub const MEMORY_MAP: &[MemoryRegion] = &[
     MemoryRegion::mmio("PCI MMIO", PCI_MMIO_START, PCI_MMIO_END),
 ];
 
+pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
+    IdentityMapping::pages("platform devices", DEVICE_MMIO_START, DEVICE_MMIO_END),
+    IdentityMapping::megapages("PCI ECAM", PCI_ECAM_START, PCI_ECAM_END),
+    IdentityMapping::pages("PCI I/O", PCI_IO_START, PCI_IO_END),
+    IdentityMapping::gigapages("PCI MMIO", PCI_MMIO_START, PCI_MMIO_END),
+];
+
+pub const MMU: MmuDescription = MmuDescription {
+    ram: AddressRange::new(RAM_START, RAM_END),
+    ram_attributes: MemoryAttributes::Standard,
+    mmio_attributes: MemoryAttributes::Standard,
+    identity_mappings: MMIO_MAPPINGS,
+    device_level1_tables: 1,
+    device_level0_tables: 4,
+};
+
 pub struct Board;
 
 impl BoardContract for Board {
@@ -47,19 +69,23 @@ impl BoardContract for Board {
         name: NAME,
         timebase_hz: TIMEBASE_HZ,
         uart: UartDescription {
+            variant: UartVariant::Ns16550,
             registers: AddressRange::new(UART_BASE, UART_BASE + 0x100),
             irq: UART_IRQ,
             register_shift: UART_REG_SHIFT,
             register_width: UART_REG_WIDTH,
             clock_hz: UART_CLOCK_HZ,
             baud: UART_BAUD,
+            quirks: UartQuirks::NONE,
         },
         plic: PlicDescription {
             registers: AddressRange::new(PLIC_BASE, PLIC_MMIO_END),
             max_irq: PLIC_MAX_IRQ,
         },
+        console: CONSOLE_CAPABILITIES,
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
+    const MMU: MmuDescription = MMU;
     const HART_IDS: &'static [usize] = HART_IDS;
 
     fn plic_s_context(physical_hart: usize) -> Option<usize> {
@@ -82,8 +108,19 @@ mod tests {
     #[test]
     fn description_matches_legacy_contract() {
         assert_eq!(<Board as BoardContract>::INFO.uart.irq, UART_IRQ);
+        assert_eq!(
+            <Board as BoardContract>::INFO.uart.variant,
+            UartVariant::Ns16550
+        );
+        assert_eq!(<Board as BoardContract>::INFO.console, CONSOLE_CAPABILITIES);
         assert_eq!(<Board as BoardContract>::HART_IDS, &[0, 1, 2, 3]);
         assert_eq!(plic_s_context(3), Some(7));
         assert!(MEMORY_MAP.iter().all(|region| !region.range.is_empty()));
+        assert_eq!(<Board as BoardContract>::MMU, MMU);
+        assert!(MMIO_MAPPINGS.iter().all(|mapping| {
+            !mapping.range.is_empty()
+                && mapping.range.start % mapping.granularity.bytes() == 0
+                && mapping.range.end % mapping.granularity.bytes() == 0
+        }));
     }
 }

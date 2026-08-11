@@ -4,8 +4,8 @@
 //! kernel RAM and the selected board's MMIO regions at identical virtual and
 //! physical addresses. RAM uses 4 KiB leaves from the outset so later guard,
 //! W^X, and read-only milestones can change one page without splitting a live
-//! superpage. Separate device level-1 tables cover CV1800B's UART and PLIC,
-//! which reside in different Sv39 1 GiB root slots.
+//! superpage. A fixed early table pool is populated from the selected BSP's
+//! typed identity-map descriptors without allocation.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -15,18 +15,26 @@ use crate::exec;
 use crate::sync::SpinLock;
 use sv39::{PageAttributes, PagePermissions, PageTableEntry};
 use vibeos_core::mmu as sv39;
+use vibeos_hal::{Board as BoardContract, MappingGranularity, MemoryAttributes};
 
-pub const KERNEL_RAM_START: usize = crate::platform::RAM_START;
-pub const KERNEL_RAM_END: usize = crate::platform::RAM_END;
-pub const PLIC_START: usize = crate::platform::PLIC_BASE;
-pub const PLIC_END: usize = crate::platform::PLIC_MMIO_END;
+pub const KERNEL_RAM_START: usize = crate::platform::MMU.ram.start;
+pub const KERNEL_RAM_END: usize = crate::platform::MMU.ram.end;
+const PLIC: vibeos_hal::PlicDescription =
+    <crate::platform::Board as BoardContract>::INFO.plic;
+pub const PLIC_START: usize = PLIC.registers.start;
+pub const PLIC_END: usize = PLIC.registers.end;
+// Compatibility aliases used by the existing in-kernel acceptance suite. The
+// mapping itself is sourced exclusively from the board's MMU descriptors.
 pub const UART_VIRTIO_START: usize = crate::platform::DEVICE_MMIO_START;
 pub const UART_VIRTIO_END: usize = crate::platform::DEVICE_MMIO_END;
 pub const STACK_GUARD_SIZE: usize = sv39::PAGE_SIZE;
 pub const STACK_SLOT_STRIDE: usize = 256 * 1024;
 
 const MEGAPAGE_SIZE: usize = 2 * 1024 * 1024;
+const GIGAPAGE_SIZE: usize = 1024 * 1024 * 1024;
 const RAM_LEVEL0_TABLES: usize = (KERNEL_RAM_END - KERNEL_RAM_START) / MEGAPAGE_SIZE;
+const MAX_DEVICE_LEVEL1_TABLES: usize = 2;
+const MAX_DEVICE_LEVEL0_TABLES: usize = 5;
 const PLIC_ENABLE_PAGE: usize = PLIC_START + 0x2000;
 pub const PLIC_CONTEXT_START: usize = PLIC_START + 0x20_0000;
 
@@ -36,22 +44,6 @@ const TEXT_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermis
 const EXECUTABLE_PERMISSIONS: PagePermissions = PagePermissions::EXECUTE;
 const MMIO_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
 const STACK_PERMISSIONS: PagePermissions = WRITABLE_PERMISSIONS;
-
-#[cfg(feature = "qemu-virt")]
-const RAM_ATTRIBUTES: PageAttributes = PageAttributes::NONE;
-#[cfg(feature = "qemu-virt")]
-const MMIO_ATTRIBUTES: PageAttributes = PageAttributes::NONE;
-
-// CV1800B's C906 implements the pre-standard T-Head C9xx PTE memory-type
-// extension. Match the vendor Linux port: normal RAM is shareable, cacheable,
-// and bufferable; device pages are shareable and strongly ordered.
-#[cfg(feature = "milkv-duo")]
-const RAM_ATTRIBUTES: PageAttributes = PageAttributes::THEAD_SHAREABLE
-    .union(PageAttributes::THEAD_CACHEABLE)
-    .union(PageAttributes::THEAD_BUFFERABLE);
-#[cfg(feature = "milkv-duo")]
-const MMIO_ATTRIBUTES: PageAttributes =
-    PageAttributes::THEAD_SHAREABLE.union(PageAttributes::THEAD_STRONG_ORDER);
 
 extern "C" {
     static __stacks_bottom: u8;
@@ -81,17 +73,8 @@ impl PageTable {
 #[repr(C)]
 struct AddressSpace {
     root: PageTable,
-    plic_level1: PageTable,
-    devices_level1: PageTable,
-    plic_control_level0: PageTable,
-    plic_context_level0: PageTable,
-    uart_virtio_level0: PageTable,
-    #[cfg(feature = "qemu-virt")]
-    pci_io_level0: PageTable,
-    #[cfg(feature = "milkv-duo")]
-    sdhci_level0: PageTable,
-    #[cfg(feature = "milkv-duo")]
-    soc_control_level0: PageTable,
+    device_level1: [PageTable; MAX_DEVICE_LEVEL1_TABLES],
+    device_level0: [PageTable; MAX_DEVICE_LEVEL0_TABLES],
     ram_level1: PageTable,
     ram_level0: [PageTable; RAM_LEVEL0_TABLES],
 }
@@ -100,17 +83,8 @@ impl AddressSpace {
     const fn empty() -> Self {
         Self {
             root: PageTable::empty(),
-            plic_level1: PageTable::empty(),
-            devices_level1: PageTable::empty(),
-            plic_control_level0: PageTable::empty(),
-            plic_context_level0: PageTable::empty(),
-            uart_virtio_level0: PageTable::empty(),
-            #[cfg(feature = "qemu-virt")]
-            pci_io_level0: PageTable::empty(),
-            #[cfg(feature = "milkv-duo")]
-            sdhci_level0: PageTable::empty(),
-            #[cfg(feature = "milkv-duo")]
-            soc_control_level0: PageTable::empty(),
+            device_level1: [const { PageTable::empty() }; MAX_DEVICE_LEVEL1_TABLES],
+            device_level0: [const { PageTable::empty() }; MAX_DEVICE_LEVEL0_TABLES],
             ram_level1: PageTable::empty(),
             ram_level0: [const { PageTable::empty() }; RAM_LEVEL0_TABLES],
         }
@@ -170,149 +144,32 @@ pub fn init_boot(boot_physical_hart: usize) {
     // fresh `AddressSpace::empty()` here: materializing the large page-table
     // hierarchy can create a temporary larger than the boot hart's stack.
 
-    tables.root.entries[sv39::vpn_index(PLIC_START, 2)] =
-        PageTableEntry::table(table_address(&tables.plic_level1))
-            .expect("PLIC level-1 table is page aligned");
     tables.root.entries[sv39::vpn_index(KERNEL_RAM_START, 2)] =
         PageTableEntry::table(table_address(&tables.ram_level1))
             .expect("RAM level-1 table is page aligned");
-
-    link_level0(
-        &mut tables.plic_level1,
-        PLIC_START,
-        &tables.plic_control_level0,
+    assert!(
+        crate::platform::MMU.device_level1_tables <= MAX_DEVICE_LEVEL1_TABLES,
+        "board MMU description exceeds the static level-1 table pool"
     );
-    link_level0(
-        &mut tables.plic_level1,
-        PLIC_CONTEXT_START,
-        &tables.plic_context_level0,
+    assert!(
+        crate::platform::MMU.device_level0_tables <= MAX_DEVICE_LEVEL0_TABLES,
+        "board MMU description exceeds the static level-0 table pool"
     );
-    if sv39::vpn_index(UART_VIRTIO_START, 2) == sv39::vpn_index(PLIC_START, 2) {
-        link_level0(
-            &mut tables.plic_level1,
-            megapage_base(UART_VIRTIO_START),
-            &tables.uart_virtio_level0,
-        );
-    } else {
-        tables.root.entries[sv39::vpn_index(UART_VIRTIO_START, 2)] =
-            PageTableEntry::table(table_address(&tables.devices_level1))
-                .expect("device level-1 table is page aligned");
-        link_level0(
-            &mut tables.devices_level1,
-            megapage_base(UART_VIRTIO_START),
-            &tables.uart_virtio_level0,
-        );
-    }
-    map_page(
-        &mut tables.plic_control_level0,
-        PLIC_START,
-        MMIO_PERMISSIONS,
-    );
-    map_page(
-        &mut tables.plic_control_level0,
-        PLIC_ENABLE_PAGE,
-        MMIO_PERMISSIONS,
-    );
-    map_page(
-        &mut tables.plic_context_level0,
-        plic_s_context_page(boot_physical_hart).expect("boot physical hart is in range"),
-        MMIO_PERMISSIONS,
-    );
-    for physical in (UART_VIRTIO_START..UART_VIRTIO_END).step_by(sv39::PAGE_SIZE) {
-        map_page(&mut tables.uart_virtio_level0, physical, MMIO_PERMISSIONS);
-    }
-    #[cfg(feature = "qemu-virt")]
     {
-        // The complete ECAM is architected as one 256 MiB identity aperture.
-        // Two-MiB leaves avoid dedicating 128 level-0 page tables merely to
-        // discover functions on secondary buses.
-        for physical in (crate::platform::PCI_ECAM_START..crate::platform::PCI_ECAM_END)
-            .step_by(MEGAPAGE_SIZE)
-        {
-            map_megapage(&mut tables.plic_level1, physical, MMIO_PERMISSIONS);
-        }
+        let mut mapper = BootIdentityMapper::new(tables);
 
-        // PCI port I/O is memory mapped by GPEX. Keep it page-granular because
-        // the surrounding 2 MiB window is not part of the host aperture.
-        link_level0(
-            &mut tables.plic_level1,
-            megapage_base(crate::platform::PCI_IO_START),
-            &tables.pci_io_level0,
+        // PLIC mappings are intentionally sparse: only global control, the
+        // enable page, and the boot supervisor context are accessible initially.
+        mapper.map_page(PLIC_START);
+        mapper.map_page(PLIC_ENABLE_PAGE);
+        mapper.map_page(
+            plic_s_context_page(boot_physical_hart).expect("boot physical hart is in range"),
         );
-        for physical in (crate::platform::PCI_IO_START..crate::platform::PCI_IO_END)
-            .step_by(sv39::PAGE_SIZE)
-        {
-            map_page(&mut tables.pci_io_level0, physical, MMIO_PERMISSIONS);
-        }
 
-        // 0x4000_0000 is both 1 GiB aligned and exactly one root entry below
-        // RAM. A gigapage leaf covers every 32-bit BAR without allocating more
-        // page-table memory or permitting access to the RAM root entry.
-        let pci_mmio = crate::platform::PCI_MMIO_START;
-        assert_eq!(pci_mmio % (1usize << 30), 0);
-        assert_eq!(crate::platform::PCI_MMIO_END - pci_mmio, 1usize << 30);
-        tables.root.entries[sv39::vpn_index(pci_mmio, 2)] =
-            PageTableEntry::leaf_with_attributes(pci_mmio, MMIO_PERMISSIONS, MMIO_ATTRIBUTES)
-                .expect("PCI MMIO gigapage is architecturally valid");
-    }
-    #[cfg(feature = "milkv-duo")]
-    {
-        // Ethernet shares UART0's 2 MiB level-0 table. SDIO0 resides in the
-        // next 2 MiB window and therefore needs its own level-0 table.
-        debug_assert_eq!(
-            megapage_base(crate::platform::ETHERNET_BASE),
-            megapage_base(UART_VIRTIO_START)
-        );
-        for physical in (crate::platform::ETHERNET_BASE
-            ..crate::platform::ETHERNET_MMIO_END)
-            .step_by(sv39::PAGE_SIZE)
-        {
-            map_page(&mut tables.uart_virtio_level0, physical, MMIO_PERMISSIONS);
+        for mapping in crate::platform::MMU.identity_mappings {
+            mapper.map_range(*mapping);
         }
-        link_level0(
-            &mut tables.devices_level1,
-            megapage_base(crate::platform::SDHCI_BASE),
-            &tables.sdhci_level0,
-        );
-        for physical in
-            (crate::platform::SDHCI_BASE..crate::platform::SDHCI_MMIO_END)
-                .step_by(sv39::PAGE_SIZE)
-        {
-            map_page(&mut tables.sdhci_level0, physical, MMIO_PERMISSIONS);
-        }
-        link_level0(
-            &mut tables.devices_level1,
-            megapage_base(crate::platform::SOC_CONTROL_BASE),
-            &tables.soc_control_level0,
-        );
-        for physical in (crate::platform::SOC_CONTROL_BASE
-            ..crate::platform::SOC_CONTROL_MMIO_END)
-            .step_by(sv39::PAGE_SIZE)
-        {
-            map_page(
-                &mut tables.soc_control_level0,
-                physical,
-                MMIO_PERMISSIONS,
-            );
-        }
-        for physical in (crate::platform::GPIOC_BASE..crate::platform::GPIOC_MMIO_END)
-            .step_by(sv39::PAGE_SIZE)
-        {
-            map_page(
-                &mut tables.soc_control_level0,
-                physical,
-                MMIO_PERMISSIONS,
-            );
-        }
-        for physical in (crate::platform::EFUSE_BASE..crate::platform::EFUSE_MMIO_END)
-            .step_by(sv39::PAGE_SIZE)
-        {
-            map_page(
-                &mut tables.soc_control_level0,
-                physical,
-                MMIO_PERMISSIONS,
-            );
-        }
+        mapper.assert_declared_capacity();
     }
 
     for (table_index, level0) in tables.ram_level0.iter_mut().enumerate() {
@@ -415,7 +272,7 @@ pub fn root_physical() -> usize {
 }
 
 pub fn plic_s_context_page(physical_hart: usize) -> Option<usize> {
-    crate::platform::plic_s_context(physical_hart)
+    <crate::platform::Board as BoardContract>::plic_s_context(physical_hart)
         .map(|context| PLIC_CONTEXT_START + context * sv39::PAGE_SIZE)
 }
 
@@ -614,25 +471,136 @@ pub fn mapping(virtual_address: usize) -> Option<Mapping> {
     None
 }
 
-fn link_level0(level1: &mut PageTable, base: usize, level0: &PageTable) {
-    assert_eq!(base % MEGAPAGE_SIZE, 0);
-    level1.entries[sv39::vpn_index(base, 1)] =
-        PageTableEntry::table(table_address(level0)).expect("device level-0 table is page aligned");
+struct BootIdentityMapper<'a> {
+    tables: &'a mut AddressSpace,
+    level1_roots: [usize; MAX_DEVICE_LEVEL1_TABLES],
+    level1_count: usize,
+    level0_windows: [usize; MAX_DEVICE_LEVEL0_TABLES],
+    level0_count: usize,
 }
 
-fn map_page(level0: &mut PageTable, physical: usize, permissions: PagePermissions) {
-    assert_eq!(physical % sv39::PAGE_SIZE, 0);
-    level0.entries[sv39::vpn_index(physical, 0)] =
-        PageTableEntry::leaf_with_attributes(physical, permissions, MMIO_ATTRIBUTES)
+impl<'a> BootIdentityMapper<'a> {
+    fn new(tables: &'a mut AddressSpace) -> Self {
+        Self {
+            tables,
+            level1_roots: [usize::MAX; MAX_DEVICE_LEVEL1_TABLES],
+            level1_count: 0,
+            level0_windows: [usize::MAX; MAX_DEVICE_LEVEL0_TABLES],
+            level0_count: 0,
+        }
+    }
+
+    fn map_range(&mut self, mapping: vibeos_hal::IdentityMapping) {
+        let step = mapping.granularity.bytes();
+        assert!(
+            !mapping.range.is_empty()
+                && mapping.range.start % step == 0
+                && mapping.range.end % step == 0,
+            "board MMIO mapping is empty or misaligned"
+        );
+        for physical in (mapping.range.start..mapping.range.end).step_by(step) {
+            match mapping.granularity {
+                MappingGranularity::Page4K => self.map_page(physical),
+                MappingGranularity::Megapage2M => self.map_megapage(physical),
+                MappingGranularity::Gigapage1G => self.map_gigapage(physical),
+            }
+        }
+    }
+
+    fn map_page(&mut self, physical: usize) {
+        assert_eq!(physical % sv39::PAGE_SIZE, 0);
+        let table_index = self.ensure_level0(physical);
+        let entry =
+            &mut self.tables.device_level0[table_index].entries[sv39::vpn_index(physical, 0)];
+        assert!(!entry.is_valid(), "board MMIO page mappings overlap");
+        *entry = mmio_leaf(physical, MMIO_PERMISSIONS)
             .expect("identity MMIO page is architecturally valid");
-}
+    }
 
-#[cfg(feature = "qemu-virt")]
-fn map_megapage(level1: &mut PageTable, physical: usize, permissions: PagePermissions) {
-    assert_eq!(physical % MEGAPAGE_SIZE, 0);
-    level1.entries[sv39::vpn_index(physical, 1)] =
-        PageTableEntry::leaf_with_attributes(physical, permissions, MMIO_ATTRIBUTES)
+    fn map_megapage(&mut self, physical: usize) {
+        assert_eq!(physical % MEGAPAGE_SIZE, 0);
+        let table_index = self.ensure_level1(physical);
+        let entry =
+            &mut self.tables.device_level1[table_index].entries[sv39::vpn_index(physical, 1)];
+        assert!(!entry.is_valid(), "board MMIO megapage mappings overlap");
+        *entry = mmio_leaf(physical, MMIO_PERMISSIONS)
             .expect("identity MMIO megapage is architecturally valid");
+    }
+
+    fn map_gigapage(&mut self, physical: usize) {
+        assert_eq!(physical % GIGAPAGE_SIZE, 0);
+        let entry = &mut self.tables.root.entries[sv39::vpn_index(physical, 2)];
+        assert!(!entry.is_valid(), "board MMIO gigapage mappings overlap");
+        *entry = mmio_leaf(physical, MMIO_PERMISSIONS)
+            .expect("identity MMIO gigapage is architecturally valid");
+    }
+
+    fn ensure_level1(&mut self, physical: usize) -> usize {
+        let root_index = sv39::vpn_index(physical, 2);
+        if let Some(index) = self.level1_roots[..self.level1_count]
+            .iter()
+            .position(|candidate| *candidate == root_index)
+        {
+            return index;
+        }
+        assert!(
+            self.level1_count < crate::platform::MMU.device_level1_tables,
+            "board MMIO mappings exhausted the declared level-1 table capacity"
+        );
+        let table_index = self.level1_count;
+        let table_physical = table_address(&self.tables.device_level1[table_index]);
+        let root_entry = &mut self.tables.root.entries[root_index];
+        assert!(
+            !root_entry.is_valid(),
+            "board MMIO mapping overlaps a root entry"
+        );
+        *root_entry =
+            PageTableEntry::table(table_physical).expect("device level-1 table is page aligned");
+        self.level1_roots[table_index] = root_index;
+        self.level1_count += 1;
+        table_index
+    }
+
+    fn ensure_level0(&mut self, physical: usize) -> usize {
+        let window = megapage_base(physical);
+        if let Some(index) = self.level0_windows[..self.level0_count]
+            .iter()
+            .position(|candidate| *candidate == window)
+        {
+            return index;
+        }
+        assert!(
+            self.level0_count < crate::platform::MMU.device_level0_tables,
+            "board MMIO mappings exhausted the declared level-0 table capacity"
+        );
+        let level1_index = self.ensure_level1(physical);
+        let table_index = self.level0_count;
+        let table_physical = table_address(&self.tables.device_level0[table_index]);
+        let level1_entry =
+            &mut self.tables.device_level1[level1_index].entries[sv39::vpn_index(physical, 1)];
+        assert!(
+            !level1_entry.is_valid(),
+            "board MMIO page mapping overlaps a megapage"
+        );
+        *level1_entry =
+            PageTableEntry::table(table_physical).expect("device level-0 table is page aligned");
+        self.level0_windows[table_index] = window;
+        self.level0_count += 1;
+        table_index
+    }
+
+    fn assert_declared_capacity(&self) {
+        assert_eq!(
+            self.level1_count,
+            crate::platform::MMU.device_level1_tables,
+            "board level-1 table declaration is not exact"
+        );
+        assert_eq!(
+            self.level0_count,
+            crate::platform::MMU.device_level0_tables,
+            "board level-0 table declaration is not exact"
+        );
+    }
 }
 
 fn assert_page_range(start: usize, end: usize) {
@@ -784,7 +752,36 @@ fn ram_leaf(
     physical: usize,
     permissions: PagePermissions,
 ) -> Result<PageTableEntry, sv39::PteError> {
-    PageTableEntry::leaf_with_attributes(physical, permissions, RAM_ATTRIBUTES)
+    PageTableEntry::leaf_with_attributes(
+        physical,
+        permissions,
+        page_attributes(crate::platform::MMU.ram_attributes),
+    )
+}
+
+fn mmio_leaf(
+    physical: usize,
+    permissions: PagePermissions,
+) -> Result<PageTableEntry, sv39::PteError> {
+    PageTableEntry::leaf_with_attributes(
+        physical,
+        permissions,
+        page_attributes(crate::platform::MMU.mmio_attributes),
+    )
+}
+
+const fn page_attributes(attributes: MemoryAttributes) -> PageAttributes {
+    match attributes {
+        MemoryAttributes::Standard => PageAttributes::NONE,
+        // CV1800B's C906 implements the pre-standard T-Head C9xx PTE
+        // extension. These values match the vendor Linux memory types.
+        MemoryAttributes::THeadNormal => PageAttributes::THEAD_SHAREABLE
+            .union(PageAttributes::THEAD_CACHEABLE)
+            .union(PageAttributes::THEAD_BUFFERABLE),
+        MemoryAttributes::THeadDevice => {
+            PageAttributes::THEAD_SHAREABLE.union(PageAttributes::THEAD_STRONG_ORDER)
+        }
+    }
 }
 
 fn table_address(table: &PageTable) -> usize {

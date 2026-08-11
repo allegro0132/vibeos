@@ -3,7 +3,6 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-./scripts/prepare-jitterentropy-rs.sh
 
 TCP_TEST_MODE=${1:-echo}
 case "$TCP_TEST_MODE" in

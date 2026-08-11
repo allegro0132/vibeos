@@ -5,3 +5,4 @@
 [submodule "vendor/jitterentropy-rs"]
 	path = vendor/jitterentropy-rs
 	url = https://github.com/qnfm/jitterentropy-rs.git
+	ignore = dirty

@@ -11,30 +11,10 @@ use alloc::string::String;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 
+use vibeos_net_protocol::StaticIpv4Address;
+
 pub const PRIMARY_INTERFACE: &str = "net0";
 pub const COMPAT_INTERFACE: &str = "eth0";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StaticIpv4Address {
-    pub address: [u8; 4],
-    pub prefix_len: u8,
-    pub default_gateway: Option<[u8; 4]>,
-}
-
-impl StaticIpv4Address {
-    pub const fn new(address: [u8; 4], prefix_len: u8) -> Self {
-        Self {
-            address,
-            prefix_len,
-            default_gateway: None,
-        }
-    }
-
-    pub const fn with_default_gateway(mut self, gateway: [u8; 4]) -> Self {
-        self.default_gateway = Some(gateway);
-        self
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ipv4Method {
@@ -47,14 +27,6 @@ pub enum Ipv4Method {
 pub struct NetworkConfiguration {
     pub link_up: bool,
     pub method: Ipv4Method,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ipv4RuntimeStatus {
-    Unconfigured,
-    Static(StaticIpv4Address),
-    DhcpDiscovering,
-    DhcpBound(StaticIpv4Address),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

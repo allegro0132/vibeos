@@ -1,4 +1,4 @@
-use vibeos_core::net_config::{
+use vibeos_netstack::command::{
     parse_dhclient_command, parse_ip_command, DhclientCommand, IpCommand,
 };
 

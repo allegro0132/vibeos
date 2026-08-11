@@ -1,7 +1,7 @@
 //! Portable configurable-IPv4 networking over VibeOS packet endpoints.
 //!
 //! This module is the first protocol layer above the raw Ethernet contract in
-//! [`crate::net`].  It deliberately exposes neither file descriptors nor an
+//! [`vibeos_core::net`]. It deliberately exposes neither file descriptors nor an
 //! ambient NIC. A supervisor resolves two directional packet capabilities as
 //! operation-time [`Revocable`] tokens and hands them to
 //! [`StaticIpv4TcpStack`]. Calling [`StaticIpv4TcpStack::poll_network`] with a
@@ -10,6 +10,8 @@
 //! and separately bounded through [`StaticIpv4TcpStack::try_recv`] and
 //! [`StaticIpv4TcpStack::try_send`]. [`StaticIpv4EchoStack`] remains as the N1
 //! acceptance adapter over that byte-stream API.
+
+#![no_std]
 
 extern crate alloc;
 
@@ -27,10 +29,41 @@ use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
-use crate::cap::Revocable;
-use crate::chan::Endpoint;
-use crate::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
-use crate::net_config::{Ipv4RuntimeStatus, StaticIpv4Address};
+use vibeos_core::cap::Revocable;
+use vibeos_core::chan::Endpoint;
+use vibeos_core::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
+
+/// Static IPv4 address and optional default route shared by network services.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticIpv4Address {
+    pub address: [u8; 4],
+    pub prefix_len: u8,
+    pub default_gateway: Option<[u8; 4]>,
+}
+
+impl StaticIpv4Address {
+    pub const fn new(address: [u8; 4], prefix_len: u8) -> Self {
+        Self {
+            address,
+            prefix_len,
+            default_gateway: None,
+        }
+    }
+
+    pub const fn with_default_gateway(mut self, gateway: [u8; 4]) -> Self {
+        self.default_gateway = Some(gateway);
+        self
+    }
+}
+
+/// Runtime address state published by the bounded IPv4 stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv4RuntimeStatus {
+    Unconfigured,
+    Static(StaticIpv4Address),
+    DhcpDiscovering,
+    DhcpBound(StaticIpv4Address),
+}
 
 /// Bytes reserved in each direction of the single TCP connection.
 pub const TCP_BUFFER_BYTES: usize = 4 * 1024;

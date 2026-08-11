@@ -19,8 +19,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vibeos_core::cap::{Cap, Revocable};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
-use vibeos_core::net_stack::{StackError, StaticIpv4Config, StaticIpv4EchoStack};
+use vibeos_net_protocol::{StackError, StaticIpv4Config, StaticIpv4EchoStack};
 
+pub mod command;
 pub mod config;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -11,4 +11,5 @@ tcp-echo-recovery-test = ["tcp-echo"]
 
 [dependencies]
 vibeos-core = { path = "../../core" }
+vibeos-net-protocol = { path = "../net-protocol" }
 vibeos-vsh = { path = "../vsh", default-features = false }

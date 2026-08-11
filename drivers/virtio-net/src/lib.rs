@@ -10,13 +10,15 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use vibeos_core::net::MAX_PACKET_LEN;
-use vibeos_core::virtio::{
-    self, AvailableRing, Descriptor, ModernInit, NegotiatedFeatures, NetDeviceModel,
-    NetDeviceState, NetOperation, NetQueue, NetResetReason, NetSubmission, UsedElement, UsedRing,
-    VirtioNetHeader, NET_HEADER_SIZE, NET_RECEIVE_QUEUE, NET_TRANSMIT_QUEUE, SPLIT_QUEUE_SIZE,
-    VIRTIO_F_VERSION_1,
+use vibeos_driver_virtio_core as virtio;
+use vibeos_driver_virtio_core::{
+    AvailableRing, Descriptor, ModernInit, NegotiatedFeatures, NetDeviceModel, NetDeviceState,
+    NetOperation, NetQueue, NetResetReason, NetSubmission, UsedElement, UsedRing, VirtioNetHeader,
+    NET_HEADER_SIZE, NET_RECEIVE_QUEUE, NET_TRANSMIT_QUEUE, SPLIT_QUEUE_SIZE, VIRTIO_F_VERSION_1,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
+
+const _: () = assert!(MAX_PACKET_LEN as u32 == virtio::NET_MAX_FRAME_SIZE);
 
 pub const RESET_POLL_BUDGET: usize = 100_000;
 pub const QUEUE_SLOTS: usize = SPLIT_QUEUE_SIZE as usize;

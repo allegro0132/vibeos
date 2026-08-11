@@ -504,7 +504,7 @@ fn take_admitted_outbound(
     outbound: &Revocable<Endpoint<StampedPacket>>,
     sessions: &PacketSessionFence,
 ) -> Result<Option<Packet>, NetError> {
-    for _ in 0..crate::virtio::SPLIT_QUEUE_SIZE {
+    for _ in 0..crate::net_device::FRONTEND_QUEUE_DEPTH {
         let Some(packet) = take_outbound(outbound)? else {
             return Ok(None);
         };

@@ -26,6 +26,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/MMU.md](docs/MMU.md)** — the shared Sv39 map, boot publication
   contract, mapped apertures, per-hart stack guards, and integrity-hardening
   sequence.
+- **[docs/HARDWARE_ARCHITECTURE.md](docs/HARDWARE_ARCHITECTURE.md)** — firmware,
+  BSP, kernel-adapter, and driver-crate boundaries plus compile-time board
+  composition.
 - **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** — single-core Milk-V Duo
   (CV1800B) support, SDK packaging, and hardware validation checklist.
 - **[docs/DURABLE_FORMAT.md](docs/DURABLE_FORMAT.md)** — the stable authority-log
@@ -99,7 +102,11 @@ QEMU golden and benchmark harnesses select that feature explicitly.
 Board selection and final linking live in `firmware/qemu-virt` and
 `firmware/milkv-duo`. Build from one firmware directory at a time so Cargo
 loads `firmware/.cargo/config.toml` and never unifies mutually exclusive board
-features into one kernel archive.
+features into one kernel archive. Each board crate supplies typed hardware
+descriptions; kernel adapters add capabilities, IRQ routing, synchronization,
+and supervision around board-independent `drivers/*` engines. See
+**[docs/HARDWARE_ARCHITECTURE.md](docs/HARDWARE_ARCHITECTURE.md)** for the crate
+boundaries and driver inventory.
 
 The QEMU `virt` port also owns its generic PCI ECAM host: it discovers type-0
 functions, sizes and assigns 32/64-bit BARs, enables bus mastering per driver,

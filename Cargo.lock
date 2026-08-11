@@ -800,15 +800,19 @@ dependencies = [
 name = "vibeos-driver-virtio-blk"
 version = "0.1.0"
 dependencies = [
- "vibeos-core",
+ "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
 ]
+
+[[package]]
+name = "vibeos-driver-virtio-core"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-driver-virtio-mmio"
 version = "0.1.0"
 dependencies = [
- "vibeos-core",
+ "vibeos-driver-virtio-core",
  "vibeos-hal",
 ]
 
@@ -817,6 +821,7 @@ name = "vibeos-driver-virtio-net"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
 ]
 
@@ -824,7 +829,7 @@ dependencies = [
 name = "vibeos-driver-virtio-rng"
 version = "0.1.0"
 dependencies = [
- "vibeos-core",
+ "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
 ]
 
@@ -851,6 +856,10 @@ name = "vibeos-hal"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-image-policy"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -863,11 +872,13 @@ dependencies = [
  "vibeos-driver-pci",
  "vibeos-driver-sdhci-blk",
  "vibeos-driver-virtio-blk",
+ "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",
  "vibeos-driver-virtio-rng",
  "vibeos-driver-xhci",
  "vibeos-hal",
+ "vibeos-image-policy",
  "vibeos-kernel-acceptance",
  "vibeos-netstack",
  "vibeos-object-store",

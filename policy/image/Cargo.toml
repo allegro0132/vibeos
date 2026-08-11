@@ -1,0 +1,9 @@
+[package]
+name = "vibeos-image-policy"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["qemu-default"]
+qemu-default = []
+milkv-duo-sd = []

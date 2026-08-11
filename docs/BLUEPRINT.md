@@ -98,7 +98,8 @@ byte-identical machine code). The *argument* has holes, enumerated honestly in �
    runtime            │  exec (scheduler)   heap   sync            │
                       └────────────────┼──────────────────────────┘
                       ┌────────────────┼──────────────────────────┐
-   hardware           │ trap  plic  uart  virtio-blk/net  sbi/linker│
+   kernel adapters    │ trap  plic  uart  device policy/supervision │
+   drivers + HAL      │ PCI  VirtIO  XHCI  DWMAC  SDHCI  board data │
                       └───────────────────────────────────────────┘
                                        │
                                   OpenSBI (M-mode)
@@ -115,8 +116,11 @@ upward except through a capability it was handed.
 | `cap.rs` | ~600 | Rights, `Cap`, `CSpace`, attenuation, revocation, explicit leases | — |
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
 | `durable.rs` | ~1000 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
-| `virtio.rs` | growing | Pure modern virtio block/net protocol and queue lifecycle models | — |
-| `kernel/virtio_*.rs` | growing | MMIO transport, stable DMA, supervised block/network services | yes |
+| `drivers/virtio-core` | growing | Board-neutral modern VirtIO protocol and queue lifecycle models | — |
+| `hal`, `boards/*` | small | Typed hardware contracts and board-specific descriptions, without device policy | — |
+| `drivers/*` | growing | Board-independent register/protocol engines and explicitly owned DMA storage | yes |
+| `policy/image` | small | Firmware-selected logical media slices and backend-neutral frontend resource limits | — |
+| kernel device adapters | growing | Capabilities, IRQ routing, synchronization and supervision around drivers | yes |
 | `components/netstack` | growing | Capability-confined IPv4/TCP stack, echo service, and network control plane | — |
 | `kernel/netstack_platform.rs` | small | Kernel-private packet/network-control adapter and recovery-only hooks | — |
 | `components/vsh` | small | Interactive VSH loop, cancellation, report rendering, and declarative registration | — |

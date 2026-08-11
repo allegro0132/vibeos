@@ -7,17 +7,29 @@
 #[cfg(all(feature = "qemu-virt", feature = "milkv-duo"))]
 compile_error!("features `qemu-virt` and `milkv-duo` are mutually exclusive");
 
+#[cfg(all(feature = "qemu-default-image", feature = "milkv-duo-sd-image"))]
+compile_error!("image-policy features are mutually exclusive");
+
+#[cfg(all(feature = "qemu-virt", not(feature = "qemu-default-image")))]
+compile_error!("QEMU firmware must select an image policy");
+
+#[cfg(all(feature = "milkv-duo", not(feature = "milkv-duo-sd-image")))]
+compile_error!("Milk-V Duo firmware must select an image policy");
+
 #[cfg(not(any(feature = "qemu-virt", feature = "milkv-duo")))]
 compile_error!("exactly one board feature must be enabled: `qemu-virt` or `milkv-duo`");
 
 #[cfg(all(feature = "qemu-virt", not(feature = "milkv-duo")))]
 mod selected {
     pub use vibeos_bsp_qemu_virt::*;
+    #[allow(unused_imports)]
+    pub use vibeos_image_policy::{BLOCK_DATA_SLICE, NETWORK_FRONTEND};
 }
 
 #[cfg(all(feature = "milkv-duo", not(feature = "qemu-virt")))]
 mod selected {
     pub use vibeos_bsp_milkv_duo::*;
+    pub use vibeos_image_policy::{BLOCK_DATA_SLICE, NETWORK_FRONTEND};
 }
 
 #[cfg(any(

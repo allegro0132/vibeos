@@ -496,15 +496,26 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             ));
             if let Some(endpoint) = interface.interrupt_in {
                 output.push_str(&format!(
-                    " report-len={} interrupt-in={:#04x} mps={} interval={}\n",
+                    " report-len={} interrupt-in={:#04x} mps={} interval={}",
                     interface.hid_report_length,
                     endpoint,
                     interface.max_packet_size,
                     interface.interval,
                 ));
-            } else {
-                output.push_str("\n");
             }
+            if let Some(endpoint) = interface.bulk_in {
+                output.push_str(&format!(
+                    " bulk-in={:#04x} mps={}",
+                    endpoint, interface.bulk_in_max_packet_size,
+                ));
+            }
+            if let Some(endpoint) = interface.bulk_out {
+                output.push_str(&format!(
+                    " bulk-out={:#04x} mps={}",
+                    endpoint, interface.bulk_out_max_packet_size,
+                ));
+            }
+            output.push_str("\n");
         }
     }
     if let Some(report) = snapshot.report_descriptor {
@@ -532,6 +543,16 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             keyboard.interval_ms,
         )),
         None => output.push_str("  HID keyboard not configured\n"),
+    }
+    if let Some(storage) = snapshot.mass_storage {
+        output.push_str(&format!(
+            "  Mass Storage SCSI/Bulk-Only interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} detected\n",
+            storage.interface,
+            storage.endpoint_in,
+            storage.max_packet_size_in,
+            storage.endpoint_out,
+            storage.max_packet_size_out,
+        ));
     }
     Ok(output)
 }

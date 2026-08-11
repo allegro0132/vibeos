@@ -4,8 +4,9 @@ VibeOS pins `jitterentropy-rs` 0.1.1 as a Git submodule at upstream commit
 `c5bd2e17194fe3a04d17f74027bb67622579405f`. The upstream tree and license stay
 unmodified in Git; `patches/jitterentropy-rs/0001-vibeos-qualification.patch`
 adds one qualification-only API behind the crate's `raw-noise` feature plus a
-no-std warning fix. `scripts/prepare-jitterentropy-rs.sh` verifies the exact
-commit and applies that patch idempotently before a Milk-V build.
+no-std warning fix. `scripts/prepare-jitterentropy-rs.sh` verifies the exact,
+clean submodule, exports it to `target/vendor/jitterentropy-rs`, and applies the
+patch only to that generated build copy.
 
 The crate describes itself as a Rust rewrite scaffold, not a certified or
 behaviorally equivalent replacement for the upstream C implementation. VibeOS

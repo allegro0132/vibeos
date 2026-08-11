@@ -56,6 +56,7 @@ Initialize the pinned Sunset fork after cloning the repository:
 
 ```sh
 git submodule update --init --recursive
+./scripts/prepare-jitterentropy-rs.sh
 ```
 
 ```sh
@@ -123,10 +124,10 @@ contains a FAT boot partition plus a raw VibeOS data partition and no Linux root
 filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
 The Milk-V production and optional Jitterentropy probe images use the
-`vendor/jitterentropy-rs` submodule pinned to one upstream commit. The Duo build
-script verifies and idempotently applies the recorded VibeOS qualification
-patch; see `patches/jitterentropy-rs/README.md`. No separate C compiler is
-required.
+`vendor/jitterentropy-rs` submodule pinned to one upstream commit. The
+preparation script keeps that submodule pristine and applies the recorded
+VibeOS qualification patch to `target/vendor/jitterentropy-rs`; see
+`patches/jitterentropy-rs/README.md`. No separate C compiler is required.
 
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
 `nightly-2026-08-01` (including `rust-src` and LLVM tools) in

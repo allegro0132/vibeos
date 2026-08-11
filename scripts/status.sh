@@ -5,6 +5,7 @@ set -eu
 LC_ALL=C
 export LC_ALL
 cd "$(dirname "$0")/.."
+./scripts/prepare-jitterentropy-rs.sh
 
 case $# in
   0) check=0 ;;

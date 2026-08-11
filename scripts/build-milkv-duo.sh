@@ -37,9 +37,7 @@ if [ "$mode_count" -gt 1 ]; then
   exit 2
 fi
 
-if [ "$diagnostic" = false ] && [ "$ssh_acceptance" = false ]; then
-  "$script_dir/prepare-jitterentropy-rs.sh"
-fi
+"$script_dir/prepare-jitterentropy-rs.sh"
 
 toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' \
   "$repo_root/rust-toolchain.toml")

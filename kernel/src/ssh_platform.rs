@@ -388,23 +388,34 @@ pub async fn provisioned_task(
     crate::uart::_print(format_args!(
         "SSH first login: user vibe, password vibeos; authorize an Ed25519 key immediately\n"
     ));
+    let mut provisioning_failure_reported = false;
     loop {
         match crate::ssh_provisioning::ensure_host_key().await {
-            Ok(config) => match crate::ssh_provisioning::install_services(space, config) {
-                Ok((read, invoke, policy)) => {
-                    crate::uart::_print(format_args!(
-                        "SSH host identity verified; starting DHCP SSH on port 22\n"
-                    ));
-                    task(
-                        space, outbound, inbound, control, random, read, invoke, policy,
-                    )
-                    .await;
+            Ok(config) => {
+                provisioning_failure_reported = false;
+                match crate::ssh_provisioning::install_services(space, config) {
+                    Ok((read, invoke, policy)) => {
+                        crate::uart::_print(format_args!(
+                            "SSH host identity verified; starting DHCP SSH on port 22\n"
+                        ));
+                        task(
+                            space, outbound, inbound, control, random, read, invoke, policy,
+                        )
+                        .await;
+                    }
+                    Err(()) => crate::uart::_print(format_args!(
+                        "SSH configuration invalid; refusing to listen\n"
+                    )),
                 }
-                Err(()) => crate::uart::_print(format_args!(
-                    "SSH configuration invalid; refusing to listen\n"
-                )),
-            },
-            Err(_) => {}
+            }
+            Err(error) => {
+                if !provisioning_failure_reported {
+                    crate::uart::_print(format_args!(
+                        "SSH provisioning unavailable ({error:?}); retrying\n"
+                    ));
+                    provisioning_failure_reported = true;
+                }
+            }
         }
         crate::exec::sleep_ms(1000).await;
     }

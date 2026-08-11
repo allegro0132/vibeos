@@ -58,8 +58,8 @@ wake publication, and the timer registry still use the retained locks below.
 | `kernel::dev::MemoryRegion::words` | Invocation admission, exclusive claim, and zeroing | Retain: generated code uses the claimed raw extent directly after admission; no per-load/store lock and no IRQ access |
 | `kernel::world::{Component::instance, Space/CSpace, components, WORLD}` | Supervision and capability graph mutation | Retain: authority/lifecycle control plane and fault recovery; never held across async I/O |
 | `kernel::store::{active, state, INSTALLED_STORE}` | Durable operation claims, state transitions, installation | Retain: cold control/recovery state; media I/O is awaited after unlock |
-| `kernel::durable_cspace::{active, graph, INSTALLED_DURABLE_CSPACE}` | Durable authority recovery/publication | Retain: tombstone/graph transaction and task-stable recovery state |
-| `kernel::saved_program::{running_owner, active, live, INSTALLED_SAVED_PROGRAM}` | Saved artifact run/publication/recovery | Retain: control-plane claims and persisted generation state |
+| `kernel::authority_store_platform::{active, graph, INSTALLED_DURABLE_CSPACE}` | Durable authority recovery/publication adapter | Retain: atomic CSpace transaction and task-stable recovery state |
+| `kernel::program_store_platform::{running_owner, active, live, INSTALLED_SAVED_PROGRAM}` | Saved artifact execution/publication adapter | Retain: control-plane claims and persisted generation state |
 
 ## SpinLock correctness boundary
 

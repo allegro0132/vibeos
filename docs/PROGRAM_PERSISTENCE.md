@@ -1,5 +1,10 @@
 # Program persistence
 
+Canonical artifact revalidation and recovered program-graph authorization live
+in the independent `services/program-store` crate. Kernel-only compilation,
+native execution, policy-cap attenuation, atomic CSpace publication, and
+fault-recovery hooks remain in `kernel/src/program_store_platform.rs`.
+
 M4.5 adds one deliberately fixed durable program entry: `hello`. It is the first
 end-to-end proof that VibeOS can persist code and restore exactly the authority
 under which that code may run.

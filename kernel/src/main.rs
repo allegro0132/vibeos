@@ -74,6 +74,7 @@ mod board_led;
 mod cap_table_pool;
 mod code_pool;
 mod dev;
+#[path = "authority_store_platform.rs"]
 mod durable_cspace;
 #[cfg(feature = "milkv-jitterentropy-probe")]
 mod jitterentropy_probe;
@@ -87,6 +88,7 @@ mod pci;
 mod platform;
 mod plic;
 mod rustc;
+#[path = "program_store_platform.rs"]
 mod saved_program;
 mod selftest;
 #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]

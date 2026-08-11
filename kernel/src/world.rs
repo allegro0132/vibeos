@@ -30,7 +30,7 @@ use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 #[cfg(feature = "milkv-ssh")]
-const SSH_PRODUCTION_MEMORY_BUDGET: usize = 256 * 1024;
+const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
     any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
     not(feature = "milkv-jitterentropy-ssh-probe")

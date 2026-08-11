@@ -3,26 +3,36 @@
 extern crate alloc;
 
 use alloc::{format, string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vibeos_core::cap::Rights;
+use vibeos_core::sync::SpinLock;
 use vibeos_ssh_identity::{
     AuthorizedKeyEntry, AuthorizedKeyPolicyService, CapabilityProfileId, HostSigningService,
     ProvisionedHostSeed, SecurityGeneration, SshEd25519PublicKey,
 };
 use vibeos_vsh::Status;
 
-const SLOT_A: u64 = 16;
-const SLOT_B: u64 = 17;
+const LEGACY_SLOT_A: u64 = 16;
+const LEGACY_SLOT_B: u64 = 17;
+const CONFIG_OBJECT_KIND: u32 = 0x5353_4801;
 const MAGIC: &[u8; 8] = b"VSSHKEY1";
 const VERSION: u16 = 1;
 const FLAG_HOST: u16 = 1;
 const FLAG_CLIENT: u16 = 2;
+const FLAG_CLIENT_KEYPAIR: u16 = 4;
 const CRC_AT: usize = 508;
 const MAX_CLIENT_KEYS: usize = 8;
 const KEYS_AT: usize = 56;
 pub const PROFILE: u32 = 1;
 static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
+static ONBOARDING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static POLICY_CHANGED: AtomicBool = AtomicBool::new(false);
+static POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CLIENT_KEYPAIR: SpinLock<Option<ClientKeyPair>> = SpinLock::new(None);
+
+pub const DEFAULT_USERNAME: &str = "vibe";
+pub const DEFAULT_PASSWORD: &str = "vibeos";
 
 fn erase(bytes: &mut [u8]) {
     for byte in bytes {
@@ -37,10 +47,13 @@ pub struct Config {
     client_keys: [[u8; 32]; MAX_CLIENT_KEYS],
     key_count: u8,
     flags: u16,
+    client_seed: [u8; 32],
+    client_public: [u8; 32],
 }
 impl Drop for Config {
     fn drop(&mut self) {
         erase(&mut self.host_seed);
+        erase(&mut self.client_seed);
     }
 }
 impl Config {
@@ -51,10 +64,16 @@ impl Config {
             client_keys: [[0; 32]; MAX_CLIENT_KEYS],
             key_count: 0,
             flags: 0,
+            client_seed: [0; 32],
+            client_public: [0; 32],
         }
     }
     pub fn complete(&self) -> bool {
-        self.flags == FLAG_HOST | FLAG_CLIENT
+        self.flags & (FLAG_HOST | FLAG_CLIENT) == FLAG_HOST | FLAG_CLIENT
+    }
+
+    fn has_host(&self) -> bool {
+        self.flags & FLAG_HOST != 0
     }
 }
 
@@ -73,6 +92,8 @@ fn encode(config: &Config) -> [u8; 512] {
         let start = KEYS_AT + index * 32;
         out[start..start + 32].copy_from_slice(key);
     }
+    out[320..352].copy_from_slice(&config.client_seed);
+    out[352..384].copy_from_slice(&config.client_public);
     let crc = vibeos_durable_format::crc32c(&out[..CRC_AT]);
     out[CRC_AT..].copy_from_slice(&crc.to_le_bytes());
     out
@@ -87,7 +108,7 @@ fn decode(bytes: &[u8; 512]) -> Option<Config> {
         return None;
     }
     let flags = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
-    if flags & !(FLAG_HOST | FLAG_CLIENT) != 0 {
+    if flags & !(FLAG_HOST | FLAG_CLIENT | FLAG_CLIENT_KEYPAIR) != 0 {
         return None;
     }
     let generation = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
@@ -113,13 +134,46 @@ fn decode(bytes: &[u8; 512]) -> Option<Config> {
         }
         client_keys[index] = key;
     }
+    let mut client_seed = [0u8; 32];
+    let mut client_public = [0u8; 32];
+    client_seed.copy_from_slice(&bytes[320..352]);
+    client_public.copy_from_slice(&bytes[352..384]);
+    if flags & FLAG_CLIENT_KEYPAIR != 0 {
+        if client_seed == [0; 32]
+            || derive_public_key(&client_seed).ok()?.to_bytes() != client_public
+        {
+            return None;
+        }
+    } else if client_seed != [0; 32] || client_public != [0; 32] {
+        return None;
+    }
     Some(Config {
         generation,
         host_seed,
         client_keys,
         key_count: key_count as u8,
         flags,
+        client_seed,
+        client_public,
     })
+}
+
+struct ClientKeyPair {
+    seed: [u8; 32],
+    public: [u8; 32],
+}
+
+impl Drop for ClientKeyPair {
+    fn drop(&mut self) {
+        erase(&mut self.seed);
+    }
+}
+
+fn derive_public_key(seed: &[u8; 32]) -> Result<SshEd25519PublicKey, ()> {
+    let provisioned = ProvisionedHostSeed::from_trusted_bytes(*seed).map_err(|_| ())?;
+    let signer =
+        vibeos_ssh_identity::HostSigner::from_provisioned_seed(provisioned).map_err(|_| ())?;
+    Ok(signer.public_key())
 }
 
 fn block_lease(
@@ -140,9 +194,9 @@ fn block_lease(
     result
 }
 
-pub async fn load() -> Result<Option<Config>, crate::block_device::BlockError> {
-    let a = crate::block_device::read_with(block_lease(Rights::READ)?, SLOT_A).await?;
-    let b = crate::block_device::read_with(block_lease(Rights::READ)?, SLOT_B).await?;
+async fn load_legacy() -> Result<Option<Config>, crate::block_device::BlockError> {
+    let a = crate::block_device::read_with(block_lease(Rights::READ)?, LEGACY_SLOT_A).await?;
+    let b = crate::block_device::read_with(block_lease(Rights::READ)?, LEGACY_SLOT_B).await?;
     Ok(match (decode(&a), decode(&b)) {
         (Some(a), Some(b)) => Some(if a.generation >= b.generation { a } else { b }),
         (Some(a), None) => Some(a),
@@ -151,20 +205,86 @@ pub async fn load() -> Result<Option<Config>, crate::block_device::BlockError> {
     })
 }
 
-async fn store(config: Config) -> Result<(), crate::block_device::BlockError> {
-    let sector = if config.generation & 1 == 0 {
-        SLOT_A
-    } else {
-        SLOT_B
-    };
-    let encoded = encode(&config);
-    crate::block_device::write_with(block_lease(Rights::WRITE)?, sector, encoded).await?;
-    crate::block_device::flush_with(block_lease(Rights::WRITE)?).await?;
-    let observed = crate::block_device::read_with(block_lease(Rights::READ)?, sector).await?;
-    if observed != encoded {
+fn map_store_error(_error: crate::store::StoreError) -> crate::block_device::BlockError {
+    crate::block_device::BlockError::DeviceIo
+}
+
+fn config_journal() -> Result<crate::store::SealedConfigJournal, crate::block_device::BlockError> {
+    let world = crate::world::world();
+    let store = world
+        .store
+        .ok_or(crate::block_device::BlockError::Offline)?;
+    let lease = world.spaces["init"]
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store, Rights::READ)
+        .map_err(|_| crate::block_device::BlockError::PermissionDenied)?;
+    Ok(lease.with(crate::store::StoreService::sealed_config_journal))
+}
+
+async fn latest_object_bytes() -> Result<Option<Vec<u8>>, crate::block_device::BlockError> {
+    let kind = crate::store::journal_object_kind(CONFIG_OBJECT_KIND)
+        .ok_or(crate::block_device::BlockError::Protocol)?;
+    let journal = config_journal()?;
+    journal.latest(kind).await.map_err(map_store_error)
+}
+
+async fn store_encoded(encoded: &[u8; 512]) -> Result<(), crate::block_device::BlockError> {
+    let world = crate::world::world();
+    let init = world.spaces["init"].clone();
+    let store = world
+        .store
+        .ok_or(crate::block_device::BlockError::Offline)?;
+    let lease = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store, Rights::WRITE)
+        .map_err(|_| crate::block_device::BlockError::PermissionDenied)?;
+    let kind = crate::store::journal_object_kind(CONFIG_OBJECT_KIND)
+        .ok_or(crate::block_device::BlockError::Protocol)?;
+    let cap = crate::store::put_with(lease, init.clone(), kind, encoded)
+        .await
+        .map_err(map_store_error)?;
+    let _ = init.0.lock().revoke(cap);
+    let mut observed = latest_object_bytes().await?;
+    let matches = observed.as_deref() == Some(encoded.as_slice());
+    if let Some(bytes) = observed.as_mut() {
+        erase(bytes);
+    }
+    if !matches {
         return Err(crate::block_device::BlockError::DeviceIo);
     }
     Ok(())
+}
+
+pub async fn load() -> Result<Option<Config>, crate::block_device::BlockError> {
+    if let Some(mut bytes) = latest_object_bytes().await? {
+        let Ok(mut encoded): Result<[u8; 512], _> = bytes.as_slice().try_into() else {
+            erase(&mut bytes);
+            return Err(crate::block_device::BlockError::Protocol);
+        };
+        erase(&mut bytes);
+        let decoded = decode(&encoded)
+            .map(Some)
+            .ok_or(crate::block_device::BlockError::Protocol);
+        erase(&mut encoded);
+        return decoded;
+    }
+    let Some(legacy) = load_legacy().await? else {
+        return Ok(None);
+    };
+    let mut encoded = encode(&legacy);
+    let stored = store_encoded(&encoded).await;
+    erase(&mut encoded);
+    stored?;
+    Ok(Some(legacy))
+}
+
+async fn store(config: Config) -> Result<(), crate::block_device::BlockError> {
+    let mut encoded = encode(&config);
+    let result = store_encoded(&encoded).await;
+    erase(&mut encoded);
+    result
 }
 
 fn parse_hex_key(text: &str) -> Result<[u8; 32], Status> {
@@ -187,7 +307,129 @@ fn parse_hex_key(text: &str) -> Result<[u8; 32], Status> {
     Ok(out)
 }
 
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn parse_openssh_key(encoded: &str) -> Result<[u8; 32], Status> {
+    let mut decoded = [0u8; 51];
+    let mut out = 0usize;
+    let mut accumulator = 0u32;
+    let mut bits = 0u8;
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        accumulator = (accumulator << 6) | u32::from(base64_value(byte).ok_or(Status::Usage)?);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            if out == decoded.len() {
+                return Err(Status::Usage);
+            }
+            decoded[out] = (accumulator >> bits) as u8;
+            out += 1;
+            accumulator &= (1u32 << bits).wrapping_sub(1);
+        }
+    }
+    if out != decoded.len()
+        || decoded[..4] != 11u32.to_be_bytes()
+        || &decoded[4..15] != b"ssh-ed25519"
+        || decoded[15..19] != 32u32.to_be_bytes()
+    {
+        return Err(Status::Usage);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded[19..]);
+    SshEd25519PublicKey::from_bytes(key).map_err(|_| Status::Usage)?;
+    Ok(key)
+}
+
+fn parse_public_key(args: &[String]) -> Result<[u8; 32], Status> {
+    match args {
+        [operation, key] if operation == "add" => parse_hex_key(key),
+        [operation, algorithm, encoded, ..] if operation == "add" && algorithm == "ssh-ed25519" => {
+            parse_openssh_key(encoded)
+        }
+        _ => Err(Status::Usage),
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (&left, &right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+pub fn onboarding_password_profile(
+    username: &str,
+    password: &str,
+) -> Option<vibeos_sshd::AuthorizedProfile> {
+    if !ONBOARDING_ACTIVE.load(Ordering::Acquire)
+        || !constant_time_eq(username.as_bytes(), DEFAULT_USERNAME.as_bytes())
+        || !constant_time_eq(password.as_bytes(), DEFAULT_PASSWORD.as_bytes())
+    {
+        return None;
+    }
+    onboarding_profile()
+}
+
+pub fn onboarding_profile() -> Option<vibeos_sshd::AuthorizedProfile> {
+    if !ONBOARDING_ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(vibeos_sshd::AuthorizedProfile {
+        generation: POLICY_GENERATION.load(Ordering::Acquire),
+        profile: CapabilityProfileId::new(PROFILE)?,
+    })
+}
+
+pub fn policy_changed() -> bool {
+    POLICY_CHANGED.load(Ordering::Acquire)
+}
+
+pub async fn ensure_host_key() -> Result<Config, crate::block_device::BlockError> {
+    if let Some(config) = load().await? {
+        if config.has_host() {
+            return Ok(config);
+        }
+    }
+    let mut seed = [0u8; 32];
+    crate::jitterentropy_random::fill_seed(&mut seed)
+        .map_err(|_| crate::block_device::BlockError::DeviceIo)?;
+    let mut config = load().await?.unwrap_or_else(Config::empty);
+    config.generation = config
+        .generation
+        .checked_add(1)
+        .ok_or(crate::block_device::BlockError::Protocol)?;
+    config.host_seed = seed;
+    config.flags |= FLAG_HOST;
+    let stored = store(config).await;
+    erase(&mut seed);
+    stored?;
+    load()
+        .await?
+        .ok_or(crate::block_device::BlockError::DeviceIo)
+}
+
 pub fn vsh_keygen(_args: &[String]) -> Result<String, Status> {
+    if CLIENT_KEYPAIR.lock().is_some() {
+        return Ok(String::from(
+            "ssh-keygen: client key already exists; use cat ssh-client-key or cat ssh-client-key.pub\n",
+        ));
+    }
     if UPDATE_BUSY.swap(true, Ordering::AcqRel) {
         return Ok(String::from("SSH provisioning is busy\n"));
     }
@@ -196,38 +438,65 @@ pub fn vsh_keygen(_args: &[String]) -> Result<String, Status> {
         UPDATE_BUSY.store(false, Ordering::Release);
         return Ok(format!("ssh-keygen failed: entropy {:?}\n", error));
     }
+    let public = match derive_public_key(&seed) {
+        Ok(public) => public.to_bytes(),
+        Err(()) => {
+            erase(&mut seed);
+            UPDATE_BUSY.store(false, Ordering::Release);
+            return Ok(String::from("ssh-keygen failed: invalid generated key\n"));
+        }
+    };
     crate::exec::spawn("ssh-keygen", async move {
         let result = async {
             let mut config = load().await?.unwrap_or_else(Config::empty);
+            if config.flags & FLAG_CLIENT_KEYPAIR != 0 {
+                return Err(crate::block_device::BlockError::Protocol);
+            }
             config.generation = config
                 .generation
                 .checked_add(1)
                 .ok_or(crate::block_device::BlockError::Protocol)?;
-            config.host_seed = seed;
-            config.flags |= FLAG_HOST;
+            config.client_seed = seed;
+            config.client_public = public;
+            config.flags |= FLAG_CLIENT_KEYPAIR;
             store(config).await
         }
         .await;
-        let mut erased = seed;
-        erase(&mut erased);
         match result {
-            Ok(()) => crate::uart::_print(format_args!(
-                "ssh-keygen: host key persisted and verified\n"
-            )),
-            Err(error) => crate::uart::_print(format_args!("ssh-keygen failed: {error}\n")),
+            Ok(()) => {
+                *CLIENT_KEYPAIR.lock() = Some(ClientKeyPair { seed, public });
+                crate::uart::_print(format_args!(
+                    "ssh-keygen: client keypair persisted; it was not authorized\n"
+                ));
+            }
+            Err(error) => {
+                let mut seed = seed;
+                erase(&mut seed);
+                crate::uart::_print(format_args!("ssh-keygen failed: {error}\n"));
+            }
         }
         UPDATE_BUSY.store(false, Ordering::Release);
     });
     Ok(String::from(
-        "ssh-keygen: generating and persisting host key...\n",
+        "ssh-keygen: generating and persisting an unregistered client keypair...\n",
     ))
 }
 
-pub fn vsh_authorize(args: &[String]) -> Result<String, Status> {
-    if args.first().map(String::as_str) != Some("add") {
-        return Err(Status::Usage);
+pub fn vsh_keycat(args: &[String]) -> Result<String, Status> {
+    let keypair = CLIENT_KEYPAIR.lock();
+    let keypair = keypair.as_ref().ok_or(Status::Unavailable)?;
+    match args.first().map(String::as_str) {
+        Some("ssh-client-key.pub") => Ok(crate::ssh_key_format::openssh_public(&keypair.public)),
+        Some("ssh-client-key") => Ok(crate::ssh_key_format::openssh_private(
+            &keypair.seed,
+            &keypair.public,
+        )),
+        _ => Err(Status::Usage),
     }
-    let key = parse_hex_key(&args[1])?;
+}
+
+pub fn vsh_authorize(args: &[String]) -> Result<String, Status> {
+    let key = parse_public_key(args)?;
     if UPDATE_BUSY.swap(true, Ordering::AcqRel) {
         return Ok(String::from("SSH provisioning is busy\n"));
     }
@@ -254,9 +523,13 @@ pub fn vsh_authorize(args: &[String]) -> Result<String, Status> {
         }
         .await;
         match result {
-            Ok(()) => crate::uart::_print(format_args!(
-                "ssh-authorize: client key persisted; SSH will start when configuration is complete\n"
-            )),
+            Ok(()) => {
+                ONBOARDING_ACTIVE.store(false, Ordering::Release);
+                POLICY_CHANGED.store(true, Ordering::Release);
+                crate::uart::_print(format_args!(
+                    "ssh-authorize: client key persisted; password authentication disabled\n"
+                ));
+            }
             Err(error) => crate::uart::_print(format_args!("ssh-authorize failed: {error}\n")),
         }
         UPDATE_BUSY.store(false, Ordering::Release);
@@ -275,7 +548,7 @@ pub fn install_services(
     ),
     (),
 > {
-    if !config.complete() {
+    if !config.has_host() {
         return Err(());
     }
     let generation = SecurityGeneration::new(config.generation).ok_or(())?;
@@ -293,5 +566,16 @@ pub fn install_services(
     let signer_read = cs.mint(signer.clone(), Rights::READ);
     let signer_invoke = cs.mint(signer, Rights::INVOKE);
     let policy = cs.mint(policy, Rights::READ);
+    *CLIENT_KEYPAIR.lock() = if config.flags & FLAG_CLIENT_KEYPAIR != 0 {
+        Some(ClientKeyPair {
+            seed: config.client_seed,
+            public: config.client_public,
+        })
+    } else {
+        None
+    };
+    POLICY_GENERATION.store(config.generation, Ordering::Release);
+    ONBOARDING_ACTIVE.store(!config.complete(), Ordering::Release);
+    POLICY_CHANGED.store(false, Ordering::Release);
     Ok((signer_read, signer_invoke, policy))
 }

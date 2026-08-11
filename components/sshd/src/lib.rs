@@ -187,7 +187,20 @@ pub trait Platform: Sync {
         policy: Cap,
         key: &SshEd25519PublicKey,
     ) -> Result<Option<AuthorizedProfile>, ()>;
-    fn install_standard_vsh_commands(&self, session: &mut vibeos_vsh::Session);
+    fn onboarding_password_profile(
+        &self,
+        _username: &str,
+        _password: &str,
+    ) -> Option<AuthorizedProfile> {
+        None
+    }
+    fn onboarding_profile(&self) -> Option<AuthorizedProfile> {
+        None
+    }
+    fn security_policy_changed(&self) -> bool {
+        false
+    }
+    fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool);
     #[cfg(feature = "qualification-stream")]
     fn accepts_streaming_exec(&self, _command: &str) -> bool {
         false
@@ -314,8 +327,14 @@ impl Ed25519HostSigner for CapabilityHostSigner<'_> {
 }
 
 #[derive(Clone, Copy)]
+enum AuthCredential {
+    PublicKey(SshEd25519PublicKey),
+    OnboardingPassword,
+}
+
+#[derive(Clone, Copy)]
 struct AuthCandidate {
-    key: SshEd25519PublicKey,
+    credential: AuthCredential,
     profile: AuthorizedProfile,
 }
 
@@ -694,6 +713,12 @@ pub async fn task(
                 component_log!(space, "ssh-test connection reset: {reason}");
                 rebind_reason = Some(reason);
             }
+        }
+
+        if space.security_policy_changed() {
+            wipe(&mut connection_seed);
+            component_log!(space, "SSH security policy changed; restarting listener");
+            return;
         }
 
         if rebind_reason.is_none() {
@@ -1340,14 +1365,33 @@ fn progress_protocol(
             }
             Event::Serv(ServEvent::FirstAuth(event)) => {
                 state.candidate = None;
+                let mut event = event;
+                let onboarding = space.onboarding_profile().is_some();
+                event
+                    .set_auth_methods(onboarding, !onboarding)
+                    .map_err(|_| "authentication-method configuration failed")?;
                 event.reject().map_err(|_| "first-auth rejection failed")?;
                 progressed = true;
             }
             Event::Serv(ServEvent::PasswordAuth(event)) => {
                 state.candidate = None;
-                event
-                    .reject()
-                    .map_err(|_| "password-auth rejection failed")?;
+                let profile = match (event.username(), event.password()) {
+                    (Ok(username), Ok(password)) => {
+                        space.onboarding_password_profile(username, password)
+                    }
+                    _ => None,
+                };
+                state.candidate = profile.map(|profile| AuthCandidate {
+                    credential: AuthCredential::OnboardingPassword,
+                    profile,
+                });
+                if profile.is_some() {
+                    event.allow().map_err(|_| "password-auth allow failed")?;
+                } else {
+                    event
+                        .reject()
+                        .map_err(|_| "password-auth rejection failed")?;
+                }
                 progressed = true;
             }
             Event::Serv(ServEvent::PubkeyAuth(event)) => {
@@ -1567,7 +1611,10 @@ fn authorize(
     if profile.generation != host.generation {
         return Ok(None);
     }
-    Ok(Some(AuthCandidate { key, profile }))
+    Ok(Some(AuthCandidate {
+        credential: AuthCredential::PublicKey(key),
+        profile,
+    }))
 }
 
 fn revalidate_candidate(
@@ -1576,8 +1623,13 @@ fn revalidate_candidate(
     signer: &CapabilityHostSigner<'_>,
     expected: AuthCandidate,
 ) -> Result<bool, &'static str> {
-    Ok(authorize(space, policy_cap, signer, expected.key)?
-        .is_some_and(|candidate| candidate.profile == expected.profile))
+    match expected.credential {
+        AuthCredential::PublicKey(key) => Ok(authorize(space, policy_cap, signer, key)?
+            .is_some_and(|candidate| candidate.profile == expected.profile)),
+        AuthCredential::OnboardingPassword => {
+            Ok(space.onboarding_profile() == Some(expected.profile))
+        }
+    }
 }
 
 fn discard_channel_input(
@@ -2327,7 +2379,11 @@ async fn serve_interactive_shell(
         .ok_or(ConnectionEnd::Reset("SSH shell started without a PTY"))?;
     let cspace = Arc::new(SpinLock::new(CSpace::new("ssh-vsh-session")));
     let mut session = vibeos_vsh::Session::with_cspace(cspace);
-    space.install_standard_vsh_commands(&mut session);
+    let onboarding = matches!(
+        protocol.committed.map(|candidate| candidate.credential),
+        Some(AuthCredential::OnboardingPassword)
+    );
+    space.install_vsh_commands(&mut session, onboarding);
     let mut frontend = TerminalFrontend::new();
 
     let repl = run_shell_repl(
@@ -2405,6 +2461,11 @@ async fn execute_with_network(
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+    let onboarding = matches!(
+        protocol.committed.map(|candidate| candidate.credential),
+        Some(AuthCredential::OnboardingPassword)
+    );
+    space.install_vsh_commands(&mut session, onboarding);
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
@@ -2774,6 +2835,9 @@ fn validate_network_authority(
     bound_epoch: u64,
     require_carrier: bool,
 ) -> Result<(), &'static str> {
+    if space.security_policy_changed() {
+        return Err("SSH security policy changed");
+    }
     let info = device_info(space, control).ok_or("network control authority was revoked")?;
     if info.quarantined {
         return Err("network device was quarantined");

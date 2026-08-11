@@ -118,6 +118,8 @@ mod rustc;
 mod saved_program;
 #[path = "selftest_platform.rs"]
 mod selftest;
+#[cfg(feature = "milkv-ssh")]
+mod ssh_key_format;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",

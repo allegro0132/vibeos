@@ -624,8 +624,11 @@ Deliberate, not overlooked:
   combinations and subsystems. The acceptance images visibly embed fixed
   fixtures and the Milk-V bring-up image uses deterministic reboot-repeating
   bytes. The production Milk-V image links neither fixture: OSR=3
-  jitterentropy-rs seeds its DRBG, UART `ssh-keygen` creates a per-device host
-  key, and an exact binary client key is stored in a two-slot CRC/readback
-  record before SSH may listen. This is a project deployment decision, not
+  jitterentropy-rs seeds its DRBG and creates a persistent per-device host key
+  on first boot. SSH then exposes a restricted `vibe`/`vibeos` onboarding
+  login; a verified `ssh-authorize` commit permanently switches the device to
+  public-key-only authentication and disconnects that session. Device-side
+  `ssh-keygen` creates a separate, unregistered client key pair. This is a
+  project deployment decision, not
   NIST/CMVP certification; microSD confidentiality, authenticated policy
   updates, and rollback resistance remain open.

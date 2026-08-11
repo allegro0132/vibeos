@@ -260,35 +260,44 @@ docker run --rm --platform linux/amd64 \
 
 The final flashable image is `target/milkv-duo/vibeos-milkv-duo-sd.img`.
 
-On first boot, create an Ed25519 client key on the administrator's computer if
-needed, then convert its public half to the exact binary form accepted by the
-UART provisioning boundary:
+On first boot, VibeOS obtains a fresh Ed25519 host seed from jitterentropy-rs,
+commits the SSH configuration as an immutable object-store version, and starts
+SSH after read-back verification. Existing sector-16/17 provisioning records
+are migrated once into the object store. Connect with the one-time onboarding
+credential:
+
+```sh
+ssh vibe@BOARD_ADDRESS
+# password: vibeos
+```
+
+The password-authenticated VSH exposes only key provisioning commands. Generate
+an Ed25519 client key on the administrator's computer and authorize its public
+half in standard OpenSSH form:
 
 ```sh
 ssh-keygen -t ed25519 -f ~/.ssh/vibeos_duo
-./scripts/ssh-ed25519-key-hex.py ~/.ssh/vibeos_duo.pub
+ssh-authorize add ssh-ed25519 AAAA...comment
 ```
 
-Run these two commands on the board's UART shell, substituting the printed
-64-character value:
+After the authorized-key update is flushed and read back, VibeOS atomically
+disables the default password, disables password authentication, and resets the
+onboarding connection. Subsequent connections are public-key-only. Up to eight
+exact Ed25519 client keys may be added; adding the same key again is idempotent
+and exceeding the bound is rejected. The legacy 64-hex public-key form remains
+accepted on UART.
 
-```text
-ssh-keygen
-ssh-authorize add 0123456789abcdef...64-hex-characters-total...
-```
+The board-side `ssh-keygen` command instead creates an independent client key
+pair and never authorizes it. `cat ssh-client-key.pub` prints its OpenSSH public
+key and `cat ssh-client-key` prints its unencrypted OpenSSH private key. Anyone
+who can read that private-key output can use the key, so transfer it over an
+authenticated session and protect it immediately.
 
-The board-side `ssh-keygen` obtains a fresh 32-byte Ed25519 host seed from
-jitterentropy-rs. Both commands update alternating data-partition sectors with
-a generation and CRC32C, flush, and read back before publication. SSH remains
-closed if either record is missing or invalid. Once both operations report
-success, DHCP starts and SSH listens on port 22 without a reboot. Provisioning
-commands are UART-only and are not installed in remote SSH sessions. Up to
-eight exact Ed25519 client keys may be added; adding the same key again is
-idempotent and exceeding the bound is rejected.
-
-The private host seed is stored on the microSD without encryption; physical
-access to the card can recover or roll back it. CRC32C detects corruption and
-torn writes but is not authentication or rollback protection.
+The host seed, authorized public keys, onboarding-complete state, and optional
+device-generated client key pair are stored on the microSD without encryption;
+physical access to the card can recover private material or roll back policy.
+The object journal detects corruption and torn writes but does not provide
+confidentiality or rollback protection.
 
 After provisioning, connect with:
 

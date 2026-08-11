@@ -34,6 +34,13 @@ use vibeos_core::exec::{self, TaskId};
 use vibeos_core::heap::{self, AllocationDomain, OwnerId};
 use vibeos_core::sync::SpinLock;
 
+fn erase_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
 /// The persistent journal is isolated from the block-driver acceptance sectors
 /// and deliberately bounded so boot-time recovery cannot monopolize the hart.
 pub const STORE_FIRST_SECTOR: u64 = 64;
@@ -431,6 +438,57 @@ impl StoreService {
         AuthorityJournal {
             inner: self.inner.clone(),
         }
+    }
+
+    /// Sealed kernel-only reader for singleton configuration records. It
+    /// exposes neither object IDs nor a general namespace: callers can only
+    /// select the newest immutable object carrying an already-known kind.
+    pub fn sealed_config_journal(&self) -> SealedConfigJournal {
+        SealedConfigJournal {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Kernel-only latest-version view used for small boot configuration objects.
+/// Writes still use the ordinary audited `put_with` path.
+#[derive(Clone)]
+pub struct SealedConfigJournal {
+    inner: Arc<StoreInner>,
+}
+
+impl SealedConfigJournal {
+    pub async fn latest(
+        &self,
+        object_kind: journal::ObjectKind,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        ensure_working_headroom()?;
+        let operation = self.inner.begin()?;
+        let result = async {
+            let scan = scan_region(&self.inner).await?;
+            let recovered = match recover_scan(&scan) {
+                Ok(recovered) => recovered,
+                Err(StoreError::Unformatted) => {
+                    self.inner.install_unformatted_recovery(scan.next_physical);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let newest = recovered
+                .committed_objects()
+                .iter()
+                .filter(|object| object.object_kind == object_kind)
+                .max_by_key(|object| object.commit_sequence)
+                .map(|object| object.bytes.clone());
+            self.inner.install_recovery(&recovered, scan.next_physical);
+            for object in &mut recovered.into_objects() {
+                erase_bytes(&mut object.bytes);
+            }
+            Ok(newest)
+        }
+        .await;
+        operation.finish();
+        result
     }
 }
 

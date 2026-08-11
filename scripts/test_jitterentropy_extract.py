@@ -50,6 +50,17 @@ class ExtractorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw index 1, expected 0"):
             MODULE.parse_log(path)
 
+    def test_accepts_rust_probe_without_upstream_stuck_counter(self) -> None:
+        path = self.log(
+            "VIBE_JENT_BEGIN source=jitterentropy-rs version=3070100 "
+            "mode=raw-timer-delta samples=1 osr=3\n"
+            "VIBE_JENT_RAW 0 000000000000002a\n"
+            "VIBE_JENT_END COMPLETE samples=1 stuck=not-exposed health=0x0\n"
+        )
+        blocks = MODULE.parse_log(path)
+        self.assertEqual(blocks[0]["values"], [42])
+        self.assertIsNone(blocks[0]["stuck"])
+
 
 if __name__ == "__main__":
     unittest.main()

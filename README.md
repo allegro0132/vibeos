@@ -46,7 +46,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw
   Ethernet through bounded TCP to a public-key-only SSH `exec` service.
 - **[docs/JITTERENTROPY.md](docs/JITTERENTROPY.md)** — the pinned Rust crate,
-  isolated Duo smoke probe, currently unavailable raw-noise assessment, and
+  isolated Duo smoke/raw-delta probe, SP800-90B evidence workflow, and
   fail-closed production admission gate.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
@@ -76,6 +76,7 @@ python3 -B scripts/milkv-tcp-test.py ADDRESS # physical Duo TCP/rearm gate
 python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/milkv-ssh-test.sh ADDRESS # explicit insecure physical SSH/VSH gate
 ./scripts/build-milkv-duo.sh --jitterentropy-probe # isolated Duo entropy probe
+./scripts/build-milkv-duo.sh --jitterentropy-ssh-probe # fixed-key SSH evidence transport
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
@@ -121,8 +122,11 @@ Milk-V Duo boot images are generated with the official SDK. The deliverable imag
 contains a FAT boot partition plus a raw VibeOS data partition and no Linux root
 filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
-The optional Jitterentropy probe loads the exactly pinned `jitterentropy-rs`
-crate from crates.io; it needs no additional submodule or separate C compiler.
+The Milk-V production and optional Jitterentropy probe images use the
+`vendor/jitterentropy-rs` submodule pinned to one upstream commit. The Duo build
+script verifies and idempotently applies the recorded VibeOS qualification
+patch; see `patches/jitterentropy-rs/README.md`. No separate C compiler is
+required.
 
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
 `nightly-2026-08-01` (including `rust-src` and LLVM tools) in
@@ -609,19 +613,18 @@ Deliberate, not overlooked:
   late IRQ. The native DWMAC DHCP/IP path has passed carrier, lease acquisition,
   and eight fresh exact-echo TCP streams on a live board; restart coordinates,
   delayed completion, late IRQ, and long-duration stress remain open.
-- **The SSH acceptance foundation is not production provisioning.** A
+- **SSH acceptance fixtures remain separate from production provisioning.** A
   bounded, fail-closed virtio-rng capability now feeds a domain-separated,
   zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator
   blocks before reuse. An opaque Ed25519 signer and immutable binary-key policy
   are exercised by the explicit `ssh-security-test`, `ssh-test`, and
   `milkv-ssh-acceptance` images. The SSH images permit a restricted exec profile
   and one PTY-backed interactive VSH session while rejecting unsupported request
-  combinations and subsystems. They visibly embed fixed host/client fixtures;
-  the Milk-V bring-up image also uses deterministic reboot-repeating random
-  bytes. Unique per-device identity, authenticated persistent policy updates,
-  rollback resistance, and a validated Milk-V Duo entropy source remain absent,
-  so production SSH stays disabled there. A pinned `jitterentropy-rs` 0.1.1
-  smoke probe now exists, but the Rust rewrite is explicitly uncertified and
-  currently exposes no raw-noise qualification API. It remains isolated until
-  both its implementation-review gates and the physical runtime/restart
-  qualification in `docs/JITTERENTROPY.md` pass.
+  combinations and subsystems. The acceptance images visibly embed fixed
+  fixtures and the Milk-V bring-up image uses deterministic reboot-repeating
+  bytes. The production Milk-V image links neither fixture: OSR=3
+  jitterentropy-rs seeds its DRBG, UART `ssh-keygen` creates a per-device host
+  key, and an exact binary client key is stored in a two-slot CRC/readback
+  record before SSH may listen. This is a project deployment decision, not
+  NIST/CMVP certification; microSD confidentiality, authenticated policy
+  updates, and rollback resistance remain open.

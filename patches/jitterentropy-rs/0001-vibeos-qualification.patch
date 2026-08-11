@@ -1,0 +1,85 @@
+diff --git a/src/collector.rs b/src/collector.rs
+index f0faf3e..6db36f8 100644
+--- a/src/collector.rs
++++ b/src/collector.rs
+@@ -236,0 +237,35 @@ impl<T: Timer> EntropyCollector<T> {
++    /// Collect one conditioned block while exporting its unconditioned timing
++    /// deltas for target qualification.
++    ///
++    /// This API is deliberately excluded from normal builds. The delta is
++    /// computed by the same private sampling function as production output;
++    /// the evidence write occurs only after the `before..after` timing window.
++    #[cfg(feature = "raw-noise")]
++    pub fn raw_block(&mut self, out: &mut [u64]) -> Result<usize, ReadError> {
++        let count = self.osr as usize;
++        if out.len() < count {
++            return Err(ReadError::OutputTooLarge);
++        }
++        let mut c = Shake256Conditioner::default();
++        c.absorb(b"jitterentropy-rs/v1");
++        c.absorb(&self.osr.to_le_bytes());
++        c.absorb(&self.flags.bits().to_le_bytes());
++
++        for delta_out in &mut out[..count] {
++            let (sample, delta) = self.sample_with_delta()?;
++            for _ in 0..self.flags.hash_loop().count() {
++                c.absorb(&sample.to_le_bytes());
++                #[cfg(feature = "alloc")]
++                if let Some(mem) = self.memory.as_mut() {
++                    mem.disturb(sample, DEFAULT_MEMORY_ROUNDS, |b| c.absorb(b));
++                }
++                self.variable_work(sample);
++            }
++            *delta_out = delta;
++        }
++
++        let mut conditioned = c.finalize_block();
++        conditioned.zeroize();
++        Ok(count)
++    }
++
+@@ -238,0 +274,5 @@ impl<T: Timer> EntropyCollector<T> {
++        self.sample_with_delta().map(|(sample, _delta)| sample)
++    }
++
++    #[inline(never)]
++    fn sample_with_delta(&mut self) -> Result<(u64, u64), ReadError> {
+@@ -263 +303 @@ impl<T: Timer> EntropyCollector<T> {
+-        Ok(folded)
++        Ok((folded, delta))
+@@ -461,0 +502,19 @@ mod tests {
++
++    #[cfg(feature = "raw-noise")]
++    #[test]
++    fn raw_block_exports_one_delta_per_osr_round() {
++        let mut ec = EntropyCollector::with_timer(
++            3,
++            Flags::DISABLE_MEMORY_ACCESS,
++            None,
++            CounterTimer::new(),
++        )
++        .expect("deterministic jitter-like test timer should pass startup validation");
++        let mut raw = [0u64; MAX_OSR as usize];
++        let count = ec
++            .raw_block(&mut raw)
++            .expect("raw qualification block should complete");
++        assert_eq!(count, 3);
++        assert!(raw[..count].iter().all(|delta| *delta != 0));
++        assert!(raw[count..].iter().all(|delta| *delta == 0));
++    }
+diff --git a/src/timer.rs b/src/timer.rs
+index c3e8196..5049697 100644
+--- a/src/timer.rs
++++ b/src/timer.rs
+@@ -1,2 +0,0 @@
+-use core::hint::black_box;
+-
+@@ -30 +28 @@ pub fn platform_now() -> Option<u64> {
+-        Some(black_box(v))
++        Some(core::hint::black_box(v))
+@@ -39 +37 @@ pub fn platform_now() -> Option<u64> {
+-        return Some(black_box(v));
++        return Some(core::hint::black_box(v));
+@@ -46 +44 @@ pub fn platform_now() -> Option<u64> {
+-        return Some(black_box(
++        return Some(core::hint::black_box(

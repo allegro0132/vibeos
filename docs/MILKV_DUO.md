@@ -7,11 +7,17 @@ FIT/SD image packaging flow based on the official Buildroot SDK.
 
 The separate `--jitterentropy-probe` image loads the exactly pinned
 `jitterentropy-rs` 0.1.1 crate against `rdtime` and exposes conditioned smoke
-testing on UART. The crate currently exposes no raw-noise qualification API.
+testing plus timer-boundary raw-delta qualification on UART. The crate itself
+did not expose a raw-noise API; the reviewable VibeOS patch adds a
+qualification-only export after the collector's private timing window closes.
 The rewrite is not a certified or behaviorally equivalent replacement for
 upstream Jitterentropy. It is a qualification artifact, not a production
 entropy source. See
 [JITTERENTROPY.md](JITTERENTROPY.md) before making any SSH security claim.
+The additional `--jitterentropy-ssh-probe` image combines that collector with
+the deliberately insecure fixed-key SSH acceptance transport and streams a
+strictly framed binary dataset on port 2222. It is a separate network/load
+qualification condition, not production SSH.
 
 > **Base-port and explicit SSH/VSH hardware validation status (2026-08-11):
 > passed within the documented boundaries.** A CV1800B board booted
@@ -35,14 +41,13 @@ exercise ordinary bidirectional traffic through that path. They do not yet
 cover driver restart coordinates, deliberately delayed DMA completion, late
 IRQs, or long-duration link stress.
 
-The production image enables the `net-shell` feature. Its supervised IPv4 stack
-exclusively owns the DWMAC packet endpoints, starts DHCPv4 automatically, and
-admits `ip`/`dhclient` only through vsh command capabilities. The DWMAC source
-uses the same boot-local device-epoch/stack-generation packet fence as
-virtio-net. These are source-level implementation facts, not a Milk-V hardware
-result. The N2 `qemu-tcp-test.sh recovery` gate still exercises only the virtio
-backend; it neither validates DWMAC restart coordinates nor injects a real
-delayed descriptor completion or late Ethernet IRQ on the board.
+The production image enables `milkv-ssh`. Its SSH stack exclusively owns the
+DWMAC packet endpoints and starts DHCPv4 after local identity provisioning.
+The image contains no fixed host or client private key. It uses the accepted
+OSR=3 jitterentropy-rs source to seed a ChaCha20 DRBG, and refuses to listen
+until a device host key and an authorized client key have both been persisted
+and verified. This is a project deployment decision based on the recorded
+board evidence, not a claim of NIST/CMVP certification.
 
 ## CPU model and support boundaries
 
@@ -248,8 +253,44 @@ docker run --rm --platform linux/amd64 \
 
 The final flashable image is `target/milkv-duo/vibeos-milkv-duo-sd.img`.
 
-On first boot with the Ethernet IO Board connected, the production image starts
-DHCP automatically. The bounded operator surface is:
+On first boot, create an Ed25519 client key on the administrator's computer if
+needed, then convert its public half to the exact binary form accepted by the
+UART provisioning boundary:
+
+```sh
+ssh-keygen -t ed25519 -f ~/.ssh/vibeos_duo
+./scripts/ssh-ed25519-key-hex.py ~/.ssh/vibeos_duo.pub
+```
+
+Run these two commands on the board's UART shell, substituting the printed
+64-character value:
+
+```text
+ssh-keygen
+ssh-authorize add 0123456789abcdef...64-hex-characters-total...
+```
+
+The board-side `ssh-keygen` obtains a fresh 32-byte Ed25519 host seed from
+jitterentropy-rs. Both commands update alternating data-partition sectors with
+a generation and CRC32C, flush, and read back before publication. SSH remains
+closed if either record is missing or invalid. Once both operations report
+success, DHCP starts and SSH listens on port 22 without a reboot. Provisioning
+commands are UART-only and are not installed in remote SSH sessions. Up to
+eight exact Ed25519 client keys may be added; adding the same key again is
+idempotent and exceeding the bound is rejected.
+
+The private host seed is stored on the microSD without encryption; physical
+access to the card can recover or roll back it. CRC32C detects corruption and
+torn writes but is not authentication or rollback protection.
+
+After provisioning, connect with:
+
+```sh
+ssh -i ~/.ssh/vibeos_duo root@BOARD_ADDRESS
+```
+
+The legacy `net-shell` diagnostic surface remains available only in its
+explicit image. Its bounded operator commands are:
 
 ```text
 ip link show
@@ -272,8 +313,7 @@ interactive per-session VSH on the board, but it is **not a secure deployment**:
 the image embeds public fixed host/client identities and a deterministic random
 provider whose sequence repeats after every reboot. Never expose it to an
 untrusted network, send secrets through it, or distribute it as a production
-image. The normal `milkv-duo,net-shell` image remains SSH-disabled until real
-hardware entropy and per-device identity provisioning exist.
+image. The normal production image does not link these acceptance fixtures.
 
 Build its bare kernel on the host:
 
@@ -529,12 +569,11 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [ ] Delayed DWMAC DMA completion and late-IRQ cases are exercised on physical
       hardware; the synthetic QEMU endpoint injection is not evidence for
       either case.
-- [ ] Before enabling SSH, a documented hardware entropy source is validated
-      on the board and a unique per-device Ed25519 identity is provisioned
-      behind non-readable signing authority. Until then the Duo SSH path fails
-      closed in production; the explicitly insecure `milkv-ssh-acceptance`
-      image, a deterministic test key, and the CRC journal do not satisfy this
-      item.
+- [x] Production SSH uses the board-evaluated OSR=3 jitterentropy-rs source and
+      locally provisions a unique Ed25519 host key behind non-readable signing
+      authority. It fails closed until both host and client records pass
+      CRC/readback validation. This project gate is not NIST/CMVP certification;
+      microSD confidentiality and authenticated rollback protection remain open.
 - [x] Flash the explicit SSH acceptance image on an isolated link and run
       `scripts/milkv-ssh-test.sh ADDRESS`. Preserve the serial warning,
       announced address, OpenSSH transcript, interactive VSH result, and final

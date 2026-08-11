@@ -6,16 +6,18 @@ export LC_ALL=C
 diagnostic=false
 ssh_acceptance=false
 jitterentropy_probe=false
+jitterentropy_ssh_probe=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
     --diagnostic) diagnostic=true ;;
     --ssh-acceptance) ssh_acceptance=true ;;
     --jitterentropy-probe) jitterentropy_probe=true ;;
-    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
+    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2
+        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -26,13 +28,14 @@ mode_count=0
 [[ "$diagnostic" == true ]] && ((mode_count += 1))
 [[ "$ssh_acceptance" == true ]] && ((mode_count += 1))
 [[ "$jitterentropy_probe" == true ]] && ((mode_count += 1))
+[[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
   echo "verify-milkv-duo-image.sh: image mode options are mutually exclusive" >&2
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
@@ -51,6 +54,9 @@ elif [[ "$ssh_acceptance" == true ]]; then
 elif [[ "$jitterentropy_probe" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-jitterentropy-probe"
   image_name="vibeos-milkv-duo-jitterentropy-probe-sd.img"
+elif [[ "$jitterentropy_ssh_probe" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-jitterentropy-ssh-probe"
+  image_name="vibeos-milkv-duo-jitterentropy-ssh-probe-sd.img"
 fi
 image="$output_dir/$image_name"
 expected_fit="$output_dir/boot.sd"

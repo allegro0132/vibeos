@@ -12,7 +12,7 @@ BEGIN = re.compile(r"VIBE_JENT_BEGIN .*\bsamples=(\d+)\b")
 RAW = re.compile(r"VIBE_JENT_RAW (\d+) ([0-9a-fA-F]{16})\b")
 END = re.compile(
     r"VIBE_JENT_END (COMPLETE|HEALTH-FAIL) samples=(\d+) "
-    r"stuck=(\d+) health=(0x[0-9a-fA-F]+)\b"
+    r"stuck=(\d+|not-exposed) health=(0x[0-9a-fA-F]+)\b"
 )
 
 
@@ -56,7 +56,9 @@ def parse_log(path: Path) -> list[dict[str, object]]:
                         f"RAW={len(values)}, END={reported}"
                     )
                 active["status"] = match.group(1)
-                active["stuck"] = int(match.group(3))
+                active["stuck"] = (
+                    None if match.group(3) == "not-exposed" else int(match.group(3))
+                )
                 active["health"] = int(match.group(4), 16)
                 blocks.append(active)
                 active = None
@@ -119,7 +121,12 @@ def main() -> int:
                 )
 
         health_failures = sum(block["status"] != "COMPLETE" for block in blocks)
-        stuck = sum(int(block["stuck"]) for block in blocks)
+        stuck_values = [block["stuck"] for block in blocks]
+        stuck = (
+            "not-exposed"
+            if any(value is None for value in stuck_values)
+            else str(sum(int(value) for value in stuck_values))
+        )
         samples = sum(len(block["values"]) for block in blocks)  # type: ignore[arg-type]
         print(
             f"extracted {samples} samples in {len(blocks)} block(s); "

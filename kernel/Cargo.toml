@@ -43,10 +43,26 @@ milkv-ssh-acceptance = [
     "dep:vibeos-ssh-identity",
     "vibeos-kernel-acceptance/milkv-ssh-acceptance",
 ]
+# Production SSH image. Device and client identities are provisioned locally;
+# no acceptance fixture is linked into this feature.
+milkv-ssh = [
+    "dep:vibeos-sshd",
+    "dep:vibeos-ssh-identity",
+    "dep:jitterentropy",
+]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.
-milkv-jitterentropy-probe = ["legacy-shell", "dep:jitterentropy"]
+milkv-jitterentropy-probe = ["legacy-shell", "dep:jitterentropy", "jitterentropy/raw-noise"]
+# Qualification-only network image. It deliberately inherits the visibly
+# insecure physical SSH acceptance identity/RNG fixtures and adds a bounded,
+# streaming raw-delta exec path that bypasses normal VSH output capture.
+milkv-jitterentropy-ssh-probe = [
+    "milkv-ssh-acceptance",
+    "dep:jitterentropy",
+    "jitterentropy/raw-noise",
+    "vibeos-sshd/qualification-stream",
+]
 
 # The kernel is a reusable `no_std` archive selected and linked by a board
 # firmware package. Its hardware cases live in `selftest_platform.rs` and run
@@ -85,7 +101,7 @@ vibeos-random = { path = "../random" }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
-jitterentropy = { package = "jitterentropy-rs", version = "=0.1.1", default-features = false, features = ["alloc"], optional = true }
+jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 vibeos-runtime-riscv = { path = "../runtime/riscv" }

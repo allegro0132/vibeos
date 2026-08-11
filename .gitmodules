@@ -2,3 +2,6 @@
 	path = vendor/sunset
 	url = git@github.com:allegro0132/sunset.git
 	branch = codex/vibeos-0.6.0
+[submodule "vendor/jitterentropy-rs"]
+	path = vendor/jitterentropy-rs
+	url = https://github.com/qnfm/jitterentropy-rs.git

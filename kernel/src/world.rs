@@ -29,8 +29,15 @@ use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
-#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+#[cfg(feature = "milkv-ssh")]
+const SSH_PRODUCTION_MEMORY_BUDGET: usize = 256 * 1024;
+#[cfg(all(
+    any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
+    not(feature = "milkv-jitterentropy-ssh-probe")
+))]
 const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
+#[cfg(feature = "milkv-jitterentropy-ssh-probe")]
+const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
 // their transient buffers to the shell owner. Keep the documented store
 // working-set floor plus client/future headroom while retaining a hard quota.
@@ -384,13 +391,21 @@ pub struct World {
     net_outbound_root: Option<Cap>,
     net_inbound_root: Option<Cap>,
     net_control_root: Option<Cap>,
-    #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
+    #[cfg(any(
+        feature = "qemu-virt",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
     rng_policy: Option<Arc<Space>>,
     #[cfg(feature = "qemu-virt")]
     rng_mmio: Option<Cap>,
     #[cfg(feature = "qemu-virt")]
     rng_dma: Option<Cap>,
-    #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
+    #[cfg(any(
+        feature = "qemu-virt",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    ))]
     rng_source_root: Option<Cap>,
     #[cfg(any(
         feature = "ssh-security-test",
@@ -1463,6 +1478,8 @@ pub fn build() {
     let rng_resources = virtio_rng::discover();
     #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
     let rng_resources = Some(vibeos_kernel_acceptance::ssh_acceptance_rng::provision());
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    let rng_resources = crate::jitterentropy_random::provision().ok();
     #[cfg(feature = "qemu-virt")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
     #[cfg(feature = "qemu-virt")]
@@ -1473,6 +1490,10 @@ pub fn build() {
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-acceptance-random-policy"));
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    let rng_policy = rng_resources
+        .as_ref()
+        .map(|_| Space::new("ssh-random-policy"));
     #[cfg(feature = "ssh-security-test")]
     let ssh_security_test_space = rng_resources
         .as_ref()
@@ -1482,6 +1503,11 @@ pub fn build() {
         .as_ref()
         .zip(rng_resources.as_ref())
         .map(|_| Space::new("ssh-test"));
+    #[cfg(feature = "milkv-ssh")]
+    let ssh_production_space = net_resources
+        .as_ref()
+        .zip(rng_resources.as_ref())
+        .map(|_| Space::new("sshd"));
     #[cfg(any(
         feature = "ssh-security-test",
         feature = "ssh-test",
@@ -1624,7 +1650,8 @@ pub fn build() {
                 feature = "tcp-echo",
                 feature = "net-shell",
                 feature = "ssh-test",
-                feature = "milkv-ssh-acceptance"
+                feature = "milkv-ssh-acceptance",
+                feature = "milkv-ssh"
             )))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
@@ -1643,7 +1670,8 @@ pub fn build() {
                 feature = "tcp-echo",
                 feature = "net-shell",
                 feature = "ssh-test",
-                feature = "milkv-ssh-acceptance"
+                feature = "milkv-ssh-acceptance",
+                feature = "milkv-ssh"
             ))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
@@ -1730,6 +1758,14 @@ pub fn build() {
         }
         (None, None) => None,
         _ => unreachable!("acceptance entropy resource and policy are constructed together"),
+    };
+    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
+        (Some(resources), Some(policy_space)) => {
+            Some(policy_space.0.lock().mint(resources.source, Rights::ALL))
+        }
+        (None, None) => None,
+        _ => unreachable!("production entropy resource and policy are constructed together"),
     };
     #[cfg(any(
         feature = "ssh-security-test",
@@ -1861,6 +1897,50 @@ pub fn build() {
             .unwrap(),
         )
     });
+    #[cfg(feature = "milkv-ssh")]
+    let ssh_production_grants = ssh_production_space.as_ref().map(|target_space| {
+        let network = net_policy
+            .as_ref()
+            .expect("SSH requires network policy")
+            .0
+            .lock();
+        let entropy = rng_policy
+            .as_ref()
+            .expect("SSH requires entropy policy")
+            .0
+            .lock();
+        let mut target = target_space.0.lock();
+        (
+            cap::grant(
+                &network,
+                net_outbound_root.expect("SSH outbound root"),
+                Rights::SEND,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &network,
+                net_inbound_root.expect("SSH inbound root"),
+                Rights::RECV,
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &network,
+                net_control_root.expect("SSH control root"),
+                Rights::READ.union(Rights::INVOKE),
+                &mut target,
+            )
+            .unwrap(),
+            cap::grant(
+                &entropy,
+                rng_source_root.expect("SSH entropy root"),
+                Rights::READ,
+                &mut target,
+            )
+            .unwrap(),
+        )
+    });
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_grants = match (
         net_policy.as_ref(),
@@ -1974,6 +2054,10 @@ pub fn build() {
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("ssh-acceptance-random-policy", space.clone());
     }
+    #[cfg(feature = "milkv-ssh")]
+    if let Some(space) = rng_policy.as_ref() {
+        spaces.insert("ssh-random-policy", space.clone());
+    }
     #[cfg(feature = "ssh-security-test")]
     if let Some(space) = ssh_security_test_space.as_ref() {
         spaces.insert("ssh-security-test", space.clone());
@@ -1981,6 +2065,10 @@ pub fn build() {
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     if let Some(space) = ssh_test_space.as_ref() {
         spaces.insert("ssh-test", space.clone());
+    }
+    #[cfg(feature = "milkv-ssh")]
+    if let Some(space) = ssh_production_space.as_ref() {
+        spaces.insert("sshd", space.clone());
     }
     #[cfg(any(
         feature = "ssh-security-test",
@@ -2036,13 +2124,21 @@ pub fn build() {
         net_outbound_root,
         net_inbound_root,
         net_control_root,
-        #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
+        #[cfg(any(
+            feature = "qemu-virt",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh"
+        ))]
         rng_policy,
         #[cfg(feature = "qemu-virt")]
         rng_mmio: rng_mmio_root,
         #[cfg(feature = "qemu-virt")]
         rng_dma: rng_dma_root,
-        #[cfg(any(feature = "qemu-virt", feature = "milkv-ssh-acceptance"))]
+        #[cfg(any(
+            feature = "qemu-virt",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh"
+        ))]
         rng_source_root,
         #[cfg(any(
             feature = "ssh-security-test",
@@ -2165,6 +2261,25 @@ pub fn build() {
                 signer_read,
                 signer_invoke,
                 policy,
+            ),
+        );
+    }
+
+    #[cfg(feature = "milkv-ssh")]
+    if let (Some(space), Some((outbound, inbound, control, random))) =
+        (ssh_production_space, ssh_production_grants)
+    {
+        world.spawn_component_inner(
+            "sshd",
+            space.clone(),
+            SSH_PRODUCTION_MEMORY_BUDGET,
+            None,
+            crate::ssh_platform::provisioned_task(
+                SpaceRef::new(&space).get(),
+                outbound,
+                inbound,
+                control,
+                random,
             ),
         );
     }

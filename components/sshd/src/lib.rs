@@ -48,6 +48,20 @@ use vibeos_vsh::terminal::{
 /// Boxed kernel-service operation used at the narrow component/platform seam.
 pub type PlatformFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+#[cfg(feature = "qualification-stream")]
+pub trait StreamingExec: Send {
+    /// Produce one bounded stdout chunk, or `None` with the SSH exit status.
+    /// A producer may return `Pending` to let the SSH transport and TCP stack
+    /// make progress between hardware acquisition steps.
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Vec<u8>>, u32>>;
+}
+
+#[cfg(feature = "qualification-stream")]
+pub type StreamingExecBox = Pin<Box<dyn StreamingExec>>;
+
 /// Platform-neutral status needed to supervise one TCP stack binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkInfo {
@@ -177,6 +191,14 @@ pub trait Platform: Sync {
         key: &SshEd25519PublicKey,
     ) -> Result<Option<AuthorizedProfile>, ()>;
     fn install_standard_vsh_commands(&self, session: &mut vibeos_vsh::Session);
+    #[cfg(feature = "qualification-stream")]
+    fn accepts_streaming_exec(&self, _command: &str) -> bool {
+        false
+    }
+    #[cfg(feature = "qualification-stream")]
+    fn open_streaming_exec(&self, _command: &str) -> Option<Result<StreamingExecBox, u32>> {
+        None
+    }
     fn log(&self, args: fmt::Arguments<'_>);
 }
 
@@ -198,7 +220,10 @@ const IDLE_POLL_CEILING_MS: u64 = 10;
 const MAX_SSH_PROGRESS_PER_TURN: usize = 32;
 const MAX_WIRE_IO_PER_TURN: usize = 8;
 const MAX_CHANNEL_DISCARDS_PER_TURN: usize = 4;
+#[cfg(not(feature = "qualification-stream"))]
 const MAX_WIRE_BYTES_PER_DIRECTION: usize = 512 * 1024;
+#[cfg(feature = "qualification-stream")]
+const MAX_WIRE_BYTES_PER_DIRECTION: usize = 64 * 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
 const WIRE_CHUNK_BYTES: usize = 1_024;
 const SHELL_PROMPT: &str = "vsh> ";
@@ -1082,6 +1107,51 @@ async fn serve_connection(
 
     match start {
         SessionStart::Exec(command) => {
+            #[cfg(feature = "qualification-stream")]
+            if let Some(opened) = space.open_streaming_exec(&command) {
+                let status = match opened {
+                    Ok(stream) => match execute_stream_with_network(
+                        stream,
+                        &mut runner,
+                        &mut signer,
+                        space,
+                        control,
+                        bound_epoch,
+                        policy,
+                        stack,
+                        &mut bridge,
+                        &mut protocol,
+                        require_carrier,
+                    )
+                    .await
+                    {
+                        Ok(status) => status,
+                        Err(ConnectionEnd::Reset(reason)) => return reset_connection(stack, reason),
+                        Err(other) => return other,
+                    },
+                    Err(status) => status,
+                };
+                return match finish_exec(
+                    &mut runner,
+                    &mut signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    &mut bridge,
+                    &mut protocol,
+                    &[],
+                    status,
+                    require_carrier,
+                )
+                .await
+                {
+                    Ok(()) => ConnectionEnd::ExecComplete(status),
+                    Err(ConnectionEnd::Reset(reason)) => reset_connection(stack, reason),
+                    Err(other) => other,
+                };
+            }
             let execution = execute_with_network(
                 &command,
                 &mut runner,
@@ -1145,6 +1215,95 @@ async fn serve_connection(
             };
             ConnectionEnd::ShellComplete(status)
         }
+    }
+}
+
+#[cfg(feature = "qualification-stream")]
+#[allow(clippy::too_many_arguments)]
+async fn execute_stream_with_network(
+    mut stream: StreamingExecBox,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut StaticIpv4TcpStack,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    require_carrier: bool,
+) -> Result<u32, ConnectionEnd> {
+    let mut pending = Vec::new();
+    let mut offset = 0usize;
+
+    loop {
+        let now = monotonic_ms();
+        validate_network_authority(space, control, bound_epoch, require_carrier)
+            .map_err(ConnectionEnd::Rebind)?;
+        let wire = bridge
+            .drive(runner, stack, now)
+            .map_err(ConnectionEnd::Reset)?;
+        if wire.ended {
+            return Err(ConnectionEnd::Reset(
+                "peer disconnected during streaming exec",
+            ));
+        }
+        let signal = progress_protocol(runner, signer, space, policy, protocol)
+            .map_err(ConnectionEnd::Reset)?;
+        if matches!(signal, ProtocolSignal::Defunct)
+            || protocol
+                .channel
+                .as_ref()
+                .is_some_and(|channel| runner.is_channel_closed(channel))
+        {
+            return Err(ConnectionEnd::Reset(
+                "SSH channel closed during streaming exec",
+            ));
+        }
+        discard_channel_input(runner, protocol).map_err(ConnectionEnd::Reset)?;
+
+        let mut application_work = false;
+        if offset < pending.len() {
+            let channel = protocol
+                .channel
+                .as_ref()
+                .ok_or(ConnectionEnd::Reset("streaming exec lost its channel"))?;
+            match runner.write_channel(channel, ChanData::Normal, &pending[offset..]) {
+                Ok(0) => {}
+                Ok(written) => {
+                    offset += written;
+                    application_work = true;
+                }
+                Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
+                Err(_) => return Err(ConnectionEnd::Reset("streaming SSH stdout closed")),
+            }
+            if offset == pending.len() {
+                pending.clear();
+                offset = 0;
+            }
+        } else {
+            let mut context = Context::from_waker(Waker::noop());
+            match stream.as_mut().poll_next(&mut context) {
+                Poll::Ready(Ok(Some(chunk))) => {
+                    if chunk.is_empty() || chunk.len() > 64 * 1024 {
+                        return Err(ConnectionEnd::Reset(
+                            "streaming exec produced an invalid chunk",
+                        ));
+                    }
+                    pending = chunk;
+                    application_work = true;
+                }
+                Poll::Ready(Ok(None)) => return Ok(0),
+                Poll::Ready(Err(status)) => return Ok(status),
+                Poll::Pending => application_work = true,
+            }
+        }
+
+        cooperate(
+            wire.worked || application_work || matches!(signal, ProtocolSignal::Progressed),
+            wire.next_poll_delay_ms,
+        )
+        .await;
     }
 }
 
@@ -1268,7 +1427,18 @@ fn progress_protocol(
                             .command()
                             .map_err(|_| "exec command was not valid UTF-8")?
                             .to_string();
-                        if vibeos_vsh::validate_ssh_exec(&value).is_ok() {
+                        if vibeos_vsh::validate_ssh_exec(&value).is_ok()
+                            || {
+                                #[cfg(feature = "qualification-stream")]
+                                {
+                                    space.accepts_streaming_exec(&value)
+                                }
+                                #[cfg(not(feature = "qualification-stream"))]
+                                {
+                                    false
+                                }
+                            }
+                        {
                             command = Some(value);
                         }
                     }

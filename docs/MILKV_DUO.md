@@ -605,9 +605,11 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
 - [x] MMU diagnostics show the kernel in
       `0x8020_0000..0x83e0_0000`, with no mapping or use of the FreeRTOS reserved
       region beginning at `0x83f4_0000`.
-- [ ] The boot log reports the DWC2 release, IRQ 30, host-channel count and a
-      powered root port without a reset/host-mode timeout. Preserve the full
-      UART log as the first physical USB bring-up artifact.
+- [x] The physical boot on 2026-08-12 reports DWC2 release `0x420a`, IRQ 30,
+      14 host channels and a powered, connected root port. `lsusb` enumerates
+      the attached Genesys Logic high-speed hub as `05e3:0610` without a
+      reset/host-mode timeout; Hub downstream traversal remains part of the
+      HID gate below.
 - [ ] A low/full/high-speed USB device completes address and device-descriptor
       enumeration on the physical OTG port. A HID Boot Keyboard is configured,
       reports its interrupt-IN endpoint, and can type commands into `vibe>`;

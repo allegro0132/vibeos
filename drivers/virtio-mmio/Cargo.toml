@@ -1,0 +1,8 @@
+[package]
+name = "vibeos-driver-virtio-mmio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-core = { path = "../../core" }
+vibeos-hal = { path = "../../hal" }

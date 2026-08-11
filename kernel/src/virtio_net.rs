@@ -390,7 +390,9 @@ pub struct NetResources {
 /// Empty modern MMIO slots are not errors. No component or network caps are
 /// created unless device ID 1 is present.
 pub fn discover() -> Option<NetResources> {
-    let transport = MmioTransport::scan_network()?;
+    // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
+    // the kernel's identity address space before device discovery begins.
+    let transport = unsafe { MmioTransport::scan_network(crate::platform::VIRTIO_MMIO) }?;
     Some(NetResources {
         mmio: MmioWindow::new(transport),
         dma: Arc::new(DmaRegion),

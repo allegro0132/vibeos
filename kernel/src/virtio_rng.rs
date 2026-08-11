@@ -295,7 +295,9 @@ pub struct RandomResources {
 /// module is removed wholesale outside `qemu-virt`, a Milk-V build cannot
 /// accidentally publish a fake `RandomSource`.
 pub fn discover() -> Option<RandomResources> {
-    let transport = MmioTransport::scan_entropy()?;
+    // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
+    // the kernel's identity address space before device discovery begins.
+    let transport = unsafe { MmioTransport::scan_entropy(crate::platform::VIRTIO_MMIO) }?;
     {
         // The transport is a boot-discovered, immutable part of the DMA claim.
         // Publish it before any component can claim the slab so raw-fault

@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
 use jitterentropy::{
-    EntropyCollector, EntropyCollectorBuilder, Flags, InitError, ReadError, Timer, version,
+    version, EntropyCollector, EntropyCollectorBuilder, Flags, InitError, ReadError, Timer,
 };
 
 use crate::{println, sbi};

@@ -21,7 +21,7 @@ use crate::cap::{CSpace, CapError, Rights};
 use crate::chan::Endpoint;
 use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
 use crate::trampoline::{self, CatchThunk, JmpBuf};
-use crate::world::{Space, world};
+use crate::world::{world, Space};
 use crate::{exec, heap, println, sbi};
 
 use vibeos_kernel_acceptance::Harness;
@@ -218,7 +218,7 @@ pub async fn run() -> Report {
 /// M6.1--M6.3: one identity-mapped Sv39 root is active on every online hart;
 /// stack guards, W^X, execute-only code, and non-executable devices are live.
 fn paging(h: &mut Harness) {
-    use vibeos_core::mmu::{PAGE_SIZE, PagePermissions};
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
 
     h.check(
         "the current hart has Sv39 enabled",
@@ -1460,7 +1460,7 @@ fn capabilities(h: &mut Harness) {
 }
 
 fn capability_table_is_read_only(range: crate::cap::CapabilityTableRange) -> bool {
-    use vibeos_core::mmu::{PAGE_SIZE, PagePermissions};
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
 
     range.start % PAGE_SIZE == 0
         && range.page_count != 0

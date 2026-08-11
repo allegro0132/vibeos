@@ -43,8 +43,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::cap::{Cap, Revocable, Rights};
 use crate::dev::{ConsoleDev, MemoryInvocation, MemoryRegion};
 use crate::sync::SpinLock;
-use crate::trampoline::{self, JmpBuf, abort, vibe_catch, vibe_enter, vibe_longjmp};
-use crate::world::{Space, world};
+use crate::trampoline::{self, abort, vibe_catch, vibe_enter, vibe_longjmp, JmpBuf};
+use crate::world::{world, Space};
 use crate::{exec, ipi, sbi};
 
 /// Where a compiled program's authority lives while it runs. `None` means no

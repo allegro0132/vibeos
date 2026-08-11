@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use vibeos_core::cap::{
     InvocationLease, PendingSlotReservation, PersistentCapIdentity, PersistentDerivationWitness,
@@ -37,8 +37,8 @@ use crate::{block_device, exec, heap, sync::SpinLock};
 
 pub(crate) use vibeos_authority_store::persistent_space_id;
 use vibeos_authority_store::{
-    CHILD_RIGHTS, CHILD_SLOT, GRANDCHILD_RIGHTS, GRANDCHILD_SLOT, MARKER, PERSISTENT_SPACE_ID_RAW,
-    ROOT_RIGHTS, ROOT_SLOT, persistent_object_kind, stored_object_resource_kind,
+    persistent_object_kind, stored_object_resource_kind, CHILD_RIGHTS, CHILD_SLOT,
+    GRANDCHILD_RIGHTS, GRANDCHILD_SLOT, MARKER, PERSISTENT_SPACE_ID_RAW, ROOT_RIGHTS, ROOT_SLOT,
 };
 pub use vibeos_authority_store::{
     DurableCSpaceError, DurableCSpaceInfo, DurableCSpaceState, PersistentTestPhase,
@@ -128,7 +128,11 @@ impl DurableCSpaceInner {
                 && claim.domain == domain
                 && token.is_none_or(|expected| claim.token == expected)
         });
-        if matches { active.take() } else { None }
+        if matches {
+            active.take()
+        } else {
+            None
+        }
     }
 
     fn clear_claim(&self, task: exec::TaskId, domain: heap::AllocationDomain, token: u64) -> bool {

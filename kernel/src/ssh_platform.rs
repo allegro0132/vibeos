@@ -12,7 +12,7 @@ use core::fmt;
 use vibeos_core::cap::{Cap, Rights};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::StampedPacket;
-use vibeos_core::ssh_identity::SshEd25519PublicKey;
+use vibeos_ssh_identity::SshEd25519PublicKey;
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
     NetworkBindError, NetworkInfo, Platform, PlatformFuture, SecretBytes, SshServicePolicy,

@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use vibeos_core::random::SEED_BYTES;
-use vibeos_core::ssh_identity::{
+use vibeos_ssh_identity::{
     AuthorizedKeyEntry, CapabilityProfileId, HostSigner, ProvisionedHostSeed, SshEd25519PublicKey,
 };
 

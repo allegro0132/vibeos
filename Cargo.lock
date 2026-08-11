@@ -768,7 +768,6 @@ name = "vibeos-core"
 version = "0.1.0"
 dependencies = [
  "chacha20 0.10.1",
- "ed25519-dalek",
  "smoltcp",
  "subtle",
  "zeroize",
@@ -936,7 +935,10 @@ version = "0.1.0"
 name = "vibeos-ssh-identity"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "subtle",
  "vibeos-core",
+ "zeroize",
 ]
 
 [[package]]
@@ -945,6 +947,7 @@ version = "0.1.0"
 dependencies = [
  "sunset",
  "vibeos-core",
+ "vibeos-ssh-identity",
 ]
 
 [[package]]

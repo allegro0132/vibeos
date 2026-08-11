@@ -58,6 +58,10 @@ the thin adapter which resolves packet, network-control, entropy, host-signer,
 authorization-policy, command-registry, and diagnostic operations through the
 component's granted capabilities. `world.rs` remains responsible only for the
 CSpace manifest, component lifecycle, restart template, and grant wiring.
+Opt-in fixtures, the deliberately insecure Milk-V bring-up RNG, and the
+portable N3 entropy/domain/signer/policy assertions live in
+`acceptance/kernel-tests/src/ssh_*`; the kernel supplies that runner only with
+the real virtio-rng transport, timer, UART, and shutdown boundary.
 
 This crate boundary is an architectural dependency boundary, not a new CPU
 privilege boundary. The component is still linked into the single trusted

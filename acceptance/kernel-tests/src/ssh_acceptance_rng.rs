@@ -9,10 +9,6 @@
 //! exists. It must never be enabled, copied, or treated as suitable for a
 //! production image, key generation, long-lived credentials, or secret data.
 
-#![cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
-
-extern crate alloc;
-
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
@@ -24,6 +20,7 @@ use vibeos_core::random::{
     SEED_BYTES,
 };
 use vibeos_core::sync::SpinLock;
+use zeroize::Zeroize;
 
 /// Match the bounded request surface consumed by the SSH acceptance component.
 pub const MAX_RANDOM_BYTES: usize = 64;
@@ -109,11 +106,7 @@ impl RandomBytes {
 
 impl Drop for RandomBytes {
     fn drop(&mut self) {
-        for byte in &mut self.bytes {
-            // Keep ordinary cleanup visible to the optimizer even though this
-            // acceptance-only output is deterministic and provides no secrecy.
-            unsafe { core::ptr::write_volatile(byte, 0) };
-        }
+        self.bytes.zeroize();
         self.len = 0;
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
     }
@@ -241,5 +234,26 @@ fn map_core_error(error: CoreRandomError) -> RandomError {
         CoreRandomError::EntropyUnavailable
         | CoreRandomError::RepeatedEntropy
         | CoreRandomError::PermanentlyFailed => RandomError::Protocol,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RandomError, RandomSource, MAX_RANDOM_BYTES};
+
+    #[test]
+    fn acceptance_stream_is_bounded_and_advances_per_request() {
+        let source = RandomSource::new();
+        assert_eq!(source.bytes(0).err(), Some(RandomError::InvalidLength));
+        assert_eq!(
+            source.bytes(MAX_RANDOM_BYTES + 1).err(),
+            Some(RandomError::InvalidLength)
+        );
+
+        let first = source.bytes(MAX_RANDOM_BYTES).unwrap();
+        let second = source.bytes(MAX_RANDOM_BYTES).unwrap();
+        assert_eq!(first.len(), MAX_RANDOM_BYTES);
+        assert_eq!(second.len(), MAX_RANDOM_BYTES);
+        assert_ne!(first.as_slice(), second.as_slice());
     }
 }

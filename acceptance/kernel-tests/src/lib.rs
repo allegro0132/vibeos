@@ -9,6 +9,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod bench;
+#[cfg(feature = "milkv-ssh-acceptance")]
+pub mod ssh_acceptance_rng;
+#[cfg(feature = "ssh-security-test")]
+pub mod ssh_security_test;
+#[cfg(feature = "ssh-test-fixture")]
+pub mod ssh_test_fixture;
 
 pub struct Report {
     pub passed: usize,

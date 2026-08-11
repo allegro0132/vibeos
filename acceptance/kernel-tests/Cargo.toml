@@ -3,6 +3,21 @@ name = "vibeos-kernel-acceptance"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Fixed identities shared by the explicit QEMU and Milk-V SSH acceptance
+# images. Keeping this opt-in prevents the normal kernel acceptance harness
+# from linking the trusted SSH identity service.
+ssh-test-fixture = ["dep:vibeos-ssh-identity"]
+# Portable N3 entropy/domain/signer/policy assertions. Hardware and CSpace
+# access stay behind a kernel-provided platform adapter.
+ssh-security-test = ["ssh-test-fixture", "dep:zeroize"]
+# Deterministic, deliberately insecure RNG used only by the physical SSH
+# bring-up image.
+milkv-ssh-acceptance = ["ssh-test-fixture", "dep:zeroize"]
+
 [dependencies]
 vibeos-core = { path = "../../core" }
 vibeos-rustc = { path = "../../compiler" }
+vibeos-ssh-identity = { path = "../../services/ssh-identity", optional = true }
+zeroize = { version = "=1.9.0", default-features = false, optional = true }

@@ -1,32 +1,45 @@
-//! Kernel adapters for the separately compiled SSH component.
+//! Kernel adapters for the separately compiled SSH component and acceptance
+//! runner.
 //!
 //! This module is intentionally thin: it resolves capabilities against the
-//! component CSpace and translates kernel-private device/security services to
-//! the platform-neutral interface implemented by `vibeos-sshd`.
+//! component CSpace and translates kernel-private devices, timers, logging, and
+//! shutdown to platform-neutral interfaces. SSH protocol and acceptance policy
+//! live in their own crates.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 use core::fmt;
 
 use vibeos_core::cap::{Cap, Rights};
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 use vibeos_core::chan::Endpoint;
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 use vibeos_core::net::StampedPacket;
+#[cfg(feature = "ssh-security-test")]
+use vibeos_kernel_acceptance::ssh_security_test::{
+    Platform as SecurityTestPlatform, PlatformFuture as SecurityPlatformFuture,
+    SecretBytes as SecuritySecretBytes,
+};
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 use vibeos_ssh_identity::SshEd25519PublicKey;
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
-    NetworkBindError, NetworkInfo, Platform, PlatformFuture, SecretBytes, SshServicePolicy,
-    StaticIpv4Address,
+    NetworkBindError, NetworkInfo, Platform as SshdPlatform, PlatformFuture, SecretBytes,
+    SshServicePolicy, StaticIpv4Address,
 };
 
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 use crate::ssh_security::{AuthorizedKeyPolicyService, HostSigningService};
 use crate::world::Space;
 
-#[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
-use crate::ssh_acceptance_rng as ssh_rng;
 #[cfg(feature = "qemu-virt")]
 use crate::virtio_rng as ssh_rng;
 use ssh_rng::RandomError;
+#[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+use vibeos_kernel_acceptance::ssh_acceptance_rng as ssh_rng;
 
 const ENTROPY_RETRY_BUDGET: usize = 5_000;
 
@@ -56,17 +69,20 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     listener_label: "milkv-ssh-acceptance",
 };
 
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 struct SshPlatform {
     space: &'static Space,
 }
 
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 impl SshPlatform {
     const fn new(space: &'static Space) -> Self {
         Self { space }
     }
 }
 
-impl Platform for SshPlatform {
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+impl SshdPlatform for SshPlatform {
     fn packet_endpoints(
         &self,
         outbound: Cap,
@@ -189,7 +205,9 @@ impl Platform for SshPlatform {
             .map_err(|_| ())?;
         let profile = crate::ssh_security::profile_for_with(&lease, key).map_err(|_| ())?;
         Ok(profile
-            .filter(|profile| profile.profile.get() == crate::ssh_test_fixture::TEST_PROFILE)
+            .filter(|profile| {
+                profile.profile.get() == vibeos_kernel_acceptance::ssh_test_fixture::TEST_PROFILE
+            })
             .map(|profile| AuthorizedProfile {
                 generation: profile.generation.get(),
                 profile: profile.profile,
@@ -206,6 +224,7 @@ impl Platform for SshPlatform {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
 pub async fn task(
     space: &'static Space,
     outbound: Cap,
@@ -233,4 +252,68 @@ pub async fn task(
         policy,
     )
     .await;
+}
+
+#[cfg(feature = "ssh-security-test")]
+struct SecurityPlatform {
+    space: &'static Space,
+    random: Cap,
+}
+
+#[cfg(feature = "ssh-security-test")]
+impl SecurityPlatform {
+    const fn new(space: &'static Space, random: Cap) -> Self {
+        Self { space, random }
+    }
+}
+
+#[cfg(feature = "ssh-security-test")]
+impl SecurityTestPlatform for SecurityPlatform {
+    fn entropy<'a>(
+        &'a self,
+        length: usize,
+    ) -> SecurityPlatformFuture<'a, Result<SecuritySecretBytes, ()>> {
+        Box::pin(async move {
+            for _ in 0..ENTROPY_RETRY_BUDGET {
+                let lease = self
+                    .space
+                    .0
+                    .lock()
+                    .lookup_lease::<ssh_rng::RandomSource>(self.random, Rights::READ)
+                    .map_err(|_| ())?;
+                match ssh_rng::bytes_with(lease, length).await {
+                    Ok(bytes) => return SecuritySecretBytes::try_from_slice(bytes.as_slice()),
+                    Err(
+                        RandomError::Offline | RandomError::Busy | RandomError::DriverRestarted,
+                    ) => crate::exec::sleep_ms(1).await,
+                    Err(_) => return Err(()),
+                }
+            }
+            Err(())
+        })
+    }
+
+    fn log(&self, args: core::fmt::Arguments<'_>) {
+        crate::uart::_print(format_args!("{args}\n"));
+    }
+}
+
+#[cfg(feature = "ssh-security-test")]
+pub async fn security_test_task(
+    space: &'static Space,
+    random: Cap,
+    signer_read: Cap,
+    signer_invoke: Cap,
+    policy: Cap,
+) {
+    let platform = SecurityPlatform::new(space, random);
+    let passed = vibeos_kernel_acceptance::ssh_security_test::run_and_report(
+        &platform,
+        space.0.as_ref(),
+        signer_read,
+        signer_invoke,
+        policy,
+    )
+    .await;
+    crate::sbi::shutdown(!passed)
 }

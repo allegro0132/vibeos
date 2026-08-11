@@ -907,6 +907,8 @@ version = "0.1.0"
 dependencies = [
  "vibeos-core",
  "vibeos-rustc",
+ "vibeos-ssh-identity",
+ "zeroize",
 ]
 
 [[package]]

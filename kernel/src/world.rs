@@ -1606,9 +1606,9 @@ pub fn build() {
     ) = match (net_resources, net_space.as_ref(), net_policy.as_ref()) {
         (Some(resources), Some(driver_space), Some(policy_space)) => {
             let outbound: Arc<NetEndpoint<StampedPacket>> =
-                NetEndpoint::new("net-outbound", crate::virtio::SPLIT_QUEUE_SIZE as usize);
+                NetEndpoint::new("net-outbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
             let inbound: Arc<NetEndpoint<StampedPacket>> =
-                NetEndpoint::new("net-inbound", crate::virtio::SPLIT_QUEUE_SIZE as usize);
+                NetEndpoint::new("net-inbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
             let mut policy = policy_space.0.lock();
             let mmio_root = policy.mint(resources.mmio, Rights::ALL);
             let dma_root = policy.mint(resources.dma, Rights::ALL);

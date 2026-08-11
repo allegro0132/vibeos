@@ -5,6 +5,8 @@
 //! the wire constants, feature/status state machine, descriptor construction,
 //! and the reset-before-reuse invariant independently testable on the host.
 
+#![cfg_attr(not(test), no_std)]
+
 use core::mem::size_of;
 
 // Virtio 1.2, section 4.2.2: modern MMIO register layout.
@@ -136,7 +138,8 @@ pub const NET_TRANSMIT_QUEUE: u16 = 1;
 pub const ENTROPY_QUEUE: u16 = 0;
 pub const ENTROPY_MAX_REQUEST: u32 = 256;
 pub const NET_HEADER_SIZE: u32 = 12;
-pub const NET_MAX_FRAME_SIZE: u32 = crate::net::MAX_PACKET_LEN as u32;
+/// Maximum untagged Ethernet frame carried by the current network model.
+pub const NET_MAX_FRAME_SIZE: u32 = 1_514;
 pub const NET_RECEIVE_BUFFER_SIZE: u32 = NET_HEADER_SIZE + NET_MAX_FRAME_SIZE;
 pub const BLOCK_SECTOR_SIZE: u32 = 512;
 pub const BLOCK_HEADER_DESCRIPTOR: u16 = 0;

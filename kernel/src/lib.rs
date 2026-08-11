@@ -64,8 +64,10 @@ extern crate alloc;
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 pub use vibeos_core::{
-    cap, chan, durable, exec, heap, interrupt, ipi, program, sync, terminal, virtio, vsh,
+    cap, chan, durable, exec, heap, interrupt, ipi, program, sync, terminal, vsh,
 };
+#[cfg(feature = "qemu-virt")]
+pub use vibeos_driver_virtio_core as virtio;
 
 mod bench_platform;
 #[cfg(feature = "milkv-duo")]

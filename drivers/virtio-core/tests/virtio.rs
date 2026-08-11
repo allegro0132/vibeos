@@ -1,6 +1,6 @@
 use core::mem::{align_of, size_of};
 
-use vibeos_core::virtio::*;
+use vibeos_driver_virtio_core::*;
 
 fn read_write_features() -> NegotiatedFeatures {
     negotiate_block_features(VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH).unwrap()

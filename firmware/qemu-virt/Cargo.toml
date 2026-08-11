@@ -19,4 +19,4 @@ test = false
 bench = false
 
 [dependencies]
-vibeos-kernel = { path = "../../kernel", default-features = false, features = ["qemu-virt"] }
+vibeos-kernel = { path = "../../kernel", default-features = false, features = ["qemu-virt", "qemu-default-image"] }

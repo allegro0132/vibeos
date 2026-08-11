@@ -19,7 +19,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use vibeos_core::virtio::{
+use vibeos_driver_virtio_core::{
     consistent_config_u64, ConfigU64Sample, InterruptCauses, DEVICE_ID_BLOCK, DEVICE_ID_ENTROPY,
     DEVICE_ID_NETWORK, MMIO_CONFIG_GENERATION_OFFSET, MMIO_CONFIG_OFFSET,
     MMIO_DEVICE_FEATURES_OFFSET, MMIO_DEVICE_FEATURES_SEL_OFFSET, MMIO_DEVICE_ID_OFFSET,

@@ -8,9 +8,9 @@
 
 use core::cell::UnsafeCell;
 
-use vibeos_core::virtio::{
-    self, AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE,
-    SPLIT_QUEUE_SIZE,
+use vibeos_driver_virtio_core as virtio;
+use vibeos_driver_virtio_core::{
+    AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE, SPLIT_QUEUE_SIZE,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
 
@@ -345,6 +345,43 @@ pub unsafe fn confirmed_reset(transport: MmioTransport, reset_budget: usize) -> 
     let _ = transport.acknowledge_interrupt();
     clear_dma();
     true
+}
+
+/// Minimal IRQ-safe acknowledgement using a transport base previously
+/// validated and exclusively assigned to this entropy device.
+///
+/// # Safety
+///
+/// `transport_base` must remain mapped as a live modern VirtIO MMIO transport
+/// for the duration of this call and must not be reassigned to a different
+/// device. Concurrent acknowledgements of the same fixed transport are
+/// permitted: the acknowledged cause bits are write-one-to-clear.
+pub unsafe fn acknowledge_interrupt_at(transport_base: usize) -> u32 {
+    let raw = unsafe {
+        ((transport_base + virtio::MMIO_INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile()
+    };
+    irq_fence();
+    let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
+    if causes != 0 {
+        irq_fence();
+        unsafe {
+            ((transport_base + virtio::MMIO_INTERRUPT_ACK_OFFSET) as *mut u32)
+                .write_volatile(causes)
+        };
+        irq_fence();
+    }
+    causes
+}
+
+#[inline]
+fn irq_fence() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags))
+    };
+
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 fn zero_dma_data() {

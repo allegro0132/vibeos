@@ -21,12 +21,10 @@ use crate::world::Space;
 const SDHCI: vibeos_hal::SdhciDescription = crate::platform::SDHCI;
 const BASE: usize = SDHCI.registers.start;
 const IRQ: u32 = SDHCI.irq;
-// The packaged image places a raw VibeOS data partition immediately after the
-// 128 MiB FAT boot partition. Expose that partition as logical sector zero so
-// existing block acceptance sectors and the journal can never overwrite FIP,
-// FIT, or FAT metadata.
-const DATA_FIRST_SECTOR: u64 = 262_145;
-const DATA_SECTORS: u64 = 8_192;
+const DATA_SLICE: vibeos_image_policy::BlockSlice = match crate::platform::BLOCK_DATA_SLICE {
+    Some(slice) => slice,
+    None => panic!("Milk-V Duo firmware must select a data block slice"),
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockError {
@@ -392,14 +390,14 @@ impl Card {
         .map_err(map_hardware_error)?;
         let physical_capacity = hardware.info().capacity_sectors;
         let available_sectors = physical_capacity
-            .checked_sub(DATA_FIRST_SECTOR)
+            .checked_sub(DATA_SLICE.first_sector)
             .ok_or(BlockError::Unsupported)?;
-        if available_sectors < DATA_SECTORS {
+        if available_sectors < DATA_SLICE.sector_count || DATA_SLICE.end_sector().is_none() {
             return Err(BlockError::Unsupported);
         }
         Ok(Self {
             hardware,
-            capacity_sectors: DATA_SECTORS,
+            capacity_sectors: DATA_SLICE.sector_count,
         })
     }
 
@@ -408,7 +406,7 @@ impl Card {
             return Err(BlockError::OutOfRange);
         }
         let physical_sector = logical_sector
-            .checked_add(DATA_FIRST_SECTOR)
+            .checked_add(DATA_SLICE.first_sector)
             .ok_or(BlockError::OutOfRange)?;
         if physical_sector >= self.hardware.info().capacity_sectors {
             return Err(BlockError::OutOfRange);

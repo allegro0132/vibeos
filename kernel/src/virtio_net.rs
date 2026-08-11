@@ -837,7 +837,7 @@ fn take_outbound() -> Result<Option<StampedPacket>, NetError> {
 }
 
 fn take_admitted_outbound(control: &mut DriverControl) -> Result<Option<Packet>, NetError> {
-    for _ in 0..QUEUE_SLOTS {
+    for _ in 0..crate::net_device::FRONTEND_QUEUE_DEPTH {
         let Some(packet) = take_outbound()? else {
             return Ok(None);
         };
@@ -871,7 +871,7 @@ fn inbound_has_space() -> Result<bool, NetError> {
     };
     authority
         .inbound
-        .try_with(|endpoint| endpoint.stats().2 < QUEUE_SLOTS)
+        .try_with(|endpoint| endpoint.stats().2 < crate::net_device::FRONTEND_QUEUE_DEPTH)
         .map_err(|_| NetError::AuthorityRevoked)
 }
 

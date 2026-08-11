@@ -28,5 +28,4 @@ pub mod ssh_identity;
 pub mod store;
 pub mod sync;
 pub mod terminal;
-pub mod virtio;
 pub mod vsh;

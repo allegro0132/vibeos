@@ -18,4 +18,4 @@ test = false
 bench = false
 
 [dependencies]
-vibeos-kernel = { path = "../../kernel", default-features = false, features = ["milkv-duo"] }
+vibeos-kernel = { path = "../../kernel", default-features = false, features = ["milkv-duo", "milkv-duo-sd-image"] }

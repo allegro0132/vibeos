@@ -27,7 +27,6 @@ vibe> echo history > @console
 vibe> echo hello
 hello
 vibe> vsh
-VibeOS vsh diagnostic session -- Ctrl-C returns to `vibe>`.
 vsh> help
   echo ...        write value arguments
   wc              count stdin bytes, words, and lines
@@ -42,15 +41,14 @@ vsh> help
   ps              component lifecycle snapshots
   caps [space]    sanitized capability summary
   mem             bounded-memory accounts
+  quiet           mute background component output
+  verbose         restore background component output
+  poweroff        power off
   pci             list discovered PCI functions
   usb info        list XHCI USB devices
   usb read N      read one USB-storage sector
   usb test        destructive CI test of sectors 7 and 8
-  quiet           mute background component output
-  verbose         restore background component output
-  poweroff        power off
 vsh> echo nested > @console
 nested
 vsh> ^C
-  returning to diagnostic shell
 vibe> 

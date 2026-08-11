@@ -35,8 +35,6 @@ use vibeos_driver_virtio_rng::{Engine, Submission};
 
 const RESET_POLL_BUDGET: usize = 100_000;
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
-const INTERRUPT_STATUS_OFFSET: usize = 0x060;
-const INTERRUPT_ACK_OFFSET: usize = 0x064;
 
 /// One invocation can request at most this many bytes.
 ///
@@ -1120,20 +1118,11 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 }
 
 fn acknowledge_irq_transport(transport_base: usize) -> u32 {
-    let raw = unsafe { ((transport_base + INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile() };
-    irq_fence();
-    let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
-    if causes != 0 {
-        irq_fence();
-        unsafe { ((transport_base + INTERRUPT_ACK_OFFSET) as *mut u32).write_volatile(causes) };
-        irq_fence();
-    }
-    causes
-}
-
-#[inline]
-fn irq_fence() {
-    unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
+    // SAFETY: QEMU's BSP identity-maps every VirtIO transport for the firmware
+    // lifetime and assigns this fixed slot only to the entropy device. PLIC
+    // teardown may leave one copied handler in flight, but concurrent W1C
+    // acknowledgements of the same transport are explicitly supported.
+    unsafe { vibeos_driver_virtio_rng::acknowledge_interrupt_at(transport_base) }
 }
 
 pub fn is_online() -> bool {

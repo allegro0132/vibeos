@@ -9,11 +9,12 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use vibeos_core::virtio::{
-    self, AvailableRing, BlockDmaAddresses, BlockOperation, BlockRequestHeader, BlockStatus,
-    Descriptor, ModernInit, NegotiatedFeatures, QueueError, ResetReason, SplitQueueModel,
-    Submission, UsedElement, UsedRing, BLOCK_HEADER_DESCRIPTOR, BLOCK_SECTOR_SIZE,
-    SPLIT_QUEUE_SIZE, STATUS_DEVICE_NEEDS_RESET, STATUS_DRIVER_OK,
+use vibeos_driver_virtio_core as virtio;
+use vibeos_driver_virtio_core::{
+    AvailableRing, BlockDmaAddresses, BlockOperation, BlockRequestHeader, BlockStatus, Descriptor,
+    ModernInit, NegotiatedFeatures, QueueError, ResetReason, SplitQueueModel, Submission,
+    UsedElement, UsedRing, BLOCK_HEADER_DESCRIPTOR, BLOCK_SECTOR_SIZE, SPLIT_QUEUE_SIZE,
+    STATUS_DEVICE_NEEDS_RESET, STATUS_DRIVER_OK,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
 
@@ -290,7 +291,7 @@ pub unsafe fn recover_after_fault(transport: MmioTransport) -> Result<(), Hardwa
 /// # Safety
 /// `transport_base` must remain mapped to a modern Virtio MMIO window.
 pub unsafe fn acknowledge_interrupt_at(transport_base: usize) -> u32 {
-    use vibeos_core::virtio::{
+    use vibeos_driver_virtio_core::{
         InterruptCauses, MMIO_INTERRUPT_ACK_OFFSET, MMIO_INTERRUPT_STATUS_OFFSET,
     };
     let raw =
@@ -439,7 +440,7 @@ fn dma_fence() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibeos_core::virtio::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_F_VERSION_1};
+    use vibeos_driver_virtio_core::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_F_VERSION_1};
 
     #[test]
     fn dma_layout_is_stable_and_queue_aligned() {

@@ -8,6 +8,11 @@
 // frontend even when a particular firmware image consumes only a subset.
 #![allow(unused_imports)]
 
+/// Capacity of the stable packet channels between a device driver and its
+/// clients. This frontend resource policy is intentionally unrelated to any
+/// backend's hardware descriptor-ring depth.
+pub const FRONTEND_QUEUE_DEPTH: usize = crate::platform::NETWORK_FRONTEND.queue_depth;
+
 #[cfg(feature = "milkv-duo")]
 #[allow(unused_imports)]
 pub use crate::dwmac_net::{

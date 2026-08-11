@@ -5,9 +5,11 @@ edition = "2021"
 autobins = false
 
 [features]
-default = ["qemu-virt"]
-qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
+default = ["qemu-virt", "qemu-default-image"]
+qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
 milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-sdhci-blk"]
+qemu-default-image = ["vibeos-image-policy/qemu-default"]
+milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
 # listener. This is deliberately separate from the eventual SSH feature so a
@@ -52,11 +54,13 @@ vibeos-driver-dwmac-net = { path = "../drivers/dwmac-net", optional = true }
 vibeos-driver-pci = { path = "../drivers/pci", optional = true }
 vibeos-driver-sdhci-blk = { path = "../drivers/sdhci-blk", optional = true }
 vibeos-driver-virtio-blk = { path = "../drivers/virtio-blk", optional = true }
+vibeos-driver-virtio-core = { path = "../drivers/virtio-core", optional = true }
 vibeos-driver-virtio-mmio = { path = "../drivers/virtio-mmio", optional = true }
 vibeos-driver-virtio-net = { path = "../drivers/virtio-net", optional = true }
 vibeos-driver-virtio-rng = { path = "../drivers/virtio-rng", optional = true }
 vibeos-driver-xhci = { path = "../drivers/xhci", optional = true }
 vibeos-hal = { path = "../hal" }
+vibeos-image-policy = { path = "../policy/image", default-features = false }
 vibeos-rustc = { path = "../compiler" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }

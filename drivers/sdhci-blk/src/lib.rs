@@ -529,8 +529,8 @@ mod tests {
 
     #[test]
     fn converts_sector_address_for_both_card_types() {
-        assert_eq!(sector_argument(true, 262_145), Ok(262_145));
-        assert_eq!(sector_argument(false, 262_145), Ok(262_145 * 512));
+        assert_eq!(sector_argument(true, 12_345), Ok(12_345));
+        assert_eq!(sector_argument(false, 12_345), Ok(12_345 * 512));
         assert_eq!(sector_argument(false, u64::MAX), Err(Error::OutOfRange));
         assert_eq!(
             sector_argument(true, u64::from(u32::MAX) + 1),

@@ -790,6 +790,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-xhci"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
@@ -818,6 +822,7 @@ dependencies = [
  "vibeos-core",
  "vibeos-driver-pci",
  "vibeos-driver-virtio-mmio",
+ "vibeos-driver-xhci",
  "vibeos-hal",
  "vibeos-kernel-acceptance",
  "vibeos-netstack",

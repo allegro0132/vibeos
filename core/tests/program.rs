@@ -1,16 +1,16 @@
-use vibeos_durable_format::{
-    preflight_recovery, preview_grant_transaction, DerivationId, DurableRights, GrantFlags,
-    GrantRecord, ObjectId, ObjectKind, RecordBody, RecordChain, RecoveredGrant, RecoveryError,
-    ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint, SlotIdentity, SpaceId, StoreId,
-    TransactionId,
-};
 use vibeos_core::program::{
     partition_tombstones_by_space, program_root_constraint, program_root_policy_is_exact,
     select_root_policy_union, sha256, ProgramArtifact, ProgramArtifactError, RootPolicyPartition,
     TombstonePartition, TombstonePartitionError, MAX_PROGRAM_EXECUTABLE_BYTES, PROGRAM_ALIAS,
     PROGRAM_ARTIFACT_HEADER_LEN, PROGRAM_ROOT_GENERATION, PROGRAM_ROOT_RIGHTS, PROGRAM_ROOT_SLOT,
 };
-use vibeos_core::store::encode_object_transaction;
+use vibeos_durable_format::encode_object_transaction;
+use vibeos_durable_format::{
+    preflight_recovery, preview_grant_transaction, DerivationId, DurableRights, GrantFlags,
+    GrantRecord, ObjectId, ObjectKind, RecordBody, RecordChain, RecoveredGrant, RecoveryError,
+    ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint, SlotIdentity, SpaceId, StoreId,
+    TransactionId,
+};
 
 fn artifact() -> ProgramArtifact {
     ProgramArtifact::new("fn main() { println!(\"hello\"); }\n", b"VIBEEXE\0fixture").unwrap()

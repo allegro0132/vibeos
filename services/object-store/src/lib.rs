@@ -11,6 +11,10 @@
 
 extern crate alloc;
 
+mod codec;
+
+pub use codec::*;
+
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -22,10 +26,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use vibeos_durable_format::{
-    self as authority, ChainCheckpoint, DecodeStatus, ObjectId, RecordBody, StoreId, TransactionId,
-};
-use vibeos_core::store as journal;
+use crate as journal;
+use vibeos_durable_format as authority;
 
 use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::exec::{self, TaskId};

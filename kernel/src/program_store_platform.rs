@@ -27,7 +27,7 @@ use vibeos_core::program::{
     self, ProgramArtifact, PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS,
     PROGRAM_ROOT_SLOT, PROGRAM_SPACE_ID_RAW,
 };
-use vibeos_core::store as object_codec;
+use vibeos_object_store as object_codec;
 
 use crate::store::{AuthorityJournal, StoredObject};
 use crate::sync::SpinLock;

@@ -1,12 +1,12 @@
 //! M4.0 durable-authority format and crash-recovery proof tests.
 
 use vibeos_durable_format::{
-    crc32c, preflight_recovery, preview_grant_transaction, preview_id_high_water,
-    preview_revoke_transaction, recover, DecodeError, DecodeStatus, DerivationId, DurableRights,
-    GrantFlags, GrantRecord, LogRecord, ObjectChunk, ObjectCommit, ObjectId, ObjectKind,
-    ObjectMetadata, RecordBody, RecordChain, RecoveredStore, RecoveryError, RecoveryPolicy,
-    ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint, SlotIdentity, SpaceId, StoreId,
-    TransactionId, CHUNK_DATA_SIZE, CRC_OFFSET, PAYLOAD_OFFSET, RECORD_SIZE,
+    crc32c, encode_object_transaction, preflight_recovery, preview_grant_transaction,
+    preview_id_high_water, preview_revoke_transaction, recover, DecodeError, DecodeStatus,
+    DerivationId, DurableRights, GrantFlags, GrantRecord, LogRecord, ObjectId, ObjectKind,
+    RecordBody, RecordChain, RecoveredStore, RecoveryError, RecoveryPolicy, ResourceKind,
+    RootConstraint, RootPolicy, RootRightsConstraint, SlotIdentity, SpaceId, StoreId,
+    TransactionId, CRC_OFFSET, PAYLOAD_OFFSET, RECORD_SIZE,
 };
 
 const HIGH_WATER: u128 = 1_000;
@@ -120,50 +120,10 @@ impl TestLog {
         object_kind: ObjectKind,
         bytes: &[u8],
     ) {
-        let chunk_count = if bytes.is_empty() {
-            0
-        } else {
-            bytes.len().div_ceil(CHUNK_DATA_SIZE) as u32
-        };
-        let content_crc32c = crc32c(bytes);
-        let (prepare_sequence, prepare_crc32c) = self.push(
-            Some(transaction),
-            RecordBody::ObjectPrepare(ObjectMetadata {
-                object_id,
-                object_kind,
-                byte_len: bytes.len() as u64,
-                chunk_count,
-                content_crc32c,
-            }),
-        );
-        let mut first_chunk_sequence = 0;
-        let mut chunk_crc_bytes = Vec::new();
-        for (index, data) in bytes.chunks(CHUNK_DATA_SIZE).enumerate() {
-            let (sequence, crc32c) = self.push(
-                Some(transaction),
-                RecordBody::ObjectChunk(ObjectChunk {
-                    object_id,
-                    chunk_index: index as u32,
-                    data: data.to_vec(),
-                }),
-            );
-            if index == 0 {
-                first_chunk_sequence = sequence;
-            }
-            chunk_crc_bytes.extend_from_slice(&crc32c.to_le_bytes());
-        }
-        self.push(
-            Some(transaction),
-            RecordBody::ObjectCommit(ObjectCommit {
-                object_id,
-                prepare_sequence,
-                prepare_crc32c,
-                chunk_count,
-                first_chunk_sequence,
-                chunks_crc32c: crc32c(&chunk_crc_bytes),
-                content_crc32c,
-            }),
-        );
+        let transaction =
+            encode_object_transaction(&mut self.chain, transaction, object_id, object_kind, bytes)
+                .unwrap();
+        self.sectors.extend(transaction.records);
     }
 }
 

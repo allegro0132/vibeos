@@ -4,7 +4,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use vibeos_durable_format::{ObjectId, StoreId, TransactionId};
-use vibeos_core::store::{
+use vibeos_object_store::{
     encode_object_transaction, recover, ObjectKind, RecordBody, RecordChain, RecoveryPolicy,
     CHUNK_DATA_SIZE,
 };

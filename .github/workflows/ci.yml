@@ -62,6 +62,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -78,7 +80,7 @@ jobs:
       - name: Install QEMU and lld
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc lld
+          sudo apt-get install -y qemu-system-misc lld clang llvm
           # Cargo's rustflags name `ld.lld`; Ubuntu ships it as lld-<version>.
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
           qemu-system-riscv64 --version
@@ -87,6 +89,8 @@ jobs:
         # FIT/full-card packaging still requires a prebuilt official SDK and
         # remains part of the documented manual hardware acceptance flow.
         run: ./scripts/build-milkv-duo.sh
+      - name: Build the Milk-V Duo Jitterentropy probe
+        run: ./scripts/build-milkv-duo.sh --jitterentropy-probe
       - name: Golden transcripts
         run: ./scripts/qemu-test.sh
       - name: QEMU/TCG benchmark regression budget

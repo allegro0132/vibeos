@@ -7,28 +7,34 @@ set -eo pipefail
 
 diagnostic=false
 ssh_acceptance=false
+jitterentropy_probe=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
     --diagnostic) diagnostic=true ;;
     --ssh-acceptance) ssh_acceptance=true ;;
-    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    --jitterentropy-probe) jitterentropy_probe=true ;;
+    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2
+        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2
         exit 2
       fi
       sdk_arg=$arg
       ;;
   esac
 done
-if [[ "$diagnostic" == true && "$ssh_acceptance" == true ]]; then
-  echo "package-milkv-duo-sdk.sh: --diagnostic and --ssh-acceptance are mutually exclusive" >&2
-  echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2
+mode_count=0
+[[ "$diagnostic" == true ]] && ((mode_count += 1))
+[[ "$ssh_acceptance" == true ]] && ((mode_count += 1))
+[[ "$jitterentropy_probe" == true ]] && ((mode_count += 1))
+if ((mode_count > 1)); then
+  echo "package-milkv-duo-sdk.sh: image mode options are mutually exclusive" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic | --ssh-acceptance] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
@@ -44,6 +50,9 @@ if [[ "$diagnostic" == true ]]; then
 elif [[ "$ssh_acceptance" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-ssh-acceptance"
   image_name="vibeos-milkv-duo-ssh-acceptance-sd.img"
+elif [[ "$jitterentropy_probe" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-jitterentropy-probe"
+  image_name="vibeos-milkv-duo-jitterentropy-probe-sd.img"
 fi
 kernel_bin="$output_dir/vibeos-kernel.bin"
 output_its="$output_dir/milkv-duo.its"
@@ -152,6 +161,8 @@ if [[ "$diagnostic" == true ]]; then
   verify_args=(--diagnostic "$sdk_root")
 elif [[ "$ssh_acceptance" == true ]]; then
   verify_args=(--ssh-acceptance "$sdk_root")
+elif [[ "$jitterentropy_probe" == true ]]; then
+  verify_args=(--jitterentropy-probe "$sdk_root")
 fi
 if ! "$script_dir/verify-milkv-duo-image.sh" "${verify_args[@]}"; then
   echo "package-milkv-duo-sdk.sh: refusing to publish an unverified SD image" >&2

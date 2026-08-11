@@ -26,6 +26,8 @@ compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image
 compile_error!("feature `ssh-test` is the QEMU-only N4 acceptance image");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
+#[cfg(all(feature = "milkv-jitterentropy-probe", not(feature = "milkv-duo")))]
+compile_error!("feature `milkv-jitterentropy-probe` is the Milk-V Duo hardware probe image");
 #[cfg(all(feature = "ssh-test", feature = "tcp-echo"))]
 compile_error!("features `ssh-test` and `tcp-echo` are mutually exclusive acceptance images");
 #[cfg(all(feature = "ssh-test", feature = "ssh-security-test"))]
@@ -43,6 +45,19 @@ compile_error!(
 ))]
 compile_error!(
     "feature `milkv-ssh-acceptance` must exclusively own the IPv4 stack and SSH test policy"
+);
+#[cfg(all(
+    feature = "milkv-jitterentropy-probe",
+    any(
+        feature = "net-shell",
+        feature = "tcp-echo",
+        feature = "ssh-test",
+        feature = "ssh-security-test",
+        feature = "milkv-ssh-acceptance"
+    )
+))]
+compile_error!(
+    "feature `milkv-jitterentropy-probe` is an isolated UART qualification image"
 );
 
 extern crate alloc;
@@ -62,6 +77,8 @@ mod cap_table_pool;
 mod code_pool;
 mod dev;
 mod durable_cspace;
+#[cfg(feature = "milkv-jitterentropy-probe")]
+mod jitterentropy_probe;
 mod mmu;
 #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
 mod net_config;

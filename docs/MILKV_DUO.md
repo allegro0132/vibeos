@@ -5,6 +5,11 @@ support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
 timebase, native microSD/DWMAC backends, and a FIT/SD image packaging flow based
 on the official Buildroot SDK.
 
+The separate `--jitterentropy-probe` image ports upstream Jitterentropy 3.7.0
+against `rdtime` and exposes conditioned smoke testing plus raw-delta capture on
+UART. It is a qualification artifact, not a production entropy source. See
+[JITTERENTROPY.md](JITTERENTROPY.md) before making any SSH security claim.
+
 > **Base-port and explicit SSH/VSH hardware validation status (2026-08-11):
 > passed within the documented boundaries.** A CV1800B board booted
 > successfully and entered the interactive shell. Sv39, the 25 MHz timer,

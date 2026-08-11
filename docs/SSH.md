@@ -162,7 +162,9 @@ provisioning work is:
 
 - Use a documented and validated Milk-V Duo hardware source or leave SSH
   disabled on that platform. Compiling a vendor RNG API or driver is not
-  hardware validation.
+  hardware validation. The isolated upstream Jitterentropy port and its
+  required physical runtime/restart gate are documented in
+  [JITTERENTROPY.md](JITTERENTROPY.md); it is not yet admitted here.
 - Provision one unique Ed25519 host identity per device, keep its public
   fingerprint stable across reboot, and leave the private seed behind a signer
   service. The SSH component receives invocation authority, not readable key

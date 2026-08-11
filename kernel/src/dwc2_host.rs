@@ -2,7 +2,7 @@
 
 use crate::{println, sync::SpinLock};
 use vibeos_driver_dwc2_host::{
-    Controller, DeviceInfo, Error, HidKeyboardInfo, HubInfo, Info, Telemetry,
+    ConfigurationInfo, Controller, DeviceInfo, Error, HidKeyboardInfo, HubInfo, Info, Telemetry,
 };
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
@@ -14,6 +14,7 @@ pub struct Snapshot {
     pub device: Option<DeviceInfo>,
     pub child: Option<DeviceInfo>,
     pub hub: Option<HubInfo>,
+    pub configuration: Option<ConfigurationInfo>,
     pub keyboard: Option<HidKeyboardInfo>,
     pub telemetry: Telemetry,
 }
@@ -55,6 +56,7 @@ pub fn snapshot() -> Option<Snapshot> {
         device: controller.device(),
         child: controller.child(),
         hub: controller.hub(),
+        configuration: controller.configuration(),
         keyboard: controller.keyboard(),
         telemetry: controller.telemetry(),
     })

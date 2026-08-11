@@ -11,7 +11,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::future::{Future, poll_fn};
+use core::future::{poll_fn, Future};
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::Poll;
@@ -21,7 +21,7 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, BlockOperation, SPLIT_QUEUE_SIZE, UsedElement};
+use crate::virtio::{self, BlockOperation, UsedElement, SPLIT_QUEUE_SIZE};
 use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;

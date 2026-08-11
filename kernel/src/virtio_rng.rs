@@ -18,7 +18,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::future::{Future, poll_fn};
+use core::future::{poll_fn, Future};
 use core::pin::pin;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::task::Poll;

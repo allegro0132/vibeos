@@ -13,8 +13,8 @@ use vibeos_netstack::{NetworkBindError, NetworkInfo, Platform};
 
 use crate::world::Space;
 
-pub use vibeos_netstack::COMPONENT_NAME;
 pub use vibeos_netstack::config::{vsh_dhclient, vsh_ip};
+pub use vibeos_netstack::COMPONENT_NAME;
 
 struct NetstackPlatform {
     space: &'static Space,

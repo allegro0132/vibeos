@@ -15,7 +15,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use vibeos_core::cap::{
     Cap, InvocationLease, PendingSlotReservation, PersistentCapIdentity, Resource, Rights,
@@ -26,8 +26,8 @@ use vibeos_durable_format::{
 use vibeos_object_store as object_codec;
 use vibeos_program_store as program;
 use vibeos_program_store::{
-    PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS, PROGRAM_ROOT_SLOT,
-    PROGRAM_SPACE_ID_RAW, ProgramArtifact,
+    ProgramArtifact, PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS,
+    PROGRAM_ROOT_SLOT, PROGRAM_SPACE_ID_RAW,
 };
 
 use crate::store::{AuthorityJournal, StoredObject};
@@ -36,7 +36,7 @@ use crate::world::Space;
 use crate::{cap, exec, heap};
 
 pub use vibeos_program_store::{
-    SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram, authorize_recovered,
+    authorize_recovered, SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram,
 };
 
 pub struct SavedProgramService {

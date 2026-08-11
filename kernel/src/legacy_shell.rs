@@ -8,12 +8,12 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::HEAP;
 use crate::cap::{CSpace, Cap, CapError, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
 use crate::net::{Packet, PacketStamp, StampedPacket};
-use crate::world::{Reading, Space, world};
+use crate::world::{world, Reading, Space};
+use crate::HEAP;
 use crate::{exec, ipi, mmu, println, sbi, sync::SpinLock, tty, uart};
 
 struct ReadOnlyCapProbe(u64);
@@ -730,7 +730,7 @@ async fn run_generated_on(
 }
 
 async fn mmu_ro_demo() {
-    use vibeos_core::mmu::{PAGE_SIZE, PagePermissions};
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
 
     let (rodata_start, rodata_end) = mmu::rodata_range();
     let rodata_read_only = [rodata_start, rodata_end - PAGE_SIZE]
@@ -847,7 +847,7 @@ async fn mmu_ro_demo() {
 }
 
 fn capability_table_range_is_read_only(range: crate::cap::CapabilityTableRange) -> bool {
-    use vibeos_core::mmu::{PAGE_SIZE, PagePermissions};
+    use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
 
     range.start % PAGE_SIZE == 0
         && range.page_count != 0
@@ -1496,9 +1496,9 @@ fn report(what: &str, outcome: Result<(), CapError>) {
 
 fn durable_demo() {
     use crate::durable::{
-        DecodeStatus, DerivationId, DurableRights, GrantFlags, GrantRecord, LogRecord, ObjectId,
-        RecordBody, RecordChain, RecoveryPolicy, ResourceKind, RootPolicy, SlotIdentity, SpaceId,
-        StoreId, TransactionId, recover,
+        recover, DecodeStatus, DerivationId, DurableRights, GrantFlags, GrantRecord, LogRecord,
+        ObjectId, RecordBody, RecordChain, RecoveryPolicy, ResourceKind, RootPolicy, SlotIdentity,
+        SpaceId, StoreId, TransactionId,
     };
 
     let store = StoreId::new(1).unwrap();

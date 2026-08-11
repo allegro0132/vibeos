@@ -68,7 +68,7 @@ pub use vibeos_core::{
     cap, chan, durable, exec, heap, interrupt, ipi, program, sync, terminal, virtio, vsh,
 };
 
-mod bench;
+mod bench_platform;
 #[cfg(feature = "milkv-duo")]
 mod board_led;
 mod cap_table_pool;
@@ -90,6 +90,7 @@ mod plic;
 mod rustc;
 #[path = "program_store_platform.rs"]
 mod saved_program;
+#[path = "selftest_platform.rs"]
 mod selftest;
 #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
 mod ssh_acceptance_rng;

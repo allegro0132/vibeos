@@ -131,6 +131,8 @@ upward except through a capability it was handed.
 | `kernel/program_store_platform.rs` | growing | Compiler, execution, CSpace publication, and exact-task cleanup adapter | — |
 | `services/authority-store` | small, trusted | Persistent-space identities, rights, lifecycle contract, and root policy | — |
 | `kernel/authority_store_platform.rs` | growing | Atomic recovered-graph installation, publication, and fault cleanup adapter | — |
+| `acceptance/kernel-tests` | small | Guest acceptance harness and benchmark policy/scenarios | — |
+| `kernel/selftest_platform.rs`, `kernel/bench_platform.rs` | growing / small | Hardware cases and kernel capability adapters for guest acceptance | yes / — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |
 | `world.rs` | 408 | The system image: supervised components, spaces, wiring | — |
 | `kernel/legacy_shell.rs` | large, gated | Diagnostic operator and hardware acceptance interface | yes |

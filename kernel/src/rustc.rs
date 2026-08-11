@@ -21,9 +21,9 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-pub use vibeos_rustc::samples::{
-    BENCHMARK as BENCH_SRC, CONFORMANCE as CONFORM_SRC, DEMO as DEMO_SRC, HELLO as HELLO_SRC,
-};
+#[cfg(feature = "legacy-shell")]
+pub use vibeos_rustc::samples::CONFORMANCE as CONFORM_SRC;
+pub use vibeos_rustc::samples::{DEMO as DEMO_SRC, HELLO as HELLO_SRC};
 
 /// Fixed M3.16 demonstration: memory is claimed before the first console
 /// operation and used again after the second operation revokes `prog`.

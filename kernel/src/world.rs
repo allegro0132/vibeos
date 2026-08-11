@@ -34,12 +34,7 @@ const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
 // their transient buffers to the shell owner. Keep the documented store
 // working-set floor plus client/future headroom while retaining a hard quota.
-#[cfg(not(feature = "milkv-jitterentropy-probe"))]
 pub const SHELL_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
-// The raw qualification command follows upstream's recorder and buffers one
-// uninterrupted 1,000,000-delta run before touching UART (8 MiB of samples).
-#[cfg(feature = "milkv-jitterentropy-probe")]
-pub const SHELL_MEMORY_BUDGET: usize = 12 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ComponentId(u64);

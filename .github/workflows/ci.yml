@@ -62,8 +62,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          submodules: recursive
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -80,7 +78,7 @@ jobs:
       - name: Install QEMU and lld
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc lld clang llvm
+          sudo apt-get install -y qemu-system-misc lld
           # Cargo's rustflags name `ld.lld`; Ubuntu ships it as lld-<version>.
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
           qemu-system-riscv64 --version

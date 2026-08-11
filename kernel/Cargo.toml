@@ -30,11 +30,10 @@ ssh-test = ["dep:sunset"]
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
 milkv-ssh-acceptance = ["dep:sunset"]
-# Dedicated hardware qualification image for the pinned upstream
-# jitterentropy-library port. It exposes conditioned smoke tests and raw timing
-# deltas through the UART shell, but is not wired into SSH until physical
-# SP800-90B evidence has passed review.
-milkv-jitterentropy-probe = ["legacy-shell"]
+# Dedicated hardware qualification image for jitterentropy-rs. It exposes a
+# conditioned smoke test through the UART shell, but is not wired into SSH
+# until the Rust rewrite's validation and independent review gates have passed.
+milkv-jitterentropy-probe = ["legacy-shell", "dep:jitterentropy"]
 
 # The kernel is `no_std` and cannot link a host test harness. Its tests live in
 # `selftest.rs` and run inside QEMU; `cargo test --workspace` must skip it.
@@ -47,3 +46,4 @@ test = false
 vibeos-core = { path = "../core" }
 vibeos-rustc = { path = "../compiler" }
 sunset = { path = "../vendor/sunset", default-features = false, features = ["alloc"], optional = true }
+jitterentropy = { package = "jitterentropy-rs", version = "=0.1.1", default-features = false, features = ["alloc"], optional = true }

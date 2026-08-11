@@ -761,6 +761,7 @@ dependencies = [
  "vibeos-netstack",
  "vibeos-rustc",
  "vibeos-sshd",
+ "vibeos-vsh",
 ]
 
 [[package]]
@@ -779,6 +780,13 @@ name = "vibeos-sshd"
 version = "0.1.0"
 dependencies = [
  "sunset",
+ "vibeos-core",
+]
+
+[[package]]
+name = "vibeos-vsh"
+version = "0.1.0"
+dependencies = [
  "vibeos-core",
 ]
 

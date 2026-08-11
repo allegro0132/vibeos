@@ -119,6 +119,9 @@ upward except through a capability it was handed.
 | `kernel/virtio_*.rs` | growing | MMIO transport, stable DMA, supervised block/network services | yes |
 | `components/netstack` | growing | Capability-confined IPv4/TCP stack, echo service, and network control plane | — |
 | `kernel/netstack_platform.rs` | small | Kernel-private packet/network-control adapter and recovery-only hooks | — |
+| `components/vsh` | small | Interactive VSH loop, cancellation, report rendering, and declarative registration | — |
+| `kernel/vsh_platform.rs` | small | Console capability plus hardware and management command adapters | — |
+| `kernel/legacy_shell.rs` | large, gated | Diagnostic acceptance commands retained only by `legacy-shell` images | yes |
 | `components/sshd` | growing | Capability-confined SSH protocol, authentication, sessions, and VSH frontend | 1 (secret wipe) |
 | `kernel/ssh_platform.rs` | small | Kernel-private network, entropy, signer, policy, command, and log adapters for `sshd` | — |
 | `exec.rs` | 1212 | Scheduler, tracked lifecycle, cancellation/join, wakers, wait queues, timers | 1 (waker construction) |

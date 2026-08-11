@@ -173,7 +173,7 @@ impl Platform for SshPlatform {
     }
 
     fn install_standard_vsh_commands(&self, session: &mut vibeos_core::vsh::Session) {
-        crate::shell::install_standard_vsh_commands(session);
+        crate::vsh_platform::install_standard_commands(session);
     }
 
     fn log(&self, args: fmt::Arguments<'_>) {

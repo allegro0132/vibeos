@@ -1,4 +1,4 @@
-//! An interactive shell — itself just another async task holding capabilities.
+//! Legacy diagnostic shell and kernel-local acceptance commands.
 
 extern crate alloc;
 
@@ -6,10 +6,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::future::{poll_fn, Future};
-use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use core::task::Poll;
 
 use crate::cap::{CSpace, Cap, CapError, Resource, Rights};
 use crate::chan::Endpoint;
@@ -34,29 +31,12 @@ impl Resource for ReadOnlyCapProbe {
 pub async fn shell_task(boot_time: u64) {
     println!("\nVibeOS shell ready -- type `help` for commands, `quiet` to mute components.\n");
     let mut vsh = crate::vsh::Session::new();
-    install_standard_vsh_commands(&mut vsh);
+    crate::vsh_platform::install_standard_commands(&mut vsh);
     loop {
         tty::prompt("vibe> ");
         if let Some(line) = read_line().await {
             if !line.is_empty() {
                 run(&line, boot_time, &mut vsh).await;
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "legacy-shell"))]
-pub async fn vsh_task(space: Arc<Space>, console: Cap, mut session: crate::vsh::Session) {
-    write_vsh_front(
-        &space,
-        console,
-        "\nVibeOS vsh ready -- capability-native shell.\n\n",
-    );
-    loop {
-        tty::prompt("vsh> ");
-        if let Some(line) = read_line().await {
-            if !line.is_empty() {
-                run_vsh_source(&line, &mut session, Some((&space, console))).await;
             }
         }
     }
@@ -80,7 +60,7 @@ async fn read_line() -> Option<String> {
 async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let trimmed = line.trim();
     if trimmed == "vsh" {
-        interactive_vsh(vsh).await;
+        crate::vsh_platform::interactive_legacy(vsh).await;
         return;
     }
     let explicit_vsh = trimmed.strip_prefix("vsh ");
@@ -94,7 +74,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             .nth(1)
             .is_some_and(|arg| arg.starts_with('%')));
     if let Some(source) = explicit_vsh.or_else(|| vsh_command.then_some(trimmed)) {
-        run_vsh_source(source, vsh, None).await;
+        crate::vsh_platform::run_legacy_source(source, vsh).await;
         return;
     }
     let mut parts = line.split_whitespace();
@@ -428,11 +408,17 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         },
 
         #[cfg(feature = "qemu-virt")]
-        "pci" => pci_status(),
+        "pci" => crate::print!(
+            "{}",
+            crate::vsh_platform::vsh_pci(&[]).expect("PCI listing is infallible")
+        ),
         #[cfg(feature = "qemu-virt")]
         "usb" => {
-            let args = rest.iter().map(|arg| String::from(*arg)).collect::<Vec<_>>();
-            match vsh_usb(&args) {
+            let args = rest
+                .iter()
+                .map(|arg| String::from(*arg))
+                .collect::<Vec<_>>();
+            match crate::vsh_platform::vsh_usb(&args) {
                 Ok(output) => crate::print!("{}", output),
                 Err(status) => println!("  usb: {:?}", status),
             }
@@ -542,315 +528,6 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         other => println!("  unknown command: {} (try `help`)", other),
     }
-}
-
-async fn interactive_vsh(session: &mut crate::vsh::Session) {
-    println!("\nVibeOS vsh diagnostic session -- Ctrl-C returns to `vibe>`.\n");
-    loop {
-        tty::prompt("vsh> ");
-        match read_line().await {
-            Some(line) if !line.is_empty() => run_vsh_source(&line, session, None).await,
-            Some(_) => {}
-            None => {
-                println!("  returning to diagnostic shell");
-                return;
-            }
-        }
-    }
-}
-
-async fn run_vsh_source(
-    source: &str,
-    vsh: &mut crate::vsh::Session,
-    front: Option<(&Arc<Space>, Cap)>,
-) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let completed = Arc::new(SpinLock::new(None));
-    let completed_task = completed.clone();
-    let cancel_task = cancel.clone();
-    let source = String::from(source);
-    let mut session = core::mem::take(vsh);
-    let handle = exec::spawn_tracked("vsh-foreground", async move {
-        let result = session.execute_cancellable(&source, cancel_task).await;
-        *completed_task.lock() = Some((session, result));
-    });
-    loop {
-        let mut join = pin!(handle.join());
-        let mut input = pin!(uart::read_byte());
-        let event = poll_fn(|cx| {
-            if let Poll::Ready(exit) = join.as_mut().poll(cx) {
-                return Poll::Ready(Ok(exit));
-            }
-            input.as_mut().poll(cx).map(Err)
-        })
-        .await;
-        match event {
-            Ok(_) => break,
-            Err(0x03) => cancel.store(true, Ordering::Release),
-            Err(_) => {}
-        }
-    }
-    let (session, result) = completed
-        .lock()
-        .take()
-        .expect("vsh foreground published no result");
-    *vsh = session;
-    let mut output = String::new();
-    match result {
-        Ok(reports) => {
-            for report in reports {
-                output.push_str(&report.output);
-                if report.status != crate::vsh::Status::Success {
-                    output.push_str(&alloc::format!(
-                        "  vsh job %{}: {:?}\n",
-                        report.id,
-                        report.status
-                    ));
-                }
-            }
-        }
-        Err(error) => output.push_str(&alloc::format!(
-            "  vsh: {} at bytes {}..{}\n",
-            error.message,
-            error.span.start,
-            error.span.end
-        )),
-    }
-    if let Some((space, console)) = front {
-        write_vsh_front(space, console, &output);
-    } else if !output.is_empty() {
-        crate::uart::_print(format_args!("{}", output));
-    }
-}
-
-fn write_vsh_front(space: &Arc<Space>, console: Cap, text: &str) {
-    match space
-        .0
-        .lock()
-        .lookup_revocable::<ConsoleDev>(console, Rights::WRITE)
-    {
-        Ok(token) => {
-            let _ = token.try_with(|console| console.write(text));
-        }
-        Err(_) => tty::cancel(),
-    }
-}
-
-pub(crate) fn install_standard_vsh_commands(session: &mut crate::vsh::Session) {
-    session.install_host_command("help", 0, 0, vsh_help);
-    session.install_host_command("ps", 0, 0, vsh_ps);
-    session.install_host_command("caps", 0, 1, vsh_caps);
-    session.install_host_command("mem", 0, 0, vsh_mem);
-    #[cfg(feature = "qemu-virt")]
-    session.install_host_command("pci", 0, 0, vsh_pci);
-    #[cfg(feature = "qemu-virt")]
-    session.install_host_command("usb", 0, 2, vsh_usb);
-    session.install_host_command("quiet", 0, 0, vsh_quiet);
-    session.install_host_command("verbose", 0, 0, vsh_verbose);
-    session.install_host_command("poweroff", 0, 0, vsh_poweroff);
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    session.install_host_command("ip", 2, 8, crate::netstack_platform::vsh_ip);
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    session.install_host_command("dhclient", 0, 2, crate::netstack_platform::vsh_dhclient);
-}
-
-pub(crate) fn vsh_help(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    let help = String::from(
-        "  echo ...        write value arguments\n\
-         \x20 wc              count stdin bytes, words, and lines\n\
-         \x20 let NAME VALUE  set a session value\n\
-         \x20 if/while        bounded control flow (`; then` / `; do`)\n\
-         \x20 function N ...  define a value-only scoped function\n\
-         \x20 echo \"$(...)\"  bounded command substitution\n\
-         \x20 run-script @S   run a read-only manifested script\n\
-         \x20 jobs            list session jobs\n\
-         \x20 wait %N         join a job\n\
-         \x20 cancel %N       cancel a job\n\
-         \x20 ps              component lifecycle snapshots\n\
-         \x20 caps [space]    sanitized capability summary\n\
-         \x20 mem             bounded-memory accounts\n\
-         \x20 pci             list discovered PCI functions\n\
-         \x20 usb info        list XHCI USB devices\n\
-         \x20 usb read N      read one USB-storage sector\n\
-         \x20 usb test        destructive CI test of sectors 7 and 8\n\
-         \x20 quiet           mute background component output\n\
-         \x20 verbose         restore background component output\n\
-         \x20 poweroff        power off\n",
-    );
-    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    let help = {
-        let mut help = help;
-        help.push_str(
-            "  ip ...          show or configure IPv4 on net0\n\
-             \x20 dhclient [-r]  acquire or stop DHCPv4\n",
-        );
-        help
-    };
-    Ok(help)
-}
-
-pub(crate) fn vsh_ps(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    let mut output = String::from("COMPONENT TASK NAME CSPACE STATE POLLS BUDGET\n");
-    for component in world().components() {
-        let c = component.snapshot();
-        output.push_str(&alloc::format!(
-            "{} {} {} {} {} {} {}\n",
-            c.id,
-            c.task_id,
-            c.name,
-            c.cspace,
-            c.state,
-            c.polls,
-            c.memory.budget_bytes
-        ));
-    }
-    Ok(output)
-}
-
-pub(crate) fn vsh_caps(args: &[String]) -> Result<String, crate::vsh::Status> {
-    let default_space = if cfg!(feature = "legacy-shell") {
-        "init"
-    } else {
-        "vsh"
-    };
-    let name = args.first().map(String::as_str).unwrap_or(default_space);
-    let system = world();
-    let Some(space) = system.spaces.get(name) else {
-        return Err(crate::vsh::Status::Unavailable);
-    };
-    let mut output = alloc::format!("CAPABILITIES {}\n", name);
-    for (_handle, kind, rights, _description) in space.0.lock().list() {
-        output.push_str(&alloc::format!("{} {}\n", kind, rights));
-    }
-    Ok(output)
-}
-
-pub(crate) fn vsh_mem(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    let (live, peak, free) = HEAP.stats();
-    let mut output = alloc::format!("heap live={} peak={} remaining={}\n", live, peak, free);
-    for component in world().components() {
-        let c = component.snapshot();
-        output.push_str(&alloc::format!(
-            "{} live={} peak={} budget={} denied={}\n",
-            c.name,
-            c.memory.live_bytes,
-            c.memory.peak_bytes,
-            c.memory.budget_bytes,
-            c.memory.denials
-        ));
-    }
-    Ok(output)
-}
-
-#[cfg(feature = "qemu-virt")]
-pub(crate) fn vsh_pci(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    let mut output = String::from("BDF VID:DID CLASS IRQ BARS\n");
-    for function in crate::pci::functions() {
-        output.push_str(&alloc::format!(
-            "{} {:04x}:{:04x} {:06x} {}",
-            function.address,
-            function.vendor_id,
-            function.device_id,
-            function.class_code(),
-            function
-                .interrupt_line
-                .map_or(String::from("-"), |irq| alloc::format!("{}", irq)),
-        ));
-        for bar in function.bars {
-            if let Some(address) = bar.address() {
-                output.push_str(&alloc::format!(" {:#x}/{}", address, bar.size()));
-            }
-        }
-        output.push('\n');
-    }
-    Ok(output)
-}
-
-#[cfg(feature = "qemu-virt")]
-fn pci_status() {
-    crate::print!("{}", vsh_pci(&[]).expect("PCI listing is infallible"));
-}
-
-#[cfg(feature = "qemu-virt")]
-pub(crate) fn vsh_usb(args: &[String]) -> Result<String, crate::vsh::Status> {
-    use crate::xhci::DeviceKind;
-
-    match args.first().map(String::as_str).unwrap_or("info") {
-        "info" => {
-            let Some(controller) = crate::xhci::info() else {
-                return Ok(String::from("XHCI offline\n"));
-            };
-            let mut output = alloc::format!(
-                "XHCI {:#06x} @ {:#x}: {} ports, {} connected, {} addressed\n",
-                controller.version,
-                controller.mmio_base,
-                controller.max_ports,
-                controller.connected_ports,
-                controller.addressed_devices,
-            );
-            for device in crate::xhci::devices() {
-                let kind = match device.kind {
-                    DeviceKind::HidKeyboard => "hid-keyboard",
-                    DeviceKind::MassStorage => "mass-storage",
-                    DeviceKind::Unsupported => "unsupported",
-                };
-                output.push_str(&alloc::format!(
-                    "port {} slot {} speed {} {:04x}:{:04x} {}",
-                    device.port,
-                    device.slot,
-                    device.speed,
-                    device.vendor_id,
-                    device.product_id,
-                    kind,
-                ));
-                if device.kind == DeviceKind::MassStorage {
-                    output.push_str(&alloc::format!(" {} sectors", device.capacity_sectors));
-                }
-                output.push('\n');
-            }
-            Ok(output)
-        }
-        "read" => {
-            let sector = args
-                .get(1)
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or(crate::vsh::Status::Usage)?;
-            let bytes = crate::xhci::read_sector(sector).map_err(|_| crate::vsh::Status::Unavailable)?;
-            let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(32).min(32);
-            Ok(alloc::format!(
-                "usb sector {}: {}\n",
-                sector,
-                String::from_utf8_lossy(&bytes[..end]),
-            ))
-        }
-        "test" => {
-            const SEED: &[u8] = b"VIBEOS-USB-SECTOR-7-SEED-v1";
-            const MARKER: &[u8] = b"VIBEOS-USB-SECTOR-8-WRITE-v1";
-            let seed = crate::xhci::read_sector(7).map_err(|_| crate::vsh::Status::Unavailable)?;
-            if !seed.starts_with(SEED) { return Err(crate::vsh::Status::Faulted); }
-            let mut write = [0u8; 512];
-            write[..MARKER.len()].copy_from_slice(MARKER);
-            crate::xhci::write_sector(8, &write).map_err(|_| crate::vsh::Status::Unavailable)?;
-            let observed = crate::xhci::read_sector(8).map_err(|_| crate::vsh::Status::Unavailable)?;
-            if observed != write { return Err(crate::vsh::Status::Faulted); }
-            Ok(String::from("USB STORAGE TEST OK (sector 7 read, sector 8 write/read)\n"))
-        }
-        _ => Err(crate::vsh::Status::Usage),
-    }
-}
-
-pub(crate) fn vsh_quiet(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    tty::set_quiet(true);
-    Ok(String::from("background component output muted\n"))
-}
-
-pub(crate) fn vsh_verbose(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    tty::set_quiet(false);
-    Ok(String::from("background component output restored\n"))
-}
-
-pub(crate) fn vsh_poweroff(_args: &[String]) -> Result<String, crate::vsh::Status> {
-    sbi::shutdown(false)
 }
 
 fn mmu_status() {

@@ -34,6 +34,8 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 use vibeos_core::cap::Revocable;
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
+use vibeos_net_api::{TcpCloseRequest, TcpFrontendError, TcpListener};
+pub use vibeos_net_api::{TcpIoResult, TcpStreamState, TcpStreamStatus};
 
 /// Static IPv4 address and optional default route shared by network services.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +118,55 @@ impl StaticIpv4Config {
     }
 }
 
+/// Interface-wide configuration owned by one shared network stack.
+///
+/// TCP ports deliberately do not appear here. They are separately allocated
+/// as [`TcpListenerHandle`] values so multiple services can share this one IP
+/// interface without gaining authority over one another's listeners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv4StackConfig {
+    pub ethernet_address: [u8; 6],
+    pub ipv4_address: [u8; 4],
+    pub prefix_len: u8,
+    pub default_gateway: Option<[u8; 4]>,
+    /// Seeds TCP initial sequence numbers. It is not application entropy.
+    pub tcp_random_seed: u64,
+}
+
+impl Ipv4StackConfig {
+    pub const fn new(
+        ethernet_address: [u8; 6],
+        ipv4_address: [u8; 4],
+        prefix_len: u8,
+        tcp_random_seed: u64,
+    ) -> Self {
+        Self {
+            ethernet_address,
+            ipv4_address,
+            prefix_len,
+            default_gateway: None,
+            tcp_random_seed,
+        }
+    }
+
+    pub const fn with_default_gateway(mut self, gateway: [u8; 4]) -> Self {
+        self.default_gateway = Some(gateway);
+        self
+    }
+}
+
+impl From<StaticIpv4Config> for Ipv4StackConfig {
+    fn from(config: StaticIpv4Config) -> Self {
+        Self {
+            ethernet_address: config.ethernet_address,
+            ipv4_address: config.ipv4_address,
+            prefix_len: config.prefix_len,
+            default_gateway: config.default_gateway,
+            tcp_random_seed: config.tcp_random_seed,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackError {
     InvalidEthernetAddress,
@@ -123,6 +174,9 @@ pub enum StackError {
     InvalidPrefixLength,
     InvalidDefaultGateway,
     InvalidListenPort,
+    ListenPortInUse,
+    TcpListenerLimitReached,
+    InvalidTcpListener,
     RouteTableFull,
     /// One of the directional packet capabilities was revoked.
     AuthorityRevoked,
@@ -143,6 +197,11 @@ impl fmt::Display for StackError {
             Self::InvalidPrefixLength => f.write_str("IPv4 prefix length exceeds 32"),
             Self::InvalidDefaultGateway => f.write_str("default gateway must be unicast"),
             Self::InvalidListenPort => f.write_str("TCP listen port must be non-zero"),
+            Self::ListenPortInUse => f.write_str("TCP listen port is already allocated"),
+            Self::TcpListenerLimitReached => {
+                f.write_str("shared TCP listener limit has been reached")
+            }
+            Self::InvalidTcpListener => f.write_str("TCP listener handle is stale or invalid"),
             Self::RouteTableFull => f.write_str("IPv4 route table is full"),
             Self::AuthorityRevoked => f.write_str("network endpoint authority was revoked"),
             Self::ClockWentBackwards {
@@ -406,47 +465,6 @@ impl phy::Device for PacketDevice {
     }
 }
 
-/// Coarse state of the one reusable passive TCP stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TcpStreamState {
-    /// No connection is active and the socket is accepting one peer.
-    Listening,
-    /// A TCP handshake is in progress.
-    Handshake,
-    /// Both halves of the byte stream are open.
-    Established,
-    /// The peer sent FIN; buffered receive bytes remain readable and the local
-    /// transmit half may still be writable.
-    PeerClosed,
-    /// A graceful local close is progressing through the TCP state machine.
-    Closing,
-    /// [`StaticIpv4TcpStack::reset`] discarded the current stream. The next
-    /// network poll rearms the listener after emitting any required reset.
-    Reset,
-    /// The socket is closed between a terminal transition and listener rearm.
-    Closed,
-}
-
-/// Result of one non-blocking, bounded byte-stream operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TcpIoResult {
-    /// Bytes were copied. Empty input or output slices yield `Progress(0)`.
-    Progress(usize),
-    /// The stream half is open, but its bounded buffer cannot currently make progress.
-    WouldBlock,
-    /// The requested stream half is closed or there is no active connection.
-    Closed,
-}
-
-/// Snapshot of bounded application-facing TCP queues.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpStreamStatus {
-    pub state: TcpStreamState,
-    pub readable_bytes: usize,
-    pub queued_send_bytes: usize,
-    pub writable_bytes: usize,
-}
-
 /// Report from one bounded network-only protocol turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpPollReport {
@@ -470,33 +488,104 @@ struct NetworkPollWork {
     next_poll_delay_ms: Option<u64>,
 }
 
-/// One dynamically configurable IPv4 interface and one reusable passive TCP byte stream.
+/// Maximum number of independently authorized passive TCP sockets sharing one
+/// IPv4 interface. Every socket reserves both fixed-size byte buffers up front.
+pub const MAX_TCP_LISTENERS: usize = 8;
+/// Bound application/frontend copies independently from packet processing.
+pub const MAX_FRONTEND_CHUNKS_PER_DRIVE: usize = 4;
+
+/// Stack-local identity of one passive TCP socket.
 ///
-/// The object is intentionally neither a socket table nor a file-descriptor
-/// namespace. It owns exactly one listener and accepts at most one connection.
-/// Network progress happens only in [`Self::poll_network`]; application calls
-/// copy at most [`MAX_TCP_STREAM_BYTES_PER_CALL`] bytes and never poll packets.
-pub struct StaticIpv4TcpStack {
-    config: StaticIpv4Config,
+/// The fields remain private so safe application code cannot forge another
+/// listener. The capability frontend wraps this identity in a `Resource`;
+/// keeping a generation here also prevents slot-reuse ABA inside the stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpListenerHandle {
+    slot: u8,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpListenerPollReport {
+    pub connection_started: bool,
+    pub connection_ended: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedTcpPollReport {
+    pub ingress_frames: usize,
+    pub more_work: bool,
+    pub next_poll_delay_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpFrontendDriveReport {
+    pub received_bytes: usize,
+    pub transmitted_bytes: usize,
+    pub close_applied: Option<TcpCloseRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpFrontendDriveError {
+    Stack(StackError),
+    Frontend(TcpFrontendError),
+    QueueInvariant,
+}
+
+impl From<StackError> for TcpFrontendDriveError {
+    fn from(error: StackError) -> Self {
+        Self::Stack(error)
+    }
+}
+
+impl From<TcpFrontendError> for TcpFrontendDriveError {
+    fn from(error: TcpFrontendError) -> Self {
+        Self::Frontend(error)
+    }
+}
+
+struct TcpListenerEntry {
+    socket: SocketHandle,
+    port: u16,
+    generation: u64,
+    connection_active: bool,
+    reset_requested: bool,
+    last_poll: TcpListenerPollReport,
+}
+
+struct SharedNetworkPollWork {
+    ingress_frames: usize,
+    application_bytes: usize,
+    more_network_work: bool,
+    next_poll_delay_ms: Option<u64>,
+}
+
+/// One dynamically configurable IPv4 interface with a bounded TCP socket set.
+///
+/// This is the shared protocol core: it owns the sole smoltcp [`Interface`]
+/// and [`SocketSet`] for this packet session. Applications identify only a
+/// listener allocated for them and never receive the interface, packet device,
+/// DHCP socket, route table, or another service's TCP socket.
+pub struct SharedIpv4TcpStack {
+    config: Ipv4StackConfig,
     device: PacketDevice,
     interface: Interface,
     sockets: SocketSet<'static>,
-    tcp_handle: SocketHandle,
+    listeners: Vec<TcpListenerEntry>,
     dhcp_handle: Option<SocketHandle>,
     ipv4_status: Ipv4RuntimeStatus,
     last_now_ms: u64,
-    connection_active: bool,
-    reset_requested: bool,
+    next_listener_generation: u64,
 }
 
-impl StaticIpv4TcpStack {
+impl SharedIpv4TcpStack {
     pub fn new(
-        config: StaticIpv4Config,
+        config: Ipv4StackConfig,
         stamp: PacketStamp,
         inbound: Revocable<Endpoint<StampedPacket>>,
         outbound: Revocable<Endpoint<StampedPacket>>,
     ) -> Result<Self, StackError> {
-        validate_config(config)?;
+        validate_stack_config(config)?;
 
         let mut device = PacketDevice::new(stamp, inbound, outbound);
         device.revalidate_authority()?;
@@ -517,24 +606,12 @@ impl StaticIpv4TcpStack {
                 .map_err(|_| StackError::RouteTableFull)?;
         }
 
-        let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let mut socket = tcp::Socket::new(receive, transmit);
-        socket.set_congestion_control(tcp::CongestionControl::Reno);
-        socket.set_nagle_enabled(false);
-        socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
-        socket
-            .listen(config.listen_port)
-            .expect("validated non-zero TCP port must be listenable");
-
-        let mut sockets = SocketSet::new(Vec::new());
-        let tcp_handle = sockets.add(socket);
         Ok(Self {
             config,
             device,
             interface,
-            sockets,
-            tcp_handle,
+            sockets: SocketSet::new(Vec::new()),
+            listeners: Vec::new(),
             dhcp_handle: None,
             ipv4_status: Ipv4RuntimeStatus::Static(StaticIpv4Address {
                 address: config.ipv4_address,
@@ -542,12 +619,11 @@ impl StaticIpv4TcpStack {
                 default_gateway: config.default_gateway,
             }),
             last_now_ms: 0,
-            connection_active: false,
-            reset_requested: false,
+            next_listener_generation: 1,
         })
     }
 
-    pub const fn config(&self) -> StaticIpv4Config {
+    pub const fn config(&self) -> Ipv4StackConfig {
         self.config
     }
 
@@ -555,8 +631,246 @@ impl StaticIpv4TcpStack {
         self.ipv4_status
     }
 
-    /// Atomically replace the one IPv4 address and optional default route.
-    /// Any active TCP tuple is aborted before the old address disappears.
+    /// Allocate one exclusive passive port from this shared stack.
+    pub fn add_tcp_listener(&mut self, port: u16) -> Result<TcpListenerHandle, StackError> {
+        self.device.revalidate_authority()?;
+        if port == 0 {
+            return Err(StackError::InvalidListenPort);
+        }
+        if self.listeners.iter().any(|listener| listener.port == port) {
+            return Err(StackError::ListenPortInUse);
+        }
+        if self.listeners.len() >= MAX_TCP_LISTENERS {
+            return Err(StackError::TcpListenerLimitReached);
+        }
+
+        let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+        let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+        let mut socket = tcp::Socket::new(receive, transmit);
+        socket.set_congestion_control(tcp::CongestionControl::Reno);
+        socket.set_nagle_enabled(false);
+        socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
+        socket
+            .listen(port)
+            .expect("validated non-zero TCP port must be listenable");
+
+        let socket = self.sockets.add(socket);
+        let generation = self.next_listener_generation;
+        self.next_listener_generation = self
+            .next_listener_generation
+            .checked_add(1)
+            .ok_or(StackError::TcpListenerLimitReached)?;
+        let slot = u8::try_from(self.listeners.len())
+            .expect("the bounded TCP listener table fits in a u8");
+        self.listeners.push(TcpListenerEntry {
+            socket,
+            port,
+            generation,
+            connection_active: false,
+            reset_requested: false,
+            last_poll: TcpListenerPollReport::default(),
+        });
+        Ok(TcpListenerHandle { slot, generation })
+    }
+
+    pub fn tcp_listener_port(&self, listener: TcpListenerHandle) -> Result<u16, StackError> {
+        Ok(self.listener(listener)?.port)
+    }
+
+    pub fn tcp_listener_poll_report(
+        &self,
+        listener: TcpListenerHandle,
+    ) -> Result<TcpListenerPollReport, StackError> {
+        Ok(self.listener(listener)?.last_poll)
+    }
+
+    pub fn tcp_is_listening(&self, listener: TcpListenerHandle) -> Result<bool, StackError> {
+        let socket = self.listener(listener)?.socket;
+        Ok(self.sockets.get::<tcp::Socket>(socket).is_listening())
+    }
+
+    pub fn tcp_connection_active(&self, listener: TcpListenerHandle) -> Result<bool, StackError> {
+        let socket = self.listener(listener)?.socket;
+        Ok(self.sockets.get::<tcp::Socket>(socket).is_active())
+    }
+
+    pub fn tcp_stream_status(
+        &self,
+        listener: TcpListenerHandle,
+    ) -> Result<TcpStreamStatus, StackError> {
+        let entry = self.listener(listener)?;
+        let socket = self.sockets.get::<tcp::Socket>(entry.socket);
+        if entry.reset_requested {
+            return Ok(TcpStreamStatus {
+                state: TcpStreamState::Reset,
+                readable_bytes: 0,
+                queued_send_bytes: 0,
+                writable_bytes: 0,
+            });
+        }
+
+        Ok(TcpStreamStatus {
+            state: stream_state(socket.state()),
+            readable_bytes: socket.recv_queue(),
+            queued_send_bytes: socket.send_queue(),
+            writable_bytes: if socket.may_send() {
+                socket.send_capacity().saturating_sub(socket.send_queue())
+            } else {
+                0
+            },
+        })
+    }
+
+    pub fn tcp_try_recv(
+        &mut self,
+        listener: TcpListenerHandle,
+        output: &mut [u8],
+    ) -> Result<TcpIoResult, StackError> {
+        self.device.revalidate_authority()?;
+        let entry = self.listener(listener)?;
+        if entry.reset_requested {
+            return Ok(TcpIoResult::Closed);
+        }
+        if output.is_empty() {
+            return Ok(TcpIoResult::Progress(0));
+        }
+
+        let socket = entry.socket;
+        let length = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
+        match self
+            .sockets
+            .get_mut::<tcp::Socket>(socket)
+            .recv_slice(&mut output[..length])
+        {
+            Ok(0) => Ok(TcpIoResult::WouldBlock),
+            Ok(received) => Ok(TcpIoResult::Progress(received)),
+            Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => Ok(TcpIoResult::Closed),
+        }
+    }
+
+    pub fn tcp_try_send(
+        &mut self,
+        listener: TcpListenerHandle,
+        input: &[u8],
+    ) -> Result<TcpIoResult, StackError> {
+        self.device.revalidate_authority()?;
+        let entry = self.listener(listener)?;
+        if entry.reset_requested {
+            return Ok(TcpIoResult::Closed);
+        }
+        if input.is_empty() {
+            return Ok(TcpIoResult::Progress(0));
+        }
+
+        let socket = entry.socket;
+        let length = input.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
+        match self
+            .sockets
+            .get_mut::<tcp::Socket>(socket)
+            .send_slice(&input[..length])
+        {
+            Ok(0) => Ok(TcpIoResult::WouldBlock),
+            Ok(sent) => Ok(TcpIoResult::Progress(sent)),
+            Err(tcp::SendError::InvalidState) => Ok(TcpIoResult::Closed),
+        }
+    }
+
+    pub fn tcp_close(&mut self, listener: TcpListenerHandle) -> Result<TcpStreamState, StackError> {
+        self.device.revalidate_authority()?;
+        let index = self.listener_index(listener)?;
+        self.listeners[index].reset_requested = false;
+        let socket = self.listeners[index].socket;
+        self.sockets.get_mut::<tcp::Socket>(socket).close();
+        Ok(self.tcp_stream_status(listener)?.state)
+    }
+
+    pub fn tcp_reset(&mut self, listener: TcpListenerHandle) -> Result<TcpStreamState, StackError> {
+        self.device.revalidate_authority()?;
+        let index = self.listener_index(listener)?;
+        let socket = self.listeners[index].socket;
+        self.sockets.get_mut::<tcp::Socket>(socket).abort();
+        self.listeners[index].reset_requested = true;
+        Ok(TcpStreamState::Reset)
+    }
+
+    /// Reconcile one capability frontend with its private smoltcp socket.
+    ///
+    /// This function never polls the interface. The owning netstack task calls
+    /// it before or after [`Self::poll_network`] so packet progress remains
+    /// serialized through the sole interface owner.
+    pub fn drive_tcp_frontend(
+        &mut self,
+        listener: TcpListenerHandle,
+        frontend: &TcpListener,
+    ) -> Result<TcpFrontendDriveReport, TcpFrontendDriveError> {
+        if self.tcp_listener_port(listener)? != frontend.port() {
+            return Err(TcpFrontendDriveError::QueueInvariant);
+        }
+
+        let mut report = TcpFrontendDriveReport::default();
+        frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
+        let mut scratch = [0u8; MAX_TCP_STREAM_BYTES_PER_CALL];
+
+        for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
+            let capacity = frontend.network_receive_capacity().min(scratch.len());
+            if capacity == 0 {
+                break;
+            }
+            match self.tcp_try_recv(listener, &mut scratch[..capacity])? {
+                TcpIoResult::Progress(0) | TcpIoResult::WouldBlock | TcpIoResult::Closed => break,
+                TcpIoResult::Progress(length) => {
+                    if frontend.network_receive(&scratch[..length]) != length {
+                        return Err(TcpFrontendDriveError::QueueInvariant);
+                    }
+                    report.received_bytes += length;
+                }
+            }
+        }
+
+        for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
+            let writable = self
+                .tcp_stream_status(listener)?
+                .writable_bytes
+                .min(scratch.len());
+            if writable == 0 {
+                break;
+            }
+            let queued = frontend.network_copy_transmit(&mut scratch[..writable]);
+            if queued == 0 {
+                break;
+            }
+            match self.tcp_try_send(listener, &scratch[..queued])? {
+                TcpIoResult::Progress(sent) => {
+                    frontend.network_consume_transmit(sent);
+                    report.transmitted_bytes += sent;
+                    if sent != queued {
+                        break;
+                    }
+                }
+                TcpIoResult::WouldBlock => break,
+                TcpIoResult::Closed => return Err(TcpFrontendDriveError::QueueInvariant),
+            }
+        }
+
+        if let Some(request) = frontend.close_request() {
+            match request {
+                TcpCloseRequest::Close => {
+                    self.tcp_close(listener)?;
+                }
+                TcpCloseRequest::Reset => {
+                    self.tcp_reset(listener)?;
+                }
+            }
+            frontend.clear_close_request(request);
+            report.close_applied = Some(request);
+            frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
+        }
+
+        Ok(report)
+    }
+
+    /// Atomically replace the interface address and route. Every active TCP
+    /// tuple is aborted before the old address disappears.
     pub fn configure_static_ipv4(&mut self, address: StaticIpv4Address) -> Result<(), StackError> {
         validate_ipv4_address(address.address, address.prefix_len, address.default_gateway)?;
         self.device.revalidate_authority()?;
@@ -595,105 +909,10 @@ impl StaticIpv4TcpStack {
         self.device.stats()
     }
 
-    pub fn is_listening(&self) -> bool {
-        self.sockets
-            .get::<tcp::Socket>(self.tcp_handle)
-            .is_listening()
-    }
-
-    pub fn connection_active(&self) -> bool {
-        self.sockets.get::<tcp::Socket>(self.tcp_handle).is_active()
-    }
-
-    /// Describe the application-visible stream without advancing the network.
-    pub fn stream_status(&self) -> TcpStreamStatus {
-        let socket = self.sockets.get::<tcp::Socket>(self.tcp_handle);
-        if self.reset_requested {
-            return TcpStreamStatus {
-                state: TcpStreamState::Reset,
-                readable_bytes: 0,
-                queued_send_bytes: 0,
-                writable_bytes: 0,
-            };
-        }
-
-        TcpStreamStatus {
-            state: stream_state(socket.state()),
-            readable_bytes: socket.recv_queue(),
-            queued_send_bytes: socket.send_queue(),
-            writable_bytes: if socket.may_send() {
-                socket.send_capacity().saturating_sub(socket.send_queue())
-            } else {
-                0
-            },
-        }
-    }
-
-    /// Copy one bounded receive fragment without polling the network.
-    pub fn try_recv(&mut self, output: &mut [u8]) -> Result<TcpIoResult, StackError> {
-        self.device.revalidate_authority()?;
-        if self.reset_requested {
-            return Ok(TcpIoResult::Closed);
-        }
-        if output.is_empty() {
-            return Ok(TcpIoResult::Progress(0));
-        }
-
-        let length = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        match socket.recv_slice(&mut output[..length]) {
-            Ok(0) => Ok(TcpIoResult::WouldBlock),
-            Ok(received) => Ok(TcpIoResult::Progress(received)),
-            Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => Ok(TcpIoResult::Closed),
-        }
-    }
-
-    /// Copy one bounded transmit fragment without polling the network.
-    pub fn try_send(&mut self, input: &[u8]) -> Result<TcpIoResult, StackError> {
-        self.device.revalidate_authority()?;
-        if self.reset_requested {
-            return Ok(TcpIoResult::Closed);
-        }
-        if input.is_empty() {
-            return Ok(TcpIoResult::Progress(0));
-        }
-
-        let length = input.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        match socket.send_slice(&input[..length]) {
-            Ok(0) => Ok(TcpIoResult::WouldBlock),
-            Ok(sent) => Ok(TcpIoResult::Progress(sent)),
-            Err(tcp::SendError::InvalidState) => Ok(TcpIoResult::Closed),
-        }
-    }
-
-    /// Gracefully close the transmit half without polling the network.
-    pub fn close(&mut self) -> Result<TcpStreamState, StackError> {
-        self.device.revalidate_authority()?;
-        self.reset_requested = false;
-        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).close();
-        Ok(self.stream_status().state)
-    }
-
-    /// Abort the current connection and discard its application buffers.
-    ///
-    /// smoltcp emits the reset during the next network poll; until then the
-    /// synthetic [`TcpStreamState::Reset`] prevents stale buffered data from
-    /// being exposed through the application API.
-    pub fn reset(&mut self) -> Result<TcpStreamState, StackError> {
-        self.device.revalidate_authority()?;
-        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).abort();
-        self.reset_requested = true;
-        Ok(TcpStreamState::Reset)
-    }
-
-    /// Advance only ARP, IPv4, and TCP by a bounded amount.
-    pub fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, StackError> {
-        let work = self.poll_with_application(now_ms, |_| 0)?;
-        Ok(TcpPollReport {
+    pub fn poll_network(&mut self, now_ms: u64) -> Result<SharedTcpPollReport, StackError> {
+        let work = self.poll_with_application(now_ms, |_, _| 0)?;
+        Ok(SharedTcpPollReport {
             ingress_frames: work.ingress_frames,
-            connection_started: work.connection_started,
-            connection_ended: work.connection_ended,
             more_work: work.more_network_work,
             next_poll_delay_ms: work.next_poll_delay_ms,
         })
@@ -702,23 +921,22 @@ impl StaticIpv4TcpStack {
     fn poll_with_application(
         &mut self,
         now_ms: u64,
-        mut service: impl FnMut(&mut tcp::Socket<'static>) -> usize,
-    ) -> Result<NetworkPollWork, StackError> {
+        mut service: impl FnMut(TcpListenerHandle, &mut tcp::Socket<'static>) -> usize,
+    ) -> Result<SharedNetworkPollWork, StackError> {
         let now = checked_instant(self.last_now_ms, now_ms)?;
         self.device.revalidate_authority()?;
         self.last_now_ms = now_ms;
-        let was_active = self.connection_active;
+        let mut was_active = [false; MAX_TCP_LISTENERS];
+        for (index, listener) in self.listeners.iter().enumerate() {
+            was_active[index] = listener.connection_active;
+        }
         let mut ingress_frames = 0;
-        let mut echoed_bytes = 0;
+        let mut application_bytes = 0;
         let mut ingress_budget_exhausted = true;
         let mut egress_budget_exhausted = true;
 
         self.interface.poll_maintenance(now);
-        // A locally requested abort must remain CLOSED for one dispatch pass so
-        // smoltcp can emit its RST before `listen()` clears the old tuple.
-        if !self.reset_requested {
-            self.ensure_listening();
-        }
+        self.ensure_listening(false);
 
         for _ in 0..MAX_INGRESS_FRAMES_PER_POLL {
             let ingress_result =
@@ -733,12 +951,14 @@ impl StaticIpv4TcpStack {
                 PollIngressSingleResult::PacketProcessed
                 | PollIngressSingleResult::SocketStateChanged => {
                     ingress_frames += 1;
-                    echoed_bytes += service(self.sockets.get_mut::<tcp::Socket>(self.tcp_handle));
-                    // Preserve the boundary between two users of the single
-                    // passive socket. If this frame ended the old active
-                    // tuple, leave any already-queued SYN for the next poll;
-                    // the end-of-turn rearm below will install LISTEN first.
-                    if was_active && !self.connection_active() {
+                    application_bytes += self.service_listeners(&mut service);
+                    // Preserve the boundary between old and new users of every
+                    // reusable passive socket. Any queued SYN remains in the
+                    // packet endpoint until the end-of-turn rearm completes.
+                    if self.listeners.iter().enumerate().any(|(index, listener)| {
+                        was_active[index]
+                            && !self.sockets.get::<tcp::Socket>(listener.socket).is_active()
+                    }) {
                         break;
                     }
                 }
@@ -747,7 +967,7 @@ impl StaticIpv4TcpStack {
 
         self.apply_dhcp_event()?;
 
-        echoed_bytes += service(self.sockets.get_mut::<tcp::Socket>(self.tcp_handle));
+        application_bytes += self.service_listeners(&mut service);
         for _ in 0..MAX_EGRESS_PASSES_PER_POLL {
             let egress_result =
                 self.interface
@@ -759,10 +979,16 @@ impl StaticIpv4TcpStack {
             }
         }
         let _ = self.device.flush_egress()?;
-        self.ensure_listening();
+        self.ensure_listening(true);
 
-        let active = self.connection_active();
-        self.connection_active = active;
+        for (index, listener) in self.listeners.iter_mut().enumerate() {
+            let active = self.sockets.get::<tcp::Socket>(listener.socket).is_active();
+            listener.last_poll = TcpListenerPollReport {
+                connection_started: !was_active[index] && active,
+                connection_ended: was_active[index] && !active,
+            };
+            listener.connection_active = active;
+        }
         let more_network_work = ingress_budget_exhausted
             || egress_budget_exhausted
             || self.device.has_immediate_work()?;
@@ -774,34 +1000,53 @@ impl StaticIpv4TcpStack {
                 .map(|delay| delay.total_millis())
         };
 
-        Ok(NetworkPollWork {
+        Ok(SharedNetworkPollWork {
             ingress_frames,
-            application_bytes: echoed_bytes,
-            connection_started: !was_active && active,
-            connection_ended: was_active && !active,
+            application_bytes,
             more_network_work,
             next_poll_delay_ms,
         })
     }
 
-    fn ensure_listening(&mut self) {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        // `is_open()` is also false in TIME-WAIT. Re-listening there would
-        // reset smoltcp's delayed-ACK/close timer and can strand a peer whose
-        // final payload and FIN arrived together. Only CLOSED has finished
-        // the old tuple and is safe to reuse as the passive listener.
-        if socket.state() == tcp::State::Closed {
-            socket
-                .listen(self.config.listen_port)
-                .expect("validated non-zero TCP port must remain listenable");
-            self.reset_requested = false;
+    fn service_listeners(
+        &mut self,
+        service: &mut impl FnMut(TcpListenerHandle, &mut tcp::Socket<'static>) -> usize,
+    ) -> usize {
+        let mut application_bytes = 0;
+        for (index, listener) in self.listeners.iter().enumerate() {
+            let handle = TcpListenerHandle {
+                slot: u8::try_from(index).expect("the bounded listener table fits in a u8"),
+                generation: listener.generation,
+            };
+            application_bytes += service(handle, self.sockets.get_mut(listener.socket));
+        }
+        application_bytes
+    }
+
+    fn ensure_listening(&mut self, rearm_resets: bool) {
+        for listener in &mut self.listeners {
+            if listener.reset_requested && !rearm_resets {
+                continue;
+            }
+            let socket = self.sockets.get_mut::<tcp::Socket>(listener.socket);
+            // `is_open()` is also false in TIME-WAIT. Re-listening there would
+            // reset delayed-ACK/close state. Only CLOSED is safe to reuse.
+            if socket.state() == tcp::State::Closed {
+                socket
+                    .listen(listener.port)
+                    .expect("an allocated TCP port must remain listenable");
+                listener.reset_requested = false;
+            }
         }
     }
 
     fn abort_for_reconfiguration(&mut self) {
-        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).abort();
-        self.connection_active = false;
-        self.reset_requested = false;
+        for listener in &mut self.listeners {
+            self.sockets.get_mut::<tcp::Socket>(listener.socket).abort();
+            listener.connection_active = false;
+            listener.reset_requested = false;
+            listener.last_poll = TcpListenerPollReport::default();
+        }
     }
 
     fn remove_dhcp_socket(&mut self) {
@@ -880,6 +1125,152 @@ impl StaticIpv4TcpStack {
             None => {}
         }
         Ok(())
+    }
+
+    fn listener(&self, listener: TcpListenerHandle) -> Result<&TcpListenerEntry, StackError> {
+        self.listeners
+            .get(usize::from(listener.slot))
+            .filter(|entry| entry.generation == listener.generation)
+            .ok_or(StackError::InvalidTcpListener)
+    }
+
+    fn listener_index(&self, listener: TcpListenerHandle) -> Result<usize, StackError> {
+        self.listener(listener)?;
+        Ok(usize::from(listener.slot))
+    }
+}
+
+/// Compatibility adapter retaining the original one-listener API while the
+/// netstack and SSH components migrate to explicit listener capabilities.
+pub struct StaticIpv4TcpStack {
+    config: StaticIpv4Config,
+    shared: SharedIpv4TcpStack,
+    listener: TcpListenerHandle,
+}
+
+impl StaticIpv4TcpStack {
+    pub fn new(
+        config: StaticIpv4Config,
+        stamp: PacketStamp,
+        inbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: Revocable<Endpoint<StampedPacket>>,
+    ) -> Result<Self, StackError> {
+        validate_config(config)?;
+        let mut shared = SharedIpv4TcpStack::new(config.into(), stamp, inbound, outbound)?;
+        let listener = shared.add_tcp_listener(config.listen_port)?;
+        Ok(Self {
+            config,
+            shared,
+            listener,
+        })
+    }
+
+    pub const fn config(&self) -> StaticIpv4Config {
+        self.config
+    }
+
+    pub const fn ipv4_status(&self) -> Ipv4RuntimeStatus {
+        self.shared.ipv4_status()
+    }
+
+    pub fn configure_static_ipv4(&mut self, address: StaticIpv4Address) -> Result<(), StackError> {
+        self.shared.configure_static_ipv4(address)?;
+        self.config.ipv4_address = address.address;
+        self.config.prefix_len = address.prefix_len;
+        self.config.default_gateway = address.default_gateway;
+        Ok(())
+    }
+
+    pub fn clear_ipv4(&mut self) -> Result<(), StackError> {
+        self.shared.clear_ipv4()
+    }
+
+    pub fn start_dhcp(&mut self) -> Result<(), StackError> {
+        self.shared.start_dhcp()
+    }
+
+    pub fn device_stats(&self) -> PacketDeviceStats {
+        self.shared.device_stats()
+    }
+
+    pub fn is_listening(&self) -> bool {
+        self.shared
+            .tcp_is_listening(self.listener)
+            .expect("the compatibility listener remains allocated")
+    }
+
+    pub fn connection_active(&self) -> bool {
+        self.shared
+            .tcp_connection_active(self.listener)
+            .expect("the compatibility listener remains allocated")
+    }
+
+    pub fn stream_status(&self) -> TcpStreamStatus {
+        self.shared
+            .tcp_stream_status(self.listener)
+            .expect("the compatibility listener remains allocated")
+    }
+
+    pub fn try_recv(&mut self, output: &mut [u8]) -> Result<TcpIoResult, StackError> {
+        self.shared.tcp_try_recv(self.listener, output)
+    }
+
+    pub fn try_send(&mut self, input: &[u8]) -> Result<TcpIoResult, StackError> {
+        self.shared.tcp_try_send(self.listener, input)
+    }
+
+    pub fn close(&mut self) -> Result<TcpStreamState, StackError> {
+        self.shared.tcp_close(self.listener)
+    }
+
+    pub fn reset(&mut self) -> Result<TcpStreamState, StackError> {
+        self.shared.tcp_reset(self.listener)
+    }
+
+    pub fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, StackError> {
+        let work = self.poll_with_application(now_ms, |_| 0)?;
+        Ok(TcpPollReport {
+            ingress_frames: work.ingress_frames,
+            connection_started: work.connection_started,
+            connection_ended: work.connection_ended,
+            more_work: work.more_network_work,
+            next_poll_delay_ms: work.next_poll_delay_ms,
+        })
+    }
+
+    fn poll_with_application(
+        &mut self,
+        now_ms: u64,
+        mut service: impl FnMut(&mut tcp::Socket<'static>) -> usize,
+    ) -> Result<NetworkPollWork, StackError> {
+        let listener = self.listener;
+        let work = self
+            .shared
+            .poll_with_application(now_ms, |candidate, socket| {
+                if candidate == listener {
+                    service(socket)
+                } else {
+                    0
+                }
+            })?;
+        let listener = self.shared.tcp_listener_poll_report(listener)?;
+        Ok(NetworkPollWork {
+            ingress_frames: work.ingress_frames,
+            application_bytes: work.application_bytes,
+            connection_started: listener.connection_started,
+            connection_ended: listener.connection_ended,
+            more_network_work: work.more_network_work,
+            next_poll_delay_ms: work.next_poll_delay_ms,
+        })
+    }
+
+    fn echo_has_immediate_work(&self) -> bool {
+        let socket = self
+            .shared
+            .listener(self.listener)
+            .expect("the compatibility listener remains allocated")
+            .socket;
+        echo_has_immediate_work(self.shared.sockets.get::<tcp::Socket>(socket))
     }
 }
 
@@ -996,8 +1387,7 @@ impl StaticIpv4EchoStack {
     /// Advance ARP, IPv4, TCP, and the compatibility echo application.
     pub fn poll(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
         let work = self.tcp.poll_with_application(now_ms, service_echo)?;
-        let echo_ready =
-            echo_has_immediate_work(self.tcp.sockets.get::<tcp::Socket>(self.tcp.tcp_handle));
+        let echo_ready = self.tcp.echo_has_immediate_work();
         let more_work = work.more_network_work || echo_ready;
         Ok(PollReport {
             ingress_frames: work.ingress_frames,
@@ -1031,6 +1421,14 @@ fn checked_instant(previous_ms: u64, now_ms: u64) -> Result<Instant, StackError>
 }
 
 fn validate_config(config: StaticIpv4Config) -> Result<(), StackError> {
+    validate_stack_config(config.into())?;
+    if config.listen_port == 0 {
+        return Err(StackError::InvalidListenPort);
+    }
+    Ok(())
+}
+
+fn validate_stack_config(config: Ipv4StackConfig) -> Result<(), StackError> {
     let ethernet = EthernetAddress(config.ethernet_address);
     if !ethernet.is_unicast() || config.ethernet_address == [0; 6] {
         return Err(StackError::InvalidEthernetAddress);
@@ -1040,9 +1438,6 @@ fn validate_config(config: StaticIpv4Config) -> Result<(), StackError> {
         config.prefix_len,
         config.default_gateway,
     )?;
-    if config.listen_port == 0 {
-        return Err(StackError::InvalidListenPort);
-    }
     Ok(())
 }
 

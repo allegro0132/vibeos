@@ -13,3 +13,4 @@ smoltcp = { version = "=0.13.1", default-features = false, features = [
     "socket-tcp-reno",
 ] }
 vibeos-core = { path = "../../core" }
+vibeos-net-api = { path = "../net-api" }

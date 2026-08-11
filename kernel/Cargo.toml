@@ -14,10 +14,10 @@ legacy-shell = []
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
-tcp-echo = ["dep:vibeos-netstack", "vibeos-netstack/tcp-echo", "vibeos-vsh/network"]
+tcp-echo = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack", "vibeos-netstack/tcp-echo", "vibeos-vsh/network"]
 # Production Milk-V Duo IPv4 control plane. It owns the raw packet endpoints,
 # starts in DHCP mode, and exposes only capability-admitted ip/dhclient commands.
-net-shell = ["dep:vibeos-netstack", "vibeos-netstack/net-shell", "vibeos-vsh/network"]
+net-shell = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack", "vibeos-netstack/net-shell", "vibeos-vsh/network"]
 # Test-only recovery hook used by the live stack-generation acceptance script.
 # It is never enabled by the normal TCP or eventual SSH image.
 tcp-echo-recovery-test = ["tcp-echo", "vibeos-netstack/tcp-echo-recovery-test"]
@@ -30,25 +30,36 @@ ssh-security-test = [
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
 ssh-test = [
+    "dep:vibeos-net-api",
+    "dep:vibeos-netstack",
     "dep:vibeos-sshd",
     "dep:vibeos-ssh-identity",
     "vibeos-kernel-acceptance/ssh-test-fixture",
+    "vibeos-netstack/static-service",
 ]
 # Explicitly insecure physical bring-up image. It reuses the fixed SSH test
 # identities and a deterministic acceptance-only random service so DWMAC,
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
 milkv-ssh-acceptance = [
+    "dep:vibeos-net-api",
+    "dep:vibeos-netstack",
     "dep:vibeos-sshd",
     "dep:vibeos-ssh-identity",
     "vibeos-kernel-acceptance/milkv-ssh-acceptance",
+    "vibeos-netstack/dhcp-service",
+    "vibeos-vsh/network",
 ]
 # Production SSH image. Device and client identities are provisioned locally;
 # no acceptance fixture is linked into this feature.
 milkv-ssh = [
+    "dep:vibeos-net-api",
+    "dep:vibeos-netstack",
     "dep:vibeos-sshd",
     "dep:vibeos-ssh-identity",
     "dep:jitterentropy",
+    "vibeos-netstack/dhcp-service",
+    "vibeos-vsh/network",
 ]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
@@ -94,6 +105,8 @@ vibeos-image-policy = { path = "../policy/image", default-features = false }
 vibeos-rustc = { path = "../compiler" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }
+vibeos-net-api = { path = "../components/net-api", optional = true }
+vibeos-net-echo = { path = "../components/net-echo", optional = true }
 vibeos-netstack = { path = "../components/netstack", default-features = false, optional = true }
 vibeos-object-store = { path = "../services/object-store" }
 vibeos-program-store = { path = "../services/program-store" }

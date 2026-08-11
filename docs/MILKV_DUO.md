@@ -41,9 +41,11 @@ exercise ordinary bidirectional traffic through that path. They do not yet
 cover driver restart coordinates, deliberately delayed DMA completion, late
 IRQs, or long-duration link stress.
 
-The production image enables `milkv-ssh`. Its SSH stack exclusively owns the
-DWMAC packet endpoints and starts DHCPv4 after local identity provisioning.
-The image contains no fixed host or client private key. It uses the accepted
+The production image enables `milkv-ssh`. An independent `net-stack` component
+exclusively owns the DWMAC packet endpoints, the sole smoltcp interface, routes,
+and DHCPv4 state. SSH receives only its port-22 listener capability and observes
+the lease published by Netstack before announcing readiness. The image contains
+no fixed host or client private key. It uses the accepted
 OSR=3 jitterentropy-rs source to seed a ChaCha20 DRBG, and refuses to listen
 until a device host key and an authorized client key have both been persisted
 and verified. This is a project deployment decision based on the recorded
@@ -326,8 +328,9 @@ After provisioning, connect with:
 ssh -i ~/.ssh/vibeos_duo root@BOARD_ADDRESS
 ```
 
-The legacy `net-shell` diagnostic surface remains available only in its
-explicit image. Its bounded operator commands are:
+The same shared Netstack control plane is exposed to the local production VSH
+and to an authenticated production SSH profile. The legacy `net-shell` image
+remains available as a network-only diagnostic. Its bounded commands are:
 
 ```text
 ip link show

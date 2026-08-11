@@ -9,6 +9,7 @@ qualification-stream = []
 
 [dependencies]
 vibeos-core = { path = "../../core" }
+vibeos-net-api = { path = "../net-api" }
 vibeos-net-protocol = { path = "../net-protocol" }
 vibeos-random = { path = "../../random" }
 vibeos-ssh-identity = { path = "../../services/ssh-identity" }

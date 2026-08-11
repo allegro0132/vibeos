@@ -11,10 +11,11 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{
     PacketSessionError, PacketSessionFence, PacketStamp, PacketStampMismatch, StampedPacket,
 };
+use vibeos_net_api::{TcpListener, TcpListenerId};
 use vibeos_net_protocol::{
-    Ipv4RuntimeStatus, PacketDevice, StackError, StaticIpv4Address, StaticIpv4Config,
-    StaticIpv4EchoStack, StaticIpv4TcpStack, TcpIoResult, TcpStreamState,
-    MAX_TCP_STREAM_BYTES_PER_CALL, TCP_BUFFER_BYTES,
+    Ipv4RuntimeStatus, Ipv4StackConfig, PacketDevice, SharedIpv4TcpStack, StackError,
+    StaticIpv4Address, StaticIpv4Config, StaticIpv4EchoStack, StaticIpv4TcpStack, TcpIoResult,
+    TcpStreamState, MAX_TCP_LISTENERS, MAX_TCP_STREAM_BYTES_PER_CALL, TCP_BUFFER_BYTES,
 };
 
 const SERVER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -332,6 +333,10 @@ impl TestClient {
     }
 
     fn open_connection(&mut self, local_port: u16) -> SocketHandle {
+        self.open_connection_to(SERVER_PORT, local_port)
+    }
+
+    fn open_connection_to(&mut self, server_port: u16, local_port: u16) -> SocketHandle {
         let receive = tcp::SocketBuffer::new(vec![0; 4096]);
         let transmit = tcp::SocketBuffer::new(vec![0; 4096]);
         let handle = self.sockets.add(tcp::Socket::new(receive, transmit));
@@ -341,7 +346,7 @@ impl TestClient {
                 self.interface.context(),
                 (
                     IpAddress::v4(SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3]),
-                    SERVER_PORT,
+                    server_port,
                 ),
                 local_port,
             )
@@ -352,6 +357,260 @@ impl TestClient {
     fn socket_by_handle(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {
         self.sockets.get_mut(handle)
     }
+}
+
+#[test]
+fn one_interface_serves_two_independent_tcp_ports() {
+    const SECOND_PORT: u16 = SERVER_PORT + 1;
+
+    let client_to_server = Endpoint::new("shared-client-to-server", 128);
+    let server_to_client = Endpoint::new("shared-server-to-client", 128);
+    let mut space = CSpace::new("shared-test-link");
+    let (_, server_in) = authority(&mut space, &client_to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &server_to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &server_to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &client_to_server, Rights::SEND);
+
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server =
+        SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let first = server.add_tcp_listener(SERVER_PORT).unwrap();
+    let second = server.add_tcp_listener(SECOND_PORT).unwrap();
+    assert_eq!(
+        server.add_tcp_listener(SERVER_PORT),
+        Err(StackError::ListenPortInUse)
+    );
+    assert_eq!(
+        server.add_tcp_listener(0),
+        Err(StackError::InvalidListenPort)
+    );
+
+    let mut client = TestClient::new(client_in, client_out);
+    let second_client = client.open_connection_to(SECOND_PORT, 49_153);
+    let first_payload = b"listener-22";
+    let second_payload = b"listener-23";
+    let mut first_sent = false;
+    let mut second_sent = false;
+    let mut first_server_received = Vec::new();
+    let mut second_server_received = Vec::new();
+    let mut first_client_received = Vec::new();
+    let mut second_client_received = Vec::new();
+
+    for now_ms in 0..5_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+
+        if !first_sent && client.socket().can_send() {
+            assert_eq!(
+                client.socket().send_slice(first_payload).unwrap(),
+                first_payload.len()
+            );
+            first_sent = true;
+        }
+        if !second_sent && client.socket_by_handle(second_client).can_send() {
+            assert_eq!(
+                client
+                    .socket_by_handle(second_client)
+                    .send_slice(second_payload)
+                    .unwrap(),
+                second_payload.len()
+            );
+            second_sent = true;
+        }
+
+        server.poll_network(now_ms).unwrap();
+        let mut scratch = [0u8; 32];
+        if first_server_received.len() < first_payload.len() {
+            if let TcpIoResult::Progress(length) = server.tcp_try_recv(first, &mut scratch).unwrap()
+            {
+                first_server_received.extend_from_slice(&scratch[..length]);
+            }
+        }
+        if second_server_received.len() < second_payload.len() {
+            if let TcpIoResult::Progress(length) =
+                server.tcp_try_recv(second, &mut scratch).unwrap()
+            {
+                second_server_received.extend_from_slice(&scratch[..length]);
+            }
+        }
+        if first_server_received.len() == first_payload.len() && first_client_received.is_empty() {
+            assert_eq!(
+                server.tcp_try_send(first, b"first").unwrap(),
+                TcpIoResult::Progress(5)
+            );
+        }
+        if second_server_received.len() == second_payload.len() && second_client_received.is_empty()
+        {
+            assert_eq!(
+                server.tcp_try_send(second, b"second").unwrap(),
+                TcpIoResult::Progress(6)
+            );
+        }
+
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        if client.socket().can_recv() {
+            let length = client.socket().recv_slice(&mut scratch).unwrap();
+            first_client_received.extend_from_slice(&scratch[..length]);
+        }
+        if client.socket_by_handle(second_client).can_recv() {
+            let length = client
+                .socket_by_handle(second_client)
+                .recv_slice(&mut scratch)
+                .unwrap();
+            second_client_received.extend_from_slice(&scratch[..length]);
+        }
+        if first_client_received.len() >= 5 && second_client_received.len() >= 6 {
+            break;
+        }
+    }
+
+    assert_eq!(first_server_received, first_payload);
+    assert_eq!(second_server_received, second_payload);
+    assert_eq!(&first_client_received[..5], b"first");
+    assert_eq!(&second_client_received[..6], b"second");
+    assert_eq!(server.tcp_listener_port(first), Ok(SERVER_PORT));
+    assert_eq!(server.tcp_listener_port(second), Ok(SECOND_PORT));
+}
+
+#[test]
+fn two_capability_frontends_share_one_interface_without_crossing_streams() {
+    const HTTP_PORT: u16 = 80;
+    let client_to_server = Endpoint::new("frontend-client-to-server", 128);
+    let server_to_client = Endpoint::new("frontend-server-to-client", 128);
+    let mut space = CSpace::new("frontend-test-link");
+    let (_, server_in) = authority(&mut space, &client_to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &server_to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &server_to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &client_to_server, Rights::SEND);
+
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server =
+        SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let ssh_socket = server.add_tcp_listener(SERVER_PORT).unwrap();
+    let http_socket = server.add_tcp_listener(HTTP_PORT).unwrap();
+    let ssh =
+        TcpListener::new("ssh", TcpListenerId::new(1).unwrap(), SERVER_PORT, 128, 128).unwrap();
+    let http =
+        TcpListener::new("http", TcpListenerId::new(2).unwrap(), HTTP_PORT, 128, 128).unwrap();
+
+    let mut client = TestClient::new(client_in, client_out);
+    let http_client = client.open_connection_to(HTTP_PORT, 49_153);
+    let mut ssh_connection = None;
+    let mut http_connection = None;
+    let mut ssh_request_sent = false;
+    let mut http_request_sent = false;
+    let mut ssh_request = Vec::new();
+    let mut http_request = Vec::new();
+    let mut ssh_response_sent = false;
+    let mut http_response_sent = false;
+    let mut ssh_response = Vec::new();
+    let mut http_response = Vec::new();
+    let mut scratch = [0u8; 64];
+
+    for now_ms in 0..5_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        server.drive_tcp_frontend(ssh_socket, &ssh).unwrap();
+        server.drive_tcp_frontend(http_socket, &http).unwrap();
+
+        ssh_connection = ssh_connection.or_else(|| ssh.try_accept());
+        http_connection = http_connection.or_else(|| http.try_accept());
+        if !ssh_request_sent && client.socket().can_send() {
+            assert_eq!(client.socket().send_slice(b"ssh").unwrap(), 3);
+            ssh_request_sent = true;
+        }
+        if !http_request_sent && client.socket_by_handle(http_client).can_send() {
+            assert_eq!(
+                client
+                    .socket_by_handle(http_client)
+                    .send_slice(b"GET /")
+                    .unwrap(),
+                5
+            );
+            http_request_sent = true;
+        }
+
+        if let Some(connection) = ssh_connection {
+            if ssh_request.len() < 3 {
+                if let TcpIoResult::Progress(length) =
+                    ssh.try_recv(connection, &mut scratch).unwrap()
+                {
+                    ssh_request.extend_from_slice(&scratch[..length]);
+                }
+            }
+            if ssh_request.len() == 3 && !ssh_response_sent {
+                assert_eq!(
+                    ssh.try_send(connection, b"SSH-OK"),
+                    Ok(TcpIoResult::Progress(6))
+                );
+                ssh_response_sent = true;
+            }
+        }
+        if let Some(connection) = http_connection {
+            if http_request.len() < 5 {
+                if let TcpIoResult::Progress(length) =
+                    http.try_recv(connection, &mut scratch).unwrap()
+                {
+                    http_request.extend_from_slice(&scratch[..length]);
+                }
+            }
+            if http_request.len() == 5 && !http_response_sent {
+                assert_eq!(
+                    http.try_send(connection, b"HTTP-OK"),
+                    Ok(TcpIoResult::Progress(7))
+                );
+                http_response_sent = true;
+            }
+        }
+
+        server.drive_tcp_frontend(ssh_socket, &ssh).unwrap();
+        server.drive_tcp_frontend(http_socket, &http).unwrap();
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        if client.socket().can_recv() {
+            let length = client.socket().recv_slice(&mut scratch).unwrap();
+            ssh_response.extend_from_slice(&scratch[..length]);
+        }
+        if client.socket_by_handle(http_client).can_recv() {
+            let length = client
+                .socket_by_handle(http_client)
+                .recv_slice(&mut scratch)
+                .unwrap();
+            http_response.extend_from_slice(&scratch[..length]);
+        }
+        if ssh_response.len() == 6 && http_response.len() == 7 {
+            break;
+        }
+    }
+
+    assert_eq!(ssh_request, b"ssh");
+    assert_eq!(http_request, b"GET /");
+    assert_eq!(ssh_response, b"SSH-OK");
+    assert_eq!(http_response, b"HTTP-OK");
+}
+
+#[test]
+fn shared_stack_enforces_listener_budget() {
+    let inbound = Endpoint::new("listener-budget-in", 4);
+    let outbound = Endpoint::new("listener-budget-out", 4);
+    let mut space = CSpace::new("listener-budget");
+    let (_, server_in) = authority(&mut space, &inbound, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &outbound, Rights::SEND);
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut stack =
+        SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+
+    for index in 0..MAX_TCP_LISTENERS {
+        stack
+            .add_tcp_listener(SERVER_PORT + u16::try_from(index).unwrap())
+            .unwrap();
+    }
+    assert_eq!(
+        stack.add_tcp_listener(SERVER_PORT + u16::try_from(MAX_TCP_LISTENERS).unwrap()),
+        Err(StackError::TcpListenerLimitReached)
+    );
 }
 
 fn raw_tcp_pair() -> (StaticIpv4TcpStack, TestClient) {

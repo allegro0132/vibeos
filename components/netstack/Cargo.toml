@@ -5,11 +5,14 @@ edition = "2021"
 
 [features]
 default = ["tcp-echo"]
-tcp-echo = []
-net-shell = []
+static-service = []
+dhcp-service = []
+tcp-echo = ["static-service"]
+net-shell = ["dhcp-service"]
 tcp-echo-recovery-test = ["tcp-echo"]
 
 [dependencies]
 vibeos-core = { path = "../../core" }
+vibeos-net-api = { path = "../net-api" }
 vibeos-net-protocol = { path = "../net-protocol" }
 vibeos-vsh = { path = "../vsh", default-features = false }

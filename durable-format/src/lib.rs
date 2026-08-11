@@ -10,8 +10,13 @@
 extern crate alloc;
 
 mod object;
+mod policy;
 
 pub use object::{encode_object_transaction, preview_object_transaction, EncodedObjectTransaction};
+pub use policy::{
+    partition_tombstones_by_space, select_root_policy_union, RootPolicyPartition,
+    TombstonePartition, TombstonePartitionError,
+};
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;

@@ -97,8 +97,8 @@ Milk-V Duo boot images are generated with the official SDK. The deliverable imag
 contains a FAT boot partition plus a raw VibeOS data partition and no Linux root
 filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
-The optional Jitterentropy probe uses a pinned Git submodule; initialize it with
-`git submodule update --init --recursive` before building that image.
+The optional Jitterentropy probe loads the exactly pinned `jitterentropy-rs`
+crate from crates.io; no Git submodule or separate C compiler is required.
 
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
 `nightly-2026-08-01` (including `rust-src` and LLVM tools) in
@@ -577,6 +577,8 @@ Deliberate, not overlooked:
   the Milk-V bring-up image also uses deterministic reboot-repeating random
   bytes. Unique per-device identity, authenticated persistent policy updates,
   rollback resistance, and a validated Milk-V Duo entropy source remain absent,
-  so production SSH stays disabled there. A pinned upstream Jitterentropy 3.7.0
-  port and UART raw-data probe now exist, but they remain isolated until the
-  physical runtime/restart qualification in `docs/JITTERENTROPY.md` passes.
+  so production SSH stays disabled there. A pinned `jitterentropy-rs` 0.1.1
+  smoke probe now exists, but the Rust rewrite is explicitly uncertified and
+  currently exposes no raw-noise qualification API. It remains isolated until
+  both its implementation-review gates and the physical runtime/restart
+  qualification in `docs/JITTERENTROPY.md` pass.

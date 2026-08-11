@@ -5,9 +5,12 @@ support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
 timebase, native microSD/DWMAC backends, and a FIT/SD image packaging flow based
 on the official Buildroot SDK.
 
-The separate `--jitterentropy-probe` image ports upstream Jitterentropy 3.7.0
-against `rdtime` and exposes conditioned smoke testing plus raw-delta capture on
-UART. It is a qualification artifact, not a production entropy source. See
+The separate `--jitterentropy-probe` image loads the exactly pinned
+`jitterentropy-rs` 0.1.1 crate against `rdtime` and exposes conditioned smoke
+testing on UART. The crate currently exposes no raw-noise qualification API.
+The rewrite is not a certified or behaviorally equivalent replacement for
+upstream Jitterentropy. It is a qualification artifact, not a production
+entropy source. See
 [JITTERENTROPY.md](JITTERENTROPY.md) before making any SSH security claim.
 
 > **Base-port and explicit SSH/VSH hardware validation status (2026-08-11):

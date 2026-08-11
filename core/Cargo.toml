@@ -14,4 +14,5 @@ smoltcp = { version = "=0.13.1", default-features = false, features = [
     "socket-tcp-reno",
 ] }
 subtle = { version = "=2.6.1", default-features = false }
+vibeos-hal = { path = "../hal" }
 zeroize = { version = "=1.9.0", default-features = false }

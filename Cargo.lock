@@ -770,6 +770,7 @@ dependencies = [
  "chacha20 0.10.1",
  "smoltcp",
  "subtle",
+ "vibeos-hal",
  "zeroize",
 ]
 
@@ -777,7 +778,6 @@ dependencies = [
 name = "vibeos-driver-dwmac-net"
 version = "0.1.0"
 dependencies = [
- "vibeos-core",
  "vibeos-hal",
 ]
 
@@ -826,9 +826,9 @@ dependencies = [
 name = "vibeos-driver-virtio-net"
 version = "0.1.0"
 dependencies = [
- "vibeos-core",
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
+ "vibeos-hal",
 ]
 
 [[package]]

@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-vibeos-core = { path = "../../core" }
 vibeos-driver-virtio-core = { path = "../virtio-core" }
 vibeos-driver-virtio-mmio = { path = "../virtio-mmio" }
+vibeos-hal = { path = "../../hal" }

@@ -6,6 +6,14 @@
 //! support crate describes address ranges and device wiring through [`Board`];
 //! drivers consume the smaller device-specific descriptions.
 
+/// Largest Ethernet frame handled by the network interface contract,
+/// excluding the four-byte frame check sequence supplied and consumed by the
+/// device.
+pub const MAX_PACKET_LEN: usize = 1_514;
+
+/// Descriptive alias for [`MAX_PACKET_LEN`].
+pub const MAX_ETHERNET_FRAME_LEN: usize = MAX_PACKET_LEN;
+
 /// Inclusive start, exclusive end physical address range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AddressRange {

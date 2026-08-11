@@ -42,6 +42,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw
   Ethernet through bounded TCP to a public-key-only SSH `exec` service.
+- **[docs/JITTERENTROPY.md](docs/JITTERENTROPY.md)** — the pinned upstream
+  Jitterentropy port, isolated Duo probe image, raw-data collection procedure,
+  and fail-closed production admission gate.
 - **[TESTING.md](TESTING.md)** — the four test layers and what each one is blind to.
 
 ## Testing
@@ -57,6 +60,7 @@ cargo test --workspace       # fast portable tests, no QEMU
 python3 -B scripts/milkv-tcp-test.py ADDRESS # physical Duo TCP/rearm gate
 python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/milkv-ssh-test.sh ADDRESS # explicit insecure physical SSH/VSH gate
+./scripts/build-milkv-duo.sh --jitterentropy-probe # isolated Duo entropy probe
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
@@ -83,6 +87,8 @@ Milk-V Duo boot images are generated with the official SDK. The deliverable imag
 contains a FAT boot partition plus a raw VibeOS data partition and no Linux root
 filesystem. Follow
 **[docs/MILKV_DUO.md](docs/MILKV_DUO.md)** for the build and flashing procedure.
+The optional Jitterentropy probe uses a pinned Git submodule; initialize it with
+`git submodule update --init --recursive` before building that image.
 
 Needs `qemu-system-riscv64`, `ld.lld`, and rustup. The repository pins
 `nightly-2026-08-01` (including `rust-src` and LLVM tools) in
@@ -561,4 +567,6 @@ Deliberate, not overlooked:
   the Milk-V bring-up image also uses deterministic reboot-repeating random
   bytes. Unique per-device identity, authenticated persistent policy updates,
   rollback resistance, and a validated Milk-V Duo entropy source remain absent,
-  so production SSH stays disabled there.
+  so production SSH stays disabled there. A pinned upstream Jitterentropy 3.7.0
+  port and UART raw-data probe now exist, but they remain isolated until the
+  physical runtime/restart qualification in `docs/JITTERENTROPY.md` passes.

@@ -133,6 +133,10 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  mmu ro          prove read-only rodata and COW capability tables");
             println!("  mmu ro fault rodata|captab  run expected-fatal write probes");
             println!("  selftest        run the in-kernel test suite");
+            #[cfg(feature = "milkv-jitterentropy-probe")]
+            println!("  jent smoke      run production Jitterentropy startup/health gate");
+            #[cfg(feature = "milkv-jitterentropy-probe")]
+            println!("  jent raw <n>    emit n raw timing deltas as validation evidence");
             println!("  quiet           mute background components (`verbose` restores)");
             println!("  mem             kernel heap usage");
             println!("  uptime          seconds since boot");
@@ -449,6 +453,21 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 );
             }
         }
+
+        #[cfg(feature = "milkv-jitterentropy-probe")]
+        "jent" => match rest.as_slice() {
+            ["smoke"] => crate::jitterentropy_probe::smoke(),
+            ["raw", count] => match count.parse::<usize>() {
+                Ok(count) if (1..=crate::jitterentropy_probe::MAX_RAW_SAMPLES).contains(&count) => {
+                    crate::jitterentropy_probe::raw(count)
+                }
+                _ => println!(
+                    "  sample count must be 1..={}",
+                    crate::jitterentropy_probe::MAX_RAW_SAMPLES
+                ),
+            },
+            _ => println!("  usage: jent smoke | jent raw <samples>"),
+        },
 
         "quiet" | "verbose" => {
             let quiet = cmd == "quiet";

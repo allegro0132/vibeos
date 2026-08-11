@@ -134,8 +134,10 @@ the configuration and boot protocol, and polls its interrupt-IN endpoint at the
 advertised interval. Newly pressed keys use the same ASCII, control-key and
 ANSI-arrow translation as the QEMU xHCI console and feed the kernel console
 input queue. The boot log prints speed, VID:PID, USB version, endpoint-zero
-packet size, and the selected HID interface/endpoint. Hotplug recovery and USB
-storage remain absent. The official SDK describes the same core/PHY ranges and
+packet size, and the selected HID interface/endpoint. A resident polling task
+detects root-port disconnect and reconnect transitions, clears stale device
+state, and repeats enumeration and HID configuration after reinsertion. USB
+storage remains absent. The official SDK describes the same core/PHY ranges and
 IRQ in
 [`cv180x_base.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x/cv180x_base.dtsi)
 and
@@ -533,7 +535,21 @@ gate. This is DWMAC/IPv4/TCP evidence only and does not claim SSH availability.
 
 ## Hardware validation checklist
 
-For the first hardware boot, preserve the full serial log and verify each item:
+For the first hardware boot, preserve the full serial log and verify each item.
+For the USB HID gate, build `./scripts/build-milkv-duo.sh --diagnostic`, capture
+UART0 at 115200 8N1 to a file, and boot with the USB keyboard disconnected.
+After the `vibe>` prompt appears, attach the keyboard, type `uptime`, unplug it,
+wait for the disconnect diagnostic, reconnect it, and type `uptime` again. Do
+not type either command through UART: the two echoed commands are the evidence
+that HID reached the console input queue. Analyze the preserved log with:
+
+```sh
+./scripts/check-milkv-usb-hid-log.sh path/to/uart.log
+```
+
+The gate passes only when the log contains two successful enumerations, two HID
+configurations, the intervening disconnect transition, and two successful
+keyboard-entered `uptime` commands, with no panic or USB failure marker.
 
 - [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
       native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
@@ -560,7 +576,9 @@ For the first hardware boot, preserve the full serial log and verify each item:
 - [ ] A low/full/high-speed USB device completes address and device-descriptor
       enumeration on the physical OTG port. A HID Boot Keyboard is configured,
       reports its interrupt-IN endpoint, and can type commands into `vibe>`;
-      disconnect/reconnect recovery and storage I/O remain later gates.
+      disconnect/reconnect repeats enumeration and restores input. Preserve the
+      UART log and pass `scripts/check-milkv-usb-hid-log.sh`; storage I/O remains
+      a later gate.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

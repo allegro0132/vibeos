@@ -88,6 +88,16 @@ const MAX_NAK_RETRIES: usize = 32;
 const HID_REPORT_BYTES: usize = 8;
 const HID_INPUT_BYTES: usize = 18;
 const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
+const USB_CLASS_HUB: u8 = 9;
+const USB_DESCRIPTOR_HUB: u16 = 0x29;
+const USB_PORT_FEAT_RESET: u16 = 4;
+const USB_PORT_FEAT_POWER: u16 = 8;
+const USB_PORT_FEAT_C_RESET: u16 = 20;
+const USB_PORT_STAT_CONNECTION: u16 = 1;
+const USB_PORT_STAT_ENABLE: u16 = 1 << 1;
+const USB_PORT_STAT_LOW_SPEED: u16 = 1 << 9;
+const USB_PORT_STAT_HIGH_SPEED: u16 = 1 << 10;
+const MAX_HUB_PORTS: u8 = 15;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
@@ -143,6 +153,15 @@ pub struct HidKeyboardInfo {
     pub endpoint_in: u8,
     pub max_packet_size: u16,
     pub interval_ms: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HubInfo {
+    pub address: u8,
+    pub ports: u8,
+    pub active_port: Option<u8>,
+    pub child_speed: Option<Speed>,
+    pub port_status: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +249,7 @@ pub struct Controller {
     endpoint_zero_max_packet: u16,
     speed: Speed,
     device: Option<DeviceInfo>,
+    hub: Option<HubInfo>,
     keyboard: Option<HidKeyboardInfo>,
     keyboard_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
@@ -456,6 +476,7 @@ impl Controller {
             endpoint_zero_max_packet: 8,
             speed: Speed::Full,
             device: None,
+            hub: None,
             keyboard: None,
             keyboard_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
@@ -489,11 +510,16 @@ impl Controller {
         self.keyboard
     }
 
+    pub const fn hub(&self) -> Option<HubInfo> {
+        self.hub
+    }
+
     /// Reset the directly attached root-port device and complete USB address
     /// and device-descriptor enumeration through endpoint zero.
     pub fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {
         if !self.connected() {
             self.device = None;
+            self.hub = None;
             self.keyboard = None;
             self.device_address = 0;
             return Ok(None);
@@ -550,6 +576,7 @@ impl Controller {
         let info = parse_device_descriptor(descriptor, self.speed, self.device_address)?;
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
         self.device = Some(info);
+        self.hub = None;
         self.keyboard = None;
         Ok(Some(info))
     }
@@ -589,6 +616,22 @@ impl Controller {
             parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
         let Some(keyboard) = keyboard else {
             self.keyboard = None;
+            if self
+                .device
+                .is_some_and(|device| device.device_class == USB_CLASS_HUB)
+            {
+                self.control_transfer(
+                    SetupPacket {
+                        request_type: 0,
+                        request: 9,
+                        value: u16::from(configuration),
+                        index: 0,
+                        length: 0,
+                    },
+                    &mut [],
+                )?;
+                self.hub = Some(self.configure_hub()?);
+            }
             return Ok(None);
         };
 
@@ -613,9 +656,97 @@ impl Controller {
             &mut [],
         )?;
         self.keyboard = Some(keyboard);
+        self.hub = None;
         self.keyboard_pid = DataPid::Data0;
         self.keyboard_last = [0; HID_REPORT_BYTES];
         Ok(Some(keyboard))
+    }
+
+    fn configure_hub(&mut self) -> Result<HubInfo, Error> {
+        let mut descriptor = [0u8; 9];
+        let length = self.control_transfer(
+            SetupPacket {
+                request_type: 0xa0,
+                request: 6,
+                value: USB_DESCRIPTOR_HUB << 8,
+                index: 0,
+                length: descriptor.len() as u16,
+            },
+            &mut descriptor,
+        )?;
+        let (ports, power_good_ms) = parse_hub_descriptor(&descriptor[..length])?;
+
+        for port in 1..=ports {
+            self.hub_port_feature(port, true, USB_PORT_FEAT_POWER)?;
+        }
+        delay_ms(
+            self.timebase_hz,
+            self.time,
+            u64::from(power_good_ms.max(20)),
+        );
+
+        let mut active_port = None;
+        let mut child_speed = None;
+        let mut port_status = 0;
+        for port in 1..=ports {
+            let status = self.hub_port_status(port)?;
+            if status & USB_PORT_STAT_CONNECTION == 0 {
+                continue;
+            }
+            self.hub_port_feature(port, true, USB_PORT_FEAT_RESET)?;
+            delay_ms(self.timebase_hz, self.time, 60);
+            let reset_status = self.hub_port_status(port)?;
+            let _ = self.hub_port_feature(port, false, USB_PORT_FEAT_C_RESET);
+            if reset_status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)
+                != USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE
+            {
+                continue;
+            }
+            active_port = Some(port);
+            child_speed = Some(hub_port_speed(reset_status));
+            port_status = reset_status;
+            break;
+        }
+
+        Ok(HubInfo {
+            address: self.device_address,
+            ports,
+            active_port,
+            child_speed,
+            port_status,
+        })
+    }
+
+    fn hub_port_feature(&mut self, port: u8, set: bool, feature: u16) -> Result<(), Error> {
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x23,
+                request: if set { 3 } else { 1 },
+                value: feature,
+                index: u16::from(port),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    fn hub_port_status(&mut self, port: u8) -> Result<u16, Error> {
+        let mut status = [0u8; 4];
+        if self.control_transfer(
+            SetupPacket {
+                request_type: 0xa3,
+                request: 0,
+                value: 0,
+                index: u16::from(port),
+                length: status.len() as u16,
+            },
+            &mut status,
+        )? != status.len()
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        Ok(u16::from_le_bytes([status[0], status[1]]))
     }
 
     /// Poll one interrupt-IN boot report and return bytes for newly pressed
@@ -903,6 +1034,28 @@ impl DataPid {
             Self::Data1 => Self::Data0,
             Self::Setup => Self::Setup,
         }
+    }
+}
+
+fn parse_hub_descriptor(descriptor: &[u8]) -> Result<(u8, u16), Error> {
+    if descriptor.len() < 7
+        || usize::from(descriptor[0]) > descriptor.len()
+        || descriptor[1] != USB_DESCRIPTOR_HUB as u8
+        || descriptor[2] == 0
+        || descriptor[2] > MAX_HUB_PORTS
+    {
+        return Err(Error::InvalidDescriptor);
+    }
+    Ok((descriptor[2], u16::from(descriptor[5]) * 2))
+}
+
+const fn hub_port_speed(status: u16) -> Speed {
+    if status & USB_PORT_STAT_LOW_SPEED != 0 {
+        Speed::Low
+    } else if status & USB_PORT_STAT_HIGH_SPEED != 0 {
+        Speed::High
+    } else {
+        Speed::Full
     }
 }
 
@@ -1411,6 +1564,15 @@ mod tests {
         assert!(reset_uses_done_handshake(0x4f54_450a));
         assert_eq!(host_channel_count(0), 1);
         assert_eq!(host_channel_count(15 << 14), 16);
+    }
+
+    #[test]
+    fn parses_usb2_hub_ports_power_delay_and_child_speed() {
+        let descriptor = [9, 0x29, 4, 0, 0, 50, 0, 0xff, 0xff];
+        assert_eq!(parse_hub_descriptor(&descriptor), Ok((4, 100)));
+        assert_eq!(hub_port_speed(USB_PORT_STAT_LOW_SPEED), Speed::Low);
+        assert_eq!(hub_port_speed(USB_PORT_STAT_HIGH_SPEED), Speed::High);
+        assert_eq!(hub_port_speed(USB_PORT_STAT_ENABLE), Speed::Full);
     }
 
     #[test]

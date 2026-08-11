@@ -456,6 +456,18 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         device.device_class,
         device.max_packet_size_0,
     ));
+    if let Some(hub) = snapshot.hub {
+        match (hub.active_port, hub.child_speed) {
+            (Some(port), Some(speed)) => output.push_str(&format!(
+                "  Hub ports={} downstream port={} speed={:?} status={:#06x}\n",
+                hub.ports, port, speed, hub.port_status,
+            )),
+            _ => output.push_str(&format!(
+                "  Hub ports={} no enabled downstream device\n",
+                hub.ports,
+            )),
+        }
+    }
     match snapshot.keyboard {
         Some(keyboard) => output.push_str(&format!(
             "  HID boot-keyboard interface={} endpoint={:#04x} mps={} interval={}ms\n",

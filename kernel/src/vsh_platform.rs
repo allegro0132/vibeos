@@ -11,7 +11,7 @@ use vibeos_core::cap::{Cap, Rights};
 use vibeos_vsh::{AsyncCommandSpec, CommandSpec, InputEvent, Platform, Session, Status};
 
 use crate::dev::ConsoleDev;
-use crate::world::{Space, world};
+use crate::world::{world, Space};
 
 pub struct VshPlatform {
     front: Option<(Arc<Space>, Cap)>,
@@ -33,6 +33,10 @@ impl VshPlatform {
 impl Platform for VshPlatform {
     fn prompt(&self, text: &'static str) {
         crate::tty::prompt(text);
+    }
+
+    fn set_completion_candidates(&self, candidates: &[String]) {
+        crate::tty::set_completion_candidates(candidates);
     }
 
     fn read_byte(&self) -> vibeos_vsh::ReadByteFuture<'_> {

@@ -463,7 +463,9 @@ the operation. Images without an IPv4 stack do not install these commands.
 
 Interactive editing is shared by the default and test shells: `Up`/`Down`
 browse command history, while `Left`/`Right` move the insertion cursor.
-Backspace and insertion work in the middle of a line. Input is bounded to
+Backspace and insertion work in the middle of a line. `Tab` completes command
+names from the current session's installed capabilities and defined functions;
+ambiguous prefixes expand to their longest common prefix. Input is bounded to
 4 KiB, and history to the newest 64 entries / 64 KiB.
 
 Functions store syntax and value-parameter names, never resolved capability

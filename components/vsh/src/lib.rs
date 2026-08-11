@@ -40,6 +40,7 @@ pub enum InputEvent {
 /// Narrow console surface required by the unprivileged frontend.
 pub trait Platform: Sync {
     fn prompt(&self, text: &'static str);
+    fn set_completion_candidates(&self, _candidates: &[String]) {}
     fn read_byte(&self) -> ReadByteFuture<'_>;
     fn accept_byte(&self, byte: u8) -> Option<InputEvent>;
     fn write(&self, text: &str);
@@ -98,6 +99,7 @@ pub async fn interactive(
     return_on_interrupt: bool,
 ) {
     loop {
+        platform.set_completion_candidates(&session.completion_candidates());
         platform.prompt("vsh> ");
         match read_line(platform).await {
             Some(line) if !line.is_empty() => run_source(platform, &line, session).await,

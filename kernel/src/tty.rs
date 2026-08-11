@@ -116,6 +116,13 @@ pub fn prompt(prompt: &'static str) {
     raw(prompt);
 }
 
+pub fn set_completion_candidates(candidates: &[alloc::string::String]) {
+    let mut tty = TTY.lock();
+    let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
+    tty.line.set_completion_candidates(candidates);
+    system.restore();
+}
+
 /// Feed one UART byte into the physical console's line discipline.
 pub fn input_byte(byte: u8) -> Option<TerminalEvent> {
     let mut tty = TTY.lock();

@@ -1556,6 +1556,21 @@ impl Session {
         }
         session
     }
+
+    /// Sorted command names visible to this session's interactive terminal.
+    /// The list is derived only from installed command capabilities, built-in
+    /// special forms, and functions defined in this session.
+    pub fn completion_candidates(&self) -> Vec<String> {
+        let mut candidates = BTreeSet::new();
+        candidates.extend(self.commands.keys().cloned());
+        candidates.extend(
+            ["let", "jobs", "wait", "cancel", "run-script"]
+                .into_iter()
+                .map(String::from),
+        );
+        candidates.extend(self.functions.keys().cloned());
+        candidates.into_iter().collect()
+    }
     fn install(
         &mut self,
         name: &'static str,

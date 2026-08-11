@@ -116,6 +116,25 @@ fn parser_preserves_capability_value_separation_and_quotes() {
 }
 
 #[test]
+fn completion_candidates_follow_session_commands_and_functions() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    assert!(session
+        .completion_candidates()
+        .contains(&String::from("fault")));
+    session.remove_command("fault");
+    assert!(!session
+        .completion_candidates()
+        .contains(&String::from("fault")));
+
+    let (session, reports) = execute(session, "function greet who { echo $who; }");
+    assert!(reports.unwrap().is_empty());
+    let candidates = session.completion_candidates();
+    assert!(candidates.contains(&String::from("greet")));
+    assert!(candidates.contains(&String::from("run-script")));
+}
+
+#[test]
 fn s4_vertical_echo_wc_pipeline() {
     let _serial = SERIAL.lock().unwrap();
     let (_session, reports) = execute(Session::new(), "echo hello | wc > @console");

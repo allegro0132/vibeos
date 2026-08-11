@@ -93,6 +93,8 @@ jobs:
         run: ./scripts/build-milkv-duo.sh --jitterentropy-probe
       - name: Golden transcripts
         run: ./scripts/qemu-test.sh
+      - name: PCI and XHCI USB acceptance
+        run: ./scripts/qemu-usb-test.sh
       - name: QEMU/TCG benchmark regression budget
         run: python3 scripts/bench.py --no-build
       - name: Four-hart throughput scaling

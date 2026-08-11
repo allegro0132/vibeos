@@ -31,6 +31,17 @@ mod selected {
     pub const DEVICE_MMIO_START: usize = UART_BASE;
     pub const DEVICE_MMIO_END: usize = 0x1000_9000;
 
+    // QEMU `virt` generic PCI host (GPEX). ECAM covers all 256 buses. The
+    // 32-bit memory aperture ends immediately below guest RAM, so a root-level
+    // 1 GiB Sv39 leaf can map it without weakening RAM permissions.
+    pub const PCI_ECAM_START: usize = 0x3000_0000;
+    pub const PCI_ECAM_END: usize = 0x4000_0000;
+    pub const PCI_IO_START: usize = 0x0300_0000;
+    pub const PCI_IO_END: usize = 0x0301_0000;
+    pub const PCI_MMIO_START: usize = 0x4000_0000;
+    pub const PCI_MMIO_END: usize = 0x8000_0000;
+    pub const PCI_INTX_FIRST_IRQ: u32 = 32;
+
     pub const TIMEBASE_HZ: u64 = 10_000_000;
     pub const VIRTIO_MMIO_SLOTS: usize = 8;
     pub const HART_IDS: &[usize] = &[0, 1, 2, 3];

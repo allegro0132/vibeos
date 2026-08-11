@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+pub mod command;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;

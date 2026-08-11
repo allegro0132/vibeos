@@ -120,6 +120,8 @@ mod saved_program;
 mod selftest;
 #[cfg(feature = "milkv-ssh")]
 mod ssh_key_format;
+#[cfg(feature = "milkv-ssh")]
+mod ssh_network_config;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",

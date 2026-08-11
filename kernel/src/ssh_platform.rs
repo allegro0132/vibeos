@@ -47,8 +47,8 @@ use vibeos_ssh_identity::SshEd25519PublicKey;
 ))]
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
-    NetworkBindError, NetworkInfo, Platform as SshdPlatform, PlatformFuture, SecretBytes,
-    SshServicePolicy, StaticIpv4Address,
+    Ipv4RuntimeStatus, NetworkBindError, NetworkConfiguration, NetworkInfo,
+    Platform as SshdPlatform, PlatformFuture, SecretBytes, SshServicePolicy, StaticIpv4Address,
 };
 
 #[cfg(any(
@@ -176,11 +176,14 @@ impl SshdPlatform for SshPlatform {
             .lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
             .ok()?;
         let info = crate::net_device::info_with(&lease).ok()?;
+        let phy_link_up = crate::net_device::carrier_up(&info);
+        #[cfg(feature = "milkv-ssh")]
+        crate::ssh_network_config::publish_carrier(phy_link_up);
         Some(NetworkInfo {
             online: info.online,
             quarantined: info.quarantined,
             session_epoch: info.session_epoch,
-            phy_link_up: crate::net_device::carrier_up(&info),
+            phy_link_up,
         })
     }
 
@@ -311,6 +314,26 @@ impl SshdPlatform for SshPlatform {
         }
     }
 
+    #[cfg(feature = "milkv-ssh")]
+    fn ipv4_configuration(&self, fallback: Ipv4Policy) -> (u64, NetworkConfiguration) {
+        crate::ssh_network_config::snapshot(fallback)
+    }
+
+    #[cfg(feature = "milkv-ssh")]
+    fn acknowledge_ipv4_configuration(&self, revision: u64, status: Ipv4RuntimeStatus) {
+        crate::ssh_network_config::acknowledge(revision, status);
+    }
+
+    #[cfg(feature = "milkv-ssh")]
+    fn publish_ipv4_status(&self, status: Ipv4RuntimeStatus) {
+        crate::ssh_network_config::publish_status(status);
+    }
+
+    #[cfg(feature = "milkv-ssh")]
+    fn ipv4_configuration_changed(&self) -> bool {
+        crate::ssh_network_config::changed()
+    }
+
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool) {
         if onboarding {
             #[cfg(feature = "milkv-ssh")]
@@ -385,14 +408,22 @@ pub async fn provisioned_task(
     control: Cap,
     random: Cap,
 ) {
-    crate::uart::_print(format_args!(
-        "SSH first login: user vibe, password vibeos; authorize an Ed25519 key immediately\n"
-    ));
+    crate::ssh_network_config::initialize(
+        SSH_SERVICE_POLICY.ipv4,
+        SSH_SERVICE_POLICY.ethernet_address,
+    );
     let mut provisioning_failure_reported = false;
     loop {
         match crate::ssh_provisioning::ensure_host_key().await {
             Ok(config) => {
                 provisioning_failure_reported = false;
+                if config.complete() {
+                    crate::uart::_print(format_args!("SSH public-key authentication active\n"));
+                } else {
+                    crate::uart::_print(format_args!(
+                        "SSH first login: user vibe, password vibeos; authorize an Ed25519 key immediately\n"
+                    ));
+                }
                 match crate::ssh_provisioning::install_services(space, config) {
                     Ok((read, invoke, policy)) => {
                         crate::uart::_print(format_args!(

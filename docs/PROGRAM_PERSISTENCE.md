@@ -106,10 +106,10 @@ rejected; a raw task fault clears only the exact task/domain run owner.
 
 ## Evidence
 
-`core/tests/program.rs` and `compiler/tests/image.rs` cover canonical codecs,
+`services/program-store/tests/model.rs` and `compiler/tests/image.rs` cover canonical codecs,
 header/ABI/authority/hash mutations, relocation completeness, import and address
-validation, and strict truncation/suffix rejection. Global root-policy tests use
-two SpaceIds and prove that a local policy cannot hide an extra root.
+validation, and strict truncation/suffix rejection. `durable-format/tests/policy.rs`
+uses two SpaceIds to prove that a local policy cannot hide an extra root.
 
 `scripts/qemu-test.sh program_persistence` boots twice against one raw image.
 Boot 1 saves and runs; boot 2 proves the save is already present and runs the

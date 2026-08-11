@@ -4,14 +4,18 @@
 
 extern crate alloc;
 
+mod model;
+
+pub use model::*;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate as program;
 use vibeos_core::cap::{PersistentCapIdentity, PersistentResourceWitness, Rights};
 use vibeos_durable_format::{
     GrantFlags, RecoveredGrant, RecoveredObject, RecoveredSlot, RecoveredStore,
 };
-use vibeos_core::program::{self, ProgramArtifact, PROGRAM_ROOT_RIGHTS, PROGRAM_ROOT_SLOT};
 use vibeos_object_store::{StoreError, StoredObject};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

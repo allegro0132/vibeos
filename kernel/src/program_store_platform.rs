@@ -23,18 +23,21 @@ use vibeos_core::cap::{
 use vibeos_durable_format::{
     DerivationId, GrantFlags, GrantRecord, ObjectId, SlotIdentity, TransactionId,
 };
-use vibeos_core::program::{
-    self, ProgramArtifact, PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS,
+use vibeos_object_store as object_codec;
+use vibeos_program_store as program;
+use vibeos_program_store::{
+    ProgramArtifact, PROGRAM_CONSOLE_RIGHTS, PROGRAM_MEMORY_RIGHTS, PROGRAM_ROOT_RIGHTS,
     PROGRAM_ROOT_SLOT, PROGRAM_SPACE_ID_RAW,
 };
-use vibeos_object_store as object_codec;
 
 use crate::store::{AuthorityJournal, StoredObject};
 use crate::sync::SpinLock;
 use crate::world::Space;
 use crate::{cap, exec, heap};
 
-pub use vibeos_program_store::{authorize_recovered, SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram};
+pub use vibeos_program_store::{
+    authorize_recovered, SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram,
+};
 
 pub struct SavedProgramService {
     inner: Arc<SavedProgramInner>,

@@ -23,12 +23,12 @@ use vibeos_core::cap::{
 };
 use vibeos_durable_format as durable;
 use vibeos_durable_format::{
-    DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant,
-    RecoveredSlot, RecoveredStore, RootConstraint, RootRightsConstraint, SlotIdentity,
+    DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
+    RecoveredStore, RootConstraint, RootPolicyPartition, RootRightsConstraint, SlotIdentity,
     TransactionId,
 };
-use vibeos_core::program::{self as program_model, RootPolicyPartition};
 use vibeos_object_store as object_codec;
+use vibeos_program_store as program_model;
 
 use crate::saved_program::{self, SavedProgramService, TrustedProgram};
 use crate::store::{AuthorityJournal, AuthoritySnapshot, StoreError, StoredObject};
@@ -1108,7 +1108,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
             constraints: &program_constraints,
         });
     }
-    let roots = program_model::select_root_policy_union(&preflight, &partitions)
+    let roots = durable::select_root_policy_union(&preflight, &partitions)
         .map_err(|_| DurableCSpaceError::RootPolicy)?;
     if has_live_program
         && !roots.iter().any(|root| {
@@ -1140,7 +1140,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
         .finish(&roots)
         .map_err(|_| DurableCSpaceError::RootPolicy)?;
     let policy_spaces = [persistent_space_id(), program_model::program_space_id()];
-    let tombstone_partitions = program_model::partition_tombstones_by_space(
+    let tombstone_partitions = durable::partition_tombstones_by_space(
         &committed_grants,
         &recovered.tombstones,
         &policy_spaces,

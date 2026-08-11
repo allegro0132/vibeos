@@ -6,7 +6,7 @@ use alloc::{string::String, sync::Arc};
 use core::{
     any::Any,
     ptr,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{Ordering, compiler_fence},
 };
 
 use jitterentropy::{EntropyCollector, EntropyCollectorBuilder, Flags, Timer};
@@ -84,10 +84,16 @@ impl EntropySource for JitterSeeds {
 }
 
 pub struct RandomSource {
-    state: SpinLock<ChaCha20Random<JitterSeeds>>,
+    state: SpinLock<Option<ChaCha20Random<JitterSeeds>>>,
 }
 impl RandomSource {
-    fn new() -> Result<Arc<Self>, RandomError> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: SpinLock::new(None),
+        })
+    }
+
+    fn initialize() -> Result<ChaCha20Random<JitterSeeds>, RandomError> {
         let collector = EntropyCollectorBuilder::new()
             .osr(OSR)
             .flags(FLAGS)
@@ -96,19 +102,20 @@ impl RandomSource {
             .map_err(|_| RandomError::Offline)?;
         let domain = RandomDomain::new(DOMAIN).ok_or(RandomError::IdentityExhausted)?;
         let limits = RandomLimits::new(MAX_RANDOM_BYTES, 1024 * 1024).map_err(map_core)?;
-        let random =
-            ChaCha20Random::new(JitterSeeds(collector), domain, limits).map_err(map_core)?;
-        Ok(Arc::new(Self {
-            state: SpinLock::new(random),
-        }))
+        ChaCha20Random::new(JitterSeeds(collector), domain, limits).map_err(map_core)
     }
     fn bytes(&self, length: usize) -> Result<RandomBytes, RandomError> {
         if !(1..=MAX_RANDOM_BYTES).contains(&length) {
             return Err(RandomError::InvalidLength);
         }
         let mut output = RandomBytes::zeroed(length);
-        self.state
-            .lock()
+        let mut state = self.state.lock();
+        if state.is_none() {
+            *state = Some(Self::initialize()?);
+        }
+        state
+            .as_mut()
+            .ok_or(RandomError::Offline)?
             .try_fill_bytes(&mut output.bytes[..length])
             .map_err(map_core)?;
         Ok(output)
@@ -131,7 +138,7 @@ pub struct RandomResources {
 }
 pub fn provision() -> Result<RandomResources, RandomError> {
     Ok(RandomResources {
-        source: RandomSource::new()?,
+        source: RandomSource::new(),
     })
 }
 pub fn fill_seed(seed: &mut [u8; SEED_BYTES]) -> Result<(), RandomError> {

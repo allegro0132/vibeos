@@ -165,6 +165,7 @@ pub struct HidKeyboardInfo {
 }
 
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
+pub const MAX_HID_REPORT_DESCRIPTOR_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InterfaceInfo {
@@ -173,9 +174,24 @@ pub struct InterfaceInfo {
     pub class: u8,
     pub subclass: u8,
     pub protocol: u8,
+    pub hid_report_length: u16,
     pub interrupt_in: Option<u8>,
     pub max_packet_size: u16,
     pub interval: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HidReportDescriptor {
+    pub interface: u8,
+    pub declared_length: u16,
+    bytes: [u8; MAX_HID_REPORT_DESCRIPTOR_BYTES],
+    length: usize,
+}
+
+impl HidReportDescriptor {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,6 +306,7 @@ pub struct Controller {
     hub: Option<HubInfo>,
     split: Option<SplitTarget>,
     configuration: Option<ConfigurationInfo>,
+    report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
     keyboard_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
@@ -520,6 +537,7 @@ impl Controller {
             hub: None,
             split: None,
             configuration: None,
+            report_descriptor: None,
             keyboard: None,
             keyboard_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
@@ -561,6 +579,10 @@ impl Controller {
         self.configuration
     }
 
+    pub const fn report_descriptor(&self) -> Option<HidReportDescriptor> {
+        self.report_descriptor
+    }
+
     pub const fn hub(&self) -> Option<HubInfo> {
         self.hub
     }
@@ -574,6 +596,7 @@ impl Controller {
             self.hub = None;
             self.split = None;
             self.configuration = None;
+            self.report_descriptor = None;
             self.keyboard = None;
             self.device_address = 0;
             return Ok(None);
@@ -634,6 +657,7 @@ impl Controller {
         self.child = None;
         self.hub = None;
         self.configuration = None;
+        self.report_descriptor = None;
         self.keyboard = None;
         Ok(Some(info))
     }
@@ -676,6 +700,7 @@ impl Controller {
         let (configuration, keyboard) =
             parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
         self.configuration = Some(configuration);
+        self.report_descriptor = None;
         let Some(keyboard) = keyboard else {
             self.keyboard = None;
             if self.child.is_none() && target.device_class == USB_CLASS_HUB {
@@ -694,6 +719,47 @@ impl Controller {
                 if self.enumerate_hub_child(hub)?.is_some() {
                     return self.configure_hid_keyboard();
                 }
+            }
+            if let Some(interface) =
+                configuration
+                    .interfaces
+                    .into_iter()
+                    .flatten()
+                    .find(|interface| {
+                        interface.class == 3
+                            && interface.interrupt_in.is_some()
+                            && interface.hid_report_length != 0
+                    })
+            {
+                self.control_transfer(
+                    SetupPacket {
+                        request_type: 0,
+                        request: 9,
+                        value: u16::from(configuration.value),
+                        index: 0,
+                        length: 0,
+                    },
+                    &mut [],
+                )?;
+                let requested =
+                    usize::from(interface.hid_report_length).min(MAX_HID_REPORT_DESCRIPTOR_BYTES);
+                let mut bytes = [0; MAX_HID_REPORT_DESCRIPTOR_BYTES];
+                let length = self.control_transfer(
+                    SetupPacket {
+                        request_type: 0x81,
+                        request: 6,
+                        value: 0x22 << 8,
+                        index: u16::from(interface.number),
+                        length: requested as u16,
+                    },
+                    &mut bytes[..requested],
+                )?;
+                self.report_descriptor = Some(HidReportDescriptor {
+                    interface: interface.number,
+                    declared_length: interface.hid_report_length,
+                    bytes,
+                    length,
+                });
             }
             return Ok(None);
         };
@@ -1464,6 +1530,7 @@ fn parse_hid_keyboard_configuration(
                     class: descriptors[offset + 5],
                     subclass: descriptors[offset + 6],
                     protocol: descriptors[offset + 7],
+                    hid_report_length: 0,
                     interrupt_in: None,
                     max_packet_size: 0,
                     interval: 0,
@@ -1476,6 +1543,25 @@ fn parse_hid_keyboard_configuration(
                     && descriptors[offset + 6] == 1
                     && descriptors[offset + 7] == 1)
                     .then_some(descriptors[offset + 2]);
+            }
+            0x21 if length >= 9 => {
+                if let Some(index) = current_interface {
+                    if let Some(info) = configuration.interfaces[index].as_mut() {
+                        let descriptor_count = usize::from(descriptors[offset + 5]);
+                        for descriptor in 0..descriptor_count {
+                            let subordinate = offset + 6 + descriptor * 3;
+                            if subordinate + 3 > offset + length {
+                                return Err(Error::InvalidDescriptor);
+                            }
+                            if descriptors[subordinate] == 0x22 {
+                                info.hid_report_length = u16::from_le_bytes([
+                                    descriptors[subordinate + 1],
+                                    descriptors[subordinate + 2],
+                                ]);
+                            }
+                        }
+                    }
+                }
             }
             5 if length >= 7 => {
                 let address = descriptors[offset + 2];
@@ -2026,6 +2112,7 @@ mod tests {
                 class: 3,
                 subclass: 1,
                 protocol: 1,
+                hid_report_length: 63,
                 interrupt_in: Some(0x81),
                 max_packet_size: 8,
                 interval: 10,

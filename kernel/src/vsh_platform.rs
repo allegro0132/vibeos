@@ -496,12 +496,30 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             ));
             if let Some(endpoint) = interface.interrupt_in {
                 output.push_str(&format!(
-                    " interrupt-in={:#04x} mps={} interval={}\n",
-                    endpoint, interface.max_packet_size, interface.interval,
+                    " report-len={} interrupt-in={:#04x} mps={} interval={}\n",
+                    interface.hid_report_length,
+                    endpoint,
+                    interface.max_packet_size,
+                    interface.interval,
                 ));
             } else {
                 output.push_str("\n");
             }
+        }
+    }
+    if let Some(report) = snapshot.report_descriptor {
+        output.push_str(&format!(
+            "  HID report descriptor interface={} length={}/{}\n",
+            report.interface,
+            report.as_slice().len(),
+            report.declared_length,
+        ));
+        for chunk in report.as_slice().chunks(16) {
+            output.push_str("    ");
+            for byte in chunk {
+                output.push_str(&format!("{byte:02x} "));
+            }
+            output.push_str("\n");
         }
     }
     match snapshot.keyboard {

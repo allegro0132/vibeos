@@ -10,7 +10,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -21,27 +20,17 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::net::{
     Endpoint, Packet, PacketSessionError, PacketSessionFence, PacketStamp, StampedPacket,
-    MAX_PACKET_LEN,
 };
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{
-    self, AvailableRing, Descriptor, ModernInit, NegotiatedFeatures, NetDeviceModel,
-    NetDeviceState, NetOperation, NetQueue, NetResetReason, NetSubmission, UsedElement, UsedRing,
-    VirtioNetHeader, NET_HEADER_SIZE, NET_RECEIVE_QUEUE, NET_TRANSMIT_QUEUE, SPLIT_QUEUE_SIZE,
-    VIRTIO_F_VERSION_1,
-};
+use crate::virtio::{self, NegotiatedFeatures, NET_HEADER_SIZE, SPLIT_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
+use vibeos_driver_virtio_net::{Engine, HardwareError, ResetReason};
 
-const RESET_POLL_BUDGET: usize = 100_000;
 const TX_TIMEOUT_MS: u64 = 2_000;
 const IDLE_POLL_MS: u64 = 1;
 const QUEUE_SLOTS: usize = SPLIT_QUEUE_SIZE as usize;
-const HEADER_BYTES: usize = NET_HEADER_SIZE as usize;
-const DMA_BYTES: usize = core::mem::size_of::<DmaSlab>();
-const INTERRUPT_STATUS_OFFSET: usize = 0x060;
-const INTERRUPT_ACK_OFFSET: usize = 0x064;
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -151,8 +140,8 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "SYSTEM stable net slab @ {:#x}, {} bytes, page aligned",
-            dma_base(),
-            DMA_BYTES
+            vibeos_driver_virtio_net::dma_base(),
+            vibeos_driver_virtio_net::dma_size()
         )
     }
 
@@ -400,69 +389,6 @@ pub fn discover() -> Option<NetResources> {
     })
 }
 
-#[repr(C)]
-struct NetBuffer {
-    header: [u8; HEADER_BYTES],
-    frame: [u8; MAX_PACKET_LEN],
-}
-
-impl NetBuffer {
-    const ZERO: Self = Self {
-        header: [0; HEADER_BYTES],
-        frame: [0; MAX_PACKET_LEN],
-    };
-}
-
-#[repr(C, align(4096))]
-struct QueueDma {
-    descriptors: [Descriptor; QUEUE_SLOTS],
-    available: AvailableRing,
-    used: UsedRing,
-}
-
-impl QueueDma {
-    const ZERO: Self = Self {
-        descriptors: [Descriptor::new(0, 0, 0, 0); QUEUE_SLOTS],
-        available: AvailableRing {
-            flags: 0,
-            index: 0,
-            ring: [0; QUEUE_SLOTS],
-        },
-        used: UsedRing {
-            flags: 0,
-            index: 0,
-            ring: [UsedElement::new(0, 0); QUEUE_SLOTS],
-        },
-    };
-}
-
-#[repr(C, align(4096))]
-struct DmaSlab {
-    receive: QueueDma,
-    transmit: QueueDma,
-    receive_buffers: [NetBuffer; QUEUE_SLOTS],
-    transmit_buffers: [NetBuffer; QUEUE_SLOTS],
-}
-
-impl DmaSlab {
-    const ZERO: Self = Self {
-        receive: QueueDma::ZERO,
-        transmit: QueueDma::ZERO,
-        receive_buffers: [const { NetBuffer::ZERO }; QUEUE_SLOTS],
-        transmit_buffers: [const { NetBuffer::ZERO }; QUEUE_SLOTS],
-    };
-}
-
-struct StableDma(UnsafeCell<DmaSlab>);
-
-// Safety: DMA_CLAIMED serializes CPU access. A device retains addresses only
-// while the claim is held, and failure to confirm reset permanently retains it.
-unsafe impl Sync for StableDma {}
-
-#[link_section = ".dma"]
-static DMA: StableDma = StableDma(UnsafeCell::new(DmaSlab::ZERO));
-static DMA_CLAIMED: AtomicBool = AtomicBool::new(false);
-
 struct DriverControl {
     transport: Option<MmioTransport>,
     features: Option<NegotiatedFeatures>,
@@ -572,27 +498,17 @@ pub async fn driver_task(
 }
 
 struct DriverSession {
-    transport: MmioTransport,
-    model: NetDeviceModel,
-    tx_deadlines: [u64; QUEUE_SLOTS],
-    armed: bool,
+    engine: Engine,
 }
 
 impl DriverSession {
     fn attach(transport: MmioTransport, authority: DriverAuthority) -> Option<Self> {
-        if CONTROL.lock().quarantined {
-            return None;
-        }
-        if DMA_CLAIMED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        if CONTROL.lock().quarantined || vibeos_driver_virtio_net::dma_quarantined() {
             return None;
         }
         {
             let mut installed = AUTHORITY.lock();
             if installed.is_some() {
-                DMA_CLAIMED.store(false, Ordering::Release);
                 return None;
             }
             *installed = Some(authority);
@@ -601,15 +517,6 @@ impl DriverSession {
         let domain = crate::heap::current_domain();
         DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
         DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
-        clear_dma();
-
-        let features = match initialize_transport(transport) {
-            Ok(features) => features,
-            Err(_) => {
-                shutdown(transport, NetError::Offline);
-                return None;
-            }
-        };
         let epoch = {
             let mut control = CONTROL.lock();
             let epoch = match control.sessions.attach_device() {
@@ -622,306 +529,211 @@ impl DriverSession {
             };
             control.active_stack_domain = None;
             control.transport = Some(transport);
-            control.features = Some(features);
             control.online = false;
             epoch
         };
-        let mut session = Self {
-            transport,
-            model: NetDeviceModel::at_epoch(epoch).expect("driver epochs are non-zero"),
-            tx_deadlines: [0; QUEUE_SLOTS],
-            armed: true,
+        let engine = match Engine::attach(transport, epoch) {
+            Ok(engine) => engine,
+            Err(_) => {
+                let mut control = CONTROL.lock();
+                control.sessions.detach_device();
+                control.quarantined = vibeos_driver_virtio_net::dma_quarantined();
+                *AUTHORITY.lock() = None;
+                clear_driver_domain();
+                return None;
+            }
         };
-        if session.post_all_receives().is_err() {
-            shutdown(transport, NetError::Protocol);
-            session.armed = false;
-            return None;
-        }
+        let mut session = Self { engine };
 
         let _ = plic::unregister(transport.irq());
         // Publish the probed base in the PLIC's atomic callback record. The
-        // IRQ top half never locks CONTROL or a second transport snapshot.
+        // IRQ top half never locks CONTROL or a task-owned driver object.
         if plic::register(transport.irq(), irq_top_half, transport.base()).is_err()
             || plic::enable(transport.irq()).is_err()
         {
-            shutdown(transport, NetError::DriverCancelled);
-            session.armed = false;
+            session.shutdown(NetError::DriverCancelled);
             return None;
         }
-        transport.add_status(virtio::STATUS_DRIVER_OK);
-        transport.notify_queue(NET_RECEIVE_QUEUE);
+        if session.engine.start().is_err() {
+            session.shutdown(NetError::DriverCancelled);
+            return None;
+        }
         {
+            let info = session.engine.info();
             let mut control = CONTROL.lock();
+            control.features = Some(session.engine_features());
             control.online = true;
-            control.rx_inflight = session.model.inflight(NetQueue::Receive);
-            control.tx_inflight = session.model.inflight(NetQueue::Transmit);
+            control.rx_inflight = info.rx_inflight;
+            control.tx_inflight = info.tx_inflight;
         }
         Some(session)
     }
 
+    fn engine_features(&self) -> NegotiatedFeatures {
+        // The core feature token is intentionally opaque to policy. Re-run
+        // the pure negotiation over the engine's accepted bitset.
+        virtio::negotiate_net_features(self.engine.info().accepted_features)
+            .expect("an attached engine negotiated VERSION_1")
+    }
+
     fn step(&mut self) -> Result<bool, NetError> {
-        let mut progressed = self.service_device_events()?;
-        progressed |= self.drain_transmit_completions()?;
+        if !authority_live(self.engine.transport()) {
+            return Err(NetError::AuthorityRevoked);
+        }
+        let causes = IRQ_CAUSES.swap(0, Ordering::AcqRel);
+        let mut progressed = match self.engine.service_device_events(causes) {
+            Ok(progressed) => progressed,
+            Err(error) => {
+                self.reset(map_reset_reason(error))?;
+                return Ok(true);
+            }
+        };
+        match self.engine.drain_transmit_completions() {
+            Ok(count) => {
+                if count != 0 {
+                    TX_PACKET_COUNT.fetch_add(u64::from(count), Ordering::Relaxed);
+                    progressed = true;
+                }
+            }
+            Err(error) => {
+                self.reset(map_reset_reason(error))?;
+                return Ok(true);
+            }
+        }
         progressed |= self.drain_receive_completions()?;
-        progressed |= self.check_transmit_timeout()?;
+        if let Err(error) = self.engine.check_timeout(crate::sbi::time()) {
+            TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+            self.reset(map_reset_reason(error))?;
+            return Ok(true);
+        }
         progressed |= self.publish_transmits()?;
         self.sync_control();
         Ok(progressed)
     }
 
-    fn service_device_events(&mut self) -> Result<bool, NetError> {
-        if !authority_live(self.transport) {
-            return Err(NetError::AuthorityRevoked);
-        }
-        let causes = virtio::InterruptCauses::from_status(IRQ_CAUSES.swap(0, Ordering::AcqRel));
-        let status = self.transport.status();
-        let expected = virtio::STATUS_ACKNOWLEDGE
-            | virtio::STATUS_DRIVER
-            | virtio::STATUS_FEATURES_OK
-            | virtio::STATUS_DRIVER_OK;
-        if status & (virtio::STATUS_DEVICE_NEEDS_RESET | virtio::STATUS_FAILED) != 0
-            || status & expected != expected
-        {
-            self.model.require_reset(NetResetReason::DeviceNeedsReset);
-            self.reset_required_transport()?;
-            return Ok(true);
-        }
-        Ok(!causes.is_empty())
-    }
-
-    fn drain_transmit_completions(&mut self) -> Result<bool, NetError> {
-        let observed = read_used_index(NetQueue::Transmit);
-        let mut progressed = false;
-        let mut budget = QUEUE_SLOTS;
-        while self.model.used_index(NetQueue::Transmit) != observed && budget != 0 {
-            let slot = virtio::ring_slot(self.model.used_index(NetQueue::Transmit)) as usize;
-            let used = read_used_element(NetQueue::Transmit, slot);
-            match self.model.complete_transmit(observed, used) {
-                Ok(completion) => {
-                    self.tx_deadlines[completion.submission.token.head as usize] = 0;
-                    TX_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
-                    progressed = true;
-                }
-                Err(_) => {
-                    self.reset_after_protocol_error()?;
-                    return Ok(true);
-                }
-            }
-            budget -= 1;
-        }
-        if self.model.used_index(NetQueue::Transmit) != observed {
-            self.model
-                .require_reset(NetResetReason::MalformedCompletion);
-            self.reset_required_transport()?;
-            return Ok(true);
-        }
-        Ok(progressed)
-    }
-
     fn drain_receive_completions(&mut self) -> Result<bool, NetError> {
-        // Completion consumption, session stamping, endpoint publication, RX
-        // repost, and the queue doorbell form one bounded rebind barrier. A
-        // stack bind cannot relabel a raw frame after this driver has consumed
-        // it from the used ring.
+        // CONTROL remains the rebind barrier across hardware completion,
+        // packet stamping, and endpoint publication.
         let control = CONTROL.lock();
-        let observed = read_used_index(NetQueue::Receive);
         let mut progressed = false;
-        let mut reposted = false;
-        let mut budget = QUEUE_SLOTS;
-        while self.model.used_index(NetQueue::Receive) != observed && budget != 0 {
+        for _ in 0..QUEUE_SLOTS {
             if !inbound_has_space()? {
                 break;
             }
-            let slot = virtio::ring_slot(self.model.used_index(NetQueue::Receive)) as usize;
-            let used = read_used_element(NetQueue::Receive, slot);
-            let frame_length = match virtio::validate_net_receive_length(used.length()) {
-                Ok(length) => length as usize,
-                Err(_) => {
-                    self.model
-                        .require_reset(NetResetReason::MalformedCompletion);
+            let frame = match self.engine.receive() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
                     drop(control);
-                    self.reset_required_transport()?;
+                    self.reset(map_reset_reason(error))?;
                     return Ok(true);
                 }
             };
-            let head = used.id();
-            let header = if head < SPLIT_QUEUE_SIZE as u32 {
-                VirtioNetHeader::from_bytes(read_receive_header(head as usize))
-            } else {
-                // The model rejects the ID before consulting this placeholder;
-                // never use an untrusted ID for a DMA address calculation.
-                VirtioNetHeader::transmit()
-            };
-            let completion = match self.model.complete_receive(observed, used, header) {
-                Ok(completion) => completion,
-                Err(_) => {
-                    drop(control);
-                    self.reset_required_transport()?;
-                    return Ok(true);
-                }
-            };
-            if completion.frame_length as usize != frame_length || frame_length == 0 {
-                self.model
-                    .require_reset(NetResetReason::MalformedCompletion);
-                drop(control);
-                self.reset_required_transport()?;
-                return Ok(true);
-            }
-            let frame = read_receive_frame(completion.submission.token.head as usize, frame_length);
-            let packet =
-                Packet::copy_from(&frame[..frame_length]).map_err(|_| NetError::Protocol)?;
+            let packet = Packet::copy_from(frame.as_bytes()).map_err(|_| NetError::Protocol)?;
             match send_inbound(&control, packet) {
                 Ok(true) => {
                     RX_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(false) => {}
                 Err(NetError::AuthorityRevoked) => return Err(NetError::AuthorityRevoked),
-                // The sole producer checked capacity immediately above. If a
-                // future policy adds another producer, bounded backpressure
-                // may race this send; drop this already-consumed frame without
-                // misclassifying ordinary pressure as a device protocol fault.
                 Err(NetError::QueueFull) => {}
                 Err(error) => return Err(error),
             }
-            let submission = self.model.post_receive().map_err(|_| NetError::Protocol)?;
-            publish_receive(submission)?;
-            reposted = true;
             progressed = true;
-            budget -= 1;
-        }
-        if reposted {
-            self.transport.notify_queue(NET_RECEIVE_QUEUE);
         }
         Ok(progressed)
     }
 
-    fn check_transmit_timeout(&mut self) -> Result<bool, NetError> {
-        let now = crate::sbi::time();
-        for head in 0..QUEUE_SLOTS {
-            let deadline = self.tx_deadlines[head];
-            if deadline == 0 || now < deadline {
-                continue;
-            }
-            let Some(submission) = self
-                .model
-                .active_submission(NetQueue::Transmit, head as u16)
-            else {
-                self.tx_deadlines[head] = 0;
-                continue;
-            };
-            self.model
-                .timeout(submission.token)
-                .map_err(|_| NetError::Protocol)?;
-            TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-            self.reset_required_transport()?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
     fn publish_transmits(&mut self) -> Result<bool, NetError> {
         let mut published = false;
-        // This guard is the stack-rebind barrier. A successful bind can only
-        // observe zero in-flight descriptors, and cannot interleave between
-        // exact stamp validation and DMA publication below.
         let mut control = CONTROL.lock();
-        while self.model.inflight(NetQueue::Transmit) < SPLIT_QUEUE_SIZE as u8 {
+        while self.engine.info().tx_inflight < SPLIT_QUEUE_SIZE as u8 {
             let Some(packet) = take_admitted_outbound(&mut control)? else {
                 break;
             };
-            let submission = self
-                .model
-                .submit_transmit(packet.len())
-                .map_err(|_| NetError::QueueFull)?;
-            publish_transmit(submission, &packet)?;
-            self.tx_deadlines[submission.token.head as usize] = crate::sbi::time()
+            let deadline = crate::sbi::time()
                 .saturating_add(TX_TIMEOUT_MS.saturating_mul(exec::timebase_hz() / 1_000));
-            control.tx_inflight = self.model.inflight(NetQueue::Transmit);
+            self.engine
+                .submit_transmit(packet.as_bytes(), deadline)
+                .map_err(map_hardware_error)?;
+            control.tx_inflight = self.engine.info().tx_inflight;
             published = true;
         }
-        if published {
-            self.transport.notify_queue(NET_TRANSMIT_QUEUE);
-        }
         drop(control);
-        if published {
-            if FAULT_AFTER_PUBLISH.swap(false, Ordering::AcqRel) {
-                panic!("injected virtio-net fault after DMA publication");
-            }
+        if published && FAULT_AFTER_PUBLISH.swap(false, Ordering::AcqRel) {
+            panic!("injected virtio-net fault after DMA publication");
         }
         Ok(published)
     }
 
-    fn post_all_receives(&mut self) -> Result<(), NetError> {
-        for _ in 0..QUEUE_SLOTS {
-            let submission = self.model.post_receive().map_err(|_| NetError::Protocol)?;
-            publish_receive(submission)?;
-        }
-        Ok(())
-    }
-
-    fn reset_after_protocol_error(&mut self) -> Result<(), NetError> {
-        if !matches!(self.model.state(), NetDeviceState::ResetRequired { .. }) {
-            self.model
-                .require_reset(NetResetReason::MalformedCompletion);
-        }
-        self.reset_required_transport()
-    }
-
-    fn reset_required_transport(&mut self) -> Result<(), NetError> {
+    fn reset(&mut self, reason: ResetReason) -> Result<(), NetError> {
+        let transport = self.engine.transport();
         {
             let mut control = CONTROL.lock();
             control.online = false;
             control.sessions.detach_device();
             control.active_stack_domain = None;
         }
-        let _ = plic::disable(self.transport.irq());
-        if !self.transport.reset(RESET_POLL_BUDGET) {
-            self.model.quarantine(NetResetReason::ResetFailed);
-            self.quarantine();
-            return Err(NetError::Quarantined);
-        }
-        let _ = self.transport.acknowledge_interrupt();
+        let _ = plic::disable(transport.irq());
         IRQ_CAUSES.store(0, Ordering::Release);
-        self.model
-            .confirm_reset(0)
-            .map_err(|_| NetError::Protocol)?;
+        let epoch = match self.engine.reset_and_reinitialize(reason) {
+            Ok(epoch) => epoch,
+            Err(HardwareError::Quarantined | HardwareError::IdentityExhausted) => {
+                self.quarantine();
+                return Err(NetError::Quarantined);
+            }
+            Err(error) => return Err(map_hardware_error(error)),
+        };
         RESET_COUNT.fetch_add(1, Ordering::Relaxed);
-        self.reinitialize_after_reset()
+        if plic::enable(transport.irq()).is_err() {
+            self.shutdown(NetError::DriverCancelled);
+            return Err(NetError::Offline);
+        }
+        let mut control = CONTROL.lock();
+        let session_epoch = control.sessions.attach_device().map_err(|_| {
+            self.engine.force_quarantine();
+            control.quarantined = true;
+            NetError::IdentityExhausted
+        })?;
+        control.active_stack_domain = None;
+        if session_epoch != epoch {
+            control.sessions.detach_device();
+            self.engine.force_quarantine();
+            control.quarantined = true;
+            return Err(NetError::Protocol);
+        }
+        let info = self.engine.info();
+        control.features = Some(self.engine_features());
+        control.online = true;
+        control.rx_inflight = info.rx_inflight;
+        control.tx_inflight = info.tx_inflight;
+        Ok(())
     }
 
-    fn reinitialize_after_reset(&mut self) -> Result<(), NetError> {
-        clear_dma();
-        let initialized = initialize_transport(self.transport);
-        if let Ok(features) = initialized {
-            self.model.reinitialize().map_err(|_| NetError::Protocol)?;
-            self.tx_deadlines = [0; QUEUE_SLOTS];
-            self.post_all_receives()?;
-            if plic::enable(self.transport.irq()).is_ok() {
-                self.transport.add_status(virtio::STATUS_DRIVER_OK);
-                self.transport.notify_queue(NET_RECEIVE_QUEUE);
-                let mut control = CONTROL.lock();
-                let epoch = control
-                    .sessions
-                    .attach_device()
-                    .map_err(|_| NetError::IdentityExhausted)?;
-                control.active_stack_domain = None;
-                if epoch != self.model.epoch() {
-                    control.sessions.detach_device();
-                    control.active_stack_domain = None;
-                    return Err(NetError::Protocol);
-                }
-                control.features = Some(features);
-                control.online = true;
-                control.rx_inflight = self.model.inflight(NetQueue::Receive);
-                control.tx_inflight = 0;
-                return Ok(());
-            }
+    fn quarantine(&mut self) {
+        let transport = self.engine.transport();
+        let _ = plic::disable(transport.irq());
+        let _ = plic::unregister(transport.irq());
+        IRQ_CAUSES.store(0, Ordering::Release);
+        self.engine.force_quarantine();
+        let info = self.engine.info();
+        {
+            let mut control = CONTROL.lock();
+            control.online = false;
+            control.quarantined = true;
+            control.sessions.detach_device();
+            control.active_stack_domain = None;
+            control.rx_inflight = info.rx_inflight;
+            control.tx_inflight = info.tx_inflight;
         }
+        *AUTHORITY.lock() = None;
+    }
 
-        let _ = plic::disable(self.transport.irq());
-        let reset = self.transport.reset(RESET_POLL_BUDGET);
-        let _ = self.transport.acknowledge_interrupt();
-        let _ = plic::unregister(self.transport.irq());
+    fn shutdown(&mut self, _reason: NetError) {
+        let transport = self.engine.transport();
+        let _ = plic::disable(transport.irq());
+        let _ = plic::unregister(transport.irq());
+        let reset = self.engine.shutdown(ResetReason::Cancelled);
         IRQ_CAUSES.store(0, Ordering::Release);
         {
             let mut control = CONTROL.lock();
@@ -935,119 +747,50 @@ impl DriverSession {
             }
         }
         *AUTHORITY.lock() = None;
-        self.armed = false;
         if reset {
-            clear_dma();
-            DMA_CLAIMED.store(false, Ordering::Release);
             clear_driver_domain();
-            Err(NetError::Offline)
-        } else {
-            Err(NetError::Quarantined)
         }
-    }
-
-    fn quarantine(&mut self) {
-        let _ = plic::disable(self.transport.irq());
-        let _ = plic::unregister(self.transport.irq());
-        let _ = self.transport.acknowledge_interrupt();
-        IRQ_CAUSES.store(0, Ordering::Release);
-        {
-            let mut control = CONTROL.lock();
-            control.online = false;
-            control.quarantined = true;
-            control.sessions.detach_device();
-            control.active_stack_domain = None;
-            control.rx_inflight = self.model.inflight(NetQueue::Receive);
-            control.tx_inflight = self.model.inflight(NetQueue::Transmit);
-        }
-        *AUTHORITY.lock() = None;
-        self.armed = false;
-        // DMA_CLAIMED intentionally remains true after an unconfirmed reset.
     }
 
     fn sync_control(&self) {
+        let info = self.engine.info();
         let mut control = CONTROL.lock();
-        control.rx_inflight = self.model.inflight(NetQueue::Receive);
-        control.tx_inflight = self.model.inflight(NetQueue::Transmit);
+        control.rx_inflight = info.rx_inflight;
+        control.tx_inflight = info.tx_inflight;
     }
 }
 
 impl Drop for DriverSession {
     fn drop(&mut self) {
-        if self.armed {
-            self.model.require_reset(NetResetReason::Cancelled);
-            shutdown(self.transport, NetError::DriverCancelled);
-            self.armed = false;
-        }
+        self.shutdown(NetError::DriverCancelled);
     }
 }
 
-fn initialize_transport(transport: MmioTransport) -> Result<NegotiatedFeatures, NetError> {
-    if !transport.reset(RESET_POLL_BUDGET) {
-        return Err(NetError::Quarantined);
-    }
-    let mut init = ModernInit::new();
-    transport.set_status(init.acknowledge().map_err(|_| NetError::Protocol)?);
-    transport.set_status(init.declare_driver().map_err(|_| NetError::Protocol)?);
-    let features = init
-        .select_net_features(transport.device_features())
-        .map_err(|_| NetError::Protocol)?;
-    if features.accepted() != VIRTIO_F_VERSION_1 {
-        return Err(NetError::Protocol);
-    }
-    transport.set_driver_features(features.accepted());
-    transport.set_status(init.set_features_ok().map_err(|_| NetError::Protocol)?);
-    init.confirm_features(transport.status())
-        .map_err(|_| NetError::Protocol)?;
-
-    for queue in [NetQueue::Receive, NetQueue::Transmit] {
-        transport.select_queue(queue.index());
-        if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
-            return Err(NetError::Protocol);
-        }
-        let (descriptors, available, used) = queue_dma_addresses(queue);
-        transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
-    }
-    Ok(features)
-}
-
-fn shutdown(transport: MmioTransport, _reason: NetError) {
-    let _ = plic::disable(transport.irq());
-    let _ = plic::unregister(transport.irq());
-    let reset = transport.reset(RESET_POLL_BUDGET);
-    let _ = transport.acknowledge_interrupt();
-    IRQ_CAUSES.store(0, Ordering::Release);
-    {
-        let mut control = CONTROL.lock();
-        control.online = false;
-        control.sessions.detach_device();
-        control.active_stack_domain = None;
-        control.rx_inflight = 0;
-        control.tx_inflight = 0;
-        if !reset {
-            control.quarantined = true;
-        }
-    }
-    *AUTHORITY.lock() = None;
-    if reset {
-        clear_dma();
-        DMA_CLAIMED.store(false, Ordering::Release);
-        clear_driver_domain();
+fn map_hardware_error(error: HardwareError) -> NetError {
+    match error {
+        HardwareError::Offline => NetError::Offline,
+        HardwareError::QueueFull => NetError::QueueFull,
+        HardwareError::TimedOut => NetError::TimedOut,
+        HardwareError::Protocol => NetError::Protocol,
+        HardwareError::Quarantined => NetError::Quarantined,
+        HardwareError::IdentityExhausted => NetError::IdentityExhausted,
     }
 }
 
-/// Token identity exhaustion is terminal even when status zero is confirmed:
-/// no later incarnation can mint a distinct epoch, so retain the DMA claim as
-/// an explicit fail-closed quarantine instead of wrapping or panicking.
+fn map_reset_reason(error: HardwareError) -> ResetReason {
+    match error {
+        HardwareError::TimedOut => ResetReason::Timeout,
+        HardwareError::Protocol | HardwareError::QueueFull => ResetReason::Protocol,
+        HardwareError::Offline => ResetReason::Device,
+        HardwareError::Quarantined | HardwareError::IdentityExhausted => ResetReason::Cancelled,
+    }
+}
+
 fn quarantine_identity_exhausted(transport: MmioTransport) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
-    let reset = transport.reset(RESET_POLL_BUDGET);
-    let _ = transport.acknowledge_interrupt();
+    vibeos_driver_virtio_net::quarantine_before_attach(transport);
     IRQ_CAUSES.store(0, Ordering::Release);
-    if reset {
-        clear_dma();
-    }
     {
         let mut control = CONTROL.lock();
         control.online = false;
@@ -1060,7 +803,6 @@ fn quarantine_identity_exhausted(transport: MmioTransport) {
     }
     *AUTHORITY.lock() = None;
     clear_driver_domain();
-    // DMA_CLAIMED deliberately remains set forever for this exhausted device.
 }
 
 fn clear_driver_domain() {
@@ -1186,177 +928,9 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 /// transport base captured atomically alongside this callback in the PLIC.
 /// No revocable task-owned object is touched by the IRQ top half.
 fn acknowledge_irq_transport(transport_base: usize) -> u32 {
-    let raw = unsafe { ((transport_base + INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile() };
-    dma_fence();
-    let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
-    if causes != 0 {
-        dma_fence();
-        unsafe { ((transport_base + INTERRUPT_ACK_OFFSET) as *mut u32).write_volatile(causes) };
-        dma_fence();
-    }
-    causes
-}
-
-fn publish_receive(submission: NetSubmission) -> Result<(), NetError> {
-    debug_assert_eq!(submission.operation, NetOperation::Receive);
-    let head = submission.token.head as usize;
-    if head >= QUEUE_SLOTS {
-        return Err(NetError::Protocol);
-    }
-    clear_receive_buffer(head);
-    prime_receive_header(head);
-    let descriptor =
-        virtio::build_net_descriptor(submission.operation, receive_buffer_address(head))
-            .map_err(|_| NetError::Protocol)?;
-    publish_descriptor(NetQueue::Receive, submission, descriptor);
-    Ok(())
-}
-
-fn publish_transmit(submission: NetSubmission, packet: &Packet) -> Result<(), NetError> {
-    let head = submission.token.head as usize;
-    if head >= QUEUE_SLOTS {
-        return Err(NetError::Protocol);
-    }
-    write_transmit_buffer(head, packet);
-    let descriptor =
-        virtio::build_net_descriptor(submission.operation, transmit_buffer_address(head))
-            .map_err(|_| NetError::Protocol)?;
-    publish_descriptor(NetQueue::Transmit, submission, descriptor);
-    Ok(())
-}
-
-fn publish_descriptor(queue: NetQueue, submission: NetSubmission, descriptor: Descriptor) {
-    unsafe {
-        let queue_dma = queue_dma_ptr(queue);
-        core::ptr::addr_of_mut!((*queue_dma).descriptors[submission.token.head as usize])
-            .write_volatile(descriptor);
-        let ring = core::ptr::addr_of_mut!((*queue_dma).available.ring) as *mut u16;
-        ring.add(submission.available_slot as usize)
-            .write_volatile(submission.token.head.to_le());
-        dma_fence();
-        core::ptr::addr_of_mut!((*queue_dma).available.index)
-            .write_volatile(submission.available_index.to_le());
-        dma_fence();
-    }
-}
-
-fn clear_receive_buffer(head: usize) {
-    unsafe {
-        let buffer = core::ptr::addr_of_mut!((*DMA.0.get()).receive_buffers[head]);
-        core::ptr::write_bytes(buffer.cast::<u8>(), 0, core::mem::size_of::<NetBuffer>());
-        dma_fence();
-    }
-}
-
-fn prime_receive_header(head: usize) {
-    // QEMU 11 keeps a 12-byte modern receive prefix even without MRG_RXBUF,
-    // but its non-MRG path writes only the first 10 metadata bytes. Seed the
-    // architected single-buffer value before publication so the untouched
-    // `num_buffers` field remains canonical. The model still requires exactly
-    // one buffer and rejects every nonzero offload flag after used.len has
-    // proved that the complete 12-byte prefix belongs to this completion.
-    let header = VirtioNetHeader::received_without_offload().to_bytes();
-    unsafe {
-        let destination =
-            core::ptr::addr_of_mut!((*DMA.0.get()).receive_buffers[head].header) as *mut u8;
-        for (index, byte) in header.iter().copied().enumerate() {
-            destination.add(index).write_volatile(byte);
-        }
-        dma_fence();
-    }
-}
-
-fn write_transmit_buffer(head: usize, packet: &Packet) {
-    unsafe {
-        let buffer = core::ptr::addr_of_mut!((*DMA.0.get()).transmit_buffers[head]);
-        core::ptr::write_bytes(buffer.cast::<u8>(), 0, core::mem::size_of::<NetBuffer>());
-        let header = VirtioNetHeader::transmit().to_bytes();
-        let header_dst = core::ptr::addr_of_mut!((*buffer).header) as *mut u8;
-        for (index, byte) in header.iter().copied().enumerate() {
-            header_dst.add(index).write_volatile(byte);
-        }
-        let frame_dst = core::ptr::addr_of_mut!((*buffer).frame) as *mut u8;
-        for (index, byte) in packet.as_bytes().iter().copied().enumerate() {
-            frame_dst.add(index).write_volatile(byte);
-        }
-        dma_fence();
-    }
-}
-
-fn read_receive_header(head: usize) -> [u8; HEADER_BYTES] {
-    let mut header = [0; HEADER_BYTES];
-    dma_fence();
-    unsafe {
-        let source = core::ptr::addr_of!((*DMA.0.get()).receive_buffers[head].header) as *const u8;
-        for (index, byte) in header.iter_mut().enumerate() {
-            *byte = source.add(index).read_volatile();
-        }
-    }
-    header
-}
-
-fn read_receive_frame(head: usize, length: usize) -> [u8; MAX_PACKET_LEN] {
-    let mut frame = [0; MAX_PACKET_LEN];
-    dma_fence();
-    unsafe {
-        let source = core::ptr::addr_of!((*DMA.0.get()).receive_buffers[head].frame) as *const u8;
-        for (index, byte) in frame[..length].iter_mut().enumerate() {
-            *byte = source.add(index).read_volatile();
-        }
-    }
-    frame
-}
-
-fn queue_dma_addresses(queue: NetQueue) -> (u64, u64, u64) {
-    unsafe {
-        let queue = queue_dma_ptr(queue);
-        (
-            core::ptr::addr_of!((*queue).descriptors) as u64,
-            core::ptr::addr_of!((*queue).available) as u64,
-            core::ptr::addr_of!((*queue).used) as u64,
-        )
-    }
-}
-
-fn receive_buffer_address(head: usize) -> u64 {
-    unsafe { core::ptr::addr_of!((*DMA.0.get()).receive_buffers[head]) as u64 }
-}
-
-fn transmit_buffer_address(head: usize) -> u64 {
-    unsafe { core::ptr::addr_of!((*DMA.0.get()).transmit_buffers[head]) as u64 }
-}
-
-unsafe fn queue_dma_ptr(queue: NetQueue) -> *mut QueueDma {
-    match queue {
-        NetQueue::Receive => unsafe { core::ptr::addr_of_mut!((*DMA.0.get()).receive) },
-        NetQueue::Transmit => unsafe { core::ptr::addr_of_mut!((*DMA.0.get()).transmit) },
-    }
-}
-
-fn read_used_index(queue: NetQueue) -> u16 {
-    dma_fence();
-    unsafe { u16::from_le(core::ptr::addr_of!((*queue_dma_ptr(queue)).used.index).read_volatile()) }
-}
-
-fn read_used_element(queue: NetQueue, slot: usize) -> UsedElement {
-    dma_fence();
-    unsafe { core::ptr::addr_of!((*queue_dma_ptr(queue)).used.ring[slot]).read_volatile() }
-}
-
-fn dma_base() -> usize {
-    DMA.0.get() as usize
-}
-
-fn clear_dma() {
-    unsafe {
-        core::ptr::write_bytes(DMA.0.get().cast::<u8>(), 0, DMA_BYTES);
-        dma_fence();
-    }
-}
-
-#[inline]
-fn dma_fence() {
-    unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
+    // Safety: PLIC registration captures the base from a successfully probed
+    // transport and unregisters the callback before transport retirement.
+    unsafe { vibeos_driver_virtio_net::acknowledge_irq_at_base(transport_base) }
 }
 
 pub fn hello_packet() -> Packet {
@@ -1411,7 +985,25 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     let _ = unsafe { AUTHORITY.recover_after_fault(domain) };
     let transport = CONTROL.lock().transport;
     if let Some(transport) = transport {
-        shutdown(transport, NetError::DriverFault);
+        let _ = plic::disable(transport.irq());
+        let _ = plic::unregister(transport.irq());
+        // Safety: the executor contract above permanently detaches every task
+        // in this exact owner/arena incarnation. PLIC delivery is detached
+        // before the hardware crate clears DMA or releases its global claim;
+        // the abandoned DriverSession can therefore never run or Drop later.
+        let reset = unsafe { vibeos_driver_virtio_net::recover_faulted_transport(transport) };
+        IRQ_CAUSES.store(0, Ordering::Release);
+        let mut control = CONTROL.lock();
+        control.online = false;
+        control.sessions.detach_device();
+        control.active_stack_domain = None;
+        control.rx_inflight = 0;
+        control.tx_inflight = 0;
+        control.quarantined = !reset;
+        *AUTHORITY.lock() = None;
+        if reset {
+            clear_driver_domain();
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "drivers/pci", "drivers/virtio-mmio", "drivers/xhci", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/object-store", "services/program-store", "services/ssh-identity", "acceptance/kernel-tests", "kernel", "firmware/qemu-virt", "firmware/milkv-duo"]
+members = ["core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "drivers/pci", "drivers/virtio-blk", "drivers/virtio-mmio", "drivers/virtio-net", "drivers/virtio-rng", "drivers/xhci", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/object-store", "services/program-store", "services/ssh-identity", "acceptance/kernel-tests", "kernel", "firmware/qemu-virt", "firmware/milkv-duo"]
 exclude = ["vendor/sunset"]
 
 [profile.dev]

@@ -1,8 +1,9 @@
 //! Supervised modern virtio-blk service.
 //!
-//! The component future owns protocol progress, never DMA storage. The latter
-//! is a fixed SYSTEM slab because cancellation can drop a future and a fault
-//! can skip every destructor while the device still holds published addresses.
+//! The component future owns scheduling and supervision, while the driver
+//! crate owns protocol progress and its fixed DMA slab. Cancellation may drop
+//! a future and a fault may skip every destructor, so recovery still confirms
+//! device reset before permitting the driver crate to reuse those addresses.
 
 extern crate alloc;
 
@@ -10,7 +11,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -21,20 +21,13 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{
-    self, AvailableRing, BlockDmaAddresses, BlockOperation, BlockRequestHeader, BlockStatus,
-    Descriptor, ModernInit, NegotiatedFeatures, ResetReason, SplitQueueModel, UsedElement,
-    UsedRing, BLOCK_SECTOR_SIZE, SPLIT_QUEUE_SIZE,
-};
+use crate::virtio::{self, BlockOperation, UsedElement, SPLIT_QUEUE_SIZE};
 use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;
+use vibeos_driver_virtio_blk::{self as block_driver, BlockEngine, HardwareError};
 
-const RESET_POLL_BUDGET: usize = 100_000;
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
-const DMA_BYTES: usize = core::mem::size_of::<DmaSlab>();
-const INTERRUPT_STATUS_OFFSET: usize = 0x060;
-const INTERRUPT_ACK_OFFSET: usize = 0x064;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockError {
@@ -133,8 +126,8 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "SYSTEM stable slab @ {:#x}, {} bytes",
-            dma_base(),
-            DMA_BYTES
+            block_driver::dma_base(),
+            block_driver::DMA_BYTES
         )
     }
 
@@ -159,12 +152,8 @@ impl BlockDevice {
             quarantined: control.quarantined,
             capacity_sectors: control.capacity,
             queue_size: SPLIT_QUEUE_SIZE,
-            read_only: control
-                .features
-                .is_some_and(|features| features.read_only()),
-            supports_flush: control
-                .features
-                .is_some_and(|features| features.supports_flush()),
+            read_only: control.read_only,
+            supports_flush: control.supports_flush,
             session_epoch: control.epoch,
             irq: control.transport.map_or(0, MmioTransport::irq),
             used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
@@ -263,50 +252,6 @@ pub fn discover() -> Option<BlockResources> {
     })
 }
 
-#[repr(C, align(4096))]
-struct DmaSlab {
-    descriptors: [Descriptor; SPLIT_QUEUE_SIZE as usize],
-    available: AvailableRing,
-    used: UsedRing,
-    header: BlockRequestHeader,
-    data: [u8; BLOCK_SECTOR_SIZE as usize],
-    status: u8,
-}
-
-impl DmaSlab {
-    const ZERO: Self = Self {
-        descriptors: [Descriptor::new(0, 0, 0, 0); SPLIT_QUEUE_SIZE as usize],
-        available: AvailableRing {
-            flags: 0,
-            index: 0,
-            ring: [0; SPLIT_QUEUE_SIZE as usize],
-        },
-        used: UsedRing {
-            flags: 0,
-            index: 0,
-            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
-        },
-        header: BlockRequestHeader {
-            request_type: 0,
-            reserved: 0,
-            sector: 0,
-        },
-        data: [0; BLOCK_SECTOR_SIZE as usize],
-        status: 0,
-    };
-}
-
-struct StableDma(UnsafeCell<DmaSlab>);
-
-// Safety: CPU access is serialized by DMA_CLAIMED and the single-in-flight
-// driver. The device sees only addresses inside this slab. Fault recovery owns
-// it only after the executor has made the old incarnation unable to resume.
-unsafe impl Sync for StableDma {}
-
-#[link_section = ".dma"]
-static DMA: StableDma = StableDma(UnsafeCell::new(DmaSlab::ZERO));
-static DMA_CLAIMED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone, Copy)]
 struct PendingRequest {
     id: u64,
@@ -330,7 +275,8 @@ enum RequestSlot {
 
 struct DriverControl {
     transport: Option<MmioTransport>,
-    features: Option<NegotiatedFeatures>,
+    read_only: bool,
+    supports_flush: bool,
     capacity: u64,
     epoch: u64,
     online: bool,
@@ -345,7 +291,8 @@ struct DriverAuthority {
 
 static CONTROL: SpinLock<DriverControl> = SpinLock::new_recoverable(DriverControl {
     transport: None,
-    features: None,
+    read_only: false,
+    supports_flush: false,
     capacity: 0,
     epoch: 0,
     online: false,
@@ -422,7 +369,7 @@ fn validate_operation(operation: BlockOperation) -> Result<(), BlockError> {
         BlockOperation::Read { sector } | BlockOperation::Write { sector }
             if sector >= info.capacity_sectors =>
         {
-            return Err(BlockError::OutOfRange)
+            return Err(BlockError::OutOfRange);
         }
         BlockOperation::Write { .. } if info.read_only => return Err(BlockError::ReadOnly),
         BlockOperation::Flush if !info.supports_flush => return Err(BlockError::FlushUnsupported),
@@ -579,8 +526,7 @@ fn complete_active(result: Result<[u8; 512], BlockError>) {
 }
 
 struct DriverSession {
-    transport: MmioTransport,
-    model: SplitQueueModel,
+    engine: Option<BlockEngine>,
     armed: bool,
 }
 
@@ -590,17 +536,9 @@ impl DriverSession {
             complete_active(Err(BlockError::Quarantined));
             return None;
         }
-        if DMA_CLAIMED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            complete_active(Err(BlockError::DriverRestarted));
-            return None;
-        }
         {
             let mut installed = AUTHORITY.lock();
             if installed.is_some() {
-                DMA_CLAIMED.store(false, Ordering::Release);
                 complete_active(Err(BlockError::DriverRestarted));
                 return None;
             }
@@ -610,32 +548,34 @@ impl DriverSession {
         let domain = crate::heap::current_domain();
         DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
         DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
-        clear_dma();
 
-        let (features, capacity) = match initialize(transport) {
-            Ok(initialized) => initialized,
+        let epoch = CONTROL
+            .lock()
+            .epoch
+            .checked_add(1)
+            .expect("block epoch exhausted");
+        let engine = match BlockEngine::attach(transport, epoch) {
+            Ok(engine) => engine,
             Err(error) => {
-                let reset = transport.reset(RESET_POLL_BUDGET);
-                if reset {
-                    DMA_CLAIMED.store(false, Ordering::Release);
-                } else {
+                if matches!(error, HardwareError::Quarantined) {
                     CONTROL.lock().quarantined = true;
                 }
                 *AUTHORITY.lock() = None;
-                complete_active(Err(error));
+                complete_active(Err(map_hardware_error(error)));
                 return None;
             }
         };
 
-        let epoch = {
+        {
+            let info = engine.info();
             let mut control = CONTROL.lock();
-            control.epoch = control.epoch.checked_add(1).expect("block epoch exhausted");
+            control.epoch = info.epoch;
             control.transport = Some(transport);
-            control.features = Some(features);
-            control.capacity = capacity;
+            control.read_only = info.read_only;
+            control.supports_flush = info.supports_flush;
+            control.capacity = info.capacity_sectors;
             control.online = true;
-            control.epoch
-        };
+        }
         let _ = plic::unregister(transport.irq());
         // The PLIC's atomic callback record publishes this validated transport
         // base together with the handler, so the top half needs no second lock
@@ -643,16 +583,47 @@ impl DriverSession {
         if plic::register(transport.irq(), irq_top_half, transport.base()).is_err()
             || plic::enable(transport.irq()).is_err()
         {
-            shutdown(transport, BlockError::DriverCancelled);
+            let _ = plic::disable(transport.irq());
+            let _ = plic::unregister(transport.irq());
+            let reset = engine.shutdown().is_ok();
+            IRQ_CAUSES.store(0, Ordering::Release);
+            {
+                let mut control = CONTROL.lock();
+                control.online = false;
+                if !reset {
+                    control.quarantined = true;
+                }
+            }
+            complete_active(Err(if reset {
+                BlockError::DriverCancelled
+            } else {
+                BlockError::Quarantined
+            }));
+            *AUTHORITY.lock() = None;
+            if reset {
+                DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
+                DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
+            }
             return None;
         }
-        transport.add_status(virtio::STATUS_DRIVER_OK);
+        engine.mark_ready();
 
         Some(Self {
-            transport,
-            model: SplitQueueModel::at_epoch(features, epoch).expect("driver epochs are non-zero"),
+            engine: Some(engine),
             armed: true,
         })
+    }
+
+    fn engine(&self) -> &BlockEngine {
+        self.engine
+            .as_ref()
+            .expect("armed block session has engine")
+    }
+
+    fn engine_mut(&mut self) -> &mut BlockEngine {
+        self.engine
+            .as_mut()
+            .expect("armed block session has engine")
     }
 
     async fn perform(&mut self, request: PendingRequest) -> Result<[u8; 512], BlockError> {
@@ -664,31 +635,34 @@ impl DriverSession {
         // request waited in the client slot. Revalidate after draining device
         // events and before exposing another descriptor.
         validate_operation(request.operation)?;
-        if !authority_live(self.transport) {
+        let transport = self.engine().transport();
+        if !authority_live(transport) {
             return Err(BlockError::AuthorityRevoked);
         }
-        let submission = self.model.submit(request.operation).map_err(queue_error)?;
-        publish_request(request, submission.available_slot)?;
+        let submission = self
+            .engine_mut()
+            .submit(request.operation, request.data)
+            .map_err(map_hardware_error)?;
         if !SUPPRESS_NEXT_NOTIFY.swap(false, Ordering::AcqRel) {
-            self.transport.notify_queue(0);
+            self.engine().notify();
         }
 
         if FAULT_AFTER_PUBLISH.swap(false, Ordering::AcqRel) {
             panic!("injected virtio-blk fault after DMA publication");
         }
 
-        let outcome = wait_for_completion(self.transport, self.model.used_index()).await;
+        let outcome = wait_for_completion(self.engine(), submission.previous_used_index()).await;
         let (observed_used, used) = match outcome {
             WaitOutcome::Completed { used_index, used } => (used_index, used),
             WaitOutcome::TimedOut => {
-                self.model
+                self.engine_mut()
                     .timeout(submission)
                     .expect("the active block submission must time out");
                 self.reset_required_transport()?;
                 return Err(BlockError::TimedOut);
             }
             WaitOutcome::DeviceNeedsReset => {
-                self.model.require_reset(ResetReason::DeviceNeedsReset);
+                self.engine_mut().require_device_reset();
                 self.reset_required_transport()?;
                 return Err(BlockError::DriverRestarted);
             }
@@ -697,30 +671,19 @@ impl DriverSession {
         // If completion and DEVICE_NEEDS_RESET become visible together, reset
         // wins. Do not interpret device-writable DMA after observing that the
         // device has declared this session unreliable.
-        if self.transport.status() & virtio::STATUS_DEVICE_NEEDS_RESET != 0 {
-            self.model.require_reset(ResetReason::DeviceNeedsReset);
+        if self.engine().device_needs_reset() {
+            self.engine_mut().require_device_reset();
             self.reset_required_transport()?;
             return Err(BlockError::DriverRestarted);
         }
 
-        let status = unsafe { core::ptr::addr_of!((*DMA.0.get()).status).read_volatile() };
-        let completion = match self.model.complete(submission, observed_used, used, status) {
-            Ok(completion) => completion,
-            Err(_) => {
+        match self.engine_mut().complete(submission, observed_used, used) {
+            Ok(data) => Ok(data),
+            Err(HardwareError::Protocol) => {
                 self.reset_required_transport()?;
-                return Err(BlockError::Protocol);
+                Err(BlockError::Protocol)
             }
-        };
-        match completion.block_status {
-            BlockStatus::Ok => {
-                if matches!(request.operation, BlockOperation::Read { .. }) {
-                    Ok(read_dma_data())
-                } else {
-                    Ok([0; 512])
-                }
-            }
-            BlockStatus::IoError => Err(BlockError::DeviceIo),
-            BlockStatus::Unsupported => Err(BlockError::Unsupported),
+            Err(error) => Err(map_hardware_error(error)),
         }
     }
 
@@ -732,21 +695,20 @@ impl DriverSession {
         // Revocation must be observed before even an idle status/config read.
         // The only raw transport operations allowed after this fails are the
         // Drop/shutdown reset and IRQ quiescence required for DMA safety.
-        if !authority_live(self.transport) {
+        if !authority_live(self.engine().transport()) {
             return Err(BlockError::AuthorityRevoked);
         }
         let causes = virtio::InterruptCauses::from_status(IRQ_CAUSES.swap(0, Ordering::AcqRel));
-        if self.transport.status() & virtio::STATUS_DEVICE_NEEDS_RESET != 0 {
-            self.model.require_reset(ResetReason::DeviceNeedsReset);
+        if self.engine().device_needs_reset() {
+            self.engine_mut().require_device_reset();
             return self.reset_required_transport();
         }
         if causes.configuration_change() {
-            if let Some(capacity) = self.transport.block_capacity() {
+            if let Ok(capacity) = self.engine_mut().refresh_capacity() {
                 CONTROL.lock().capacity = capacity;
             } else {
                 // A permanently moving generation is a faulty transport, not
                 // permission to monopolize the non-preemptive kernel hart.
-                self.model.require_reset(ResetReason::DeviceNeedsReset);
                 self.reset_required_transport()?;
             }
         }
@@ -756,46 +718,48 @@ impl DriverSession {
     /// Reset a queue model which is already in ResetRequired, then negotiate a
     /// fresh session before allowing its stable DMA slab to be reused.
     fn reset_required_transport(&mut self) -> Result<(), BlockError> {
-        let _ = plic::disable(self.transport.irq());
-        if !self.transport.reset(RESET_POLL_BUDGET) {
-            self.quarantine();
-            return Err(BlockError::Quarantined);
-        }
-        let _ = self.transport.acknowledge_interrupt();
+        let transport = self.engine().transport();
+        let _ = plic::disable(transport.irq());
         IRQ_CAUSES.store(0, Ordering::Release);
-        self.model
-            .confirm_reset(0)
-            .expect("confirmed transport reset releases descriptors");
-        self.reinitialize_after_reset()
+        match self.engine_mut().reset_and_reinitialize() {
+            Ok(()) => self.reinitialize_after_reset(),
+            Err(HardwareError::Quarantined) => {
+                self.quarantine();
+                Err(BlockError::Quarantined)
+            }
+            Err(error) => Err(map_hardware_error(error)),
+        }
     }
 
     fn reinitialize_after_reset(&mut self) -> Result<(), BlockError> {
-        let _ = plic::disable(self.transport.irq());
-        let _ = self.transport.acknowledge_interrupt();
+        let transport = self.engine().transport();
+        let _ = plic::disable(transport.irq());
+        let _ = transport.acknowledge_interrupt();
         IRQ_CAUSES.store(0, Ordering::Release);
-        clear_dma();
 
-        if let Ok((features, capacity)) = initialize(self.transport) {
-            if plic::enable(self.transport.irq()).is_ok() {
-                self.transport.add_status(virtio::STATUS_DRIVER_OK);
-                self.model = SplitQueueModel::at_epoch(features, self.model.epoch())
-                    .expect("a live driver epoch is non-zero");
-                let mut control = CONTROL.lock();
-                control.features = Some(features);
-                control.capacity = capacity;
-                control.epoch = self.model.epoch();
-                control.online = true;
-                return Ok(());
-            }
+        if plic::enable(transport.irq()).is_ok() {
+            self.engine().mark_ready();
+            let info = self.engine().info();
+            let mut control = CONTROL.lock();
+            control.read_only = info.read_only;
+            control.supports_flush = info.supports_flush;
+            control.capacity = info.capacity_sectors;
+            control.epoch = info.epoch;
+            control.online = true;
+            return Ok(());
         }
 
         // A second initialization can fail after status zero was already
         // confirmed. Fail closed: quiesce once more and terminate this
         // incarnation instead of leaving a stale `online` session.
-        let _ = plic::disable(self.transport.irq());
-        let reset = self.transport.reset(RESET_POLL_BUDGET);
-        let _ = self.transport.acknowledge_interrupt();
-        let _ = plic::unregister(self.transport.irq());
+        let _ = plic::disable(transport.irq());
+        let reset = self
+            .engine
+            .take()
+            .expect("terminating block session has engine")
+            .shutdown()
+            .is_ok();
+        let _ = plic::unregister(transport.irq());
         IRQ_CAUSES.store(0, Ordering::Release);
         {
             let mut control = CONTROL.lock();
@@ -807,8 +771,6 @@ impl DriverSession {
         *AUTHORITY.lock() = None;
         self.armed = false;
         if reset {
-            clear_dma();
-            DMA_CLAIMED.store(false, Ordering::Release);
             DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
             DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
             Err(BlockError::Offline)
@@ -818,9 +780,10 @@ impl DriverSession {
     }
 
     fn quarantine(&mut self) {
-        let _ = plic::disable(self.transport.irq());
-        let _ = plic::unregister(self.transport.irq());
-        let _ = self.transport.acknowledge_interrupt();
+        let transport = self.engine().transport();
+        let _ = plic::disable(transport.irq());
+        let _ = plic::unregister(transport.irq());
+        let _ = transport.acknowledge_interrupt();
         IRQ_CAUSES.store(0, Ordering::Release);
         {
             let mut control = CONTROL.lock();
@@ -836,42 +799,44 @@ impl DriverSession {
 impl Drop for DriverSession {
     fn drop(&mut self) {
         if self.armed {
-            shutdown(self.transport, BlockError::DriverCancelled);
+            let transport = self.engine().transport();
+            let _ = plic::disable(transport.irq());
+            let _ = plic::unregister(transport.irq());
+            let reset = self
+                .engine
+                .take()
+                .expect("armed block session has engine")
+                .shutdown()
+                .is_ok();
+            IRQ_CAUSES.store(0, Ordering::Release);
+            {
+                let mut control = CONTROL.lock();
+                control.online = false;
+                if !reset {
+                    control.quarantined = true;
+                }
+            }
+            complete_active(Err(if reset {
+                BlockError::DriverCancelled
+            } else {
+                BlockError::Quarantined
+            }));
+            *AUTHORITY.lock() = None;
+            if reset {
+                DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
+                DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
+            }
             self.armed = false;
         }
     }
 }
 
-fn initialize(transport: MmioTransport) -> Result<(NegotiatedFeatures, u64), BlockError> {
-    if !transport.reset(RESET_POLL_BUDGET) {
-        return Err(BlockError::Quarantined);
-    }
-    let mut init = ModernInit::new();
-    transport.set_status(init.acknowledge().map_err(|_| BlockError::Protocol)?);
-    transport.set_status(init.declare_driver().map_err(|_| BlockError::Protocol)?);
-    let features = init
-        .select_features(transport.device_features())
-        .map_err(|_| BlockError::Unsupported)?;
-    transport.set_driver_features(features.accepted());
-    transport.set_status(init.set_features_ok().map_err(|_| BlockError::Protocol)?);
-    init.confirm_features(transport.status())
-        .map_err(|_| BlockError::Unsupported)?;
-
-    transport.select_queue(0);
-    if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
-        return Err(BlockError::Unsupported);
-    }
-    let (descriptors, available, used) = dma_addresses();
-    transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
-    let capacity = transport.block_capacity().ok_or(BlockError::Protocol)?;
-    Ok((features, capacity))
-}
-
-fn shutdown(transport: MmioTransport, reason: BlockError) {
+fn shutdown_transport(transport: MmioTransport, reason: BlockError) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
-    let reset = transport.reset(RESET_POLL_BUDGET);
-    let _ = transport.acknowledge_interrupt();
+    // Safety: the executor has made the faulted owner permanently unable to
+    // resume, so no live BlockEngine can touch the slab after this point.
+    let reset = unsafe { block_driver::recover_after_fault(transport) }.is_ok();
     IRQ_CAUSES.store(0, Ordering::Release);
     {
         let mut control = CONTROL.lock();
@@ -887,8 +852,6 @@ fn shutdown(transport: MmioTransport, reason: BlockError) {
     }));
     *AUTHORITY.lock() = None;
     if reset {
-        clear_dma();
-        DMA_CLAIMED.store(false, Ordering::Release);
         DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
         DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
     }
@@ -920,7 +883,8 @@ enum WaitSignal {
     TimedOut,
 }
 
-async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> WaitOutcome {
+async fn wait_for_completion(engine: &BlockEngine, previous_used: u16) -> WaitOutcome {
+    let transport = engine.transport();
     let deadline = crate::sbi::time()
         .saturating_add(REQUEST_TIMEOUT_MS.saturating_mul(exec::timebase_hz() / 1_000));
     loop {
@@ -931,12 +895,11 @@ async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> Wa
         if transport.status() & virtio::STATUS_DEVICE_NEEDS_RESET != 0 {
             return WaitOutcome::DeviceNeedsReset;
         }
-        let used_index = read_used_index();
+        let used_index = engine.used_index();
         if used_index != previous_used {
-            let slot = virtio::ring_slot(previous_used) as usize;
             return WaitOutcome::Completed {
                 used_index,
-                used: read_used_element(slot),
+                used: engine.used_element(previous_used),
             };
         }
         let now = crate::sbi::time();
@@ -955,12 +918,11 @@ async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> Wa
             if transport.status() & virtio::STATUS_DEVICE_NEEDS_RESET != 0 {
                 return Poll::Ready(WaitSignal::DeviceNeedsReset);
             }
-            let used_index = read_used_index();
+            let used_index = engine.used_index();
             if used_index != previous_used {
-                let slot = virtio::ring_slot(previous_used) as usize;
                 return Poll::Ready(WaitSignal::Completed {
                     used_index,
-                    used: read_used_element(slot),
+                    used: engine.used_element(previous_used),
                 });
             }
             if timeout.as_mut().poll(cx).is_ready() {
@@ -974,7 +936,7 @@ async fn wait_for_completion(transport: MmioTransport, previous_used: u16) -> Wa
         .await;
         match signal {
             WaitSignal::Completed { used_index, used } => {
-                return WaitOutcome::Completed { used_index, used }
+                return WaitOutcome::Completed { used_index, used };
             }
             WaitSignal::DeviceNeedsReset => return WaitOutcome::DeviceNeedsReset,
             WaitSignal::TimedOut => return WaitOutcome::TimedOut,
@@ -1000,110 +962,20 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 /// originate from a successfully probed `MmioTransport`; no task-owned pointer
 /// or revocable object is dereferenced in the top half.
 fn acknowledge_irq_transport(transport_base: usize) -> u32 {
-    let raw = unsafe { ((transport_base + INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile() };
-    dma_fence();
-    let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
-    if causes != 0 {
-        dma_fence();
-        unsafe { ((transport_base + INTERRUPT_ACK_OFFSET) as *mut u32).write_volatile(causes) };
-        dma_fence();
-    }
-    causes
+    unsafe { block_driver::acknowledge_interrupt_at(transport_base) }
 }
 
-fn publish_request(request: PendingRequest, available_slot: u16) -> Result<(), BlockError> {
-    let addresses = unsafe {
-        let slab = DMA.0.get();
-        BlockDmaAddresses {
-            header: core::ptr::addr_of!((*slab).header) as u64,
-            data: core::ptr::addr_of!((*slab).data) as u64,
-            status: core::ptr::addr_of!((*slab).status) as u64,
-        }
-    };
-    let chain = virtio::build_block_chain(request.operation, addresses)
-        .map_err(|_| BlockError::Protocol)?;
-    unsafe {
-        let slab = DMA.0.get();
-        core::ptr::addr_of_mut!((*slab).header)
-            .write_volatile(BlockRequestHeader::new(request.operation));
-        core::ptr::addr_of_mut!((*slab).status).write_volatile(0xff);
-        if matches!(request.operation, BlockOperation::Write { .. }) {
-            let data = core::ptr::addr_of_mut!((*slab).data) as *mut u8;
-            for (index, byte) in request.data.iter().copied().enumerate() {
-                data.add(index).write_volatile(byte);
-            }
-        }
-        for (index, descriptor) in chain.descriptors.iter().copied().enumerate() {
-            core::ptr::addr_of_mut!((*slab).descriptors[index]).write_volatile(descriptor);
-        }
-        let ring = core::ptr::addr_of_mut!((*slab).available.ring) as *mut u16;
-        ring.add(available_slot as usize)
-            .write_volatile(virtio::BLOCK_HEADER_DESCRIPTOR.to_le());
-        dma_fence();
-        let index = core::ptr::addr_of_mut!((*slab).available.index);
-        let next = u16::from_le(index.read_volatile()).wrapping_add(1);
-        index.write_volatile(next.to_le());
-        dma_fence();
-    }
-    Ok(())
-}
-
-fn dma_addresses() -> (u64, u64, u64) {
-    unsafe {
-        let slab = DMA.0.get();
-        (
-            core::ptr::addr_of!((*slab).descriptors) as u64,
-            core::ptr::addr_of!((*slab).available) as u64,
-            core::ptr::addr_of!((*slab).used) as u64,
-        )
-    }
-}
-
-fn dma_base() -> usize {
-    DMA.0.get() as usize
-}
-
-fn clear_dma() {
-    unsafe {
-        // Safety: attach owns DMA_CLAIMED, or fault recovery has made the old
-        // incarnation terminal and confirmed device reset before this call.
-        core::ptr::write_bytes(DMA.0.get().cast::<u8>(), 0, DMA_BYTES);
-        dma_fence();
-    }
-}
-
-fn read_used_index() -> u16 {
-    dma_fence();
-    unsafe { u16::from_le(core::ptr::addr_of!((*DMA.0.get()).used.index).read_volatile()) }
-}
-
-fn read_used_element(slot: usize) -> UsedElement {
-    dma_fence();
-    unsafe { core::ptr::addr_of!((*DMA.0.get()).used.ring[slot]).read_volatile() }
-}
-
-fn read_dma_data() -> [u8; 512] {
-    let mut data = [0u8; 512];
-    unsafe {
-        let source = core::ptr::addr_of!((*DMA.0.get()).data) as *const u8;
-        for (index, byte) in data.iter_mut().enumerate() {
-            *byte = source.add(index).read_volatile();
-        }
-    }
-    data
-}
-
-#[inline]
-fn dma_fence() {
-    unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
-}
-
-fn queue_error(error: virtio::QueueError) -> BlockError {
+fn map_hardware_error(error: HardwareError) -> BlockError {
     match error {
-        virtio::QueueError::Busy => BlockError::QueueFull,
-        virtio::QueueError::ReadOnly => BlockError::ReadOnly,
-        virtio::QueueError::FlushUnsupported => BlockError::FlushUnsupported,
-        _ => BlockError::Protocol,
+        HardwareError::AlreadyClaimed => BlockError::DriverRestarted,
+        HardwareError::QueueFull => BlockError::QueueFull,
+        HardwareError::ReadOnly => BlockError::ReadOnly,
+        HardwareError::FlushUnsupported => BlockError::FlushUnsupported,
+        HardwareError::DeviceIo => BlockError::DeviceIo,
+        HardwareError::Unsupported => BlockError::Unsupported,
+        HardwareError::Protocol => BlockError::Protocol,
+        HardwareError::Quarantined => BlockError::Quarantined,
+        HardwareError::RestartRequired => BlockError::DriverRestarted,
     }
 }
 
@@ -1149,7 +1021,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
 
     let transport = CONTROL.lock().transport;
     if let Some(transport) = transport {
-        shutdown(transport, BlockError::DriverFault);
+        shutdown_transport(transport, BlockError::DriverFault);
     } else {
         complete_active(Err(BlockError::DriverFault));
     }

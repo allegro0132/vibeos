@@ -1,0 +1,9 @@
+[package]
+name = "vibeos-driver-virtio-blk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-core = { path = "../../core" }
+vibeos-driver-virtio-mmio = { path = "../virtio-mmio" }
+

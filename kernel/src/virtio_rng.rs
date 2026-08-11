@@ -18,7 +18,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
 use core::pin::pin;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -29,15 +28,11 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{
-    self, AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE,
-    SPLIT_QUEUE_SIZE,
-};
+use crate::virtio::{self, SPLIT_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
+use vibeos_driver_virtio_rng::{Engine, Submission};
 
-const ENTROPY_QUEUE: u16 = 0;
-const ENTROPY_DESCRIPTOR: u16 = 0;
 const RESET_POLL_BUDGET: usize = 100_000;
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
 const INTERRUPT_STATUS_OFFSET: usize = 0x060;
@@ -47,8 +42,7 @@ const INTERRUPT_ACK_OFFSET: usize = 0x064;
 ///
 /// The bound limits DMA exposure, queue work, per-client kernel state, and the
 /// amount of entropy copied through a capability invocation.
-pub const MAX_RANDOM_BYTES: usize = 64;
-const DMA_BYTES: usize = core::mem::size_of::<DmaSlab>();
+pub use vibeos_driver_virtio_rng::MAX_RANDOM_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RandomError {
@@ -65,6 +59,19 @@ pub enum RandomError {
     AuthorityRevoked,
     PermissionDenied,
     IdentityExhausted,
+}
+
+fn map_engine_error(error: vibeos_driver_virtio_rng::Error) -> RandomError {
+    use vibeos_driver_virtio_rng::Error;
+    match error {
+        Error::InvalidLength => RandomError::InvalidLength,
+        Error::Busy => RandomError::Busy,
+        Error::Protocol => RandomError::Protocol,
+        Error::Unsupported => RandomError::Unsupported,
+        Error::DriverRestarted => RandomError::DriverRestarted,
+        Error::IdentityExhausted => RandomError::IdentityExhausted,
+        Error::Quarantined => RandomError::Quarantined,
+    }
 }
 
 impl core::fmt::Display for RandomError {
@@ -192,8 +199,8 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "SYSTEM stable entropy slab @ {:#x}, {} bytes",
-            dma_base(),
-            DMA_BYTES
+            vibeos_driver_virtio_rng::dma_base(),
+            vibeos_driver_virtio_rng::DMA_BYTES
         )
     }
 
@@ -320,42 +327,11 @@ pub fn discover() -> Option<RandomResources> {
     })
 }
 
-#[repr(C, align(4096))]
-struct DmaSlab {
-    descriptors: [Descriptor; SPLIT_QUEUE_SIZE as usize],
-    available: AvailableRing,
-    used: UsedRing,
-    data: [u8; MAX_RANDOM_BYTES],
-}
-
-impl DmaSlab {
-    const ZERO: Self = Self {
-        descriptors: [Descriptor::new(0, 0, 0, 0); SPLIT_QUEUE_SIZE as usize],
-        available: AvailableRing {
-            flags: 0,
-            index: 0,
-            ring: [0; SPLIT_QUEUE_SIZE as usize],
-        },
-        used: UsedRing {
-            flags: 0,
-            index: 0,
-            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
-        },
-        data: [0; MAX_RANDOM_BYTES],
-    };
-}
-
-struct StableDma(UnsafeCell<DmaSlab>);
-
 // Safety: DMA_CLAIM_ARENA serializes task-side CPU access. Its non-zero value
 // is the exact tracked arena which owns the current device incarnation, so
 // fault recovery can identify a claim even if attach has not yet published any
 // other driver state. A confirmed status-zero reset is the only path which
 // releases the slab for another incarnation.
-unsafe impl Sync for StableDma {}
-
-#[link_section = ".dma"]
-static DMA: StableDma = StableDma(UnsafeCell::new(DmaSlab::ZERO));
 static DMA_CLAIM_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 
 #[derive(Clone, Copy)]
@@ -411,108 +387,6 @@ static USED_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
 static BYTE_COUNT: AtomicU64 = AtomicU64::new(0);
 static RESET_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RandomSubmission {
-    epoch: u64,
-    requested: u16,
-    available_slot: u16,
-    expected_used_index: u16,
-}
-
-struct RandomQueueModel {
-    epoch: u64,
-    available_index: u16,
-    used_index: u16,
-    active: Option<RandomSubmission>,
-    reset_required: bool,
-}
-
-impl RandomQueueModel {
-    fn new(epoch: u64) -> Result<Self, RandomError> {
-        if epoch == 0 {
-            return Err(RandomError::IdentityExhausted);
-        }
-        Ok(Self {
-            epoch,
-            available_index: 0,
-            used_index: 0,
-            active: None,
-            reset_required: false,
-        })
-    }
-
-    fn submit(&mut self, requested: usize) -> Result<RandomSubmission, RandomError> {
-        if self.reset_required {
-            return Err(RandomError::DriverRestarted);
-        }
-        if self.active.is_some() {
-            return Err(RandomError::Busy);
-        }
-        if !(1..=MAX_RANDOM_BYTES).contains(&requested) {
-            return Err(RandomError::InvalidLength);
-        }
-        let previous_available = self.available_index;
-        self.available_index = self.available_index.wrapping_add(1);
-        let submission = RandomSubmission {
-            epoch: self.epoch,
-            requested: requested as u16,
-            available_slot: virtio::ring_slot(previous_available),
-            expected_used_index: self.used_index.wrapping_add(1),
-        };
-        self.active = Some(submission);
-        Ok(submission)
-    }
-
-    fn complete(
-        &mut self,
-        submission: RandomSubmission,
-        observed_used_index: u16,
-        used: UsedElement,
-    ) -> Result<usize, RandomError> {
-        let result = self.validate_completion(submission, observed_used_index, used);
-        match result {
-            Ok(length) => {
-                self.used_index = observed_used_index;
-                self.active = None;
-                Ok(length)
-            }
-            Err(error) => {
-                self.reset_required = true;
-                Err(error)
-            }
-        }
-    }
-
-    fn validate_completion(
-        &self,
-        submission: RandomSubmission,
-        observed_used_index: u16,
-        used: UsedElement,
-    ) -> Result<usize, RandomError> {
-        if submission.epoch != self.epoch || self.active != Some(submission) {
-            return Err(RandomError::Protocol);
-        }
-        if observed_used_index != submission.expected_used_index {
-            return Err(RandomError::Protocol);
-        }
-        if used.id() != u32::from(ENTROPY_DESCRIPTOR) {
-            return Err(RandomError::Protocol);
-        }
-        let length = used.length() as usize;
-        // The virtio-rng device may return fewer bytes than offered. Zero makes
-        // no progress and a length above the descriptor would expose stale or
-        // out-of-bounds DMA, so both are protocol failures.
-        if length == 0 || length > submission.requested as usize {
-            return Err(RandomError::Protocol);
-        }
-        Ok(length)
-    }
-
-    fn require_reset(&mut self) {
-        self.reset_required = true;
-    }
-}
 
 async fn request(length: usize) -> Result<RandomBytes, RandomError> {
     if !(1..=MAX_RANDOM_BYTES).contains(&length) {
@@ -798,15 +672,9 @@ fn complete_active(result: Result<RandomBytes, RandomError>) {
 
 struct DriverSession {
     transport: MmioTransport,
-    model: RandomQueueModel,
+    engine: Engine,
     claim_arena: ArenaId,
     armed: bool,
-}
-
-#[derive(Clone, Copy)]
-struct InitializedTransport {
-    accepted_features: u64,
-    ready_status: u32,
 }
 
 impl DriverSession {
@@ -852,19 +720,20 @@ impl DriverSession {
             *installed = Some(authority);
         }
 
-        clear_dma();
-
-        let initialized = match initialize_transport(transport) {
-            Ok(initialized) => initialized,
+        let epoch = match advance_epoch() {
+            Ok(epoch) => epoch,
             Err(error) => {
                 attach_failed(transport, claim_arena, error);
                 return None;
             }
         };
-        let epoch = match advance_epoch() {
-            Ok(epoch) => epoch,
+        // Safety: this incarnation holds the exact DMA_CLAIM_ARENA claim and
+        // no Engine has been published. On later attach failure the local
+        // engine is never accessed again before teardown resets the device.
+        let engine = match unsafe { Engine::prepare(transport, epoch, RESET_POLL_BUDGET) } {
+            Ok(engine) => engine,
             Err(error) => {
-                attach_failed(transport, claim_arena, error);
+                attach_failed(transport, claim_arena, map_engine_error(error));
                 return None;
             }
         };
@@ -876,21 +745,20 @@ impl DriverSession {
             shutdown(transport, claim_arena, RandomError::DriverCancelled);
             return None;
         }
-        transport.set_status(initialized.ready_status);
-        if !operational_status(transport.status()) {
+        if engine.start().is_err() {
             shutdown(transport, claim_arena, RandomError::DriverRestarted);
             return None;
         }
         {
             let mut control = CONTROL.lock();
             control.transport = Some(transport);
-            control.accepted_features = initialized.accepted_features;
+            control.accepted_features = engine.accepted_features();
             control.online = true;
         }
 
         Some(Self {
             transport,
-            model: RandomQueueModel::new(epoch).expect("a published entropy epoch is non-zero"),
+            engine,
             claim_arena,
             armed: true,
         })
@@ -898,7 +766,7 @@ impl DriverSession {
 
     async fn perform(&mut self, request: PendingRequest) -> Result<RandomBytes, RandomError> {
         self.service_device_events()?;
-        if request.expected_epoch != self.model.epoch {
+        if request.expected_epoch != self.engine.epoch() {
             return Err(RandomError::DriverRestarted);
         }
         if crate::sbi::time() >= request.deadline {
@@ -926,41 +794,38 @@ impl DriverSession {
             if !authority_live(self.transport) {
                 return Err(RandomError::AuthorityRevoked);
             }
-            let submission = self.model.submit(requested - offset)?;
-            publish_request(submission)?;
-            self.transport.notify_queue(ENTROPY_QUEUE);
+            let submission = self
+                .engine
+                .submit(requested - offset)
+                .map_err(map_engine_error)?;
 
-            let outcome =
-                wait_for_completion(self.transport, self.model.used_index, deadline).await;
-            let (observed_used, used) = match outcome {
-                WaitOutcome::Completed { used_index, used } => (used_index, used),
+            match wait_for_completion(&self.engine, submission, deadline).await {
+                WaitOutcome::Completed => {}
                 WaitOutcome::TimedOut => {
                     TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-                    self.model.require_reset();
+                    self.engine.require_reset();
                     self.reset_required_transport()?;
                     return Err(RandomError::TimedOut);
                 }
                 WaitOutcome::DeviceNeedsReset => {
-                    self.model.require_reset();
+                    self.engine.require_reset();
                     self.reset_required_transport()?;
                     return Err(RandomError::DriverRestarted);
                 }
-            };
+            }
 
-            if !operational_status(self.transport.status()) {
-                self.model.require_reset();
+            if !self.engine.operational() {
+                self.engine.require_reset();
                 self.reset_required_transport()?;
                 return Err(RandomError::DriverRestarted);
             }
-            let length = match self.model.complete(submission, observed_used, used) {
+            let length = match self.engine.finish(submission, &mut result.bytes[offset..]) {
                 Ok(length) => length,
                 Err(_) => {
                     self.reset_required_transport()?;
                     return Err(RandomError::Protocol);
                 }
             };
-            read_dma_data(&mut result.bytes[offset..offset + length]);
-            zero_dma_data();
             offset += length;
         }
 
@@ -973,8 +838,8 @@ impl DriverSession {
             return Err(RandomError::AuthorityRevoked);
         }
         let _ = virtio::InterruptCauses::from_status(IRQ_CAUSES.swap(0, Ordering::AcqRel));
-        if !operational_status(self.transport.status()) {
-            self.model.require_reset();
+        if !self.engine.operational() {
+            self.engine.require_reset();
             self.reset_required_transport()?;
         }
         Ok(())
@@ -983,42 +848,41 @@ impl DriverSession {
     fn reset_required_transport(&mut self) -> Result<(), RandomError> {
         let _ = plic::disable(self.transport.irq());
         CONTROL.lock().online = false;
-        if !self.transport.reset(RESET_POLL_BUDGET) {
+        if self.engine.shutdown(RESET_POLL_BUDGET).is_err() {
             self.quarantine();
             return Err(RandomError::Quarantined);
         }
-        let _ = self.transport.acknowledge_interrupt();
         IRQ_CAUSES.store(0, Ordering::Release);
         RESET_COUNT.fetch_add(1, Ordering::Relaxed);
         self.reinitialize_after_reset()
     }
 
     fn reinitialize_after_reset(&mut self) -> Result<(), RandomError> {
-        clear_dma();
         let mut identity_exhausted = false;
-        let initialized = initialize_transport(self.transport);
-        if let Ok(initialized) = initialized {
-            if let Ok(epoch) = advance_epoch() {
+        if let Ok(epoch) = advance_epoch() {
+            // Rebuild the existing engine in place: its lifetime continues to
+            // cover the process-wide slab, so no second Engine alias exists.
+            if self
+                .engine
+                .reset_and_prepare(epoch, RESET_POLL_BUDGET)
+                .is_ok()
+            {
                 if plic::enable(self.transport.irq()).is_ok() {
-                    self.transport.set_status(initialized.ready_status);
-                    if operational_status(self.transport.status()) {
-                        self.model = RandomQueueModel::new(epoch)
-                            .expect("a reinitialized entropy epoch is non-zero");
+                    if self.engine.start().is_ok() {
                         let mut control = CONTROL.lock();
-                        control.accepted_features = initialized.accepted_features;
+                        control.accepted_features = self.engine.accepted_features();
                         control.online = true;
                         return Ok(());
                     }
                 }
-            } else {
-                identity_exhausted = true;
-                CONTROL.lock().quarantined = true;
             }
+        } else {
+            identity_exhausted = true;
+            CONTROL.lock().quarantined = true;
         }
 
         let _ = plic::disable(self.transport.irq());
-        let reset = self.transport.reset(RESET_POLL_BUDGET);
-        let _ = self.transport.acknowledge_interrupt();
+        let reset = self.engine.shutdown(RESET_POLL_BUDGET).is_ok();
         let _ = plic::unregister(self.transport.irq());
         IRQ_CAUSES.store(0, Ordering::Release);
         {
@@ -1030,7 +894,6 @@ impl DriverSession {
         }
         *AUTHORITY.lock() = None;
         if reset {
-            clear_dma();
             // Retain the exact claim until `perform` returns, the in-flight
             // request is completed, and DriverSession::drop enters shutdown's
             // CONTROL barrier. Releasing here would let a replacement attach
@@ -1080,47 +943,6 @@ impl Drop for DriverSession {
     }
 }
 
-fn initialize_transport(transport: MmioTransport) -> Result<InitializedTransport, RandomError> {
-    if transport.device_id() != virtio::DEVICE_ID_ENTROPY {
-        return Err(RandomError::Unsupported);
-    }
-    if !transport.reset(RESET_POLL_BUDGET) {
-        return Err(RandomError::Quarantined);
-    }
-
-    let mut init = ModernInit::new();
-    transport.set_status(init.acknowledge().map_err(|_| RandomError::Protocol)?);
-    transport.set_status(init.declare_driver().map_err(|_| RandomError::Protocol)?);
-    let features = init
-        .select_entropy_features(transport.device_features())
-        .map_err(|_| RandomError::Unsupported)?;
-    transport.set_driver_features(features.accepted());
-    transport.set_status(init.set_features_ok().map_err(|_| RandomError::Protocol)?);
-    init.confirm_features(transport.status())
-        .map_err(|_| RandomError::Unsupported)?;
-
-    transport.select_queue(ENTROPY_QUEUE);
-    if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
-        return Err(RandomError::Unsupported);
-    }
-    let (descriptors, available, used) = dma_addresses();
-    transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
-    let ready_status = init.set_driver_ok().map_err(|_| RandomError::Protocol)?;
-    Ok(InitializedTransport {
-        accepted_features: features.accepted(),
-        ready_status,
-    })
-}
-
-fn operational_status(status: u32) -> bool {
-    let expected = virtio::STATUS_ACKNOWLEDGE
-        | virtio::STATUS_DRIVER
-        | virtio::STATUS_FEATURES_OK
-        | virtio::STATUS_DRIVER_OK;
-    status & (virtio::STATUS_FAILED | virtio::STATUS_DEVICE_NEEDS_RESET) == 0
-        && status & expected == expected
-}
-
 fn advance_epoch() -> Result<u64, RandomError> {
     let mut control = CONTROL.lock();
     let Some(epoch) = control.epoch.checked_add(1) else {
@@ -1133,19 +955,20 @@ fn advance_epoch() -> Result<u64, RandomError> {
 }
 
 fn attach_failed(transport: MmioTransport, claim_arena: ArenaId, error: RandomError) {
-    let reset = transport.reset(RESET_POLL_BUDGET);
-    let _ = transport.acknowledge_interrupt();
+    // Safety: attach owns the exact DMA claim and the failed local Engine is
+    // no longer accessed; no replacement can attach until claim release.
+    let reset = unsafe { vibeos_driver_virtio_rng::confirmed_reset(transport, RESET_POLL_BUDGET) };
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
-    if reset {
-        clear_dma();
-    }
     finish_claimed_teardown(claim_arena, reset, error);
 }
 
 fn quarantine_inconsistent_attach(transport: MmioTransport) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
+    // Do not clear DMA here: the inconsistent stale authority means an old CPU
+    // session cannot be proven quiescent. Reset best-effort and quarantine the
+    // exact claim forever instead.
     let _ = transport.reset(RESET_POLL_BUDGET);
     let _ = transport.acknowledge_interrupt();
     IRQ_CAUSES.store(0, Ordering::Release);
@@ -1163,13 +986,12 @@ fn shutdown(transport: MmioTransport, claim_arena: ArenaId, reason: RandomError)
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
     CONTROL.lock().online = false;
-    let reset = transport.reset(RESET_POLL_BUDGET);
-    let _ = transport.acknowledge_interrupt();
+    // Safety: ordinary teardown or fault recovery owns the exact claim; a
+    // faulted owner is permanently detached before this path, and normal
+    // DriverSession teardown performs no concurrent Engine access.
+    let reset = unsafe { vibeos_driver_virtio_rng::confirmed_reset(transport, RESET_POLL_BUDGET) };
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
-    if reset {
-        clear_dma();
-    }
     finish_claimed_teardown(claim_arena, reset, reason);
 }
 
@@ -1224,35 +1046,30 @@ fn authority_live(transport: MmioTransport) -> bool {
 }
 
 enum WaitOutcome {
-    Completed { used_index: u16, used: UsedElement },
+    Completed,
     DeviceNeedsReset,
     TimedOut,
 }
 
 enum WaitSignal {
-    Completed { used_index: u16, used: UsedElement },
+    Completed,
     DeviceNeedsReset,
     Irq,
     TimedOut,
 }
 
 async fn wait_for_completion(
-    transport: MmioTransport,
-    previous_used: u16,
+    engine: &Engine,
+    submission: Submission,
     deadline: u64,
 ) -> WaitOutcome {
     loop {
         let irq = IRQ_WAIT.wait();
-        if !operational_status(transport.status()) {
+        if !engine.operational() {
             return WaitOutcome::DeviceNeedsReset;
         }
-        let used_index = read_used_index();
-        if used_index != previous_used {
-            let slot = virtio::ring_slot(previous_used) as usize;
-            return WaitOutcome::Completed {
-                used_index,
-                used: read_used_element(slot),
-            };
+        if engine.completion(submission).is_some() {
+            return WaitOutcome::Completed;
         }
         let now = crate::sbi::time();
         if now >= deadline {
@@ -1266,16 +1083,11 @@ async fn wait_for_completion(
         let mut irq = pin!(irq);
         let mut timeout = pin!(timeout);
         let signal = poll_fn(|cx| {
-            if !operational_status(transport.status()) {
+            if !engine.operational() {
                 return Poll::Ready(WaitSignal::DeviceNeedsReset);
             }
-            let used_index = read_used_index();
-            if used_index != previous_used {
-                let slot = virtio::ring_slot(previous_used) as usize;
-                return Poll::Ready(WaitSignal::Completed {
-                    used_index,
-                    used: read_used_element(slot),
-                });
+            if engine.completion(submission).is_some() {
+                return Poll::Ready(WaitSignal::Completed);
             }
             if timeout.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(WaitSignal::TimedOut);
@@ -1287,9 +1099,7 @@ async fn wait_for_completion(
         })
         .await;
         match signal {
-            WaitSignal::Completed { used_index, used } => {
-                return WaitOutcome::Completed { used_index, used }
-            }
+            WaitSignal::Completed => return WaitOutcome::Completed,
             WaitSignal::DeviceNeedsReset => return WaitOutcome::DeviceNeedsReset,
             WaitSignal::TimedOut => return WaitOutcome::TimedOut,
             WaitSignal::Irq => {}
@@ -1311,96 +1121,18 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 
 fn acknowledge_irq_transport(transport_base: usize) -> u32 {
     let raw = unsafe { ((transport_base + INTERRUPT_STATUS_OFFSET) as *const u32).read_volatile() };
-    dma_fence();
+    irq_fence();
     let causes = virtio::InterruptCauses::from_status(raw).ack_bits();
     if causes != 0 {
-        dma_fence();
+        irq_fence();
         unsafe { ((transport_base + INTERRUPT_ACK_OFFSET) as *mut u32).write_volatile(causes) };
-        dma_fence();
+        irq_fence();
     }
     causes
 }
 
-fn publish_request(submission: RandomSubmission) -> Result<(), RandomError> {
-    if submission.requested == 0 || submission.requested as usize > MAX_RANDOM_BYTES {
-        return Err(RandomError::InvalidLength);
-    }
-    zero_dma_data();
-    let data_address = unsafe { core::ptr::addr_of!((*DMA.0.get()).data) as u64 };
-    let descriptor = Descriptor::new(
-        data_address,
-        u32::from(submission.requested),
-        DESC_F_WRITE,
-        0,
-    );
-    unsafe {
-        let slab = DMA.0.get();
-        core::ptr::addr_of_mut!((*slab).descriptors[ENTROPY_DESCRIPTOR as usize])
-            .write_volatile(descriptor);
-        let ring = core::ptr::addr_of_mut!((*slab).available.ring) as *mut u16;
-        ring.add(submission.available_slot as usize)
-            .write_volatile(ENTROPY_DESCRIPTOR.to_le());
-        dma_fence();
-        core::ptr::addr_of_mut!((*slab).available.index)
-            .write_volatile(submission.expected_used_index.to_le());
-        dma_fence();
-    }
-    Ok(())
-}
-
-fn dma_addresses() -> (u64, u64, u64) {
-    unsafe {
-        let slab = DMA.0.get();
-        (
-            core::ptr::addr_of!((*slab).descriptors) as u64,
-            core::ptr::addr_of!((*slab).available) as u64,
-            core::ptr::addr_of!((*slab).used) as u64,
-        )
-    }
-}
-
-fn dma_base() -> usize {
-    DMA.0.get() as usize
-}
-
-fn clear_dma() {
-    unsafe {
-        core::ptr::write_bytes(DMA.0.get().cast::<u8>(), 0, DMA_BYTES);
-        dma_fence();
-    }
-}
-
-fn zero_dma_data() {
-    unsafe {
-        let data = core::ptr::addr_of_mut!((*DMA.0.get()).data) as *mut u8;
-        for index in 0..MAX_RANDOM_BYTES {
-            data.add(index).write_volatile(0);
-        }
-        dma_fence();
-    }
-}
-
-fn read_used_index() -> u16 {
-    dma_fence();
-    unsafe { u16::from_le(core::ptr::addr_of!((*DMA.0.get()).used.index).read_volatile()) }
-}
-
-fn read_used_element(slot: usize) -> UsedElement {
-    dma_fence();
-    unsafe { core::ptr::addr_of!((*DMA.0.get()).used.ring[slot]).read_volatile() }
-}
-
-fn read_dma_data(output: &mut [u8]) {
-    unsafe {
-        let source = core::ptr::addr_of!((*DMA.0.get()).data) as *const u8;
-        for (index, byte) in output.iter_mut().enumerate() {
-            *byte = source.add(index).read_volatile();
-        }
-    }
-}
-
 #[inline]
-fn dma_fence() {
+fn irq_fence() {
     unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
 }
 

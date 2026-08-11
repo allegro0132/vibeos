@@ -11,10 +11,10 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{
     PacketSessionError, PacketSessionFence, PacketStamp, PacketStampMismatch, StampedPacket,
 };
-use vibeos_core::net_config::{Ipv4RuntimeStatus, StaticIpv4Address};
-use vibeos_core::net_stack::{
-    PacketDevice, StackError, StaticIpv4Config, StaticIpv4EchoStack, StaticIpv4TcpStack,
-    TcpIoResult, TcpStreamState, MAX_TCP_STREAM_BYTES_PER_CALL, TCP_BUFFER_BYTES,
+use vibeos_net_protocol::{
+    Ipv4RuntimeStatus, PacketDevice, StackError, StaticIpv4Address, StaticIpv4Config,
+    StaticIpv4EchoStack, StaticIpv4TcpStack, TcpIoResult, TcpStreamState,
+    MAX_TCP_STREAM_BYTES_PER_CALL, TCP_BUFFER_BYTES,
 };
 
 const SERVER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -625,7 +625,10 @@ fn server_close_acknowledges_a_late_payload_and_fin_before_relisten() {
         "the delayed ACK for the final payload+FIN was lost"
     );
     assert_eq!(server.stream_status().state, TcpStreamState::Closing);
-    assert!(!server.is_listening(), "TIME-WAIT was reset into LISTEN early");
+    assert!(
+        !server.is_listening(),
+        "TIME-WAIT was reset into LISTEN early"
+    );
 
     // Once the old tuple's close timer really expires, the reusable socket may
     // become a passive listener again.
@@ -702,8 +705,7 @@ fn peer_first_close_rearms_quickly_and_accepts_a_second_connection() {
         server.poll_network(now_ms).unwrap();
         client.poll(now_ms);
         now_ms += 1;
-        if server.stream_status().state == TcpStreamState::Established
-            && client.socket().may_send()
+        if server.stream_status().state == TcpStreamState::Established && client.socket().may_send()
         {
             break;
         }

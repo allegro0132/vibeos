@@ -5,11 +5,12 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 
-use vibeos_core::net_config::{
+use vibeos_net_protocol::{Ipv4RuntimeStatus, StackError, StaticIpv4Address, StaticIpv4EchoStack};
+
+use crate::command::{
     parse_dhclient_command, parse_ip_command, DhclientCommand, IpCommand, Ipv4Method,
-    Ipv4RuntimeStatus, NetworkConfiguration, StaticIpv4Address, PRIMARY_INTERFACE,
+    NetworkConfiguration, PRIMARY_INTERFACE,
 };
-use vibeos_core::net_stack::{StackError, StaticIpv4EchoStack};
 use vibeos_core::sync::SpinLock;
 use vibeos_vsh::Status;
 

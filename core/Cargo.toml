@@ -5,14 +5,6 @@ edition = "2021"
 
 [dependencies]
 chacha20 = { version = "=0.10.1", default-features = false, features = ["rng", "zeroize"] }
-smoltcp = { version = "=0.13.1", default-features = false, features = [
-    "alloc",
-    "medium-ethernet",
-    "proto-ipv4",
-    "socket-dhcpv4",
-    "socket-tcp",
-    "socket-tcp-reno",
-] }
 subtle = { version = "=2.6.1", default-features = false }
 vibeos-hal = { path = "../hal" }
 zeroize = { version = "=1.9.0", default-features = false }

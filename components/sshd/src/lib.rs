@@ -33,9 +33,6 @@ use sunset::{
 use vibeos_core::cap::{CSpace, Cap, Revocable};
 use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
-use vibeos_core::net_config::Ipv4RuntimeStatus;
-pub use vibeos_core::net_config::StaticIpv4Address;
-use vibeos_core::net_stack::{StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState};
 use vibeos_core::random::{ChaCha20Random, EntropySource, RandomDomain, RandomLimits, SEED_BYTES};
 use vibeos_ssh_identity::{CapabilityProfileId, SshEd25519PublicKey};
 use vibeos_core::sync::SpinLock;
@@ -43,6 +40,10 @@ use vibeos_vsh::terminal::{
     FrontendError, TerminalEvent, TerminalFrontend, MAX_EMIT_TEXT_BYTES,
     MAX_INPUT_BYTES as MAX_TERMINAL_INPUT_BYTES,
 };
+use vibeos_net_protocol::{
+    Ipv4RuntimeStatus, StaticIpv4Config, StaticIpv4TcpStack, TcpIoResult, TcpStreamState,
+};
+pub use vibeos_net_protocol::StaticIpv4Address;
 
 /// Boxed kernel-service operation used at the narrow component/platform seam.
 pub type PlatformFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

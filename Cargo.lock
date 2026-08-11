@@ -768,7 +768,6 @@ name = "vibeos-core"
 version = "0.1.0"
 dependencies = [
  "chacha20 0.10.1",
- "smoltcp",
  "subtle",
  "vibeos-hal",
  "zeroize",
@@ -905,10 +904,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-net-protocol"
+version = "0.1.0"
+dependencies = [
+ "smoltcp",
+ "vibeos-core",
+]
+
+[[package]]
 name = "vibeos-netstack"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-net-protocol",
  "vibeos-vsh",
 ]
 
@@ -948,6 +956,7 @@ version = "0.1.0"
 dependencies = [
  "sunset",
  "vibeos-core",
+ "vibeos-net-protocol",
  "vibeos-ssh-identity",
  "vibeos-vsh",
 ]

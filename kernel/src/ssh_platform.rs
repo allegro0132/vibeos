@@ -273,8 +273,51 @@ impl SshdPlatform for SshPlatform {
             }))
     }
 
-    fn install_standard_vsh_commands(&self, session: &mut vibeos_vsh::Session) {
-        crate::vsh_platform::install_remote_commands(session);
+    fn onboarding_password_profile(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Option<AuthorizedProfile> {
+        #[cfg(feature = "milkv-ssh")]
+        {
+            crate::ssh_provisioning::onboarding_password_profile(username, password)
+        }
+        #[cfg(not(feature = "milkv-ssh"))]
+        {
+            let _ = (username, password);
+            None
+        }
+    }
+
+    fn onboarding_profile(&self) -> Option<AuthorizedProfile> {
+        #[cfg(feature = "milkv-ssh")]
+        {
+            crate::ssh_provisioning::onboarding_profile()
+        }
+        #[cfg(not(feature = "milkv-ssh"))]
+        {
+            None
+        }
+    }
+
+    fn security_policy_changed(&self) -> bool {
+        #[cfg(feature = "milkv-ssh")]
+        {
+            crate::ssh_provisioning::policy_changed()
+        }
+        #[cfg(not(feature = "milkv-ssh"))]
+        {
+            false
+        }
+    }
+
+    fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool) {
+        if onboarding {
+            #[cfg(feature = "milkv-ssh")]
+            crate::vsh_platform::install_ssh_onboarding_commands(session);
+        } else {
+            crate::vsh_platform::install_remote_commands(session);
+        }
     }
 
     #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
@@ -343,28 +386,24 @@ pub async fn provisioned_task(
     random: Cap,
 ) {
     crate::uart::_print(format_args!(
-        "SSH provisioning: run ssh-keygen, then ssh-authorize add <64-hex-ed25519-key> on UART\n"
+        "SSH first login: user vibe, password vibeos; authorize an Ed25519 key immediately\n"
     ));
     loop {
-        match crate::ssh_provisioning::load().await {
-            Ok(Some(config)) if config.complete() => {
-                match crate::ssh_provisioning::install_services(space, config) {
-                    Ok((read, invoke, policy)) => {
-                        crate::uart::_print(format_args!(
-                            "SSH provisioning verified; starting DHCP SSH on port 22\n"
-                        ));
-                        task(
-                            space, outbound, inbound, control, random, read, invoke, policy,
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(()) => crate::uart::_print(format_args!(
-                        "SSH configuration invalid; refusing to listen\n"
-                    )),
+        match crate::ssh_provisioning::ensure_host_key().await {
+            Ok(config) => match crate::ssh_provisioning::install_services(space, config) {
+                Ok((read, invoke, policy)) => {
+                    crate::uart::_print(format_args!(
+                        "SSH host identity verified; starting DHCP SSH on port 22\n"
+                    ));
+                    task(
+                        space, outbound, inbound, control, random, read, invoke, policy,
+                    )
+                    .await;
                 }
-            }
-            Ok(_) => {}
+                Err(()) => crate::uart::_print(format_args!(
+                    "SSH configuration invalid; refusing to listen\n"
+                )),
+            },
             Err(_) => {}
         }
         crate::exec::sleep_ms(1000).await;

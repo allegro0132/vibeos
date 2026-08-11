@@ -93,8 +93,7 @@ pub fn install_standard_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
 }
 
-/// Install commands admitted to an authenticated remote SSH session. Local
-/// identity provisioning remains UART-only even after SSH is operational.
+/// Install commands admitted to an authenticated public-key SSH session.
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
@@ -102,6 +101,15 @@ pub fn install_standard_commands(session: &mut Session) {
 ))]
 pub fn install_remote_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, BASE_COMMANDS);
+    #[cfg(feature = "milkv-ssh")]
+    vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
+}
+
+/// The default password receives only the commands needed to replace itself
+/// with a client public key. It never receives the standard remote profile.
+#[cfg(feature = "milkv-ssh")]
+pub fn install_ssh_onboarding_commands(session: &mut Session) {
+    vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
 }
 
 #[cfg(feature = "milkv-ssh")]
@@ -115,8 +123,14 @@ const SSH_PROVISIONING_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ssh-authorize",
         min_args: 2,
-        max_args: 2,
+        max_args: 4,
         handler: crate::ssh_provisioning::vsh_authorize,
+    },
+    CommandSpec {
+        name: "cat",
+        min_args: 1,
+        max_args: 1,
+        handler: crate::ssh_provisioning::vsh_keycat,
     },
 ];
 

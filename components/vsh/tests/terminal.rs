@@ -137,6 +137,48 @@ fn input_limit_accepts_exactly_the_bound_then_bells_without_mutation() {
 }
 
 #[test]
+fn tab_completes_unique_and_common_command_prefixes() {
+    let mut line = LineDiscipline::new();
+    line.set_completion_candidates(&[
+        String::from("cancel"),
+        String::from("caps"),
+        String::from("echo"),
+        String::from("wc"),
+    ]);
+
+    feed(&mut line, b"ec");
+    assert_eq!(line.feed_byte(b'\t'), InputAction::Redraw);
+    assert_eq!(line.input(), "echo ");
+
+    feed(&mut line, b"\r");
+    feed(&mut line, b"c");
+    assert_eq!(line.feed_byte(b'\t'), InputAction::Redraw);
+    assert_eq!(line.input(), "ca");
+    assert_eq!(line.feed_byte(b'\t'), InputAction::Bell);
+
+    feed(&mut line, b"\r");
+    feed(&mut line, b"echo value | w");
+    assert_eq!(line.feed_byte(b'\t'), InputAction::Redraw);
+    assert_eq!(line.input(), "echo value | wc ");
+}
+
+#[test]
+fn tab_only_completes_command_positions_and_replaces_the_current_token() {
+    let mut line = LineDiscipline::new();
+    line.set_completion_candidates(&[String::from("echo"), String::from("true")]);
+
+    feed(&mut line, b"echo tr");
+    assert_eq!(line.feed_byte(b'\t'), InputAction::Bell);
+    assert_eq!(line.input(), "echo tr");
+
+    feed(&mut line, b"\r");
+    feed(&mut line, b"echx");
+    feed(&mut line, b"\x1b[D");
+    assert_eq!(line.feed_byte(b'\t'), InputAction::Redraw);
+    assert_eq!(line.input(), "echo ");
+}
+
+#[test]
 fn adjacent_duplicate_and_empty_lines_do_not_replace_history() {
     let mut line = LineDiscipline::new();
     feed(&mut line, b"one\r");

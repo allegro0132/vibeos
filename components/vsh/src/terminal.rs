@@ -14,6 +14,8 @@ use alloc::vec::Vec;
 pub const MAX_INPUT_BYTES: usize = 4 * 1024;
 pub const MAX_HISTORY_ENTRIES: usize = 64;
 pub const MAX_HISTORY_BYTES: usize = 64 * 1024;
+pub const MAX_COMPLETION_CANDIDATES: usize = 256;
+pub const MAX_COMPLETION_BYTES: usize = 16 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 64;
 pub const MAX_EMIT_TEXT_BYTES: usize = 1024;
 pub const MAX_PENDING_OUTPUT_BYTES: usize = 8 * 1024;
@@ -69,6 +71,7 @@ pub struct LineDiscipline {
     history_index: Option<usize>,
     draft: String,
     escape: EscapeState,
+    completion_candidates: Vec<String>,
 }
 
 impl LineDiscipline {
@@ -81,6 +84,7 @@ impl LineDiscipline {
             history_index: None,
             draft: String::new(),
             escape: EscapeState::Ground,
+            completion_candidates: Vec::new(),
         }
     }
 
@@ -91,6 +95,27 @@ impl LineDiscipline {
         self.history_index = None;
         self.draft.clear();
         self.escape = EscapeState::Ground;
+    }
+
+    /// Replace the command names considered by Tab completion. The bounded,
+    /// owned copy keeps terminal input independent from the shell session and
+    /// prevents a restricted frontend from consulting ambient command state.
+    pub fn set_completion_candidates(&mut self, candidates: &[String]) {
+        self.completion_candidates.clear();
+        let mut bytes = 0usize;
+        for candidate in candidates.iter().take(MAX_COMPLETION_CANDIDATES) {
+            if candidate.is_empty() || !candidate.chars().all(is_command_character) {
+                continue;
+            }
+            let Some(total) = bytes.checked_add(candidate.len()) else {
+                break;
+            };
+            if total > MAX_COMPLETION_BYTES {
+                break;
+            }
+            self.completion_candidates.push(candidate.clone());
+            bytes = total;
+        }
     }
 
     /// Feed one raw terminal byte through the incremental escape decoder.
@@ -139,6 +164,7 @@ impl LineDiscipline {
 
         match byte {
             b'\r' | b'\n' => self.submit(),
+            b'\t' => self.complete_command(),
             0x7f | 0x08 => self.backspace(),
             0x03 => self.interrupt(),
             0x1b => {
@@ -170,6 +196,96 @@ impl LineDiscipline {
     /// Number of displayed characters between the cursor and the end of input.
     pub fn cursor_tail_chars(&self) -> usize {
         self.input[self.cursor..].chars().count()
+    }
+
+    fn complete_command(&mut self) -> InputAction {
+        let Some((start, end)) = self.command_token_span() else {
+            return InputAction::Bell;
+        };
+        let prefix = &self.input[start..self.cursor];
+        let mut matches = self
+            .completion_candidates
+            .iter()
+            .filter(|candidate| candidate.starts_with(prefix));
+        let Some(first) = matches.next() else {
+            return InputAction::Bell;
+        };
+        let mut replacement_len = first.len();
+        let mut count = 1usize;
+        for candidate in matches {
+            count += 1;
+            replacement_len = common_prefix_len(first, candidate, replacement_len);
+        }
+        let append_space = count == 1
+            && self.input[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_whitespace());
+        let replacement_len = if count == 1 {
+            first.len()
+        } else {
+            replacement_len
+        };
+        if replacement_len == prefix.len() && !append_space && end == self.cursor {
+            return InputAction::Bell;
+        }
+        let replacement = &first[..replacement_len];
+        let new_len = self
+            .input
+            .len()
+            .saturating_sub(end - start)
+            .saturating_add(replacement.len())
+            .saturating_add(usize::from(append_space));
+        if new_len > MAX_INPUT_BYTES {
+            return InputAction::Bell;
+        }
+        self.input.replace_range(start..end, replacement);
+        self.cursor = start + replacement.len();
+        if append_space {
+            self.input.insert(self.cursor, ' ');
+            self.cursor += 1;
+        }
+        self.history_index = None;
+        self.draft.clear();
+        InputAction::Redraw
+    }
+
+    fn command_token_span(&self) -> Option<(usize, usize)> {
+        let before_cursor = &self.input[..self.cursor];
+        let start = before_cursor
+            .char_indices()
+            .rev()
+            .find_map(|(index, character)| {
+                (character.is_whitespace() || is_command_separator(character))
+                    .then_some(index + character.len_utf8())
+            })
+            .unwrap_or(0);
+        let prefix = &self.input[start..self.cursor];
+        if prefix.is_empty() || !prefix.chars().all(is_command_character) {
+            return None;
+        }
+        let preceding = self.input[..start].trim_end();
+        if !preceding.is_empty()
+            && !preceding
+                .chars()
+                .next_back()
+                .is_some_and(is_command_separator)
+        {
+            return None;
+        }
+        let end = self.cursor
+            + self.input[self.cursor..]
+                .find(|character: char| {
+                    character.is_whitespace() || is_command_separator(character)
+                })
+                .unwrap_or(self.input.len() - self.cursor);
+        if !self.input[self.cursor..end]
+            .chars()
+            .all(is_command_character)
+        {
+            return None;
+        }
+        Some((start, end))
     }
 
     fn type_char(&mut self, character: char) -> InputAction {
@@ -295,6 +411,24 @@ impl Default for LineDiscipline {
     }
 }
 
+fn is_command_separator(character: char) -> bool {
+    matches!(character, ';' | '|' | '&' | '(' | ')')
+}
+
+fn is_command_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+}
+
+fn common_prefix_len(first: &str, other: &str, limit: usize) -> usize {
+    first
+        .as_bytes()
+        .iter()
+        .zip(other.as_bytes())
+        .take(limit)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 /// A bounded terminal frontend error. Backpressure and oversized writes are
 /// distinct so callers know whether draining and retrying can make progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,6 +479,10 @@ impl TerminalFrontend {
             last_text_ended_line: false,
             output_had_text: false,
         }
+    }
+
+    pub fn set_completion_candidates(&mut self, candidates: &[String]) {
+        self.line.set_completion_candidates(candidates);
     }
 
     /// Queue a fresh prompt after all output already pending for this session.

@@ -2293,6 +2293,7 @@ async fn run_shell_repl(
 ) -> Result<u32, ConnectionEnd> {
     let mut status = 0;
     loop {
+        frontend.set_completion_candidates(&session.completion_candidates());
         match next_shell_event(
             runner,
             signer,

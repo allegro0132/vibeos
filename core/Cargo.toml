@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 vibeos-durable-format = { path = "../durable-format" }
 vibeos-hal = { path = "../hal" }
+
+[target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
+vibeos-runtime-riscv = { path = "../runtime/riscv" }

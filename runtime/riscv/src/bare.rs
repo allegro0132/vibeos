@@ -2,7 +2,8 @@
 
 use core::arch::asm;
 
-use super::{HartState, IpiError};
+use crate::mapping::{hart_state_from_sbi, ipi_error_from_sbi};
+use crate::{HartState, IpiError};
 
 const SSTATUS_SIE: usize = 1 << 1;
 const SSTATUS_MXR: usize = 1 << 19;
@@ -18,34 +19,6 @@ pub const RFENCE_EXTENSION_ID: usize = 0x52464E43;
 const SBI_EXT_RFENCE_REMOTE_FENCE_I: usize = 0;
 const SBI_EXT_RFENCE_REMOTE_SFENCE_VMA: usize = 1;
 const PAGE_SIZE: usize = 4096;
-
-const fn ipi_error_from_sbi(error: isize) -> IpiError {
-    match error {
-        -1 => IpiError::Failed,
-        -2 => IpiError::NotSupported,
-        -3 => IpiError::InvalidParam,
-        -4 => IpiError::Denied,
-        -5 => IpiError::InvalidAddress,
-        -6 => IpiError::AlreadyAvailable,
-        -7 => IpiError::AlreadyStarted,
-        -8 => IpiError::AlreadyStopped,
-        -9 => IpiError::NoSharedMemory,
-        other => IpiError::Unknown(other),
-    }
-}
-
-const fn hart_state_from_sbi(value: usize) -> HartState {
-    match value {
-        0 => HartState::Started,
-        1 => HartState::Stopped,
-        2 => HartState::StartPending,
-        3 => HartState::StopPending,
-        4 => HartState::Suspended,
-        5 => HartState::SuspendPending,
-        6 => HartState::ResumePending,
-        other => HartState::Unknown(other),
-    }
-}
 
 /// Disable S-mode interrupts; returns whether they were previously enabled.
 #[inline]
@@ -97,8 +70,13 @@ pub fn cached_logical_hart_index() -> Option<usize> {
 }
 
 /// Install the current hart's already-validated logical scheduler identity.
+///
+/// # Safety
+///
+/// `index` must be the logical scheduler identity already validated for the
+/// current physical hart, and this must run on that hart.
 #[inline(always)]
-pub(crate) unsafe fn cache_logical_hart_index(index: usize) {
+pub unsafe fn cache_logical_hart_index(index: usize) {
     let encoded = index
         .checked_add(1)
         .expect("logical hart cache encoding overflowed");

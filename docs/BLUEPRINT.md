@@ -117,6 +117,7 @@ upward except through a capability it was handed.
 | `chan.rs` | 116 | Typed bounded endpoints; rights pick the direction | — |
 | `durable-format/` | ~1800 | Sealed authority-log codec, stable IDs, fail-closed recovery | — |
 | `random/` | ~400 | Bounded ChaCha20 DRBG, domain separation, reseeding, and entropy-source contract | — |
+| `runtime/riscv/` | ~300 | Bare-metal RISC-V CSR, assembly, and SBI runtime seam | yes |
 | `drivers/virtio-core` | growing | Board-neutral modern VirtIO protocol and queue lifecycle models | — |
 | `hal`, `boards/*` | small | Typed hardware contracts and board-specific descriptions, without device policy | — |
 | `drivers/*` | growing | Board-independent register/protocol engines and explicitly owned DMA storage | yes |

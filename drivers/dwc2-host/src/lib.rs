@@ -7,7 +7,7 @@
 
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, AtomicBool, Ordering},
 };
 use vibeos_hal::Dwc2Description;
 

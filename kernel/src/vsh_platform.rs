@@ -467,7 +467,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     if let Some(hub) = snapshot.hub {
         let child_count = snapshot.children.iter().flatten().count();
         output.push_str(&format!(
-            "  Hub ports={} downstream devices={}\n",
+            "  Hub ports={} descendants={}\n",
             hub.ports, child_count,
         ));
         for child in snapshot.children.into_iter().flatten() {
@@ -484,6 +484,17 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
                 child.port,
                 child.port_status,
             ));
+            if let Some(child_hub) = snapshot
+                .hubs
+                .iter()
+                .flatten()
+                .find(|candidate| candidate.address == child.device.address)
+            {
+                output.push_str(&format!(
+                    "  Hub device={:03} ports={} depth={}\n",
+                    child_hub.address, child_hub.ports, child.depth,
+                ));
+            }
         }
     }
     if let Some(configuration) = snapshot.configuration {

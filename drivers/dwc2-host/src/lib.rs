@@ -146,6 +146,10 @@ pub enum Error {
     StorageCswTag(u32),
     StorageCswResidue(u32),
     StorageBlockSize(u32),
+    StorageCbwLength(usize),
+    StorageDataLength { expected: usize, actual: usize },
+    StorageCswLength(usize),
+    StorageCapacityTooLarge,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -681,7 +685,7 @@ impl Controller {
             return Err(Error::StorageBlockSize(block_size));
         }
         if last_lba == u32::MAX {
-            return Err(Error::StorageProtocol);
+            return Err(Error::StorageCapacityTooLarge);
         }
         storage.capacity_sectors = Some(u64::from(last_lba) + 1);
         storage.block_size = Some(block_size);
@@ -1158,15 +1162,19 @@ impl Controller {
             if data_in {
                 let actual = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, data)?;
                 if actual != data.len() {
-                    return Err(Error::StorageProtocol);
+                    return Err(Error::StorageDataLength {
+                        expected: data.len(),
+                        actual,
+                    });
                 }
             } else {
                 self.bulk_out(storage.endpoint_out, storage.max_packet_size_out, data)?;
             }
         }
         let mut csw = [0; CSW_LENGTH];
-        if self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, &mut csw)? != CSW_LENGTH {
-            return Err(Error::StorageProtocol);
+        let csw_length = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, &mut csw)?;
+        if csw_length != CSW_LENGTH {
+            return Err(Error::StorageCswLength(csw_length));
         }
         let signature = u32::from_le_bytes(csw[0..4].try_into().unwrap());
         let observed_tag = u32::from_le_bytes(csw[4..8].try_into().unwrap());
@@ -1220,7 +1228,7 @@ impl Controller {
             MAX_NAK_RETRIES,
         )?;
         if actual != input.len() {
-            return Err(Error::StorageProtocol);
+            return Err(Error::StorageCbwLength(actual));
         }
         self.storage_pid_out = advance_pid(self.storage_pid_out, actual, max_packet);
         Ok(())

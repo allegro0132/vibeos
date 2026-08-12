@@ -1,5 +1,6 @@
 use vibeos_blob_format::{
-    encode_blob, encoded_len, sha256, verify_proof, BlobError, BlobView, HEADER_SIZE, LEAF_SIZE,
+    BlobDescriptor, BlobError, BlobView, HEADER_SIZE, LEAF_SIZE, encode_blob, encoded_len, sha256,
+    verify_proof,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -110,6 +111,60 @@ fn strict_decoder_rejects_header_tree_data_and_suffix_mutations() {
 }
 
 #[test]
+fn standalone_header_decoder_is_strict_without_requiring_blob_tail() {
+    let encoded = encode_blob(21, &vec![0x6d; LEAF_SIZE + 3]).unwrap();
+    let header: [u8; HEADER_SIZE] = encoded[..HEADER_SIZE].try_into().unwrap();
+    let expected = BlobView::decode(&encoded).unwrap().descriptor();
+    assert_eq!(BlobDescriptor::decode_header(&header), Ok(expected));
+
+    for (offset, error) in [
+        (0, BlobError::BadMagic),
+        (8, BlobError::UnsupportedVersion),
+        (10, BlobError::UnsupportedVersion),
+        (12, BlobError::UnsupportedHash),
+        (14, BlobError::NonCanonical),
+        (15, BlobError::NonCanonical),
+        (20, BlobError::NonCanonical),
+        (23, BlobError::NonCanonical),
+        (32, BlobError::NonCanonical),
+        (36, BlobError::NonCanonical),
+        (72, BlobError::NonCanonical),
+        (80, BlobError::NonCanonical),
+        (88, BlobError::NonCanonical),
+        (96, BlobError::NonCanonical),
+        (127, BlobError::NonCanonical),
+    ] {
+        let mut mutated = header;
+        mutated[offset] ^= 1;
+        assert_eq!(
+            BlobDescriptor::decode_header(&mutated),
+            Err(error),
+            "accepted header mutation at byte {offset}"
+        );
+    }
+
+    let mut zero_kind = header;
+    zero_kind[16..20].fill(0);
+    assert_eq!(
+        BlobDescriptor::decode_header(&zero_kind),
+        Err(BlobError::EmptyObjectKind)
+    );
+
+    // Header-only decoding carries the declared root; the full view is what
+    // binds it to the canonical tree root.
+    let mut wrong_root = header;
+    wrong_root[40] ^= 1;
+    let declared = BlobDescriptor::decode_header(&wrong_root).unwrap();
+    assert_ne!(declared.root, expected.root);
+    let mut wrong_blob = encoded;
+    wrong_blob[..HEADER_SIZE].copy_from_slice(&wrong_root);
+    assert!(matches!(
+        BlobView::decode(&wrong_blob),
+        Err(BlobError::RootMismatch)
+    ));
+}
+
+#[test]
 fn roots_change_at_all_domain_boundaries() {
     let a = encode_blob(1, b"same").unwrap();
     let b = encode_blob(2, b"same").unwrap();
@@ -215,8 +270,9 @@ fn fixture_pattern(len: usize, multiplier: usize, addend: usize) -> Vec<u8> {
 fn frozen_m4_blobs_remain_byte_identical() {
     const MAXIMUM_M4_CONTENT: usize = 360_352;
     const MAXIMUM_M4_ENCODED: usize = 360 * 1024;
+    type FixtureCase = (&'static str, u32, Vec<u8>, &'static [u8], &'static str);
 
-    let cases: [(&str, u32, Vec<u8>, &[u8], &str); 4] = [
+    let cases: [FixtureCase; 4] = [
         (
             "empty",
             0x4d34_0001,

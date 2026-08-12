@@ -266,6 +266,13 @@ Acceptance:
 
 ### M7.4 — Streaming Blob CAS and deduplication
 
+**Status: complete (2026-08-12).** The canonical streaming Blob state
+machine, separate Object/Blob indexes, complete-Blob deduplication, directed
+authenticated reads, and independent capability publication contract are
+recorded in [STORAGE_V2_CAS.md](STORAGE_V2_CAS.md); the focused host and
+independent-verifier results are recorded in
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** large Blobs no longer require one contiguous caller allocation, and
 identical content shares physical storage without sharing authority.
 

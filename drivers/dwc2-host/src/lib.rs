@@ -1422,7 +1422,7 @@ impl Controller {
                         let remaining =
                             unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff }
                                 as usize;
-                        let actual = length.saturating_sub(remaining);
+                        let actual = completed_length(direction_in, length, remaining);
                         if direction_in {
                             invalidate_range(
                                 self.description.cache_line_bytes,
@@ -1659,7 +1659,7 @@ impl Controller {
                 unsafe { channel_write(self.description, channel, HCINT, status) };
                 let remaining =
                     unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff } as usize;
-                let actual = length.saturating_sub(remaining);
+                let actual = completed_length(direction_in, length, remaining);
                 if direction_in && actual != 0 {
                     invalidate_range(self.description.cache_line_bytes, dma_address, actual);
                 }
@@ -1730,6 +1730,17 @@ fn advance_pid(pid: DataPid, bytes: usize, max_packet: u16) -> DataPid {
         pid
     } else {
         pid.toggled()
+    }
+}
+
+const fn completed_length(direction_in: bool, requested: usize, remaining: usize) -> usize {
+    // CV1800B's DWC2 4.20a buffer-DMA path leaves XFRSIZ unchanged for a
+    // successfully completed OUT transaction. Transfer Complete is the OUT
+    // acknowledgement; only IN uses XFRSIZ to report a short packet.
+    if direction_in {
+        requested.saturating_sub(remaining)
+    } else {
+        requested
     }
 }
 
@@ -2515,6 +2526,8 @@ mod tests {
         );
         assert_eq!(advance_pid(DataPid::Data0, 512, 64), DataPid::Data0);
         assert_eq!(advance_pid(DataPid::Data0, 31, 64), DataPid::Data1);
+        assert_eq!(completed_length(false, 31, 31), 31);
+        assert_eq!(completed_length(true, 512, 128), 384);
     }
 
     #[test]

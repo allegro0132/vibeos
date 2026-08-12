@@ -42,6 +42,8 @@ jobs:
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
         run: python3 -B scripts/bench.py --selftest
+      - name: Verify the independent Storage V2 image parser
+        run: python3 -B scripts/storage-v2-image.py --selftest
 
   differential:
     name: Real-rustc differential oracle

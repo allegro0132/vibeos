@@ -334,6 +334,7 @@ first draft because bare integer literals infer as `i32` while the subset is
 ./scripts/qemu-ssh-security-test.sh  # independent N3 entropy/identity gate
 ./scripts/qemu-ssh-test.sh           # independent N4/N5 OpenSSH wire gate
 ./scripts/qemu-test.sh program_persistence # two boots plus raw artifact evidence
+python3 -B scripts/storage-v2-image.py --selftest # independent Storage V2 format/parser gate
 ./scripts/qemu-test.sh smp_queues   # logical queues + boot-hart SBI/SSIP, one CPU
 ./scripts/qemu-test.sh guard_page   # expected-fatal store-page-fault + exact stval
 ./scripts/qemu-test.sh wx           # seal, cross-hart execute, clear, same-address reuse

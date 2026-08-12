@@ -20,6 +20,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/STORAGE_V2_ROADMAP.md](docs/STORAGE_V2_ROADMAP.md)** — the post-v1
   managed-block Blob CAS plan: `sha2`, segment/checkpoint format, root-based GC,
   online growth, quotas, scrub, and M4 migration.
+- **[docs/STORAGE_V2_FORMAT.md](docs/STORAGE_V2_FORMAT.md)** — the frozen v1
+  segment, seal, checkpoint, and power-cut recovery ABI.
 - **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
   Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
   cancellation, and fail-closed admission.
@@ -82,6 +84,7 @@ python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/build-milkv-duo.sh --jitterentropy-ssh-probe # fixed-key SSH evidence transport
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
+python3 -B scripts/storage-v2-image.py --selftest # independent format verifier
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
 ```
 
@@ -402,6 +405,8 @@ its process owns. Here, authority is not a property of the code.
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
 | `durable-format/` | zero-dependency sealed-log codec, stable IDs, and fail-closed recovery (`no_std`) |
 | `blob-format/` | canonical immutable Merkle blob encoding and chunk proofs (`no_std`) |
+| `storage-device/` | capability-scoped block ranges, geometry, sessions, and mutation certainty (`no_std`) |
+| `segment-format/` | allocation-free Storage V2 segment/checkpoint codec and verifier (`no_std`) |
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
 | `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |

@@ -30,3 +30,58 @@ Reproduce the focused measurements and target dependency check with:
 cargo run -p vibeos-blob-format --release --example hash-throughput --locked --offline
 ./scripts/check-blob-sha2.sh
 ```
+
+## M7.1 capability-scoped block contract
+
+Accepted on 2026-08-12 at commit `1c3a983c722e418c05000319767f16389d191aa3`.
+The portable contract tests cover checked range attenuation, complete disjoint
+grant layouts, stale device incarnations, truthful geometry, exact M4 adapter
+translation, and mutation certainty. Driver tests pin the publication boundary
+to the VirtIO `avail.idx` store and the SDHCI CMD24/CMD13 `COMMAND` stores.
+
+The QEMU `block`, `store`, and `block_recovery` cases passed against real raw
+backing images. The exact Milk-V `milkv-duo-sd` firmware built with the pinned
+nightly toolchain; its image verifier now requires the policy LBA 262145 and
+8192-sector data partition.
+
+Focused reproduction:
+
+```sh
+cargo test -p vibeos-storage-device -p vibeos-core \
+  -p vibeos-driver-virtio-blk -p vibeos-driver-sdhci-blk \
+  -p vibeos-object-store --locked --offline
+./scripts/qemu-test.sh block
+./scripts/qemu-test.sh store
+./scripts/qemu-test.sh block_recovery
+```
+
+## M7.2 canonical segment format and crash model
+
+Accepted on 2026-08-12. The `vibeos-segment-format` crate is `no_std`, uses no
+allocator, and compiles for `riscv64imac-unknown-none-elf` with only `core`.
+Its production tests cover every record kind, exact layout, opaque verified
+records, checked geometry and pointer arithmetic, strict checkpoint selection,
+payload hashing, segment hash chains, all 4096 strict seal prefixes, and every
+possible single-byte corruption of a sealed checkpoint body.
+
+M7.2 freezes and validates the allocation-free structural selection phase.
+Resolving a selected checkpoint's roots against finalized segments is the
+I/O-owning mount phase implemented and fault-injected by M7.3; a structural
+selection is deliberately not exposed as a mounted store.
+
+`scripts/storage-v2-image.py` is an independent Python parser with literal ABI
+offsets, CRC32C, SHA-256, checkpoint/pointer/segment verification, stable JSON,
+and negative image fixtures. A Rust integration test writes a canonical anchor
+with the production encoder and requires that independent parser to accept it.
+
+Focused reproduction:
+
+```sh
+cargo test -p vibeos-segment-format --locked --offline
+cargo clippy -p vibeos-segment-format --all-targets --locked --offline -- -D warnings
+python3 -B scripts/storage-v2-image.py --selftest
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
+rustup run nightly-2026-08-01 cargo check -p vibeos-segment-format \
+  --target riscv64imac-unknown-none-elf -Zbuild-std=core --locked --offline
+```

@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use vibeos_driver_dwmac_net::{Engine, Error as HardwareError};
+use vibeos_driver_dwmac_net::{DmaStorage, Engine, Error as HardwareError};
 
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
@@ -26,6 +26,9 @@ const TX_TIMEOUT_MS: u64 = 2_000;
 
 const DWMAC: vibeos_hal::DwmacDescription = crate::platform::DWMAC;
 const IRQ: u32 = DWMAC.irq;
+
+#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
+static DMA: DmaStorage = DmaStorage::new();
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -92,6 +95,7 @@ pub struct NetInfo {
     pub timeouts: u64,
     pub rx_inflight: u8,
     pub tx_inflight: u8,
+    pub ethernet_address: [u8; 6],
     pub phy_link_up: bool,
     pub tx_descriptor_status: u32,
     pub dma_status: u32,
@@ -117,7 +121,15 @@ impl Resource for MmioWindow {
     }
 }
 
-pub struct DmaRegion;
+pub struct DmaRegion {
+    storage: &'static DmaStorage,
+}
+
+impl DmaRegion {
+    fn storage(&self) -> &'static DmaStorage {
+        self.storage
+    }
+}
 impl Resource for DmaRegion {
     fn kind(&self) -> &'static str {
         "dma-region"
@@ -125,7 +137,7 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "DWMAC stable cache-isolated two-descriptor slab @ {:#x}",
-            vibeos_driver_dwmac_net::dma_region_base()
+            vibeos_driver_dwmac_net::dma_region_base(self.storage)
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -141,7 +153,7 @@ impl NetDevice {
         // apertures for the firmware lifetime. CONTROL serializes this
         // diagnostic snapshot with kernel packet-engine operations; the
         // selected status registers are non-destructive reads.
-        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC) };
+        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC, &DMA) };
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
@@ -167,7 +179,8 @@ impl NetDevice {
             timeouts: TIMEOUTS.load(Ordering::Acquire),
             rx_inflight: u8::from(state.online),
             tx_inflight: u8::from(state.tx_inflight),
-            phy_link_up: usb_cdc_ready() || hardware.phy_link_up,
+            ethernet_address: GUEST_MAC,
+            phy_link_up: hardware.phy_link_up,
             tx_descriptor_status: hardware.tx_descriptor_status,
             dma_status: hardware.dma_status,
             clock_enable: hardware.clock_enable,
@@ -194,6 +207,7 @@ impl Resource for NetDevice {
 }
 
 pub struct NetResources {
+    pub location: crate::net_device::NetworkLocation,
     pub mmio: Arc<MmioWindow>,
     pub dma: Arc<DmaRegion>,
     pub control: Arc<NetDevice>,
@@ -201,8 +215,11 @@ pub struct NetResources {
 
 pub fn discover() -> Option<NetResources> {
     Some(NetResources {
+        location: crate::net_device::NetworkLocation::Mmio {
+            base: DWMAC.registers.start,
+        },
         mmio: Arc::new(MmioWindow),
-        dma: Arc::new(DmaRegion),
+        dma: Arc::new(DmaRegion { storage: &DMA }),
         control: Arc::new(NetDevice),
     })
 }
@@ -298,7 +315,7 @@ pub async fn driver_task(
         )
     };
     let (Ok(mmio), Ok(dma), Ok(outbound), Ok(inbound), Ok(control)) = authority else {
-        crate::println!("  usb net   driver capability lookup failed");
+        crate::println!("  dwmac net driver capability lookup failed");
         return;
     };
 
@@ -306,30 +323,31 @@ pub async fn driver_task(
     DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
     DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
 
-    let engine = if usb_cdc_ready() {
-        None
-    } else {
-        match with_device_authority(&mmio, &dma, &control, || {
-            // SAFETY: the retained and currently live capabilities authorize the
-            // identity-mapped BSP apertures and crate-owned `.dma` slab. The
-            // firmware linker keeps that slab physically contiguous and below the
-            // board's 32-bit DMA limit for this engine's lifetime.
-            unsafe {
-                Engine::claim(
-                    DWMAC,
-                    GUEST_MAC,
-                    crate::sbi::time,
-                    crate::exec::timebase_hz(),
-                )
-            }
-            .map_err(|_| NetError::DriverFault)
-        }) {
-            Ok(engine) => Some(engine),
-            Err(_) => {
-                crate::println!("  usb net   DWMAC claim failed");
-                shutdown_driver_policy(false);
-                return;
-            }
+    let storage = match dma.try_with(DmaRegion::storage) {
+        Ok(storage) => storage,
+        Err(_) => return,
+    };
+    let engine = match with_device_authority(&mmio, &dma, &control, || {
+        // SAFETY: the retained and currently live capabilities authorize the
+        // identity-mapped BSP apertures and this resource's `.dma` storage. The
+        // firmware linker keeps that slab physically contiguous and below the
+        // board's 32-bit DMA limit for this engine's lifetime.
+        unsafe {
+            Engine::claim(
+                DWMAC,
+                storage,
+                GUEST_MAC,
+                crate::sbi::time,
+                crate::exec::timebase_hz(),
+            )
+        }
+        .map_err(|_| NetError::DriverFault)
+    }) {
+        Ok(engine) => engine,
+        Err(_) => {
+            crate::println!("  dwmac net driver claim failed");
+            shutdown_driver_policy(false);
+            return;
         }
     };
 
@@ -348,12 +366,20 @@ pub async fn driver_task(
     })
     .is_err()
     {
-        crate::println!("  usb net   driver device attach failed");
-        let reset = engine.is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
+        crate::println!("  dwmac net driver device attach failed");
+        let reset = engine.shutdown();
         shutdown_driver_policy(reset);
         return;
     }
-    let mut session = DriverSession { engine };
+    crate::println!(
+        "  dwmac net online, IRQ {}, DMA {:#x}, epoch {}",
+        engine.irq(),
+        storage.base(),
+        CONTROL.lock().sessions.device_epoch(),
+    );
+    let mut session = DriverSession {
+        engine: Some(engine),
+    };
 
     let mut pending_tx = None;
     let mut tx_deadline = 0;
@@ -372,7 +398,7 @@ pub async fn driver_task(
                 &mut link_poll,
             )
         }) {
-            crate::println!("  usb net   driver stopped: {error:?}");
+            crate::println!("  dwmac net driver stopped: {error:?}");
             return;
         }
         crate::exec::sleep_ms(1).await;
@@ -384,8 +410,8 @@ struct DriverSession {
 }
 
 impl DriverSession {
-    fn engine_mut(&mut self) -> Option<&mut Engine> {
-        self.engine.as_mut()
+    fn engine_mut(&mut self) -> &mut Engine {
+        self.engine.as_mut().expect("live DWMAC driver session")
     }
 }
 
@@ -412,7 +438,7 @@ fn with_device_authority<R>(
 }
 
 fn driver_turn(
-    mut engine: Option<&mut Engine>,
+    engine: &mut Engine,
     outbound: &Revocable<Endpoint<StampedPacket>>,
     inbound: &Revocable<Endpoint<StampedPacket>>,
     pending_tx: &mut Option<Packet>,
@@ -429,12 +455,7 @@ fn driver_turn(
         // generation from becoming active between stamp validation and OWN.
         let mut state = CONTROL.lock();
         let now = crate::sbi::time();
-        let use_usb_cdc = usb_cdc_ready();
-        let descriptor_busy = if use_usb_cdc {
-            false
-        } else {
-            engine.as_ref().ok_or(NetError::DriverFault)?.tx_owned()
-        };
+        let descriptor_busy = engine.tx_owned();
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
         if descriptor_busy {
             // The deadline covers DMA ownership after publication as well as
@@ -455,21 +476,7 @@ fn driver_turn(
             }
         }
         if let Some(packet) = pending_tx.as_ref() {
-            let transmitted = if use_usb_cdc {
-                match crate::dwc2_host::transmit_cdc_ecm(packet.as_bytes()) {
-                    Ok(()) => Ok(()),
-                    Err(vibeos_driver_dwc2_host::Error::Nak) => Err(HardwareError::QueueFull),
-                    Err(error) => {
-                        crate::println!("  usb net   CDC-ECM transmit failed: {error:?}");
-                        Err(HardwareError::TimedOut)
-                    }
-                }
-            } else {
-                engine
-                    .as_mut()
-                    .ok_or(NetError::DriverFault)?
-                    .transmit(packet.as_bytes())
-            };
+            let transmitted = engine.transmit(packet.as_bytes());
             match transmitted {
                 Ok(()) => {
                     *pending_tx = None;
@@ -493,24 +500,7 @@ fn driver_turn(
         // exact session stamping, endpoint publication, and RX rearm. A stack
         // restart cannot relabel a raw frame after the driver consumes it.
         let mut frame = [0u8; MAX_PACKET_LEN];
-        let received = if use_usb_cdc {
-            match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
-                Ok(length) => Some(length),
-                Err(
-                    vibeos_driver_dwc2_host::Error::Nak
-                    | vibeos_driver_dwc2_host::Error::TransferTimedOut,
-                ) => None,
-                Err(error) => {
-                    crate::println!("  usb net   CDC-ECM receive failed: {error:?}");
-                    return Err(NetError::DriverFault);
-                }
-            }
-        } else {
-            engine
-                .as_mut()
-                .ok_or(NetError::DriverFault)?
-                .receive(&mut frame)
-        };
+        let received = engine.receive(&mut frame);
         if let Some(length) = received {
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
             match send_inbound(inbound, &state.sessions, packet) {
@@ -525,15 +515,9 @@ fn driver_turn(
     *link_poll = link_poll.wrapping_add(1);
     if *link_poll >= 1_000 {
         *link_poll = 0;
-        if let Some(engine) = engine {
-            engine.poll_link();
-        }
+        engine.poll_link();
     }
     Ok(())
-}
-
-fn usb_cdc_ready() -> bool {
-    crate::dwc2_host::snapshot().is_some_and(|snapshot| snapshot.cdc_ecm.is_some())
 }
 
 fn tx_timeout_ticks() -> u64 {
@@ -643,7 +627,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
-    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC) };
+    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC, &DMA) };
     shutdown_driver_policy(reset);
 }
 

@@ -94,15 +94,7 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     feature = "milkv-ssh"
 ))]
 fn ssh_service_policy() -> SshServicePolicy {
-    let mut policy = SSH_SERVICE_POLICY;
-    #[cfg(feature = "milkv-duo")]
-    if let Some(mac) = crate::dwc2_host::snapshot()
-        .and_then(|snapshot| snapshot.cdc_ecm)
-        .and_then(|ecm| ecm.mac_address)
-    {
-        policy.ethernet_address = mac;
-    }
-    policy
+    SSH_SERVICE_POLICY
 }
 
 #[cfg(feature = "milkv-ssh-acceptance")]
@@ -297,8 +289,8 @@ impl SshdPlatform for SshPlatform {
             .lock()
             .lookup_revocable::<TcpListener>(listener, Rights::READ)
             .ok()?;
-        listener_authority.try_with(|_| ()).ok()?;
-        Some(vibeos_netstack::config::runtime_status())
+        let listener_id = listener_authority.try_with(TcpListener::id).ok()?.get();
+        vibeos_netstack::config::runtime_status_for_listener(listener_id)
     }
 
     fn entropy<'a>(

@@ -1,4 +1,4 @@
-//! Pure parsing for the bounded operator-controlled IPv4 command surface.
+//! Pure parsing for the operator-controlled IPv4 command surface.
 
 extern crate alloc;
 
@@ -8,27 +8,24 @@ use core::str::FromStr;
 
 use crate::StaticIpv4Address;
 
-/// Keep the control-plane table deliberately bounded. Each admitted interface
-/// still needs its own packet endpoints, device-control capability, smoltcp
-/// state, and listener capabilities; parsing a name never creates authority.
-pub const MAX_NETWORK_INTERFACES: usize = 4;
+/// Compatibility spelling for the first topology-sorted interface.
+/// This does not identify a driver class.
 pub const PRIMARY_INTERFACE: &str = "net0";
 pub const COMPAT_INTERFACE: &str = "eth0";
 
 /// Stable, boot-local index used to join an interface's packet capabilities,
 /// control state, and human-readable `netN` name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NetworkInterfaceId(u8);
+pub struct NetworkInterfaceId(u16);
 
 impl NetworkInterfaceId {
-    pub const PRIMARY: Self = Self(0);
+    /// First entry after the image policy sorts physical topology keys.
+    pub const FIRST: Self = Self(0);
+    /// Compatibility alias; the first entry is not bound to a driver class.
+    pub const PRIMARY: Self = Self::FIRST;
 
-    pub const fn new(index: u8) -> Option<Self> {
-        if (index as usize) < MAX_NETWORK_INTERFACES {
-            Some(Self(index))
-        } else {
-            None
-        }
+    pub const fn new(index: u16) -> Self {
+        Self(index)
     }
 
     pub const fn index(self) -> usize {
@@ -127,7 +124,7 @@ pub fn parse_ip_command(args: &[String]) -> Result<IpCommand, CommandParseError>
         }),
         ["route", "replace" | "add", "default", "via", gateway] => {
             Ok(IpCommand::ReplaceDefaultRoute {
-                interface: NetworkInterfaceId::PRIMARY,
+                interface: NetworkInterfaceId::FIRST,
                 gateway: parse_unicast_ipv4(gateway)?,
             })
         }
@@ -152,10 +149,10 @@ pub fn parse_ip_command(args: &[String]) -> Result<IpCommand, CommandParseError>
 pub fn parse_dhclient_command(args: &[String]) -> Result<DhclientCommand, CommandParseError> {
     match string_args(args).as_slice() {
         [] => Ok(DhclientCommand::Acquire {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
         }),
         ["-r"] => Ok(DhclientCommand::Release {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
         }),
         ["-r", device] => Ok(DhclientCommand::Release {
             interface: parse_interface(device)?,
@@ -190,10 +187,9 @@ fn parse_interface(device: &str) -> Result<NetworkInterfaceId, CommandParseError
         ));
     }
     let index = index
-        .parse::<u8>()
+        .parse::<u16>()
         .map_err(|_| CommandParseError("invalid network interface index"))?;
-    NetworkInterfaceId::new(index)
-        .ok_or(CommandParseError("network interface index is out of range"))
+    Ok(NetworkInterfaceId::new(index))
 }
 
 fn parse_cidr(value: &str) -> Result<([u8; 4], u8), CommandParseError> {

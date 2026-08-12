@@ -781,6 +781,7 @@ dependencies = [
 name = "vibeos-driver-dwc2-host"
 version = "0.1.0"
 dependencies = [
+ "vibeos-driver-rtl815x",
  "vibeos-hal",
 ]
 
@@ -804,6 +805,10 @@ version = "0.1.0"
 dependencies = [
  "vibeos-hal",
 ]
+
+[[package]]
+name = "vibeos-driver-rtl815x"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-driver-sdhci-blk"

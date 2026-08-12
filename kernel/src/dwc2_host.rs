@@ -2,12 +2,14 @@
 
 use crate::{println, sync::SpinLock};
 use vibeos_driver_dwc2_host::{
-    CdcEcmInfo, ConfigurationInfo, Controller, DeviceInfo, Error, HidKeyboardInfo,
-    HidReportDescriptor, HubChildInfo, HubInfo, Info, MassStorageInfo, Telemetry,
+    CdcEcmInfo, ConfigurationInfo, Controller, DeviceInfo, DmaStorage, Error, HidKeyboardInfo,
+    HidReportDescriptor, HubChildInfo, HubInfo, Info, MassStorageInfo, Telemetry, UsbBusPath,
     MAX_DEVICE_CONFIGURATIONS, MAX_HUB_CHILDREN,
 };
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
+#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
+static DMA: DmaStorage = DmaStorage::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -41,6 +43,7 @@ pub fn init() -> Result<Info, Error> {
     let controller = unsafe {
         Controller::initialize(
             crate::platform::DWC2,
+            &DMA,
             crate::platform::TIMEBASE_HZ,
             crate::sbi::time,
         )
@@ -59,6 +62,13 @@ pub fn connected() -> bool {
 
 pub fn info() -> Option<Info> {
     CONTROLLER.lock().as_ref().map(Controller::info)
+}
+
+pub fn network_bus_path() -> Option<UsbBusPath> {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .and_then(Controller::network_bus_path)
 }
 
 pub fn snapshot() -> Option<Snapshot> {

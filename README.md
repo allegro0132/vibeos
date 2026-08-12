@@ -446,8 +446,11 @@ poweroff        power off
 ```
 
 The dedicated QEMU `tcp-echo` image and the production Milk-V Duo image install
-a bounded Linux-style IPv4 control surface. `net0` is the canonical device name
-and `eth0` is an accepted compatibility alias. Milk-V Duo starts in DHCP mode:
+a bounded Linux-style IPv4 control surface. Admitted devices are sorted by a
+stable bus-topology key and exposed as the boot-local `netN` list; `ethN` is an
+accepted compatibility spelling for the same index. Milk-V Duo starts in DHCP
+mode. Inspect `ip link show` before selecting an interface; a single-NIC QEMU
+boot normally exposes `net0`:
 
 ```text
 ip link show
@@ -605,16 +608,20 @@ Deliberate, not overlooked:
 - **Networking remains deliberately feature-gated.** Diagnostic images expose
   only bounded raw-L2 service. Driver/stack queues carry owned `StampedPacket`
   values tied to one boot-local device epoch and stack generation. One
-  independent `net-stack` component can fairly drive up to four explicitly
-  capability-backed `netN` interfaces; each owns separate packet endpoints,
+  independent `net-stack` component can fairly drive the runtime-discovered
+  list of explicitly capability-backed `netN` interfaces; each owns separate packet endpoints,
   smoltcp state, ARP, IPv4 address, route, DHCPv4 client, session generation,
   and listener set. Revocation or quarantine retires only the affected
   interface. Bounded `TcpListener` capability frontends give each service
   exclusive authority over its own port and generation-bound connections; SSH
-  no longer owns the IPv4 stack. The compatibility entry point and current
-  image policies still wire one NIC and one service listener per image. A
-  multi-NIC board policy must grant one distinct endpoint/control/listener
-  bundle per admitted device; parsing `net1` never creates hardware authority.
+  no longer owns the IPv4 stack. The QEMU policy still wires one VirtIO NIC.
+  The Milk-V policy sorts DWMAC and any detected USB CDC-ECM function by stable
+  MMIO/USB topology and then assigns boot-local `netN` names. They have distinct
+  packet endpoints, controls, DHCP clients, and restart supervision; the
+  service listener remains deliberately attached to the DWMAC capability root,
+  independent of its assigned ordinal. Any further
+  multi-NIC policy must grant one distinct endpoint/control/listener bundle per
+  admitted device; parsing `net1` never creates hardware authority.
   The shared core supports eight listeners per interface and has a two-port
   isolation test. It
   still provides no DNS resolver, IPv6, general UDP API, or POSIX socket
@@ -622,8 +629,9 @@ Deliberate, not overlooked:
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
   are absent from normal images and do not model delayed DMA completion or a
   late IRQ. The native DWMAC DHCP/IP path has passed carrier, lease acquisition,
-  and eight fresh exact-echo TCP streams on a live board; restart coordinates,
-  delayed completion, late IRQ, and long-duration stress remain open.
+  and eight fresh exact-echo TCP streams on a live board. Simultaneous DWMAC +
+  CDC-ECM physical acceptance, restart coordinates, delayed completion, late
+  IRQ, and long-duration stress remain open.
 - **SSH acceptance fixtures remain separate from production provisioning.** A
   bounded, fail-closed virtio-rng capability now feeds a domain-separated,
   zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator

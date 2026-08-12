@@ -158,6 +158,8 @@ mod trampoline;
 mod trap;
 mod tty;
 mod uart;
+#[cfg(feature = "milkv-duo")]
+mod usb_ecm_net;
 #[cfg(feature = "qemu-virt")]
 mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
@@ -535,6 +537,8 @@ pub extern "C" fn kmain() -> ! {
     let world = world::world();
     world::start_block_supervisor();
     world::start_net_supervisor();
+    #[cfg(feature = "milkv-duo")]
+    world::start_usb_net_supervisor();
     #[cfg(feature = "qemu-virt")]
     world::start_rng_supervisor();
     #[cfg(feature = "qemu-virt")]
@@ -738,6 +742,8 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         // visible to safe lifecycle callers.
         block_device::recover_faulted_domain(domain);
         net_device::recover_faulted_domain(domain);
+        #[cfg(feature = "milkv-duo")]
+        usb_ecm_net::recover_faulted_domain(domain);
         #[cfg(feature = "qemu-virt")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);

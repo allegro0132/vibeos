@@ -4,11 +4,12 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use vibeos_core::sync::SpinLock;
 use vibeos_net_protocol::command::{
     parse_dhclient_command, parse_ip_command, DhclientCommand, IpCommand, Ipv4Method,
-    NetworkConfiguration, NetworkInterfaceId, MAX_NETWORK_INTERFACES,
+    NetworkConfiguration, NetworkInterfaceId,
 };
 use vibeos_net_protocol::{Ipv4RuntimeStatus, SharedIpv4TcpStack, StackError, StaticIpv4Address};
 use vibeos_vsh::Status;
@@ -33,28 +34,27 @@ struct ControlState {
     ethernet_address: [u8; 6],
 }
 
-/// The deterministic acceptance image keeps its historical address on net0
-/// and leaves later interfaces unconfigured until the operator assigns unique
-/// subnets. DHCP images may safely discover a lease independently on every
-/// admitted link.
+/// The deterministic acceptance image assigns its historical address to the
+/// interface carrying the explicitly granted service listener. DHCP images
+/// may safely discover a lease independently on every admitted link.
 #[cfg(feature = "static-service")]
-const PRIMARY_BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
+const SERVICE_BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::Static(DEFAULT_STATIC),
 };
 #[cfg(feature = "static-service")]
-const SECONDARY_BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
+const DEFAULT_BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::None,
 };
 
 #[cfg(feature = "dhcp-service")]
-const PRIMARY_BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
+const SERVICE_BOOT_CONFIGURATION: NetworkConfiguration = NetworkConfiguration {
     link_up: true,
     method: Ipv4Method::Dhcp,
 };
 #[cfg(feature = "dhcp-service")]
-const SECONDARY_BOOT_CONFIGURATION: NetworkConfiguration = PRIMARY_BOOT_CONFIGURATION;
+const DEFAULT_BOOT_CONFIGURATION: NetworkConfiguration = SERVICE_BOOT_CONFIGURATION;
 
 const fn initial_control(desired: NetworkConfiguration) -> ControlState {
     ControlState {
@@ -68,12 +68,16 @@ const fn initial_control(desired: NetworkConfiguration) -> ControlState {
     }
 }
 
-static CONTROL: SpinLock<[ControlState; MAX_NETWORK_INTERFACES]> = SpinLock::new([
-    initial_control(PRIMARY_BOOT_CONFIGURATION),
-    initial_control(SECONDARY_BOOT_CONFIGURATION),
-    initial_control(SECONDARY_BOOT_CONFIGURATION),
-    initial_control(SECONDARY_BOOT_CONFIGURATION),
-]);
+const fn boot_configuration(has_service_listener: bool) -> NetworkConfiguration {
+    if has_service_listener {
+        SERVICE_BOOT_CONFIGURATION
+    } else {
+        DEFAULT_BOOT_CONFIGURATION
+    }
+}
+
+static CONTROL: SpinLock<Vec<ControlState>> = SpinLock::new(Vec::new());
+static LISTENER_INTERFACES: SpinLock<Vec<(u64, NetworkInterfaceId)>> = SpinLock::new(Vec::new());
 
 pub fn vsh_ip(args: &[String]) -> Result<String, Status> {
     let command = parse_ip_command(args).map_err(|_| Status::Usage)?;
@@ -111,10 +115,12 @@ pub fn vsh_ip(args: &[String]) -> Result<String, Status> {
         }
         IpCommand::ReplaceDefaultRoute { interface, gateway } => {
             let mut control = CONTROL.lock();
-            let state = &mut control[interface.index()];
-            if !state.present {
+            let Some(state) = control
+                .get_mut(interface.index())
+                .filter(|state| state.present)
+            else {
                 return Err(Status::Usage);
-            }
+            };
             let Ipv4Method::Static(mut address) = state.desired.method else {
                 return Err(Status::Usage);
             };
@@ -153,8 +159,38 @@ pub fn vsh_dhclient(args: &[String]) -> Result<String, Status> {
 
 /// Admit one capability-backed interface into the operator-visible table.
 /// Merely parsing `netN` never marks it present.
-pub fn register_interface(interface: NetworkInterfaceId) {
-    CONTROL.lock()[interface.index()].present = true;
+pub fn register_interface(interface: NetworkInterfaceId, has_service_listener: bool) -> bool {
+    let mut control = CONTROL.lock();
+    let index = interface.index();
+    if index >= control.len() {
+        let additional = index + 1 - control.len();
+        if control.try_reserve_exact(additional).is_err() {
+            return false;
+        }
+        while control.len() <= index {
+            control.push(initial_control(DEFAULT_BOOT_CONFIGURATION));
+        }
+    }
+    if has_service_listener && !control[index].present {
+        control[index].desired = boot_configuration(true);
+    }
+    control[index].present = true;
+    true
+}
+
+pub fn register_listener(interface: NetworkInterfaceId, listener_id: u64) -> bool {
+    let mut listeners = LISTENER_INTERFACES.lock();
+    if let Some((_, registered)) = listeners
+        .iter()
+        .find(|(candidate, _)| *candidate == listener_id)
+    {
+        return *registered == interface;
+    }
+    if listeners.try_reserve_exact(1).is_err() {
+        return false;
+    }
+    listeners.push((listener_id, interface));
+    true
 }
 
 pub fn reconcile(
@@ -164,7 +200,9 @@ pub fn reconcile(
 ) -> Result<(), StackError> {
     let (revision, desired) = {
         let control = CONTROL.lock();
-        let state = control[interface.index()];
+        let state = *control
+            .get(interface.index())
+            .expect("registered interface retains control state");
         (state.revision, state.desired)
     };
     if revision == *observed_revision {
@@ -196,27 +234,34 @@ pub fn publish_stack_status(
 
 pub fn publish_carrier(interface: NetworkInterfaceId, carrier_up: bool) {
     let mut control = CONTROL.lock();
-    let state = &mut control[interface.index()];
-    state.present = true;
-    state.carrier_up = carrier_up;
+    if let Some(state) = control.get_mut(interface.index()) {
+        state.present = true;
+        state.carrier_up = carrier_up;
+    }
 }
 
 pub fn publish_ethernet_address(interface: NetworkInterfaceId, ethernet_address: [u8; 6]) {
     let mut control = CONTROL.lock();
-    let state = &mut control[interface.index()];
-    state.present = true;
-    state.ethernet_address = ethernet_address;
-}
-
-/// Backwards-compatible primary-interface observation used by SSH policy.
-pub fn runtime_status() -> Ipv4RuntimeStatus {
-    runtime_status_on(NetworkInterfaceId::PRIMARY).unwrap_or(Ipv4RuntimeStatus::Unconfigured)
+    if let Some(state) = control.get_mut(interface.index()) {
+        state.present = true;
+        state.ethernet_address = ethernet_address;
+    }
 }
 
 pub fn runtime_status_on(interface: NetworkInterfaceId) -> Option<Ipv4RuntimeStatus> {
     let control = CONTROL.lock();
-    let state = control[interface.index()];
-    state.present.then_some(state.runtime)
+    control
+        .get(interface.index())
+        .filter(|state| state.present)
+        .map(|state| state.runtime)
+}
+
+pub fn runtime_status_for_listener(listener_id: u64) -> Option<Ipv4RuntimeStatus> {
+    let interface = LISTENER_INTERFACES
+        .lock()
+        .iter()
+        .find_map(|(candidate, interface)| (*candidate == listener_id).then_some(*interface))?;
+    runtime_status_on(interface)
 }
 
 fn update(
@@ -224,10 +269,12 @@ fn update(
     change: impl FnOnce(&mut NetworkConfiguration),
 ) -> Result<(), Status> {
     let mut control = CONTROL.lock();
-    let state = &mut control[interface.index()];
-    if !state.present {
+    let Some(state) = control
+        .get_mut(interface.index())
+        .filter(|state| state.present)
+    else {
         return Err(Status::Usage);
-    }
+    };
     change(&mut state.desired);
     state.revision = state.revision.wrapping_add(1).max(1);
     Ok(())
@@ -235,22 +282,23 @@ fn update(
 
 fn publish_runtime(interface: NetworkInterfaceId, revision: u64, status: Ipv4RuntimeStatus) {
     let mut control = CONTROL.lock();
-    let state = &mut control[interface.index()];
-    if revision == state.revision {
-        state.applied_revision = revision;
-        state.runtime = status;
+    if let Some(state) = control.get_mut(interface.index()) {
+        if revision == state.revision {
+            state.applied_revision = revision;
+            state.runtime = status;
+        }
     }
 }
 
 fn show_links(interface: Option<NetworkInterfaceId>) -> Result<String, Status> {
-    let control = *CONTROL.lock();
+    let control = CONTROL.lock().clone();
     render_selected(&control, interface, |id, state, output| {
         output.push_str(&format_link(id, state));
     })
 }
 
 fn show_addresses(interface: Option<NetworkInterfaceId>) -> Result<String, Status> {
-    let control = *CONTROL.lock();
+    let control = CONTROL.lock().clone();
     render_selected(&control, interface, |id, state, output| {
         output.push_str(&format_link(id, state));
         match state.runtime {
@@ -270,7 +318,7 @@ fn show_addresses(interface: Option<NetworkInterfaceId>) -> Result<String, Statu
 }
 
 fn show_routes(interface: Option<NetworkInterfaceId>) -> Result<String, Status> {
-    let control = *CONTROL.lock();
+    let control = CONTROL.lock().clone();
     render_selected(&control, interface, |id, state, output| {
         match state.runtime {
             Ipv4RuntimeStatus::Static(address) => {
@@ -285,24 +333,28 @@ fn show_routes(interface: Option<NetworkInterfaceId>) -> Result<String, Status> 
 }
 
 fn render_selected(
-    control: &[ControlState; MAX_NETWORK_INTERFACES],
+    control: &[ControlState],
     interface: Option<NetworkInterfaceId>,
     mut render: impl FnMut(NetworkInterfaceId, ControlState, &mut String),
 ) -> Result<String, Status> {
     let mut output = String::new();
     if let Some(interface) = interface {
-        let state = control[interface.index()];
-        if !state.present {
+        let Some(state) = control
+            .get(interface.index())
+            .copied()
+            .filter(|state| state.present)
+        else {
             return Err(Status::Usage);
-        }
+        };
         render(interface, state, &mut output);
         return Ok(output);
     }
 
     for (index, state) in control.iter().copied().enumerate() {
         if state.present {
-            let interface = NetworkInterfaceId::new(index as u8)
-                .expect("bounded control-table index is a valid interface");
+            let interface = NetworkInterfaceId::new(
+                u16::try_from(index).expect("registered interface index fits its identity"),
+            );
             render(interface, state, &mut output);
         }
     }
@@ -381,17 +433,19 @@ mod tests {
     }
 
     #[test]
-    fn secondary_interface_configuration_is_isolated_from_primary() {
-        let primary = NetworkInterfaceId::PRIMARY;
-        let secondary = NetworkInterfaceId::new(1).unwrap();
-        register_interface(primary);
-        register_interface(secondary);
-        publish_ethernet_address(primary, [0x02, 0, 0, 0, 0, 1]);
-        publish_ethernet_address(secondary, [0x02, 0, 0, 0, 1, 1]);
-        publish_carrier(primary, true);
-        publish_carrier(secondary, true);
+    fn dynamically_sized_interface_configuration_is_isolated() {
+        let first = NetworkInterfaceId::FIRST;
+        let second = NetworkInterfaceId::new(1);
+        let distant = NetworkInterfaceId::new(17);
+        assert!(register_interface(first, true));
+        assert!(register_interface(second, false));
+        assert!(register_interface(distant, false));
+        publish_ethernet_address(first, [0x02, 0, 0, 0, 0, 1]);
+        publish_ethernet_address(second, [0x02, 0, 0, 0, 1, 1]);
+        publish_carrier(first, true);
+        publish_carrier(second, true);
 
-        let primary_before = CONTROL.lock()[primary.index()].desired;
+        let first_before = CONTROL.lock()[first.index()].desired;
         vsh_ip(&args(&[
             "addr",
             "replace",
@@ -411,19 +465,21 @@ mod tests {
         ]))
         .unwrap();
 
-        let control = *CONTROL.lock();
-        assert_eq!(control[primary.index()].desired, primary_before);
+        let control = CONTROL.lock();
+        assert_eq!(control[first.index()].desired, first_before);
         assert_eq!(
-            control[secondary.index()].desired.method,
+            control[second.index()].desired.method,
             Ipv4Method::Static(
                 StaticIpv4Address::new([192, 168, 8, 20], 24)
                     .with_default_gateway([192, 168, 8, 1])
             )
         );
+        drop(control);
 
         let links = vsh_ip(&args(&["link", "show"])).unwrap();
         assert!(links.contains("net0"));
         assert!(links.contains("net1"));
+        assert!(links.contains("net17"));
         assert!(links.contains("02:00:00:00:01:01"));
         assert!(vsh_ip(&args(&["link", "show", "dev", "net2"])).is_err());
     }

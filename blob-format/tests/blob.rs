@@ -204,3 +204,63 @@ fn encoded_length_preflight_is_exact_across_tree_boundaries() {
         );
     }
 }
+
+fn fixture_pattern(len: usize, multiplier: usize, addend: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| ((index * multiplier + addend) % 251) as u8)
+        .collect()
+}
+
+#[test]
+fn frozen_m4_blobs_remain_byte_identical() {
+    const MAXIMUM_M4_CONTENT: usize = 360_352;
+    const MAXIMUM_M4_ENCODED: usize = 360 * 1024;
+
+    let cases: [(&str, u32, Vec<u8>, &[u8], &str); 4] = [
+        (
+            "empty",
+            0x4d34_0001,
+            vec![],
+            include_bytes!("fixtures/m4/empty.blob"),
+            "6a9a6ad612151e663835d1f29fb26a3b4f5ae59ef17787dd292df1b957e2e4b8",
+        ),
+        (
+            "one-leaf",
+            0x4d34_0002,
+            fixture_pattern(37, 17, 3),
+            include_bytes!("fixtures/m4/one-leaf.blob"),
+            "7b5e65a208b097fe36ce72d6ae47e0172a742740103d6620ed332907344f4290",
+        ),
+        (
+            "multi-leaf",
+            0x4d34_0003,
+            fixture_pattern(LEAF_SIZE * 3 + 17, 29, 7),
+            include_bytes!("fixtures/m4/multi-leaf.blob"),
+            "7b4044dbe5f78c6666c49e91c519e64cf81a9ec9b310154cfea9469805532f98",
+        ),
+        (
+            "maximum-m4",
+            0x4d34_0004,
+            fixture_pattern(MAXIMUM_M4_CONTENT, 43, 11),
+            include_bytes!("fixtures/m4/maximum-m4.blob"),
+            "61f308f72b3762308f8078f564cd28c4858b05496ea9b87f2a0b814e776f26c4",
+        ),
+    ];
+
+    for (name, object_kind, content, frozen, expected_root) in cases {
+        assert_eq!(
+            encode_blob(object_kind, &content).unwrap(),
+            frozen,
+            "{name}"
+        );
+        let view = BlobView::decode(frozen).unwrap();
+        assert_eq!(view.data(), content, "{name}");
+        assert_eq!(hex(&view.descriptor().root), expected_root, "{name}");
+        view.verify_all().unwrap();
+    }
+
+    assert_eq!(
+        include_bytes!("fixtures/m4/maximum-m4.blob").len(),
+        MAXIMUM_M4_ENCODED
+    );
+}

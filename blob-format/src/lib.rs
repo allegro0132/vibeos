@@ -9,6 +9,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use sha2::{Digest, Sha256};
 
 pub type Hash = [u8; HASH_SIZE];
 
@@ -507,7 +508,7 @@ fn leaf_hash(object_kind: u32, index: u32, chunk: &[u8]) -> Hash {
     hasher.update(&index.to_le_bytes());
     hasher.update(&(chunk.len() as u32).to_le_bytes());
     hasher.update(chunk);
-    hasher.finish()
+    hasher.finalize().into()
 }
 
 fn empty_hash(object_kind: u32, index: u32) -> Hash {
@@ -515,7 +516,7 @@ fn empty_hash(object_kind: u32, index: u32) -> Hash {
     hasher.update(EMPTY_DOMAIN);
     hasher.update(&object_kind.to_le_bytes());
     hasher.update(&index.to_le_bytes());
-    hasher.finish()
+    hasher.finalize().into()
 }
 
 fn node_hash(level: u32, left: &Hash, right: &Hash) -> Hash {
@@ -524,7 +525,7 @@ fn node_hash(level: u32, left: &Hash, right: &Hash) -> Hash {
     hasher.update(&level.to_le_bytes());
     hasher.update(left);
     hasher.update(right);
-    hasher.finish()
+    hasher.finalize().into()
 }
 
 fn blob_root(object_kind: u32, byte_len: u64, leaf_count: u32, tree_root: &Hash) -> Hash {
@@ -535,7 +536,7 @@ fn blob_root(object_kind: u32, byte_len: u64, leaf_count: u32, tree_root: &Hash)
     hasher.update(&(LEAF_SIZE as u32).to_le_bytes());
     hasher.update(&leaf_count.to_le_bytes());
     hasher.update(tree_root);
-    hasher.finish()
+    hasher.finalize().into()
 }
 
 fn tree_hash(bytes: &[u8], index: usize) -> Result<Hash, BlobError> {
@@ -597,17 +598,22 @@ fn get_u64(bytes: &[u8], offset: usize) -> Result<u64, BlobError> {
 pub fn sha256(input: &[u8]) -> Hash {
     let mut hasher = Sha256::new();
     hasher.update(input);
-    hasher.finish()
+    hasher.finalize().into()
 }
 
-struct Sha256 {
+/// The implementation replaced by RustCrypto in M7.0. It remains compiled only
+/// into this crate's unit tests as a differential compatibility oracle and is
+/// removed once the frozen M4 fixtures have passed the compatibility gate.
+#[cfg(test)]
+struct TestSha256 {
     state: [u32; 8],
     block: [u8; 64],
     block_len: usize,
     byte_len: u64,
 }
 
-impl Sha256 {
+#[cfg(test)]
+impl TestSha256 {
     const fn new() -> Self {
         Self {
             state: [
@@ -670,6 +676,7 @@ impl Sha256 {
     }
 }
 
+#[cfg(test)]
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -726,5 +733,26 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
     for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
         *slot = slot.wrapping_add(value);
+    }
+}
+
+#[cfg(test)]
+mod compatibility_oracle {
+    use super::{sha256, Hash, TestSha256};
+
+    fn oracle(input: &[u8]) -> Hash {
+        let mut hasher = TestSha256::new();
+        hasher.update(input);
+        hasher.finish()
+    }
+
+    #[test]
+    fn rustcrypto_matches_the_previous_implementation_at_block_boundaries() {
+        for len in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 65_537] {
+            let input: alloc::vec::Vec<u8> = (0..len)
+                .map(|index| ((index * 37 + 11) % 251) as u8)
+                .collect();
+            assert_eq!(sha256(&input), oracle(&input), "length {len}");
+        }
     }
 }

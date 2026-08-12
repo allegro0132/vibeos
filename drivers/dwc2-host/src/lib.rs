@@ -150,6 +150,7 @@ pub enum Error {
     StorageDataLength { expected: usize, actual: usize },
     StorageCswLength(usize),
     StorageCapacityTooLarge,
+    StorageOutOfRange,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -691,6 +692,18 @@ impl Controller {
         storage.block_size = Some(block_size);
         self.mass_storage = Some(storage);
         Ok(Some(storage))
+    }
+
+    pub fn read_sector(&mut self, sector: u64) -> Result<[u8; 512], Error> {
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let capacity = storage.capacity_sectors.ok_or(Error::StorageProtocol)?;
+        if sector >= capacity || sector > u64::from(u32::MAX) {
+            return Err(Error::StorageOutOfRange);
+        }
+        let cdb = read_10_cdb(sector as u32);
+        let mut bytes = [0; 512];
+        self.bot_command(&cdb, true, &mut bytes)?;
+        Ok(bytes)
     }
 
     pub const fn configuration(&self) -> Option<ConfigurationInfo> {
@@ -1733,6 +1746,14 @@ fn advance_pid(pid: DataPid, bytes: usize, max_packet: u16) -> DataPid {
     }
 }
 
+fn read_10_cdb(sector: u32) -> [u8; 10] {
+    let mut cdb = [0; 10];
+    cdb[0] = 0x28;
+    cdb[2..6].copy_from_slice(&sector.to_be_bytes());
+    cdb[7..9].copy_from_slice(&1u16.to_be_bytes());
+    cdb
+}
+
 const fn completed_length(direction_in: bool, requested: usize, remaining: usize) -> usize {
     // CV1800B's DWC2 4.20a buffer-DMA path leaves XFRSIZ unchanged for a
     // successfully completed OUT transaction. Transfer Complete is the OUT
@@ -2528,6 +2549,10 @@ mod tests {
         assert_eq!(advance_pid(DataPid::Data0, 31, 64), DataPid::Data1);
         assert_eq!(completed_length(false, 31, 31), 31);
         assert_eq!(completed_length(true, 512, 128), 384);
+        assert_eq!(
+            read_10_cdb(0x1234_5678),
+            [0x28, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 1, 0]
+        );
     }
 
     #[test]

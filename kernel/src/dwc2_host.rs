@@ -91,6 +91,14 @@ pub fn configure_mass_storage() -> Result<Option<MassStorageInfo>, Error> {
         .configure_mass_storage()
 }
 
+pub fn read_sector(sector: u64) -> Result<[u8; 512], Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .read_sector(sector)
+}
+
 pub async fn service_task() {
     let mut was_connected = CONTROLLER
         .lock()

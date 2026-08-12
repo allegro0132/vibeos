@@ -205,6 +205,21 @@ pub struct MassStorageInfo {
     pub block_size: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CdcEcmInfo {
+    pub configuration: u8,
+    pub control_interface: u8,
+    pub data_interface: u8,
+    pub data_alternate: u8,
+    pub endpoint_in: u8,
+    pub endpoint_out: u8,
+    pub max_packet_size_in: u16,
+    pub max_packet_size_out: u16,
+    pub status_endpoint: Option<u8>,
+    pub mac_string_index: u8,
+    pub mac_address: Option<[u8; 6]>,
+}
+
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
 pub const MAX_INTERFACE_ENDPOINTS: usize = 8;
 pub const MAX_DEVICE_CONFIGURATIONS: usize = 8;
@@ -225,6 +240,7 @@ pub struct InterfaceInfo {
     pub bulk_out: Option<u8>,
     pub bulk_in_max_packet_size: u16,
     pub bulk_out_max_packet_size: u16,
+    pub cdc_mac_string_index: Option<u8>,
     pub endpoints: [Option<EndpointInfo>; MAX_INTERFACE_ENDPOINTS],
 }
 
@@ -400,6 +416,8 @@ pub struct Controller {
     keyboard_target: Option<TransferTarget>,
     mass_storage: Option<MassStorageInfo>,
     storage_target: Option<TransferTarget>,
+    cdc_ecm: Option<CdcEcmInfo>,
+    cdc_ecm_target: Option<TransferTarget>,
     storage_pid_in: DataPid,
     storage_pid_out: DataPid,
     storage_tag: u32,
@@ -643,6 +661,8 @@ impl Controller {
             keyboard_target: None,
             mass_storage: None,
             storage_target: None,
+            cdc_ecm: None,
+            cdc_ecm_target: None,
             storage_pid_in: DataPid::Data0,
             storage_pid_out: DataPid::Data0,
             storage_tag: 1,
@@ -711,6 +731,17 @@ impl Controller {
         self.mass_storage
     }
 
+    pub const fn cdc_ecm(&self) -> Option<CdcEcmInfo> {
+        self.cdc_ecm
+    }
+
+    pub const fn cdc_ecm_device_address(&self) -> Option<u8> {
+        match self.cdc_ecm_target {
+            Some(target) => Some(target.address),
+            None => None,
+        }
+    }
+
     pub const fn storage_device_address(&self) -> Option<u8> {
         match self.storage_target {
             Some(target) => Some(target.address),
@@ -762,6 +793,72 @@ impl Controller {
         self.storage_target = None;
         delay_ms(self.timebase_hz, self.time, 100);
         Ok(true)
+    }
+
+    /// Select the standards-based CDC-ECM configuration exposed by an
+    /// RTL8153 and activate its data-interface alternate setting.
+    pub fn configure_cdc_ecm(&mut self) -> Result<Option<CdcEcmInfo>, Error> {
+        let Some(mut ecm) = self.cdc_ecm else {
+            return Ok(None);
+        };
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(ecm.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x01,
+                request: 11,
+                value: u16::from(ecm.data_alternate),
+                index: u16::from(ecm.data_interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        ecm.mac_address = self.read_mac_string(ecm.mac_string_index)?;
+        self.cdc_ecm = Some(ecm);
+        Ok(Some(ecm))
+    }
+
+    fn read_mac_string(&mut self, string_index: u8) -> Result<Option<[u8; 6]>, Error> {
+        if string_index == 0 {
+            return Ok(None);
+        }
+        let mut languages = [0; 4];
+        let language_length = self.control_transfer(
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: 3 << 8,
+                index: 0,
+                length: languages.len() as u16,
+            },
+            &mut languages,
+        )?;
+        if language_length < 4 || languages[1] != 3 {
+            return Err(Error::InvalidDescriptor);
+        }
+        let language = u16::from_le_bytes([languages[2], languages[3]]);
+        let mut descriptor = [0; 64];
+        let length = self.control_transfer(
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: (3 << 8) | u16::from(string_index),
+                index: language,
+                length: descriptor.len() as u16,
+            },
+            &mut descriptor,
+        )?;
+        parse_mac_string_descriptor(&descriptor[..length]).map(Some)
     }
 
     fn device_at_address(&self, address: u8) -> Option<DeviceInfo> {
@@ -937,6 +1034,8 @@ impl Controller {
             self.keyboard_target = None;
             self.mass_storage = None;
             self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
             self.device_address = 0;
             return Ok(None);
         }
@@ -1005,6 +1104,8 @@ impl Controller {
         self.keyboard_target = None;
         self.mass_storage = None;
         self.storage_target = None;
+        self.cdc_ecm = None;
+        self.cdc_ecm_target = None;
         Ok(Some(info))
     }
 
@@ -1016,6 +1117,8 @@ impl Controller {
             self.keyboard_target = None;
             self.mass_storage = None;
             self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
             return Ok(None);
         };
         if !self.connected() {
@@ -1023,6 +1126,8 @@ impl Controller {
             self.keyboard_target = None;
             self.mass_storage = None;
             self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
             return Ok(None);
         }
         let transfer_target = self.current_target();
@@ -1035,6 +1140,8 @@ impl Controller {
         for index in 1..usize::from(target.configuration_count).min(MAX_DEVICE_CONFIGURATIONS) {
             self.configurations[index] = Some(self.read_configuration(index as u8)?.0);
         }
+        self.cdc_ecm = find_cdc_ecm(self.configurations);
+        self.cdc_ecm_target = self.cdc_ecm.map(|_| transfer_target);
         self.mass_storage = find_mass_storage(configuration);
         self.storage_target = self.mass_storage.map(|_| transfer_target);
         self.report_descriptor = None;
@@ -1192,6 +1299,8 @@ impl Controller {
         let mut selected_storage = None;
         let mut selected_storage_target = None;
         let mut selected_storage_configuration = None;
+        let mut selected_cdc_ecm = None;
+        let mut selected_cdc_ecm_target = None;
 
         let mut child_index = 0;
         while child_index < MAX_HUB_CHILDREN {
@@ -1207,6 +1316,8 @@ impl Controller {
             self.keyboard_target = None;
             self.mass_storage = None;
             self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
 
             self.configure_hid_keyboard()?;
             let is_hub = child.device.device_class == USB_CLASS_HUB
@@ -1253,6 +1364,10 @@ impl Controller {
                 selected_storage_target = self.storage_target;
                 selected_storage_configuration = self.configuration;
             }
+            if selected_cdc_ecm.is_none() && self.cdc_ecm.is_some() {
+                selected_cdc_ecm = self.cdc_ecm;
+                selected_cdc_ecm_target = self.cdc_ecm_target;
+            }
             child_index += 1;
         }
 
@@ -1266,8 +1381,13 @@ impl Controller {
         self.report_descriptor = selected_report_descriptor;
         self.mass_storage = selected_storage;
         self.storage_target = selected_storage_target;
+        self.cdc_ecm = selected_cdc_ecm;
+        self.cdc_ecm_target = selected_cdc_ecm_target;
         self.configuration = selected_keyboard_configuration.or(selected_storage_configuration);
-        if let Some(target) = selected_keyboard_target.or(selected_storage_target) {
+        if let Some(target) = selected_keyboard_target
+            .or(selected_storage_target)
+            .or(selected_cdc_ecm_target)
+        {
             self.select_target(target);
         }
         Ok(selected_keyboard)
@@ -2350,6 +2470,7 @@ fn parse_hid_keyboard_configuration(
                     bulk_out: None,
                     bulk_in_max_packet_size: 0,
                     bulk_out_max_packet_size: 0,
+                    cdc_mac_string_index: None,
                     endpoints: [None; MAX_INTERFACE_ENDPOINTS],
                 };
                 current_interface = configuration.interfaces.iter().position(Option::is_none);
@@ -2377,6 +2498,13 @@ fn parse_hid_keyboard_configuration(
                                 ]);
                             }
                         }
+                    }
+                }
+            }
+            0x24 if length >= 4 && descriptors[offset + 2] == 0x0f => {
+                if let Some(index) = current_interface {
+                    if let Some(info) = configuration.interfaces[index].as_mut() {
+                        info.cdc_mac_string_index = Some(descriptors[offset + 3]);
                     }
                 }
             }
@@ -2468,6 +2596,77 @@ fn find_mass_storage(configuration: ConfigurationInfo) -> Option<MassStorageInfo
                 block_size: None,
             })
         })
+}
+
+fn find_cdc_ecm(
+    configurations: [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS],
+) -> Option<CdcEcmInfo> {
+    configurations
+        .into_iter()
+        .flatten()
+        .find_map(|configuration| {
+            let control = configuration
+                .interfaces
+                .into_iter()
+                .flatten()
+                .find(|interface| interface.class == 0x02 && interface.subclass == 0x06)?;
+            let data = configuration
+                .interfaces
+                .into_iter()
+                .flatten()
+                .find(|interface| {
+                    interface.class == 0x0a
+                        && interface.alternate != 0
+                        && interface.bulk_in.is_some()
+                        && interface.bulk_out.is_some()
+                })?;
+            Some(CdcEcmInfo {
+                configuration: configuration.value,
+                control_interface: control.number,
+                data_interface: data.number,
+                data_alternate: data.alternate,
+                endpoint_in: data.bulk_in?,
+                endpoint_out: data.bulk_out?,
+                max_packet_size_in: data.bulk_in_max_packet_size,
+                max_packet_size_out: data.bulk_out_max_packet_size,
+                status_endpoint: control.interrupt_in,
+                mac_string_index: control.cdc_mac_string_index.unwrap_or(0),
+                mac_address: None,
+            })
+        })
+}
+
+fn parse_mac_string_descriptor(descriptor: &[u8]) -> Result<[u8; 6], Error> {
+    if descriptor.len() < 26 || descriptor[1] != 3 || usize::from(descriptor[0]) > descriptor.len()
+    {
+        return Err(Error::InvalidDescriptor);
+    }
+    let mut nibbles = [0; 12];
+    let mut count = 0;
+    let (pairs, remainder) = descriptor[2..usize::from(descriptor[0])].as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(Error::InvalidDescriptor);
+    }
+    for pair in pairs {
+        if pair[1] != 0 || count == nibbles.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        nibbles[count] = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            b'A'..=b'F' => pair[0] - b'A' + 10,
+            _ => return Err(Error::InvalidDescriptor),
+        };
+        count += 1;
+    }
+    if count != nibbles.len() {
+        return Err(Error::InvalidDescriptor);
+    }
+    let mut mac = [0; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        *byte = nibbles[index * 2] << 4 | nibbles[index * 2 + 1];
+    }
+    Ok(mac)
 }
 
 const fn is_rtl8151_install_mode(device: DeviceInfo) -> bool {
@@ -3096,6 +3295,7 @@ mod tests {
                 bulk_out: None,
                 bulk_in_max_packet_size: 0,
                 bulk_out_max_packet_size: 0,
+                cdc_mac_string_index: None,
                 endpoints: [
                     Some(EndpointInfo {
                         address: 0x81,
@@ -3165,6 +3365,51 @@ mod tests {
         );
         assert!(!bot_requires_reset_recovery(Error::StorageCommandFailed(1)));
         assert!(bot_requires_reset_recovery(Error::StorageCommandFailed(2)));
+    }
+
+    #[test]
+    fn finds_cdc_ecm_alternate_and_parses_mac_string() {
+        let descriptors = [
+            9, 2, 88, 0, 2, 2, 0, 0x80, 50, // configuration
+            8, 11, 0, 2, 2, 6, 0, 0, // interface association
+            9, 4, 0, 0, 1, 2, 6, 0, 0, // CDC-ECM control
+            5, 0x24, 0, 0x10, 0x01, // CDC header
+            5, 0x24, 6, 0, 1, // CDC union
+            13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, // Ethernet
+            7, 5, 0x83, 3, 16, 0, 8, // status interrupt
+            9, 4, 1, 0, 0, 0x0a, 0, 0, 0, // inactive data alt
+            9, 4, 1, 1, 2, 0x0a, 0, 0, 0, // active data alt
+            7, 5, 0x81, 2, 0, 2, 0, // bulk IN 512
+            7, 5, 0x02, 2, 0, 2, 0, // bulk OUT 512
+        ];
+        let (configuration, keyboard) =
+            parse_hid_keyboard_configuration(&descriptors, Speed::High).unwrap();
+        assert_eq!(keyboard, None);
+        let mut configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+        configurations[1] = Some(configuration);
+        assert_eq!(
+            find_cdc_ecm(configurations),
+            Some(CdcEcmInfo {
+                configuration: 2,
+                control_interface: 0,
+                data_interface: 1,
+                data_alternate: 1,
+                endpoint_in: 0x81,
+                endpoint_out: 0x02,
+                max_packet_size_in: 512,
+                max_packet_size_out: 512,
+                status_endpoint: Some(0x83),
+                mac_string_index: 4,
+                mac_address: None,
+            })
+        );
+        assert_eq!(
+            parse_mac_string_descriptor(&[
+                26, 3, b'0', 0, b'2', 0, b'1', 0, b'2', 0, b'3', 0, b'4', 0, b'5', 0, b'6', 0,
+                b'7', 0, b'8', 0, b'9', 0, b'a', 0,
+            ]),
+            Ok([0x02, 0x12, 0x34, 0x56, 0x78, 0x9a])
+        );
     }
 
     #[test]

@@ -124,6 +124,10 @@ pub fn hub_topology_changed() -> Result<bool, Error> {
 }
 
 pub async fn service_task() {
+    // A hub present during board power-on can still be finishing its own reset
+    // and downstream power sequencing when the kernel initializes DWC2. Defer
+    // the first enumeration until the scheduler and board power rails settle.
+    crate::exec::sleep_ms(500).await;
     let mut was_connected = CONTROLLER
         .lock()
         .as_ref()

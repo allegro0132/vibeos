@@ -285,6 +285,13 @@ enum KeyboardLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HubPowerMode {
+    Ganged,
+    Individual,
+    AlwaysOn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HidInputBatch {
     bytes: [u8; HID_INPUT_BYTES],
     length: usize,
@@ -1196,16 +1203,23 @@ impl Controller {
             },
             &mut descriptor,
         )?;
-        let (ports, power_good_ms) = parse_hub_descriptor(&descriptor[..length])?;
-
-        for port in 1..=ports {
-            self.hub_port_feature(port, true, USB_PORT_FEAT_POWER)?;
+        let (ports, power_good_ms, power_mode) = parse_hub_descriptor(&descriptor[..length])?;
+        let settle_ms = u64::from(power_good_ms.max(20));
+        match power_mode {
+            HubPowerMode::Ganged => {
+                self.hub_port_feature(1, true, USB_PORT_FEAT_POWER)?;
+                delay_ms(self.timebase_hz, self.time, settle_ms);
+            }
+            HubPowerMode::Individual => {
+                for port in 1..=ports {
+                    self.hub_port_feature(port, true, USB_PORT_FEAT_POWER)?;
+                    delay_ms(self.timebase_hz, self.time, settle_ms);
+                }
+            }
+            HubPowerMode::AlwaysOn => {
+                delay_ms(self.timebase_hz, self.time, settle_ms);
+            }
         }
-        delay_ms(
-            self.timebase_hz,
-            self.time,
-            u64::from(power_good_ms.max(20)),
-        );
 
         Ok(HubInfo {
             address: self.device_address,
@@ -2139,7 +2153,7 @@ const fn completed_length(direction_in: bool, requested: usize, remaining: usize
     }
 }
 
-fn parse_hub_descriptor(descriptor: &[u8]) -> Result<(u8, u16), Error> {
+fn parse_hub_descriptor(descriptor: &[u8]) -> Result<(u8, u16, HubPowerMode), Error> {
     if descriptor.len() < 7
         || usize::from(descriptor[0]) > descriptor.len()
         || descriptor[1] != USB_DESCRIPTOR_HUB as u8
@@ -2148,7 +2162,13 @@ fn parse_hub_descriptor(descriptor: &[u8]) -> Result<(u8, u16), Error> {
     {
         return Err(Error::InvalidDescriptor);
     }
-    Ok((descriptor[2], u16::from(descriptor[5]) * 2))
+    let characteristics = u16::from_le_bytes([descriptor[3], descriptor[4]]);
+    let power_mode = match characteristics & 0x3 {
+        0 => HubPowerMode::Ganged,
+        1 => HubPowerMode::Individual,
+        _ => HubPowerMode::AlwaysOn,
+    };
+    Ok((descriptor[2], u16::from(descriptor[5]) * 2, power_mode))
 }
 
 const fn hub_port_speed(status: u16) -> Speed {
@@ -2839,7 +2859,15 @@ mod tests {
     #[test]
     fn parses_usb2_hub_ports_power_delay_and_child_speed() {
         let descriptor = [9, 0x29, 4, 0, 0, 50, 0, 0xff, 0xff];
-        assert_eq!(parse_hub_descriptor(&descriptor), Ok((4, 100)));
+        assert_eq!(
+            parse_hub_descriptor(&descriptor),
+            Ok((4, 100, HubPowerMode::Ganged))
+        );
+        let individual = [9, 0x29, 4, 1, 0, 10, 0, 0xff, 0xff];
+        assert_eq!(
+            parse_hub_descriptor(&individual),
+            Ok((4, 20, HubPowerMode::Individual))
+        );
         assert_eq!(hub_port_speed(USB_PORT_STAT_LOW_SPEED), Speed::Low);
         assert_eq!(hub_port_speed(USB_PORT_STAT_HIGH_SPEED), Speed::High);
         assert_eq!(hub_port_speed(USB_PORT_STAT_ENABLE), Speed::Full);

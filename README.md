@@ -15,8 +15,11 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/BLUEPRINT.md](docs/BLUEPRINT.md)** — architecture, the four bets, the
   capability model's invariants, the compiler's confinement argument and where it
   leaks, and the trust model.
-- **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M7,
   workstreams, testing strategy, metrics, and the risk register.
+- **[docs/STORAGE_V2_ROADMAP.md](docs/STORAGE_V2_ROADMAP.md)** — the post-v1
+  managed-block Blob CAS plan: `sha2`, segment/checkpoint format, root-based GC,
+  online growth, quotas, scrub, and M4 migration.
 - **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
   Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
   cancellation, and fail-closed admission.

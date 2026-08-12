@@ -94,6 +94,8 @@ M1 Foundations ──┬─► M2 Confinement ──┬─► M3 Memory & Types
                                       │         M6 MMU integrity
                                       └──────┬──────┘
                                            v1.0
+                                             │
+                              M7 scalable Blob CAS storage
 ```
 
 M2 comes before M3 because adding language features to a compiler whose generated
@@ -785,6 +787,22 @@ exactly. Every QEMU boot must also publish the `.rodata`/4 MiB COW-pool marker.
 5. Programs survive reboot with exactly the authority that was persisted.
 6. Published measurements for every number in §5.
 
+### M7 — Scalable capability-addressed storage (post-v1)
+
+M7 replaces the fixed 512-sector M4 journal backend with a managed-block-device
+Blob CAS backed by immutable segments, dual checkpoints, root-based garbage
+collection, quotas, scrub, and capability-scoped online growth. It preserves the
+existing `StoredObject` API and keeps content digests separate from authority.
+The logical Merkle format moves to the pure-Rust `sha2` implementation without
+changing any encoded byte or root.
+
+The ordered stages are M7.0 SHA compatibility, M7.1 block-range and geometry
+contracts, M7.2 canonical segment format, M7.3 append-only segment storage, M7.4
+streaming CAS, M7.5 GC, M7.6 growth/quotas/scrub, and M7.7 M4 migration and
+cutover. Raw NOR/NAND, paths, chunk-level deduplication, encryption, multi-device
+RAID, and online shrink are outside this milestone. The complete dependency and
+acceptance plan is in [STORAGE_V2_ROADMAP.md](STORAGE_V2_ROADMAP.md).
+
 ---
 
 ## 3. Workstreams
@@ -796,7 +814,7 @@ The continuing tracks after the partial M3 milestone are:
 | **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
 | **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
 | **Compiler** | `compiler`, `kernel/rustc`, trampoline | Resolved-cap lease semantics are complete; 3.4–3.6 remain evidence-driven language-track work rather than a persistence prerequisite |
-| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.5 durable model, virtio block/network, object store, fixed persistent CSpace, and verified source/binary persistence |
+| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.5 durable model followed by M7 segment/checkpoint storage, GC, growth, and migration |
 | **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 
 The lifecycle track is the integration spine: a driver, persisted program, or remote

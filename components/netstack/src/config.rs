@@ -30,6 +30,7 @@ struct ControlState {
     applied_revision: u64,
     runtime: Ipv4RuntimeStatus,
     carrier_up: bool,
+    ethernet_address: [u8; 6],
 }
 
 /// Image-selected boot policy for the network service.
@@ -55,6 +56,7 @@ static CONTROL: SpinLock<ControlState> = SpinLock::new(ControlState {
     applied_revision: 0,
     runtime: Ipv4RuntimeStatus::Unconfigured,
     carrier_up: false,
+    ethernet_address: DEFAULT_MAC,
 });
 
 pub fn vsh_ip(args: &[String]) -> Result<String, Status> {
@@ -156,6 +158,10 @@ pub fn publish_carrier(carrier_up: bool) {
     CONTROL.lock().carrier_up = carrier_up;
 }
 
+pub fn publish_ethernet_address(ethernet_address: [u8; 6]) {
+    CONTROL.lock().ethernet_address = ethernet_address;
+}
+
 /// Return the address state published by the independently running stack.
 ///
 /// This is deliberately observation-only: services may use it to announce the
@@ -192,7 +198,7 @@ fn show_link() -> String {
     };
     format!(
         "1: {PRIMARY_INTERFACE}: <{flags}> mtu 1500 state {state}\n    link/ether {} brd ff:ff:ff:ff:ff:ff\n",
-        format_mac(DEFAULT_MAC)
+        format_mac(control.ethernet_address)
     )
 }
 

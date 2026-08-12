@@ -75,6 +75,10 @@ impl Platform for NetstackPlatform {
             quarantined: info.quarantined,
             session_epoch: info.session_epoch,
             phy_link_up: crate::net_device::carrier_up(&info),
+            ethernet_address: crate::dwc2_host::snapshot()
+                .and_then(|snapshot| snapshot.cdc_ecm)
+                .and_then(|ecm| ecm.mac_address)
+                .unwrap_or(crate::net_device::GUEST_MAC),
         })
     }
 

@@ -35,6 +35,7 @@ pub struct NetworkInfo {
     pub quarantined: bool,
     pub session_epoch: u64,
     pub phy_link_up: bool,
+    pub ethernet_address: [u8; 6],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +63,6 @@ pub trait Platform: Sync {
 
 type Space = dyn Platform;
 
-const GUEST_MAC: [u8; 6] = config::DEFAULT_MAC;
 const GUEST_IPV4: [u8; 4] = config::DEFAULT_IPV4;
 const GATEWAY_IPV4: [u8; 4] = config::DEFAULT_GATEWAY;
 const PREFIX_LEN: u8 = config::DEFAULT_PREFIX_LEN;
@@ -142,6 +142,7 @@ pub async fn task(
             return;
         };
         config::publish_carrier(info.online && info.phy_link_up);
+        config::publish_ethernet_address(info.ethernet_address);
         if info.quarantined {
             return;
         }
@@ -160,7 +161,7 @@ pub async fn task(
                 Err(_) => return,
             };
             let config = Ipv4StackConfig::new(
-                GUEST_MAC,
+                info.ethernet_address,
                 GUEST_IPV4,
                 PREFIX_LEN,
                 TCP_TEST_SEED ^ stamp.device_epoch(),

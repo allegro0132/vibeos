@@ -166,6 +166,50 @@ impl AllocationV2 {
         &self.bitmap
     }
 
+    /// Publish-time growth constructor. It preserves the complete old prefix,
+    /// changes exactly one old Free carrier to Allocated, and creates an exact
+    /// all-Free suffix without cloning an intermediate enlarged map.
+    pub(crate) fn grow_free_suffix(
+        &self,
+        checkpoint_generation: u64,
+        next_segment_generation: u64,
+        admitted_segments: u64,
+        carrier: u64,
+    ) -> Result<Self, AllocationV2Error> {
+        validate_allocation(self)?;
+        if admitted_segments <= self.admitted_segments
+            || admitted_segments > MAX_ALLOCATION_V2_SEGMENTS as u64
+            || checkpoint_generation <= self.checkpoint_generation
+            || next_segment_generation
+                != self
+                    .next_segment_generation
+                    .checked_add(1)
+                    .ok_or(AllocationV2Error::ArithmeticOverflow)?
+            || !self.retired.is_empty()
+            || self.segment_state(carrier) != Some(SegmentAllocation::Free)
+        {
+            return Err(AllocationV2Error::InvalidTransition);
+        }
+        let new_len = bitmap_len(admitted_segments)?;
+        let mut bitmap = vec![0_u8; new_len];
+        bitmap[..self.bitmap.len()].copy_from_slice(&self.bitmap);
+        replace_raw_state(
+            &mut bitmap,
+            carrier as usize,
+            SegmentAllocation::Allocated as u8,
+        );
+        let grown = Self {
+            checkpoint_generation,
+            admitted_segments,
+            next_segment_generation,
+            cleaner_reserve_segments: self.cleaner_reserve_segments,
+            bitmap,
+            retired: Vec::new(),
+        };
+        validate_allocation(&grown)?;
+        Ok(grown)
+    }
+
     pub(crate) fn allocated_bytes(&self) -> Option<usize> {
         self.bitmap.capacity().checked_add(
             self.retired

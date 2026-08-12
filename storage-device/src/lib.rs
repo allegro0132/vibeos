@@ -62,10 +62,12 @@ impl DeviceSession {
     }
 }
 
-/// Exact authority over a non-empty half-open range of logical blocks.
+/// Exact descriptor for a non-empty half-open range of logical blocks.
 ///
 /// Fields are private so safe callers can narrow a received value only through
-/// [`BlockRange::attenuate`]. Trusted image policy is the sole root minter.
+/// [`BlockRange::attenuate`]. A root descriptor is an unsafe trusted-policy
+/// boundary; online-growth APIs additionally require a session-bound
+/// [`BlockRangeCapability`] rather than accepting this descriptor alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockRange {
     device_id: DeviceId,
@@ -74,8 +76,14 @@ pub struct BlockRange {
 }
 
 impl BlockRange {
-    /// Mint a root range from trusted discovery/provisioning policy.
-    pub const fn root(
+    /// Mint a root descriptor from trusted discovery/provisioning policy.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the device's root provisioning policy and must
+    /// ensure independently minted roots do not alias. Safe code can only
+    /// attenuate a root it has already received.
+    pub const unsafe fn root(
         device_id: DeviceId,
         first_block: u64,
         block_count: u64,
@@ -129,7 +137,11 @@ impl BlockRange {
         let Some(first_block) = self.first_block.checked_add(relative_first) else {
             return Err(ContractError::ArithmeticOverflow);
         };
-        Self::root(self.device_id, first_block, block_count)
+        Ok(Self {
+            device_id: self.device_id,
+            first_block,
+            block_count,
+        })
     }
 
     pub const fn contains(self, other: Self) -> bool {
@@ -169,6 +181,135 @@ impl BlockRange {
             return Err(ContractError::ArithmeticOverflow);
         };
         Ok((first, length))
+    }
+}
+
+/// Trusted, non-cloneable issuer for one boot/device-incarnation range tree.
+///
+/// A provisioner derives sibling range capabilities from one parent without
+/// allowing a holder of a child to widen it or manufacture another sibling.
+pub struct BlockRangeProvisioner {
+    parent: BlockRange,
+    session: DeviceSession,
+}
+
+impl fmt::Debug for BlockRangeProvisioner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BlockRangeProvisioner(<opaque>)")
+    }
+}
+
+impl BlockRangeProvisioner {
+    /// Establish one root range tree for the current device incarnation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be trusted discovery/provisioning policy and must own
+    /// the named root exclusively for this authority domain.
+    pub unsafe fn new(
+        session: DeviceSession,
+        first_block: u64,
+        block_count: u64,
+    ) -> Result<Self, ContractError> {
+        // SAFETY: inherited from this constructor's trusted-policy contract.
+        let parent = unsafe { BlockRange::root(session.device_id(), first_block, block_count)? };
+        Ok(Self { parent, session })
+    }
+
+    /// Derive one exact child. This can only shrink the provisioner's parent.
+    pub fn derive(
+        &self,
+        relative_first: u64,
+        block_count: u64,
+    ) -> Result<BlockRangeCapability, ContractError> {
+        Ok(BlockRangeCapability {
+            parent: self.parent,
+            range: self.parent.attenuate(relative_first, block_count)?,
+            session: self.session,
+        })
+    }
+}
+
+/// Session-bound authority over one exact logical-block range.
+///
+/// The parent and session fields are private. A holder may copy or attenuate
+/// this capability, but cannot widen it or derive a disjoint sibling.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct BlockRangeCapability {
+    parent: BlockRange,
+    range: BlockRange,
+    session: DeviceSession,
+}
+
+impl fmt::Debug for BlockRangeCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BlockRangeCapability(<opaque>)")
+    }
+}
+
+impl BlockRangeCapability {
+    pub const fn range(self) -> BlockRange {
+        self.range
+    }
+
+    pub const fn session(self) -> DeviceSession {
+        self.session
+    }
+
+    pub fn attenuate(self, relative_first: u64, block_count: u64) -> Result<Self, ContractError> {
+        Ok(Self {
+            parent: self.parent,
+            range: self.range.attenuate(relative_first, block_count)?,
+            session: self.session,
+        })
+    }
+
+    pub const fn same_authority_domain(self, other: Self) -> bool {
+        self.parent.device_id.get() == other.parent.device_id.get()
+            && self.parent.first_block == other.parent.first_block
+            && self.parent.block_count == other.parent.block_count
+            && self.session.device_id.get() == other.session.device_id.get()
+            && self.session.incarnation == other.session.incarnation
+    }
+
+    /// Join one exact adjacent sibling from the same root/session domain.
+    pub const fn join_adjacent(self, sibling: Self) -> Result<Self, ContractError> {
+        if !self.same_authority_domain(sibling) {
+            return if self.session.device_id.get() != sibling.session.device_id.get() {
+                Err(ContractError::WrongDevice)
+            } else if self.session.incarnation != sibling.session.incarnation {
+                Err(ContractError::StaleIncarnation)
+            } else {
+                Err(ContractError::OutsideRange)
+            };
+        }
+        if self.range.end_block() != sibling.range.first_block {
+            return if self.range.overlaps(sibling.range) {
+                Err(ContractError::OverlappingRange)
+            } else {
+                Err(ContractError::OutsideRange)
+            };
+        }
+        let block_count = match self
+            .range
+            .block_count
+            .checked_add(sibling.range.block_count)
+        {
+            Some(value) => value,
+            None => return Err(ContractError::ArithmeticOverflow),
+        };
+        let relative_first = match self.range.first_block.checked_sub(self.parent.first_block) {
+            Some(value) => value,
+            None => return Err(ContractError::OutsideRange),
+        };
+        Ok(Self {
+            parent: self.parent,
+            range: match self.parent.attenuate(relative_first, block_count) {
+                Ok(value) => value,
+                Err(error) => return Err(error),
+            },
+            session: self.session,
+        })
     }
 }
 
@@ -544,17 +685,17 @@ pub fn validate_request(
         .translate(relative_first, u64::from(block_count))?;
     match operation {
         Operation::Read | Operation::Write { .. } if buffer_len != byte_len => {
-            return Err(ContractError::WrongBufferLength)
+            return Err(ContractError::WrongBufferLength);
         }
         Operation::Discard if buffer_len != 0 => return Err(ContractError::WrongBufferLength),
         _ => {}
     }
     match operation {
         Operation::Write { .. } | Operation::Discard if current.read_only => {
-            return Err(ContractError::ReadOnly)
+            return Err(ContractError::ReadOnly);
         }
         Operation::Write { fua: true } if !geometry.supports_fua => {
-            return Err(ContractError::FuaUnsupported)
+            return Err(ContractError::FuaUnsupported);
         }
         Operation::Discard => {
             let Some(discard) = geometry.discard else {

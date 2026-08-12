@@ -36,7 +36,15 @@ use crate::codec::{
     CATALOG_SNAPSHOT_HEADER_LEN,
 };
 use crate::device::PageDevice;
+use crate::maintenance::{
+    MaintenanceDomain, MaintenanceOperation, MaintenanceOperationLease, StoreMaintenance,
+    StoreMaintenanceProvisioner,
+};
 use crate::pins::{PinRegistry, SharedPinRegistry};
+use crate::quota::{
+    PrincipalQuotaTable, PrincipalQuotaUsage, QuotaDiagnostics, QuotaError, StoragePrincipal,
+    StorageQuotaProvisioner, DEFAULT_MAX_STORAGE_PRINCIPALS,
+};
 use crate::root_codec::{
     decode_persistent_root_set, PersistentRootEntry, PersistentRootSet, PERSISTENT_ROOT_ENTRY_LEN,
     PERSISTENT_ROOT_SET_HEADER_LEN,
@@ -66,6 +74,8 @@ pub struct StoreRuntimeContext {
     pub(crate) pins: SharedStorePinRegistry,
     published_generation: alloc::sync::Arc<AtomicU64>,
     typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
+    maintenance_domain: alloc::sync::Arc<MaintenanceDomain>,
+    pub(crate) quota: Option<PrincipalQuotaTable>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +83,7 @@ pub enum RuntimeContextError {
     TooManyTypedReferenceKinds,
     InvalidTypedReferenceKind,
     AllocationFailed,
+    Quota(QuotaError),
 }
 
 impl fmt::Display for RuntimeContextError {
@@ -81,16 +92,41 @@ impl fmt::Display for RuntimeContextError {
             Self::TooManyTypedReferenceKinds => "too many typed-reference ObjectKinds",
             Self::InvalidTypedReferenceKind => "typed-reference ObjectKind must be non-zero",
             Self::AllocationFailed => "typed-reference policy allocation failed",
+            Self::Quota(error) => return write!(formatter, "{error}"),
         })
     }
 }
 
 impl core::error::Error for RuntimeContextError {}
 
+impl From<QuotaError> for RuntimeContextError {
+    fn from(value: QuotaError) -> Self {
+        Self::Quota(value)
+    }
+}
+
 impl StoreRuntimeContext {
     pub fn new() -> Self {
         Self::with_typed_reference_kinds(&[])
             .expect("empty Storage V2 typed-reference policy must be valid")
+    }
+
+    /// Build one trusted runtime together with its sole maintenance root
+    /// provisioner. The provisioner is intentionally non-cloneable and is not
+    /// reproduced by [`Self::clone`] or [`SegmentStore::runtime_context`].
+    pub fn with_maintenance_provisioner() -> (Self, StoreMaintenanceProvisioner) {
+        Self::with_typed_reference_kinds_and_maintenance_provisioner(&[])
+            .expect("empty Storage V2 typed-reference policy must be valid")
+    }
+
+    /// Trusted-policy variant which also installs the typed-reference parser
+    /// allowlist used by GC and scrub.
+    pub fn with_typed_reference_kinds_and_maintenance_provisioner(
+        kinds: &[u32],
+    ) -> Result<(Self, StoreMaintenanceProvisioner), RuntimeContextError> {
+        let context = Self::with_typed_reference_kinds(kinds)?;
+        let provisioner = StoreMaintenanceProvisioner::new(context.maintenance_domain.clone());
+        Ok((context, provisioner))
     }
 
     /// Constructs one trusted runtime policy for ObjectKinds whose immutable
@@ -117,7 +153,44 @@ impl StoreRuntimeContext {
             pins,
             published_generation: alloc::sync::Arc::new(AtomicU64::new(0)),
             typed_reference_kinds: alloc::sync::Arc::new(typed_reference_kinds),
+            maintenance_domain: alloc::sync::Arc::new(MaintenanceDomain::new()),
+            quota: None,
         })
+    }
+
+    /// Build a boot-local governed storage runtime and its sole trusted
+    /// principal provisioner. A fresh process reboot creates a fresh domain;
+    /// M7.6 intentionally does not persist principal attribution in media.
+    pub fn governed() -> Result<(Self, StorageQuotaProvisioner), RuntimeContextError> {
+        Self::governed_with_typed_reference_kinds(&[])
+    }
+
+    /// Build one governed runtime while returning both trusted provisioners.
+    /// This is the production composition point for quota-governed stores
+    /// which also expose separately attenuated maintenance resources.
+    pub fn governed_with_maintenance_provisioner(
+    ) -> Result<(Self, StorageQuotaProvisioner, StoreMaintenanceProvisioner), RuntimeContextError>
+    {
+        Self::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
+    }
+
+    pub fn governed_with_typed_reference_kinds(
+        kinds: &[u32],
+    ) -> Result<(Self, StorageQuotaProvisioner), RuntimeContextError> {
+        let mut context = Self::with_typed_reference_kinds(kinds)?;
+        let table = PrincipalQuotaTable::new(DEFAULT_MAX_STORAGE_PRINCIPALS)?;
+        let provisioner = table.provisioner();
+        context.quota = Some(table);
+        Ok((context, provisioner))
+    }
+
+    pub fn governed_with_typed_reference_kinds_and_maintenance_provisioner(
+        kinds: &[u32],
+    ) -> Result<(Self, StorageQuotaProvisioner, StoreMaintenanceProvisioner), RuntimeContextError>
+    {
+        let (context, quota) = Self::governed_with_typed_reference_kinds(kinds)?;
+        let maintenance = StoreMaintenanceProvisioner::new(context.maintenance_domain.clone());
+        Ok((context, quota, maintenance))
     }
 
     pub fn admits_typed_reference_kind(&self, object_kind: u32) -> bool {
@@ -219,8 +292,12 @@ pub enum StoreError<E> {
     ObjectTooLarge,
     ObjectUnavailable,
     ObjectMismatch,
+    MaintenanceAuthority,
     CatalogMode,
     IdExhausted,
+    PrincipalRequired,
+    Quota(QuotaError),
+    QuotaPersistenceUnavailable,
 }
 
 impl<E: fmt::Display> fmt::Display for StoreError<E> {
@@ -243,10 +320,20 @@ impl<E: fmt::Display> fmt::Display for StoreError<E> {
             Self::ObjectTooLarge => f.write_str("object exceeds the M7.3 compatibility profile"),
             Self::ObjectUnavailable => f.write_str("object is unavailable"),
             Self::ObjectMismatch => f.write_str("object handle does not match this store"),
+            Self::MaintenanceAuthority => {
+                f.write_str("Storage V2 maintenance provisioner does not match this runtime")
+            }
             Self::CatalogMode => {
                 f.write_str("operation is incompatible with the mounted catalog mode")
             }
             Self::IdExhausted => f.write_str("object identifier space is exhausted"),
+            Self::PrincipalRequired => {
+                f.write_str("Storage V2 governed writes require a storage principal")
+            }
+            Self::Quota(error) => write!(f, "{error}"),
+            Self::QuotaPersistenceUnavailable => {
+                f.write_str("boot-local quota attribution cannot enter persistent authority")
+            }
         }
     }
 }
@@ -254,6 +341,12 @@ impl<E: fmt::Display> fmt::Display for StoreError<E> {
 impl<E> From<FormatError> for StoreError<E> {
     fn from(value: FormatError) -> Self {
         Self::Format(value)
+    }
+}
+
+impl<E> From<QuotaError> for StoreError<E> {
+    fn from(value: QuotaError) -> Self {
+        Self::Quota(value)
     }
 }
 
@@ -276,6 +369,7 @@ pub(crate) struct MountedState {
     pub(crate) catalog_root: PhysicalPointer,
     pub(crate) replay_tail: PhysicalPointer,
     pub(crate) authority_root: PhysicalPointer,
+    pub(crate) allocation_root: PhysicalPointer,
     pub(crate) allocation: AllocationV2,
     pub(crate) allocation_version: u16,
     pub(crate) persistent_roots: Option<PersistentRootSet>,
@@ -283,30 +377,44 @@ pub(crate) struct MountedState {
     pub(crate) cas: Option<CasMountedState>,
     pub(crate) recovery_peak_bytes: usize,
     pub(crate) last_segment: Option<(u64, u64, [u8; 32])>,
+    pub(crate) last_segment_previous: Option<(u64, u64, [u8; 32])>,
+    pub(crate) last_segment_target_checkpoint_generation: u64,
 }
 
-struct CheckpointTransitionWitness {
+pub(crate) struct CheckpointTransitionWitness {
     store_uuid: StoreUuid,
     generation: u64,
     admitted_segments: u64,
     next_segment_generation: u64,
     cleaner_reserve_segments: u32,
+    replay_count: u32,
+    catalog_root: PhysicalPointer,
+    replay_tail: PhysicalPointer,
+    authority_root: PhysicalPointer,
+    allocation_root: PhysicalPointer,
     allocation: AllocationV2,
+    last_segment: Option<(u64, u64, [u8; 32])>,
 }
 
 impl CheckpointTransitionWitness {
-    fn from_mounted(state: MountedState) -> Self {
+    pub(crate) fn from_mounted(state: MountedState) -> Self {
         Self {
             store_uuid: state.superblock.binding.store_uuid,
             generation: state.generation,
             admitted_segments: state.admitted_segments,
             next_segment_generation: state.next_segment_generation,
             cleaner_reserve_segments: state.cleaner_reserve_segments,
+            replay_count: state.replay_count,
+            catalog_root: state.catalog_root,
+            replay_tail: state.replay_tail,
+            authority_root: state.authority_root,
+            allocation_root: state.allocation_root,
             allocation: state.allocation,
+            last_segment: state.last_segment,
         }
     }
 
-    fn resident_bytes(&self) -> Option<usize> {
+    pub(crate) fn resident_bytes(&self) -> Option<usize> {
         self.allocation.allocated_bytes()
     }
 }
@@ -319,6 +427,8 @@ pub struct SegmentStore<D> {
     pub(crate) pins: SharedStorePinRegistry,
     pub(crate) published_generation: alloc::sync::Arc<AtomicU64>,
     pub(crate) typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
+    pub(crate) maintenance_domain: alloc::sync::Arc<MaintenanceDomain>,
+    pub(crate) quota: Option<PrincipalQuotaTable>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -339,6 +449,8 @@ impl<D: PageDevice> SegmentStore<D> {
             pins: runtime.pins,
             published_generation: runtime.published_generation,
             typed_reference_kinds: runtime.typed_reference_kinds,
+            maintenance_domain: runtime.maintenance_domain,
+            quota: runtime.quota,
         }
     }
 
@@ -347,7 +459,69 @@ impl<D: PageDevice> SegmentStore<D> {
             pins: self.pins.clone(),
             published_generation: self.published_generation.clone(),
             typed_reference_kinds: self.typed_reference_kinds.clone(),
+            maintenance_domain: self.maintenance_domain.clone(),
+            quota: self.quota.clone(),
         }
+    }
+
+    pub fn principal_quota_usage(
+        &self,
+        principal: &StoragePrincipal,
+    ) -> Result<PrincipalQuotaUsage, QuotaError> {
+        self.quota
+            .as_ref()
+            .ok_or(QuotaError::UnknownPrincipal)?
+            .principal_usage(principal)
+    }
+
+    pub fn quota_diagnostics(&self) -> Option<QuotaDiagnostics> {
+        self.quota.as_ref().map(PrincipalQuotaTable::diagnostics)
+    }
+
+    /// Mint the maintenance root only for trusted policy holding the exact
+    /// non-cloneable provisioner created with this runtime. A store handle or
+    /// cloned runtime context alone is insufficient.
+    pub fn provision_maintenance_root(
+        &self,
+        provisioner: &StoreMaintenanceProvisioner,
+    ) -> Result<StoreMaintenance, StoreError<D::Error>> {
+        let state = self.require_current_generation()?;
+        if !provisioner.authorizes(&self.maintenance_domain) {
+            return Err(StoreError::MaintenanceAuthority);
+        }
+        Ok(StoreMaintenance::mint_root(
+            self.maintenance_domain.clone(),
+            state.superblock.binding.store_uuid,
+            state.superblock.device_id,
+            state.superblock.range_first_logical_block,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mint_maintenance_root(&self) -> Result<StoreMaintenance, StoreError<D::Error>> {
+        let state = self.require_current_generation()?;
+        Ok(StoreMaintenance::mint_root(
+            self.maintenance_domain.clone(),
+            state.superblock.binding.store_uuid,
+            state.superblock.device_id,
+            state.superblock.range_first_logical_block,
+        ))
+    }
+
+    pub(crate) fn acquire_maintenance(
+        &self,
+        maintenance: &StoreMaintenance,
+        operation: MaintenanceOperation,
+    ) -> Option<MaintenanceOperationLease> {
+        self.require_current_generation().ok().and_then(|state| {
+            maintenance.acquire(
+                operation,
+                &self.maintenance_domain,
+                state.superblock.binding.store_uuid,
+                state.superblock.device_id,
+                state.superblock.range_first_logical_block,
+            )
+        })
     }
 
     pub fn into_device(self) -> D {
@@ -480,11 +654,31 @@ impl<D: PageDevice> SegmentStore<D> {
         let right = read_superblock(&self.device, 2).await?;
         let selected = select_superblock(left, right)?.ok_or(StoreError::Unformatted)?;
         let superblock = *selected.value();
+        let logical_block_size = u64::from(device_info.logical_block_size);
+        if logical_block_size == 0
+            || !(PAGE_SIZE as u64).is_multiple_of(logical_block_size)
+            || !device_info
+                .logical_block_count
+                .is_multiple_of(PAGE_SIZE as u64 / logical_block_size)
+        {
+            return Err(StoreError::Corrupt);
+        }
+        let blocks_per_page = PAGE_SIZE as u64 / logical_block_size;
+        let expected_device_pages = device_info
+            .logical_block_count
+            .checked_div(blocks_per_page)
+            .ok_or(StoreError::Corrupt)?;
+        let expected_initial_blocks = superblock
+            .initial_range_pages
+            .checked_mul(blocks_per_page)
+            .ok_or(StoreError::Corrupt)?;
         if superblock.device_id != device_info.device_id
             || superblock.range_first_logical_block != device_info.range_first_logical_block
-            || superblock.initial_block_count != device_info.logical_block_count
+            || superblock.initial_block_count != expected_initial_blocks
+            || superblock.initial_block_count > device_info.logical_block_count
             || superblock.logical_block_size != device_info.logical_block_size
             || superblock.initial_range_pages > device_info.page_count
+            || expected_device_pages != device_info.page_count
             || superblock.max_replay_records != self.limits.max_replay_records
         {
             return Err(StoreError::Corrupt);
@@ -568,6 +762,9 @@ impl<D: PageDevice> SegmentStore<D> {
         content_root: [u8; 32],
         bytes: &[u8],
     ) -> Result<ObjectHandle, StoreError<D::Error>> {
+        if self.quota.is_some() {
+            return Err(StoreError::PrincipalRequired);
+        }
         let current = self.require_current_generation()?;
         let byte_len = u64::try_from(bytes.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         if byte_len > self.limits.max_compat_object_bytes
@@ -919,7 +1116,7 @@ fn optional_verified<T>(status: DecodeStatus<VerifiedRecord<T>>) -> Option<Verif
     }
 }
 
-async fn read_superblock<D: PageDevice>(
+pub(crate) async fn read_superblock<D: PageDevice>(
     device: &D,
     page: u64,
 ) -> Result<Option<VerifiedRecord<Superblock>>, StoreError<D::Error>> {
@@ -927,7 +1124,7 @@ async fn read_superblock<D: PageDevice>(
     Ok(optional_verified(decode_superblock_verified(&body, &seal)?))
 }
 
-async fn read_checkpoint<D: PageDevice>(
+pub(crate) async fn read_checkpoint<D: PageDevice>(
     device: &D,
     page: u64,
 ) -> Result<Option<VerifiedRecord<Checkpoint>>, StoreError<D::Error>> {
@@ -982,7 +1179,11 @@ fn codec_error<E>(error: CodecError) -> StoreError<E> {
 
 pub(crate) struct ScannedSegment {
     pub(crate) matched: Option<ExtentRecord>,
+    pub(crate) record_count: u32,
+    pub(crate) total_payload_bytes: u64,
     pub(crate) segment_seal_body_sha256: [u8; 32],
+    pub(crate) previous_segment: (u64, u64, [u8; 32]),
+    pub(crate) header_target_checkpoint_generation: u64,
 }
 
 pub(crate) async fn scan_segment<D: PageDevice>(
@@ -1129,7 +1330,15 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     }
     Ok(ScannedSegment {
         matched,
+        record_count: summary_value.record_count,
+        total_payload_bytes: summary_value.total_payload_bytes,
         segment_seal_body_sha256: segment_seal.digest().body_sha256(),
+        previous_segment: (
+            header.value().previous_segment_no,
+            header.value().previous_segment_generation,
+            header.value().previous_segment_seal_body_sha256,
+        ),
+        header_target_checkpoint_generation: header.value().binding.target_checkpoint_generation,
     })
 }
 
@@ -1137,6 +1346,8 @@ pub(crate) struct ResolvedPayload {
     pub(crate) bytes: Vec<u8>,
     pub(crate) extent: ExtentRecord,
     pub(crate) segment_seal_body_sha256: [u8; 32],
+    pub(crate) previous_segment: (u64, u64, [u8; 32]),
+    pub(crate) header_target_checkpoint_generation: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1209,6 +1420,8 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
         bytes,
         extent,
         segment_seal_body_sha256: scanned.segment_seal_body_sha256,
+        previous_segment: scanned.previous_segment,
+        header_target_checkpoint_generation: scanned.header_target_checkpoint_generation,
     })
 }
 
@@ -1363,7 +1576,7 @@ async fn read_recovery_pointer_payload<D: PageDevice>(
     .await
 }
 
-async fn recover_state<D: PageDevice>(
+pub(crate) async fn recover_state<D: PageDevice>(
     device: &D,
     superblock: Superblock,
     checkpoint: VerifiedRecord<Checkpoint>,
@@ -1373,125 +1586,132 @@ async fn recover_state<D: PageDevice>(
     let mut catalog = Vec::new();
     let mut cas = None;
     let mut recovery_peak = 0_usize;
-    let (allocation, allocation_version, last_segment) =
-        if checkpoint.allocation_root == PhysicalPointer::Null {
-            if checkpoint.binding.generation != 1 {
-                return Err(StoreError::Corrupt);
-            }
-            let bitmap_bytes = allocation_v2_bitmap_bytes::<D::Error>(checkpoint.admitted_segments)
-                .map_err(|_| StoreError::Corrupt)?;
-            if checkpoint.admitted_segments > MAX_ALLOCATION_V2_SEGMENTS as u64 {
-                return Err(StoreError::Corrupt);
-            }
-            if bitmap_bytes > limits.recovery_memory_bytes {
-                return Err(StoreError::MemoryLimit);
-            }
-            let legacy = AllocationState {
-                checkpoint_generation: checkpoint.binding.generation,
-                admitted_segments: checkpoint.admitted_segments,
-                allocated_prefix_segments: 0,
-                next_segment_generation: checkpoint.next_segment_generation,
-                cleaner_reserve_segments: checkpoint.cleaner_reserve_segments,
-            };
-            let decoded = AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?;
-            recovery_observe(
-                &mut recovery_peak,
-                limits.recovery_memory_bytes,
-                allocation_resident_bytes(&decoded).map_err(|_| StoreError::MemoryLimit)?,
-            )?;
-            (decoded, 1, None)
-        } else {
-            let payload = read_recovery_pointer_payload(
-                device,
-                superblock.binding.store_uuid,
-                checkpoint.admitted_segments,
-                checkpoint.next_segment_generation,
-                checkpoint.binding.generation,
-                checkpoint.allocation_root,
-                ExtentKind::Allocation,
-                limits.recovery_memory_bytes,
-                0,
-            )
-            .await?;
-            let allocation_encoded_bytes = payload.bytes.capacity();
-            let version = payload
-                .bytes
-                .get(0x08..0x0a)
-                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-                .ok_or(StoreError::Corrupt)?;
-            let allocation_decoded_upper = allocation_decode_capacity_upper_bound(
-                &payload.bytes,
-                version,
-                checkpoint.admitted_segments,
-            )?;
-            recovery_preflight_decode(
-                limits.recovery_memory_bytes,
-                0,
-                allocation_encoded_bytes,
-                allocation_decoded_upper,
-            )?;
-            let decoded = match version {
-                1 => {
-                    let legacy = decode_allocation(&payload.bytes).map_err(codec_error)?;
-                    if legacy.checkpoint_generation != checkpoint.binding.generation
-                        || legacy.checkpoint_generation
-                            != payload.extent.binding.target_checkpoint_generation
-                        || legacy.admitted_segments != checkpoint.admitted_segments
-                        || legacy.allocated_prefix_segments == 0
-                        || legacy.next_segment_generation != checkpoint.next_segment_generation
-                        || legacy.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
-                    {
-                        return Err(StoreError::Corrupt);
-                    }
-                    let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
-                        return Err(StoreError::Corrupt);
-                    };
-                    if root.segment_no.checked_add(1) != Some(legacy.allocated_prefix_segments) {
-                        return Err(StoreError::Corrupt);
-                    }
-                    AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?
-                }
-                2 => {
-                    let current =
-                        decode_allocation_v2(&payload.bytes).map_err(|_| StoreError::Corrupt)?;
-                    if current.checkpoint_generation != checkpoint.binding.generation
-                        || current.checkpoint_generation
-                            != payload.extent.binding.target_checkpoint_generation
-                        || current.admitted_segments != checkpoint.admitted_segments
-                        || current.next_segment_generation != checkpoint.next_segment_generation
-                        || current.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
-                    {
-                        return Err(StoreError::Corrupt);
-                    }
-                    current
-                }
-                _ => return Err(StoreError::Corrupt),
-            };
-            let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
-                return Err(StoreError::Corrupt);
-            };
-            if decoded.segment_state(root.segment_no) != Some(SegmentAllocation::Allocated) {
-                return Err(StoreError::Corrupt);
-            }
-            let allocation_decoded_bytes =
-                allocation_resident_bytes(&decoded).map_err(|_| StoreError::MemoryLimit)?;
-            recovery_observe(
-                &mut recovery_peak,
-                limits.recovery_memory_bytes,
-                allocation_encoded_bytes
-                    .checked_add(allocation_decoded_bytes)
-                    .ok_or(StoreError::MemoryLimit)?,
-            )?;
-            (
-                decoded,
-                version,
-                Some((
-                    root.segment_no,
-                    root.segment_generation,
-                    payload.segment_seal_body_sha256,
-                )),
-            )
+    let (
+        allocation,
+        allocation_version,
+        last_segment,
+        last_segment_previous,
+        last_segment_target_checkpoint_generation,
+    ) = if checkpoint.allocation_root == PhysicalPointer::Null {
+        if checkpoint.binding.generation != 1 {
+            return Err(StoreError::Corrupt);
+        }
+        let bitmap_bytes = allocation_v2_bitmap_bytes::<D::Error>(checkpoint.admitted_segments)
+            .map_err(|_| StoreError::Corrupt)?;
+        if checkpoint.admitted_segments > MAX_ALLOCATION_V2_SEGMENTS as u64 {
+            return Err(StoreError::Corrupt);
+        }
+        if bitmap_bytes > limits.recovery_memory_bytes {
+            return Err(StoreError::MemoryLimit);
+        }
+        let legacy = AllocationState {
+            checkpoint_generation: checkpoint.binding.generation,
+            admitted_segments: checkpoint.admitted_segments,
+            allocated_prefix_segments: 0,
+            next_segment_generation: checkpoint.next_segment_generation,
+            cleaner_reserve_segments: checkpoint.cleaner_reserve_segments,
         };
+        let decoded = AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?;
+        recovery_observe(
+            &mut recovery_peak,
+            limits.recovery_memory_bytes,
+            allocation_resident_bytes(&decoded).map_err(|_| StoreError::MemoryLimit)?,
+        )?;
+        (decoded, 1, None, None, checkpoint.binding.generation)
+    } else {
+        let payload = read_recovery_pointer_payload(
+            device,
+            superblock.binding.store_uuid,
+            checkpoint.admitted_segments,
+            checkpoint.next_segment_generation,
+            checkpoint.binding.generation,
+            checkpoint.allocation_root,
+            ExtentKind::Allocation,
+            limits.recovery_memory_bytes,
+            0,
+        )
+        .await?;
+        let allocation_encoded_bytes = payload.bytes.capacity();
+        let version = payload
+            .bytes
+            .get(0x08..0x0a)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .ok_or(StoreError::Corrupt)?;
+        let allocation_decoded_upper = allocation_decode_capacity_upper_bound(
+            &payload.bytes,
+            version,
+            checkpoint.admitted_segments,
+        )?;
+        recovery_preflight_decode(
+            limits.recovery_memory_bytes,
+            0,
+            allocation_encoded_bytes,
+            allocation_decoded_upper,
+        )?;
+        let decoded = match version {
+            1 => {
+                let legacy = decode_allocation(&payload.bytes).map_err(codec_error)?;
+                if legacy.checkpoint_generation != checkpoint.binding.generation
+                    || legacy.checkpoint_generation
+                        != payload.extent.binding.target_checkpoint_generation
+                    || legacy.admitted_segments != checkpoint.admitted_segments
+                    || legacy.allocated_prefix_segments == 0
+                    || legacy.next_segment_generation != checkpoint.next_segment_generation
+                    || legacy.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
+                    return Err(StoreError::Corrupt);
+                };
+                if root.segment_no.checked_add(1) != Some(legacy.allocated_prefix_segments) {
+                    return Err(StoreError::Corrupt);
+                }
+                AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?
+            }
+            2 => {
+                let current =
+                    decode_allocation_v2(&payload.bytes).map_err(|_| StoreError::Corrupt)?;
+                if current.checkpoint_generation != checkpoint.binding.generation
+                    || current.checkpoint_generation
+                        != payload.extent.binding.target_checkpoint_generation
+                    || current.admitted_segments != checkpoint.admitted_segments
+                    || current.next_segment_generation != checkpoint.next_segment_generation
+                    || current.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                current
+            }
+            _ => return Err(StoreError::Corrupt),
+        };
+        let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
+            return Err(StoreError::Corrupt);
+        };
+        if decoded.segment_state(root.segment_no) != Some(SegmentAllocation::Allocated) {
+            return Err(StoreError::Corrupt);
+        }
+        let allocation_decoded_bytes =
+            allocation_resident_bytes(&decoded).map_err(|_| StoreError::MemoryLimit)?;
+        recovery_observe(
+            &mut recovery_peak,
+            limits.recovery_memory_bytes,
+            allocation_encoded_bytes
+                .checked_add(allocation_decoded_bytes)
+                .ok_or(StoreError::MemoryLimit)?,
+        )?;
+        (
+            decoded,
+            version,
+            Some((
+                root.segment_no,
+                root.segment_generation,
+                payload.segment_seal_body_sha256,
+            )),
+            Some(payload.previous_segment),
+            payload.header_target_checkpoint_generation,
+        )
+    };
     for pointer in [
         checkpoint.catalog_root,
         checkpoint.authority_root,
@@ -1944,6 +2164,7 @@ async fn recover_state<D: PageDevice>(
         catalog_root: checkpoint.catalog_root,
         replay_tail: checkpoint.replay_tail,
         authority_root: checkpoint.authority_root,
+        allocation_root: checkpoint.allocation_root,
         allocation,
         allocation_version,
         persistent_roots,
@@ -1951,6 +2172,8 @@ async fn recover_state<D: PageDevice>(
         cas,
         recovery_peak_bytes: recovery_peak,
         last_segment,
+        last_segment_previous,
+        last_segment_target_checkpoint_generation,
     })
 }
 
@@ -1966,7 +2189,7 @@ fn require_allocated_pointer<E>(
     Ok(())
 }
 
-fn validate_checkpoint_transition<E>(
+pub(crate) fn validate_checkpoint_transition<E>(
     older: &CheckpointTransitionWitness,
     newer: &MountedState,
 ) -> Result<(), StoreError<E>> {
@@ -1975,9 +2198,15 @@ fn validate_checkpoint_transition<E>(
         .checked_add(1)
         .is_none_or(|generation| generation != newer.generation)
         || older.store_uuid != newer.superblock.binding.store_uuid
-        || older.admitted_segments != newer.admitted_segments
         || older.cleaner_reserve_segments != newer.cleaner_reserve_segments
     {
+        return Err(StoreError::Corrupt);
+    }
+
+    if newer.admitted_segments > older.admitted_segments {
+        return validate_growth_checkpoint_transition(older, newer);
+    }
+    if older.admitted_segments != newer.admitted_segments {
         return Err(StoreError::Corrupt);
     }
 
@@ -1990,6 +2219,75 @@ fn validate_checkpoint_transition<E>(
         newer.next_segment_generation,
         newer.allocation_version,
     )
+}
+
+fn validate_growth_checkpoint_transition<E>(
+    older: &CheckpointTransitionWitness,
+    newer: &MountedState,
+) -> Result<(), StoreError<E>> {
+    if newer.allocation_version != 2
+        || newer.allocation.admitted_segments != newer.admitted_segments
+        || !older.allocation.retired_segments().is_empty()
+        || !newer.allocation.retired_segments().is_empty()
+        || older.replay_count != newer.replay_count
+        || older.catalog_root != newer.catalog_root
+        || older.replay_tail != newer.replay_tail
+        || older.authority_root != newer.authority_root
+    {
+        return Err(StoreError::Corrupt);
+    }
+
+    let counts = newer.allocation.counts().map_err(|_| StoreError::Corrupt)?;
+    let protected_free = u64::from(newer.cleaner_reserve_segments)
+        .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))
+        .ok_or(StoreError::Corrupt)?;
+    if counts.free < protected_free {
+        return Err(StoreError::Corrupt);
+    }
+
+    let mut allocated_carrier = None;
+    for segment_no in 0..older.admitted_segments {
+        match (
+            older.allocation.segment_state(segment_no),
+            newer.allocation.segment_state(segment_no),
+        ) {
+            (Some(before), Some(after)) if before == after => {}
+            (Some(SegmentAllocation::Free), Some(SegmentAllocation::Allocated)) => {
+                if allocated_carrier.replace(segment_no).is_some() {
+                    return Err(StoreError::Corrupt);
+                }
+            }
+            _ => return Err(StoreError::Corrupt),
+        }
+    }
+    let carrier = allocated_carrier.ok_or(StoreError::Corrupt)?;
+    let PhysicalPointer::Value(allocation_root) = newer.allocation_root else {
+        return Err(StoreError::Corrupt);
+    };
+    let expected_previous = older
+        .last_segment
+        .unwrap_or((ANCHOR_SEGMENT_NO, 0, [0; 32]));
+    if newer.allocation_root == older.allocation_root
+        || allocation_root.segment_no != carrier
+        || allocation_root.segment_generation != older.next_segment_generation
+        || allocation_root.extent_kind != ExtentKind::Allocation
+        || newer
+            .last_segment
+            .is_none_or(|last| last.0 != carrier || last.1 != older.next_segment_generation)
+        || newer.last_segment_previous != Some(expected_previous)
+        || newer.last_segment_target_checkpoint_generation != newer.generation
+        || (older.admitted_segments..newer.admitted_segments).any(|segment_no| {
+            newer.allocation.segment_state(segment_no) != Some(SegmentAllocation::Free)
+        })
+        || newer.next_segment_generation
+            != older
+                .next_segment_generation
+                .checked_add(1)
+                .ok_or(StoreError::Corrupt)?
+    {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

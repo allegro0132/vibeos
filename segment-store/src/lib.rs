@@ -8,6 +8,8 @@
 #![allow(async_fn_in_trait)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod allocation_v2;
 mod authority;
@@ -17,9 +19,18 @@ mod codec;
 mod compat;
 mod device;
 mod gc;
+mod maintenance;
+#[cfg(test)]
+mod maintenance_growth_tests;
 mod mark;
 mod pins;
+mod quota;
+#[cfg(test)]
+mod quota_integration_tests;
 mod root_codec;
+mod scrub;
+#[cfg(test)]
+mod scrub_tests;
 mod store;
 mod typed_api;
 mod typed_manifest;
@@ -33,7 +44,8 @@ pub use allocation_v2::{
 
 pub use authority::{
     resolve_authorized, AccessError, AuthorizedObject, AuthorizedObjectSpace,
-    ObjectPublicationTarget, PublicationIntent, PublishError,
+    AuthorizedPublication, ObjectPublicationPersistence, ObjectPublicationTarget,
+    PublicationIntent, PublishError,
 };
 pub use cas::{
     BlobWriter, CasCommitError, CasObjectHandle, CasStoreError, ForegroundBlobError,
@@ -57,12 +69,26 @@ pub use codec::{
     CATALOG_SNAPSHOT_HEADER_LEN,
 };
 pub use compat::PutGetAdapter;
-pub use device::{BlockPageDevice, BlockPageError, PageDevice, PageDeviceInfo};
+pub use device::{BlockPageDevice, BlockPageError, GrowablePageDevice, PageDevice, PageDeviceInfo};
 pub use gc::{GcError, GcStoreError, GcTelemetry, GcTimeSource};
+pub use maintenance::{
+    GrowError, MaintenanceAuthorityError, MaintenanceOperation, StoreMaintenance,
+    StoreMaintenanceProvisioner,
+};
+pub use quota::{
+    canonical_attributable_physical_bytes, PrincipalQuotaLimits, PrincipalQuotaUsage,
+    QuotaDiagnostics, QuotaError, StoragePrincipal, StorageQuotaProvisioner,
+    DEFAULT_MAX_STORAGE_PRINCIPALS, QUOTA_DEDUP_UNIQUE_OBJECT_BYTES,
+    QUOTA_PHYSICAL_FORMULA_VERSION,
+};
 pub use root_codec::{
     decode_persistent_root_set, encode_persistent_root_set, PersistentRootEntry, PersistentRootSet,
     RootCodecError, MAX_PERSISTENT_ROOT_ENTRIES, MAX_PERSISTENT_ROOT_SET_PAYLOAD_LEN,
     PERSISTENT_ROOT_ENTRY_LEN, PERSISTENT_ROOT_SET_HEADER_LEN, PERSISTENT_ROOT_SET_VERSION,
+};
+pub use scrub::{
+    ScrubCorruptionDomain, ScrubDeviceHealth, ScrubError, ScrubReport, ScrubStatus,
+    SCRUB_REPORT_VERSION,
 };
 pub use store::{
     CapacityClass, FormatOptions, ObjectHandle, RuntimeContextError, SegmentStore, StoreError,

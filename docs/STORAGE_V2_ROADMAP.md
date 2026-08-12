@@ -356,6 +356,12 @@ Acceptance:
 
 ### M7.6 — Online growth, quotas, and scrub
 
+**Status: complete (2026-08-12).** The capability-gated growth protocol,
+principal accounting, bounded full-media scrub, anonymous powered-off verifier,
+and fault/revocation gates are recorded in
+[STORAGE_V2_MAINTENANCE.md](STORAGE_V2_MAINTENANCE.md) and
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** an authorized administrator can add capacity without reboot-time
 formatting or partition-table mutation, and one client cannot consume the
 cleaner's safety margin.

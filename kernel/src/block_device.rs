@@ -106,7 +106,9 @@ pub(crate) fn discover() -> Option<BlockResources> {
     // The SDHCI backend already translates its provisioned physical partition
     // into a zero-based managed namespace. QEMU's managed image also starts at
     // logical zero. Partition offsets therefore never enter a client CSpace.
-    let range = BlockRange::root(MANAGED_DEVICE_ID, 0, slice.sector_count).ok()?;
+    // SAFETY: image policy is the sole root provisioning authority for the
+    // managed device namespace; client CSpaces receive only attenuated ranges.
+    let range = unsafe { BlockRange::root(MANAGED_DEVICE_ID, 0, slice.sector_count) }.ok()?;
     Some(BlockResources {
         mmio: resources.mmio,
         dma: resources.dma,

@@ -29,6 +29,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -157,6 +158,15 @@ pub(crate) enum PinAdmission {
     CompletionCritical,
 }
 
+/// Opaque authority/accounting lifetime retained by one owner-scoped root
+/// slot. Keeping it in the registry (rather than only in the guard's arena)
+/// lets trusted fault cleanup release it after synchronous task termination.
+pub(crate) trait RootRetention: Send + Sync {}
+
+impl<T: Send + Sync> RootRetention for T {}
+
+pub(crate) type RootRetentionHandle = Arc<dyn RootRetention>;
+
 struct RootSlot {
     lease: AtomicU64,
     object_low: AtomicU64,
@@ -165,7 +175,12 @@ struct RootSlot {
     object_kind: AtomicU64,
     class: AtomicU64,
     owner: AtomicU64,
+    retention: UnsafeCell<Option<RootRetentionHandle>>,
 }
+
+// SAFETY: `retention` is read or changed only while `root_revision` is held in
+// its odd writer state. All other fields are atomic.
+unsafe impl Sync for RootSlot {}
 
 impl RootSlot {
     fn new() -> Self {
@@ -177,6 +192,7 @@ impl RootSlot {
             object_kind: AtomicU64::new(0),
             class: AtomicU64::new(0),
             owner: AtomicU64::new(0),
+            retention: UnsafeCell::new(None),
         }
     }
 
@@ -319,6 +335,17 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
         owner: PinOwner,
         admission: PinAdmission,
     ) -> Result<RuntimeRootPin<'_, ROOT_SLOTS, READER_SLOTS>, PinError> {
+        self.pin_root_with_retention(key, class, owner, admission, None)
+    }
+
+    fn pin_root_with_retention(
+        &self,
+        key: RootKey,
+        class: RuntimeRootClass,
+        owner: PinOwner,
+        admission: PinAdmission,
+        mut retention: Option<RootRetentionHandle>,
+    ) -> Result<RuntimeRootPin<'_, ROOT_SLOTS, READER_SLOTS>, PinError> {
         validate_owner(owner)?;
         let lease = next_non_reserved(&self.next_lease)?;
         let admitted = match admission {
@@ -349,6 +376,12 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
                 .store(u64::from(key.object_kind), Ordering::Relaxed);
             slot.class.store(class as u64, Ordering::Relaxed);
             slot.owner.store(owner.0, Ordering::Relaxed);
+            // SAFETY: `_write` exclusively serializes every retention access;
+            // a Free slot has had its prior retention taken before reuse.
+            unsafe {
+                debug_assert!((*slot.retention.get()).is_none());
+                *slot.retention.get() = retention.take();
+            }
             slot.lease.store(lease, Ordering::Release);
             return Ok(RuntimeRootPin {
                 registry: self,
@@ -469,28 +502,32 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
     pub(crate) fn release_stopped_owner(&self, stopped: FaultDomainStopped) -> ReleasedPins {
         let owner = stopped.owner.0;
         let mut released = ReleasedPins::default();
-        let _root_write = self.begin_root_write();
-        for slot in &self.roots {
-            loop {
+        for index in 0..self.roots.len() {
+            let retention = {
+                let _root_write = self.begin_root_write();
+                let slot = &self.roots[index];
                 let lease = slot.lease.load(Ordering::Acquire);
-                if lease == FREE {
-                    break;
-                }
                 let claim = claiming_owner(lease);
-                if claim.is_some_and(|claim_owner| claim_owner != owner)
-                    || (claim.is_none() && slot.owner.load(Ordering::Relaxed) != owner)
-                {
-                    break;
-                }
-                if slot
-                    .lease
-                    .compare_exchange(lease, FREE, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+                let owned = lease != FREE
+                    && (claim == Some(owner)
+                        || (claim.is_none() && slot.owner.load(Ordering::Relaxed) == owner));
+                if owned
+                    && slot
+                        .lease
+                        .compare_exchange(lease, FREE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
                 {
                     released.roots += 1;
-                    break;
+                    // SAFETY: `_root_write` exclusively serializes retention
+                    // access and this exact lease has just become Free.
+                    unsafe { (*slot.retention.get()).take() }
+                } else {
+                    None
                 }
-            }
+            };
+            // Dropping retained object authority can release another root and
+            // must therefore happen after the registry writer guard is gone.
+            drop(retention);
         }
         for slot in &self.readers {
             loop {
@@ -518,11 +555,21 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
     }
 
     fn release_root(&self, index: usize, lease: u64) {
-        let _write = self.begin_root_write();
-        let slot = &self.roots[index];
-        let _ = slot
-            .lease
-            .compare_exchange(lease, FREE, Ordering::AcqRel, Ordering::Acquire);
+        let retention = {
+            let _write = self.begin_root_write();
+            let slot = &self.roots[index];
+            if slot
+                .lease
+                .compare_exchange(lease, FREE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // SAFETY: `_write` exclusively serializes retention access.
+                unsafe { (*slot.retention.get()).take() }
+            } else {
+                None
+            }
+        };
+        drop(retention);
     }
 
     fn release_reader(&self, index: usize, lease: u64) {
@@ -547,7 +594,29 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
         owner: PinOwner,
         admission: PinAdmission,
     ) -> Result<OwnedRuntimeRootPin<ROOT_SLOTS, READER_SLOTS>, PinError> {
-        let borrowed = registry.pin_root(key, class, owner, admission)?;
+        Self::pin_root_owned_with_retention(registry, key, class, owner, admission, None)
+    }
+
+    pub(crate) fn pin_root_owned_retained(
+        registry: &SharedPinRegistry<ROOT_SLOTS, READER_SLOTS>,
+        key: RootKey,
+        class: RuntimeRootClass,
+        owner: PinOwner,
+        admission: PinAdmission,
+        retention: RootRetentionHandle,
+    ) -> Result<OwnedRuntimeRootPin<ROOT_SLOTS, READER_SLOTS>, PinError> {
+        Self::pin_root_owned_with_retention(registry, key, class, owner, admission, Some(retention))
+    }
+
+    fn pin_root_owned_with_retention(
+        registry: &SharedPinRegistry<ROOT_SLOTS, READER_SLOTS>,
+        key: RootKey,
+        class: RuntimeRootClass,
+        owner: PinOwner,
+        admission: PinAdmission,
+        retention: Option<RootRetentionHandle>,
+    ) -> Result<OwnedRuntimeRootPin<ROOT_SLOTS, READER_SLOTS>, PinError> {
+        let borrowed = registry.pin_root_with_retention(key, class, owner, admission, retention)?;
         let slot = borrowed.slot;
         let lease = borrowed.lease;
         let key = borrowed.key;

@@ -96,6 +96,7 @@ pub enum GcError {
     Allocation(AllocationV2Error),
     RootCodec(RootCodecError),
     Pins,
+    QuotaPersistenceUnavailable,
 }
 
 impl fmt::Display for GcError {
@@ -123,6 +124,9 @@ impl fmt::Display for GcError {
             Self::Allocation(error) => return write!(f, "{error}"),
             Self::RootCodec(error) => return write!(f, "{error}"),
             Self::Pins => "runtime pin admission or snapshot failed",
+            Self::QuotaPersistenceUnavailable => {
+                "boot-local quota attribution cannot enter persistent root policy"
+            }
         })
     }
 }
@@ -345,10 +349,20 @@ pub(crate) fn capture_mark_roots<const ROOT_SLOTS: usize, const READER_SLOTS: us
 /// Typed-child adapter used by the asynchronous engine.  MarkPlanner itself is
 /// deliberately synchronous, so all admitted typed payloads are authenticated
 /// and decoded into this bounded table before traversal starts.
-struct DecodedTypedChildren {
+pub(crate) struct DecodedTypedChildren {
     entries: Vec<(u128, Vec<ChildReference>)>,
     allocated_bytes: usize,
     peak_bytes: usize,
+}
+
+impl DecodedTypedChildren {
+    pub(crate) const fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes
+    }
+
+    pub(crate) const fn peak_bytes(&self) -> usize {
+        self.peak_bytes
+    }
 }
 
 struct GcMemoryAccount {
@@ -458,7 +472,7 @@ impl TypedChildSource for DecodedTypedChildren {
     }
 }
 
-async fn decode_typed_children<D: PageDevice>(
+pub(crate) async fn decode_typed_children<D: PageDevice>(
     device: &D,
     state: &MountedState,
     limits: StoreLimits,
@@ -1517,7 +1531,7 @@ fn required_gc_segments(
     Ok(segments)
 }
 
-struct SegmentBuilder {
+pub(crate) struct SegmentBuilder {
     store_uuid: StoreUuid,
     checkpoint_generation: u64,
     segments: Vec<u64>,
@@ -1612,7 +1626,7 @@ impl SegmentSummaryAccumulator {
 }
 
 impl SegmentBuilder {
-    async fn begin<D: PageDevice>(
+    pub(crate) async fn begin<D: PageDevice>(
         device: &D,
         state: &MountedState,
         checkpoint_generation: u64,
@@ -1746,7 +1760,7 @@ impl SegmentBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn payload<D: PageDevice>(
+    pub(crate) async fn payload<D: PageDevice>(
         &mut self,
         device: &D,
         extent_kind: ExtentKind,
@@ -1796,7 +1810,7 @@ impl SegmentBuilder {
         Ok(pointer)
     }
 
-    async fn finish<D: PageDevice>(
+    pub(crate) async fn finish<D: PageDevice>(
         mut self,
         device: &D,
     ) -> Result<(u64, u64, [u8; 32]), GcStoreError<D::Error>> {
@@ -2601,6 +2615,12 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         roots: &[&AuthorizedObject<CasObjectHandle>],
     ) -> Result<(), GcStoreError<D::Error>> {
+        if roots
+            .iter()
+            .any(|root| root.backend_handle().is_quota_charged())
+        {
+            return Err(GcError::QuotaPersistenceUnavailable.into());
+        }
         let mut memory = GcMemoryAccount::new(self.limits.recovery_memory_bytes);
         let state_bytes = mounted_state_heap_bytes(self.require_current_generation()?)?;
         let cloned_states = state_bytes
@@ -2837,6 +2857,12 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         roots: &[&AuthorizedObject<CasObjectHandle>],
     ) -> Result<GcTelemetry, GcStoreError<D::Error>> {
+        if roots
+            .iter()
+            .any(|root| root.backend_handle().is_quota_charged())
+        {
+            return Err(GcError::QuotaPersistenceUnavailable.into());
+        }
         self.collect_garbage_with_policy(Some(roots)).await
     }
 

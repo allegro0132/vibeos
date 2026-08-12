@@ -27,6 +27,7 @@ pub struct AuthorizedObject<H> {
     backend_handle: H,
     object_kind: u32,
     exact_len: u64,
+    maximum_persistence: ObjectPublicationPersistence,
 }
 
 impl<H> AuthorizedObject<H> {
@@ -39,11 +40,13 @@ impl<H> AuthorizedObject<H> {
         backend_handle: H,
         object_kind: u32,
         exact_len: u64,
+        maximum_persistence: ObjectPublicationPersistence,
     ) -> Self {
         Self {
             backend_handle,
             object_kind,
             exact_len,
+            maximum_persistence,
         }
     }
 
@@ -71,8 +74,42 @@ impl<H> AuthorizedObject<H> {
 pub enum PublishError<E> {
     /// The target no longer has the incarnation captured before commit I/O.
     StaleIncarnation,
+    /// The committed authority is boot-local and cannot be installed into a
+    /// target whose root survives reboot.
+    PersistenceDenied,
     /// The target could not install the new independent capability root.
     Target(E),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectPublicationPersistence {
+    RuntimeOnly,
+    Persistent,
+}
+
+/// A publication already checked against the target's persistence class.
+///
+/// Only [`PublicationIntent::publish`] can construct this value. Keeping the
+/// committed object and captured incarnation inside one non-cloneable token
+/// prevents safe callers from invoking a target's installation hook with an
+/// unchecked boot-local object.
+pub struct AuthorizedPublication<T: ?Sized, H> {
+    expected_incarnation: u64,
+    object: Arc<AuthorizedObject<H>>,
+    target: PhantomData<fn(&T)>,
+}
+
+impl<T: ?Sized, H> AuthorizedPublication<T, H> {
+    /// The lifecycle incarnation captured before durable commit I/O.
+    pub const fn expected_incarnation(&self) -> u64 {
+        self.expected_incarnation
+    }
+
+    /// Consume the checked publication and transfer its exact object authority
+    /// into the target's newly allocated independent root.
+    pub fn into_object(self) -> Arc<AuthorizedObject<H>> {
+        self.object
+    }
 }
 
 /// A synchronous target for one newly committed object.
@@ -91,11 +128,17 @@ pub trait ObjectPublicationTarget<H>: Send + Sync {
     /// Return the target's current lifecycle incarnation.
     fn incarnation(&self) -> u64;
 
-    /// Atomically publish `object` as a fresh root if the incarnation matches.
+    /// Whether a successfully installed root can survive a process reboot.
+    /// M7.6 boot-local quota charges may target only `RuntimeOnly` spaces.
+    fn persistence(&self) -> ObjectPublicationPersistence;
+
+    /// Atomically publish the checked token as a fresh root if its captured
+    /// incarnation matches. An error return must not retain the token or its
+    /// object: failed publication owns no object authority, and retaining it
+    /// would also retain any quota charge indefinitely.
     fn publish_independent_root(
         &self,
-        expected_incarnation: u64,
-        object: Arc<AuthorizedObject<H>>,
+        publication: AuthorizedPublication<Self, H>,
     ) -> Result<Self::Capability, PublishError<Self::Error>>;
 }
 
@@ -130,6 +173,10 @@ where
         self.expected_incarnation
     }
 
+    pub fn persistence(&self) -> ObjectPublicationPersistence {
+        self.target.persistence()
+    }
+
     /// Publish a CAS-authorized object after its checkpoint is durable.
     ///
     /// There is intentionally no async work here. The target performs the
@@ -138,8 +185,16 @@ where
         self,
         object: AuthorizedObject<H>,
     ) -> Result<T::Capability, PublishError<T::Error>> {
-        self.target
-            .publish_independent_root(self.expected_incarnation, Arc::new(object))
+        if self.target.persistence() == ObjectPublicationPersistence::Persistent
+            && object.maximum_persistence == ObjectPublicationPersistence::RuntimeOnly
+        {
+            return Err(PublishError::PersistenceDenied);
+        }
+        self.target.publish_independent_root(AuthorizedPublication {
+            expected_incarnation: self.expected_incarnation,
+            object: Arc::new(object),
+            target: PhantomData,
+        })
     }
 }
 
@@ -163,9 +218,10 @@ pub trait AuthorizedObjectSpace<H>: ObjectPublicationTarget<H> {
     /// Resolve an object only when `capability` grants live read authority.
     fn resolve_read(&self, capability: Self::Capability) -> Option<Arc<AuthorizedObject<H>>>;
 
-    /// Administrative root revocation. Descendants of this exact root are the
-    /// target implementation's responsibility; unrelated object roots must not
-    /// be affected.
+    /// Administrative root revocation. A successful return must synchronously
+    /// discard the slot's `Arc<AuthorizedObject<_>>` after descendants are no
+    /// longer live; merely marking a retained object unreadable can safely leak
+    /// quota forever. Unrelated object roots must not be affected.
     fn revoke_root(&self, capability: Self::Capability) -> bool;
 }
 
@@ -213,7 +269,7 @@ mod tests {
         generation: u64,
         readable: bool,
         alive: bool,
-        object: Arc<AuthorizedObject<H>>,
+        object: Option<Arc<AuthorizedObject<H>>>,
     }
 
     struct ModelState<H> {
@@ -250,21 +306,12 @@ mod tests {
                 slot.readable = false;
             }
         }
-    }
 
-    impl<H: Send + Sync + 'static> ObjectPublicationTarget<H> for ModelSpace<H> {
-        type Capability = ModelCapability;
-        type Error = ModelPublishError;
-
-        fn incarnation(&self) -> u64 {
-            self.state.lock().unwrap().incarnation
-        }
-
-        fn publish_independent_root(
+        fn publish_checked(
             &self,
             expected_incarnation: u64,
             object: Arc<AuthorizedObject<H>>,
-        ) -> Result<Self::Capability, PublishError<Self::Error>> {
+        ) -> Result<ModelCapability, PublishError<ModelPublishError>> {
             let mut state = self.state.lock().unwrap();
             if state.incarnation != expected_incarnation {
                 return Err(PublishError::StaleIncarnation);
@@ -277,12 +324,34 @@ mod tests {
                 generation: 1,
                 readable: true,
                 alive: true,
-                object,
+                object: Some(object),
             });
             Ok(ModelCapability {
                 slot,
                 generation: 1,
             })
+        }
+    }
+
+    impl<H: Send + Sync + 'static> ObjectPublicationTarget<H> for ModelSpace<H> {
+        type Capability = ModelCapability;
+        type Error = ModelPublishError;
+
+        fn incarnation(&self) -> u64 {
+            self.state.lock().unwrap().incarnation
+        }
+
+        fn persistence(&self) -> ObjectPublicationPersistence {
+            ObjectPublicationPersistence::RuntimeOnly
+        }
+
+        fn publish_independent_root(
+            &self,
+            publication: AuthorizedPublication<Self, H>,
+        ) -> Result<Self::Capability, PublishError<Self::Error>> {
+            let expected_incarnation = publication.expected_incarnation();
+            let object = publication.into_object();
+            self.publish_checked(expected_incarnation, object)
         }
     }
 
@@ -293,7 +362,7 @@ mod tests {
             if slot.generation != capability.generation || !slot.alive || !slot.readable {
                 return None;
             }
-            Some(slot.object.clone())
+            slot.object.clone()
         }
 
         fn revoke_root(&self, capability: Self::Capability) -> bool {
@@ -305,6 +374,7 @@ mod tests {
                 return false;
             }
             slot.alive = false;
+            slot.object.take();
             true
         }
     }
@@ -317,6 +387,7 @@ mod tests {
             },
             7,
             4096,
+            ObjectPublicationPersistence::Persistent,
         )
     }
 
@@ -366,6 +437,49 @@ mod tests {
             intent.publish(committed(1, [1; 32])),
             Err(PublishError::StaleIncarnation)
         );
+    }
+
+    #[test]
+    fn boot_local_object_cannot_bypass_persistent_target_gate() {
+        struct PersistentSpace(ModelSpace<PrivateHandle>);
+
+        impl ObjectPublicationTarget<PrivateHandle> for PersistentSpace {
+            type Capability = ModelCapability;
+            type Error = ModelPublishError;
+
+            fn incarnation(&self) -> u64 {
+                self.0.incarnation()
+            }
+
+            fn persistence(&self) -> ObjectPublicationPersistence {
+                ObjectPublicationPersistence::Persistent
+            }
+
+            fn publish_independent_root(
+                &self,
+                publication: AuthorizedPublication<Self, PrivateHandle>,
+            ) -> Result<Self::Capability, PublishError<Self::Error>> {
+                let expected_incarnation = publication.expected_incarnation();
+                let object = publication.into_object();
+                self.0.publish_checked(expected_incarnation, object)
+            }
+        }
+
+        let target = Arc::new(PersistentSpace(ModelSpace::new()));
+        let object = AuthorizedObject::from_committed(
+            PrivateHandle {
+                object_id: 1,
+                shared_content: [1; 32],
+            },
+            7,
+            4096,
+            ObjectPublicationPersistence::RuntimeOnly,
+        );
+        assert_eq!(
+            PublicationIntent::capture(target.clone()).publish(object),
+            Err(PublishError::PersistenceDenied)
+        );
+        assert!(target.0.state.lock().unwrap().slots.is_empty());
     }
 
     #[test]

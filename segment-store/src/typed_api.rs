@@ -19,6 +19,7 @@ use crate::cas::{CasObjectHandle, CasStoreError, ForegroundBlobError};
 use crate::cas_codec::REFERENCE_CODEC_TYPED_V1;
 use crate::device::PageDevice;
 use crate::gc::{GcStoreError, GcTelemetry, GcTimeSource};
+use crate::quota::StoragePrincipal;
 use crate::store::{SegmentStore, StoreError};
 use crate::typed_manifest::{
     encode_typed_manifest_refs_v1, TypedManifestRefsV1, TypedObjectReference, TypedRefsError,
@@ -156,10 +157,35 @@ impl<D: PageDevice> SegmentStore<D> {
         object_kind: u32,
         children: &[&AuthorizedObject<CasObjectHandle>],
     ) -> Result<AuthorizedObject<CasObjectHandle>, TypedCommitError<D::Error>> {
+        if self.quota.is_some() {
+            return Err(StoreError::PrincipalRequired.into());
+        }
         let payload = self.typed_manifest_payload(object_kind, children)?;
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| TypedCommitError::TooManyChildren)?;
         let mut writer = self.begin_blob_with_reference_codec(
+            object_kind,
+            payload_len,
+            None,
+            REFERENCE_CODEC_TYPED_V1,
+        )?;
+        for chunk in payload.chunks(PAGE_SIZE) {
+            writer.write_chunk(chunk).await?;
+        }
+        writer.commit().await.map_err(Into::into)
+    }
+
+    pub async fn commit_typed_manifest_for_principal(
+        &mut self,
+        principal: &StoragePrincipal,
+        object_kind: u32,
+        children: &[&AuthorizedObject<CasObjectHandle>],
+    ) -> Result<AuthorizedObject<CasObjectHandle>, TypedCommitError<D::Error>> {
+        let payload = self.typed_manifest_payload(object_kind, children)?;
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| TypedCommitError::TooManyChildren)?;
+        let mut writer = self.begin_blob_with_reference_codec_for_principal(
+            principal,
             object_kind,
             payload_len,
             None,
@@ -181,6 +207,9 @@ impl<D: PageDevice> SegmentStore<D> {
         clock: &C,
     ) -> Result<(AuthorizedObject<CasObjectHandle>, Option<GcTelemetry>), TypedCommitError<D::Error>>
     {
+        if self.quota.is_some() {
+            return Err(StoreError::PrincipalRequired.into());
+        }
         let probe = self.typed_manifest_payload(object_kind, children)?;
         let payload_len =
             u64::try_from(probe.len()).map_err(|_| TypedCommitError::TooManyChildren)?;

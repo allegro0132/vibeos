@@ -215,6 +215,16 @@ removing only the disk then left the keyboard online, where `echo hidok7`
 arrived exactly. The hub polling task checks port membership every 250 ms and
 rebuilds function bindings when it changes.
 
+The recursive-hub gate on 2026-08-12 placed a high-speed `1a40:0101` hub on
+root-hub address 1 / port 1, then the Full-Speed Apple keyboard on the nested
+hub's address 2 / port 3. `lsusb` reported the keyboard at address 3 with the
+complete parent chain, and `echo nestedhidok` arrived exactly through split
+transactions targeting the nearest high-speed hub. Removing only the keyboard
+reduced the descendant count from two to one while preserving both hubs.
+Reinsertion restored Report HID without reboot, and `echo n2ok` arrived exactly.
+Traversal is bounded to four hub levels and fifteen non-root devices; nested
+hubs must currently negotiate High Speed.
+
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after
 enabling all five USB clocks. Host role selection powers VBUS before the DWC2
@@ -681,6 +691,10 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       Removing and reinserting the keyboard preserves disk READ(10); removing
       the disk preserves exact HID input. Each topology transition reassigns
       addresses and restores the remaining functions without a reboot.
+- [x] Recursive enumeration traverses the physical `05e3:0610` -> `1a40:0101`
+      -> `05ac:0220` topology. The Full-Speed keyboard works at depth two through
+      the nested high-speed hub's transaction translator, and nested-port
+      removal/reinsertion clears and restores HID without removing either hub.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

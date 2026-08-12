@@ -465,29 +465,26 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         device.max_packet_size_0,
     ));
     if let Some(hub) = snapshot.hub {
-        match (hub.active_port, hub.child_speed) {
-            (Some(port), Some(speed)) => output.push_str(&format!(
-                "  Hub ports={} downstream port={} speed={:?} status={:#06x}\n",
-                hub.ports, port, speed, hub.port_status,
-            )),
-            _ => output.push_str(&format!(
-                "  Hub ports={} no enabled downstream device\n",
-                hub.ports,
-            )),
-        }
-    }
-    if let Some(child) = snapshot.child {
+        let child_count = snapshot.children.iter().flatten().count();
         output.push_str(&format!(
-            "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} parent=001 port={}\n",
-            child.address,
-            child.vendor_id,
-            child.product_id,
-            child.speed,
-            child.usb_version,
-            child.device_class,
-            child.max_packet_size_0,
-            snapshot.hub.and_then(|hub| hub.active_port).unwrap_or(0),
+            "  Hub ports={} downstream devices={}\n",
+            hub.ports, child_count,
         ));
+        for child in snapshot.children.into_iter().flatten() {
+            output.push_str(&format!(
+                "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} parent={:03} port={} status={:#06x}\n",
+                child.device.address,
+                child.device.vendor_id,
+                child.device.product_id,
+                child.device.speed,
+                child.device.usb_version,
+                child.device.device_class,
+                child.device.max_packet_size_0,
+                hub.address,
+                child.port,
+                child.port_status,
+            ));
+        }
     }
     if let Some(configuration) = snapshot.configuration {
         output.push_str(&format!(
@@ -544,7 +541,8 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     }
     match snapshot.keyboard {
         Some(keyboard) => output.push_str(&format!(
-            "  HID keyboard protocol={:?} interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            "  HID keyboard device={} protocol={:?} interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            snapshot.keyboard_device_address.unwrap_or(0),
             keyboard.protocol,
             keyboard.interface,
             keyboard.endpoint_in,
@@ -555,7 +553,8 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     }
     if let Some(storage) = snapshot.mass_storage {
         output.push_str(&format!(
-            "  Mass Storage SCSI/Bulk-Only interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} detected\n",
+            "  Mass Storage device={} SCSI/Bulk-Only interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} detected\n",
+            snapshot.storage_device_address.unwrap_or(0),
             storage.interface,
             storage.endpoint_in,
             storage.max_packet_size_in,

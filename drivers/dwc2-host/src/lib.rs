@@ -658,8 +658,22 @@ impl Controller {
         self.keyboard
     }
 
+    pub const fn keyboard_device_address(&self) -> Option<u8> {
+        match self.keyboard_target {
+            Some(target) => Some(target.address),
+            None => None,
+        }
+    }
+
     pub const fn mass_storage(&self) -> Option<MassStorageInfo> {
         self.mass_storage
+    }
+
+    pub const fn storage_device_address(&self) -> Option<u8> {
+        match self.storage_target {
+            Some(target) => Some(target.address),
+            None => None,
+        }
     }
 
     /// Select the detected SCSI Bulk-Only interface and probe its logical

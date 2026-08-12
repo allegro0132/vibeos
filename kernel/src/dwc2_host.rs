@@ -19,7 +19,9 @@ pub struct Snapshot {
     pub configuration: Option<ConfigurationInfo>,
     pub report_descriptor: Option<HidReportDescriptor>,
     pub keyboard: Option<HidKeyboardInfo>,
+    pub keyboard_device_address: Option<u8>,
     pub mass_storage: Option<MassStorageInfo>,
+    pub storage_device_address: Option<u8>,
     pub telemetry: Telemetry,
 }
 
@@ -64,7 +66,9 @@ pub fn snapshot() -> Option<Snapshot> {
         configuration: controller.configuration(),
         report_descriptor: controller.report_descriptor(),
         keyboard: controller.keyboard(),
+        keyboard_device_address: controller.keyboard_device_address(),
         mass_storage: controller.mass_storage(),
+        storage_device_address: controller.storage_device_address(),
         telemetry: controller.telemetry(),
     })
 }

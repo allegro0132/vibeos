@@ -137,6 +137,10 @@ checkpoint remains a valid fallback throughout a torn checkpoint switch.
 
 ### M7.0 — Freeze compatibility and adopt `sha2`
 
+**Status: complete (2026-08-12).** The frozen M4 fixtures, dependency audit,
+firmware-size and portable-throughput measurements are recorded in
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** Storage V2 starts from an unchanged, independently verified Blob
 identity.
 

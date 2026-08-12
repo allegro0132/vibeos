@@ -1010,6 +1010,13 @@ name = "vibeos-rustc"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-segment-format"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "vibeos-ssh-identity"
 version = "0.1.0"
 dependencies = [

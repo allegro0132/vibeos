@@ -198,6 +198,12 @@ Acceptance:
 
 ### M7.2 — Canonical segment format and crash model
 
+**Status: complete (2026-08-12).** The frozen page ABI, independent powered-off
+parser, strict seal-prefix crash model, opaque verified-record API, checked
+geometry, and cross-language fixture are recorded in
+[STORAGE_V2_FORMAT.md](STORAGE_V2_FORMAT.md) and
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** a pure `no_std` format crate can encode, reject, and recover every
 Storage V2 structural record without performing I/O or allocating.
 

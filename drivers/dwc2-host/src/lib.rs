@@ -1167,8 +1167,19 @@ impl Controller {
     }
 
     fn record_hub(&mut self, hub: HubInfo) -> Result<(), Error> {
-        let index = usize::from(hub.address.saturating_sub(1));
-        let slot = self.hubs.get_mut(index).ok_or(Error::InvalidDescriptor)?;
+        if let Some(slot) = self
+            .hubs
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|candidate| candidate.address == hub.address))
+        {
+            *slot = Some(hub);
+            return Ok(());
+        }
+        let slot = self
+            .hubs
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::InvalidDescriptor)?;
         *slot = Some(hub);
         Ok(())
     }

@@ -706,6 +706,20 @@ impl Controller {
         Ok(bytes)
     }
 
+    /// Write one logical sector using SCSI WRITE(10).
+    ///
+    /// Callers must ensure that overwriting the selected sector is safe.
+    pub fn write_sector(&mut self, sector: u64, bytes: &[u8; 512]) -> Result<(), Error> {
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let capacity = storage.capacity_sectors.ok_or(Error::StorageProtocol)?;
+        if sector >= capacity || sector > u64::from(u32::MAX) {
+            return Err(Error::StorageOutOfRange);
+        }
+        let cdb = write_10_cdb(sector as u32);
+        let mut data = *bytes;
+        self.bot_command(&cdb, false, &mut data)
+    }
+
     pub const fn configuration(&self) -> Option<ConfigurationInfo> {
         self.configuration
     }
@@ -1151,6 +1165,21 @@ impl Controller {
     }
 
     fn bot_command(&mut self, cdb: &[u8], data_in: bool, data: &mut [u8]) -> Result<(), Error> {
+        let result = self.bot_command_once(cdb, data_in, data);
+        if let Err(error) = result {
+            if bot_requires_reset_recovery(error) {
+                let _ = self.bot_reset_recovery();
+            }
+        }
+        result
+    }
+
+    fn bot_command_once(
+        &mut self,
+        cdb: &[u8],
+        data_in: bool,
+        data: &mut [u8],
+    ) -> Result<(), Error> {
         const CBW_LENGTH: usize = 31;
         const CSW_LENGTH: usize = 13;
         if cdb.is_empty() || cdb.len() > 16 || data.len() > DMA_BYTES {
@@ -1204,6 +1233,35 @@ impl Controller {
         if residue != 0 {
             return Err(Error::StorageCswResidue(residue));
         }
+        Ok(())
+    }
+
+    fn bot_reset_recovery(&mut self) -> Result<(), Error> {
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x21,
+                request: 0xff,
+                value: 0,
+                index: u16::from(storage.interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        for endpoint in [storage.endpoint_in, storage.endpoint_out] {
+            self.control_transfer(
+                SetupPacket {
+                    request_type: 0x02,
+                    request: 1,
+                    value: 0,
+                    index: u16::from(endpoint),
+                    length: 0,
+                },
+                &mut [],
+            )?;
+        }
+        self.storage_pid_in = DataPid::Data0;
+        self.storage_pid_out = DataPid::Data0;
         Ok(())
     }
 
@@ -1752,6 +1810,30 @@ fn read_10_cdb(sector: u32) -> [u8; 10] {
     cdb[2..6].copy_from_slice(&sector.to_be_bytes());
     cdb[7..9].copy_from_slice(&1u16.to_be_bytes());
     cdb
+}
+
+fn write_10_cdb(sector: u32) -> [u8; 10] {
+    let mut cdb = read_10_cdb(sector);
+    cdb[0] = 0x2a;
+    cdb
+}
+
+const fn bot_requires_reset_recovery(error: Error) -> bool {
+    matches!(
+        error,
+        Error::TransferTimedOut
+            | Error::TransferFailed(_)
+            | Error::Stalled
+            | Error::Nak
+            | Error::StorageProtocol
+            | Error::StorageCommandFailed(2)
+            | Error::StorageCswSignature(_)
+            | Error::StorageCswTag(_)
+            | Error::StorageCswResidue(_)
+            | Error::StorageCbwLength(_)
+            | Error::StorageDataLength { .. }
+            | Error::StorageCswLength(_)
+    )
 }
 
 const fn completed_length(direction_in: bool, requested: usize, remaining: usize) -> usize {
@@ -2553,6 +2635,12 @@ mod tests {
             read_10_cdb(0x1234_5678),
             [0x28, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 1, 0]
         );
+        assert_eq!(
+            write_10_cdb(0x1234_5678),
+            [0x2a, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 1, 0]
+        );
+        assert!(!bot_requires_reset_recovery(Error::StorageCommandFailed(1)));
+        assert!(bot_requires_reset_recovery(Error::StorageCommandFailed(2)));
     }
 
     #[test]

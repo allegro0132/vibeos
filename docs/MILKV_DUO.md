@@ -146,9 +146,17 @@ as the QEMU xHCI console and feed the kernel console input queue. The boot log
 prints speed, VID:PID, USB version, endpoint-zero packet size, keyboard protocol,
 and the selected HID interface/endpoint. A resident polling task
 detects root-port disconnect and reconnect transitions, clears stale device
-state, and repeats enumeration and HID configuration after reinsertion. USB
-storage remains absent. The official SDK describes the same core/PHY ranges and
-IRQ in
+state, and repeats enumeration and HID configuration after reinsertion.
+
+SCSI transparent-command-set, Bulk-Only USB storage is also supported on LUN
+zero. The driver discovers the bulk-IN and bulk-OUT endpoints, issues TEST UNIT
+READY, REQUEST SENSE and READ CAPACITY(10), and accepts 512-byte logical blocks.
+READ(10) and WRITE(10) transfer one raw sector at a time; failed BOT transport
+or phase transactions perform the required Mass Storage Reset followed by
+CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints. VibeOS does not yet mount a
+FAT or other filesystem from USB, so this is raw block access rather than a
+file-oriented `mount`, `cp`, or directory interface. The official SDK describes
+the same core/PHY ranges and IRQ in
 [`cv180x_base.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x/cv180x_base.dtsi)
 and
 [`cv180x_base_riscv.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi).
@@ -160,6 +168,13 @@ Authenticated SSH sessions install the same shared VSH command profile, so
 `lsusb` and other read-only platform diagnostics are available over either
 transport. The default-password onboarding profile remains deliberately
 restricted until a public key is authorized.
+For an attached disk, `usb info` prints endpoint packet sizes and capacity, and
+`usb read N` dumps one 512-byte sector. The hardware acceptance image also
+provides `usb write-test CONFIRM`, locked to the explicitly reserved LBA
+4,000,000. It saves that sector, writes a deterministic pattern, reads it back,
+restores the original bytes, and verifies the restoration. It must only be run
+on media where that LBA is known to be disposable, and power and USB must remain
+stable until the restoration message appears.
 For a usable keyboard it also prints `HID keyboard protocol=Boot` or
 `protocol=Report` with the selected interface and interrupt-IN endpoint. It
 also reports each interface class tuple and the HID report-descriptor length.
@@ -644,9 +659,13 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       configuration and report-descriptor enumeration on the physical OTG port.
       The Apple `05ac:0220` report keyboard is configured on interface 2 / endpoint
       `0x83`, and `hidtest123` reaches `vsh>` exactly through USB input.
+- [x] A high-speed `1f75:0903` SCSI/BOT disk behind hub port 3 reports
+      123,469,824 sectors of 512 bytes. READ(10) returned the complete protective
+      MBR including its `55 aa` signature. On 2026-08-12, the guarded WRITE(10)
+      test on reserved LBA 4,000,000 passed its pattern readback and restoration
+      checks; an independent subsequent READ(10) matched the original 512 bytes.
 - [ ] Disconnect/reconnect repeats hub-child enumeration and restores keyboard
-      input. Preserve the UART log and pass `scripts/check-milkv-usb-hid-log.sh`;
-      storage I/O remains a later gate.
+      input. Preserve the UART log and pass `scripts/check-milkv-usb-hid-log.sh`.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

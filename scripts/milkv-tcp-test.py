@@ -49,7 +49,10 @@ def parse_args() -> argparse.Namespace:
             "binary echo on every fresh TCP stream."
         )
     )
-    parser.add_argument("host", help="IPv4 address reported by `ip -4 addr show dev net0`")
+    parser.add_argument(
+        "host",
+        help="IPv4 address reported by `ip -4 addr show dev <DWMAC_NET>`",
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
     parser.add_argument("--timeout", type=float, default=3.0)

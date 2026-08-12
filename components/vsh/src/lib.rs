@@ -199,7 +199,7 @@ pub fn help(_args: &[String]) -> Result<String, Status> {
     let help = {
         let mut help = help;
         help.push_str(
-            "  ip ...          show or configure IPv4 on net0\n\
+            "  ip ...          show or configure IPv4 on netN\n\
              \x20 dhclient [-r]  acquire or stop DHCPv4\n",
         );
         help

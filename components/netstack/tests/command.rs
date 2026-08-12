@@ -15,7 +15,7 @@ fn parses_linux_style_show_and_static_ipv4_commands() {
     assert_eq!(
         parse_ip_command(&args(&["-4", "addr", "show", "dev", "eth0"])),
         Ok(IpCommand::ShowAddress {
-            interface: Some(NetworkInterfaceId::PRIMARY),
+            interface: Some(NetworkInterfaceId::FIRST),
         })
     );
     assert_eq!(
@@ -27,7 +27,7 @@ fn parses_linux_style_show_and_static_ipv4_commands() {
             "net0"
         ])),
         Ok(IpCommand::ReplaceAddress {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
             address: [192, 168, 7, 20],
             prefix_len: 24,
         })
@@ -43,7 +43,7 @@ fn parses_linux_style_show_and_static_ipv4_commands() {
             "net0"
         ])),
         Ok(IpCommand::ReplaceDefaultRoute {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
             gateway: [192, 168, 7, 1],
         })
     );
@@ -54,27 +54,27 @@ fn parses_link_and_dhcp_commands_with_eth0_alias() {
     assert_eq!(
         parse_ip_command(&args(&["link", "set", "dev", "eth0", "down"])),
         Ok(IpCommand::SetLink {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
             up: false,
         })
     );
     assert_eq!(
         parse_dhclient_command(&[]),
         Ok(DhclientCommand::Acquire {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
         })
     );
     assert_eq!(
         parse_dhclient_command(&args(&["-r", "eth0"])),
         Ok(DhclientCommand::Release {
-            interface: NetworkInterfaceId::PRIMARY,
+            interface: NetworkInterfaceId::FIRST,
         })
     );
 }
 
 #[test]
-fn carries_secondary_interface_identity_through_every_command() {
-    let net1 = NetworkInterfaceId::new(1).unwrap();
+fn carries_nonzero_interface_identity_through_every_command() {
+    let net1 = NetworkInterfaceId::new(1);
     assert_eq!(
         parse_ip_command(&args(&["link", "show", "dev", "net1"])),
         Ok(IpCommand::ShowLink {
@@ -113,7 +113,13 @@ fn rejects_out_of_scope_devices_and_invalid_addresses() {
     );
     assert!(parse_ip_command(&args(&["route", "replace", "default", "via", "224.0.0.1"])).is_err());
     assert!(parse_ip_command(&args(&["link", "show", "dev", "wlan0"])).is_err());
-    assert!(parse_ip_command(&args(&["link", "show", "dev", "net4"])).is_err());
+    assert_eq!(
+        parse_ip_command(&args(&["link", "show", "dev", "net4096"])),
+        Ok(IpCommand::ShowLink {
+            interface: Some(NetworkInterfaceId::new(4096)),
+        })
+    );
+    assert!(parse_ip_command(&args(&["link", "show", "dev", "net65536"])).is_err());
     assert!(parse_ip_command(&args(&["link", "show", "dev", "net01"])).is_err());
     assert!(parse_dhclient_command(&args(&["-1", "net0"])).is_err());
 }

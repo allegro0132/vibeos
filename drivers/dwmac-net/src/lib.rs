@@ -111,16 +111,41 @@ const _: () = {
     assert!(core::mem::offset_of!(Slab, tx) % 64 == 0);
 };
 
-struct StableDma(UnsafeCell<Slab>);
-unsafe impl Sync for StableDma {}
-#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
-static DMA: StableDma = StableDma(UnsafeCell::new(Slab::ZERO));
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-static PHY_LINK_UP: AtomicBool = AtomicBool::new(false);
-static RESETS: AtomicU64 = AtomicU64::new(0);
-static RX_PACKETS: AtomicU64 = AtomicU64::new(0);
-static TX_PACKETS: AtomicU64 = AtomicU64::new(0);
-static TX_STATUS: AtomicU64 = AtomicU64::new(0);
+pub struct DmaStorage {
+    slab: UnsafeCell<Slab>,
+    claimed: AtomicBool,
+    phy_link_up: AtomicBool,
+    resets: AtomicU64,
+    rx_packets: AtomicU64,
+    tx_packets: AtomicU64,
+    tx_status: AtomicU64,
+}
+
+unsafe impl Sync for DmaStorage {}
+
+impl DmaStorage {
+    pub const fn new() -> Self {
+        Self {
+            slab: UnsafeCell::new(Slab::ZERO),
+            claimed: AtomicBool::new(false),
+            phy_link_up: AtomicBool::new(false),
+            resets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
+            tx_status: AtomicU64::new(0),
+        }
+    }
+
+    pub fn base(&self) -> usize {
+        self.slab.get() as usize
+    }
+}
+
+impl Default for DmaStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Validate invariants required by the fixed CV1800B engine without touching
 /// hardware. This is also suitable for BSP table tests on the host.
@@ -146,9 +171,10 @@ const fn range_contains_bytes(start: usize, end: usize, bytes: usize) -> bool {
     }
 }
 
-/// Exclusive live ownership of the fixed DMA slab and the DWMAC instance.
+/// Exclusive live ownership of one caller-supplied DMA slab and DWMAC instance.
 pub struct Engine {
     description: DwmacDescription,
+    dma: &'static DmaStorage,
     time: fn() -> u64,
     timebase_hz: u64,
     live: bool,
@@ -160,12 +186,13 @@ impl Engine {
     /// # Safety
     /// `time` must be monotonic in `timebase_hz` ticks and every described
     /// MMIO range must remain mapped with exclusive device ownership for the
-    /// returned engine's lifetime. The crate-owned `.dma` slab must be
+    /// returned engine's lifetime. The supplied `.dma` slab must be
     /// identity mapped, physically contiguous, coherent with the explicit
     /// cache maintenance below, and reachable within `dma_address_bits`;
     /// descriptor addresses are published directly from their Rust address.
     pub unsafe fn claim(
         description: DwmacDescription,
+        dma: &'static DmaStorage,
         guest_mac: [u8; 6],
         time: fn() -> u64,
         timebase_hz: u64,
@@ -173,7 +200,8 @@ impl Engine {
         if !validate_description(description) {
             return Err(Error::InvalidDescription);
         }
-        if CLAIMED
+        if dma
+            .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -181,13 +209,14 @@ impl Engine {
         }
         let mut engine = Self {
             description,
+            dma,
             time,
             timebase_hz,
             live: false,
         };
         if let Err(error) = unsafe { engine.initialize(guest_mac) } {
-            let _ = shutdown(description);
-            CLAIMED.store(false, Ordering::Release);
+            let _ = shutdown(description, dma);
+            dma.claimed.store(false, Ordering::Release);
             return Err(error);
         }
         engine.live = true;
@@ -199,14 +228,16 @@ impl Engine {
     }
 
     pub fn tx_owned(&self) -> bool {
-        let dma = unsafe { &*DMA.0.get() };
+        let dma = unsafe { &*self.dma.slab.get() };
         invalidate_range(
             self.description.cache_line_bytes,
             descriptor_address(&dma.tx_desc),
             core::mem::size_of_val(&dma.tx_desc),
         );
         let status = dma.tx_desc.words[0];
-        TX_STATUS.store(u64::from(status), Ordering::Release);
+        self.dma
+            .tx_status
+            .store(u64::from(status), Ordering::Release);
         status & DESC_OWN != 0
     }
 
@@ -214,20 +245,24 @@ impl Engine {
         if packet.len() > DMA_BUFFER_LEN {
             return Err(Error::PacketTooLarge);
         }
-        let dma = unsafe { &mut *DMA.0.get() };
+        let dma = unsafe { &mut *self.dma.slab.get() };
         invalidate_range(
             self.description.cache_line_bytes,
             descriptor_address(&dma.tx_desc),
             core::mem::size_of_val(&dma.tx_desc),
         );
         if dma.tx_desc.words[0] & DESC_OWN != 0 {
-            TX_STATUS.store(u64::from(dma.tx_desc.words[0]), Ordering::Release);
+            self.dma
+                .tx_status
+                .store(u64::from(dma.tx_desc.words[0]), Ordering::Release);
             return Err(Error::QueueFull);
         }
         dma.tx[..packet.len()].copy_from_slice(packet);
         dma.tx_desc.words[1] = packet.len() as u32 | TX_END_RING | TX_FIRST | TX_LAST;
         dma.tx_desc.words[0] = DESC_OWN;
-        TX_STATUS.store(u64::from(DESC_OWN), Ordering::Release);
+        self.dma
+            .tx_status
+            .store(u64::from(DESC_OWN), Ordering::Release);
         clean_range(
             self.description.cache_line_bytes,
             buffer_address(&dma.tx),
@@ -239,12 +274,12 @@ impl Engine {
             core::mem::size_of_val(&dma.tx_desc),
         );
         write32(self.description, DMA_TX_POLL, 1);
-        TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        self.dma.tx_packets.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
-        let dma = unsafe { &mut *DMA.0.get() };
+        let dma = unsafe { &mut *self.dma.slab.get() };
         invalidate_range(
             self.description.cache_line_bytes,
             descriptor_address(&dma.rx_desc),
@@ -268,7 +303,7 @@ impl Engine {
                 with_fcs.min(DMA_BUFFER_LEN),
             );
             output[..length].copy_from_slice(&dma.rx[..length]);
-            RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+            self.dma.rx_packets.fetch_add(1, Ordering::Relaxed);
             Some(length)
         } else {
             None
@@ -285,14 +320,14 @@ impl Engine {
     }
 
     pub fn poll_link(&mut self) {
-        update_phy_link(self.description);
+        update_phy_link(self.description, self.dma);
     }
 
-    /// Stop DMA and release the static DMA ownership claim.
+    /// Stop DMA and release this instance's DMA ownership claim.
     pub fn shutdown(mut self) -> bool {
-        let reset = shutdown(self.description);
+        let reset = shutdown(self.description, self.dma);
         self.live = false;
-        CLAIMED.store(false, Ordering::Release);
+        self.dma.claimed.store(false, Ordering::Release);
         reset
     }
 
@@ -306,8 +341,8 @@ impl Engine {
         if !wait_reset(self.description) {
             return Err(Error::TimedOut);
         }
-        RESETS.fetch_add(1, Ordering::Relaxed);
-        let dma = unsafe { &mut *DMA.0.get() };
+        self.dma.resets.fetch_add(1, Ordering::Relaxed);
+        let dma = unsafe { &mut *self.dma.slab.get() };
         *dma = Slab::ZERO;
         let rx = descriptor_address(&dma.rx_desc);
         let tx = descriptor_address(&dma.tx_desc);
@@ -326,7 +361,7 @@ impl Engine {
         dma.tx_desc.words[2] = txb as u32;
         clean_range(
             self.description.cache_line_bytes,
-            dma_base(),
+            self.dma.base(),
             core::mem::size_of::<Slab>(),
         );
         write32(
@@ -369,7 +404,7 @@ impl Engine {
                 | DMA_START_TX,
         );
         write32(self.description, DMA_RX_POLL, 1);
-        update_phy_link(self.description);
+        update_phy_link(self.description, self.dma);
         let _ = read32(self.description, GMAC_MII_ADDR);
         Ok(())
     }
@@ -378,8 +413,8 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.live {
-            let _ = shutdown(self.description);
-            CLAIMED.store(false, Ordering::Release);
+            let _ = shutdown(self.description, self.dma);
+            self.dma.claimed.store(false, Ordering::Release);
         }
     }
 }
@@ -391,26 +426,26 @@ impl Drop for Engine {
 /// readable for this call. The caller must also serialize these diagnostic
 /// reads with platform operations for which the DWMAC, clock, or ePHY
 /// register semantics require exclusive access.
-pub unsafe fn telemetry(description: DwmacDescription) -> Telemetry {
-    let tx_descriptor_status = TX_STATUS.load(Ordering::Acquire) as u32;
+pub unsafe fn telemetry(description: DwmacDescription, dma: &DmaStorage) -> Telemetry {
+    let tx_descriptor_status = dma.tx_status.load(Ordering::Acquire) as u32;
     Telemetry {
-        phy_link_up: PHY_LINK_UP.load(Ordering::Acquire),
+        phy_link_up: dma.phy_link_up.load(Ordering::Acquire),
         tx_descriptor_status,
         dma_status: read32(description, DMA_STATUS),
         clock_enable: soc_read32(description.soc_control.start + 0x2000),
         clock_bypass: soc_read32(description.soc_control.start + 0x2030),
         clock_divider: soc_read32(description.soc_control.start + 0x208c),
         ephy_control: soc_read32(description.soc_control.start + 0x9800),
-        resets: RESETS.load(Ordering::Acquire),
-        rx_packets: RX_PACKETS.load(Ordering::Acquire),
-        tx_packets: TX_PACKETS.load(Ordering::Acquire),
+        resets: dma.resets.load(Ordering::Acquire),
+        rx_packets: dma.rx_packets.load(Ordering::Acquire),
+        tx_packets: dma.tx_packets.load(Ordering::Acquire),
     }
 }
 
-/// Physical address of the crate-owned stable DMA slab, for diagnostics and
+/// Physical address of the caller-owned stable DMA slab, for diagnostics and
 /// kernel resource descriptions only.
-pub fn dma_region_base() -> usize {
-    dma_base()
+pub fn dma_region_base(dma: &DmaStorage) -> usize {
+    dma.base()
 }
 
 /// Force hardware quiescence and clear an ownership claim after the previous
@@ -420,13 +455,13 @@ pub fn dma_region_base() -> usize {
 /// The caller must prove that no old `Engine` can run or be dropped again.
 /// Every range in `description` must still satisfy the mapping and exclusive
 /// MMIO requirements of [`Engine::claim`] while recovery touches the device.
-pub unsafe fn recover_faulted(description: DwmacDescription) -> bool {
-    let reset = shutdown(description);
-    CLAIMED.store(false, Ordering::Release);
+pub unsafe fn recover_faulted(description: DwmacDescription, dma: &DmaStorage) -> bool {
+    let reset = shutdown(description, dma);
+    dma.claimed.store(false, Ordering::Release);
     reset
 }
 
-fn shutdown(d: DwmacDescription) -> bool {
+fn shutdown(d: DwmacDescription, dma: &DmaStorage) -> bool {
     write32(d, DMA_INT_ENABLE, 0);
     write32(d, DMA_CONTROL, 0);
     write32(
@@ -436,8 +471,8 @@ fn shutdown(d: DwmacDescription) -> bool {
     );
     write32(d, DMA_BUS_MODE, read32(d, DMA_BUS_MODE) | DMA_SOFT_RESET);
     let reset = wait_reset(d);
-    PHY_LINK_UP.store(false, Ordering::Release);
-    TX_STATUS.store(0, Ordering::Release);
+    dma.phy_link_up.store(false, Ordering::Release);
+    dma.tx_status.store(0, Ordering::Release);
     reset
 }
 fn wait_reset(d: DwmacDescription) -> bool {
@@ -450,20 +485,20 @@ fn wait_reset(d: DwmacDescription) -> bool {
     false
 }
 
-fn update_phy_link(d: DwmacDescription) {
+fn update_phy_link(d: DwmacDescription, dma: &DmaStorage) {
     if mdio_read(d, 1).is_none() {
-        PHY_LINK_UP.store(false, Ordering::Release);
+        dma.phy_link_up.store(false, Ordering::Release);
         return;
     }
     let Some(status) = mdio_read(d, 1) else {
-        PHY_LINK_UP.store(false, Ordering::Release);
+        dma.phy_link_up.store(false, Ordering::Release);
         return;
     };
     if status & (1 << 2) == 0 {
-        PHY_LINK_UP.store(false, Ordering::Release);
+        dma.phy_link_up.store(false, Ordering::Release);
         return;
     }
-    PHY_LINK_UP.store(true, Ordering::Release);
+    dma.phy_link_up.store(true, Ordering::Release);
     let control = mdio_read(d, 0).unwrap_or(0);
     let (fast, full) = if control & (1 << 12) != 0 && status & (1 << 5) != 0 {
         let partner = mdio_read(d, 5).unwrap_or(0);
@@ -714,9 +749,6 @@ fn delay(time: fn() -> u64, hz: u64, ms: u64) {
     while time() < end {
         core::hint::spin_loop()
     }
-}
-fn dma_base() -> usize {
-    DMA.0.get() as usize
 }
 fn descriptor_address(v: &Descriptor) -> usize {
     v.words.as_ptr() as usize

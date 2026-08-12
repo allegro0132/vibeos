@@ -1,9 +1,10 @@
 //! Capability-confined multi-interface IPv4 stack service.
 //!
-//! The image grants up to four independent NIC capability bundles. Each bundle
-//! owns its own smoltcp interface, address policy, routes, DHCP client, packet
-//! session, and bounded set of TCP listener frontends. Applications remain
-//! separate components and never receive packet endpoints or smoltcp objects.
+//! The image grants a boot-discovered list of independent NIC capability
+//! bundles. Each bundle owns its own smoltcp interface, address policy, routes,
+//! DHCP client, packet session, and bounded set of TCP listener frontends.
+//! Applications remain separate components and never receive packet endpoints
+//! or smoltcp objects.
 
 #![no_std]
 
@@ -27,7 +28,7 @@ use vibeos_net_protocol::{
     Ipv4StackConfig, SharedIpv4TcpStack, TcpListenerHandle, MAX_TCP_LISTENERS,
 };
 
-pub use vibeos_net_protocol::command::{NetworkInterfaceId, MAX_NETWORK_INTERFACES};
+pub use vibeos_net_protocol::command::NetworkInterfaceId;
 
 pub mod command;
 pub mod config;
@@ -147,7 +148,7 @@ pub async fn task(
     listener_caps: TcpListenerCapabilities,
 ) {
     let interfaces = [NetworkInterfaceCapabilities::new(
-        NetworkInterfaceId::PRIMARY,
+        NetworkInterfaceId::FIRST,
         outbound_cap,
         inbound_cap,
         control_cap,
@@ -163,16 +164,18 @@ pub async fn task(
 /// is retired without taking healthy interfaces down with it.
 pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterfaceCapabilities]) {
     let mut interfaces = Vec::new();
-    let admitted = interface_caps.len().min(MAX_NETWORK_INTERFACES);
-    if interfaces.try_reserve_exact(admitted).is_err() {
+    if interfaces.try_reserve_exact(interface_caps.len()).is_err() {
         return;
     }
-    let mut seen = [false; MAX_NETWORK_INTERFACES];
-    for caps in interface_caps.iter().copied().take(MAX_NETWORK_INTERFACES) {
-        if seen[caps.interface.index()] {
+    let mut seen = Vec::new();
+    if seen.try_reserve_exact(interface_caps.len()).is_err() {
+        return;
+    }
+    for caps in interface_caps.iter().copied() {
+        if seen.contains(&caps.interface) {
             continue;
         }
-        seen[caps.interface.index()] = true;
+        seen.push(caps.interface);
         let Some((outbound, inbound)) = space.packet_endpoints(caps.outbound, caps.inbound) else {
             continue;
         };
@@ -186,12 +189,25 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
                 valid = false;
                 break;
             };
+            let listener_id = match listener.try_with(TcpListener::id) {
+                Ok(listener_id) => listener_id.get(),
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            };
+            if !config::register_listener(caps.interface, listener_id) {
+                valid = false;
+                break;
+            }
             listeners.push(listener);
         }
         if !valid {
             continue;
         }
-        config::register_interface(caps.interface);
+        if !config::register_interface(caps.interface, !listeners.is_empty()) {
+            continue;
+        }
         interfaces.push(InterfaceTask {
             interface: caps.interface,
             outbound,

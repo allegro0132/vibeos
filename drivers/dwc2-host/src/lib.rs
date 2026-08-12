@@ -104,12 +104,6 @@ const USB_CLASS_HUB: u8 = 9;
 const USB_CLASS_MASS_STORAGE: u8 = 8;
 const USB_MASS_STORAGE_SCSI: u8 = 6;
 const USB_MASS_STORAGE_BULK_ONLY: u8 = 0x50;
-const REALTEK_VENDOR_ID: u16 = 0x0bda;
-const RTL8151_INSTALL_MODE_PRODUCT_ID: u16 = 0x8151;
-const RTL8151_MODE_SWITCH_MESSAGE: [u8; 31] = [
-    0x55, 0x53, 0x42, 0x43, 0x08, 0x60, 0xd9, 0xa9, 0xc0, 0x00, 0x00, 0x00, 0x80, 0x00, 0x06, 0xe0,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
 const USB_DESCRIPTOR_HUB: u16 = 0x29;
 const USB_PORT_FEAT_RESET: u16 = 4;
 const USB_PORT_FEAT_POWER: u16 = 8;
@@ -120,15 +114,36 @@ const USB_PORT_STAT_LOW_SPEED: u16 = 1 << 9;
 const USB_PORT_STAT_HIGH_SPEED: u16 = 1 << 10;
 const MAX_HUB_PORTS: u8 = 15;
 
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-
 #[repr(C, align(64))]
-struct DmaBuffer(UnsafeCell<[u8; DMA_BYTES]>);
+pub struct DmaStorage {
+    buffer: UnsafeCell<[u8; DMA_BYTES]>,
+    claimed: AtomicBool,
+}
 
-unsafe impl Sync for DmaBuffer {}
+unsafe impl Sync for DmaStorage {}
 
-#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
-static DMA: DmaBuffer = DmaBuffer(UnsafeCell::new([0; DMA_BYTES]));
+impl DmaStorage {
+    pub const fn new() -> Self {
+        Self {
+            buffer: UnsafeCell::new([0; DMA_BYTES]),
+            claimed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn base(&self) -> usize {
+        self.buffer.get() as usize
+    }
+
+    unsafe fn with_bytes_mut<R>(&self, operation: impl FnOnce(&mut [u8; DMA_BYTES]) -> R) -> R {
+        operation(unsafe { &mut *self.buffer.get() })
+    }
+}
+
+impl Default for DmaStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -300,6 +315,13 @@ pub struct HubChildInfo {
 }
 
 const MAX_HUB_DEPTH: u8 = 4;
+pub const MAX_USB_BUS_PATH_DEPTH: usize = MAX_HUB_DEPTH as usize + 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsbBusPath {
+    pub ports: [u8; MAX_USB_BUS_PATH_DEPTH],
+    pub depth: u8,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SplitTarget {
@@ -399,6 +421,7 @@ pub struct Telemetry {
 /// Exclusive ownership of the fixed CV1800B DWC2 host instance.
 pub struct Controller {
     description: Dwc2Description,
+    dma: &'static DmaStorage,
     info: Info,
     timebase_hz: u64,
     time: fn() -> u64,
@@ -421,6 +444,7 @@ pub struct Controller {
     storage_target: Option<TransferTarget>,
     cdc_ecm: Option<CdcEcmInfo>,
     cdc_ecm_target: Option<TransferTarget>,
+    network_bus_path: Option<UsbBusPath>,
     bulk_pids: [[DataPid; 32]; 16],
     storage_tag: u32,
     keyboard_layout: KeyboardLayout,
@@ -436,16 +460,21 @@ impl Controller {
     /// # Safety
     /// All ranges in `description` must be identity-mapped, strongly ordered
     /// MMIO for the CV1800B and remain exclusively owned until `shutdown`.
-    /// `time` must advance monotonically in `timebase_hz` ticks.
+    /// `dma` must be permanently allocated, identity-mapped, physically
+    /// contiguous, cache coherent for the platform, and reachable within the
+    /// described DMA address width. `time` must advance monotonically in
+    /// `timebase_hz` ticks.
     pub unsafe fn initialize(
         description: Dwc2Description,
+        dma: &'static DmaStorage,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
         if !validate_description(description) || timebase_hz == 0 {
             return Err(Error::InvalidDescription);
         }
-        if CLAIMED
+        if dma
+            .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -483,7 +512,7 @@ impl Controller {
         compiler_fence(Ordering::SeqCst);
         delay_us(timebase_hz, time, PHY_UTMI_RESET_SETTLE_US);
 
-        let result = unsafe { Self::initialize_core(description, timebase_hz, time) };
+        let result = unsafe { Self::initialize_core(description, dma, timebase_hz, time) };
         match result {
             Ok(controller) => Ok(controller),
             Err(error) => {
@@ -492,7 +521,7 @@ impl Controller {
                     soc_write(description, CLK_ENABLE_2, old_clocks_2);
                     soc_write(description, CLK_ENABLE_1, old_clocks_1);
                 }
-                CLAIMED.store(false, Ordering::Release);
+                dma.claimed.store(false, Ordering::Release);
                 Err(error)
             }
         }
@@ -500,6 +529,7 @@ impl Controller {
 
     unsafe fn initialize_core(
         description: Dwc2Description,
+        dma: &'static DmaStorage,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
@@ -612,7 +642,7 @@ impl Controller {
         if dma_architecture == 0 {
             return Err(Error::UnsupportedDma(dma_architecture));
         }
-        let dma_address = DMA.0.get() as usize;
+        let dma_address = dma.base();
         if dma_address > u32::MAX as usize
             || dma_address.saturating_add(DMA_BYTES) > (1usize << description.dma_address_bits)
         {
@@ -634,6 +664,7 @@ impl Controller {
         }
         Ok(Self {
             description,
+            dma,
             info: Info {
                 core_id,
                 release: core_id as u16,
@@ -665,6 +696,7 @@ impl Controller {
             storage_target: None,
             cdc_ecm: None,
             cdc_ecm_target: None,
+            network_bus_path: None,
             bulk_pids: [[DataPid::Data0; 32]; 16],
             storage_tag: 1,
             keyboard_layout: KeyboardLayout::Boot,
@@ -743,6 +775,13 @@ impl Controller {
         }
     }
 
+    /// Stable root-port/hub-port path of the active or mode-switching network
+    /// function. USB device addresses are deliberately excluded because they
+    /// are reassigned after every enumeration.
+    pub const fn network_bus_path(&self) -> Option<UsbBusPath> {
+        self.network_bus_path
+    }
+
     pub const fn storage_device_address(&self) -> Option<u8> {
         match self.storage_target {
             Some(target) => Some(target.address),
@@ -763,36 +802,24 @@ impl Controller {
         let Some(device) = self.device_at_address(target.address) else {
             return Ok(false);
         };
-        if !is_rtl8151_install_mode(device) {
+        if vibeos_driver_rtl815x::classify(device.vendor_id, device.product_id)
+            != vibeos_driver_rtl815x::Personality::InstallMode
+        {
             return Ok(false);
         }
+        let network_bus_path = self
+            .bus_path_for_address(target.address)
+            .ok_or(Error::NoDevice)?;
 
-        self.select_target(target);
-        self.control_transfer(
-            SetupPacket {
-                request_type: 0,
-                request: 9,
-                value: u16::from(storage.configuration),
-                index: 0,
-                length: 0,
-            },
-            &mut [],
-        )?;
-        self.reset_bulk_pids(target.address, storage.endpoint_in);
-        self.reset_bulk_pids(target.address, storage.endpoint_out);
-        self.bulk_out(
-            storage.endpoint_out,
-            storage.max_packet_size_out,
-            &RTL8151_MODE_SWITCH_MESSAGE,
-        )?;
-
-        // usb_modeswitch asks for the 13-byte BOT status wrapper immediately
-        // after the message. Some revisions disconnect before returning it.
-        let mut csw = [0; 13];
-        let _ = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, &mut csw);
+        let mut transport = Rtl815xInstallTransport {
+            controller: self,
+            target,
+            storage,
+        };
+        vibeos_driver_rtl815x::switch_install_mode(&mut transport)?;
+        self.network_bus_path = Some(network_bus_path);
         self.mass_storage = None;
         self.storage_target = None;
-        delay_ms(self.timebase_hz, self.time, 100);
         Ok(true)
     }
 
@@ -838,6 +865,7 @@ impl Controller {
         self.reset_bulk_pids(target.address, ecm.endpoint_out);
         ecm.mac_address = self.read_mac_string(ecm.mac_string_index)?;
         self.cdc_ecm = Some(ecm);
+        self.network_bus_path = self.bus_path_for_address(target.address);
         Ok(Some(ecm))
     }
 
@@ -1675,13 +1703,23 @@ impl Controller {
                     return Err(Error::InvalidDescriptor);
                 }
                 let mut report = [0u8; HID_REPORT_BYTES];
-                unsafe { report.copy_from_slice(&dma_bytes()[..HID_REPORT_BYTES]) };
+                unsafe {
+                    self.dma
+                        .with_bytes_mut(|bytes| report.copy_from_slice(&bytes[..HID_REPORT_BYTES]))
+                };
                 let input = decode_hid_report(report, self.keyboard_last);
                 self.keyboard_last = report;
                 Ok(input)
             }
             KeyboardLayout::AppleReport => {
-                let report = unsafe { &dma_bytes()[..actual] };
+                let mut report = [0; APPLE_NKRO_REPORT_BYTES];
+                let report_len = actual.min(report.len());
+                unsafe {
+                    self.dma.with_bytes_mut(|bytes| {
+                        report[..report_len].copy_from_slice(&bytes[..report_len])
+                    })
+                };
+                let report = &report[..report_len];
                 match report.first() {
                     Some(1) if report.len() >= 9 => {
                         let mut normalized = [0; HID_REPORT_BYTES];
@@ -1826,6 +1864,11 @@ impl Controller {
         self.split = target.split;
     }
 
+    fn bus_path_for_address(&self, address: u8) -> Option<UsbBusPath> {
+        let root = self.device?;
+        usb_bus_path(root, &self.children, address)
+    }
+
     fn bulk_pid_index(endpoint: u8, direction_in: bool) -> usize {
         usize::from(endpoint & 0x0f) + if direction_in { 16 } else { 0 }
     }
@@ -1878,7 +1921,10 @@ impl Controller {
             timeout_ms,
         )?;
         self.bulk_pids[address][pid_index] = advance_pid(pid, actual, max_packet);
-        unsafe { output[..actual].copy_from_slice(&dma_bytes()[..actual]) };
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| output[..actual].copy_from_slice(&bytes[..actual]))
+        };
         Ok(actual)
     }
 
@@ -1889,7 +1935,10 @@ impl Controller {
             .bulk_pids
             .get(address)
             .ok_or(Error::InvalidDescriptor)?[pid_index];
-        unsafe { dma_bytes()[..input.len()].copy_from_slice(input) };
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| bytes[..input.len()].copy_from_slice(input))
+        };
         let actual = self.channel_transfer(
             self.device_address,
             endpoint & 0x0f,
@@ -1922,7 +1971,10 @@ impl Controller {
             return Err(Error::BufferTooSmall);
         }
         let direction_in = setup.request_type & 0x80 != 0;
-        unsafe { dma_bytes()[..8].copy_from_slice(&setup.to_bytes()) };
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| bytes[..8].copy_from_slice(&setup.to_bytes()))
+        };
         self.channel_transfer(
             self.device_address,
             0,
@@ -1938,7 +1990,10 @@ impl Controller {
             0
         } else {
             if !direction_in {
-                unsafe { dma_bytes()[..length].copy_from_slice(&data[..length]) };
+                unsafe {
+                    self.dma
+                        .with_bytes_mut(|bytes| bytes[..length].copy_from_slice(&data[..length]))
+                };
             }
             let actual = self.channel_transfer(
                 self.device_address,
@@ -1951,7 +2006,10 @@ impl Controller {
                 MAX_NAK_RETRIES,
             )?;
             if direction_in {
-                unsafe { data[..actual].copy_from_slice(&dma_bytes()[..actual]) };
+                unsafe {
+                    self.dma
+                        .with_bytes_mut(|bytes| data[..actual].copy_from_slice(&bytes[..actual]))
+                };
             }
             actual
         };
@@ -2069,7 +2127,7 @@ impl Controller {
         } else {
             length.div_ceil(packet_bytes)
         };
-        let dma_address = DMA.0.get() as usize;
+        let dma_address = self.dma.base();
 
         for _ in 0..nak_retries {
             if direction_in {
@@ -2308,7 +2366,7 @@ impl Controller {
         max_packet: u16,
         dma_offset: usize,
     ) -> Result<(u32, usize), Error> {
-        let dma_address = DMA.0.get() as usize + dma_offset;
+        let dma_address = self.dma.base() + dma_offset;
         if direction_in {
             invalidate_range(
                 self.description.cache_line_bytes,
@@ -2389,14 +2447,14 @@ impl Controller {
                 port & !(HPRT_CHANGE_BITS | HPRT_POWER),
             );
         }
-        CLAIMED.store(false, Ordering::Release);
+        self.dma.claimed.store(false, Ordering::Release);
         core::mem::forget(self);
     }
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        CLAIMED.store(false, Ordering::Release);
+        self.dma.claimed.store(false, Ordering::Release);
     }
 }
 
@@ -2510,6 +2568,41 @@ fn transfer_target_for_child(child: HubChildInfo) -> TransferTarget {
             .zip(child.tt_port)
             .map(|(hub_address, port)| SplitTarget { hub_address, port }),
     }
+}
+
+fn usb_bus_path(
+    root: DeviceInfo,
+    children: &[Option<HubChildInfo>; MAX_HUB_CHILDREN],
+    address: u8,
+) -> Option<UsbBusPath> {
+    let mut ports = [0; MAX_USB_BUS_PATH_DEPTH];
+    ports[0] = 1;
+    if address == root.address {
+        return Some(UsbBusPath { ports, depth: 1 });
+    }
+
+    let mut reverse = [0; MAX_HUB_DEPTH as usize];
+    let mut count = 0usize;
+    let mut current = address;
+    while current != root.address {
+        if count == reverse.len() {
+            return None;
+        }
+        let child = children
+            .iter()
+            .flatten()
+            .find(|child| child.device.address == current)?;
+        reverse[count] = child.port;
+        count += 1;
+        current = child.parent_hub_address;
+    }
+    for index in 0..count {
+        ports[index + 1] = reverse[count - index - 1];
+    }
+    Some(UsbBusPath {
+        ports,
+        depth: (count + 1) as u8,
+    })
 }
 
 const fn split_target_for_child(
@@ -2748,6 +2841,60 @@ fn find_cdc_ecm(
         })
 }
 
+struct Rtl815xInstallTransport<'a> {
+    controller: &'a mut Controller,
+    target: TransferTarget,
+    storage: MassStorageInfo,
+}
+
+impl vibeos_driver_rtl815x::InstallModeTransport for Rtl815xInstallTransport<'_> {
+    type Error = Error;
+
+    fn select_configuration(&mut self) -> Result<(), Self::Error> {
+        self.controller.select_target(self.target);
+        self.controller.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(self.storage.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    fn reset_bulk_data_toggles(&mut self) {
+        self.controller
+            .reset_bulk_pids(self.target.address, self.storage.endpoint_in);
+        self.controller
+            .reset_bulk_pids(self.target.address, self.storage.endpoint_out);
+    }
+
+    fn send_command(&mut self, command: &[u8]) -> Result<(), Self::Error> {
+        self.controller.bulk_out(
+            self.storage.endpoint_out,
+            self.storage.max_packet_size_out,
+            command,
+        )
+    }
+
+    fn receive_status(&mut self, status: &mut [u8; 13]) -> Result<(), Self::Error> {
+        self.controller
+            .bulk_in(
+                self.storage.endpoint_in,
+                self.storage.max_packet_size_in,
+                status,
+            )
+            .map(|_| ())
+    }
+
+    fn settle_after_disconnect(&mut self) {
+        delay_ms(self.controller.timebase_hz, self.controller.time, 100);
+    }
+}
+
 fn parse_mac_string_descriptor(descriptor: &[u8]) -> Result<[u8; 6], Error> {
     if descriptor.len() < 26 || descriptor[1] != 3 || usize::from(descriptor[0]) > descriptor.len()
     {
@@ -2779,10 +2926,6 @@ fn parse_mac_string_descriptor(descriptor: &[u8]) -> Result<[u8; 6], Error> {
         *byte = nibbles[index * 2] << 4 | nibbles[index * 2 + 1];
     }
     Ok(mac)
-}
-
-const fn is_rtl8151_install_mode(device: DeviceInfo) -> bool {
-    device.vendor_id == REALTEK_VENDOR_ID && device.product_id == RTL8151_INSTALL_MODE_PRODUCT_ID
 }
 
 fn is_apple_report_keyboard_descriptor(descriptor: &[u8]) -> bool {
@@ -3094,10 +3237,6 @@ fn delay_us(timebase_hz: u64, time: fn() -> u64, microseconds: u64) {
     }
 }
 
-unsafe fn dma_bytes() -> &'static mut [u8; DMA_BYTES] {
-    unsafe { &mut *DMA.0.get() }
-}
-
 fn clean_range(line: usize, start: usize, size: usize) {
     cache_range(line, start, size, true)
 }
@@ -3333,6 +3472,35 @@ mod tests {
             Some(upstream_tt)
         );
         assert_eq!(split_target_for_child(None, 1, 2, Speed::High), None);
+        let root = DeviceInfo {
+            address: 1,
+            speed: Speed::High,
+            ..child.device
+        };
+        let hub_child = HubChildInfo {
+            device: DeviceInfo {
+                address: 2,
+                speed: Speed::High,
+                device_class: USB_CLASS_HUB,
+                ..child.device
+            },
+            parent_hub_address: 1,
+            port: 2,
+            depth: 1,
+            tt_hub_address: None,
+            tt_port: None,
+            ..child
+        };
+        let mut children = [None; MAX_HUB_CHILDREN];
+        children[0] = Some(hub_child);
+        children[1] = Some(child);
+        assert_eq!(
+            usb_bus_path(root, &children, 3),
+            Some(UsbBusPath {
+                ports: [1, 2, 4, 0, 0],
+                depth: 3,
+            })
+        );
         let target = SplitTarget {
             hub_address: 1,
             port: 1,
@@ -3364,15 +3532,6 @@ mod tests {
         assert_eq!(info.product_id, 0x5678);
         assert_eq!(info.max_packet_size_0, 64);
         assert_eq!(info.configuration_count, 1);
-        assert!(!is_rtl8151_install_mode(info));
-        assert!(is_rtl8151_install_mode(DeviceInfo {
-            vendor_id: REALTEK_VENDOR_ID,
-            product_id: RTL8151_INSTALL_MODE_PRODUCT_ID,
-            ..info
-        }));
-        assert_eq!(&RTL8151_MODE_SWITCH_MESSAGE[..4], b"USBC");
-        assert_eq!(RTL8151_MODE_SWITCH_MESSAGE[12], 0x80);
-        assert_eq!(RTL8151_MODE_SWITCH_MESSAGE[15], 0xe0);
         assert_eq!(port_speed(0), Ok(Speed::High));
         assert_eq!(port_speed(1 << HPRT_SPEED_SHIFT), Ok(Speed::Full));
         assert_eq!(port_speed(2 << HPRT_SPEED_SHIFT), Ok(Speed::Low));

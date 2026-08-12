@@ -2,8 +2,8 @@
 
 VibeOS provides **single-core board support for the Milk-V Duo C906B**. Current
 support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
-timebase, native microSD/DWMAC backends, DWC2 USB host and HID keyboard input, and a
-FIT/SD image packaging flow based on the official Buildroot SDK.
+timebase, native microSD/DWMAC backends, DWC2 USB host with HID and CDC-ECM
+classes, and a FIT/SD image packaging flow based on the official Buildroot SDK.
 
 The separate `--jitterentropy-probe` image loads the exactly pinned
 `jitterentropy-rs` 0.1.1 crate against `rdtime` and exposes conditioned smoke
@@ -41,15 +41,22 @@ exercise ordinary bidirectional traffic through that path. They do not yet
 cover driver restart coordinates, deliberately delayed DMA completion, late
 IRQs, or long-duration link stress.
 
-The production image enables `milkv-ssh`. An independent `net-stack` component
-exclusively owns the DWMAC packet endpoints, the sole smoltcp interface, routes,
-and DHCPv4 state. SSH receives only its port-22 listener capability and observes
-the lease published by Netstack before announcing readiness. The image contains
+The production image enables `milkv-ssh`. One independent `net-stack` component
+fairly drives the interfaces discovered at boot. The image policy sorts each
+NIC's stable physical location (`mmio@...` or the DWC2 controller plus USB port
+path) and assigns the boot-local `netN` ordinals from that order; no ordinal is
+reserved for DWMAC, CDC-ECM, or RTL815x. Each admitted NIC has its own packet
+endpoints, device epoch, MAC identity, ARP cache, route table, DHCPv4 client and
+fault boundary. SSH receives only the port-22 listener capability attached to
+the DWMAC policy root and observes that interface's lease before announcing
+readiness; another NIC does not acquire SSH authority merely by appearing. The image contains
 no fixed host or client private key. It uses the accepted
 OSR=3 jitterentropy-rs source to seed a ChaCha20 DRBG, and refuses to listen
 until a device host key and an authorized client key have both been persisted
 and verified. This is a project deployment decision based on the recorded
-board evidence, not a claim of NIST/CMVP certification.
+board evidence, not a claim of NIST/CMVP certification. The dual-interface
+composition builds, but its simultaneous physical gate remains unchecked until
+the UART procedure below is run with both links attached.
 
 ## CPU model and support boundaries
 
@@ -86,7 +93,7 @@ bound.
 | virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
 | microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
 | Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
-| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration and HID boot/report keyboards |
+| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration, HID and CDC-ECM |
 | Blue status LED | active-high GPIOC24; `drivers/milkv-duo-led` configures and verifies it after enabling Sv39 |
 
 The Duo USB & Ethernet IO Board V1.11 does not route the RJ45 LED terminals to
@@ -397,18 +404,19 @@ ssh -i ~/.ssh/vibeos_duo root@BOARD_ADDRESS
 
 The same shared Netstack control plane is exposed to the local production VSH
 and to an authenticated production SSH profile. The legacy `net-shell` image
-remains available as a network-only diagnostic. Its bounded commands are:
+remains available as a network-only diagnostic. First list the admitted
+interfaces, then substitute the chosen name for `netN`:
 
 ```text
 ip link show
-ip -4 addr show dev net0
-ip addr replace 192.168.1.20/24 dev net0
-ip route replace default via 192.168.1.1 dev net0
-dhclient net0
-dhclient -r net0
+ip -4 addr show dev netN
+ip addr replace 192.168.1.20/24 dev netN
+ip route replace default via 192.168.1.1 dev netN
+dhclient netN
+dhclient -r netN
 ```
 
-`eth0` is accepted as an alias for `net0`. `dhclient -r` stops the client and
+`ethN` is accepted as an alias for the corresponding `netN`. `dhclient -r` stops the client and
 clears the local IPv4 configuration; smoltcp does not currently emit a DHCP
 RELEASE packet.
 
@@ -611,12 +619,13 @@ In short: **115200 8N1**.
 
 ### Physical IPv4/TCP gate
 
-On the serial `vsh>` prompt, obtain the address assigned to the production
-image and confirm that carrier is present:
+On the serial `vsh>` prompt, read the boot line
+`net map netN <- mmio@0x4070000 (dwmac)`, substitute that name for
+`<DWMAC_NET>`, obtain its address, and confirm that carrier is present:
 
 ```text
 ip link show
-ip -4 addr show dev net0
+ip -4 addr show dev <DWMAC_NET>
 ```
 
 From another machine on the same link, pass that address to the bounded host
@@ -632,6 +641,42 @@ after a reboot or on another network. On 2026-08-10, a physical Duo connected
 through host interface `en7` reported `UP,LOWER_UP` and the dynamic address
 `169.254.184.75/16`; eight consecutive fresh streams passed the exact-echo
 gate. This is DWMAC/IPv4/TCP evidence only and does not claim SSH availability.
+
+### Simultaneous DWMAC + USB CDC-ECM gate
+
+Build a DHCP-enabled image, attach both the Ethernet IO Board and a supported
+USB CDC-ECM function, and connect the two links to DHCP-capable networks. They
+may share one LAN, but the DHCP server must issue distinct addresses for their
+distinct MAC identities. Read the two boot-time `net map` lines and substitute
+the names mapped from `mmio@0x4070000` and `usb@0x4340000/...` below. The
+ordinals come from sorted physical topology, not the driver kind.
+
+Capture UART0 from boot, wait for both leases, then run:
+
+```text
+ip link show
+ip -4 addr show dev <DWMAC_NET>
+ip -4 addr show dev <USB_NET>
+ip route show dev <DWMAC_NET>
+ip route show dev <USB_NET>
+```
+
+The gate requires both links to report `UP,LOWER_UP` at the same time and both
+interfaces to show different dynamic IPv4 leases. Re-run the two address
+commands after unplugging and reconnecting the USB NIC: `<DWMAC_NET>` must
+retain its lease, while `<USB_NET>` must return with a higher device epoch and
+reacquire its own lease. The first simultaneous-online portion of the preserved log is
+machine-checkable with:
+
+```sh
+./scripts/check-milkv-dual-net-log.sh path/to/uart.log
+```
+
+Independent DHCP discovery on both interfaces exercises RX and TX on both data
+paths without sharing a packet session. The production and diagnostic service
+listener remains attached to the DWMAC policy root regardless of its `netN`
+ordinal; the dual-network log gate therefore does not claim that SSH or TCP echo
+is exposed through the USB interface.
 
 ## Hardware validation checklist
 
@@ -704,6 +749,11 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       reached the bounded listener through the assigned address and returned
       exact binary echoes. Lease renewal still belongs to the longer-duration
       network stress gate.
+- [ ] With DWMAC and USB CDC-ECM attached together, both topology-mapped `netN`
+      interfaces report `UP,LOWER_UP`, acquire distinct DHCP leases, and pass
+      `scripts/check-milkv-dual-net-log.sh`. USB unplug/reconnect retires and
+      rebinds only the USB-mapped interface; fresh-board UART evidence is still
+      required.
 - [ ] A live DWMAC reset/restart advances the device epoch and stack generation;
       packets from each retired coordinate are rejected in both directions,
       and the retired TCP stream does not resume in the replacement stack.

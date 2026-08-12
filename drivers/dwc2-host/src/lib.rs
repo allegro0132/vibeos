@@ -91,6 +91,7 @@ const HCSPLT_ENABLE: u32 = 1 << 31;
 const REGISTER_TIMEOUT_MS: u64 = 10;
 const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
+const CDC_RX_POLL_TIMEOUT_MS: u64 = 2;
 const DMA_BYTES: usize = 2_048;
 pub const MAX_ETHERNET_FRAME_BYTES: usize = 1_536;
 const MAX_NAK_RETRIES: usize = 32;
@@ -849,7 +850,13 @@ impl Controller {
             return Err(Error::BufferTooSmall);
         }
         self.select_target(target);
-        self.bulk_in_with_retries(ecm.endpoint_in, ecm.max_packet_size_in, output, 1)
+        self.bulk_in_with_retries(
+            ecm.endpoint_in,
+            ecm.max_packet_size_in,
+            output,
+            1,
+            CDC_RX_POLL_TIMEOUT_MS,
+        )
     }
 
     /// Transmit one raw Ethernet frame through the active CDC-ECM interface.
@@ -1836,7 +1843,13 @@ impl Controller {
         max_packet: u16,
         output: &mut [u8],
     ) -> Result<usize, Error> {
-        self.bulk_in_with_retries(endpoint, max_packet, output, MAX_NAK_RETRIES)
+        self.bulk_in_with_retries(
+            endpoint,
+            max_packet,
+            output,
+            MAX_NAK_RETRIES,
+            TRANSFER_TIMEOUT_MS,
+        )
     }
 
     fn bulk_in_with_retries(
@@ -1845,6 +1858,7 @@ impl Controller {
         max_packet: u16,
         output: &mut [u8],
         nak_retries: usize,
+        timeout_ms: u64,
     ) -> Result<usize, Error> {
         let address = usize::from(self.device_address);
         let pid_index = Self::bulk_pid_index(endpoint, true);
@@ -1852,7 +1866,7 @@ impl Controller {
             .bulk_pids
             .get(address)
             .ok_or(Error::InvalidDescriptor)?[pid_index];
-        let actual = self.channel_transfer(
+        let actual = self.channel_transfer_with_timeout(
             self.device_address,
             endpoint & 0x0f,
             true,
@@ -1861,6 +1875,7 @@ impl Controller {
             output.len(),
             max_packet,
             nak_retries,
+            timeout_ms,
         )?;
         self.bulk_pids[address][pid_index] = advance_pid(pid, actual, max_packet);
         unsafe { output[..actual].copy_from_slice(&dma_bytes()[..actual]) };
@@ -2006,6 +2021,32 @@ impl Controller {
         max_packet: u16,
         nak_retries: usize,
     ) -> Result<usize, Error> {
+        self.channel_transfer_with_timeout(
+            address,
+            endpoint,
+            direction_in,
+            endpoint_type,
+            pid,
+            length,
+            max_packet,
+            nak_retries,
+            TRANSFER_TIMEOUT_MS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn channel_transfer_with_timeout(
+        &mut self,
+        address: u8,
+        endpoint: u8,
+        direction_in: bool,
+        endpoint_type: EndpointType,
+        pid: DataPid,
+        length: usize,
+        max_packet: u16,
+        nak_retries: usize,
+        timeout_ms: u64,
+    ) -> Result<usize, Error> {
         if length > DMA_BYTES || endpoint > 15 || address > 127 || max_packet == 0 {
             return Err(Error::BufferTooSmall);
         }
@@ -2074,7 +2115,7 @@ impl Controller {
             }
 
             let started = (self.time)();
-            let timeout = ticks_for_ms(self.timebase_hz, TRANSFER_TIMEOUT_MS);
+            let timeout = ticks_for_ms(self.timebase_hz, timeout_ms);
             loop {
                 let status = unsafe { channel_read(self.description, channel, HCINT) };
                 if status & HCINT_CHANNEL_HALTED != 0 {

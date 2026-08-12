@@ -169,6 +169,7 @@ pub struct DeviceInfo {
     pub vendor_id: u16,
     pub product_id: u16,
     pub max_packet_size_0: u8,
+    pub configuration_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,6 +200,8 @@ pub struct MassStorageInfo {
 }
 
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
+pub const MAX_INTERFACE_ENDPOINTS: usize = 8;
+pub const MAX_DEVICE_CONFIGURATIONS: usize = 8;
 pub const MAX_HID_REPORT_DESCRIPTOR_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +219,15 @@ pub struct InterfaceInfo {
     pub bulk_out: Option<u8>,
     pub bulk_in_max_packet_size: u16,
     pub bulk_out_max_packet_size: u16,
+    pub endpoints: [Option<EndpointInfo>; MAX_INTERFACE_ENDPOINTS],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointInfo {
+    pub address: u8,
+    pub attributes: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +387,8 @@ pub struct Controller {
     hubs: [Option<HubInfo>; MAX_HUB_CHILDREN],
     split: Option<SplitTarget>,
     configuration: Option<ConfigurationInfo>,
+    configurations: [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS],
+    configuration_device_address: Option<u8>,
     report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
     keyboard_target: Option<TransferTarget>,
@@ -616,6 +630,8 @@ impl Controller {
             hubs: [None; MAX_HUB_CHILDREN],
             split: None,
             configuration: None,
+            configurations: [None; MAX_DEVICE_CONFIGURATIONS],
+            configuration_device_address: None,
             report_descriptor: None,
             keyboard: None,
             keyboard_target: None,
@@ -668,6 +684,14 @@ impl Controller {
 
     pub const fn keyboard(&self) -> Option<HidKeyboardInfo> {
         self.keyboard
+    }
+
+    pub const fn configurations(&self) -> [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS] {
+        self.configurations
+    }
+
+    pub const fn configuration_device_address(&self) -> Option<u8> {
+        self.configuration_device_address
     }
 
     pub const fn keyboard_device_address(&self) -> Option<u8> {
@@ -842,6 +866,8 @@ impl Controller {
             self.hubs = [None; MAX_HUB_CHILDREN];
             self.split = None;
             self.configuration = None;
+            self.configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+            self.configuration_device_address = None;
             self.report_descriptor = None;
             self.keyboard = None;
             self.keyboard_target = None;
@@ -908,6 +934,8 @@ impl Controller {
         self.hub = None;
         self.hubs = [None; MAX_HUB_CHILDREN];
         self.configuration = None;
+        self.configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+        self.configuration_device_address = None;
         self.report_descriptor = None;
         self.keyboard = None;
         self.keyboard_target = None;
@@ -935,32 +963,14 @@ impl Controller {
         }
         let transfer_target = self.current_target();
 
-        let mut header = [0u8; 9];
-        let request = SetupPacket {
-            request_type: 0x80,
-            request: 6,
-            value: 2 << 8,
-            index: 0,
-            length: header.len() as u16,
-        };
-        if self.control_transfer(request, &mut header)? != header.len() {
-            return Err(Error::InvalidDescriptor);
-        }
-        let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
-        if total < header.len() || total > DMA_BYTES {
-            return Err(Error::InvalidDescriptor);
-        }
-        let mut descriptors = [0u8; DMA_BYTES];
-        let request = SetupPacket {
-            length: total as u16,
-            ..request
-        };
-        if self.control_transfer(request, &mut descriptors[..total])? != total {
-            return Err(Error::InvalidDescriptor);
-        }
-        let (configuration, keyboard) =
-            parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
+        let (configuration, keyboard) = self.read_configuration(0)?;
         self.configuration = Some(configuration);
+        self.configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+        self.configurations[0] = Some(configuration);
+        self.configuration_device_address = Some(target.address);
+        for index in 1..usize::from(target.configuration_count).min(MAX_DEVICE_CONFIGURATIONS) {
+            self.configurations[index] = Some(self.read_configuration(index as u8)?.0);
+        }
         self.mass_storage = find_mass_storage(configuration);
         self.storage_target = self.mass_storage.map(|_| transfer_target);
         self.report_descriptor = None;
@@ -1069,6 +1079,39 @@ impl Controller {
         self.keyboard_last = [0; HID_REPORT_BYTES];
         self.keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
         Ok(Some(keyboard))
+    }
+
+    fn read_configuration(
+        &mut self,
+        descriptor_index: u8,
+    ) -> Result<(ConfigurationInfo, Option<HidKeyboardInfo>), Error> {
+        let mut header = [0u8; 9];
+        let request = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: (2 << 8) | u16::from(descriptor_index),
+            index: 0,
+            length: header.len() as u16,
+        };
+        if self.control_transfer(request, &mut header)? != header.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if total < header.len() || total > DMA_BYTES {
+            return Err(Error::InvalidDescriptor);
+        }
+        let mut descriptors = [0u8; DMA_BYTES];
+        if self.control_transfer(
+            SetupPacket {
+                length: total as u16,
+                ..request
+            },
+            &mut descriptors[..total],
+        )? != total
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        parse_hid_keyboard_configuration(&descriptors[..total], self.speed)
     }
 
     fn configure_hub_child_functions(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
@@ -2243,6 +2286,7 @@ fn parse_hid_keyboard_configuration(
                     bulk_out: None,
                     bulk_in_max_packet_size: 0,
                     bulk_out_max_packet_size: 0,
+                    endpoints: [None; MAX_INTERFACE_ENDPOINTS],
                 };
                 current_interface = configuration.interfaces.iter().position(Option::is_none);
                 if let Some(index) = current_interface {
@@ -2277,6 +2321,18 @@ fn parse_hid_keyboard_configuration(
                 let attributes = descriptors[offset + 3];
                 let max_packet =
                     u16::from_le_bytes([descriptors[offset + 4], descriptors[offset + 5]]) & 0x07ff;
+                if let Some(index) = current_interface {
+                    if let Some(info) = configuration.interfaces[index].as_mut() {
+                        if let Some(slot) = info.endpoints.iter_mut().find(|slot| slot.is_none()) {
+                            *slot = Some(EndpointInfo {
+                                address,
+                                attributes,
+                                max_packet_size: max_packet,
+                                interval: descriptors[offset + 6],
+                            });
+                        }
+                    }
+                }
                 if address & 0x80 != 0
                     && attributes & 0x03 == 3
                     && max_packet >= HID_REPORT_BYTES as u16
@@ -2556,6 +2612,7 @@ fn parse_device_descriptor(
         vendor_id: u16::from_le_bytes([descriptor[8], descriptor[9]]),
         product_id: u16::from_le_bytes([descriptor[10], descriptor[11]]),
         max_packet_size_0: descriptor[7],
+        configuration_count: descriptor[17],
     })
 }
 
@@ -2852,6 +2909,7 @@ mod tests {
                 vendor_id: 0x1234,
                 product_id: 0x5678,
                 max_packet_size_0: 64,
+                configuration_count: 1,
             },
             parent_hub_address: 2,
             port: 4,
@@ -2960,6 +3018,21 @@ mod tests {
                 bulk_out: None,
                 bulk_in_max_packet_size: 0,
                 bulk_out_max_packet_size: 0,
+                endpoints: [
+                    Some(EndpointInfo {
+                        address: 0x81,
+                        attributes: 3,
+                        max_packet_size: 8,
+                        interval: 10,
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
             })
         );
         assert_eq!(

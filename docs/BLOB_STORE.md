@@ -66,3 +66,19 @@ Run the focused gate with:
 cargo test -p vibeos-blob-format -p vibeos-object-store
 ./scripts/qemu-test.sh blob
 ```
+
+## SHA-256 dependency provenance
+
+M7.0 replaces the private production SHA-256 routine with RustCrypto
+[`sha2`](https://github.com/RustCrypto/hashes) 0.11.0, licensed
+`MIT OR Apache-2.0`. `blob-format/Cargo.toml` disables default features and
+`Cargo.lock` pins the exact release and crates.io checksum. On the bare-metal
+RISC-V target the resolved graph contains `sha2`, `digest`, `block-buffer`,
+`crypto-common`, `hybrid-array`, `typenum`, and `cfg-if`; the architecture-gated
+`cpufeatures` dependency is not selected. `scripts/check-blob-sha2.sh` checks
+that graph and builds the real no-std firmware with the pinned toolchain.
+
+The immutable M4 fixtures and measurements used for the transition are recorded
+in [STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md). Updating `sha2` requires
+rerunning those byte-compatibility, firmware, QEMU, and raw-image gates before
+accepting the new `Cargo.lock` pin.

@@ -91,7 +91,8 @@ const HCSPLT_ENABLE: u32 = 1 << 31;
 const REGISTER_TIMEOUT_MS: u64 = 10;
 const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
-const DMA_BYTES: usize = 1_024;
+const DMA_BYTES: usize = 2_048;
+pub const MAX_ETHERNET_FRAME_BYTES: usize = 1_536;
 const MAX_NAK_RETRIES: usize = 32;
 const MAX_COMPLETE_SPLIT_RETRIES: usize = 16;
 const HID_REPORT_BYTES: usize = 8;
@@ -153,6 +154,7 @@ pub enum Error {
     StorageCswResidue(u32),
     StorageBlockSize(u32),
     StorageCbwLength(usize),
+    TransferLength { expected: usize, actual: usize },
     StorageDataLength { expected: usize, actual: usize },
     StorageCswLength(usize),
     StorageCapacityTooLarge,
@@ -418,8 +420,7 @@ pub struct Controller {
     storage_target: Option<TransferTarget>,
     cdc_ecm: Option<CdcEcmInfo>,
     cdc_ecm_target: Option<TransferTarget>,
-    storage_pid_in: DataPid,
-    storage_pid_out: DataPid,
+    bulk_pids: [[DataPid; 32]; 16],
     storage_tag: u32,
     keyboard_layout: KeyboardLayout,
     keyboard_pid: DataPid,
@@ -663,8 +664,7 @@ impl Controller {
             storage_target: None,
             cdc_ecm: None,
             cdc_ecm_target: None,
-            storage_pid_in: DataPid::Data0,
-            storage_pid_out: DataPid::Data0,
+            bulk_pids: [[DataPid::Data0; 32]; 16],
             storage_tag: 1,
             keyboard_layout: KeyboardLayout::Boot,
             keyboard_pid: DataPid::Data0,
@@ -777,8 +777,8 @@ impl Controller {
             },
             &mut [],
         )?;
-        self.storage_pid_in = DataPid::Data0;
-        self.storage_pid_out = DataPid::Data0;
+        self.reset_bulk_pids(target.address, storage.endpoint_in);
+        self.reset_bulk_pids(target.address, storage.endpoint_out);
         self.bulk_out(
             storage.endpoint_out,
             storage.max_packet_size_out,
@@ -823,9 +823,44 @@ impl Controller {
             },
             &mut [],
         )?;
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x21,
+                request: 0x43,
+                value: 0x000d,
+                index: u16::from(ecm.control_interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.reset_bulk_pids(target.address, ecm.endpoint_in);
+        self.reset_bulk_pids(target.address, ecm.endpoint_out);
         ecm.mac_address = self.read_mac_string(ecm.mac_string_index)?;
         self.cdc_ecm = Some(ecm);
         Ok(Some(ecm))
+    }
+
+    /// Receive one raw Ethernet frame from the active CDC-ECM interface.
+    /// `Nak` means no frame is currently queued and is normal for polling.
+    pub fn receive_cdc_ecm(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        let ecm = self.cdc_ecm.ok_or(Error::NoDevice)?;
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        if output.len() > MAX_ETHERNET_FRAME_BYTES {
+            return Err(Error::BufferTooSmall);
+        }
+        self.select_target(target);
+        self.bulk_in_with_retries(ecm.endpoint_in, ecm.max_packet_size_in, output, 1)
+    }
+
+    /// Transmit one raw Ethernet frame through the active CDC-ECM interface.
+    pub fn transmit_cdc_ecm(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let ecm = self.cdc_ecm.ok_or(Error::NoDevice)?;
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        if frame.len() < 14 || frame.len() > MAX_ETHERNET_FRAME_BYTES {
+            return Err(Error::BufferTooSmall);
+        }
+        self.select_target(target);
+        self.bulk_out(ecm.endpoint_out, ecm.max_packet_size_out, frame)
     }
 
     fn read_mac_string(&mut self, string_index: u8) -> Result<Option<[u8; 6]>, Error> {
@@ -891,8 +926,8 @@ impl Controller {
             },
             &mut [],
         )?;
-        self.storage_pid_in = DataPid::Data0;
-        self.storage_pid_out = DataPid::Data0;
+        self.reset_bulk_pids(target.address, storage.endpoint_in);
+        self.reset_bulk_pids(target.address, storage.endpoint_out);
         self.storage_tag = 1;
         delay_ms(self.timebase_hz, self.time, 10);
 
@@ -1763,8 +1798,8 @@ impl Controller {
                 &mut [],
             )?;
         }
-        self.storage_pid_in = DataPid::Data0;
-        self.storage_pid_out = DataPid::Data0;
+        self.reset_bulk_pids(target.address, storage.endpoint_in);
+        self.reset_bulk_pids(target.address, storage.endpoint_out);
         Ok(())
     }
 
@@ -1784,43 +1819,79 @@ impl Controller {
         self.split = target.split;
     }
 
+    fn bulk_pid_index(endpoint: u8, direction_in: bool) -> usize {
+        usize::from(endpoint & 0x0f) + if direction_in { 16 } else { 0 }
+    }
+
+    fn reset_bulk_pids(&mut self, address: u8, endpoint: u8) {
+        if let Some(pids) = self.bulk_pids.get_mut(usize::from(address)) {
+            pids[Self::bulk_pid_index(endpoint, false)] = DataPid::Data0;
+            pids[Self::bulk_pid_index(endpoint, true)] = DataPid::Data0;
+        }
+    }
+
     fn bulk_in(
         &mut self,
         endpoint: u8,
         max_packet: u16,
         output: &mut [u8],
     ) -> Result<usize, Error> {
+        self.bulk_in_with_retries(endpoint, max_packet, output, MAX_NAK_RETRIES)
+    }
+
+    fn bulk_in_with_retries(
+        &mut self,
+        endpoint: u8,
+        max_packet: u16,
+        output: &mut [u8],
+        nak_retries: usize,
+    ) -> Result<usize, Error> {
+        let address = usize::from(self.device_address);
+        let pid_index = Self::bulk_pid_index(endpoint, true);
+        let pid = self
+            .bulk_pids
+            .get(address)
+            .ok_or(Error::InvalidDescriptor)?[pid_index];
         let actual = self.channel_transfer(
             self.device_address,
             endpoint & 0x0f,
             true,
             EndpointType::Bulk,
-            self.storage_pid_in,
+            pid,
             output.len(),
             max_packet,
-            MAX_NAK_RETRIES,
+            nak_retries,
         )?;
-        self.storage_pid_in = advance_pid(self.storage_pid_in, actual, max_packet);
+        self.bulk_pids[address][pid_index] = advance_pid(pid, actual, max_packet);
         unsafe { output[..actual].copy_from_slice(&dma_bytes()[..actual]) };
         Ok(actual)
     }
 
     fn bulk_out(&mut self, endpoint: u8, max_packet: u16, input: &[u8]) -> Result<(), Error> {
+        let address = usize::from(self.device_address);
+        let pid_index = Self::bulk_pid_index(endpoint, false);
+        let pid = self
+            .bulk_pids
+            .get(address)
+            .ok_or(Error::InvalidDescriptor)?[pid_index];
         unsafe { dma_bytes()[..input.len()].copy_from_slice(input) };
         let actual = self.channel_transfer(
             self.device_address,
             endpoint & 0x0f,
             false,
             EndpointType::Bulk,
-            self.storage_pid_out,
+            pid,
             input.len(),
             max_packet,
             MAX_NAK_RETRIES,
         )?;
         if actual != input.len() {
-            return Err(Error::StorageCbwLength(actual));
+            return Err(Error::TransferLength {
+                expected: input.len(),
+                actual,
+            });
         }
-        self.storage_pid_out = advance_pid(self.storage_pid_out, actual, max_packet);
+        self.bulk_pids[address][pid_index] = advance_pid(pid, actual, max_packet);
         Ok(())
     }
 
@@ -3353,6 +3424,8 @@ mod tests {
         );
         assert_eq!(advance_pid(DataPid::Data0, 512, 64), DataPid::Data0);
         assert_eq!(advance_pid(DataPid::Data0, 31, 64), DataPid::Data1);
+        assert_eq!(Controller::bulk_pid_index(2, false), 2);
+        assert_eq!(Controller::bulk_pid_index(2, true), 18);
         assert_eq!(completed_length(false, 31, 31), 31);
         assert_eq!(completed_length(true, 512, 128), 384);
         assert_eq!(

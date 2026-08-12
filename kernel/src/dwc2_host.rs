@@ -124,6 +124,22 @@ pub fn configure_cdc_ecm() -> Result<Option<CdcEcmInfo>, Error> {
         .configure_cdc_ecm()
 }
 
+pub fn receive_cdc_ecm(output: &mut [u8]) -> Result<usize, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .receive_cdc_ecm(output)
+}
+
+pub fn transmit_cdc_ecm(frame: &[u8]) -> Result<(), Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .transmit_cdc_ecm(frame)
+}
+
 pub fn read_sector(sector: u64) -> Result<[u8; 512], Error> {
     CONTROLLER
         .lock()

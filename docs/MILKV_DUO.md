@@ -181,9 +181,12 @@ also reports each interface class tuple and the HID report-descriptor length.
 `connected, not enumerated` distinguishes
 an electrical connection from successful USB protocol enumeration.
 For a directly attached high-speed hub it also configures hub power, resets the
-first connected downstream port, and reports that child's negotiated speed and
-raw port status. This provides the topology needed to select native high-speed
-transactions or USB 2.0 split transactions before assigning the child address.
+connected downstream ports, assigns each child a unique address, and reports
+each child's negotiated speed and raw port status. HID and Mass Storage keep
+independent address, endpoint-toggle and split-transaction state, so their
+transfers can be interleaved through the same hub. This provides the topology
+needed to select native high-speed transactions or USB 2.0 split transactions
+before assigning each child address.
 On 2026-08-12, UART and an authenticated SSH PTY returned the same physical
 topology: hub `05e3:0610`, four ports, with a connected, enabled and powered
 Full-Speed child on port 1 (`wPortStatus = 0x0103`).
@@ -201,6 +204,16 @@ advertised both Report ID 1's five-key array and Report ID 2's 104-key NKRO
 bitmap. Typing `hidtest123` on that keyboard produced the exact ten-byte VSH
 command and the expected `unknown command at bytes 0..10` response, with no
 missing, duplicated or reordered key.
+
+The multi-device gate on the same date simultaneously enumerated that keyboard
+as address 2 on hub port 1 and a high-speed `1f75:0903` SCSI/BOT disk as address
+3 on port 3. `echo hidusbcombo` entered through HID exactly, followed by a
+successful 512-byte `usb read 0` from the disk with the `55 aa` MBR signature.
+Removing the keyboard caused a bounded re-enumeration that left the disk online
+at address 2 and READ(10) working. Reinserting it restored both functions;
+removing only the disk then left the keyboard online, where `echo hidok7`
+arrived exactly. The hub polling task checks port membership every 250 ms and
+rebuilds function bindings when it changes.
 
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after
@@ -664,8 +677,10 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       MBR including its `55 aa` signature. On 2026-08-12, the guarded WRITE(10)
       test on reserved LBA 4,000,000 passed its pattern readback and restoration
       checks; an independent subsequent READ(10) matched the original 512 bytes.
-- [ ] Disconnect/reconnect repeats hub-child enumeration and restores keyboard
-      input. Preserve the UART log and pass `scripts/check-milkv-usb-hid-log.sh`.
+- [x] Hub multi-device enumeration runs HID and Mass Storage simultaneously.
+      Removing and reinserting the keyboard preserves disk READ(10); removing
+      the disk preserves exact HID input. Each topology transition reassigns
+      addresses and restores the remaining functions without a reboot.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B

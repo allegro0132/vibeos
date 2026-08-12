@@ -32,10 +32,7 @@ impl Platform for NetstackPlatform {
         &self,
         outbound: Cap,
         inbound: Cap,
-    ) -> Option<(
-        vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
-        vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
-    )> {
+    ) -> Option<vibeos_netstack::PacketEndpoints> {
         let cspace = self.space.0.lock();
         let outbound = cspace
             .lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
@@ -75,10 +72,7 @@ impl Platform for NetstackPlatform {
             quarantined: info.quarantined,
             session_epoch: info.session_epoch,
             phy_link_up: crate::net_device::carrier_up(&info),
-            ethernet_address: crate::dwc2_host::snapshot()
-                .and_then(|snapshot| snapshot.cdc_ecm)
-                .and_then(|ecm| ecm.mac_address)
-                .unwrap_or(crate::net_device::GUEST_MAC),
+            ethernet_address: network_ethernet_address(),
         })
     }
 
@@ -91,16 +85,38 @@ impl Platform for NetstackPlatform {
     }
 }
 
+#[cfg(feature = "qemu-virt")]
+fn network_ethernet_address() -> [u8; 6] {
+    crate::net_device::GUEST_MAC
+}
+
+#[cfg(feature = "milkv-duo")]
+fn network_ethernet_address() -> [u8; 6] {
+    crate::dwc2_host::snapshot()
+        .and_then(|snapshot| snapshot.cdc_ecm)
+        .and_then(|ecm| ecm.mac_address)
+        .unwrap_or(crate::net_device::GUEST_MAC)
+}
+
 pub async fn task(space: &'static Space, outbound: Cap, inbound: Cap, control: Cap, listener: Cap) {
-    let platform = NetstackPlatform::new(space);
-    vibeos_netstack::task(
-        &platform,
+    let interfaces = [vibeos_netstack::NetworkInterfaceCapabilities::new(
+        vibeos_netstack::NetworkInterfaceId::PRIMARY,
         outbound,
         inbound,
         control,
         vibeos_netstack::one_tcp_listener(listener),
-    )
-    .await;
+    )];
+    task_with_interfaces(space, &interfaces).await;
+}
+
+/// Kernel adapter for a policy-provided set of NIC capability bundles. The
+/// boot world still decides which devices and listeners are admitted.
+pub async fn task_with_interfaces(
+    space: &'static Space,
+    interfaces: &[vibeos_netstack::NetworkInterfaceCapabilities],
+) {
+    let platform = NetstackPlatform::new(space);
+    vibeos_netstack::task_with_interfaces(&platform, interfaces).await;
 }
 
 /// Test-image-only stack fault trigger. Hardware staging remains kernel-only.

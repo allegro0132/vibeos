@@ -603,14 +603,20 @@ Deliberate, not overlooked:
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.
 - **Networking remains deliberately feature-gated.** Diagnostic images expose
-  only bounded raw-L2 service. Driver/stack queues now carry owned
-  `StampedPacket` values tied to one boot-local device epoch and stack
-  generation. One independent `net-stack` component owns the sole smoltcp
-  interface, ARP, one IPv4 address, one default route, and DHCPv4. Bounded
-  `TcpListener` capability frontends give each service exclusive authority over
-  its own port and generation-bound connections; SSH no longer owns the IPv4
-  stack. The shared core supports eight listeners and has a two-port isolation
-  test, while current image policy wires one service listener per image. It
+  only bounded raw-L2 service. Driver/stack queues carry owned `StampedPacket`
+  values tied to one boot-local device epoch and stack generation. One
+  independent `net-stack` component can fairly drive up to four explicitly
+  capability-backed `netN` interfaces; each owns separate packet endpoints,
+  smoltcp state, ARP, IPv4 address, route, DHCPv4 client, session generation,
+  and listener set. Revocation or quarantine retires only the affected
+  interface. Bounded `TcpListener` capability frontends give each service
+  exclusive authority over its own port and generation-bound connections; SSH
+  no longer owns the IPv4 stack. The compatibility entry point and current
+  image policies still wire one NIC and one service listener per image. A
+  multi-NIC board policy must grant one distinct endpoint/control/listener
+  bundle per admitted device; parsing `net1` never creates hardware authority.
+  The shared core supports eight listeners per interface and has a two-port
+  isolation test. It
   still provides no DNS resolver, IPv6, general UDP API, or POSIX socket
   namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks

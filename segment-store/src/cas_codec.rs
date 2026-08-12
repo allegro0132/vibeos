@@ -58,6 +58,7 @@ pub enum CasCodecError {
     OutOfBounds,
     UnsortedOrDuplicate,
     MissingBlobMapping,
+    OrphanBlobMapping,
     OverlappingPointer,
     Blob(BlobError),
     Format(FormatError),
@@ -75,6 +76,7 @@ impl fmt::Display for CasCodecError {
             Self::OutOfBounds => "CAS payload exceeds an admitted bound",
             Self::UnsortedOrDuplicate => "CAS table is not strictly ordered",
             Self::MissingBlobMapping => "CAS object has no BlobKey mapping",
+            Self::OrphanBlobMapping => "CAS BlobKey mapping has no Object mapping",
             Self::OverlappingPointer => "CAS physical pointers overlap",
             Self::Blob(_) => "CAS payload has invalid canonical Blob geometry",
             Self::Format(_) => "CAS payload contains a malformed physical pointer",
@@ -798,6 +800,15 @@ fn validate_snapshot(value: &CasSnapshot, context: CasCodecContext) -> Result<()
             return Err(CasCodecError::MissingBlobMapping);
         }
     }
+    for blob in &value.blobs {
+        if !value
+            .objects
+            .iter()
+            .any(|object| object.blob_key == blob.blob_key)
+        {
+            return Err(CasCodecError::OrphanBlobMapping);
+        }
+    }
     let object_end = checked_table_len(
         CAS_SNAPSHOT_HEADER_LEN,
         value.objects.len(),
@@ -1345,6 +1356,12 @@ mod tests {
         assert_eq!(
             encode_cas_snapshot(&missing, context()),
             Err(CasCodecError::MissingBlobMapping)
+        );
+        let mut orphan = value.clone();
+        orphan.objects.retain(|object| object.blob_key == first_key);
+        assert_eq!(
+            encode_cas_snapshot(&orphan, context()),
+            Err(CasCodecError::OrphanBlobMapping)
         );
     }
 

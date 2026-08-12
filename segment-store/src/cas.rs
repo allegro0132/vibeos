@@ -17,13 +17,14 @@ use vibeos_segment_format::{
     payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
     Checkpoint, ExtentKind, ExtentRecord, FormatError, Page, PhysicalPointer, PointerValue,
     RecordBinding, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO,
-    DATA_END_PAGE, DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_SEAL_BODY_PAGE,
-    SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
+    DATA_END_PAGE, DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_PAGES,
+    SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
 use crate::allocation_v2::{encode_allocation_v2, AllocationTransition};
 use crate::authority::{
-    AuthorizedObject, ObjectPublicationTarget, PublicationIntent, PublishError,
+    AuthorizedObject, ObjectPublicationPersistence, ObjectPublicationTarget, PublicationIntent,
+    PublishError,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -35,7 +36,12 @@ use crate::codec::{encode_allocation, AllocationState};
 use crate::device::PageDevice;
 use crate::gc::{GcStoreError, GcTelemetry, GcTimeSource};
 use crate::pins::{
-    OwnedObjectReadPin, OwnedRuntimeRootPin, PinAdmission, PinRegistry, RootKey, RuntimeRootClass,
+    OwnedObjectReadPin, OwnedRuntimeRootPin, PinAdmission, PinRegistry, RootKey,
+    RootRetentionHandle, RuntimeRootClass,
+};
+use crate::quota::{
+    canonical_attributable_physical_bytes, CommittedQuotaCharge, PrincipalQuotaTable,
+    QuotaReservation, StoragePrincipal, QUOTA_DEDUP_UNIQUE_OBJECT_BYTES,
 };
 use crate::store::{
     read_pointer_payload, scan_segment, validate_cas_blob_descriptors, write_checkpoint,
@@ -53,7 +59,53 @@ pub struct CasObjectHandle {
     object_kind: u32,
     exact_len: u64,
     commit_generation: u64,
-    root_pin: Arc<OwnedRuntimeRootPin<ROOT_PIN_SLOTS, READER_PIN_SLOTS>>,
+    authority: Arc<ObjectAuthorityLease>,
+}
+
+struct ObjectAuthorityLease {
+    root_pin: Option<OwnedRuntimeRootPin<ROOT_PIN_SLOTS, READER_PIN_SLOTS>>,
+    quota_charge: Option<(PrincipalQuotaTable, CommittedQuotaCharge)>,
+}
+
+impl Drop for ObjectAuthorityLease {
+    fn drop(&mut self) {
+        // Revoke the final runtime root before making its quota available to a
+        // concurrent admission. Struct fields would otherwise be dropped only
+        // after this body, briefly exposing an authorized but uncharged Object.
+        drop(self.root_pin.take());
+        if let Some((table, charge)) = self.quota_charge.take() {
+            let _ = table.account_authority_revoked(charge);
+        }
+    }
+}
+
+struct PendingCasObjectHandle {
+    store_uuid: StoreUuid,
+    object_id: u128,
+    object_kind: u32,
+    exact_len: u64,
+    commit_generation: u64,
+    root_pin: OwnedRuntimeRootPin<ROOT_PIN_SLOTS, READER_PIN_SLOTS>,
+    is_new_blob: bool,
+}
+
+impl PendingCasObjectHandle {
+    fn complete(
+        self,
+        quota_charge: Option<(PrincipalQuotaTable, CommittedQuotaCharge)>,
+    ) -> CasObjectHandle {
+        CasObjectHandle {
+            store_uuid: self.store_uuid,
+            object_id: self.object_id,
+            object_kind: self.object_kind,
+            exact_len: self.exact_len,
+            commit_generation: self.commit_generation,
+            authority: Arc::new(ObjectAuthorityLease {
+                root_pin: Some(self.root_pin),
+                quota_charge,
+            }),
+        }
+    }
 }
 
 /// Why an already-authorized object must remain in a GC root snapshot after
@@ -128,7 +180,7 @@ impl Clone for CasObjectHandle {
             object_kind: self.object_kind,
             exact_len: self.exact_len,
             commit_generation: self.commit_generation,
-            root_pin: Arc::clone(&self.root_pin),
+            authority: Arc::clone(&self.authority),
         }
     }
 }
@@ -155,7 +207,12 @@ impl CasObjectHandle {
         &self,
         registry: &crate::store::SharedStorePinRegistry,
     ) -> Result<RootKey, crate::pins::PinError> {
-        if !self.root_pin.is_active() || !self.root_pin.belongs_to(registry) {
+        let root_pin = self
+            .authority
+            .root_pin
+            .as_ref()
+            .ok_or(crate::pins::PinError::RecheckFailed)?;
+        if !root_pin.is_active() || !root_pin.belongs_to(registry) {
             return Err(crate::pins::PinError::RecheckFailed);
         }
         RootKey::new(self.object_id, self.commit_generation, self.object_kind)
@@ -163,6 +220,10 @@ impl CasObjectHandle {
 
     pub(crate) const fn store_uuid(&self) -> StoreUuid {
         self.store_uuid
+    }
+
+    pub(crate) fn is_quota_charged(&self) -> bool {
+        self.authority.quota_charge.is_some()
     }
 }
 
@@ -189,6 +250,7 @@ pub enum CasStoreError<E> {
     ExpectedRootMismatch,
     HashCollision,
     WriterFailed,
+    Quota(crate::quota::QuotaError),
 }
 
 #[derive(Debug)]
@@ -228,6 +290,7 @@ impl<E: fmt::Display> fmt::Display for CasStoreError<E> {
             Self::ExpectedRootMismatch => f.write_str("caller Blob root hint does not match input"),
             Self::HashCollision => f.write_str("BlobKey collision failed full-byte verification"),
             Self::WriterFailed => f.write_str("Blob writer cannot resume after an I/O failure"),
+            Self::Quota(error) => write!(f, "{error}"),
         }
     }
 }
@@ -247,6 +310,12 @@ impl<E> From<BlobError> for CasStoreError<E> {
 impl<E> From<CasCodecError> for CasStoreError<E> {
     fn from(value: CasCodecError) -> Self {
         Self::Codec(value)
+    }
+}
+
+impl<E> From<crate::quota::QuotaError> for CasStoreError<E> {
+    fn from(value: crate::quota::QuotaError) -> Self {
+        Self::Quota(value)
     }
 }
 
@@ -357,6 +426,7 @@ pub struct BlobWriter<'a, D: PageDevice> {
     prepared: bool,
     mutated: bool,
     failed: bool,
+    quota_reservation: Option<QuotaReservation>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -382,6 +452,9 @@ impl<D: PageDevice> SegmentStore<D> {
         expected_root: Option<Hash>,
         clock: &C,
     ) -> Result<(BlobWriter<'_, D>, Option<GcTelemetry>), ForegroundBlobError<D::Error>> {
+        if self.quota.is_some() {
+            return Err(CasStoreError::Store(StoreError::PrincipalRequired).into());
+        }
         let telemetry = self
             .prepare_blob_with_reference_codec_foreground_gc(
                 object_kind,
@@ -396,6 +469,85 @@ impl<D: PageDevice> SegmentStore<D> {
             exact_len,
             expected_root,
             REFERENCE_CODEC_RAW,
+        )?;
+        Ok((writer, telemetry))
+    }
+
+    pub async fn begin_blob_with_foreground_gc_for_principal<C: GcTimeSource>(
+        &mut self,
+        principal: &StoragePrincipal,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        clock: &C,
+    ) -> Result<(BlobWriter<'_, D>, Option<GcTelemetry>), ForegroundBlobError<D::Error>> {
+        self.begin_blob_with_reference_codec_foreground_gc_for_principal(
+            principal,
+            object_kind,
+            exact_len,
+            expected_root,
+            REFERENCE_CODEC_RAW,
+            clock,
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_blob_with_reference_codec_foreground_gc_for_principal<
+        C: GcTimeSource,
+    >(
+        &mut self,
+        principal: &StoragePrincipal,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        reference_codec: u16,
+        clock: &C,
+    ) -> Result<(BlobWriter<'_, D>, Option<GcTelemetry>), ForegroundBlobError<D::Error>> {
+        BlobGeometry::for_len(exact_len).map_err(CasStoreError::from)?;
+        StreamingMerkle::begin(object_kind, exact_len, EmissionSink::new())
+            .map_err(map_streaming_error)?;
+        // Reserve both principal dimensions before a foreground collection is
+        // allowed to mutate media. The detached reservation survives every
+        // non-writing admission probe and every bounded GC cycle below.
+        let reservation = self.reserve_blob_quota(principal, exact_len)?;
+        let maximum_cycles = self.info().map_err(CasStoreError::from)?.admitted_segments;
+        let mut cycles = 0_u64;
+        let mut aggregate = GcTelemetry::default();
+        let mut started = None;
+        loop {
+            let admission = self
+                .begin_blob_with_reference_codec_internal(
+                    object_kind,
+                    exact_len,
+                    expected_root,
+                    reference_codec,
+                    None,
+                )
+                .map(drop);
+            match admission {
+                Ok(()) => break,
+                Err(error) if Self::gc_can_relieve_blob_admission(&error) => {
+                    if cycles == maximum_cycles {
+                        return Err(error.into());
+                    }
+                    started.get_or_insert_with(|| clock.monotonic_ns());
+                    aggregate.saturating_merge_cycle(self.collect_garbage().await?);
+                    cycles += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let telemetry = started.map(|start| {
+            aggregate.foreground_pause_ns = clock.monotonic_ns().saturating_sub(start);
+            aggregate.pause_time_measured = true;
+            aggregate
+        });
+        let writer = self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            expected_root,
+            reference_codec,
+            Some(reservation),
         )?;
         Ok((writer, telemetry))
     }
@@ -529,9 +681,16 @@ impl<D: PageDevice> SegmentStore<D> {
                 PinAdmission::CompletionCritical,
             ),
         };
-        let pin =
-            PinRegistry::pin_root_owned(&self.pins, key, runtime_class, owner.owner, admission)
-                .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        let retention: RootRetentionHandle = handle.authority.clone();
+        let pin = PinRegistry::pin_root_owned_retained(
+            &self.pins,
+            key,
+            runtime_class,
+            owner.owner,
+            admission,
+            retention,
+        )
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
         Ok(RuntimeObjectPin { _pin: pin })
     }
 
@@ -541,11 +700,37 @@ impl<D: PageDevice> SegmentStore<D> {
         exact_len: u64,
         expected_root: Option<Hash>,
     ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        if self.quota.is_some() {
+            return Err(StoreError::PrincipalRequired.into());
+        }
         self.begin_blob_with_reference_codec(
             object_kind,
             exact_len,
             expected_root,
             REFERENCE_CODEC_RAW,
+        )
+    }
+
+    /// Begin a governed raw Blob write. The store derives both quota charges
+    /// and ordinary capacity internally before returning a writer, so callers
+    /// cannot understate physical attribution or borrow cleaner reserve.
+    pub fn begin_blob_for_principal(
+        &mut self,
+        principal: &StoragePrincipal,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        BlobGeometry::for_len(exact_len)?;
+        StreamingMerkle::begin(object_kind, exact_len, EmissionSink::new())
+            .map_err(map_streaming_error)?;
+        let reservation = self.reserve_blob_quota(principal, exact_len)?;
+        self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            expected_root,
+            REFERENCE_CODEC_RAW,
+            Some(reservation),
         )
     }
 
@@ -555,6 +740,75 @@ impl<D: PageDevice> SegmentStore<D> {
         exact_len: u64,
         expected_root: Option<Hash>,
         reference_codec: u16,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        if self.quota.is_some() {
+            return Err(StoreError::PrincipalRequired.into());
+        }
+        self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            expected_root,
+            reference_codec,
+            None,
+        )
+    }
+
+    pub(crate) fn begin_blob_with_reference_codec_for_principal(
+        &mut self,
+        principal: &StoragePrincipal,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        reference_codec: u16,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        BlobGeometry::for_len(exact_len)?;
+        StreamingMerkle::begin(object_kind, exact_len, EmissionSink::new())
+            .map_err(map_streaming_error)?;
+        let reservation = self.reserve_blob_quota(principal, exact_len)?;
+        self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            expected_root,
+            reference_codec,
+            Some(reservation),
+        )
+    }
+
+    fn reserve_blob_quota(
+        &self,
+        principal: &StoragePrincipal,
+        exact_len: u64,
+    ) -> Result<QuotaReservation, CasStoreError<D::Error>> {
+        let state = self.require_current_generation()?;
+        let counts = state.allocation.counts().map_err(|_| StoreError::Corrupt)?;
+        let protected = u64::from(state.cleaner_reserve_segments)
+            .checked_add(u64::from(crate::store::ROOT_POLICY_HEADROOM_SEGMENTS))
+            .ok_or(StoreError::Corrupt)?;
+        let ordinary_segments = counts.free.saturating_sub(protected);
+        let ordinary_available_bytes = ordinary_segments
+            .checked_mul(SEGMENT_PAGES)
+            .and_then(|pages| pages.checked_mul(PAGE_SIZE as u64))
+            .ok_or(StoreError::Corrupt)?;
+        let physical_bytes = canonical_attributable_physical_bytes(exact_len)?;
+        self.quota
+            .as_ref()
+            .ok_or(crate::quota::QuotaError::UnknownPrincipal)?
+            .reserve(
+                principal,
+                exact_len,
+                physical_bytes,
+                ordinary_available_bytes,
+            )
+            .map_err(Into::into)
+    }
+
+    fn begin_blob_with_reference_codec_internal(
+        &mut self,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        reference_codec: u16,
+        quota_reservation: Option<QuotaReservation>,
     ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
         if reference_codec != REFERENCE_CODEC_RAW
             && reference_codec != crate::cas_codec::REFERENCE_CODEC_TYPED_V1
@@ -660,6 +914,7 @@ impl<D: PageDevice> SegmentStore<D> {
             prepared: false,
             mutated: false,
             failed: false,
+            quota_reservation,
         })
     }
 
@@ -864,9 +1119,10 @@ impl<D: PageDevice> SegmentStore<D> {
             handle.object_kind,
         )
         .map_err(|_| StoreError::ObjectUnavailable)?;
-        if handle.root_pin.key() != key
-            || !handle.root_pin.is_active()
-            || !handle.root_pin.belongs_to(&self.pins)
+        if handle
+            .root_key(&self.pins)
+            .map_err(|_| StoreError::ObjectUnavailable)?
+            != key
         {
             return Err(StoreError::ObjectUnavailable.into());
         }
@@ -1370,7 +1626,7 @@ impl<D: PageDevice> BlobWriter<'_, D> {
         };
 
         let state = self.state.take().ok_or(CasStoreError::WriterFailed)?;
-        let handle = commit_snapshot(
+        let pending = commit_snapshot(
             &self.store.device,
             &state,
             self.store.limits,
@@ -1387,10 +1643,33 @@ impl<D: PageDevice> BlobWriter<'_, D> {
         // The checkpoint is durable, but publication is still withheld. A cold
         // reread installs the exact selected state before authority can escape.
         self.store.mount().await?;
+        let quota_charge = match self.quota_reservation.take() {
+            Some(reservation) => {
+                let table = self
+                    .store
+                    .quota
+                    .clone()
+                    .ok_or(crate::quota::QuotaError::UnknownPrincipal)?;
+                let charge = if pending.is_new_blob {
+                    reservation.commit()
+                } else {
+                    reservation.commit_with_unique_physical(QUOTA_DEDUP_UNIQUE_OBJECT_BYTES)?
+                };
+                Some((table, charge))
+            }
+            None => None,
+        };
+        let handle = pending.complete(quota_charge);
+        let maximum_persistence = if handle.is_quota_charged() {
+            ObjectPublicationPersistence::RuntimeOnly
+        } else {
+            ObjectPublicationPersistence::Persistent
+        };
         Ok(AuthorizedObject::from_committed(
             handle,
             self.object_kind,
             self.geometry.exact_len(),
+            maximum_persistence,
         ))
     }
 
@@ -1401,6 +1680,13 @@ impl<D: PageDevice> BlobWriter<'_, D> {
     where
         T: ObjectPublicationTarget<CasObjectHandle> + ?Sized,
     {
+        if self.quota_reservation.is_some()
+            && intent.persistence() == ObjectPublicationPersistence::Persistent
+        {
+            return Err(CasCommitError::Store(CasStoreError::Store(
+                StoreError::QuotaPersistenceUnavailable,
+            )));
+        }
         let object = self.commit().await.map_err(CasCommitError::Store)?;
         intent.publish(object).map_err(CasCommitError::Publish)
     }
@@ -2016,7 +2302,7 @@ async fn commit_snapshot<D: PageDevice>(
     payload_hashes: &[Hash],
     pins: &crate::store::SharedStorePinRegistry,
     reference_codec: u16,
-) -> Result<CasObjectHandle, CasStoreError<D::Error>> {
+) -> Result<PendingCasObjectHandle, CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
         .checked_add(1)
@@ -2358,13 +2644,14 @@ async fn commit_snapshot<D: PageDevice>(
         PinAdmission::CompletionCritical,
     )
     .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
-    Ok(CasObjectHandle {
+    Ok(PendingCasObjectHandle {
         store_uuid: state.superblock.binding.store_uuid,
         object_id: state.next_object_id,
         object_kind: blob_key.object_kind(),
         exact_len: blob_key.exact_len(),
         commit_generation: checkpoint_generation,
-        root_pin: Arc::new(root_pin),
+        root_pin,
+        is_new_blob: is_new,
     })
 }
 

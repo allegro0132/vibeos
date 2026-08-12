@@ -250,3 +250,71 @@ rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
 
 The QEMU `store` case remains the M4 compatibility backend until M7.7; M7.5's
 scalable media gate is the production Rust raw-image/Python verifier above.
+
+## M7.6 online growth, quotas, and scrub
+
+Accepted on 2026-08-12. M7.6 adds a distinct attenuable `StoreMaintenance`
+resource, session-bound adjacent-range growth, boot-runtime storage principals,
+pre-I/O logical and attributable-physical reservations, and read-only bounded
+scrub. Maintenance invocations hold a counted lease for their whole async
+operation; global revocation returns `OperationsInFlight` while a lease exists
+and permanently rejects every prior token once it succeeds. Growth records the
+enlarged allocation map in generation G+1 before the suffix becomes allocatable
+and rechecks the exact device session, immutable geometry, read-only state, and
+range capability before mutation.
+
+The governed write path charges every Object the frozen canonical envelope even
+on a dedup hit, reports cumulative unique bytes and dedup savings separately,
+and excludes cleaner reserve plus root-policy headroom from admission. Quota
+authority remains boot-local: persistent publication is blocked by a
+target-type-bound publication token, while owner-scoped runtime pins retain the
+charge inside the pin registry so synchronous fault cleanup releases forgotten
+guards without leaking roots or quota.
+
+Scrub independently rereads both anchors and checkpoint pairs, validates every
+Allocated and Retired segment extent payload SHA-256 and zero padding, closes
+both directions of the Object/Blob mapping relation, reconstructs every
+canonical Blob, and parses every policy-admitted typed object including
+runtime-only entries. It returns only the closed anonymous report schema and
+performs no repair or capability publication.
+
+The complete host run passed 11 canonical Blob tests, 6 streaming-Blob tests,
+29 segment-format tests, 119 segment-store library tests, 44 segment-store
+integration tests, and 12 storage-device contract tests. The store library set
+includes exact/one-byte-under growth-memory admission, every grow mutation
+boundary, real-device geometry/session/read-only drift, quota reserve isolation,
+dedup and rollback, maintenance revocation concurrency, leaked-pin fault
+cleanup, publication-persistence sealing, and ten scrub scenarios. Strict
+all-target Clippy completed with warnings denied.
+
+The four independent verifier selftests reported 22 base-image cases, 6 CAS
+cases, 123 GC mutation cases, and 32 maintenance/growth cases. A production Rust
+growth test exported its powered-off image and required the maintenance verifier
+to accept the enlarged generation and anonymous schema. The retained QEMU M4
+compatibility gate verified its 512-record chain, both objects, raw backing
+journal, and negative parity fixtures.
+
+Commands used for the recorded results:
+
+```sh
+cargo test -p vibeos-storage-device -p vibeos-segment-format \
+  -p vibeos-blob-format -p vibeos-segment-store --locked --offline --no-fail-fast
+cargo clippy -p vibeos-segment-store -p vibeos-storage-device \
+  -p vibeos-segment-format -p vibeos-blob-format \
+  --all-targets --locked --offline -- -D warnings
+python3 -B scripts/storage-v2-image.py --selftest
+python3 -B scripts/verify-storage-v2-cas.py --selftest
+python3 -B scripts/verify-storage-v2-gc.py --selftest
+python3 -B scripts/verify-storage-v2-maintenance.py --selftest
+./scripts/qemu-test.sh store
+```
+
+The pinned firmware toolchain also compiled the complete store with only
+`core` and `alloc`:
+
+```sh
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
+rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
+  --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
+```

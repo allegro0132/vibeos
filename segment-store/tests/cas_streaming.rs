@@ -13,9 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vibeos_segment_format::{admitted_pages, Page, StoreUuid, PAGE_SIZE};
 use vibeos_segment_store::{
-    resolve_authorized, AuthorizedObject, AuthorizedObjectSpace, CasObjectHandle, CasStoreError,
-    FormatOptions, ObjectPublicationTarget, PageDevice, PageDeviceInfo, PublicationIntent,
-    PublishError, SegmentStore, StoreError, StoreInfo, StoreLimits, StoreRuntimeContext,
+    resolve_authorized, AuthorizedObject, AuthorizedObjectSpace, AuthorizedPublication,
+    CasObjectHandle, CasStoreError, FormatOptions, ObjectPublicationPersistence,
+    ObjectPublicationTarget, PageDevice, PageDeviceInfo, PublicationIntent, PublishError,
+    SegmentStore, StoreError, StoreInfo, StoreLimits, StoreRuntimeContext,
 };
 use vibeos_storage_device::MutationFailure;
 
@@ -402,7 +403,7 @@ struct TestCapability {
 struct CapabilitySlot {
     generation: u64,
     alive: bool,
-    object: Arc<AuthorizedObject<CasObjectHandle>>,
+    object: Option<Arc<AuthorizedObject<CasObjectHandle>>>,
 }
 
 struct ModelSpace {
@@ -427,11 +428,16 @@ impl ObjectPublicationTarget<CasObjectHandle> for ModelSpace {
         self.incarnation
     }
 
+    fn persistence(&self) -> ObjectPublicationPersistence {
+        ObjectPublicationPersistence::RuntimeOnly
+    }
+
     fn publish_independent_root(
         &self,
-        expected_incarnation: u64,
-        object: Arc<AuthorizedObject<CasObjectHandle>>,
+        publication: AuthorizedPublication<Self, CasObjectHandle>,
     ) -> Result<Self::Capability, PublishError<Self::Error>> {
+        let expected_incarnation = publication.expected_incarnation();
+        let object = publication.into_object();
         if expected_incarnation != self.incarnation {
             return Err(PublishError::StaleIncarnation);
         }
@@ -441,7 +447,7 @@ impl ObjectPublicationTarget<CasObjectHandle> for ModelSpace {
         slots.push(CapabilitySlot {
             generation,
             alive: true,
-            object,
+            object: Some(object),
         });
         Ok(TestCapability { slot, generation })
     }
@@ -457,7 +463,7 @@ impl AuthorizedObjectSpace<CasObjectHandle> for ModelSpace {
             .unwrap()
             .get(capability.slot as usize)
             .filter(|slot| slot.generation == capability.generation && slot.alive)
-            .map(|slot| Arc::clone(&slot.object))
+            .and_then(|slot| slot.object.clone())
     }
 
     fn revoke_root(&self, capability: Self::Capability) -> bool {
@@ -469,6 +475,7 @@ impl AuthorizedObjectSpace<CasObjectHandle> for ModelSpace {
             return false;
         }
         slot.alive = false;
+        slot.object.take();
         true
     }
 }

@@ -6,7 +6,7 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 ---
 
 > **Current status (2026-08-12):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, M5.5, M6, and Storage V2 M7.0--M7.5 are
+> sequence through 3.16, M4.5, M5.5, M6, and Storage V2 M7.0--M7.6 are
 > complete. The original M3 language-expansion items remain partial. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
@@ -789,11 +789,13 @@ exactly. Every QEMU boot must also publish the `.rodata`/4 MiB COW-pool marker.
 
 ### M7 — Scalable capability-addressed storage (post-v1)
 
-**Status (2026-08-12):** M7.0--M7.5 are complete: SHA compatibility,
+**Status (2026-08-12):** M7.0--M7.6 are complete: SHA compatibility,
 capability-scoped block contracts, canonical segment format, append-only
 storage, streaming CAS, and root-based crash-safe cleaning. M7.6 online growth,
-quotas, and scrub is next. See [STORAGE_V2_GC.md](STORAGE_V2_GC.md) for the
-accepted GC, pinning, and reuse-barrier contract.
+quotas, and scrub add capability-gated adjacent capacity, governed admission,
+and bounded anonymous media verification. M7.7 migration and default cutover is
+next. See [STORAGE_V2_MAINTENANCE.md](STORAGE_V2_MAINTENANCE.md) for the accepted
+maintenance, accounting, and scrub contract.
 
 M7 replaces the fixed 512-sector M4 journal backend with a managed-block-device
 Blob CAS backed by immutable segments, dual checkpoints, root-based garbage

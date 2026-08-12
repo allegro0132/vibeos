@@ -1,7 +1,7 @@
 use vibeos_storage_device::{
     admit_non_overlapping, successful_write_durability, validate_flush, validate_grant_layout,
-    validate_request, BlockRange, ContractError, DeviceGeometry, DeviceId, DeviceInfo,
-    DeviceSession, DiscardGeometry, FailureReason, Legacy512Adapter, MutationCertainty,
+    validate_request, BlockRange, BlockRangeProvisioner, ContractError, DeviceGeometry, DeviceId,
+    DeviceInfo, DeviceSession, DiscardGeometry, FailureReason, Legacy512Adapter, MutationCertainty,
     MutationFailure, Operation, RangeInfo, RangeSession, WriteCache, WriteDurability,
 };
 
@@ -37,7 +37,7 @@ fn info(device: DeviceId, incarnation: u64) -> DeviceInfo {
 
 #[test]
 fn attenuation_can_only_shrink_the_parent() {
-    let root = BlockRange::root(id(1), 1_000, 500).unwrap();
+    let root = unsafe { BlockRange::root(id(1), 1_000, 500) }.unwrap();
     let child = root.attenuate(100, 200).unwrap();
     let leaf = child.attenuate(50, 25).unwrap();
     assert_eq!(child.first_block(), 1_100);
@@ -55,13 +55,13 @@ fn attenuation_can_only_shrink_the_parent() {
 #[test]
 fn overflow_out_of_range_and_independent_overlap_fail_closed() {
     assert_eq!(
-        BlockRange::root(id(1), u64::MAX, 2),
+        unsafe { BlockRange::root(id(1), u64::MAX, 2) },
         Err(ContractError::ArithmeticOverflow)
     );
-    let first = BlockRange::root(id(1), 64, 512).unwrap();
-    let adjacent = BlockRange::root(id(1), 576, 10).unwrap();
-    let overlap = BlockRange::root(id(1), 575, 10).unwrap();
-    let other_device = BlockRange::root(id(2), 64, 512).unwrap();
+    let first = unsafe { BlockRange::root(id(1), 64, 512) }.unwrap();
+    let adjacent = unsafe { BlockRange::root(id(1), 576, 10) }.unwrap();
+    let overlap = unsafe { BlockRange::root(id(1), 575, 10) }.unwrap();
+    let other_device = unsafe { BlockRange::root(id(2), 64, 512) }.unwrap();
     assert_eq!(admit_non_overlapping(&[first], adjacent), Ok(()));
     assert_eq!(
         admit_non_overlapping(&[first], overlap),
@@ -74,7 +74,7 @@ fn overflow_out_of_range_and_independent_overlap_fail_closed() {
 
 #[test]
 fn a_complete_grant_layout_is_contained_and_pairwise_disjoint() {
-    let parent = BlockRange::root(id(1), 0, 2_048).unwrap();
+    let parent = unsafe { BlockRange::root(id(1), 0, 2_048) }.unwrap();
     let diagnostics = parent.attenuate(0, 64).unwrap();
     let m4 = parent.attenuate(64, 512).unwrap();
     let v2_tail = parent.attenuate(576, 1_472).unwrap();
@@ -85,16 +85,22 @@ fn a_complete_grant_layout_is_contained_and_pairwise_disjoint() {
     assert_eq!(
         validate_grant_layout(
             parent,
-            &[diagnostics, BlockRange::root(id(1), 63, 2).unwrap()]
+            &[
+                diagnostics,
+                unsafe { BlockRange::root(id(1), 63, 2) }.unwrap()
+            ]
         ),
         Err(ContractError::OverlappingRange)
     );
     assert_eq!(
-        validate_grant_layout(parent, &[BlockRange::root(id(1), 2_047, 2).unwrap()]),
+        validate_grant_layout(
+            parent,
+            &[unsafe { BlockRange::root(id(1), 2_047, 2) }.unwrap()]
+        ),
         Err(ContractError::OutsideRange)
     );
     assert_eq!(
-        validate_grant_layout(parent, &[BlockRange::root(id(2), 0, 1).unwrap()]),
+        validate_grant_layout(parent, &[unsafe { BlockRange::root(id(2), 0, 1) }.unwrap()]),
         Err(ContractError::WrongDevice)
     );
 }
@@ -102,7 +108,7 @@ fn a_complete_grant_layout_is_contained_and_pairwise_disjoint() {
 #[test]
 fn stale_and_changed_devices_are_rejected_before_address_disclosure() {
     let device = id(7);
-    let range = BlockRange::root(device, 64, 512).unwrap();
+    let range = unsafe { BlockRange::root(device, 64, 512) }.unwrap();
     let binding = RangeSession::bind(range, info(device, 3)).unwrap();
     assert_eq!(
         binding.validate_current(info(device, 4)),
@@ -115,10 +121,52 @@ fn stale_and_changed_devices_are_rejected_before_address_disclosure() {
 }
 
 #[test]
+fn online_range_capabilities_join_only_adjacent_current_session_siblings() {
+    let session = DeviceSession::new(id(8), 3).unwrap();
+    // SAFETY: the test fixture is the sole root provisioning policy for this
+    // device/session and derives every tested child from this issuer.
+    let provisioner = unsafe { BlockRangeProvisioner::new(session, 64, 512) }.unwrap();
+    let left = provisioner.derive(0, 128).unwrap();
+    let right = provisioner.derive(128, 384).unwrap();
+    let joined = left.join_adjacent(right).unwrap();
+    assert_eq!(joined.range().first_block(), 64);
+    assert_eq!(joined.range().block_count(), 512);
+    assert_eq!(joined.session(), session);
+    assert_eq!(right.join_adjacent(left), Err(ContractError::OutsideRange));
+
+    // SAFETY: a distinct test-only incarnation deliberately models stale
+    // trusted discovery output, which must not join the current session.
+    let stale =
+        unsafe { BlockRangeProvisioner::new(DeviceSession::new(id(8), 4).unwrap(), 64, 512) }
+            .unwrap()
+            .derive(128, 384)
+            .unwrap();
+    assert_eq!(
+        left.join_adjacent(stale),
+        Err(ContractError::StaleIncarnation)
+    );
+    // SAFETY: this deliberately independent test root models a foreign
+    // authority tree; same coordinates/session do not grant join authority.
+    let foreign = unsafe { BlockRangeProvisioner::new(session, 0, 1_024) }
+        .unwrap()
+        .derive(192, 384)
+        .unwrap();
+    assert_eq!(
+        left.join_adjacent(foreign),
+        Err(ContractError::OutsideRange)
+    );
+    assert_eq!(format!("{left:?}"), "BlockRangeCapability(<opaque>)");
+}
+
+#[test]
 fn request_validation_binds_range_geometry_buffer_and_features() {
     let device = id(9);
     let current = info(device, 1);
-    let binding = RangeSession::bind(BlockRange::root(device, 64, 512).unwrap(), current).unwrap();
+    let binding = RangeSession::bind(
+        unsafe { BlockRange::root(device, 64, 512) }.unwrap(),
+        current,
+    )
+    .unwrap();
     let request = validate_request(binding, current, Operation::Read, 10, 2, 1024).unwrap();
     assert_eq!(request.physical_first_block(), 74);
     assert_eq!(request.byte_len(), 1024);
@@ -146,7 +194,11 @@ fn request_validation_binds_range_geometry_buffer_and_features() {
 fn discard_geometry_and_read_only_state_are_enforced() {
     let device = id(11);
     let current = info(device, 1);
-    let binding = RangeSession::bind(BlockRange::root(device, 0, 512).unwrap(), current).unwrap();
+    let binding = RangeSession::bind(
+        unsafe { BlockRange::root(device, 0, 512) }.unwrap(),
+        current,
+    )
+    .unwrap();
     assert!(validate_request(binding, current, Operation::Discard, 8, 8, 0).is_ok());
     assert_eq!(
         validate_request(binding, current, Operation::Discard, 1, 8, 0),
@@ -171,9 +223,11 @@ fn discard_geometry_and_read_only_state_are_enforced() {
 fn discard_alignment_uses_the_translated_device_lba() {
     let device = id(12);
     let current = info(device, 1);
-    let aligned = RangeSession::bind(BlockRange::root(device, 8, 64).unwrap(), current).unwrap();
+    let aligned =
+        RangeSession::bind(unsafe { BlockRange::root(device, 8, 64) }.unwrap(), current).unwrap();
     assert!(validate_request(aligned, current, Operation::Discard, 0, 8, 0).is_ok());
-    let shifted = RangeSession::bind(BlockRange::root(device, 1, 64).unwrap(), current).unwrap();
+    let shifted =
+        RangeSession::bind(unsafe { BlockRange::root(device, 1, 64) }.unwrap(), current).unwrap();
     assert_eq!(
         validate_request(shifted, current, Operation::Discard, 0, 8, 0),
         Err(ContractError::DiscardMisaligned)
@@ -182,7 +236,7 @@ fn discard_alignment_uses_the_translated_device_lba() {
 
 #[test]
 fn legacy_adapter_preserves_numbers_without_widening_the_range() {
-    let range = BlockRange::root(id(13), 1_064, 512).unwrap();
+    let range = unsafe { BlockRange::root(id(13), 1_064, 512) }.unwrap();
     let adapter = Legacy512Adapter::new(range, 64).unwrap();
     assert_eq!(adapter.legacy_end_sector(), 576);
     assert_eq!(adapter.relative_sector(64), Ok(0));

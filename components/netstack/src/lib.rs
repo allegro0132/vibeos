@@ -115,6 +115,13 @@ pub const fn one_tcp_listener(listener: Cap) -> TcpListenerCapabilities {
     listeners
 }
 
+pub const fn two_tcp_listeners(first: Cap, second: Cap) -> TcpListenerCapabilities {
+    let mut listeners = no_tcp_listeners();
+    listeners[0] = Some(first);
+    listeners[1] = Some(second);
+    listeners
+}
+
 #[cfg(feature = "tcp-echo-recovery-test")]
 static FAULT_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "tcp-echo-recovery-test")]
@@ -349,9 +356,14 @@ impl InterfaceTask {
                 let port = listener
                     .try_with(TcpListener::port)
                     .map_err(|_| InterfaceError::Retired)?;
-                let socket = next
-                    .add_tcp_listener(port)
+                let port_group = listener
+                    .try_with(TcpListener::port_group)
                     .map_err(|_| InterfaceError::Retired)?;
+                let socket = match port_group {
+                    Some(group) => next.add_shared_tcp_listener(port, group.get()),
+                    None => next.add_tcp_listener(port),
+                }
+                .map_err(|_| InterfaceError::Retired)?;
                 bound_listeners.push(BoundListener {
                     frontend: listener.clone(),
                     socket,

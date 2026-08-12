@@ -70,6 +70,7 @@ cargo check -p vibeos-sshd # board-neutral SSH component
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/qemu-tcp-test.sh   # N1 static/DHCP IPv4 and TCP echo through host forwarding
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
+./scripts/qemu-iperf3-test.sh # real iperf3 client, forward and reverse TCP
 ./scripts/qemu-ssh-security-test.sh # N3 entropy/identity capability gate
 ./scripts/qemu-ssh-test.sh   # N4/N5 real OpenSSH exec and rejection gate
 python3 -B scripts/milkv-tcp-test.py ADDRESS # physical Duo TCP/rearm gate
@@ -77,6 +78,7 @@ python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/milkv-ssh-test.sh ADDRESS # explicit insecure physical SSH/VSH gate
 ./scripts/build-milkv-duo.sh --jitterentropy-probe # isolated Duo entropy probe
 ./scripts/build-milkv-duo.sh --jitterentropy-ssh-probe # fixed-key SSH evidence transport
+./scripts/build-milkv-duo.sh --iperf3-server # DHCP iperf3 server image for Duo
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
@@ -401,6 +403,7 @@ its process owns. Here, authority is not a property of the code.
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
 | `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |
+| `components/iperf3-server/` | bounded iperf3-compatible single-stream TCP server (`no_std`) |
 | `kernel/src/netstack_platform.rs` | thin packet/network-control adapter plus recovery-only test hooks |
 | `components/vsh/` | capability-native interactive loop, foreground cancellation, rendering, and command registration (`no_std`) |
 | `kernel/src/vsh_platform.rs` | console capability and hardware/management command adapters |
@@ -463,6 +466,15 @@ dhclient -r net0
 
 Possession of each installed vsh command capability is the authority to invoke
 the operation. Images without an IPv4 stack do not install these commands.
+
+The dedicated iperf3 images listen on TCP port `5201` and support one TCP
+stream in the normal client-to-server direction or reverse mode. Build and
+exercise the QEMU image with `./scripts/qemu-iperf3-test.sh`. For Milk-V Duo,
+build `./scripts/build-milkv-duo.sh --iperf3-server`, boot the generated image,
+wait for DHCP, inspect the address with `ip -4 addr show dev net0`, then run
+`iperf3 -c ADDRESS` or `iperf3 -c ADDRESS -R` from the peer. UDP, parallel
+streams, bidirectional mode, authentication, IPv6, and non-zero omit intervals
+are rejected; test duration is capped at 60 seconds.
 
 Interactive editing is shared by the default and test shells: `Up`/`Down`
 browse command history, while `Left`/`Right` move the insertion cursor.

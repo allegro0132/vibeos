@@ -2,9 +2,9 @@
 
 use crate::{println, sync::SpinLock};
 use vibeos_driver_dwc2_host::{
-    ConfigurationInfo, Controller, DeviceInfo, Error, HidKeyboardInfo, HidReportDescriptor,
-    HubChildInfo, HubInfo, Info, MassStorageInfo, Telemetry, MAX_DEVICE_CONFIGURATIONS,
-    MAX_HUB_CHILDREN,
+    CdcEcmInfo, ConfigurationInfo, Controller, DeviceInfo, Error, HidKeyboardInfo,
+    HidReportDescriptor, HubChildInfo, HubInfo, Info, MassStorageInfo, Telemetry,
+    MAX_DEVICE_CONFIGURATIONS, MAX_HUB_CHILDREN,
 };
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
@@ -26,6 +26,8 @@ pub struct Snapshot {
     pub keyboard_device_address: Option<u8>,
     pub mass_storage: Option<MassStorageInfo>,
     pub storage_device_address: Option<u8>,
+    pub cdc_ecm: Option<CdcEcmInfo>,
+    pub cdc_ecm_device_address: Option<u8>,
     pub telemetry: Telemetry,
 }
 
@@ -76,6 +78,8 @@ pub fn snapshot() -> Option<Snapshot> {
         keyboard_device_address: controller.keyboard_device_address(),
         mass_storage: controller.mass_storage(),
         storage_device_address: controller.storage_device_address(),
+        cdc_ecm: controller.cdc_ecm(),
+        cdc_ecm_device_address: controller.cdc_ecm_device_address(),
         telemetry: controller.telemetry(),
     })
 }
@@ -110,6 +114,14 @@ pub fn switch_rtl8151_install_mode() -> Result<bool, Error> {
         .as_mut()
         .ok_or(Error::NoDevice)?
         .switch_rtl8151_install_mode()
+}
+
+pub fn configure_cdc_ecm() -> Result<Option<CdcEcmInfo>, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .configure_cdc_ecm()
 }
 
 pub fn read_sector(sector: u64) -> Result<[u8; 512], Error> {
@@ -164,12 +176,17 @@ pub async fn service_task() {
                                 Some(device) => {
                                     let keyboard = controller.configure_hid_keyboard()?;
                                     let mode_switched = controller.switch_rtl8151_install_mode()?;
+                                    let cdc_ecm = if mode_switched {
+                                        None
+                                    } else {
+                                        controller.configure_cdc_ecm()?
+                                    };
                                     let storage = if mode_switched {
                                         None
                                     } else {
                                         controller.configure_mass_storage()?
                                     };
-                                    Ok(Some((device, keyboard, storage, mode_switched)))
+                                    Ok(Some((device, keyboard, storage, mode_switched, cdc_ecm)))
                                 }
                                 None => Ok(None),
                             })
@@ -178,7 +195,7 @@ pub async fn service_task() {
                 }
             };
             match attached {
-                Ok(Some((device, keyboard, storage, mode_switched))) => {
+                Ok(Some((device, keyboard, storage, mode_switched, cdc_ecm))) => {
                     println!(
                         "  usb dev   hotplug addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
                         device.address,
@@ -191,6 +208,16 @@ pub async fn service_task() {
                     if mode_switched {
                         println!(
                             "  usb net   sent RTL8151 install-mode switch; waiting for Ethernet re-enumeration"
+                        );
+                    }
+                    if let Some(ecm) = cdc_ecm {
+                        println!(
+                            "  usb net   CDC-ECM configured, interface {} alt {}, IN ep {}, OUT ep {}, MAC {:?}",
+                            ecm.data_interface,
+                            ecm.data_alternate,
+                            ecm.endpoint_in & 0x0f,
+                            ecm.endpoint_out & 0x0f,
+                            ecm.mac_address,
                         );
                     }
                     match keyboard {

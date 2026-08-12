@@ -611,6 +611,22 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             storage.max_packet_size_out,
         ));
     }
+    if let Some(ecm) = snapshot.cdc_ecm {
+        output.push_str(&format!(
+            "  CDC ECM device={} configuration={} control-interface={} data-interface={} alt={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} status={:?} mac={:?}\n",
+            snapshot.cdc_ecm_device_address.unwrap_or(0),
+            ecm.configuration,
+            ecm.control_interface,
+            ecm.data_interface,
+            ecm.data_alternate,
+            ecm.endpoint_in,
+            ecm.max_packet_size_in,
+            ecm.endpoint_out,
+            ecm.max_packet_size_out,
+            ecm.status_endpoint,
+            ecm.mac_address,
+        ));
+    }
     Ok(output)
 }
 

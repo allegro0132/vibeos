@@ -465,6 +465,20 @@ pub extern "C" fn kmain() -> ! {
                         "  usb net   sent RTL8151 install-mode switch; waiting for Ethernet re-enumeration"
                     );
                 }
+                if !rtl8151_switched {
+                    match dwc2_host::configure_cdc_ecm() {
+                        Ok(Some(ecm)) => println!(
+                            "  usb net   CDC-ECM configured, interface {} alt {}, IN ep {}, OUT ep {}, MAC {:?}",
+                            ecm.data_interface,
+                            ecm.data_alternate,
+                            ecm.endpoint_in & 0x0f,
+                            ecm.endpoint_out & 0x0f,
+                            ecm.mac_address,
+                        ),
+                        Ok(None) => {}
+                        Err(error) => println!("  usb net   CDC-ECM configuration FAILED: {:?}", error),
+                    }
+                }
                 match if rtl8151_switched {
                     Ok(None)
                 } else {

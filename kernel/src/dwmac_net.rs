@@ -167,7 +167,7 @@ impl NetDevice {
             timeouts: TIMEOUTS.load(Ordering::Acquire),
             rx_inflight: u8::from(state.online),
             tx_inflight: u8::from(state.tx_inflight),
-            phy_link_up: hardware.phy_link_up,
+            phy_link_up: usb_cdc_ready() || hardware.phy_link_up,
             tx_descriptor_status: hardware.tx_descriptor_status,
             dma_status: hardware.dma_status,
             clock_enable: hardware.clock_enable,
@@ -425,7 +425,8 @@ fn driver_turn(
         // generation from becoming active between stamp validation and OWN.
         let mut state = CONTROL.lock();
         let now = crate::sbi::time();
-        let descriptor_busy = engine.tx_owned();
+        let use_usb_cdc = usb_cdc_ready();
+        let descriptor_busy = !use_usb_cdc && engine.tx_owned();
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
         if descriptor_busy {
             // The deadline covers DMA ownership after publication as well as
@@ -446,7 +447,16 @@ fn driver_turn(
             }
         }
         if let Some(packet) = pending_tx.as_ref() {
-            match engine.transmit(packet.as_bytes()) {
+            let transmitted = if use_usb_cdc {
+                match crate::dwc2_host::transmit_cdc_ecm(packet.as_bytes()) {
+                    Ok(()) => Ok(()),
+                    Err(vibeos_driver_dwc2_host::Error::Nak) => Err(HardwareError::QueueFull),
+                    Err(_) => Err(HardwareError::TimedOut),
+                }
+            } else {
+                engine.transmit(packet.as_bytes())
+            };
+            match transmitted {
                 Ok(()) => {
                     *pending_tx = None;
                     state.tx_inflight = true;
@@ -469,7 +479,16 @@ fn driver_turn(
         // exact session stamping, endpoint publication, and RX rearm. A stack
         // restart cannot relabel a raw frame after the driver consumes it.
         let mut frame = [0u8; MAX_PACKET_LEN];
-        if let Some(length) = engine.receive(&mut frame) {
+        let received = if use_usb_cdc {
+            match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
+                Ok(length) => Some(length),
+                Err(vibeos_driver_dwc2_host::Error::Nak) => None,
+                Err(_) => return Err(NetError::DriverFault),
+            }
+        } else {
+            engine.receive(&mut frame)
+        };
+        if let Some(length) = received {
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
             match send_inbound(inbound, &state.sessions, packet) {
                 Ok(()) => {}
@@ -486,6 +505,10 @@ fn driver_turn(
         engine.poll_link();
     }
     Ok(())
+}
+
+fn usb_cdc_ready() -> bool {
+    crate::dwc2_host::snapshot().is_some_and(|snapshot| snapshot.cdc_ecm.is_some())
 }
 
 fn tx_timeout_ticks() -> u64 {

@@ -775,6 +775,36 @@ impl Controller {
         self.hub
     }
 
+    pub fn hub_topology_changed(&mut self) -> Result<bool, Error> {
+        let Some(hub) = self.hub else {
+            return Ok(false);
+        };
+        let root = self.device.ok_or(Error::NoDevice)?;
+        let saved = self.current_target();
+        self.select_target(TransferTarget {
+            address: root.address,
+            endpoint_zero_max_packet: u16::from(root.max_packet_size_0),
+            speed: root.speed,
+            split: None,
+        });
+        let result = (|| {
+            for port in 1..=hub.ports {
+                let connected = self.hub_port_status(port)? & USB_PORT_STAT_CONNECTION != 0;
+                let enumerated = self
+                    .children
+                    .iter()
+                    .flatten()
+                    .any(|child| child.port == port);
+                if connected != enumerated {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })();
+        self.select_target(saved);
+        result
+    }
+
     /// Reset the directly attached root-port device and complete USB address
     /// and device-descriptor enumeration through endpoint zero.
     pub fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {

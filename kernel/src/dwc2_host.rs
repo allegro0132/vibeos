@@ -113,17 +113,32 @@ pub fn write_sector(sector: u64, bytes: &[u8; 512]) -> Result<(), Error> {
         .write_sector(sector, bytes)
 }
 
+pub fn hub_topology_changed() -> Result<bool, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .hub_topology_changed()
+}
+
 pub async fn service_task() {
     let mut was_connected = CONTROLLER
         .lock()
         .as_ref()
         .is_some_and(|controller| controller.connected() && controller.device().is_some());
+    let mut hub_poll_elapsed_ms = 0u16;
     loop {
         let connected = CONTROLLER
             .lock()
             .as_ref()
             .is_some_and(Controller::connected);
-        if connected && !was_connected {
+        let topology_changed = if connected && was_connected && hub_poll_elapsed_ms >= 250 {
+            hub_poll_elapsed_ms = 0;
+            hub_topology_changed().unwrap_or(false)
+        } else {
+            false
+        };
+        if connected && (!was_connected || topology_changed) {
             let attached = {
                 let mut guard = CONTROLLER.lock();
                 match guard.as_mut() {
@@ -131,9 +146,11 @@ pub async fn service_task() {
                         controller
                             .enumerate_device()
                             .and_then(|device| match device {
-                                Some(device) => controller
-                                    .configure_hid_keyboard()
-                                    .map(|keyboard| Some((device, keyboard))),
+                                Some(device) => {
+                                    let keyboard = controller.configure_hid_keyboard()?;
+                                    let storage = controller.configure_mass_storage()?;
+                                    Ok(Some((device, keyboard, storage)))
+                                }
                                 None => Ok(None),
                             })
                     }
@@ -141,7 +158,7 @@ pub async fn service_task() {
                 }
             };
             match attached {
-                Ok(Some((device, keyboard))) => {
+                Ok(Some((device, keyboard, storage))) => {
                     println!(
                         "  usb dev   hotplug addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
                         device.address,
@@ -163,6 +180,16 @@ pub async fn service_task() {
                         None => println!(
                             "  usb hid   attached device has no supported keyboard interface"
                         ),
+                    }
+                    if let Some(storage) = storage {
+                        println!(
+                            "  usb disk  attached SCSI/BOT, interface {}, IN ep {}, OUT ep {}, {} sectors x {} bytes",
+                            storage.interface,
+                            storage.endpoint_in & 0x0f,
+                            storage.endpoint_out & 0x0f,
+                            storage.capacity_sectors.unwrap_or(0),
+                            storage.block_size.unwrap_or(0),
+                        );
                     }
                 }
                 Ok(None) => println!("  usb hid   device disconnected during hotplug enumeration"),
@@ -194,7 +221,9 @@ pub async fn service_task() {
                 crate::uart::inject_usb_input(*byte);
             }
         }
-        crate::exec::sleep_ms(u64::from(interval_ms.max(1))).await;
+        let interval_ms = interval_ms.max(1);
+        crate::exec::sleep_ms(u64::from(interval_ms)).await;
+        hub_poll_elapsed_ms = hub_poll_elapsed_ms.saturating_add(interval_ms);
     }
 }
 

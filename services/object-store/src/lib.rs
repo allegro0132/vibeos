@@ -34,6 +34,7 @@ use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::exec::{self, TaskId};
 use vibeos_core::heap::{self, AllocationDomain, OwnerId};
 use vibeos_core::sync::SpinLock;
+use vibeos_storage_device::{DeviceSession, MutationFailure, MutationResult};
 
 fn erase_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -67,6 +68,15 @@ const FIRST_ALLOCATABLE_ID: u128 = 1;
 const STORED_OBJECT_RIGHTS: Rights = Rights::READ.union(Rights::GRANT).union(Rights::REVOKE);
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send + 'a>>;
+pub type BackendMutationFuture<'a, T> =
+    Pin<Box<dyn Future<Output = MutationResult<T, BackendError>> + Send + 'a>>;
+
+/// Classify the durability barrier that follows a successfully submitted
+/// write. Even when the barrier itself is rejected before publication, the
+/// composite durable-write operation can no longer claim no media effect.
+pub fn barrier_after_successful_write<T, E>(barrier: MutationResult<T, E>) -> MutationResult<T, E> {
+    barrier.map_err(MutationFailure::force_ambiguous)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendError {
@@ -114,14 +124,22 @@ pub struct BackendInfo {
     pub capacity_sectors: u64,
     pub read_only: bool,
     pub supports_flush: bool,
+    /// Exact device incarnation used by every I/O in one store operation.
+    pub session: DeviceSession,
 }
 
 /// Block and memory-accounting surface required by the object service.
 pub trait Platform: Send + Sync {
     fn info(&self) -> Result<BackendInfo, BackendError>;
-    fn read_sector(&self, sector: u64) -> BackendFuture<'_, [u8; 512]>;
-    fn write_sector(&self, sector: u64, bytes: [u8; 512]) -> BackendFuture<'_, ()>;
-    fn flush(&self) -> BackendFuture<'_, ()>;
+    fn read_sector(&self, session: DeviceSession, sector: u64) -> BackendFuture<'_, [u8; 512]>;
+    /// Write one historical M4 sector and make it durable using one pinned
+    /// device session. A failure retains whether media effect is possible.
+    fn write_sector_durable(
+        &self,
+        session: DeviceSession,
+        sector: u64,
+        bytes: [u8; 512],
+    ) -> BackendMutationFuture<'_, ()>;
     fn has_working_headroom(&self, required: usize) -> bool;
 }
 
@@ -153,6 +171,7 @@ pub enum StoreError {
     Busy,
     BackendAuthority,
     Backend(BackendError),
+    BackendMutation(MutationFailure<BackendError>),
     DeviceTooSmall,
     ReadOnly,
     FlushUnsupported,
@@ -173,6 +192,12 @@ impl core::fmt::Display for StoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Backend(error) => write!(f, "object-store block I/O failed: {error}"),
+            Self::BackendMutation(failure) => write!(
+                f,
+                "object-store durable write failed: {} ({:?})",
+                failure.error(),
+                failure.certainty()
+            ),
             _ => f.write_str(match self {
                 Self::PermissionDenied => "store capability lacks the required right",
                 Self::Busy => "object store already has an active operation",
@@ -195,7 +220,7 @@ impl core::fmt::Display for StoreError {
                     "store caller lacks the bounded journal-recovery headroom"
                 }
                 Self::OutsideTask => "store operations require an executor task context",
-                Self::Backend(_) => unreachable!(),
+                Self::Backend(_) | Self::BackendMutation(_) => unreachable!(),
             }),
         }
     }
@@ -204,6 +229,12 @@ impl core::fmt::Display for StoreError {
 impl From<BackendError> for StoreError {
     fn from(error: BackendError) -> Self {
         Self::Backend(error)
+    }
+}
+
+impl From<MutationFailure<BackendError>> for StoreError {
+    fn from(failure: MutationFailure<BackendError>) -> Self {
+        Self::BackendMutation(failure)
     }
 }
 
@@ -633,7 +664,7 @@ impl AuthorityJournal {
 
             let final_checkpoint = validate_preview(&before, records)?;
             for record in records {
-                append_record(&self.inner, &mut scan.next_physical, record).await?;
+                append_record(&self.inner, &mut scan.next_physical, scan.session, record).await?;
             }
 
             // A flush is not accepted on faith: the complete semantic pass
@@ -904,11 +935,11 @@ async fn put_to_space(
     // commit-flush minimum and keeps every acknowledged prefix independently
     // recoverable under the v1 ordered-flush media contract.
     if let Some(format) = format_record.as_ref() {
-        append_record(&inner, &mut scan.next_physical, format).await?;
+        append_record(&inner, &mut scan.next_physical, scan.session, format).await?;
     }
-    append_record(&inner, &mut scan.next_physical, &high_water).await?;
+    append_record(&inner, &mut scan.next_physical, scan.session, &high_water).await?;
     for record in &transaction.records {
-        append_record(&inner, &mut scan.next_physical, record).await?;
+        append_record(&inner, &mut scan.next_physical, scan.session, record).await?;
     }
     drop(transaction);
 
@@ -1104,6 +1135,7 @@ struct PhysicalScan {
     /// First physical slot after every observed non-zero sector, including a
     /// torn tail.  Such a tail is never overwritten; a retry chains around it.
     next_physical: usize,
+    session: DeviceSession,
 }
 
 async fn scan_region(inner: &StoreInner) -> Result<PhysicalScan, StoreError> {
@@ -1115,13 +1147,16 @@ async fn scan_region(inner: &StoreInner) -> Result<PhysicalScan, StoreError> {
     let mut next_physical = 0;
     for offset in 0..STORE_LOG_SECTORS {
         let sector = STORE_FIRST_SECTOR + offset as u64;
-        let bytes = read_sector(inner, sector).await?;
+        let bytes = read_sector(inner, info.session, sector).await?;
         if bytes.iter().any(|byte| *byte != 0) {
             next_physical = offset + 1;
         }
         STORE_SCRATCH.write(offset, bytes);
     }
-    Ok(PhysicalScan { next_physical })
+    Ok(PhysicalScan {
+        next_physical,
+        session: info.session,
+    })
 }
 
 fn recover_scan(_scan: &PhysicalScan) -> Result<authority::RecoveryPreflight, StoreError> {
@@ -1205,15 +1240,16 @@ fn map_recovery_error(error: authority::RecoveryError) -> StoreError {
 async fn append_record(
     inner: &StoreInner,
     next_physical: &mut usize,
+    session: DeviceSession,
     record: &[u8; journal::RECORD_SIZE],
 ) -> Result<(), StoreError> {
     if *next_physical >= STORE_LOG_SECTORS {
         return Err(StoreError::JournalFull);
     }
     let sector = STORE_FIRST_SECTOR + *next_physical as u64;
-    write_sector(inner, sector, *record).await?;
+    write_sector_durable(inner, session, sector, *record).await?;
     *next_physical += 1;
-    flush(inner).await
+    Ok(())
 }
 
 fn backend_info(inner: &StoreInner) -> Result<BackendInfo, StoreError> {
@@ -1231,16 +1267,24 @@ fn validate_writable_backend(inner: &StoreInner) -> Result<(), StoreError> {
     Ok(())
 }
 
-async fn read_sector(inner: &StoreInner, sector: u64) -> Result<[u8; 512], StoreError> {
-    Ok(inner.platform.read_sector(sector).await?)
+async fn read_sector(
+    inner: &StoreInner,
+    session: DeviceSession,
+    sector: u64,
+) -> Result<[u8; 512], StoreError> {
+    Ok(inner.platform.read_sector(session, sector).await?)
 }
 
-async fn write_sector(inner: &StoreInner, sector: u64, bytes: [u8; 512]) -> Result<(), StoreError> {
-    Ok(inner.platform.write_sector(sector, bytes).await?)
-}
-
-async fn flush(inner: &StoreInner) -> Result<(), StoreError> {
-    Ok(inner.platform.flush().await?)
+async fn write_sector_durable(
+    inner: &StoreInner,
+    session: DeviceSession,
+    sector: u64,
+    bytes: [u8; 512],
+) -> Result<(), StoreError> {
+    Ok(inner
+        .platform
+        .write_sector_durable(session, sector, bytes)
+        .await?)
 }
 
 fn map_encode_error(error: journal::EncodeError) -> StoreError {

@@ -32,9 +32,14 @@ pub struct NetworkFrontendPolicy {
 /// device backend's descriptor-ring size.
 pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 8 };
 
-/// The QEMU image exposes its complete emulated block device.
+/// The default QEMU image admits exactly the 1 MiB raw device created by the
+/// run and acceptance harnesses. A larger attachment is not ambient authority;
+/// later capacity must be admitted explicitly through Storage V2 growth.
 #[cfg(feature = "qemu-default")]
-pub const BLOCK_DATA_SLICE: Option<BlockSlice> = None;
+pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
+    first_sector: 0,
+    sector_count: 2_048,
+});
 
 /// The packaged Duo image places raw service data immediately after its
 /// 128 MiB FAT boot partition.
@@ -51,6 +56,12 @@ mod tests {
     #[test]
     fn frontend_queue_is_bounded() {
         assert!(NETWORK_FRONTEND.queue_depth > 0);
+    }
+
+    #[cfg(feature = "qemu-default")]
+    #[test]
+    fn qemu_data_slice_is_exact_and_checked() {
+        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(2_048));
     }
 
     #[cfg(feature = "milkv-duo-sd")]

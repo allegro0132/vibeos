@@ -201,6 +201,23 @@ impl Card {
     }
 
     pub fn write_sector(&mut self, physical_sector: u64, data: &[u8; 512]) -> Result<(), Error> {
+        self.write_sector_tracked(physical_sector, data, || {})
+    }
+
+    /// Write one sector and report the exact point at which CMD24 is
+    /// published to the controller.
+    ///
+    /// `on_command_published` runs after all request validation and the
+    /// command/data inhibit wait have succeeded, immediately before the
+    /// volatile store to the SDHCI `COMMAND` register. Once the callback has
+    /// run, an error from this method must therefore be treated as potentially
+    /// having changed the card.
+    pub fn write_sector_tracked(
+        &mut self,
+        physical_sector: u64,
+        data: &[u8; 512],
+        on_command_published: impl FnOnce(),
+    ) -> Result<(), Error> {
         validate_sector(self.capacity_sectors, physical_sector)?;
         self.wait_inhibit(true)?;
         self.last_command = 24;
@@ -212,9 +229,9 @@ impl Card {
             sector_argument(self.high_capacity, physical_sector)?,
         );
         self.write16(TRANSFER_MODE, 0);
-        self.write16(
-            COMMAND,
+        self.publish_command(
             command_word(24, CMD_RESP_48 | CMD_CRC | CMD_INDEX | CMD_DATA),
+            on_command_published,
         );
         self.wait_interrupt(INT_BUFFER_WRITE_READY)?;
         for chunk in data.chunks_exact(4) {
@@ -230,12 +247,27 @@ impl Card {
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
+        self.flush_tracked(|| {})
+    }
+
+    /// Wait for the card to become ready and report when the first CMD13 is
+    /// published to the controller.
+    ///
+    /// The callback runs exactly once, immediately before the first volatile
+    /// `COMMAND` register store. It is not run when the pre-command inhibit
+    /// wait fails. Further CMD13 polls do not invoke it again: after the first
+    /// publication the flush request has already crossed its submission
+    /// boundary.
+    pub fn flush_tracked(&mut self, on_command_published: impl FnOnce()) -> Result<(), Error> {
+        let mut on_command_published = Some(on_command_published);
         for _ in 0..10_000 {
-            let status = self.command(
-                13,
-                u32::from(self.rca) << 16,
-                CMD_RESP_48 | CMD_CRC | CMD_INDEX,
-            )?[0];
+            let argument = u32::from(self.rca) << 16;
+            let flags = CMD_RESP_48 | CMD_CRC | CMD_INDEX;
+            let status = if let Some(on_command_published) = on_command_published.take() {
+                self.command_tracked(13, argument, flags, on_command_published)?[0]
+            } else {
+                self.command(13, argument, flags)?[0]
+            };
             if status & (1 << 8) != 0 && (status >> 9) & 0xf == 4 {
                 return Ok(());
             }
@@ -323,13 +355,23 @@ impl Card {
     }
 
     fn command(&mut self, index: u8, argument: u32, flags: u16) -> Result<[u32; 4], Error> {
+        self.command_tracked(index, argument, flags, || {})
+    }
+
+    fn command_tracked(
+        &mut self,
+        index: u8,
+        argument: u32,
+        flags: u16,
+        on_command_published: impl FnOnce(),
+    ) -> Result<[u32; 4], Error> {
         self.wait_inhibit(flags & CMD_DATA != 0 || flags & 3 == CMD_RESP_48_BUSY)?;
         self.last_command = index;
         self.last_interrupt_status = 0;
         self.clear_interrupts();
         self.write32(ARGUMENT, argument);
         self.write16(TRANSFER_MODE, 0);
-        self.write16(COMMAND, command_word(index, flags));
+        self.publish_command(command_word(index, flags), on_command_published);
         self.wait_interrupt(INT_COMMAND_COMPLETE)?;
         self.write32(INT_STATUS, INT_COMMAND_COMPLETE);
         if flags & 3 == CMD_RESP_136 {
@@ -342,6 +384,12 @@ impl Card {
         } else {
             Ok([self.read32(RESPONSE), 0, 0, 0])
         }
+    }
+
+    #[inline]
+    fn publish_command(&self, command: u16, on_command_published: impl FnOnce()) {
+        on_command_published();
+        self.write16(COMMAND, command);
     }
 
     fn wait_inhibit(&self, data: bool) -> Result<(), Error> {
@@ -506,6 +554,40 @@ fn unstuff(response: [u32; 4], start: usize, size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
+    use vibeos_hal::AddressRange;
+
+    const TEST_MMIO_WORDS: usize = 0x100;
+
+    fn fake_card(registers: &mut [u32; TEST_MMIO_WORDS]) -> Card {
+        let start = registers.as_mut_ptr() as usize;
+        Card {
+            description: SdhciDescription {
+                registers: AddressRange::new(start, start + core::mem::size_of_val(registers)),
+                irq: 0,
+                // None of the command-path tests touch SoC control registers.
+                soc_control: AddressRange::new(start, start + core::mem::size_of_val(registers)),
+                source_clock_hz: 1,
+                bus_width: 1,
+                init_clock_hz: 1,
+                data_clock_hz: 1,
+            },
+            timebase_hz: 1,
+            time: || 0,
+            rca: 1,
+            high_capacity: true,
+            capacity_sectors: 1,
+            last_command: 0,
+            last_interrupt_status: 0,
+        }
+    }
+
+    fn read_test_command(registers: &[u32; TEST_MMIO_WORDS]) -> u16 {
+        let address = registers.as_ptr() as usize + COMMAND;
+        // The test buffer is live, aligned for a u16 access at COMMAND, and
+        // models the volatile MMIO cell used by the production path.
+        unsafe { (address as *const u16).read_volatile() }
+    }
 
     #[test]
     fn clock_divisor_matches_cv1800b_rates() {
@@ -543,5 +625,83 @@ mod tests {
         assert_eq!(validate_sector(1024, 1023), Ok(()));
         assert_eq!(validate_sector(1024, 1024), Err(Error::OutOfRange));
         assert_eq!(validate_sector(0, 0), Err(Error::OutOfRange));
+    }
+
+    #[test]
+    fn tracked_write_does_not_publish_on_pre_command_failures() {
+        let mut registers = [0u32; TEST_MMIO_WORDS];
+        let mut card = fake_card(&mut registers);
+        let publications = Cell::new(0);
+
+        assert_eq!(
+            card.write_sector_tracked(1, &[0u8; SECTOR_SIZE], || {
+                publications.set(publications.get() + 1);
+            }),
+            Err(Error::OutOfRange)
+        );
+        assert_eq!(publications.get(), 0);
+        assert_eq!(read_test_command(&registers), 0);
+
+        // A busy command/data path is also rejected before CMD24 publication.
+        registers[PRESENT_STATE / 4] = 3;
+        assert_eq!(
+            card.write_sector_tracked(0, &[0u8; SECTOR_SIZE], || {
+                publications.set(publications.get() + 1);
+            }),
+            Err(Error::TimedOut)
+        );
+        assert_eq!(publications.get(), 0);
+        assert_eq!(read_test_command(&registers), 0);
+    }
+
+    #[test]
+    fn tracked_write_publishes_once_immediately_before_cmd24_store() {
+        let mut registers = [0u32; TEST_MMIO_WORDS];
+        let mut card = fake_card(&mut registers);
+        let command_address = registers.as_ptr() as usize + COMMAND;
+        let publications = Cell::new(0);
+
+        // Plain memory cannot emulate INT_STATUS write-one-to-clear, so the
+        // request intentionally fails at the first interrupt wait, after the
+        // COMMAND store. That is exactly the ambiguity boundary under test.
+        assert_eq!(
+            card.write_sector_tracked(0, &[0u8; SECTOR_SIZE], || {
+                assert_eq!(
+                    unsafe { (command_address as *const u16).read_volatile() },
+                    0
+                );
+                publications.set(publications.get() + 1);
+            }),
+            Err(Error::DeviceIo)
+        );
+        assert_eq!(publications.get(), 1);
+        assert_eq!(
+            read_test_command(&registers),
+            command_word(24, CMD_RESP_48 | CMD_CRC | CMD_INDEX | CMD_DATA)
+        );
+    }
+
+    #[test]
+    fn tracked_flush_publishes_once_immediately_before_cmd13_store() {
+        let mut registers = [0u32; TEST_MMIO_WORDS];
+        let mut card = fake_card(&mut registers);
+        let command_address = registers.as_ptr() as usize + COMMAND;
+        let publications = Cell::new(0);
+
+        assert_eq!(
+            card.flush_tracked(|| {
+                assert_eq!(
+                    unsafe { (command_address as *const u16).read_volatile() },
+                    0
+                );
+                publications.set(publications.get() + 1);
+            }),
+            Err(Error::DeviceIo)
+        );
+        assert_eq!(publications.get(), 1);
+        assert_eq!(
+            read_test_command(&registers),
+            command_word(13, CMD_RESP_48 | CMD_CRC | CMD_INDEX)
+        );
     }
 }

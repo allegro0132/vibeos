@@ -395,8 +395,12 @@ pub struct World {
     pub durable_cspace: Option<Cap>,
     durable_cspace_service: Option<Arc<durable_cspace::DurableCSpaceService>>,
     pub block_space: Option<Cap>,
+    /// Private roots for driver restart and range attenuation. Neither init nor
+    /// the store backend receives this CSpace's raw device capability.
+    block_policy: Option<Arc<Space>>,
     block_mmio: Option<Cap>,
     block_dma: Option<Cap>,
+    block_raw: Option<Cap>,
     /// init sees only these directional packet interfaces and the control
     /// service. The MMIO/DMA roots live in the private policy CSpace below.
     pub net_outbound: Option<Cap>,
@@ -702,6 +706,38 @@ impl World {
             };
         }
 
+        if template == ComponentTemplate::BlockDriver {
+            let policy = self
+                .block_policy
+                .as_ref()
+                .expect("block policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            return ComponentGrants::BlockDriver {
+                mmio: cap::grant(
+                    &policy,
+                    self.block_mmio.expect("block MMIO root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("block policy retains the MMIO grant root"),
+                dma: cap::grant(
+                    &policy,
+                    self.block_dma.expect("block DMA root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("block policy retains the DMA grant root"),
+                service: cap::grant(
+                    &policy,
+                    self.block_raw.expect("raw block service root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("block policy retains the raw service grant root"),
+            };
+        }
+
         if template == ComponentTemplate::NetDriver {
             let policy = self
                 .net_policy
@@ -840,29 +876,9 @@ impl World {
                 cap::grant(&init, self.console, Rights::WRITE, &mut target)
                     .expect("init retains the console grant root"),
             ),
-            ComponentTemplate::BlockDriver => ComponentGrants::BlockDriver {
-                mmio: cap::grant(
-                    &init,
-                    self.block_mmio.expect("block MMIO root exists"),
-                    Rights::READ.union(Rights::WRITE),
-                    &mut target,
-                )
-                .expect("init retains the block MMIO grant root"),
-                dma: cap::grant(
-                    &init,
-                    self.block_dma.expect("block DMA root exists"),
-                    Rights::READ.union(Rights::WRITE),
-                    &mut target,
-                )
-                .expect("init retains the block DMA grant root"),
-                service: cap::grant(
-                    &init,
-                    self.block.expect("block service root exists"),
-                    Rights::READ.union(Rights::WRITE),
-                    &mut target,
-                )
-                .expect("init retains the block service grant root"),
-            },
+            ComponentTemplate::BlockDriver => {
+                unreachable!("block grants come from the private policy CSpace")
+            }
             ComponentTemplate::NetDriver => {
                 unreachable!("network grants come from the private policy CSpace")
             }
@@ -1548,6 +1564,7 @@ pub fn build() {
         .as_ref()
         .map(|_| Space::new_persistent("saved-program", crate::program::program_space_id()));
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
+    let block_policy = block_resources.as_ref().map(|_| Space::new("block-policy"));
     let net_resources = net_device::discover();
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
     let net_policy = net_resources
@@ -1667,47 +1684,114 @@ pub fn build() {
     )
     .unwrap();
 
-    let (block_root, block_mmio_root, block_dma_root, block_grants) =
-        match (block_resources, block_space.as_ref()) {
-            (Some(resources), Some(space)) => {
-                let mmio_root = cs.mint(resources.mmio, Rights::ALL);
-                let dma_root = cs.mint(resources.dma, Rights::ALL);
-                let service_root = cs.mint(resources.device, Rights::ALL);
-                let mut target = space.0.lock();
-                let grants = (
-                    cap::grant(
-                        &cs,
-                        mmio_root,
-                        Rights::READ.union(Rights::WRITE),
-                        &mut target,
-                    )
-                    .unwrap(),
-                    cap::grant(
-                        &cs,
-                        dma_root,
-                        Rights::READ.union(Rights::WRITE),
-                        &mut target,
-                    )
-                    .unwrap(),
-                    cap::grant(
-                        &cs,
-                        service_root,
-                        Rights::READ.union(Rights::WRITE),
-                        &mut target,
-                    )
-                    .unwrap(),
-                );
-                drop(target);
-                (
-                    Some(service_root),
-                    Some(mmio_root),
-                    Some(dma_root),
-                    Some(grants),
+    let (
+        block_root,
+        store_block_grant,
+        block_mmio_root,
+        block_dma_root,
+        block_raw_root,
+        block_grants,
+    ) = match (
+        block_resources,
+        block_space.as_ref(),
+        block_policy.as_ref(),
+        store_backend.as_ref(),
+    ) {
+        (Some(resources), Some(space), Some(policy_space), Some(backend_space)) => {
+            const DIAGNOSTIC_BLOCKS: u64 = vibeos_object_store::STORE_FIRST_SECTOR;
+            const STORE_BLOCKS: u64 =
+                vibeos_object_store::STORE_END_SECTOR - vibeos_object_store::STORE_FIRST_SECTOR;
+
+            let managed_range = resources.managed_range.range();
+            let diagnostic_range = managed_range
+                .attenuate(0, DIAGNOSTIC_BLOCKS)
+                .expect("image block range contains the diagnostic window");
+            let store_range = managed_range
+                .attenuate(vibeos_object_store::STORE_FIRST_SECTOR, STORE_BLOCKS)
+                .expect("image block range contains the M4 journal");
+            vibeos_storage_device::validate_grant_layout(
+                managed_range,
+                &[diagnostic_range, store_range],
+            )
+            .expect("image block grants are contained and pairwise disjoint");
+
+            let mut policy = policy_space.0.lock();
+            let mmio_root = policy.mint(resources.mmio, Rights::ALL);
+            let dma_root = policy.mint(resources.dma, Rights::ALL);
+            let raw_root = policy.mint(resources.raw_device, Rights::ALL);
+            let range_root = policy.mint(resources.managed_range, Rights::ALL);
+
+            // init receives only the legacy diagnostic/provisioning window.
+            // Its final copy has no GRANT or REVOKE right.
+            let diagnostic_policy = policy
+                .derive_scoped::<block_device::BlockDevice>(
+                    range_root,
+                    (0, DIAGNOSTIC_BLOCKS),
+                    Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
                 )
-            }
-            (None, None) => (None, None, None, None),
-            _ => unreachable!("block resources and CSpace are constructed together"),
-        };
+                .expect("image block range contains the diagnostic window");
+            let diagnostic = cap::grant(
+                &policy,
+                diagnostic_policy,
+                Rights::READ.union(Rights::WRITE),
+                &mut cs,
+            )
+            .unwrap();
+
+            // The M4 adapter gets exactly [64,576). Sector numbers outside
+            // that historical journal are rejected before raw dispatch.
+            let store_policy = policy
+                .derive_scoped::<block_device::BlockDevice>(
+                    range_root,
+                    (vibeos_object_store::STORE_FIRST_SECTOR, STORE_BLOCKS),
+                    Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+                )
+                .expect("image block range contains the M4 journal");
+            let store_grant = cap::grant(
+                &policy,
+                store_policy,
+                Rights::READ.union(Rights::WRITE),
+                &mut backend_space.0.lock(),
+            )
+            .unwrap();
+
+            let mut target = space.0.lock();
+            let grants = (
+                cap::grant(
+                    &policy,
+                    mmio_root,
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .unwrap(),
+                cap::grant(
+                    &policy,
+                    dma_root,
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .unwrap(),
+                cap::grant(
+                    &policy,
+                    raw_root,
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .unwrap(),
+            );
+            drop(target);
+            (
+                Some(diagnostic),
+                Some(store_grant),
+                Some(mmio_root),
+                Some(dma_root),
+                Some(raw_root),
+                Some(grants),
+            )
+        }
+        (None, None, None, None) => (None, None, None, None, None, None),
+        _ => unreachable!("block resources, policy, backend, and CSpace are constructed together"),
+    };
     let (
         net_outbound,
         net_inbound,
@@ -2106,7 +2190,7 @@ pub fn build() {
         _ => unreachable!("TCP echo app grant exists exactly with its listener"),
     };
     let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) = match (
-        block_root,
+        store_block_grant,
         store_backend.as_ref(),
         persistent_test.as_ref(),
         saved_program_space.as_ref(),
@@ -2123,17 +2207,9 @@ pub fn build() {
             Some(saved_console),
             Some(saved_memory),
         ) => {
-            // The store receives only block read/write authority in a private
-            // backend CSpace. Its public service cap discloses neither the
-            // device nor stable object identifiers.
-            let block_grant = cap::grant(
-                &cs,
-                block,
-                Rights::READ.union(Rights::WRITE),
-                &mut backend.0.lock(),
-            )
-            .unwrap();
-            let service = crate::store_platform::new_service(backend.clone(), block_grant);
+            // `block` is already the exact [64,576) scoped grant installed in
+            // this private backend CSpace by block policy.
+            let service = crate::store_platform::new_service(backend.clone(), block);
             let journal = service.authority_journal();
             let store_cap = cs.mint(service, Rights::ALL);
             let saved = saved_program::SavedProgramService::new(
@@ -2173,6 +2249,9 @@ pub fn build() {
     spaces.insert("vsh", vsh);
     if let Some(space) = block_space.as_ref() {
         spaces.insert("virtio-blk", space.clone());
+    }
+    if let Some(space) = block_policy.as_ref() {
+        spaces.insert("block-policy", space.clone());
     }
     if let Some(space) = net_space.as_ref() {
         spaces.insert("virtio-net", space.clone());
@@ -2261,8 +2340,10 @@ pub fn build() {
         durable_cspace: durable_cspace_root,
         durable_cspace_service,
         block_space: c_block_space,
+        block_policy,
         block_mmio: block_mmio_root,
         block_dma: block_dma_root,
+        block_raw: block_raw_root,
         net_outbound,
         net_inbound,
         net_control,

@@ -908,7 +908,7 @@ impl Controller {
                 let hub = self.configure_hub()?;
                 self.hub = Some(hub);
                 if self.enumerate_hub_children(hub)? != 0 {
-                    return self.configure_hid_keyboard();
+                    return self.configure_hub_child_functions();
                 }
             }
             if let Some(interface) =
@@ -996,6 +996,77 @@ impl Controller {
         self.keyboard_last = [0; HID_REPORT_BYTES];
         self.keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
         Ok(Some(keyboard))
+    }
+
+    fn configure_hub_child_functions(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
+        let hub = self.hub.ok_or(Error::NoDevice)?;
+        let children = self.children;
+        let legacy_child = self.child;
+
+        let mut selected_keyboard = None;
+        let mut selected_keyboard_target = None;
+        let mut selected_keyboard_layout = KeyboardLayout::Boot;
+        let mut selected_keyboard_pid = DataPid::Data0;
+        let mut selected_keyboard_last = [0; HID_REPORT_BYTES];
+        let mut selected_keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
+        let mut selected_report_descriptor = None;
+        let mut selected_keyboard_configuration = None;
+        let mut selected_storage = None;
+        let mut selected_storage_target = None;
+        let mut selected_storage_configuration = None;
+
+        for child in children.into_iter().flatten() {
+            let target = TransferTarget {
+                address: child.device.address,
+                endpoint_zero_max_packet: u16::from(child.device.max_packet_size_0),
+                speed: child.device.speed,
+                split: (child.device.speed != Speed::High).then_some(SplitTarget {
+                    hub_address: hub.address,
+                    port: child.port,
+                }),
+            };
+            self.select_target(target);
+            self.child = Some(child.device);
+            self.configuration = None;
+            self.report_descriptor = None;
+            self.keyboard = None;
+            self.keyboard_target = None;
+            self.mass_storage = None;
+            self.storage_target = None;
+
+            self.configure_hid_keyboard()?;
+            if selected_keyboard.is_none() && self.keyboard.is_some() {
+                selected_keyboard = self.keyboard;
+                selected_keyboard_target = self.keyboard_target;
+                selected_keyboard_layout = self.keyboard_layout;
+                selected_keyboard_pid = self.keyboard_pid;
+                selected_keyboard_last = self.keyboard_last;
+                selected_keyboard_nkro_last = self.keyboard_nkro_last;
+                selected_report_descriptor = self.report_descriptor;
+                selected_keyboard_configuration = self.configuration;
+            }
+            if selected_storage.is_none() && self.mass_storage.is_some() {
+                selected_storage = self.mass_storage;
+                selected_storage_target = self.storage_target;
+                selected_storage_configuration = self.configuration;
+            }
+        }
+
+        self.child = legacy_child;
+        self.keyboard = selected_keyboard;
+        self.keyboard_target = selected_keyboard_target;
+        self.keyboard_layout = selected_keyboard_layout;
+        self.keyboard_pid = selected_keyboard_pid;
+        self.keyboard_last = selected_keyboard_last;
+        self.keyboard_nkro_last = selected_keyboard_nkro_last;
+        self.report_descriptor = selected_report_descriptor;
+        self.mass_storage = selected_storage;
+        self.storage_target = selected_storage_target;
+        self.configuration = selected_keyboard_configuration.or(selected_storage_configuration);
+        if let Some(target) = selected_keyboard_target.or(selected_storage_target) {
+            self.select_target(target);
+        }
+        Ok(selected_keyboard)
     }
 
     fn configure_hub(&mut self) -> Result<HubInfo, Error> {

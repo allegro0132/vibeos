@@ -480,7 +480,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
                 child.device.usb_version,
                 child.device.device_class,
                 child.device.max_packet_size_0,
-                hub.address,
+                child.parent_hub_address,
                 child.port,
                 child.port_status,
             ));

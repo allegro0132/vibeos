@@ -455,7 +455,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         return Ok(output);
     };
     output.push_str(&format!(
-        "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={}\n",
+        "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} configurations={}\n",
         device.address,
         device.vendor_id,
         device.product_id,
@@ -463,6 +463,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         device.usb_version,
         device.device_class,
         device.max_packet_size_0,
+        device.configuration_count,
     ));
     if let Some(hub) = snapshot.hub {
         let child_count = snapshot.children.iter().flatten().count();
@@ -472,7 +473,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         ));
         for child in snapshot.children.into_iter().flatten() {
             output.push_str(&format!(
-                "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} parent={:03} port={} status={:#06x}\n",
+                "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} configurations={} parent={:03} port={} status={:#06x}\n",
                 child.device.address,
                 child.device.vendor_id,
                 child.device.product_id,
@@ -480,6 +481,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
                 child.device.usb_version,
                 child.device.device_class,
                 child.device.max_packet_size_0,
+                child.device.configuration_count,
                 child.parent_hub_address,
                 child.port,
                 child.port_status,
@@ -502,10 +504,25 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             }
         }
     }
-    if let Some(configuration) = snapshot.configuration {
+    if let Some(address) = snapshot.configuration_device_address {
         output.push_str(&format!(
-            "  Configuration {} length={} interfaces={}\n",
-            configuration.value, configuration.total_length, configuration.declared_interfaces,
+            "  Descriptor configurations for device={address:03}\n"
+        ));
+    }
+    for (descriptor_index, configuration) in snapshot
+        .configurations
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, configuration)| {
+            configuration.map(|configuration| (index, configuration))
+        })
+    {
+        output.push_str(&format!(
+            "  Configuration index={} value={} length={} interfaces={}\n",
+            descriptor_index,
+            configuration.value,
+            configuration.total_length,
+            configuration.declared_interfaces,
         ));
         for interface in configuration.interfaces.into_iter().flatten() {
             output.push_str(&format!(
@@ -538,6 +555,22 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
                 ));
             }
             output.push_str("\n");
+            for endpoint in interface.endpoints.into_iter().flatten() {
+                let transfer_type = match endpoint.attributes & 0x03 {
+                    0 => "control",
+                    1 => "isochronous",
+                    2 => "bulk",
+                    _ => "interrupt",
+                };
+                output.push_str(&format!(
+                    "      Endpoint {:#04x} type={} attributes={:#04x} mps={} interval={}\n",
+                    endpoint.address,
+                    transfer_type,
+                    endpoint.attributes,
+                    endpoint.max_packet_size,
+                    endpoint.interval,
+                ));
+            }
         }
     }
     if let Some(report) = snapshot.report_descriptor {

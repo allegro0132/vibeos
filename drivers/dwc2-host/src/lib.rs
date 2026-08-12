@@ -265,6 +265,14 @@ struct SplitTarget {
 }
 
 #[derive(Clone, Copy)]
+struct TransferTarget {
+    address: u8,
+    endpoint_zero_max_packet: u16,
+    speed: Speed,
+    split: Option<SplitTarget>,
+}
+
+#[derive(Clone, Copy)]
 enum KeyboardLayout {
     Boot,
     AppleReport,
@@ -362,7 +370,9 @@ pub struct Controller {
     configuration: Option<ConfigurationInfo>,
     report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
+    keyboard_target: Option<TransferTarget>,
     mass_storage: Option<MassStorageInfo>,
+    storage_target: Option<TransferTarget>,
     storage_pid_in: DataPid,
     storage_pid_out: DataPid,
     storage_tag: u32,
@@ -600,7 +610,9 @@ impl Controller {
             configuration: None,
             report_descriptor: None,
             keyboard: None,
+            keyboard_target: None,
             mass_storage: None,
+            storage_target: None,
             storage_pid_in: DataPid::Data0,
             storage_pid_out: DataPid::Data0,
             storage_tag: 1,
@@ -656,6 +668,8 @@ impl Controller {
         let Some(mut storage) = self.mass_storage else {
             return Ok(None);
         };
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
         self.control_transfer(
             SetupPacket {
                 request_type: 0,
@@ -759,7 +773,9 @@ impl Controller {
             self.configuration = None;
             self.report_descriptor = None;
             self.keyboard = None;
+            self.keyboard_target = None;
             self.mass_storage = None;
+            self.storage_target = None;
             self.device_address = 0;
             return Ok(None);
         }
@@ -822,7 +838,9 @@ impl Controller {
         self.configuration = None;
         self.report_descriptor = None;
         self.keyboard = None;
+        self.keyboard_target = None;
         self.mass_storage = None;
+        self.storage_target = None;
         Ok(Some(info))
     }
 
@@ -831,14 +849,19 @@ impl Controller {
     pub fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
         let Some(target) = self.child.or(self.device) else {
             self.keyboard = None;
+            self.keyboard_target = None;
             self.mass_storage = None;
+            self.storage_target = None;
             return Ok(None);
         };
         if !self.connected() {
             self.keyboard = None;
+            self.keyboard_target = None;
             self.mass_storage = None;
+            self.storage_target = None;
             return Ok(None);
         }
+        let transfer_target = self.current_target();
 
         let mut header = [0u8; 9];
         let request = SetupPacket {
@@ -867,6 +890,7 @@ impl Controller {
             parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
         self.configuration = Some(configuration);
         self.mass_storage = find_mass_storage(configuration);
+        self.storage_target = self.mass_storage.map(|_| transfer_target);
         self.report_descriptor = None;
         let Some(keyboard) = keyboard else {
             self.keyboard = None;
@@ -935,6 +959,7 @@ impl Controller {
                         interval_ms: hid_poll_interval_ms(self.speed, interface.interval),
                         protocol: HidKeyboardProtocol::Report,
                     });
+                    self.keyboard_target = Some(transfer_target);
                     self.keyboard_layout = KeyboardLayout::AppleReport;
                     self.keyboard_pid = DataPid::Data0;
                     self.keyboard_last = [0; HID_REPORT_BYTES];
@@ -965,6 +990,7 @@ impl Controller {
             &mut [],
         )?;
         self.keyboard = Some(keyboard);
+        self.keyboard_target = Some(transfer_target);
         self.keyboard_layout = KeyboardLayout::Boot;
         self.keyboard_pid = DataPid::Data0;
         self.keyboard_last = [0; HID_REPORT_BYTES];
@@ -1157,10 +1183,13 @@ impl Controller {
     /// pressed keys. A USB NAK is normal idle state and produces an empty batch.
     pub fn poll_keyboard(&mut self) -> Result<HidInputBatch, Error> {
         let keyboard = self.keyboard.ok_or(Error::NoDevice)?;
+        let target = self.keyboard_target.ok_or(Error::NoDevice)?;
         if !self.connected() {
             self.keyboard = None;
+            self.keyboard_target = None;
             return Err(Error::NoDevice);
         }
+        self.select_target(target);
         let result = self.channel_transfer(
             self.device_address,
             keyboard.endpoint_in & 0x0f,
@@ -1214,6 +1243,8 @@ impl Controller {
     }
 
     fn bot_command(&mut self, cdb: &[u8], data_in: bool, data: &mut [u8]) -> Result<(), Error> {
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
         let result = self.bot_command_once(cdb, data_in, data);
         if let Err(error) = result {
             if bot_requires_reset_recovery(error) {
@@ -1287,6 +1318,8 @@ impl Controller {
 
     fn bot_reset_recovery(&mut self) -> Result<(), Error> {
         let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
         self.control_transfer(
             SetupPacket {
                 request_type: 0x21,
@@ -1312,6 +1345,22 @@ impl Controller {
         self.storage_pid_in = DataPid::Data0;
         self.storage_pid_out = DataPid::Data0;
         Ok(())
+    }
+
+    fn current_target(&self) -> TransferTarget {
+        TransferTarget {
+            address: self.device_address,
+            endpoint_zero_max_packet: self.endpoint_zero_max_packet,
+            speed: self.speed,
+            split: self.split,
+        }
+    }
+
+    fn select_target(&mut self, target: TransferTarget) {
+        self.device_address = target.address;
+        self.endpoint_zero_max_packet = target.endpoint_zero_max_packet;
+        self.speed = target.speed;
+        self.split = target.split;
     }
 
     fn bulk_in(

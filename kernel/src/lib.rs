@@ -17,8 +17,32 @@
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
 #[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
 compile_error!("feature `net-shell` is the Milk-V Duo production IPv4 image");
+#[cfg(all(feature = "iperf3-server", not(feature = "qemu-virt")))]
+compile_error!("feature `iperf3-server` is the QEMU iperf3 server image");
+#[cfg(all(feature = "milkv-iperf3-server", not(feature = "milkv-duo")))]
+compile_error!("feature `milkv-iperf3-server` is the Milk-V Duo iperf3 server image");
 #[cfg(all(feature = "net-shell", feature = "tcp-echo"))]
 compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 images");
+#[cfg(all(
+    feature = "iperf3-server",
+    any(
+        feature = "tcp-echo",
+        feature = "ssh-test",
+        feature = "ssh-security-test"
+    )
+))]
+compile_error!("feature `iperf3-server` is an isolated QEMU network image");
+#[cfg(all(
+    feature = "milkv-iperf3-server",
+    any(
+        feature = "net-shell",
+        feature = "milkv-ssh",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-jitterentropy-probe",
+        feature = "milkv-jitterentropy-ssh-probe"
+    )
+))]
+compile_error!("feature `milkv-iperf3-server` is an isolated Milk-V network image");
 #[cfg(all(feature = "ssh-security-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 #[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
@@ -97,6 +121,8 @@ mod code_pool;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
+#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+mod iperf3_platform;
 #[cfg(any(
     feature = "milkv-jitterentropy-probe",
     feature = "milkv-jitterentropy-ssh-probe"
@@ -114,7 +140,9 @@ mod net_echo_platform;
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 mod netstack_platform;
 #[cfg(feature = "qemu-virt")]
@@ -554,7 +582,9 @@ pub extern "C" fn kmain() -> ! {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]

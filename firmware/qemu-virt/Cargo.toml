@@ -9,6 +9,7 @@ default = []
 legacy-shell = ["vibeos-kernel/legacy-shell"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
+iperf3-server = ["vibeos-kernel/iperf3-server"]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = ["vibeos-kernel/ssh-test"]
 

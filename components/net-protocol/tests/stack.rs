@@ -475,6 +475,53 @@ fn one_interface_serves_two_independent_tcp_ports() {
 }
 
 #[test]
+fn explicit_port_group_accepts_two_simultaneous_tcp_connections() {
+    const GROUP: u64 = 0x4950_4552_4633;
+    let client_to_server = Endpoint::new("group-client-to-server", 128);
+    let server_to_client = Endpoint::new("group-server-to-client", 128);
+    let mut space = CSpace::new("group-test-link");
+    let (_, server_in) = authority(&mut space, &client_to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &server_to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &server_to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &client_to_server, Rights::SEND);
+
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server =
+        SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let control = server.add_shared_tcp_listener(SERVER_PORT, GROUP).unwrap();
+    let data = server.add_shared_tcp_listener(SERVER_PORT, GROUP).unwrap();
+    assert_eq!(
+        server.add_shared_tcp_listener(SERVER_PORT, GROUP + 1),
+        Err(StackError::ListenPortInUse)
+    );
+    assert_eq!(
+        server.add_tcp_listener(SERVER_PORT),
+        Err(StackError::ListenPortInUse)
+    );
+
+    let mut client = TestClient::new(client_in, client_out);
+    let second_client = client.open_connection_to(SERVER_PORT, 49_153);
+    let mut both_active = false;
+    for now_ms in 0..5_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        if server.tcp_connection_active(control).unwrap()
+            && server.tcp_connection_active(data).unwrap()
+        {
+            both_active = true;
+            break;
+        }
+        let _ = client.socket_by_handle(second_client);
+    }
+
+    assert!(
+        both_active,
+        "both sockets in the shared port group must accept"
+    );
+}
+
+#[test]
 fn two_capability_frontends_share_one_interface_without_crossing_streams() {
     const HTTP_PORT: u16 = 80;
     let client_to_server = Endpoint::new("frontend-client-to-server", 128);

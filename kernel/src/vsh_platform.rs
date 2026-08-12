@@ -108,7 +108,9 @@ fn install_shared_commands(session: &mut Session) {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
@@ -121,7 +123,9 @@ fn install_shared_commands(session: &mut Session) {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 pub fn install_remote_commands(session: &mut Session) {
     install_shared_commands(session);
@@ -262,7 +266,9 @@ const MILKV_USB_COMMANDS: &[CommandSpec] = &[
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 const NETWORK_COMMANDS: &[CommandSpec] = &[
     CommandSpec {

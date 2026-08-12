@@ -496,7 +496,10 @@ fn driver_turn(
         let received = if use_usb_cdc {
             match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
                 Ok(length) => Some(length),
-                Err(vibeos_driver_dwc2_host::Error::Nak) => None,
+                Err(
+                    vibeos_driver_dwc2_host::Error::Nak
+                    | vibeos_driver_dwc2_host::Error::TransferTimedOut,
+                ) => None,
                 Err(error) => {
                     crate::println!("  usb net   CDC-ECM receive failed: {error:?}");
                     return Err(NetError::DriverFault);

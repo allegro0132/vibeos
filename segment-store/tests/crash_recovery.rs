@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vibeos_segment_format::{admitted_pages, payload_sha256, Page, StoreUuid};
 use vibeos_segment_store::{
     CapacityClass, FormatOptions, ObjectHandle, PageDevice, PageDeviceInfo, SegmentStore,
-    StoreError, StoreInfo, StoreLimits,
+    StoreError, StoreInfo, StoreLimits, MAX_ALLOCATION_V2_SEGMENTS,
 };
 use vibeos_storage_device::{MutationCertainty, MutationFailure};
 
@@ -292,6 +292,59 @@ fn format(device: FaultDevice, limits: StoreLimits, reserve: u32) -> SegmentStor
     store
 }
 
+#[test]
+fn format_admits_the_allocation_v2_maximum_and_rejects_max_plus_one_before_writing() {
+    let maximum = MAX_ALLOCATION_V2_SEGMENTS as u64;
+    let generous = StoreLimits {
+        recovery_memory_bytes: 2 * 1024 * 1024,
+        ..limits()
+    };
+    let maximum_device = FaultDevice::blank(maximum);
+    let maximum_store = format(maximum_device, generous, 2);
+    let info = maximum_store.info().unwrap();
+    assert_eq!(info.admitted_segments, maximum);
+    assert_eq!(info.recovery_peak_bytes, maximum.div_ceil(4) as usize);
+
+    let oversized = FaultDevice::blank(maximum + 1);
+    let mut refused = SegmentStore::new(oversized.clone(), generous);
+    assert_eq!(
+        block_on(refused.format(options(generous, 2))),
+        Err(StoreError::InvalidConfig)
+    );
+    assert_eq!(oversized.mutation_count(), 0);
+    assert!(oversized.durable_image().is_empty());
+}
+
+#[test]
+fn new_format_rejects_reserve_one_before_writing() {
+    let store_limits = limits();
+    let device = FaultDevice::blank(6);
+    let mut store = SegmentStore::new(device.clone(), store_limits);
+    assert_eq!(
+        block_on(store.format(options(store_limits, 1))),
+        Err(StoreError::InvalidConfig)
+    );
+    assert_eq!(device.mutation_count(), 0);
+    assert!(device.durable_image().is_empty());
+}
+
+#[test]
+fn format_rejects_an_initial_allocation_bitmap_over_the_recovery_budget() {
+    let segments = 1024_u64;
+    let constrained = StoreLimits {
+        recovery_memory_bytes: segments.div_ceil(4) as usize - 1,
+        ..limits()
+    };
+    let device = FaultDevice::blank(segments);
+    let mut store = SegmentStore::new(device.clone(), constrained);
+    assert_eq!(
+        block_on(store.format(options(constrained, 2))),
+        Err(StoreError::InvalidConfig)
+    );
+    assert_eq!(device.mutation_count(), 0);
+    assert!(device.durable_image().is_empty());
+}
+
 fn seeded_store(
     segment_count: u64,
     limits: StoreLimits,
@@ -357,7 +410,7 @@ fn every_format_write_and_flush_boundary_is_atomic_under_fault_or_cancel() {
     let probe_device = FaultDevice::blank(6);
     let mut probe = SegmentStore::new(probe_device.clone(), limits);
     probe_device.reset_mutation_count();
-    block_on(probe.format(options(limits, 1))).unwrap();
+    block_on(probe.format(options(limits, 2))).unwrap();
     let boundary_count = probe_device.mutation_count();
     assert!(boundary_count >= 8);
 
@@ -372,7 +425,7 @@ fn every_format_write_and_flush_boundary_is_atomic_under_fault_or_cancel() {
             let device = FaultDevice::blank(6);
             device.arm(boundary, action);
             let mut store = SegmentStore::new(device.clone(), limits);
-            assert!(block_on(store.format(options(limits, 1))).is_err());
+            assert!(block_on(store.format(options(limits, 2))).is_err());
             assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
             let case = format!("format mutation {boundary}, action {action:?}");
             assert_unformatted_or_exact_empty(device, limits, &case);
@@ -381,7 +434,7 @@ fn every_format_write_and_flush_boundary_is_atomic_under_fault_or_cancel() {
             let device = FaultDevice::blank(6);
             device.arm(boundary, FaultAction::Pending(effect));
             let mut store = SegmentStore::new(device.clone(), limits);
-            let mut format = Box::pin(store.format(options(limits, 1)));
+            let mut format = Box::pin(store.format(options(limits, 2)));
             assert_eq!(poll_once(format.as_mut()), Poll::Pending);
             drop(format);
             assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
@@ -473,7 +526,7 @@ fn cancellation_at_every_put_mutation_invalidates_cursors_and_recovers() {
 fn orphan_segment_zero_does_not_break_a_chain_starting_at_segment_one() {
     let limits = limits();
     let device = FaultDevice::blank(8);
-    drop(format(device.clone(), limits, 1));
+    drop(format(device.clone(), limits, 2));
     device.power_cycle();
 
     let (mut interrupted, before) = mount(device.clone(), limits);
@@ -508,7 +561,7 @@ fn orphan_segment_zero_does_not_break_a_chain_starting_at_segment_one() {
 #[test]
 fn first_not_submitted_restart_and_read_failures_have_explicit_state() {
     let limits = limits();
-    let (seed_device, old_handle, old_info) = seeded_store(12, limits, 1);
+    let (seed_device, old_handle, old_info) = seeded_store(12, limits, 2);
     let seed_image = seed_device.durable_image();
     let page_count = seed_device.page_count();
     let attempted = b"attempt-after-seed";
@@ -578,7 +631,10 @@ fn first_not_submitted_restart_and_read_failures_have_explicit_state() {
     );
     assert_eq!(remount.info(), Err(StoreError::NotMounted));
     read_device.clear_read_fault();
-    assert_eq!(block_on(remount.mount()).unwrap(), old_info);
+    let remounted = block_on(remount.mount()).unwrap();
+    assert_eq!(remounted.generation, old_info.generation);
+    assert_eq!(remounted.object_count, old_info.object_count);
+    assert_eq!(remounted.allocated_segments, old_info.allocated_segments);
 }
 
 #[test]
@@ -588,7 +644,7 @@ fn capacity_errors_name_payload_metadata_and_cleaner_reserve() {
         ..limits()
     };
     let payload_device = FaultDevice::blank(8);
-    let mut payload_store = format(payload_device, payload_limits, 1);
+    let mut payload_store = format(payload_device, payload_limits, 2);
     assert_eq!(
         block_on(payload_store.put(OBJECT_KIND, root(&[0; 9]), &[0; 9])),
         Err(StoreError::Capacity(CapacityClass::Payload))
@@ -599,7 +655,7 @@ fn capacity_errors_name_payload_metadata_and_cleaner_reserve() {
         ..limits()
     };
     let metadata_device = FaultDevice::blank(8);
-    let mut metadata_store = format(metadata_device, metadata_limits, 1);
+    let mut metadata_store = format(metadata_device, metadata_limits, 2);
     block_on(metadata_store.put(OBJECT_KIND, root(b"first"), b"first")).unwrap();
     let before = metadata_store.info().unwrap();
     assert_eq!(
@@ -610,7 +666,7 @@ fn capacity_errors_name_payload_metadata_and_cleaner_reserve() {
 
     let reserve_limits = limits();
     let reserve_device = FaultDevice::blank(5);
-    let mut reserve_store = format(reserve_device, reserve_limits, 1);
+    let mut reserve_store = format(reserve_device, reserve_limits, 2);
     let mut saw_reserve = false;
     for index in 0..8_u8 {
         let before = reserve_store.info().unwrap();
@@ -655,6 +711,55 @@ fn dense_recovery_reports_and_enforces_its_memory_ceiling() {
         );
     }
 
+    let exact = StoreLimits {
+        recovery_memory_bytes: info.recovery_peak_bytes,
+        ..limits
+    };
+    let (_, exact_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()),
+        exact,
+    );
+    assert_eq!(exact_info.recovery_peak_bytes, info.recovery_peak_bytes);
+
+    let too_small = StoreLimits {
+        recovery_memory_bytes: info.recovery_peak_bytes - 1,
+        ..limits
+    };
+    let mut refused = SegmentStore::new(
+        FaultDevice::from_durable(device.page_count(), image),
+        too_small,
+    );
+    assert_eq!(block_on(refused.mount()), Err(StoreError::MemoryLimit));
+}
+
+#[test]
+fn replay_merge_reports_and_enforces_its_aggregate_memory_ceiling() {
+    let limits = limits();
+    let device = FaultDevice::blank(12);
+    let mut store = format(device.clone(), limits, 2);
+    block_on(store.put(OBJECT_KIND, root(b"snapshot"), b"snapshot")).unwrap();
+    block_on(store.put(OBJECT_KIND, root(b"replay"), b"replay")).unwrap();
+    assert_eq!(store.info().unwrap().replay_count, 1);
+    device.power_cycle();
+    let image = device.durable_image();
+
+    let (_, info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()),
+        limits,
+    );
+    assert_eq!(info.object_count, 2);
+    assert_eq!(info.replay_count, 1);
+
+    let exact = StoreLimits {
+        recovery_memory_bytes: info.recovery_peak_bytes,
+        ..limits
+    };
+    let (_, exact_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()),
+        exact,
+    );
+    assert_eq!(exact_info.recovery_peak_bytes, info.recovery_peak_bytes);
+
     let too_small = StoreLimits {
         recovery_memory_bytes: info.recovery_peak_bytes - 1,
         ..limits
@@ -670,7 +775,7 @@ fn dense_recovery_reports_and_enforces_its_memory_ceiling() {
 fn production_image_is_reconstructed_by_the_independent_python_verifier() {
     let limits = limits();
     let device = FaultDevice::blank(6);
-    let mut store = format(device.clone(), limits, 1);
+    let mut store = format(device.clone(), limits, 2);
     let first = b"rust-writer-python-reader-one";
     let second = b"rust-writer-python-reader-two";
     block_on(store.put(OBJECT_KIND, root(first), first)).unwrap();

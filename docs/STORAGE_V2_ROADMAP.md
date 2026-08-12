@@ -306,6 +306,14 @@ Acceptance:
 
 ### M7.5 — Root-based GC and segment cleaning
 
+**Status: complete (2026-08-12).** The frozen allocation/root/reference formats,
+bounded mark traversal, reader/root pinning, deterministic partial relocation,
+G/G+1/G+2 reuse barrier, legacy initial-root bootstrap, and independent
+powered-off verification are recorded in
+[STORAGE_V2_GC.md](STORAGE_V2_GC.md); the executed host, power-cut, lint,
+firmware, and raw-image gates are recorded in
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** unreachable storage is reclaimed without racing live capabilities,
 readers, persistent authority, or crash recovery.
 

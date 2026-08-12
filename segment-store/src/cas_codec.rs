@@ -12,12 +12,18 @@ use core::fmt;
 
 use vibeos_blob_format::{BlobError, BlobGeometry, HEADER_SIZE};
 use vibeos_segment_format::{
-    ExtentKind, FormatError, HASH_ALGORITHM_SHA256, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE,
-    POINTER_SIZE, PhysicalPointer, PointerValue, StoreUuid, decode_physical_pointer,
-    encode_physical_pointer, validate_pointer,
+    decode_physical_pointer, encode_physical_pointer, validate_pointer, ExtentKind, FormatError,
+    PhysicalPointer, PointerValue, StoreUuid, HASH_ALGORITHM_SHA256, MAX_EXTENT_PAYLOAD_PAGES,
+    PAGE_SIZE, POINTER_SIZE,
 };
 
 pub const CAS_CODEC_VERSION: u16 = 1;
+/// Snapshot/delta version which admits the M7.5 typed-reference tag.
+pub const CAS_GC_CODEC_VERSION: u16 = 2;
+/// Raw object bytes have no GC edges.
+pub const REFERENCE_CODEC_RAW: u16 = 0;
+/// Canonical `VIBEREF1` child-reference payload.
+pub const REFERENCE_CODEC_TYPED_V1: u16 = 1;
 pub const MAX_BLOB_CONTENT_LEN: u64 = 64 * 1024 * 1024;
 pub const MAX_BLOB_EXTENTS: usize = 66;
 pub const CANONICAL_CONTENT_EXTENT_LEN: u64 = MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64;
@@ -182,6 +188,12 @@ pub struct ObjectMapping {
     pub object_id: u128,
     pub blob_key: BlobKey,
     pub commit_generation: u64,
+    /// Persisted interpretation of the object payload for GC traversal.
+    ///
+    /// This belongs to the independently revocable Object mapping rather than
+    /// the deduplicated Blob mapping: identical bytes may be admitted as raw
+    /// data in one object and as a typed manifest in another.
+    pub reference_codec: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,6 +428,10 @@ fn validate_object_mapping(
     if value.object_id == 0
         || value.commit_generation == 0
         || value.commit_generation > checkpoint_generation
+        || !matches!(
+            value.reference_codec,
+            REFERENCE_CODEC_RAW | REFERENCE_CODEC_TYPED_V1
+        )
     {
         return Err(CasCodecError::InvalidField);
     }
@@ -425,6 +441,7 @@ fn validate_object_mapping(
 fn write_object_mapping(
     value: ObjectMapping,
     checkpoint_generation: u64,
+    codec_version: u16,
     out: &mut [u8],
 ) -> Result<(), CasCodecError> {
     if out.len() != OBJECT_MAPPING_LEN {
@@ -435,23 +452,42 @@ fn write_object_mapping(
     put_u128(out, 0x00, value.object_id);
     write_blob_key(value.blob_key, &mut out[0x10..0x50])?;
     put_u64(out, 0x50, value.commit_generation);
+    match codec_version {
+        CAS_CODEC_VERSION if value.reference_codec == REFERENCE_CODEC_RAW => {}
+        CAS_GC_CODEC_VERSION => put_u16(out, 0x58, value.reference_codec),
+        _ => return Err(CasCodecError::InvalidField),
+    }
     Ok(())
 }
 
 fn read_object_mapping(
     input: &[u8],
     checkpoint_generation: u64,
+    codec_version: u16,
 ) -> Result<ObjectMapping, CasCodecError> {
     if input.len() != OBJECT_MAPPING_LEN {
         return Err(CasCodecError::InvalidLength);
     }
-    if !is_zero(&input[0x58..0x60]) {
-        return Err(CasCodecError::NonZeroReserved);
-    }
+    let reference_codec = match codec_version {
+        CAS_CODEC_VERSION => {
+            if !is_zero(&input[0x58..0x60]) {
+                return Err(CasCodecError::NonZeroReserved);
+            }
+            REFERENCE_CODEC_RAW
+        }
+        CAS_GC_CODEC_VERSION => {
+            if !is_zero(&input[0x5a..0x60]) {
+                return Err(CasCodecError::NonZeroReserved);
+            }
+            get_u16(input, 0x58)
+        }
+        _ => return Err(CasCodecError::InvalidField),
+    };
     let value = ObjectMapping {
         object_id: get_u128(input, 0x00),
         blob_key: decode_blob_key(&input[0x10..0x50])?,
         commit_generation: get_u64(input, 0x50),
+        reference_codec,
     };
     validate_object_mapping(value, checkpoint_generation)?;
     Ok(value)
@@ -523,10 +559,7 @@ fn read_blob_mapping(
     Ok((value, pointer))
 }
 
-fn validate_manifest(
-    value: &BlobManifest,
-    context: CasCodecContext,
-) -> Result<Vec<PointerValue>, CasCodecError> {
+fn validate_manifest(value: &BlobManifest, context: CasCodecContext) -> Result<(), CasCodecError> {
     validate_blob_key(value.blob_key)?;
     if value.encoded_blob_len != canonical_blob_encoded_len(value.blob_key.exact_len)?
         || value.extents.is_empty()
@@ -555,10 +588,6 @@ fn validate_manifest(
     let extent_count =
         u32::try_from(expected_extent_count).map_err(|_| CasCodecError::ArithmeticOverflow)?;
     let mut expected_offset = 0_u64;
-    let mut pointers = Vec::new();
-    pointers
-        .try_reserve_exact(value.extents.len())
-        .map_err(|_| CasCodecError::InvalidLength)?;
     for (index, extent) in value.extents.iter().enumerate() {
         let expected_index = u32::try_from(index).map_err(|_| CasCodecError::ArithmeticOverflow)?;
         let expected_payload_len = if index == 0 {
@@ -586,12 +615,12 @@ fn validate_manifest(
         if pointer.exact_byte_len != extent.payload_byte_len {
             return Err(CasCodecError::InvalidPointer);
         }
-        for previous in &pointers {
-            if pointers_conflict(*previous, pointer) {
+        for previous in &value.extents[..index] {
+            let previous = validate_context_pointer(previous.pointer, context, ExtentKind::Blob)?;
+            if pointers_conflict(previous, pointer) {
                 return Err(CasCodecError::OverlappingPointer);
             }
         }
-        pointers.push(pointer);
         expected_offset = expected_offset
             .checked_add(extent.payload_byte_len)
             .ok_or(CasCodecError::ArithmeticOverflow)?;
@@ -599,7 +628,7 @@ fn validate_manifest(
     if expected_offset != value.encoded_blob_len {
         return Err(CasCodecError::InvalidLength);
     }
-    Ok(pointers)
+    Ok(())
 }
 
 fn write_manifest_extent(
@@ -736,10 +765,7 @@ pub fn decode_blob_manifest(
     Ok(value)
 }
 
-fn validate_snapshot(
-    value: &CasSnapshot,
-    context: CasCodecContext,
-) -> Result<Vec<PointerValue>, CasCodecError> {
+fn validate_snapshot(value: &CasSnapshot, context: CasCodecContext) -> Result<(), CasCodecError> {
     if value.checkpoint_generation == 0 {
         return Err(CasCodecError::InvalidField);
     }
@@ -753,18 +779,14 @@ fn validate_snapshot(
             return Err(CasCodecError::UnsortedOrDuplicate);
         }
     }
-    let mut manifest_pointers = Vec::new();
-    manifest_pointers
-        .try_reserve_exact(value.blobs.len())
-        .map_err(|_| CasCodecError::InvalidLength)?;
-    for blob in &value.blobs {
+    for (index, blob) in value.blobs.iter().enumerate() {
         let pointer = validate_blob_mapping(*blob, context)?;
-        for previous in &manifest_pointers {
-            if pointers_conflict(*previous, pointer) {
+        for previous in &value.blobs[..index] {
+            let previous = validate_blob_mapping(*previous, context)?;
+            if pointers_conflict(previous, pointer) {
                 return Err(CasCodecError::OverlappingPointer);
             }
         }
-        manifest_pointers.push(pointer);
     }
     for object in &value.objects {
         validate_object_mapping(*object, value.checkpoint_generation)?;
@@ -785,7 +807,7 @@ fn validate_snapshot(
     if total > MAX_METADATA_PAYLOAD_LEN {
         return Err(CasCodecError::InvalidLength);
     }
-    Ok(manifest_pointers)
+    Ok(())
 }
 
 pub fn encode_cas_snapshot(
@@ -796,9 +818,18 @@ pub fn encode_cas_snapshot(
     let object_offset = CAS_SNAPSHOT_HEADER_LEN;
     let blob_offset = checked_table_len(object_offset, value.objects.len(), OBJECT_MAPPING_LEN)?;
     let encoded_len = checked_table_len(blob_offset, value.blobs.len(), BLOB_MAPPING_LEN)?;
+    let codec_version = if value
+        .objects
+        .iter()
+        .any(|object| object.reference_codec != REFERENCE_CODEC_RAW)
+    {
+        CAS_GC_CODEC_VERSION
+    } else {
+        CAS_CODEC_VERSION
+    };
     let mut out = vec![0; encoded_len];
     out[0x00..0x08].copy_from_slice(CAS_MAGIC);
-    put_u16(&mut out, 0x08, CAS_CODEC_VERSION);
+    put_u16(&mut out, 0x08, codec_version);
     put_u16(&mut out, 0x0a, CAS_KIND_SNAPSHOT);
     put_u32(&mut out, 0x0c, CAS_SNAPSHOT_HEADER_LEN as u32);
     put_u64(&mut out, 0x10, value.checkpoint_generation);
@@ -822,6 +853,7 @@ pub fn encode_cas_snapshot(
         write_object_mapping(
             *object,
             value.checkpoint_generation,
+            codec_version,
             &mut out[offset..offset + OBJECT_MAPPING_LEN],
         )?;
     }
@@ -842,7 +874,8 @@ pub fn decode_cas_snapshot(
     if &input[0x00..0x08] != CAS_MAGIC {
         return Err(CasCodecError::InvalidMagic);
     }
-    if get_u16(input, 0x08) != CAS_CODEC_VERSION
+    let codec_version = get_u16(input, 0x08);
+    if !matches!(codec_version, CAS_CODEC_VERSION | CAS_GC_CODEC_VERSION)
         || get_u16(input, 0x0a) != CAS_KIND_SNAPSHOT
         || get_u32(input, 0x0c) as usize != CAS_SNAPSHOT_HEADER_LEN
         || get_u32(input, 0x20) as usize != OBJECT_MAPPING_LEN
@@ -877,6 +910,7 @@ pub fn decode_cas_snapshot(
         objects.push(read_object_mapping(
             &input[offset..offset + OBJECT_MAPPING_LEN],
             checkpoint_generation,
+            codec_version,
         )?);
     }
     let mut blobs = Vec::new();
@@ -949,9 +983,14 @@ pub fn encode_cas_delta(
     } else {
         CAS_DELTA_REUSE_LEN
     };
+    let codec_version = if value.object.reference_codec == REFERENCE_CODEC_RAW {
+        CAS_CODEC_VERSION
+    } else {
+        CAS_GC_CODEC_VERSION
+    };
     let mut out = vec![0; encoded_len];
     out[0x00..0x08].copy_from_slice(CAS_MAGIC);
-    put_u16(&mut out, 0x08, CAS_CODEC_VERSION);
+    put_u16(&mut out, 0x08, codec_version);
     put_u16(&mut out, 0x0a, CAS_KIND_DELTA);
     put_u32(&mut out, 0x0c, CAS_DELTA_HEADER_LEN as u32);
     put_u64(&mut out, 0x10, value.checkpoint_generation);
@@ -979,6 +1018,7 @@ pub fn encode_cas_delta(
     write_object_mapping(
         value.object,
         value.checkpoint_generation,
+        codec_version,
         &mut out[CAS_DELTA_HEADER_LEN..CAS_DELTA_REUSE_LEN],
     )?;
     if let Some(blob) = value.new_blob {
@@ -998,7 +1038,8 @@ pub fn decode_cas_delta(input: &[u8], context: CasCodecContext) -> Result<CasDel
     if &input[0x00..0x08] != CAS_MAGIC {
         return Err(CasCodecError::InvalidMagic);
     }
-    if get_u16(input, 0x08) != CAS_CODEC_VERSION
+    let codec_version = get_u16(input, 0x08);
+    if !matches!(codec_version, CAS_CODEC_VERSION | CAS_GC_CODEC_VERSION)
         || get_u16(input, 0x0a) != CAS_KIND_DELTA
         || get_u32(input, 0x0c) as usize != CAS_DELTA_HEADER_LEN
         || get_u32(input, 0x20) as usize != OBJECT_MAPPING_LEN
@@ -1029,6 +1070,7 @@ pub fn decode_cas_delta(input: &[u8], context: CasCodecContext) -> Result<CasDel
     let object = read_object_mapping(
         &input[CAS_DELTA_HEADER_LEN..CAS_DELTA_REUSE_LEN],
         checkpoint_generation,
+        codec_version,
     )?;
     let new_blob = if has_blob {
         Some(read_blob_mapping(&input[CAS_DELTA_REUSE_LEN..CAS_DELTA_NEW_BLOB_LEN], context)?.0)
@@ -1266,16 +1308,19 @@ mod tests {
                     object_id: 1,
                     blob_key: first_key,
                     commit_generation: 7,
+                    reference_codec: REFERENCE_CODEC_RAW,
                 },
                 ObjectMapping {
                     object_id: 2,
                     blob_key: first_key,
                     commit_generation: 8,
+                    reference_codec: REFERENCE_CODEC_RAW,
                 },
                 ObjectMapping {
                     object_id: 3,
                     blob_key: second_key,
                     commit_generation: 8,
+                    reference_codec: REFERENCE_CODEC_RAW,
                 },
             ],
             blobs: vec![first_blob, second_blob],
@@ -1354,12 +1399,60 @@ mod tests {
     }
 
     #[test]
+    fn typed_reference_tag_requires_v2_and_v1_remains_byte_compatible() {
+        let blob_key = key(1, 20, 2);
+        let blob = BlobMapping {
+            blob_key,
+            manifest: manifest_pointer(6, 3, 6),
+        };
+        let mut snapshot = CasSnapshot {
+            checkpoint_generation: 8,
+            objects: vec![ObjectMapping {
+                object_id: 1,
+                blob_key,
+                commit_generation: 8,
+                reference_codec: REFERENCE_CODEC_RAW,
+            }],
+            blobs: vec![blob],
+        };
+        let v1 = encode_cas_snapshot(&snapshot, context()).unwrap();
+        assert_eq!(get_u16(&v1, 0x08), CAS_CODEC_VERSION);
+        assert!(is_zero(
+            &v1[CAS_SNAPSHOT_HEADER_LEN + 0x58..CAS_SNAPSHOT_HEADER_LEN + 0x60]
+        ));
+        assert_eq!(decode_cas_snapshot(&v1, context()).unwrap(), snapshot);
+
+        snapshot.objects[0].reference_codec = REFERENCE_CODEC_TYPED_V1;
+        let v2 = encode_cas_snapshot(&snapshot, context()).unwrap();
+        assert_eq!(get_u16(&v2, 0x08), CAS_GC_CODEC_VERSION);
+        assert_eq!(
+            get_u16(&v2, CAS_SNAPSHOT_HEADER_LEN + 0x58),
+            REFERENCE_CODEC_TYPED_V1
+        );
+        assert_eq!(decode_cas_snapshot(&v2, context()).unwrap(), snapshot);
+
+        let mut bad_reserved = v2.clone();
+        bad_reserved[CAS_SNAPSHOT_HEADER_LEN + 0x5a] = 1;
+        assert_eq!(
+            decode_cas_snapshot(&bad_reserved, context()),
+            Err(CasCodecError::NonZeroReserved)
+        );
+        let mut unknown = snapshot;
+        unknown.objects[0].reference_codec = 2;
+        assert_eq!(
+            encode_cas_snapshot(&unknown, context()),
+            Err(CasCodecError::InvalidField)
+        );
+    }
+
+    #[test]
     fn delta_roundtrip_covers_new_and_deduplicated_blobs() {
         let blob_key = key(9, 123, 9);
         let object = ObjectMapping {
             object_id: 42,
             blob_key,
             commit_generation: 5,
+            reference_codec: REFERENCE_CODEC_RAW,
         };
         let new_blob = BlobMapping {
             blob_key,
@@ -1393,6 +1486,7 @@ mod tests {
                 object_id: 43,
                 blob_key,
                 commit_generation: 6,
+                reference_codec: REFERENCE_CODEC_RAW,
             },
             new_blob: None,
         };
@@ -1412,6 +1506,7 @@ mod tests {
                 object_id: 1,
                 blob_key,
                 commit_generation: 7,
+                reference_codec: REFERENCE_CODEC_RAW,
             },
             new_blob: Some(BlobMapping {
                 blob_key,

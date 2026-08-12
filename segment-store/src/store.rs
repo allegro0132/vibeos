@@ -2,36 +2,140 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::{fmt, mem};
 
 use vibeos_segment_format::{
-    ANCHOR_PAGES, ANCHOR_SEGMENT_NO, BodyDigest, Checkpoint, DATA_END_PAGE, DATA_FIRST_PAGE,
-    DecodeStatus, ExtentKind, ExtentRecord, FormatError, FormatGeometry, MAX_EXTENT_PAYLOAD_PAGES,
-    PAGE_SIZE, Page, PhysicalPointer, PointerValue, RecordBinding, SEGMENT_PAGES,
-    SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE, SegmentHeader,
-    SegmentSeal, SegmentSummary, StoreUuid, Superblock, VerifiedRecord, admitted_pages,
-    decode_checkpoint_verified, decode_extent_verified, decode_segment_header_verified,
-    decode_segment_seal_verified, decode_segment_summary_verified, decode_superblock_verified,
-    descriptor_chain_initial, descriptor_chain_next, encode_checkpoint_body, encode_extent_body,
-    encode_record_seal, encode_segment_header_body, encode_segment_seal_body,
-    encode_segment_summary_body, encode_superblock_body, payload_chain_initial, payload_chain_next,
-    payload_sha256, segment_base_page, select_checkpoint_for_superblock, select_superblock,
+    admitted_pages, decode_checkpoint_verified, decode_extent_verified,
+    decode_segment_header_verified, decode_segment_seal_verified, decode_segment_summary_verified,
+    decode_superblock_verified, descriptor_chain_initial, descriptor_chain_next,
+    encode_checkpoint_body, encode_extent_body, encode_record_seal, encode_segment_header_body,
+    encode_segment_seal_body, encode_segment_summary_body, encode_superblock_body,
+    payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page,
+    select_checkpoint_for_superblock, select_superblock, BodyDigest, Checkpoint, DecodeStatus,
+    ExtentKind, ExtentRecord, FormatError, FormatGeometry, Page, PhysicalPointer, PointerValue,
+    RecordBinding, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid, Superblock,
+    VerifiedRecord, ANCHOR_PAGES, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE,
+    MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_PAGES, SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE,
+    SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 use vibeos_storage_device::{MutationCertainty, MutationFailure};
 
+use crate::allocation_v2::{
+    decode_allocation_v2, AllocationV2, SegmentAllocation, ALLOCATION_V2_HEADER_LEN,
+    MAX_ALLOCATION_V2_SEGMENTS, RETIRED_SEGMENT_ENTRY_LEN,
+};
 use crate::cas_codec::{
-    BlobManifest, BlobMapping, CasCodecContext, ObjectMapping, decode_blob_manifest,
-    decode_cas_snapshot,
+    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping, CasCodecContext,
+    ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
+    CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, OBJECT_MAPPING_LEN,
 };
 use crate::codec::{
-    AllocationState, CATALOG_ENTRY_LEN, CATALOG_SNAPSHOT_HEADER_LEN, CatalogEntry, CatalogPayload,
-    CatalogPayloadKind, CodecError, decode_allocation, decode_catalog, encode_allocation,
-    encode_catalog,
+    decode_allocation, decode_catalog, encode_allocation, encode_catalog, AllocationState,
+    CatalogEntry, CatalogPayload, CatalogPayloadKind, CodecError, CATALOG_ENTRY_LEN,
+    CATALOG_SNAPSHOT_HEADER_LEN,
 };
 use crate::device::PageDevice;
+use crate::pins::{PinRegistry, SharedPinRegistry};
+use crate::root_codec::{
+    decode_persistent_root_set, PersistentRootEntry, PersistentRootSet, PERSISTENT_ROOT_ENTRY_LEN,
+    PERSISTENT_ROOT_SET_HEADER_LEN,
+};
 
 const METADATA_KIND_CATALOG: u32 = 0xffff_0001;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
+
+pub(crate) const ROOT_PIN_SLOTS: usize = 256;
+pub(crate) const READER_PIN_SLOTS: usize = 256;
+pub(crate) const RESERVED_ROOT_PIN_SLOTS: usize = 8;
+pub(crate) const RESERVED_READER_PIN_SLOTS: usize = 8;
+pub const MAX_TYPED_REFERENCE_KINDS: usize = 64;
+/// One non-cleaner segment is held back so persistent root policy can revoke
+/// the last ordinary object before foreground GC needs the cleaner reserve.
+pub const ROOT_POLICY_HEADROOM_SEGMENTS: u32 = 1;
+pub(crate) type StorePinRegistry = PinRegistry<ROOT_PIN_SLOTS, READER_PIN_SLOTS>;
+pub(crate) type SharedStorePinRegistry = SharedPinRegistry<ROOT_PIN_SLOTS, READER_PIN_SLOTS>;
+
+/// Runtime-only root/read pin domain for one mounted store service.
+///
+/// Keep this value across device-session recovery while in-memory object
+/// capabilities remain live. A real process reboot reconstructs durable roots
+/// and starts a fresh context because no old in-memory capability survives.
+#[derive(Clone)]
+pub struct StoreRuntimeContext {
+    pub(crate) pins: SharedStorePinRegistry,
+    published_generation: alloc::sync::Arc<AtomicU64>,
+    typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeContextError {
+    TooManyTypedReferenceKinds,
+    InvalidTypedReferenceKind,
+    AllocationFailed,
+}
+
+impl fmt::Display for RuntimeContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooManyTypedReferenceKinds => "too many typed-reference ObjectKinds",
+            Self::InvalidTypedReferenceKind => "typed-reference ObjectKind must be non-zero",
+            Self::AllocationFailed => "typed-reference policy allocation failed",
+        })
+    }
+}
+
+impl core::error::Error for RuntimeContextError {}
+
+impl StoreRuntimeContext {
+    pub fn new() -> Self {
+        Self::with_typed_reference_kinds(&[])
+            .expect("empty Storage V2 typed-reference policy must be valid")
+    }
+
+    /// Constructs one trusted runtime policy for ObjectKinds whose immutable
+    /// payloads may be interpreted as `refs-v1`.  The policy is not derived
+    /// from media; callers rebuild it from trusted boot configuration.
+    pub fn with_typed_reference_kinds(kinds: &[u32]) -> Result<Self, RuntimeContextError> {
+        if kinds.len() > MAX_TYPED_REFERENCE_KINDS {
+            return Err(RuntimeContextError::TooManyTypedReferenceKinds);
+        }
+        if kinds.contains(&0) {
+            return Err(RuntimeContextError::InvalidTypedReferenceKind);
+        }
+        let mut typed_reference_kinds = Vec::new();
+        typed_reference_kinds
+            .try_reserve_exact(kinds.len())
+            .map_err(|_| RuntimeContextError::AllocationFailed)?;
+        typed_reference_kinds.extend_from_slice(kinds);
+        typed_reference_kinds.sort_unstable();
+        typed_reference_kinds.dedup();
+        let pins = StorePinRegistry::new(RESERVED_ROOT_PIN_SLOTS, RESERVED_READER_PIN_SLOTS)
+            .expect("fixed Storage V2 pin-registry configuration")
+            .into_shared();
+        Ok(Self {
+            pins,
+            published_generation: alloc::sync::Arc::new(AtomicU64::new(0)),
+            typed_reference_kinds: alloc::sync::Arc::new(typed_reference_kinds),
+        })
+    }
+
+    pub fn admits_typed_reference_kind(&self, object_kind: u32) -> bool {
+        self.typed_reference_kinds
+            .binary_search(&object_kind)
+            .is_ok()
+    }
+}
+
+impl Default for StoreRuntimeContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn publish_runtime_generation(current: &AtomicU64, generation: u64) -> bool {
+    current.fetch_max(generation, Ordering::AcqRel) <= generation
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapacityClass {
@@ -109,6 +213,7 @@ pub enum StoreError<E> {
     Format(FormatError),
     Corrupt,
     RecoveryRequired,
+    GcResumeRequired,
     Capacity(CapacityClass),
     MemoryLimit,
     ObjectTooLarge,
@@ -130,6 +235,9 @@ impl<E: fmt::Display> fmt::Display for StoreError<E> {
             Self::Format(error) => write!(f, "{error}"),
             Self::Corrupt => f.write_str("Storage V2 media is corrupt"),
             Self::RecoveryRequired => f.write_str("Storage V2 requires cold recovery"),
+            Self::GcResumeRequired => {
+                f.write_str("Storage V2 must finish the pending GC reuse barrier")
+            }
             Self::Capacity(class) => write!(f, "Storage V2 {class:?} capacity exhausted"),
             Self::MemoryLimit => f.write_str("Storage V2 recovery memory ceiling exceeded"),
             Self::ObjectTooLarge => f.write_str("object exceeds the M7.3 compatibility profile"),
@@ -167,10 +275,40 @@ pub(crate) struct MountedState {
     pub(crate) replay_count: u32,
     pub(crate) catalog_root: PhysicalPointer,
     pub(crate) replay_tail: PhysicalPointer,
+    pub(crate) authority_root: PhysicalPointer,
+    pub(crate) allocation: AllocationV2,
+    pub(crate) allocation_version: u16,
+    pub(crate) persistent_roots: Option<PersistentRootSet>,
     pub(crate) catalog: Vec<CatalogEntry>,
     pub(crate) cas: Option<CasMountedState>,
     pub(crate) recovery_peak_bytes: usize,
     pub(crate) last_segment: Option<(u64, u64, [u8; 32])>,
+}
+
+struct CheckpointTransitionWitness {
+    store_uuid: StoreUuid,
+    generation: u64,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    cleaner_reserve_segments: u32,
+    allocation: AllocationV2,
+}
+
+impl CheckpointTransitionWitness {
+    fn from_mounted(state: MountedState) -> Self {
+        Self {
+            store_uuid: state.superblock.binding.store_uuid,
+            generation: state.generation,
+            admitted_segments: state.admitted_segments,
+            next_segment_generation: state.next_segment_generation,
+            cleaner_reserve_segments: state.cleaner_reserve_segments,
+            allocation: state.allocation,
+        }
+    }
+
+    fn resident_bytes(&self) -> Option<usize> {
+        self.allocation.allocated_bytes()
+    }
 }
 
 pub struct SegmentStore<D> {
@@ -178,15 +316,37 @@ pub struct SegmentStore<D> {
     pub(crate) limits: StoreLimits,
     pub(crate) mounted: Option<MountedState>,
     pub(crate) poisoned: bool,
+    pub(crate) pins: SharedStorePinRegistry,
+    pub(crate) published_generation: alloc::sync::Arc<AtomicU64>,
+    pub(crate) typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
     pub fn new(device: D, limits: StoreLimits) -> Self {
+        Self::new_with_runtime_context(device, limits, StoreRuntimeContext::new())
+    }
+
+    pub fn new_with_runtime_context(
+        device: D,
+        limits: StoreLimits,
+        runtime: StoreRuntimeContext,
+    ) -> Self {
         Self {
             device,
             limits,
             mounted: None,
             poisoned: false,
+            pins: runtime.pins,
+            published_generation: runtime.published_generation,
+            typed_reference_kinds: runtime.typed_reference_kinds,
+        }
+    }
+
+    pub fn runtime_context(&self) -> StoreRuntimeContext {
+        StoreRuntimeContext {
+            pins: self.pins.clone(),
+            published_generation: self.published_generation.clone(),
+            typed_reference_kinds: self.typed_reference_kinds.clone(),
         }
     }
 
@@ -213,9 +373,15 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let device_info = self.device.info();
         let segments = segments_for_page_count(device_info.page_count)?;
-        if options.cleaner_reserve_segments == 0
-            || u64::from(options.cleaner_reserve_segments) >= segments
+        let initial_allocation_bytes = allocation_v2_bitmap_bytes(segments)?;
+        let ordinary_floor = u64::from(options.cleaner_reserve_segments)
+            .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))
+            .ok_or(StoreError::InvalidConfig)?;
+        if options.cleaner_reserve_segments < 2
+            || ordinary_floor >= segments
             || options.limits.max_replay_records == 0
+            || segments > MAX_ALLOCATION_V2_SEGMENTS as u64
+            || initial_allocation_bytes > options.limits.recovery_memory_bytes
         {
             return Err(StoreError::InvalidConfig);
         }
@@ -328,14 +494,69 @@ impl<D: PageDevice> SegmentStore<D> {
         let selected =
             select_checkpoint_for_superblock(selected, left, right, device_info.page_count)?
                 .ok_or(StoreError::Unformatted)?;
+        let selected_generation = selected.value().binding.generation;
         // A complete publication marker is a promise to decode strictly even
-        // on the older slot.  Validate both sealed stores before choosing which
-        // state to install; malformed old metadata is not silently ignored.
-        for candidate in [left, right].into_iter().flatten() {
-            recover_state(&self.device, superblock, candidate, self.limits).await?;
+        // on the older slot. Recover it first, retain only the allocation-map
+        // witness, then recover the newer state under the remaining memory
+        // budget. This validates the pair without holding two full catalogs.
+        let mut state = match (left, right) {
+            (Some(left), Some(right)) => {
+                let (older, newer) =
+                    if left.value().binding.generation < right.value().binding.generation {
+                        (left, right)
+                    } else if right.value().binding.generation < left.value().binding.generation {
+                        (right, left)
+                    } else {
+                        return Err(StoreError::Corrupt);
+                    };
+                if newer.value().binding.generation != selected_generation {
+                    return Err(StoreError::Corrupt);
+                }
+                let older_state =
+                    recover_state(&self.device, superblock, older, self.limits).await?;
+                let older_peak = older_state.recovery_peak_bytes;
+                let witness = CheckpointTransitionWitness::from_mounted(older_state);
+                let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
+                let remaining = self
+                    .limits
+                    .recovery_memory_bytes
+                    .checked_sub(witness_bytes)
+                    .ok_or(StoreError::MemoryLimit)?;
+                let newer_limits = StoreLimits {
+                    recovery_memory_bytes: remaining,
+                    ..self.limits
+                };
+                let mut newer_state =
+                    recover_state(&self.device, superblock, newer, newer_limits).await?;
+                validate_checkpoint_transition(&witness, &newer_state)?;
+                let pair_peak = witness_bytes
+                    .checked_add(newer_state.recovery_peak_bytes)
+                    .ok_or(StoreError::MemoryLimit)?;
+                newer_state.recovery_peak_bytes = older_peak.max(pair_peak);
+                if newer_state.recovery_peak_bytes > self.limits.recovery_memory_bytes {
+                    return Err(StoreError::MemoryLimit);
+                }
+                newer_state
+            }
+            (Some(candidate), None) | (None, Some(candidate)) => {
+                if candidate.value().binding.generation != selected_generation {
+                    return Err(StoreError::Corrupt);
+                }
+                recover_state(&self.device, superblock, candidate, self.limits).await?
+            }
+            (None, None) => return Err(StoreError::Unformatted),
+        };
+        state.recovery_peak_bytes = state
+            .recovery_peak_bytes
+            .max(state.resident_heap_bytes().ok_or(StoreError::MemoryLimit)?);
+        if state.recovery_peak_bytes > self.limits.recovery_memory_bytes {
+            return Err(StoreError::MemoryLimit);
         }
-        let state = recover_state(&self.device, superblock, selected, self.limits).await?;
         let info = state.info();
+        if !publish_runtime_generation(&self.published_generation, state.generation) {
+            self.poisoned = true;
+            return Err(StoreError::RecoveryRequired);
+        }
         self.mounted = Some(state);
         self.poisoned = false;
         Ok(info)
@@ -347,13 +568,7 @@ impl<D: PageDevice> SegmentStore<D> {
         content_root: [u8; 32],
         bytes: &[u8],
     ) -> Result<ObjectHandle, StoreError<D::Error>> {
-        let Some(current) = self.mounted.as_ref() else {
-            return Err(if self.poisoned {
-                StoreError::RecoveryRequired
-            } else {
-                StoreError::NotMounted
-            });
-        };
+        let current = self.require_current_generation()?;
         let byte_len = u64::try_from(bytes.len()).map_err(|_| StoreError::ObjectTooLarge)?;
         if byte_len > self.limits.max_compat_object_bytes
             || byte_len > (MAX_EXTENT_PAYLOAD_PAGES as u64) * (PAGE_SIZE as u64)
@@ -365,6 +580,9 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         if current.cas.is_some() {
             return Err(StoreError::CatalogMode);
+        }
+        if !current.allocation.retired_segments().is_empty() {
+            return Err(StoreError::GcResumeRequired);
         }
         if current.catalog.len() >= self.limits.max_catalog_entries as usize {
             return Err(StoreError::Capacity(CapacityClass::Metadata));
@@ -390,9 +608,10 @@ impl<D: PageDevice> SegmentStore<D> {
             return Err(StoreError::Capacity(CapacityClass::Metadata));
         }
         if current.next_physical_segment
-            >= current
-                .admitted_segments
-                .saturating_sub(u64::from(current.cleaner_reserve_segments))
+            >= current.admitted_segments.saturating_sub(
+                u64::from(current.cleaner_reserve_segments)
+                    .saturating_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS)),
+            )
         {
             return Err(StoreError::Capacity(CapacityClass::CleanerReserve));
         }
@@ -412,12 +631,27 @@ impl<D: PageDevice> SegmentStore<D> {
         .await;
         match result {
             Ok((handle, recovered)) => {
+                if !publish_runtime_generation(&self.published_generation, recovered.generation) {
+                    return Err(StoreError::RecoveryRequired);
+                }
                 self.mounted = Some(recovered);
                 self.poisoned = false;
                 Ok(handle)
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn require_current_generation(&self) -> Result<&MountedState, StoreError<D::Error>> {
+        let state = self.mounted.as_ref().ok_or(if self.poisoned {
+            StoreError::RecoveryRequired
+        } else {
+            StoreError::NotMounted
+        })?;
+        if self.published_generation.load(Ordering::Acquire) != state.generation {
+            return Err(StoreError::RecoveryRequired);
+        }
+        Ok(state)
     }
 
     pub async fn get(&self, handle: &ObjectHandle) -> Result<Vec<u8>, StoreError<D::Error>> {
@@ -473,9 +707,88 @@ impl<D: PageDevice> SegmentStore<D> {
 }
 
 impl MountedState {
+    pub(crate) fn resident_heap_bytes(&self) -> Option<usize> {
+        let mut bytes = self.allocation.allocated_bytes()?.checked_add(
+            self.catalog
+                .capacity()
+                .checked_mul(mem::size_of::<CatalogEntry>())?,
+        )?;
+        if let Some(cas) = &self.cas {
+            bytes = bytes
+                .checked_add(
+                    cas.objects
+                        .capacity()
+                        .checked_mul(mem::size_of::<ObjectMapping>())?,
+                )?
+                .checked_add(
+                    cas.blobs
+                        .capacity()
+                        .checked_mul(mem::size_of::<BlobMapping>())?,
+                )?;
+        }
+        if let Some(roots) = &self.persistent_roots {
+            bytes = bytes.checked_add(roots.allocated_bytes()?)?;
+        }
+        Some(bytes)
+    }
+
+    pub(crate) fn find_free_run(&self, required: u64, may_use_reserve: bool) -> Option<u64> {
+        if required == 0 {
+            return None;
+        }
+        let free = self.allocation.counts().ok()?.free;
+        let ordinary_floor = u64::from(self.cleaner_reserve_segments)
+            .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))?;
+        if free < required || (!may_use_reserve && free.checked_sub(required)? < ordinary_floor) {
+            return None;
+        }
+        if self.allocation_version == 1 {
+            let end = self.next_physical_segment.checked_add(required)?;
+            if end > self.admitted_segments {
+                return None;
+            }
+            return (self.next_physical_segment..end)
+                .all(|segment_no| {
+                    self.allocation.segment_state(segment_no) == Some(SegmentAllocation::Free)
+                })
+                .then_some(self.next_physical_segment);
+        }
+        let mut run_start = 0_u64;
+        let mut run_len = 0_u64;
+        for segment_no in 0..self.admitted_segments {
+            if self.allocation.segment_state(segment_no) == Some(SegmentAllocation::Free) {
+                if run_len == 0 {
+                    run_start = segment_no;
+                }
+                run_len += 1;
+                if run_len == required {
+                    return Some(run_start);
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        None
+    }
+
     fn info(&self) -> StoreInfo {
-        let allocated_segments = self.next_physical_segment;
-        let free_segments = self.admitted_segments.saturating_sub(allocated_segments);
+        let (allocated_segments, free_segments) = if self.allocation_version == 1 {
+            // The legacy prefix allocator quarantines every non-zero final
+            // seal through the recovered frontier, including sealed orphans
+            // which were never named by a checkpoint.  Report that physical
+            // consumption rather than only the committed allocation payload.
+            (
+                self.next_physical_segment,
+                self.admitted_segments
+                    .saturating_sub(self.next_physical_segment),
+            )
+        } else {
+            let counts = self
+                .allocation
+                .counts()
+                .expect("mounted allocation map was strictly decoded");
+            (counts.allocated.saturating_add(counts.retired), counts.free)
+        };
         StoreInfo {
             generation: self.generation,
             admitted_segments: self.admitted_segments,
@@ -491,6 +804,42 @@ impl MountedState {
             recovery_peak_bytes: self.recovery_peak_bytes,
         }
     }
+}
+
+fn allocation_resident_bytes(allocation: &AllocationV2) -> Result<usize, ()> {
+    allocation.allocated_bytes().ok_or(())
+}
+
+fn cas_resident_bytes(cas: Option<&CasMountedState>) -> Result<usize, ()> {
+    cas.map_or(Ok(0), |cas| {
+        cas.objects
+            .capacity()
+            .checked_mul(mem::size_of::<ObjectMapping>())
+            .and_then(|bytes| {
+                cas.blobs
+                    .capacity()
+                    .checked_mul(mem::size_of::<BlobMapping>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .ok_or(())
+    })
+}
+
+fn root_resident_bytes(roots: Option<&PersistentRootSet>) -> Result<usize, ()> {
+    roots.map_or(Ok(0), |roots| roots.allocated_bytes().ok_or(()))
+}
+
+fn recovery_resident_bytes(
+    allocation: &AllocationV2,
+    catalog: &Vec<CatalogEntry>,
+    cas: Option<&CasMountedState>,
+    roots: Option<&PersistentRootSet>,
+) -> Result<usize, ()> {
+    allocation_resident_bytes(allocation)?
+        .checked_add(measured_catalog_bytes(catalog))
+        .and_then(|bytes| cas_resident_bytes(cas).ok()?.checked_add(bytes))
+        .and_then(|bytes| root_resident_bytes(roots).ok()?.checked_add(bytes))
+        .ok_or(())
 }
 
 fn validate_limits<E>(limits: StoreLimits) -> Result<(), StoreError<E>> {
@@ -525,6 +874,10 @@ fn segments_for_page_count<E>(page_count: u64) -> Result<u64, StoreError<E>> {
         return Err(StoreError::InvalidConfig);
     }
     Ok(data_pages / SEGMENT_PAGES)
+}
+
+fn allocation_v2_bitmap_bytes<E>(segments: u64) -> Result<usize, StoreError<E>> {
+    usize::try_from(segments.div_ceil(4)).map_err(|_| StoreError::InvalidConfig)
 }
 
 async fn write_page<D: PageDevice>(
@@ -859,6 +1212,157 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     })
 }
 
+fn recovery_remaining<E>(limit: usize, resident: usize) -> Result<usize, StoreError<E>> {
+    limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)
+}
+
+fn recovery_preflight_decode<E>(
+    limit: usize,
+    resident: usize,
+    encoded_capacity: usize,
+    decoded_capacity_upper_bound: usize,
+) -> Result<(), StoreError<E>> {
+    resident
+        .checked_add(encoded_capacity)
+        .and_then(|bytes| bytes.checked_add(decoded_capacity_upper_bound))
+        .filter(|bytes| *bytes <= limit)
+        .map(|_| ())
+        .ok_or(StoreError::MemoryLimit)
+}
+
+fn recovery_observe<E>(peak: &mut usize, limit: usize, bytes: usize) -> Result<(), StoreError<E>> {
+    if bytes > limit {
+        return Err(StoreError::MemoryLimit);
+    }
+    *peak = (*peak).max(bytes);
+    Ok(())
+}
+
+fn input_u32(input: &[u8], offset: usize) -> Option<u32> {
+    let bytes = input.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn allocation_decode_capacity_upper_bound<E>(
+    input: &[u8],
+    version: u16,
+    admitted_segments: u64,
+) -> Result<usize, StoreError<E>> {
+    let bitmap_bytes =
+        allocation_v2_bitmap_bytes::<E>(admitted_segments).map_err(|_| StoreError::Corrupt)?;
+    match version {
+        1 => Ok(bitmap_bytes),
+        2 => {
+            let retirement_bytes = input
+                .len()
+                .checked_sub(ALLOCATION_V2_HEADER_LEN)
+                .and_then(|bytes| bytes.checked_sub(bitmap_bytes))
+                .filter(|bytes| bytes % RETIRED_SEGMENT_ENTRY_LEN == 0)
+                .ok_or(StoreError::Corrupt)?;
+            let retired_count = retirement_bytes / RETIRED_SEGMENT_ENTRY_LEN;
+            bitmap_bytes
+                .checked_add(
+                    retired_count
+                        .checked_mul(mem::size_of::<crate::allocation_v2::RetiredSegment>())
+                        .ok_or(StoreError::MemoryLimit)?,
+                )
+                .ok_or(StoreError::MemoryLimit)
+        }
+        _ => Err(StoreError::Corrupt),
+    }
+}
+
+fn cas_snapshot_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+    let object_count = input_u32(input, 0x18).ok_or(StoreError::Corrupt)? as usize;
+    let blob_count = input_u32(input, 0x1c).ok_or(StoreError::Corrupt)? as usize;
+    let expected_len = object_count
+        .checked_mul(OBJECT_MAPPING_LEN)
+        .and_then(|bytes| bytes.checked_add(CAS_SNAPSHOT_HEADER_LEN))
+        .and_then(|bytes| blob_count.checked_mul(BLOB_MAPPING_LEN)?.checked_add(bytes))
+        .ok_or(StoreError::Corrupt)?;
+    if expected_len != input.len() {
+        return Err(StoreError::Corrupt);
+    }
+    object_count
+        .checked_mul(mem::size_of::<ObjectMapping>())
+        .and_then(|bytes| {
+            blob_count
+                .checked_mul(mem::size_of::<BlobMapping>())?
+                .checked_add(bytes)
+        })
+        .ok_or(StoreError::MemoryLimit)
+}
+
+fn catalog_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+    let entry_count = input_u32(input, 0x18).ok_or(StoreError::Corrupt)? as usize;
+    entry_count
+        .checked_mul(mem::size_of::<CatalogEntry>())
+        .ok_or(StoreError::MemoryLimit)
+}
+
+fn blob_manifest_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+    let extent_count = input_u32(input, 0x58).ok_or(StoreError::Corrupt)? as usize;
+    let expected_len = extent_count
+        .checked_mul(MANIFEST_EXTENT_LEN)
+        .and_then(|bytes| bytes.checked_add(BLOB_MANIFEST_HEADER_LEN))
+        .ok_or(StoreError::Corrupt)?;
+    if expected_len != input.len() {
+        return Err(StoreError::Corrupt);
+    }
+    extent_count
+        .checked_mul(mem::size_of::<ManifestExtent>())
+        .ok_or(StoreError::MemoryLimit)
+}
+
+fn persistent_roots_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+    let entry_count = input_u32(input, 0x18).ok_or(StoreError::Corrupt)? as usize;
+    let expected_len = entry_count
+        .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
+        .and_then(|bytes| bytes.checked_add(PERSISTENT_ROOT_SET_HEADER_LEN))
+        .ok_or(StoreError::Corrupt)?;
+    if expected_len != input.len() {
+        return Err(StoreError::Corrupt);
+    }
+    entry_count
+        .checked_mul(mem::size_of::<PersistentRootEntry>())
+        .ok_or(StoreError::MemoryLimit)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_recovery_pointer_payload<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    expected_kind: ExtentKind,
+    memory_limit: usize,
+    resident_bytes: usize,
+) -> Result<ResolvedPayload, StoreError<D::Error>> {
+    let remaining = recovery_remaining(memory_limit, resident_bytes)?;
+    if let PhysicalPointer::Value(pointer) = pointer {
+        let exact_len = usize::try_from(pointer.exact_byte_len).map_err(|_| StoreError::Corrupt)?;
+        if exact_len > MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE {
+            return Err(StoreError::Corrupt);
+        }
+        if exact_len > remaining {
+            return Err(StoreError::MemoryLimit);
+        }
+    }
+    read_pointer_payload(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        expected_kind,
+        remaining,
+    )
+    .await
+}
+
 async fn recover_state<D: PageDevice>(
     device: &D,
     superblock: Superblock,
@@ -868,10 +1372,138 @@ async fn recover_state<D: PageDevice>(
     let checkpoint = *checkpoint.value();
     let mut catalog = Vec::new();
     let mut cas = None;
-    let mut cas_max_referenced_segment = None::<u64>;
     let mut recovery_peak = 0_usize;
+    let (allocation, allocation_version, last_segment) =
+        if checkpoint.allocation_root == PhysicalPointer::Null {
+            if checkpoint.binding.generation != 1 {
+                return Err(StoreError::Corrupt);
+            }
+            let bitmap_bytes = allocation_v2_bitmap_bytes::<D::Error>(checkpoint.admitted_segments)
+                .map_err(|_| StoreError::Corrupt)?;
+            if checkpoint.admitted_segments > MAX_ALLOCATION_V2_SEGMENTS as u64 {
+                return Err(StoreError::Corrupt);
+            }
+            if bitmap_bytes > limits.recovery_memory_bytes {
+                return Err(StoreError::MemoryLimit);
+            }
+            let legacy = AllocationState {
+                checkpoint_generation: checkpoint.binding.generation,
+                admitted_segments: checkpoint.admitted_segments,
+                allocated_prefix_segments: 0,
+                next_segment_generation: checkpoint.next_segment_generation,
+                cleaner_reserve_segments: checkpoint.cleaner_reserve_segments,
+            };
+            let decoded = AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?;
+            recovery_observe(
+                &mut recovery_peak,
+                limits.recovery_memory_bytes,
+                allocation_resident_bytes(&decoded).map_err(|_| StoreError::MemoryLimit)?,
+            )?;
+            (decoded, 1, None)
+        } else {
+            let payload = read_recovery_pointer_payload(
+                device,
+                superblock.binding.store_uuid,
+                checkpoint.admitted_segments,
+                checkpoint.next_segment_generation,
+                checkpoint.binding.generation,
+                checkpoint.allocation_root,
+                ExtentKind::Allocation,
+                limits.recovery_memory_bytes,
+                0,
+            )
+            .await?;
+            let allocation_encoded_bytes = payload.bytes.capacity();
+            let version = payload
+                .bytes
+                .get(0x08..0x0a)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .ok_or(StoreError::Corrupt)?;
+            let allocation_decoded_upper = allocation_decode_capacity_upper_bound(
+                &payload.bytes,
+                version,
+                checkpoint.admitted_segments,
+            )?;
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                0,
+                allocation_encoded_bytes,
+                allocation_decoded_upper,
+            )?;
+            let decoded = match version {
+                1 => {
+                    let legacy = decode_allocation(&payload.bytes).map_err(codec_error)?;
+                    if legacy.checkpoint_generation != checkpoint.binding.generation
+                        || legacy.checkpoint_generation
+                            != payload.extent.binding.target_checkpoint_generation
+                        || legacy.admitted_segments != checkpoint.admitted_segments
+                        || legacy.allocated_prefix_segments == 0
+                        || legacy.next_segment_generation != checkpoint.next_segment_generation
+                        || legacy.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                    let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
+                        return Err(StoreError::Corrupt);
+                    };
+                    if root.segment_no.checked_add(1) != Some(legacy.allocated_prefix_segments) {
+                        return Err(StoreError::Corrupt);
+                    }
+                    AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?
+                }
+                2 => {
+                    let current =
+                        decode_allocation_v2(&payload.bytes).map_err(|_| StoreError::Corrupt)?;
+                    if current.checkpoint_generation != checkpoint.binding.generation
+                        || current.checkpoint_generation
+                            != payload.extent.binding.target_checkpoint_generation
+                        || current.admitted_segments != checkpoint.admitted_segments
+                        || current.next_segment_generation != checkpoint.next_segment_generation
+                        || current.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                    current
+                }
+                _ => return Err(StoreError::Corrupt),
+            };
+            let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
+                return Err(StoreError::Corrupt);
+            };
+            if decoded.segment_state(root.segment_no) != Some(SegmentAllocation::Allocated) {
+                return Err(StoreError::Corrupt);
+            }
+            let allocation_decoded_bytes =
+                allocation_resident_bytes(&decoded).map_err(|_| StoreError::MemoryLimit)?;
+            recovery_observe(
+                &mut recovery_peak,
+                limits.recovery_memory_bytes,
+                allocation_encoded_bytes
+                    .checked_add(allocation_decoded_bytes)
+                    .ok_or(StoreError::MemoryLimit)?,
+            )?;
+            (
+                decoded,
+                version,
+                Some((
+                    root.segment_no,
+                    root.segment_generation,
+                    payload.segment_seal_body_sha256,
+                )),
+            )
+        };
+    for pointer in [
+        checkpoint.catalog_root,
+        checkpoint.authority_root,
+        checkpoint.allocation_root,
+        checkpoint.replay_tail,
+    ] {
+        require_allocated_pointer(&allocation, pointer)?;
+    }
     if checkpoint.catalog_root != PhysicalPointer::Null {
-        let snapshot = read_pointer_payload(
+        let allocation_bytes =
+            allocation_resident_bytes(&allocation).map_err(|_| StoreError::MemoryLimit)?;
+        let snapshot = read_recovery_pointer_payload(
             device,
             superblock.binding.store_uuid,
             checkpoint.admitted_segments,
@@ -880,13 +1512,11 @@ async fn recover_state<D: PageDevice>(
             checkpoint.catalog_root,
             ExtentKind::Catalog,
             limits.recovery_memory_bytes,
+            allocation_bytes,
         )
         .await?;
         if snapshot.bytes.starts_with(b"VIBECAS2") {
-            if checkpoint.replay_count != 0
-                || checkpoint.replay_tail != PhysicalPointer::Null
-                || checkpoint.authority_root != PhysicalPointer::Null
-            {
+            if checkpoint.replay_count != 0 || checkpoint.replay_tail != PhysicalPointer::Null {
                 return Err(StoreError::Corrupt);
             }
             let context = CasCodecContext::new(
@@ -895,9 +1525,15 @@ async fn recover_state<D: PageDevice>(
                 checkpoint.next_segment_generation,
             )
             .map_err(|_| StoreError::Corrupt)?;
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                allocation_bytes,
+                snapshot.bytes.capacity(),
+                cas_snapshot_decode_capacity_upper_bound(&snapshot.bytes)?,
+            )?;
             let decoded =
                 decode_cas_snapshot(&snapshot.bytes, context).map_err(|_| StoreError::Corrupt)?;
-            if decoded.checkpoint_generation != checkpoint.binding.generation
+            if decoded.checkpoint_generation > checkpoint.binding.generation
                 || decoded.checkpoint_generation
                     != snapshot.extent.binding.target_checkpoint_generation
                 || decoded.objects.len() > limits.max_catalog_entries as usize
@@ -918,23 +1554,24 @@ async fn recover_state<D: PageDevice>(
                 })
                 .ok_or(StoreError::MemoryLimit)?;
             let snapshot_capacity = snapshot.bytes.capacity();
-            recovery_peak = cas_bytes
-                .checked_add(snapshot_capacity)
-                .ok_or(StoreError::MemoryLimit)?;
+            recovery_observe(
+                &mut recovery_peak,
+                limits.recovery_memory_bytes,
+                allocation_bytes
+                    .checked_add(cas_bytes)
+                    .and_then(|bytes| bytes.checked_add(snapshot_capacity))
+                    .ok_or(StoreError::MemoryLimit)?,
+            )?;
             // The decoded tables own their data; release the encoded snapshot
             // before reading a manifest so the measured recovery peak is also
             // the actual live-memory bound.
             drop(snapshot);
             for blob in &decoded.blobs {
-                let PhysicalPointer::Value(manifest_pointer) = blob.manifest else {
+                let PhysicalPointer::Value(_manifest_pointer) = blob.manifest else {
                     return Err(StoreError::Corrupt);
                 };
-                cas_max_referenced_segment = Some(
-                    cas_max_referenced_segment.map_or(manifest_pointer.segment_no, |current| {
-                        current.max(manifest_pointer.segment_no)
-                    }),
-                );
-                let manifest = read_pointer_payload(
+                require_allocated_pointer(&allocation, blob.manifest)?;
+                let manifest = read_recovery_pointer_payload(
                     device,
                     superblock.binding.store_uuid,
                     checkpoint.admitted_segments,
@@ -943,22 +1580,29 @@ async fn recover_state<D: PageDevice>(
                     blob.manifest,
                     ExtentKind::Catalog,
                     limits.recovery_memory_bytes,
+                    allocation_bytes
+                        .checked_add(cas_bytes)
+                        .ok_or(StoreError::MemoryLimit)?,
                 )
                 .await?;
+                recovery_preflight_decode(
+                    limits.recovery_memory_bytes,
+                    allocation_bytes
+                        .checked_add(cas_bytes)
+                        .ok_or(StoreError::MemoryLimit)?,
+                    manifest.bytes.capacity(),
+                    blob_manifest_decode_capacity_upper_bound(&manifest.bytes)?,
+                )?;
                 let decoded_manifest = decode_blob_manifest(&manifest.bytes, context)
                     .map_err(|_| StoreError::Corrupt)?;
                 if decoded_manifest.blob_key != blob.blob_key {
                     return Err(StoreError::Corrupt);
                 }
                 for declared in &decoded_manifest.extents {
-                    let PhysicalPointer::Value(pointer) = declared.pointer else {
+                    let PhysicalPointer::Value(_pointer) = declared.pointer else {
                         return Err(StoreError::Corrupt);
                     };
-                    cas_max_referenced_segment = Some(
-                        cas_max_referenced_segment.map_or(pointer.segment_no, |current| {
-                            current.max(pointer.segment_no)
-                        }),
-                    );
+                    require_allocated_pointer(&allocation, declared.pointer)?;
                 }
                 validate_cas_blob_descriptors(
                     device,
@@ -969,23 +1613,34 @@ async fn recover_state<D: PageDevice>(
                     &decoded_manifest,
                 )
                 .await?;
-                recovery_peak = recovery_peak.max(
-                    cas_bytes
-                        .checked_add(manifest.bytes.capacity())
+                recovery_observe(
+                    &mut recovery_peak,
+                    limits.recovery_memory_bytes,
+                    allocation_bytes
+                        .checked_add(cas_bytes)
+                        .and_then(|bytes| bytes.checked_add(manifest.bytes.capacity()))
                         .and_then(|bytes| {
                             bytes.checked_add(
-                                decoded_manifest.extents.capacity()
-                                    * mem::size_of::<crate::cas_codec::ManifestExtent>(),
+                                decoded_manifest
+                                    .extents
+                                    .capacity()
+                                    .checked_mul(mem::size_of::<ManifestExtent>())?,
                             )
                         })
                         .ok_or(StoreError::MemoryLimit)?,
-                );
+                )?;
             }
             cas = Some(CasMountedState {
                 objects: decoded.objects,
                 blobs: decoded.blobs,
             });
         } else {
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                allocation_bytes,
+                snapshot.bytes.capacity(),
+                catalog_decode_capacity_upper_bound(&snapshot.bytes)?,
+            )?;
             let decoded = decode_catalog(&snapshot.bytes, superblock.binding.store_uuid)
                 .map_err(codec_error)?;
             if decoded.kind != CatalogPayloadKind::Snapshot
@@ -1001,17 +1656,23 @@ async fn recover_state<D: PageDevice>(
                 return Err(StoreError::MemoryLimit);
             }
             catalog = decoded.entries;
-            recovery_peak = measured_catalog_bytes(&catalog)
-                .checked_add(snapshot.bytes.capacity())
-                .ok_or(StoreError::MemoryLimit)?;
-        }
-        if recovery_peak > limits.recovery_memory_bytes {
-            return Err(StoreError::MemoryLimit);
+            recovery_observe(
+                &mut recovery_peak,
+                limits.recovery_memory_bytes,
+                allocation_bytes
+                    .checked_add(measured_catalog_bytes(&catalog))
+                    .and_then(|bytes| bytes.checked_add(snapshot.bytes.capacity()))
+                    .ok_or(StoreError::MemoryLimit)?,
+            )?;
         }
     }
 
+    let mut persistent_roots = None;
     if checkpoint.authority_root != PhysicalPointer::Null {
-        let authority = read_pointer_payload(
+        let resident_before_roots =
+            recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None)
+                .map_err(|_| StoreError::MemoryLimit)?;
+        let authority = read_recovery_pointer_payload(
             device,
             superblock.binding.store_uuid,
             checkpoint.admitted_segments,
@@ -1020,16 +1681,46 @@ async fn recover_state<D: PageDevice>(
             checkpoint.authority_root,
             ExtentKind::Authority,
             limits.recovery_memory_bytes,
+            resident_before_roots,
         )
         .await?;
-        recovery_peak = recovery_peak.max(
-            measured_catalog_bytes(&catalog)
-                .checked_add(authority.bytes.capacity())
-                .ok_or(StoreError::MemoryLimit)?,
-        );
-        if recovery_peak > limits.recovery_memory_bytes {
-            return Err(StoreError::MemoryLimit);
+        recovery_preflight_decode(
+            limits.recovery_memory_bytes,
+            resident_before_roots,
+            authority.bytes.capacity(),
+            persistent_roots_decode_capacity_upper_bound(&authority.bytes)?,
+        )?;
+        let decoded =
+            decode_persistent_root_set(&authority.bytes).map_err(|_| StoreError::Corrupt)?;
+        if decoded.checkpoint_generation > checkpoint.binding.generation
+            || decoded.checkpoint_generation
+                != authority.extent.binding.target_checkpoint_generation
+        {
+            return Err(StoreError::Corrupt);
         }
+        let cas_state = cas.as_ref().ok_or(StoreError::Corrupt)?;
+        for root in decoded.entries() {
+            let object = cas_state
+                .objects
+                .binary_search_by_key(&root.object_id, |object| object.object_id)
+                .ok()
+                .map(|index| cas_state.objects[index])
+                .ok_or(StoreError::Corrupt)?;
+            if object.commit_generation != root.commit_generation
+                || object.blob_key.object_kind() != root.object_kind
+            {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        recovery_observe(
+            &mut recovery_peak,
+            limits.recovery_memory_bytes,
+            resident_before_roots
+                .checked_add(authority.bytes.capacity())
+                .and_then(|bytes| bytes.checked_add(decoded.allocated_bytes()?))
+                .ok_or(StoreError::MemoryLimit)?,
+        )?;
+        persistent_roots = Some(decoded);
     }
 
     let mut reverse_deltas = Vec::new();
@@ -1037,7 +1728,14 @@ async fn recover_state<D: PageDevice>(
         .ok()
         .and_then(|count| count.checked_mul(mem::size_of::<CatalogEntry>()))
         .ok_or(StoreError::MemoryLimit)?;
-    let replay_allocation_peak = measured_catalog_bytes(&catalog)
+    let resident_bytes = recovery_resident_bytes(
+        &allocation,
+        &catalog,
+        cas.as_ref(),
+        persistent_roots.as_ref(),
+    )
+    .map_err(|_| StoreError::MemoryLimit)?;
+    let replay_allocation_peak = resident_bytes
         .checked_add(replay_capacity_bytes)
         .ok_or(StoreError::MemoryLimit)?;
     if replay_allocation_peak > limits.recovery_memory_bytes {
@@ -1046,15 +1744,25 @@ async fn recover_state<D: PageDevice>(
     reverse_deltas
         .try_reserve_exact(checkpoint.replay_count as usize)
         .map_err(|_| StoreError::MemoryLimit)?;
-    recovery_peak = recovery_peak.max(
-        measured_catalog_bytes(&catalog)
+    recovery_observe(
+        &mut recovery_peak,
+        limits.recovery_memory_bytes,
+        resident_bytes
             .checked_add(reverse_deltas.capacity() * mem::size_of::<CatalogEntry>())
             .ok_or(StoreError::MemoryLimit)?,
-    );
+    )?;
     let mut pointer = checkpoint.replay_tail;
     let mut expected_depth = u64::from(checkpoint.replay_count);
     while expected_depth != 0 {
-        let delta = read_pointer_payload(
+        let replay_resident = resident_bytes
+            .checked_add(
+                reverse_deltas
+                    .capacity()
+                    .checked_mul(mem::size_of::<CatalogEntry>())
+                    .ok_or(StoreError::MemoryLimit)?,
+            )
+            .ok_or(StoreError::MemoryLimit)?;
+        let delta = read_recovery_pointer_payload(
             device,
             superblock.binding.store_uuid,
             checkpoint.admitted_segments,
@@ -1063,8 +1771,15 @@ async fn recover_state<D: PageDevice>(
             pointer,
             ExtentKind::CatalogDelta,
             limits.recovery_memory_bytes,
+            replay_resident,
         )
         .await?;
+        recovery_preflight_decode(
+            limits.recovery_memory_bytes,
+            replay_resident,
+            delta.bytes.capacity(),
+            catalog_decode_capacity_upper_bound(&delta.bytes)?,
+        )?;
         let decoded =
             decode_catalog(&delta.bytes, superblock.binding.store_uuid).map_err(codec_error)?;
         if decoded.kind != CatalogPayloadKind::Delta
@@ -1078,21 +1793,65 @@ async fn recover_state<D: PageDevice>(
         reverse_deltas.push(decoded.entries[0]);
         pointer = decoded.previous_delta;
         expected_depth -= 1;
-        let peak = measured_catalog_bytes(&catalog)
-            .checked_add(reverse_deltas.capacity() * mem::size_of::<CatalogEntry>())
-            .and_then(|value| value.checked_add(delta.bytes.capacity()))
+        let peak = replay_resident
+            .checked_add(delta.bytes.capacity())
+            .and_then(|value| value.checked_add(measured_catalog_bytes(&decoded.entries)))
             .ok_or(StoreError::MemoryLimit)?;
-        recovery_peak = recovery_peak.max(peak);
-        if recovery_peak > limits.recovery_memory_bytes {
-            return Err(StoreError::MemoryLimit);
-        }
+        recovery_observe(&mut recovery_peak, limits.recovery_memory_bytes, peak)?;
     }
     if pointer != PhysicalPointer::Null {
         return Err(StoreError::Corrupt);
     }
-    for entry in reverse_deltas.into_iter().rev() {
-        catalog.push(entry);
+    let final_catalog_len = catalog
+        .len()
+        .checked_add(reverse_deltas.len())
+        .ok_or(StoreError::MemoryLimit)?;
+    if final_catalog_len > limits.max_catalog_entries as usize {
+        return Err(StoreError::MemoryLimit);
     }
+    let catalog_additional = final_catalog_len - catalog.len();
+    let catalog_growth_bytes = final_catalog_len
+        .saturating_sub(catalog.capacity())
+        .checked_mul(mem::size_of::<CatalogEntry>())
+        .ok_or(StoreError::MemoryLimit)?;
+    let merge_preflight = resident_bytes
+        .checked_add(
+            reverse_deltas
+                .capacity()
+                .checked_mul(mem::size_of::<CatalogEntry>())
+                .ok_or(StoreError::MemoryLimit)?,
+        )
+        .and_then(|bytes| bytes.checked_add(catalog_growth_bytes))
+        .ok_or(StoreError::MemoryLimit)?;
+    recovery_observe(
+        &mut recovery_peak,
+        limits.recovery_memory_bytes,
+        merge_preflight,
+    )?;
+    catalog
+        .try_reserve_exact(catalog_additional)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    let merge_peak = allocation_resident_bytes(&allocation)
+        .map_err(|_| StoreError::MemoryLimit)?
+        .checked_add(cas_resident_bytes(cas.as_ref()).map_err(|_| StoreError::MemoryLimit)?)
+        .and_then(|bytes| {
+            root_resident_bytes(persistent_roots.as_ref())
+                .ok()?
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| bytes.checked_add(measured_catalog_bytes(&catalog)))
+        .and_then(|bytes| {
+            reverse_deltas
+                .capacity()
+                .checked_mul(mem::size_of::<CatalogEntry>())?
+                .checked_add(bytes)
+        })
+        .ok_or(StoreError::MemoryLimit)?;
+    recovery_observe(&mut recovery_peak, limits.recovery_memory_bytes, merge_peak)?;
+    for entry in reverse_deltas.iter().rev() {
+        catalog.push(*entry);
+    }
+    drop(reverse_deltas);
     if cas.is_none() {
         validate_catalog(
             &catalog,
@@ -1103,83 +1862,25 @@ async fn recover_state<D: PageDevice>(
             limits,
         )?;
     }
-    recovery_peak = recovery_peak.max(measured_catalog_bytes(&catalog));
+    recovery_peak = recovery_peak.max(
+        recovery_resident_bytes(
+            &allocation,
+            &catalog,
+            cas.as_ref(),
+            persistent_roots.as_ref(),
+        )
+        .map_err(|_| StoreError::MemoryLimit)?,
+    );
     if recovery_peak > limits.recovery_memory_bytes {
         return Err(StoreError::MemoryLimit);
     }
-    let (allocated_prefix, last_segment) = if checkpoint.allocation_root == PhysicalPointer::Null {
-        if checkpoint.binding.generation != 1 || !catalog.is_empty() || cas.is_some() {
-            return Err(StoreError::Corrupt);
-        }
-        (0, None)
-    } else {
-        let allocation = read_pointer_payload(
-            device,
-            superblock.binding.store_uuid,
-            checkpoint.admitted_segments,
-            checkpoint.next_segment_generation,
-            checkpoint.binding.generation,
-            checkpoint.allocation_root,
-            ExtentKind::Allocation,
-            limits.recovery_memory_bytes,
-        )
-        .await?;
-        let decoded = decode_allocation(&allocation.bytes).map_err(codec_error)?;
-        if decoded.checkpoint_generation != checkpoint.binding.generation
-            || decoded.checkpoint_generation
-                != allocation.extent.binding.target_checkpoint_generation
-            || decoded.admitted_segments != checkpoint.admitted_segments
-            || decoded.allocated_prefix_segments == 0
-            || decoded.allocated_prefix_segments > checkpoint.admitted_segments
-            || decoded.next_segment_generation != checkpoint.next_segment_generation
-            || decoded.cleaner_reserve_segments != checkpoint.cleaner_reserve_segments
-        {
-            return Err(StoreError::Corrupt);
-        }
-        let PhysicalPointer::Value(root) = checkpoint.allocation_root else {
-            return Err(StoreError::Corrupt);
-        };
-        if root.segment_no + 1 != decoded.allocated_prefix_segments {
-            return Err(StoreError::Corrupt);
-        }
-        recovery_peak = recovery_peak.max(
-            measured_catalog_bytes(&catalog)
-                .checked_add(allocation.bytes.capacity())
-                .ok_or(StoreError::MemoryLimit)?,
-        );
-        (
-            decoded.allocated_prefix_segments,
-            Some((
-                root.segment_no,
-                root.segment_generation,
-                allocation.segment_seal_body_sha256,
-            )),
-        )
-    };
-    if recovery_peak > limits.recovery_memory_bytes {
-        return Err(StoreError::MemoryLimit);
-    }
-    if cas_max_referenced_segment.is_some_and(|segment_no| segment_no >= allocated_prefix) {
+    if checkpoint.allocation_root == PhysicalPointer::Null && (!catalog.is_empty() || cas.is_some())
+    {
         return Err(StoreError::Corrupt);
-    }
-
-    for pointer in [
-        checkpoint.catalog_root,
-        checkpoint.authority_root,
-        checkpoint.allocation_root,
-        checkpoint.replay_tail,
-    ] {
-        if let PhysicalPointer::Value(pointer) = pointer {
-            if pointer.segment_no >= allocated_prefix {
-                return Err(StoreError::Corrupt);
-            }
-        }
     }
     for entry in &catalog {
         if let PhysicalPointer::Value(pointer) = entry.blob {
-            if pointer.segment_no >= allocated_prefix {
-                return Err(StoreError::Corrupt);
-            }
+            require_allocated_pointer(&allocation, entry.blob)?;
             validate_blob_descriptor(
                 device,
                 superblock.binding.store_uuid,
@@ -1197,25 +1898,40 @@ async fn recover_state<D: PageDevice>(
     // non-zero final-seal page after the committed frontier. Internal bytes
     // behind an exact-zero publication page are safe to replace only through
     // the explicit zero/flush/reread gate in append_object.
-    let mut next_physical_segment = allocated_prefix;
-    for segment_no in allocated_prefix..checkpoint.admitted_segments {
+    let first_free = (0..checkpoint.admitted_segments)
+        .find(|segment_no| allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free))
+        .unwrap_or(checkpoint.admitted_segments);
+    let mut next_physical_segment = first_free;
+    for segment_no in first_free..checkpoint.admitted_segments {
+        if allocation_version == 2
+            && allocation.segment_state(segment_no) != Some(SegmentAllocation::Free)
+        {
+            continue;
+        }
         let base = segment_base_page(segment_no)?;
         let mut final_seal = [0; PAGE_SIZE];
         device
             .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut final_seal)
             .await
             .map_err(StoreError::Device)?;
-        if final_seal.iter().any(|byte| *byte != 0) {
+        if allocation_version == 1 && final_seal.iter().any(|byte| *byte != 0) {
             next_physical_segment = segment_no.checked_add(1).ok_or(StoreError::Corrupt)?;
         }
     }
-    let next_object_id = cas
+    let media_next_object_id = cas
         .as_ref()
         .and_then(|cas| cas.objects.last().map(|entry| entry.object_id))
         .or_else(|| catalog.last().map(|entry| entry.object_id))
         .map(|object_id| object_id.checked_add(1).ok_or(StoreError::IdExhausted))
         .transpose()?
         .unwrap_or(1);
+    // Checkpoint generation is the durable ObjectId high-water floor. Every
+    // production commit consumes at most one ObjectId and advances generation;
+    // GC advances generation without consuming an ID. Taking the maximum also
+    // mounts older/externally produced catalogs without colliding with a live
+    // mapping. GC separately refuses to discard such a catalog if its media
+    // high-water exceeds the generation-backed floor.
+    let next_object_id = media_next_object_id.max(u128::from(checkpoint.binding.generation));
     Ok(MountedState {
         superblock,
         generation: checkpoint.binding.generation,
@@ -1227,11 +1943,140 @@ async fn recover_state<D: PageDevice>(
         replay_count: checkpoint.replay_count,
         catalog_root: checkpoint.catalog_root,
         replay_tail: checkpoint.replay_tail,
+        authority_root: checkpoint.authority_root,
+        allocation,
+        allocation_version,
+        persistent_roots,
         catalog,
         cas,
         recovery_peak_bytes: recovery_peak,
         last_segment,
     })
+}
+
+fn require_allocated_pointer<E>(
+    allocation: &AllocationV2,
+    pointer: PhysicalPointer,
+) -> Result<(), StoreError<E>> {
+    if let PhysicalPointer::Value(pointer) = pointer {
+        if allocation.segment_state(pointer.segment_no) != Some(SegmentAllocation::Allocated) {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_transition<E>(
+    older: &CheckpointTransitionWitness,
+    newer: &MountedState,
+) -> Result<(), StoreError<E>> {
+    if older
+        .generation
+        .checked_add(1)
+        .is_none_or(|generation| generation != newer.generation)
+        || older.store_uuid != newer.superblock.binding.store_uuid
+        || older.admitted_segments != newer.admitted_segments
+        || older.cleaner_reserve_segments != newer.cleaner_reserve_segments
+    {
+        return Err(StoreError::Corrupt);
+    }
+
+    validate_allocation_checkpoint_transition(
+        &older.allocation,
+        &newer.allocation,
+        older.generation,
+        newer.generation,
+        older.next_segment_generation,
+        newer.next_segment_generation,
+        newer.allocation_version,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_allocation_checkpoint_transition<E>(
+    older: &AllocationV2,
+    newer: &AllocationV2,
+    older_generation: u64,
+    newer_generation: u64,
+    older_next_segment_generation: u64,
+    newer_next_segment_generation: u64,
+    newer_allocation_version: u16,
+) -> Result<(), StoreError<E>> {
+    if older.admitted_segments != newer.admitted_segments
+        || older.cleaner_reserve_segments != newer.cleaner_reserve_segments
+    {
+        return Err(StoreError::Corrupt);
+    }
+
+    let mut free_to_allocated = 0_u64;
+    let mut allocated_to_retired = 0_u64;
+    let mut retired_to_free = 0_u64;
+    for segment_no in 0..older.admitted_segments {
+        let before = older.segment_state(segment_no).ok_or(StoreError::Corrupt)?;
+        let after = newer.segment_state(segment_no).ok_or(StoreError::Corrupt)?;
+        match (before, after) {
+            (SegmentAllocation::Free, SegmentAllocation::Free)
+            | (SegmentAllocation::Allocated, SegmentAllocation::Allocated)
+            | (SegmentAllocation::Retired, SegmentAllocation::Retired) => {}
+            (SegmentAllocation::Free, SegmentAllocation::Allocated) => {
+                free_to_allocated = free_to_allocated
+                    .checked_add(1)
+                    .ok_or(StoreError::Corrupt)?;
+            }
+            (SegmentAllocation::Allocated, SegmentAllocation::Retired) => {
+                if newer.retire_generation(segment_no) != Some(newer_generation) {
+                    return Err(StoreError::Corrupt);
+                }
+                allocated_to_retired = allocated_to_retired
+                    .checked_add(1)
+                    .ok_or(StoreError::Corrupt)?;
+            }
+            (SegmentAllocation::Retired, SegmentAllocation::Free) => {
+                retired_to_free = retired_to_free.checked_add(1).ok_or(StoreError::Corrupt)?;
+            }
+            _ => return Err(StoreError::Corrupt),
+        }
+    }
+
+    let older_counts = older.counts().map_err(|_| StoreError::Corrupt)?;
+    if allocated_to_retired != 0 {
+        // G -> G+1 relocation: a non-empty strict subset or the complete old
+        // Allocated set becomes Retired at exactly G+1. Unselected Allocated
+        // segments remain current and no earlier retired cycle may overlap it.
+        if retired_to_free != 0
+            || older_counts.retired != 0
+            || allocated_to_retired > older_counts.allocated
+            || free_to_allocated == 0
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else if retired_to_free != 0 {
+        // G+1 -> G+2 reuse barrier: reclaim the complete retired set and
+        // allocate exactly one distinct segment for the new allocation root.
+        if retired_to_free != older_counts.retired
+            || older
+                .retired_segments()
+                .iter()
+                .any(|entry| entry.retire_generation != older_generation)
+            || newer.counts().map_err(|_| StoreError::Corrupt)?.retired != 0
+            || free_to_allocated != 1
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else if older_counts.retired != 0 {
+        // No ordinary checkpoint may advance while a reuse barrier is pending.
+        return Err(StoreError::Corrupt);
+    }
+
+    if newer_allocation_version == 2 {
+        let assigned = newer_next_segment_generation
+            .checked_sub(older_next_segment_generation)
+            .ok_or(StoreError::Corrupt)?;
+        if assigned != free_to_allocated {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1900,3 +2745,256 @@ fn _mutation_is_ambiguous<E>(failure: &MutationFailure<E>) -> bool {
 const _: () = {
     assert!(CATALOG_ENTRY_LEN <= PAGE_SIZE);
 };
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use crate::allocation_v2::RetiredSegment;
+
+    #[test]
+    fn recovery_decode_preflight_enforces_the_aggregate_ceiling() {
+        recovery_preflight_decode::<()>(100, 40, 30, 30).unwrap();
+        assert_eq!(
+            recovery_preflight_decode::<()>(100, 40, 30, 31),
+            Err(StoreError::MemoryLimit)
+        );
+        assert_eq!(
+            recovery_remaining::<()>(100, 101),
+            Err(StoreError::MemoryLimit)
+        );
+    }
+
+    fn map(
+        generation: u64,
+        next_segment_generation: u64,
+        states: &[SegmentAllocation],
+        retired: &[RetiredSegment],
+    ) -> AllocationV2 {
+        AllocationV2::new(generation, next_segment_generation, 1, states, retired).unwrap()
+    }
+
+    #[test]
+    fn checkpoint_pair_rejects_allocated_to_free_without_retirement_barrier() {
+        let older = map(
+            9,
+            20,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        let forged = map(
+            10,
+            21,
+            &[
+                SegmentAllocation::Free,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        assert_eq!(
+            validate_allocation_checkpoint_transition::<()>(&older, &forged, 9, 10, 20, 21, 2,),
+            Err(StoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn checkpoint_pair_accepts_exact_relocation_and_reuse_transitions() {
+        let older = map(
+            9,
+            20,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        let relocated = map(
+            10,
+            21,
+            &[
+                SegmentAllocation::Retired,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[RetiredSegment {
+                segment_no: 0,
+                retire_generation: 10,
+            }],
+        );
+        let reused = map(
+            11,
+            22,
+            &[
+                SegmentAllocation::Free,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Allocated,
+            ],
+            &[],
+        );
+        validate_allocation_checkpoint_transition::<()>(&older, &relocated, 9, 10, 20, 21, 2)
+            .unwrap();
+        validate_allocation_checkpoint_transition::<()>(&relocated, &reused, 10, 11, 21, 22, 2)
+            .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_pair_accepts_one_ordinary_allocation() {
+        let older = map(
+            9,
+            20,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        let newer = map(
+            10,
+            21,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        validate_allocation_checkpoint_transition::<()>(&older, &newer, 9, 10, 20, 21, 2).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_pair_accepts_partial_low_live_relocation() {
+        let older = map(
+            9,
+            20,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        let forged = map(
+            10,
+            21,
+            &[
+                SegmentAllocation::Retired,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[RetiredSegment {
+                segment_no: 0,
+                retire_generation: 10,
+            }],
+        );
+        validate_allocation_checkpoint_transition::<()>(&older, &forged, 9, 10, 20, 21, 2).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_pair_rejects_partial_reclaim() {
+        let older = map(
+            10,
+            20,
+            &[
+                SegmentAllocation::Retired,
+                SegmentAllocation::Retired,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[
+                RetiredSegment {
+                    segment_no: 0,
+                    retire_generation: 10,
+                },
+                RetiredSegment {
+                    segment_no: 1,
+                    retire_generation: 10,
+                },
+            ],
+        );
+        let forged = map(
+            11,
+            21,
+            &[
+                SegmentAllocation::Free,
+                SegmentAllocation::Retired,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[RetiredSegment {
+                segment_no: 1,
+                retire_generation: 10,
+            }],
+        );
+        assert_eq!(
+            validate_allocation_checkpoint_transition::<()>(&older, &forged, 10, 11, 20, 21, 2,),
+            Err(StoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn checkpoint_pair_rejects_segment_generation_delta_mismatch() {
+        let older = map(
+            9,
+            20,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        let forged = map(
+            10,
+            22,
+            &[
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        assert_eq!(
+            validate_allocation_checkpoint_transition::<()>(&older, &forged, 9, 10, 20, 22, 2,),
+            Err(StoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn checkpoint_pair_rejects_reclaim_of_stale_retirement_generation() {
+        let older = map(
+            10,
+            20,
+            &[
+                SegmentAllocation::Retired,
+                SegmentAllocation::Free,
+                SegmentAllocation::Free,
+            ],
+            &[RetiredSegment {
+                segment_no: 0,
+                retire_generation: 9,
+            }],
+        );
+        let forged = map(
+            11,
+            21,
+            &[
+                SegmentAllocation::Free,
+                SegmentAllocation::Allocated,
+                SegmentAllocation::Free,
+            ],
+            &[],
+        );
+        assert_eq!(
+            validate_allocation_checkpoint_transition::<()>(&older, &forged, 10, 11, 20, 21, 2,),
+            Err(StoreError::Corrupt)
+        );
+    }
+}

@@ -189,3 +189,64 @@ RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
 rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
   --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
 ```
+
+## M7.5 root-based GC and segment cleaning
+
+Accepted on 2026-08-12. M7.5 adds the frozen `VIBEALC2` allocation map,
+`VIBERST2` persistent roots, `VIBEREF1` typed edges, reference-codec admission,
+fixed-capacity root/reader pins, low-live partial relocation, and the
+G/G+1/G+2 retirement barrier. New formats reserve at least two cleaner
+segments; historical reserve-one media remains readable but cannot enter GC.
+A full-prefix M7.4-style image at `free == reserve` bootstraps its first root
+policy inside the same G+1 relocation from exact same-runtime authorized
+witnesses.
+
+The focused store run passed 77 library tests, 8 streaming-CAS tests, 12
+append/recovery tests, and 22 GC integration tests. The GC tests include both
+ordinary and legacy-bootstrap mutation-boundary matrices over not-submitted,
+ambiguous, visible-only, durable, and pending/cancelled effects. They also
+cover G+1 recovery/resume, exact-zero old-seal readback, G+2 cold recovery,
+fresh-generation reuse, partial-pointer preservation, acknowledged copied
+payload and padding corruption, typed traversal, ObjectId high-water,
+fault-domain pin cleanup, catalog-triggered foreground cleaning, stable cycles
+larger than initial ordinary capacity, and exact memory-limit/one-byte-under
+admission with no media mutation.
+
+The independent GC verifier duplicates all closed payload layouts and partial
+transition rules. Its selftest reports 123 mutation cases and covers legitimate
+opaque and trusted-typed objects retained only by a runtime root at power loss.
+The Rust ABI test
+exports production-codec payloads and requires Python acceptance, then corrupts
+the typed payload and requires fail-closed rejection. The powered-off raw-image
+test additionally runs a real production partial GC through G+2, exports the
+dense durable page image, and requires the independent parser to select and
+validate allocation-v2, roots, CAS, manifests, every live Blob extent, and
+canonical Blob bytes/root. Persistent reachability is reported separately from
+nonpersistent runtime-retained objects, while the complete CAS Object-to-Blob
+set and every trusted typed object's direct child identities remain closed; a
+raw payload mutation is rejected.
+
+The complete host gate and strict lint were:
+
+```sh
+cargo test -p vibeos-segment-store -p vibeos-segment-format \
+  -p vibeos-blob-format --locked --offline
+cargo clippy -p vibeos-segment-store -p vibeos-segment-format \
+  -p vibeos-blob-format --all-targets --locked --offline -- -D warnings
+python3 -B scripts/storage-v2-image.py --selftest
+python3 -B scripts/verify-storage-v2-cas.py --selftest
+python3 -B scripts/verify-storage-v2-gc.py --selftest
+./scripts/qemu-test.sh store
+```
+
+The pinned-toolchain firmware build remained allocator-bounded and `no_std`:
+
+```sh
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
+rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
+  --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
+```
+
+The QEMU `store` case remains the M4 compatibility backend until M7.7; M7.5's
+scalable media gate is the production Rust raw-image/Python verifier above.

@@ -6,6 +6,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::fmt::Write as _;
 
 use vibeos_core::cap::{Cap, Rights};
 #[cfg(feature = "milkv-ssh")]
@@ -251,7 +252,7 @@ const MILKV_USB_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "usb",
         min_args: 0,
-        max_args: 1,
+        max_args: 2,
         handler: vsh_milkv_usb,
     },
 ];
@@ -567,7 +568,31 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
 
 #[cfg(feature = "milkv-duo")]
 fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
-    if args.first().is_some_and(|argument| argument != "info") {
+    if args.first().is_some_and(|argument| argument == "read") {
+        let sector = args
+            .get(1)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(Status::Usage)?;
+        let bytes = crate::dwc2_host::read_sector(sector).map_err(|_| Status::Unavailable)?;
+        let mut output = format!("USB sector {sector}:\n");
+        for (line, chunk) in bytes.chunks(16).enumerate() {
+            write!(&mut output, "{:08x}  ", line * 16).map_err(|_| Status::Faulted)?;
+            for byte in chunk {
+                write!(&mut output, "{byte:02x} ").map_err(|_| Status::Faulted)?;
+            }
+            output.push_str(" | ");
+            for byte in chunk {
+                output.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                    char::from(*byte)
+                } else {
+                    '.'
+                });
+            }
+            output.push('\n');
+        }
+        return Ok(output);
+    }
+    if args.first().is_some_and(|argument| argument != "info") || args.len() > 1 {
         return Err(Status::Usage);
     }
     let Some(storage) = crate::dwc2_host::snapshot().and_then(|snapshot| snapshot.mass_storage)

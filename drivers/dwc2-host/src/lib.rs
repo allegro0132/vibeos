@@ -99,6 +99,9 @@ const APPLE_NKRO_REPORT_BYTES: usize = 15;
 const HID_INPUT_BYTES: usize = 18;
 const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
 const USB_CLASS_HUB: u8 = 9;
+const USB_CLASS_MASS_STORAGE: u8 = 8;
+const USB_MASS_STORAGE_SCSI: u8 = 6;
+const USB_MASS_STORAGE_BULK_ONLY: u8 = 0x50;
 const USB_DESCRIPTOR_HUB: u16 = 0x29;
 const USB_PORT_FEAT_RESET: u16 = 4;
 const USB_PORT_FEAT_POWER: u16 = 8;
@@ -172,6 +175,16 @@ pub enum HidKeyboardProtocol {
     Report,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MassStorageInfo {
+    pub configuration: u8,
+    pub interface: u8,
+    pub endpoint_in: u8,
+    pub endpoint_out: u8,
+    pub max_packet_size_in: u16,
+    pub max_packet_size_out: u16,
+}
+
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
 pub const MAX_HID_REPORT_DESCRIPTOR_BYTES: usize = 256;
 
@@ -186,6 +199,10 @@ pub struct InterfaceInfo {
     pub interrupt_in: Option<u8>,
     pub max_packet_size: u16,
     pub interval: u8,
+    pub bulk_in: Option<u8>,
+    pub bulk_out: Option<u8>,
+    pub bulk_in_max_packet_size: u16,
+    pub bulk_out_max_packet_size: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +339,7 @@ pub struct Controller {
     configuration: Option<ConfigurationInfo>,
     report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
+    mass_storage: Option<MassStorageInfo>,
     keyboard_layout: KeyboardLayout,
     keyboard_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
@@ -555,6 +573,7 @@ impl Controller {
             configuration: None,
             report_descriptor: None,
             keyboard: None,
+            mass_storage: None,
             keyboard_layout: KeyboardLayout::Boot,
             keyboard_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
@@ -593,6 +612,10 @@ impl Controller {
         self.keyboard
     }
 
+    pub const fn mass_storage(&self) -> Option<MassStorageInfo> {
+        self.mass_storage
+    }
+
     pub const fn configuration(&self) -> Option<ConfigurationInfo> {
         self.configuration
     }
@@ -616,6 +639,7 @@ impl Controller {
             self.configuration = None;
             self.report_descriptor = None;
             self.keyboard = None;
+            self.mass_storage = None;
             self.device_address = 0;
             return Ok(None);
         }
@@ -677,6 +701,7 @@ impl Controller {
         self.configuration = None;
         self.report_descriptor = None;
         self.keyboard = None;
+        self.mass_storage = None;
         Ok(Some(info))
     }
 
@@ -685,10 +710,12 @@ impl Controller {
     pub fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
         let Some(target) = self.child.or(self.device) else {
             self.keyboard = None;
+            self.mass_storage = None;
             return Ok(None);
         };
         if !self.connected() {
             self.keyboard = None;
+            self.mass_storage = None;
             return Ok(None);
         }
 
@@ -718,6 +745,7 @@ impl Controller {
         let (configuration, keyboard) =
             parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
         self.configuration = Some(configuration);
+        self.mass_storage = find_mass_storage(configuration);
         self.report_descriptor = None;
         let Some(keyboard) = keyboard else {
             self.keyboard = None;
@@ -1593,6 +1621,10 @@ fn parse_hid_keyboard_configuration(
                     interrupt_in: None,
                     max_packet_size: 0,
                     interval: 0,
+                    bulk_in: None,
+                    bulk_out: None,
+                    bulk_in_max_packet_size: 0,
+                    bulk_out_max_packet_size: 0,
                 };
                 current_interface = configuration.interfaces.iter().position(Option::is_none);
                 if let Some(index) = current_interface {
@@ -1653,12 +1685,49 @@ fn parse_hid_keyboard_configuration(
                         }
                     }
                 }
+                if attributes & 0x03 == 2 && max_packet != 0 && usize::from(max_packet) <= DMA_BYTES
+                {
+                    if let Some(index) = current_interface {
+                        if let Some(info) = configuration.interfaces[index].as_mut() {
+                            if address & 0x80 != 0 && info.bulk_in.is_none() {
+                                info.bulk_in = Some(address);
+                                info.bulk_in_max_packet_size = max_packet;
+                            } else if address & 0x80 == 0 && info.bulk_out.is_none() {
+                                info.bulk_out = Some(address);
+                                info.bulk_out_max_packet_size = max_packet;
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
         offset += length;
     }
     Ok((configuration, keyboard))
+}
+
+fn find_mass_storage(configuration: ConfigurationInfo) -> Option<MassStorageInfo> {
+    configuration
+        .interfaces
+        .into_iter()
+        .flatten()
+        .find_map(|interface| {
+            if interface.class != USB_CLASS_MASS_STORAGE
+                || interface.subclass != USB_MASS_STORAGE_SCSI
+                || interface.protocol != USB_MASS_STORAGE_BULK_ONLY
+            {
+                return None;
+            }
+            Some(MassStorageInfo {
+                configuration: configuration.value,
+                interface: interface.number,
+                endpoint_in: interface.bulk_in?,
+                endpoint_out: interface.bulk_out?,
+                max_packet_size_in: interface.bulk_in_max_packet_size,
+                max_packet_size_out: interface.bulk_out_max_packet_size,
+            })
+        })
 }
 
 fn is_apple_report_keyboard_descriptor(descriptor: &[u8]) -> bool {
@@ -2214,6 +2283,10 @@ mod tests {
                 interrupt_in: Some(0x81),
                 max_packet_size: 8,
                 interval: 10,
+                bulk_in: None,
+                bulk_out: None,
+                bulk_in_max_packet_size: 0,
+                bulk_out_max_packet_size: 0,
             })
         );
         assert_eq!(
@@ -2228,6 +2301,30 @@ mod tests {
         );
         assert_eq!(hid_poll_interval_ms(Speed::High, 4), 1);
         assert_eq!(hid_poll_interval_ms(Speed::High, 7), 8);
+    }
+
+    #[test]
+    fn finds_scsi_bulk_only_mass_storage_endpoints() {
+        let descriptors = [
+            9, 2, 32, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 2, 8, 6, 0x50, 0, // SCSI bulk-only interface
+            7, 5, 0x81, 2, 64, 0, 0, // bulk IN
+            7, 5, 0x02, 2, 64, 0, 0, // bulk OUT
+        ];
+        let (configuration, keyboard) =
+            parse_hid_keyboard_configuration(&descriptors, Speed::High).unwrap();
+        assert_eq!(keyboard, None);
+        assert_eq!(
+            find_mass_storage(configuration),
+            Some(MassStorageInfo {
+                configuration: 1,
+                interface: 0,
+                endpoint_in: 0x81,
+                endpoint_out: 0x02,
+                max_packet_size_in: 64,
+                max_packet_size_out: 64,
+            })
+        );
     }
 
     #[test]

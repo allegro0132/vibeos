@@ -786,27 +786,41 @@ impl Controller {
     }
 
     pub fn hub_topology_changed(&mut self) -> Result<bool, Error> {
-        let Some(hub) = self.hub else {
+        if self.hub.is_none() {
             return Ok(false);
-        };
+        }
         let root = self.device.ok_or(Error::NoDevice)?;
         let saved = self.current_target();
-        self.select_target(TransferTarget {
-            address: root.address,
-            endpoint_zero_max_packet: u16::from(root.max_packet_size_0),
-            speed: root.speed,
-            split: None,
-        });
+        let hubs = self.hubs;
+        let children = self.children;
         let result = (|| {
-            for port in 1..=hub.ports {
-                let connected = self.hub_port_status(port)? & USB_PORT_STAT_CONNECTION != 0;
-                let enumerated = self
-                    .children
-                    .iter()
-                    .flatten()
-                    .any(|child| child.port == port);
-                if connected != enumerated {
-                    return Ok(true);
+            for hub in hubs.into_iter().flatten() {
+                let target = if hub.address == root.address {
+                    TransferTarget {
+                        address: root.address,
+                        endpoint_zero_max_packet: u16::from(root.max_packet_size_0),
+                        speed: root.speed,
+                        split: None,
+                    }
+                } else {
+                    let child = children
+                        .iter()
+                        .flatten()
+                        .find(|child| child.device.address == hub.address)
+                        .copied()
+                        .ok_or(Error::NoDevice)?;
+                    transfer_target_for_child(child)
+                };
+                self.select_target(target);
+                for port in 1..=hub.ports {
+                    let connected = self.hub_port_status(port)? & USB_PORT_STAT_CONNECTION != 0;
+                    let enumerated = children
+                        .iter()
+                        .flatten()
+                        .any(|child| child.parent_hub_address == hub.address && child.port == port);
+                    if connected != enumerated {
+                        return Ok(true);
+                    }
                 }
             }
             Ok(false)

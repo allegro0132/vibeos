@@ -305,25 +305,29 @@ pub async fn driver_task(
     DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
     DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
 
-    let engine = match with_device_authority(&mmio, &dma, &control, || {
-        // SAFETY: the retained and currently live capabilities authorize the
-        // identity-mapped BSP apertures and crate-owned `.dma` slab. The
-        // firmware linker keeps that slab physically contiguous and below the
-        // board's 32-bit DMA limit for this engine's lifetime.
-        unsafe {
-            Engine::claim(
-                DWMAC,
-                GUEST_MAC,
-                crate::sbi::time,
-                crate::exec::timebase_hz(),
-            )
-        }
-        .map_err(|_| NetError::DriverFault)
-    }) {
-        Ok(engine) => engine,
-        Err(_) => {
-            shutdown_driver_policy(false);
-            return;
+    let engine = if usb_cdc_ready() {
+        None
+    } else {
+        match with_device_authority(&mmio, &dma, &control, || {
+            // SAFETY: the retained and currently live capabilities authorize the
+            // identity-mapped BSP apertures and crate-owned `.dma` slab. The
+            // firmware linker keeps that slab physically contiguous and below the
+            // board's 32-bit DMA limit for this engine's lifetime.
+            unsafe {
+                Engine::claim(
+                    DWMAC,
+                    GUEST_MAC,
+                    crate::sbi::time,
+                    crate::exec::timebase_hz(),
+                )
+            }
+            .map_err(|_| NetError::DriverFault)
+        }) {
+            Ok(engine) => Some(engine),
+            Err(_) => {
+                shutdown_driver_policy(false);
+                return;
+            }
         }
     };
 
@@ -342,13 +346,11 @@ pub async fn driver_task(
     })
     .is_err()
     {
-        let reset = engine.shutdown();
+        let reset = engine.is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
         shutdown_driver_policy(reset);
         return;
     }
-    let mut session = DriverSession {
-        engine: Some(engine),
-    };
+    let mut session = DriverSession { engine };
 
     let mut pending_tx = None;
     let mut tx_deadline = 0;
@@ -380,8 +382,8 @@ struct DriverSession {
 }
 
 impl DriverSession {
-    fn engine_mut(&mut self) -> &mut Engine {
-        self.engine.as_mut().expect("live DWMAC driver session")
+    fn engine_mut(&mut self) -> Option<&mut Engine> {
+        self.engine.as_mut()
     }
 }
 
@@ -390,7 +392,7 @@ impl Drop for DriverSession {
         let reset = self
             .engine
             .take()
-            .map_or(true, vibeos_driver_dwmac_net::Engine::shutdown);
+            .is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
         shutdown_driver_policy(reset);
     }
 }
@@ -408,7 +410,7 @@ fn with_device_authority<R>(
 }
 
 fn driver_turn(
-    engine: &mut Engine,
+    mut engine: Option<&mut Engine>,
     outbound: &Revocable<Endpoint<StampedPacket>>,
     inbound: &Revocable<Endpoint<StampedPacket>>,
     pending_tx: &mut Option<Packet>,
@@ -426,7 +428,11 @@ fn driver_turn(
         let mut state = CONTROL.lock();
         let now = crate::sbi::time();
         let use_usb_cdc = usb_cdc_ready();
-        let descriptor_busy = !use_usb_cdc && engine.tx_owned();
+        let descriptor_busy = if use_usb_cdc {
+            false
+        } else {
+            engine.as_ref().ok_or(NetError::DriverFault)?.tx_owned()
+        };
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
         if descriptor_busy {
             // The deadline covers DMA ownership after publication as well as
@@ -454,7 +460,10 @@ fn driver_turn(
                     Err(_) => Err(HardwareError::TimedOut),
                 }
             } else {
-                engine.transmit(packet.as_bytes())
+                engine
+                    .as_mut()
+                    .ok_or(NetError::DriverFault)?
+                    .transmit(packet.as_bytes())
             };
             match transmitted {
                 Ok(()) => {
@@ -486,7 +495,10 @@ fn driver_turn(
                 Err(_) => return Err(NetError::DriverFault),
             }
         } else {
-            engine.receive(&mut frame)
+            engine
+                .as_mut()
+                .ok_or(NetError::DriverFault)?
+                .receive(&mut frame)
         };
         if let Some(length) = received {
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
@@ -502,7 +514,9 @@ fn driver_turn(
     *link_poll = link_poll.wrapping_add(1);
     if *link_poll >= 1_000 {
         *link_poll = 0;
-        engine.poll_link();
+        if let Some(engine) = engine {
+            engine.poll_link();
+        }
     }
     Ok(())
 }

@@ -58,6 +58,7 @@ impl core::fmt::Display for NetError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetInfo {
     pub online: bool,
+    pub carrier_up: bool,
     pub quarantined: bool,
     pub session_epoch: u64,
     pub stack_generation: u64,
@@ -92,6 +93,7 @@ struct Control {
     sessions: PacketSessionFence,
     active_stack_domain: Option<AllocationDomain>,
     online: bool,
+    carrier_up: bool,
     quarantined: bool,
     ethernet_address: [u8; 6],
     tx_inflight: bool,
@@ -118,6 +120,7 @@ impl NetDevice {
                 sessions: PacketSessionFence::new(),
                 active_stack_domain: None,
                 online: false,
+                carrier_up: false,
                 quarantined: false,
                 ethernet_address: FALLBACK_MAC,
                 tx_inflight: false,
@@ -137,6 +140,7 @@ impl NetDevice {
         let control = self.control.lock();
         NetInfo {
             online: control.online,
+            carrier_up: control.carrier_up,
             quarantined: control.quarantined,
             session_epoch: control.sessions.device_epoch(),
             stack_generation: control
@@ -165,6 +169,7 @@ impl NetDevice {
         let mut control = self.control.lock();
         let was_online = control.online;
         control.online = false;
+        control.carrier_up = false;
         control.sessions.detach_device();
         control.active_stack_domain = None;
         control.tx_inflight = false;
@@ -303,6 +308,8 @@ pub async fn driver_task(
     };
     let mut pending_tx = None;
     let mut tx_deadline = 0;
+    let mut next_carrier_poll = 0;
+    let mut carrier_observed = false;
 
     loop {
         let turn = transport.try_with(|_| {
@@ -316,6 +323,8 @@ pub async fn driver_task(
                     &inbound,
                     &mut pending_tx,
                     &mut tx_deadline,
+                    &mut next_carrier_poll,
+                    &mut carrier_observed,
                 )
             })
         });
@@ -327,6 +336,8 @@ pub async fn driver_task(
                 }
                 pending_tx = None;
                 tx_deadline = 0;
+                next_carrier_poll = 0;
+                carrier_observed = false;
             }
             Ok(Ok(Err(error))) => {
                 crate::println!("  usb net   driver stopped: {error:?}");
@@ -354,6 +365,8 @@ fn driver_turn(
     inbound: &Revocable<Endpoint<StampedPacket>>,
     pending_tx: &mut Option<Packet>,
     tx_deadline: &mut u64,
+    next_carrier_poll: &mut u64,
+    carrier_observed: &mut bool,
 ) -> Result<(), NetError> {
     let ecm = crate::dwc2_host::snapshot().and_then(|snapshot| snapshot.cdc_ecm);
     let Some(ecm) = ecm else {
@@ -372,6 +385,7 @@ fn driver_turn(
         control.active_stack_domain = None;
         control.ethernet_address = ecm.mac_address.unwrap_or(FALLBACK_MAC);
         control.online = true;
+        control.carrier_up = false;
         control.quarantined = false;
         control.tx_inflight = false;
         crate::println!(
@@ -387,6 +401,45 @@ fn driver_turn(
     }
 
     let now = crate::sbi::time();
+    if now >= *next_carrier_poll {
+        *next_carrier_poll = now.saturating_add(
+            u64::from(ecm.status_interval_ms).saturating_mul(crate::exec::timebase_hz()) / 1_000,
+        );
+        match crate::dwc2_host::poll_cdc_ecm_carrier() {
+            Ok(status) if status.link_up.is_some() => {
+                let carrier_up = status.link_up.expect("matched present carrier status");
+                if !*carrier_observed || carrier_up != control.carrier_up {
+                    if let Some(raw) = status.rtl815x_phystatus {
+                        crate::println!(
+                            "  usb net   RTL815x carrier {}, PHYSTATUS {:#06x}",
+                            if carrier_up { "up" } else { "down" },
+                            raw,
+                        );
+                    } else {
+                        crate::println!(
+                            "  usb net   CDC-ECM carrier {}",
+                            if carrier_up { "up" } else { "down" }
+                        );
+                    }
+                }
+                *carrier_observed = true;
+                control.carrier_up = carrier_up;
+            }
+            Ok(_) => {}
+            Err(vibeos_driver_dwc2_host::Error::NoDevice) => return Err(NetError::Offline),
+            Err(vibeos_driver_dwc2_host::Error::InvalidDescriptor)
+                if ecm.status_endpoint.is_none() => {}
+            Err(_) => return Err(NetError::DriverFault),
+        }
+    }
+
+    if !control.carrier_up {
+        *pending_tx = None;
+        *tx_deadline = 0;
+        control.tx_inflight = false;
+        return Ok(());
+    }
+
     if pending_tx.is_none() {
         if let Some(packet) = take_admitted_outbound(device, outbound, &control.sessions)? {
             *pending_tx = Some(packet);

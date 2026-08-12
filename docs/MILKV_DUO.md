@@ -41,6 +41,29 @@ exercise ordinary bidirectional traffic through that path. They do not yet
 cover driver restart coordinates, deliberately delayed DMA completion, late
 IRQs, or long-duration link stress.
 
+The CV1800B EPHY page-10 link-pulse table uses Milk-V's alternate tuning for
+cable-removal detection. The original table can leave standard MII BMSR link
+status asserted after unplug; the official
+[CVITEK PHY driver](https://github.com/milkv-duo/duo-buildroot-sdk/blob/23eb84fecb29585dbb5728d6b7e2475ff273baac/linux_5.10/drivers/net/phy/cvitek.c)
+documents that failure beside the replacement values. On carrier loss VibeOS
+retires the interface's live protocol-stack instance and clears its displayed
+IPv4 address and routes while retaining operator intent. Reconnection creates a
+fresh stack and restarts DHCP (or reapplies static configuration).
+
+CDC-ECM keeps USB presence separate from Ethernet carrier. The USB network
+frontend remains online while the adapter is enumerated, but `LOWER_UP` follows
+the class control interface's interrupt-IN `NETWORK_CONNECTION` notifications.
+Removing the RJ45 cable therefore retires only that interface's live stack and
+clears its DHCP address and route; reconnecting it starts DHCP again. Removing
+the USB device still advances the device epoch during re-enumeration.
+
+Realtek RTL8152/RTL8153/RTL8156 firmware is an explicit exception: an RTL8153
+was observed reporting `NETWORK_CONNECTION=1` with no RJ45 cable. For those
+identified products, `drivers/rtl815x` reads the vendor PLA `PHYSTATUS`
+register and uses its `LINK_STATUS` bit as the carrier authority, matching the
+official Linux r8152 driver's link-state source. Non-Realtek CDC-ECM devices
+continue to use the class notification.
+
 The production image enables `milkv-ssh`. One independent `net-stack` component
 fairly drives the interfaces discovered at boot. The image policy sorts each
 NIC's stable physical location (`mmio@...` or the DWC2 controller plus USB port
@@ -662,10 +685,12 @@ ip route show dev <USB_NET>
 ```
 
 The gate requires both links to report `UP,LOWER_UP` at the same time and both
-interfaces to show different dynamic IPv4 leases. Re-run the two address
-commands after unplugging and reconnecting the USB NIC: `<DWMAC_NET>` must
-retain its lease, while `<USB_NET>` must return with a higher device epoch and
-reacquire its own lease. The first simultaneous-online portion of the preserved log is
+interfaces to show different dynamic IPv4 leases. First remove only the USB
+adapter's RJ45 cable: `<USB_NET>` must lose `LOWER_UP`, its address and route,
+then reacquire a lease after reconnection without changing its USB device
+epoch. Next unplug and reconnect the entire USB NIC: `<DWMAC_NET>` must retain
+its lease, while `<USB_NET>` must return with a higher device epoch and reacquire
+its own lease. The first simultaneous-online portion of the preserved log is
 machine-checkable with:
 
 ```sh
@@ -749,6 +774,16 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       reached the bounded listener through the assigned address and returned
       exact binary echoes. Lease renewal still belongs to the longer-duration
       network stress gate.
+- [ ] Removing the DWMAC cable clears `LOWER_UP`, its dynamic IPv4 address, and
+      its DHCP route; reconnecting the cable restores carrier and obtains a
+      fresh lease without rebooting. The fix builds and has host tests, but
+      fresh-board UART evidence is still required.
+- [x] On 2026-08-13, a physical `0bda:8153` in CDC-ECM mode remained `<UP>`
+      without an RJ45 cable while both `usb-ecm-net` and `net-stack` continued
+      running. Inserting the cable changed RTL815x `PHYSTATUS` from link-down to
+      `0x00f3`, published `LOWER_UP`, and acquired `192.168.77.11/24` by DHCP.
+      Removing it produced `PHYSTATUS 0x0090`, removed `LOWER_UP`, and cleared
+      the IPv4 address and route without detaching the USB device.
 - [ ] With DWMAC and USB CDC-ECM attached together, both topology-mapped `netN`
       interfaces report `UP,LOWER_UP`, acquire distinct DHCP leases, and pass
       `scripts/check-milkv-dual-net-log.sh`. USB unplug/reconnect retires and

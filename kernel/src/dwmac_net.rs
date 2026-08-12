@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use vibeos_driver_dwmac_net::{DmaStorage, Engine, Error as HardwareError};
+use vibeos_driver_dwmac_net::{DmaStorage, Engine, Error as HardwareError, InstanceState};
 
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
@@ -29,6 +29,7 @@ const IRQ: u32 = DWMAC.irq;
 
 #[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
 static DMA: DmaStorage = DmaStorage::new();
+static INSTANCE: InstanceState = InstanceState::new();
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -153,7 +154,7 @@ impl NetDevice {
         // apertures for the firmware lifetime. CONTROL serializes this
         // diagnostic snapshot with kernel packet-engine operations; the
         // selected status registers are non-destructive reads.
-        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC, &DMA) };
+        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC, &INSTANCE) };
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
@@ -336,6 +337,7 @@ pub async fn driver_task(
             Engine::claim(
                 DWMAC,
                 storage,
+                &INSTANCE,
                 GUEST_MAC,
                 crate::sbi::time,
                 crate::exec::timebase_hz(),
@@ -627,7 +629,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
-    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC, &DMA) };
+    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC, &INSTANCE) };
     shutdown_driver_policy(reset);
 }
 

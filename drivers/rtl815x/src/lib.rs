@@ -18,6 +18,18 @@ const INSTALL_MODE_MESSAGE: [u8; 31] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+pub const GET_REGISTERS_REQUEST_TYPE: u8 = 0xc0;
+pub const GET_REGISTERS_REQUEST: u8 = 0x05;
+const MCU_TYPE_PLA: u16 = 0x0100;
+const PLA_PHYSTATUS: u16 = 0xe908;
+const LINK_STATUS: u8 = 0x02;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkStatus {
+    pub raw: u16,
+    pub link_up: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Personality {
     InstallMode,
@@ -48,6 +60,34 @@ pub trait InstallModeTransport {
     fn settle_after_disconnect(&mut self);
 }
 
+/// Narrow vendor-register transport used only for RTL815x PHY status.
+pub trait RegisterTransport {
+    type Error;
+
+    fn read_registers(
+        &mut self,
+        value: u16,
+        index: u16,
+        output: &mut [u8; 4],
+    ) -> Result<(), Self::Error>;
+}
+
+/// Read the authoritative copper PHY carrier state.
+///
+/// RTL815x CDC firmware may report `NETWORK_CONNECTION=1` whenever its USB
+/// data interface is enabled, even with no RJ45 cable. Linux's r8152 driver
+/// instead reads the aligned PLA_PHYSTATUS dword and tests LINK_STATUS.
+pub fn read_link_status<T: RegisterTransport>(transport: &mut T) -> Result<LinkStatus, T::Error> {
+    let mut status = [0; 4];
+    transport.read_registers(PLA_PHYSTATUS & !3, MCU_TYPE_PLA, &mut status)?;
+    let offset = usize::from(PLA_PHYSTATUS & 3);
+    let raw = u16::from_le_bytes([status[offset], status[offset + 1]]);
+    Ok(LinkStatus {
+        raw,
+        link_up: raw != u16::MAX && raw as u8 & LINK_STATUS != 0,
+    })
+}
+
 /// Switch one positively identified RTL8151 install-mode function.
 ///
 /// Devices commonly disconnect before returning the BOT CSW, so status-read
@@ -73,6 +113,28 @@ mod tests {
         count: usize,
         command: [u8; 31],
         fail_status: bool,
+    }
+
+    struct FakeRegisters {
+        value: u16,
+        index: u16,
+        status: [u8; 4],
+    }
+
+    impl RegisterTransport for FakeRegisters {
+        type Error = ();
+
+        fn read_registers(
+            &mut self,
+            value: u16,
+            index: u16,
+            output: &mut [u8; 4],
+        ) -> Result<(), Self::Error> {
+            self.value = value;
+            self.index = index;
+            *output = self.status;
+            Ok(())
+        }
     }
 
     impl FakeTransport {
@@ -141,5 +203,47 @@ mod tests {
         assert_eq!(&transport.command[..4], b"USBC");
         assert_eq!(transport.command[12], 0x80);
         assert_eq!(transport.command[15], 0xe0);
+    }
+
+    #[test]
+    fn reads_real_phy_carrier_from_pla_phystatus() {
+        let mut down = FakeRegisters {
+            value: 0,
+            index: 0,
+            status: [0, 0, 0, 0],
+        };
+        assert_eq!(
+            read_link_status(&mut down),
+            Ok(LinkStatus {
+                raw: 0,
+                link_up: false
+            })
+        );
+        assert_eq!(down.value, 0xe908);
+        assert_eq!(down.index, 0x0100);
+
+        let mut up = FakeRegisters {
+            status: [LINK_STATUS, 0, 0, 0],
+            ..down
+        };
+        assert_eq!(
+            read_link_status(&mut up),
+            Ok(LinkStatus {
+                raw: 2,
+                link_up: true
+            })
+        );
+
+        let mut invalid = FakeRegisters {
+            status: [0xff; 4],
+            ..up
+        };
+        assert_eq!(
+            read_link_status(&mut invalid),
+            Ok(LinkStatus {
+                raw: u16::MAX,
+                link_up: false
+            })
+        );
     }
 }

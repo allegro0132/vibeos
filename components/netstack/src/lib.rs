@@ -252,7 +252,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
                 }
                 Err(InterfaceError::Retired) => {
                     interface.retired = true;
-                    config::publish_carrier(interface.interface, false);
+                    config::publish_link_down(interface.interface);
                     live_interfaces -= 1;
                 }
             }
@@ -304,14 +304,15 @@ impl InterfaceTask {
         let Some(info) = device_info(space, self.control) else {
             return Err(InterfaceError::Retired);
         };
-        config::publish_carrier(self.interface, info.online && info.phy_link_up);
         config::publish_ethernet_address(self.interface, info.ethernet_address);
         if info.quarantined {
             return Err(InterfaceError::Retired);
         }
-        if !info.online {
+        if !info.online || !info.phy_link_up {
+            self.drop_carrier();
             return Ok(InterfacePollReport::idle(1));
         }
+        config::publish_carrier(self.interface, true);
 
         if self.observed_epoch != Some(info.session_epoch)
             || self.observed_ethernet_address != Some(info.ethernet_address)
@@ -394,6 +395,14 @@ impl InterfaceTask {
                 .unwrap_or(IDLE_POLL_CEILING_MS)
                 .clamp(1, IDLE_POLL_CEILING_MS),
         })
+    }
+
+    fn drop_carrier(&mut self) {
+        config::publish_link_down(self.interface);
+        self.stack = None;
+        self.observed_epoch = None;
+        self.observed_ethernet_address = None;
+        self.observed_config_revision = 0;
     }
 }
 

@@ -240,6 +240,18 @@ pub fn publish_carrier(interface: NetworkInterfaceId, carrier_up: bool) {
     }
 }
 
+/// Publish physical link loss and invalidate address state learned on the old
+/// carrier. The desired configuration is deliberately retained so DHCP or a
+/// static address can be applied again when the carrier returns.
+pub fn publish_link_down(interface: NetworkInterfaceId) {
+    let mut control = CONTROL.lock();
+    if let Some(state) = control.get_mut(interface.index()) {
+        state.present = true;
+        state.carrier_up = false;
+        state.runtime = Ipv4RuntimeStatus::Unconfigured;
+    }
+}
+
 pub fn publish_ethernet_address(interface: NetworkInterfaceId, ethernet_address: [u8; 6]) {
     let mut control = CONTROL.lock();
     if let Some(state) = control.get_mut(interface.index()) {
@@ -482,5 +494,36 @@ mod tests {
         assert!(links.contains("net17"));
         assert!(links.contains("02:00:00:00:01:01"));
         assert!(vsh_ip(&args(&["link", "show", "dev", "net2"])).is_err());
+    }
+
+    #[test]
+    fn physical_link_loss_clears_runtime_address_but_retains_intent() {
+        let interface = NetworkInterfaceId::new(23);
+        assert!(register_interface(interface, false));
+        vsh_dhclient(&args(&["net23"])).unwrap();
+        publish_carrier(interface, true);
+        let revision = CONTROL.lock()[interface.index()].revision;
+        publish_stack_status(
+            interface,
+            revision,
+            Ipv4RuntimeStatus::DhcpBound(
+                StaticIpv4Address::new([192, 168, 77, 10], 24)
+                    .with_default_gateway([192, 168, 77, 1]),
+            ),
+        );
+
+        publish_link_down(interface);
+
+        let state = CONTROL.lock()[interface.index()];
+        assert!(!state.carrier_up);
+        assert_eq!(state.runtime, Ipv4RuntimeStatus::Unconfigured);
+        assert_eq!(state.desired.method, Ipv4Method::Dhcp);
+        assert!(!vsh_ip(&args(&["link", "show", "dev", "net23"]))
+            .unwrap()
+            .contains("LOWER_UP"));
+        assert!(vsh_ip(&args(&["-4", "addr", "show", "dev", "net23"]))
+            .unwrap()
+            .lines()
+            .all(|line| !line.trim_start().starts_with("inet ")));
     }
 }

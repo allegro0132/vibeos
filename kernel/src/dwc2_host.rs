@@ -3,13 +3,14 @@
 use crate::{println, sync::SpinLock};
 use vibeos_driver_dwc2_host::{
     CdcEcmInfo, ConfigurationInfo, Controller, DeviceInfo, DmaStorage, Error, HidKeyboardInfo,
-    HidReportDescriptor, HubChildInfo, HubInfo, Info, MassStorageInfo, Telemetry, UsbBusPath,
-    MAX_DEVICE_CONFIGURATIONS, MAX_HUB_CHILDREN,
+    HidReportDescriptor, HubChildInfo, HubInfo, Info, InstanceState, MassStorageInfo, Telemetry,
+    UsbBusPath, MAX_DEVICE_CONFIGURATIONS, MAX_HUB_CHILDREN,
 };
 
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
 #[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
 static DMA: DmaStorage = DmaStorage::new();
+static INSTANCE: InstanceState = InstanceState::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -44,6 +45,7 @@ pub fn init() -> Result<Info, Error> {
         Controller::initialize(
             crate::platform::DWC2,
             &DMA,
+            &INSTANCE,
             crate::platform::TIMEBASE_HZ,
             crate::sbi::time,
         )
@@ -148,6 +150,14 @@ pub fn transmit_cdc_ecm(frame: &[u8]) -> Result<(), Error> {
         .as_mut()
         .ok_or(Error::NoDevice)?
         .transmit_cdc_ecm(frame)
+}
+
+pub fn poll_cdc_ecm_carrier() -> Result<vibeos_driver_dwc2_host::CdcCarrierStatus, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .poll_cdc_ecm_carrier()
 }
 
 pub fn read_sector(sector: u64) -> Result<[u8; 512], Error> {

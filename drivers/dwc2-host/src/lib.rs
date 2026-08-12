@@ -117,6 +117,13 @@ const MAX_HUB_PORTS: u8 = 15;
 #[repr(C, align(64))]
 pub struct DmaStorage {
     buffer: UnsafeCell<[u8; DMA_BYTES]>,
+}
+
+/// CPU-only ownership state for one controller instance.
+///
+/// Keep this in normally initialized memory. The device-visible DMA buffer may
+/// live in a linker `NOLOAD` section whose initial bytes are unspecified.
+pub struct InstanceState {
     claimed: AtomicBool,
 }
 
@@ -126,7 +133,6 @@ impl DmaStorage {
     pub const fn new() -> Self {
         Self {
             buffer: UnsafeCell::new([0; DMA_BYTES]),
-            claimed: AtomicBool::new(false),
         }
     }
 
@@ -140,6 +146,20 @@ impl DmaStorage {
 }
 
 impl Default for DmaStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InstanceState {
+    pub const fn new() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for InstanceState {
     fn default() -> Self {
         Self::new()
     }
@@ -234,8 +254,16 @@ pub struct CdcEcmInfo {
     pub max_packet_size_in: u16,
     pub max_packet_size_out: u16,
     pub status_endpoint: Option<u8>,
+    pub status_max_packet_size: u16,
+    pub status_interval_ms: u16,
     pub mac_string_index: u8,
     pub mac_address: Option<[u8; 6]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CdcCarrierStatus {
+    pub link_up: Option<bool>,
+    pub rtl815x_phystatus: Option<u16>,
 }
 
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
@@ -422,6 +450,7 @@ pub struct Telemetry {
 pub struct Controller {
     description: Dwc2Description,
     dma: &'static DmaStorage,
+    state: &'static InstanceState,
     info: Info,
     timebase_hz: u64,
     time: fn() -> u64,
@@ -449,6 +478,7 @@ pub struct Controller {
     storage_tag: u32,
     keyboard_layout: KeyboardLayout,
     keyboard_pid: DataPid,
+    cdc_status_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
     keyboard_nkro_last: [u8; APPLE_NKRO_REPORT_BYTES],
 }
@@ -467,13 +497,14 @@ impl Controller {
     pub unsafe fn initialize(
         description: Dwc2Description,
         dma: &'static DmaStorage,
+        state: &'static InstanceState,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
         if !validate_description(description) || timebase_hz == 0 {
             return Err(Error::InvalidDescription);
         }
-        if dma
+        if state
             .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -512,7 +543,7 @@ impl Controller {
         compiler_fence(Ordering::SeqCst);
         delay_us(timebase_hz, time, PHY_UTMI_RESET_SETTLE_US);
 
-        let result = unsafe { Self::initialize_core(description, dma, timebase_hz, time) };
+        let result = unsafe { Self::initialize_core(description, dma, state, timebase_hz, time) };
         match result {
             Ok(controller) => Ok(controller),
             Err(error) => {
@@ -521,7 +552,7 @@ impl Controller {
                     soc_write(description, CLK_ENABLE_2, old_clocks_2);
                     soc_write(description, CLK_ENABLE_1, old_clocks_1);
                 }
-                dma.claimed.store(false, Ordering::Release);
+                state.claimed.store(false, Ordering::Release);
                 Err(error)
             }
         }
@@ -530,6 +561,7 @@ impl Controller {
     unsafe fn initialize_core(
         description: Dwc2Description,
         dma: &'static DmaStorage,
+        state: &'static InstanceState,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
@@ -665,6 +697,7 @@ impl Controller {
         Ok(Self {
             description,
             dma,
+            state,
             info: Info {
                 core_id,
                 release: core_id as u16,
@@ -701,6 +734,7 @@ impl Controller {
             storage_tag: 1,
             keyboard_layout: KeyboardLayout::Boot,
             keyboard_pid: DataPid::Data0,
+            cdc_status_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
             keyboard_nkro_last: [0; APPLE_NKRO_REPORT_BYTES],
         })
@@ -863,6 +897,7 @@ impl Controller {
         )?;
         self.reset_bulk_pids(target.address, ecm.endpoint_in);
         self.reset_bulk_pids(target.address, ecm.endpoint_out);
+        self.cdc_status_pid = DataPid::Data0;
         ecm.mac_address = self.read_mac_string(ecm.mac_string_index)?;
         self.cdc_ecm = Some(ecm);
         self.network_bus_path = self.bus_path_for_address(target.address);
@@ -896,6 +931,68 @@ impl Controller {
         }
         self.select_target(target);
         self.bulk_out(ecm.endpoint_out, ecm.max_packet_size_out, frame)
+    }
+
+    /// Poll the CDC notification endpoint for a physical media transition.
+    /// A NAK or a speed-change notification carries no new carrier state.
+    pub fn poll_cdc_ecm_carrier(&mut self) -> Result<CdcCarrierStatus, Error> {
+        let ecm = self.cdc_ecm.ok_or(Error::NoDevice)?;
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        if self
+            .device_at_address(target.address)
+            .is_some_and(|device| {
+                vibeos_driver_rtl815x::classify(device.vendor_id, device.product_id)
+                    == vibeos_driver_rtl815x::Personality::Ethernet
+            })
+        {
+            let mut transport = Rtl815xRegisterTransport {
+                controller: self,
+                target,
+            };
+            return vibeos_driver_rtl815x::read_link_status(&mut transport).map(|status| {
+                CdcCarrierStatus {
+                    link_up: Some(status.link_up),
+                    rtl815x_phystatus: Some(status.raw),
+                }
+            });
+        }
+        let endpoint = ecm.status_endpoint.ok_or(Error::InvalidDescriptor)?;
+        if ecm.status_max_packet_size < 8 || usize::from(ecm.status_max_packet_size) > DMA_BYTES {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.select_target(target);
+        let actual = match self.channel_transfer(
+            self.device_address,
+            endpoint & 0x0f,
+            true,
+            EndpointType::Interrupt,
+            self.cdc_status_pid,
+            usize::from(ecm.status_max_packet_size),
+            ecm.status_max_packet_size,
+            1,
+        ) {
+            Ok(actual) => actual,
+            Err(Error::Nak) => {
+                return Ok(CdcCarrierStatus {
+                    link_up: None,
+                    rtl815x_phystatus: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        self.cdc_status_pid = self.cdc_status_pid.toggled();
+        let mut notification = [0u8; 64];
+        let length = actual.min(notification.len());
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| notification[..length].copy_from_slice(&bytes[..length]))
+        };
+        parse_cdc_ecm_carrier_notification(&notification[..length]).map(|link_up| {
+            CdcCarrierStatus {
+                link_up,
+                rtl815x_phystatus: None,
+            }
+        })
     }
 
     fn read_mac_string(&mut self, string_index: u8) -> Result<Option<[u8; 6]>, Error> {
@@ -1210,7 +1307,7 @@ impl Controller {
         for index in 1..usize::from(target.configuration_count).min(MAX_DEVICE_CONFIGURATIONS) {
             self.configurations[index] = Some(self.read_configuration(index as u8)?.0);
         }
-        self.cdc_ecm = find_cdc_ecm(self.configurations);
+        self.cdc_ecm = find_cdc_ecm(self.configurations, self.speed);
         self.cdc_ecm_target = self.cdc_ecm.map(|_| transfer_target);
         self.mass_storage = find_mass_storage(configuration);
         self.storage_target = self.mass_storage.map(|_| transfer_target);
@@ -2447,14 +2544,14 @@ impl Controller {
                 port & !(HPRT_CHANGE_BITS | HPRT_POWER),
             );
         }
-        self.dma.claimed.store(false, Ordering::Release);
+        self.state.claimed.store(false, Ordering::Release);
         core::mem::forget(self);
     }
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        self.dma.claimed.store(false, Ordering::Release);
+        self.state.claimed.store(false, Ordering::Release);
     }
 }
 
@@ -2805,6 +2902,7 @@ fn find_mass_storage(configuration: ConfigurationInfo) -> Option<MassStorageInfo
 
 fn find_cdc_ecm(
     configurations: [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS],
+    speed: Speed,
 ) -> Option<CdcEcmInfo> {
     configurations
         .into_iter()
@@ -2835,16 +2933,68 @@ fn find_cdc_ecm(
                 max_packet_size_in: data.bulk_in_max_packet_size,
                 max_packet_size_out: data.bulk_out_max_packet_size,
                 status_endpoint: control.interrupt_in,
+                status_max_packet_size: control.max_packet_size,
+                status_interval_ms: hid_poll_interval_ms(speed, control.interval),
                 mac_string_index: control.cdc_mac_string_index.unwrap_or(0),
                 mac_address: None,
             })
         })
 }
 
+fn parse_cdc_ecm_carrier_notification(bytes: &[u8]) -> Result<Option<bool>, Error> {
+    if bytes.len() < 8 {
+        return Err(Error::InvalidDescriptor);
+    }
+    let request_type = bytes[0];
+    let notification = bytes[1];
+    let value = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let length = usize::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+    if request_type != 0xa1 || bytes.len() < 8usize.saturating_add(length) {
+        return Err(Error::InvalidDescriptor);
+    }
+    match notification {
+        0x00 if length == 0 => Ok(Some(value != 0)),
+        0x2a if length == 8 => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 struct Rtl815xInstallTransport<'a> {
     controller: &'a mut Controller,
     target: TransferTarget,
     storage: MassStorageInfo,
+}
+
+struct Rtl815xRegisterTransport<'a> {
+    controller: &'a mut Controller,
+    target: TransferTarget,
+}
+
+impl vibeos_driver_rtl815x::RegisterTransport for Rtl815xRegisterTransport<'_> {
+    type Error = Error;
+
+    fn read_registers(
+        &mut self,
+        value: u16,
+        index: u16,
+        output: &mut [u8; 4],
+    ) -> Result<(), Self::Error> {
+        self.controller.select_target(self.target);
+        let actual = self.controller.control_transfer(
+            SetupPacket {
+                request_type: vibeos_driver_rtl815x::GET_REGISTERS_REQUEST_TYPE,
+                request: vibeos_driver_rtl815x::GET_REGISTERS_REQUEST,
+                value,
+                index,
+                length: output.len() as u16,
+            },
+            output,
+        )?;
+        if actual != output.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        Ok(())
+    }
 }
 
 impl vibeos_driver_rtl815x::InstallModeTransport for Rtl815xInstallTransport<'_> {
@@ -3392,6 +3542,13 @@ mod tests {
     #[test]
     fn cv1800b_description_covers_every_register() {
         assert!(validate_description(VALID));
+        assert_eq!(core::mem::size_of::<DmaStorage>(), DMA_BYTES);
+        assert_eq!(core::mem::align_of::<DmaStorage>(), 64);
+        let state = InstanceState::new();
+        assert!(state
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
         let mut short = VALID;
         short.registers.end = short.registers.start + HPRT0;
         assert!(!validate_description(short));
@@ -3661,7 +3818,7 @@ mod tests {
         let mut configurations = [None; MAX_DEVICE_CONFIGURATIONS];
         configurations[1] = Some(configuration);
         assert_eq!(
-            find_cdc_ecm(configurations),
+            find_cdc_ecm(configurations, Speed::High),
             Some(CdcEcmInfo {
                 configuration: 2,
                 control_interface: 0,
@@ -3672,6 +3829,8 @@ mod tests {
                 max_packet_size_in: 512,
                 max_packet_size_out: 512,
                 status_endpoint: Some(0x83),
+                status_max_packet_size: 16,
+                status_interval_ms: 16,
                 mac_string_index: 4,
                 mac_address: None,
             })
@@ -3682,6 +3841,28 @@ mod tests {
                 b'7', 0, b'8', 0, b'9', 0, b'a', 0,
             ]),
             Ok([0x02, 0x12, 0x34, 0x56, 0x78, 0x9a])
+        );
+    }
+
+    #[test]
+    fn parses_cdc_ecm_network_connection_notifications() {
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[0xa1, 0, 1, 0, 0, 0, 0, 0]),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[0xa1, 0, 0, 0, 0, 0, 0, 0]),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[
+                0xa1, 0x2a, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[0xa1, 0, 1, 0]),
+            Err(Error::InvalidDescriptor)
         );
     }
 

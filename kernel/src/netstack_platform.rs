@@ -94,7 +94,7 @@ impl Platform for NetstackPlatform {
                 online: info.online,
                 quarantined: info.quarantined,
                 session_epoch: info.session_epoch,
-                phy_link_up: info.online,
+                phy_link_up: info.carrier_up,
                 ethernet_address: info.ethernet_address,
             });
         }

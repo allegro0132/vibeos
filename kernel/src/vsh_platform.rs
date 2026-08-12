@@ -484,6 +484,11 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
                 child.port,
                 child.port_status,
             ));
+            if let (Some(tt_hub), Some(tt_port)) = (child.tt_hub_address, child.tt_port) {
+                output.push_str(&format!(
+                    "  Transaction Translator hub={tt_hub:03} port={tt_port}\n"
+                ));
+            }
             if let Some(child_hub) = snapshot
                 .hubs
                 .iter()

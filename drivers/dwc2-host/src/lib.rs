@@ -258,6 +258,8 @@ pub struct HubChildInfo {
     pub port: u8,
     pub port_status: u16,
     pub depth: u8,
+    pub tt_hub_address: Option<u8>,
+    pub tt_port: Option<u8>,
 }
 
 const MAX_HUB_DEPTH: u8 = 4;
@@ -1109,7 +1111,7 @@ impl Controller {
                         .any(|interface| interface.class == USB_CLASS_HUB)
                 });
             if is_hub {
-                if child.depth >= MAX_HUB_DEPTH || child.device.speed != Speed::High {
+                if child.depth >= MAX_HUB_DEPTH {
                     return Err(Error::InvalidDescriptor);
                 }
                 let configuration = self.configuration.ok_or(Error::InvalidDescriptor)?;
@@ -1165,8 +1167,19 @@ impl Controller {
     }
 
     fn record_hub(&mut self, hub: HubInfo) -> Result<(), Error> {
-        let index = usize::from(hub.address.saturating_sub(1));
-        let slot = self.hubs.get_mut(index).ok_or(Error::InvalidDescriptor)?;
+        if let Some(slot) = self
+            .hubs
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|candidate| candidate.address == hub.address))
+        {
+            *slot = Some(hub);
+            return Ok(());
+        }
+        let slot = self
+            .hubs
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::InvalidDescriptor)?;
         *slot = Some(hub);
         Ok(())
     }
@@ -1264,10 +1277,11 @@ impl Controller {
                 continue;
             }
             let speed = hub_port_speed(reset_status);
+            let split = split_target_for_child(hub_target.split, hub.address, port, speed);
             let address = 2u8
                 .checked_add(count as u8)
                 .ok_or(Error::InvalidDescriptor)?;
-            let info = self.enumerate_hub_child(hub, port, speed, address)?;
+            let info = self.enumerate_hub_child(speed, address, split)?;
             let slot = self
                 .children
                 .get_mut(count)
@@ -1278,6 +1292,8 @@ impl Controller {
                 port,
                 port_status: reset_status,
                 depth,
+                tt_hub_address: split.map(|target| target.hub_address),
+                tt_port: split.map(|target| target.port),
             });
             if self.child.is_none() {
                 self.child = Some(info);
@@ -1300,15 +1316,11 @@ impl Controller {
 
     fn enumerate_hub_child(
         &mut self,
-        hub: HubInfo,
-        port: u8,
         speed: Speed,
         address: u8,
+        split: Option<SplitTarget>,
     ) -> Result<DeviceInfo, Error> {
-        self.split = (speed != Speed::High).then_some(SplitTarget {
-            hub_address: hub.address,
-            port,
-        });
+        self.split = split;
         self.speed = speed;
         self.device_address = 0;
         self.endpoint_zero_max_packet = match speed {
@@ -2154,10 +2166,26 @@ fn transfer_target_for_child(child: HubChildInfo) -> TransferTarget {
         address: child.device.address,
         endpoint_zero_max_packet: u16::from(child.device.max_packet_size_0),
         speed: child.device.speed,
-        split: (child.device.speed != Speed::High).then_some(SplitTarget {
-            hub_address: child.parent_hub_address,
-            port: child.port,
+        split: child
+            .tt_hub_address
+            .zip(child.tt_port)
+            .map(|(hub_address, port)| SplitTarget { hub_address, port }),
+    }
+}
+
+const fn split_target_for_child(
+    parent_split: Option<SplitTarget>,
+    parent_hub_address: u8,
+    port: u8,
+    speed: Speed,
+) -> Option<SplitTarget> {
+    match parent_split {
+        Some(target) => Some(target),
+        None if !matches!(speed, Speed::High) => Some(SplitTarget {
+            hub_address: parent_hub_address,
+            port,
         }),
+        None => None,
     }
 }
 
@@ -2829,6 +2857,8 @@ mod tests {
             port: 4,
             port_status: USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE,
             depth: 2,
+            tt_hub_address: Some(2),
+            tt_port: Some(4),
         };
         let nested_target = transfer_target_for_child(child);
         assert_eq!(nested_target.address, 3);
@@ -2846,11 +2876,26 @@ mod tests {
                     speed: Speed::High,
                     ..child.device
                 },
+                tt_hub_address: None,
+                tt_port: None,
                 ..child
             })
             .split,
             None
         );
+        let upstream_tt = SplitTarget {
+            hub_address: 1,
+            port: 2,
+        };
+        assert_eq!(
+            split_target_for_child(None, 1, 2, Speed::Full),
+            Some(upstream_tt)
+        );
+        assert_eq!(
+            split_target_for_child(Some(upstream_tt), 3, 4, Speed::Full),
+            Some(upstream_tt)
+        );
+        assert_eq!(split_target_for_child(None, 1, 2, Speed::High), None);
         let target = SplitTarget {
             hub_address: 1,
             port: 1,

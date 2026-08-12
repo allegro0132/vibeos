@@ -298,6 +298,7 @@ pub async fn driver_task(
         )
     };
     let (Ok(mmio), Ok(dma), Ok(outbound), Ok(inbound), Ok(control)) = authority else {
+        crate::println!("  usb net   driver capability lookup failed");
         return;
     };
 
@@ -325,6 +326,7 @@ pub async fn driver_task(
         }) {
             Ok(engine) => Some(engine),
             Err(_) => {
+                crate::println!("  usb net   DWMAC claim failed");
                 shutdown_driver_policy(false);
                 return;
             }
@@ -346,6 +348,7 @@ pub async fn driver_task(
     })
     .is_err()
     {
+        crate::println!("  usb net   driver device attach failed");
         let reset = engine.is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
         shutdown_driver_policy(reset);
         return;
@@ -359,7 +362,7 @@ pub async fn driver_task(
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
-        if with_device_authority(&mmio, &dma, &control, || {
+        if let Err(error) = with_device_authority(&mmio, &dma, &control, || {
             driver_turn(
                 session.engine_mut(),
                 &outbound,
@@ -368,9 +371,8 @@ pub async fn driver_task(
                 &mut tx_deadline,
                 &mut link_poll,
             )
-        })
-        .is_err()
-        {
+        }) {
+            crate::println!("  usb net   driver stopped: {error:?}");
             return;
         }
         crate::exec::sleep_ms(1).await;
@@ -457,7 +459,10 @@ fn driver_turn(
                 match crate::dwc2_host::transmit_cdc_ecm(packet.as_bytes()) {
                     Ok(()) => Ok(()),
                     Err(vibeos_driver_dwc2_host::Error::Nak) => Err(HardwareError::QueueFull),
-                    Err(_) => Err(HardwareError::TimedOut),
+                    Err(error) => {
+                        crate::println!("  usb net   CDC-ECM transmit failed: {error:?}");
+                        Err(HardwareError::TimedOut)
+                    }
                 }
             } else {
                 engine
@@ -492,7 +497,10 @@ fn driver_turn(
             match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
                 Ok(length) => Some(length),
                 Err(vibeos_driver_dwc2_host::Error::Nak) => None,
-                Err(_) => return Err(NetError::DriverFault),
+                Err(error) => {
+                    crate::println!("  usb net   CDC-ECM receive failed: {error:?}");
+                    return Err(NetError::DriverFault);
+                }
             }
         } else {
             engine

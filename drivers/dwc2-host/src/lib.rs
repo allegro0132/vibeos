@@ -254,11 +254,15 @@ pub const MAX_HUB_CHILDREN: usize = MAX_HUB_PORTS as usize;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HubChildInfo {
     pub device: DeviceInfo,
+    pub parent_hub_address: u8,
     pub port: u8,
     pub port_status: u16,
+    pub depth: u8,
 }
 
-#[derive(Clone, Copy)]
+const MAX_HUB_DEPTH: u8 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SplitTarget {
     hub_address: u8,
     port: u8,
@@ -366,6 +370,7 @@ pub struct Controller {
     child: Option<DeviceInfo>,
     children: [Option<HubChildInfo>; MAX_HUB_CHILDREN],
     hub: Option<HubInfo>,
+    hubs: [Option<HubInfo>; MAX_HUB_CHILDREN],
     split: Option<SplitTarget>,
     configuration: Option<ConfigurationInfo>,
     report_descriptor: Option<HidReportDescriptor>,
@@ -606,6 +611,7 @@ impl Controller {
             child: None,
             children: [None; MAX_HUB_CHILDREN],
             hub: None,
+            hubs: [None; MAX_HUB_CHILDREN],
             split: None,
             configuration: None,
             report_descriptor: None,
@@ -652,6 +658,10 @@ impl Controller {
 
     pub const fn children(&self) -> [Option<HubChildInfo>; MAX_HUB_CHILDREN] {
         self.children
+    }
+
+    pub const fn hubs(&self) -> [Option<HubInfo>; MAX_HUB_CHILDREN] {
+        self.hubs
     }
 
     pub const fn keyboard(&self) -> Option<HidKeyboardInfo> {
@@ -813,6 +823,7 @@ impl Controller {
             self.child = None;
             self.children = [None; MAX_HUB_CHILDREN];
             self.hub = None;
+            self.hubs = [None; MAX_HUB_CHILDREN];
             self.split = None;
             self.configuration = None;
             self.report_descriptor = None;
@@ -879,6 +890,7 @@ impl Controller {
         self.child = None;
         self.children = [None; MAX_HUB_CHILDREN];
         self.hub = None;
+        self.hubs = [None; MAX_HUB_CHILDREN];
         self.configuration = None;
         self.report_descriptor = None;
         self.keyboard = None;
@@ -951,7 +963,8 @@ impl Controller {
                 )?;
                 let hub = self.configure_hub()?;
                 self.hub = Some(hub);
-                if self.enumerate_hub_children(hub)? != 0 {
+                self.record_hub(hub)?;
+                if self.enumerate_hub_children(hub, true, 1)? != 0 {
                     return self.configure_hub_child_functions();
                 }
             }
@@ -1043,8 +1056,6 @@ impl Controller {
     }
 
     fn configure_hub_child_functions(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
-        let hub = self.hub.ok_or(Error::NoDevice)?;
-        let children = self.children;
         let legacy_child = self.child;
 
         let mut selected_keyboard = None;
@@ -1059,16 +1070,12 @@ impl Controller {
         let mut selected_storage_target = None;
         let mut selected_storage_configuration = None;
 
-        for child in children.into_iter().flatten() {
-            let target = TransferTarget {
-                address: child.device.address,
-                endpoint_zero_max_packet: u16::from(child.device.max_packet_size_0),
-                speed: child.device.speed,
-                split: (child.device.speed != Speed::High).then_some(SplitTarget {
-                    hub_address: hub.address,
-                    port: child.port,
-                }),
+        let mut child_index = 0;
+        while child_index < MAX_HUB_CHILDREN {
+            let Some(child) = self.children[child_index] else {
+                break;
             };
+            let target = transfer_target_for_child(child);
             self.select_target(target);
             self.child = Some(child.device);
             self.configuration = None;
@@ -1079,6 +1086,35 @@ impl Controller {
             self.storage_target = None;
 
             self.configure_hid_keyboard()?;
+            let is_hub = child.device.device_class == USB_CLASS_HUB
+                || self.configuration.is_some_and(|configuration| {
+                    configuration
+                        .interfaces
+                        .into_iter()
+                        .flatten()
+                        .any(|interface| interface.class == USB_CLASS_HUB)
+                });
+            if is_hub {
+                if child.depth >= MAX_HUB_DEPTH || child.device.speed != Speed::High {
+                    return Err(Error::InvalidDescriptor);
+                }
+                let configuration = self.configuration.ok_or(Error::InvalidDescriptor)?;
+                self.control_transfer(
+                    SetupPacket {
+                        request_type: 0,
+                        request: 9,
+                        value: u16::from(configuration.value),
+                        index: 0,
+                        length: 0,
+                    },
+                    &mut [],
+                )?;
+                let nested_hub = self.configure_hub()?;
+                self.record_hub(nested_hub)?;
+                self.enumerate_hub_children(nested_hub, false, child.depth + 1)?;
+                child_index += 1;
+                continue;
+            }
             if selected_keyboard.is_none() && self.keyboard.is_some() {
                 selected_keyboard = self.keyboard;
                 selected_keyboard_target = self.keyboard_target;
@@ -1094,6 +1130,7 @@ impl Controller {
                 selected_storage_target = self.storage_target;
                 selected_storage_configuration = self.configuration;
             }
+            child_index += 1;
         }
 
         self.child = legacy_child;
@@ -1111,6 +1148,13 @@ impl Controller {
             self.select_target(target);
         }
         Ok(selected_keyboard)
+    }
+
+    fn record_hub(&mut self, hub: HubInfo) -> Result<(), Error> {
+        let index = usize::from(hub.address.saturating_sub(1));
+        let slot = self.hubs.get_mut(index).ok_or(Error::InvalidDescriptor)?;
+        *slot = Some(hub);
+        Ok(())
     }
 
     fn configure_hub(&mut self) -> Result<HubInfo, Error> {
@@ -1177,16 +1221,21 @@ impl Controller {
         Ok(u16::from_le_bytes([status[0], status[1]]))
     }
 
-    fn enumerate_hub_children(&mut self, mut hub: HubInfo) -> Result<usize, Error> {
-        self.child = None;
-        self.children = [None; MAX_HUB_CHILDREN];
-        let hub_device = self.device.ok_or(Error::NoDevice)?;
-        let mut count = 0;
+    fn enumerate_hub_children(
+        &mut self,
+        mut hub: HubInfo,
+        reset_table: bool,
+        depth: u8,
+    ) -> Result<usize, Error> {
+        if reset_table {
+            self.child = None;
+            self.children = [None; MAX_HUB_CHILDREN];
+        }
+        let hub_target = self.current_target();
+        let mut count = self.children.iter().flatten().count();
+        let initial_count = count;
         for port in 1..=hub.ports {
-            self.device_address = hub_device.address;
-            self.endpoint_zero_max_packet = u16::from(hub_device.max_packet_size_0);
-            self.speed = hub_device.speed;
-            self.split = None;
+            self.select_target(hub_target);
             let status = self.hub_port_status(port)?;
             if status & USB_PORT_STAT_CONNECTION == 0 {
                 continue;
@@ -1205,10 +1254,16 @@ impl Controller {
                 .checked_add(count as u8)
                 .ok_or(Error::InvalidDescriptor)?;
             let info = self.enumerate_hub_child(hub, port, speed, address)?;
-            self.children[count] = Some(HubChildInfo {
+            let slot = self
+                .children
+                .get_mut(count)
+                .ok_or(Error::InvalidDescriptor)?;
+            *slot = Some(HubChildInfo {
                 device: info,
+                parent_hub_address: hub.address,
                 port,
                 port_status: reset_status,
+                depth,
             });
             if self.child.is_none() {
                 self.child = Some(info);
@@ -1218,17 +1273,15 @@ impl Controller {
             }
             count += 1;
         }
-        self.hub = Some(hub);
-        if let Some(first) = self.children[0] {
-            self.device_address = first.device.address;
-            self.endpoint_zero_max_packet = u16::from(first.device.max_packet_size_0);
-            self.speed = first.device.speed;
-            self.split = (first.device.speed != Speed::High).then_some(SplitTarget {
-                hub_address: hub.address,
-                port: first.port,
-            });
+        if self
+            .device
+            .is_some_and(|device| device.address == hub.address)
+        {
+            self.hub = Some(hub);
         }
-        Ok(count)
+        self.record_hub(hub)?;
+        self.select_target(hub_target);
+        Ok(count - initial_count)
     }
 
     fn enumerate_hub_child(
@@ -2082,6 +2135,18 @@ const fn hub_port_speed(status: u16) -> Speed {
     }
 }
 
+fn transfer_target_for_child(child: HubChildInfo) -> TransferTarget {
+    TransferTarget {
+        address: child.device.address,
+        endpoint_zero_max_packet: u16::from(child.device.max_packet_size_0),
+        speed: child.device.speed,
+        split: (child.device.speed != Speed::High).then_some(SplitTarget {
+            hub_address: child.parent_hub_address,
+            port: child.port,
+        }),
+    }
+}
+
 const fn split_control(target: SplitTarget, complete: bool) -> u32 {
     HCSPLT_ENABLE
         | HCSPLT_TRANSACTION_ALL
@@ -2736,6 +2801,42 @@ mod tests {
         assert_eq!(hub_port_speed(USB_PORT_STAT_LOW_SPEED), Speed::Low);
         assert_eq!(hub_port_speed(USB_PORT_STAT_HIGH_SPEED), Speed::High);
         assert_eq!(hub_port_speed(USB_PORT_STAT_ENABLE), Speed::Full);
+        let child = HubChildInfo {
+            device: DeviceInfo {
+                address: 3,
+                speed: Speed::Full,
+                usb_version: 0x0200,
+                device_class: 0,
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                max_packet_size_0: 64,
+            },
+            parent_hub_address: 2,
+            port: 4,
+            port_status: USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE,
+            depth: 2,
+        };
+        let nested_target = transfer_target_for_child(child);
+        assert_eq!(nested_target.address, 3);
+        assert_eq!(nested_target.speed, Speed::Full);
+        assert_eq!(
+            nested_target.split,
+            Some(SplitTarget {
+                hub_address: 2,
+                port: 4,
+            })
+        );
+        assert_eq!(
+            transfer_target_for_child(HubChildInfo {
+                device: DeviceInfo {
+                    speed: Speed::High,
+                    ..child.device
+                },
+                ..child
+            })
+            .split,
+            None
+        );
         let target = SplitTarget {
             hub_address: 1,
             port: 1,

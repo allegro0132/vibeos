@@ -102,6 +102,12 @@ const USB_CLASS_HUB: u8 = 9;
 const USB_CLASS_MASS_STORAGE: u8 = 8;
 const USB_MASS_STORAGE_SCSI: u8 = 6;
 const USB_MASS_STORAGE_BULK_ONLY: u8 = 0x50;
+const REALTEK_VENDOR_ID: u16 = 0x0bda;
+const RTL8151_INSTALL_MODE_PRODUCT_ID: u16 = 0x8151;
+const RTL8151_MODE_SWITCH_MESSAGE: [u8; 31] = [
+    0x55, 0x53, 0x42, 0x43, 0x08, 0x60, 0xd9, 0xa9, 0xc0, 0x00, 0x00, 0x00, 0x80, 0x00, 0x06, 0xe0,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 const USB_DESCRIPTOR_HUB: u16 = 0x29;
 const USB_PORT_FEAT_RESET: u16 = 4;
 const USB_PORT_FEAT_POWER: u16 = 8;
@@ -710,6 +716,64 @@ impl Controller {
             Some(target) => Some(target.address),
             None => None,
         }
+    }
+
+    /// Switch a Realtek RTL815x device from its 0bda:8151 virtual CD-ROM
+    /// personality into its native Ethernet personality. The 31-byte BOT
+    /// message is the command used by usb_modeswitch for this install mode.
+    /// A successful command deliberately makes the device disappear and
+    /// re-enumerate, so failure to receive the trailing CSW is not fatal.
+    pub fn switch_rtl8151_install_mode(&mut self) -> Result<bool, Error> {
+        let Some(storage) = self.mass_storage else {
+            return Ok(false);
+        };
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        let Some(device) = self.device_at_address(target.address) else {
+            return Ok(false);
+        };
+        if !is_rtl8151_install_mode(device) {
+            return Ok(false);
+        }
+
+        self.select_target(target);
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(storage.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.storage_pid_in = DataPid::Data0;
+        self.storage_pid_out = DataPid::Data0;
+        self.bulk_out(
+            storage.endpoint_out,
+            storage.max_packet_size_out,
+            &RTL8151_MODE_SWITCH_MESSAGE,
+        )?;
+
+        // usb_modeswitch asks for the 13-byte BOT status wrapper immediately
+        // after the message. Some revisions disconnect before returning it.
+        let mut csw = [0; 13];
+        let _ = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, &mut csw);
+        self.mass_storage = None;
+        self.storage_target = None;
+        delay_ms(self.timebase_hz, self.time, 100);
+        Ok(true)
+    }
+
+    fn device_at_address(&self, address: u8) -> Option<DeviceInfo> {
+        self.device
+            .filter(|device| device.address == address)
+            .or_else(|| {
+                self.children
+                    .iter()
+                    .flatten()
+                    .find(|child| child.device.address == address)
+                    .map(|child| child.device)
+            })
     }
 
     /// Select the detected SCSI Bulk-Only interface and probe its logical
@@ -2406,6 +2470,10 @@ fn find_mass_storage(configuration: ConfigurationInfo) -> Option<MassStorageInfo
         })
 }
 
+const fn is_rtl8151_install_mode(device: DeviceInfo) -> bool {
+    device.vendor_id == REALTEK_VENDOR_ID && device.product_id == RTL8151_INSTALL_MODE_PRODUCT_ID
+}
+
 fn is_apple_report_keyboard_descriptor(descriptor: &[u8]) -> bool {
     const ARRAY_REPORT: &[u8] = &[
         0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15,
@@ -2984,6 +3052,16 @@ mod tests {
         assert_eq!(info.vendor_id, 0x1234);
         assert_eq!(info.product_id, 0x5678);
         assert_eq!(info.max_packet_size_0, 64);
+        assert_eq!(info.configuration_count, 1);
+        assert!(!is_rtl8151_install_mode(info));
+        assert!(is_rtl8151_install_mode(DeviceInfo {
+            vendor_id: REALTEK_VENDOR_ID,
+            product_id: RTL8151_INSTALL_MODE_PRODUCT_ID,
+            ..info
+        }));
+        assert_eq!(&RTL8151_MODE_SWITCH_MESSAGE[..4], b"USBC");
+        assert_eq!(RTL8151_MODE_SWITCH_MESSAGE[12], 0x80);
+        assert_eq!(RTL8151_MODE_SWITCH_MESSAGE[15], 0xe0);
         assert_eq!(port_speed(0), Ok(Speed::High));
         assert_eq!(port_speed(1 << HPRT_SPEED_SHIFT), Ok(Speed::Full));
         assert_eq!(port_speed(2 << HPRT_SPEED_SHIFT), Ok(Speed::Low));

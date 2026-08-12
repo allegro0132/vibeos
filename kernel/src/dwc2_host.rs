@@ -104,6 +104,14 @@ pub fn configure_mass_storage() -> Result<Option<MassStorageInfo>, Error> {
         .configure_mass_storage()
 }
 
+pub fn switch_rtl8151_install_mode() -> Result<bool, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .switch_rtl8151_install_mode()
+}
+
 pub fn read_sector(sector: u64) -> Result<[u8; 512], Error> {
     CONTROLLER
         .lock()
@@ -155,8 +163,13 @@ pub async fn service_task() {
                             .and_then(|device| match device {
                                 Some(device) => {
                                     let keyboard = controller.configure_hid_keyboard()?;
-                                    let storage = controller.configure_mass_storage()?;
-                                    Ok(Some((device, keyboard, storage)))
+                                    let mode_switched = controller.switch_rtl8151_install_mode()?;
+                                    let storage = if mode_switched {
+                                        None
+                                    } else {
+                                        controller.configure_mass_storage()?
+                                    };
+                                    Ok(Some((device, keyboard, storage, mode_switched)))
                                 }
                                 None => Ok(None),
                             })
@@ -165,7 +178,7 @@ pub async fn service_task() {
                 }
             };
             match attached {
-                Ok(Some((device, keyboard, storage))) => {
+                Ok(Some((device, keyboard, storage, mode_switched))) => {
                     println!(
                         "  usb dev   hotplug addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
                         device.address,
@@ -175,6 +188,11 @@ pub async fn service_task() {
                         device.usb_version,
                         device.max_packet_size_0,
                     );
+                    if mode_switched {
+                        println!(
+                            "  usb net   sent RTL8151 install-mode switch; waiting for Ethernet re-enumeration"
+                        );
+                    }
                     match keyboard {
                         Some(keyboard) => println!(
                             "  usb hid   attached {:?} keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",

@@ -453,7 +453,23 @@ pub extern "C" fn kmain() -> ! {
                     Ok(None) => println!("  usb hid   no supported keyboard interface"),
                     Err(error) => println!("  usb hid   configuration FAILED: {:?}", error),
                 }
-                match dwc2_host::configure_mass_storage() {
+                let rtl8151_switched = match dwc2_host::switch_rtl8151_install_mode() {
+                    Ok(switched) => switched,
+                    Err(error) => {
+                        println!("  usb net   RTL8151 mode switch FAILED: {:?}", error);
+                        false
+                    }
+                };
+                if rtl8151_switched {
+                    println!(
+                        "  usb net   sent RTL8151 install-mode switch; waiting for Ethernet re-enumeration"
+                    );
+                }
+                match if rtl8151_switched {
+                    Ok(None)
+                } else {
+                    dwc2_host::configure_mass_storage()
+                } {
                     Ok(Some(storage)) => println!(
                         "  usb disk  SCSI/BOT interface {}, IN ep {}, OUT ep {}, {} sectors x {} bytes",
                         storage.interface,

@@ -428,6 +428,48 @@ pub extern "C" fn kmain() -> ! {
             usb.phy_utmi_control,
         );
     }
+    #[cfg(feature = "milkv-duo")]
+    if dwc2_host::connected() {
+        match dwc2_host::enumerate_device() {
+            Ok(Some(device)) => {
+                println!(
+                    "  usb dev   addr {}, {:?}, {:04x}:{:04x}, USB {:#06x}, EP0 {}",
+                    device.address,
+                    device.speed,
+                    device.vendor_id,
+                    device.product_id,
+                    device.usb_version,
+                    device.max_packet_size_0,
+                );
+                match dwc2_host::configure_hid_keyboard() {
+                    Ok(Some(keyboard)) => println!(
+                        "  usb hid   {:?} keyboard, interface {}, IN ep {}, MPS {}, poll {} ms",
+                        keyboard.protocol,
+                        keyboard.interface,
+                        keyboard.endpoint_in & 0x0f,
+                        keyboard.max_packet_size,
+                        keyboard.interval_ms,
+                    ),
+                    Ok(None) => println!("  usb hid   no supported keyboard interface"),
+                    Err(error) => println!("  usb hid   configuration FAILED: {:?}", error),
+                }
+                match dwc2_host::configure_mass_storage() {
+                    Ok(Some(storage)) => println!(
+                        "  usb disk  SCSI/BOT interface {}, IN ep {}, OUT ep {}, {} sectors x {} bytes",
+                        storage.interface,
+                        storage.endpoint_in & 0x0f,
+                        storage.endpoint_out & 0x0f,
+                        storage.capacity_sectors.unwrap_or(0),
+                        storage.block_size.unwrap_or(0),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => println!("  usb disk  configuration FAILED: {:?}", error),
+                }
+            }
+            Ok(None) => println!("  usb dev   disconnected during enumeration"),
+            Err(error) => println!("  usb dev   enumeration FAILED: {:?}", error),
+        }
+    }
     assert!(
         mmu::wx_remote_fence_ready(),
         "multicore W^X requires the SBI RFENCE extension"

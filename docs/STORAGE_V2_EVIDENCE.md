@@ -85,3 +85,47 @@ RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
 rustup run nightly-2026-08-01 cargo check -p vibeos-segment-format \
   --target riscv64imac-unknown-none-elf -Zbuild-std=core --locked --offline
 ```
+
+## M7.3 append-only segment store
+
+Accepted on 2026-08-12. `vibeos-segment-store` is a `no_std + alloc`,
+single-writer implementation over the M7.1 `BlockRange`/`BlockIo` contract. It
+formats dual superblocks/checkpoints, conservatively seals one immutable
+transaction segment, maintains an on-media catalog snapshot plus bounded delta
+chain, preserves cleaner reserve, and exposes only opaque object handles
+through its transitional `put/get` adapter.
+
+The host fault device keeps visible and durable media separate. Eight
+integration tests inject not-submitted failure, ambiguous completion before or
+after media effect, pending cancellation, and driver restart at every format
+and put write/flush boundary. Cold recovery sees the preceding checkpoint or
+the exact new checkpoint. The same suite covers sealed orphan quarantine,
+three truthful capacity classes, read failures, and a measured recovery-memory
+ceiling whose one-byte-under case fails closed.
+
+The production Rust writer exports a powered-off raw image during the test and
+requires `scripts/storage-v2-image.py` to reconstruct both committed objects.
+The independent parser's 22 selftests cover catalog snapshot/delta and
+allocation schemas, bounded replay, every sealed checkpoint, nested pointer
+range and generation checks, orphan reporting, exact Blob reconstruction, and
+the M7.2 structural corruption set. Object discovery starts only at the
+selected catalog root; normal Rust mount reads metadata payloads and extent
+descriptors without scanning Blob payload bytes.
+
+The default QEMU backend remains the M4 compatibility journal until M7.7. Its
+existing `./scripts/qemu-test.sh store` guest and independent 512-record raw
+backing verifier remained green after adding `segment-store`; M7.3's scalable
+raw-image acceptance is the host production-writer/Python-verifier gate above.
+
+Focused reproduction:
+
+```sh
+cargo test -p vibeos-segment-store -p vibeos-segment-format --locked --offline
+cargo clippy -p vibeos-segment-store -p vibeos-segment-format \
+  --all-targets --locked --offline -- -D warnings
+python3 -B scripts/storage-v2-image.py --selftest
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
+rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
+  --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
+```

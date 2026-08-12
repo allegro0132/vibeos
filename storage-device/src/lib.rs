@@ -563,7 +563,7 @@ pub fn validate_request(
             if block_count > discard.max_blocks
                 || physical_first_block % u64::from(discard.granularity_blocks)
                     != u64::from(discard.alignment_blocks)
-                || block_count % discard.granularity_blocks != 0
+                || !block_count.is_multiple_of(discard.granularity_blocks)
             {
                 return Err(ContractError::DiscardMisaligned);
             }

@@ -1270,7 +1270,6 @@ fn validate_segment_header(value: &SegmentHeader) -> Result<(), FormatError> {
         || value.binding.target_checkpoint_generation == 0
         || value.base_page != expected_base
         || (!no_previous && !has_previous)
-        || (no_previous && value.binding.segment_no != 0)
         || (has_previous && value.previous_segment_no == value.binding.segment_no)
     {
         return Err(FormatError::InvalidBinding);

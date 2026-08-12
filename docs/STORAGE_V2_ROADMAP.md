@@ -231,6 +231,12 @@ Acceptance:
 
 ### M7.3 — Append-only segment store
 
+**Status: complete (2026-08-12).** The bounded `no_std + alloc` writer,
+catalog/allocation payload ABI, exhaustive mutation-boundary model, and
+powered-off Rust-to-Python reconstruction gate are recorded in
+[STORAGE_V2_STORE.md](STORAGE_V2_STORE.md) and
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** the current object API can persist immutable extents in a scalable
 region without GC.
 

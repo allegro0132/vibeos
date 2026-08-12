@@ -100,7 +100,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  chan            telemetry channel depth and totals");
             println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  durable         recover a sealed capability log and tombstone");
-            println!("  blk info|test   inspect or exercise the supervised block device");
+            println!("  blk info|scope|test   inspect or exercise the scoped block device");
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  blob test       commit and verify a two-leaf Merkle blob");
@@ -1889,6 +1889,80 @@ async fn block_command(args: &[&str]) {
                 Err(e) => println!("  refused: {}", e),
             }
         }
+        "scope" => {
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
+            let Ok(lease) = lease else {
+                println!("  refused: block capability lacks read authority");
+                return;
+            };
+            let info = match crate::block_device::range_info_with(&lease) {
+                Ok(info) => info,
+                Err(error) => {
+                    println!("  block range: unavailable ({})", error);
+                    return;
+                }
+            };
+            let range = lease.with(crate::block_device::BlockDevice::range);
+            let geometry = info.geometry();
+            let physical = match geometry.physical_block_size() {
+                Some(bytes) => bytes,
+                None => 0,
+            };
+            let cache = match geometry.write_cache() {
+                vibeos_storage_device::WriteCache::WriteThrough => "write-through",
+                vibeos_storage_device::WriteCache::Volatile => "volatile",
+                vibeos_storage_device::WriteCache::Unknown => "unknown",
+            };
+            println!(
+                "  block range: [{}, {}), {} blocks, logical {} B",
+                range.first_block(),
+                range.end_block(),
+                range.block_count(),
+                geometry.logical_block_size()
+            );
+            if physical == 0 {
+                println!(
+                    "  geometry: physical unknown, preferred {} @ +{}, max {}, cache {}",
+                    geometry.preferred_write_blocks(),
+                    geometry.preferred_write_alignment_blocks(),
+                    geometry.max_transfer_blocks(),
+                    cache
+                );
+            } else {
+                println!(
+                    "  geometry: physical {} B, preferred {} @ +{}, max {}, cache {}",
+                    physical,
+                    geometry.preferred_write_blocks(),
+                    geometry.preferred_write_alignment_blocks(),
+                    geometry.max_transfer_blocks(),
+                    cache
+                );
+            }
+            println!(
+                "  durability: flush {}, FUA {}, discard {}, incarnation {}",
+                if geometry.supports_flush() {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if geometry.supports_fua() { "yes" } else { "no" },
+                if geometry.discard().is_some() {
+                    "yes"
+                } else {
+                    "no"
+                },
+                info.session().incarnation()
+            );
+            let boundary = crate::block_device::read_with(lease, range.block_count()).await;
+            if boundary == Err(crate::block_device::BlockError::OutOfRange) {
+                println!("  range boundary: out-of-range refused");
+            } else {
+                println!("  range boundary: invariant failed");
+            }
+        }
         "test" => {
             #[cfg(feature = "qemu-virt")]
             let irq_before = {
@@ -2179,7 +2253,7 @@ async fn block_command(args: &[&str]) {
             }
         }
         other => println!(
-            "  usage: blk [info|test|fault|recover|timeout|cancel|revoke] (got `{}`)",
+            "  usage: blk [info|scope|test|fault|recover|timeout|cancel|revoke] (got `{}`)",
             other
         ),
     }

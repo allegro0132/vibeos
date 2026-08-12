@@ -167,6 +167,10 @@ Acceptance:
 
 ### M7.1 — Capability-scoped block contract
 
+**Status: complete (2026-08-12).** The accepted range, geometry, legacy
+adapter, and mutation-ambiguity contract is recorded in
+[STORAGE_DEVICE.md](STORAGE_DEVICE.md).
+
 **Outcome:** storage consumes an explicitly authorized block range and can make
 correct decisions from device geometry without knowing board or partition
 details.

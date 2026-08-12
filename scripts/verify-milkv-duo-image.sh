@@ -140,6 +140,11 @@ if p2_type != 0xDA:
     fail(f"partition 2 type is 0x{p2_type:02x}, expected raw VibeOS data 0xda")
 if p2_start != p1_start + p1_size:
     fail(f"data partition starts at {p2_start}, expected {p1_start + p1_size}")
+# Keep the packaged image's physical LBA contract synchronized with
+# policy/image and the SDHCI logical-to-physical adapter.
+expected_data_start = 262_145
+if p2_start != expected_data_start:
+    fail(f"data partition starts at {p2_start}, policy requires {expected_data_start}")
 expected_data_sectors = 4 * 1024 * 1024 // sector_size
 if p2_size != expected_data_sectors:
     fail(f"data partition has {p2_size} sectors, expected {expected_data_sectors}")

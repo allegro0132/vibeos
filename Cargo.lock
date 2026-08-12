@@ -920,6 +920,7 @@ dependencies = [
  "vibeos-rustc",
  "vibeos-ssh-identity",
  "vibeos-sshd",
+ "vibeos-storage-device",
  "vibeos-vsh",
 ]
 
@@ -975,6 +976,7 @@ dependencies = [
  "vibeos-blob-format",
  "vibeos-core",
  "vibeos-durable-format",
+ "vibeos-storage-device",
 ]
 
 [[package]]
@@ -1029,6 +1031,10 @@ dependencies = [
  "vibeos-ssh-identity",
  "vibeos-vsh",
 ]
+
+[[package]]
+name = "vibeos-storage-device"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-vsh"

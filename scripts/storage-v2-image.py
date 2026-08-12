@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Independent, fail-closed inspector for the frozen VibeOS Storage V2 image ABI.
+"""Independent, fail-closed inspector for the VibeOS Storage V2 image ABI.
 
 This file intentionally duplicates the on-disk constants and offsets.  It does
 not import, parse, or otherwise depend on the Rust implementation, so it can
 serve as an independent compatibility oracle in CI and during recovery work.
+It validates both the frozen M7.2 structural format and the M7.3 canonical
+catalog/allocation payloads, then reconstructs objects only from checkpoint
+roots even though powered-off verification hashes every physical extent.
 """
 
 from __future__ import annotations
@@ -14,7 +17,6 @@ import json
 import mmap
 import os
 import struct
-import sys
 from typing import Any, Callable, Optional
 
 
@@ -43,6 +45,16 @@ SEAL_MAGIC = b"VIBESL2\x00"
 TERMINAL_MARKER = b"VIBESG2-SEALED!!"
 DESCRIPTOR_CHAIN_DOMAIN = b"VIBESG2-DESC-v1"
 DATA_CHAIN_DOMAIN = b"VIBESG2-DATA-v1"
+
+CATALOG_MAGIC = b"VIBECAT2"
+ALLOCATION_MAGIC = b"VIBEALC2"
+CATALOG_VERSION = 1
+CATALOG_SNAPSHOT = 1
+CATALOG_DELTA = 2
+CATALOG_SNAPSHOT_HEADER_SIZE = 0x40
+CATALOG_DELTA_HEADER_SIZE = 0xA0
+CATALOG_ENTRY_SIZE = 0xB0
+ALLOCATION_PAYLOAD_SIZE = 0x40
 
 RECORD_KINDS = {
     1: "superblock",
@@ -639,7 +651,6 @@ def segment_header_validator(segment_no: int, base_page: int) -> Callable[[dict[
         previous_generation = record["previous_segment_generation"]
         previous_hash = record["previous_segment_seal_body_sha256"]
         if previous_no == ANCHOR_SEGMENT_NO:
-            require(segment_no == 0, "only the first physical segment may start a chain")
             require(previous_generation == 0, "first segment predecessor generation must be zero")
             require(all_zero(previous_hash), "first segment predecessor hash must be zero")
         else:
@@ -1059,60 +1070,272 @@ def ranges_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return left["descriptor_relative_page"] < right_end and right["descriptor_relative_page"] < left_end
 
 
+def resolve_extent_pointer(
+    checkpoint: dict[str, Any],
+    pointer_name: str,
+    pointer: dict[str, Any],
+    segments: list[dict[str, Any]],
+    errors: list[str],
+) -> Optional[dict[str, Any]]:
+    """Resolve one checkpoint/catalog pointer without trusting an in-memory index.
+
+    The returned extent has already passed the full segment verifier and agrees
+    byte-for-byte with the pointer's physical and digest binding.  Callers must
+    still apply their payload-specific schema.
+    """
+
+    if pointer["status"] == "null":
+        return None
+    record = checkpoint["record"]
+    checkpoint_generation = record["binding"]["generation"]
+    prefix = f"checkpoint generation {checkpoint_generation} {pointer_name}"
+    if pointer["store_uuid"] != record["binding"]["store_uuid"]:
+        errors.append(f"{prefix}: pointer UUID mismatch")
+        return None
+    if pointer["segment_no"] >= record["admitted_segments"]:
+        errors.append(f"{prefix}: pointer references an unadmitted segment")
+        return None
+    if pointer["segment_generation"] >= record["next_segment_generation"]:
+        errors.append(f"{prefix}: pointer segment generation is not committed")
+        return None
+    segment = next(
+        (item for item in segments if item["segment_no"] == pointer["segment_no"]),
+        None,
+    )
+    if segment is None or segment.get("status") != "sealed":
+        errors.append(f"{prefix}: pointer does not reference a sealed segment")
+        return None
+    if segment.get("_generation") != pointer["segment_generation"]:
+        errors.append(f"{prefix}: segment generation mismatch")
+        return None
+    if (
+        segment["final_seal"]["record"]["target_checkpoint_generation"]
+        > checkpoint_generation
+    ):
+        errors.append(f"{prefix}: segment was finalized for a newer checkpoint")
+        return None
+    extent = segment.get("_extent_lookup", {}).get(
+        (pointer["descriptor_relative_page"], pointer["ordinal"])
+    )
+    if extent is None:
+        errors.append(f"{prefix}: descriptor was not found")
+        return None
+    if extent["binding"]["target_checkpoint_generation"] > checkpoint_generation:
+        errors.append(f"{prefix}: extent targets a newer checkpoint")
+        return None
+    expected = (
+        extent["extent_kind"],
+        extent["payload_first_relative_page"],
+        extent["payload_pages"],
+        extent["payload_byte_len"],
+        extent["payload_sha256"],
+    )
+    observed = (
+        pointer["extent_kind"],
+        pointer["payload_relative_page"],
+        pointer["payload_pages"],
+        pointer["exact_byte_len"],
+        pointer["payload_sha256"],
+    )
+    if observed != expected:
+        errors.append(f"{prefix}: pointer and extent descriptor disagree")
+        return None
+    return extent
+
+
+def pointer_identity(pointer: dict[str, Any]) -> tuple[int, int, int, int]:
+    require(pointer["status"] == "value", "null pointer has no physical identity")
+    return (
+        pointer["segment_no"],
+        pointer["segment_generation"],
+        pointer["descriptor_relative_page"],
+        pointer["ordinal"],
+    )
+
+
+def read_exact_extent_payload(
+    image: bytes | bytearray | mmap.mmap | memoryview,
+    extent: dict[str, Any],
+) -> bytes:
+    base = segment_base_page(extent["binding"]["segment_no"])
+    first_page = base + extent["payload_first_relative_page"]
+    start = first_page * PAGE_SIZE
+    exact_len = extent["payload_byte_len"]
+    require(start <= len(image), "extent payload starts outside image")
+    require(exact_len <= len(image) - start, "extent payload ends outside image")
+    return bytes(image[start : start + exact_len])
+
+
+def require_single_extent_payload(extent: dict[str, Any], label: str) -> None:
+    payload_len = extent["payload_byte_len"]
+    require(extent["extent_index"] == 0, f"{label} extent index must be zero")
+    require(extent["extent_count"] == 1, f"{label} extent count must be one")
+    require(extent["content_byte_len"] == payload_len, f"{label} content length mismatch")
+    require(extent["encoded_blob_len"] == payload_len, f"{label} encoded length mismatch")
+    require(extent["encoded_offset"] == 0, f"{label} encoded offset must be zero")
+    require(extent["merkle_root"] == extent["payload_sha256"], f"{label} content root mismatch")
+
+
+def parse_catalog_entry(
+    payload: bytes,
+    offset: int,
+    catalog_generation: int,
+    catalog_kind: int,
+    store_uuid: bytes,
+) -> dict[str, Any]:
+    require(offset <= len(payload), "catalog entry offset exceeds payload")
+    require(len(payload) - offset >= CATALOG_ENTRY_SIZE, "catalog entry is truncated")
+    raw = payload[offset : offset + CATALOG_ENTRY_SIZE]
+    object_id = raw[0x00:0x10]
+    exact_payload_len = u64(raw, 0x18)
+    commit_generation = u64(raw, 0x20)
+    blob = parse_pointer(raw[0x48:0xA8])
+    require(not all_zero(object_id), "catalog object ID must be non-zero")
+    require(u32(raw, 0x10) != 0, "catalog object kind must be non-zero")
+    require(u32(raw, 0x14) == 0, "catalog entry flags must be zero")
+    require(commit_generation > 0, "catalog commit generation must be non-zero")
+    require(
+        commit_generation <= catalog_generation,
+        "catalog entry commits after its metadata record",
+    )
+    if catalog_kind == CATALOG_DELTA:
+        require(
+            commit_generation == catalog_generation,
+            "catalog delta entry has the wrong commit generation",
+        )
+    require_zero(raw, 0xA8, 0xB0, "catalog entry reserved bytes")
+    if exact_payload_len == 0:
+        require(blob["status"] == "null", "empty catalog object has a Blob pointer")
+        require(raw[0x28:0x48] == sha256(b""), "empty catalog object has the wrong content root")
+    else:
+        require(blob["status"] == "value", "non-empty catalog object has no Blob pointer")
+        require(blob["store_uuid"] == store_uuid, "catalog Blob pointer UUID mismatch")
+        require(blob["extent_kind"] == 1, "catalog object pointer is not a Blob pointer")
+        require(
+            blob["exact_byte_len"] == exact_payload_len,
+            "catalog object length differs from its Blob pointer",
+        )
+        require(
+            blob["payload_sha256"] == raw[0x28:0x48],
+            "catalog content root differs from its Blob pointer",
+        )
+    return {
+        "object_id": object_id,
+        "object_kind": u32(raw, 0x10),
+        "exact_payload_len": exact_payload_len,
+        "commit_generation": commit_generation,
+        "content_root": raw[0x28:0x48],
+        "blob": blob,
+    }
+
+
+def parse_catalog_payload(
+    payload: bytes,
+    extent: dict[str, Any],
+    expected_kind: int,
+) -> dict[str, Any]:
+    require(len(payload) >= CATALOG_SNAPSHOT_HEADER_SIZE, "catalog payload is shorter than its header")
+    require(payload[0x00:0x08] == CATALOG_MAGIC, "invalid catalog magic")
+    require(u16(payload, 0x08) == CATALOG_VERSION, "invalid catalog version")
+    require(u16(payload, 0x0A) == expected_kind, "catalog payload has the wrong kind")
+    header_size = CATALOG_SNAPSHOT_HEADER_SIZE if expected_kind == CATALOG_SNAPSHOT else CATALOG_DELTA_HEADER_SIZE
+    require(u32(payload, 0x0C) == header_size, "invalid catalog header length")
+    catalog_generation = u64(payload, 0x10)
+    entry_count = u32(payload, 0x18)
+    require(
+        catalog_generation == extent["binding"]["target_checkpoint_generation"],
+        "catalog generation differs from its extent target",
+    )
+    require(u32(payload, 0x1C) == CATALOG_ENTRY_SIZE, "invalid catalog entry size")
+    chain_count = u64(payload, 0x20)
+    require(entry_count > 0, "catalog payload must contain at least one entry")
+    if expected_kind == CATALOG_SNAPSHOT:
+        require_zero(payload, 0x28, 0x40, "catalog snapshot reserved bytes")
+        previous = {"status": "null"}
+        require(chain_count == entry_count, "catalog snapshot chain count is inconsistent")
+    else:
+        require(entry_count == 1, "catalog delta must contain exactly one entry")
+        require(len(payload) >= CATALOG_DELTA_HEADER_SIZE, "catalog delta header is truncated")
+        previous = parse_pointer(payload[0x28:0x88])
+        require_zero(payload, 0x88, 0xA0, "catalog delta reserved bytes")
+        require(chain_count > 0, "catalog delta chain count must be non-zero")
+        require(
+            (chain_count == 1) == (previous["status"] == "null"),
+            "catalog delta chain count and previous pointer disagree",
+        )
+        if previous["status"] == "value":
+            require(previous["extent_kind"] == 5, "catalog delta previous pointer has the wrong kind")
+            require(
+                previous["store_uuid"] == extent["binding"]["store_uuid"],
+                "catalog delta previous pointer UUID mismatch",
+            )
+            require(
+                previous["exact_byte_len"] == CATALOG_DELTA_HEADER_SIZE + CATALOG_ENTRY_SIZE,
+                "catalog delta previous pointer has the wrong length",
+            )
+    expected_len = header_size + entry_count * CATALOG_ENTRY_SIZE
+    require(len(payload) == expected_len, "catalog payload has a non-canonical length")
+    entries = [
+        parse_catalog_entry(
+            payload,
+            header_size + index * CATALOG_ENTRY_SIZE,
+            catalog_generation,
+            expected_kind,
+            extent["binding"]["store_uuid"],
+        )
+        for index in range(entry_count)
+    ]
+    if expected_kind == CATALOG_SNAPSHOT:
+        object_ids = [int.from_bytes(entry["object_id"], "little") for entry in entries]
+        require(
+            all(left < right for left, right in zip(object_ids, object_ids[1:])),
+            "catalog snapshot object IDs are not strictly increasing",
+        )
+    return {
+        "kind": "snapshot" if expected_kind == CATALOG_SNAPSHOT else "delta",
+        "checkpoint_generation": catalog_generation,
+        "entry_count": entry_count,
+        "chain_count": chain_count,
+        "previous": previous,
+        "entries": entries,
+    }
+
+
+def parse_allocation_payload(payload: bytes, extent: dict[str, Any]) -> dict[str, Any]:
+    require(len(payload) == ALLOCATION_PAYLOAD_SIZE, "allocation payload has a non-canonical length")
+    require(payload[0x00:0x08] == ALLOCATION_MAGIC, "invalid allocation magic")
+    require(u16(payload, 0x08) == 1, "invalid allocation version")
+    require(u16(payload, 0x0A) == ALLOCATION_PAYLOAD_SIZE, "invalid allocation header length")
+    require(u32(payload, 0x0C) == 0, "allocation flags must be zero")
+    checkpoint_generation = u64(payload, 0x10)
+    require(
+        checkpoint_generation == extent["binding"]["target_checkpoint_generation"],
+        "allocation generation differs from its extent target",
+    )
+    require_zero(payload, 0x34, 0x40, "allocation reserved bytes")
+    return {
+        "checkpoint_generation": checkpoint_generation,
+        "admitted_segments": u64(payload, 0x18),
+        "allocated_prefix_segments": u64(payload, 0x20),
+        "next_segment_generation": u64(payload, 0x28),
+        "cleaner_reserve_segments": u32(payload, 0x30),
+    }
+
+
 def verify_checkpoint_pointers(
     checkpoint: dict[str, Any],
     segments: list[dict[str, Any]],
     errors: list[str],
 ) -> None:
     record = checkpoint["record"]
-    checkpoint_generation = record["binding"]["generation"]
-    store_uuid = record["binding"]["store_uuid"]
-    segment_by_no = {segment["segment_no"]: segment for segment in segments}
     pointers = [(name, record[name]) for name in EXPECTED_POINTER_KINDS]
     for name, pointer in pointers:
-        if pointer["status"] == "null":
-            continue
-        prefix = f"checkpoint generation {checkpoint_generation} {name}"
-        if pointer["store_uuid"] != store_uuid:
-            errors.append(f"{prefix}: pointer UUID mismatch")
-            continue
-        if pointer["segment_no"] >= record["admitted_segments"]:
-            errors.append(f"{prefix}: pointer references an unadmitted segment")
-            continue
-        segment = segment_by_no.get(pointer["segment_no"])
-        if segment is None or segment.get("status") != "sealed":
-            errors.append(f"{prefix}: pointer does not reference a sealed segment")
-            continue
-        if segment.get("_generation") != pointer["segment_generation"]:
-            errors.append(f"{prefix}: segment generation mismatch")
-            continue
-        extent = segment.get("_extent_lookup", {}).get(
-            (pointer["descriptor_relative_page"], pointer["ordinal"])
-        )
-        if extent is None:
-            errors.append(f"{prefix}: descriptor was not found")
-            continue
-        if extent["binding"]["target_checkpoint_generation"] > checkpoint_generation:
-            errors.append(f"{prefix}: extent targets a newer checkpoint")
-        expected = (
-            extent["extent_kind"],
-            extent["payload_pages"],
-            extent["payload_byte_len"],
-            extent["payload_sha256"],
-        )
-        observed = (
-            pointer["extent_kind"],
-            pointer["payload_pages"],
-            pointer["exact_byte_len"],
-            pointer["payload_sha256"],
-        )
-        if observed != expected:
-            errors.append(f"{prefix}: pointer and extent descriptor disagree")
+        resolve_extent_pointer(checkpoint, name, pointer, segments, errors)
     for left_index, (left_name, left) in enumerate(pointers):
         for right_name, right in pointers[left_index + 1 :]:
             if ranges_overlap(left, right):
                 errors.append(
-                    f"checkpoint generation {checkpoint_generation} pointers "
+                    f"checkpoint generation {record['binding']['generation']} pointers "
                     f"{left_name} and {right_name} overlap"
                 )
 
@@ -1144,6 +1367,280 @@ def verify_checkpoint_against_superblock(
     if record["admitted_segments"] > physical_segments:
         errors.append(f"{prefix}: admits segments beyond the image")
     verify_checkpoint_pointers(checkpoint, segments, errors)
+
+
+def verify_store_checkpoint(
+    image: bytes | bytearray | mmap.mmap | memoryview,
+    checkpoint: Optional[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    errors: list[str],
+) -> dict[str, Any]:
+    """Reconstruct the committed object set from roots, never from Blob scans."""
+
+    if checkpoint is None:
+        return {
+            "status": "unavailable",
+            "object_count": 0,
+            "objects": [],
+            "orphan_extents": [],
+        }
+
+    error_count = len(errors)
+    cp = checkpoint["record"]
+    cp_generation = cp["binding"]["generation"]
+    reachable: set[tuple[int, int, int, int]] = set()
+
+    def resolve(name: str, pointer: dict[str, Any], expected_extent_kind: int) -> Optional[dict[str, Any]]:
+        if pointer["status"] == "null":
+            return None
+        reachable.add(pointer_identity(pointer))
+        extent = resolve_extent_pointer(checkpoint, name, pointer, segments, errors)
+        if extent is not None and extent["extent_kind"] != expected_extent_kind:
+            errors.append(
+                f"checkpoint generation {cp_generation} {name}: "
+                "resolved descriptor has the wrong extent kind"
+            )
+            return None
+        return extent
+
+    catalog_entries: list[dict[str, Any]] = []
+    catalog_root = cp["catalog_root"]
+    if catalog_root["status"] == "value":
+        extent = resolve("catalog_root", catalog_root, 2)
+        if extent is not None:
+            try:
+                require_single_extent_payload(extent, "catalog snapshot")
+                snapshot = parse_catalog_payload(
+                    read_exact_extent_payload(image, extent),
+                    extent,
+                    CATALOG_SNAPSHOT,
+                )
+                require(
+                    snapshot["checkpoint_generation"] <= cp_generation,
+                    "catalog snapshot targets a newer checkpoint",
+                )
+                catalog_entries.extend(snapshot["entries"])
+            except FormatViolation as exc:
+                errors.append(f"checkpoint generation {cp_generation} catalog_root payload: {exc}")
+
+    replay_nodes: list[dict[str, Any]] = []
+    replay_pointer = cp["replay_tail"]
+    expected_chain_count = cp["replay_count"]
+    seen_replay: set[tuple[int, int, int, int]] = set()
+    while expected_chain_count > 0:
+        if replay_pointer["status"] != "value":
+            errors.append(
+                f"checkpoint generation {cp_generation} replay chain ended before "
+                f"{cp['replay_count']} records"
+            )
+            break
+        identity = pointer_identity(replay_pointer)
+        if identity in seen_replay:
+            errors.append(f"checkpoint generation {cp_generation} replay chain contains a cycle")
+            break
+        seen_replay.add(identity)
+        extent = resolve(f"replay[{expected_chain_count}]", replay_pointer, 5)
+        if extent is None:
+            break
+        try:
+            require_single_extent_payload(extent, "catalog delta")
+            delta = parse_catalog_payload(
+                read_exact_extent_payload(image, extent),
+                extent,
+                CATALOG_DELTA,
+            )
+            require(
+                delta["checkpoint_generation"] <= cp_generation,
+                "catalog delta targets a newer checkpoint",
+            )
+            require(
+                delta["chain_count"] == expected_chain_count,
+                "catalog delta chain count does not match checkpoint replay count",
+            )
+        except FormatViolation as exc:
+            errors.append(
+                f"checkpoint generation {cp_generation} replay[{expected_chain_count}] payload: {exc}"
+            )
+            break
+        replay_nodes.append(delta)
+        replay_pointer = delta["previous"]
+        expected_chain_count -= 1
+    if expected_chain_count == 0 and replay_pointer["status"] != "null":
+        errors.append(f"checkpoint generation {cp_generation} replay chain exceeds replay_count")
+    for delta in reversed(replay_nodes):
+        catalog_entries.extend(delta["entries"])
+
+    allocation: Optional[dict[str, Any]] = None
+    allocation_pointer = cp["allocation_root"]
+    if allocation_pointer["status"] == "value":
+        extent = resolve("allocation_root", allocation_pointer, 4)
+        if extent is not None:
+            try:
+                require_single_extent_payload(extent, "allocation")
+                allocation = parse_allocation_payload(
+                    read_exact_extent_payload(image, extent),
+                    extent,
+                )
+                require(
+                    allocation["checkpoint_generation"] == cp_generation,
+                    "allocation payload is not for the selected checkpoint",
+                )
+                require(
+                    allocation["admitted_segments"] == cp["admitted_segments"],
+                    "allocation admitted segment count differs from checkpoint",
+                )
+                require(
+                    allocation["next_segment_generation"] == cp["next_segment_generation"],
+                    "allocation next generation differs from checkpoint",
+                )
+                require(
+                    allocation["cleaner_reserve_segments"] == cp["cleaner_reserve_segments"],
+                    "allocation cleaner reserve differs from checkpoint",
+                )
+                require(
+                    allocation["allocated_prefix_segments"] <= allocation["admitted_segments"],
+                    "allocation prefix exceeds admitted segments",
+                )
+                require(
+                    allocation["allocated_prefix_segments"] > 0,
+                    "allocation root declares an empty allocated prefix",
+                )
+                require(
+                    allocation_pointer["segment_no"] + 1
+                    == allocation["allocated_prefix_segments"],
+                    "allocation root is not in the final allocated segment",
+                )
+                require(
+                    allocation["allocated_prefix_segments"]
+                    + allocation["cleaner_reserve_segments"]
+                    <= allocation["admitted_segments"],
+                    "allocation prefix consumes cleaner reserve",
+                )
+            except FormatViolation as exc:
+                errors.append(f"checkpoint generation {cp_generation} allocation_root payload: {exc}")
+                allocation = None
+
+    authority = cp["authority_root"]
+    if authority["status"] == "value":
+        resolve("authority_root", authority, 3)
+
+    objects: list[dict[str, Any]] = []
+    seen_objects: set[bytes] = set()
+    previous_object_id = 0
+    for entry_index, entry in enumerate(catalog_entries):
+        object_label = entry["object_id"].hex()
+        object_id_value = int.from_bytes(entry["object_id"], "little")
+        if entry["object_id"] in seen_objects:
+            errors.append(
+                f"checkpoint generation {cp_generation} catalog entry {entry_index}: "
+                f"duplicate object ID {object_label}"
+            )
+            continue
+        if object_id_value <= previous_object_id:
+            errors.append(
+                f"checkpoint generation {cp_generation} catalog entry {entry_index}: "
+                "object IDs are not strictly increasing"
+            )
+        seen_objects.add(entry["object_id"])
+        previous_object_id = object_id_value
+        object_result = {
+            "object_id": entry["object_id"],
+            "object_kind": entry["object_kind"],
+            "exact_payload_len": entry["exact_payload_len"],
+            "commit_generation": entry["commit_generation"],
+            "content_root": entry["content_root"],
+            "blob": entry["blob"],
+        }
+        if entry["blob"]["status"] == "value":
+            blob = resolve(f"object {object_label} Blob", entry["blob"], 1)
+            if blob is not None:
+                raw_shape = (
+                    blob["object_kind"],
+                    blob["extent_index"],
+                    blob["extent_count"],
+                    blob["content_byte_len"],
+                    blob["encoded_blob_len"],
+                    blob["encoded_offset"],
+                    blob["payload_byte_len"],
+                    blob["merkle_root"],
+                    blob["payload_sha256"],
+                )
+                expected_shape = (
+                    entry["object_kind"],
+                    0,
+                    1,
+                    entry["exact_payload_len"],
+                    entry["exact_payload_len"],
+                    0,
+                    entry["exact_payload_len"],
+                    entry["content_root"],
+                    entry["content_root"],
+                )
+                if raw_shape != expected_shape:
+                    errors.append(
+                        f"checkpoint generation {cp_generation} object {object_label}: "
+                        "Blob descriptor does not encode the canonical M7.3 object"
+                    )
+                if blob["binding"]["target_checkpoint_generation"] != entry["commit_generation"]:
+                    errors.append(
+                        f"checkpoint generation {cp_generation} object {object_label}: "
+                        "Blob target differs from object commit generation"
+                    )
+                if sha256(read_exact_extent_payload(image, blob)) != entry["content_root"]:
+                    errors.append(
+                        f"checkpoint generation {cp_generation} object {object_label}: "
+                        "reconstructed payload content root mismatch"
+                    )
+        objects.append(object_result)
+
+    if catalog_entries and allocation_pointer["status"] == "null":
+        errors.append(f"checkpoint generation {cp_generation}: committed objects have no allocation root")
+    if allocation is not None:
+        allocated_prefix = allocation["allocated_prefix_segments"]
+        for identity in sorted(reachable):
+            if identity[0] >= allocated_prefix:
+                errors.append(
+                    f"checkpoint generation {cp_generation}: reachable extent in segment "
+                    f"{identity[0]} lies outside allocated prefix {allocated_prefix}"
+                )
+
+    orphan_extents: list[dict[str, Any]] = []
+    for segment in segments:
+        if segment.get("status") != "sealed":
+            continue
+        for extent_entry in segment["extents"]:
+            if extent_entry.get("status") != "sealed":
+                continue
+            extent = extent_entry["record"]
+            relative_page = extent["binding"]["self_page"] - segment["base_page"]
+            identity = (
+                segment["segment_no"],
+                segment["_generation"],
+                relative_page,
+                extent["binding"]["ordinal"],
+            )
+            if identity not in reachable:
+                orphan_extents.append(
+                    {
+                        "segment_no": segment["segment_no"],
+                        "segment_generation": segment["_generation"],
+                        "descriptor_relative_page": relative_page,
+                        "ordinal": extent["binding"]["ordinal"],
+                        "extent_kind": EXTENT_KINDS[extent["extent_kind"]],
+                        "exact_byte_len": extent["payload_byte_len"],
+                        "payload_sha256": extent["payload_sha256"],
+                        "within_admitted_range": segment["segment_no"] < cp["admitted_segments"],
+                    }
+                )
+
+    return {
+        "status": "verified" if len(errors) == error_count else "corrupt",
+        "checkpoint_generation": cp_generation,
+        "object_count": len(objects),
+        "objects": objects,
+        "allocation": allocation,
+        "orphan_extents": orphan_extents,
+    }
 
 
 def public_value(value: Any) -> Any:
@@ -1202,15 +1699,16 @@ def parse_image(image: bytes | bytearray | mmap.mmap | memoryview) -> dict[str, 
                 errors,
             )
 
-    if selected_checkpoint is not None:
-        checkpoint_record = selected_checkpoint["record"]
-        sealed_generations = [
-            segment.get("_generation")
-            for segment in segments[: checkpoint_record["admitted_segments"]]
-            if segment.get("status") == "sealed"
-        ]
-        if sealed_generations and checkpoint_record["next_segment_generation"] <= max(sealed_generations):
-            errors.append("checkpoint next segment generation is not newer than sealed segments")
+    selected_store: Optional[dict[str, Any]] = None
+    for checkpoint in sealed_checkpoints:
+        verified_store = verify_store_checkpoint(image, checkpoint, segments, errors)
+        if checkpoint is selected_checkpoint:
+            selected_store = verified_store
+    store = (
+        selected_store
+        if selected_store is not None
+        else verify_store_checkpoint(image, None, segments, errors)
+    )
 
     any_unsealed = any(
         entry["status"] == "unsealed" for entry in superblocks + checkpoints
@@ -1227,6 +1725,7 @@ def parse_image(image: bytes | bytearray | mmap.mmap | memoryview) -> dict[str, 
         errors.append("non-empty image has no sealed superblock")
     if errors:
         status = "corrupt"
+        store["status"] = "corrupt"
     elif not any_metadata:
         status = "empty"
     elif selected_super is not None and selected_checkpoint is None:
@@ -1263,6 +1762,7 @@ def parse_image(image: bytes | bytearray | mmap.mmap | memoryview) -> dict[str, 
                 "generation": selected_checkpoint["record"]["binding"]["generation"],
             }
         ),
+        "store": store,
         "segments": segments,
         "errors": sorted(set(errors)),
     }
@@ -1365,19 +1865,27 @@ def make_pointer_bytes(pointer: Optional[dict[str, Any]]) -> bytes:
 
 def selftest_image(
     *,
+    segment_count: int = 2,
+    data_segment_no: int = 0,
     segment_generation: int = 1,
+    target_checkpoint: int = 1,
     previous_segment_no: int = ANCHOR_SEGMENT_NO,
     previous_segment_generation: int = 0,
     previous_segment_seal_body_sha256: bytes = bytes(32),
+    catalog_mode: str = "snapshot",
+    blob_pointer_segment_no: Optional[int] = None,
+    catalog_chain_count: int = 1,
+    allocated_prefix_segments: int = 1,
+    catalog_magic: bytes = CATALOG_MAGIC,
 ) -> bytearray:
-    # One used segment plus the mandatory cleaner reserve.
-    segment_count = 2
+    # The fixture always leaves at least the mandatory cleaner reserve.
+    require(segment_count >= 2, "selftest image needs a usable segment and cleaner reserve")
+    require(0 <= data_segment_no < segment_count, "selftest data segment is out of range")
     total_pages = admitted_pages(segment_count)
     image = bytearray(total_pages * PAGE_SIZE)
     store_uuid = bytes(range(1, 17))
     device_id = bytes(range(0x21, 0x31))
-    base = segment_base_page(0)
-    target_checkpoint = 1
+    base = segment_base_page(data_segment_no)
 
     for copy, page_no in ((0, 0), (1, 2)):
         payload = bytearray(0x80)
@@ -1428,68 +1936,170 @@ def selftest_image(
     header_binding = {
         "store_uuid": store_uuid,
         "generation": segment_generation,
-        "segment_no": 0,
+        "segment_no": data_segment_no,
         "ordinal": 0,
         "self_page": base,
         "target_checkpoint_generation": target_checkpoint,
     }
     header_digest = write_pair(image, base, 3, header_binding, bytes(header_payload))
 
-    payload_bytes = b"storage-v2-independent-parser-selftest"
-    payload_sha = sha256(payload_bytes)
-    payload_page = bytearray(PAGE_SIZE)
-    payload_page[: len(payload_bytes)] = payload_bytes
-    write_page(image, base + 4, bytes(payload_page))
-    extent_payload = bytearray(0x80)
-    put_u16(extent_payload, 0x00, 2)  # catalog
-    put_u16(extent_payload, 0x02, HASH_ALGORITHM_SHA256)
-    put_u32(extent_payload, 0x08, 1)
-    put_u32(extent_payload, 0x0C, 0)
-    put_u32(extent_payload, 0x10, 1)
-    put_u32(extent_payload, 0x14, 1)
-    put_u64(extent_payload, 0x18, len(payload_bytes))
-    put_u64(extent_payload, 0x20, len(payload_bytes))
-    put_u64(extent_payload, 0x28, 0)
-    put_u64(extent_payload, 0x30, len(payload_bytes))
-    put_u32(extent_payload, 0x38, 4)
-    put_u32(extent_payload, 0x3C, 3)
-    extent_payload[0x40:0x60] = payload_sha
-    extent_payload[0x60:0x80] = payload_sha
-    extent_binding = {
-        "store_uuid": store_uuid,
-        "generation": segment_generation,
-        "segment_no": 0,
-        "ordinal": 1,
-        "self_page": base + 2,
-        "target_checkpoint_generation": target_checkpoint,
-    }
-    extent_digest = write_pair(image, base + 2, 4, extent_binding, bytes(extent_payload))
+    descriptor_chain = chain_initial(
+        DESCRIPTOR_CHAIN_DOMAIN, store_uuid, data_segment_no, segment_generation
+    )
+    payload_chain = chain_initial(
+        DATA_CHAIN_DOMAIN, store_uuid, data_segment_no, segment_generation
+    )
+    relative_page = DATA_FIRST_PAGE
+    ordinal = 1
+    payload_page_count = 0
+    total_payload_bytes = 0
+    kind_counts = [0, 0, 0, 0, 0]
+    kind_bytes = [0, 0, 0, 0, 0]
 
-    descriptor_chain = chain_initial(DESCRIPTOR_CHAIN_DOMAIN, store_uuid, 0, segment_generation)
-    descriptor_chain = descriptor_chain_update(
-        descriptor_chain, store_uuid, 0, segment_generation, 1, extent_digest["body_sha256"], payload_sha
+    def append_extent(extent_kind: int, object_kind: int, payload_bytes: bytes) -> dict[str, Any]:
+        nonlocal descriptor_chain, payload_chain, relative_page, ordinal
+        nonlocal payload_page_count, total_payload_bytes
+        payload_sha = sha256(payload_bytes)
+        pages = ceil_pages(len(payload_bytes))
+        for page_index in range(pages):
+            payload_page = bytearray(PAGE_SIZE)
+            chunk = payload_bytes[page_index * PAGE_SIZE : (page_index + 1) * PAGE_SIZE]
+            payload_page[: len(chunk)] = chunk
+            write_page(image, base + relative_page + 2 + page_index, bytes(payload_page))
+        extent_payload = bytearray(0x80)
+        put_u16(extent_payload, 0x00, extent_kind)
+        put_u16(extent_payload, 0x02, HASH_ALGORITHM_SHA256)
+        put_u32(extent_payload, 0x08, object_kind)
+        put_u32(extent_payload, 0x0C, 0)
+        put_u32(extent_payload, 0x10, 1)
+        put_u32(extent_payload, 0x14, pages)
+        put_u64(extent_payload, 0x18, len(payload_bytes))
+        put_u64(extent_payload, 0x20, len(payload_bytes))
+        put_u64(extent_payload, 0x28, 0)
+        put_u64(extent_payload, 0x30, len(payload_bytes))
+        put_u32(extent_payload, 0x38, relative_page + 2)
+        put_u32(extent_payload, 0x3C, 2 + pages)
+        extent_payload[0x40:0x60] = payload_sha
+        extent_payload[0x60:0x80] = payload_sha
+        binding = {
+            "store_uuid": store_uuid,
+            "generation": segment_generation,
+            "segment_no": data_segment_no,
+            "ordinal": ordinal,
+            "self_page": base + relative_page,
+            "target_checkpoint_generation": target_checkpoint,
+        }
+        digest = write_pair(image, base + relative_page, 4, binding, bytes(extent_payload))
+        descriptor_chain = descriptor_chain_update(
+            descriptor_chain,
+            store_uuid,
+            data_segment_no,
+            segment_generation,
+            ordinal,
+            digest["body_sha256"],
+            payload_sha,
+        )
+        payload_chain = data_chain_update(
+            payload_chain,
+            store_uuid,
+            data_segment_no,
+            segment_generation,
+            ordinal,
+            len(payload_bytes),
+            payload_sha,
+        )
+        pointer = {
+            "store_uuid": store_uuid,
+            "segment_no": data_segment_no,
+            "segment_generation": segment_generation,
+            "descriptor_relative_page": relative_page,
+            "payload_relative_page": relative_page + 2,
+            "payload_pages": pages,
+            "ordinal": ordinal,
+            "exact_byte_len": len(payload_bytes),
+            "extent_kind": extent_kind,
+            "payload_sha256": payload_sha,
+        }
+        kind_counts[extent_kind - 1] += 1
+        kind_bytes[extent_kind - 1] += len(payload_bytes)
+        payload_page_count += pages
+        total_payload_bytes += len(payload_bytes)
+        relative_page += 2 + pages
+        ordinal += 1
+        return pointer
+
+    object_payload = b"storage-v2-independent-parser-selftest"
+    object_root = sha256(object_payload)
+    blob_pointer = append_extent(1, 1, object_payload)
+    catalog_blob_pointer = dict(blob_pointer)
+    catalog_blob_pointer["segment_no"] = (
+        data_segment_no if blob_pointer_segment_no is None else blob_pointer_segment_no
     )
-    payload_chain = chain_initial(DATA_CHAIN_DOMAIN, store_uuid, 0, segment_generation)
-    payload_chain = data_chain_update(
-        payload_chain, store_uuid, 0, segment_generation, 1, len(payload_bytes), payload_sha
-    )
+    catalog_entry = bytearray(CATALOG_ENTRY_SIZE)
+    catalog_entry[0x00:0x10] = bytes(range(0x41, 0x51))
+    put_u32(catalog_entry, 0x10, 1)
+    put_u64(catalog_entry, 0x18, len(object_payload))
+    put_u64(catalog_entry, 0x20, target_checkpoint)
+    catalog_entry[0x28:0x48] = object_root
+    catalog_entry[0x48:0xA8] = make_pointer_bytes(catalog_blob_pointer)
+
+    require(catalog_mode in ("snapshot", "delta"), "invalid selftest catalog mode")
+    require(len(catalog_magic) == 8, "selftest catalog magic must be eight bytes")
+    if catalog_mode == "snapshot":
+        catalog_payload = bytearray(CATALOG_SNAPSHOT_HEADER_SIZE + CATALOG_ENTRY_SIZE)
+        catalog_payload[0x00:0x08] = catalog_magic
+        put_u16(catalog_payload, 0x08, CATALOG_VERSION)
+        put_u16(catalog_payload, 0x0A, CATALOG_SNAPSHOT)
+        put_u32(catalog_payload, 0x0C, CATALOG_SNAPSHOT_HEADER_SIZE)
+        put_u64(catalog_payload, 0x10, target_checkpoint)
+        put_u32(catalog_payload, 0x18, 1)
+        put_u32(catalog_payload, 0x1C, CATALOG_ENTRY_SIZE)
+        put_u64(catalog_payload, 0x20, catalog_chain_count)
+        catalog_payload[CATALOG_SNAPSHOT_HEADER_SIZE:] = catalog_entry
+        catalog_pointer = append_extent(2, 2, bytes(catalog_payload))
+    else:
+        catalog_payload = bytearray(CATALOG_DELTA_HEADER_SIZE + CATALOG_ENTRY_SIZE)
+        catalog_payload[0x00:0x08] = catalog_magic
+        put_u16(catalog_payload, 0x08, CATALOG_VERSION)
+        put_u16(catalog_payload, 0x0A, CATALOG_DELTA)
+        put_u32(catalog_payload, 0x0C, CATALOG_DELTA_HEADER_SIZE)
+        put_u64(catalog_payload, 0x10, target_checkpoint)
+        put_u32(catalog_payload, 0x18, 1)
+        put_u32(catalog_payload, 0x1C, CATALOG_ENTRY_SIZE)
+        put_u64(catalog_payload, 0x20, catalog_chain_count)
+        catalog_payload[CATALOG_DELTA_HEADER_SIZE:] = catalog_entry
+        catalog_pointer = append_extent(5, 5, bytes(catalog_payload))
+
+    allocation_payload = bytearray(ALLOCATION_PAYLOAD_SIZE)
+    allocation_payload[0x00:0x08] = ALLOCATION_MAGIC
+    put_u16(allocation_payload, 0x08, 1)
+    put_u16(allocation_payload, 0x0A, ALLOCATION_PAYLOAD_SIZE)
+    put_u64(allocation_payload, 0x10, target_checkpoint)
+    put_u64(allocation_payload, 0x18, segment_count)
+    put_u64(allocation_payload, 0x20, allocated_prefix_segments)
+    put_u64(allocation_payload, 0x28, segment_generation + 1)
+    put_u32(allocation_payload, 0x30, 1)
+    allocation_pointer = append_extent(4, 4, bytes(allocation_payload))
+
     summary_payload = bytearray(0xC8)
-    put_u32(summary_payload, 0x00, 1)
-    put_u32(summary_payload, 0x04, 5)
-    put_u32(summary_payload, 0x08, 1)
-    put_u64(summary_payload, 0x10, len(payload_bytes))
+    put_u32(summary_payload, 0x00, ordinal - 1)
+    put_u32(summary_payload, 0x04, relative_page)
+    put_u32(summary_payload, 0x08, payload_page_count)
+    put_u64(summary_payload, 0x10, total_payload_bytes)
     put_u64(summary_payload, 0x18, target_checkpoint)
     put_u64(summary_payload, 0x20, target_checkpoint)
     summary_payload[0x28:0x48] = header_digest["body_sha256"]
     summary_payload[0x48:0x68] = descriptor_chain
     summary_payload[0x68:0x88] = payload_chain
-    put_u32(summary_payload, 0x8C, 1)  # catalog count
-    put_u64(summary_payload, 0xA8, len(payload_bytes))  # catalog bytes
+    for kind_index, count in enumerate(kind_counts):
+        put_u32(summary_payload, 0x88 + kind_index * 4, count)
+    for kind_index, byte_count in enumerate(kind_bytes):
+        put_u64(summary_payload, 0xA0 + kind_index * 8, byte_count)
     summary_binding = {
         "store_uuid": store_uuid,
         "generation": segment_generation,
-        "segment_no": 0,
-        "ordinal": 2,
+        "segment_no": data_segment_no,
+        "ordinal": ordinal,
         "self_page": base + SUMMARY_BODY_PAGE,
         "target_checkpoint_generation": target_checkpoint,
     }
@@ -1502,43 +2112,35 @@ def selftest_image(
     final_payload[0x20:0x40] = summary_digest["body_sha256"]
     final_payload[0x40:0x60] = descriptor_chain
     final_payload[0x60:0x80] = payload_chain
-    put_u32(final_payload, 0x80, 1)
-    put_u32(final_payload, 0x84, 5)
-    put_u32(final_payload, 0x88, 1)
-    put_u64(final_payload, 0x90, len(payload_bytes))
+    put_u32(final_payload, 0x80, ordinal - 1)
+    put_u32(final_payload, 0x84, relative_page)
+    put_u32(final_payload, 0x88, payload_page_count)
+    put_u64(final_payload, 0x90, total_payload_bytes)
     put_u64(final_payload, 0x98, target_checkpoint)
     final_binding = {
         "store_uuid": store_uuid,
         "generation": segment_generation,
-        "segment_no": 0,
-        "ordinal": 3,
+        "segment_no": data_segment_no,
+        "ordinal": ordinal + 1,
         "self_page": base + SEGMENT_SEAL_BODY_PAGE,
         "target_checkpoint_generation": target_checkpoint,
     }
     write_pair(image, base + SEGMENT_SEAL_BODY_PAGE, 6, final_binding, bytes(final_payload))
 
-    pointer = {
-        "store_uuid": store_uuid,
-        "segment_no": 0,
-        "segment_generation": segment_generation,
-        "descriptor_relative_page": 2,
-        "payload_relative_page": 4,
-        "payload_pages": 1,
-        "ordinal": 1,
-        "exact_byte_len": len(payload_bytes),
-        "extent_kind": 2,
-        "payload_sha256": payload_sha,
-    }
     checkpoint_payload = bytearray(0x1C0)
     checkpoint_payload[0] = 0
     put_u64(checkpoint_payload, 0x08, 0)
     put_u64(checkpoint_payload, 0x10, total_pages)
     put_u64(checkpoint_payload, 0x18, segment_count)
     put_u64(checkpoint_payload, 0x20, segment_generation + 1)
-    put_u32(checkpoint_payload, 0x28, 0)
+    put_u32(checkpoint_payload, 0x28, 0 if catalog_mode == "snapshot" else 1)
     put_u32(checkpoint_payload, 0x2C, 64)
     put_u32(checkpoint_payload, 0x30, 1)
-    checkpoint_payload[0x40:0xA0] = make_pointer_bytes(pointer)
+    if catalog_mode == "snapshot":
+        checkpoint_payload[0x40:0xA0] = make_pointer_bytes(catalog_pointer)
+    else:
+        checkpoint_payload[0x160:0x1C0] = make_pointer_bytes(catalog_pointer)
+    checkpoint_payload[0x100:0x160] = make_pointer_bytes(allocation_pointer)
     checkpoint_binding = {
         "store_uuid": store_uuid,
         "generation": 1,
@@ -1597,7 +2199,134 @@ def run_selftest() -> dict[str, Any]:
     require(valid["status"] == "ok", f"valid image rejected: {valid['errors']}")
     require(valid["selected_checkpoint"] == {"slot": 0, "generation": 1}, "checkpoint selection failed")
     require(valid["segments"][0]["status"] == "sealed", "sealed segment was not accepted")
+    require(valid["store"]["status"] == "verified", "store roots were not verified")
+    require(valid["store"]["object_count"] == 1, "catalog object was not reconstructed")
+    require(not valid["store"]["orphan_extents"], "reachable extents were reported as orphans")
     tests.append("valid")
+
+    committed_with_room = selftest_image(segment_count=3)
+    predecessor_body = page_at(
+        committed_with_room,
+        segment_base_page(0) + SEGMENT_SEAL_BODY_PAGE,
+    )
+    require(predecessor_body is not None, "selftest predecessor body is outside image")
+    orphan_source = selftest_image(
+        segment_count=3,
+        data_segment_no=1,
+        segment_generation=2,
+        target_checkpoint=2,
+        previous_segment_no=0,
+        previous_segment_generation=1,
+        previous_segment_seal_body_sha256=sha256(predecessor_body),
+        allocated_prefix_segments=2,
+    )
+    orphan_start = segment_base_page(1) * PAGE_SIZE
+    orphan_end = orphan_start + SEGMENT_PAGES * PAGE_SIZE
+    committed_with_room[orphan_start:orphan_end] = orphan_source[orphan_start:orphan_end]
+    sealed_orphan = parse_image(committed_with_room)
+    require(
+        sealed_orphan["status"] == "ok",
+        f"fully sealed crash orphan rejected: {sealed_orphan['errors']}",
+    )
+    require(
+        sealed_orphan["selected_checkpoint"] == {"slot": 0, "generation": 1},
+        "sealed orphan advanced the checkpoint",
+    )
+    require(sealed_orphan["store"]["object_count"] == 1, "sealed orphan published its object")
+    require(
+        len(sealed_orphan["store"]["orphan_extents"]) == 3,
+        "sealed orphan extents were not reported",
+    )
+    tests.append("sealed_orphan_may_use_next_generation")
+
+    reachable_at_next_generation = bytearray(image)
+
+    def roll_back_next_generation(payload: bytearray) -> None:
+        put_u64(payload, 0x20, 1)
+
+    rewrite_selftest_pair(
+        reachable_at_next_generation,
+        4,
+        2,
+        roll_back_next_generation,
+    )
+    reachable_at_next_result = parse_image(reachable_at_next_generation)
+    require(
+        reachable_at_next_result["status"] == "corrupt",
+        "reachable segment at next generation was accepted",
+    )
+    require(
+        any("pointer segment generation is not committed" in error
+            for error in reachable_at_next_result["errors"]),
+        "reachable next-generation pointer was not diagnosed",
+    )
+    tests.append("next_generation_applies_only_to_reachable_extents")
+
+    delta_result = parse_image(selftest_image(catalog_mode="delta"))
+    require(delta_result["status"] == "ok", f"valid delta rejected: {delta_result['errors']}")
+    require(delta_result["store"]["object_count"] == 1, "delta replay did not reconstruct object")
+    tests.append("catalog_delta_replay")
+
+    bad_delta_count = parse_image(selftest_image(catalog_mode="delta", catalog_chain_count=2))
+    require(bad_delta_count["status"] == "corrupt", "wrong delta chain count was accepted")
+    require(
+        any("chain count and previous pointer disagree" in error for error in bad_delta_count["errors"]),
+        "wrong delta chain count was not diagnosed",
+    )
+    tests.append("catalog_delta_bound")
+
+    old_malformed = selftest_image(catalog_magic=b"BADCAT!!")
+    publish_selftest_checkpoint(old_malformed, 2)
+
+    def make_new_checkpoint_empty(payload: bytearray) -> None:
+        put_u32(payload, 0x28, 0)
+        payload[0x40:0x1C0] = bytes(0x180)
+
+    rewrite_selftest_pair(old_malformed, 6, 2, make_new_checkpoint_empty)
+    old_malformed_result = parse_image(old_malformed)
+    require(
+        old_malformed_result["selected_checkpoint"] == {"slot": 1, "generation": 2},
+        "new structurally valid checkpoint was not selected",
+    )
+    require(old_malformed_result["status"] == "corrupt", "malformed old sealed metadata was ignored")
+    require(old_malformed_result["store"]["status"] == "corrupt", "store status did not fail closed")
+    require(
+        any("checkpoint generation 1 catalog_root payload: invalid catalog magic" in error
+            for error in old_malformed_result["errors"]),
+        "malformed old sealed metadata was not diagnosed",
+    )
+    tests.append("every_sealed_checkpoint_metadata")
+
+    outside_blob = parse_image(selftest_image(blob_pointer_segment_no=2))
+    require(outside_blob["status"] == "corrupt", "out-of-range committed Blob was accepted")
+    require(
+        any("pointer references an unadmitted segment" in error for error in outside_blob["errors"]),
+        "out-of-range committed Blob was not diagnosed",
+    )
+    tests.append("committed_blob_range")
+
+    outside_prefix = parse_image(selftest_image(allocated_prefix_segments=0))
+    require(outside_prefix["status"] == "corrupt", "reachable extent outside allocation was accepted")
+    require(
+        any("empty allocated prefix" in error for error in outside_prefix["errors"]),
+        "allocation prefix escape was not diagnosed",
+    )
+    tests.append("allocation_prefix")
+
+    orphan = bytearray(image)
+
+    def drop_catalog_root(payload: bytearray) -> None:
+        payload[0x40:0xA0] = bytes(POINTER_SIZE)
+
+    rewrite_selftest_pair(orphan, 4, 2, drop_catalog_root)
+    orphan_result = parse_image(orphan)
+    require(orphan_result["status"] == "ok", f"orphan tail was rejected: {orphan_result['errors']}")
+    require(orphan_result["store"]["object_count"] == 0, "orphan Blob became a committed object")
+    require(
+        any(item["extent_kind"] == "blob" for item in orphan_result["store"]["orphan_extents"]),
+        "orphan Blob was not reported",
+    )
+    tests.append("catalog_only_discovery_and_orphans")
 
     pair_errors: list[str] = []
     empty_pair = decode_pair(bytes(PAGE_SIZE * 2), 0, 1, 1, "empty", pair_errors)
@@ -1771,6 +2500,31 @@ def run_selftest() -> dict[str, Any]:
         "invalid predecessor generation was not diagnosed",
     )
 
+    # A crash orphan may consume physical segment zero before any segment is
+    # finalized.  The first finalized chain member is therefore allowed to
+    # start at any admitted physical segment, while the anchor predecessor
+    # fields must still appear as one exact all-or-nothing tuple.
+    first_nonzero_segment = 1
+    first_nonzero_base = segment_base_page(first_nonzero_segment)
+    first_nonzero_binding = {
+        "store_uuid": bytes(range(1, 17)),
+        "generation": 1,
+        "segment_no": first_nonzero_segment,
+        "ordinal": 0,
+        "self_page": first_nonzero_base,
+        "target_checkpoint_generation": 1,
+    }
+    first_nonzero_record = {
+        "base_page": first_nonzero_base,
+        "previous_segment_no": ANCHOR_SEGMENT_NO,
+        "previous_segment_generation": 0,
+        "previous_segment_seal_body_sha256": bytes(32),
+    }
+    segment_header_validator(first_nonzero_segment, first_nonzero_base)(
+        first_nonzero_record,
+        {"binding": first_nonzero_binding},
+    )
+
     reused = selftest_image(
         segment_generation=2,
         previous_segment_no=1,
@@ -1782,7 +2536,7 @@ def run_selftest() -> dict[str, Any]:
         reused_result["status"] == "ok" and not reused_result["errors"],
         f"reused segment zero was rejected: {reused_result['errors']}",
     )
-    tests.append("predecessor_shape_and_reused_segment")
+    tests.append("predecessor_shape_first_finalized_and_reused_segment")
 
     overflowing_range = bytearray(image)
 

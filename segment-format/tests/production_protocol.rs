@@ -157,6 +157,22 @@ fn extent_validation_is_checked_and_allows_empty_logical_content() {
 }
 
 #[test]
+fn first_finalized_chain_member_may_follow_a_quarantined_physical_prefix() {
+    let mut first = segment_header(3, 1);
+    first.previous_segment_no = vibeos_segment_format::ANCHOR_SEGMENT_NO;
+    first.previous_segment_generation = 0;
+    first.previous_segment_seal_body_sha256 = [0; 32];
+    let mut page = [0; 4096];
+    encode_segment_header_body(&first, &mut page).unwrap();
+
+    first.previous_segment_generation = 1;
+    assert_eq!(
+        encode_segment_header_body(&first, &mut page),
+        Err(FormatError::InvalidBinding)
+    );
+}
+
+#[test]
 fn physical_pointer_codec_rejects_noncanonical_length_and_reserved_data() {
     let pointer = production_common::pointer(ExtentKind::Blob, 0, 41, 2, 2, 1);
     let mut encoded = [0; POINTER_SIZE];

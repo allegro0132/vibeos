@@ -592,6 +592,50 @@ fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
         }
         return Ok(output);
     }
+    if args
+        .first()
+        .is_some_and(|argument| argument == "write-test")
+    {
+        const TEST_SECTOR: u64 = 4_000_000;
+        if args.get(1).map(String::as_str) != Some("CONFIRM") || args.len() != 2 {
+            return Err(Status::Usage);
+        }
+
+        let original =
+            crate::dwc2_host::read_sector(TEST_SECTOR).map_err(|_| Status::Unavailable)?;
+        let mut pattern = [0; 512];
+        let prefix = b"VIBEOS USB WRITE TEST";
+        pattern[..prefix.len()].copy_from_slice(prefix);
+        pattern[24..32].copy_from_slice(&TEST_SECTOR.to_le_bytes());
+        for (index, byte) in pattern[32..].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(0x5a);
+        }
+
+        if crate::dwc2_host::write_sector(TEST_SECTOR, &pattern).is_err() {
+            let _ = crate::dwc2_host::write_sector(TEST_SECTOR, &original);
+            return Err(Status::Unavailable);
+        }
+        let observed = match crate::dwc2_host::read_sector(TEST_SECTOR) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let _ = crate::dwc2_host::write_sector(TEST_SECTOR, &original);
+                return Err(Status::Unavailable);
+            }
+        };
+        if observed != pattern {
+            let _ = crate::dwc2_host::write_sector(TEST_SECTOR, &original);
+            return Err(Status::Faulted);
+        }
+        crate::dwc2_host::write_sector(TEST_SECTOR, &original).map_err(|_| Status::Unavailable)?;
+        let restored =
+            crate::dwc2_host::read_sector(TEST_SECTOR).map_err(|_| Status::Unavailable)?;
+        if restored != original {
+            return Err(Status::Faulted);
+        }
+        return Ok(format!(
+            "USB sector {TEST_SECTOR} WRITE(10) readback passed; original data restored\n"
+        ));
+    }
     if args.first().is_some_and(|argument| argument != "info") || args.len() > 1 {
         return Err(Status::Usage);
     }

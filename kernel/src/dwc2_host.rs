@@ -99,6 +99,14 @@ pub fn read_sector(sector: u64) -> Result<[u8; 512], Error> {
         .read_sector(sector)
 }
 
+pub fn write_sector(sector: u64, bytes: &[u8; 512]) -> Result<(), Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .write_sector(sector, bytes)
+}
+
 pub async fn service_task() {
     let mut was_connected = CONTROLLER
         .lock()

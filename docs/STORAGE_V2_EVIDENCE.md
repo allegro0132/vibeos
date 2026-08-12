@@ -129,3 +129,63 @@ RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
 rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
   --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
 ```
+
+## M7.4 streaming Blob CAS and deduplication
+
+Accepted on 2026-08-12. The focused host run covered both the new M7.4 path and
+the retained M7.3 path. `vibeos-blob-format` passed its 11 canonical-format
+integration tests and 6 streaming-builder integration tests. The streaming
+tests compare the incremental descriptor, header, and indexed tree with the
+non-streaming encoder at empty, leaf, and tree boundaries; the 64 MiB synthetic
+case reaches the 15-emission maximum while retaining the fixed 15-slot frontier.
+They also cover strict ordering and lengths, explicit resumable padding, exact
+extent geometry, and permanent poisoning after an ambiguous sink failure.
+
+`vibeos-segment-store` passed 21 unit tests, including the frozen M7.3 codecs,
+the M7.4 BlobKey/manifest/snapshot/delta codecs, directed-range arithmetic, and
+the authority boundary. Those authority tests give two objects the same
+test-only content identity, revoke one independent root without affecting the
+other, reject a stale publication incarnation, and return the same unavailable
+error for missing and unauthorized resolution.
+
+One Rust-to-Python ABI integration test emitted a canonical manifest, snapshot,
+new-Blob delta, and reuse delta with the production Rust encoders. The
+independent Python verifier accepted the exact files and their four-entry
+header/content/content/tree manifest. Eight CAS streaming integration tests
+covered strict chunk admission, canonical empty content, a 1 MiB-plus stream
+across cold mount, directed chunk/proof reads, whole verification, required
+content/proof corruption, expected-root mismatch, abandonment, cancellation
+after a durable staging write, complete mutation-boundary fault injection, and
+deduplication. The deduplication case produced two fresh independently
+revocable object roots over one physical Blob; its powered-off image was parsed
+as two Object mappings, one Blob mapping, and one deduplicated reference by the
+independent verifier.
+
+The same run retained all 8 M7.3 crash-recovery integration tests. Thus the CAS
+changes did not replace the existing format/put boundary fault matrix, capacity
+classification, dense recovery-memory ceiling, orphan handling, or powered-off
+M7.3 reconstruction gate.
+
+The standalone CAS verifier selftest reported `ok` for six named cases:
+`duplicate-object-same-blob`, `gap`, `overlap`, `noncanonical-split`,
+`bad-reserved`, and `bad-tree`. Strict all-target Clippy for `blob-format` and
+`segment-store` completed with warnings denied.
+
+Commands used for the recorded host results:
+
+```sh
+cargo test -p vibeos-blob-format -p vibeos-segment-store --locked --offline
+cargo clippy -p vibeos-segment-store -p vibeos-blob-format \
+  --all-targets --locked --offline -- -D warnings
+python3 -B scripts/verify-storage-v2-cas.py --selftest
+```
+
+The same pinned-toolchain run compiled `vibeos-segment-store` for the
+`riscv64imac-unknown-none-elf` firmware target with only `core` and `alloc`:
+
+```sh
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
+rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
+  --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
+```

@@ -5,25 +5,28 @@ use alloc::vec::Vec;
 use core::{fmt, mem};
 
 use vibeos_segment_format::{
-    admitted_pages, decode_checkpoint_verified, decode_extent_verified,
-    decode_segment_header_verified, decode_segment_seal_verified, decode_segment_summary_verified,
-    decode_superblock_verified, descriptor_chain_initial, descriptor_chain_next,
-    encode_checkpoint_body, encode_extent_body, encode_record_seal, encode_segment_header_body,
-    encode_segment_seal_body, encode_segment_summary_body, encode_superblock_body,
-    payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page,
-    select_checkpoint_for_superblock, select_superblock, BodyDigest, Checkpoint, DecodeStatus,
-    ExtentKind, ExtentRecord, FormatError, FormatGeometry, Page, PhysicalPointer, PointerValue,
-    RecordBinding, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid, Superblock,
-    VerifiedRecord, ANCHOR_PAGES, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE,
-    MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_PAGES, SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE,
-    SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
+    ANCHOR_PAGES, ANCHOR_SEGMENT_NO, BodyDigest, Checkpoint, DATA_END_PAGE, DATA_FIRST_PAGE,
+    DecodeStatus, ExtentKind, ExtentRecord, FormatError, FormatGeometry, MAX_EXTENT_PAYLOAD_PAGES,
+    PAGE_SIZE, Page, PhysicalPointer, PointerValue, RecordBinding, SEGMENT_PAGES,
+    SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE, SegmentHeader,
+    SegmentSeal, SegmentSummary, StoreUuid, Superblock, VerifiedRecord, admitted_pages,
+    decode_checkpoint_verified, decode_extent_verified, decode_segment_header_verified,
+    decode_segment_seal_verified, decode_segment_summary_verified, decode_superblock_verified,
+    descriptor_chain_initial, descriptor_chain_next, encode_checkpoint_body, encode_extent_body,
+    encode_record_seal, encode_segment_header_body, encode_segment_seal_body,
+    encode_segment_summary_body, encode_superblock_body, payload_chain_initial, payload_chain_next,
+    payload_sha256, segment_base_page, select_checkpoint_for_superblock, select_superblock,
 };
 use vibeos_storage_device::{MutationCertainty, MutationFailure};
 
+use crate::cas_codec::{
+    BlobManifest, BlobMapping, CasCodecContext, ObjectMapping, decode_blob_manifest,
+    decode_cas_snapshot,
+};
 use crate::codec::{
-    decode_allocation, decode_catalog, encode_allocation, encode_catalog, AllocationState,
-    CatalogEntry, CatalogPayload, CatalogPayloadKind, CodecError, CATALOG_ENTRY_LEN,
-    CATALOG_SNAPSHOT_HEADER_LEN,
+    AllocationState, CATALOG_ENTRY_LEN, CATALOG_SNAPSHOT_HEADER_LEN, CatalogEntry, CatalogPayload,
+    CatalogPayloadKind, CodecError, decode_allocation, decode_catalog, encode_allocation,
+    encode_catalog,
 };
 use crate::device::PageDevice;
 
@@ -111,6 +114,7 @@ pub enum StoreError<E> {
     ObjectTooLarge,
     ObjectUnavailable,
     ObjectMismatch,
+    CatalogMode,
     IdExhausted,
 }
 
@@ -131,6 +135,9 @@ impl<E: fmt::Display> fmt::Display for StoreError<E> {
             Self::ObjectTooLarge => f.write_str("object exceeds the M7.3 compatibility profile"),
             Self::ObjectUnavailable => f.write_str("object is unavailable"),
             Self::ObjectMismatch => f.write_str("object handle does not match this store"),
+            Self::CatalogMode => {
+                f.write_str("operation is incompatible with the mounted catalog mode")
+            }
             Self::IdExhausted => f.write_str("object identifier space is exhausted"),
         }
     }
@@ -143,27 +150,34 @@ impl<E> From<FormatError> for StoreError<E> {
 }
 
 #[derive(Clone)]
-struct MountedState {
-    superblock: Superblock,
-    generation: u64,
-    admitted_segments: u64,
-    next_physical_segment: u64,
-    next_segment_generation: u64,
-    next_object_id: u128,
-    cleaner_reserve_segments: u32,
-    replay_count: u32,
-    catalog_root: PhysicalPointer,
-    replay_tail: PhysicalPointer,
-    catalog: Vec<CatalogEntry>,
-    recovery_peak_bytes: usize,
-    last_segment: Option<(u64, u64, [u8; 32])>,
+pub(crate) struct CasMountedState {
+    pub(crate) objects: Vec<ObjectMapping>,
+    pub(crate) blobs: Vec<BlobMapping>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MountedState {
+    pub(crate) superblock: Superblock,
+    pub(crate) generation: u64,
+    pub(crate) admitted_segments: u64,
+    pub(crate) next_physical_segment: u64,
+    pub(crate) next_segment_generation: u64,
+    pub(crate) next_object_id: u128,
+    pub(crate) cleaner_reserve_segments: u32,
+    pub(crate) replay_count: u32,
+    pub(crate) catalog_root: PhysicalPointer,
+    pub(crate) replay_tail: PhysicalPointer,
+    pub(crate) catalog: Vec<CatalogEntry>,
+    pub(crate) cas: Option<CasMountedState>,
+    pub(crate) recovery_peak_bytes: usize,
+    pub(crate) last_segment: Option<(u64, u64, [u8; 32])>,
 }
 
 pub struct SegmentStore<D> {
-    device: D,
-    limits: StoreLimits,
-    mounted: Option<MountedState>,
-    poisoned: bool,
+    pub(crate) device: D,
+    pub(crate) limits: StoreLimits,
+    pub(crate) mounted: Option<MountedState>,
+    pub(crate) poisoned: bool,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -349,6 +363,9 @@ impl<D: PageDevice> SegmentStore<D> {
         if object_kind == 0 || payload_sha256(bytes) != content_root {
             return Err(StoreError::ObjectMismatch);
         }
+        if current.cas.is_some() {
+            return Err(StoreError::CatalogMode);
+        }
         if current.catalog.len() >= self.limits.max_catalog_entries as usize {
             return Err(StoreError::Capacity(CapacityClass::Metadata));
         }
@@ -465,7 +482,11 @@ impl MountedState {
             allocated_segments,
             free_segments,
             cleaner_reserved_segments: self.cleaner_reserve_segments,
-            object_count: self.catalog.len() as u32,
+            object_count: self
+                .cas
+                .as_ref()
+                .map_or(self.catalog.len(), |cas| cas.objects.len())
+                as u32,
             replay_count: self.replay_count,
             recovery_peak_bytes: self.recovery_peak_bytes,
         }
@@ -561,7 +582,7 @@ async fn read_checkpoint<D: PageDevice>(
     Ok(optional_verified(decode_checkpoint_verified(&body, &seal)?))
 }
 
-async fn write_checkpoint<D: PageDevice>(
+pub(crate) async fn write_checkpoint<D: PageDevice>(
     device: &D,
     checkpoint: &Checkpoint,
     clear_first: bool,
@@ -606,12 +627,12 @@ fn codec_error<E>(error: CodecError) -> StoreError<E> {
     }
 }
 
-struct ScannedSegment {
-    matched: Option<ExtentRecord>,
-    segment_seal_body_sha256: [u8; 32],
+pub(crate) struct ScannedSegment {
+    pub(crate) matched: Option<ExtentRecord>,
+    pub(crate) segment_seal_body_sha256: [u8; 32],
 }
 
-async fn scan_segment<D: PageDevice>(
+pub(crate) async fn scan_segment<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
     admitted_segments: u64,
@@ -759,14 +780,14 @@ async fn scan_segment<D: PageDevice>(
     })
 }
 
-struct ResolvedPayload {
-    bytes: Vec<u8>,
-    extent: ExtentRecord,
-    segment_seal_body_sha256: [u8; 32],
+pub(crate) struct ResolvedPayload {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) extent: ExtentRecord,
+    pub(crate) segment_seal_body_sha256: [u8; 32],
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn read_pointer_payload<D: PageDevice>(
+pub(crate) async fn read_pointer_payload<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
     admitted_segments: u64,
@@ -846,6 +867,8 @@ async fn recover_state<D: PageDevice>(
 ) -> Result<MountedState, StoreError<D::Error>> {
     let checkpoint = *checkpoint.value();
     let mut catalog = Vec::new();
+    let mut cas = None;
+    let mut cas_max_referenced_segment = None::<u64>;
     let mut recovery_peak = 0_usize;
     if checkpoint.catalog_root != PhysicalPointer::Null {
         let snapshot = read_pointer_payload(
@@ -859,23 +882,129 @@ async fn recover_state<D: PageDevice>(
             limits.recovery_memory_bytes,
         )
         .await?;
-        let decoded =
-            decode_catalog(&snapshot.bytes, superblock.binding.store_uuid).map_err(codec_error)?;
-        if decoded.kind != CatalogPayloadKind::Snapshot
-            || decoded.checkpoint_generation > checkpoint.binding.generation
-            || decoded.checkpoint_generation != snapshot.extent.binding.target_checkpoint_generation
-            || decoded.chain_count != decoded.entries.len() as u64
-            || decoded.previous_delta != PhysicalPointer::Null
-        {
-            return Err(StoreError::Corrupt);
+        if snapshot.bytes.starts_with(b"VIBECAS2") {
+            if checkpoint.replay_count != 0
+                || checkpoint.replay_tail != PhysicalPointer::Null
+                || checkpoint.authority_root != PhysicalPointer::Null
+            {
+                return Err(StoreError::Corrupt);
+            }
+            let context = CasCodecContext::new(
+                superblock.binding.store_uuid,
+                checkpoint.admitted_segments,
+                checkpoint.next_segment_generation,
+            )
+            .map_err(|_| StoreError::Corrupt)?;
+            let decoded =
+                decode_cas_snapshot(&snapshot.bytes, context).map_err(|_| StoreError::Corrupt)?;
+            if decoded.checkpoint_generation != checkpoint.binding.generation
+                || decoded.checkpoint_generation
+                    != snapshot.extent.binding.target_checkpoint_generation
+                || decoded.objects.len() > limits.max_catalog_entries as usize
+                || decoded.blobs.len() > limits.max_catalog_entries as usize
+            {
+                return Err(StoreError::Corrupt);
+            }
+            let cas_bytes = decoded
+                .objects
+                .capacity()
+                .checked_mul(mem::size_of::<ObjectMapping>())
+                .and_then(|bytes| {
+                    decoded
+                        .blobs
+                        .capacity()
+                        .checked_mul(mem::size_of::<BlobMapping>())
+                        .and_then(|more| bytes.checked_add(more))
+                })
+                .ok_or(StoreError::MemoryLimit)?;
+            let snapshot_capacity = snapshot.bytes.capacity();
+            recovery_peak = cas_bytes
+                .checked_add(snapshot_capacity)
+                .ok_or(StoreError::MemoryLimit)?;
+            // The decoded tables own their data; release the encoded snapshot
+            // before reading a manifest so the measured recovery peak is also
+            // the actual live-memory bound.
+            drop(snapshot);
+            for blob in &decoded.blobs {
+                let PhysicalPointer::Value(manifest_pointer) = blob.manifest else {
+                    return Err(StoreError::Corrupt);
+                };
+                cas_max_referenced_segment = Some(
+                    cas_max_referenced_segment.map_or(manifest_pointer.segment_no, |current| {
+                        current.max(manifest_pointer.segment_no)
+                    }),
+                );
+                let manifest = read_pointer_payload(
+                    device,
+                    superblock.binding.store_uuid,
+                    checkpoint.admitted_segments,
+                    checkpoint.next_segment_generation,
+                    checkpoint.binding.generation,
+                    blob.manifest,
+                    ExtentKind::Catalog,
+                    limits.recovery_memory_bytes,
+                )
+                .await?;
+                let decoded_manifest = decode_blob_manifest(&manifest.bytes, context)
+                    .map_err(|_| StoreError::Corrupt)?;
+                if decoded_manifest.blob_key != blob.blob_key {
+                    return Err(StoreError::Corrupt);
+                }
+                for declared in &decoded_manifest.extents {
+                    let PhysicalPointer::Value(pointer) = declared.pointer else {
+                        return Err(StoreError::Corrupt);
+                    };
+                    cas_max_referenced_segment = Some(
+                        cas_max_referenced_segment.map_or(pointer.segment_no, |current| {
+                            current.max(pointer.segment_no)
+                        }),
+                    );
+                }
+                validate_cas_blob_descriptors(
+                    device,
+                    superblock.binding.store_uuid,
+                    checkpoint.admitted_segments,
+                    checkpoint.next_segment_generation,
+                    checkpoint.binding.generation,
+                    &decoded_manifest,
+                )
+                .await?;
+                recovery_peak = recovery_peak.max(
+                    cas_bytes
+                        .checked_add(manifest.bytes.capacity())
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                decoded_manifest.extents.capacity()
+                                    * mem::size_of::<crate::cas_codec::ManifestExtent>(),
+                            )
+                        })
+                        .ok_or(StoreError::MemoryLimit)?,
+                );
+            }
+            cas = Some(CasMountedState {
+                objects: decoded.objects,
+                blobs: decoded.blobs,
+            });
+        } else {
+            let decoded = decode_catalog(&snapshot.bytes, superblock.binding.store_uuid)
+                .map_err(codec_error)?;
+            if decoded.kind != CatalogPayloadKind::Snapshot
+                || decoded.checkpoint_generation > checkpoint.binding.generation
+                || decoded.checkpoint_generation
+                    != snapshot.extent.binding.target_checkpoint_generation
+                || decoded.chain_count != decoded.entries.len() as u64
+                || decoded.previous_delta != PhysicalPointer::Null
+            {
+                return Err(StoreError::Corrupt);
+            }
+            if decoded.entries.len() > limits.max_catalog_entries as usize {
+                return Err(StoreError::MemoryLimit);
+            }
+            catalog = decoded.entries;
+            recovery_peak = measured_catalog_bytes(&catalog)
+                .checked_add(snapshot.bytes.capacity())
+                .ok_or(StoreError::MemoryLimit)?;
         }
-        if decoded.entries.len() > limits.max_catalog_entries as usize {
-            return Err(StoreError::MemoryLimit);
-        }
-        catalog = decoded.entries;
-        recovery_peak = measured_catalog_bytes(&catalog)
-            .checked_add(snapshot.bytes.capacity())
-            .ok_or(StoreError::MemoryLimit)?;
         if recovery_peak > limits.recovery_memory_bytes {
             return Err(StoreError::MemoryLimit);
         }
@@ -964,21 +1093,22 @@ async fn recover_state<D: PageDevice>(
     for entry in reverse_deltas.into_iter().rev() {
         catalog.push(entry);
     }
-    validate_catalog(
-        &catalog,
-        superblock.binding.store_uuid,
-        checkpoint.admitted_segments,
-        checkpoint.next_segment_generation,
-        checkpoint.binding.generation,
-        limits,
-    )?;
+    if cas.is_none() {
+        validate_catalog(
+            &catalog,
+            superblock.binding.store_uuid,
+            checkpoint.admitted_segments,
+            checkpoint.next_segment_generation,
+            checkpoint.binding.generation,
+            limits,
+        )?;
+    }
     recovery_peak = recovery_peak.max(measured_catalog_bytes(&catalog));
     if recovery_peak > limits.recovery_memory_bytes {
         return Err(StoreError::MemoryLimit);
     }
-
     let (allocated_prefix, last_segment) = if checkpoint.allocation_root == PhysicalPointer::Null {
-        if checkpoint.binding.generation != 1 || !catalog.is_empty() {
+        if checkpoint.binding.generation != 1 || !catalog.is_empty() || cas.is_some() {
             return Err(StoreError::Corrupt);
         }
         (0, None)
@@ -1029,6 +1159,9 @@ async fn recover_state<D: PageDevice>(
     if recovery_peak > limits.recovery_memory_bytes {
         return Err(StoreError::MemoryLimit);
     }
+    if cas_max_referenced_segment.is_some_and(|segment_no| segment_no >= allocated_prefix) {
+        return Err(StoreError::Corrupt);
+    }
 
     for pointer in [
         checkpoint.catalog_root,
@@ -1076,14 +1209,11 @@ async fn recover_state<D: PageDevice>(
             next_physical_segment = segment_no.checked_add(1).ok_or(StoreError::Corrupt)?;
         }
     }
-    let next_object_id = catalog
-        .last()
-        .map(|entry| {
-            entry
-                .object_id
-                .checked_add(1)
-                .ok_or(StoreError::IdExhausted)
-        })
+    let next_object_id = cas
+        .as_ref()
+        .and_then(|cas| cas.objects.last().map(|entry| entry.object_id))
+        .or_else(|| catalog.last().map(|entry| entry.object_id))
+        .map(|object_id| object_id.checked_add(1).ok_or(StoreError::IdExhausted))
         .transpose()?
         .unwrap_or(1);
     Ok(MountedState {
@@ -1098,6 +1228,7 @@ async fn recover_state<D: PageDevice>(
         catalog_root: checkpoint.catalog_root,
         replay_tail: checkpoint.replay_tail,
         catalog,
+        cas,
         recovery_peak_bytes: recovery_peak,
         last_segment,
     })
@@ -1138,6 +1269,48 @@ async fn validate_blob_descriptor<D: PageDevice>(
         || extent.payload_sha256 != entry.content_root
     {
         return Err(StoreError::Corrupt);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn validate_cas_blob_descriptors<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    manifest: &BlobManifest,
+) -> Result<(), StoreError<D::Error>> {
+    for declared in &manifest.extents {
+        let PhysicalPointer::Value(pointer) = declared.pointer else {
+            return Err(StoreError::Corrupt);
+        };
+        let scanned = scan_segment(
+            device,
+            store_uuid,
+            admitted_segments,
+            next_segment_generation,
+            checkpoint_generation,
+            pointer,
+        )
+        .await?;
+        let extent = scanned.matched.ok_or(StoreError::Corrupt)?;
+        if extent.extent_kind != ExtentKind::Blob
+            || extent.object_kind != manifest.blob_key.object_kind()
+            || extent.extent_index != declared.extent_index
+            || extent.extent_count != declared.extent_count
+            || extent.content_byte_len != manifest.blob_key.exact_len()
+            || extent.encoded_blob_len != manifest.encoded_blob_len
+            || extent.encoded_offset != declared.encoded_offset
+            || extent.payload_byte_len != declared.payload_byte_len
+            || extent.merkle_root != manifest.blob_key.merkle_root()
+            || extent.payload_first_relative_page != pointer.payload_relative_page
+            || extent.payload_pages != pointer.payload_pages
+            || extent.payload_sha256 != pointer.payload_sha256
+        {
+            return Err(StoreError::Corrupt);
+        }
     }
     Ok(())
 }

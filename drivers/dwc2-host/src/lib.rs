@@ -140,6 +140,12 @@ pub enum Error {
     TransferFailed(u32),
     Stalled,
     Nak,
+    StorageProtocol,
+    StorageCommandFailed(u8),
+    StorageCswSignature(u32),
+    StorageCswTag(u32),
+    StorageCswResidue(u32),
+    StorageBlockSize(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +189,8 @@ pub struct MassStorageInfo {
     pub endpoint_out: u8,
     pub max_packet_size_in: u16,
     pub max_packet_size_out: u16,
+    pub capacity_sectors: Option<u64>,
+    pub block_size: Option<u32>,
 }
 
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
@@ -340,6 +348,9 @@ pub struct Controller {
     report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
     mass_storage: Option<MassStorageInfo>,
+    storage_pid_in: DataPid,
+    storage_pid_out: DataPid,
+    storage_tag: u32,
     keyboard_layout: KeyboardLayout,
     keyboard_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
@@ -574,6 +585,9 @@ impl Controller {
             report_descriptor: None,
             keyboard: None,
             mass_storage: None,
+            storage_pid_in: DataPid::Data0,
+            storage_pid_out: DataPid::Data0,
+            storage_tag: 1,
             keyboard_layout: KeyboardLayout::Boot,
             keyboard_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
@@ -614,6 +628,65 @@ impl Controller {
 
     pub const fn mass_storage(&self) -> Option<MassStorageInfo> {
         self.mass_storage
+    }
+
+    /// Select the detected SCSI Bulk-Only interface and probe its logical
+    /// block capacity. Only LUN zero and 512-byte logical blocks are supported.
+    pub fn configure_mass_storage(&mut self) -> Result<Option<MassStorageInfo>, Error> {
+        let Some(mut storage) = self.mass_storage else {
+            return Ok(None);
+        };
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(storage.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.storage_pid_in = DataPid::Data0;
+        self.storage_pid_out = DataPid::Data0;
+        self.storage_tag = 1;
+        delay_ms(self.timebase_hz, self.time, 10);
+
+        let test_unit_ready = [0x00, 0, 0, 0, 0, 0];
+        let mut ready = false;
+        for _ in 0..10 {
+            match self.bot_command(&test_unit_ready, true, &mut []) {
+                Ok(()) => {
+                    ready = true;
+                    break;
+                }
+                Err(Error::StorageCommandFailed(_)) => {
+                    let request_sense = [0x03, 0, 0, 0, 18, 0];
+                    let mut sense = [0; 18];
+                    let _ = self.bot_command(&request_sense, true, &mut sense);
+                    delay_ms(self.timebase_hz, self.time, 100);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !ready {
+            return Err(Error::StorageCommandFailed(1));
+        }
+
+        let read_capacity = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut capacity = [0; 8];
+        self.bot_command(&read_capacity, true, &mut capacity)?;
+        let last_lba = u32::from_be_bytes(capacity[0..4].try_into().unwrap());
+        let block_size = u32::from_be_bytes(capacity[4..8].try_into().unwrap());
+        if block_size != 512 {
+            return Err(Error::StorageBlockSize(block_size));
+        }
+        if last_lba == u32::MAX {
+            return Err(Error::StorageProtocol);
+        }
+        storage.capacity_sectors = Some(u64::from(last_lba) + 1);
+        storage.block_size = Some(block_size);
+        self.mass_storage = Some(storage);
+        Ok(Some(storage))
     }
 
     pub const fn configuration(&self) -> Option<ConfigurationInfo> {
@@ -1058,6 +1131,99 @@ impl Controller {
                 }
             }
         }
+    }
+
+    fn bot_command(&mut self, cdb: &[u8], data_in: bool, data: &mut [u8]) -> Result<(), Error> {
+        const CBW_LENGTH: usize = 31;
+        const CSW_LENGTH: usize = 13;
+        if cdb.is_empty() || cdb.len() > 16 || data.len() > DMA_BYTES {
+            return Err(Error::StorageProtocol);
+        }
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let tag = self.storage_tag;
+        self.storage_tag = self
+            .storage_tag
+            .checked_add(1)
+            .ok_or(Error::StorageProtocol)?;
+
+        let mut cbw = [0; CBW_LENGTH];
+        cbw[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());
+        cbw[4..8].copy_from_slice(&tag.to_le_bytes());
+        cbw[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        cbw[12] = if data_in { 0x80 } else { 0 };
+        cbw[14] = cdb.len() as u8;
+        cbw[15..15 + cdb.len()].copy_from_slice(cdb);
+        self.bulk_out(storage.endpoint_out, storage.max_packet_size_out, &cbw)?;
+        if !data.is_empty() {
+            if data_in {
+                let actual = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, data)?;
+                if actual != data.len() {
+                    return Err(Error::StorageProtocol);
+                }
+            } else {
+                self.bulk_out(storage.endpoint_out, storage.max_packet_size_out, data)?;
+            }
+        }
+        let mut csw = [0; CSW_LENGTH];
+        if self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, &mut csw)? != CSW_LENGTH {
+            return Err(Error::StorageProtocol);
+        }
+        let signature = u32::from_le_bytes(csw[0..4].try_into().unwrap());
+        let observed_tag = u32::from_le_bytes(csw[4..8].try_into().unwrap());
+        let residue = u32::from_le_bytes(csw[8..12].try_into().unwrap());
+        if signature != 0x5342_5355 {
+            return Err(Error::StorageCswSignature(signature));
+        }
+        if observed_tag != tag {
+            return Err(Error::StorageCswTag(observed_tag));
+        }
+        if csw[12] != 0 {
+            return Err(Error::StorageCommandFailed(csw[12]));
+        }
+        if residue != 0 {
+            return Err(Error::StorageCswResidue(residue));
+        }
+        Ok(())
+    }
+
+    fn bulk_in(
+        &mut self,
+        endpoint: u8,
+        max_packet: u16,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        let actual = self.channel_transfer(
+            self.device_address,
+            endpoint & 0x0f,
+            true,
+            EndpointType::Bulk,
+            self.storage_pid_in,
+            output.len(),
+            max_packet,
+            MAX_NAK_RETRIES,
+        )?;
+        self.storage_pid_in = advance_pid(self.storage_pid_in, actual, max_packet);
+        unsafe { output[..actual].copy_from_slice(&dma_bytes()[..actual]) };
+        Ok(actual)
+    }
+
+    fn bulk_out(&mut self, endpoint: u8, max_packet: u16, input: &[u8]) -> Result<(), Error> {
+        unsafe { dma_bytes()[..input.len()].copy_from_slice(input) };
+        let actual = self.channel_transfer(
+            self.device_address,
+            endpoint & 0x0f,
+            false,
+            EndpointType::Bulk,
+            self.storage_pid_out,
+            input.len(),
+            max_packet,
+            MAX_NAK_RETRIES,
+        )?;
+        if actual != input.len() {
+            return Err(Error::StorageProtocol);
+        }
+        self.storage_pid_out = advance_pid(self.storage_pid_out, actual, max_packet);
+        Ok(())
     }
 
     /// Execute one USB control request on the currently addressed endpoint 0.
@@ -1528,6 +1694,7 @@ impl Drop for Controller {
 #[repr(u32)]
 enum EndpointType {
     Control = 0,
+    Bulk = 2,
     Interrupt = 3,
 }
 
@@ -1546,6 +1713,15 @@ impl DataPid {
             Self::Data1 => Self::Data0,
             Self::Setup => Self::Setup,
         }
+    }
+}
+
+fn advance_pid(pid: DataPid, bytes: usize, max_packet: u16) -> DataPid {
+    let packets = bytes.div_ceil(usize::from(max_packet));
+    if packets % 2 == 0 {
+        pid
+    } else {
+        pid.toggled()
     }
 }
 
@@ -1726,6 +1902,8 @@ fn find_mass_storage(configuration: ConfigurationInfo) -> Option<MassStorageInfo
                 endpoint_out: interface.bulk_out?,
                 max_packet_size_in: interface.bulk_in_max_packet_size,
                 max_packet_size_out: interface.bulk_out_max_packet_size,
+                capacity_sectors: None,
+                block_size: None,
             })
         })
 }
@@ -2323,8 +2501,12 @@ mod tests {
                 endpoint_out: 0x02,
                 max_packet_size_in: 64,
                 max_packet_size_out: 64,
+                capacity_sectors: None,
+                block_size: None,
             })
         );
+        assert_eq!(advance_pid(DataPid::Data0, 512, 64), DataPid::Data0);
+        assert_eq!(advance_pid(DataPid::Data0, 31, 64), DataPid::Data1);
     }
 
     #[test]

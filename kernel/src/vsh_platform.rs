@@ -241,12 +241,20 @@ const QEMU_COMMANDS: &[CommandSpec] = &[
 ];
 
 #[cfg(feature = "milkv-duo")]
-const MILKV_USB_COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "lsusb",
-    min_args: 0,
-    max_args: 0,
-    handler: vsh_lsusb,
-}];
+const MILKV_USB_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "lsusb",
+        min_args: 0,
+        max_args: 0,
+        handler: vsh_lsusb,
+    },
+    CommandSpec {
+        name: "usb",
+        min_args: 0,
+        max_args: 1,
+        handler: vsh_milkv_usb,
+    },
+];
 
 #[cfg(any(
     feature = "tcp-echo",
@@ -555,6 +563,34 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         ));
     }
     Ok(output)
+}
+
+#[cfg(feature = "milkv-duo")]
+fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
+    if args.first().is_some_and(|argument| argument != "info") {
+        return Err(Status::Usage);
+    }
+    let Some(storage) = crate::dwc2_host::snapshot().and_then(|snapshot| snapshot.mass_storage)
+    else {
+        return Ok(String::from("USB mass storage not detected\n"));
+    };
+    let (Some(sectors), Some(block_size)) = (storage.capacity_sectors, storage.block_size) else {
+        return Ok(format!(
+            "USB mass storage interface {} detected, capacity not configured\n",
+            storage.interface,
+        ));
+    };
+    Ok(format!(
+        "USB mass storage SCSI/BOT interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} sectors={} block-size={} bytes={}\n",
+        storage.interface,
+        storage.endpoint_in,
+        storage.max_packet_size_in,
+        storage.endpoint_out,
+        storage.max_packet_size_out,
+        sectors,
+        block_size,
+        sectors.saturating_mul(u64::from(block_size)),
+    ))
 }
 
 fn vsh_quiet(_args: &[String]) -> Result<String, Status> {

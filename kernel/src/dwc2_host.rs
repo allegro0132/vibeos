@@ -83,6 +83,14 @@ pub fn configure_hid_keyboard() -> Result<Option<HidKeyboardInfo>, Error> {
         .configure_hid_keyboard()
 }
 
+pub fn configure_mass_storage() -> Result<Option<MassStorageInfo>, Error> {
+    CONTROLLER
+        .lock()
+        .as_mut()
+        .ok_or(Error::NoDevice)?
+        .configure_mass_storage()
+}
+
 pub async fn service_task() {
     let mut was_connected = CONTROLLER
         .lock()

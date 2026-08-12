@@ -9,38 +9,70 @@
 
 extern crate alloc;
 
+mod allocation_v2;
 mod authority;
 mod cas;
 mod cas_codec;
 mod codec;
 mod compat;
 mod device;
+mod gc;
+mod mark;
+mod pins;
+mod root_codec;
 mod store;
+mod typed_api;
+mod typed_manifest;
+
+pub use allocation_v2::{
+    decode_allocation_v2, encode_allocation_v2, AllocationCounts, AllocationTransition,
+    AllocationV2, AllocationV2Error, RetiredSegment, SegmentAllocation, ALLOCATION_V2_HEADER_LEN,
+    ALLOCATION_V2_VERSION, MAX_ALLOCATION_V2_PAYLOAD_LEN, MAX_ALLOCATION_V2_SEGMENTS,
+    RETIRED_SEGMENT_ENTRY_LEN,
+};
 
 pub use authority::{
-    AccessError, AuthorizedObject, AuthorizedObjectSpace, ObjectPublicationTarget,
-    PublicationIntent, PublishError, resolve_authorized,
+    resolve_authorized, AccessError, AuthorizedObject, AuthorizedObjectSpace,
+    ObjectPublicationTarget, PublicationIntent, PublishError,
 };
 pub use cas::{
-    BlobWriter, CasCommitError, CasObjectHandle, CasStoreError, VerifiedCasBlob, VerifiedCasChunk,
+    BlobWriter, CasCommitError, CasObjectHandle, CasStoreError, ForegroundBlobError,
+    ReleasedRuntimePins, RuntimeObjectPin, RuntimeObjectPinClass, RuntimePinOwner,
+    RuntimePinOwnerError, StoppedRuntimePinOwner, VerifiedCasBlob, VerifiedCasChunk,
 };
 pub use cas_codec::{
-    BLOB_KEY_LEN, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN, BlobKey, BlobManifest, BlobMapping,
-    CANONICAL_CONTENT_EXTENT_LEN, CAS_CODEC_VERSION, CAS_DELTA_HEADER_LEN, CAS_DELTA_NEW_BLOB_LEN,
-    CAS_DELTA_REUSE_LEN, CAS_SNAPSHOT_HEADER_LEN, CasCodecContext, CasCodecError, CasDelta,
-    CasSnapshot, MANIFEST_EXTENT_LEN, MAX_BLOB_CONTENT_LEN, MAX_BLOB_EXTENTS, ManifestExtent,
-    OBJECT_MAPPING_LEN, ObjectMapping, canonical_blob_encoded_len, decode_blob_key,
-    decode_blob_manifest, decode_cas_delta, decode_cas_snapshot, encode_blob_key,
-    encode_blob_manifest, encode_cas_delta, encode_cas_snapshot,
+    canonical_blob_encoded_len, decode_blob_key, decode_blob_manifest, decode_cas_delta,
+    decode_cas_snapshot, encode_blob_key, encode_blob_manifest, encode_cas_delta,
+    encode_cas_snapshot, BlobKey, BlobManifest, BlobMapping, CasCodecContext, CasCodecError,
+    CasDelta, CasSnapshot, ManifestExtent, ObjectMapping, BLOB_KEY_LEN, BLOB_MANIFEST_HEADER_LEN,
+    BLOB_MAPPING_LEN, CANONICAL_CONTENT_EXTENT_LEN, CAS_CODEC_VERSION, CAS_DELTA_HEADER_LEN,
+    CAS_DELTA_NEW_BLOB_LEN, CAS_DELTA_REUSE_LEN, CAS_GC_CODEC_VERSION, CAS_SNAPSHOT_HEADER_LEN,
+    MANIFEST_EXTENT_LEN, MAX_BLOB_CONTENT_LEN, MAX_BLOB_EXTENTS, OBJECT_MAPPING_LEN,
+    REFERENCE_CODEC_RAW, REFERENCE_CODEC_TYPED_V1,
 };
 pub use codec::{
-    ALLOCATION_PAYLOAD_LEN, AllocationState, CATALOG_DELTA_HEADER_LEN, CATALOG_DELTA_PAYLOAD_LEN,
-    CATALOG_ENTRY_LEN, CATALOG_SNAPSHOT_HEADER_LEN, CatalogEntry, CatalogPayload,
-    CatalogPayloadKind, CodecError, decode_allocation, decode_catalog, encode_allocation,
-    encode_catalog,
+    decode_allocation, decode_catalog, encode_allocation, encode_catalog, AllocationState,
+    CatalogEntry, CatalogPayload, CatalogPayloadKind, CodecError, ALLOCATION_PAYLOAD_LEN,
+    CATALOG_DELTA_HEADER_LEN, CATALOG_DELTA_PAYLOAD_LEN, CATALOG_ENTRY_LEN,
+    CATALOG_SNAPSHOT_HEADER_LEN,
 };
 pub use compat::PutGetAdapter;
 pub use device::{BlockPageDevice, BlockPageError, PageDevice, PageDeviceInfo};
+pub use gc::{GcError, GcStoreError, GcTelemetry, GcTimeSource};
+pub use root_codec::{
+    decode_persistent_root_set, encode_persistent_root_set, PersistentRootEntry, PersistentRootSet,
+    RootCodecError, MAX_PERSISTENT_ROOT_ENTRIES, MAX_PERSISTENT_ROOT_SET_PAYLOAD_LEN,
+    PERSISTENT_ROOT_ENTRY_LEN, PERSISTENT_ROOT_SET_HEADER_LEN, PERSISTENT_ROOT_SET_VERSION,
+};
 pub use store::{
-    CapacityClass, FormatOptions, ObjectHandle, SegmentStore, StoreError, StoreInfo, StoreLimits,
+    CapacityClass, FormatOptions, ObjectHandle, RuntimeContextError, SegmentStore, StoreError,
+    StoreInfo, StoreLimits, StoreRuntimeContext, MAX_TYPED_REFERENCE_KINDS,
+    ROOT_POLICY_HEADROOM_SEGMENTS,
+};
+pub use typed_api::TypedCommitError;
+pub use typed_manifest::{
+    decode_typed_manifest_refs_v1, encode_typed_manifest_refs_v1, ReferenceCodecAdmission,
+    ReferenceCodecTag, TypedManifestRefsV1, TypedObjectReference, TypedRefsError,
+    MAX_TYPED_REFERENCES, MAX_TYPED_REFS_PAYLOAD_LEN, REFERENCE_CODEC_TAG_LEN,
+    REFS_V1_ADMISSION_TAG, TYPED_REFERENCE_ENTRY_LEN, TYPED_REFS_HEADER_LEN, TYPED_REFS_VERSION,
 };

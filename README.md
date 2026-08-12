@@ -26,6 +26,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   segment writer, catalog/allocation payload ABI, bounded recovery, and fault model.
 - **[docs/STORAGE_V2_CAS.md](docs/STORAGE_V2_CAS.md)** — the canonical streaming
   Blob layout, CAS catalog ABI, complete-Blob deduplication, and authority rules.
+- **[docs/STORAGE_V2_GC.md](docs/STORAGE_V2_GC.md)** — persistent/runtime roots,
+  typed edges, generation pins, and the crash-safe G/G+1/G+2 reuse barrier.
 - **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
   Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
   cancellation, and fail-closed admission.
@@ -411,7 +413,7 @@ its process owns. Here, authority is not a property of the code.
 | `blob-format/` | canonical immutable Merkle blob encoding and chunk proofs (`no_std`) |
 | `storage-device/` | capability-scoped block ranges, geometry, sessions, and mutation certainty (`no_std`) |
 | `segment-format/` | allocation-free Storage V2 segment/checkpoint codec and verifier (`no_std`) |
-| `segment-store/` | bounded streaming Storage V2 Blob CAS, complete-Blob deduplication, and opaque authority publication (`no_std + alloc`) |
+| `segment-store/` | bounded streaming Storage V2 Blob CAS, complete-Blob deduplication, root-based cleaning, and opaque authority publication (`no_std + alloc`) |
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
 | `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |

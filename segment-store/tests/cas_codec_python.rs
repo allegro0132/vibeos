@@ -5,11 +5,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use vibeos_segment_format::{ExtentKind, PAGE_SIZE, PhysicalPointer, PointerValue, StoreUuid};
+use vibeos_segment_format::{ExtentKind, PhysicalPointer, PointerValue, StoreUuid, PAGE_SIZE};
 use vibeos_segment_store::{
-    BlobKey, BlobManifest, BlobMapping, CANONICAL_CONTENT_EXTENT_LEN, CasCodecContext, CasDelta,
-    CasSnapshot, ManifestExtent, ObjectMapping, encode_blob_key, encode_blob_manifest,
-    encode_cas_delta, encode_cas_snapshot,
+    encode_blob_key, encode_blob_manifest, encode_cas_delta, encode_cas_snapshot, BlobKey,
+    BlobManifest, BlobMapping, CasCodecContext, CasDelta, CasSnapshot, ManifestExtent,
+    ObjectMapping, CANONICAL_CONTENT_EXTENT_LEN,
 };
 
 fn pointer(
@@ -118,6 +118,7 @@ fn write_fixture(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         object_id: snapshot_id,
         blob_key,
         commit_generation: 1,
+        reference_codec: 0,
     };
     let snapshot = CasSnapshot {
         checkpoint_generation: 2,
@@ -151,6 +152,7 @@ fn write_fixture(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             object_id: second_id,
             blob_key,
             commit_generation: 3,
+            reference_codec: 0,
         },
         new_blob: None,
     };

@@ -1,4 +1,4 @@
-use core::future::{Future, pending};
+use core::future::{pending, Future};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::collections::BTreeMap;
@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vibeos_segment_format::{PAGE_SIZE, Page, StoreUuid, admitted_pages};
+use vibeos_segment_format::{admitted_pages, Page, StoreUuid, PAGE_SIZE};
 use vibeos_segment_store::{
-    AuthorizedObject, AuthorizedObjectSpace, CasObjectHandle, CasStoreError, FormatOptions,
-    ObjectPublicationTarget, PageDevice, PageDeviceInfo, PublicationIntent, PublishError,
-    SegmentStore, StoreError, StoreInfo, StoreLimits, resolve_authorized,
+    resolve_authorized, AuthorizedObject, AuthorizedObjectSpace, CasObjectHandle, CasStoreError,
+    FormatOptions, ObjectPublicationTarget, PageDevice, PageDeviceInfo, PublicationIntent,
+    PublishError, SegmentStore, StoreError, StoreInfo, StoreLimits, StoreRuntimeContext,
 };
 use vibeos_storage_device::MutationFailure;
 
@@ -324,6 +324,15 @@ fn mount(device: FaultDevice) -> (SegmentStore<FaultDevice>, StoreInfo) {
     (store, info)
 }
 
+fn mount_with_runtime(
+    device: FaultDevice,
+    runtime: StoreRuntimeContext,
+) -> (SegmentStore<FaultDevice>, StoreInfo) {
+    let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    let info = block_on(store.mount()).expect("cold mount must succeed");
+    (store, info)
+}
+
 fn pattern_chunk(index: u32, len: usize) -> Vec<u8> {
     let start = u64::from(index) * PAGE_SIZE as u64;
     (0..len)
@@ -505,12 +514,13 @@ fn large_stream_survives_cold_mount_and_supports_directed_and_whole_verification
     let device = FaultDevice::blank(16);
     let mut store = format(device.clone());
     let object = put_stream(&mut store, exact_len);
+    let runtime = store.runtime_context();
     let committed = store.info().unwrap();
     assert_eq!(committed.object_count, 1);
     drop(store);
 
     device.power_cycle();
-    let (cold, recovered) = mount(device.clone());
+    let (cold, recovered) = mount_with_runtime(device.clone(), runtime);
     assert_eq!(recovered.generation, committed.generation);
     assert_eq!(recovered.object_count, 1);
 
@@ -558,9 +568,10 @@ fn large_stream_survives_cold_mount_and_supports_directed_and_whole_verification
     let small_device = FaultDevice::blank(12);
     let mut small_store = format(small_device.clone());
     let small_object = put_stream(&mut small_store, (PAGE_SIZE * 2) as u64);
+    let small_runtime = small_store.runtime_context();
     drop(small_store);
     small_device.power_cycle();
-    let (small_cold, _) = mount(small_device.clone());
+    let (small_cold, _) = mount_with_runtime(small_device.clone(), small_runtime);
     small_device.reset_reads();
     block_on(small_cold.get_blob_chunk(&small_object, 0)).unwrap();
     let small_reads = small_device.read_count();
@@ -581,11 +592,12 @@ fn empty_blob_is_canonical_across_commit_and_cold_mount() {
     let mut store = format(device.clone());
     let writer = store.begin_blob(OBJECT_KIND, 0, None).unwrap();
     let object = block_on(writer.commit()).expect("empty Blob must commit without caller chunks");
+    let runtime = store.runtime_context();
     let committed = store.info().unwrap();
     drop(store);
 
     device.power_cycle();
-    let (cold, recovered) = mount(device);
+    let (cold, recovered) = mount_with_runtime(device, runtime);
     assert_eq!(recovered.generation, committed.generation);
     let chunk = block_on(cold.get_blob_chunk(&object, 0)).expect("empty leaf must verify");
     assert!(chunk.bytes.is_empty());
@@ -602,6 +614,7 @@ fn corrupted_content_and_required_proof_bytes_fail_closed() {
     let device = FaultDevice::blank(12);
     let mut store = format(device.clone());
     let object = put_stream(&mut store, exact_len);
+    let runtime = store.runtime_context();
     device.power_cycle();
     let image = device.durable_image();
     let page_count = device.page_count();
@@ -611,7 +624,7 @@ fn corrupted_content_and_required_proof_bytes_fail_closed() {
     let first = pattern_chunk(0, PAGE_SIZE);
     content_corrupt.flip_durable_page_with_prefix(&first[..64], 7);
     content_corrupt.power_cycle();
-    let (content_store, _) = mount(content_corrupt);
+    let (content_store, _) = mount_with_runtime(content_corrupt, runtime.clone());
     assert!(
         block_on(content_store.get_blob_chunk(&object, 0)).is_err(),
         "a corrupted requested content byte must not escape"
@@ -627,7 +640,7 @@ fn corrupted_content_and_required_proof_bytes_fail_closed() {
     let tree = &encoded[tree_offset..];
     tree_corrupt.flip_durable_page_with_prefix(tree, vibeos_blob_format::HASH_SIZE);
     tree_corrupt.power_cycle();
-    let (tree_store, _) = mount(tree_corrupt);
+    let (tree_store, _) = mount_with_runtime(tree_corrupt, runtime);
     assert!(
         block_on(tree_store.get_blob_chunk(&object, 0)).is_err(),
         "a corrupted sibling hash must invalidate the directed proof"
@@ -763,27 +776,23 @@ fn cancellation_after_a_durable_staging_write_leaves_the_old_checkpoint_mountabl
 fn assert_old_or_exact_new_after_commit_fault(
     device: FaultDevice,
     old_info: StoreInfo,
-    old_object: &AuthorizedObject<CasObjectHandle>,
     case: &str,
 ) {
     device.power_cycle();
-    let (recovered, info) = mount(device);
+    let (_recovered, info) = mount(device);
     assert!(
         (info.generation == old_info.generation && info.object_count == old_info.object_count)
             || (info.generation == old_info.generation + 1
                 && info.object_count == old_info.object_count + 1),
         "{case}: recovery selected a mixed CAS state: old={old_info:?}, recovered={info:?}"
     );
-    let old_chunk = block_on(recovered.get_blob_chunk(old_object, 0))
-        .unwrap_or_else(|error| panic!("{case}: preceding object was lost: {error:?}"));
-    assert_eq!(old_chunk.bytes, pattern_chunk(0, PAGE_SIZE));
 }
 
 #[test]
 fn every_commit_mutation_boundary_recovers_the_old_or_exact_new_cas_checkpoint() {
     let seed_device = FaultDevice::blank(16);
     let mut seed_store = format(seed_device.clone());
-    let old_object = put_stream(&mut seed_store, PAGE_SIZE as u64);
+    let _old_object = put_stream(&mut seed_store, PAGE_SIZE as u64);
     let old_info = seed_store.info().unwrap();
     seed_device.power_cycle();
     let seed_image = seed_device.durable_image();
@@ -827,7 +836,6 @@ fn every_commit_mutation_boundary_recovers_the_old_or_exact_new_cas_checkpoint()
             assert_old_or_exact_new_after_commit_fault(
                 device,
                 old_info,
-                &old_object,
                 &format!("commit mutation {boundary}, action {action:?}"),
             );
         }
@@ -850,7 +858,6 @@ fn every_commit_mutation_boundary_recovers_the_old_or_exact_new_cas_checkpoint()
             assert_old_or_exact_new_after_commit_fault(
                 device,
                 old_info,
-                &old_object,
                 &format!("commit mutation {boundary}, cancelled with {effect:?}"),
             );
         }

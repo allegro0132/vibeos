@@ -1,38 +1,45 @@
 //! Streaming canonical Blob CAS over the frozen Storage V2 segment ABI.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
 use vibeos_blob_format::{
-    BlobDescriptor, BlobError, BlobGeometry, HASH_SIZE, HEADER_SIZE, Hash, LEAF_SIZE,
-    MAX_STREAMING_EMISSIONS_PER_STEP, MerkleProof, MerkleTreeSink, StreamingError, StreamingMerkle,
-    verify_proof,
+    verify_proof, BlobDescriptor, BlobError, BlobGeometry, Hash, MerkleProof, MerkleTreeSink,
+    StreamingError, StreamingMerkle, HASH_SIZE, HEADER_SIZE, LEAF_SIZE,
+    MAX_STREAMING_EMISSIONS_PER_STEP,
 };
 use vibeos_segment_format::{
-    ANCHOR_SEGMENT_NO, BodyDigest, Checkpoint, DATA_END_PAGE, DATA_FIRST_PAGE, ExtentKind,
-    ExtentRecord, FormatError, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, Page, PhysicalPointer,
-    PointerValue, RecordBinding, SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE,
-    SUMMARY_SEAL_PAGE, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid,
     descriptor_chain_initial, descriptor_chain_next, encode_extent_body, encode_record_seal,
     encode_segment_header_body, encode_segment_seal_body, encode_segment_summary_body,
-    payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page,
+    payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
+    Checkpoint, ExtentKind, ExtentRecord, FormatError, Page, PhysicalPointer, PointerValue,
+    RecordBinding, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO,
+    DATA_END_PAGE, DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_SEAL_BODY_PAGE,
+    SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
+use crate::allocation_v2::{encode_allocation_v2, AllocationTransition};
 use crate::authority::{
     AuthorizedObject, ObjectPublicationTarget, PublicationIntent, PublishError,
 };
 use crate::cas_codec::{
-    BLOB_MAPPING_LEN, BlobKey, BlobManifest, BlobMapping, CANONICAL_CONTENT_EXTENT_LEN,
-    CAS_SNAPSHOT_HEADER_LEN, CasCodecContext, CasCodecError, CasSnapshot, MAX_BLOB_EXTENTS,
-    MAX_METADATA_PAYLOAD_LEN, ManifestExtent, OBJECT_MAPPING_LEN, ObjectMapping,
-    decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot,
+    decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
+    BlobMapping, CasCodecContext, CasCodecError, CasSnapshot, ManifestExtent, ObjectMapping,
+    BLOB_MAPPING_LEN, CANONICAL_CONTENT_EXTENT_LEN, CAS_SNAPSHOT_HEADER_LEN, MAX_BLOB_EXTENTS,
+    MAX_METADATA_PAYLOAD_LEN, OBJECT_MAPPING_LEN, REFERENCE_CODEC_RAW,
 };
-use crate::codec::{AllocationState, encode_allocation};
+use crate::codec::{encode_allocation, AllocationState};
 use crate::device::PageDevice;
+use crate::gc::{GcStoreError, GcTelemetry, GcTimeSource};
+use crate::pins::{
+    OwnedObjectReadPin, OwnedRuntimeRootPin, PinAdmission, PinRegistry, RootKey, RuntimeRootClass,
+};
 use crate::store::{
-    CapacityClass, MountedState, SegmentStore, StoreError, read_pointer_payload, scan_segment,
-    validate_cas_blob_descriptors, write_checkpoint,
+    read_pointer_payload, scan_segment, validate_cas_blob_descriptors, write_checkpoint,
+    CapacityClass, MountedState, SegmentStore, StoreError, READER_PIN_SLOTS, ROOT_PIN_SLOTS,
 };
 
 const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
@@ -40,13 +47,99 @@ const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const MAX_TREE_PAGES: usize = MAX_EXTENT_PAYLOAD_PAGES as usize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CasObjectHandle {
     store_uuid: StoreUuid,
     object_id: u128,
     object_kind: u32,
     exact_len: u64,
     commit_generation: u64,
+    root_pin: Arc<OwnedRuntimeRootPin<ROOT_PIN_SLOTS, READER_PIN_SLOTS>>,
+}
+
+/// Why an already-authorized object must remain in a GC root snapshot after
+/// the caller's ordinary object resource may be released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeObjectPinClass {
+    InvocationLease,
+    ExplicitSnapshot,
+    AuthorityTransaction,
+    MigrationTransaction,
+}
+
+/// A bounded runtime root created only from an existing authorized object.
+/// Dropping the guard releases the exact root-slot lease.
+pub struct RuntimeObjectPin {
+    _pin: OwnedRuntimeRootPin<ROOT_PIN_SLOTS, READER_PIN_SLOTS>,
+}
+
+/// Opaque identity shared by every pin owned by one runtime fault domain.
+/// It conveys no object authority and can be minted only by this store's
+/// runtime context.
+pub struct RuntimePinOwner {
+    owner: crate::pins::PinOwner,
+    registry: crate::store::SharedStorePinRegistry,
+}
+
+impl core::fmt::Debug for RuntimePinOwner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RuntimePinOwner")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Scheduler proof that a runtime fault domain has synchronously stopped.
+/// The constructor is explicit: a timeout or elapsed clock is not proof.
+pub struct StoppedRuntimePinOwner {
+    stopped: crate::pins::FaultDomainStopped,
+    registry: crate::store::SharedStorePinRegistry,
+}
+
+impl StoppedRuntimePinOwner {
+    /// # Safety
+    ///
+    /// The caller must be the trusted executor/fault-domain bridge and must
+    /// have synchronously joined the task represented by `owner`. Timeouts,
+    /// cancellation requests, and elapsed time do not satisfy this contract.
+    pub unsafe fn after_synchronous_join(owner: RuntimePinOwner) -> Self {
+        Self {
+            stopped: crate::pins::FaultDomainStopped::after_join(owner.owner),
+            registry: owner.registry,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimePinOwnerError {
+    WrongStore,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReleasedRuntimePins {
+    pub roots: usize,
+    pub readers: usize,
+}
+
+impl Clone for CasObjectHandle {
+    fn clone(&self) -> Self {
+        Self {
+            store_uuid: self.store_uuid,
+            object_id: self.object_id,
+            object_kind: self.object_kind,
+            exact_len: self.exact_len,
+            commit_generation: self.commit_generation,
+            root_pin: Arc::clone(&self.root_pin),
+        }
+    }
+}
+
+impl core::fmt::Debug for CasObjectHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CasObjectHandle")
+            .field("object_kind", &self.object_kind)
+            .field("exact_len", &self.exact_len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CasObjectHandle {
@@ -56,6 +149,20 @@ impl CasObjectHandle {
 
     pub const fn exact_len(&self) -> u64 {
         self.exact_len
+    }
+
+    pub(crate) fn root_key(
+        &self,
+        registry: &crate::store::SharedStorePinRegistry,
+    ) -> Result<RootKey, crate::pins::PinError> {
+        if !self.root_pin.is_active() || !self.root_pin.belongs_to(registry) {
+            return Err(crate::pins::PinError::RecheckFailed);
+        }
+        RootKey::new(self.object_id, self.commit_generation, self.object_kind)
+    }
+
+    pub(crate) const fn store_uuid(&self) -> StoreUuid {
+        self.store_uuid
     }
 }
 
@@ -82,6 +189,33 @@ pub enum CasStoreError<E> {
     ExpectedRootMismatch,
     HashCollision,
     WriterFailed,
+}
+
+#[derive(Debug)]
+pub enum ForegroundBlobError<E> {
+    Cas(CasStoreError<E>),
+    Gc(GcStoreError<E>),
+}
+
+impl<E: fmt::Display> fmt::Display for ForegroundBlobError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cas(error) => write!(formatter, "{error}"),
+            Self::Gc(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl<E> From<CasStoreError<E>> for ForegroundBlobError<E> {
+    fn from(error: CasStoreError<E>) -> Self {
+        Self::Cas(error)
+    }
+}
+
+impl<E> From<GcStoreError<E>> for ForegroundBlobError<E> {
+    fn from(error: GcStoreError<E>) -> Self {
+        Self::Gc(error)
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for CasStoreError<E> {
@@ -213,6 +347,7 @@ pub struct BlobWriter<'a, D: PageDevice> {
     store: &'a mut SegmentStore<D>,
     state: Option<MountedState>,
     object_kind: u32,
+    reference_codec: u16,
     geometry: BlobGeometry,
     expected_root: Option<Hash>,
     merkle: Option<StreamingMerkle<EmissionSink>>,
@@ -225,19 +360,218 @@ pub struct BlobWriter<'a, D: PageDevice> {
 }
 
 impl<D: PageDevice> SegmentStore<D> {
+    fn gc_can_relieve_blob_admission(error: &CasStoreError<D::Error>) -> bool {
+        matches!(
+            error,
+            CasStoreError::Store(StoreError::GcResumeRequired)
+                | CasStoreError::Store(StoreError::Capacity(
+                    CapacityClass::Metadata | CapacityClass::CleanerReserve
+                ))
+        )
+    }
+
+    /// Normal foreground admission path for a streaming Blob. If the exact
+    /// request would consume root-policy or cleaner headroom, run one bounded
+    /// low-live-ratio collection before returning capacity failure, then retry
+    /// admission against the newly mounted generation. The optional telemetry
+    /// is present only when foreground cleaning ran.
+    pub async fn begin_blob_with_foreground_gc<C: GcTimeSource>(
+        &mut self,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        clock: &C,
+    ) -> Result<(BlobWriter<'_, D>, Option<GcTelemetry>), ForegroundBlobError<D::Error>> {
+        let telemetry = self
+            .prepare_blob_with_reference_codec_foreground_gc(
+                object_kind,
+                exact_len,
+                expected_root,
+                REFERENCE_CODEC_RAW,
+                clock,
+            )
+            .await?;
+        let writer = self.begin_blob_with_reference_codec(
+            object_kind,
+            exact_len,
+            expected_root,
+            REFERENCE_CODEC_RAW,
+        )?;
+        Ok((writer, telemetry))
+    }
+
+    pub(crate) async fn prepare_blob_with_reference_codec_foreground_gc<C: GcTimeSource>(
+        &mut self,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        reference_codec: u16,
+        clock: &C,
+    ) -> Result<Option<GcTelemetry>, ForegroundBlobError<D::Error>> {
+        let maximum_cycles = self.info().map_err(CasStoreError::from)?.admitted_segments;
+        let mut cycles = 0_u64;
+        let mut aggregate = GcTelemetry::default();
+        let mut started = None;
+        loop {
+            // Probe admission and immediately drop the non-writing writer so
+            // its mutable borrow cannot span a subsequent cleaning cycle.
+            let admission = self
+                .begin_blob_with_reference_codec(
+                    object_kind,
+                    exact_len,
+                    expected_root,
+                    reference_codec,
+                )
+                .map(drop);
+            match admission {
+                Ok(()) => break,
+                Err(error) if Self::gc_can_relieve_blob_admission(&error) => {
+                    if cycles == maximum_cycles {
+                        return Err(error.into());
+                    }
+                    started.get_or_insert_with(|| clock.monotonic_ns());
+                    aggregate.saturating_merge_cycle(self.collect_garbage().await?);
+                    cycles += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let telemetry = started.map(|start| {
+            aggregate.foreground_pause_ns = clock.monotonic_ns().saturating_sub(start);
+            aggregate.pause_time_measured = true;
+            aggregate
+        });
+        Ok(telemetry)
+    }
+
+    pub fn allocate_runtime_pin_owner(&self) -> Result<RuntimePinOwner, CasStoreError<D::Error>> {
+        self.require_current_generation()?;
+        self.pins
+            .allocate_owner()
+            .map(|owner| RuntimePinOwner {
+                owner,
+                registry: self.pins.clone(),
+            })
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata).into())
+    }
+
+    /// Release every leaked pin for a fault domain only after the scheduler
+    /// has synchronously joined it. Other owners' pins are untouched.
+    pub fn release_stopped_runtime_pins(
+        &self,
+        stopped: StoppedRuntimePinOwner,
+    ) -> Result<ReleasedRuntimePins, RuntimePinOwnerError> {
+        if !Arc::ptr_eq(&stopped.registry, &self.pins) {
+            return Err(RuntimePinOwnerError::WrongStore);
+        }
+        let released = self.pins.release_stopped_owner(stopped.stopped);
+        Ok(ReleasedRuntimePins {
+            roots: released.roots,
+            readers: released.readers,
+        })
+    }
+
+    /// Pin an existing authorized object for one runtime operation or explicit
+    /// snapshot. This accepts no ObjectId or digest and therefore cannot turn
+    /// media identity into authority.
+    pub fn pin_runtime_object(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+        class: RuntimeObjectPinClass,
+    ) -> Result<RuntimeObjectPin, CasStoreError<D::Error>> {
+        let owner = self.allocate_runtime_pin_owner()?;
+        self.pin_runtime_object_owned(object, class, &owner)
+    }
+
+    /// Variant used by a task/fault-domain bridge so every pin can be reaped
+    /// together after synchronous task termination.
+    pub fn pin_runtime_object_owned(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+        class: RuntimeObjectPinClass,
+        owner: &RuntimePinOwner,
+    ) -> Result<RuntimeObjectPin, CasStoreError<D::Error>> {
+        if !Arc::ptr_eq(&owner.registry, &self.pins) {
+            return Err(StoreError::ObjectUnavailable.into());
+        }
+        let state = self.require_current_generation()?;
+        let handle = object.backend_handle();
+        let key = handle
+            .root_key(&self.pins)
+            .map_err(|_| StoreError::ObjectUnavailable)?;
+        let cas = state.cas.as_ref().ok_or(StoreError::ObjectUnavailable)?;
+        let mapping = cas
+            .objects
+            .binary_search_by_key(&key.object_id(), |mapping| mapping.object_id)
+            .ok()
+            .map(|index| cas.objects[index])
+            .filter(|mapping| {
+                mapping.commit_generation == key.commit_generation()
+                    && mapping.blob_key.object_kind() == key.object_kind()
+            })
+            .ok_or(StoreError::ObjectUnavailable)?;
+        if mapping.blob_key.exact_len() != object.exact_len() {
+            return Err(StoreError::ObjectUnavailable.into());
+        }
+        let (runtime_class, admission) = match class {
+            RuntimeObjectPinClass::InvocationLease => {
+                (RuntimeRootClass::InvocationLease, PinAdmission::Ordinary)
+            }
+            RuntimeObjectPinClass::ExplicitSnapshot => {
+                (RuntimeRootClass::ExplicitSnapshot, PinAdmission::Ordinary)
+            }
+            RuntimeObjectPinClass::AuthorityTransaction => (
+                RuntimeRootClass::AuthorityTransaction,
+                PinAdmission::CompletionCritical,
+            ),
+            RuntimeObjectPinClass::MigrationTransaction => (
+                RuntimeRootClass::MigrationTransaction,
+                PinAdmission::CompletionCritical,
+            ),
+        };
+        let pin =
+            PinRegistry::pin_root_owned(&self.pins, key, runtime_class, owner.owner, admission)
+                .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        Ok(RuntimeObjectPin { _pin: pin })
+    }
+
     pub fn begin_blob(
         &mut self,
         object_kind: u32,
         exact_len: u64,
         expected_root: Option<Hash>,
     ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
-        let current = self.mounted.as_ref().ok_or(if self.poisoned {
-            StoreError::RecoveryRequired
-        } else {
-            StoreError::NotMounted
-        })?;
+        self.begin_blob_with_reference_codec(
+            object_kind,
+            exact_len,
+            expected_root,
+            REFERENCE_CODEC_RAW,
+        )
+    }
+
+    pub(crate) fn begin_blob_with_reference_codec(
+        &mut self,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        reference_codec: u16,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        if reference_codec != REFERENCE_CODEC_RAW
+            && reference_codec != crate::cas_codec::REFERENCE_CODEC_TYPED_V1
+        {
+            return Err(StoreError::InvalidConfig.into());
+        }
+        // Immutable caller errors must be rejected before a foreground caller
+        // can decide to clean, and therefore before any GC media mutation.
+        let geometry = BlobGeometry::for_len(exact_len)?;
+        let merkle = StreamingMerkle::begin(object_kind, exact_len, EmissionSink::new())
+            .map_err(map_streaming_error)?;
+        let current = self.require_current_generation()?;
         if !current.catalog.is_empty() {
             return Err(StoreError::CatalogMode.into());
+        }
+        if !current.allocation.retired_segments().is_empty() {
+            return Err(StoreError::GcResumeRequired.into());
         }
         let cas_object_count = current.cas.as_ref().map_or(0, |cas| cas.objects.len());
         if cas_object_count >= self.limits.max_catalog_entries as usize {
@@ -283,12 +617,11 @@ impl<D: PageDevice> SegmentStore<D> {
         {
             return Err(StoreError::Capacity(CapacityClass::Metadata).into());
         }
-        let geometry = BlobGeometry::for_len(exact_len)?;
         let checkpoint_generation = current
             .generation
             .checked_add(1)
             .ok_or(StoreError::IdExhausted)?;
-        let (extents, segments) = plan_scratch(
+        let (mut extents, mut segments) = plan_scratch(
             current.superblock.binding.store_uuid,
             current.next_physical_segment,
             current.next_segment_generation,
@@ -299,24 +632,25 @@ impl<D: PageDevice> SegmentStore<D> {
             .ok()
             .and_then(|count| count.checked_add(1))
             .ok_or(StoreError::Capacity(CapacityClass::Payload))?;
-        let ordinary_end = current
-            .admitted_segments
-            .saturating_sub(u64::from(current.cleaner_reserve_segments));
-        if current
-            .next_physical_segment
-            .checked_add(required)
-            .is_none_or(|end| end > ordinary_end)
-        {
-            return Err(StoreError::Capacity(CapacityClass::CleanerReserve).into());
+        let first_segment = current
+            .find_free_run(required, false)
+            .ok_or(StoreError::Capacity(CapacityClass::CleanerReserve))?;
+        if first_segment != current.next_physical_segment {
+            (extents, segments) = plan_scratch(
+                current.superblock.binding.store_uuid,
+                first_segment,
+                current.next_segment_generation,
+                checkpoint_generation,
+                geometry,
+            )?;
         }
-        let merkle = StreamingMerkle::begin(object_kind, exact_len, EmissionSink::new())
-            .map_err(map_streaming_error)?;
         let state = self.mounted.take().ok_or(StoreError::NotMounted)?;
         self.poisoned = true;
         Ok(BlobWriter {
             store: self,
             state: Some(state),
             object_kind,
+            reference_codec,
             geometry,
             expected_root,
             merkle: Some(merkle),
@@ -334,6 +668,7 @@ impl<D: PageDevice> SegmentStore<D> {
         object: &AuthorizedObject<CasObjectHandle>,
         index: u32,
     ) -> Result<VerifiedCasChunk, CasStoreError<D::Error>> {
+        let read_pin = self.pin_blob_reader(object)?;
         let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
         let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
         if index >= geometry.leaf_count() {
@@ -399,6 +734,7 @@ impl<D: PageDevice> SegmentStore<D> {
             siblings,
         };
         verify_proof(descriptor, &bytes, &proof)?;
+        drop(read_pin);
         Ok(VerifiedCasChunk {
             descriptor,
             index,
@@ -411,58 +747,11 @@ impl<D: PageDevice> SegmentStore<D> {
         &self,
         object: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<VerifiedCasBlob, CasStoreError<D::Error>> {
+        let read_pin = self.pin_blob_reader(object)?;
         let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
-        let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
-        let mut builder = StreamingMerkle::begin(
-            descriptor.object_kind,
-            descriptor.byte_len,
-            EmissionSink::new(),
-        )
-        .map_err(map_streaming_error)?;
-        for index in 0..geometry.leaf_count() {
-            if descriptor.byte_len == 0 {
-                break;
-            }
-            let chunk_len = descriptor
-                .byte_len
-                .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
-                .min(LEAF_SIZE as u64) as usize;
-            let bytes = read_manifest_range(
-                &self.device,
-                state,
-                &manifest,
-                HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
-                chunk_len,
-            )
-            .await?;
-            builder
-                .push_chunk(index, &bytes)
-                .map_err(map_streaming_error)?;
-            verify_tree_emissions(
-                &self.device,
-                state,
-                &manifest,
-                geometry,
-                builder.sink_mut().take(),
-            )
-            .await?;
-        }
-        while builder.padding_remaining().map_err(map_streaming_error)? != 0 {
-            builder.pad_next().map_err(map_streaming_error)?;
-            verify_tree_emissions(
-                &self.device,
-                state,
-                &manifest,
-                geometry,
-                builder.sink_mut().take(),
-            )
-            .await?;
-        }
-        let computed = builder.finalize().map_err(map_streaming_error)?;
-        if computed.descriptor != descriptor {
-            return Err(StoreError::Corrupt.into());
-        }
+        verify_resolved_blob(&self.device, state, descriptor, &manifest).await?;
+        drop(read_pin);
         Ok(VerifiedCasBlob {
             descriptor,
             verified_encoded_bytes: manifest.encoded_blob_len,
@@ -478,8 +767,14 @@ impl<D: PageDevice> SegmentStore<D> {
         } else {
             StoreError::NotMounted
         })?;
+        if self.published_generation.load(Ordering::Acquire) != state.generation {
+            return Err(StoreError::RecoveryRequired.into());
+        }
         let cas = state.cas.as_ref().ok_or(StoreError::ObjectUnavailable)?;
         let handle = object.backend_handle();
+        if handle.root_key(&self.pins).is_err() {
+            return Err(StoreError::ObjectUnavailable.into());
+        }
         if handle.store_uuid != state.superblock.binding.store_uuid
             || handle.object_kind != object.object_kind()
             || handle.exact_len != object.exact_len()
@@ -549,6 +844,129 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         Ok((descriptor, manifest))
     }
+
+    fn pin_blob_reader(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<OwnedObjectReadPin<ROOT_PIN_SLOTS, READER_PIN_SLOTS>, CasStoreError<D::Error>> {
+        let state = self.mounted.as_ref().ok_or(if self.poisoned {
+            StoreError::RecoveryRequired
+        } else {
+            StoreError::NotMounted
+        })?;
+        if self.published_generation.load(Ordering::Acquire) != state.generation {
+            return Err(StoreError::RecoveryRequired.into());
+        }
+        let handle = object.backend_handle();
+        let key = RootKey::new(
+            handle.object_id,
+            handle.commit_generation,
+            handle.object_kind,
+        )
+        .map_err(|_| StoreError::ObjectUnavailable)?;
+        if handle.root_pin.key() != key
+            || !handle.root_pin.is_active()
+            || !handle.root_pin.belongs_to(&self.pins)
+        {
+            return Err(StoreError::ObjectUnavailable.into());
+        }
+        let owner = self
+            .pins
+            .allocate_owner()
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        let pin = PinRegistry::pin_object_reader_owned(
+            &self.pins,
+            key,
+            state.generation,
+            owner,
+            PinAdmission::Ordinary,
+        )
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        let observed_generation = self.published_generation.load(Ordering::Acquire);
+        pin.finish_recheck(key, observed_generation)
+            .map_err(|_| StoreError::ObjectUnavailable.into())
+    }
+}
+
+/// Verify one already-resolved manifest without exercising object authority.
+/// This is crate-private so GC and scrub can authenticate staged media without
+/// turning a content digest or catalog identity into an object-opening API.
+pub(crate) async fn verify_manifest_blob<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    manifest: &BlobManifest,
+) -> Result<(), CasStoreError<D::Error>> {
+    let geometry = BlobGeometry::for_len(manifest.blob_key.exact_len())?;
+    let descriptor = BlobDescriptor {
+        object_kind: manifest.blob_key.object_kind(),
+        byte_len: manifest.blob_key.exact_len(),
+        leaf_count: geometry.leaf_count(),
+        tree_node_count: geometry.tree_node_count(),
+        root: manifest.blob_key.merkle_root(),
+    };
+    validate_cas_blob_descriptors(
+        device,
+        state.superblock.binding.store_uuid,
+        state.admitted_segments,
+        state.next_segment_generation,
+        state.generation,
+        manifest,
+    )
+    .await?;
+    let header = read_manifest_range(device, state, manifest, 0, HEADER_SIZE).await?;
+    let header: &[u8; HEADER_SIZE] = header
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Corrupt)?;
+    if BlobDescriptor::decode_header(header)? != descriptor {
+        return Err(StoreError::Corrupt.into());
+    }
+    verify_resolved_blob(device, state, descriptor, manifest).await
+}
+
+async fn verify_resolved_blob<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    descriptor: BlobDescriptor,
+    manifest: &BlobManifest,
+) -> Result<(), CasStoreError<D::Error>> {
+    let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
+    let mut builder = StreamingMerkle::begin(
+        descriptor.object_kind,
+        descriptor.byte_len,
+        EmissionSink::new(),
+    )
+    .map_err(map_streaming_error)?;
+    for index in 0..geometry.leaf_count() {
+        if descriptor.byte_len == 0 {
+            break;
+        }
+        let chunk_len = descriptor
+            .byte_len
+            .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
+            .min(LEAF_SIZE as u64) as usize;
+        let bytes = read_manifest_range(
+            device,
+            state,
+            manifest,
+            HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
+            chunk_len,
+        )
+        .await?;
+        builder
+            .push_chunk(index, &bytes)
+            .map_err(map_streaming_error)?;
+        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+    }
+    while builder.padding_remaining().map_err(map_streaming_error)? != 0 {
+        builder.pad_next().map_err(map_streaming_error)?;
+        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+    }
+    let computed = builder.finalize().map_err(map_streaming_error)?;
+    if computed.descriptor != descriptor {
+        return Err(StoreError::Corrupt.into());
+    }
+    Ok(())
 }
 
 impl<D: PageDevice> Drop for BlobWriter<'_, D> {
@@ -585,7 +1003,7 @@ async fn verify_tree_emissions<D: PageDevice>(
     Ok(())
 }
 
-async fn read_manifest_range<D: PageDevice>(
+pub(crate) async fn read_manifest_range<D: PageDevice>(
     device: &D,
     state: &MountedState,
     manifest: &BlobManifest,
@@ -722,10 +1140,11 @@ impl<D: PageDevice> BlobWriter<'_, D> {
             return Ok(());
         }
         self.mutated = true;
-        let state = self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
-        let extra_metadata_segment = state
-            .next_physical_segment
-            .checked_add(self.segments.len() as u64)
+        self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
+        let extra_metadata_segment = self
+            .segments
+            .last()
+            .and_then(|segment| segment.segment_no.checked_add(1))
             .ok_or(StoreError::Capacity(CapacityClass::Payload))?;
         for segment_no in self
             .segments
@@ -961,6 +1380,8 @@ impl<D: PageDevice> BlobWriter<'_, D> {
             &self.extents,
             &self.segments,
             &payload_hashes,
+            &self.store.pins,
+            self.reference_codec,
         )
         .await?;
         // The checkpoint is durable, but publication is still withheld. A cold
@@ -986,15 +1407,15 @@ impl<D: PageDevice> BlobWriter<'_, D> {
 }
 
 #[derive(Clone)]
-struct FinalRecord {
-    value: ExtentRecord,
-    digest: BodyDigest,
-    body: Page,
-    seal: Page,
+pub(crate) struct FinalRecord {
+    pub(crate) value: ExtentRecord,
+    pub(crate) digest: BodyDigest,
+    pub(crate) body: Page,
+    pub(crate) seal: Page,
 }
 
 impl FinalRecord {
-    fn pointer(&self) -> PhysicalPointer {
+    pub(crate) fn pointer(&self) -> PhysicalPointer {
         PhysicalPointer::Value(PointerValue {
             store_uuid: self.value.binding.store_uuid,
             segment_no: self.value.binding.segment_no,
@@ -1011,7 +1432,7 @@ impl FinalRecord {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_record(
+pub(crate) fn build_record(
     store_uuid: StoreUuid,
     segment_no: u64,
     segment_generation: u64,
@@ -1066,7 +1487,7 @@ fn build_record(
     })
 }
 
-async fn write_page<D: PageDevice>(
+pub(crate) async fn write_page<D: PageDevice>(
     device: &D,
     page: u64,
     bytes: &Page,
@@ -1077,7 +1498,7 @@ async fn write_page<D: PageDevice>(
         .map_err(StoreError::Mutation)
 }
 
-async fn flush<D: PageDevice>(device: &D) -> Result<(), StoreError<D::Error>> {
+pub(crate) async fn flush<D: PageDevice>(device: &D) -> Result<(), StoreError<D::Error>> {
     device.flush().await.map_err(StoreError::Mutation)
 }
 
@@ -1474,7 +1895,7 @@ async fn seal_scratch_segment<D: PageDevice>(
     .await
 }
 
-async fn finalize_segment<D: PageDevice>(
+pub(crate) async fn finalize_segment<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
     checkpoint_generation: u64,
@@ -1593,6 +2014,8 @@ async fn commit_snapshot<D: PageDevice>(
     scratch_extents: &[ScratchExtent],
     scratch_segments: &[ScratchSegment],
     payload_hashes: &[Hash],
+    pins: &crate::store::SharedStorePinRegistry,
+    reference_codec: u16,
 ) -> Result<CasObjectHandle, CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -1600,10 +2023,18 @@ async fn commit_snapshot<D: PageDevice>(
         .ok_or(StoreError::IdExhausted)?;
     let is_new = existing.is_none();
     let data_segment_count = if is_new { scratch_segments.len() } else { 0 };
-    let metadata_segment_no = state
-        .next_physical_segment
-        .checked_add(data_segment_count as u64)
-        .ok_or(StoreError::IdExhausted)?;
+    let scratch_first_segment = scratch_segments
+        .first()
+        .map(|segment| segment.segment_no)
+        .ok_or(StoreError::Corrupt)?;
+    let metadata_segment_no = if is_new {
+        scratch_segments
+            .last()
+            .and_then(|segment| segment.segment_no.checked_add(1))
+            .ok_or(StoreError::IdExhausted)?
+    } else {
+        scratch_first_segment
+    };
     let metadata_generation = state
         .next_segment_generation
         .checked_add(data_segment_count as u64)
@@ -1713,6 +2144,7 @@ async fn commit_snapshot<D: PageDevice>(
         object_id: state.next_object_id,
         blob_key,
         commit_generation: checkpoint_generation,
+        reference_codec,
     });
     if is_new {
         blobs
@@ -1758,15 +2190,38 @@ async fn commit_snapshot<D: PageDevice>(
     let catalog_root = snapshot_record.pointer();
     records.push(snapshot_record);
 
-    let allocated_prefix_segments = metadata_segment_no + 1;
-    let allocation = AllocationState {
-        checkpoint_generation,
-        admitted_segments: state.admitted_segments,
-        allocated_prefix_segments,
-        next_segment_generation,
-        cleaner_reserve_segments: state.cleaner_reserve_segments,
+    let allocation_bytes = if state.allocation_version == 2 {
+        let mut allocated_segments = Vec::new();
+        allocated_segments
+            .try_reserve_exact(data_segment_count + 1)
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        if is_new {
+            allocated_segments.extend(scratch_segments.iter().map(|segment| segment.segment_no));
+        }
+        allocated_segments.push(metadata_segment_no);
+        let allocation = state
+            .allocation
+            .apply_transition(AllocationTransition {
+                checkpoint_generation,
+                next_segment_generation,
+                allocate: &allocated_segments,
+                retire: &[],
+                reclaim: &[],
+            })
+            .map_err(|_| StoreError::Corrupt)?;
+        encode_allocation_v2(&allocation).map_err(|_| StoreError::Corrupt)?
+    } else {
+        let allocated_prefix_segments = metadata_segment_no + 1;
+        encode_allocation(AllocationState {
+            checkpoint_generation,
+            admitted_segments: state.admitted_segments,
+            allocated_prefix_segments,
+            next_segment_generation,
+            cleaner_reserve_segments: state.cleaner_reserve_segments,
+        })
+        .map_err(|_| StoreError::Corrupt)?
+        .to_vec()
     };
-    let allocation_bytes = encode_allocation(allocation).map_err(|_| StoreError::Corrupt)?;
     let allocation_record = build_record(
         state.superblock.binding.store_uuid,
         metadata_segment_no,
@@ -1881,21 +2336,39 @@ async fn commit_snapshot<D: PageDevice>(
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
         catalog_root,
-        authority_root: PhysicalPointer::Null,
+        authority_root: state.authority_root,
         allocation_root,
         replay_tail: PhysicalPointer::Null,
     };
     write_checkpoint(device, &checkpoint, true).await?;
+    let root_key = RootKey::new(
+        state.next_object_id,
+        checkpoint_generation,
+        blob_key.object_kind(),
+    )
+    .map_err(|_| StoreError::Corrupt)?;
+    let owner = pins
+        .allocate_owner()
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+    let root_pin = PinRegistry::pin_root_owned(
+        pins,
+        root_key,
+        RuntimeRootClass::ObjectResource,
+        owner,
+        PinAdmission::CompletionCritical,
+    )
+    .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
     Ok(CasObjectHandle {
         store_uuid: state.superblock.binding.store_uuid,
         object_id: state.next_object_id,
         object_kind: blob_key.object_kind(),
         exact_len: blob_key.exact_len(),
         commit_generation: checkpoint_generation,
+        root_pin: Arc::new(root_pin),
     })
 }
 
-async fn write_payload_record<D: PageDevice>(
+pub(crate) async fn write_payload_record<D: PageDevice>(
     device: &D,
     base: u64,
     record: &FinalRecord,
@@ -2118,17 +2591,17 @@ mod tests {
         let (extents, _) =
             plan_scratch::<()>(StoreUuid::new([1; 16]).unwrap(), 1, 2, 3, geometry).unwrap();
         assert!(find_scratch_extent::<()>(&extents, 0, HEADER_SIZE as u64).is_ok());
-        assert!(
-            find_scratch_extent::<()>(&extents, HEADER_SIZE as u64, CANONICAL_CONTENT_EXTENT_LEN,)
-                .is_ok()
-        );
-        assert!(
-            find_scratch_extent::<()>(
-                &extents,
-                HEADER_SIZE as u64 + CANONICAL_CONTENT_EXTENT_LEN - 1,
-                2,
-            )
-            .is_err()
-        );
+        assert!(find_scratch_extent::<()>(
+            &extents,
+            HEADER_SIZE as u64,
+            CANONICAL_CONTENT_EXTENT_LEN,
+        )
+        .is_ok());
+        assert!(find_scratch_extent::<()>(
+            &extents,
+            HEADER_SIZE as u64 + CANONICAL_CONTENT_EXTENT_LEN - 1,
+            2,
+        )
+        .is_err());
     }
 }

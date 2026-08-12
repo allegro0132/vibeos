@@ -249,6 +249,15 @@ pub struct HubInfo {
     pub port_status: u16,
 }
 
+pub const MAX_HUB_CHILDREN: usize = MAX_HUB_PORTS as usize;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HubChildInfo {
+    pub device: DeviceInfo,
+    pub port: u8,
+    pub port_status: u16,
+}
+
 #[derive(Clone, Copy)]
 struct SplitTarget {
     hub_address: u8,
@@ -347,6 +356,7 @@ pub struct Controller {
     speed: Speed,
     device: Option<DeviceInfo>,
     child: Option<DeviceInfo>,
+    children: [Option<HubChildInfo>; MAX_HUB_CHILDREN],
     hub: Option<HubInfo>,
     split: Option<SplitTarget>,
     configuration: Option<ConfigurationInfo>,
@@ -584,6 +594,7 @@ impl Controller {
             speed: Speed::Full,
             device: None,
             child: None,
+            children: [None; MAX_HUB_CHILDREN],
             hub: None,
             split: None,
             configuration: None,
@@ -625,6 +636,10 @@ impl Controller {
 
     pub const fn child(&self) -> Option<DeviceInfo> {
         self.child
+    }
+
+    pub const fn children(&self) -> [Option<HubChildInfo>; MAX_HUB_CHILDREN] {
+        self.children
     }
 
     pub const fn keyboard(&self) -> Option<HidKeyboardInfo> {
@@ -738,6 +753,7 @@ impl Controller {
         if !self.connected() {
             self.device = None;
             self.child = None;
+            self.children = [None; MAX_HUB_CHILDREN];
             self.hub = None;
             self.split = None;
             self.configuration = None;
@@ -801,6 +817,7 @@ impl Controller {
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
         self.device = Some(info);
         self.child = None;
+        self.children = [None; MAX_HUB_CHILDREN];
         self.hub = None;
         self.configuration = None;
         self.report_descriptor = None;
@@ -866,7 +883,7 @@ impl Controller {
                 )?;
                 let hub = self.configure_hub()?;
                 self.hub = Some(hub);
-                if self.enumerate_hub_child(hub)?.is_some() {
+                if self.enumerate_hub_children(hub)? != 0 {
                     return self.configure_hid_keyboard();
                 }
             }
@@ -978,35 +995,12 @@ impl Controller {
             u64::from(power_good_ms.max(20)),
         );
 
-        let mut active_port = None;
-        let mut child_speed = None;
-        let mut port_status = 0;
-        for port in 1..=ports {
-            let status = self.hub_port_status(port)?;
-            if status & USB_PORT_STAT_CONNECTION == 0 {
-                continue;
-            }
-            self.hub_port_feature(port, true, USB_PORT_FEAT_RESET)?;
-            delay_ms(self.timebase_hz, self.time, 60);
-            let reset_status = self.hub_port_status(port)?;
-            let _ = self.hub_port_feature(port, false, USB_PORT_FEAT_C_RESET);
-            if reset_status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)
-                != USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE
-            {
-                continue;
-            }
-            active_port = Some(port);
-            child_speed = Some(hub_port_speed(reset_status));
-            port_status = reset_status;
-            break;
-        }
-
         Ok(HubInfo {
             address: self.device_address,
             ports,
-            active_port,
-            child_speed,
-            port_status,
+            active_port: None,
+            child_speed: None,
+            port_status: 0,
         })
     }
 
@@ -1042,11 +1036,67 @@ impl Controller {
         Ok(u16::from_le_bytes([status[0], status[1]]))
     }
 
-    fn enumerate_hub_child(&mut self, hub: HubInfo) -> Result<Option<DeviceInfo>, Error> {
-        let (Some(port), Some(speed)) = (hub.active_port, hub.child_speed) else {
-            self.child = None;
-            return Ok(None);
-        };
+    fn enumerate_hub_children(&mut self, mut hub: HubInfo) -> Result<usize, Error> {
+        self.child = None;
+        self.children = [None; MAX_HUB_CHILDREN];
+        let hub_device = self.device.ok_or(Error::NoDevice)?;
+        let mut count = 0;
+        for port in 1..=hub.ports {
+            self.device_address = hub_device.address;
+            self.endpoint_zero_max_packet = u16::from(hub_device.max_packet_size_0);
+            self.speed = hub_device.speed;
+            self.split = None;
+            let status = self.hub_port_status(port)?;
+            if status & USB_PORT_STAT_CONNECTION == 0 {
+                continue;
+            }
+            self.hub_port_feature(port, true, USB_PORT_FEAT_RESET)?;
+            delay_ms(self.timebase_hz, self.time, 60);
+            let reset_status = self.hub_port_status(port)?;
+            let _ = self.hub_port_feature(port, false, USB_PORT_FEAT_C_RESET);
+            if reset_status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)
+                != USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE
+            {
+                continue;
+            }
+            let speed = hub_port_speed(reset_status);
+            let address = 2u8
+                .checked_add(count as u8)
+                .ok_or(Error::InvalidDescriptor)?;
+            let info = self.enumerate_hub_child(hub, port, speed, address)?;
+            self.children[count] = Some(HubChildInfo {
+                device: info,
+                port,
+                port_status: reset_status,
+            });
+            if self.child.is_none() {
+                self.child = Some(info);
+                hub.active_port = Some(port);
+                hub.child_speed = Some(speed);
+                hub.port_status = reset_status;
+            }
+            count += 1;
+        }
+        self.hub = Some(hub);
+        if let Some(first) = self.children[0] {
+            self.device_address = first.device.address;
+            self.endpoint_zero_max_packet = u16::from(first.device.max_packet_size_0);
+            self.speed = first.device.speed;
+            self.split = (first.device.speed != Speed::High).then_some(SplitTarget {
+                hub_address: hub.address,
+                port: first.port,
+            });
+        }
+        Ok(count)
+    }
+
+    fn enumerate_hub_child(
+        &mut self,
+        hub: HubInfo,
+        port: u8,
+        speed: Speed,
+        address: u8,
+    ) -> Result<DeviceInfo, Error> {
         self.split = (speed != Speed::High).then_some(SplitTarget {
             hub_address: hub.address,
             port,
@@ -1079,13 +1129,13 @@ impl Controller {
             SetupPacket {
                 request_type: 0,
                 request: 5,
-                value: 2,
+                value: u16::from(address),
                 index: 0,
                 length: 0,
             },
             &mut [],
         )?;
-        self.device_address = 2;
+        self.device_address = address;
         delay_ms(self.timebase_hz, self.time, 2);
 
         let full = SetupPacket {
@@ -1100,8 +1150,7 @@ impl Controller {
         }
         let info = parse_device_descriptor(descriptor, speed, self.device_address)?;
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
-        self.child = Some(info);
-        Ok(Some(info))
+        Ok(info)
     }
 
     /// Poll one interrupt-IN keyboard report and return bytes for newly

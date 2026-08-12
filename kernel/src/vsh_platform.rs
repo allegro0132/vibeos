@@ -632,6 +632,32 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
 
 #[cfg(feature = "milkv-duo")]
 fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
+    if args.first().is_some_and(|argument| argument == "net-rx") {
+        if args.len() != 1 {
+            return Err(Status::Usage);
+        }
+        let mut frame = [0; vibeos_driver_dwc2_host::MAX_ETHERNET_FRAME_BYTES];
+        for _ in 0..100 {
+            match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
+                Ok(length) => {
+                    let mut output = format!("CDC-ECM received Ethernet frame length={length}\n");
+                    for (line, chunk) in frame[..length].chunks(16).enumerate() {
+                        write!(&mut output, "{:04x}  ", line * 16).map_err(|_| Status::Faulted)?;
+                        for byte in chunk {
+                            write!(&mut output, "{byte:02x} ").map_err(|_| Status::Faulted)?;
+                        }
+                        output.push('\n');
+                    }
+                    return Ok(output);
+                }
+                Err(vibeos_driver_dwc2_host::Error::Nak) => {}
+                Err(_) => return Err(Status::Unavailable),
+            }
+        }
+        return Ok(String::from(
+            "CDC-ECM receive queue empty after 100 polls\n",
+        ));
+    }
     if args.first().is_some_and(|argument| argument == "read") {
         let sector = args
             .get(1)

@@ -874,6 +874,7 @@ name = "vibeos-file-store"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-durable-format",
  "vibeos-segment-format",
  "vibeos-segment-store",
  "vibeos-storage-device",

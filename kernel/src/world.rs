@@ -2016,6 +2016,8 @@ pub fn build() {
                 crate::segment_store_platform::MIGRATION_CONTROL_BLOCK_COUNT;
             const STORAGE_V2_FIRST: u64 = crate::segment_store_platform::STORAGE_V2_FIRST_BLOCK;
             const STORAGE_V2_BLOCKS: u64 = crate::segment_store_platform::STORAGE_V2_BLOCK_COUNT;
+            const STORAGE_V2_GRANULE: u64 =
+                crate::segment_store_platform::STORAGE_V2_GROWTH_GRANULE_BLOCKS;
 
             let managed_range = resources.managed_range.range();
             let diagnostic_range = managed_range
@@ -2027,8 +2029,17 @@ pub fn build() {
             let migration_control_range = managed_range
                 .attenuate(MIGRATION_CONTROL_FIRST, MIGRATION_CONTROL_BLOCKS)
                 .expect("image block range contains the migration-control window");
+            let storage_v2_available = managed_range
+                .block_count()
+                .checked_sub(STORAGE_V2_FIRST)
+                .expect("image block range contains Storage V2 start");
+            let storage_v2_extra = storage_v2_available
+                .checked_sub(STORAGE_V2_BLOCKS)
+                .expect("image block range contains the initial Storage V2 window");
+            let storage_v2_provisioned_blocks =
+                STORAGE_V2_BLOCKS + (storage_v2_extra / STORAGE_V2_GRANULE) * STORAGE_V2_GRANULE;
             let storage_v2_range = managed_range
-                .attenuate(STORAGE_V2_FIRST, STORAGE_V2_BLOCKS)
+                .attenuate(STORAGE_V2_FIRST, storage_v2_provisioned_blocks)
                 .expect("image block range contains the initial Storage V2 window");
             vibeos_storage_device::validate_grant_layout(
                 managed_range,
@@ -2126,7 +2137,7 @@ pub fn build() {
             let storage_v2_policy = policy
                 .derive_scoped::<block_device::BlockDevice>(
                     range_root,
-                    (STORAGE_V2_FIRST, STORAGE_V2_BLOCKS),
+                    (STORAGE_V2_FIRST, storage_v2_provisioned_blocks),
                     Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
                 )
                 .expect("image block range contains the initial Storage V2 window");

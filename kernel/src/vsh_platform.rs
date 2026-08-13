@@ -74,9 +74,13 @@ impl Platform for VshPlatform {
     }
 }
 
-pub async fn task(space: Arc<Space>, console: Cap, mut session: Session) {
+pub async fn task(space: Arc<Space>, console: Cap, session: Session) {
     #[cfg(feature = "file-tree")]
-    bind_persistent_file_tree(&mut session).await;
+    let session = {
+        let mut session = session;
+        bind_persistent_file_tree(&mut session).await;
+        session
+    };
     let platform = VshPlatform::capability_front(space, console);
     vibeos_vsh::task(&platform, session).await;
 }

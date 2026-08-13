@@ -503,6 +503,17 @@ impl FileTreeRoot {
             || persisted_metadata.iter().any(|(file_id, metadata)| {
                 state.link_count(*file_id, metadata.file_type) != metadata.link_count
             })
+            || state.inodes.iter().any(|(file_id, inode)| {
+                if *file_id == crate::ROOT_FILE_ID {
+                    return state.dirents.values().any(|child| child == file_id);
+                }
+                let incoming = state
+                    .dirents
+                    .values()
+                    .filter(|child| *child == file_id)
+                    .count();
+                incoming == 0 || (inode.file_type == FileType::Directory && incoming != 1)
+            })
         {
             return Err(FileError::InvalidType.into());
         }

@@ -1055,14 +1055,14 @@ impl FsTransaction {
             .dirents
             .retain(|(p, n), _child| !doomed.contains(p) && !(*p == parent && *n == name));
         for inode_id in ids {
-            if self.working.link_count(
-                inode_id,
-                self.working
-                    .inodes
-                    .get(&inode_id)
-                    .map(|i| i.file_type)
-                    .unwrap_or(FileType::Regular),
-            ) == 0
+            let inode_type = self
+                .working
+                .inodes
+                .get(&inode_id)
+                .map(|inode| inode.file_type)
+                .unwrap_or(FileType::Regular);
+            if inode_type == FileType::Directory
+                || self.working.link_count(inode_id, inode_type) == 0
             {
                 self.working.inodes.remove(&inode_id);
             }
@@ -1257,6 +1257,7 @@ mod tests {
         tx.remove(&path("tree"), true, false).unwrap();
         tx.commit().unwrap();
         assert!(root.snapshot().stat(&path("outside"), true).is_ok());
+        assert_eq!(root.snapshot().state.inodes.len(), 2);
     }
 
     #[test]

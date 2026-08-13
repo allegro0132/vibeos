@@ -1,0 +1,5 @@
+quiet
+stat @home/etc
+stat @home/gc
+echo VIBE_FILE_TREE_BOOT3_OK
+@quit

@@ -95,7 +95,6 @@ impl CoreFeature {
                 | Self::LinearMemory
                 | Self::Tables
                 | Self::ImportsExports
-                | Self::Start
                 | Self::DataElements
         )
     }
@@ -110,6 +109,8 @@ pub struct ProfileLimits {
     pub max_core_nesting: u32,
     pub max_types: u32,
     pub max_functions: u32,
+    pub max_params_per_function: u32,
+    pub max_results_per_function: u32,
     pub max_imports: u32,
     pub max_exports: u32,
     pub max_globals: u32,
@@ -145,6 +146,8 @@ pub const PROFILE_1_LIMITS: ProfileLimits = ProfileLimits {
     max_core_nesting: 128,
     max_types: 1024,
     max_functions: 1024,
+    max_params_per_function: 32,
+    max_results_per_function: 32,
     max_imports: 256,
     max_exports: 256,
     max_globals: 256,
@@ -219,6 +222,8 @@ pub enum LimitKind {
     CoreModuleBytes,
     Types,
     Functions,
+    Parameters,
+    Results,
     Imports,
     Exports,
     Globals,
@@ -241,6 +246,8 @@ pub enum LimitKind {
     CanonicalValueBytes,
     StringBytes,
     ListElements,
+    CoreNesting,
+    EngineAllocationBytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

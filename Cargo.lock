@@ -1171,6 +1171,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasm-runtime"
+version = "0.1.0"
+dependencies = [
+ "dlr-wasm-interpreter",
+ "vibeos-component-format",
+ "wasmi",
+ "wasmparser 0.255.0",
+ "wat",
+]
+
+[[package]]
 name = "virtue"
 version = "0.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

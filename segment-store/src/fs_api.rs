@@ -15,10 +15,11 @@ use crate::cas_codec::{ObjectMapping, REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW
 use crate::device::PageDevice;
 use crate::gc::GcStoreError;
 use crate::{
-    decode_fs_btree_node_v1, encode_fs_btree_node_v1, encode_fs_root_v1, FsBtreeEntryV1,
-    FsBtreeNodeV1, FsCodecError, FsRootV1, FsTreeKind, SegmentStore, StoreError,
-    TypedObjectReference, FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT,
-    FS_BTREE_NODE_V1_KIND, FS_DATA_V1_KIND, FS_OBJECT_MAX_LEN, FS_ROOT_V1_KIND,
+    decode_fs_btree_node_v1, decode_fs_data_node_v1, encode_fs_btree_node_v1,
+    encode_fs_data_node_v1, encode_fs_root_v1, FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError,
+    FsDataNodeV1, FsRootV1, FsTreeKind, SegmentStore, StoreError, TypedObjectReference,
+    FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT, FS_BTREE_NODE_V1_KIND,
+    FS_DATA_CHUNK_MAX_LEN, FS_DATA_V1_KIND, FS_OBJECT_MAX_LEN, FS_ROOT_V1_KIND,
 };
 
 pub struct FsNodeEntryInput<'a> {
@@ -92,15 +93,29 @@ pub struct FsPersistentRoot {
 #[derive(Clone)]
 pub struct FsPersistentData {
     object: Arc<AuthorizedObject<CasObjectHandle>>,
+    layout: FsPersistentDataLayout,
+}
+
+#[derive(Clone)]
+enum FsPersistentDataLayout {
+    Raw,
+    Stream(FsDataNodeV1),
 }
 
 impl FsPersistentData {
     pub fn exact_len(&self) -> u64 {
-        self.object.exact_len()
+        match &self.layout {
+            FsPersistentDataLayout::Raw => self.object.exact_len(),
+            FsPersistentDataLayout::Stream(node) => node.total_len,
+        }
     }
 
     pub fn chunk_count(&self) -> u64 {
-        self.object.exact_len().div_ceil(PAGE_SIZE as u64)
+        match &self.layout {
+            FsPersistentDataLayout::Raw => self.object.exact_len().div_ceil(PAGE_SIZE as u64),
+            FsPersistentDataLayout::Stream(node) if node.total_len == 0 => 0,
+            FsPersistentDataLayout::Stream(node) => node.chunk_index + 1,
+        }
     }
 }
 
@@ -184,7 +199,10 @@ impl<D: PageDevice> SegmentStore<D> {
                     && mapping.blob_key.object_kind() == expected_kind
                     && match expected_kind {
                         FS_BTREE_NODE_V1_KIND => mapping.reference_codec == REFERENCE_CODEC_FS_V1,
-                        FS_DATA_V1_KIND => mapping.reference_codec == REFERENCE_CODEC_RAW,
+                        FS_DATA_V1_KIND => matches!(
+                            mapping.reference_codec,
+                            REFERENCE_CODEC_RAW | REFERENCE_CODEC_FS_V1
+                        ),
                         _ => false,
                     }
             })
@@ -209,6 +227,22 @@ impl<D: PageDevice> SegmentStore<D> {
             )
             .map_err(|_| StoreError::ObjectUnavailable)?,
         ))
+    }
+
+    async fn recover_fs_data_reference(
+        &self,
+        reference: TypedObjectReference,
+    ) -> Result<FsPersistentData, FsRootPublishError<D::Error>> {
+        let mapping = self.fs_mapping_for_reference(reference, FS_DATA_V1_KIND)?;
+        let object = self.recover_fs_reference(reference, FS_DATA_V1_KIND)?;
+        let layout = if mapping.reference_codec == REFERENCE_CODEC_FS_V1 {
+            FsPersistentDataLayout::Stream(decode_fs_data_node_v1(
+                &self.read_fs_object_bytes(&object).await?,
+            )?)
+        } else {
+            FsPersistentDataLayout::Raw
+        };
+        Ok(FsPersistentData { object, layout })
     }
 
     fn fs_reference_for(
@@ -243,7 +277,10 @@ impl<D: PageDevice> SegmentStore<D> {
                         FS_ROOT_V1_KIND | FS_BTREE_NODE_V1_KIND => {
                             mapping.reference_codec == REFERENCE_CODEC_FS_V1
                         }
-                        crate::FS_DATA_V1_KIND => mapping.reference_codec == REFERENCE_CODEC_RAW,
+                        crate::FS_DATA_V1_KIND => matches!(
+                            mapping.reference_codec,
+                            REFERENCE_CODEC_RAW | REFERENCE_CODEC_FS_V1
+                        ),
                         _ => false,
                     }
             })
@@ -252,6 +289,88 @@ impl<D: PageDevice> SegmentStore<D> {
             object_id: mapping.object_id,
             commit_generation: mapping.commit_generation,
             object_kind: mapping.blob_key.object_kind(),
+        })
+    }
+
+    /// Append one bounded file-data chunk to an immutable skip-linked stream.
+    /// Only the tail handle and at most 64 opaque ancestor references are kept
+    /// in memory, so staging memory is independent of the resulting file size.
+    pub async fn commit_fs_data_chunk(
+        &mut self,
+        previous: Option<&FsPersistentData>,
+        bytes: &[u8],
+    ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
+        if bytes.len() > FS_DATA_CHUNK_MAX_LEN
+            || (bytes.is_empty() && previous.is_some_and(|data| data.exact_len() != 0))
+        {
+            return Err(FsCodecError::OutOfBounds.into());
+        }
+        let (chunk_index, total_len, ancestors) = match previous {
+            None => (0, bytes.len() as u64, Vec::new()),
+            Some(data) if data.exact_len() == 0 => (0, bytes.len() as u64, Vec::new()),
+            Some(data) => {
+                let FsPersistentDataLayout::Stream(node) = &data.layout else {
+                    return Err(FsStructuralCommitError::InvalidChild);
+                };
+                let chunk_index = node
+                    .chunk_index
+                    .checked_add(1)
+                    .ok_or(FsCodecError::ArithmeticOverflow)?;
+                let total_len = node
+                    .total_len
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(FsCodecError::ArithmeticOverflow)?;
+                let required = (u64::BITS - chunk_index.leading_zeros()) as usize;
+                let mut ancestors = Vec::new();
+                ancestors
+                    .try_reserve_exact(required)
+                    .map_err(|_| FsCodecError::OutOfBounds)?;
+                ancestors.push(self.fs_reference_for(&data.object)?);
+                for level in 1..required {
+                    let halfway = self
+                        .recover_fs_data_reference(ancestors[level - 1])
+                        .await
+                        .map_err(|error| match error {
+                            FsRootPublishError::Store(error) => {
+                                FsStructuralCommitError::Store(error)
+                            }
+                            FsRootPublishError::Codec(error) => {
+                                FsStructuralCommitError::Codec(error)
+                            }
+                            _ => FsStructuralCommitError::InvalidChild,
+                        })?;
+                    let FsPersistentDataLayout::Stream(halfway_node) = &halfway.layout else {
+                        return Err(FsStructuralCommitError::InvalidChild);
+                    };
+                    let reference = halfway_node
+                        .ancestors
+                        .get(level - 1)
+                        .copied()
+                        .ok_or(FsStructuralCommitError::InvalidChild)?;
+                    ancestors.push(reference);
+                }
+                (chunk_index, total_len, ancestors)
+            }
+        };
+        let decoded = FsDataNodeV1 {
+            chunk_index,
+            total_len,
+            ancestors,
+            bytes: bytes.to_vec(),
+        };
+        let payload = encode_fs_data_node_v1(&decoded)?;
+        let mut writer = self.begin_blob_with_reference_codec(
+            FS_DATA_V1_KIND,
+            payload.len() as u64,
+            None,
+            REFERENCE_CODEC_FS_V1,
+        )?;
+        for chunk in payload.chunks(PAGE_SIZE) {
+            writer.write_chunk(chunk).await?;
+        }
+        Ok(FsPersistentData {
+            object: Arc::new(writer.commit().await?),
+            layout: FsPersistentDataLayout::Stream(decoded),
         })
     }
 
@@ -694,9 +813,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     .map_err(|_| StoreError::MemoryLimit)?;
                 for entry in node.entries {
                     let content = match entry.reference {
-                        Some(reference) => Some(FsPersistentData {
-                            object: self.recover_fs_reference(reference, FS_DATA_V1_KIND)?,
-                        }),
+                        Some(reference) => Some(self.recover_fs_data_reference(reference).await?),
                         None => None,
                     };
                     output.push(FsPersistentTreeEntry {
@@ -732,8 +849,46 @@ impl<D: PageDevice> SegmentStore<D> {
         if index >= data.chunk_count() {
             return Ok(None);
         }
-        let index = u32::try_from(index).map_err(|_| FsRootPublishError::InvalidRoot)?;
-        Ok(Some(self.get_blob_chunk(&data.object, index).await?.bytes))
+        match &data.layout {
+            FsPersistentDataLayout::Raw => {
+                let index = u32::try_from(index).map_err(|_| FsRootPublishError::InvalidRoot)?;
+                Ok(Some(self.get_blob_chunk(&data.object, index).await?.bytes))
+            }
+            FsPersistentDataLayout::Stream(tail) => {
+                let mut current = data.clone();
+                let mut current_index = tail.chunk_index;
+                while current_index > index {
+                    let distance = current_index - index;
+                    let jump = (u64::BITS - 1 - distance.leading_zeros()) as usize;
+                    let FsPersistentDataLayout::Stream(node) = &current.layout else {
+                        return Err(FsRootPublishError::InvalidRoot);
+                    };
+                    let reference = *node
+                        .ancestors
+                        .get(jump)
+                        .ok_or(FsRootPublishError::InvalidRoot)?;
+                    let next = self.recover_fs_data_reference(reference).await?;
+                    let FsPersistentDataLayout::Stream(next_node) = &next.layout else {
+                        return Err(FsRootPublishError::InvalidRoot);
+                    };
+                    let expected_index = current_index
+                        .checked_sub(1u64 << jump)
+                        .ok_or(FsRootPublishError::InvalidRoot)?;
+                    if next_node.chunk_index != expected_index
+                        || next_node.total_len >= node.total_len
+                        || next_node.total_len + node.bytes.len() as u64 > node.total_len
+                    {
+                        return Err(FsRootPublishError::InvalidRoot);
+                    }
+                    current = next;
+                    current_index = expected_index;
+                }
+                let FsPersistentDataLayout::Stream(node) = current.layout else {
+                    return Err(FsRootPublishError::InvalidRoot);
+                };
+                Ok(Some(node.bytes))
+            }
+        }
     }
 }
 
@@ -998,6 +1153,34 @@ mod tests {
         assert_eq!(recovered.generation(), 2);
         assert_eq!(recovered.next_file_id(), 4);
         assert_eq!(recovered.root_file_id(), 1);
+    }
+
+    #[test]
+    fn file_data_stream_keeps_a_bounded_tail_and_supports_logarithmic_lookup() {
+        let device = TestDevice::blank(48);
+        let mut store = format(device);
+        let empty = block_on(store.commit_fs_data_chunk(None, &[])).unwrap();
+        assert_eq!(empty.exact_len(), 0);
+        assert_eq!(empty.chunk_count(), 0);
+        assert_eq!(block_on(store.read_fs_data_chunk(&empty, 0)).unwrap(), None);
+
+        let mut tail = empty;
+        for index in 0u8..16 {
+            let bytes = alloc::vec![index; usize::from(index % 5 + 1)];
+            tail = block_on(store.commit_fs_data_chunk(Some(&tail), &bytes)).unwrap();
+        }
+        assert_eq!(tail.chunk_count(), 16);
+        assert_eq!(tail.exact_len(), 46);
+        for index in [0, 1, 7, 8, 14, 15] {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index)).unwrap(),
+                Some(alloc::vec![index as u8; (index as usize % 5) + 1])
+            );
+        }
+        assert_eq!(
+            block_on(store.read_fs_data_chunk(&tail, tail.chunk_count())).unwrap(),
+            None
+        );
     }
 
     fn root_switch_fixture() -> (

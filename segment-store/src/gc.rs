@@ -574,7 +574,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
             && !matches!(
                 object.blob_key.object_kind(),
-                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND
+                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND | crate::FS_DATA_V1_KIND
             )
         {
             return Err(GcError::Corrupt.into());
@@ -729,7 +729,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         let decoded = if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
             && matches!(
                 object_kind,
-                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND
+                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND | crate::FS_DATA_V1_KIND
             ) {
             crate::decode_fs_typed_references(object_kind, view.data(), object.commit_generation)
                 .map_err(|_| GcError::Corrupt)?

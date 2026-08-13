@@ -1,7 +1,7 @@
 //! Polling Synopsys DWMAC engine for the CV1800B integrated Ethernet MAC.
 //!
 //! The crate owns registers, clock/ePHY setup and one cache-isolated RX/TX
-//! descriptor pair. Kernel capabilities, packet sessions and supervision are
+//! descriptor rings. Kernel capabilities, packet sessions and supervision are
 //! deliberately outside this layer.
 
 #![cfg_attr(not(test), no_std)]
@@ -13,6 +13,8 @@ use core::{
 use vibeos_hal::{DwmacDescription, MAX_PACKET_LEN};
 
 const DMA_BUFFER_LEN: usize = 1_536;
+pub const RX_RING_SIZE: usize = 32;
+pub const TX_RING_SIZE: usize = 32;
 const RESET_BUDGET: usize = 2_000_000;
 const GMAC_CONTROL: usize = 0x0000;
 const GMAC_FRAME_FILTER: usize = 0x0004;
@@ -31,6 +33,9 @@ const DMA_INT_ENABLE: usize = 0x101c;
 const DMA_AXI_BUS_MODE: usize = 0x1028;
 const DMA_SOFT_RESET: u32 = 1;
 const DMA_AAL: u32 = 1 << 25;
+// Each enhanced descriptor uses four hardware words and occupies one 64-byte
+// cache line. Tell DMA to skip the remaining twelve words when advancing.
+const DMA_DESCRIPTOR_SKIP_WORDS: u32 = 12 << 2;
 const DMA_START_RX: u32 = 1 << 1;
 const DMA_START_TX: u32 = 1 << 13;
 const DMA_RX_STORE_FORWARD: u32 = 1 << 25;
@@ -107,17 +112,17 @@ impl Descriptor {
 
 #[repr(C, align(64))]
 struct Slab {
-    rx_desc: Descriptor,
-    tx_desc: Descriptor,
-    rx: [u8; DMA_BUFFER_LEN],
-    tx: [u8; DMA_BUFFER_LEN],
+    rx_desc: [Descriptor; RX_RING_SIZE],
+    tx_desc: [Descriptor; TX_RING_SIZE],
+    rx: [[u8; DMA_BUFFER_LEN]; RX_RING_SIZE],
+    tx: [[u8; DMA_BUFFER_LEN]; TX_RING_SIZE],
 }
 impl Slab {
     const ZERO: Self = Self {
-        rx_desc: Descriptor::ZERO,
-        tx_desc: Descriptor::ZERO,
-        rx: [0; DMA_BUFFER_LEN],
-        tx: [0; DMA_BUFFER_LEN],
+        rx_desc: [Descriptor::ZERO; RX_RING_SIZE],
+        tx_desc: [Descriptor::ZERO; TX_RING_SIZE],
+        rx: [[0; DMA_BUFFER_LEN]; RX_RING_SIZE],
+        tx: [[0; DMA_BUFFER_LEN]; TX_RING_SIZE],
     };
 }
 
@@ -128,6 +133,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Slab, tx_desc) % 64 == 0);
     assert!(core::mem::offset_of!(Slab, rx) % 64 == 0);
     assert!(core::mem::offset_of!(Slab, tx) % 64 == 0);
+    assert!(DMA_BUFFER_LEN % 64 == 0);
 };
 
 pub struct DmaStorage {
@@ -217,6 +223,10 @@ pub struct Engine {
     state: &'static InstanceState,
     time: fn() -> u64,
     timebase_hz: u64,
+    rx_index: usize,
+    tx_produce: usize,
+    tx_reclaim: usize,
+    tx_in_flight: usize,
     live: bool,
 }
 
@@ -254,6 +264,10 @@ impl Engine {
             state,
             time,
             timebase_hz,
+            rx_index: 0,
+            tx_produce: 0,
+            tx_reclaim: 0,
+            tx_in_flight: 0,
             live: false,
         };
         if let Err(error) = unsafe { engine.initialize(guest_mac) } {
@@ -269,65 +283,71 @@ impl Engine {
         self.description.irq
     }
 
-    pub fn tx_owned(&self) -> bool {
-        let dma = unsafe { &*self.dma.slab.get() };
-        invalidate_range(
-            self.description.cache_line_bytes,
-            descriptor_address(&dma.tx_desc),
-            core::mem::size_of_val(&dma.tx_desc),
-        );
-        let status = dma.tx_desc.words[0];
-        self.state
-            .tx_status
-            .store(u64::from(status), Ordering::Release);
-        status & DESC_OWN != 0
+    pub fn tx_owned(&mut self) -> bool {
+        self.reap_transmit();
+        self.tx_in_flight != 0
     }
 
     pub fn transmit(&mut self, packet: &[u8]) -> Result<(), Error> {
         if packet.len() > DMA_BUFFER_LEN {
             return Err(Error::PacketTooLarge);
         }
+        self.reap_transmit();
+        if self.tx_in_flight == TX_RING_SIZE {
+            return Err(Error::QueueFull);
+        }
+        let index = self.tx_produce;
         let dma = unsafe { &mut *self.dma.slab.get() };
         invalidate_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.tx_desc),
-            core::mem::size_of_val(&dma.tx_desc),
+            descriptor_address(&dma.tx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
-        if dma.tx_desc.words[0] & DESC_OWN != 0 {
+        if dma.tx_desc[index].words[0] & DESC_OWN != 0 {
             self.state
                 .tx_status
-                .store(u64::from(dma.tx_desc.words[0]), Ordering::Release);
+                .store(u64::from(dma.tx_desc[index].words[0]), Ordering::Release);
             return Err(Error::QueueFull);
         }
-        dma.tx[..packet.len()].copy_from_slice(packet);
-        dma.tx_desc.words[1] = packet.len() as u32 | TX_END_RING | TX_FIRST | TX_LAST;
-        dma.tx_desc.words[0] = DESC_OWN;
+        dma.tx[index][..packet.len()].copy_from_slice(packet);
+        dma.tx_desc[index].words[1] = packet.len() as u32
+            | TX_FIRST
+            | TX_LAST
+            | if index + 1 == TX_RING_SIZE {
+                TX_END_RING
+            } else {
+                0
+            };
+        dma.tx_desc[index].words[0] = DESC_OWN;
         self.state
             .tx_status
             .store(u64::from(DESC_OWN), Ordering::Release);
         clean_range(
             self.description.cache_line_bytes,
-            buffer_address(&dma.tx),
+            buffer_address(&dma.tx[index]),
             packet.len(),
         );
         clean_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.tx_desc),
-            core::mem::size_of_val(&dma.tx_desc),
+            descriptor_address(&dma.tx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
+        self.tx_produce = (index + 1) % TX_RING_SIZE;
+        self.tx_in_flight += 1;
         write32(self.description, DMA_TX_POLL, 1);
         self.state.tx_packets.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
+        let index = self.rx_index;
         let dma = unsafe { &mut *self.dma.slab.get() };
         invalidate_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.rx_desc),
-            core::mem::size_of_val(&dma.rx_desc),
+            descriptor_address(&dma.rx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
-        let status = dma.rx_desc.words[0];
+        let status = dma.rx_desc[index].words[0];
         if status & DESC_OWN != 0 {
             return None;
         }
@@ -341,24 +361,51 @@ impl Engine {
         let result = if valid {
             invalidate_range(
                 self.description.cache_line_bytes,
-                buffer_address(&dma.rx),
+                buffer_address(&dma.rx[index]),
                 with_fcs.min(DMA_BUFFER_LEN),
             );
-            output[..length].copy_from_slice(&dma.rx[..length]);
+            output[..length].copy_from_slice(&dma.rx[index][..length]);
             self.state.rx_packets.fetch_add(1, Ordering::Relaxed);
             Some(length)
         } else {
             None
         };
-        dma.rx_desc.words[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
-        dma.rx_desc.words[0] = DESC_OWN;
+        dma.rx_desc[index].words[1] = DMA_BUFFER_LEN as u32
+            | if index + 1 == RX_RING_SIZE {
+                RX_END_RING
+            } else {
+                0
+            };
+        dma.rx_desc[index].words[0] = DESC_OWN;
         clean_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.rx_desc),
-            core::mem::size_of_val(&dma.rx_desc),
+            descriptor_address(&dma.rx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
+        self.rx_index = (index + 1) % RX_RING_SIZE;
         write32(self.description, DMA_RX_POLL, 1);
         result
+    }
+
+    fn reap_transmit(&mut self) {
+        let dma = unsafe { &*self.dma.slab.get() };
+        while self.tx_in_flight != 0 {
+            let descriptor = &dma.tx_desc[self.tx_reclaim];
+            invalidate_range(
+                self.description.cache_line_bytes,
+                descriptor_address(descriptor),
+                core::mem::size_of::<Descriptor>(),
+            );
+            let status = descriptor.words[0];
+            self.state
+                .tx_status
+                .store(u64::from(status), Ordering::Release);
+            if status & DESC_OWN != 0 {
+                break;
+            }
+            self.tx_reclaim = (self.tx_reclaim + 1) % TX_RING_SIZE;
+            self.tx_in_flight -= 1;
+        }
     }
 
     pub fn poll_link(&mut self) {
@@ -386,21 +433,35 @@ impl Engine {
         self.state.resets.fetch_add(1, Ordering::Relaxed);
         let dma = unsafe { &mut *self.dma.slab.get() };
         *dma = Slab::ZERO;
-        let rx = descriptor_address(&dma.rx_desc);
-        let tx = descriptor_address(&dma.tx_desc);
-        let rxb = buffer_address(&dma.rx);
-        let txb = buffer_address(&dma.tx);
-        if [rx, tx, rxb, txb]
-            .iter()
-            .any(|&address| address > u32::MAX as usize)
+        let rx = descriptor_address(&dma.rx_desc[0]);
+        let tx = descriptor_address(&dma.tx_desc[0]);
+        if self.dma.base() > u32::MAX as usize
+            || self
+                .dma
+                .base()
+                .checked_add(core::mem::size_of::<Slab>() - 1)
+                .is_none_or(|end| end > u32::MAX as usize)
         {
             return Err(Error::AddressTooWide);
         }
-        dma.rx_desc.words[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
-        dma.rx_desc.words[2] = rxb as u32;
-        dma.rx_desc.words[0] = DESC_OWN;
-        dma.tx_desc.words[1] = TX_END_RING;
-        dma.tx_desc.words[2] = txb as u32;
+        for index in 0..RX_RING_SIZE {
+            dma.rx_desc[index].words[1] = DMA_BUFFER_LEN as u32
+                | if index + 1 == RX_RING_SIZE {
+                    RX_END_RING
+                } else {
+                    0
+                };
+            dma.rx_desc[index].words[2] = buffer_address(&dma.rx[index]) as u32;
+            dma.rx_desc[index].words[0] = DESC_OWN;
+        }
+        for index in 0..TX_RING_SIZE {
+            dma.tx_desc[index].words[1] = if index + 1 == TX_RING_SIZE {
+                TX_END_RING
+            } else {
+                0
+            };
+            dma.tx_desc[index].words[2] = buffer_address(&dma.tx[index]) as u32;
+        }
         clean_range(
             self.description.cache_line_bytes,
             self.dma.base(),
@@ -409,7 +470,7 @@ impl Engine {
         write32(
             self.description,
             DMA_BUS_MODE,
-            DMA_AAL | (8 << 8) | (8 << 17),
+            DMA_AAL | DMA_DESCRIPTOR_SKIP_WORDS | (8 << 8) | (8 << 17),
         );
         write32(
             self.description,

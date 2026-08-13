@@ -1,7 +1,7 @@
 //! Polling CV1800B DWMAC backend for the Milk-V Duo Ethernet IO Board.
 //!
-//! The minimal profile uses one normal RX descriptor and one normal TX
-//! descriptor. Each descriptor occupies its own non-coherent cache line even
+//! The driver uses bounded normal RX and TX descriptor rings. Each descriptor
+//! occupies its own non-coherent cache line even
 //! though the device consumes only the first four words. Packet transport
 //! remains the same bounded, capability-addressed raw-L2 interface used by the
 //! QEMU virtio-net backend.
@@ -23,6 +23,7 @@ use crate::sync::SpinLock;
 use crate::world::Space;
 
 const TX_TIMEOUT_MS: u64 = 2_000;
+const DRIVER_BATCH_PACKETS: usize = 32;
 
 const DWMAC: vibeos_hal::DwmacDescription = crate::platform::DWMAC;
 const IRQ: u32 = DWMAC.irq;
@@ -137,7 +138,7 @@ impl Resource for DmaRegion {
     }
     fn describe(&self) -> String {
         format!(
-            "DWMAC stable cache-isolated two-descriptor slab @ {:#x}",
+            "DWMAC stable cache-isolated descriptor-ring slab @ {:#x}",
             vibeos_driver_dwmac_net::dma_region_base(self.storage)
         )
     }
@@ -158,7 +159,8 @@ impl NetDevice {
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
-            queue_size: 1,
+            queue_size: u16::try_from(vibeos_driver_dwmac_net::RX_RING_SIZE)
+                .expect("DWMAC ring size fits telemetry"),
             header_size: 0,
             accepted_features: 0,
             session_epoch: state.sessions.device_epoch(),
@@ -452,49 +454,36 @@ fn driver_turn(
     link_poll: &mut u16,
 ) -> Result<bool, NetError> {
     let mut immediate_work = false;
-    // Once a packet leaves the bounded endpoint, this task owns it until the
-    // sole TX descriptor accepts it. Descriptor ownership is ordinary
-    // backpressure until the bounded hardware deadline: retain the packet and
-    // do not dequeue a second one while DMA is using the descriptor.
+    // Once a packet leaves the bounded endpoint, this task owns it until a TX
+    // descriptor accepts it. Ring pressure is ordinary backpressure until the
+    // bounded hardware deadline; retain the one packet that did not fit.
     {
         // Binding and DMA publication share CONTROL. Marking the pending/raw
         // descriptor reservation before releasing this guard prevents a new
         // generation from becoming active between stamp validation and OWN.
         let mut state = CONTROL.lock();
         let now = crate::sbi::time();
-        let descriptor_busy = engine.tx_owned();
-        immediate_work |= descriptor_busy;
-        state.tx_inflight = descriptor_busy || pending_tx.is_some();
-        if descriptor_busy {
-            // The deadline covers DMA ownership after publication as well as
-            // software waiting to publish. A corrupted or stalled OWN bit must
-            // restart the supervised driver instead of wedging TX forever.
-            if *tx_deadline == 0 {
-                *tx_deadline = now.saturating_add(tx_timeout_ticks());
-            } else if now >= *tx_deadline {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                panic!("CV1800B DWMAC TX descriptor timed out");
-            }
-        } else if pending_tx.is_none() {
-            *tx_deadline = 0;
-            if let Some(packet) = take_admitted_outbound(outbound, &state.sessions)? {
-                *pending_tx = Some(packet);
-                *tx_deadline = now.saturating_add(tx_timeout_ticks());
-                state.tx_inflight = true;
-            }
+        let was_busy = engine.tx_owned();
+        if was_busy && *tx_deadline != 0 && now >= *tx_deadline {
+            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            panic!("CV1800B DWMAC TX descriptor ring timed out");
         }
-        if let Some(packet) = pending_tx.as_ref() {
-            let transmitted = engine.transmit(packet.as_bytes());
-            match transmitted {
+        for _ in 0..DRIVER_BATCH_PACKETS {
+            if pending_tx.is_none() {
+                *pending_tx = take_admitted_outbound(outbound, &state.sessions)?;
+            }
+            let Some(packet) = pending_tx.as_ref() else {
+                break;
+            };
+            match engine.transmit(packet.as_bytes()) {
                 Ok(()) => {
                     *pending_tx = None;
-                    state.tx_inflight = true;
+                    *tx_deadline = now.saturating_add(tx_timeout_ticks());
                     immediate_work = true;
                 }
-                Err(HardwareError::QueueFull) if now < *tx_deadline => {}
                 Err(HardwareError::QueueFull) => {
-                    TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                    panic!("CV1800B DWMAC TX descriptor timed out");
+                    immediate_work = true;
+                    break;
                 }
                 Err(HardwareError::PacketTooLarge) => {
                     // A safely constructed Packet always fits the DMA buffer.
@@ -504,20 +493,30 @@ fn driver_turn(
                 Err(_) => return Err(NetError::DriverFault),
             }
         }
+        let descriptor_busy = engine.tx_owned();
+        state.tx_inflight = descriptor_busy || pending_tx.is_some();
+        immediate_work |= state.tx_inflight;
+        if state.tx_inflight && *tx_deadline == 0 {
+            *tx_deadline = now.saturating_add(tx_timeout_ticks());
+        } else if !state.tx_inflight {
+            *tx_deadline = 0;
+        }
 
         // Keep the same rebind barrier from descriptor consumption through
         // exact session stamping, endpoint publication, and RX rearm. A stack
         // restart cannot relabel a raw frame after the driver consumes it.
         let mut frame = [0u8; MAX_PACKET_LEN];
-        let received = engine.receive(&mut frame);
-        if let Some(length) = received {
+        for _ in 0..DRIVER_BATCH_PACKETS {
+            let Some(length) = engine.receive(&mut frame) else {
+                break;
+            };
             immediate_work = true;
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
             match send_inbound(inbound, &state.sessions, packet) {
                 Ok(()) => {}
-                // RX has already consumed and rearmed its sole descriptor, so
-                // bounded client pressure drops this one frame.
-                Err(NetError::QueueFull) => {}
+                // RX has already consumed and rearmed this descriptor. Stop
+                // the batch after one pressure drop so the stack can drain.
+                Err(NetError::QueueFull) => break,
                 Err(error) => return Err(error),
             }
         }

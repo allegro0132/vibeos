@@ -30,7 +30,7 @@ pub struct NetworkFrontendPolicy {
 
 /// Bounded capacity of each stable packet endpoint. This is independent of a
 /// device backend's descriptor-ring size.
-pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 8 };
+pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 64 };
 
 /// The default QEMU image admits the exact 64 MiB managed slice created by the
 /// run and acceptance harnesses. Storage V2 initially formats only its policy

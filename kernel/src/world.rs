@@ -29,6 +29,9 @@ use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
+const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
+#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+const IPERF3_SERVER_MEMORY_BUDGET: usize = 128 * 1024;
 #[cfg(feature = "milkv-ssh")]
 const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
@@ -3176,7 +3179,7 @@ pub fn build() {
         world.spawn_component_inner(
             crate::netstack_platform::COMPONENT_NAME,
             space.clone(),
-            BACKGROUND_MEMORY_BUDGET,
+            NETWORK_STACK_MEMORY_BUDGET,
             Some(ComponentTemplate::Ipv4Stack),
             crate::netstack_platform::task_with_discovered(SpaceRef::new(&space).get(), interfaces),
         );
@@ -3198,7 +3201,7 @@ pub fn build() {
         world.spawn_component_inner(
             "iperf3-server",
             space.clone(),
-            BACKGROUND_MEMORY_BUDGET,
+            IPERF3_SERVER_MEMORY_BUDGET,
             Some(ComponentTemplate::Iperf3Server),
             crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
         );

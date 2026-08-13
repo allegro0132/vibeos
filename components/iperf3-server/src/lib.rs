@@ -21,7 +21,7 @@ pub const COOKIE_BYTES: usize = 37;
 pub const MAX_CONTROL_JSON_BYTES: usize = 4 * 1024;
 pub const MAX_TEST_SECONDS: u64 = 60;
 
-const IO_CHUNK_BYTES: usize = 1024;
+const IO_CHUNK_BYTES: usize = 16 * 1024;
 const IDLE_POLL_MS: u64 = 1;
 const TEST_END_GRACE_MS: u64 = 5_000;
 

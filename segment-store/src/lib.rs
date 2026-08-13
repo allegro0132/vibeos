@@ -19,6 +19,8 @@ mod cas_codec;
 mod codec;
 mod compat;
 mod device;
+mod fs_codec;
+mod fs_reference;
 mod gc;
 mod maintenance;
 #[cfg(test)]
@@ -83,6 +85,15 @@ pub use codec::{
 };
 pub use compat::PutGetAdapter;
 pub use device::{BlockPageDevice, BlockPageError, GrowablePageDevice, PageDevice, PageDeviceInfo};
+pub use fs_codec::{
+    decode_fs_btree_node_v1, decode_fs_root_v1, encode_fs_btree_node_v1, encode_fs_root_v1,
+    FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError, FsRootV1, FsTreeKind, FS_BTREE_HEADER_LEN,
+    FS_BTREE_MAX_HEIGHT, FS_OBJECT_MAX_LEN, FS_ROOT_V1_LEN,
+};
+pub use fs_reference::{
+    decode_fs_typed_references, fs_typed_reference_kinds, FsReferenceError, FS_BTREE_NODE_V1_KIND,
+    FS_DATA_V1_KIND, FS_ROOT_V1_KIND,
+};
 pub use gc::{GcError, GcStoreError, GcTelemetry, GcTimeSource};
 pub use maintenance::{
     GrowError, MaintenanceAuthorityError, MaintenanceOperation, StoreMaintenance,

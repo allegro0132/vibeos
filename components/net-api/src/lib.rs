@@ -23,7 +23,7 @@ use vibeos_core::sync::SpinLock;
 
 pub const DEFAULT_TCP_FRONTEND_BUFFER_BYTES: usize = 4 * 1024;
 pub const MAX_TCP_FRONTEND_BUFFER_BYTES: usize = 64 * 1024;
-pub const MAX_TCP_IO_BYTES_PER_CALL: usize = 16 * 1024;
+pub const MAX_TCP_IO_BYTES_PER_CALL: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpStreamState {
@@ -288,12 +288,12 @@ impl TcpListener {
             .min(MAX_TCP_IO_BYTES_PER_CALL)
             .min(inner.receive.len());
         if length != 0 {
-            for byte in &mut output[..length] {
-                *byte = inner
-                    .receive
-                    .pop_front()
-                    .expect("the bounded receive length was checked");
-            }
+            let (first, second) = inner.receive.as_slices();
+            let first_length = length.min(first.len());
+            output[..first_length].copy_from_slice(&first[..first_length]);
+            let second_length = length - first_length;
+            output[first_length..length].copy_from_slice(&second[..second_length]);
+            inner.receive.drain(..length);
             return Ok(TcpIoResult::Progress(length));
         }
         if matches!(
@@ -333,7 +333,9 @@ impl TcpListener {
         if length == 0 {
             return Ok(TcpIoResult::WouldBlock);
         }
-        inner.transmit.extend(&input[..length]);
+        inner
+            .transmit
+            .extend(input[..length].iter().copied());
         Ok(TcpIoResult::Progress(length))
     }
 
@@ -396,7 +398,7 @@ impl TcpListener {
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
             .min(self.receive_capacity.saturating_sub(inner.receive.len()));
-        inner.receive.extend(&input[..length]);
+        inner.receive.extend(input[..length].iter().copied());
         length
     }
 
@@ -412,9 +414,11 @@ impl TcpListener {
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
             .min(inner.transmit.len());
-        for (output, queued) in output[..length].iter_mut().zip(inner.transmit.iter()) {
-            *output = *queued;
-        }
+        let (first, second) = inner.transmit.as_slices();
+        let first_length = length.min(first.len());
+        output[..first_length].copy_from_slice(&first[..first_length]);
+        let second_length = length - first_length;
+        output[first_length..length].copy_from_slice(&second[..second_length]);
         length
     }
 

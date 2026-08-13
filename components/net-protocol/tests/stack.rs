@@ -114,6 +114,38 @@ fn packet_device_retains_one_frame_across_endpoint_backpressure() {
 }
 
 #[test]
+fn packet_device_only_suppresses_checksums_for_enabled_offloads() {
+    let inbound = Endpoint::new("checksum-in", 1);
+    let outbound = Endpoint::new("checksum-out", 1);
+    let mut space = CSpace::new("checksum-device");
+    let (_, inbound_authority) = authority(&mut space, &inbound, Rights::RECV);
+    let (_, outbound_authority) = authority(&mut space, &outbound, Rights::SEND);
+    let mut device = PacketDevice::new(session_stamp(), inbound_authority, outbound_authority);
+
+    assert!(device.capabilities().checksum.tcp.tx());
+    device.set_tx_checksum_offload(true);
+    let checksum = device.capabilities().checksum;
+    assert!(checksum.ipv4.rx() && !checksum.ipv4.tx());
+    assert!(checksum.tcp.rx() && !checksum.tcp.tx());
+    assert!(checksum.udp.rx() && !checksum.udp.tx());
+    assert!(checksum.icmpv4.rx() && checksum.icmpv4.tx());
+
+    device.set_tx_checksum_offload(false);
+    device.set_rx_checksum_offload(true);
+    let checksum = device.capabilities().checksum;
+    assert!(!checksum.ipv4.rx() && checksum.ipv4.tx());
+    assert!(!checksum.tcp.rx() && checksum.tcp.tx());
+    assert!(!checksum.udp.rx() && checksum.udp.tx());
+
+    device.set_tx_checksum_offload(true);
+    let checksum = device.capabilities().checksum;
+    assert!(!checksum.ipv4.rx() && !checksum.ipv4.tx());
+    assert!(!checksum.tcp.rx() && !checksum.tcp.tx());
+    assert!(!checksum.udp.rx() && !checksum.udp.tx());
+    assert!(checksum.icmpv4.rx() && checksum.icmpv4.tx());
+}
+
+#[test]
 fn packet_device_rejects_stale_ingress_without_blocking_fresh_traffic() {
     let inbound = Endpoint::new("stale-device-in", 1);
     let outbound = Endpoint::new("stale-device-out", 1);

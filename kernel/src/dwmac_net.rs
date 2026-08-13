@@ -390,7 +390,7 @@ pub async fn driver_task(
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
-        if let Err(error) = with_device_authority(&mmio, &dma, &control, || {
+        let turn = with_device_authority(&mmio, &dma, &control, || {
             driver_turn(
                 session.engine_mut(),
                 &outbound,
@@ -399,11 +399,15 @@ pub async fn driver_task(
                 &mut tx_deadline,
                 &mut link_poll,
             )
-        }) {
-            crate::println!("  dwmac net driver stopped: {error:?}");
-            return;
+        });
+        match turn {
+            Ok(true) => crate::exec::yield_now().await,
+            Ok(false) => crate::exec::sleep_ms(1).await,
+            Err(error) => {
+                crate::println!("  dwmac net driver stopped: {error:?}");
+                return;
+            }
         }
-        crate::exec::sleep_ms(1).await;
     }
 }
 
@@ -446,7 +450,8 @@ fn driver_turn(
     pending_tx: &mut Option<Packet>,
     tx_deadline: &mut u64,
     link_poll: &mut u16,
-) -> Result<(), NetError> {
+) -> Result<bool, NetError> {
+    let mut immediate_work = false;
     // Once a packet leaves the bounded endpoint, this task owns it until the
     // sole TX descriptor accepts it. Descriptor ownership is ordinary
     // backpressure until the bounded hardware deadline: retain the packet and
@@ -458,6 +463,7 @@ fn driver_turn(
         let mut state = CONTROL.lock();
         let now = crate::sbi::time();
         let descriptor_busy = engine.tx_owned();
+        immediate_work |= descriptor_busy;
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
         if descriptor_busy {
             // The deadline covers DMA ownership after publication as well as
@@ -483,6 +489,7 @@ fn driver_turn(
                 Ok(()) => {
                     *pending_tx = None;
                     state.tx_inflight = true;
+                    immediate_work = true;
                 }
                 Err(HardwareError::QueueFull) if now < *tx_deadline => {}
                 Err(HardwareError::QueueFull) => {
@@ -504,6 +511,7 @@ fn driver_turn(
         let mut frame = [0u8; MAX_PACKET_LEN];
         let received = engine.receive(&mut frame);
         if let Some(length) = received {
+            immediate_work = true;
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
             match send_inbound(inbound, &state.sessions, packet) {
                 Ok(()) => {}
@@ -514,12 +522,18 @@ fn driver_turn(
             }
         }
     }
-    *link_poll = link_poll.wrapping_add(1);
-    if *link_poll >= 1_000 {
-        *link_poll = 0;
-        engine.poll_link();
+    // Preserve the original approximately-one-second PHY cadence.  Busy
+    // turns can now run much faster than 1 kHz, so counting them would make
+    // MDIO polling consume the data path.  Once traffic stops, idle turns
+    // resume the link check and promptly observe a disconnected cable.
+    if !immediate_work {
+        *link_poll = link_poll.wrapping_add(1);
+        if *link_poll >= 1_000 {
+            *link_poll = 0;
+            engine.poll_link();
+        }
     }
-    Ok(())
+    Ok(immediate_work)
 }
 
 fn tx_timeout_ticks() -> u64 {

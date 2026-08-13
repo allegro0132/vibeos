@@ -83,6 +83,8 @@ impl Platform for NetstackPlatform {
                 session_epoch: info.session_epoch,
                 phy_link_up: crate::net_device::carrier_up(&info),
                 ethernet_address: info.ethernet_address,
+                tx_checksum_offload: crate::net_device::tx_checksum_offload(&info),
+                rx_checksum_offload: crate::net_device::rx_checksum_offload(&info),
             });
         }
         #[cfg(feature = "milkv-duo")]
@@ -96,6 +98,8 @@ impl Platform for NetstackPlatform {
                 session_epoch: info.session_epoch,
                 phy_link_up: info.carrier_up,
                 ethernet_address: info.ethernet_address,
+                tx_checksum_offload: false,
+                rx_checksum_offload: false,
             });
         }
         None

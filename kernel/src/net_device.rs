@@ -130,3 +130,25 @@ pub const fn carrier_up(_info: &NetInfo) -> bool {
 pub const fn carrier_up(info: &NetInfo) -> bool {
     info.phy_link_up
 }
+
+/// Report whether the selected physical backend completes IPv4/TCP/UDP
+/// checksums requested by its packet descriptors.
+#[cfg(feature = "qemu-virt")]
+pub const fn tx_checksum_offload(_info: &NetInfo) -> bool {
+    false
+}
+
+#[cfg(feature = "milkv-duo")]
+pub const fn tx_checksum_offload(info: &NetInfo) -> bool {
+    info.tx_checksum_offload
+}
+
+#[cfg(feature = "qemu-virt")]
+pub const fn rx_checksum_offload(_info: &NetInfo) -> bool {
+    false
+}
+
+#[cfg(feature = "milkv-duo")]
+pub const fn rx_checksum_offload(info: &NetInfo) -> bool {
+    info.rx_checksum_offload
+}

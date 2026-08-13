@@ -40,6 +40,8 @@ pub struct NetworkInfo {
     pub session_epoch: u64,
     pub phy_link_up: bool,
     pub ethernet_address: [u8; 6],
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,7 +342,9 @@ impl InterfaceTask {
                 PREFIX_LEN,
                 TCP_TEST_SEED ^ stamp.device_epoch() ^ ((self.interface.index() as u64) << 32),
             )
-            .with_default_gateway(GATEWAY_IPV4);
+            .with_default_gateway(GATEWAY_IPV4)
+            .with_tx_checksum_offload(info.tx_checksum_offload)
+            .with_rx_checksum_offload(info.rx_checksum_offload);
             let mut next = SharedIpv4TcpStack::new(
                 stack_config,
                 stamp,

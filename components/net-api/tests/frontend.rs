@@ -98,6 +98,45 @@ fn queues_are_bounded_and_close_requests_are_explicit() {
 }
 
 #[test]
+fn bulk_frontend_copies_preserve_wrapped_queue_order() {
+    let listener = listener("wrapped", 5, 5201, 8);
+    listener
+        .network_update_state(TcpStreamState::Established)
+        .unwrap();
+    let connection = listener.try_accept().unwrap();
+
+    assert_eq!(listener.network_receive(b"abcdef"), 6);
+    let mut first = [0u8; 4];
+    assert_eq!(
+        listener.try_recv(connection, &mut first),
+        Ok(TcpIoResult::Progress(4))
+    );
+    assert_eq!(listener.network_receive(b"ghijkl"), 6);
+    let mut wrapped_receive = [0u8; 8];
+    assert_eq!(
+        listener.try_recv(connection, &mut wrapped_receive),
+        Ok(TcpIoResult::Progress(8))
+    );
+    assert_eq!(&wrapped_receive, b"efghijkl");
+
+    assert_eq!(
+        listener.try_send(connection, b"mnopqr"),
+        Ok(TcpIoResult::Progress(6))
+    );
+    listener.network_consume_transmit(4);
+    assert_eq!(
+        listener.try_send(connection, b"stuvwx"),
+        Ok(TcpIoResult::Progress(6))
+    );
+    let mut wrapped_transmit = [0u8; 8];
+    assert_eq!(
+        listener.network_copy_transmit(&mut wrapped_transmit),
+        wrapped_transmit.len()
+    );
+    assert_eq!(&wrapped_transmit, b"qrstuvwx");
+}
+
+#[test]
 fn cspace_rights_and_root_revocation_confine_listener_access() {
     let listener = listener("rights", 4, 443, 16);
     let mut policy = CSpace::new("network-policy");

@@ -89,6 +89,8 @@ pub struct NetInfo {
     pub used_interrupts: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
     pub stale_ingress_drops: u64,
     pub stale_egress_drops: u64,
     pub stale_egress_device_epoch_drops: u64,
@@ -172,6 +174,8 @@ impl NetDevice {
             used_interrupts: 0,
             rx_packets: hardware.rx_packets,
             tx_packets: hardware.tx_packets,
+            tx_checksum_offload: hardware.tx_checksum_offload,
+            rx_checksum_offload: hardware.rx_checksum_offload,
             stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
             stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
             stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
@@ -376,10 +380,12 @@ pub async fn driver_task(
         return;
     }
     crate::println!(
-        "  dwmac net online, IRQ {}, DMA {:#x}, epoch {}",
+        "  dwmac net online, IRQ {}, DMA {:#x}, epoch {}, tx-csum {}, rx-csum {}",
         engine.irq(),
         storage.base(),
         CONTROL.lock().sessions.device_epoch(),
+        engine.tx_checksum_offload(),
+        engine.rx_checksum_offload(),
     );
     let mut session = DriverSession {
         engine: Some(engine),

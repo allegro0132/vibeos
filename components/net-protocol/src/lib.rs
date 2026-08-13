@@ -26,7 +26,7 @@ use smoltcp::iface::{
     Config as InterfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle,
     SocketSet,
 };
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
@@ -78,7 +78,7 @@ pub const MAX_EGRESS_PASSES_PER_POLL: usize = 32;
 /// Bound application work independently from packet parsing work.
 pub const MAX_ECHO_CHUNKS_PER_POLL: usize = 4;
 /// At most this many application bytes are copied by one stream I/O call.
-pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 16 * 1024;
+pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 32 * 1024;
 const ECHO_CHUNK_BYTES: usize = MAX_TCP_STREAM_BYTES_PER_CALL;
 const TCP_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -131,6 +131,11 @@ pub struct Ipv4StackConfig {
     pub default_gateway: Option<[u8; 4]>,
     /// Seeds TCP initial sequence numbers. It is not application entropy.
     pub tcp_random_seed: u64,
+    /// The physical egress backend generates IPv4 and TCP/UDP checksums.
+    pub tx_checksum_offload: bool,
+    /// The physical ingress backend verifies IPv4 and TCP/UDP checksums and
+    /// discards frames for which the descriptor reports an error.
+    pub rx_checksum_offload: bool,
 }
 
 impl Ipv4StackConfig {
@@ -146,11 +151,23 @@ impl Ipv4StackConfig {
             prefix_len,
             default_gateway: None,
             tcp_random_seed,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
         }
     }
 
     pub const fn with_default_gateway(mut self, gateway: [u8; 4]) -> Self {
         self.default_gateway = Some(gateway);
+        self
+    }
+
+    pub const fn with_tx_checksum_offload(mut self, enabled: bool) -> Self {
+        self.tx_checksum_offload = enabled;
+        self
+    }
+
+    pub const fn with_rx_checksum_offload(mut self, enabled: bool) -> Self {
+        self.rx_checksum_offload = enabled;
         self
     }
 }
@@ -163,6 +180,8 @@ impl From<StaticIpv4Config> for Ipv4StackConfig {
             prefix_len: config.prefix_len,
             default_gateway: config.default_gateway,
             tcp_random_seed: config.tcp_random_seed,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
         }
     }
 }
@@ -243,6 +262,8 @@ pub struct PacketDevice {
     pending_egress: Option<StampedPacket>,
     stats: PacketDeviceStats,
     authority_revoked: bool,
+    tx_checksum_offload: bool,
+    rx_checksum_offload: bool,
 }
 
 impl PacketDevice {
@@ -258,7 +279,17 @@ impl PacketDevice {
             pending_egress: None,
             stats: PacketDeviceStats::default(),
             authority_revoked: false,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
         }
+    }
+
+    pub const fn set_tx_checksum_offload(&mut self, enabled: bool) {
+        self.tx_checksum_offload = enabled;
+    }
+
+    pub const fn set_rx_checksum_offload(&mut self, enabled: bool) {
+        self.rx_checksum_offload = enabled;
     }
 
     pub const fn stamp(&self) -> PacketStamp {
@@ -465,6 +496,15 @@ impl phy::Device for PacketDevice {
         // endpoints use the same or greater depth, and QEMU can safely honor
         // this conservative hardware-derived burst contract as well.
         capabilities.max_burst_size = Some(32);
+        let checksum = match (self.rx_checksum_offload, self.tx_checksum_offload) {
+            (false, false) => Checksum::Both,
+            (false, true) => Checksum::Rx,
+            (true, false) => Checksum::Tx,
+            (true, true) => Checksum::None,
+        };
+        capabilities.checksum.ipv4 = checksum;
+        capabilities.checksum.tcp = checksum;
+        capabilities.checksum.udp = checksum;
         capabilities
     }
 }
@@ -593,6 +633,8 @@ impl SharedIpv4TcpStack {
         validate_stack_config(config)?;
 
         let mut device = PacketDevice::new(stamp, inbound, outbound);
+        device.set_tx_checksum_offload(config.tx_checksum_offload);
+        device.set_rx_checksum_offload(config.rx_checksum_offload);
         device.revalidate_authority()?;
         let ethernet_address = EthernetAddress(config.ethernet_address);
         let mut interface_config = InterfaceConfig::new(ethernet_address.into());

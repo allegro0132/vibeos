@@ -21,7 +21,7 @@ pub const COOKIE_BYTES: usize = 37;
 pub const MAX_CONTROL_JSON_BYTES: usize = 4 * 1024;
 pub const MAX_TEST_SECONDS: u64 = 60;
 
-const IO_CHUNK_BYTES: usize = 16 * 1024;
+const IO_CHUNK_BYTES: usize = 32 * 1024;
 const IDLE_POLL_MS: u64 = 1;
 const TEST_END_GRACE_MS: u64 = 5_000;
 
@@ -114,7 +114,6 @@ pub struct Server {
     test_started_ms: u64,
     test_elapsed_ms: u64,
     bytes_transferred: u64,
-    payload_state: u32,
 }
 
 impl Server {
@@ -136,7 +135,6 @@ impl Server {
             test_started_ms: 0,
             test_elapsed_ms: 0,
             bytes_transferred: 0,
-            payload_state: 0x6d2b_79f5,
         }
     }
 
@@ -439,13 +437,10 @@ impl Server {
         let Some(connection) = self.data else {
             return Err(SocketError::Failed);
         };
-        let mut payload = [0u8; IO_CHUNK_BYTES];
-        for byte in &mut payload {
-            self.payload_state ^= self.payload_state << 13;
-            self.payload_state ^= self.payload_state >> 17;
-            self.payload_state ^= self.payload_state << 5;
-            *byte = self.payload_state as u8;
-        }
+        // iperf3 measures byte transport and does not validate payload entropy.
+        // A fixed pattern avoids spending three xorshift operations per byte on
+        // the small core while retaining a full-sized, deterministic payload.
+        let payload = [0xa5u8; IO_CHUNK_BYTES];
         match space.tcp_send(listener, connection, &payload)? {
             TcpIoResult::Progress(length) => {
                 self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);

@@ -31,6 +31,7 @@ const DMA_STATUS: usize = 0x1014;
 const DMA_CONTROL: usize = 0x1018;
 const DMA_INT_ENABLE: usize = 0x101c;
 const DMA_AXI_BUS_MODE: usize = 0x1028;
+const DMA_HW_FEATURE: usize = 0x1058;
 const DMA_SOFT_RESET: u32 = 1;
 const DMA_AAL: u32 = 1 << 25;
 // Each enhanced descriptor uses four hardware words and occupies one 64-byte
@@ -41,9 +42,12 @@ const DMA_START_TX: u32 = 1 << 13;
 const DMA_RX_STORE_FORWARD: u32 = 1 << 25;
 const DMA_TX_STORE_FORWARD: u32 = 1 << 21;
 const DMA_FLUSH_TX: u32 = 1 << 20;
+const DMA_HW_TX_CHECKSUM: u32 = 1 << 16;
+const DMA_HW_RX_CHECKSUM_TYPE2: u32 = 1 << 18;
 const MAC_RX_ENABLE: u32 = 1 << 2;
 const MAC_TX_ENABLE: u32 = 1 << 3;
 const MAC_ACS: u32 = 1 << 7;
+const MAC_IP_CHECKSUM_OFFLOAD: u32 = 1 << 10;
 const MAC_DUPLEX: u32 = 1 << 11;
 const MAC_FAST_ETHERNET: u32 = 1 << 14;
 const MAC_MII_PORT: u32 = 1 << 15;
@@ -55,6 +59,9 @@ const RX_FIRST: u32 = 1 << 9;
 const RX_ERROR: u32 = 1 << 15;
 const RX_END_RING: u32 = 1 << 25;
 const TX_END_RING: u32 = 1 << 25;
+// Normal DWMAC descriptor TDES1 checksum insertion control. Value three asks
+// hardware to generate the IPv4 header plus TCP/UDP pseudoheader checksum.
+const TX_CHECKSUM_INSERTION_FULL: u32 = 3 << 27;
 const TX_FIRST: u32 = 1 << 29;
 const TX_LAST: u32 = 1 << 30;
 
@@ -99,6 +106,8 @@ pub struct Telemetry {
     pub resets: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -198,7 +207,7 @@ pub const fn validate_description(description: DwmacDescription) -> bool {
     range_contains_bytes(
         description.registers.start,
         description.registers.end,
-        DMA_AXI_BUS_MODE + 4,
+        DMA_HW_FEATURE + 4,
     ) && range_contains_bytes(
         description.soc_control.start,
         description.soc_control.end,
@@ -227,6 +236,8 @@ pub struct Engine {
     tx_produce: usize,
     tx_reclaim: usize,
     tx_in_flight: usize,
+    tx_checksum_offload: bool,
+    rx_checksum_offload: bool,
     live: bool,
 }
 
@@ -268,6 +279,8 @@ impl Engine {
             tx_produce: 0,
             tx_reclaim: 0,
             tx_in_flight: 0,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
             live: false,
         };
         if let Err(error) = unsafe { engine.initialize(guest_mac) } {
@@ -281,6 +294,14 @@ impl Engine {
 
     pub fn irq(&self) -> u32 {
         self.description.irq
+    }
+
+    pub const fn tx_checksum_offload(&self) -> bool {
+        self.tx_checksum_offload
+    }
+
+    pub const fn rx_checksum_offload(&self) -> bool {
+        self.rx_checksum_offload
     }
 
     pub fn tx_owned(&mut self) -> bool {
@@ -313,6 +334,11 @@ impl Engine {
         dma.tx_desc[index].words[1] = packet.len() as u32
             | TX_FIRST
             | TX_LAST
+            | if self.tx_checksum_offload {
+                TX_CHECKSUM_INSERTION_FULL
+            } else {
+                0
+            }
             | if index + 1 == TX_RING_SIZE {
                 TX_END_RING
             } else {
@@ -472,6 +498,9 @@ impl Engine {
             DMA_BUS_MODE,
             DMA_AAL | DMA_DESCRIPTOR_SKIP_WORDS | (8 << 8) | (8 << 17),
         );
+        let hardware_features = read32(self.description, DMA_HW_FEATURE);
+        self.tx_checksum_offload = hardware_features & DMA_HW_TX_CHECKSUM != 0;
+        self.rx_checksum_offload = hardware_features & DMA_HW_RX_CHECKSUM_TYPE2 != 0;
         write32(
             self.description,
             DMA_AXI_BUS_MODE,
@@ -495,7 +524,17 @@ impl Engine {
         write32(
             self.description,
             GMAC_CONTROL,
-            MAC_MII_PORT | MAC_FAST_ETHERNET | MAC_DUPLEX | MAC_ACS | MAC_RX_ENABLE | MAC_TX_ENABLE,
+            MAC_MII_PORT
+                | MAC_FAST_ETHERNET
+                | MAC_DUPLEX
+                | MAC_ACS
+                | MAC_RX_ENABLE
+                | MAC_TX_ENABLE
+                | if self.rx_checksum_offload {
+                    MAC_IP_CHECKSUM_OFFLOAD
+                } else {
+                    0
+                },
         );
         write32(
             self.description,
@@ -542,6 +581,10 @@ pub unsafe fn telemetry(description: DwmacDescription, state: &InstanceState) ->
         resets: state.resets.load(Ordering::Acquire),
         rx_packets: state.rx_packets.load(Ordering::Acquire),
         tx_packets: state.tx_packets.load(Ordering::Acquire),
+        tx_checksum_offload: read32(description, DMA_HW_FEATURE) & DMA_HW_TX_CHECKSUM != 0,
+        rx_checksum_offload: read32(description, DMA_HW_FEATURE)
+            & DMA_HW_RX_CHECKSUM_TYPE2
+            != 0,
     }
 }
 
@@ -918,6 +961,19 @@ mod tests {
         assert_eq!(EPHY_LINK_PULSE.first(), Some(&(0x40, 0x2000)));
         assert_eq!(EPHY_LINK_PULSE.get(6), Some(&(0x58, 0x94a0)));
         assert_eq!(EPHY_LINK_PULSE.last(), Some(&(0x70, 0x0081)));
+    }
+
+    #[test]
+    fn normal_descriptor_requests_full_tx_checksum_insertion() {
+        assert_eq!(TX_CHECKSUM_INSERTION_FULL, 3 << 27);
+        assert_eq!(TX_CHECKSUM_INSERTION_FULL & (TX_FIRST | TX_LAST), 0);
+    }
+
+    #[test]
+    fn checksum_capability_bits_match_dwmac1000_layout() {
+        assert_eq!(DMA_HW_TX_CHECKSUM, 1 << 16);
+        assert_eq!(DMA_HW_RX_CHECKSUM_TYPE2, 1 << 18);
+        assert_eq!(MAC_IP_CHECKSUM_OFFLOAD, 1 << 10);
     }
     #[test]
     fn error_values_are_stable() {

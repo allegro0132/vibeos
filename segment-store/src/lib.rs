@@ -13,6 +13,7 @@ extern crate std;
 
 mod allocation_v2;
 mod authority;
+mod authority_snapshot;
 mod cas;
 mod cas_codec;
 mod codec;
@@ -23,6 +24,10 @@ mod maintenance;
 #[cfg(test)]
 mod maintenance_growth_tests;
 mod mark;
+mod migration;
+mod persistent_authority;
+#[cfg(test)]
+mod persistent_authority_tests;
 mod pins;
 mod quota;
 #[cfg(test)]
@@ -46,6 +51,14 @@ pub use authority::{
     resolve_authorized, AccessError, AuthorizedObject, AuthorizedObjectSpace,
     AuthorizedPublication, ObjectPublicationPersistence, ObjectPublicationTarget,
     PublicationIntent, PublishError,
+};
+pub use authority_snapshot::{
+    decode_persistent_authority_snapshot, encode_persistent_authority_snapshot,
+    root_policy_commitment, AuthoritySnapshotError, PersistentAuthorityImport,
+    PersistentAuthoritySnapshot, PersistentPrincipalPolicy, StablePrincipalId,
+    LEGACY_SYSTEM_PRINCIPAL, MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN, MAX_STABLE_PRINCIPALS,
+    PERSISTENT_AUTHORITY_HEADER_LEN, PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN,
+    PERSISTENT_AUTHORITY_PRINCIPAL_LEN, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION,
 };
 pub use cas::{
     BlobWriter, CasCommitError, CasObjectHandle, CasStoreError, ForegroundBlobError,
@@ -74,6 +87,21 @@ pub use gc::{GcError, GcStoreError, GcTelemetry, GcTimeSource};
 pub use maintenance::{
     GrowError, MaintenanceAuthorityError, MaintenanceOperation, StoreMaintenance,
     StoreMaintenanceProvisioner,
+};
+pub use migration::{
+    decode_migration_control, encode_migration_control, probe_storage_formats,
+    select_migration_control, ColdScrubEvidence, FormatProbe, LegacyFormatProbe, MigrationControl,
+    MigrationControlError, MigrationController, MigrationError, MigrationState,
+    MigrationTransition, MigrationWrite, StorageV2FormatProbe, CONTROL_BODY_MAGIC,
+    CONTROL_FORMAT_VERSION, CONTROL_PAGE_COUNT, CONTROL_SEAL_MAGIC, CONTROL_TERMINAL_MARKER,
+    M4_FIRST_LOGICAL_BLOCK, M4_LOGICAL_BLOCK_COUNT, MIGRATION_CONTROL_FIRST_LOGICAL_BLOCK,
+    MIGRATION_CONTROL_LOGICAL_BLOCK_COUNT, V2_DEFAULT_FIRST_LOGICAL_BLOCK,
+    V2_DEFAULT_LOGICAL_BLOCK_COUNT,
+};
+pub use persistent_authority::{
+    PersistentAuthorityAppendResult, PersistentAuthorityError, PersistentAuthorityTransientObjects,
+    PersistentAuthorityView, PersistentAuthorityWriter, PersistentObjectHandle,
+    PersistentSingletonUpdate,
 };
 pub use quota::{
     canonical_attributable_physical_bytes, PrincipalQuotaLimits, PrincipalQuotaUsage,

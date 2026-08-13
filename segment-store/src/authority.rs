@@ -66,6 +66,10 @@ impl<H> AuthorizedObject<H> {
     pub(crate) const fn backend_handle(&self) -> &H {
         &self.backend_handle
     }
+
+    pub(crate) fn backend_handle_mut(&mut self) -> &mut H {
+        &mut self.backend_handle
+    }
 }
 
 /// Publication failure deliberately distinguishes only target lifecycle from

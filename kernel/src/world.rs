@@ -394,6 +394,9 @@ pub struct World {
     /// init's explicit authority on the persistent-test CSpace lifecycle.
     pub durable_cspace: Option<Cap>,
     durable_cspace_service: Option<Arc<durable_cspace::DurableCSpaceService>>,
+    pub(crate) storage_v2: Option<Arc<crate::segment_store_platform::StorageV2Devices>>,
+    /// init's sole invocation authority for the explicit M4-to-V2 cutover.
+    pub(crate) storage_migration: Option<Cap>,
     pub block_space: Option<Cap>,
     /// Private roots for driver restart and range attenuation. Neither init nor
     /// the store backend receives this CSpace's raw device capability.
@@ -454,6 +457,22 @@ pub struct World {
         feature = "milkv-ssh-acceptance"
     ))]
     ssh_authorized_policy_root: Option<Cap>,
+}
+
+#[derive(Clone, Copy)]
+struct StoreBlockGrants {
+    /// M4 remains writable only until explicit V2 activation. The migration
+    /// coordinator revokes this whole private backend root at activation and
+    /// retains a separately sealed read-only source for the compatibility
+    /// window.
+    legacy_active: Cap,
+    /// Independent sibling retained as the one-release, read-only migration
+    /// source after the writable M4 service branch is revoked.
+    legacy_read: Cap,
+    /// The dual body/seal migration selector at [576, 608).
+    migration_control: Cap,
+    /// The initially admitted Storage V2 range at [2048, 67712).
+    storage_v2: Cap,
 }
 
 impl World {
@@ -1289,6 +1308,7 @@ pub fn start_block_supervisor() {
         return;
     };
     let durable_cspace = world.durable_cspace_service.clone();
+    let storage_v2 = world.storage_v2.clone();
     exec::spawn("supervisor:virtio-blk", async move {
         let mut attempts = 0u32;
         let mut recovery_operation =
@@ -1312,6 +1332,19 @@ pub fn start_block_supervisor() {
             let snapshot = component.snapshot();
             match snapshot.state {
                 exec::TaskState::Running if block_device::is_online() => {
+                    if let Some(storage_v2) = storage_v2.as_ref() {
+                        let probe = storage_v2.boot_probe().await;
+                        if matches!(
+                            probe,
+                            Err(_)
+                                | Ok(crate::segment_store_platform::BootStoreSelection::FailClosed)
+                        ) {
+                            if let Some(operation) = recovery_operation.take() {
+                                operation.fail();
+                            }
+                            return;
+                        }
+                    }
                     let service = durable_cspace
                         .as_ref()
                         .expect("a pending durable recovery has a service");
@@ -1686,7 +1719,7 @@ pub fn build() {
 
     let (
         block_root,
-        store_block_grant,
+        store_block_grants,
         block_mmio_root,
         block_dma_root,
         block_raw_root,
@@ -1699,19 +1732,36 @@ pub fn build() {
     ) {
         (Some(resources), Some(space), Some(policy_space), Some(backend_space)) => {
             const DIAGNOSTIC_BLOCKS: u64 = vibeos_object_store::STORE_FIRST_SECTOR;
-            const STORE_BLOCKS: u64 =
+            const LEGACY_STORE_BLOCKS: u64 =
                 vibeos_object_store::STORE_END_SECTOR - vibeos_object_store::STORE_FIRST_SECTOR;
+            const MIGRATION_CONTROL_FIRST: u64 =
+                crate::segment_store_platform::MIGRATION_CONTROL_FIRST_BLOCK;
+            const MIGRATION_CONTROL_BLOCKS: u64 =
+                crate::segment_store_platform::MIGRATION_CONTROL_BLOCK_COUNT;
+            const STORAGE_V2_FIRST: u64 = crate::segment_store_platform::STORAGE_V2_FIRST_BLOCK;
+            const STORAGE_V2_BLOCKS: u64 = crate::segment_store_platform::STORAGE_V2_BLOCK_COUNT;
 
             let managed_range = resources.managed_range.range();
             let diagnostic_range = managed_range
                 .attenuate(0, DIAGNOSTIC_BLOCKS)
                 .expect("image block range contains the diagnostic window");
             let store_range = managed_range
-                .attenuate(vibeos_object_store::STORE_FIRST_SECTOR, STORE_BLOCKS)
+                .attenuate(vibeos_object_store::STORE_FIRST_SECTOR, LEGACY_STORE_BLOCKS)
                 .expect("image block range contains the M4 journal");
+            let migration_control_range = managed_range
+                .attenuate(MIGRATION_CONTROL_FIRST, MIGRATION_CONTROL_BLOCKS)
+                .expect("image block range contains the migration-control window");
+            let storage_v2_range = managed_range
+                .attenuate(STORAGE_V2_FIRST, STORAGE_V2_BLOCKS)
+                .expect("image block range contains the initial Storage V2 window");
             vibeos_storage_device::validate_grant_layout(
                 managed_range,
-                &[diagnostic_range, store_range],
+                &[
+                    diagnostic_range,
+                    store_range,
+                    migration_control_range,
+                    storage_v2_range,
+                ],
             )
             .expect("image block grants are contained and pairwise disjoint");
 
@@ -1738,18 +1788,63 @@ pub fn build() {
             )
             .unwrap();
 
-            // The M4 adapter gets exactly [64,576). Sector numbers outside
-            // that historical journal are rejected before raw dispatch.
-            let store_policy = policy
+            // The old boot remains writable before migration. Explicit V2
+            // activation revokes this private grant; it is never copied into a
+            // client CSpace.
+            let legacy_writer_policy = policy
                 .derive_scoped::<block_device::BlockDevice>(
                     range_root,
-                    (vibeos_object_store::STORE_FIRST_SECTOR, STORE_BLOCKS),
+                    (vibeos_object_store::STORE_FIRST_SECTOR, LEGACY_STORE_BLOCKS),
                     Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
                 )
                 .expect("image block range contains the M4 journal");
-            let store_grant = cap::grant(
+            let legacy_active = cap::grant(
                 &policy,
-                store_policy,
+                legacy_writer_policy,
+                Rights::READ.union(Rights::WRITE),
+                &mut backend_space.0.lock(),
+            )
+            .unwrap();
+            // Derive a distinct sibling from the range root. Revoking the
+            // writer branch cannot kill this one-release read-only source.
+            let legacy_reader_policy = policy
+                .derive_scoped::<block_device::BlockDevice>(
+                    range_root,
+                    (vibeos_object_store::STORE_FIRST_SECTOR, LEGACY_STORE_BLOCKS),
+                    Rights::READ.union(Rights::GRANT),
+                )
+                .expect("image block range contains the M4 compatibility source");
+            let legacy_read = cap::grant(
+                &policy,
+                legacy_reader_policy,
+                Rights::READ,
+                &mut backend_space.0.lock(),
+            )
+            .unwrap();
+            let control_policy = policy
+                .derive_scoped::<block_device::BlockDevice>(
+                    range_root,
+                    (MIGRATION_CONTROL_FIRST, MIGRATION_CONTROL_BLOCKS),
+                    Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+                )
+                .expect("image block range contains the migration-control window");
+            let migration_control = cap::grant(
+                &policy,
+                control_policy,
+                Rights::READ.union(Rights::WRITE),
+                &mut backend_space.0.lock(),
+            )
+            .unwrap();
+            let storage_v2_policy = policy
+                .derive_scoped::<block_device::BlockDevice>(
+                    range_root,
+                    (STORAGE_V2_FIRST, STORAGE_V2_BLOCKS),
+                    Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+                )
+                .expect("image block range contains the initial Storage V2 window");
+            let storage_v2 = cap::grant(
+                &policy,
+                storage_v2_policy,
                 Rights::READ.union(Rights::WRITE),
                 &mut backend_space.0.lock(),
             )
@@ -1782,7 +1877,12 @@ pub fn build() {
             drop(target);
             (
                 Some(diagnostic),
-                Some(store_grant),
+                Some(StoreBlockGrants {
+                    legacy_active,
+                    legacy_read,
+                    migration_control,
+                    storage_v2,
+                }),
                 Some(mmio_root),
                 Some(dma_root),
                 Some(raw_root),
@@ -2189,8 +2289,15 @@ pub fn build() {
         (None, None, None) => None,
         _ => unreachable!("TCP echo app grant exists exactly with its listener"),
     };
-    let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root) = match (
-        store_block_grant,
+    let (
+        store_root,
+        durable_cspace_root,
+        durable_cspace_service,
+        saved_program_root,
+        storage_v2,
+        storage_migration,
+    ) = match (
+        store_block_grants,
         store_backend.as_ref(),
         persistent_test.as_ref(),
         saved_program_space.as_ref(),
@@ -2199,7 +2306,7 @@ pub fn build() {
         saved_memory_policy,
     ) {
         (
-            Some(block),
+            Some(blocks),
             Some(backend),
             Some(persistent),
             Some(saved_target),
@@ -2207,11 +2314,33 @@ pub fn build() {
             Some(saved_console),
             Some(saved_memory),
         ) => {
-            // `block` is already the exact [64,576) scoped grant installed in
-            // this private backend CSpace by block policy.
-            let service = crate::store_platform::new_service(backend.clone(), block);
+            let storage_v2 = Arc::new(
+                crate::segment_store_platform::StorageV2Devices::new(
+                    backend.clone(),
+                    blocks.legacy_active,
+                    blocks.legacy_read,
+                    blocks.migration_control,
+                    blocks.storage_v2,
+                )
+                .expect("trusted Storage V2 grants match the frozen image layout"),
+            );
+            // One facade owns both formats. Its sealed backend selector is
+            // published by the boot probe; Pending/FailClosed never fall
+            // through to legacy media.
+            let service = crate::store_platform::new_service(
+                backend.clone(),
+                blocks.legacy_read,
+                blocks.legacy_active,
+                storage_v2.legacy_write_gate(),
+                storage_v2.runtime.clone(),
+            );
+            storage_v2.bind_legacy_store(&service);
             let journal = service.authority_journal();
             let store_cap = cs.mint(service, Rights::ALL);
+            let migration_cap = cs.mint(
+                crate::segment_store_platform::StorageMigrationAuthority::new(&storage_v2),
+                Rights::INVOKE,
+            );
             let saved = saved_program::SavedProgramService::new(
                 journal.clone(),
                 saved_target.clone(),
@@ -2231,9 +2360,11 @@ pub fn build() {
                 Some(durable_cap),
                 Some(durable),
                 Some(saved_cap),
+                Some(storage_v2),
+                Some(migration_cap),
             )
         }
-        (None, None, None, None, None, None, None) => (None, None, None, None),
+        (None, None, None, None, None, None, None) => (None, None, None, None, None, None),
         _ => unreachable!("store backend exists exactly when a block device exists"),
     };
     drop(cs);
@@ -2339,6 +2470,8 @@ pub fn build() {
         saved_program: saved_program_root,
         durable_cspace: durable_cspace_root,
         durable_cspace_service,
+        storage_v2,
+        storage_migration,
         block_space: c_block_space,
         block_policy,
         block_mmio: block_mmio_root,
@@ -2643,23 +2776,39 @@ async fn fault_probe_task(space: SpaceRef, memory_budget: usize) {
     panic!("fault probe unexpectedly stayed within its allocation quota");
 }
 
-/// Audited M4.2 probe. It allocates the normal recovery/transaction working
-/// set, then faults after taking the store claim and before the first write.
-/// Raw teardown must reclaim both the caller arena and the abandoned claim.
+/// Audited unified-store probe. It allocates the normal recovery/transaction
+/// working set, then faults after taking the facade claim and before the first
+/// M4 or V2 write. Raw teardown must reclaim both the caller arena and the
+/// abandoned claim.
 async fn store_fault_probe_task(space: SpaceRef, service: Cap) {
     const MARKER: &[u8] = b"VIBEOS-STORE-FAULT-PROBE-v1";
+    const BUSY_RETRIES: usize = 4_096;
     let mut payload: Vec<u8> = (0..900)
         .map(|index| ((index * 29 + 7) % 251) as u8)
         .collect();
     payload[..MARKER.len()].copy_from_slice(MARKER);
     let kind = store::journal_object_kind(0xF042).expect("fault-probe object kind is non-zero");
-    let lease = space
-        .get()
-        .0
-        .lock()
-        .lookup_lease::<store::StoreService>(service, Rights::WRITE)
-        .expect("store fault probe receives an explicit write grant");
-    let result =
-        store::put_with_static_fault_before_write(lease, space.get(), kind, &payload).await;
-    panic!("injected store fault unexpectedly returned: {result:?}");
+    // The shell becomes interactive independently of durable boot recovery.
+    // Under a loaded multi-hart QEMU run the recovery coordinator may still
+    // own the legitimate store operation epoch for a few polls. Busy is not a
+    // fault-injection result: yield and retry until this exact probe acquires
+    // the facade claim and reaches the sealed pre-write panic. Keep the retry
+    // bounded so a genuinely abandoned claim still fails acceptance instead
+    // of parking the shell forever.
+    for attempt in 0..BUSY_RETRIES {
+        let lease = space
+            .get()
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(service, Rights::WRITE)
+            .expect("store fault probe receives an explicit write grant");
+        let result =
+            store::put_with_static_fault_before_write(lease, space.get(), kind, &payload).await;
+        if result == Err(store::StoreError::Busy) && attempt + 1 != BUSY_RETRIES {
+            exec::sleep_ms(1).await;
+            continue;
+        }
+        panic!("injected store fault unexpectedly returned: {result:?}");
+    }
+    unreachable!("the bounded store-fault retry loop always returns or faults");
 }

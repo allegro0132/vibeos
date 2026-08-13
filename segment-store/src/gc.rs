@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -26,7 +27,7 @@ use vibeos_segment_format::{
     admitted_pages, descriptor_chain_initial, descriptor_chain_next, encode_record_seal,
     encode_segment_header_body, encode_segment_seal_body, encode_segment_summary_body,
     payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
-    Checkpoint, ExtentKind, PhysicalPointer, RecordBinding, SegmentHeader, SegmentSeal,
+    Checkpoint, ExtentKind, Page, PhysicalPointer, RecordBinding, SegmentHeader, SegmentSeal,
     SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE,
     SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
@@ -35,6 +36,9 @@ use crate::allocation_v2::{
     encode_allocation_v2, AllocationTransition, AllocationV2, AllocationV2Error, SegmentAllocation,
 };
 use crate::authority::AuthorizedObject;
+use crate::authority_snapshot::{
+    encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
+};
 use crate::cas::{
     build_record, flush, verify_manifest_blob, write_page, write_payload_record, CasObjectHandle,
     CasStoreError, FinalRecord,
@@ -69,6 +73,16 @@ const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
 const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const METADATA_KIND_ROOT_SET: u32 = 0xffff_0020;
+const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
+
+/// Allocate page I/O scratch directly in its final heap representation so the
+/// segment-builder futures remain safe for the kernel's bounded stack.
+fn heap_page() -> Box<Page> {
+    vec![0_u8; PAGE_SIZE]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("fixed page allocation has the exact page length"))
+}
 
 /// A full-compaction pass is bounded by the same catalog ceiling as recovery.
 /// The largest transient byte buffer is one canonical Blob extent (1 MiB).
@@ -95,6 +109,7 @@ pub enum GcError {
     CorruptAt(&'static str),
     Allocation(AllocationV2Error),
     RootCodec(RootCodecError),
+    AuthoritySnapshot(AuthoritySnapshotError),
     Pins,
     QuotaPersistenceUnavailable,
 }
@@ -123,6 +138,7 @@ impl fmt::Display for GcError {
             Self::CorruptAt(stage) => return write!(f, "GC failed authentication at {stage}"),
             Self::Allocation(error) => return write!(f, "{error}"),
             Self::RootCodec(error) => return write!(f, "{error}"),
+            Self::AuthoritySnapshot(error) => return write!(f, "{error}"),
             Self::Pins => "runtime pin admission or snapshot failed",
             Self::QuotaPersistenceUnavailable => {
                 "boot-local quota attribution cannot enter persistent root policy"
@@ -142,6 +158,12 @@ impl From<AllocationV2Error> for GcError {
 impl From<RootCodecError> for GcError {
     fn from(value: RootCodecError) -> Self {
         Self::RootCodec(value)
+    }
+}
+
+impl From<AuthoritySnapshotError> for GcError {
+    fn from(value: AuthoritySnapshotError) -> Self {
+        Self::AuthoritySnapshot(value)
     }
 }
 
@@ -1159,7 +1181,10 @@ impl GcTelemetry {
     }
 }
 
-fn select_free_segments(allocation: &AllocationV2, count: usize) -> Result<Vec<u64>, GcError> {
+pub(crate) fn select_free_segments(
+    allocation: &AllocationV2,
+    count: usize,
+) -> Result<Vec<u64>, GcError> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(count)
@@ -1668,10 +1693,10 @@ impl SegmentBuilder {
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
         // An unsealed target is never authoritative. Exact-zero the final seal
         // before writing payload and verify the zero write durably.
-        let zero = [0; PAGE_SIZE];
+        let zero = heap_page();
         write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &zero).await?;
         flush(device).await?;
-        let mut observed = [0; PAGE_SIZE];
+        let mut observed = heap_page();
         device
             .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
             .await
@@ -1695,8 +1720,8 @@ impl SegmentBuilder {
             previous_segment_generation,
             previous_segment_seal_body_sha256: previous_hash,
         };
-        let mut body = [0; PAGE_SIZE];
-        let mut seal = [0; PAGE_SIZE];
+        let mut body = heap_page();
+        let mut seal = heap_page();
         let header_digest =
             encode_segment_header_body(&header, &mut body).map_err(StoreError::Format)?;
         encode_record_seal(header_digest, &mut seal).map_err(StoreError::Format)?;
@@ -1860,8 +1885,8 @@ async fn finalize_accumulated_segment<D: PageDevice>(
         kind_counts: accumulated.kind_counts,
         kind_bytes: accumulated.kind_bytes,
     };
-    let mut summary_body = [0; PAGE_SIZE];
-    let mut summary_seal = [0; PAGE_SIZE];
+    let mut summary_body = heap_page();
+    let mut summary_seal = heap_page();
     let summary_digest =
         encode_segment_summary_body(&summary, &mut summary_body).map_err(StoreError::Format)?;
     encode_record_seal(summary_digest, &mut summary_seal).map_err(StoreError::Format)?;
@@ -1884,8 +1909,8 @@ async fn finalize_accumulated_segment<D: PageDevice>(
         total_payload_bytes: accumulated.total_payload_bytes,
         target_checkpoint_generation: checkpoint_generation,
     };
-    let mut seal_body = [0; PAGE_SIZE];
-    let mut final_seal = [0; PAGE_SIZE];
+    let mut seal_body = heap_page();
+    let mut final_seal = heap_page();
     let seal_digest =
         encode_segment_seal_body(&seal, &mut seal_body).map_err(StoreError::Format)?;
     encode_record_seal(seal_digest, &mut final_seal).map_err(StoreError::Format)?;
@@ -2002,7 +2027,7 @@ fn manifest_table_bytes(manifests: &[BlobManifest]) -> Result<usize, GcError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn verify_staged_payload<D: PageDevice>(
+pub(crate) async fn verify_staged_payload<D: PageDevice>(
     device: &D,
     state: &MountedState,
     checkpoint_generation: u64,
@@ -2080,7 +2105,7 @@ async fn verify_staged_copied_extent<D: PageDevice>(
         .checked_add(u64::from(pointer.payload_relative_page))
         .and_then(|page| page.checked_add(last_payload_relative))
         .ok_or(GcError::ArithmeticOverflow)?;
-    let mut page = [0; PAGE_SIZE];
+    let mut page = heap_page();
     device
         .read_page(last_payload_page, &mut page)
         .await
@@ -2099,6 +2124,7 @@ async fn relocate_live_state<D: PageDevice>(
     mark: &MarkPlan,
     root_count: usize,
     roots: &PersistentRootSet,
+    authority: Option<&PersistentAuthoritySnapshot>,
     manifests: &[BlobManifest],
     manifest_lens: &[usize],
     plan: &GcSegmentPlan,
@@ -2120,7 +2146,21 @@ async fn relocate_live_state<D: PageDevice>(
         target_next_generation,
     )
     .map_err(|_| GcError::Corrupt)?;
-    let root_bytes = encode_persistent_root_set(roots).map_err(GcError::from)?;
+    let (root_bytes, root_kind) = match authority {
+        Some(snapshot) => (
+            encode_persistent_authority_snapshot(
+                &snapshot
+                    .relocated(plan.relocation_generation)
+                    .map_err(GcError::from)?,
+            )
+            .map_err(GcError::from)?,
+            METADATA_KIND_PERSISTENT_AUTHORITY,
+        ),
+        None => (
+            encode_persistent_root_set(roots).map_err(GcError::from)?,
+            METADATA_KIND_ROOT_SET,
+        ),
+    };
     let allocation_bytes =
         encode_allocation_v2(&plan.relocation_allocation).map_err(GcError::from)?;
 
@@ -2251,7 +2291,7 @@ async fn relocate_live_state<D: PageDevice>(
         .payload(
             device,
             ExtentKind::Authority,
-            METADATA_KIND_ROOT_SET,
+            root_kind,
             0,
             1,
             root_bytes.len() as u64,
@@ -2393,7 +2433,7 @@ async fn relocate_live_state<D: PageDevice>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn publish_checkpoint<D: PageDevice>(
+pub(crate) async fn publish_checkpoint<D: PageDevice>(
     device: &D,
     state: &MountedState,
     limits: StoreLimits,
@@ -2437,10 +2477,10 @@ async fn clear_old_checkpoint_seal<D: PageDevice>(
 ) -> Result<ExactZeroCheckpointSeal, GcStoreError<D::Error>> {
     let slot = (generation - 1) & 1;
     let seal_page = 5 + slot * 2;
-    let zero = [0; PAGE_SIZE];
+    let zero = heap_page();
     write_page(device, seal_page, &zero).await?;
     flush(device).await?;
-    let mut observed = [0; PAGE_SIZE];
+    let mut observed = heap_page();
     device
         .read_page(seal_page, &mut observed)
         .await
@@ -2615,6 +2655,16 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         roots: &[&AuthorizedObject<CasObjectHandle>],
     ) -> Result<(), GcStoreError<D::Error>> {
+        // VIBEAUT2 is the sole durable owner of both the root closure and its
+        // logical authority/quota policy. Replacing it with a bare VIBERST2
+        // payload would silently discard that policy.
+        if self
+            .require_current_generation()?
+            .persistent_authority
+            .is_some()
+        {
+            return Err(GcError::InvalidPhase.into());
+        }
         if roots
             .iter()
             .any(|root| root.backend_handle().is_quota_charged())
@@ -3064,7 +3114,17 @@ impl<D: PageDevice> SegmentStore<D> {
         let manifest_lens_bytes =
             vector_bytes(manifest_lens.capacity(), core::mem::size_of::<usize>())?;
         memory.retain(manifest_lens_bytes)?;
-        let root_len = persistent_root_encoded_len(&relocated_roots)?;
+        let root_len = match state.persistent_authority.as_ref() {
+            Some(authority) => {
+                let relocated = authority
+                    .relocated(relocation_generation)
+                    .map_err(GcError::from)?;
+                encode_persistent_authority_snapshot(&relocated)
+                    .map_err(GcError::from)?
+                    .len()
+            }
+            None => persistent_root_encoded_len(&relocated_roots)?,
+        };
         // Exact snapshot length from table counts.
         let snapshot_len = cas_snapshot_len(mark.live_objects().len(), mark.live_blobs().len())?;
         // Rank equal-capacity segments by authoritative live extent bytes.
@@ -3226,6 +3286,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 &mark,
                 roots.len(),
                 &relocated_roots,
+                state.persistent_authority.as_ref(),
                 &manifests,
                 &manifest_lens,
                 &plan,

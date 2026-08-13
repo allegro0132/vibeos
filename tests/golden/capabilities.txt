@@ -2,15 +2,16 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> spaces
+  block-policy 9 caps
   guest    1 caps
-  init     14 caps
+  init     13 caps
   logger   2 caps
   persistent-test 0 caps
   prog     2 caps
   saved-program 0 caps
   saved-program-policy 2 caps
   sensor   1 caps
-  store-backend 1 caps
+  store-backend 3 caps
   virtio-blk 3 caps
 vibe> caps init
   owner component:5  task task:6  name shell  state running  reason -
@@ -24,12 +25,11 @@ vibe> caps init
   cap:5.0      cspace    r-----   sensor [1 caps]
   cap:6.0      cspace    r-----   logger [2 caps]
   cap:7.0      memory    rwsvgx   prog-arena [4096 x i64]
-  cap:8.0      virtio-mmio rwsvgx   modern block transport slot 0 @ 0xADDR, IRQ 1, vendor 0xADDR
-  cap:9.0      dma-region rwsvgx   SYSTEM stable slab @ 0xADDR, 4096 bytes
-  cap:10.0     block-device rwsvgx   virtio-blk [2048 sectors, queue 8, epoch 1]
-  cap:11.0     object-store rwsvgx   capability-addressed object store (recovery pending)
-  cap:12.0     durable-cspace rw----   persistent-test CSpace [Ready, 0 live grants, 0 tombstones]
-  cap:13.0     saved-program rw----   fixed saved program `hello` [ReadyEmpty, artifact absent, authority console=w memory=rw]
+  cap:8.0      block-range rw----   device:564942454f5300000000000000000001 logical blocks [0..64)
+  cap:9.0      object-store rwsvgx   capability-addressed object store [0 objects, 1 journal sectors]
+  cap:10.0     storage-v2-migration ------i  explicit Storage V2 migration authority
+  cap:11.0     durable-cspace rw----   persistent-test CSpace [Ready, 0 live grants, 0 tombstones]
+  cap:12.0     saved-program rw----   fixed saved program `hello` [ReadyEmpty, artifact absent, authority console=w memory=rw]
   rights: r=read w=write s=send v=recv g=grant x=revoke i=invoke
 vibe> caps logger
   owner component:2  task task:2  name logger  state running  reason -

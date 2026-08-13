@@ -1,0 +1,7 @@
+quiet
+run hello
+storage status
+storage rollback
+@sleep 5
+storage status
+halt

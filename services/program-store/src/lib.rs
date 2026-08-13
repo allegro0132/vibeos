@@ -9,6 +9,7 @@ mod model;
 pub use model::*;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate as program;
@@ -22,19 +23,31 @@ use vibeos_object_store::{StoreError, StoredObject};
 #[repr(u8)]
 pub enum SavedProgramState {
     Cold = 0,
-    ReadyEmpty = 1,
-    Ready = 2,
-    FailedClosed = 3,
+    /// Durable graph installation completed, but the unified boot coordinator
+    /// has not yet activated dependent authority.
+    Staging = 1,
+    ReadyEmpty = 2,
+    Ready = 3,
+    FailedClosed = 4,
 }
 
 impl SavedProgramState {
     pub fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::Cold,
-            1 => Self::ReadyEmpty,
-            2 => Self::Ready,
+            1 => Self::Staging,
+            2 => Self::ReadyEmpty,
+            3 => Self::Ready,
             _ => Self::FailedClosed,
         }
+    }
+
+    pub const fn recovery_pending(self) -> bool {
+        matches!(self, Self::Cold | Self::Staging)
+    }
+
+    pub const fn client_ready(self) -> bool {
+        matches!(self, Self::ReadyEmpty | Self::Ready)
     }
 }
 
@@ -105,6 +118,17 @@ pub struct TrustedProgram {
 pub fn authorize_recovered(
     recovered: &RecoveredStore,
 ) -> Result<TrustedProgram, SavedProgramError> {
+    authorize_recovered_with(recovered, |object| Ok(StoredObject::from_recovered(object)))
+}
+
+/// Authorize a recovered program while requiring the selected persistence
+/// backend to materialize the exact object resource. Storage V2 uses this hook
+/// to bind the durable graph identity to an opaque CAS capability; callers
+/// cannot substitute a media ObjectId lookup.
+pub fn authorize_recovered_with(
+    recovered: &RecoveredStore,
+    resolve: impl FnOnce(&RecoveredObject) -> Result<Arc<StoredObject>, SavedProgramError>,
+) -> Result<TrustedProgram, SavedProgramError> {
     if !recovered.tombstones.is_empty()
         || recovered
             .slots
@@ -164,13 +188,14 @@ pub fn authorize_recovered(
         })
         .ok_or(SavedProgramError::UnexpectedGraph)?;
     validate_recovered_object(object)?;
+    let resource = resolve(object)?;
     Ok(TrustedProgram {
         slots,
         grants,
         resources: alloc::vec![PersistentResourceWitness::new(
             object_id,
             program::stored_object_resource_kind(),
-            StoredObject::from_recovered(object),
+            resource,
         )],
         live: true,
     })

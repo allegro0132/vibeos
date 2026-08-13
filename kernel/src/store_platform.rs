@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use vibeos_core::cap::{Cap, Rights};
 use vibeos_object_store::{
@@ -20,45 +21,65 @@ use crate::world::Space;
 
 struct StorePlatform {
     backend: Arc<Space>,
-    block: Cap,
+    read_block: Cap,
+    write_block: Cap,
+    write_frozen: Arc<AtomicBool>,
     adapter: Legacy512Adapter,
 }
 
 impl StorePlatform {
-    fn new(backend: Arc<Space>, block: Cap) -> Self {
-        let range = backend
+    fn new(
+        backend: Arc<Space>,
+        read_block: Cap,
+        write_block: Cap,
+        write_frozen: Arc<AtomicBool>,
+    ) -> Self {
+        let read_range = backend
             .0
             .lock()
-            .lookup_lease::<BlockDevice>(block, Rights::READ)
+            .lookup_lease::<BlockDevice>(read_block, Rights::READ)
             .expect("store backend receives a readable block range")
             .with(BlockDevice::range);
-        assert_eq!(range.first_block(), STORE_FIRST_SECTOR);
-        assert_eq!(range.end_block(), STORE_END_SECTOR);
-        let adapter = Legacy512Adapter::new(range, STORE_FIRST_SECTOR)
+        let write_range = backend
+            .0
+            .lock()
+            .lookup_lease::<BlockDevice>(write_block, Rights::WRITE)
+            .expect("store backend receives a writable sibling block range")
+            .with(BlockDevice::range);
+        assert_eq!(read_range, write_range);
+        assert_eq!(read_range.first_block(), STORE_FIRST_SECTOR);
+        assert_eq!(read_range.end_block(), STORE_END_SECTOR);
+        let adapter = Legacy512Adapter::new(read_range, STORE_FIRST_SECTOR)
             .expect("the exact M4 range has a valid legacy namespace");
         Self {
             backend,
-            block,
+            read_block,
+            write_block,
+            write_frozen,
             adapter,
         }
     }
 
-    fn lease(
-        &self,
-        need: Rights,
-    ) -> Result<vibeos_core::cap::InvocationLease<BlockDevice>, BackendError> {
+    fn read_lease(&self) -> Result<vibeos_core::cap::InvocationLease<BlockDevice>, BackendError> {
         self.backend
             .0
             .lock()
-            .lookup_lease::<BlockDevice>(self.block, need)
+            .lookup_lease::<BlockDevice>(self.read_block, Rights::READ)
+            .map_err(|_| BackendError::AuthorityRevoked)
+    }
+
+    fn write_lease(&self) -> Result<vibeos_core::cap::InvocationLease<BlockDevice>, BackendError> {
+        self.backend
+            .0
+            .lock()
+            .lookup_lease::<BlockDevice>(self.write_block, Rights::WRITE)
             .map_err(|_| BackendError::AuthorityRevoked)
     }
 }
 
 impl Platform for StorePlatform {
     fn info(&self) -> Result<BackendInfo, BackendError> {
-        let info =
-            block_device::range_info_with(&self.lease(Rights::READ)?).map_err(map_block_error)?;
+        let info = block_device::range_info_with(&self.read_lease()?).map_err(map_block_error)?;
         let geometry = info.geometry();
         if geometry.logical_block_size() != LEGACY_BLOCK_SIZE
             || !geometry.supports_flush()
@@ -71,7 +92,7 @@ impl Platform for StorePlatform {
             // Preserve the M4 journal's historical absolute sector namespace.
             // I/O below translates it back to the range-relative API.
             capacity_sectors: self.adapter.legacy_end_sector(),
-            read_only: info.read_only(),
+            read_only: info.read_only() || self.write_frozen.load(Ordering::Acquire),
             supports_flush: geometry.supports_flush(),
             session: info.session(),
         })
@@ -87,7 +108,7 @@ impl Platform for StorePlatform {
                 .adapter
                 .relative_sector(sector)
                 .map_err(map_contract_error)?;
-            let lease = self.lease(Rights::READ)?;
+            let lease = self.read_lease()?;
             let mut output = [0; 512];
             block_device::read_blocks_with_session(&lease, session, relative, 1, &mut output)
                 .await
@@ -103,6 +124,9 @@ impl Platform for StorePlatform {
         bytes: [u8; 512],
     ) -> BackendMutationFuture<'_, ()> {
         Box::pin(async move {
+            if self.write_frozen.load(Ordering::Acquire) {
+                return Err(MutationFailure::not_submitted(BackendError::ReadOnly));
+            }
             let relative = self
                 .adapter
                 .relative_sector(sector)
@@ -112,9 +136,10 @@ impl Platform for StorePlatform {
             // data write and its durability barrier. A driver restart between
             // the two is therefore observable instead of silently mixing
             // device incarnations.
-            let lease = self
-                .lease(Rights::WRITE)
-                .map_err(MutationFailure::not_submitted)?;
+            let lease = self.write_lease().map_err(MutationFailure::not_submitted)?;
+            if self.write_frozen.load(Ordering::Acquire) {
+                return Err(MutationFailure::not_submitted(BackendError::ReadOnly));
+            }
             let session = block_device::begin_mutation(&lease)
                 .map_err(|failure| failure.map(map_block_error))?;
             if session.device_session() != expected {
@@ -162,8 +187,22 @@ impl PublicationTarget for Space {
     }
 }
 
-pub fn new_service(backend: Arc<Space>, block: Cap) -> Arc<StoreService> {
-    StoreService::new(Arc::new(StorePlatform::new(backend, block)))
+pub fn new_service(
+    backend: Arc<Space>,
+    read_block: Cap,
+    write_block: Cap,
+    write_frozen: Arc<AtomicBool>,
+    storage_v2: Arc<dyn vibeos_object_store::StorageV2Backend>,
+) -> Arc<StoreService> {
+    StoreService::new_with_storage_v2(
+        Arc::new(StorePlatform::new(
+            backend,
+            read_block,
+            write_block,
+            write_frozen,
+        )),
+        Some(storage_v2),
+    )
 }
 
 fn map_block_error(error: BlockError) -> BackendError {

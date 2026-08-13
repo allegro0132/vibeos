@@ -918,6 +918,8 @@ dependencies = [
  "vibeos-random",
  "vibeos-runtime-riscv",
  "vibeos-rustc",
+ "vibeos-segment-format",
+ "vibeos-segment-store",
  "vibeos-ssh-identity",
  "vibeos-sshd",
  "vibeos-storage-device",
@@ -1022,6 +1024,7 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "vibeos-blob-format",
+ "vibeos-durable-format",
  "vibeos-segment-format",
  "vibeos-storage-device",
 ]

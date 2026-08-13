@@ -1,0 +1,7 @@
+quiet
+storage status
+rustc save hello
+run hello
+pcspace test
+@sleep 15
+halt

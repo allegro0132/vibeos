@@ -42,7 +42,7 @@ to the VirtIO `avail.idx` store and the SDHCI CMD24/CMD13 `COMMAND` stores.
 The QEMU `block`, `store`, and `block_recovery` cases passed against real raw
 backing images. The exact Milk-V `milkv-duo-sd` firmware built with the pinned
 nightly toolchain; its image verifier now requires the policy LBA 262145 and
-8192-sector data partition.
+131072-sector data partition.
 
 Focused reproduction:
 
@@ -317,4 +317,86 @@ RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
 RUSTDOC="$(rustup which --toolchain nightly-2026-08-01 rustdoc)" \
 rustup run nightly-2026-08-01 cargo check -p vibeos-segment-store \
   --target riscv64imac-unknown-none-elf -Zbuild-std=core,alloc --locked --offline
+```
+
+## M7.7 migration and default cutover
+
+Accepted on 2026-08-13. M7.7 installs one fail-closed object-store facade over
+the frozen M4 reader and Storage V2, persists the exact externally admitted
+authority and principal quota state as `VIBEAUT2`, and switches program,
+persistent-CSpace, sealed-singleton, and ordinary object recovery together. A
+Pending, corrupt, or ambiguous selector cannot fall through to M4. Migration
+freezes and drains the logical M4 facade, revokes its private physical writer,
+and retains only a sibling read capability for the rollback release.
+
+The selector matrix covers Freeze, Stage, Activate, Rollback, and Close, each at
+all six write/flush mutation boundaries with three failure effects and three
+cancellation effects. All 180 interrupted transitions recovered the preceding
+record or the exact successor. Native format and empty-authority import have
+separate every-boundary failure/cancel matrices; generation-1 Closed control
+publication has a separate every-boundary failure matrix. The
+persistent-authority suite also covers exact stable/V2 bindings,
+quota reconstruction and atomic rejection, delayed grants, singleton
+replacement, byte-exact anonymous adoption, and foreground GC at the minimum
+eight-segment geometry. The complete `segment-store` run passed 151 library
+tests plus 45 integration tests.
+
+The Rust-independent migration verifier selftest passed 24,588 mutation and
+negative cases. It understands the production allocation-v1 to allocation-v2
+fallback transition without weakening either decoder, independently recovers
+both retained checkpoints, reconstructs every CAS byte and Blob root, validates
+the exact authority/quota binding set and external policy, and rejects writes
+outside the fixed ranges. Native mode additionally proves fixed UUID,
+generation-1 `RollbackClosed`, activation floor 2, the canonical empty authority
+commitment, strict subsequent logical history, and an all-zero M4 range.
+
+One 64 MiB QEMU raw image completed seven powered-off boots:
+
+| boot | observed durable result |
+|---:|---|
+| 1 | final writable M4 publication; capture exact rollback baseline |
+| 2 | `V2Staged` generation 2 |
+| 3 | explicit rollback to `FrozenM4` generation 3 |
+| 4 | explicit re-stage to `V2Staged` generation 4 |
+| 5 | explicit activation to `V2Active` generation 5 |
+| 6 | explicit close to `RollbackClosed` generation 6 |
+| 7 | Closed reboot; program/CSpace/store/Blob recovery and two terminal transition refusals |
+
+After every boot the harness compared `[0,64)` and frozen `[64,576)` byte for
+byte and independently verified the exact selector state and generation on the
+powered-off image. A separate genuinely blank image completed two native V2
+boots. It initialized directly to generation-1 Closed, preserved an all-zero M4
+range, recovered the saved program and persistent CSpace, and completed ordinary
+store and Blob writes after reboot. The saved-program recovery path remains
+staged until both durable graphs are installed and the coordinator atomically
+activates dependents; concurrent pre-activation waiters and failure races are
+covered by host tests.
+
+The Milk-V policy and image scripts now agree on a 131,072-sector (64 MiB) data
+partition at physical LBA 262145. A local SDK package and two independent image
+verifier runs accepted a 201,327,104-byte image with partition 1 `[1,262145)` and
+partition 2 `[262145,393217)`. A complete scan proved the raw partition was zero
+except for the canonical logical-sector-7 seed. The verified local artifact is
+ignored build output, not repository source; physical boot remains a manual
+hardware acceptance step. CI independently tests both QEMU and Milk-V policy
+features, while the verifier selftest corrupts the prefix, seed/padding, suffix,
+last byte, old 4 MiB geometry, and truncation.
+
+Reproduction commands:
+
+```sh
+cargo test --workspace --exclude vibeos-kernel \
+  --exclude vibeos-firmware-qemu-virt \
+  --exclude vibeos-firmware-milkv-duo --locked --offline --no-fail-fast
+cargo clippy -p vibeos-segment-store -p vibeos-object-store \
+  -p vibeos-program-store --all-targets --no-deps --locked --offline -- -D warnings
+python3 -B scripts/storage-v2-image.py --selftest
+python3 -B scripts/verify-storage-v2-cas.py --selftest
+python3 -B scripts/verify-storage-v2-gc.py --selftest
+python3 -B scripts/verify-storage-v2-maintenance.py --selftest
+python3 -B scripts/verify-storage-v2-migration.py --selftest
+./scripts/verify-milkv-duo-image.sh --selftest
+./scripts/qemu-test.sh storage_v2
+./scripts/qemu-test.sh storage_v2_native
+./scripts/build-milkv-duo.sh
 ```

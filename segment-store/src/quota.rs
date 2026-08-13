@@ -30,17 +30,18 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use vibeos_blob_format::BlobGeometry;
 use vibeos_segment_format::PAGE_SIZE;
 
+use crate::authority_snapshot::{PersistentPrincipalPolicy, StablePrincipalId};
 use crate::cas_codec::{
     BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN, CANONICAL_CONTENT_EXTENT_LEN, MANIFEST_EXTENT_LEN,
     OBJECT_MAPPING_LEN,
@@ -48,6 +49,12 @@ use crate::cas_codec::{
 
 /// Maximum number of boot-local storage principals in one governed runtime.
 pub const DEFAULT_MAX_STORAGE_PRINCIPALS: u32 = 256;
+
+/// Maximum number of live boot-local object charges which may be waiting for
+/// an exact stable-object binding. The runtime root table has the same hard
+/// bound, so reserving this storage up front keeps the quota lock allocation
+/// free without introducing a second, smaller admission ceiling.
+const MAX_PENDING_PERSISTENT_CHARGES: usize = 256;
 
 /// Frozen M7.6 physical-attribution formula version.
 pub const QUOTA_PHYSICAL_FORMULA_VERSION: u16 = 1;
@@ -198,6 +205,7 @@ struct PrincipalSeal {
     // Give every `Arc` a real allocation and a distinct address even on
     // allocators that special-case zero-sized values.
     _marker: u8,
+    stable_id: Option<StablePrincipalId>,
 }
 
 /// Opaque accounting resource required for quota-charged storage admission.
@@ -219,6 +227,10 @@ impl fmt::Debug for StoragePrincipal {
 impl StoragePrincipal {
     pub const fn ceilings(&self) -> PrincipalQuotaLimits {
         self.ceilings
+    }
+
+    pub(crate) fn stable_id(&self) -> Option<StablePrincipalId> {
+        self.seal.stable_id
     }
 
     /// Derive an equivalent principal token with ceilings no larger than this
@@ -270,11 +282,30 @@ impl StorageQuotaProvisioner {
 struct PrincipalAccount {
     seal: Arc<PrincipalSeal>,
     limits: PrincipalQuotaLimits,
+    persistent_logical_bytes: u64,
+    persistent_physical_bytes: u64,
     committed_logical_bytes: u64,
     committed_physical_bytes: u64,
     reserved_logical_bytes: u64,
     reserved_physical_bytes: u64,
     admission_revoked: bool,
+}
+
+struct PersistentRestorePlan {
+    account_index: Option<usize>,
+    seal: Arc<PrincipalSeal>,
+    limits: PrincipalQuotaLimits,
+    persistent_logical_bytes: u64,
+    persistent_physical_bytes: u64,
+    projected_logical_bytes: u64,
+    projected_physical_bytes: u64,
+    admission_revoked: bool,
+}
+
+struct CandidateReconcilePlan {
+    charge: Arc<CommittedChargeState>,
+    account_index: usize,
+    transfer_to_persistent: bool,
 }
 
 #[derive(Default)]
@@ -297,7 +328,14 @@ struct AggregateAccounting {
 struct QuotaStateData {
     maximum_principals: u32,
     accounts: Vec<PrincipalAccount>,
+    persistent_candidates: Vec<PersistentChargeCandidate>,
     aggregate: AggregateAccounting,
+}
+
+struct PersistentChargeCandidate {
+    stable_object_id: u128,
+    v2_object_id: u128,
+    charge: Weak<CommittedChargeState>,
 }
 
 /// A tiny no_std lock.  Quota critical sections contain no allocation, media
@@ -384,12 +422,17 @@ impl PrincipalQuotaTable {
         accounts
             .try_reserve_exact(capacity)
             .map_err(|_| QuotaError::AllocationFailed)?;
+        let mut persistent_candidates = Vec::new();
+        persistent_candidates
+            .try_reserve_exact(MAX_PENDING_PERSISTENT_CHARGES)
+            .map_err(|_| QuotaError::AllocationFailed)?;
         Ok(Self {
             state: Arc::new(QuotaState {
                 locked: AtomicBool::new(false),
                 data: UnsafeCell::new(QuotaStateData {
                     maximum_principals,
                     accounts,
+                    persistent_candidates,
                     aggregate: AggregateAccounting::default(),
                 }),
             }),
@@ -414,7 +457,10 @@ impl PrincipalQuotaTable {
         // Allocate outside the no-allocation critical section.  A concurrent
         // admission may fill the final slot before we acquire the lock; in
         // that case this harmless candidate seal is simply dropped.
-        let seal = Arc::new(PrincipalSeal { _marker: 0xa7 });
+        let seal = Arc::new(PrincipalSeal {
+            _marker: 0xa7,
+            stable_id: None,
+        });
         let mut state = self.state.lock();
         if state.accounts.len() >= state.maximum_principals as usize {
             record_rejection(&mut state.aggregate);
@@ -425,6 +471,8 @@ impl PrincipalQuotaTable {
         state.accounts.push(PrincipalAccount {
             seal: Arc::clone(&seal),
             limits,
+            persistent_logical_bytes: 0,
+            persistent_physical_bytes: 0,
             committed_logical_bytes: 0,
             committed_physical_bytes: 0,
             reserved_logical_bytes: 0,
@@ -435,6 +483,326 @@ impl PrincipalQuotaTable {
             seal,
             ceilings: limits,
         })
+    }
+
+    /// Atomically replace the persistent portion of every stable account.
+    ///
+    /// Existing seals and boot-local committed charges survive replacement;
+    /// only the usage attributed to the prior authority snapshot is removed.
+    /// After the first install, every existing stable principal must appear
+    /// exactly once with unchanged limits and admission state.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn restore_persistent(
+        &self,
+        policies: &[PersistentPrincipalPolicy],
+    ) -> Result<Vec<StoragePrincipal>, QuotaError> {
+        self.restore_persistent_inner(policies, None, true)
+    }
+
+    pub(crate) fn restore_persistent_with_bindings(
+        &self,
+        policies: &[PersistentPrincipalPolicy],
+        bindings: &[(u128, u128)],
+    ) -> Result<Vec<StoragePrincipal>, QuotaError> {
+        self.restore_persistent_inner(policies, Some(bindings), true)
+    }
+
+    /// Validate a complete persistent-accounting replacement without changing
+    /// charge state, principal accounts, aggregate counters, or diagnostics.
+    ///
+    /// Persistent-authority transactions use this before their first read or
+    /// media mutation. They repeat the same validation immediately before the
+    /// authority checkpoint write, when all final stable/V2 bindings are known.
+    pub(crate) fn preflight_persistent_with_bindings(
+        &self,
+        policies: &[PersistentPrincipalPolicy],
+        bindings: &[(u128, u128)],
+    ) -> Result<(), QuotaError> {
+        self.restore_persistent_inner(policies, Some(bindings), false)
+            .map(drop)
+    }
+
+    fn restore_persistent_inner(
+        &self,
+        policies: &[PersistentPrincipalPolicy],
+        bindings: Option<&[(u128, u128)]>,
+        apply: bool,
+    ) -> Result<Vec<StoragePrincipal>, QuotaError> {
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(policies.len())
+            .map_err(|_| QuotaError::AllocationFailed)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(policies.len())
+            .map_err(|_| QuotaError::AllocationFailed)?;
+        let mut reconciliations = Vec::new();
+        reconciliations
+            .try_reserve_exact(MAX_PENDING_PERSISTENT_CHARGES)
+            .map_err(|_| QuotaError::AllocationFailed)?;
+        let mut state = self.state.lock();
+        if state.accounts.iter().any(|account| {
+            account.seal.stable_id.is_none()
+                && (account.committed_logical_bytes != 0
+                    || account.committed_physical_bytes != 0
+                    || account.reserved_logical_bytes != 0
+                    || account.reserved_physical_bytes != 0)
+        }) {
+            return Err(QuotaError::InvalidConfiguration);
+        }
+        let mut previous_principal = None;
+        for policy in policies {
+            if policy.logical_limit_bytes == 0
+                || policy.physical_limit_bytes == 0
+                || policy.committed_logical_bytes > policy.logical_limit_bytes
+                || policy.committed_physical_bytes > policy.physical_limit_bytes
+                || previous_principal.is_some_and(|principal| principal >= policy.principal)
+            {
+                return Err(QuotaError::InvalidConfiguration);
+            }
+            previous_principal = Some(policy.principal);
+        }
+        if state.accounts.iter().any(|account| {
+            account.seal.stable_id.is_some_and(|principal| {
+                !policies.iter().any(|policy| policy.principal == principal)
+            })
+        }) {
+            return Err(QuotaError::InvalidConfiguration);
+        }
+        let new_count = policies
+            .iter()
+            .filter(|policy| {
+                !state
+                    .accounts
+                    .iter()
+                    .any(|account| account.seal.stable_id == Some(policy.principal))
+            })
+            .count();
+        if state.accounts.len().saturating_add(new_count) > state.maximum_principals as usize {
+            return Err(QuotaError::PrincipalCapacity);
+        }
+        if let Some(bindings) = bindings {
+            for candidate in &state.persistent_candidates {
+                let Some(charge) = candidate.charge.upgrade() else {
+                    continue;
+                };
+                let persistent =
+                    bindings.contains(&(candidate.stable_object_id, candidate.v2_object_id));
+                let status = charge.status.load(Ordering::Acquire);
+                let transfer_to_persistent = persistent && status == CHARGE_ACTIVE;
+                let reactivate_runtime = !persistent && status == CHARGE_TRANSFERRED;
+                if !transfer_to_persistent && !reactivate_runtime {
+                    continue;
+                }
+                let account_index = find_account(&state.accounts, &charge.seal)
+                    .ok_or(QuotaError::UnknownPrincipal)?;
+                reconciliations.push(CandidateReconcilePlan {
+                    charge,
+                    account_index,
+                    transfer_to_persistent,
+                });
+            }
+        }
+        let (old_persistent_logical_total, old_persistent_physical_total) = state
+            .accounts
+            .iter()
+            .filter(|account| account.seal.stable_id.is_some())
+            .try_fold((0_u64, 0_u64), |(logical, physical), account| {
+                Some((
+                    logical.checked_add(account.persistent_logical_bytes)?,
+                    physical.checked_add(account.persistent_physical_bytes)?,
+                ))
+            })
+            .ok_or(QuotaError::CounterOverflow)?;
+        let mut new_persistent_logical_total = 0_u64;
+        let mut new_persistent_physical_total = 0_u64;
+        for policy in policies {
+            let limits = PrincipalQuotaLimits {
+                logical_bytes: policy.logical_limit_bytes,
+                physical_bytes: policy.physical_limit_bytes,
+            };
+            let account_index = state
+                .accounts
+                .iter()
+                .position(|account| account.seal.stable_id == Some(policy.principal));
+            let (seal, projected_logical_bytes, projected_physical_bytes) =
+                if let Some(index) = account_index {
+                    let account = &state.accounts[index];
+                    if account.limits != limits
+                        || account.reserved_logical_bytes != 0
+                        || account.reserved_physical_bytes != 0
+                        || account.admission_revoked != policy.admission_revoked
+                    {
+                        return Err(QuotaError::InvalidConfiguration);
+                    }
+                    let (reconciled_logical, reconciled_physical) = reconciliations
+                        .iter()
+                        .filter(|plan| plan.account_index == index)
+                        .try_fold(
+                            (
+                                account.committed_logical_bytes,
+                                account.committed_physical_bytes,
+                            ),
+                            |(logical, physical), plan| {
+                                if plan.transfer_to_persistent {
+                                    Some((
+                                        logical.checked_sub(plan.charge.logical_bytes)?,
+                                        physical.checked_sub(plan.charge.physical_bytes)?,
+                                    ))
+                                } else {
+                                    Some((
+                                        logical.checked_add(plan.charge.logical_bytes)?,
+                                        physical.checked_add(plan.charge.physical_bytes)?,
+                                    ))
+                                }
+                            },
+                        )
+                        .ok_or(QuotaError::InvalidConfiguration)?;
+                    let runtime_logical = reconciled_logical
+                        .checked_sub(account.persistent_logical_bytes)
+                        .ok_or(QuotaError::InvalidConfiguration)?;
+                    let runtime_physical = reconciled_physical
+                        .checked_sub(account.persistent_physical_bytes)
+                        .ok_or(QuotaError::InvalidConfiguration)?;
+                    let projected_logical = runtime_logical
+                        .checked_add(policy.committed_logical_bytes)
+                        .ok_or(QuotaError::CounterOverflow)?;
+                    let projected_physical = runtime_physical
+                        .checked_add(policy.committed_physical_bytes)
+                        .ok_or(QuotaError::CounterOverflow)?;
+                    if projected_logical > limits.logical_bytes
+                        || projected_physical > limits.physical_bytes
+                    {
+                        return Err(QuotaError::InvalidConfiguration);
+                    }
+                    (
+                        Arc::clone(&account.seal),
+                        projected_logical,
+                        projected_physical,
+                    )
+                } else {
+                    (
+                        Arc::new(PrincipalSeal {
+                            _marker: 0xa7,
+                            stable_id: Some(policy.principal),
+                        }),
+                        policy.committed_logical_bytes,
+                        policy.committed_physical_bytes,
+                    )
+                };
+            new_persistent_logical_total = new_persistent_logical_total
+                .checked_add(policy.committed_logical_bytes)
+                .ok_or(QuotaError::CounterOverflow)?;
+            new_persistent_physical_total = new_persistent_physical_total
+                .checked_add(policy.committed_physical_bytes)
+                .ok_or(QuotaError::CounterOverflow)?;
+            plans.push(PersistentRestorePlan {
+                account_index,
+                seal,
+                limits,
+                persistent_logical_bytes: policy.committed_logical_bytes,
+                persistent_physical_bytes: policy.committed_physical_bytes,
+                projected_logical_bytes,
+                projected_physical_bytes,
+                admission_revoked: policy.admission_revoked,
+            });
+        }
+        let (reconciled_aggregate_logical, reconciled_aggregate_physical) = reconciliations
+            .iter()
+            .try_fold(
+                (
+                    state.aggregate.committed_logical_bytes,
+                    state.aggregate.committed_physical_bytes,
+                ),
+                |(logical, physical), plan| {
+                    if plan.transfer_to_persistent {
+                        Some((
+                            logical.checked_sub(plan.charge.logical_bytes)?,
+                            physical.checked_sub(plan.charge.physical_bytes)?,
+                        ))
+                    } else {
+                        Some((
+                            logical.checked_add(plan.charge.logical_bytes)?,
+                            physical.checked_add(plan.charge.physical_bytes)?,
+                        ))
+                    }
+                },
+            )
+            .ok_or(QuotaError::InvalidConfiguration)?;
+        let aggregate_logical = reconciled_aggregate_logical
+            .checked_sub(old_persistent_logical_total)
+            .ok_or(QuotaError::InvalidConfiguration)?
+            .checked_add(new_persistent_logical_total)
+            .ok_or(QuotaError::CounterOverflow)?;
+        let aggregate_physical = reconciled_aggregate_physical
+            .checked_sub(old_persistent_physical_total)
+            .ok_or(QuotaError::InvalidConfiguration)?
+            .checked_add(new_persistent_physical_total)
+            .ok_or(QuotaError::CounterOverflow)?;
+
+        // Everything fallible has completed. A preflight deliberately returns
+        // before touching even anonymous high-water/event telemetry.
+        if !apply {
+            return Ok(Vec::new());
+        }
+
+        // Apply the validated plan while
+        // holding the same lock, so a failed restore never leaves a partial
+        // principal table or aggregate counter update behind.
+        for reconciliation in &reconciliations {
+            reconciliation.charge.status.store(
+                if reconciliation.transfer_to_persistent {
+                    CHARGE_TRANSFERRED
+                } else {
+                    CHARGE_ACTIVE
+                },
+                Ordering::Release,
+            );
+        }
+        if bindings.is_some() {
+            state.persistent_candidates.retain(|candidate| {
+                candidate
+                    .charge
+                    .upgrade()
+                    .is_some_and(|charge| charge.status.load(Ordering::Acquire) != CHARGE_RELEASED)
+            });
+        }
+        for plan in plans {
+            if let Some(index) = plan.account_index {
+                let account = &mut state.accounts[index];
+                account.persistent_logical_bytes = plan.persistent_logical_bytes;
+                account.persistent_physical_bytes = plan.persistent_physical_bytes;
+                account.committed_logical_bytes = plan.projected_logical_bytes;
+                account.committed_physical_bytes = plan.projected_physical_bytes;
+            } else {
+                state.accounts.push(PrincipalAccount {
+                    seal: Arc::clone(&plan.seal),
+                    limits: plan.limits,
+                    persistent_logical_bytes: plan.persistent_logical_bytes,
+                    persistent_physical_bytes: plan.persistent_physical_bytes,
+                    committed_logical_bytes: plan.projected_logical_bytes,
+                    committed_physical_bytes: plan.projected_physical_bytes,
+                    reserved_logical_bytes: 0,
+                    reserved_physical_bytes: 0,
+                    admission_revoked: plan.admission_revoked,
+                });
+            }
+            output.push(StoragePrincipal {
+                seal: plan.seal,
+                ceilings: plan.limits,
+            });
+        }
+        state.aggregate.committed_logical_bytes = aggregate_logical;
+        state.aggregate.committed_physical_bytes = aggregate_physical;
+        state.aggregate.logical_high_water_bytes = state
+            .aggregate
+            .logical_high_water_bytes
+            .max(aggregate_logical);
+        state.aggregate.physical_high_water_bytes = state
+            .aggregate
+            .physical_high_water_bytes
+            .max(aggregate_physical);
+        Ok(output)
     }
 
     /// Atomically reserve both quota dimensions and ordinary capacity.
@@ -658,31 +1026,116 @@ impl PrincipalQuotaTable {
             return Err(QuotaError::ChargeFromDifferentTable);
         }
         let mut state = self.state.lock();
-        let index =
-            find_account(&state.accounts, &charge.seal).ok_or(QuotaError::UnknownPrincipal)?;
+        match charge.charge.status.compare_exchange(
+            CHARGE_ACTIVE,
+            CHARGE_RELEASED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(CHARGE_TRANSFERRED) => {
+                charge
+                    .charge
+                    .status
+                    .store(CHARGE_RELEASED, Ordering::Release);
+                charge.released = true;
+                return Ok(());
+            }
+            Err(CHARGE_RELEASED) => panic!("a committed charge is released at most once"),
+            Err(_) => unreachable!("committed charge state is valid"),
+        }
+        let index = find_account(&state.accounts, &charge.charge.seal)
+            .ok_or(QuotaError::UnknownPrincipal)?;
         {
             let account = &mut state.accounts[index];
             account.committed_logical_bytes = account
                 .committed_logical_bytes
-                .checked_sub(charge.logical_bytes)
+                .checked_sub(charge.charge.logical_bytes)
                 .expect("a committed charge is released at most once");
             account.committed_physical_bytes = account
                 .committed_physical_bytes
-                .checked_sub(charge.physical_bytes)
+                .checked_sub(charge.charge.physical_bytes)
                 .expect("a committed charge is released at most once");
         }
         state.aggregate.committed_logical_bytes = state
             .aggregate
             .committed_logical_bytes
-            .checked_sub(charge.logical_bytes)
+            .checked_sub(charge.charge.logical_bytes)
             .expect("aggregate includes every committed charge");
         state.aggregate.committed_physical_bytes = state
             .aggregate
             .committed_physical_bytes
-            .checked_sub(charge.physical_bytes)
+            .checked_sub(charge.charge.physical_bytes)
             .expect("aggregate includes every committed charge");
         charge.released = true;
         Ok(())
+    }
+
+    /// Associate one live runtime charge with the exact stable logical object
+    /// which created it. The table retains only a weak reference: dropping the
+    /// final source capability still releases the charge immediately.
+    pub(crate) fn bind_persistent_candidate(
+        &self,
+        stable_object_id: u128,
+        v2_object_id: u128,
+        charge: &CommittedQuotaCharge,
+    ) -> Result<(), QuotaError> {
+        if stable_object_id == 0 || v2_object_id == 0 || !Arc::ptr_eq(&self.state, &charge.state) {
+            return Err(QuotaError::ChargeFromDifferentTable);
+        }
+        if charge.charge.seal.stable_id.is_none()
+            || charge.charge.status.load(Ordering::Acquire) != CHARGE_ACTIVE
+        {
+            return Err(QuotaError::InvalidConfiguration);
+        }
+        let mut state = self.state.lock();
+        state.persistent_candidates.retain(|candidate| {
+            candidate
+                .charge
+                .upgrade()
+                .is_some_and(|charge| charge.status.load(Ordering::Acquire) != CHARGE_RELEASED)
+        });
+        if let Some(existing) = state
+            .persistent_candidates
+            .iter()
+            .find(|candidate| candidate.stable_object_id == stable_object_id)
+        {
+            return if existing.v2_object_id == v2_object_id
+                && existing
+                    .charge
+                    .upgrade()
+                    .is_some_and(|existing| Arc::ptr_eq(&existing, &charge.charge))
+            {
+                Ok(())
+            } else {
+                Err(QuotaError::InvalidConfiguration)
+            };
+        }
+        if state.persistent_candidates.len() == state.persistent_candidates.capacity() {
+            return Err(QuotaError::PrincipalCapacity);
+        }
+        state.persistent_candidates.push(PersistentChargeCandidate {
+            stable_object_id,
+            v2_object_id,
+            charge: Arc::downgrade(&charge.charge),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn has_active_persistent_candidate(
+        &self,
+        stable_object_id: u128,
+        v2_object_id: u128,
+    ) -> bool {
+        let state = self.state.lock();
+        state.persistent_candidates.iter().any(|candidate| {
+            candidate.stable_object_id == stable_object_id
+                && candidate.v2_object_id == v2_object_id
+                && candidate
+                    .charge
+                    .upgrade()
+                    .is_some_and(|charge| charge.status.load(Ordering::Acquire) == CHARGE_ACTIVE)
+        })
     }
 }
 
@@ -803,11 +1256,15 @@ impl QuotaReservation {
             );
         }
         self.active = false;
-        Ok(CommittedQuotaCharge {
-            state: Arc::clone(&self.state),
+        let charge = Arc::new(CommittedChargeState {
+            status: AtomicU8::new(CHARGE_ACTIVE),
             seal: Arc::clone(&self.seal),
             logical_bytes: self.logical_bytes,
             physical_bytes: self.physical_bytes,
+        });
+        Ok(CommittedQuotaCharge {
+            state: Arc::clone(&self.state),
+            charge,
             released: false,
         })
     }
@@ -865,20 +1322,35 @@ impl Drop for QuotaReservation {
 #[must_use = "a committed quota charge must remain attached to its Object authority"]
 pub(crate) struct CommittedQuotaCharge {
     state: Arc<QuotaState>,
+    charge: Arc<CommittedChargeState>,
+    released: bool,
+}
+
+const CHARGE_ACTIVE: u8 = 0;
+const CHARGE_TRANSFERRED: u8 = 1;
+const CHARGE_RELEASED: u8 = 2;
+
+struct CommittedChargeState {
+    status: AtomicU8,
     seal: Arc<PrincipalSeal>,
     logical_bytes: u64,
     physical_bytes: u64,
-    released: bool,
 }
 
 impl fmt::Debug for CommittedQuotaCharge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CommittedQuotaCharge")
-            .field("logical_bytes", &self.logical_bytes)
-            .field("physical_bytes", &self.physical_bytes)
+            .field("logical_bytes", &self.charge.logical_bytes)
+            .field("physical_bytes", &self.charge.physical_bytes)
             .field("released", &self.released)
             .finish_non_exhaustive()
+    }
+}
+
+impl CommittedQuotaCharge {
+    pub(crate) fn is_active(&self) -> bool {
+        self.charge.status.load(Ordering::Acquire) == CHARGE_ACTIVE
     }
 }
 
@@ -1015,5 +1487,345 @@ mod tests {
         );
         drop(pending);
         assert!(table.principal_usage(&principal).unwrap().admission_revoked);
+    }
+
+    #[test]
+    fn stable_principal_usage_rebuild_is_idempotent_and_exact() {
+        let table = PrincipalQuotaTable::new(2).unwrap();
+        let policy = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x51; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 40,
+            committed_physical_bytes: 80,
+            admission_revoked: false,
+        };
+        let first = table.restore_persistent(&[policy]).unwrap();
+        let second = table.restore_persistent(&[policy]).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(table.diagnostics().admitted_principals, 1);
+        assert_eq!(
+            table.principal_usage(&second[0]).unwrap(),
+            PrincipalQuotaUsage {
+                limits: limits(100, 200),
+                committed_logical_bytes: 40,
+                committed_physical_bytes: 80,
+                reserved_logical_bytes: 0,
+                reserved_physical_bytes: 0,
+                admission_revoked: false,
+            }
+        );
+        let mut reduced = policy;
+        reduced.committed_logical_bytes = 30;
+        reduced.committed_physical_bytes = 60;
+        let reduced_principal = table.restore_persistent(&[reduced]).unwrap();
+        assert_eq!(
+            table.principal_usage(&reduced_principal[0]).unwrap(),
+            PrincipalQuotaUsage {
+                limits: limits(100, 200),
+                committed_logical_bytes: 30,
+                committed_physical_bytes: 60,
+                reserved_logical_bytes: 0,
+                reserved_physical_bytes: 0,
+                admission_revoked: false,
+            }
+        );
+        let diagnostics = table.diagnostics();
+        assert_eq!(diagnostics.committed_logical_bytes, 30);
+        assert_eq!(diagnostics.committed_physical_bytes, 60);
+        assert_eq!(diagnostics.logical_high_water_bytes, 40);
+        assert_eq!(diagnostics.physical_high_water_bytes, 80);
+
+        let mut mismatch = reduced;
+        mismatch.logical_limit_bytes = 101;
+        assert_eq!(
+            table.restore_persistent(&[mismatch]).unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn persistent_replacement_preserves_runtime_committed_charges() {
+        let table = PrincipalQuotaTable::new(1).unwrap();
+        let mut policy = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x59; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 40,
+            committed_physical_bytes: 80,
+            admission_revoked: false,
+        };
+        let principal = table.restore_persistent(&[policy]).unwrap().remove(0);
+        drop(table.reserve(&principal, 10, 20, 200).unwrap().commit());
+
+        policy.committed_logical_bytes = 15;
+        policy.committed_physical_bytes = 30;
+        let restored = table.restore_persistent(&[policy]).unwrap();
+        let usage = table.principal_usage(&restored[0]).unwrap();
+        assert_eq!(usage.committed_logical_bytes, 25);
+        assert_eq!(usage.committed_physical_bytes, 50);
+        let diagnostics = table.diagnostics();
+        assert_eq!(diagnostics.committed_logical_bytes, 25);
+        assert_eq!(diagnostics.committed_physical_bytes, 50);
+        assert_eq!(diagnostics.logical_high_water_bytes, 50);
+        assert_eq!(diagnostics.physical_high_water_bytes, 100);
+    }
+
+    #[test]
+    fn exact_binding_reconcile_transfers_and_reactivates_atomically() {
+        let table = PrincipalQuotaTable::new(1).unwrap();
+        let policy = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x61; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 0,
+            committed_physical_bytes: 0,
+            admission_revoked: false,
+        };
+        let principal = table.restore_persistent(&[policy]).unwrap().remove(0);
+        let charge = table.reserve(&principal, 10, 20, 200).unwrap().commit();
+        table.bind_persistent_candidate(7, 11, &charge).unwrap();
+
+        let mut rooted = policy;
+        rooted.committed_logical_bytes = 10;
+        rooted.committed_physical_bytes = 20;
+        let before_preflight = table.principal_usage(&principal).unwrap();
+        let diagnostics_before_preflight = table.diagnostics();
+        table
+            .preflight_persistent_with_bindings(&[rooted], &[(7, 11)])
+            .unwrap();
+        assert_eq!(charge.charge.status.load(Ordering::Acquire), CHARGE_ACTIVE);
+        assert_eq!(table.principal_usage(&principal).unwrap(), before_preflight);
+        assert_eq!(table.diagnostics(), diagnostics_before_preflight);
+        table
+            .restore_persistent_with_bindings(&[rooted], &[(7, 11)])
+            .unwrap();
+        assert_eq!(
+            charge.charge.status.load(Ordering::Acquire),
+            CHARGE_TRANSFERRED
+        );
+        assert_eq!(
+            table
+                .principal_usage(&principal)
+                .unwrap()
+                .committed_logical_bytes,
+            10
+        );
+
+        // A stable-ID match to the wrong V2 mapping does not consume this
+        // candidate; removing the exact binding reactivates runtime ownership.
+        table
+            .restore_persistent_with_bindings(&[policy], &[(7, 12)])
+            .unwrap();
+        assert_eq!(charge.charge.status.load(Ordering::Acquire), CHARGE_ACTIVE);
+        assert_eq!(
+            table
+                .principal_usage(&principal)
+                .unwrap()
+                .committed_logical_bytes,
+            10
+        );
+        table.account_authority_revoked(charge).unwrap();
+        assert_eq!(
+            table
+                .principal_usage(&principal)
+                .unwrap()
+                .committed_logical_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn failed_binding_restore_preserves_active_and_transferred_charge_state() {
+        let table = PrincipalQuotaTable::new(1).unwrap();
+        let policy = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x63; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 0,
+            committed_physical_bytes: 0,
+            admission_revoked: false,
+        };
+        let principal = table.restore_persistent(&[policy]).unwrap().remove(0);
+        let charge = table.reserve(&principal, 10, 20, 200).unwrap().commit();
+        table.bind_persistent_candidate(7, 11, &charge).unwrap();
+
+        // The exact binding would transfer this ACTIVE charge, but the later
+        // account-policy mismatch must fail without changing any state.
+        let mut invalid_active = policy;
+        invalid_active.logical_limit_bytes = 101;
+        let active_usage = table.principal_usage(&principal).unwrap();
+        let active_diagnostics = table.diagnostics();
+        assert_eq!(
+            table
+                .restore_persistent_with_bindings(&[invalid_active], &[(7, 11)])
+                .unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        assert_eq!(charge.charge.status.load(Ordering::Acquire), CHARGE_ACTIVE);
+        assert_eq!(table.principal_usage(&principal).unwrap(), active_usage);
+        assert_eq!(table.diagnostics(), active_diagnostics);
+
+        let mut rooted = policy;
+        rooted.committed_logical_bytes = 10;
+        rooted.committed_physical_bytes = 20;
+        table
+            .restore_persistent_with_bindings(&[rooted], &[(7, 11)])
+            .unwrap();
+        assert_eq!(
+            charge.charge.status.load(Ordering::Acquire),
+            CHARGE_TRANSFERRED
+        );
+
+        // Omitting the binding would reactivate the TRANSFERRED charge. The
+        // same late policy failure must leave it transferred and leave both
+        // capability-scoped usage and anonymous diagnostics byte-for-byte
+        // unchanged.
+        let mut invalid_transferred = policy;
+        invalid_transferred.logical_limit_bytes = 101;
+        let transferred_usage = table.principal_usage(&principal).unwrap();
+        let transferred_diagnostics = table.diagnostics();
+        assert_eq!(
+            table
+                .restore_persistent_with_bindings(&[invalid_transferred], &[])
+                .unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        assert_eq!(
+            charge.charge.status.load(Ordering::Acquire),
+            CHARGE_TRANSFERRED
+        );
+        assert_eq!(
+            table.principal_usage(&principal).unwrap(),
+            transferred_usage
+        );
+        assert_eq!(table.diagnostics(), transferred_diagnostics);
+    }
+
+    #[test]
+    fn failed_multi_principal_restore_is_atomic_and_replacement_updates_high_water() {
+        let table = PrincipalQuotaTable::new(3).unwrap();
+        let first = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x61; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 10,
+            committed_physical_bytes: 20,
+            admission_revoked: false,
+        };
+        let second = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x62; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 30,
+            committed_physical_bytes: 40,
+            admission_revoked: false,
+        };
+        let principals = table.restore_persistent(&[first, second]).unwrap();
+        let baseline = table.diagnostics();
+        assert_eq!(baseline.committed_logical_bytes, 40);
+        assert_eq!(baseline.committed_physical_bytes, 60);
+
+        let mut replaced_first = first;
+        replaced_first.committed_logical_bytes = 5;
+        replaced_first.committed_physical_bytes = 10;
+        let mut invalid_second = second;
+        invalid_second.admission_revoked = true;
+        assert_eq!(
+            table
+                .restore_persistent(&[replaced_first, invalid_second])
+                .unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        assert_eq!(table.diagnostics(), baseline);
+        assert_eq!(
+            table.principal_usage(&principals[0]).unwrap(),
+            PrincipalQuotaUsage {
+                limits: limits(100, 200),
+                committed_logical_bytes: 10,
+                committed_physical_bytes: 20,
+                reserved_logical_bytes: 0,
+                reserved_physical_bytes: 0,
+                admission_revoked: false,
+            }
+        );
+
+        let mut grown_second = second;
+        grown_second.committed_logical_bytes = 60;
+        grown_second.committed_physical_bytes = 100;
+        table
+            .restore_persistent(&[replaced_first, grown_second])
+            .unwrap();
+        let grown = table.diagnostics();
+        assert_eq!(grown.committed_logical_bytes, 65);
+        assert_eq!(grown.committed_physical_bytes, 110);
+        assert_eq!(grown.logical_high_water_bytes, 65);
+        assert_eq!(grown.physical_high_water_bytes, 110);
+
+        table.restore_persistent(&[replaced_first, second]).unwrap();
+        let reduced = table.diagnostics();
+        assert_eq!(reduced.committed_logical_bytes, 35);
+        assert_eq!(reduced.committed_physical_bytes, 50);
+        assert_eq!(reduced.logical_high_water_bytes, 65);
+        assert_eq!(reduced.physical_high_water_bytes, 110);
+    }
+
+    #[test]
+    fn persistent_restore_rejects_duplicate_missing_reserved_and_underflow_state_atomically() {
+        let table = PrincipalQuotaTable::new(2).unwrap();
+        let first = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x71; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 10,
+            committed_physical_bytes: 20,
+            admission_revoked: false,
+        };
+        let second = PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x72; 16]).unwrap(),
+            logical_limit_bytes: 100,
+            physical_limit_bytes: 200,
+            committed_logical_bytes: 30,
+            committed_physical_bytes: 40,
+            admission_revoked: false,
+        };
+        let principals = table.restore_persistent(&[first, second]).unwrap();
+        let baseline = table.diagnostics();
+
+        assert_eq!(
+            table.restore_persistent(&[first, first]).unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        assert_eq!(
+            table.restore_persistent(&[first]).unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        let reservation = table.reserve(&principals[0], 1, 1, 200).unwrap();
+        assert_eq!(
+            table.restore_persistent(&[first, second]).unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        drop(reservation);
+        assert_eq!(table.diagnostics().committed_logical_bytes, 40);
+        assert_eq!(table.diagnostics().committed_physical_bytes, 60);
+
+        {
+            let mut state = table.state.lock();
+            state.accounts[0].persistent_logical_bytes = 11;
+        }
+        assert_eq!(
+            table.restore_persistent(&[first, second]).unwrap_err(),
+            QuotaError::InvalidConfiguration
+        );
+        let after = table.diagnostics();
+        assert_eq!(
+            after.committed_logical_bytes,
+            baseline.committed_logical_bytes
+        );
+        assert_eq!(
+            after.committed_physical_bytes,
+            baseline.committed_physical_bytes
+        );
     }
 }

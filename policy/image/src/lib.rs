@@ -32,13 +32,14 @@ pub struct NetworkFrontendPolicy {
 /// device backend's descriptor-ring size.
 pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 8 };
 
-/// The default QEMU image admits exactly the 1 MiB raw device created by the
-/// run and acceptance harnesses. A larger attachment is not ambient authority;
-/// later capacity must be admitted explicitly through Storage V2 growth.
+/// The default QEMU image admits the exact 64 MiB managed slice created by the
+/// run and acceptance harnesses. Storage V2 initially formats only its policy
+/// range within this slice; the unused suffix is not ambient store capacity and
+/// may be admitted only by an explicit maintenance growth operation.
 #[cfg(feature = "qemu-default")]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 0,
-    sector_count: 2_048,
+    sector_count: 131_072,
 });
 
 /// The packaged Duo image places raw service data immediately after its
@@ -46,7 +47,7 @@ pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
 #[cfg(feature = "milkv-duo-sd")]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 262_145,
-    sector_count: 8_192,
+    sector_count: 131_072,
 });
 
 #[cfg(test)]
@@ -61,12 +62,12 @@ mod tests {
     #[cfg(feature = "qemu-default")]
     #[test]
     fn qemu_data_slice_is_exact_and_checked() {
-        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(2_048));
+        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(131_072));
     }
 
     #[cfg(feature = "milkv-duo-sd")]
     #[test]
     fn duo_data_slice_does_not_overflow() {
-        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(270_337));
+        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(393_217));
     }
 }

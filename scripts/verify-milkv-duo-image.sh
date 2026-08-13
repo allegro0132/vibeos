@@ -3,10 +3,204 @@
 set -euo pipefail
 export LC_ALL=C
 
+usage() {
+  echo "usage: $0 --selftest" >&2
+  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+}
+
+verify_raw_data_partition() {
+  python3 - "$@" <<'PY'
+import os
+import struct
+import sys
+import tempfile
+
+SECTOR_SIZE = 512
+EXPECTED_DATA_SECTORS = 64 * 1024 * 1024 // SECTOR_SIZE
+SEED_SECTOR = 7
+SEED = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
+EXPECTED_SEED_SECTOR = SEED + bytes(SECTOR_SIZE - len(SEED))
+SCAN_CHUNK_BYTES = 1024 * 1024
+
+
+class Violation(Exception):
+    pass
+
+
+def scan_zero_region(image_file, partition_offset, start, length):
+    image_file.seek(partition_offset + start)
+    consumed = 0
+    while consumed < length:
+        requested = min(SCAN_CHUNK_BYTES, length - consumed)
+        chunk = image_file.read(requested)
+        if len(chunk) != requested:
+            raise Violation(
+                f"data partition ended while scanning logical byte {start + consumed}"
+            )
+        if chunk.count(0) != len(chunk):
+            index = next(index for index, value in enumerate(chunk) if value)
+            logical_byte = start + consumed + index
+            sector, byte_in_sector = divmod(logical_byte, SECTOR_SIZE)
+            raise Violation(
+                f"non-zero byte 0x{chunk[index]:02x} at data logical sector "
+                f"{sector}, byte {byte_in_sector}; only sector {SEED_SECTOR} may be non-zero"
+            )
+        consumed += len(chunk)
+
+
+def verify_region(image_file, start_sector, sector_count):
+    if sector_count != EXPECTED_DATA_SECTORS:
+        raise Violation(
+            f"data partition has {sector_count} sectors, expected {EXPECTED_DATA_SECTORS}"
+        )
+
+    partition_offset = start_sector * SECTOR_SIZE
+    partition_bytes = sector_count * SECTOR_SIZE
+    image_bytes = os.fstat(image_file.fileno()).st_size
+    required_bytes = partition_offset + partition_bytes
+    if image_bytes < required_bytes:
+        raise Violation(
+            f"data partition ends at byte {required_bytes}, but image has {image_bytes} bytes"
+        )
+
+    seed_offset = SEED_SECTOR * SECTOR_SIZE
+    scan_zero_region(image_file, partition_offset, 0, seed_offset)
+
+    image_file.seek(partition_offset + seed_offset)
+    actual_seed_sector = image_file.read(SECTOR_SIZE)
+    if actual_seed_sector != EXPECTED_SEED_SECTOR:
+        mismatch = next(
+            (
+                index
+                for index, (actual, expected) in enumerate(
+                    zip(actual_seed_sector, EXPECTED_SEED_SECTOR)
+                )
+                if actual != expected
+            ),
+            min(len(actual_seed_sector), SECTOR_SIZE),
+        )
+        raise Violation(
+            f"data logical sector {SEED_SECTOR} is not canonical "
+            f"(first mismatch at byte {mismatch})"
+        )
+
+    suffix_start = seed_offset + SECTOR_SIZE
+    scan_zero_region(
+        image_file,
+        partition_offset,
+        suffix_start,
+        partition_bytes - suffix_start,
+    )
+
+
+def verify_image(path):
+    with open(path, "rb") as image_file:
+        mbr = image_file.read(SECTOR_SIZE)
+        if len(mbr) != SECTOR_SIZE:
+            raise Violation("image is shorter than one MBR sector")
+        p2_entry = 446 + 16
+        p2_start, p2_size = struct.unpack_from("<II", mbr, p2_entry + 8)
+        verify_region(image_file, p2_start, p2_size)
+
+
+def expect_rejected(label, image_file, offset, replacement, expected_message):
+    image_file.seek(offset)
+    original = image_file.read(len(replacement))
+    image_file.seek(offset)
+    image_file.write(replacement)
+    try:
+        verify_region(image_file, 0, EXPECTED_DATA_SECTORS)
+    except Violation as error:
+        if expected_message not in str(error):
+            raise RuntimeError(
+                f"selftest {label!r} failed for the wrong reason: {error}"
+            ) from error
+    else:
+        raise RuntimeError(f"selftest {label!r} was accepted")
+    finally:
+        image_file.seek(offset)
+        image_file.write(original)
+
+
+def run_selftest():
+    partition_bytes = EXPECTED_DATA_SECTORS * SECTOR_SIZE
+    with tempfile.TemporaryFile() as image_file:
+        image_file.truncate(partition_bytes)
+        image_file.seek(SEED_SECTOR * SECTOR_SIZE)
+        image_file.write(SEED)
+        verify_region(image_file, 0, EXPECTED_DATA_SECTORS)
+
+        try:
+            verify_region(image_file, 0, 4 * 1024 * 1024 // SECTOR_SIZE)
+        except Violation as error:
+            if "expected 131072" not in str(error):
+                raise RuntimeError(
+                    f"selftest 'old-4MiB-layout' failed for the wrong reason: {error}"
+                ) from error
+        else:
+            raise RuntimeError("selftest 'old-4MiB-layout' was accepted")
+
+        expect_rejected("prefix-byte", image_file, 0, b"\x01", "logical sector 0")
+        expect_rejected(
+            "corrupt-seed",
+            image_file,
+            SEED_SECTOR * SECTOR_SIZE,
+            b"\x00",
+            "sector 7 is not canonical",
+        )
+        expect_rejected(
+            "seed-padding",
+            image_file,
+            SEED_SECTOR * SECTOR_SIZE + len(SEED),
+            b"\x01",
+            "sector 7 is not canonical",
+        )
+        expect_rejected(
+            "first-suffix-sector",
+            image_file,
+            (SEED_SECTOR + 1) * SECTOR_SIZE,
+            b"\x01",
+            "logical sector 8",
+        )
+        expect_rejected(
+            "partition-final-byte",
+            image_file,
+            partition_bytes - 1,
+            b"\x01",
+            "logical sector 131071",
+        )
+
+        image_file.truncate(partition_bytes - 1)
+        try:
+            verify_region(image_file, 0, EXPECTED_DATA_SECTORS)
+        except Violation as error:
+            if "but image has" not in str(error):
+                raise RuntimeError(
+                    f"selftest 'truncated-partition' failed for the wrong reason: {error}"
+                ) from error
+        else:
+            raise RuntimeError("selftest 'truncated-partition' was accepted")
+
+    print("verify-milkv-duo-image.sh raw data selftest: PASS (7 negative cases)")
+
+
+try:
+    if sys.argv[1:] == ["--selftest"]:
+        run_selftest()
+    elif len(sys.argv) == 2:
+        verify_image(sys.argv[1])
+    else:
+        raise RuntimeError("internal raw-data verifier invocation is invalid")
+except (OSError, RuntimeError, Violation) as error:
+    raise SystemExit(f"verify-milkv-duo-image.sh: {error}")
+PY
+}
+
 diagnostic=false
 ssh_acceptance=false
 jitterentropy_probe=false
 jitterentropy_ssh_probe=false
+selftest=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -14,10 +208,11 @@ for arg in "$@"; do
     --ssh-acceptance) ssh_acceptance=true ;;
     --jitterentropy-probe) jitterentropy_probe=true ;;
     --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
-    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    --selftest) selftest=true ;;
+    -*) usage; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+        usage
         exit 2
       fi
       sdk_arg=$arg
@@ -31,11 +226,24 @@ mode_count=0
 [[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
   echo "verify-milkv-duo-image.sh: image mode options are mutually exclusive" >&2
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+  usage
   exit 2
 fi
+if [[ "$selftest" == true ]]; then
+  if ((mode_count != 0)) || [[ -n "$sdk_arg" ]]; then
+    echo "verify-milkv-duo-image.sh: --selftest does not accept an SDK root or image mode" >&2
+    usage
+    exit 2
+  fi
+  command -v python3 >/dev/null || {
+    echo "verify-milkv-duo-image.sh: required tool is missing: python3" >&2
+    exit 1
+  }
+  verify_raw_data_partition --selftest
+  exit 0
+fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+  usage
   exit 2
 fi
 
@@ -145,7 +353,7 @@ if p2_start != p1_start + p1_size:
 expected_data_start = 262_145
 if p2_start != expected_data_start:
     fail(f"data partition starts at {p2_start}, policy requires {expected_data_start}")
-expected_data_sectors = 4 * 1024 * 1024 // sector_size
+expected_data_sectors = 64 * 1024 * 1024 // sector_size
 if p2_size != expected_data_sectors:
     fail(f"data partition has {p2_size} sectors, expected {expected_data_sectors}")
 
@@ -161,25 +369,8 @@ print(p1_start)
 PY
 )
 
-python3 - "$image" <<'PY'
-import struct
-import sys
-
-path = sys.argv[1]
-sector_size = 512
-seed = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
-with open(path, "rb") as image_file:
-    mbr = image_file.read(sector_size)
-    p2_start = struct.unpack_from("<I", mbr, 446 + 16 + 8)[0]
-    image_file.seek((p2_start + 7) * sector_size)
-    sector7 = image_file.read(sector_size)
-    image_file.seek((p2_start + 8) * sector_size)
-    sector8 = image_file.read(sector_size)
-if not sector7.startswith(seed) or any(sector7[len(seed):]):
-    raise SystemExit("verify-milkv-duo-image.sh: data sector 7 seed is not canonical")
-if any(sector8):
-    raise SystemExit("verify-milkv-duo-image.sh: data sector 8 is not initially zero")
-PY
+verify_raw_data_partition "$image"
+echo "raw data partition: canonical sector 7 seed + zero-filled remainder verified"
 
 echo "== FAT boot partition =="
 fat_image="${image}@@$((p1_start * 512))"

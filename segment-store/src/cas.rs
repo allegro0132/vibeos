@@ -1,8 +1,10 @@
 //! Streaming canonical Blob CAS over the frozen Storage V2 segment ABI.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::future::Future;
 use core::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
@@ -52,6 +54,16 @@ const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
 const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const MAX_TREE_PAGES: usize = MAX_EXTENT_PAYLOAD_PAGES as usize;
+
+/// Allocate page-sized I/O scratch directly in the heap-backed representation.
+/// Keeping `Page` arrays out of async generator variants is part of the kernel
+/// stack contract: these buffers routinely live across device awaits.
+fn heap_page() -> Box<Page> {
+    alloc::vec![0_u8; PAGE_SIZE]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("fixed page allocation has the exact page length"))
+}
 
 pub struct CasObjectHandle {
     store_uuid: StoreUuid,
@@ -218,13 +230,120 @@ impl CasObjectHandle {
         RootKey::new(self.object_id, self.commit_generation, self.object_kind)
     }
 
+    pub(crate) fn authority_key(&self) -> Result<RootKey, crate::pins::PinError> {
+        RootKey::new(self.object_id, self.commit_generation, self.object_kind)
+    }
+
     pub(crate) const fn store_uuid(&self) -> StoreUuid {
         self.store_uuid
     }
 
-    pub(crate) fn is_quota_charged(&self) -> bool {
-        self.authority.quota_charge.is_some()
+    pub(crate) const fn persistent_binding_parts(&self) -> (u128, u64, u32) {
+        (self.object_id, self.commit_generation, self.object_kind)
     }
+
+    pub(crate) fn is_quota_charged(&self) -> bool {
+        self.authority
+            .quota_charge
+            .as_ref()
+            .is_some_and(|(_, charge)| charge.is_active())
+    }
+
+    /// Bind this live runtime charge to the stable logical object authenticated
+    /// by the authority append which created it. No object or principal lookup
+    /// capability is exposed; the table keeps only a weak transfer witness.
+    pub(crate) fn bind_persistent_quota_candidate(
+        &self,
+        stable_object_id: u128,
+    ) -> Result<(), crate::quota::QuotaError> {
+        match self.authority.quota_charge.as_ref() {
+            Some((table, charge)) => {
+                table.bind_persistent_candidate(stable_object_id, self.object_id, charge)
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn can_attach_quota_charge(&mut self) -> bool {
+        Arc::get_mut(&mut self.authority).is_some_and(|authority| {
+            authority.root_pin.is_some() && authority.quota_charge.is_none()
+        })
+    }
+
+    pub(crate) fn attach_quota_charge(
+        &mut self,
+        table: PrincipalQuotaTable,
+        charge: CommittedQuotaCharge,
+    ) {
+        let authority = Arc::get_mut(&mut self.authority)
+            .expect("promotable quota adoption preflights unique authority ownership");
+        assert!(authority.root_pin.is_some());
+        assert!(authority.quota_charge.is_none());
+        authority.quota_charge = Some((table, charge));
+    }
+}
+
+pub(crate) fn recover_persistent_cas_object(
+    store_uuid: StoreUuid,
+    mapping: ObjectMapping,
+) -> AuthorizedObject<CasObjectHandle> {
+    AuthorizedObject::from_committed(
+        CasObjectHandle {
+            store_uuid,
+            object_id: mapping.object_id,
+            object_kind: mapping.blob_key.object_kind(),
+            exact_len: mapping.blob_key.exact_len(),
+            commit_generation: mapping.commit_generation,
+            authority: Arc::new(ObjectAuthorityLease {
+                // The checkpoint's persistent root set, not a boot-local pin,
+                // owns the lifetime of this recovered authority.
+                root_pin: None,
+                quota_charge: None,
+            }),
+        },
+        mapping.blob_key.object_kind(),
+        mapping.blob_key.exact_len(),
+        ObjectPublicationPersistence::Persistent,
+    )
+}
+
+/// Reconstitute boot-local authority only after a higher layer has matched an
+/// authenticated logical object record to this exact catalog mapping and Blob
+/// root. This is crate-private; raw ObjectId/CAS lookup never crosses the API.
+pub(crate) fn recover_promotable_cas_object(
+    store_uuid: StoreUuid,
+    mapping: ObjectMapping,
+    pins: &crate::store::SharedStorePinRegistry,
+) -> Result<AuthorizedObject<CasObjectHandle>, crate::pins::PinError> {
+    let key = RootKey::new(
+        mapping.object_id,
+        mapping.commit_generation,
+        mapping.blob_key.object_kind(),
+    )?;
+    let owner = pins.allocate_owner()?;
+    let root_pin = PinRegistry::pin_root_owned(
+        pins,
+        key,
+        RuntimeRootClass::AuthorityTransaction,
+        owner,
+        PinAdmission::CompletionCritical,
+    )?;
+    Ok(AuthorizedObject::from_committed(
+        CasObjectHandle {
+            store_uuid,
+            object_id: mapping.object_id,
+            object_kind: mapping.blob_key.object_kind(),
+            exact_len: mapping.blob_key.exact_len(),
+            commit_generation: mapping.commit_generation,
+            authority: Arc::new(ObjectAuthorityLease {
+                root_pin: Some(root_pin),
+                quota_charge: None,
+            }),
+        },
+        mapping.blob_key.object_kind(),
+        mapping.blob_key.exact_len(),
+        ObjectPublicationPersistence::RuntimeOnly,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -711,6 +830,23 @@ impl<D: PageDevice> SegmentStore<D> {
         )
     }
 
+    /// Migration-only raw writer. The caller must already hold the explicit
+    /// maintenance lease; persistent quota state is installed by the final
+    /// authority checkpoint rather than by a boot-local charge token.
+    pub(crate) fn begin_blob_for_persistent_import(
+        &mut self,
+        object_kind: u32,
+        exact_len: u64,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            None,
+            REFERENCE_CODEC_RAW,
+            None,
+        )
+    }
+
     /// Begin a governed raw Blob write. The store derives both quota charges
     /// and ordinary capacity internally before returning a writer, so callers
     /// cannot understate physical attribution or borrow cleaner reserve.
@@ -774,7 +910,7 @@ impl<D: PageDevice> SegmentStore<D> {
         )
     }
 
-    fn reserve_blob_quota(
+    pub(crate) fn reserve_blob_quota(
         &self,
         principal: &StoragePrincipal,
         exact_len: u64,
@@ -800,6 +936,21 @@ impl<D: PageDevice> SegmentStore<D> {
                 ordinary_available_bytes,
             )
             .map_err(Into::into)
+    }
+
+    pub(crate) fn begin_blob_with_quota_reservation(
+        &mut self,
+        object_kind: u32,
+        exact_len: u64,
+        reservation: QuotaReservation,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            None,
+            REFERENCE_CODEC_RAW,
+            Some(reservation),
+        )
     }
 
     fn begin_blob_with_reference_codec_internal(
@@ -1027,7 +1178,15 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let cas = state.cas.as_ref().ok_or(StoreError::ObjectUnavailable)?;
         let handle = object.backend_handle();
-        if handle.root_key(&self.pins).is_err() {
+        if handle.root_key(&self.pins).is_err()
+            && !state.persistent_roots.as_ref().is_some_and(|roots| {
+                roots.entries().iter().any(|root| {
+                    root.object_id == handle.object_id
+                        && root.commit_generation == handle.commit_generation
+                        && root.object_kind == handle.object_kind
+                })
+            })
+        {
             return Err(StoreError::ObjectUnavailable.into());
         }
         if handle.store_uuid != state.superblock.binding.store_uuid
@@ -1113,17 +1272,18 @@ impl<D: PageDevice> SegmentStore<D> {
             return Err(StoreError::RecoveryRequired.into());
         }
         let handle = object.backend_handle();
-        let key = RootKey::new(
-            handle.object_id,
-            handle.commit_generation,
-            handle.object_kind,
-        )
-        .map_err(|_| StoreError::ObjectUnavailable)?;
-        if handle
-            .root_key(&self.pins)
-            .map_err(|_| StoreError::ObjectUnavailable)?
-            != key
-        {
+        let key = handle
+            .authority_key()
+            .map_err(|_| StoreError::ObjectUnavailable)?;
+        let runtime_root = handle.root_key(&self.pins).ok();
+        let durable_root = state.persistent_roots.as_ref().is_some_and(|roots| {
+            roots.entries().iter().any(|root| {
+                root.object_id == key.object_id()
+                    && root.commit_generation == key.commit_generation()
+                    && root.object_kind == key.object_kind()
+            })
+        });
+        if runtime_root != Some(key) && !durable_root {
             return Err(StoreError::ObjectUnavailable.into());
         }
         let owner = self
@@ -1312,7 +1472,7 @@ pub(crate) async fn read_manifest_range<D: PageDevice>(
     let mut copied = 0_usize;
     let mut page_index = first_page;
     while copied != len {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = heap_page();
         let physical = base
             .checked_add(u64::from(pointer.payload_relative_page))
             .and_then(|value| value.checked_add(page_index))
@@ -1334,7 +1494,7 @@ pub(crate) async fn read_manifest_range<D: PageDevice>(
     Ok(output)
 }
 
-impl<D: PageDevice> BlobWriter<'_, D> {
+impl<'a, D: PageDevice> BlobWriter<'a, D> {
     pub const fn exact_len(&self) -> u64 {
         self.geometry.exact_len()
     }
@@ -1378,7 +1538,7 @@ impl<D: PageDevice> BlobWriter<'_, D> {
             self.failed = true;
             return Err(error);
         }
-        let mut page = [0; PAGE_SIZE];
+        let mut page = heap_page();
         page[..bytes.len()].copy_from_slice(bytes);
         if let Err(error) = self.write_exact_page(content_offset, &page).await {
             self.failed = true;
@@ -1409,7 +1569,7 @@ impl<D: PageDevice> BlobWriter<'_, D> {
             .chain(core::iter::once(extra_metadata_segment))
         {
             let base = segment_base_page(segment_no)?;
-            let zero = [0; PAGE_SIZE];
+            let zero = heap_page();
             self.store
                 .device
                 .write_page(base + u64::from(SEGMENT_SEAL_PAGE), &zero)
@@ -1420,7 +1580,7 @@ impl<D: PageDevice> BlobWriter<'_, D> {
                 .flush()
                 .await
                 .map_err(StoreError::Mutation)?;
-            let mut observed = [0; PAGE_SIZE];
+            let mut observed = heap_page();
             self.store
                 .device
                 .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
@@ -1488,7 +1648,7 @@ impl<D: PageDevice> BlobWriter<'_, D> {
                 .checked_add(u64::from(extent.payload_relative_page))
                 .and_then(|page| page.checked_add(tree_page as u64))
                 .ok_or(StoreError::Corrupt)?;
-            let mut page = [0; PAGE_SIZE];
+            let mut page = heap_page();
             if self.tree_initialized[tree_page] {
                 self.store
                     .device
@@ -1514,9 +1674,57 @@ impl<D: PageDevice> BlobWriter<'_, D> {
         Ok(())
     }
 
-    pub async fn commit(
-        mut self,
-    ) -> Result<AuthorizedObject<CasObjectHandle>, CasStoreError<D::Error>> {
+    pub fn commit(
+        self,
+    ) -> impl Future<Output = Result<AuthorizedObject<CasObjectHandle>, CasStoreError<D::Error>>> + 'a
+    {
+        // Move the modest writer state to its final heap address before the
+        // async generator is constructed. This is deliberately not
+        // `Box::pin(async { ... })`: no large child future is first
+        // materialized on the kernel stack.
+        let mut writer = Box::new(self);
+        async move {
+            let root = writer.finish_blob_encoding().await?;
+            let (pending, object_kind, exact_len) = writer.commit_encoded_snapshot(root).await?;
+            // The checkpoint is durable, but publication is still withheld. A
+            // cold reread installs the exact selected state before authority
+            // can escape.
+            writer.store.mount().await?;
+            let quota_charge = match writer.quota_reservation.take() {
+                Some(reservation) => {
+                    let table = writer
+                        .store
+                        .quota
+                        .clone()
+                        .ok_or(crate::quota::QuotaError::UnknownPrincipal)?;
+                    let charge = if pending.is_new_blob {
+                        reservation.commit()
+                    } else {
+                        reservation.commit_with_unique_physical(QUOTA_DEDUP_UNIQUE_OBJECT_BYTES)?
+                    };
+                    Some((table, charge))
+                }
+                None => None,
+            };
+            let handle = pending.complete(quota_charge);
+            let maximum_persistence = if handle.is_quota_charged() {
+                ObjectPublicationPersistence::RuntimeOnly
+            } else {
+                ObjectPublicationPersistence::Persistent
+            };
+            Ok(AuthorizedObject::from_committed(
+                handle,
+                object_kind,
+                exact_len,
+                maximum_persistence,
+            ))
+        }
+    }
+
+    /// Complete the streaming Merkle state and persist the canonical header.
+    /// This phase intentionally ends before catalog publication so its Merkle
+    /// locals cannot overlap the snapshot or cold-mount child futures.
+    async fn finish_blob_encoding(&mut self) -> Result<Hash, CasStoreError<D::Error>> {
         if self.failed {
             return Err(CasStoreError::WriterFailed);
         }
@@ -1558,15 +1766,21 @@ impl<D: PageDevice> BlobWriter<'_, D> {
             return Err(CasStoreError::ExpectedRootMismatch);
         }
 
-        let mut header_page = [0; PAGE_SIZE];
+        let mut header_page = heap_page();
         header_page[..HEADER_SIZE].copy_from_slice(&streaming.header);
         self.write_exact_page(0, &header_page).await?;
+        Ok(streaming.descriptor.root)
+    }
+
+    /// Authenticate any dedup candidate and publish the new CAS checkpoint.
+    /// Returning before the subsequent mount keeps the snapshot future out of
+    /// the mount suspension variant rather than summing both stack footprints.
+    async fn commit_encoded_snapshot(
+        &mut self,
+        root: Hash,
+    ) -> Result<(PendingCasObjectHandle, u32, u64), CasStoreError<D::Error>> {
         let state = self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
-        let blob_key = BlobKey::sha256(
-            self.object_kind,
-            self.geometry.exact_len(),
-            streaming.descriptor.root,
-        )?;
+        let blob_key = BlobKey::sha256(self.object_kind, self.geometry.exact_len(), root)?;
 
         let mut payload_hashes = Vec::new();
         payload_hashes
@@ -1640,37 +1854,7 @@ impl<D: PageDevice> BlobWriter<'_, D> {
             self.reference_codec,
         )
         .await?;
-        // The checkpoint is durable, but publication is still withheld. A cold
-        // reread installs the exact selected state before authority can escape.
-        self.store.mount().await?;
-        let quota_charge = match self.quota_reservation.take() {
-            Some(reservation) => {
-                let table = self
-                    .store
-                    .quota
-                    .clone()
-                    .ok_or(crate::quota::QuotaError::UnknownPrincipal)?;
-                let charge = if pending.is_new_blob {
-                    reservation.commit()
-                } else {
-                    reservation.commit_with_unique_physical(QUOTA_DEDUP_UNIQUE_OBJECT_BYTES)?
-                };
-                Some((table, charge))
-            }
-            None => None,
-        };
-        let handle = pending.complete(quota_charge);
-        let maximum_persistence = if handle.is_quota_charged() {
-            ObjectPublicationPersistence::RuntimeOnly
-        } else {
-            ObjectPublicationPersistence::Persistent
-        };
-        Ok(AuthorizedObject::from_committed(
-            handle,
-            self.object_kind,
-            self.geometry.exact_len(),
-            maximum_persistence,
-        ))
+        Ok((pending, self.object_kind, self.geometry.exact_len()))
     }
 
     pub async fn commit_to<T>(
@@ -1696,8 +1880,8 @@ impl<D: PageDevice> BlobWriter<'_, D> {
 pub(crate) struct FinalRecord {
     pub(crate) value: ExtentRecord,
     pub(crate) digest: BodyDigest,
-    pub(crate) body: Page,
-    pub(crate) seal: Page,
+    pub(crate) body: Box<Page>,
+    pub(crate) seal: Box<Page>,
 }
 
 impl FinalRecord {
@@ -1761,8 +1945,8 @@ pub(crate) fn build_record(
         merkle_root,
         payload_sha256: payload_hash,
     };
-    let mut body = [0; PAGE_SIZE];
-    let mut seal = [0; PAGE_SIZE];
+    let mut body = heap_page();
+    let mut seal = heap_page();
     let digest = encode_extent_body(&value, &mut body)?;
     encode_record_seal(digest, &mut seal)?;
     Ok(FinalRecord {
@@ -1797,7 +1981,7 @@ async fn hash_scratch_extent<D: PageDevice>(
         usize::try_from(extent.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
     let mut hasher = Sha256::new();
     for page_index in 0..extent.payload_byte_len.div_ceil(PAGE_SIZE as u64) {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = heap_page();
         device
             .read_page(
                 base + u64::from(extent.payload_relative_page) + page_index,
@@ -1844,7 +2028,7 @@ async fn read_scratch_range<D: PageDevice>(
     let mut copied = 0_usize;
     let mut page_index = first_page;
     while copied != len {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = heap_page();
         device
             .read_page(
                 base + u64::from(extent.payload_relative_page) + page_index,
@@ -2060,8 +2244,8 @@ async fn compare_manifests<D: PageDevice>(
         let mut remaining =
             usize::try_from(scratch.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
         for page_index in 0..scratch.payload_byte_len.div_ceil(PAGE_SIZE as u64) {
-            let mut left = [0; PAGE_SIZE];
-            let mut right = [0; PAGE_SIZE];
+            let mut left = heap_page();
+            let mut right = heap_page();
             device
                 .read_page(
                     scratch_base + u64::from(scratch.payload_relative_page) + page_index,
@@ -2120,8 +2304,8 @@ async fn seal_scratch_segment<D: PageDevice>(
         previous_segment_generation,
         previous_segment_seal_body_sha256: previous_hash,
     };
-    let mut header_body = [0; PAGE_SIZE];
-    let mut header_seal = [0; PAGE_SIZE];
+    let mut header_body = heap_page();
+    let mut header_seal = heap_page();
     let header_digest = encode_segment_header_body(&header, &mut header_body)?;
     encode_record_seal(header_digest, &mut header_seal)?;
     write_page(device, base, &header_body).await?;
@@ -2251,8 +2435,8 @@ pub(crate) async fn finalize_segment<D: PageDevice>(
         kind_counts,
         kind_bytes,
     };
-    let mut summary_body = [0; PAGE_SIZE];
-    let mut summary_seal = [0; PAGE_SIZE];
+    let mut summary_body = heap_page();
+    let mut summary_seal = heap_page();
     let summary_digest = encode_segment_summary_body(&summary, &mut summary_body)?;
     encode_record_seal(summary_digest, &mut summary_seal)?;
     let seal = SegmentSeal {
@@ -2274,8 +2458,8 @@ pub(crate) async fn finalize_segment<D: PageDevice>(
         total_payload_bytes,
         target_checkpoint_generation: checkpoint_generation,
     };
-    let mut seal_body = [0; PAGE_SIZE];
-    let mut final_seal = [0; PAGE_SIZE];
+    let mut seal_body = heap_page();
+    let mut final_seal = heap_page();
     let seal_digest = encode_segment_seal_body(&seal, &mut seal_body)?;
     encode_record_seal(seal_digest, &mut final_seal)?;
     write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
@@ -2365,8 +2549,8 @@ async fn commit_snapshot<D: PageDevice>(
         previous_segment_generation,
         previous_segment_seal_body_sha256: previous_hash,
     };
-    let mut header_body = [0; PAGE_SIZE];
-    let mut header_seal = [0; PAGE_SIZE];
+    let mut header_body = heap_page();
+    let mut header_seal = heap_page();
     let header_digest = encode_segment_header_body(&header, &mut header_body)?;
     encode_record_seal(header_digest, &mut header_seal)?;
     write_page(device, base, &header_body).await?;
@@ -2663,7 +2847,7 @@ pub(crate) async fn write_payload_record<D: PageDevice>(
 ) -> Result<(), StoreError<D::Error>> {
     let mut copied = 0_usize;
     for page_index in 0..record.value.payload_pages {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = heap_page();
         let take = (payload.len() - copied).min(PAGE_SIZE);
         page[..take].copy_from_slice(&payload[copied..copied + take]);
         write_page(

@@ -2,13 +2,16 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::cap::{CSpace, Cap, CapError, Resource, Rights};
+use crate::cap::{CSpace, Cap, CapError, InvocationLease, Resource, Rights};
 use crate::chan::Endpoint;
 use crate::dev::ConsoleDev;
 use crate::net::{Packet, PacketStamp, StampedPacket};
@@ -103,6 +106,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  blk info|scope|test   inspect or exercise the scoped block device");
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
+            println!("  storage status|migrate  inspect or explicitly cut over Storage V2");
+            println!("  storage migrate-stage  acceptance interruption after durable Stage");
             println!("  blob test       commit and verify a two-leaf Merkle blob");
             println!("  pcspace test    exercise three-boot persistent authority recovery");
             println!("  smp queues      prove four physical executors and cross-hart wakeups");
@@ -404,6 +409,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         "net" => net_command(&rest).await,
 
         "store" => store_command(&rest).await,
+        "storage" => storage_v2_command(&rest).await,
 
         "blob" => blob_command(&rest).await,
 
@@ -2378,6 +2384,169 @@ async fn store_command(args: &[&str]) {
             println!("  namespace check: capability only; no path or ObjectId lookup");
         }
         other => println!("  usage: store [info|test|fault] (got `{}`)", other),
+    }
+}
+
+type StorageV2MigrationFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    crate::segment_store_platform::MigrationReport,
+                    crate::segment_store_platform::MigrationRunError,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageV2OperatorAction {
+    Migrate,
+    MigrateStage,
+    Rollback,
+    CloseRollback,
+}
+
+/// Construct the large migration state machine only after the dedicated
+/// worker has reached its first poll. Returning a type-erased heap future keeps
+/// the worker envelope small: the shell must not materialize and memcpy the
+/// roughly 84 KiB opaque `migrate_inner` future while its own poll stack is
+/// still live.
+fn storage_v2_operator_future(
+    storage: Arc<crate::segment_store_platform::StorageV2Devices>,
+    authority: InvocationLease<crate::segment_store_platform::StorageMigrationAuthority>,
+    action: StorageV2OperatorAction,
+) -> StorageV2MigrationFuture {
+    match action {
+        StorageV2OperatorAction::Migrate => {
+            Box::pin(async move { storage.migrate(&authority).await })
+        }
+        StorageV2OperatorAction::MigrateStage => {
+            Box::pin(async move { storage.migrate_until_staged(&authority).await })
+        }
+        StorageV2OperatorAction::Rollback => {
+            Box::pin(async move { storage.rollback(&authority).await })
+        }
+        StorageV2OperatorAction::CloseRollback => {
+            Box::pin(async move { storage.close_rollback(&authority).await })
+        }
+    }
+}
+
+async fn storage_v2_command(args: &[&str]) {
+    let w = world();
+    let Some(storage) = w.storage_v2.as_ref() else {
+        println!("  Storage V2: offline (no managed block backend)");
+        return;
+    };
+    match args.first().copied().unwrap_or("status") {
+        "status" => {
+            let selected = match storage.selected_boot_store() {
+                Some(crate::segment_store_platform::BootStoreSelection::Blank) => "blank",
+                Some(crate::segment_store_platform::BootStoreSelection::LegacyM4) => "M4",
+                Some(crate::segment_store_platform::BootStoreSelection::StorageV2) => "V2",
+                Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => {
+                    "fail-closed"
+                }
+                None => "probe-pending",
+            };
+            match storage.migration_control().await {
+                Ok(Some(control)) => println!(
+                    "  Storage V2: boot {}, migration {:?} generation {}",
+                    selected, control.state, control.generation
+                ),
+                Ok(None) => println!("  Storage V2: boot {}, migration control absent", selected),
+                Err(_) => println!("  Storage V2: boot fail-closed, migration control corrupt"),
+            }
+        }
+        raw_action @ ("migrate" | "migrate-stage" | "rollback" | "close-rollback") => {
+            let action = match raw_action {
+                "migrate" => StorageV2OperatorAction::Migrate,
+                "migrate-stage" => StorageV2OperatorAction::MigrateStage,
+                "rollback" => StorageV2OperatorAction::Rollback,
+                "close-rollback" => StorageV2OperatorAction::CloseRollback,
+                _ => unreachable!(),
+            };
+            let Some(migration) = w.storage_migration else {
+                println!("  Storage V2 migration: authority unavailable");
+                return;
+            };
+            let authority = match w.spaces["init"]
+                .0
+                .lock()
+                .lookup_lease::<crate::segment_store_platform::StorageMigrationAuthority>(
+                migration,
+                Rights::INVOKE,
+            ) {
+                Ok(authority) => authority,
+                Err(_) => {
+                    println!("  Storage V2 migration: permission denied");
+                    return;
+                }
+            };
+            // The migration state machine deliberately has a much larger
+            // future than ordinary shell commands (bounded mount, import,
+            // scrub, and selector proof all coexist). Run it as its own
+            // system-owned executor task. Its first poll performs the boxed
+            // construction below, after the UART shell's poll stack is gone;
+            // the lease then remains live for the complete operation.
+            let result_slot = alloc::sync::Arc::new(crate::sync::SpinLock::new(None));
+            let worker_result = result_slot.clone();
+            let worker_storage = storage.clone();
+            let worker = crate::exec::spawn_tracked_owned(
+                vibeos_core::heap::OwnerId::SYSTEM,
+                "storage-v2-migrate",
+                async move {
+                    let result =
+                        storage_v2_operator_future(worker_storage, authority, action).await;
+                    *worker_result.lock() = Some(result);
+                },
+            );
+            let exit = worker.join().await;
+            if exit.state() != crate::exec::TaskState::Exited {
+                println!("  Storage V2 migration worker failed: {}", exit.reason());
+                return;
+            }
+            let result = result_slot
+                .lock()
+                .take()
+                .expect("an exited migration worker publishes one result");
+            match (action, result) {
+                (StorageV2OperatorAction::MigrateStage, Ok(report)) => println!(
+                    "VIBE_STORAGE_V2_STAGED state={:?} generation={} checkpoint={} objects={}",
+                    report.state,
+                    report.generation,
+                    report.checkpoint_generation,
+                    report.object_count
+                ),
+                (StorageV2OperatorAction::Migrate, Ok(report)) => println!(
+                    "VIBE_STORAGE_V2_MIGRATED state={:?} generation={} checkpoint={} objects={}",
+                    report.state,
+                    report.generation,
+                    report.checkpoint_generation,
+                    report.object_count
+                ),
+                (StorageV2OperatorAction::Rollback, Ok(report)) => println!(
+                    "VIBE_STORAGE_V2_ROLLED_BACK state={:?} generation={} checkpoint={} objects={}",
+                    report.state,
+                    report.generation,
+                    report.checkpoint_generation,
+                    report.object_count
+                ),
+                (StorageV2OperatorAction::CloseRollback, Ok(report)) => println!(
+                    "VIBE_STORAGE_V2_ROLLBACK_CLOSED state={:?} generation={} checkpoint={} objects={}",
+                    report.state,
+                    report.generation,
+                    report.checkpoint_generation,
+                    report.object_count
+                ),
+                (_, Err(error)) => println!("  Storage V2 operation failed: {:?}", error),
+            }
+        }
+        other => println!(
+            "  usage: storage [status|migrate|migrate-stage|rollback|close-rollback] (got `{}`)",
+            other
+        ),
     }
 }
 

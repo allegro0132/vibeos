@@ -140,6 +140,111 @@ fn infinite_work_yields_then_exhausts_exact_total_and_cancellation_wins() {
 }
 
 #[test]
+fn instance_owned_call_state_is_exclusive_resumable_and_cleans_terminal_state() {
+    let source = r#"
+        (module
+          (memory (export "memory") 1 1)
+          (func (export "count") (param i32) (result i32)
+            (local i32)
+            local.get 0
+            local.set 1
+            block $done
+              loop $again
+                local.get 1
+                i32.eqz
+                br_if $done
+                local.get 1
+                i32.const 1
+                i32.sub
+                local.set 1
+                br $again
+              end
+            end
+            local.get 1)
+          (func (export "identity") (param i32) (result i32)
+            local.get 0))
+    "#;
+    let module = compile(source);
+    let mut instance = module.instantiate().unwrap();
+
+    instance
+        .start_call("count", &[CoreValue::I32(64)], 10_000, 7)
+        .unwrap();
+    assert!(instance.has_active_call());
+    assert_eq!(
+        instance.start_call("identity", &[CoreValue::I32(1)], 100, 10),
+        Err(TrapCode::Validation)
+    );
+    assert!(matches!(instance.poll_call(), PollResult::Pending { .. }));
+
+    // Memory access is serialized by `&mut CoreInstance` and is permitted
+    // while the interpreter continuation is suspended between polls.
+    instance.write_memory("memory", 8, &[1, 2, 3, 4]).unwrap();
+    let mut bytes = [0; 4];
+    instance.read_memory("memory", 8, &mut bytes).unwrap();
+    assert_eq!(bytes, [1, 2, 3, 4]);
+
+    instance.cancel_call().unwrap();
+    assert_eq!(
+        instance.poll_call(),
+        PollResult::Trapped(TrapCode::Cancelled)
+    );
+    assert!(!instance.has_active_call());
+    let cancelled = instance.call_metrics().unwrap();
+    assert!(cancelled.consumed_fuel > 0);
+    assert_eq!(cancelled.consumed_fuel + cancelled.remaining_fuel, 10_000);
+
+    instance
+        .start_call("identity", &[CoreValue::I32(42)], 100, 10)
+        .unwrap();
+    assert_eq!(
+        instance.poll_call(),
+        PollResult::Ready(vec![CoreValue::I32(42)])
+    );
+    assert!(!instance.has_active_call());
+    assert_eq!(
+        instance.poll_call(),
+        PollResult::Trapped(TrapCode::Validation)
+    );
+    assert_eq!(instance.cancel_call(), Err(TrapCode::Validation));
+}
+
+#[test]
+fn dropping_legacy_invocation_discards_its_instance_owned_continuation() {
+    let module = compile(r#"(module (func (export "spin") (loop br 0)))"#);
+    let mut instance = module.instantiate().unwrap();
+    let mut call = instance.begin_call("spin", &[], 1_000, 10).unwrap();
+    assert!(matches!(call.poll(), PollResult::Pending { .. }));
+    drop(call);
+
+    assert!(!instance.has_active_call());
+    instance.start_call("spin", &[], 10, 10).unwrap();
+    assert!(matches!(instance.poll_call(), PollResult::Pending { .. }));
+    assert_eq!(
+        instance.poll_call(),
+        PollResult::Trapped(TrapCode::FuelExhausted)
+    );
+}
+
+#[test]
+fn owner_can_discard_an_instance_owned_continuation_without_another_poll() {
+    let module = compile(r#"(module (func (export "spin") (loop br 0)))"#);
+    let mut instance = module.instantiate().unwrap();
+    instance.start_call("spin", &[], 1_000, 10).unwrap();
+    assert!(matches!(instance.poll_call(), PollResult::Pending { .. }));
+
+    let before = instance.call_metrics().unwrap();
+    instance.discard_call().unwrap();
+    assert!(!instance.has_active_call());
+    assert_eq!(instance.call_metrics(), Some(before));
+    assert_eq!(instance.discard_call(), Err(TrapCode::Validation));
+
+    instance
+        .start_call("spin", &[], 10, 10)
+        .expect("discard makes the instance immediately reusable");
+}
+
+#[test]
 fn memory_access_and_growth_obey_the_effective_maximum() {
     let source = r#"
         (module

@@ -618,7 +618,12 @@ impl ValidatedCore {
                 trap: map_wasmi_error(&error),
                 detail: AdmissionDetail::Malformed,
             })?;
-        Ok(CoreInstance { store, instance })
+        Ok(CoreInstance {
+            store,
+            instance,
+            active_call: None,
+            last_call: None,
+        })
     }
 }
 
@@ -664,16 +669,28 @@ impl CoreValue {
 pub struct CoreInstance {
     store: Store<HostState>,
     instance: Instance,
+    active_call: Option<ActiveCall>,
+    last_call: Option<CallMetrics>,
 }
 
 impl CoreInstance {
-    pub fn begin_call<'a>(
-        &'a mut self,
+    /// Starts one call whose continuation is owned by this instance.
+    ///
+    /// Unlike [`CoreInstance::begin_call`], this does not borrow the instance
+    /// for the lifetime of the call. Component runtimes can therefore keep
+    /// their own multi-stage state machine and drive this call with
+    /// [`CoreInstance::poll_call`]. Exactly one call may be active per Core
+    /// instance.
+    pub fn start_call(
+        &mut self,
         export: &str,
         inputs: &[CoreValue],
         total_fuel: u64,
         poll_quantum: u64,
-    ) -> Result<Invocation<'a>, TrapCode> {
+    ) -> Result<(), TrapCode> {
+        if self.active_call.is_some() {
+            return Err(TrapCode::Validation);
+        }
         if total_fuel == 0
             || total_fuel > PROFILE_1_LIMITS.total_fuel
             || poll_quantum == 0
@@ -701,8 +718,8 @@ impl CoreInstance {
         }
         let inputs = inputs.iter().copied().map(CoreValue::into_wasmi).collect();
         let outputs = ty.results().iter().copied().map(Val::default).collect();
-        Ok(Invocation {
-            instance: self,
+        self.last_call = None;
+        self.active_call = Some(ActiveCall {
             function,
             inputs,
             outputs,
@@ -712,10 +729,86 @@ impl CoreInstance {
             consumed_fuel: 0,
             started: false,
             cancelled: false,
+        });
+        Ok(())
+    }
+
+    /// Polls the active call for at most its configured quantum.
+    ///
+    /// A terminal result removes the call and its continuation before this
+    /// method returns. A subsequent call can then be started immediately.
+    pub fn poll_call(&mut self) -> PollResult {
+        let Some(call) = self.active_call.as_mut() else {
+            return PollResult::Trapped(TrapCode::Validation);
+        };
+        let result = call.poll(&mut self.store);
+        if !matches!(result, PollResult::Pending { .. }) {
+            let call = self
+                .active_call
+                .take()
+                .expect("the active call was present before polling");
+            self.last_call = Some(call.metrics());
+        }
+        result
+    }
+
+    /// Requests cancellation of the active call. The next poll reports the
+    /// stable `Cancelled` trap and drops the continuation without executing
+    /// more guest instructions.
+    pub fn cancel_call(&mut self) -> Result<(), TrapCode> {
+        let call = self.active_call.as_mut().ok_or(TrapCode::Validation)?;
+        call.cancelled = true;
+        Ok(())
+    }
+
+    /// Abandons the active call without polling or executing more guest code.
+    ///
+    /// This is the teardown counterpart to [`CoreInstance::cancel_call`]. A
+    /// caller that remains alive should request cancellation and poll once to
+    /// observe the stable `Cancelled` terminal result. An owning component
+    /// continuation that is itself being dropped cannot do that safely, so it
+    /// uses this method to release the interpreter continuation immediately.
+    pub fn discard_call(&mut self) -> Result<(), TrapCode> {
+        if self.active_call.is_none() {
+            return Err(TrapCode::Validation);
+        }
+        self.discard_active_call();
+        Ok(())
+    }
+
+    pub const fn has_active_call(&self) -> bool {
+        self.active_call.is_some()
+    }
+
+    /// Returns fuel accounting for the active call, or for the most recently
+    /// completed call until another call starts.
+    pub fn call_metrics(&self) -> Option<CallMetrics> {
+        self.active_call
+            .as_ref()
+            .map(ActiveCall::metrics)
+            .or(self.last_call)
+    }
+
+    pub fn begin_call<'a>(
+        &'a mut self,
+        export: &str,
+        inputs: &[CoreValue],
+        total_fuel: u64,
+        poll_quantum: u64,
+    ) -> Result<Invocation<'a>, TrapCode> {
+        self.start_call(export, inputs, total_fuel, poll_quantum)?;
+        Ok(Invocation {
+            instance: self,
+            consumed_fuel: 0,
+            remaining_fuel: total_fuel,
             terminal: false,
         })
     }
 
+    /// Linear-memory accesses copy bytes and never expose a reference into the
+    /// store. They are consequently permitted while a call is suspended
+    /// between `poll_call` invocations; Rust's `&mut self` discipline prevents
+    /// them from racing with an executing poll.
     pub fn read_memory(
         &self,
         export: &str,
@@ -744,15 +837,41 @@ impl CoreInstance {
         Ok(self.memory(export)?.data_size(&self.store))
     }
 
+    /// Grows an exported memory to cover `minimum_bytes`, preserving the Core
+    /// module's declared maximum and the store's owner limits.
+    pub fn grow_memory_to(&mut self, export: &str, minimum_bytes: usize) -> Result<(), TrapCode> {
+        let memory = self.memory(export)?;
+        let current = memory.data_size(&self.store);
+        if minimum_bytes <= current {
+            return Ok(());
+        }
+        let additional_bytes = minimum_bytes
+            .checked_sub(current)
+            .ok_or(TrapCode::MemoryOutOfBounds)?;
+        let additional_pages = additional_bytes
+            .checked_add(65_535)
+            .ok_or(TrapCode::MemoryOutOfBounds)?
+            / 65_536;
+        memory
+            .grow(&mut self.store, additional_pages as u64)
+            .map_err(|_| TrapCode::MemoryOutOfBounds)?;
+        Ok(())
+    }
+
     fn memory(&self, export: &str) -> Result<Memory, TrapCode> {
         self.instance
             .get_memory(&self.store, export)
             .ok_or(TrapCode::Validation)
     }
+
+    fn discard_active_call(&mut self) {
+        if let Some(call) = self.active_call.take() {
+            self.last_call = Some(call.metrics());
+        }
+    }
 }
 
-pub struct Invocation<'a> {
-    instance: &'a mut CoreInstance,
+struct ActiveCall {
     function: Func,
     inputs: Vec<Val>,
     outputs: Vec<Val>,
@@ -762,6 +881,93 @@ pub struct Invocation<'a> {
     consumed_fuel: u64,
     started: bool,
     cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallMetrics {
+    pub consumed_fuel: u64,
+    pub remaining_fuel: u64,
+}
+
+impl ActiveCall {
+    const fn metrics(&self) -> CallMetrics {
+        CallMetrics {
+            consumed_fuel: self.consumed_fuel,
+            remaining_fuel: self.remaining_fuel,
+        }
+    }
+
+    fn poll(&mut self, store: &mut Store<HostState>) -> PollResult {
+        if self.cancelled {
+            self.continuation = None;
+            return PollResult::Trapped(TrapCode::Cancelled);
+        }
+        if self.remaining_fuel == 0 {
+            self.continuation = None;
+            return PollResult::Trapped(TrapCode::FuelExhausted);
+        }
+
+        let grant = min(self.remaining_fuel, self.poll_quantum);
+        if store.set_fuel(grant).is_err() {
+            return PollResult::Trapped(TrapCode::FuelExhausted);
+        }
+        let call = if let Some(continuation) = self.continuation.take() {
+            if continuation.required_fuel() > grant {
+                return PollResult::Trapped(
+                    if continuation.required_fuel() > self.remaining_fuel {
+                        TrapCode::FuelExhausted
+                    } else {
+                        TrapCode::LimitExceeded
+                    },
+                );
+            }
+            continuation.resume(&mut *store, &mut self.outputs)
+        } else if !self.started {
+            self.started = true;
+            self.function
+                .call_resumable(&mut *store, &self.inputs, &mut self.outputs)
+        } else {
+            return PollResult::Trapped(TrapCode::Validation);
+        };
+
+        let left = store.get_fuel().unwrap_or(0).min(grant);
+        let used = grant - left;
+        self.consumed_fuel = self.consumed_fuel.saturating_add(used);
+        self.remaining_fuel = self.remaining_fuel.saturating_sub(used);
+        match call {
+            Ok(ResumableCall::Finished) => {
+                let mut values = Vec::with_capacity(self.outputs.len());
+                for value in &self.outputs {
+                    let Some(value) = CoreValue::from_wasmi(value) else {
+                        return PollResult::Trapped(TrapCode::Validation);
+                    };
+                    values.push(value);
+                }
+                PollResult::Ready(values)
+            }
+            Ok(ResumableCall::OutOfFuel(continuation)) => {
+                if self.remaining_fuel == 0 {
+                    PollResult::Trapped(TrapCode::FuelExhausted)
+                } else if continuation.required_fuel() > self.poll_quantum {
+                    PollResult::Trapped(TrapCode::LimitExceeded)
+                } else {
+                    self.continuation = Some(continuation);
+                    PollResult::Pending {
+                        consumed_fuel: self.consumed_fuel,
+                        remaining_fuel: self.remaining_fuel,
+                    }
+                }
+            }
+            Ok(ResumableCall::HostTrap(_)) => PollResult::Trapped(TrapCode::Validation),
+            Err(error) => PollResult::Trapped(map_wasmi_error(&error)),
+        }
+    }
+}
+
+pub struct Invocation<'a> {
+    instance: &'a mut CoreInstance,
+    consumed_fuel: u64,
+    remaining_fuel: u64,
     terminal: bool,
 }
 
@@ -777,7 +983,9 @@ pub enum PollResult {
 
 impl Invocation<'_> {
     pub fn cancel(&mut self) {
-        self.cancelled = true;
+        if !self.terminal {
+            let _ = self.instance.cancel_call();
+        }
     }
 
     pub const fn consumed_fuel(&self) -> u64 {
@@ -792,82 +1000,20 @@ impl Invocation<'_> {
         if self.terminal {
             return PollResult::Trapped(TrapCode::Cancelled);
         }
-        if self.cancelled {
-            self.continuation = None;
-            self.terminal = true;
-            return PollResult::Trapped(TrapCode::Cancelled);
+        let result = self.instance.poll_call();
+        if let Some(metrics) = self.instance.call_metrics() {
+            self.consumed_fuel = metrics.consumed_fuel;
+            self.remaining_fuel = metrics.remaining_fuel;
         }
-        if self.remaining_fuel == 0 {
-            self.continuation = None;
-            self.terminal = true;
-            return PollResult::Trapped(TrapCode::FuelExhausted);
-        }
+        self.terminal = !matches!(result, PollResult::Pending { .. });
+        result
+    }
+}
 
-        let grant = min(self.remaining_fuel, self.poll_quantum);
-        if self.instance.store.set_fuel(grant).is_err() {
-            self.terminal = true;
-            return PollResult::Trapped(TrapCode::FuelExhausted);
-        }
-        let call = if let Some(continuation) = self.continuation.take() {
-            if continuation.required_fuel() > grant {
-                self.terminal = true;
-                return PollResult::Trapped(
-                    if continuation.required_fuel() > self.remaining_fuel {
-                        TrapCode::FuelExhausted
-                    } else {
-                        TrapCode::LimitExceeded
-                    },
-                );
-            }
-            continuation.resume(&mut self.instance.store, &mut self.outputs)
-        } else if !self.started {
-            self.started = true;
-            self.function
-                .call_resumable(&mut self.instance.store, &self.inputs, &mut self.outputs)
-        } else {
-            self.terminal = true;
-            return PollResult::Trapped(TrapCode::Validation);
-        };
-
-        let left = self.instance.store.get_fuel().unwrap_or(0).min(grant);
-        let used = grant - left;
-        self.consumed_fuel = self.consumed_fuel.saturating_add(used);
-        self.remaining_fuel = self.remaining_fuel.saturating_sub(used);
-        match call {
-            Ok(ResumableCall::Finished) => {
-                self.terminal = true;
-                let mut values = Vec::with_capacity(self.outputs.len());
-                for value in &self.outputs {
-                    let Some(value) = CoreValue::from_wasmi(value) else {
-                        return PollResult::Trapped(TrapCode::Validation);
-                    };
-                    values.push(value);
-                }
-                PollResult::Ready(values)
-            }
-            Ok(ResumableCall::OutOfFuel(continuation)) => {
-                if self.remaining_fuel == 0 {
-                    self.terminal = true;
-                    PollResult::Trapped(TrapCode::FuelExhausted)
-                } else if continuation.required_fuel() > self.poll_quantum {
-                    self.terminal = true;
-                    PollResult::Trapped(TrapCode::LimitExceeded)
-                } else {
-                    self.continuation = Some(continuation);
-                    PollResult::Pending {
-                        consumed_fuel: self.consumed_fuel,
-                        remaining_fuel: self.remaining_fuel,
-                    }
-                }
-            }
-            Ok(ResumableCall::HostTrap(_)) => {
-                self.terminal = true;
-                PollResult::Trapped(TrapCode::Validation)
-            }
-            Err(error) => {
-                self.terminal = true;
-                PollResult::Trapped(map_wasmi_error(&error))
-            }
+impl Drop for Invocation<'_> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            let _ = self.instance.discard_call();
         }
     }
 }

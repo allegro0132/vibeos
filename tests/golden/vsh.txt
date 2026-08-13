@@ -47,6 +47,7 @@ vsh> help
   pci             list discovered PCI functions
   usb info        list XHCI USB devices
   usb read N      read one USB-storage sector
+  usb write-test CONFIRM  verify WRITE(10) on reserved LBA 4000000
   usb test        destructive CI test of sectors 7 and 8
 vsh> echo nested > @console
 nested

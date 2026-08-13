@@ -19,7 +19,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::cas_codec::{
-    BlobKey, BlobMapping, ObjectMapping, REFERENCE_CODEC_RAW, REFERENCE_CODEC_TYPED_V1,
+    BlobKey, BlobMapping, ObjectMapping, REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW,
+    REFERENCE_CODEC_TYPED_V1,
 };
 use crate::pins::RootKey;
 
@@ -323,7 +324,7 @@ impl MarkPlanner {
 
             match object.reference_codec {
                 REFERENCE_CODEC_RAW => {}
-                REFERENCE_CODEC_TYPED_V1 => {
+                REFERENCE_CODEC_TYPED_V1 | REFERENCE_CODEC_FS_V1 => {
                     let child_count = match source.read_children(&object, &mut self.children) {
                         Ok(count) => count,
                         Err(_) => {

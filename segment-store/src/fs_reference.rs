@@ -48,30 +48,24 @@ impl From<FsCodecError> for FsReferenceError {
 pub fn decode_fs_typed_references(
     parent_kind: u32,
     bytes: &[u8],
+    storage_commit_generation: u64,
 ) -> Result<TypedManifestRefsV1, FsReferenceError> {
     if parent_kind != FS_ROOT_V1_KIND && parent_kind != FS_BTREE_NODE_V1_KIND {
         return Err(FsReferenceError::InvalidParentKind);
     }
-    let (generation, mut references): (u64, Vec<TypedObjectReference>) =
-        if parent_kind == FS_ROOT_V1_KIND {
-            let root = decode_fs_root_v1(bytes)?;
-            (
-                root.commit_generation,
-                alloc::vec![root.inode_tree, root.dirent_tree],
-            )
-        } else {
-            let node = decode_fs_btree_node_v1(bytes)?;
-            (
-                node.commit_generation,
-                node.entries
-                    .into_iter()
-                    .filter_map(|entry| entry.reference)
-                    .collect(),
-            )
-        };
+    let mut references: Vec<TypedObjectReference> = if parent_kind == FS_ROOT_V1_KIND {
+        let root = decode_fs_root_v1(bytes)?;
+        alloc::vec![root.inode_tree, root.dirent_tree]
+    } else {
+        let node = decode_fs_btree_node_v1(bytes)?;
+        node.entries
+            .into_iter()
+            .filter_map(|entry| entry.reference)
+            .collect()
+    };
     references.sort_unstable_by_key(|reference| reference.object_id);
     references.dedup();
-    TypedManifestRefsV1::new(parent_kind, generation, references).map_err(Into::into)
+    TypedManifestRefsV1::new(parent_kind, storage_commit_generation, references).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -103,7 +97,7 @@ mod tests {
             dirent_tree: other_node,
         };
         assert_eq!(
-            decode_fs_typed_references(FS_ROOT_V1_KIND, &encode_fs_root_v1(&root).unwrap())
+            decode_fs_typed_references(FS_ROOT_V1_KIND, &encode_fs_root_v1(&root).unwrap(), 10)
                 .unwrap()
                 .references(),
             &[node, other_node]
@@ -126,14 +120,15 @@ mod tests {
         assert_eq!(
             decode_fs_typed_references(
                 FS_BTREE_NODE_V1_KIND,
-                &encode_fs_btree_node_v1(&leaf).unwrap()
+                &encode_fs_btree_node_v1(&leaf).unwrap(),
+                10,
             )
             .unwrap()
             .references(),
             &[data]
         );
         assert_eq!(
-            decode_fs_typed_references(FS_DATA_V1_KIND, &[]),
+            decode_fs_typed_references(FS_DATA_V1_KIND, &[], 10),
             Err(FsReferenceError::InvalidParentKind)
         );
     }

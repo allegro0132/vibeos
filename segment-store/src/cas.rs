@@ -963,6 +963,7 @@ impl<D: PageDevice> SegmentStore<D> {
     ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
         if reference_codec != REFERENCE_CODEC_RAW
             && reference_codec != crate::cas_codec::REFERENCE_CODEC_TYPED_V1
+            && reference_codec != crate::cas_codec::REFERENCE_CODEC_FS_V1
         {
             return Err(StoreError::InvalidConfig.into());
         }

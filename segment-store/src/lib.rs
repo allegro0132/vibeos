@@ -19,6 +19,7 @@ mod cas_codec;
 mod codec;
 mod compat;
 mod device;
+mod fs_api;
 mod fs_codec;
 mod fs_reference;
 mod gc;
@@ -75,7 +76,7 @@ pub use cas_codec::{
     BLOB_MAPPING_LEN, CANONICAL_CONTENT_EXTENT_LEN, CAS_CODEC_VERSION, CAS_DELTA_HEADER_LEN,
     CAS_DELTA_NEW_BLOB_LEN, CAS_DELTA_REUSE_LEN, CAS_GC_CODEC_VERSION, CAS_SNAPSHOT_HEADER_LEN,
     MANIFEST_EXTENT_LEN, MAX_BLOB_CONTENT_LEN, MAX_BLOB_EXTENTS, OBJECT_MAPPING_LEN,
-    REFERENCE_CODEC_RAW, REFERENCE_CODEC_TYPED_V1,
+    REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW, REFERENCE_CODEC_TYPED_V1,
 };
 pub use codec::{
     decode_allocation, decode_catalog, encode_allocation, encode_catalog, AllocationState,
@@ -85,6 +86,7 @@ pub use codec::{
 };
 pub use compat::PutGetAdapter;
 pub use device::{BlockPageDevice, BlockPageError, GrowablePageDevice, PageDevice, PageDeviceInfo};
+pub use fs_api::{FsNodeEntryInput, FsPersistentRoot, FsRootPublishError, FsStructuralCommitError};
 pub use fs_codec::{
     decode_fs_btree_node_v1, decode_fs_root_v1, encode_fs_btree_node_v1, encode_fs_root_v1,
     FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError, FsRootV1, FsTreeKind, FS_BTREE_HEADER_LEN,

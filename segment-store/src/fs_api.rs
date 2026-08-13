@@ -17,8 +17,8 @@ use crate::gc::GcStoreError;
 use crate::{
     decode_fs_btree_node_v1, encode_fs_btree_node_v1, encode_fs_root_v1, FsBtreeEntryV1,
     FsBtreeNodeV1, FsCodecError, FsRootV1, FsTreeKind, SegmentStore, StoreError,
-    TypedObjectReference, FS_BTREE_MAX_HEIGHT, FS_BTREE_NODE_V1_KIND, FS_DATA_V1_KIND,
-    FS_ROOT_V1_KIND,
+    TypedObjectReference, FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT,
+    FS_BTREE_NODE_V1_KIND, FS_DATA_V1_KIND, FS_OBJECT_MAX_LEN, FS_ROOT_V1_KIND,
 };
 
 pub struct FsNodeEntryInput<'a> {
@@ -83,6 +83,7 @@ impl<E> From<FsCodecError> for FsRootPublishError<E> {
 
 /// Cold-recoverable namespace root. Object identity and CAS keys remain
 /// private; callers can inspect only file-tree policy fields.
+#[derive(Clone)]
 pub struct FsPersistentRoot {
     _object: Arc<AuthorizedObject<CasObjectHandle>>,
     decoded: FsRootV1,
@@ -109,6 +110,41 @@ pub struct FsPersistentTreeEntry {
     pub content: Option<FsPersistentData>,
 }
 
+struct RecoverableFsNode {
+    decoded: FsBtreeNodeV1,
+    mapping: ObjectMapping,
+}
+
+struct CowBuiltNode {
+    minimum_key: Vec<u8>,
+    object: Arc<AuthorizedObject<CasObjectHandle>>,
+}
+
+fn partition_fs_entries(
+    entries: &[FsBtreeEntryV1],
+) -> Result<Vec<core::ops::Range<usize>>, FsCodecError> {
+    let mut pages = Vec::new();
+    let mut start = 0usize;
+    let mut used = FS_BTREE_HEADER_LEN;
+    for (index, entry) in entries.iter().enumerate() {
+        let size = FS_BTREE_ENTRY_HEADER_LEN
+            .checked_add(entry.key.len())
+            .and_then(|size| size.checked_add(entry.value.len()))
+            .ok_or(FsCodecError::OutOfBounds)?;
+        if FS_BTREE_HEADER_LEN + size > FS_OBJECT_MAX_LEN {
+            return Err(FsCodecError::OutOfBounds);
+        }
+        if index > start && used + size > FS_OBJECT_MAX_LEN {
+            pages.push(start..index);
+            start = index;
+            used = FS_BTREE_HEADER_LEN;
+        }
+        used += size;
+    }
+    pages.push(start..entries.len());
+    Ok(pages)
+}
+
 impl FsPersistentRoot {
     pub const fn namespace_uuid(&self) -> u128 {
         self.decoded.namespace_uuid
@@ -125,11 +161,11 @@ impl FsPersistentRoot {
 }
 
 impl<D: PageDevice> SegmentStore<D> {
-    fn recover_fs_reference(
+    fn fs_mapping_for_reference(
         &self,
         reference: TypedObjectReference,
         expected_kind: u32,
-    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsRootPublishError<D::Error>> {
+    ) -> Result<ObjectMapping, FsRootPublishError<D::Error>> {
         if reference.object_kind != expected_kind {
             return Err(FsRootPublishError::InvalidRoot);
         }
@@ -153,6 +189,15 @@ impl<D: PageDevice> SegmentStore<D> {
                     }
             })
             .ok_or(FsRootPublishError::InvalidRoot)?;
+        Ok(mapping)
+    }
+
+    fn recover_fs_reference(
+        &self,
+        reference: TypedObjectReference,
+        expected_kind: u32,
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsRootPublishError<D::Error>> {
+        let mapping = self.fs_mapping_for_reference(reference, expected_kind)?;
         Ok(Arc::new(
             recover_promotable_cas_object(
                 self.require_current_generation()?
@@ -247,6 +292,180 @@ impl<D: PageDevice> SegmentStore<D> {
             writer.write_chunk(chunk).await?;
         }
         writer.commit().await.map_err(Into::into)
+    }
+
+    async fn recover_fs_nodes(
+        &self,
+        root: &FsPersistentRoot,
+        tree: FsTreeKind,
+    ) -> Result<Vec<RecoverableFsNode>, FsRootPublishError<D::Error>> {
+        let first = match tree {
+            FsTreeKind::Inode => root.decoded.inode_tree,
+            FsTreeKind::Dirent => root.decoded.dirent_tree,
+        };
+        let mut pending = alloc::vec![first];
+        let mut nodes = Vec::new();
+        while let Some(reference) = pending.pop() {
+            if nodes.len() >= 4096 {
+                return Err(StoreError::MemoryLimit.into());
+            }
+            let object = self.recover_fs_reference(reference, FS_BTREE_NODE_V1_KIND)?;
+            let decoded = decode_fs_btree_node_v1(&self.read_fs_object_bytes(&object).await?)?;
+            if decoded.tree != tree || decoded.commit_generation > root.decoded.commit_generation {
+                return Err(FsRootPublishError::InvalidRoot);
+            }
+            if decoded.level > 0 {
+                for entry in &decoded.entries {
+                    pending.push(entry.reference.ok_or(FsRootPublishError::InvalidRoot)?);
+                }
+            }
+            let mapping = self.fs_mapping_for_reference(reference, FS_BTREE_NODE_V1_KIND)?;
+            nodes.push(RecoverableFsNode { decoded, mapping });
+        }
+        Ok(nodes)
+    }
+
+    async fn commit_cow_node(
+        &mut self,
+        node: FsBtreeNodeV1,
+        old_nodes: &[RecoverableFsNode],
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
+        if let Some(reused) = old_nodes
+            .iter()
+            .find(|old| {
+                old.decoded.tree == node.tree
+                    && old.decoded.level == node.level
+                    && old.decoded.entries == node.entries
+            })
+            .map(|old| old.mapping)
+        {
+            return Ok(Arc::new(
+                recover_promotable_cas_object(
+                    self.require_current_generation()?
+                        .superblock
+                        .binding
+                        .store_uuid,
+                    reused,
+                    &self.pins,
+                )
+                .map_err(|_| StoreError::ObjectUnavailable)?,
+            ));
+        }
+        let payload = encode_fs_btree_node_v1(&node)?;
+        let mut writer = self.begin_blob_with_reference_codec(
+            FS_BTREE_NODE_V1_KIND,
+            payload.len() as u64,
+            None,
+            REFERENCE_CODEC_FS_V1,
+        )?;
+        for chunk in payload.chunks(PAGE_SIZE) {
+            writer.write_chunk(chunk).await?;
+        }
+        Ok(Arc::new(writer.commit().await?))
+    }
+
+    /// Build a deterministic B+tree while reusing byte-equivalent nodes and
+    /// unchanged leaf data edges reachable from the previous opaque root.
+    pub async fn commit_fs_cow_tree(
+        &mut self,
+        previous: Option<&FsPersistentRoot>,
+        tree: FsTreeKind,
+        namespace_generation: u64,
+        entries: &[FsNodeEntryInput<'_>],
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
+        let old_nodes = match previous {
+            Some(root) => self
+                .recover_fs_nodes(root, tree)
+                .await
+                .map_err(|error| match error {
+                    FsRootPublishError::Store(error) => FsStructuralCommitError::Store(error),
+                    FsRootPublishError::Codec(error) => FsStructuralCommitError::Codec(error),
+                    _ => FsStructuralCommitError::InvalidChild,
+                })?,
+            None => Vec::new(),
+        };
+        let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(entries.len())
+            .map_err(|_| FsCodecError::OutOfBounds)?;
+        for input in entries {
+            let mut reference = match input.child {
+                Some(child) => Some(self.fs_reference_for(child)?),
+                None => None,
+            };
+            if reference.is_none() && tree == FsTreeKind::Inode {
+                reference = old_nodes
+                    .iter()
+                    .filter(|node| node.decoded.level == 0)
+                    .flat_map(|node| &node.decoded.entries)
+                    .find(|entry| entry.key == input.key && entry.value == input.value)
+                    .and_then(|entry| entry.reference);
+            }
+            leaves.push(FsBtreeEntryV1 {
+                key: input.key.to_vec(),
+                value: input.value.to_vec(),
+                reference,
+            });
+        }
+        let mut built = Vec::new();
+        for range in partition_fs_entries(&leaves)? {
+            let object = self
+                .commit_cow_node(
+                    FsBtreeNodeV1 {
+                        tree,
+                        level: 0,
+                        commit_generation: namespace_generation,
+                        entries: leaves[range.clone()].to_vec(),
+                    },
+                    &old_nodes,
+                )
+                .await?;
+            built.push(CowBuiltNode {
+                minimum_key: leaves
+                    .get(range.start)
+                    .map(|entry| entry.key.clone())
+                    .unwrap_or_default(),
+                object,
+            });
+        }
+        let mut level = 1u8;
+        while built.len() > 1 {
+            if level > FS_BTREE_MAX_HEIGHT {
+                return Err(FsCodecError::OutOfBounds.into());
+            }
+            let mut internal = Vec::new();
+            for child in &built {
+                internal.push(FsBtreeEntryV1 {
+                    key: child.minimum_key.clone(),
+                    value: Vec::new(),
+                    reference: Some(self.fs_reference_for(&child.object)?),
+                });
+            }
+            let mut parents = Vec::new();
+            for range in partition_fs_entries(&internal)? {
+                let object = self
+                    .commit_cow_node(
+                        FsBtreeNodeV1 {
+                            tree,
+                            level,
+                            commit_generation: namespace_generation,
+                            entries: internal[range.clone()].to_vec(),
+                        },
+                        &old_nodes,
+                    )
+                    .await?;
+                parents.push(CowBuiltNode {
+                    minimum_key: internal[range.start].key.clone(),
+                    object,
+                });
+            }
+            built = parents;
+            level += 1;
+        }
+        built
+            .pop()
+            .map(|node| node.object)
+            .ok_or(FsStructuralCommitError::InvalidChild)
     }
 
     pub async fn commit_fs_root(

@@ -12,8 +12,13 @@ pub const FS_BTREE_MAX_HEIGHT: u8 = 8;
 pub const FS_ROOT_V1_LEN: usize = 0xb0;
 pub const FS_BTREE_HEADER_LEN: usize = 0x40;
 pub const FS_BTREE_ENTRY_HEADER_LEN: usize = 0x30;
+pub const FS_DATA_HEADER_LEN: usize = 0x40;
+pub const FS_DATA_REFERENCE_LEN: usize = 0x28;
+pub const FS_DATA_MAX_ANCESTORS: usize = 64;
+pub const FS_DATA_CHUNK_MAX_LEN: usize = 4096;
 const FS_ROOT_MAGIC: &[u8; 8] = b"VIBEFSR1";
 const FS_NODE_MAGIC: &[u8; 8] = b"VIBEFSN1";
+const FS_DATA_MAGIC: &[u8; 8] = b"VIBEFSD1";
 const FS_CODEC_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +73,18 @@ pub struct FsBtreeNodeV1 {
     pub level: u8,
     pub commit_generation: u64,
     pub entries: Vec<FsBtreeEntryV1>,
+}
+
+/// One immutable, bounded file-content chunk. `ancestors[k]` names the node
+/// exactly `2^k` chunks before this node. The inode points at the final node,
+/// permitting append-only staging with a fixed 64-reference frontier while
+/// retaining logarithmic lookup of any 4 KiB chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FsDataNodeV1 {
+    pub chunk_index: u64,
+    pub total_len: u64,
+    pub ancestors: Vec<TypedObjectReference>,
+    pub bytes: Vec<u8>,
 }
 
 fn put_u16(out: &mut [u8], offset: usize, value: u16) {
@@ -186,6 +203,112 @@ pub fn decode_fs_root_v1(input: &[u8]) -> Result<FsRootV1, FsCodecError> {
         return Err(FsCodecError::InvalidField);
     }
     Ok(root)
+}
+
+fn fs_data_ancestor_count(chunk_index: u64) -> usize {
+    if chunk_index == 0 {
+        0
+    } else {
+        (u64::BITS - chunk_index.leading_zeros()) as usize
+    }
+}
+
+pub fn encode_fs_data_node_v1(node: &FsDataNodeV1) -> Result<Vec<u8>, FsCodecError> {
+    let expected_ancestors = fs_data_ancestor_count(node.chunk_index);
+    if node.ancestors.len() != expected_ancestors
+        || node.ancestors.len() > FS_DATA_MAX_ANCESTORS
+        || node.bytes.len() > FS_DATA_CHUNK_MAX_LEN
+        || (node.total_len == 0
+            && (node.chunk_index != 0 || !node.ancestors.is_empty() || !node.bytes.is_empty()))
+        || (node.total_len != 0 && node.bytes.is_empty())
+        || node.total_len < node.bytes.len() as u64
+        || (node.chunk_index == 0 && node.total_len != node.bytes.len() as u64)
+        || (node.chunk_index != 0 && node.total_len <= node.bytes.len() as u64)
+    {
+        return Err(FsCodecError::InvalidField);
+    }
+    for reference in &node.ancestors {
+        validate_reference(*reference, Some(FS_DATA_V1_KIND))?;
+    }
+    let length = FS_DATA_HEADER_LEN
+        .checked_add(
+            node.ancestors
+                .len()
+                .checked_mul(FS_DATA_REFERENCE_LEN)
+                .ok_or(FsCodecError::ArithmeticOverflow)?,
+        )
+        .and_then(|length| length.checked_add(node.bytes.len()))
+        .ok_or(FsCodecError::ArithmeticOverflow)?;
+    let mut out = vec![0; length];
+    out[..8].copy_from_slice(FS_DATA_MAGIC);
+    put_u16(&mut out, 0x08, FS_CODEC_VERSION);
+    put_u16(&mut out, 0x0a, FS_DATA_HEADER_LEN as u16);
+    put_u32(
+        &mut out,
+        0x0c,
+        u32::try_from(length).map_err(|_| FsCodecError::OutOfBounds)?,
+    );
+    put_u64(&mut out, 0x10, node.chunk_index);
+    put_u64(&mut out, 0x18, node.total_len);
+    put_u32(&mut out, 0x20, node.bytes.len() as u32);
+    put_u16(&mut out, 0x24, node.ancestors.len() as u16);
+    let mut offset = FS_DATA_HEADER_LEN;
+    for reference in &node.ancestors {
+        encode_reference(&mut out, offset, *reference);
+        offset += FS_DATA_REFERENCE_LEN;
+    }
+    out[offset..].copy_from_slice(&node.bytes);
+    Ok(out)
+}
+
+pub fn decode_fs_data_node_v1(input: &[u8]) -> Result<FsDataNodeV1, FsCodecError> {
+    if input.len() < FS_DATA_HEADER_LEN || &input[..8] != FS_DATA_MAGIC {
+        return Err(if input.len() < FS_DATA_HEADER_LEN {
+            FsCodecError::InvalidLength
+        } else {
+            FsCodecError::InvalidMagic
+        });
+    }
+    if get_u16(input, 0x08) != FS_CODEC_VERSION
+        || get_u16(input, 0x0a) as usize != FS_DATA_HEADER_LEN
+        || get_u32(input, 0x0c) as usize != input.len()
+        || !zero(&input[0x26..FS_DATA_HEADER_LEN])
+    {
+        return Err(FsCodecError::InvalidField);
+    }
+    let chunk_index = get_u64(input, 0x10);
+    let total_len = get_u64(input, 0x18);
+    let bytes_len = get_u32(input, 0x20) as usize;
+    let ancestor_count = get_u16(input, 0x24) as usize;
+    let references_len = ancestor_count
+        .checked_mul(FS_DATA_REFERENCE_LEN)
+        .ok_or(FsCodecError::ArithmeticOverflow)?;
+    let bytes_offset = FS_DATA_HEADER_LEN
+        .checked_add(references_len)
+        .ok_or(FsCodecError::ArithmeticOverflow)?;
+    if bytes_offset.checked_add(bytes_len) != Some(input.len()) {
+        return Err(FsCodecError::InvalidLength);
+    }
+    let mut ancestors = Vec::new();
+    ancestors
+        .try_reserve_exact(ancestor_count)
+        .map_err(|_| FsCodecError::OutOfBounds)?;
+    for index in 0..ancestor_count {
+        ancestors.push(decode_reference(
+            input,
+            FS_DATA_HEADER_LEN + index * FS_DATA_REFERENCE_LEN,
+        )?);
+    }
+    let node = FsDataNodeV1 {
+        chunk_index,
+        total_len,
+        ancestors,
+        bytes: input[bytes_offset..].to_vec(),
+    };
+    if encode_fs_data_node_v1(&node)? != input {
+        return Err(FsCodecError::InvalidField);
+    }
+    Ok(node)
 }
 
 fn validate_node(node: &FsBtreeNodeV1) -> Result<usize, FsCodecError> {
@@ -407,5 +530,39 @@ mod tests {
             encode_fs_btree_node_v1(&too_high),
             Err(FsCodecError::InvalidField)
         );
+    }
+
+    #[test]
+    fn data_nodes_are_canonical_bounded_and_cannot_forge_child_kinds() {
+        let first = FsDataNodeV1 {
+            chunk_index: 0,
+            total_len: 3,
+            ancestors: Vec::new(),
+            bytes: vec![1, 2, 3],
+        };
+        let encoded = encode_fs_data_node_v1(&first).unwrap();
+        assert_eq!(decode_fs_data_node_v1(&encoded).unwrap(), first);
+
+        let fourth = FsDataNodeV1 {
+            chunk_index: 3,
+            total_len: 16,
+            ancestors: vec![
+                reference(10, FS_DATA_V1_KIND),
+                reference(8, FS_DATA_V1_KIND),
+            ],
+            bytes: vec![9; 4],
+        };
+        let encoded = encode_fs_data_node_v1(&fourth).unwrap();
+        assert_eq!(decode_fs_data_node_v1(&encoded).unwrap(), fourth);
+
+        let mut wrong_kind = fourth.clone();
+        wrong_kind.ancestors[0] = reference(10, FS_BTREE_NODE_V1_KIND);
+        assert_eq!(
+            encode_fs_data_node_v1(&wrong_kind),
+            Err(FsCodecError::InvalidReference)
+        );
+        let mut corrupt = encoded;
+        corrupt[0x26] = 1;
+        assert!(decode_fs_data_node_v1(&corrupt).is_err());
     }
 }

@@ -9,16 +9,16 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::{
-    decode_fs_btree_node_v1, decode_fs_root_v1, FsCodecError, TypedManifestRefsV1,
-    TypedObjectReference, TypedRefsError,
+    decode_fs_btree_node_v1, decode_fs_data_node_v1, decode_fs_root_v1, FsCodecError,
+    TypedManifestRefsV1, TypedObjectReference, TypedRefsError,
 };
 
 pub const FS_ROOT_V1_KIND: u32 = 0x4653_0101;
 pub const FS_BTREE_NODE_V1_KIND: u32 = 0x4653_0102;
 pub const FS_DATA_V1_KIND: u32 = 0x4653_0103;
 
-pub const fn fs_typed_reference_kinds() -> [u32; 2] {
-    [FS_ROOT_V1_KIND, FS_BTREE_NODE_V1_KIND]
+pub const fn fs_typed_reference_kinds() -> [u32; 3] {
+    [FS_ROOT_V1_KIND, FS_BTREE_NODE_V1_KIND, FS_DATA_V1_KIND]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,26 +42,31 @@ impl From<FsCodecError> for FsReferenceError {
     }
 }
 
-/// Decode references only after policy has selected an FS structural kind.
-/// Data objects are deliberately excluded: arbitrary file bytes can never
-/// manufacture GC edges even when they contain a byte-perfect refs payload.
+/// Decode references only after policy selected the exact FS codec for this
+/// object. Raw file bytes retain the raw codec and therefore cannot manufacture
+/// graph edges even if they happen to contain a byte-perfect data-node payload.
 pub fn decode_fs_typed_references(
     parent_kind: u32,
     bytes: &[u8],
     storage_commit_generation: u64,
 ) -> Result<TypedManifestRefsV1, FsReferenceError> {
-    if parent_kind != FS_ROOT_V1_KIND && parent_kind != FS_BTREE_NODE_V1_KIND {
+    if parent_kind != FS_ROOT_V1_KIND
+        && parent_kind != FS_BTREE_NODE_V1_KIND
+        && parent_kind != FS_DATA_V1_KIND
+    {
         return Err(FsReferenceError::InvalidParentKind);
     }
     let mut references: Vec<TypedObjectReference> = if parent_kind == FS_ROOT_V1_KIND {
         let root = decode_fs_root_v1(bytes)?;
         alloc::vec![root.inode_tree, root.dirent_tree]
-    } else {
+    } else if parent_kind == FS_BTREE_NODE_V1_KIND {
         let node = decode_fs_btree_node_v1(bytes)?;
         node.entries
             .into_iter()
             .filter_map(|entry| entry.reference)
             .collect()
+    } else {
+        decode_fs_data_node_v1(bytes)?.ancestors
     };
     references.sort_unstable_by_key(|reference| reference.object_id);
     references.dedup();
@@ -127,9 +132,21 @@ mod tests {
             .references(),
             &[data]
         );
+        let data_node = crate::FsDataNodeV1 {
+            chunk_index: 1,
+            total_len: 2,
+            ancestors: vec![data],
+            bytes: vec![2],
+        };
         assert_eq!(
-            decode_fs_typed_references(FS_DATA_V1_KIND, &[], 10),
-            Err(FsReferenceError::InvalidParentKind)
+            decode_fs_typed_references(
+                FS_DATA_V1_KIND,
+                &crate::encode_fs_data_node_v1(&data_node).unwrap(),
+                10,
+            )
+            .unwrap()
+            .references(),
+            &[data]
         );
     }
 }

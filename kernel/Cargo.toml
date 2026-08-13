@@ -103,6 +103,8 @@ vibeos-driver-xhci = { path = "../drivers/xhci", optional = true }
 vibeos-hal = { path = "../hal" }
 vibeos-image-policy = { path = "../policy/image", default-features = false }
 vibeos-rustc = { path = "../compiler" }
+vibeos-segment-format = { path = "../segment-format" }
+vibeos-segment-store = { path = "../segment-store" }
 vibeos-storage-device = { path = "../storage-device" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }

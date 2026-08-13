@@ -789,13 +789,15 @@ exactly. Every QEMU boot must also publish the `.rodata`/4 MiB COW-pool marker.
 
 ### M7 — Scalable capability-addressed storage (post-v1)
 
-**Status (2026-08-12):** M7.0--M7.6 are complete: SHA compatibility,
-capability-scoped block contracts, canonical segment format, append-only
-storage, streaming CAS, and root-based crash-safe cleaning. M7.6 online growth,
-quotas, and scrub add capability-gated adjacent capacity, governed admission,
-and bounded anonymous media verification. M7.7 migration and default cutover is
-next. See [STORAGE_V2_MAINTENANCE.md](STORAGE_V2_MAINTENANCE.md) for the accepted
-maintenance, accounting, and scrub contract.
+**Status (2026-08-13): complete.** M7.0--M7.7 now cover SHA compatibility,
+capability-scoped block contracts, the canonical segment format, append-only
+storage, streaming CAS, root-based crash-safe cleaning, online maintenance and
+quotas, explicit M4 migration/rollback, and native Storage V2 initialization on
+blank managed media. The migration gate drives one raw image through seven
+cold boots and every selector state, while a separate two-boot case proves the
+native default without touching M4. See
+[STORAGE_V2_MAINTENANCE.md](STORAGE_V2_MAINTENANCE.md) for maintenance and
+accounting and [STORAGE_V2_MIGRATION.md](STORAGE_V2_MIGRATION.md) for cutover.
 
 M7 replaces the fixed 512-sector M4 journal backend with a managed-block-device
 Blob CAS backed by immutable segments, dual checkpoints, root-based garbage

@@ -1,5 +1,6 @@
 //! Append, checkpoint, and bounded recovery state machine.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,10 @@ use crate::allocation_v2::{
     decode_allocation_v2, AllocationV2, SegmentAllocation, ALLOCATION_V2_HEADER_LEN,
     MAX_ALLOCATION_V2_SEGMENTS, RETIRED_SEGMENT_ENTRY_LEN,
 };
+use crate::authority_snapshot::{
+    decode_persistent_authority_snapshot, PersistentAuthoritySnapshot,
+    PERSISTENT_AUTHORITY_HEADER_LEN,
+};
 use crate::cas_codec::{
     decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping, CasCodecContext,
     ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
@@ -35,7 +40,7 @@ use crate::codec::{
     CatalogEntry, CatalogPayload, CatalogPayloadKind, CodecError, CATALOG_ENTRY_LEN,
     CATALOG_SNAPSHOT_HEADER_LEN,
 };
-use crate::device::PageDevice;
+use crate::device::{PageDevice, PageDeviceInfo};
 use crate::maintenance::{
     MaintenanceDomain, MaintenanceOperation, MaintenanceOperationLease, StoreMaintenance,
     StoreMaintenanceProvisioner,
@@ -243,6 +248,98 @@ pub struct FormatOptions {
     pub limits: StoreLimits,
 }
 
+const INITIAL_FORMAT_WRITE_ORDER: [u64; 6] = [0, 2, 1, 3, 4, 5];
+
+struct InitialFormatPlan {
+    pages: Box<[Page; 6]>,
+}
+
+fn initial_format_plan<E>(
+    device_info: PageDeviceInfo,
+    options: FormatOptions,
+) -> Result<InitialFormatPlan, StoreError<E>> {
+    validate_limits(options.limits)?;
+    let segments = segments_for_page_count(device_info.page_count)?;
+    let initial_allocation_bytes = allocation_v2_bitmap_bytes(segments)?;
+    let ordinary_floor = u64::from(options.cleaner_reserve_segments)
+        .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))
+        .ok_or(StoreError::InvalidConfig)?;
+    if options.cleaner_reserve_segments < 2
+        || ordinary_floor >= segments
+        || options.limits.max_replay_records == 0
+        || segments > MAX_ALLOCATION_V2_SEGMENTS as u64
+        || initial_allocation_bytes > options.limits.recovery_memory_bytes
+    {
+        return Err(StoreError::InvalidConfig);
+    }
+
+    let base_binding = RecordBinding {
+        store_uuid: options.store_uuid,
+        generation: 1,
+        segment_no: ANCHOR_SEGMENT_NO,
+        ordinal: 0,
+        self_page: 0,
+        target_checkpoint_generation: 0,
+    };
+    let superblock_base = Superblock {
+        binding: base_binding,
+        copy: 0,
+        geometry: FormatGeometry::STORAGE_V2,
+        cleaner_reserve_segments: options.cleaner_reserve_segments,
+        initial_range_pages: device_info.page_count,
+        initial_segments: segments,
+        device_id: device_info.device_id,
+        range_first_logical_block: device_info.range_first_logical_block,
+        initial_block_count: device_info.logical_block_count,
+        logical_block_size: device_info.logical_block_size,
+        max_replay_records: options.limits.max_replay_records,
+    };
+    let mut superblocks = [superblock_base; 2];
+    superblocks[1].copy = 1;
+    superblocks[1].binding.ordinal = 1;
+    superblocks[1].binding.self_page = 2;
+
+    let mut pages = Box::new([[0; PAGE_SIZE]; 6]);
+    for (index, page) in [0usize, 2].into_iter().enumerate() {
+        let digest = encode_superblock_body(&superblocks[index], &mut pages[page])?;
+        encode_record_seal(digest, &mut pages[page + 1])?;
+    }
+    let checkpoint = Checkpoint {
+        binding: RecordBinding {
+            store_uuid: options.store_uuid,
+            generation: 1,
+            segment_no: ANCHOR_SEGMENT_NO,
+            ordinal: 0,
+            self_page: 4,
+            target_checkpoint_generation: 1,
+        },
+        slot: 0,
+        previous_generation: 0,
+        admitted_range_pages: device_info.page_count,
+        admitted_segments: segments,
+        next_segment_generation: 1,
+        replay_count: 0,
+        max_replay_records: options.limits.max_replay_records,
+        cleaner_reserve_segments: options.cleaner_reserve_segments,
+        catalog_root: PhysicalPointer::Null,
+        authority_root: PhysicalPointer::Null,
+        allocation_root: PhysicalPointer::Null,
+        replay_tail: PhysicalPointer::Null,
+    };
+    let digest = encode_checkpoint_body(&checkpoint, &mut pages[4])?;
+    encode_record_seal(digest, &mut pages[5])?;
+    Ok(InitialFormatPlan { pages })
+}
+
+fn is_canonical_block_write_prefix(observed: &Page, expected: &Page) -> bool {
+    const FORMAT_BLOCK_SIZE: usize = 512;
+    (0..=PAGE_SIZE / FORMAT_BLOCK_SIZE).any(|written| {
+        let boundary = written * FORMAT_BLOCK_SIZE;
+        observed[..boundary] == expected[..boundary]
+            && observed[boundary..].iter().all(|byte| *byte == 0)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectHandle {
     store_uuid: StoreUuid,
@@ -373,6 +470,7 @@ pub(crate) struct MountedState {
     pub(crate) allocation: AllocationV2,
     pub(crate) allocation_version: u16,
     pub(crate) persistent_roots: Option<PersistentRootSet>,
+    pub(crate) persistent_authority: Option<PersistentAuthoritySnapshot>,
     pub(crate) catalog: Vec<CatalogEntry>,
     pub(crate) cas: Option<CasMountedState>,
     pub(crate) recovery_peak_bytes: usize,
@@ -494,6 +592,7 @@ impl<D: PageDevice> SegmentStore<D> {
             state.superblock.binding.store_uuid,
             state.superblock.device_id,
             state.superblock.range_first_logical_block,
+            state.superblock.initial_block_count,
         ))
     }
 
@@ -505,6 +604,7 @@ impl<D: PageDevice> SegmentStore<D> {
             state.superblock.binding.store_uuid,
             state.superblock.device_id,
             state.superblock.range_first_logical_block,
+            state.superblock.initial_block_count,
         ))
     }
 
@@ -520,6 +620,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 state.superblock.binding.store_uuid,
                 state.superblock.device_id,
                 state.superblock.range_first_logical_block,
+                state.superblock.initial_block_count,
             )
         })
     }
@@ -541,33 +642,20 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         options: FormatOptions,
     ) -> Result<StoreInfo, StoreError<D::Error>> {
-        validate_limits(options.limits)?;
         if self.mounted.is_some() {
             return Err(StoreError::AlreadyFormatted);
         }
         let device_info = self.device.info();
-        let segments = segments_for_page_count(device_info.page_count)?;
-        let initial_allocation_bytes = allocation_v2_bitmap_bytes(segments)?;
-        let ordinary_floor = u64::from(options.cleaner_reserve_segments)
-            .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))
-            .ok_or(StoreError::InvalidConfig)?;
-        if options.cleaner_reserve_segments < 2
-            || ordinary_floor >= segments
-            || options.limits.max_replay_records == 0
-            || segments > MAX_ALLOCATION_V2_SEGMENTS as u64
-            || initial_allocation_bytes > options.limits.recovery_memory_bytes
-        {
-            return Err(StoreError::InvalidConfig);
-        }
+        let plan = initial_format_plan(device_info, options)?;
 
         // Formatting never guesses whether anchor bytes are disposable.  Data
         // segments are outside the format-identification boundary and may hold
         // bytes from an unrelated earlier use of an explicitly provisioned
         // range; the new superblock/checkpoint initially reference none of them.
-        let mut page = [0; PAGE_SIZE];
+        let mut page = Box::new([0; PAGE_SIZE]);
         for page_no in 0..ANCHOR_PAGES {
             self.device
-                .read_page(page_no, &mut page)
+                .read_page(page_no, page.as_mut())
                 .await
                 .map_err(StoreError::Device)?;
             if page.iter().any(|byte| *byte != 0) {
@@ -577,70 +665,116 @@ impl<D: PageDevice> SegmentStore<D> {
 
         self.limits = options.limits;
         self.poisoned = true;
-        let base_binding = RecordBinding {
-            store_uuid: options.store_uuid,
-            generation: 1,
-            segment_no: ANCHOR_SEGMENT_NO,
-            ordinal: 0,
-            self_page: 0,
-            target_checkpoint_generation: 0,
-        };
-        let superblock_base = Superblock {
-            binding: base_binding,
-            copy: 0,
-            geometry: FormatGeometry::STORAGE_V2,
-            cleaner_reserve_segments: options.cleaner_reserve_segments,
-            initial_range_pages: device_info.page_count,
-            initial_segments: segments,
-            device_id: device_info.device_id,
-            range_first_logical_block: device_info.range_first_logical_block,
-            initial_block_count: device_info.logical_block_count,
-            logical_block_size: device_info.logical_block_size,
-            max_replay_records: options.limits.max_replay_records,
-        };
-        let mut superblocks = [superblock_base; 2];
-        superblocks[1].copy = 1;
-        superblocks[1].binding.ordinal = 1;
-        superblocks[1].binding.self_page = 2;
-
-        let mut bodies = [[0; PAGE_SIZE]; 2];
-        let mut seals = [[0; PAGE_SIZE]; 2];
-        for index in 0..2 {
-            let digest = encode_superblock_body(&superblocks[index], &mut bodies[index])?;
-            encode_record_seal(digest, &mut seals[index])?;
-            write_page(&self.device, (index * 2) as u64, &bodies[index]).await?;
+        for page_no in INITIAL_FORMAT_WRITE_ORDER {
+            write_page(&self.device, page_no, &plan.pages[page_no as usize]).await?;
             flush(&self.device).await?;
         }
-        for (index, seal) in seals.iter().enumerate() {
-            write_page(&self.device, (index * 2 + 1) as u64, seal).await?;
-            flush(&self.device).await?;
-        }
-
-        let checkpoint = Checkpoint {
-            binding: RecordBinding {
-                store_uuid: options.store_uuid,
-                generation: 1,
-                segment_no: ANCHOR_SEGMENT_NO,
-                ordinal: 0,
-                self_page: 4,
-                target_checkpoint_generation: 1,
-            },
-            slot: 0,
-            previous_generation: 0,
-            admitted_range_pages: device_info.page_count,
-            admitted_segments: segments,
-            next_segment_generation: 1,
-            replay_count: 0,
-            max_replay_records: options.limits.max_replay_records,
-            cleaner_reserve_segments: options.cleaner_reserve_segments,
-            catalog_root: PhysicalPointer::Null,
-            authority_root: PhysicalPointer::Null,
-            allocation_root: PhysicalPointer::Null,
-            replay_tail: PhysicalPointer::Null,
-        };
-        write_checkpoint(&self.device, &checkpoint, false).await?;
         self.poisoned = false;
         self.mount().await
+    }
+
+    /// Resume only an exact crash prefix of this formatter's deterministic
+    /// initial anchor image. Arbitrary non-zero, foreign, or reordered anchor
+    /// bytes are corruption and are never erased or reformatted.
+    pub async fn format_or_resume_canonical(
+        &mut self,
+        options: FormatOptions,
+    ) -> Result<StoreInfo, StoreError<D::Error>> {
+        if self.mounted.is_some() {
+            return Err(StoreError::AlreadyFormatted);
+        }
+        let device_info = self.device.info();
+        if device_info.logical_block_size != 512 {
+            return Err(StoreError::InvalidConfig);
+        }
+        let plan = initial_format_plan(device_info, options)?;
+        let mut observed = Box::new([0; PAGE_SIZE]);
+        let mut first_incomplete = None;
+        for (index, page_no) in INITIAL_FORMAT_WRITE_ORDER.into_iter().enumerate() {
+            self.device
+                .read_page(page_no, observed.as_mut())
+                .await
+                .map_err(StoreError::Device)?;
+            let expected = &plan.pages[page_no as usize];
+            if first_incomplete.is_none() && observed.as_ref() == expected {
+                continue;
+            }
+            if first_incomplete.is_none() && is_canonical_block_write_prefix(&observed, expected) {
+                first_incomplete = Some(index);
+                continue;
+            }
+            if observed.iter().any(|byte| *byte != 0) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        for page_no in 6..ANCHOR_PAGES {
+            self.device
+                .read_page(page_no, observed.as_mut())
+                .await
+                .map_err(StoreError::Device)?;
+            if observed.iter().any(|byte| *byte != 0) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+
+        self.limits = options.limits;
+        let next = first_incomplete.unwrap_or(INITIAL_FORMAT_WRITE_ORDER.len());
+        if next == INITIAL_FORMAT_WRITE_ORDER.len() {
+            return self.mount().await;
+        }
+        self.poisoned = true;
+        // Continue at the first incomplete page. Rewriting an earlier complete
+        // page and then crashing part-way through it would leave later complete
+        // pages behind a torn predecessor, which is deliberately rejected as
+        // a reordered/foreign image on the following boot.
+        for page_no in INITIAL_FORMAT_WRITE_ORDER[next..].iter().copied() {
+            write_page(&self.device, page_no, &plan.pages[page_no as usize]).await?;
+            flush(&self.device).await?;
+        }
+        self.poisoned = false;
+        self.mount().await
+    }
+
+    /// Recognize the only formatted-but-authority-missing state admitted by
+    /// native provisioning. A merely mountable foreign or previously used V2
+    /// store is not an initializer residue.
+    pub fn is_canonical_initial_format(
+        &self,
+        options: FormatOptions,
+    ) -> Result<bool, StoreError<D::Error>> {
+        let state = self.require_current_generation()?;
+        Ok(state.superblock.binding.store_uuid == options.store_uuid
+            && state.superblock.cleaner_reserve_segments == options.cleaner_reserve_segments
+            && state.superblock.max_replay_records == options.limits.max_replay_records
+            && state.generation == 1
+            && state.replay_count == 0
+            && state.next_segment_generation == 1
+            && state.next_physical_segment == 0
+            && state.next_object_id == 1
+            && state.allocation_version == 1
+            && state.last_segment_target_checkpoint_generation == 1
+            && state.catalog_root == PhysicalPointer::Null
+            && state.replay_tail == PhysicalPointer::Null
+            && state.authority_root == PhysicalPointer::Null
+            && state.allocation_root == PhysicalPointer::Null
+            && state.persistent_roots.is_none()
+            && state.persistent_authority.is_none()
+            && state.catalog.is_empty()
+            && state.cas.is_none()
+            && state.last_segment.is_none()
+            && state.last_segment_previous.is_none()
+            && state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .allocated
+                == 0
+            && state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .retired
+                == 0)
     }
 
     pub async fn mount(&mut self) -> Result<StoreInfo, StoreError<D::Error>> {
@@ -926,6 +1060,9 @@ impl MountedState {
         if let Some(roots) = &self.persistent_roots {
             bytes = bytes.checked_add(roots.allocated_bytes()?)?;
         }
+        if let Some(authority) = &self.persistent_authority {
+            bytes = bytes.checked_add(authority.allocated_bytes()?)?;
+        }
         Some(bytes)
     }
 
@@ -1026,16 +1163,22 @@ fn root_resident_bytes(roots: Option<&PersistentRootSet>) -> Result<usize, ()> {
     roots.map_or(Ok(0), |roots| roots.allocated_bytes().ok_or(()))
 }
 
+fn authority_resident_bytes(authority: Option<&PersistentAuthoritySnapshot>) -> Result<usize, ()> {
+    authority.map_or(Ok(0), |value| value.allocated_bytes().ok_or(()))
+}
+
 fn recovery_resident_bytes(
     allocation: &AllocationV2,
     catalog: &Vec<CatalogEntry>,
     cas: Option<&CasMountedState>,
     roots: Option<&PersistentRootSet>,
+    authority: Option<&PersistentAuthoritySnapshot>,
 ) -> Result<usize, ()> {
     allocation_resident_bytes(allocation)?
         .checked_add(measured_catalog_bytes(catalog))
         .and_then(|bytes| cas_resident_bytes(cas).ok()?.checked_add(bytes))
         .and_then(|bytes| root_resident_bytes(roots).ok()?.checked_add(bytes))
+        .and_then(|bytes| authority_resident_bytes(authority).ok()?.checked_add(bytes))
         .ok_or(())
 }
 
@@ -1095,15 +1238,15 @@ async fn flush<D: PageDevice>(device: &D) -> Result<(), StoreError<D::Error>> {
 async fn read_pair<D: PageDevice>(
     device: &D,
     body_page: u64,
-) -> Result<(Page, Page), StoreError<D::Error>> {
-    let mut body = [0; PAGE_SIZE];
-    let mut seal = [0; PAGE_SIZE];
+) -> Result<(Box<Page>, Box<Page>), StoreError<D::Error>> {
+    let mut body = Box::new([0; PAGE_SIZE]);
+    let mut seal = Box::new([0; PAGE_SIZE]);
     device
-        .read_page(body_page, &mut body)
+        .read_page(body_page, body.as_mut())
         .await
         .map_err(StoreError::Device)?;
     device
-        .read_page(body_page + 1, &mut seal)
+        .read_page(body_page + 1, seal.as_mut())
         .await
         .map_err(StoreError::Device)?;
     Ok((body, seal))
@@ -1139,25 +1282,25 @@ pub(crate) async fn write_checkpoint<D: PageDevice>(
 ) -> Result<VerifiedRecord<Checkpoint>, StoreError<D::Error>> {
     let body_page = 4 + u64::from(checkpoint.slot) * 2;
     if clear_first {
-        let zero = [0; PAGE_SIZE];
+        let zero = Box::new([0; PAGE_SIZE]);
         // Remove the old publication marker before touching its body.  Clearing
         // the body first could leave a durable old seal authenticating zero or
         // torn bytes, which is correctly fatal to the strict decoder.
         write_page(device, body_page + 1, &zero).await?;
         flush(device).await?;
-        let mut observed_seal = [0; PAGE_SIZE];
+        let mut observed_seal = Box::new([0; PAGE_SIZE]);
         device
-            .read_page(body_page + 1, &mut observed_seal)
+            .read_page(body_page + 1, observed_seal.as_mut())
             .await
             .map_err(StoreError::Device)?;
         if observed_seal.iter().any(|byte| *byte != 0) {
             return Err(StoreError::Corrupt);
         }
     }
-    let mut body = [0; PAGE_SIZE];
-    let mut seal = [0; PAGE_SIZE];
-    let digest = encode_checkpoint_body(checkpoint, &mut body)?;
-    encode_record_seal(digest, &mut seal)?;
+    let mut body = Box::new([0; PAGE_SIZE]);
+    let mut seal = Box::new([0; PAGE_SIZE]);
+    let digest = encode_checkpoint_body(checkpoint, body.as_mut())?;
+    encode_record_seal(digest, seal.as_mut())?;
     write_page(device, body_page, &body).await?;
     flush(device).await?;
     write_page(device, body_page + 1, &seal).await?;
@@ -1400,11 +1543,11 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     let base = segment_base_page(pointer.segment_no)?;
     let mut copied = 0;
     for index in 0..pointer.payload_pages {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = Box::new([0; PAGE_SIZE]);
         device
             .read_page(
                 base + u64::from(pointer.payload_relative_page) + u64::from(index),
-                &mut page,
+                page.as_mut(),
             )
             .await
             .map_err(StoreError::Device)?;
@@ -1538,6 +1681,32 @@ fn persistent_roots_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize
     }
     entry_count
         .checked_mul(mem::size_of::<PersistentRootEntry>())
+        .ok_or(StoreError::MemoryLimit)
+}
+
+fn persistent_authority_decode_capacity_upper_bound<E>(
+    input: &[u8],
+) -> Result<usize, StoreError<E>> {
+    if input.len() < PERSISTENT_AUTHORITY_HEADER_LEN {
+        return Err(StoreError::Corrupt);
+    }
+    let object_count = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
+    let principal_count = input_u32(input, 0x3c).ok_or(StoreError::Corrupt)? as usize;
+    let record_count = input_u32(input, 0x40).ok_or(StoreError::Corrupt)? as usize;
+    object_count
+        .checked_mul(core::mem::size_of::<
+            crate::authority_snapshot::PersistentObjectBinding,
+        >())
+        .and_then(|bytes| {
+            principal_count
+                .checked_mul(core::mem::size_of::<crate::PersistentPrincipalPolicy>())?
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| {
+            record_count
+                .checked_mul(vibeos_durable_format::RECORD_SIZE)?
+                .checked_add(bytes)
+        })
         .ok_or(StoreError::MemoryLimit)
 }
 
@@ -1888,9 +2057,10 @@ pub(crate) async fn recover_state<D: PageDevice>(
     }
 
     let mut persistent_roots = None;
+    let mut persistent_authority = None;
     if checkpoint.authority_root != PhysicalPointer::Null {
         let resident_before_roots =
-            recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None)
+            recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None, None)
                 .map_err(|_| StoreError::MemoryLimit)?;
         let authority = read_recovery_pointer_payload(
             device,
@@ -1904,27 +2074,60 @@ pub(crate) async fn recover_state<D: PageDevice>(
             resident_before_roots,
         )
         .await?;
-        recovery_preflight_decode(
-            limits.recovery_memory_bytes,
-            resident_before_roots,
-            authority.bytes.capacity(),
-            persistent_roots_decode_capacity_upper_bound(&authority.bytes)?,
-        )?;
-        let decoded =
-            decode_persistent_root_set(&authority.bytes).map_err(|_| StoreError::Corrupt)?;
-        if decoded.checkpoint_generation > checkpoint.binding.generation
-            || decoded.checkpoint_generation
+        // A freshly formatted V2 store has a null catalog root. Installing an
+        // explicit empty authority snapshot is still valid: there are no
+        // bindings which would require CAS resolution yet.
+        let cas_objects: &[ObjectMapping] =
+            cas.as_ref().map_or(&[], |state| state.objects.as_slice());
+        let (decoded_roots, decoded_authority) = if authority.bytes.starts_with(b"VIBEAUT2") {
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                resident_before_roots,
+                authority.bytes.capacity(),
+                persistent_authority_decode_capacity_upper_bound(&authority.bytes)?,
+            )?;
+            let decoded = decode_persistent_authority_snapshot(&authority.bytes)
+                .map_err(|_| StoreError::Corrupt)?;
+            if decoded.checkpoint_generation()
                 != authority.extent.binding.target_checkpoint_generation
-        {
-            return Err(StoreError::Corrupt);
-        }
-        let cas_state = cas.as_ref().ok_or(StoreError::Corrupt)?;
-        for root in decoded.entries() {
-            let object = cas_state
+            {
+                return Err(StoreError::Corrupt);
+            }
+            let mut entries: Vec<PersistentRootEntry> = decoded
                 .objects
+                .iter()
+                .map(|binding| PersistentRootEntry {
+                    object_id: binding.v2_object_id,
+                    commit_generation: binding.commit_generation,
+                    object_kind: binding.object_kind,
+                })
+                .collect();
+            entries.sort_unstable_by_key(|entry| entry.object_id);
+            let roots = PersistentRootSet::new(decoded.checkpoint_generation(), entries)
+                .map_err(|_| StoreError::Corrupt)?;
+            (roots, Some(decoded))
+        } else {
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                resident_before_roots,
+                authority.bytes.capacity(),
+                persistent_roots_decode_capacity_upper_bound(&authority.bytes)?,
+            )?;
+            let decoded =
+                decode_persistent_root_set(&authority.bytes).map_err(|_| StoreError::Corrupt)?;
+            if decoded.checkpoint_generation > checkpoint.binding.generation
+                || decoded.checkpoint_generation
+                    != authority.extent.binding.target_checkpoint_generation
+            {
+                return Err(StoreError::Corrupt);
+            }
+            (decoded, None)
+        };
+        for root in decoded_roots.entries() {
+            let object = cas_objects
                 .binary_search_by_key(&root.object_id, |object| object.object_id)
                 .ok()
-                .map(|index| cas_state.objects[index])
+                .map(|index| cas_objects[index])
                 .ok_or(StoreError::Corrupt)?;
             if object.commit_generation != root.commit_generation
                 || object.blob_key.object_kind() != root.object_kind
@@ -1937,10 +2140,18 @@ pub(crate) async fn recover_state<D: PageDevice>(
             limits.recovery_memory_bytes,
             resident_before_roots
                 .checked_add(authority.bytes.capacity())
-                .and_then(|bytes| bytes.checked_add(decoded.allocated_bytes()?))
+                .and_then(|bytes| bytes.checked_add(decoded_roots.allocated_bytes()?))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        decoded_authority
+                            .as_ref()
+                            .map_or(0, |value| value.allocated_bytes().unwrap_or(usize::MAX)),
+                    )
+                })
                 .ok_or(StoreError::MemoryLimit)?,
         )?;
-        persistent_roots = Some(decoded);
+        persistent_roots = Some(decoded_roots);
+        persistent_authority = decoded_authority;
     }
 
     let mut reverse_deltas = Vec::new();
@@ -1953,6 +2164,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         &catalog,
         cas.as_ref(),
         persistent_roots.as_ref(),
+        persistent_authority.as_ref(),
     )
     .map_err(|_| StoreError::MemoryLimit)?;
     let replay_allocation_peak = resident_bytes
@@ -2088,6 +2300,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
             &catalog,
             cas.as_ref(),
             persistent_roots.as_ref(),
+            persistent_authority.as_ref(),
         )
         .map_err(|_| StoreError::MemoryLimit)?,
     );
@@ -2168,6 +2381,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         allocation,
         allocation_version,
         persistent_roots,
+        persistent_authority,
         catalog,
         cas,
         recovery_peak_bytes: recovery_peak,

@@ -404,6 +404,16 @@ fn assert_unformatted_or_exact_empty(device: FaultDevice, limits: StoreLimits, c
     }
 }
 
+fn assert_format_prefix_resumes(device: FaultDevice, limits: StoreLimits, case: &str) {
+    device.power_cycle();
+    let mut recovered = SegmentStore::new(device, limits);
+    let info = block_on(recovered.format_or_resume_canonical(options(limits, 2)))
+        .unwrap_or_else(|error| panic!("{case}: exact format prefix did not resume: {error:?}"));
+    assert_eq!(info.generation, 1, "{case}: wrong resumed generation");
+    assert_eq!(info.object_count, 0, "{case}: resume published objects");
+    assert_eq!(info.replay_count, 0, "{case}: resume published replay");
+}
+
 #[test]
 fn every_format_write_and_flush_boundary_is_atomic_under_fault_or_cancel() {
     let limits = limits();
@@ -428,7 +438,8 @@ fn every_format_write_and_flush_boundary_is_atomic_under_fault_or_cancel() {
             assert!(block_on(store.format(options(limits, 2))).is_err());
             assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
             let case = format!("format mutation {boundary}, action {action:?}");
-            assert_unformatted_or_exact_empty(device, limits, &case);
+            assert_unformatted_or_exact_empty(device.clone(), limits, &case);
+            assert_format_prefix_resumes(device, limits, &case);
         }
         for effect in [Effect::None, Effect::Visible, Effect::Durable] {
             let device = FaultDevice::blank(6);
@@ -439,9 +450,88 @@ fn every_format_write_and_flush_boundary_is_atomic_under_fault_or_cancel() {
             drop(format);
             assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
             let case = format!("format mutation {boundary}, pending effect {effect:?}");
-            assert_unformatted_or_exact_empty(device, limits, &case);
+            assert_unformatted_or_exact_empty(device.clone(), limits, &case);
+            assert_format_prefix_resumes(device, limits, &case);
         }
     }
+}
+
+#[test]
+fn format_resume_accepts_only_the_canonical_block_prefix() {
+    let limits = limits();
+    let complete_device = FaultDevice::blank(6);
+    drop(format(complete_device.clone(), limits, 2));
+    let complete = complete_device.durable_image();
+
+    let order = [0_u64, 2, 1, 3, 4, 5];
+    for current in 0..order.len() {
+        for written_blocks in 0..=8 {
+            let mut prefix = BTreeMap::new();
+            for page in &order[..current] {
+                prefix.insert(*page, complete[page]);
+            }
+            if written_blocks != 0 {
+                let mut torn = [0; 4096];
+                let written = written_blocks * 512;
+                torn[..written].copy_from_slice(&complete[&order[current]][..written]);
+                prefix.insert(order[current], torn);
+            }
+            let resumable = FaultDevice::from_durable(complete_device.page_count(), prefix);
+            assert_format_prefix_resumes(
+                resumable,
+                limits,
+                &format!("page {current}, block prefix {written_blocks}"),
+            );
+        }
+    }
+
+    let mut corrupt_page = complete[&0];
+    corrupt_page[7] ^= 1;
+    let corrupt = FaultDevice::from_durable(
+        complete_device.page_count(),
+        BTreeMap::from([(0, corrupt_page)]),
+    );
+    let mut store = SegmentStore::new(corrupt.clone(), limits);
+    assert_eq!(
+        block_on(store.format_or_resume_canonical(options(limits, 2))),
+        Err(StoreError::Corrupt)
+    );
+    assert_eq!(corrupt.mutation_count(), 0);
+
+    let mut non_block_prefix = [0; 4096];
+    non_block_prefix[..7].copy_from_slice(&complete[&0][..7]);
+    let non_block = FaultDevice::from_durable(
+        complete_device.page_count(),
+        BTreeMap::from([(0, non_block_prefix)]),
+    );
+    let mut store = SegmentStore::new(non_block.clone(), limits);
+    assert_eq!(
+        block_on(store.format_or_resume_canonical(options(limits, 2))),
+        Err(StoreError::Corrupt)
+    );
+    assert_eq!(non_block.mutation_count(), 0);
+
+    let out_of_order = FaultDevice::from_durable(
+        complete_device.page_count(),
+        BTreeMap::from([(2, complete[&2])]),
+    );
+    let mut store = SegmentStore::new(out_of_order.clone(), limits);
+    assert_eq!(
+        block_on(store.format_or_resume_canonical(options(limits, 2))),
+        Err(StoreError::Corrupt)
+    );
+    assert_eq!(out_of_order.mutation_count(), 0);
+
+    let reserved = FaultDevice::from_durable(
+        complete_device.page_count(),
+        BTreeMap::from([(6, [1; 4096])]),
+    );
+    let mut store = SegmentStore::new(reserved.clone(), limits);
+    assert_eq!(
+        block_on(store.format_or_resume_canonical(options(limits, 2))),
+        Err(StoreError::Corrupt)
+    );
+    assert_eq!(reserved.mutation_count(), 0);
 }
 
 #[test]

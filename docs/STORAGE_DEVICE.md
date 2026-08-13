@@ -51,15 +51,21 @@ the supervised driver component. The client layout is:
 | Holder | Managed logical range | Rights | Can delegate or revoke? |
 |---|---:|---|---|
 | `init` diagnostics | `[0, 64)` | `READ | WRITE` | No |
-| Store backend | `[64, 576)` | `READ | WRITE` | No |
+| M4 rollback source | `[64, 576)` | `READ` after V2 activation | No |
+| Migration control | `[576, 608)` | maintenance only | No |
+| Reserved gap | `[608, 2048)` | none | N/A |
+| Storage V2 | `[2048, 67712)` initially | `READ | WRITE` | No |
 | `block-policy` | complete admitted image range | policy root | Yes, only through checked attenuation |
 
-The two client ranges are disjoint. Blocks `[576, capacity)` are not granted to
-either client. On QEMU the admitted image range is `[0, 2048)`. On Milk-V the
-managed range is `[0, 8192)` and the SDHCI backend alone translates it to
-physical microSD sectors `[262145, 270337)`. Consequently neither `init` nor the
-Store can name a boot-partition sector; the physical partition offset never
-enters their CSpaces.
+All granted ranges are pairwise disjoint. The V2 suffix `[67712, 131072)` is
+not initially admitted to the Store, and the current firmware does not retain
+a suffix capability or expose an online-grow operation. The suffix is reserved
+for future wiring; admitting adjacent capacity will require a separately
+authorized operation. On QEMU the managed image range is `[0, 131072)`. On
+Milk-V the managed range is `[0, 131072)` and the SDHCI backend alone translates
+it to physical microSD sectors `[262145, 393217)`. Consequently neither `init`
+nor the Store can name a boot-partition sector; the physical partition offset
+never enters their CSpaces.
 
 ## Geometry and request validation
 

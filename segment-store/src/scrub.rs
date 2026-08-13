@@ -5,6 +5,7 @@
 //! API.  Every path below is read-only: corruption is diagnosed and left for
 //! an explicit recovery or migration operation.
 
+use alloc::boxed::Box;
 use core::fmt;
 
 use sha2::{Digest, Sha256};
@@ -226,42 +227,47 @@ impl<D: PageDevice> SegmentStore<D> {
             return Err(ScrubError::MemoryLimit);
         }
 
-        if let Err(error) = verify_segment_set(&self.device, current, Some(&mut report)).await {
+        if let Err(error) =
+            Box::pin(verify_segment_set(&self.device, current, Some(&mut report))).await
+        {
             return finish_step_error(report, ScrubCorruptionDomain::SegmentMetadata, error);
         }
         if current.authority_root != PhysicalPointer::Null {
-            if let Err(error) =
-                verify_pointer_payload_and_padding(&self.device, current, current.authority_root)
-                    .await
+            if let Err(error) = Box::pin(verify_pointer_payload_and_padding(
+                &self.device,
+                current,
+                current.authority_root,
+            ))
+            .await
             {
                 return finish_step_error(report, ScrubCorruptionDomain::AuthorityGraph, error);
             }
         }
-        if let Err(error) = verify_state_contents(
+        if let Err(error) = Box::pin(verify_state_contents(
             &self.device,
             current,
             self.limits.recovery_memory_bytes,
             0,
             Some(&mut report),
-        )
+        ))
         .await
         {
             return finish_step_error(report, ScrubCorruptionDomain::BlobDataOrTree, error);
         }
-        if let Err(error) = verify_durable_authority_closure(
+        if let Err(error) = Box::pin(verify_durable_authority_closure(
             &self.device,
             current,
             self.limits,
             &self.typed_reference_kinds,
             0,
             Some(&mut report),
-        )
+        ))
         .await
         {
             return finish_step_error(report, ScrubCorruptionDomain::AuthorityGraph, error);
         }
 
-        let left_super = match read_superblock(&self.device, 0).await {
+        let left_super = match Box::pin(read_superblock(&self.device, 0)).await {
             Ok(value) => value,
             Err(error) => {
                 return finish_step_error(
@@ -271,7 +277,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 )
             }
         };
-        let right_super = match read_superblock(&self.device, 2).await {
+        let right_super = match Box::pin(read_superblock(&self.device, 2)).await {
             Ok(value) => value,
             Err(error) => {
                 return finish_step_error(
@@ -291,7 +297,7 @@ impl<D: PageDevice> SegmentStore<D> {
             Ok(Some(value)) if value.value() == &current.superblock => value,
             Ok(_) | Err(_) => return Ok(report.corrupt(ScrubCorruptionDomain::Anchor)),
         };
-        let left = match read_checkpoint(&self.device, 4).await {
+        let left = match Box::pin(read_checkpoint(&self.device, 4)).await {
             Ok(value) => value,
             Err(error) => {
                 return finish_step_error(
@@ -302,7 +308,7 @@ impl<D: PageDevice> SegmentStore<D> {
             }
         };
         report.verified_checkpoint_copies = u8::from(left.is_some());
-        let right = match read_checkpoint(&self.device, 6).await {
+        let right = match Box::pin(read_checkpoint(&self.device, 6)).await {
             Ok(value) => value,
             Err(error) => {
                 return finish_step_error(
@@ -324,8 +330,12 @@ impl<D: PageDevice> SegmentStore<D> {
             Ok(Some(value)) if value.value().binding.generation == current.generation => value,
             Ok(_) | Err(_) => return Ok(report.corrupt(ScrubCorruptionDomain::Anchor)),
         };
-        if let Err(error) =
-            verify_checkpoint_payloads(&self.device, current, selected.value()).await
+        if let Err(error) = Box::pin(verify_checkpoint_payloads(
+            &self.device,
+            current,
+            selected.value(),
+        ))
+        .await
         {
             return finish_step_error(report, ScrubCorruptionDomain::AllocationOrMapping, error);
         }
@@ -350,26 +360,34 @@ impl<D: PageDevice> SegmentStore<D> {
                     } else {
                         (right, left)
                     };
-                let older_state =
-                    match recover_state(&self.device, current.superblock, older, candidate_limits)
-                        .await
-                    {
-                        Ok(state) => state,
-                        Err(error) => {
-                            return finish_step_error(
-                                report,
-                                ScrubCorruptionDomain::AllocationOrMapping,
-                                StepError::from_store(error),
-                            )
-                        }
-                    };
+                let older_state = match Box::pin(recover_state(
+                    &self.device,
+                    current.superblock,
+                    older,
+                    candidate_limits,
+                ))
+                .await
+                {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return finish_step_error(
+                            report,
+                            ScrubCorruptionDomain::AllocationOrMapping,
+                            StepError::from_store(error),
+                        )
+                    }
+                };
                 report.observe_memory(
                     current_resident
                         .checked_add(older_state.recovery_peak_bytes)
                         .ok_or(ScrubError::MemoryLimit)?,
                 );
-                if let Err(error) =
-                    verify_checkpoint_payloads(&self.device, &older_state, older.value()).await
+                if let Err(error) = Box::pin(verify_checkpoint_payloads(
+                    &self.device,
+                    &older_state,
+                    older.value(),
+                ))
+                .await
                 {
                     return finish_step_error(
                         report,
@@ -377,32 +395,34 @@ impl<D: PageDevice> SegmentStore<D> {
                         error,
                     );
                 }
-                if let Err(error) = verify_segment_set(&self.device, &older_state, None).await {
+                if let Err(error) =
+                    Box::pin(verify_segment_set(&self.device, &older_state, None)).await
+                {
                     return finish_step_error(
                         report,
                         ScrubCorruptionDomain::SegmentMetadata,
                         error,
                     );
                 }
-                if let Err(error) = verify_state_contents(
+                if let Err(error) = Box::pin(verify_state_contents(
                     &self.device,
                     &older_state,
                     self.limits.recovery_memory_bytes,
                     current_resident,
                     None,
-                )
+                ))
                 .await
                 {
                     return finish_step_error(report, ScrubCorruptionDomain::BlobDataOrTree, error);
                 }
-                if let Err(error) = verify_durable_authority_closure(
+                if let Err(error) = Box::pin(verify_durable_authority_closure(
                     &self.device,
                     &older_state,
                     self.limits,
                     &self.typed_reference_kinds,
                     current_resident,
                     Some(&mut report),
-                )
+                ))
                 .await
                 {
                     return finish_step_error(report, ScrubCorruptionDomain::AuthorityGraph, error);
@@ -412,7 +432,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 let newer_budget = candidate_budget
                     .checked_sub(witness_bytes)
                     .ok_or(ScrubError::MemoryLimit)?;
-                let newer_state = match recover_state(
+                let newer_state = match Box::pin(recover_state(
                     &self.device,
                     current.superblock,
                     newer,
@@ -420,7 +440,7 @@ impl<D: PageDevice> SegmentStore<D> {
                         recovery_memory_bytes: newer_budget,
                         ..self.limits
                     },
-                )
+                ))
                 .await
                 {
                     Ok(state) => state,
@@ -446,13 +466,13 @@ impl<D: PageDevice> SegmentStore<D> {
                 {
                     return Ok(report.corrupt(ScrubCorruptionDomain::AllocationOrMapping));
                 }
-                if let Err(error) = verify_state_contents(
+                if let Err(error) = Box::pin(verify_state_contents(
                     &self.device,
                     &newer_state,
                     self.limits.recovery_memory_bytes,
                     current_resident.saturating_add(witness_bytes),
                     None,
-                )
+                ))
                 .await
                 {
                     return finish_step_error(report, ScrubCorruptionDomain::BlobDataOrTree, error);
@@ -460,12 +480,12 @@ impl<D: PageDevice> SegmentStore<D> {
                 report.checkpoint_fallback_verified = true;
             }
             (Some(candidate), None) | (None, Some(candidate)) => {
-                let recovered = match recover_state(
+                let recovered = match Box::pin(recover_state(
                     &self.device,
                     current.superblock,
                     candidate,
                     candidate_limits,
-                )
+                ))
                 .await
                 {
                     Ok(state) => state,
@@ -737,14 +757,14 @@ async fn verify_segment_set<D: PageDevice>(
             continue;
         }
         let base = segment_base_page(segment_no).map_err(|_| StepError::Corrupt)?;
-        let mut body = [0; PAGE_SIZE];
-        let mut seal = [0; PAGE_SIZE];
+        let mut body = Box::new([0; PAGE_SIZE]);
+        let mut seal = Box::new([0; PAGE_SIZE]);
         device
-            .read_page(base, &mut body)
+            .read_page(base, body.as_mut())
             .await
             .map_err(StepError::Device)?;
         device
-            .read_page(base + 1, &mut seal)
+            .read_page(base + 1, seal.as_mut())
             .await
             .map_err(StepError::Device)?;
         let header =
@@ -990,16 +1010,16 @@ async fn verify_segment_payloads_and_padding<D: PageDevice>(
         let descriptor_page = base
             .checked_add(u64::from(relative))
             .ok_or(StepError::Corrupt)?;
-        let mut body = [0; PAGE_SIZE];
-        let mut seal = [0; PAGE_SIZE];
+        let mut body = Box::new([0; PAGE_SIZE]);
+        let mut seal = Box::new([0; PAGE_SIZE]);
         device
-            .read_page(descriptor_page, &mut body)
+            .read_page(descriptor_page, body.as_mut())
             .await
             .map_err(StepError::Device)?;
         device
             .read_page(
                 descriptor_page.checked_add(1).ok_or(StepError::Corrupt)?,
-                &mut seal,
+                seal.as_mut(),
             )
             .await
             .map_err(StepError::Device)?;
@@ -1057,13 +1077,13 @@ async fn verify_exact_payload_and_padding<D: PageDevice>(
     let mut remaining = exact_byte_len;
     let mut hasher = Sha256::new();
     for page_index in 0..u64::from(payload_pages) {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = Box::new([0; PAGE_SIZE]);
         device
             .read_page(
                 first_page
                     .checked_add(page_index)
                     .ok_or(StepError::Corrupt)?,
-                &mut page,
+                page.as_mut(),
             )
             .await
             .map_err(StepError::Device)?;

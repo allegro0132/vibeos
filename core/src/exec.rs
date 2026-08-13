@@ -801,6 +801,7 @@ struct Task {
     ready: bool,
     stealable: bool,
     publication: TaskPublication,
+    reclaimable_domain: Option<ReclaimableDomainKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -824,7 +825,13 @@ pub type FaultGuard = fn(&mut dyn FnMut()) -> bool;
 
 /// Reclaim all raw allocations in one audited fault arena without running
 /// their Rust destructors. The kernel installs this alongside its heap.
-pub type FaultReclaimer = unsafe fn(AllocationDomain);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultReclaimOutcome {
+    Reclaimed,
+    Quarantined,
+}
+
+pub type FaultReclaimer = unsafe fn(TaskId, AllocationDomain) -> FaultReclaimOutcome;
 
 /// Repair task-stable state abandoned by one exact faulted task. The executor
 /// invokes this only after that task is detached forever and before publishing
@@ -857,6 +864,8 @@ static FAULT_GUARD: AtomicUsize = AtomicUsize::new(0);
 static FAULT_RECLAIMER: AtomicUsize = AtomicUsize::new(0);
 static FAULT_CLEANUP: AtomicUsize = AtomicUsize::new(0);
 static READY_NOTIFY_HOOK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(target_arch = "riscv64"))]
+static RECLAIMABLE_TEARDOWN_TEST_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 fn load_fault_guard() -> Option<FaultGuard> {
     let address = FAULT_GUARD.load(Ordering::Acquire);
@@ -915,6 +924,32 @@ pub fn clear_ready_notify_hook() {
     READY_NOTIFY_HOOK.store(0, Ordering::Release);
 }
 
+/// Host-only deterministic interleaving hook after a tracked domain and all
+/// siblings have committed Faulted, but before sibling detachment begins.
+#[cfg(not(target_arch = "riscv64"))]
+pub fn set_reclaimable_teardown_test_hook(hook: fn(AllocationDomain)) {
+    RECLAIMABLE_TEARDOWN_TEST_HOOK.store(hook as usize, Ordering::Release);
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn clear_reclaimable_teardown_test_hook() {
+    RECLAIMABLE_TEARDOWN_TEST_HOOK.store(0, Ordering::Release);
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn run_reclaimable_teardown_test_hook(domain: AllocationDomain) {
+    let address = RECLAIMABLE_TEARDOWN_TEST_HOOK.swap(0, Ordering::AcqRel);
+    if address != 0 {
+        // SAFETY: the host-only slot is populated exclusively by the typed
+        // setter above and consumed once while SCHED is not held.
+        let hook = unsafe { core::mem::transmute::<usize, fn(AllocationDomain)>(address) };
+        hook(domain);
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn run_reclaimable_teardown_test_hook(_domain: AllocationDomain) {}
+
 fn notify_ready_hart(hart: HartId) {
     if let Some(hook) = load_ready_notify_hook() {
         hook(hart);
@@ -929,9 +964,260 @@ fn notify_fault_cleanup(task: TaskId, domain: AllocationDomain) {
     }
 }
 
+/// Scheduler-visible phase of one raw-reclaimable allocation domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimableDomainPhase {
+    Active,
+    TearingDown,
+    TerminalReady,
+    Quarantined,
+}
+
+/// Allocation-free diagnostic snapshot of one tracked-domain scheduler gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimableDomainSnapshot {
+    pub home_hart: HartId,
+    pub live_tasks: usize,
+    pub exclusive: bool,
+    pub phase: ReclaimableDomainPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimableDomainMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimableDomainError {
+    TableFull,
+    Missing,
+    WrongHome,
+    NotActive,
+    Exclusive,
+    LiveTaskOverflow,
+    LiveTaskMismatch,
+    RemoteRunning,
+    DomainMismatch,
+    GenerationExhausted,
+    KeyMismatch,
+    TaskMismatch,
+    StatusMismatch,
+    LifecycleMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReclaimableDomainKey {
+    slot: u8,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ReclaimableDomainRecord {
+    key: ReclaimableDomainKey,
+    domain: AllocationDomain,
+    home_hart: HartId,
+    live_tasks: usize,
+    exclusive: bool,
+    exclusive_task: Option<TaskId>,
+    exclusive_status: Option<usize>,
+    phase: ReclaimableDomainPhase,
+}
+
+impl ReclaimableDomainRecord {
+    const fn snapshot(self) -> ReclaimableDomainSnapshot {
+        ReclaimableDomainSnapshot {
+            home_hart: self.home_hart,
+            live_tasks: self.live_tasks,
+            exclusive: self.exclusive,
+            phase: self.phase,
+        }
+    }
+}
+
+/// Fixed SYSTEM-owned scheduler metadata for every active allocator arena.
+/// The table never allocates while SCHED is held or during fault teardown.
+struct ReclaimableDomains {
+    records: [Option<ReclaimableDomainRecord>; heap::MAX_ALLOCATION_ARENAS],
+    generations: [u64; heap::MAX_ALLOCATION_ARENAS],
+}
+
+impl ReclaimableDomains {
+    const fn new() -> Self {
+        Self {
+            records: [None; heap::MAX_ALLOCATION_ARENAS],
+            generations: [0; heap::MAX_ALLOCATION_ARENAS],
+        }
+    }
+
+    fn index_of_arena(&self, arena: ArenaId) -> Option<usize> {
+        self.records.iter().position(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.domain.arena == arena)
+        })
+    }
+
+    fn record(&self, domain: AllocationDomain) -> Option<ReclaimableDomainRecord> {
+        self.index_of_arena(domain.arena)
+            .and_then(|index| self.records[index])
+            .filter(|record| record.domain == domain)
+    }
+
+    fn record_exact(
+        &self,
+        key: ReclaimableDomainKey,
+        domain: AllocationDomain,
+    ) -> Result<ReclaimableDomainRecord, ReclaimableDomainError> {
+        let record = self
+            .records
+            .get(key.slot as usize)
+            .and_then(|record| *record)
+            .ok_or(ReclaimableDomainError::Missing)?;
+        if record.key != key {
+            return Err(ReclaimableDomainError::KeyMismatch);
+        }
+        if record.domain != domain {
+            return Err(ReclaimableDomainError::DomainMismatch);
+        }
+        Ok(record)
+    }
+
+    fn validate_active_task(
+        &self,
+        key: ReclaimableDomainKey,
+        domain: AllocationDomain,
+        home_hart: HartId,
+        task: TaskId,
+        status: &Arc<TaskStatus>,
+    ) -> Result<ReclaimableDomainRecord, ReclaimableDomainError> {
+        let record = self.record_exact(key, domain)?;
+        if record.phase != ReclaimableDomainPhase::Active {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        if record.home_hart != home_hart {
+            return Err(ReclaimableDomainError::WrongHome);
+        }
+        if record.exclusive {
+            if record.live_tasks != 1 || record.exclusive_task != Some(task) {
+                return Err(ReclaimableDomainError::TaskMismatch);
+            }
+            if record.exclusive_status != Some(Arc::as_ptr(status) as usize) {
+                return Err(ReclaimableDomainError::StatusMismatch);
+            }
+        }
+        Ok(record)
+    }
+
+    fn preflight(
+        &self,
+        domain: AllocationDomain,
+        home_hart: HartId,
+        mode: ReclaimableDomainMode,
+    ) -> Result<(), ReclaimableDomainError> {
+        debug_assert!(domain.arena.is_tracked());
+        if let Some(index) = self.index_of_arena(domain.arena) {
+            let record = self.records[index].expect("tracked-domain index remains occupied");
+            if record.domain != domain {
+                return Err(ReclaimableDomainError::DomainMismatch);
+            }
+            if record.phase != ReclaimableDomainPhase::Active {
+                return Err(ReclaimableDomainError::NotActive);
+            }
+            if record.home_hart != home_hart {
+                return Err(ReclaimableDomainError::WrongHome);
+            }
+            if record.exclusive || mode == ReclaimableDomainMode::Exclusive {
+                return Err(ReclaimableDomainError::Exclusive);
+            }
+            record
+                .live_tasks
+                .checked_add(1)
+                .ok_or(ReclaimableDomainError::LiveTaskOverflow)?;
+            return Ok(());
+        }
+        if !self
+            .records
+            .iter()
+            .enumerate()
+            .any(|(index, record)| record.is_none() && self.generations[index] != u64::MAX)
+        {
+            return Err(ReclaimableDomainError::TableFull);
+        }
+        Ok(())
+    }
+
+    fn admit(
+        &mut self,
+        domain: AllocationDomain,
+        home_hart: HartId,
+        mode: ReclaimableDomainMode,
+        task: TaskId,
+        status: &Arc<TaskStatus>,
+    ) -> Result<ReclaimableDomainKey, ReclaimableDomainError> {
+        self.preflight(domain, home_hart, mode)?;
+        if let Some(index) = self.index_of_arena(domain.arena) {
+            let record = self.records[index]
+                .as_mut()
+                .expect("tracked-domain index remains occupied");
+            record.live_tasks += 1;
+            return Ok(record.key);
+        }
+        let index = self
+            .records
+            .iter()
+            .enumerate()
+            .find_map(|(index, record)| {
+                (record.is_none() && self.generations[index] != u64::MAX).then_some(index)
+            })
+            .ok_or(ReclaimableDomainError::TableFull)?;
+        let generation = self.generations[index]
+            .checked_add(1)
+            .ok_or(ReclaimableDomainError::GenerationExhausted)?;
+        self.generations[index] = generation;
+        let key = ReclaimableDomainKey {
+            slot: u8::try_from(index).expect("reclaimable-domain table exceeds u8"),
+            generation,
+        };
+        self.records[index] = Some(ReclaimableDomainRecord {
+            key,
+            domain,
+            home_hart,
+            live_tasks: 1,
+            exclusive: mode == ReclaimableDomainMode::Exclusive,
+            exclusive_task: (mode == ReclaimableDomainMode::Exclusive).then_some(task),
+            exclusive_status: (mode == ReclaimableDomainMode::Exclusive)
+                .then_some(Arc::as_ptr(status) as usize),
+            phase: ReclaimableDomainPhase::Active,
+        });
+        Ok(key)
+    }
+
+    fn retire_terminal(
+        &mut self,
+        key: ReclaimableDomainKey,
+        domain: AllocationDomain,
+    ) -> Result<(), ReclaimableDomainError> {
+        let record = self.record_exact(key, domain)?;
+        if record.phase != ReclaimableDomainPhase::TerminalReady {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        self.records[key.slot as usize] = None;
+        Ok(())
+    }
+
+    fn active_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.is_some())
+            .count()
+    }
+}
+
 struct Sched {
     tasks: BTreeMap<TaskId, Task>,
     ready: RunQueues<TaskId>,
+    reclaimable_domains: ReclaimableDomains,
     /// Each hart owns one independently polled task. A task is lifted out of
     /// `tasks` while its future is executing, so lifecycle and wake paths must
     /// inspect all hart slots before treating an id as inactive.
@@ -963,11 +1249,24 @@ struct RunningTask {
     domain: AllocationDomain,
     name: Arc<str>,
     status: Arc<TaskStatus>,
+    reclaimable_domain: Option<ReclaimableDomainKey>,
+}
+
+#[derive(Clone, Copy)]
+struct ReclaimableTeardownPermit {
+    key: ReclaimableDomainKey,
+    domain: AllocationDomain,
+    home_hart: HartId,
+    live_tasks: usize,
+    exclusive: bool,
+    primary_task: TaskId,
+    primary_status: usize,
 }
 
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     tasks: BTreeMap::new(),
     ready: RunQueues::new(),
+    reclaimable_domains: ReclaimableDomains::new(),
     harts: [const { HartRunState::new() }; MAX_HARTS],
     completed: 0,
     faulted: 0,
@@ -1009,6 +1308,211 @@ impl Sched {
         let index = hart.index();
         debug_assert!(self.harts[index].running.is_some());
         self.harts[index].running = None;
+    }
+
+    /// Close dispatch and spawn admission for one exact tracked domain.
+    ///
+    /// The primary task is either the exact running slot named by
+    /// `running_status`, or has already been detached by guarded Drop. It
+    /// remains counted in `live_tasks`. All tuple checks happen before the
+    /// phase/running-slot mutation. Once TearingDown is published under SCHED,
+    /// no same-domain task may become runnable or be newly admitted.
+    fn begin_reclaimable_teardown(
+        &mut self,
+        domain: AllocationDomain,
+        key: ReclaimableDomainKey,
+        home_hart: HartId,
+        primary_task: TaskId,
+        primary_status: &Arc<TaskStatus>,
+        primary_running: bool,
+    ) -> Result<ReclaimableTeardownPermit, ReclaimableDomainError> {
+        let record = self.reclaimable_domains.record_exact(key, domain)?;
+        let index = key.slot as usize;
+        if record.phase != ReclaimableDomainPhase::Active {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        if record.home_hart != home_hart {
+            return Err(ReclaimableDomainError::WrongHome);
+        }
+        if record.exclusive && record.exclusive_task != Some(primary_task) {
+            return Err(ReclaimableDomainError::TaskMismatch);
+        }
+        let primary_status_identity = Arc::as_ptr(primary_status) as usize;
+        if record.exclusive && record.exclusive_status != Some(primary_status_identity) {
+            return Err(ReclaimableDomainError::StatusMismatch);
+        }
+        if self
+            .running_tasks()
+            .any(|running| running.domain == domain && running.hart != home_hart)
+        {
+            return Err(ReclaimableDomainError::RemoteRunning);
+        }
+        if self
+            .tasks
+            .values()
+            .any(|task| task.domain == domain && task.queue_owner != home_hart)
+        {
+            return Err(ReclaimableDomainError::WrongHome);
+        }
+        if primary_running {
+            if !self.harts[home_hart.index()]
+                .running
+                .as_ref()
+                .is_some_and(|running| {
+                    running.id == primary_task
+                        && running.hart == home_hart
+                        && running.domain == domain
+                        && Arc::ptr_eq(&running.status, primary_status)
+                })
+            {
+                return Err(ReclaimableDomainError::LiveTaskMismatch);
+            }
+        } else if self.running_tasks().any(|running| running.domain == domain) {
+            return Err(ReclaimableDomainError::LiveTaskMismatch);
+        }
+        let mapped_siblings = self
+            .tasks
+            .values()
+            .filter(|task| task.domain == domain)
+            .count();
+        let expected_live = mapped_siblings
+            .checked_add(1)
+            .ok_or(ReclaimableDomainError::LiveTaskOverflow)?;
+        if expected_live != record.live_tasks {
+            return Err(ReclaimableDomainError::LiveTaskMismatch);
+        }
+
+        // Validate the complete sibling set before changing any lifecycle
+        // cell. Every mapped member is then committed to Faulted in this same
+        // scheduler critical section, closing the cancel-before-detach race.
+        for task in self.tasks.values().filter(|task| task.domain == domain) {
+            if task.reclaimable_domain != Some(key) {
+                return Err(ReclaimableDomainError::KeyMismatch);
+            }
+            if !task.is_published() || task.stealable {
+                return Err(ReclaimableDomainError::LifecycleMismatch);
+            }
+            let raw = task.status.raw_state();
+            if raw != TaskState::Running as u8 && raw != CANCEL_REQUESTED {
+                return Err(ReclaimableDomainError::LifecycleMismatch);
+            }
+        }
+        for task in self.tasks.values().filter(|task| task.domain == domain) {
+            task.status
+                .claim_terminal(TaskState::Faulted)
+                .expect("validated arena sibling lost its fault claim under SCHED");
+        }
+
+        self.reclaimable_domains.records[index]
+            .as_mut()
+            .expect("validated tracked-domain record remains occupied")
+            .phase = ReclaimableDomainPhase::TearingDown;
+        if primary_running {
+            self.clear_running(home_hart);
+            self.harts[home_hart.index()].woken = false;
+        }
+        Ok(ReclaimableTeardownPermit {
+            key,
+            domain,
+            home_hart,
+            live_tasks: record.live_tasks,
+            exclusive: record.exclusive,
+            primary_task,
+            primary_status: primary_status_identity,
+        })
+    }
+
+    fn verify_reclaimable_teardown(
+        &self,
+        permit: ReclaimableTeardownPermit,
+    ) -> Result<(), ReclaimableDomainError> {
+        let record = self
+            .reclaimable_domains
+            .record_exact(permit.key, permit.domain)?;
+        if record.phase != ReclaimableDomainPhase::TearingDown {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        if record.home_hart != permit.home_hart {
+            return Err(ReclaimableDomainError::WrongHome);
+        }
+        if record.live_tasks != permit.live_tasks {
+            return Err(ReclaimableDomainError::LiveTaskMismatch);
+        }
+        if record.exclusive && record.exclusive_task != Some(permit.primary_task) {
+            return Err(ReclaimableDomainError::TaskMismatch);
+        }
+        if record.exclusive && record.exclusive_status != Some(permit.primary_status) {
+            return Err(ReclaimableDomainError::StatusMismatch);
+        }
+        if self.tasks.values().any(|task| task.domain == permit.domain)
+            || self
+                .running_tasks()
+                .any(|running| running.domain == permit.domain)
+        {
+            return Err(ReclaimableDomainError::LiveTaskMismatch);
+        }
+        Ok(())
+    }
+
+    fn finish_reclaimable_teardown(
+        &mut self,
+        permit: ReclaimableTeardownPermit,
+        outcome: FaultReclaimOutcome,
+    ) -> Result<(), ReclaimableDomainError> {
+        self.verify_reclaimable_teardown(permit)?;
+        let record = self.reclaimable_domains.records[permit.key.slot as usize]
+            .as_mut()
+            .expect("verified teardown record remains occupied");
+        record.phase = match outcome {
+            FaultReclaimOutcome::Reclaimed => ReclaimableDomainPhase::TerminalReady,
+            FaultReclaimOutcome::Quarantined => ReclaimableDomainPhase::Quarantined,
+        };
+        Ok(())
+    }
+
+    /// Account one exact task after guarded Drop completed normally. The last
+    /// task closes spawn/dispatch admission before terminal publication; the
+    /// retained record is removed only after observers can see the terminal
+    /// state.
+    fn finish_reclaimable_task(
+        &mut self,
+        key: ReclaimableDomainKey,
+        domain: AllocationDomain,
+        home_hart: HartId,
+        task: TaskId,
+        status: &Arc<TaskStatus>,
+    ) -> Result<bool, ReclaimableDomainError> {
+        let record = self.reclaimable_domains.record_exact(key, domain)?;
+        if record.phase != ReclaimableDomainPhase::Active {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        if record.home_hart != home_hart {
+            return Err(ReclaimableDomainError::WrongHome);
+        }
+        if record.exclusive {
+            if record.exclusive_task != Some(task) {
+                return Err(ReclaimableDomainError::TaskMismatch);
+            }
+            if record.exclusive_status != Some(Arc::as_ptr(status) as usize) {
+                return Err(ReclaimableDomainError::StatusMismatch);
+            }
+            if record.live_tasks != 1 {
+                return Err(ReclaimableDomainError::LiveTaskMismatch);
+            }
+        }
+        let retained = self.reclaimable_domains.records[key.slot as usize]
+            .as_mut()
+            .expect("validated reclaimable-domain record remains occupied");
+        if retained.live_tasks == 1 {
+            retained.phase = ReclaimableDomainPhase::TerminalReady;
+            Ok(true)
+        } else {
+            retained.live_tasks = retained
+                .live_tasks
+                .checked_sub(1)
+                .ok_or(ReclaimableDomainError::LiveTaskMismatch)?;
+            Ok(false)
+        }
     }
 }
 
@@ -1053,12 +1557,33 @@ fn assert_sched_invariants(s: &Sched) {
     for (id, task) in &s.tasks {
         let raw = task.status.raw_state();
         debug_assert!(
-            raw == TaskState::Running as u8 || raw == CANCEL_REQUESTED,
-            "mapped task {id} has detached lifecycle phase {raw}"
-        );
-        debug_assert!(
             !task.domain.arena.is_tracked() || !task.stealable,
             "tracked task {id} must remain hart-affine"
+        );
+        let tracked_record = if task.domain.arena.is_tracked() {
+            let key = task
+                .reclaimable_domain
+                .expect("tracked task has no scheduler domain key");
+            let record = s
+                .reclaimable_domains
+                .record_exact(key, task.domain)
+                .expect("tracked task has no scheduler domain record");
+            debug_assert_eq!(
+                record.home_hart, task.queue_owner,
+                "tracked task {id} escaped its domain home hart"
+            );
+            Some(record)
+        } else {
+            None
+        };
+        debug_assert!(
+            raw == TaskState::Running as u8
+                || raw == CANCEL_REQUESTED
+                || (raw == FAULT_COMMITTED
+                    && tracked_record.is_some_and(|record| {
+                        record.phase == ReclaimableDomainPhase::TearingDown
+                    })),
+            "mapped task {id} has detached lifecycle phase {raw}"
         );
         debug_assert_eq!(
             s.ready.owner(*id),
@@ -1112,6 +1637,25 @@ fn assert_sched_invariants(s: &Sched) {
             "running task {} has invalid lifecycle phase {raw}",
             running.id
         );
+        if running.domain.arena.is_tracked() {
+            let key = running
+                .reclaimable_domain
+                .expect("running tracked task has no scheduler domain key");
+            let record = s
+                .reclaimable_domains
+                .record_exact(key, running.domain)
+                .expect("running tracked task has no scheduler domain record");
+            debug_assert_eq!(
+                record.home_hart, running.hart,
+                "running tracked task {} escaped its domain home hart",
+                running.id
+            );
+            debug_assert_eq!(
+                record.phase,
+                ReclaimableDomainPhase::Active,
+                "a tearing-down domain remained runnable"
+            );
+        }
         for other in s
             .harts
             .iter()
@@ -1128,6 +1672,26 @@ fn assert_sched_invariants(s: &Sched) {
                 "two running slots share task {} status",
                 running.id
             );
+        }
+    }
+
+    for record in s.reclaimable_domains.records.iter().flatten() {
+        let mapped = s
+            .tasks
+            .values()
+            .filter(|task| task.domain == record.domain)
+            .count();
+        let running = s
+            .running_tasks()
+            .filter(|task| task.domain == record.domain)
+            .count();
+        debug_assert!(
+            mapped + running <= record.live_tasks,
+            "tracked-domain scheduler projection exceeds its live task count"
+        );
+        debug_assert!(record.live_tasks != 0);
+        if record.exclusive {
+            debug_assert_eq!(record.live_tasks, 1);
         }
     }
 }
@@ -1387,6 +1951,50 @@ pub unsafe fn spawn_reclaimable_owned(
         "a reclaimable task needs an installed fault reclaimer"
     );
     spawn_tracked_domain(domain, current_queue_hart(), false, name, fut)
+}
+
+/// Host-model helper that immediately spawns the sole task permitted to
+/// execute in one audited allocation arena.
+///
+/// The executor records a stable home hart and rejects every sibling before it
+/// can become runnable. Target managed components must instead use the prepared
+/// registry publication path: an immediately runnable future cannot be bound
+/// to its SYSTEM lifecycle record first. Keeping this helper off target builds
+/// prevents it from becoming an accidental production admission boundary.
+///
+/// # Safety
+///
+/// The escape, registration, and active-arena requirements of
+/// [`spawn_reclaimable_owned`] apply. In addition, the caller must not race two
+/// first publications for the same arena. The future and its Drop path must
+/// not attempt to spawn a child in the same domain; that is a fail-stop
+/// contract violation.
+#[cfg(not(target_arch = "riscv64"))]
+pub unsafe fn spawn_exclusive_reclaimable_owned(
+    domain: AllocationDomain,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    assert!(
+        domain.arena.is_tracked(),
+        "an exclusive reclaimable task needs a tracked arena"
+    );
+    assert!(
+        domain.owner != OwnerId::SYSTEM,
+        "SYSTEM cannot be a raw-reclaimable component arena"
+    );
+    assert!(
+        load_fault_reclaimer().is_some(),
+        "an exclusive reclaimable task needs an installed fault reclaimer"
+    );
+    spawn_tracked_domain_mode(
+        domain,
+        current_queue_hart(),
+        false,
+        ReclaimableDomainMode::Exclusive,
+        name,
+        fut,
+    )
 }
 
 /// One future whose task envelope and lifecycle identity have been allocated,
@@ -1652,6 +2260,7 @@ fn make_task(
         ready: false,
         stealable,
         publication: TaskPublication::Prepared(0),
+        reclaimable_domain: None,
     };
     let handle = TaskHandle { id, domain, status };
     (task, handle)
@@ -1664,6 +2273,34 @@ fn spawn_tracked_domain(
     name: &str,
     fut: impl Future<Output = ()> + Send + 'static,
 ) -> TaskHandle {
+    spawn_tracked_domain_mode(
+        domain,
+        queue_owner,
+        stealable,
+        ReclaimableDomainMode::Shared,
+        name,
+        fut,
+    )
+}
+
+fn spawn_tracked_domain_mode(
+    domain: AllocationDomain,
+    queue_owner: HartId,
+    stealable: bool,
+    reclaimable_mode: ReclaimableDomainMode,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    if domain.arena.is_tracked() {
+        let preflight =
+            SCHED
+                .lock()
+                .reclaimable_domains
+                .preflight(domain, queue_owner, reclaimable_mode);
+        if let Err(error) = preflight {
+            panic!("reclaimable domain spawn preflight rejected: {error:?}");
+        }
+    }
     let id = next_task_id();
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(true))));
@@ -1679,7 +2316,7 @@ fn spawn_tracked_domain(
     allocation.restore();
 
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    let task = Task {
+    let mut task = Task {
         id,
         domain,
         name: task_name,
@@ -1689,6 +2326,7 @@ fn spawn_tracked_domain(
         ready: true,
         stealable,
         publication: TaskPublication::Published,
+        reclaimable_domain: None,
     };
     let mut s = SCHED.lock();
     // Every live task can migrate to any queue after a steal and then become
@@ -1702,6 +2340,26 @@ fn spawn_tracked_domain(
         // Reclaim it at the same guarded owner boundary as a scheduled task.
         let _ = reclaim_task(task);
         panic!("ready queue allocation failed");
+    }
+    if domain.arena.is_tracked() {
+        let key =
+            match s
+                .reclaimable_domains
+                .admit(domain, queue_owner, reclaimable_mode, id, &status)
+            {
+                Ok(key) => key,
+                Err(error) => {
+                    drop(s);
+                    system.restore();
+                    // A concurrent unsafe first-publication violation cannot
+                    // safely run Drop against an arena which may now execute
+                    // elsewhere. Keep the future inert and leak only its arena
+                    // bytes; the scheduler owns no record or wake target for it.
+                    abandon_task_without_drop(task);
+                    panic!("reclaimable domain spawn commit rejected: {error:?}");
+                }
+            };
+        task.reclaimable_domain = Some(key);
     }
     s.tasks.insert(id, task);
     s.ready
@@ -1733,6 +2391,8 @@ fn publish_terminal(status: &TaskStatus, claim: TerminalClaim) -> Option<TaskSta
 struct ReclaimResult {
     id: TaskId,
     domain: AllocationDomain,
+    home_hart: HartId,
+    reclaimable_domain: Option<ReclaimableDomainKey>,
     faulted: bool,
 }
 
@@ -1747,6 +2407,8 @@ fn reclaim_task(task: Task) -> ReclaimResult {
         name,
         mut future,
         status,
+        queue_owner,
+        reclaimable_domain,
         ..
     } = task;
 
@@ -1797,6 +2459,8 @@ fn reclaim_task(task: Task) -> ReclaimResult {
     ReclaimResult {
         id,
         domain,
+        home_hart: queue_owner,
+        reclaimable_domain,
         faulted,
     }
 }
@@ -1827,21 +2491,70 @@ struct FaultVictim {
 }
 
 fn teardown_faulted_domain(
-    domain: AllocationDomain,
+    permit: ReclaimableTeardownPermit,
     primary_id: TaskId,
-    primary_task: Option<Task>,
+    mut primary_task: Option<Task>,
     primary_status: Arc<TaskStatus>,
     primary_claim: TerminalClaim,
 ) {
+    let domain = permit.domain;
     debug_assert!(domain.arena.is_tracked());
-    {
-        let s = SCHED.lock();
-        check_sched!(&s);
-        assert!(
-            s.running_tasks().all(|running| running.domain != domain),
-            "fault teardown cannot reclaim a domain still running on another hart"
+    run_reclaimable_teardown_test_hook(domain);
+
+    // Managed component instances use an exclusive domain. Once the fault
+    // transition clears its exact running slot there can be no sibling to
+    // discover, so keep this safety-critical path allocation-free. The shared
+    // path below remains for the older audited task-group contract.
+    if permit.exclusive {
+        assert_eq!(permit.live_tasks, 1, "exclusive fault permit is not unique");
+        assert_eq!(permit.primary_task, primary_id);
+        assert_eq!(
+            permit.primary_status,
+            Arc::as_ptr(&primary_status) as usize,
+            "exclusive fault permit status changed"
         );
+        {
+            let s = SCHED.lock();
+            s.verify_reclaimable_teardown(permit)
+                .unwrap_or_else(|error| panic!("exclusive fault teardown mismatch: {error:?}"));
+            check_sched!(&s);
+            check_arena_detached!(&s, domain);
+        }
+
+        drain_task_registrations(&primary_status);
+        if let Some(task) = primary_task.take() {
+            abandon_task_without_drop(task);
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        notify_fault_cleanup(primary_id, domain);
+        let outcome = load_fault_reclaimer()
+            .map_or(FaultReclaimOutcome::Quarantined, |reclaim| unsafe {
+                reclaim(primary_id, domain)
+            });
+        system.restore();
+
+        {
+            let mut s = SCHED.lock();
+            s.finish_reclaimable_teardown(permit, outcome)
+                .unwrap_or_else(|error| {
+                    panic!("exclusive fault teardown completion mismatch: {error:?}")
+                });
+            check_sched!(&s);
+        }
+        publish_terminal(&primary_status, primary_claim);
+        if outcome == FaultReclaimOutcome::Reclaimed {
+            let mut s = SCHED.lock();
+            s.reclaimable_domains
+                .retire_terminal(permit.key, domain)
+                .unwrap_or_else(|error| {
+                    panic!("exclusive fault terminal retirement mismatch: {error:?}")
+                });
+            check_sched!(&s);
+        }
+        return;
     }
+
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     let mut victims = Vec::new();
     {
@@ -1868,6 +2581,15 @@ fn teardown_faulted_domain(
                 .tasks
                 .remove(&id)
                 .expect("an arena sibling disappeared under SCHED");
+            assert_eq!(
+                task.reclaimable_domain,
+                Some(permit.key),
+                "fault victim carries a stale reclaimable-domain generation"
+            );
+            assert_eq!(
+                task.queue_owner, permit.home_hart,
+                "fault victim escaped its reclaimable-domain home hart"
+            );
             if task.ready {
                 assert!(
                     s.ready.remove(task.queue_owner, id),
@@ -1875,9 +2597,12 @@ fn teardown_faulted_domain(
                 );
             }
             let status = task.status.clone();
-            let claim = status
-                .claim_terminal(TaskState::Faulted)
-                .expect("an arena sibling could not claim fault teardown");
+            assert_eq!(
+                status.raw_state(),
+                FAULT_COMMITTED,
+                "an arena sibling lost its committed fault before detach"
+            );
+            let claim = TerminalClaim::new(TaskState::Faulted);
             victims.push(FaultVictim {
                 id,
                 task: Some(task),
@@ -1885,6 +2610,8 @@ fn teardown_faulted_domain(
                 claim,
             });
         }
+        s.verify_reclaimable_teardown(permit)
+            .unwrap_or_else(|error| panic!("fault teardown gate mismatch: {error:?}"));
         check_sched!(&s);
         check_arena_detached!(&s, domain);
     }
@@ -1905,15 +2632,30 @@ fn teardown_faulted_domain(
     for victim in &victims {
         notify_fault_cleanup(victim.id, domain);
     }
-    if let Some(reclaim) = load_fault_reclaimer() {
-        unsafe { reclaim(domain) };
-    }
+    let outcome = load_fault_reclaimer()
+        .map_or(FaultReclaimOutcome::Quarantined, |reclaim| unsafe {
+            reclaim(primary_id, domain)
+        });
     system.restore();
+
+    {
+        let mut s = SCHED.lock();
+        s.finish_reclaimable_teardown(permit, outcome)
+            .unwrap_or_else(|error| panic!("fault teardown completion mismatch: {error:?}"));
+        check_sched!(&s);
+    }
 
     // Publication is the teardown linearization point: a supervisor cannot
     // observe Faulted and restart the component before raw reclaim completed.
     for victim in victims {
         publish_terminal(&victim.status, victim.claim);
+    }
+    if outcome == FaultReclaimOutcome::Reclaimed {
+        let mut s = SCHED.lock();
+        s.reclaimable_domains
+            .retire_terminal(permit.key, domain)
+            .unwrap_or_else(|error| panic!("fault terminal retirement mismatch: {error:?}"));
+        check_sched!(&s);
     }
 }
 
@@ -1925,14 +2667,56 @@ fn reclaim_and_publish(task: Task, status: &Arc<TaskStatus>, claim: TerminalClai
         claim
     };
     if result.faulted && result.domain.arena.is_tracked() {
-        teardown_faulted_domain(result.domain, result.id, None, status.clone(), claim);
+        let key = result
+            .reclaimable_domain
+            .expect("a tracked destructor fault has no domain generation");
+        let permit = {
+            let mut s = SCHED.lock();
+            let permit = s
+                .begin_reclaimable_teardown(
+                    result.domain,
+                    key,
+                    result.home_hart,
+                    result.id,
+                    status,
+                    false,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("tracked destructor fault gate mismatch: {error:?}")
+                });
+            check_sched!(&s);
+            permit
+        };
+        teardown_faulted_domain(permit, result.id, None, status.clone(), claim);
     } else {
         if result.faulted {
             let mut system = heap::enter_owner(OwnerId::SYSTEM);
             notify_fault_cleanup(result.id, result.domain);
             system.restore();
         }
+        let terminal_domain = if result.domain.arena.is_tracked() {
+            let key = result
+                .reclaimable_domain
+                .expect("a tracked task has no domain generation");
+            let mut s = SCHED.lock();
+            let last = s
+                .finish_reclaimable_task(key, result.domain, result.home_hart, result.id, status)
+                .unwrap_or_else(|error| panic!("tracked task terminal gate mismatch: {error:?}"));
+            check_sched!(&s);
+            last.then_some((key, result.domain))
+        } else {
+            None
+        };
         publish_terminal(status, claim);
+        if let Some((key, domain)) = terminal_domain {
+            let mut s = SCHED.lock();
+            s.reclaimable_domains
+                .retire_terminal(key, domain)
+                .unwrap_or_else(|error| {
+                    panic!("tracked task terminal retirement mismatch: {error:?}")
+                });
+            check_sched!(&s);
+        }
     }
 }
 
@@ -1945,6 +2729,25 @@ fn requested_outcome(handle: &TaskHandle) -> CancelOutcome {
                 .expect("a published terminal state has an exit report"),
         ),
         CancelRequest::TooLate(state) => CancelOutcome::TooLate(state),
+    }
+}
+
+/// Report a cancellation that lost to a scheduler-domain lifecycle transition
+/// without mutating the task status. A non-active reclaimable record must
+/// already have a matching committed or published terminal status; observing
+/// an ordinary Running/CANCEL_REQUESTED value here is a fail-stop invariant
+/// violation rather than permission to reopen the lifecycle.
+fn nonactive_cancel_outcome(handle: &TaskHandle) -> CancelOutcome {
+    match handle.status.raw_state() {
+        raw @ 1..=3 => CancelOutcome::AlreadyTerminal(TaskExit::new(
+            handle.id,
+            TaskState::from_raw(raw),
+            handle.status.polls.load(Ordering::Acquire),
+        )),
+        EXIT_COMMITTED => CancelOutcome::TooLate(TaskState::Exited),
+        CANCEL_COMMITTED => CancelOutcome::TooLate(TaskState::Cancelled),
+        FAULT_COMMITTED => CancelOutcome::TooLate(TaskState::Faulted),
+        raw => panic!("a non-active reclaimable task retained mutable lifecycle state {raw}"),
     }
 }
 
@@ -1972,9 +2775,39 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
     let action = {
         let mut s = SCHED.lock();
         check_sched!(&s);
-        let action = if s.running_hart_for(handle.id).is_some() {
-            Action::Return(requested_outcome(handle))
-        } else if s.tasks.contains_key(&handle.id) {
+        let action = if let Some(running_hart) = s.running_hart_for(handle.id) {
+            let running = s.harts[running_hart.index()]
+                .running
+                .as_ref()
+                .expect("running hart lookup remains exact");
+            assert!(
+                Arc::ptr_eq(&running.status, &handle.status),
+                "a task handle resolved to a different running status object"
+            );
+            let active = if running.domain.arena.is_tracked() {
+                let key = running
+                    .reclaimable_domain
+                    .expect("running tracked cancel target has no domain generation");
+                match s.reclaimable_domains.validate_active_task(
+                    key,
+                    running.domain,
+                    running_hart,
+                    handle.id,
+                    &running.status,
+                ) {
+                    Ok(_) => true,
+                    Err(ReclaimableDomainError::NotActive) => false,
+                    Err(error) => panic!("running tracked cancel gate mismatch: {error:?}"),
+                }
+            } else {
+                true
+            };
+            Action::Return(if active {
+                requested_outcome(handle)
+            } else {
+                nonactive_cancel_outcome(handle)
+            })
+        } else if let Some(target) = s.tasks.get(&handle.id) {
             // The caller hart's running slot covers the small dispatch/return
             // windows before the current-task scope is installed or after it
             // is restored, which matters for cancellation from an IRQ hook.
@@ -1984,66 +2817,87 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
                 || s.running_count() != 0,
                 |hart| s.harts[hart.index()].running.is_some(),
             );
-            let (target_domain, target_owner) = {
-                let task = s
-                    .tasks
-                    .get(&handle.id)
-                    .expect("mapped cancellation target remains present");
-                (task.domain, task.queue_owner)
-            };
-            let tracked_domain_running = target_domain.arena.is_tracked()
-                && s.running_tasks()
-                    .any(|running| running.domain == target_domain);
-            let remote_tracked_reclaim =
-                target_domain.arena.is_tracked() && caller_hart != Some(target_owner);
-            if caller_hart.is_none()
-                || user_code_active
-                || caller_running
-                || tracked_domain_running
-                || remote_tracked_reclaim
-            {
-                let outcome = requested_outcome(handle);
-                let (ready, owner, stealable) = {
-                    let task = s
-                        .tasks
-                        .get(&handle.id)
-                        .expect("mapped cancellation target remains present");
-                    (task.ready, task.queue_owner, task.stealable)
-                };
-                if outcome == CancelOutcome::Requested && !ready {
-                    match s.ready.enqueue(owner, handle.id, stealable) {
-                        Ok(()) => {
-                            s.tasks
-                                .get_mut(&handle.id)
-                                .expect("mapped cancellation target remains present")
-                                .ready = true;
-                            notify_hart = Some(owner);
-                        }
-                        Err(EnqueueError::CapacityExhausted) => {
-                            ready_capacity_exhausted = true;
-                        }
-                        Err(EnqueueError::Duplicate) => {
-                            panic!("cancel target acquired duplicate ready ownership")
-                        }
-                    }
+            assert!(
+                Arc::ptr_eq(&target.status, &handle.status),
+                "a task handle resolved to a different mapped status object"
+            );
+            let target_domain = target.domain;
+            let target_owner = target.queue_owner;
+            let active = if target_domain.arena.is_tracked() {
+                let key = target
+                    .reclaimable_domain
+                    .expect("mapped tracked cancel target has no domain generation");
+                match s.reclaimable_domains.validate_active_task(
+                    key,
+                    target_domain,
+                    target_owner,
+                    handle.id,
+                    &target.status,
+                ) {
+                    Ok(_) => true,
+                    Err(ReclaimableDomainError::NotActive) => false,
+                    Err(error) => panic!("mapped tracked cancel gate mismatch: {error:?}"),
                 }
-                Action::Return(outcome)
             } else {
-                match handle.status.claim_terminal(TaskState::Cancelled) {
-                    Some(claim) => {
+                true
+            };
+            if !active {
+                Action::Return(nonactive_cancel_outcome(handle))
+            } else {
+                let tracked_domain_running = target_domain.arena.is_tracked()
+                    && s.running_tasks()
+                        .any(|running| running.domain == target_domain);
+                let remote_tracked_reclaim =
+                    target_domain.arena.is_tracked() && caller_hart != Some(target_owner);
+                if caller_hart.is_none()
+                    || user_code_active
+                    || caller_running
+                    || tracked_domain_running
+                    || remote_tracked_reclaim
+                {
+                    let outcome = requested_outcome(handle);
+                    let (ready, owner, stealable) = {
                         let task = s
                             .tasks
-                            .remove(&handle.id)
-                            .expect("contains_key was checked under the same lock");
-                        if task.ready {
-                            assert!(
-                                s.ready.remove(task.queue_owner, handle.id),
-                                "cancel target metadata must identify its exact queue"
-                            );
+                            .get(&handle.id)
+                            .expect("mapped cancellation target remains present");
+                        (task.ready, task.queue_owner, task.stealable)
+                    };
+                    if outcome == CancelOutcome::Requested && !ready {
+                        match s.ready.enqueue(owner, handle.id, stealable) {
+                            Ok(()) => {
+                                s.tasks
+                                    .get_mut(&handle.id)
+                                    .expect("mapped cancellation target remains present")
+                                    .ready = true;
+                                notify_hart = Some(owner);
+                            }
+                            Err(EnqueueError::CapacityExhausted) => {
+                                ready_capacity_exhausted = true;
+                            }
+                            Err(EnqueueError::Duplicate) => {
+                                panic!("cancel target acquired duplicate ready ownership")
+                            }
                         }
-                        Action::Reclaim(task, claim)
                     }
-                    None => Action::Return(requested_outcome(handle)),
+                    Action::Return(outcome)
+                } else {
+                    match handle.status.claim_terminal(TaskState::Cancelled) {
+                        Some(claim) => {
+                            let task = s
+                                .tasks
+                                .remove(&handle.id)
+                                .expect("contains_key was checked under the same lock");
+                            if task.ready {
+                                assert!(
+                                    s.ready.remove(task.queue_owner, handle.id),
+                                    "cancel target metadata must identify its exact queue"
+                                );
+                            }
+                            Action::Reclaim(task, claim)
+                        }
+                        None => Action::Return(requested_outcome(handle)),
+                    }
                 }
             }
         } else {
@@ -2120,7 +2974,27 @@ pub fn wake_with_disposition(id: TaskId) -> WakeDisposition {
         let owner = task.queue_owner;
         let ready = task.ready;
         let stealable = task.stealable;
-        if ready {
+        let active = if task.domain.arena.is_tracked() {
+            let key = task
+                .reclaimable_domain
+                .expect("tracked wake target has no domain generation");
+            match s.reclaimable_domains.validate_active_task(
+                key,
+                task.domain,
+                owner,
+                id,
+                &task.status,
+            ) {
+                Ok(_) => true,
+                Err(ReclaimableDomainError::NotActive) => false,
+                Err(error) => panic!("tracked wake gate mismatch: {error:?}"),
+            }
+        } else {
+            true
+        };
+        if !active {
+            WakeDisposition::Inactive
+        } else if ready {
             WakeDisposition::AlreadyQueued { hart: owner }
         } else {
             match s.ready.enqueue(owner, id, stealable) {
@@ -2141,8 +3015,34 @@ pub fn wake_with_disposition(id: TaskId) -> WakeDisposition {
             }
         }
     } else if let Some(hart) = s.running_hart_for(id) {
-        s.harts[hart.index()].woken = true;
-        WakeDisposition::Running { hart }
+        let running = s.harts[hart.index()]
+            .running
+            .as_ref()
+            .expect("running hart lookup remains exact");
+        let active = if running.domain.arena.is_tracked() {
+            let key = running
+                .reclaimable_domain
+                .expect("running tracked wake target has no domain generation");
+            match s.reclaimable_domains.validate_active_task(
+                key,
+                running.domain,
+                hart,
+                id,
+                &running.status,
+            ) {
+                Ok(_) => true,
+                Err(ReclaimableDomainError::NotActive) => false,
+                Err(error) => panic!("running tracked wake gate mismatch: {error:?}"),
+            }
+        } else {
+            true
+        };
+        if active {
+            s.harts[hart.index()].woken = true;
+            WakeDisposition::Running { hart }
+        } else {
+            WakeDisposition::Inactive
+        }
     } else {
         WakeDisposition::Inactive
     };
@@ -2259,16 +3159,72 @@ pub fn scheduler_lock_stats() -> crate::sync::SpinLockStats {
     SCHED.stats()
 }
 
+/// Inspect one exact tracked allocation domain without exposing its scheduler
+/// lease generation. A reused arena carrying a different owner is unrelated
+/// and therefore returns `None` rather than aliasing the live incarnation.
+pub fn reclaimable_domain_snapshot(domain: AllocationDomain) -> Option<ReclaimableDomainSnapshot> {
+    SCHED
+        .lock()
+        .reclaimable_domains
+        .record(domain)
+        .map(ReclaimableDomainRecord::snapshot)
+}
+
+/// Number of scheduler-domain slots retained in any lifecycle phase. Sticky
+/// quarantines deliberately remain included until reboot/fail-stop.
+pub fn reclaimable_domain_count() -> usize {
+    SCHED.lock().reclaimable_domains.active_count()
+}
+
 /// Linearizable logical queue affinity for one live task. A running task owns
 /// the executing hart; a ready or parked task owns its metadata hart.
 pub fn task_queue_owner(id: TaskId) -> Option<HartId> {
     let s = SCHED.lock();
-    s.running_hart_for(id).or_else(|| {
-        s.tasks
-            .get(&id)
-            .filter(|task| task.is_published())
-            .map(|task| task.queue_owner)
-    })
+    if let Some(hart) = s.running_hart_for(id) {
+        let running = s.harts[hart.index()]
+            .running
+            .as_ref()
+            .expect("running hart lookup remains exact");
+        if running.domain.arena.is_tracked() {
+            let key = running
+                .reclaimable_domain
+                .expect("running tracked queue-owner target has no domain generation");
+            match s.reclaimable_domains.validate_active_task(
+                key,
+                running.domain,
+                hart,
+                id,
+                &running.status,
+            ) {
+                Ok(_) => return Some(hart),
+                Err(ReclaimableDomainError::NotActive) => return None,
+                Err(error) => panic!("running tracked queue-owner gate mismatch: {error:?}"),
+            }
+        }
+        return Some(hart);
+    }
+    s.tasks
+        .get(&id)
+        .filter(|task| task.is_published())
+        .and_then(|task| {
+            if !task.domain.arena.is_tracked() {
+                return Some(task.queue_owner);
+            }
+            let key = task
+                .reclaimable_domain
+                .expect("tracked queue-owner target has no domain generation");
+            match s.reclaimable_domains.validate_active_task(
+                key,
+                task.domain,
+                task.queue_owner,
+                id,
+                &task.status,
+            ) {
+                Ok(_) => Some(task.queue_owner),
+                Err(ReclaimableDomainError::NotActive) => None,
+                Err(error) => panic!("tracked queue-owner gate mismatch: {error:?}"),
+            }
+        })
 }
 
 /// True when `hart` has neither local work nor stealable remote work.
@@ -2363,6 +3319,43 @@ fn poll_once_on(hart: HartId) -> bool {
             return false;
         };
         let id = ready_dispatch.task;
+        if let Some(candidate) = s.tasks.get(&id) {
+            if candidate.domain.arena.is_tracked() {
+                let key = candidate
+                    .reclaimable_domain
+                    .expect("tracked dispatch candidate has no domain key");
+                let record = s
+                    .reclaimable_domains
+                    .record_exact(key, candidate.domain)
+                    .unwrap_or_else(|error| panic!("tracked dispatch domain mismatch: {error:?}"));
+                assert_eq!(
+                    record.phase,
+                    ReclaimableDomainPhase::Active,
+                    "a non-active reclaimable domain reached dispatch"
+                );
+                assert_eq!(
+                    record.home_hart, hart,
+                    "a reclaimable task reached a non-home executor hart"
+                );
+                assert_eq!(
+                    candidate.queue_owner, record.home_hart,
+                    "reclaimable task queue owner changed"
+                );
+                assert_eq!(
+                    ready_dispatch.source, record.home_hart,
+                    "reclaimable task was dispatched from a foreign queue"
+                );
+                assert!(!candidate.stealable && !ready_dispatch.stolen);
+                if record.exclusive {
+                    assert_eq!(record.live_tasks, 1);
+                    assert_eq!(record.exclusive_task, Some(id));
+                    assert_eq!(
+                        record.exclusive_status,
+                        Some(Arc::as_ptr(&candidate.status) as usize)
+                    );
+                }
+            }
+        }
         let mut task = s
             .tasks
             .remove(&id)
@@ -2388,6 +3381,7 @@ fn poll_once_on(hart: HartId) -> bool {
                     domain: task.domain,
                     name: task.name.clone(),
                     status: status.clone(),
+                    reclaimable_domain: task.reclaimable_domain,
                 },
             );
             Dispatch::Poll(id, task, status)
@@ -2463,9 +3457,9 @@ fn poll_once_on(hart: HartId) -> bool {
         // public ownership rules permit.
         // Safety: this remains inside the same hart-pinned executor turn.
         let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
-        let claim = {
+        let (claim, teardown) = {
             let mut s = SCHED.lock();
-            debug_assert!(s.harts[hart.index()]
+            assert!(s.harts[hart.index()]
                 .running
                 .as_ref()
                 .is_some_and(|running| {
@@ -2474,19 +3468,25 @@ fn poll_once_on(hart: HartId) -> bool {
                         && running.domain == task.domain
                         && Arc::ptr_eq(&running.status, &status)
                 }));
-            s.clear_running(hart);
-            s.harts[hart.index()].woken = false;
-            if task.domain.arena.is_tracked() {
-                assert!(
-                    s.running_tasks()
-                        .all(|running| running.domain != task.domain),
-                    "a tracked fault domain is concurrently running on another hart"
-                );
-            }
+            let teardown = if task.domain.arena.is_tracked() {
+                let key = task
+                    .reclaimable_domain
+                    .expect("a running tracked fault has no domain generation");
+                Some(
+                    s.begin_reclaimable_teardown(task.domain, key, hart, id, &status, true)
+                        .unwrap_or_else(|error| {
+                            panic!("tracked poll fault gate mismatch: {error:?}")
+                        }),
+                )
+            } else {
+                s.clear_running(hart);
+                s.harts[hart.index()].woken = false;
+                None
+            };
             let claim = status.claim_terminal(TaskState::Faulted);
             check_sched!(&s);
             check_status_detached!(&s, status.as_ref());
-            claim
+            (claim, teardown)
         };
         // Safety: this remains inside the same hart-pinned executor turn.
         unsafe { system.restore_on_verified_hart() };
@@ -2494,8 +3494,13 @@ fn poll_once_on(hart: HartId) -> bool {
             panic!("a faulted running task could not claim its terminal state");
         };
         if task.domain.arena.is_tracked() {
-            let domain = task.domain;
-            teardown_faulted_domain(domain, id, Some(task), status, claim);
+            teardown_faulted_domain(
+                teardown.expect("tracked poll fault produced no teardown permit"),
+                id,
+                Some(task),
+                status,
+                claim,
+            );
         } else {
             // Ordinary tasks have no audited escape contract. Clean external
             // registrations, but conservatively leak their future allocation.
@@ -2515,6 +3520,22 @@ fn poll_once_on(hart: HartId) -> bool {
     // Safety: this remains inside the same hart-pinned executor turn.
     let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
     let mut s = SCHED.lock();
+    if task.domain.arena.is_tracked() {
+        let key = task
+            .reclaimable_domain
+            .expect("a running tracked task has no domain generation");
+        s.reclaimable_domains
+            .validate_active_task(key, task.domain, hart, id, &status)
+            .unwrap_or_else(|error| panic!("tracked poll return gate mismatch: {error:?}"));
+        assert_eq!(
+            s.harts[hart.index()]
+                .running
+                .as_ref()
+                .and_then(|running| running.reclaimable_domain),
+            Some(key),
+            "running slot carries a stale reclaimable-domain generation"
+        );
+    }
     s.clear_running(hart);
     let woken = core::mem::take(&mut s.harts[hart.index()].woken);
     if poll == Poll::Pending && !status.cancellation_requested() {
@@ -3213,5 +4234,60 @@ impl Future for Yield {
         self.yielded = true;
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod reclaimable_domain_tests {
+    use super::*;
+
+    #[test]
+    fn stale_domain_generation_cannot_resolve_a_reused_slot() {
+        let first_domain = AllocationDomain::new(OwnerId::new(91), ArenaId::new(92));
+        let second_domain = AllocationDomain::new(OwnerId::new(93), first_domain.arena);
+        let home = HartId::new(0).unwrap();
+        let published = Arc::new(AtomicBool::new(true));
+        let first_status = Arc::new(TaskStatus::new(published.clone()));
+        let second_status = Arc::new(TaskStatus::new(published));
+        let first_task = TaskId(9_001);
+        let second_task = TaskId(9_002);
+        let mut domains = ReclaimableDomains::new();
+
+        let stale = domains
+            .admit(
+                first_domain,
+                home,
+                ReclaimableDomainMode::Exclusive,
+                first_task,
+                &first_status,
+            )
+            .unwrap();
+        domains.records[stale.slot as usize].as_mut().unwrap().phase =
+            ReclaimableDomainPhase::TerminalReady;
+        domains.retire_terminal(stale, first_domain).unwrap();
+
+        let current = domains
+            .admit(
+                second_domain,
+                home,
+                ReclaimableDomainMode::Exclusive,
+                second_task,
+                &second_status,
+            )
+            .unwrap();
+        assert_eq!(current.slot, stale.slot);
+        assert_ne!(current.generation, stale.generation);
+        assert!(matches!(
+            domains.record_exact(stale, second_domain),
+            Err(ReclaimableDomainError::KeyMismatch)
+        ));
+        assert!(matches!(
+            domains.validate_active_task(stale, second_domain, home, second_task, &second_status,),
+            Err(ReclaimableDomainError::KeyMismatch)
+        ));
+        assert!(matches!(
+            domains.validate_active_task(current, second_domain, home, first_task, &first_status,),
+            Err(ReclaimableDomainError::TaskMismatch)
+        ));
     }
 }

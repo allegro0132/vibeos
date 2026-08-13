@@ -689,7 +689,10 @@ pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) ->
 /// Executor callback after every task and external registration in a tracked
 /// incarnation has been detached. The sealed World templates prove that no
 /// arena-backed pointer escaped, so raw reclamation is sound and runs no Drop.
-unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
+unsafe fn reclaim_faulted_component(
+    _primary_task: exec::TaskId,
+    domain: heap::AllocationDomain,
+) -> exec::FaultReclaimOutcome {
     unsafe {
         // Repair component-stable synchronization state while the exact
         // faulting incarnation is still identifiable and before Faulted is
@@ -703,6 +706,7 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         HEAP.reclaim_faulted_domain(domain)
             .expect("a faulted audited arena must reclaim atomically");
     }
+    exec::FaultReclaimOutcome::Reclaimed
 }
 
 /// Repair exact-task stable state for both conservative untracked faults and

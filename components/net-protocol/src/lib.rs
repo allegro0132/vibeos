@@ -397,13 +397,9 @@ impl phy::TxToken for PacketTxToken<'_> {
         );
         debug_assert!(self.pending_egress.is_none());
 
-        let mut frame = [0u8; MAX_PACKET_LEN];
-        let result = f(&mut frame[..len]);
-        let packet = StampedPacket::new(
-            Packet::copy_from(&frame[..len])
-                .expect("smoltcp emitted an empty or oversized Ethernet frame"),
-            self.stamp,
-        );
+        let (frame, result) = Packet::write_with(len, f)
+            .expect("smoltcp emitted an empty or oversized Ethernet frame");
+        let packet = StampedPacket::new(frame, self.stamp);
         match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);

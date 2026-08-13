@@ -38,6 +38,10 @@ const DMA_AAL: u32 = 1 << 25;
 // cache line. Tell DMA to skip the remaining twelve words when advancing.
 const DMA_DESCRIPTOR_SKIP_WORDS: u32 = 12 << 2;
 const DMA_START_RX: u32 = 1 << 1;
+// Let DMA begin fetching the next TX descriptor while the current frame is
+// still being drained from the store-and-forward FIFO. Linux stmmac enables
+// this together with TSF specifically to improve sustained throughput.
+const DMA_OPERATE_SECOND_FRAME: u32 = 1 << 2;
 const DMA_START_TX: u32 = 1 << 13;
 const DMA_RX_STORE_FORWARD: u32 = 1 << 25;
 const DMA_TX_STORE_FORWARD: u32 = 1 << 21;
@@ -542,6 +546,7 @@ impl Engine {
             DMA_FLUSH_TX
                 | DMA_RX_STORE_FORWARD
                 | DMA_TX_STORE_FORWARD
+                | DMA_OPERATE_SECOND_FRAME
                 | DMA_START_RX
                 | DMA_START_TX,
         );
@@ -974,6 +979,13 @@ mod tests {
         assert_eq!(DMA_HW_TX_CHECKSUM, 1 << 16);
         assert_eq!(DMA_HW_RX_CHECKSUM_TYPE2, 1 << 18);
         assert_eq!(MAC_IP_CHECKSUM_OFFLOAD, 1 << 10);
+    }
+
+    #[test]
+    fn store_and_forward_uses_operate_on_second_frame() {
+        assert_eq!(DMA_OPERATE_SECOND_FRAME, 1 << 2);
+        assert_eq!(DMA_OPERATE_SECOND_FRAME & DMA_START_RX, 0);
+        assert_eq!(DMA_OPERATE_SECOND_FRAME & DMA_START_TX, 0);
     }
     #[test]
     fn error_values_are_stable() {

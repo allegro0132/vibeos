@@ -32,7 +32,6 @@ fn profile_starts_integer_only_and_proposal_closed() {
         CoreFeature::LinearMemory,
         CoreFeature::Tables,
         CoreFeature::ImportsExports,
-        CoreFeature::Start,
         CoreFeature::DataElements,
     ] {
         assert!(feature.enabled(), "{feature:?}");
@@ -55,6 +54,7 @@ fn profile_starts_integer_only_and_proposal_closed() {
         CoreFeature::GarbageCollection,
         CoreFeature::CustomPageSizes,
         CoreFeature::WideArithmetic,
+        CoreFeature::Start,
     ] {
         assert!(!feature.enabled(), "{feature:?}");
     }

@@ -1,0 +1,13 @@
+[package]
+name = "vibeos-wasm-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-component-format = { path = "../component-format" }
+wasmi = { version = "=1.1.0", default-features = false, features = ["extra-checks", "prefer-btree-collections"] }
+wasmparser = { version = "=0.255.0", default-features = false, features = ["features", "prefer-btree-collections", "validate"] }
+
+[dev-dependencies]
+dlr-wasm-interpreter = { version = "=0.2.0", default-features = false }
+wat = "=1.255.0"

@@ -52,6 +52,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/PROGRAM_PERSISTENCE.md](docs/PROGRAM_PERSISTENCE.md)** — canonical
   source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
   restored least authority.
+- **[docs/WASM_ROADMAP.md](docs/WASM_ROADMAP.md)** — the Component Model-first
+  admitted-code plan: WIT contracts, bounded Core-WASM execution, CSpace-backed
+  resources, native async, composition, durable installation, and later adapters/AOT.
 - **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw

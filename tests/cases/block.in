@@ -1,4 +1,5 @@
 quiet
 blk info
+blk scope
 blk test
 halt

@@ -34,6 +34,7 @@ use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::exec::{self, TaskId};
 use vibeos_core::heap::{self, AllocationDomain, OwnerId};
 use vibeos_core::sync::SpinLock;
+use vibeos_storage_device::{DeviceSession, MutationFailure, MutationResult};
 
 fn erase_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -67,6 +68,15 @@ const FIRST_ALLOCATABLE_ID: u128 = 1;
 const STORED_OBJECT_RIGHTS: Rights = Rights::READ.union(Rights::GRANT).union(Rights::REVOKE);
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send + 'a>>;
+pub type BackendMutationFuture<'a, T> =
+    Pin<Box<dyn Future<Output = MutationResult<T, BackendError>> + Send + 'a>>;
+
+/// Classify the durability barrier that follows a successfully submitted
+/// write. Even when the barrier itself is rejected before publication, the
+/// composite durable-write operation can no longer claim no media effect.
+pub fn barrier_after_successful_write<T, E>(barrier: MutationResult<T, E>) -> MutationResult<T, E> {
+    barrier.map_err(MutationFailure::force_ambiguous)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendError {
@@ -114,14 +124,22 @@ pub struct BackendInfo {
     pub capacity_sectors: u64,
     pub read_only: bool,
     pub supports_flush: bool,
+    /// Exact device incarnation used by every I/O in one store operation.
+    pub session: DeviceSession,
 }
 
 /// Block and memory-accounting surface required by the object service.
 pub trait Platform: Send + Sync {
     fn info(&self) -> Result<BackendInfo, BackendError>;
-    fn read_sector(&self, sector: u64) -> BackendFuture<'_, [u8; 512]>;
-    fn write_sector(&self, sector: u64, bytes: [u8; 512]) -> BackendFuture<'_, ()>;
-    fn flush(&self) -> BackendFuture<'_, ()>;
+    fn read_sector(&self, session: DeviceSession, sector: u64) -> BackendFuture<'_, [u8; 512]>;
+    /// Write one historical M4 sector and make it durable using one pinned
+    /// device session. A failure retains whether media effect is possible.
+    fn write_sector_durable(
+        &self,
+        session: DeviceSession,
+        sector: u64,
+        bytes: [u8; 512],
+    ) -> BackendMutationFuture<'_, ()>;
     fn has_working_headroom(&self, required: usize) -> bool;
 }
 
@@ -153,6 +171,7 @@ pub enum StoreError {
     Busy,
     BackendAuthority,
     Backend(BackendError),
+    BackendMutation(MutationFailure<BackendError>),
     DeviceTooSmall,
     ReadOnly,
     FlushUnsupported,
@@ -173,6 +192,12 @@ impl core::fmt::Display for StoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Backend(error) => write!(f, "object-store block I/O failed: {error}"),
+            Self::BackendMutation(failure) => write!(
+                f,
+                "object-store durable write failed: {} ({:?})",
+                failure.error(),
+                failure.certainty()
+            ),
             _ => f.write_str(match self {
                 Self::PermissionDenied => "store capability lacks the required right",
                 Self::Busy => "object store already has an active operation",
@@ -195,7 +220,7 @@ impl core::fmt::Display for StoreError {
                     "store caller lacks the bounded journal-recovery headroom"
                 }
                 Self::OutsideTask => "store operations require an executor task context",
-                Self::Backend(_) => unreachable!(),
+                Self::Backend(_) | Self::BackendMutation(_) => unreachable!(),
             }),
         }
     }
@@ -205,6 +230,136 @@ impl From<BackendError> for StoreError {
     fn from(error: BackendError) -> Self {
         Self::Backend(error)
     }
+}
+
+impl From<MutationFailure<BackendError>> for StoreError {
+    fn from(failure: MutationFailure<BackendError>) -> Self {
+        Self::BackendMutation(failure)
+    }
+}
+
+/// Boot-selected persistence backend. `Pending` and `FailClosed` never fall
+/// through to the legacy journal: the selector must explicitly publish M4 or
+/// V2 before durable recovery can begin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageBackendSelection {
+    Pending,
+    LegacyM4,
+    StorageV2,
+    FailClosed,
+}
+
+/// Harmless aggregate information supplied by the sealed V2 runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageV2BackendInfo {
+    pub ready: bool,
+    pub busy: bool,
+    pub allocated_segments: usize,
+    pub recovered_objects: usize,
+    pub checkpoint_generation: u64,
+}
+
+/// Opaque backend-owned authority. The object-store facade can carry and
+/// compare this token but cannot derive a media address or stable identifier
+/// from it. Only the backend which created it can downcast the sealed payload.
+#[derive(Clone)]
+pub struct StorageV2ObjectToken {
+    inner: Arc<dyn Any + Send + Sync>,
+}
+
+impl StorageV2ObjectToken {
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        Self {
+            inner: Arc::new(value),
+        }
+    }
+
+    pub fn downcast_ref<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.inner.as_ref().downcast_ref::<T>()
+    }
+}
+
+/// One exact logical-journal object bound to an opaque V2 object capability.
+/// Construction is checked again against the recovered durable-format record
+/// before the binding can enter an `AuthoritySnapshot`.
+#[derive(Clone)]
+pub struct StorageV2RecoveredObject {
+    stable_object_id: ObjectId,
+    object_kind: journal::ObjectKind,
+    byte_len: usize,
+    commit_sequence: u64,
+    token: StorageV2ObjectToken,
+}
+
+impl StorageV2RecoveredObject {
+    pub fn new(object: &authority::RecoveredObject, token: StorageV2ObjectToken) -> Self {
+        Self {
+            stable_object_id: object.object_id,
+            object_kind: object.object_kind,
+            byte_len: object.bytes.len(),
+            commit_sequence: object.commit_sequence,
+            token,
+        }
+    }
+
+    fn matches(&self, object: &authority::RecoveredObject) -> bool {
+        self.stable_object_id == object.object_id
+            && self.object_kind == object.object_kind
+            && self.byte_len == object.bytes.len()
+            && self.commit_sequence == object.commit_sequence
+    }
+}
+
+/// Strictly recovered authority plus the private V2 bindings for exactly the
+/// objects which may be materialized as capabilities.
+pub struct StorageV2AuthoritySnapshot {
+    pub used_sectors: usize,
+    pub preflight: authority::RecoveryPreflight,
+    objects: Vec<StorageV2RecoveredObject>,
+}
+
+impl StorageV2AuthoritySnapshot {
+    pub fn new(
+        used_sectors: usize,
+        preflight: authority::RecoveryPreflight,
+        mut objects: Vec<StorageV2RecoveredObject>,
+    ) -> Result<Self, StoreError> {
+        objects.sort_unstable_by_key(|object| object.stable_object_id);
+        if objects
+            .windows(2)
+            .any(|pair| pair[0].stable_object_id == pair[1].stable_object_id)
+            || objects.iter().any(|binding| {
+                !preflight
+                    .committed_objects()
+                    .iter()
+                    .any(|object| binding.matches(object))
+            })
+        {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(Self {
+            used_sectors,
+            preflight,
+            objects,
+        })
+    }
+}
+
+pub type StorageV2Future<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + Send + 'a>>;
+
+/// Kernel-sealed Storage V2 bridge. It deliberately speaks the existing
+/// durable record stream and opaque object capabilities, never Blob keys,
+/// ObjectIds, paths, or physical pointers.
+pub trait StorageV2Backend: Send + Sync {
+    fn selection(&self) -> StorageBackendSelection;
+    fn info(&self) -> StorageV2BackendInfo;
+    fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot>;
+    fn append_authority<'a>(
+        &'a self,
+        expected: ChainCheckpoint,
+        records: &'a [[u8; journal::RECORD_SIZE]],
+    ) -> StorageV2Future<'a, StorageV2AuthoritySnapshot>;
+    fn read_object<'a>(&'a self, object: &'a StorageV2ObjectToken) -> StorageV2Future<'a, Vec<u8>>;
 }
 
 /// Error boundary for the canonical Merkle-blob profile. Journal failures and
@@ -338,6 +493,7 @@ static STORE_SCRATCH: StableScratch = StableScratch::new();
 
 struct StoreInner {
     platform: Arc<dyn Platform>,
+    v2: Option<Arc<dyn StorageV2Backend>>,
     active: SpinLock<Option<ActiveClaim>>,
     state: SpinLock<RuntimeState>,
 }
@@ -462,9 +618,17 @@ pub struct StoreService {
 
 impl StoreService {
     pub fn new(platform: Arc<dyn Platform>) -> Arc<Self> {
+        Self::new_with_storage_v2(platform, None)
+    }
+
+    pub fn new_with_storage_v2(
+        platform: Arc<dyn Platform>,
+        v2: Option<Arc<dyn StorageV2Backend>>,
+    ) -> Arc<Self> {
         let inner = system_allocation(|| {
             Arc::new(StoreInner {
                 platform,
+                v2,
                 active: SpinLock::new_recoverable(None),
                 state: SpinLock::new(RuntimeState::COLD),
             })
@@ -481,6 +645,34 @@ impl StoreService {
     }
 
     pub fn info(&self) -> StoreInfo {
+        if let Some(v2) = self.inner.v2.as_ref() {
+            match v2.selection() {
+                StorageBackendSelection::StorageV2 => {
+                    let info = v2.info();
+                    return StoreInfo {
+                        ready: info.ready,
+                        // V2 operations are serialized twice: the facade gate
+                        // spans capability publication and deterministic fault
+                        // injection, while the backend gate spans mutable
+                        // SegmentStore access.  Report either claim so callers
+                        // cannot mistake the gap between those phases for an
+                        // idle store.
+                        busy: info.busy || self.inner.active.lock().is_some(),
+                        used_sectors: info.allocated_segments,
+                        recovered_objects: info.recovered_objects,
+                        id_high_water: 0,
+                        last_sequence: info.checkpoint_generation,
+                    };
+                }
+                StorageBackendSelection::Pending | StorageBackendSelection::FailClosed => {
+                    return StoreInfo {
+                        ready: false,
+                        ..self.inner.info()
+                    };
+                }
+                StorageBackendSelection::LegacyM4 => {}
+            }
+        }
         self.inner.info()
     }
 
@@ -516,6 +708,24 @@ impl SealedConfigJournal {
         &self,
         object_kind: journal::ObjectKind,
     ) -> Result<Option<Vec<u8>>, StoreError> {
+        if let Some(v2) = selected_v2_backend(&self.inner)? {
+            let snapshot = v2.recover_authority().await?;
+            let newest = snapshot
+                .preflight
+                .committed_objects()
+                .iter()
+                .filter(|object| object.object_kind == object_kind)
+                .max_by_key(|object| object.commit_sequence);
+            return match newest {
+                Some(object) => {
+                    let token = snapshot
+                        .token_for(object)
+                        .ok_or(StoreError::ObjectUnavailable)?;
+                    v2.read_object(token).await.map(Some)
+                }
+                None => Ok(None),
+            };
+        }
         ensure_working_headroom()?;
         let operation = self.inner.begin()?;
         let result = async {
@@ -554,9 +764,47 @@ pub struct AuthoritySnapshot {
     pub checkpoint: ChainCheckpoint,
     pub used_sectors: usize,
     pub preflight: Option<authority::RecoveryPreflight>,
+    v2_objects: Option<Arc<Vec<StorageV2RecoveredObject>>>,
+}
+
+#[derive(Clone)]
+pub struct AuthorityObjectResolver {
+    v2_objects: Option<Arc<Vec<StorageV2RecoveredObject>>>,
+}
+
+impl AuthorityObjectResolver {
+    pub fn stored_object(
+        &self,
+        object: &authority::RecoveredObject,
+    ) -> Result<Arc<StoredObject>, StoreError> {
+        stored_object_from_bindings(self.v2_objects.as_deref(), object)
+    }
 }
 
 impl AuthoritySnapshot {
+    /// Wrap a strict legacy preflight for external policy validation without
+    /// granting any Storage V2 object bindings. This constructor exists for
+    /// the migration coordinator, which must run the production M4 authority
+    /// validator before importing any bytes into the disjoint V2 range.
+    pub fn from_legacy_preflight(
+        used_sectors: usize,
+        preflight: authority::RecoveryPreflight,
+    ) -> Result<Self, StoreError> {
+        if preflight.store_id() != store_id() {
+            return Err(StoreError::Corrupt);
+        }
+        let checkpoint = preflight
+            .chain_checkpoint()
+            .map_err(|_| StoreError::Corrupt)?;
+        Ok(Self {
+            formatted: true,
+            checkpoint,
+            used_sectors,
+            preflight: Some(preflight),
+            v2_objects: None,
+        })
+    }
+
     pub fn id_high_water(&self) -> u128 {
         self.preflight
             .as_ref()
@@ -567,6 +815,64 @@ impl AuthoritySnapshot {
     pub fn chain(&self) -> Result<authority::RecordChain, StoreError> {
         authority::RecordChain::from_checkpoint(store_id(), self.checkpoint)
             .map_err(|_| StoreError::Corrupt)
+    }
+
+    /// Construct a stored-object resource only when this exact recovered
+    /// record is covered by the selected backend's authenticated binding set.
+    pub fn stored_object(
+        &self,
+        object: &authority::RecoveredObject,
+    ) -> Result<Arc<StoredObject>, StoreError> {
+        stored_object_from_bindings(self.v2_objects.as_deref(), object)
+    }
+
+    pub fn object_resolver(&self) -> AuthorityObjectResolver {
+        AuthorityObjectResolver {
+            v2_objects: self.v2_objects.clone(),
+        }
+    }
+}
+
+fn stored_object_from_bindings(
+    bindings: Option<&Vec<StorageV2RecoveredObject>>,
+    object: &authority::RecoveredObject,
+) -> Result<Arc<StoredObject>, StoreError> {
+    match bindings {
+        None => Ok(StoredObject::from_recovered(object)),
+        Some(bindings) => {
+            let binding = bindings
+                .binary_search_by_key(&object.object_id, |binding| binding.stable_object_id)
+                .ok()
+                .map(|index| &bindings[index])
+                .filter(|binding| binding.matches(object))
+                .ok_or(StoreError::ObjectUnavailable)?;
+            Ok(StoredObject::from_storage_v2(object, binding.token.clone()))
+        }
+    }
+}
+
+impl StorageV2AuthoritySnapshot {
+    fn token_for(&self, object: &authority::RecoveredObject) -> Option<&StorageV2ObjectToken> {
+        self.objects
+            .binary_search_by_key(&object.object_id, |binding| binding.stable_object_id)
+            .ok()
+            .map(|index| &self.objects[index])
+            .filter(|binding| binding.matches(object))
+            .map(|binding| &binding.token)
+    }
+
+    fn into_facade(self) -> Result<AuthoritySnapshot, StoreError> {
+        let checkpoint = self
+            .preflight
+            .chain_checkpoint()
+            .map_err(|_| StoreError::Corrupt)?;
+        Ok(AuthoritySnapshot {
+            formatted: true,
+            checkpoint,
+            used_sectors: self.used_sectors,
+            preflight: Some(self.preflight),
+            v2_objects: Some(Arc::new(self.objects)),
+        })
     }
 }
 
@@ -580,10 +886,16 @@ pub struct AuthorityJournal {
 
 impl AuthorityJournal {
     pub async fn recover(&self) -> Result<AuthoritySnapshot, StoreError> {
+        if let Some(v2) = selected_v2_backend(&self.inner)? {
+            return v2.recover_authority().await?.into_facade();
+        }
         ensure_working_headroom()?;
         let operation = self.inner.begin()?;
         let result = async {
-            validate_writable_backend(&self.inner)?;
+            // Recovery is deliberately valid after the migration controller
+            // freezes the M4 writer branch.  Only append requires WRITE and a
+            // flush barrier; scanning an already-published journal needs the
+            // retained read capability alone.
             let scan = scan_region(&self.inner).await?;
             let snapshot = authority_snapshot(&scan)?;
             if let Some(preflight) = snapshot.preflight.as_ref() {
@@ -614,6 +926,9 @@ impl AuthorityJournal {
         if records.is_empty() {
             return Err(StoreError::Corrupt);
         }
+        if let Some(v2) = selected_v2_backend(&self.inner)? {
+            return v2.append_authority(expected, records).await?.into_facade();
+        }
         ensure_working_headroom()?;
         let operation = self.inner.begin()?;
         let result = async {
@@ -633,7 +948,7 @@ impl AuthorityJournal {
 
             let final_checkpoint = validate_preview(&before, records)?;
             for record in records {
-                append_record(&self.inner, &mut scan.next_physical, record).await?;
+                append_record(&self.inner, &mut scan.next_physical, scan.session, record).await?;
             }
 
             // A flush is not accepted on faith: the complete semantic pass
@@ -663,7 +978,26 @@ impl AuthorityJournal {
         if !object.authorizes(Rights::READ) {
             return Err(StoreError::PermissionDenied);
         }
-        read_committed_object(self.inner.clone(), object).await
+        let v2_token = object.with(|stored| stored.v2_token.clone());
+        match v2_token {
+            Some(token) => {
+                selected_v2_backend(&self.inner)?
+                    .ok_or(StoreError::ObjectUnavailable)?
+                    .read_object(&token)
+                    .await
+            }
+            // A Staged boot reconstructs live capabilities from the frozen M4
+            // authority before an explicit same-boot activation. Those exact
+            // resources remain readable through the retained read-only M4
+            // sibling for this rollback release; they never become an ambient
+            // ObjectId lookup, and every post-activation write still selects
+            // V2. A subsequent boot reconstructs the capability with a V2
+            // token from VIBEAUT2.
+            None => {
+                gate_exact_m4_read(&self.inner)?;
+                read_committed_object(self.inner.clone(), object).await
+            }
+        }
     }
 }
 
@@ -693,9 +1027,20 @@ pub unsafe fn recover_faulted_task(task: TaskId, domain: AllocationDomain) {
     // has now detached that task forever. A same-domain task on another hart
     // carries a different key and cannot have its guard recovered here.
     let _ = unsafe { inner.active.recover_after_task_fault(domain, task_key) };
-    let mut active = inner.active.lock();
+    clear_faulted_active_claim(&inner.active, task, domain);
+}
+
+fn clear_faulted_active_claim(
+    active: &SpinLock<Option<ActiveClaim>>,
+    task: TaskId,
+    domain: AllocationDomain,
+) -> bool {
+    let mut active = active.lock();
     if active.is_some_and(|claim| claim.task == task && claim.domain == domain) {
         *active = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -728,6 +1073,7 @@ pub struct StoredObject {
     object_kind: journal::ObjectKind,
     byte_len: usize,
     commit_sequence: u64,
+    v2_token: Option<StorageV2ObjectToken>,
 }
 
 impl StoredObject {
@@ -739,6 +1085,23 @@ impl StoredObject {
                 object_kind: object.object_kind,
                 byte_len: object.bytes.len(),
                 commit_sequence: object.commit_sequence,
+                v2_token: None,
+            })
+        })
+    }
+
+    fn from_storage_v2(
+        object: &authority::RecoveredObject,
+        token: StorageV2ObjectToken,
+    ) -> Arc<Self> {
+        system_allocation(|| {
+            Arc::new(Self {
+                store_id: store_id(),
+                object_id: object.object_id,
+                object_kind: object.object_kind,
+                byte_len: object.bytes.len(),
+                commit_sequence: object.commit_sequence,
+                v2_token: Some(token),
             })
         })
     }
@@ -822,13 +1185,88 @@ async fn put_to_space(
     if bytes.len() > journal::MAX_OBJECT_SIZE {
         return Err(StoreError::ObjectTooLarge);
     }
-    ensure_working_headroom()?;
 
-    // Snapshot the destination before the first await.  Publication uses the
-    // same-incarnation primitive after commit, so restart cannot redirect a
-    // successful transaction into a fresh authority domain.
+    // Snapshot the destination before either backend can await. Publication
+    // must never redirect a completed transaction into a restarted authority
+    // domain, irrespective of which durable format is selected at boot.
     let target_incarnation = target.incarnation();
     let inner = lease.with(|service| service.inner.clone());
+    if let Some(backend) = selected_v2_backend(&inner)? {
+        // The V2 backend has its own exclusive mutable-store epoch, but that
+        // epoch begins only at append time.  Keep the facade claim across
+        // recovery, preview, the audited pre-write fault point, append, and
+        // capability publication. Raw task cleanup can therefore identify and
+        // release the exact abandoned operation even when the panic precedes
+        // the first backend mutation.
+        let operation = inner.begin()?;
+        // V2 ordinary object publication must update the durable record stream
+        // and its private binding table in the same checkpoint. The backend
+        // owns the ID reservation and exact readback; the facade publishes
+        // only the returned sealed object.
+        let snapshot = backend.recover_authority().await?;
+        let before = snapshot.into_facade()?;
+        let old_high_water = before.id_high_water();
+        let first_id = old_high_water.max(FIRST_ALLOCATABLE_ID);
+        let object_raw = first_id.checked_add(1).ok_or(StoreError::IdExhausted)?;
+        let exclusive_end = object_raw.checked_add(1).ok_or(StoreError::IdExhausted)?;
+        let transaction_id = TransactionId::new(first_id).ok_or(StoreError::IdExhausted)?;
+        let object_id = ObjectId::new(object_raw).ok_or(StoreError::IdExhausted)?;
+        let mut chain = before.chain()?;
+        let high_water = chain
+            .append(None, journal::RecordBody::IdHighWater { exclusive_end })
+            .map_err(map_encode_error)?;
+        let (transaction, _) = journal::preview_object_transaction(
+            &chain,
+            transaction_id,
+            object_id,
+            object_kind,
+            bytes,
+        )
+        .map_err(map_encode_error)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(1 + transaction.records.len())
+            .map_err(|_| StoreError::InsufficientMemory)?;
+        records.push(high_water);
+        records.extend(transaction.records);
+
+        if let Some(target) = fault_target {
+            assert_eq!(
+                exec::current_task_id().expect("the injected store path runs in a task"),
+                target.task
+            );
+            assert_eq!(heap::current_domain(), target.domain);
+            FAULT_REACHED
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_add(1)
+                })
+                .expect("store fault-injection counter exhausted");
+            panic!("injected object-store fault before durable write");
+        }
+
+        let committed = backend
+            .append_authority(before.checkpoint, &records)
+            .await?;
+        let object = committed
+            .preflight
+            .committed_objects()
+            .iter()
+            .find(|candidate| {
+                candidate.object_id == object_id
+                    && candidate.object_kind == object_kind
+                    && candidate.bytes.as_slice() == bytes
+            })
+            .ok_or(StoreError::ObjectMismatch)?;
+        let token = committed
+            .token_for(object)
+            .ok_or(StoreError::ObjectMismatch)?
+            .clone();
+        let resource = StoredObject::from_storage_v2(object, token);
+        let published = target.publish(target_incarnation, resource, STORED_OBJECT_RIGHTS);
+        operation.finish();
+        return published.ok_or(StoreError::PublicationTargetRestarted);
+    }
+    ensure_working_headroom()?;
     let operation = inner.begin()?;
 
     validate_writable_backend(&inner)?;
@@ -904,11 +1342,11 @@ async fn put_to_space(
     // commit-flush minimum and keeps every acknowledged prefix independently
     // recoverable under the v1 ordered-flush media contract.
     if let Some(format) = format_record.as_ref() {
-        append_record(&inner, &mut scan.next_physical, format).await?;
+        append_record(&inner, &mut scan.next_physical, scan.session, format).await?;
     }
-    append_record(&inner, &mut scan.next_physical, &high_water).await?;
+    append_record(&inner, &mut scan.next_physical, scan.session, &high_water).await?;
     for record in &transaction.records {
-        append_record(&inner, &mut scan.next_physical, record).await?;
+        append_record(&inner, &mut scan.next_physical, scan.session, record).await?;
     }
     drop(transaction);
 
@@ -936,6 +1374,7 @@ async fn put_to_space(
             object_kind,
             byte_len,
             commit_sequence,
+            v2_token: None,
         })
     });
     let published = target.publish(target_incarnation, object, STORED_OBJECT_RIGHTS);
@@ -954,7 +1393,21 @@ pub async fn get_with(
         return Err(StoreError::PermissionDenied);
     }
     let inner = service.with(|store| store.inner.clone());
-    read_committed_object(inner, object).await
+    let token = object.with(|stored| stored.v2_token.clone());
+    match token {
+        Some(token) => {
+            selected_v2_backend(&inner)?
+                .ok_or(StoreError::ObjectUnavailable)?
+                .read_object(&token)
+                .await
+        }
+        // See AuthorityJournal::read: an already-held pre-activation
+        // capability may read only its exact frozen M4 object until reboot.
+        None => {
+            gate_exact_m4_read(&inner)?;
+            read_committed_object(inner, object).await
+        }
+    }
 }
 
 /// Encode content into the canonical Merkle-blob profile after enforcing the
@@ -1104,24 +1557,35 @@ struct PhysicalScan {
     /// First physical slot after every observed non-zero sector, including a
     /// torn tail.  Such a tail is never overwritten; a retry chains around it.
     next_physical: usize,
+    session: DeviceSession,
 }
 
 async fn scan_region(inner: &StoreInner) -> Result<PhysicalScan, StoreError> {
-    let info = backend_info(inner)?;
-    if info.capacity_sectors < STORE_END_SECTOR {
-        return Err(StoreError::DeviceTooSmall);
-    }
+    let info = validate_recovery_backend_info(backend_info(inner)?)?;
 
     let mut next_physical = 0;
     for offset in 0..STORE_LOG_SECTORS {
         let sector = STORE_FIRST_SECTOR + offset as u64;
-        let bytes = read_sector(inner, sector).await?;
+        let bytes = read_sector(inner, info.session, sector).await?;
         if bytes.iter().any(|byte| *byte != 0) {
             next_physical = offset + 1;
         }
         STORE_SCRATCH.write(offset, bytes);
     }
-    Ok(PhysicalScan { next_physical })
+    Ok(PhysicalScan {
+        next_physical,
+        session: info.session,
+    })
+}
+
+fn validate_recovery_backend_info(backend: BackendInfo) -> Result<BackendInfo, StoreError> {
+    if backend.capacity_sectors < STORE_END_SECTOR {
+        return Err(StoreError::DeviceTooSmall);
+    }
+    // `read_only` and `supports_flush` are mutation properties.  Requiring
+    // either here would make the intentionally frozen M4 compatibility image
+    // unreadable during V2Staged recovery.
+    Ok(backend)
 }
 
 fn recover_scan(_scan: &PhysicalScan) -> Result<authority::RecoveryPreflight, StoreError> {
@@ -1139,6 +1603,7 @@ fn authority_snapshot(scan: &PhysicalScan) -> Result<AuthoritySnapshot, StoreErr
                 checkpoint,
                 used_sectors: scan.next_physical,
                 preflight: Some(preflight),
+                v2_objects: None,
             })
         }
         Err(authority::RecoveryError::MissingFormat) => Ok(AuthoritySnapshot {
@@ -1150,9 +1615,41 @@ fn authority_snapshot(scan: &PhysicalScan) -> Result<AuthoritySnapshot, StoreErr
             },
             used_sectors: scan.next_physical,
             preflight: None,
+            v2_objects: None,
         }),
         Err(_) => Err(StoreError::Corrupt),
     }
+}
+
+fn selected_v2_backend(
+    inner: &StoreInner,
+) -> Result<Option<Arc<dyn StorageV2Backend>>, StoreError> {
+    let Some(backend) = inner.v2.as_ref() else {
+        return Ok(None);
+    };
+    if selection_uses_storage_v2(backend.selection())? {
+        Ok(Some(backend.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn selection_uses_storage_v2(selection: StorageBackendSelection) -> Result<bool, StoreError> {
+    match selection {
+        StorageBackendSelection::LegacyM4 => Ok(false),
+        StorageBackendSelection::StorageV2 => Ok(true),
+        StorageBackendSelection::Pending => Err(StoreError::Unformatted),
+        StorageBackendSelection::FailClosed => Err(StoreError::Corrupt),
+    }
+}
+
+/// Gate the retained exact-capability M4 read path through the same backend
+/// selection used by ordinary V2 reads. A same-boot V2 activation may retain
+/// an already-held M4 capability, but ambiguous or corrupt selection must fail
+/// closed before any legacy media is read.
+fn gate_exact_m4_read(inner: &StoreInner) -> Result<(), StoreError> {
+    selected_v2_backend(inner)?;
+    Ok(())
 }
 
 fn validate_preview(
@@ -1205,15 +1702,16 @@ fn map_recovery_error(error: authority::RecoveryError) -> StoreError {
 async fn append_record(
     inner: &StoreInner,
     next_physical: &mut usize,
+    session: DeviceSession,
     record: &[u8; journal::RECORD_SIZE],
 ) -> Result<(), StoreError> {
     if *next_physical >= STORE_LOG_SECTORS {
         return Err(StoreError::JournalFull);
     }
     let sector = STORE_FIRST_SECTOR + *next_physical as u64;
-    write_sector(inner, sector, *record).await?;
+    write_sector_durable(inner, session, sector, *record).await?;
     *next_physical += 1;
-    flush(inner).await
+    Ok(())
 }
 
 fn backend_info(inner: &StoreInner) -> Result<BackendInfo, StoreError> {
@@ -1231,16 +1729,24 @@ fn validate_writable_backend(inner: &StoreInner) -> Result<(), StoreError> {
     Ok(())
 }
 
-async fn read_sector(inner: &StoreInner, sector: u64) -> Result<[u8; 512], StoreError> {
-    Ok(inner.platform.read_sector(sector).await?)
+async fn read_sector(
+    inner: &StoreInner,
+    session: DeviceSession,
+    sector: u64,
+) -> Result<[u8; 512], StoreError> {
+    Ok(inner.platform.read_sector(session, sector).await?)
 }
 
-async fn write_sector(inner: &StoreInner, sector: u64, bytes: [u8; 512]) -> Result<(), StoreError> {
-    Ok(inner.platform.write_sector(sector, bytes).await?)
-}
-
-async fn flush(inner: &StoreInner) -> Result<(), StoreError> {
-    Ok(inner.platform.flush().await?)
+async fn write_sector_durable(
+    inner: &StoreInner,
+    session: DeviceSession,
+    sector: u64,
+    bytes: [u8; 512],
+) -> Result<(), StoreError> {
+    Ok(inner
+        .platform
+        .write_sector_durable(session, sector, bytes)
+        .await?)
 }
 
 fn map_encode_error(error: journal::EncodeError) -> StoreError {
@@ -1269,4 +1775,75 @@ fn system_allocation<T>(operation: impl FnOnce() -> T) -> T {
     let value = operation();
     scope.restore();
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vibeos_storage_device::{DeviceId, DeviceSession};
+
+    #[test]
+    fn recovery_backend_accepts_frozen_read_only_media() {
+        let session = DeviceSession::new(DeviceId::new(1).unwrap(), 1).unwrap();
+        let backend = BackendInfo {
+            capacity_sectors: STORE_END_SECTOR,
+            read_only: true,
+            supports_flush: false,
+            session,
+        };
+        assert_eq!(validate_recovery_backend_info(backend), Ok(backend));
+    }
+
+    #[test]
+    fn recovery_backend_still_rejects_a_short_device() {
+        let session = DeviceSession::new(DeviceId::new(1).unwrap(), 1).unwrap();
+        let backend = BackendInfo {
+            capacity_sectors: STORE_END_SECTOR - 1,
+            read_only: false,
+            supports_flush: true,
+            session,
+        };
+        assert_eq!(
+            validate_recovery_backend_info(backend),
+            Err(StoreError::DeviceTooSmall)
+        );
+    }
+
+    #[test]
+    fn exact_m4_read_gate_covers_all_backend_selections() {
+        assert_eq!(
+            selection_uses_storage_v2(StorageBackendSelection::LegacyM4),
+            Ok(false)
+        );
+        assert_eq!(
+            selection_uses_storage_v2(StorageBackendSelection::StorageV2),
+            Ok(true)
+        );
+        assert_eq!(
+            selection_uses_storage_v2(StorageBackendSelection::Pending),
+            Err(StoreError::Unformatted)
+        );
+        assert_eq!(
+            selection_uses_storage_v2(StorageBackendSelection::FailClosed),
+            Err(StoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn fault_cleanup_clears_only_the_exact_facade_claim() {
+        let task = TaskId(41);
+        let other_task = TaskId(42);
+        let domain = AllocationDomain::SYSTEM;
+        let active = SpinLock::new_recoverable(Some(ActiveClaim {
+            task,
+            domain,
+            token: 7,
+        }));
+
+        assert!(!clear_faulted_active_claim(&active, other_task, domain));
+        assert!(active.lock().is_some());
+        assert!(clear_faulted_active_claim(&active, task, domain));
+        assert!(active.lock().is_none());
+        assert!(!clear_faulted_active_claim(&active, task, domain));
+    }
 }

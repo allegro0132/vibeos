@@ -24,13 +24,13 @@ use vibeos_core::cap::{
 use vibeos_durable_format as durable;
 use vibeos_durable_format::{
     DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
-    RecoveredStore, RootConstraint, RootPolicyPartition, RootRightsConstraint, SlotIdentity,
-    TransactionId,
+    RecoveredStore, RootConstraint, RootPolicy, RootPolicyPartition, RootRightsConstraint,
+    SlotIdentity, StoreId, TransactionId,
 };
 use vibeos_object_store as object_codec;
 use vibeos_program_store as program_model;
 
-use crate::saved_program::{self, SavedProgramService, TrustedProgram};
+use crate::saved_program::{SavedProgramService, TrustedProgram};
 use crate::store::{AuthorityJournal, AuthoritySnapshot, StoreError, StoredObject};
 use crate::world::Space;
 use crate::{block_device, exec, heap, sync::SpinLock};
@@ -44,6 +44,217 @@ pub use vibeos_authority_store::{
     DurableCSpaceError, DurableCSpaceInfo, DurableCSpaceState, PersistentTestPhase,
     PersistentTestReport,
 };
+
+const STORAGE_V2_EXTERNAL_POLICY: &[u8] = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801";
+const SSH_CONFIG_OBJECT_KIND_RAW: u32 = 0x5353_4801;
+const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
+
+pub(crate) fn storage_v2_external_policy_sha256() -> [u8; 32] {
+    vibeos_segment_store::root_policy_commitment(STORAGE_V2_EXTERNAL_POLICY)
+}
+
+/// Construct the sole native-empty authority snapshot. It is deliberately the
+/// same one-record M4 logical format accepted by migration, with no roots,
+/// objects, or optional sealed singletons, and is bound to the compiled
+/// external policy before it can reach V2 media.
+pub(crate) fn storage_v2_empty_import(
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    vibeos_segment_store::PersistentAuthorityImport::empty(
+        store_id,
+        STORAGE_V2_EXTERNAL_POLICY,
+        Vec::new(),
+    )
+    .map_err(|_| DurableCSpaceError::RootPolicy)
+}
+
+/// Recognize only the post-import residue produced by native empty
+/// provisioning. This is intentionally stricter than generic V2 validity:
+/// UUID, logical stream, policy digest, zero object bindings, and the complete
+/// principal policy must all equal the canonical constructor.
+pub(crate) fn is_storage_v2_native_empty_view(
+    view: &vibeos_segment_store::PersistentAuthorityView,
+    expected: &vibeos_segment_store::PersistentAuthorityImport,
+) -> bool {
+    view.store_uuid() == *b"VIBEOS-STOR-V2!!"
+        && view.checkpoint_generation() == 2
+        && view.root_policy_sha256() == expected.root_policy_sha256()
+        && view.record_stream() == expected.record_stream()
+        && view.objects().is_empty()
+        && view.principal_policies() == expected.principals()
+        && view.principals().len() == expected.principals().len()
+}
+
+fn validate_storage_v2_records(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+) -> Result<durable::RecoveryPreflight, DurableCSpaceError> {
+    if records.is_empty() || records.len() > vibeos_object_store::STORE_LOG_SECTORS {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let preflight = durable::preflight_recovery(records, store_id)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    // This is the complete production validator: exact external roots, fixed
+    // CSpace history, typed resource witnesses, and saved-program semantics.
+    let snapshot = AuthoritySnapshot::from_legacy_preflight(records.len(), preflight.clone())?;
+    let _validated = authorize_snapshot(snapshot)?;
+    Ok(preflight)
+}
+
+/// Revalidate a V2 authority payload under the compiled production policy.
+/// The on-media policy digest is only a commitment; it cannot replace this
+/// semantic pass before boot publishes Storage V2 as the selected backend.
+pub(crate) fn validate_storage_v2_record_stream(
+    record_stream: &[u8],
+) -> Result<(), DurableCSpaceError> {
+    storage_v2_recovery_import(record_stream).map(|_| ())
+}
+
+/// Reconstruct the exact inert authority import selected by the kernel's
+/// compiled external policy. Cold Storage V2 recovery uses this value to prove
+/// that every private stable-object binding names the logical record bytes,
+/// rather than trusting the on-media policy digest or object metadata alone.
+pub(crate) fn storage_v2_recovery_import(
+    record_stream: &[u8],
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    if record_stream.is_empty()
+        || !record_stream
+            .len()
+            .is_multiple_of(vibeos_durable_format::RECORD_SIZE)
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let record_count = record_stream.len() / vibeos_durable_format::RECORD_SIZE;
+    if record_count > vibeos_object_store::STORE_LOG_SECTORS {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(record_count)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    for record in record_stream.chunks_exact(vibeos_durable_format::RECORD_SIZE) {
+        records.push(
+            record
+                .try_into()
+                .map_err(|_| DurableCSpaceError::RootPolicy)?,
+        );
+    }
+    storage_v2_migration_import(&records)
+}
+
+#[cfg(any(test, feature = "legacy-shell"))]
+mod storage_v2_policy_tests {
+    use super::*;
+
+    fn record_stream(records: &[[u8; durable::RECORD_SIZE]]) -> Vec<u8> {
+        records.iter().flatten().copied().collect()
+    }
+
+    #[cfg_attr(test, test)]
+    pub(crate) fn v2_stream_policy_rejects_semantic_extra_root_with_canonical_records() {
+        let store_id = StoreId::new(M4_STORE_ID_RAW).unwrap();
+        let mut chain = durable::RecordChain::new(store_id);
+        let mut records = vec![chain.append(None, durable::RecordBody::Format).unwrap()];
+        records.push(
+            chain
+                .append(None, durable::RecordBody::IdHighWater { exclusive_end: 5 })
+                .unwrap(),
+        );
+        let object_id = durable::ObjectId::new(2).unwrap();
+        records.extend(
+            durable::encode_object_transaction(
+                &mut chain,
+                durable::TransactionId::new(1).unwrap(),
+                object_id,
+                durable::ObjectKind::new(0x7f00_0001).unwrap(),
+                b"semantically outside the production root policy",
+            )
+            .unwrap()
+            .records,
+        );
+        let grant = durable::GrantRecord {
+            derivation_id: durable::DerivationId::new(4).unwrap(),
+            parent_id: None,
+            object_id,
+            target: durable::SlotIdentity {
+                space: durable::SpaceId::new(0x7f00_0002).unwrap(),
+                slot: 0,
+                generation: 0,
+            },
+            rights: durable::DurableRights::READ,
+            resource_kind: durable::ResourceKind::new(0x7f00_0003).unwrap(),
+            flags: durable::GrantFlags::ROOT,
+        };
+        records.extend(
+            durable::preview_grant_transaction(
+                &chain,
+                durable::TransactionId::new(3).unwrap(),
+                grant,
+            )
+            .unwrap()
+            .0
+            .records,
+        );
+
+        assert_eq!(
+            validate_storage_v2_record_stream(&record_stream(&records)),
+            Err(DurableCSpaceError::RootPolicy)
+        );
+    }
+
+    #[cfg_attr(test, test)]
+    pub(crate) fn v2_stream_policy_accepts_canonical_empty_authority() {
+        let store_id = StoreId::new(M4_STORE_ID_RAW).unwrap();
+        let mut chain = durable::RecordChain::new(store_id);
+        let records = [chain.append(None, durable::RecordBody::Format).unwrap()];
+        assert_eq!(
+            validate_storage_v2_record_stream(&record_stream(&records)),
+            Ok(())
+        );
+        let native = storage_v2_empty_import().unwrap();
+        assert_eq!(native.record_stream(), record_stream(&records));
+        assert_eq!(
+            native.root_policy_sha256(),
+            storage_v2_external_policy_sha256()
+        );
+        assert_eq!(native.admitted_object_count(), 0);
+    }
+}
+
+#[cfg(feature = "legacy-shell")]
+pub(crate) fn run_storage_v2_policy_selftests() {
+    storage_v2_policy_tests::v2_stream_policy_accepts_canonical_empty_authority();
+    storage_v2_policy_tests::v2_stream_policy_rejects_semantic_extra_root_with_canonical_records();
+}
+
+/// Build the inert import only after running the same exact graph and saved
+/// program policy used by live M4 boot. The SSH configuration kind is an
+/// optional sealed singleton in the compiled policy: when present, exactly its
+/// newest committed value is retained without turning ObjectKind into lookup
+/// authority.
+pub(crate) fn storage_v2_migration_import(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let preflight = validate_storage_v2_records(records)?;
+    let roots = select_storage_v2_roots(&preflight)?;
+    let ssh_kind = durable::ObjectKind::new(SSH_CONFIG_OBJECT_KIND_RAW)
+        .expect("fixed SSH configuration kind is non-zero");
+    let sealed_singletons = preflight
+        .committed_objects()
+        .iter()
+        .any(|object| object.object_kind == ssh_kind)
+        .then_some(ssh_kind);
+    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_sealed_singletons(
+        records,
+        store_id,
+        &roots,
+        sealed_singletons.as_slice(),
+        STORAGE_V2_EXTERNAL_POLICY,
+        Vec::new(),
+    )
+    .map_err(|_| DurableCSpaceError::RootPolicy)
+}
 
 #[derive(Default)]
 struct LiveGraph {
@@ -290,7 +501,7 @@ impl DurableCSpaceService {
             }
             self.inner
                 .saved_program
-                .install_recovered(program_identities.first().copied())
+                .stage_recovered(program_identities.first().copied())
                 .map_err(|_| DurableCSpaceError::Install)?;
             self.install_live_graph(&identities, trusted.shape);
             Ok(())
@@ -327,6 +538,13 @@ impl DurableCSpaceService {
         self.wait_ready().await?;
         // The first target-CSpace observation occurs strictly after Ready.
         let _ = self.inner.target.0.lock().incarnation();
+        self.inner
+            .saved_program
+            .activate_recovered()
+            .map_err(|_| DurableCSpaceError::Install)?;
+        // SavedProgram Ready is the final fallible activation publication.
+        // From here to the coordinator's exact claim release there is no await
+        // or fallible operation for a remote client to overtake.
         self.inner.dependent_started.store(true, Ordering::Release);
         Ok(())
     }
@@ -563,7 +781,7 @@ impl DurableCSpaceService {
                 &grant,
             )
             .await?;
-        let resource = StoredObject::from_recovered(&object);
+        let resource = committed.stored_object(&object)?;
         let identity = operation.install_root(&grant, resource)?;
         self.refresh_live_graph(committed)?;
         Ok(identity)
@@ -1051,34 +1269,9 @@ struct TrustedSnapshot {
     program: TrustedProgram,
 }
 
-fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, DurableCSpaceError> {
-    let Some(preflight) = snapshot.preflight else {
-        return Ok(TrustedSnapshot {
-            slots: Vec::new(),
-            grants: Vec::new(),
-            resources: Vec::new(),
-            shape: ValidatedGraphShape {
-                child_history_generation: None,
-                descendant_history_generation: None,
-                tombstones: 0,
-            },
-            program: TrustedProgram {
-                slots: Vec::new(),
-                grants: Vec::new(),
-                resources: Vec::new(),
-                live: false,
-            },
-        });
-    };
-    let committed_grants = preflight.committed_grants().to_vec();
-    let persistent_committed_grants: Vec<_> = committed_grants
-        .iter()
-        .filter(|grant| grant.grant.target.space == persistent_space_id())
-        .cloned()
-        .collect();
-    // Root selection is global. Each independently owned SpaceId contributes a
-    // constraint only when its slot history says it has live authority; finish
-    // then rejects every extra root not present in this union.
+fn select_storage_v2_roots(
+    preflight: &durable::RecoveryPreflight,
+) -> Result<Vec<RootPolicy>, DurableCSpaceError> {
     let has_live_authority = preflight
         .slots()
         .iter()
@@ -1108,7 +1301,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
             constraints: &program_constraints,
         });
     }
-    let roots = durable::select_root_policy_union(&preflight, &partitions)
+    let roots = durable::select_root_policy_union(preflight, &partitions)
         .map_err(|_| DurableCSpaceError::RootPolicy)?;
     if has_live_program
         && !roots.iter().any(|root| {
@@ -1118,6 +1311,52 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     {
         return Err(DurableCSpaceError::RootPolicy);
     }
+    if has_live_authority
+        && !roots.iter().any(|root| {
+            root.grant.target.space == persistent_space_id()
+                && root.grant.target.slot == ROOT_SLOT
+                && root.grant.target.generation == 0
+                && root.grant.parent_id.is_none()
+                && root.grant.flags == GrantFlags::ROOT
+                && root.grant.rights == ROOT_RIGHTS
+                && root.grant.resource_kind == stored_object_resource_kind()
+        })
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    Ok(roots)
+}
+
+fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, DurableCSpaceError> {
+    let object_resolver = snapshot.object_resolver();
+    let Some(preflight) = snapshot.preflight else {
+        return Ok(TrustedSnapshot {
+            slots: Vec::new(),
+            grants: Vec::new(),
+            resources: Vec::new(),
+            shape: ValidatedGraphShape {
+                child_history_generation: None,
+                descendant_history_generation: None,
+                tombstones: 0,
+            },
+            program: TrustedProgram {
+                slots: Vec::new(),
+                grants: Vec::new(),
+                resources: Vec::new(),
+                live: false,
+            },
+        });
+    };
+    let committed_grants = preflight.committed_grants().to_vec();
+    let persistent_committed_grants: Vec<_> = committed_grants
+        .iter()
+        .filter(|grant| grant.grant.target.space == persistent_space_id())
+        .cloned()
+        .collect();
+    // Root selection is global. Each independently owned SpaceId contributes a
+    // constraint only when its slot history says it has live authority; finish
+    // then rejects every extra root not present in this union.
+    let roots = select_storage_v2_roots(&preflight)?;
     let root_object = roots
         .iter()
         .find(|root| root.grant.target.space == persistent_space_id())
@@ -1133,7 +1372,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
             if object.object_kind != persistent_object_kind() {
                 return Err(DurableCSpaceError::RootPolicy);
             }
-            Ok(StoredObject::from_recovered(object))
+            object_resolver.stored_object(object).map_err(Into::into)
         })
         .transpose()?;
     let recovered = preflight
@@ -1227,8 +1466,12 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
         last_sequence: recovered.last_sequence,
         last_crc32c: recovered.last_crc32c,
     };
-    let program = saved_program::authorize_recovered(&program_recovered)
-        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let program = program_model::authorize_recovered_with(&program_recovered, |object| {
+        object_resolver
+            .stored_object(object)
+            .map_err(program_model::SavedProgramError::from)
+    })
+    .map_err(|_| DurableCSpaceError::RootPolicy)?;
     Ok(TrustedSnapshot {
         slots: persistent.slots,
         grants: persistent.grants,

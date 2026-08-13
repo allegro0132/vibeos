@@ -8,11 +8,13 @@ extern crate alloc;
 
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vibeos_driver_sdhci_blk::{Card as HardwareCard, Error as HardwareError};
+use vibeos_storage_device::{MutationFailure, MutationResult};
 
-use crate::cap::{Cap, InvocationLease, Resource, Rights};
+use crate::cap::{Cap, Resource, Rights};
 use crate::exec::WaitQueue;
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::sync::SpinLock;
@@ -161,51 +163,46 @@ pub fn discover() -> Option<BlockResources> {
     })
 }
 
-pub fn info_with(lease: &InvocationLease<BlockDevice>) -> Result<BlockInfo, BlockError> {
-    if !lease.authorizes(Rights::READ) {
-        return Err(BlockError::PermissionDenied);
-    }
-    Ok(lease.with(BlockDevice::info))
+/// Raw backend entry points used only after the shared block facade validates
+/// a capability-scoped request.
+pub(crate) fn raw_info() -> BlockInfo {
+    BlockDevice.info()
 }
 
-pub async fn read_with(
-    lease: InvocationLease<BlockDevice>,
-    sector: u64,
-) -> Result<[u8; 512], BlockError> {
-    if !lease.authorizes(Rights::READ) {
-        return Err(BlockError::PermissionDenied);
-    }
-    lease.with(|_| ());
-    let result = with_card(|card| card.read_sector(sector));
-    drop(lease);
-    result
+pub(crate) async fn raw_read_at(expected_epoch: u64, sector: u64) -> Result<[u8; 512], BlockError> {
+    with_card_at(expected_epoch, |card| card.read_sector(sector))
 }
 
-pub async fn write_with(
-    lease: InvocationLease<BlockDevice>,
+pub(crate) async fn raw_write_at(
+    expected_epoch: u64,
     sector: u64,
     data: [u8; 512],
-) -> Result<(), BlockError> {
-    if !lease.authorizes(Rights::WRITE) {
-        return Err(BlockError::PermissionDenied);
-    }
-    lease.with(|_| ());
-    let result = with_card(|card| card.write_sector(sector, &data));
-    drop(lease);
-    result
+) -> MutationResult<(), BlockError> {
+    let submitted = Cell::new(false);
+    with_card_at(expected_epoch, |card| {
+        card.write_sector_tracked(sector, &data, || submitted.set(true))
+    })
+    .map_err(|error| mutation_failure(error, submitted.get()))
 }
 
-pub async fn flush_with(lease: InvocationLease<BlockDevice>) -> Result<(), BlockError> {
-    if !lease.authorizes(Rights::WRITE) {
-        return Err(BlockError::PermissionDenied);
-    }
-    lease.with(|_| ());
-    let result = with_card(Card::flush);
-    drop(lease);
-    result
+pub(crate) async fn raw_flush_at(expected_epoch: u64) -> MutationResult<(), BlockError> {
+    let submitted = Cell::new(false);
+    with_card_at(expected_epoch, |card| {
+        card.flush_tracked(|| submitted.set(true))
+    })
+    .map_err(|error| mutation_failure(error, submitted.get()))
 }
 
-fn with_card<T>(
+fn mutation_failure(error: BlockError, submitted: bool) -> MutationFailure<BlockError> {
+    if submitted {
+        MutationFailure::ambiguous(error)
+    } else {
+        MutationFailure::not_submitted(error)
+    }
+}
+
+fn with_card_at<T>(
+    expected_epoch: u64,
     operation: impl FnOnce(&mut Card) -> Result<T, BlockError>,
 ) -> Result<T, BlockError> {
     if IO_CLAIMED
@@ -226,6 +223,12 @@ fn with_card<T>(
         if !state.online {
             release_io_claim();
             return Err(BlockError::Offline);
+        }
+        // This is the dispatch linearization point: compare the incarnation
+        // while holding the same lock that transfers the Card out of HOST.
+        if state.epoch != expected_epoch {
+            release_io_claim();
+            return Err(BlockError::DriverRestarted);
         }
         match state.card.take() {
             Some(card) => card,
@@ -421,15 +424,22 @@ impl Card {
             .map_err(map_hardware_error)
     }
 
-    fn write_sector(&mut self, logical_sector: u64, data: &[u8; 512]) -> Result<(), BlockError> {
+    fn write_sector_tracked(
+        &mut self,
+        logical_sector: u64,
+        data: &[u8; 512],
+        on_command_published: impl FnOnce(),
+    ) -> Result<(), BlockError> {
         let physical_sector = self.physical_sector(logical_sector)?;
         self.hardware
-            .write_sector(physical_sector, data)
+            .write_sector_tracked(physical_sector, data, on_command_published)
             .map_err(map_hardware_error)
     }
 
-    fn flush(&mut self) -> Result<(), BlockError> {
-        self.hardware.flush().map_err(map_hardware_error)
+    fn flush_tracked(&mut self, on_command_published: impl FnOnce()) -> Result<(), BlockError> {
+        self.hardware
+            .flush_tracked(on_command_published)
+            .map_err(map_hardware_error)
     }
 }
 

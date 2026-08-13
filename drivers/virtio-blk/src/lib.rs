@@ -187,9 +187,30 @@ impl BlockEngine {
         operation: BlockOperation,
         data: [u8; 512],
     ) -> Result<PendingSubmission, HardwareError> {
+        self.submit_tracked(operation, data, || {})
+    }
+
+    /// Publish one request and report the exact transition at which the
+    /// device can first observe it.
+    ///
+    /// The callback runs immediately before the volatile `avail.idx` store,
+    /// after every fallible queue/descriptor preparation step. If it panics,
+    /// callers must conservatively treat the operation as submitted even
+    /// though the index store may not have executed.
+    pub fn submit_tracked(
+        &mut self,
+        operation: BlockOperation,
+        data: [u8; 512],
+        on_request_published: impl FnOnce(),
+    ) -> Result<PendingSubmission, HardwareError> {
         let previous_used_index = self.model.used_index();
         let protocol = self.model.submit(operation).map_err(map_queue_error)?;
-        publish_request(operation, data, protocol.available_slot)?;
+        publish_request(
+            operation,
+            data,
+            protocol.available_slot,
+            on_request_published,
+        )?;
         Ok(PendingSubmission {
             protocol,
             operation,
@@ -249,6 +270,9 @@ impl BlockEngine {
             .map_err(|_| HardwareError::Protocol)?;
         clear_dma();
         let (features, capacity) = initialize(self.transport)?;
+        // `confirm_reset(0)` above already advanced the queue incarnation.
+        // Rebuild negotiated state at that exact epoch rather than skipping a
+        // second value during one hardware reset.
         self.model = SplitQueueModel::at_epoch(features, self.model.epoch())
             .ok_or(HardwareError::Protocol)?;
         self.features = features;
@@ -343,7 +367,11 @@ fn publish_request(
     operation: BlockOperation,
     data: [u8; 512],
     available_slot: u16,
+    on_request_published: impl FnOnce(),
 ) -> Result<(), HardwareError> {
+    if available_slot >= SPLIT_QUEUE_SIZE {
+        return Err(HardwareError::Protocol);
+    }
     let addresses = unsafe {
         let slab = DMA.0.get();
         BlockDmaAddresses {
@@ -373,6 +401,7 @@ fn publish_request(
         dma_fence();
         let index = core::ptr::addr_of_mut!((*slab).available.index);
         let next = u16::from_le(index.read_volatile()).wrapping_add(1);
+        on_request_published();
         index.write_volatile(next.to_le());
         dma_fence();
     }
@@ -440,6 +469,7 @@ fn dma_fence() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
     use vibeos_driver_virtio_core::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_F_VERSION_1};
 
     #[test]
@@ -488,5 +518,42 @@ mod tests {
         // takes BlockEngine by value. Safe code therefore cannot touch DMA via
         // the old owner after the method returns, including on reset failure.
         let _: fn(BlockEngine) -> Result<(), HardwareError> = BlockEngine::shutdown;
+    }
+
+    #[test]
+    fn tracked_publication_marks_exactly_before_available_index() {
+        clear_dma();
+        let publications = Cell::new(0);
+        let slab = DMA.0.get();
+        publish_request(BlockOperation::Write { sector: 7 }, [0xa5; 512], 0, || {
+            // Safety: this test exclusively exercises the static slab;
+            // the callback runs synchronously before publish_request
+            // returns and no device is attached on the host.
+            unsafe {
+                assert_eq!(u16::from_le((*slab).available.index), 0);
+                assert_eq!(
+                    u16::from_le((*slab).available.ring[0]),
+                    BLOCK_HEADER_DESCRIPTOR
+                );
+            }
+            publications.set(publications.get() + 1);
+        })
+        .unwrap();
+        assert_eq!(publications.get(), 1);
+        // Safety: publish_request completed and the host has no attached
+        // device that could concurrently mutate this test slab.
+        assert_eq!(unsafe { u16::from_le((*slab).available.index) }, 1);
+
+        let rejected = Cell::new(0);
+        assert_eq!(
+            publish_request(
+                BlockOperation::Read { sector: 0 },
+                [0; 512],
+                SPLIT_QUEUE_SIZE,
+                || rejected.set(rejected.get() + 1),
+            ),
+            Err(HardwareError::Protocol)
+        );
+        assert_eq!(rejected.get(), 0);
     }
 }

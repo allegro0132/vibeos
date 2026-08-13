@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use vibeos_core::cap::{
     grant, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource, Rights,
-    CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
+    ScopedResource, CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
 };
+use vibeos_core::heap::{current_owner, enter_owner, OwnerId};
 use vibeos_durable_format::{
     DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId, RecoveredGrant, RecoveredSlot,
     ResourceKind, SlotIdentity, SpaceId, TransactionId,
@@ -20,6 +21,13 @@ struct Gadget;
 
 struct DropTrackedWidget {
     drops: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ScopedWindow {
+    first: u64,
+    count: u64,
+    allocation_owner: OwnerId,
 }
 
 /// A safe but dishonest implementation. Typed resolution must follow the
@@ -55,6 +63,34 @@ impl Resource for DropTrackedWidget {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl Resource for ScopedWindow {
+    fn kind(&self) -> &'static str {
+        "scoped-window"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// Safety: the implementation preserves the same logical window identity and
+// constructs only a checked non-empty subset without external side effects.
+unsafe impl ScopedResource for ScopedWindow {
+    type Scope = (u64, u64);
+
+    fn attenuate(&self, (relative_first, count): Self::Scope) -> Option<Arc<Self>> {
+        let relative_end = relative_first.checked_add(count)?;
+        if count == 0 || relative_end > self.count {
+            return None;
+        }
+        Some(Arc::new(Self {
+            first: self.first.checked_add(relative_first)?,
+            count,
+            allocation_owner: current_owner(),
+        }))
     }
 }
 
@@ -251,6 +287,91 @@ fn derived_caps_cannot_re_widen_through_a_chain() {
     assert_eq!(
         cs.derive(leaf, Rights::READ).err(),
         Some(CapError::InsufficientRights)
+    );
+}
+
+#[test]
+fn scoped_derivation_narrows_resource_and_rights_together() {
+    let mut cs = CSpace::new("scoped");
+    let root = cs.mint(
+        Arc::new(ScopedWindow {
+            first: 1_000,
+            count: 500,
+            allocation_owner: OwnerId::SYSTEM,
+        }),
+        Rights::ALL,
+    );
+    let child = cs
+        .derive_scoped::<ScopedWindow>(root, (100, 200), Rights::READ.union(Rights::GRANT))
+        .unwrap();
+    let observed = cs
+        .lookup_lease::<ScopedWindow>(child, Rights::READ)
+        .unwrap();
+    assert_eq!(
+        observed.with(|window| (window.first, window.count)),
+        (1_100, 200)
+    );
+    assert_eq!(
+        cs.derive_scoped::<ScopedWindow>(child, (0, 201), Rights::READ),
+        Err(CapError::Amplification)
+    );
+    assert_eq!(
+        cs.derive_scoped::<ScopedWindow>(child, (0, 1), Rights::WRITE),
+        Err(CapError::Amplification)
+    );
+}
+
+#[test]
+fn scoped_child_keeps_cross_space_revocation_ancestry() {
+    let mut source = CSpace::new("source");
+    let mut target = CSpace::new("target");
+    let root = source.mint(
+        Arc::new(ScopedWindow {
+            first: 64,
+            count: 512,
+            allocation_owner: OwnerId::SYSTEM,
+        }),
+        Rights::ALL,
+    );
+    let child = source
+        .derive_scoped::<ScopedWindow>(root, (16, 32), Rights::READ.union(Rights::GRANT))
+        .unwrap();
+    let remote = grant(&source, child, Rights::READ, &mut target).unwrap();
+    assert!(target
+        .lookup_lease::<ScopedWindow>(remote, Rights::READ)
+        .is_ok());
+    assert_eq!(source.revoke(root), Ok(2));
+    assert_eq!(
+        target
+            .lookup_lease::<ScopedWindow>(remote, Rights::READ)
+            .err(),
+        Some(CapError::Invalid)
+    );
+}
+
+#[test]
+fn scoped_derivation_allocates_the_published_resource_to_system() {
+    let mut cs = CSpace::new("scoped-allocation");
+    let root = cs.mint(
+        Arc::new(ScopedWindow {
+            first: 0,
+            count: 16,
+            allocation_owner: OwnerId::SYSTEM,
+        }),
+        Rights::ALL,
+    );
+    let component_owner = OwnerId::new(901);
+    let child = {
+        let _component = enter_owner(component_owner);
+        cs.derive_scoped::<ScopedWindow>(root, (4, 4), Rights::READ)
+            .unwrap()
+    };
+    let child = cs
+        .lookup_lease::<ScopedWindow>(child, Rights::READ)
+        .unwrap();
+    assert_eq!(
+        child.with(|window| window.allocation_owner),
+        OwnerId::SYSTEM
     );
 }
 

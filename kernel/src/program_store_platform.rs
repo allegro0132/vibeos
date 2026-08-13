@@ -36,7 +36,7 @@ use crate::world::Space;
 use crate::{cap, exec, heap};
 
 pub use vibeos_program_store::{
-    authorize_recovered, SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram,
+    SavedProgramError, SavedProgramInfo, SavedProgramState, TrustedProgram,
 };
 
 pub struct SavedProgramService {
@@ -53,6 +53,7 @@ struct SavedProgramInner {
     running: AtomicBool,
     running_owner: SpinLock<Option<SavedRunOwner>>,
     active: SpinLock<Option<SavedActiveClaim>>,
+    staged_artifact: SpinLock<Option<PersistentCapIdentity>>,
     live: SpinLock<SavedProgramLive>,
 }
 
@@ -98,6 +99,7 @@ impl SavedProgramService {
             running: AtomicBool::new(false),
             running_owner: SpinLock::new_recoverable(None),
             active: SpinLock::new_recoverable(None),
+            staged_artifact: SpinLock::new_recoverable(None),
             live: SpinLock::new_recoverable(SavedProgramLive::default()),
         });
         {
@@ -131,7 +133,7 @@ impl SavedProgramService {
             match self.state() {
                 SavedProgramState::ReadyEmpty | SavedProgramState::Ready => return Ok(()),
                 SavedProgramState::FailedClosed => return Err(SavedProgramError::NotReady),
-                SavedProgramState::Cold => exec::sleep_ms(1).await,
+                SavedProgramState::Cold | SavedProgramState::Staging => exec::sleep_ms(1).await,
             }
         }
     }
@@ -145,6 +147,7 @@ impl SavedProgramService {
             .state
             .store(SavedProgramState::FailedClosed as u8, Ordering::Release);
         let _ = self.inner.target.0.lock().quarantine_persistent();
+        *self.inner.staged_artifact.lock() = None;
         *self.inner.live.lock() = SavedProgramLive::default();
     }
 
@@ -167,7 +170,9 @@ impl SavedProgramService {
         match self.state() {
             SavedProgramState::ReadyEmpty => {}
             SavedProgramState::Ready => return Err(SavedProgramError::AlreadySaved),
-            SavedProgramState::Cold | SavedProgramState::FailedClosed => {
+            SavedProgramState::Cold
+            | SavedProgramState::Staging
+            | SavedProgramState::FailedClosed => {
                 return Err(SavedProgramError::NotReady);
             }
         }
@@ -194,6 +199,9 @@ impl SavedProgramService {
         if self.inner.running.load(Ordering::Acquire) || owner.is_some() {
             return Err(SavedProgramError::Busy);
         }
+        if !self.state().client_ready() {
+            return Err(SavedProgramError::NotReady);
+        }
         // Publish the fault-recoverable owner before the observable busy bit.
         // If this task faults at either instruction, raw cleanup can identify
         // the exact owner while all competitors remain excluded by this lock.
@@ -212,31 +220,50 @@ impl SavedProgramService {
     /// partitions have passed external policy and the persistent slot graph has
     /// been installed. No dependent can observe this CSpace before this method
     /// and the M4.3 target both complete.
-    pub(crate) fn install_recovered(
+    pub(crate) fn stage_recovered(
         &self,
         identity: Option<PersistentCapIdentity>,
     ) -> Result<(), SavedProgramError> {
-        match identity {
-            None => {
-                *self.inner.live.lock() = SavedProgramLive::default();
-                self.inner
-                    .state
-                    .store(SavedProgramState::ReadyEmpty as u8, Ordering::Release);
-                Ok(())
-            }
-            Some(identity) => {
-                let (console, memory) = self.install_manifest_authority()?;
-                *self.inner.live.lock() = SavedProgramLive {
-                    artifact: Some(identity),
-                    console: Some(console),
-                    memory: Some(memory),
-                };
-                self.inner
-                    .state
-                    .store(SavedProgramState::Ready as u8, Ordering::Release);
-                Ok(())
-            }
+        if self.state() != SavedProgramState::Cold {
+            return Err(SavedProgramError::Install);
         }
+        *self.inner.staged_artifact.lock() = identity;
+        *self.inner.live.lock() = SavedProgramLive::default();
+        self.inner
+            .state
+            .store(SavedProgramState::Staging as u8, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish recovered program authority only after the durable coordinator
+    /// has installed both CSpaces and entered Ready. The final state store is
+    /// the client-visible activation point and follows every fallible grant.
+    pub(crate) fn activate_recovered(&self) -> Result<(), SavedProgramError> {
+        if self.state() != SavedProgramState::Staging {
+            return Err(SavedProgramError::Install);
+        }
+        let identity = *self.inner.staged_artifact.lock();
+        let (live, state) = match identity {
+            None => (SavedProgramLive::default(), SavedProgramState::ReadyEmpty),
+            Some(identity) => match self.install_manifest_authority() {
+                Ok((console, memory)) => (
+                    SavedProgramLive {
+                        artifact: Some(identity),
+                        console: Some(console),
+                        memory: Some(memory),
+                    },
+                    SavedProgramState::Ready,
+                ),
+                Err(error) => {
+                    self.mark_failed_closed();
+                    return Err(error);
+                }
+            },
+        };
+        *self.inner.live.lock() = live;
+        *self.inner.staged_artifact.lock() = None;
+        self.inner.state.store(state as u8, Ordering::Release);
+        Ok(())
     }
 
     fn install_manifest_authority(&self) -> Result<(Cap, Cap), SavedProgramError> {
@@ -390,6 +417,7 @@ fn quarantine_operation(
         .state
         .store(SavedProgramState::FailedClosed as u8, Ordering::Release);
     let _ = inner.target.0.lock().quarantine_persistent();
+    *inner.staged_artifact.lock() = None;
     *inner.live.lock() = SavedProgramLive::default();
 
     let mut active = inner.active.lock();
@@ -599,7 +627,7 @@ impl SavedProgramService {
                     && candidate.bytes.as_slice() == bytes
             })
             .ok_or(SavedProgramError::UnexpectedGraph)?;
-        let resource = StoredObject::from_recovered(object);
+        let resource = committed.stored_object(object)?;
         let identity = operation.install_root(&grant, resource)?;
         let (console, memory) = self.install_manifest_authority()?;
         *self.inner.live.lock() = SavedProgramLive {
@@ -641,6 +669,9 @@ pub async fn run_with(
         .lookup_persistent_identity::<StoredObject>(identity, Rights::READ)
         .map_err(|_| SavedProgramError::Missing)?;
     let bytes = service.inner.journal.read(artifact_lease).await?;
+    if service.state() != SavedProgramState::Ready {
+        return Err(SavedProgramError::NotReady);
+    }
     let artifact = ProgramArtifact::decode(&bytes).map_err(|_| SavedProgramError::Artifact)?;
 
     // This exact comparison is the admission proof for persisted native code.
@@ -651,6 +682,9 @@ pub async fn run_with(
     let funcs = compiled.funcs;
     let compiled_bytes = compiled.bytes;
     let data_bytes = compiled.data_bytes;
+    if service.state() != SavedProgramState::Ready {
+        return Err(SavedProgramError::NotReady);
+    }
     let outcome =
         crate::rustc::run_with_authority(&compiled, &service.inner.target, console, memory);
     Ok(SavedRunReport {
@@ -714,6 +748,11 @@ pub(crate) unsafe fn recover_faulted_task(task: exec::TaskId, domain: heap::Allo
             .recover_after_task_fault(domain, task_key)
     };
     let _ = unsafe { inner.active.recover_after_task_fault(domain, task_key) };
+    let _ = unsafe {
+        inner
+            .staged_artifact
+            .recover_after_task_fault(domain, task_key)
+    };
     let _ = unsafe { inner.live.recover_after_task_fault(domain, task_key) };
     let _ = unsafe { inner.target.0.recover_after_task_fault(domain, task_key) };
     let _ = unsafe { inner.policy.0.recover_after_task_fault(domain, task_key) };

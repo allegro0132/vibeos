@@ -181,6 +181,7 @@ mod dwmac_net;
 mod net_device;
 #[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
+mod segment_store_platform;
 mod store_platform;
 mod trampoline;
 mod trap;
@@ -789,6 +790,7 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
 unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomain) {
     unsafe {
         store::recover_faulted_task(task, domain);
+        segment_store_platform::recover_faulted_task(task, domain);
         // Durable boot recovery installs and fail-closes the saved-program
         // target. Repair all saved-program locks first so durable quarantine
         // cannot spin on a guard abandoned by this same faulted task. Both

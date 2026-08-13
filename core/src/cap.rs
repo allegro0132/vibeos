@@ -448,6 +448,27 @@ pub trait Resource: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// A resource whose semantic authority can be narrowed while preserving the
+/// capability derivation ancestry.
+///
+/// The capability system still enforces `GRANT` and rights attenuation. This
+/// trait supplies the resource-specific monotonicity check needed by resources
+/// such as a logical-block range, where copying the same object is not enough.
+///
+/// # Safety
+///
+/// An implementation must return `None` unless `requested` is a semantic
+/// subset of `self`. A returned resource must retain the same underlying
+/// identity, must not add authority or perform an external side effect, and
+/// must remain valid independently of the allocation domain of the caller.
+/// Violating these rules can amplify a capability despite the ordinary rights
+/// checks, so implementations belong to the capability TCB.
+pub unsafe trait ScopedResource: Resource + Sized {
+    type Scope: Copy;
+
+    fn attenuate(&self, requested: Self::Scope) -> Option<Arc<Self>>;
+}
+
 #[derive(Clone)]
 struct Slot {
     generation: u64,
@@ -1790,6 +1811,54 @@ impl CSpace {
         let mut candidate = self.candidate_slots(1);
         let slot = Self::alloc_candidate_slot(&mut candidate);
         candidate[slot as usize].entry = Some(Entry { obj, rights, node });
+        let derived = Cap {
+            slot,
+            generation: candidate[slot as usize].generation,
+        };
+        self.publish_slots(candidate);
+        Ok(derived)
+    }
+
+    /// Derive a child capability whose rights and resource-specific scope are
+    /// both monotonic subsets of the parent.
+    ///
+    /// The child receives a normal derivation node rather than a fresh root, so
+    /// revoking the parent still reaches refined children copied into another
+    /// CSpace. Code with mutable CSpace access is already trusted to mint roots;
+    /// this API exists to retain ancestry when that code intentionally narrows
+    /// semantic authority.
+    pub fn derive_scoped<T: ScopedResource>(
+        &mut self,
+        cap: Cap,
+        scope: T::Scope,
+        rights: Rights,
+    ) -> Result<Cap, CapError> {
+        let entry = self.entry(cap)?;
+        if entry.node.persistent.is_some() {
+            return Err(CapError::PersistentLifecycleRequired);
+        }
+        if !entry.rights.contains(Rights::GRANT) {
+            return Err(CapError::InsufficientRights);
+        }
+        if !entry.rights.contains(rights) {
+            return Err(CapError::Amplification);
+        }
+        let object: Arc<dyn Any + Send + Sync> = entry.obj.clone();
+        let object = Arc::downcast::<T>(object).map_err(|_| CapError::WrongType)?;
+        // The refined object is published into a supervisor-owned capability
+        // table and may outlive a reclaimable caller arena. Allocate it under
+        // SYSTEM for the same reason as the derivation and table metadata.
+        let refined =
+            system_allocation(|| object.attenuate(scope)).ok_or(CapError::Amplification)?;
+        let parent = entry.node.clone();
+        let node = system_allocation(|| Derivation::child(&parent));
+        let mut candidate = self.candidate_slots(1);
+        let slot = Self::alloc_candidate_slot(&mut candidate);
+        candidate[slot as usize].entry = Some(Entry {
+            obj: refined,
+            rights,
+            node,
+        });
         let derived = Cap {
             slot,
             generation: candidate[slot as usize].generation,

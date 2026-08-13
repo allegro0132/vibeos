@@ -874,6 +874,18 @@ name = "vibeos-component-format"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-component-runtime"
+version = "0.1.0"
+dependencies = [
+ "dlr-wasm-interpreter",
+ "vibeos-component-format",
+ "vibeos-wasm-runtime",
+ "wasmparser 0.255.0",
+ "wat",
+ "wit-parser",
+]
+
+[[package]]
 name = "vibeos-core"
 version = "0.1.0"
 dependencies = [

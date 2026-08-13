@@ -59,6 +59,13 @@ impl Platform for Iperf3Platform {
             .map_err(map_frontend_error)
     }
 
+    fn tcp_close(&self, listener: Cap, connection: TcpConnectionToken) -> Result<(), SocketError> {
+        self.listener(listener, Rights::INVOKE)?
+            .try_with(|listener| listener.request_close(connection))
+            .map_err(|_| SocketError::AuthorityRevoked)?
+            .map_err(map_frontend_error)
+    }
+
     fn tcp_reset(&self, listener: Cap, connection: TcpConnectionToken) -> Result<(), SocketError> {
         self.listener(listener, Rights::INVOKE)?
             .try_with(|listener| listener.request_reset(connection))

@@ -23,7 +23,7 @@ use vibeos_core::sync::SpinLock;
 
 pub const DEFAULT_TCP_FRONTEND_BUFFER_BYTES: usize = 4 * 1024;
 pub const MAX_TCP_FRONTEND_BUFFER_BYTES: usize = 64 * 1024;
-pub const MAX_TCP_IO_BYTES_PER_CALL: usize = 1024;
+pub const MAX_TCP_IO_BYTES_PER_CALL: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpStreamState {

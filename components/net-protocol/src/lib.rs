@@ -70,15 +70,15 @@ pub enum Ipv4RuntimeStatus {
 }
 
 /// Bytes reserved in each direction of the single TCP connection.
-pub const TCP_BUFFER_BYTES: usize = 4 * 1024;
+pub const TCP_BUFFER_BYTES: usize = 32 * 1024;
 /// At most this many ingress frames are consumed by one cooperative poll.
-pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 8;
+pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 32;
 /// At most this many bounded egress passes are made by one cooperative poll.
-pub const MAX_EGRESS_PASSES_PER_POLL: usize = 8;
+pub const MAX_EGRESS_PASSES_PER_POLL: usize = 32;
 /// Bound application work independently from packet parsing work.
 pub const MAX_ECHO_CHUNKS_PER_POLL: usize = 4;
 /// At most this many application bytes are copied by one stream I/O call.
-pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 1_024;
+pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 16 * 1024;
 const ECHO_CHUNK_BYTES: usize = MAX_TCP_STREAM_BYTES_PER_CALL;
 const TCP_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -460,7 +460,11 @@ impl phy::Device for PacketDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ethernet;
         capabilities.max_transmission_unit = MAX_PACKET_LEN;
-        capabilities.max_burst_size = Some(1);
+        // Bound the advertised TCP window to the number of frames the physical
+        // DWMAC RX ring can absorb before software runs again. The image packet
+        // endpoints use the same or greater depth, and QEMU can safely honor
+        // this conservative hardware-derived burst contract as well.
+        capabilities.max_burst_size = Some(32);
         capabilities
     }
 }

@@ -14,6 +14,7 @@ cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
 ./scripts/qemu-usb-test.sh     # PCI/XHCI HID, BOT/SCSI, INTx, and hotplug
 ./scripts/qemu-tcp-test.sh     # N1 static/DHCP IPv4 and TCP echo over QEMU hostfwd
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
+./scripts/qemu-iperf3-test.sh # iperf3 control/data interoperability in both directions
 ./scripts/qemu-ssh-security-test.sh # N3 QEMU entropy/identity boundary gate
 ./scripts/qemu-ssh-test.sh     # N4/N5 real OpenSSH exec and rejection gate
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
@@ -130,6 +131,14 @@ The harness is QEMU/virtio-only and provides no Milk-V Duo DWMAC hardware
 evidence. This document describes the gate and its blind spots; it does not
 assert that the current run passed, nor does it test an entropy source, host
 key, or SSH protocol.
+
+`qemu-iperf3-test.sh` builds the isolated `iperf3-server` image, forwards an
+ephemeral loopback port to guest TCP `5201`, and runs the host's real iperf3
+client twice: first normal TCP and then `-R`. Both commands must complete and
+report non-zero received bytes. Portable tests separately verify that only an
+explicit shared-port group can own two simultaneous sockets. This is a TCP
+single-stream compatibility gate; it does not cover UDP, parallel streams,
+IPv6, authentication, bidirectional mode, or physical NIC performance.
 
 `qemu-ssh-security-test.sh` is the separate N3 security-boundary gate. It boots
 the explicitly marked test-identity image twice with QEMU's `/dev/urandom`-

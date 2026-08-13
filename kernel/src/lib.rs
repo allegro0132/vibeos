@@ -17,8 +17,32 @@
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
 #[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
 compile_error!("feature `net-shell` is the Milk-V Duo production IPv4 image");
+#[cfg(all(feature = "iperf3-server", not(feature = "qemu-virt")))]
+compile_error!("feature `iperf3-server` is the QEMU iperf3 server image");
+#[cfg(all(feature = "milkv-iperf3-server", not(feature = "milkv-duo")))]
+compile_error!("feature `milkv-iperf3-server` is the Milk-V Duo iperf3 server image");
 #[cfg(all(feature = "net-shell", feature = "tcp-echo"))]
 compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 images");
+#[cfg(all(
+    feature = "iperf3-server",
+    any(
+        feature = "tcp-echo",
+        feature = "ssh-test",
+        feature = "ssh-security-test"
+    )
+))]
+compile_error!("feature `iperf3-server` is an isolated QEMU network image");
+#[cfg(all(
+    feature = "milkv-iperf3-server",
+    any(
+        feature = "net-shell",
+        feature = "milkv-ssh",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-jitterentropy-probe",
+        feature = "milkv-jitterentropy-ssh-probe"
+    )
+))]
+compile_error!("feature `milkv-iperf3-server` is an isolated Milk-V network image");
 #[cfg(all(feature = "ssh-security-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 #[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
@@ -97,6 +121,8 @@ mod code_pool;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
+#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+mod iperf3_platform;
 #[cfg(any(
     feature = "milkv-jitterentropy-probe",
     feature = "milkv-jitterentropy-ssh-probe"
@@ -114,7 +140,9 @@ mod net_echo_platform;
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 mod netstack_platform;
 #[cfg(feature = "qemu-virt")]
@@ -158,6 +186,8 @@ mod trampoline;
 mod trap;
 mod tty;
 mod uart;
+#[cfg(feature = "milkv-duo")]
+mod usb_ecm_net;
 #[cfg(feature = "qemu-virt")]
 mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
@@ -453,6 +483,48 @@ pub extern "C" fn kmain() -> ! {
                     Ok(None) => println!("  usb hid   no supported keyboard interface"),
                     Err(error) => println!("  usb hid   configuration FAILED: {:?}", error),
                 }
+                let rtl8151_switched = match dwc2_host::switch_rtl8151_install_mode() {
+                    Ok(switched) => switched,
+                    Err(error) => {
+                        println!("  usb net   RTL8151 mode switch FAILED: {:?}", error);
+                        false
+                    }
+                };
+                if rtl8151_switched {
+                    println!(
+                        "  usb net   sent RTL8151 install-mode switch; waiting for Ethernet re-enumeration"
+                    );
+                }
+                if !rtl8151_switched {
+                    match dwc2_host::configure_cdc_ecm() {
+                        Ok(Some(ecm)) => println!(
+                            "  usb net   CDC-ECM configured, interface {} alt {}, IN ep {}, OUT ep {}, MAC {:?}",
+                            ecm.data_interface,
+                            ecm.data_alternate,
+                            ecm.endpoint_in & 0x0f,
+                            ecm.endpoint_out & 0x0f,
+                            ecm.mac_address,
+                        ),
+                        Ok(None) => {}
+                        Err(error) => println!("  usb net   CDC-ECM configuration FAILED: {:?}", error),
+                    }
+                }
+                match if rtl8151_switched {
+                    Ok(None)
+                } else {
+                    dwc2_host::configure_mass_storage()
+                } {
+                    Ok(Some(storage)) => println!(
+                        "  usb disk  SCSI/BOT interface {}, IN ep {}, OUT ep {}, {} sectors x {} bytes",
+                        storage.interface,
+                        storage.endpoint_in & 0x0f,
+                        storage.endpoint_out & 0x0f,
+                        storage.capacity_sectors.unwrap_or(0),
+                        storage.block_size.unwrap_or(0),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => println!("  usb disk  configuration FAILED: {:?}", error),
+                }
             }
             Ok(None) => println!("  usb dev   disconnected during enumeration"),
             Err(error) => println!("  usb dev   enumeration FAILED: {:?}", error),
@@ -493,6 +565,8 @@ pub extern "C" fn kmain() -> ! {
     let world = world::world();
     world::start_block_supervisor();
     world::start_net_supervisor();
+    #[cfg(feature = "milkv-duo")]
+    world::start_usb_net_supervisor();
     #[cfg(feature = "qemu-virt")]
     world::start_rng_supervisor();
     #[cfg(feature = "qemu-virt")]
@@ -508,7 +582,9 @@ pub extern "C" fn kmain() -> ! {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
@@ -696,6 +772,8 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         // visible to safe lifecycle callers.
         block_device::recover_faulted_domain(domain);
         net_device::recover_faulted_domain(domain);
+        #[cfg(feature = "milkv-duo")]
+        usb_ecm_net::recover_faulted_domain(domain);
         #[cfg(feature = "qemu-virt")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);

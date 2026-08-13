@@ -21,6 +21,22 @@ net-shell = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack",
 # Test-only recovery hook used by the live stack-generation acceptance script.
 # It is never enabled by the normal TCP or eventual SSH image.
 tcp-echo-recovery-test = ["tcp-echo", "vibeos-netstack/tcp-echo-recovery-test"]
+# Dedicated QEMU iperf3 TCP server image with static IPv4 configuration.
+iperf3-server = [
+    "dep:vibeos-iperf3-server",
+    "dep:vibeos-net-api",
+    "dep:vibeos-netstack",
+    "vibeos-netstack/static-service",
+    "vibeos-vsh/network",
+]
+# Physical Milk-V Duo iperf3 TCP server image with DHCP configuration.
+milkv-iperf3-server = [
+    "dep:vibeos-iperf3-server",
+    "dep:vibeos-net-api",
+    "dep:vibeos-netstack",
+    "vibeos-netstack/dhcp-service",
+    "vibeos-vsh/network",
+]
 # Dedicated N3 acceptance image. It exercises the real virtio-rng capability,
 # a test-only provisioned host signer, and an immutable binary auth policy.
 ssh-security-test = [
@@ -105,6 +121,7 @@ vibeos-image-policy = { path = "../policy/image", default-features = false }
 vibeos-rustc = { path = "../compiler" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }
+vibeos-iperf3-server = { path = "../components/iperf3-server", optional = true }
 vibeos-net-api = { path = "../components/net-api", optional = true }
 vibeos-net-echo = { path = "../components/net-echo", optional = true }
 vibeos-netstack = { path = "../components/netstack", default-features = false, optional = true }

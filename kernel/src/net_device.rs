@@ -8,10 +8,86 @@
 // frontend even when a particular firmware image consumes only a subset.
 #![allow(unused_imports)]
 
+use alloc::{format, string::String};
+use core::fmt::Write as _;
+
 /// Capacity of the stable packet channels between a device driver and its
 /// clients. This frontend resource policy is intentionally unrelated to any
 /// backend's hardware descriptor-ring depth.
 pub const FRONTEND_QUEUE_DEPTH: usize = crate::platform::NETWORK_FRONTEND.queue_depth;
+
+/// Stable physical attachment identity used only to order discovered NICs.
+/// Interface names are assigned after sorting these keys; no `netN` value is
+/// coupled to a driver kind or discovery order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkLocation {
+    Mmio {
+        base: usize,
+    },
+    Usb {
+        controller: usize,
+        ports: [u8; 8],
+        depth: u8,
+    },
+}
+
+impl Ord for NetworkLocation {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.anchor()
+            .cmp(&other.anchor())
+            .then_with(|| match (self, other) {
+                (Self::Mmio { .. }, Self::Mmio { .. }) => core::cmp::Ordering::Equal,
+                (Self::Mmio { .. }, Self::Usb { .. }) => core::cmp::Ordering::Less,
+                (Self::Usb { .. }, Self::Mmio { .. }) => core::cmp::Ordering::Greater,
+                (
+                    Self::Usb {
+                        ports: left_ports,
+                        depth: left_depth,
+                        ..
+                    },
+                    Self::Usb {
+                        ports: right_ports,
+                        depth: right_depth,
+                        ..
+                    },
+                ) => left_ports
+                    .cmp(right_ports)
+                    .then_with(|| left_depth.cmp(right_depth)),
+            })
+    }
+}
+
+impl PartialOrd for NetworkLocation {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl NetworkLocation {
+    const fn anchor(self) -> usize {
+        match self {
+            Self::Mmio { base } => base,
+            Self::Usb { controller, .. } => controller,
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            Self::Mmio { base } => format!("mmio@{base:#x}"),
+            Self::Usb {
+                controller,
+                ports,
+                depth,
+            } => {
+                let mut output = format!("usb@{controller:#x}");
+                for port in ports.into_iter().take(usize::from(depth)) {
+                    let _ = write!(output, "/{port}");
+                }
+                output
+            }
+        }
+    }
+}
 
 #[cfg(feature = "milkv-duo")]
 #[allow(unused_imports)]

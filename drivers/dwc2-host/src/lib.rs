@@ -91,7 +91,9 @@ const HCSPLT_ENABLE: u32 = 1 << 31;
 const REGISTER_TIMEOUT_MS: u64 = 10;
 const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
-const DMA_BYTES: usize = 1_024;
+const CDC_RX_POLL_TIMEOUT_MS: u64 = 2;
+const DMA_BYTES: usize = 2_048;
+pub const MAX_ETHERNET_FRAME_BYTES: usize = 1_536;
 const MAX_NAK_RETRIES: usize = 32;
 const MAX_COMPLETE_SPLIT_RETRIES: usize = 16;
 const HID_REPORT_BYTES: usize = 8;
@@ -112,15 +114,56 @@ const USB_PORT_STAT_LOW_SPEED: u16 = 1 << 9;
 const USB_PORT_STAT_HIGH_SPEED: u16 = 1 << 10;
 const MAX_HUB_PORTS: u8 = 15;
 
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-
 #[repr(C, align(64))]
-struct DmaBuffer(UnsafeCell<[u8; DMA_BYTES]>);
+pub struct DmaStorage {
+    buffer: UnsafeCell<[u8; DMA_BYTES]>,
+}
 
-unsafe impl Sync for DmaBuffer {}
+/// CPU-only ownership state for one controller instance.
+///
+/// Keep this in normally initialized memory. The device-visible DMA buffer may
+/// live in a linker `NOLOAD` section whose initial bytes are unspecified.
+pub struct InstanceState {
+    claimed: AtomicBool,
+}
 
-#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
-static DMA: DmaBuffer = DmaBuffer(UnsafeCell::new([0; DMA_BYTES]));
+unsafe impl Sync for DmaStorage {}
+
+impl DmaStorage {
+    pub const fn new() -> Self {
+        Self {
+            buffer: UnsafeCell::new([0; DMA_BYTES]),
+        }
+    }
+
+    pub fn base(&self) -> usize {
+        self.buffer.get() as usize
+    }
+
+    unsafe fn with_bytes_mut<R>(&self, operation: impl FnOnce(&mut [u8; DMA_BYTES]) -> R) -> R {
+        operation(unsafe { &mut *self.buffer.get() })
+    }
+}
+
+impl Default for DmaStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InstanceState {
+    pub const fn new() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for InstanceState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -140,6 +183,18 @@ pub enum Error {
     TransferFailed(u32),
     Stalled,
     Nak,
+    StorageProtocol,
+    StorageCommandFailed(u8),
+    StorageCswSignature(u32),
+    StorageCswTag(u32),
+    StorageCswResidue(u32),
+    StorageBlockSize(u32),
+    StorageCbwLength(usize),
+    TransferLength { expected: usize, actual: usize },
+    StorageDataLength { expected: usize, actual: usize },
+    StorageCswLength(usize),
+    StorageCapacityTooLarge,
+    StorageOutOfRange,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +213,7 @@ pub struct DeviceInfo {
     pub vendor_id: u16,
     pub product_id: u16,
     pub max_packet_size_0: u8,
+    pub configuration_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,9 +239,36 @@ pub struct MassStorageInfo {
     pub endpoint_out: u8,
     pub max_packet_size_in: u16,
     pub max_packet_size_out: u16,
+    pub capacity_sectors: Option<u64>,
+    pub block_size: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CdcEcmInfo {
+    pub configuration: u8,
+    pub control_interface: u8,
+    pub data_interface: u8,
+    pub data_alternate: u8,
+    pub endpoint_in: u8,
+    pub endpoint_out: u8,
+    pub max_packet_size_in: u16,
+    pub max_packet_size_out: u16,
+    pub status_endpoint: Option<u8>,
+    pub status_max_packet_size: u16,
+    pub status_interval_ms: u16,
+    pub mac_string_index: u8,
+    pub mac_address: Option<[u8; 6]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CdcCarrierStatus {
+    pub link_up: Option<bool>,
+    pub rtl815x_phystatus: Option<u16>,
 }
 
 pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
+pub const MAX_INTERFACE_ENDPOINTS: usize = 8;
+pub const MAX_DEVICE_CONFIGURATIONS: usize = 8;
 pub const MAX_HID_REPORT_DESCRIPTOR_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +286,16 @@ pub struct InterfaceInfo {
     pub bulk_out: Option<u8>,
     pub bulk_in_max_packet_size: u16,
     pub bulk_out_max_packet_size: u16,
+    pub cdc_mac_string_index: Option<u8>,
+    pub endpoints: [Option<EndpointInfo>; MAX_INTERFACE_ENDPOINTS],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointInfo {
+    pub address: u8,
+    pub attributes: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,10 +329,40 @@ pub struct HubInfo {
     pub port_status: u16,
 }
 
-#[derive(Clone, Copy)]
+pub const MAX_HUB_CHILDREN: usize = MAX_HUB_PORTS as usize;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HubChildInfo {
+    pub device: DeviceInfo,
+    pub parent_hub_address: u8,
+    pub port: u8,
+    pub port_status: u16,
+    pub depth: u8,
+    pub tt_hub_address: Option<u8>,
+    pub tt_port: Option<u8>,
+}
+
+const MAX_HUB_DEPTH: u8 = 4;
+pub const MAX_USB_BUS_PATH_DEPTH: usize = MAX_HUB_DEPTH as usize + 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsbBusPath {
+    pub ports: [u8; MAX_USB_BUS_PATH_DEPTH],
+    pub depth: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SplitTarget {
     hub_address: u8,
     port: u8,
+}
+
+#[derive(Clone, Copy)]
+struct TransferTarget {
+    address: u8,
+    endpoint_zero_max_packet: u16,
+    speed: Speed,
+    split: Option<SplitTarget>,
 }
 
 #[derive(Clone, Copy)]
@@ -326,6 +449,8 @@ pub struct Telemetry {
 /// Exclusive ownership of the fixed CV1800B DWC2 host instance.
 pub struct Controller {
     description: Dwc2Description,
+    dma: &'static DmaStorage,
+    state: &'static InstanceState,
     info: Info,
     timebase_hz: u64,
     time: fn() -> u64,
@@ -334,14 +459,26 @@ pub struct Controller {
     speed: Speed,
     device: Option<DeviceInfo>,
     child: Option<DeviceInfo>,
+    children: [Option<HubChildInfo>; MAX_HUB_CHILDREN],
     hub: Option<HubInfo>,
+    hubs: [Option<HubInfo>; MAX_HUB_CHILDREN],
     split: Option<SplitTarget>,
     configuration: Option<ConfigurationInfo>,
+    configurations: [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS],
+    configuration_device_address: Option<u8>,
     report_descriptor: Option<HidReportDescriptor>,
     keyboard: Option<HidKeyboardInfo>,
+    keyboard_target: Option<TransferTarget>,
     mass_storage: Option<MassStorageInfo>,
+    storage_target: Option<TransferTarget>,
+    cdc_ecm: Option<CdcEcmInfo>,
+    cdc_ecm_target: Option<TransferTarget>,
+    network_bus_path: Option<UsbBusPath>,
+    bulk_pids: [[DataPid; 32]; 16],
+    storage_tag: u32,
     keyboard_layout: KeyboardLayout,
     keyboard_pid: DataPid,
+    cdc_status_pid: DataPid,
     keyboard_last: [u8; HID_REPORT_BYTES],
     keyboard_nkro_last: [u8; APPLE_NKRO_REPORT_BYTES],
 }
@@ -353,16 +490,22 @@ impl Controller {
     /// # Safety
     /// All ranges in `description` must be identity-mapped, strongly ordered
     /// MMIO for the CV1800B and remain exclusively owned until `shutdown`.
-    /// `time` must advance monotonically in `timebase_hz` ticks.
+    /// `dma` must be permanently allocated, identity-mapped, physically
+    /// contiguous, cache coherent for the platform, and reachable within the
+    /// described DMA address width. `time` must advance monotonically in
+    /// `timebase_hz` ticks.
     pub unsafe fn initialize(
         description: Dwc2Description,
+        dma: &'static DmaStorage,
+        state: &'static InstanceState,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
         if !validate_description(description) || timebase_hz == 0 {
             return Err(Error::InvalidDescription);
         }
-        if CLAIMED
+        if state
+            .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -400,7 +543,7 @@ impl Controller {
         compiler_fence(Ordering::SeqCst);
         delay_us(timebase_hz, time, PHY_UTMI_RESET_SETTLE_US);
 
-        let result = unsafe { Self::initialize_core(description, timebase_hz, time) };
+        let result = unsafe { Self::initialize_core(description, dma, state, timebase_hz, time) };
         match result {
             Ok(controller) => Ok(controller),
             Err(error) => {
@@ -409,7 +552,7 @@ impl Controller {
                     soc_write(description, CLK_ENABLE_2, old_clocks_2);
                     soc_write(description, CLK_ENABLE_1, old_clocks_1);
                 }
-                CLAIMED.store(false, Ordering::Release);
+                state.claimed.store(false, Ordering::Release);
                 Err(error)
             }
         }
@@ -417,6 +560,8 @@ impl Controller {
 
     unsafe fn initialize_core(
         description: Dwc2Description,
+        dma: &'static DmaStorage,
+        state: &'static InstanceState,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
@@ -529,7 +674,7 @@ impl Controller {
         if dma_architecture == 0 {
             return Err(Error::UnsupportedDma(dma_architecture));
         }
-        let dma_address = DMA.0.get() as usize;
+        let dma_address = dma.base();
         if dma_address > u32::MAX as usize
             || dma_address.saturating_add(DMA_BYTES) > (1usize << description.dma_address_bits)
         {
@@ -551,6 +696,8 @@ impl Controller {
         }
         Ok(Self {
             description,
+            dma,
+            state,
             info: Info {
                 core_id,
                 release: core_id as u16,
@@ -568,14 +715,26 @@ impl Controller {
             speed: Speed::Full,
             device: None,
             child: None,
+            children: [None; MAX_HUB_CHILDREN],
             hub: None,
+            hubs: [None; MAX_HUB_CHILDREN],
             split: None,
             configuration: None,
+            configurations: [None; MAX_DEVICE_CONFIGURATIONS],
+            configuration_device_address: None,
             report_descriptor: None,
             keyboard: None,
+            keyboard_target: None,
             mass_storage: None,
+            storage_target: None,
+            cdc_ecm: None,
+            cdc_ecm_target: None,
+            network_bus_path: None,
+            bulk_pids: [[DataPid::Data0; 32]; 16],
+            storage_tag: 1,
             keyboard_layout: KeyboardLayout::Boot,
             keyboard_pid: DataPid::Data0,
+            cdc_status_pid: DataPid::Data0,
             keyboard_last: [0; HID_REPORT_BYTES],
             keyboard_nkro_last: [0; APPLE_NKRO_REPORT_BYTES],
         })
@@ -608,12 +767,364 @@ impl Controller {
         self.child
     }
 
+    pub const fn children(&self) -> [Option<HubChildInfo>; MAX_HUB_CHILDREN] {
+        self.children
+    }
+
+    pub const fn hubs(&self) -> [Option<HubInfo>; MAX_HUB_CHILDREN] {
+        self.hubs
+    }
+
     pub const fn keyboard(&self) -> Option<HidKeyboardInfo> {
         self.keyboard
     }
 
+    pub const fn configurations(&self) -> [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS] {
+        self.configurations
+    }
+
+    pub const fn configuration_device_address(&self) -> Option<u8> {
+        self.configuration_device_address
+    }
+
+    pub const fn keyboard_device_address(&self) -> Option<u8> {
+        match self.keyboard_target {
+            Some(target) => Some(target.address),
+            None => None,
+        }
+    }
+
     pub const fn mass_storage(&self) -> Option<MassStorageInfo> {
         self.mass_storage
+    }
+
+    pub const fn cdc_ecm(&self) -> Option<CdcEcmInfo> {
+        self.cdc_ecm
+    }
+
+    pub const fn cdc_ecm_device_address(&self) -> Option<u8> {
+        match self.cdc_ecm_target {
+            Some(target) => Some(target.address),
+            None => None,
+        }
+    }
+
+    /// Stable root-port/hub-port path of the active or mode-switching network
+    /// function. USB device addresses are deliberately excluded because they
+    /// are reassigned after every enumeration.
+    pub const fn network_bus_path(&self) -> Option<UsbBusPath> {
+        self.network_bus_path
+    }
+
+    pub const fn storage_device_address(&self) -> Option<u8> {
+        match self.storage_target {
+            Some(target) => Some(target.address),
+            None => None,
+        }
+    }
+
+    /// Switch a Realtek RTL815x device from its 0bda:8151 virtual CD-ROM
+    /// personality into its native Ethernet personality. The 31-byte BOT
+    /// message is the command used by usb_modeswitch for this install mode.
+    /// A successful command deliberately makes the device disappear and
+    /// re-enumerate, so failure to receive the trailing CSW is not fatal.
+    pub fn switch_rtl8151_install_mode(&mut self) -> Result<bool, Error> {
+        let Some(storage) = self.mass_storage else {
+            return Ok(false);
+        };
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        let Some(device) = self.device_at_address(target.address) else {
+            return Ok(false);
+        };
+        if vibeos_driver_rtl815x::classify(device.vendor_id, device.product_id)
+            != vibeos_driver_rtl815x::Personality::InstallMode
+        {
+            return Ok(false);
+        }
+        let network_bus_path = self
+            .bus_path_for_address(target.address)
+            .ok_or(Error::NoDevice)?;
+
+        let mut transport = Rtl815xInstallTransport {
+            controller: self,
+            target,
+            storage,
+        };
+        vibeos_driver_rtl815x::switch_install_mode(&mut transport)?;
+        self.network_bus_path = Some(network_bus_path);
+        self.mass_storage = None;
+        self.storage_target = None;
+        Ok(true)
+    }
+
+    /// Select the standards-based CDC-ECM configuration exposed by an
+    /// RTL8153 and activate its data-interface alternate setting.
+    pub fn configure_cdc_ecm(&mut self) -> Result<Option<CdcEcmInfo>, Error> {
+        let Some(mut ecm) = self.cdc_ecm else {
+            return Ok(None);
+        };
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(ecm.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x01,
+                request: 11,
+                value: u16::from(ecm.data_alternate),
+                index: u16::from(ecm.data_interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x21,
+                request: 0x43,
+                value: 0x000d,
+                index: u16::from(ecm.control_interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.reset_bulk_pids(target.address, ecm.endpoint_in);
+        self.reset_bulk_pids(target.address, ecm.endpoint_out);
+        self.cdc_status_pid = DataPid::Data0;
+        ecm.mac_address = self.read_mac_string(ecm.mac_string_index)?;
+        self.cdc_ecm = Some(ecm);
+        self.network_bus_path = self.bus_path_for_address(target.address);
+        Ok(Some(ecm))
+    }
+
+    /// Receive one raw Ethernet frame from the active CDC-ECM interface.
+    /// `Nak` means no frame is currently queued and is normal for polling.
+    pub fn receive_cdc_ecm(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        let ecm = self.cdc_ecm.ok_or(Error::NoDevice)?;
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        if output.len() > MAX_ETHERNET_FRAME_BYTES {
+            return Err(Error::BufferTooSmall);
+        }
+        self.select_target(target);
+        self.bulk_in_with_retries(
+            ecm.endpoint_in,
+            ecm.max_packet_size_in,
+            output,
+            1,
+            CDC_RX_POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// Transmit one raw Ethernet frame through the active CDC-ECM interface.
+    pub fn transmit_cdc_ecm(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let ecm = self.cdc_ecm.ok_or(Error::NoDevice)?;
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        if frame.len() < 14 || frame.len() > MAX_ETHERNET_FRAME_BYTES {
+            return Err(Error::BufferTooSmall);
+        }
+        self.select_target(target);
+        self.bulk_out(ecm.endpoint_out, ecm.max_packet_size_out, frame)
+    }
+
+    /// Poll the CDC notification endpoint for a physical media transition.
+    /// A NAK or a speed-change notification carries no new carrier state.
+    pub fn poll_cdc_ecm_carrier(&mut self) -> Result<CdcCarrierStatus, Error> {
+        let ecm = self.cdc_ecm.ok_or(Error::NoDevice)?;
+        let target = self.cdc_ecm_target.ok_or(Error::NoDevice)?;
+        if self
+            .device_at_address(target.address)
+            .is_some_and(|device| {
+                vibeos_driver_rtl815x::classify(device.vendor_id, device.product_id)
+                    == vibeos_driver_rtl815x::Personality::Ethernet
+            })
+        {
+            let mut transport = Rtl815xRegisterTransport {
+                controller: self,
+                target,
+            };
+            return vibeos_driver_rtl815x::read_link_status(&mut transport).map(|status| {
+                CdcCarrierStatus {
+                    link_up: Some(status.link_up),
+                    rtl815x_phystatus: Some(status.raw),
+                }
+            });
+        }
+        let endpoint = ecm.status_endpoint.ok_or(Error::InvalidDescriptor)?;
+        if ecm.status_max_packet_size < 8 || usize::from(ecm.status_max_packet_size) > DMA_BYTES {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.select_target(target);
+        let actual = match self.channel_transfer(
+            self.device_address,
+            endpoint & 0x0f,
+            true,
+            EndpointType::Interrupt,
+            self.cdc_status_pid,
+            usize::from(ecm.status_max_packet_size),
+            ecm.status_max_packet_size,
+            1,
+        ) {
+            Ok(actual) => actual,
+            Err(Error::Nak) => {
+                return Ok(CdcCarrierStatus {
+                    link_up: None,
+                    rtl815x_phystatus: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        self.cdc_status_pid = self.cdc_status_pid.toggled();
+        let mut notification = [0u8; 64];
+        let length = actual.min(notification.len());
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| notification[..length].copy_from_slice(&bytes[..length]))
+        };
+        parse_cdc_ecm_carrier_notification(&notification[..length]).map(|link_up| {
+            CdcCarrierStatus {
+                link_up,
+                rtl815x_phystatus: None,
+            }
+        })
+    }
+
+    fn read_mac_string(&mut self, string_index: u8) -> Result<Option<[u8; 6]>, Error> {
+        if string_index == 0 {
+            return Ok(None);
+        }
+        let mut languages = [0; 4];
+        let language_length = self.control_transfer(
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: 3 << 8,
+                index: 0,
+                length: languages.len() as u16,
+            },
+            &mut languages,
+        )?;
+        if language_length < 4 || languages[1] != 3 {
+            return Err(Error::InvalidDescriptor);
+        }
+        let language = u16::from_le_bytes([languages[2], languages[3]]);
+        let mut descriptor = [0; 64];
+        let length = self.control_transfer(
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: (3 << 8) | u16::from(string_index),
+                index: language,
+                length: descriptor.len() as u16,
+            },
+            &mut descriptor,
+        )?;
+        parse_mac_string_descriptor(&descriptor[..length]).map(Some)
+    }
+
+    fn device_at_address(&self, address: u8) -> Option<DeviceInfo> {
+        self.device
+            .filter(|device| device.address == address)
+            .or_else(|| {
+                self.children
+                    .iter()
+                    .flatten()
+                    .find(|child| child.device.address == address)
+                    .map(|child| child.device)
+            })
+    }
+
+    /// Select the detected SCSI Bulk-Only interface and probe its logical
+    /// block capacity. Only LUN zero and 512-byte logical blocks are supported.
+    pub fn configure_mass_storage(&mut self) -> Result<Option<MassStorageInfo>, Error> {
+        let Some(mut storage) = self.mass_storage else {
+            return Ok(None);
+        };
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(storage.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        self.reset_bulk_pids(target.address, storage.endpoint_in);
+        self.reset_bulk_pids(target.address, storage.endpoint_out);
+        self.storage_tag = 1;
+        delay_ms(self.timebase_hz, self.time, 10);
+
+        let test_unit_ready = [0x00, 0, 0, 0, 0, 0];
+        let mut ready = false;
+        for _ in 0..10 {
+            match self.bot_command(&test_unit_ready, true, &mut []) {
+                Ok(()) => {
+                    ready = true;
+                    break;
+                }
+                Err(Error::StorageCommandFailed(_)) => {
+                    let request_sense = [0x03, 0, 0, 0, 18, 0];
+                    let mut sense = [0; 18];
+                    let _ = self.bot_command(&request_sense, true, &mut sense);
+                    delay_ms(self.timebase_hz, self.time, 100);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !ready {
+            return Err(Error::StorageCommandFailed(1));
+        }
+
+        let read_capacity = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut capacity = [0; 8];
+        self.bot_command(&read_capacity, true, &mut capacity)?;
+        let last_lba = u32::from_be_bytes(capacity[0..4].try_into().unwrap());
+        let block_size = u32::from_be_bytes(capacity[4..8].try_into().unwrap());
+        if block_size != 512 {
+            return Err(Error::StorageBlockSize(block_size));
+        }
+        if last_lba == u32::MAX {
+            return Err(Error::StorageCapacityTooLarge);
+        }
+        storage.capacity_sectors = Some(u64::from(last_lba) + 1);
+        storage.block_size = Some(block_size);
+        self.mass_storage = Some(storage);
+        Ok(Some(storage))
+    }
+
+    pub fn read_sector(&mut self, sector: u64) -> Result<[u8; 512], Error> {
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let capacity = storage.capacity_sectors.ok_or(Error::StorageProtocol)?;
+        if sector >= capacity || sector > u64::from(u32::MAX) {
+            return Err(Error::StorageOutOfRange);
+        }
+        let cdb = read_10_cdb(sector as u32);
+        let mut bytes = [0; 512];
+        self.bot_command(&cdb, true, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Write one logical sector using SCSI WRITE(10).
+    ///
+    /// Callers must ensure that overwriting the selected sector is safe.
+    pub fn write_sector(&mut self, sector: u64, bytes: &[u8; 512]) -> Result<(), Error> {
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let capacity = storage.capacity_sectors.ok_or(Error::StorageProtocol)?;
+        if sector >= capacity || sector > u64::from(u32::MAX) {
+            return Err(Error::StorageOutOfRange);
+        }
+        let cdb = write_10_cdb(sector as u32);
+        let mut data = *bytes;
+        self.bot_command(&cdb, false, &mut data)
     }
 
     pub const fn configuration(&self) -> Option<ConfigurationInfo> {
@@ -628,18 +1139,70 @@ impl Controller {
         self.hub
     }
 
+    pub fn hub_topology_changed(&mut self) -> Result<bool, Error> {
+        if self.hub.is_none() {
+            return Ok(false);
+        }
+        let root = self.device.ok_or(Error::NoDevice)?;
+        let saved = self.current_target();
+        let hubs = self.hubs;
+        let children = self.children;
+        let result = (|| {
+            for hub in hubs.into_iter().flatten() {
+                let target = if hub.address == root.address {
+                    TransferTarget {
+                        address: root.address,
+                        endpoint_zero_max_packet: u16::from(root.max_packet_size_0),
+                        speed: root.speed,
+                        split: None,
+                    }
+                } else {
+                    let child = children
+                        .iter()
+                        .flatten()
+                        .find(|child| child.device.address == hub.address)
+                        .copied()
+                        .ok_or(Error::NoDevice)?;
+                    transfer_target_for_child(child)
+                };
+                self.select_target(target);
+                for port in 1..=hub.ports {
+                    let connected = self.hub_port_status(port)? & USB_PORT_STAT_CONNECTION != 0;
+                    let enumerated = children
+                        .iter()
+                        .flatten()
+                        .any(|child| child.parent_hub_address == hub.address && child.port == port);
+                    if connected != enumerated {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })();
+        self.select_target(saved);
+        result
+    }
+
     /// Reset the directly attached root-port device and complete USB address
     /// and device-descriptor enumeration through endpoint zero.
     pub fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {
         if !self.connected() {
             self.device = None;
             self.child = None;
+            self.children = [None; MAX_HUB_CHILDREN];
             self.hub = None;
+            self.hubs = [None; MAX_HUB_CHILDREN];
             self.split = None;
             self.configuration = None;
+            self.configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+            self.configuration_device_address = None;
             self.report_descriptor = None;
             self.keyboard = None;
+            self.keyboard_target = None;
             self.mass_storage = None;
+            self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
             self.device_address = 0;
             return Ok(None);
         }
@@ -697,11 +1260,19 @@ impl Controller {
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
         self.device = Some(info);
         self.child = None;
+        self.children = [None; MAX_HUB_CHILDREN];
         self.hub = None;
+        self.hubs = [None; MAX_HUB_CHILDREN];
         self.configuration = None;
+        self.configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+        self.configuration_device_address = None;
         self.report_descriptor = None;
         self.keyboard = None;
+        self.keyboard_target = None;
         self.mass_storage = None;
+        self.storage_target = None;
+        self.cdc_ecm = None;
+        self.cdc_ecm_target = None;
         Ok(Some(info))
     }
 
@@ -710,42 +1281,36 @@ impl Controller {
     pub fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
         let Some(target) = self.child.or(self.device) else {
             self.keyboard = None;
+            self.keyboard_target = None;
             self.mass_storage = None;
+            self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
             return Ok(None);
         };
         if !self.connected() {
             self.keyboard = None;
+            self.keyboard_target = None;
             self.mass_storage = None;
+            self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
             return Ok(None);
         }
+        let transfer_target = self.current_target();
 
-        let mut header = [0u8; 9];
-        let request = SetupPacket {
-            request_type: 0x80,
-            request: 6,
-            value: 2 << 8,
-            index: 0,
-            length: header.len() as u16,
-        };
-        if self.control_transfer(request, &mut header)? != header.len() {
-            return Err(Error::InvalidDescriptor);
-        }
-        let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
-        if total < header.len() || total > DMA_BYTES {
-            return Err(Error::InvalidDescriptor);
-        }
-        let mut descriptors = [0u8; DMA_BYTES];
-        let request = SetupPacket {
-            length: total as u16,
-            ..request
-        };
-        if self.control_transfer(request, &mut descriptors[..total])? != total {
-            return Err(Error::InvalidDescriptor);
-        }
-        let (configuration, keyboard) =
-            parse_hid_keyboard_configuration(&descriptors[..total], self.speed)?;
+        let (configuration, keyboard) = self.read_configuration(0)?;
         self.configuration = Some(configuration);
+        self.configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+        self.configurations[0] = Some(configuration);
+        self.configuration_device_address = Some(target.address);
+        for index in 1..usize::from(target.configuration_count).min(MAX_DEVICE_CONFIGURATIONS) {
+            self.configurations[index] = Some(self.read_configuration(index as u8)?.0);
+        }
+        self.cdc_ecm = find_cdc_ecm(self.configurations, self.speed);
+        self.cdc_ecm_target = self.cdc_ecm.map(|_| transfer_target);
         self.mass_storage = find_mass_storage(configuration);
+        self.storage_target = self.mass_storage.map(|_| transfer_target);
         self.report_descriptor = None;
         let Some(keyboard) = keyboard else {
             self.keyboard = None;
@@ -762,8 +1327,9 @@ impl Controller {
                 )?;
                 let hub = self.configure_hub()?;
                 self.hub = Some(hub);
-                if self.enumerate_hub_child(hub)?.is_some() {
-                    return self.configure_hid_keyboard();
+                self.record_hub(hub)?;
+                if self.enumerate_hub_children(hub, true, 1)? != 0 {
+                    return self.configure_hub_child_functions();
                 }
             }
             if let Some(interface) =
@@ -814,6 +1380,7 @@ impl Controller {
                         interval_ms: hid_poll_interval_ms(self.speed, interface.interval),
                         protocol: HidKeyboardProtocol::Report,
                     });
+                    self.keyboard_target = Some(transfer_target);
                     self.keyboard_layout = KeyboardLayout::AppleReport;
                     self.keyboard_pid = DataPid::Data0;
                     self.keyboard_last = [0; HID_REPORT_BYTES];
@@ -844,11 +1411,171 @@ impl Controller {
             &mut [],
         )?;
         self.keyboard = Some(keyboard);
+        self.keyboard_target = Some(transfer_target);
         self.keyboard_layout = KeyboardLayout::Boot;
         self.keyboard_pid = DataPid::Data0;
         self.keyboard_last = [0; HID_REPORT_BYTES];
         self.keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
         Ok(Some(keyboard))
+    }
+
+    fn read_configuration(
+        &mut self,
+        descriptor_index: u8,
+    ) -> Result<(ConfigurationInfo, Option<HidKeyboardInfo>), Error> {
+        let mut header = [0u8; 9];
+        let request = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: (2 << 8) | u16::from(descriptor_index),
+            index: 0,
+            length: header.len() as u16,
+        };
+        if self.control_transfer(request, &mut header)? != header.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        let total = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if total < header.len() || total > DMA_BYTES {
+            return Err(Error::InvalidDescriptor);
+        }
+        let mut descriptors = [0u8; DMA_BYTES];
+        if self.control_transfer(
+            SetupPacket {
+                length: total as u16,
+                ..request
+            },
+            &mut descriptors[..total],
+        )? != total
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        parse_hid_keyboard_configuration(&descriptors[..total], self.speed)
+    }
+
+    fn configure_hub_child_functions(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
+        let legacy_child = self.child;
+
+        let mut selected_keyboard = None;
+        let mut selected_keyboard_target = None;
+        let mut selected_keyboard_layout = KeyboardLayout::Boot;
+        let mut selected_keyboard_pid = DataPid::Data0;
+        let mut selected_keyboard_last = [0; HID_REPORT_BYTES];
+        let mut selected_keyboard_nkro_last = [0; APPLE_NKRO_REPORT_BYTES];
+        let mut selected_report_descriptor = None;
+        let mut selected_keyboard_configuration = None;
+        let mut selected_storage = None;
+        let mut selected_storage_target = None;
+        let mut selected_storage_configuration = None;
+        let mut selected_cdc_ecm = None;
+        let mut selected_cdc_ecm_target = None;
+
+        let mut child_index = 0;
+        while child_index < MAX_HUB_CHILDREN {
+            let Some(child) = self.children[child_index] else {
+                break;
+            };
+            let target = transfer_target_for_child(child);
+            self.select_target(target);
+            self.child = Some(child.device);
+            self.configuration = None;
+            self.report_descriptor = None;
+            self.keyboard = None;
+            self.keyboard_target = None;
+            self.mass_storage = None;
+            self.storage_target = None;
+            self.cdc_ecm = None;
+            self.cdc_ecm_target = None;
+
+            self.configure_hid_keyboard()?;
+            let is_hub = child.device.device_class == USB_CLASS_HUB
+                || self.configuration.is_some_and(|configuration| {
+                    configuration
+                        .interfaces
+                        .into_iter()
+                        .flatten()
+                        .any(|interface| interface.class == USB_CLASS_HUB)
+                });
+            if is_hub {
+                if child.depth >= MAX_HUB_DEPTH {
+                    return Err(Error::InvalidDescriptor);
+                }
+                let configuration = self.configuration.ok_or(Error::InvalidDescriptor)?;
+                self.control_transfer(
+                    SetupPacket {
+                        request_type: 0,
+                        request: 9,
+                        value: u16::from(configuration.value),
+                        index: 0,
+                        length: 0,
+                    },
+                    &mut [],
+                )?;
+                let nested_hub = self.configure_hub()?;
+                self.record_hub(nested_hub)?;
+                self.enumerate_hub_children(nested_hub, false, child.depth + 1)?;
+                child_index += 1;
+                continue;
+            }
+            if selected_keyboard.is_none() && self.keyboard.is_some() {
+                selected_keyboard = self.keyboard;
+                selected_keyboard_target = self.keyboard_target;
+                selected_keyboard_layout = self.keyboard_layout;
+                selected_keyboard_pid = self.keyboard_pid;
+                selected_keyboard_last = self.keyboard_last;
+                selected_keyboard_nkro_last = self.keyboard_nkro_last;
+                selected_report_descriptor = self.report_descriptor;
+                selected_keyboard_configuration = self.configuration;
+            }
+            if selected_storage.is_none() && self.mass_storage.is_some() {
+                selected_storage = self.mass_storage;
+                selected_storage_target = self.storage_target;
+                selected_storage_configuration = self.configuration;
+            }
+            if selected_cdc_ecm.is_none() && self.cdc_ecm.is_some() {
+                selected_cdc_ecm = self.cdc_ecm;
+                selected_cdc_ecm_target = self.cdc_ecm_target;
+            }
+            child_index += 1;
+        }
+
+        self.child = legacy_child;
+        self.keyboard = selected_keyboard;
+        self.keyboard_target = selected_keyboard_target;
+        self.keyboard_layout = selected_keyboard_layout;
+        self.keyboard_pid = selected_keyboard_pid;
+        self.keyboard_last = selected_keyboard_last;
+        self.keyboard_nkro_last = selected_keyboard_nkro_last;
+        self.report_descriptor = selected_report_descriptor;
+        self.mass_storage = selected_storage;
+        self.storage_target = selected_storage_target;
+        self.cdc_ecm = selected_cdc_ecm;
+        self.cdc_ecm_target = selected_cdc_ecm_target;
+        self.configuration = selected_keyboard_configuration.or(selected_storage_configuration);
+        if let Some(target) = selected_keyboard_target
+            .or(selected_storage_target)
+            .or(selected_cdc_ecm_target)
+        {
+            self.select_target(target);
+        }
+        Ok(selected_keyboard)
+    }
+
+    fn record_hub(&mut self, hub: HubInfo) -> Result<(), Error> {
+        if let Some(slot) = self
+            .hubs
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|candidate| candidate.address == hub.address))
+        {
+            *slot = Some(hub);
+            return Ok(());
+        }
+        let slot = self
+            .hubs
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::InvalidDescriptor)?;
+        *slot = Some(hub);
+        Ok(())
     }
 
     fn configure_hub(&mut self) -> Result<HubInfo, Error> {
@@ -874,35 +1601,12 @@ impl Controller {
             u64::from(power_good_ms.max(20)),
         );
 
-        let mut active_port = None;
-        let mut child_speed = None;
-        let mut port_status = 0;
-        for port in 1..=ports {
-            let status = self.hub_port_status(port)?;
-            if status & USB_PORT_STAT_CONNECTION == 0 {
-                continue;
-            }
-            self.hub_port_feature(port, true, USB_PORT_FEAT_RESET)?;
-            delay_ms(self.timebase_hz, self.time, 60);
-            let reset_status = self.hub_port_status(port)?;
-            let _ = self.hub_port_feature(port, false, USB_PORT_FEAT_C_RESET);
-            if reset_status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)
-                != USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE
-            {
-                continue;
-            }
-            active_port = Some(port);
-            child_speed = Some(hub_port_speed(reset_status));
-            port_status = reset_status;
-            break;
-        }
-
         Ok(HubInfo {
             address: self.device_address,
             ports,
-            active_port,
-            child_speed,
-            port_status,
+            active_port: None,
+            child_speed: None,
+            port_status: 0,
         })
     }
 
@@ -938,15 +1642,79 @@ impl Controller {
         Ok(u16::from_le_bytes([status[0], status[1]]))
     }
 
-    fn enumerate_hub_child(&mut self, hub: HubInfo) -> Result<Option<DeviceInfo>, Error> {
-        let (Some(port), Some(speed)) = (hub.active_port, hub.child_speed) else {
+    fn enumerate_hub_children(
+        &mut self,
+        mut hub: HubInfo,
+        reset_table: bool,
+        depth: u8,
+    ) -> Result<usize, Error> {
+        if reset_table {
             self.child = None;
-            return Ok(None);
-        };
-        self.split = (speed != Speed::High).then_some(SplitTarget {
-            hub_address: hub.address,
-            port,
-        });
+            self.children = [None; MAX_HUB_CHILDREN];
+        }
+        let hub_target = self.current_target();
+        let mut count = self.children.iter().flatten().count();
+        let initial_count = count;
+        for port in 1..=hub.ports {
+            self.select_target(hub_target);
+            let status = self.hub_port_status(port)?;
+            if status & USB_PORT_STAT_CONNECTION == 0 {
+                continue;
+            }
+            self.hub_port_feature(port, true, USB_PORT_FEAT_RESET)?;
+            delay_ms(self.timebase_hz, self.time, 60);
+            let reset_status = self.hub_port_status(port)?;
+            let _ = self.hub_port_feature(port, false, USB_PORT_FEAT_C_RESET);
+            if reset_status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)
+                != USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE
+            {
+                continue;
+            }
+            let speed = hub_port_speed(reset_status);
+            let split = split_target_for_child(hub_target.split, hub.address, port, speed);
+            let address = 2u8
+                .checked_add(count as u8)
+                .ok_or(Error::InvalidDescriptor)?;
+            let info = self.enumerate_hub_child(speed, address, split)?;
+            let slot = self
+                .children
+                .get_mut(count)
+                .ok_or(Error::InvalidDescriptor)?;
+            *slot = Some(HubChildInfo {
+                device: info,
+                parent_hub_address: hub.address,
+                port,
+                port_status: reset_status,
+                depth,
+                tt_hub_address: split.map(|target| target.hub_address),
+                tt_port: split.map(|target| target.port),
+            });
+            if self.child.is_none() {
+                self.child = Some(info);
+                hub.active_port = Some(port);
+                hub.child_speed = Some(speed);
+                hub.port_status = reset_status;
+            }
+            count += 1;
+        }
+        if self
+            .device
+            .is_some_and(|device| device.address == hub.address)
+        {
+            self.hub = Some(hub);
+        }
+        self.record_hub(hub)?;
+        self.select_target(hub_target);
+        Ok(count - initial_count)
+    }
+
+    fn enumerate_hub_child(
+        &mut self,
+        speed: Speed,
+        address: u8,
+        split: Option<SplitTarget>,
+    ) -> Result<DeviceInfo, Error> {
+        self.split = split;
         self.speed = speed;
         self.device_address = 0;
         self.endpoint_zero_max_packet = match speed {
@@ -975,13 +1743,13 @@ impl Controller {
             SetupPacket {
                 request_type: 0,
                 request: 5,
-                value: 2,
+                value: u16::from(address),
                 index: 0,
                 length: 0,
             },
             &mut [],
         )?;
-        self.device_address = 2;
+        self.device_address = address;
         delay_ms(self.timebase_hz, self.time, 2);
 
         let full = SetupPacket {
@@ -996,18 +1764,20 @@ impl Controller {
         }
         let info = parse_device_descriptor(descriptor, speed, self.device_address)?;
         self.endpoint_zero_max_packet = u16::from(info.max_packet_size_0);
-        self.child = Some(info);
-        Ok(Some(info))
+        Ok(info)
     }
 
     /// Poll one interrupt-IN keyboard report and return bytes for newly
     /// pressed keys. A USB NAK is normal idle state and produces an empty batch.
     pub fn poll_keyboard(&mut self) -> Result<HidInputBatch, Error> {
         let keyboard = self.keyboard.ok_or(Error::NoDevice)?;
+        let target = self.keyboard_target.ok_or(Error::NoDevice)?;
         if !self.connected() {
             self.keyboard = None;
+            self.keyboard_target = None;
             return Err(Error::NoDevice);
         }
+        self.select_target(target);
         let result = self.channel_transfer(
             self.device_address,
             keyboard.endpoint_in & 0x0f,
@@ -1030,13 +1800,23 @@ impl Controller {
                     return Err(Error::InvalidDescriptor);
                 }
                 let mut report = [0u8; HID_REPORT_BYTES];
-                unsafe { report.copy_from_slice(&dma_bytes()[..HID_REPORT_BYTES]) };
+                unsafe {
+                    self.dma
+                        .with_bytes_mut(|bytes| report.copy_from_slice(&bytes[..HID_REPORT_BYTES]))
+                };
                 let input = decode_hid_report(report, self.keyboard_last);
                 self.keyboard_last = report;
                 Ok(input)
             }
             KeyboardLayout::AppleReport => {
-                let report = unsafe { &dma_bytes()[..actual] };
+                let mut report = [0; APPLE_NKRO_REPORT_BYTES];
+                let report_len = actual.min(report.len());
+                unsafe {
+                    self.dma.with_bytes_mut(|bytes| {
+                        report[..report_len].copy_from_slice(&bytes[..report_len])
+                    })
+                };
+                let report = &report[..report_len];
                 match report.first() {
                     Some(1) if report.len() >= 9 => {
                         let mut normalized = [0; HID_REPORT_BYTES];
@@ -1060,6 +1840,222 @@ impl Controller {
         }
     }
 
+    fn bot_command(&mut self, cdb: &[u8], data_in: bool, data: &mut [u8]) -> Result<(), Error> {
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
+        let result = self.bot_command_once(cdb, data_in, data);
+        if let Err(error) = result {
+            if bot_requires_reset_recovery(error) {
+                let _ = self.bot_reset_recovery();
+            }
+        }
+        result
+    }
+
+    fn bot_command_once(
+        &mut self,
+        cdb: &[u8],
+        data_in: bool,
+        data: &mut [u8],
+    ) -> Result<(), Error> {
+        const CBW_LENGTH: usize = 31;
+        const CSW_LENGTH: usize = 13;
+        if cdb.is_empty() || cdb.len() > 16 || data.len() > DMA_BYTES {
+            return Err(Error::StorageProtocol);
+        }
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let tag = self.storage_tag;
+        self.storage_tag = self
+            .storage_tag
+            .checked_add(1)
+            .ok_or(Error::StorageProtocol)?;
+
+        let mut cbw = [0; CBW_LENGTH];
+        cbw[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());
+        cbw[4..8].copy_from_slice(&tag.to_le_bytes());
+        cbw[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        cbw[12] = if data_in { 0x80 } else { 0 };
+        cbw[14] = cdb.len() as u8;
+        cbw[15..15 + cdb.len()].copy_from_slice(cdb);
+        self.bulk_out(storage.endpoint_out, storage.max_packet_size_out, &cbw)?;
+        if !data.is_empty() {
+            if data_in {
+                let actual = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, data)?;
+                if actual != data.len() {
+                    return Err(Error::StorageDataLength {
+                        expected: data.len(),
+                        actual,
+                    });
+                }
+            } else {
+                self.bulk_out(storage.endpoint_out, storage.max_packet_size_out, data)?;
+            }
+        }
+        let mut csw = [0; CSW_LENGTH];
+        let csw_length = self.bulk_in(storage.endpoint_in, storage.max_packet_size_in, &mut csw)?;
+        if csw_length != CSW_LENGTH {
+            return Err(Error::StorageCswLength(csw_length));
+        }
+        let signature = u32::from_le_bytes(csw[0..4].try_into().unwrap());
+        let observed_tag = u32::from_le_bytes(csw[4..8].try_into().unwrap());
+        let residue = u32::from_le_bytes(csw[8..12].try_into().unwrap());
+        if signature != 0x5342_5355 {
+            return Err(Error::StorageCswSignature(signature));
+        }
+        if observed_tag != tag {
+            return Err(Error::StorageCswTag(observed_tag));
+        }
+        if csw[12] != 0 {
+            return Err(Error::StorageCommandFailed(csw[12]));
+        }
+        if residue != 0 {
+            return Err(Error::StorageCswResidue(residue));
+        }
+        Ok(())
+    }
+
+    fn bot_reset_recovery(&mut self) -> Result<(), Error> {
+        let storage = self.mass_storage.ok_or(Error::NoDevice)?;
+        let target = self.storage_target.ok_or(Error::NoDevice)?;
+        self.select_target(target);
+        self.control_transfer(
+            SetupPacket {
+                request_type: 0x21,
+                request: 0xff,
+                value: 0,
+                index: u16::from(storage.interface),
+                length: 0,
+            },
+            &mut [],
+        )?;
+        for endpoint in [storage.endpoint_in, storage.endpoint_out] {
+            self.control_transfer(
+                SetupPacket {
+                    request_type: 0x02,
+                    request: 1,
+                    value: 0,
+                    index: u16::from(endpoint),
+                    length: 0,
+                },
+                &mut [],
+            )?;
+        }
+        self.reset_bulk_pids(target.address, storage.endpoint_in);
+        self.reset_bulk_pids(target.address, storage.endpoint_out);
+        Ok(())
+    }
+
+    fn current_target(&self) -> TransferTarget {
+        TransferTarget {
+            address: self.device_address,
+            endpoint_zero_max_packet: self.endpoint_zero_max_packet,
+            speed: self.speed,
+            split: self.split,
+        }
+    }
+
+    fn select_target(&mut self, target: TransferTarget) {
+        self.device_address = target.address;
+        self.endpoint_zero_max_packet = target.endpoint_zero_max_packet;
+        self.speed = target.speed;
+        self.split = target.split;
+    }
+
+    fn bus_path_for_address(&self, address: u8) -> Option<UsbBusPath> {
+        let root = self.device?;
+        usb_bus_path(root, &self.children, address)
+    }
+
+    fn bulk_pid_index(endpoint: u8, direction_in: bool) -> usize {
+        usize::from(endpoint & 0x0f) + if direction_in { 16 } else { 0 }
+    }
+
+    fn reset_bulk_pids(&mut self, address: u8, endpoint: u8) {
+        if let Some(pids) = self.bulk_pids.get_mut(usize::from(address)) {
+            pids[Self::bulk_pid_index(endpoint, false)] = DataPid::Data0;
+            pids[Self::bulk_pid_index(endpoint, true)] = DataPid::Data0;
+        }
+    }
+
+    fn bulk_in(
+        &mut self,
+        endpoint: u8,
+        max_packet: u16,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.bulk_in_with_retries(
+            endpoint,
+            max_packet,
+            output,
+            MAX_NAK_RETRIES,
+            TRANSFER_TIMEOUT_MS,
+        )
+    }
+
+    fn bulk_in_with_retries(
+        &mut self,
+        endpoint: u8,
+        max_packet: u16,
+        output: &mut [u8],
+        nak_retries: usize,
+        timeout_ms: u64,
+    ) -> Result<usize, Error> {
+        let address = usize::from(self.device_address);
+        let pid_index = Self::bulk_pid_index(endpoint, true);
+        let pid = self
+            .bulk_pids
+            .get(address)
+            .ok_or(Error::InvalidDescriptor)?[pid_index];
+        let actual = self.channel_transfer_with_timeout(
+            self.device_address,
+            endpoint & 0x0f,
+            true,
+            EndpointType::Bulk,
+            pid,
+            output.len(),
+            max_packet,
+            nak_retries,
+            timeout_ms,
+        )?;
+        self.bulk_pids[address][pid_index] = advance_pid(pid, actual, max_packet);
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| output[..actual].copy_from_slice(&bytes[..actual]))
+        };
+        Ok(actual)
+    }
+
+    fn bulk_out(&mut self, endpoint: u8, max_packet: u16, input: &[u8]) -> Result<(), Error> {
+        let address = usize::from(self.device_address);
+        let pid_index = Self::bulk_pid_index(endpoint, false);
+        let pid = self
+            .bulk_pids
+            .get(address)
+            .ok_or(Error::InvalidDescriptor)?[pid_index];
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| bytes[..input.len()].copy_from_slice(input))
+        };
+        let actual = self.channel_transfer(
+            self.device_address,
+            endpoint & 0x0f,
+            false,
+            EndpointType::Bulk,
+            pid,
+            input.len(),
+            max_packet,
+            MAX_NAK_RETRIES,
+        )?;
+        if actual != input.len() {
+            return Err(Error::TransferLength {
+                expected: input.len(),
+                actual,
+            });
+        }
+        self.bulk_pids[address][pid_index] = advance_pid(pid, actual, max_packet);
+        Ok(())
+    }
+
     /// Execute one USB control request on the currently addressed endpoint 0.
     /// The returned length is the actual data-stage byte count.
     pub fn control_transfer(
@@ -1072,7 +2068,10 @@ impl Controller {
             return Err(Error::BufferTooSmall);
         }
         let direction_in = setup.request_type & 0x80 != 0;
-        unsafe { dma_bytes()[..8].copy_from_slice(&setup.to_bytes()) };
+        unsafe {
+            self.dma
+                .with_bytes_mut(|bytes| bytes[..8].copy_from_slice(&setup.to_bytes()))
+        };
         self.channel_transfer(
             self.device_address,
             0,
@@ -1088,7 +2087,10 @@ impl Controller {
             0
         } else {
             if !direction_in {
-                unsafe { dma_bytes()[..length].copy_from_slice(&data[..length]) };
+                unsafe {
+                    self.dma
+                        .with_bytes_mut(|bytes| bytes[..length].copy_from_slice(&data[..length]))
+                };
             }
             let actual = self.channel_transfer(
                 self.device_address,
@@ -1101,7 +2103,10 @@ impl Controller {
                 MAX_NAK_RETRIES,
             )?;
             if direction_in {
-                unsafe { data[..actual].copy_from_slice(&dma_bytes()[..actual]) };
+                unsafe {
+                    self.dma
+                        .with_bytes_mut(|bytes| data[..actual].copy_from_slice(&bytes[..actual]))
+                };
             }
             actual
         };
@@ -1171,6 +2176,32 @@ impl Controller {
         max_packet: u16,
         nak_retries: usize,
     ) -> Result<usize, Error> {
+        self.channel_transfer_with_timeout(
+            address,
+            endpoint,
+            direction_in,
+            endpoint_type,
+            pid,
+            length,
+            max_packet,
+            nak_retries,
+            TRANSFER_TIMEOUT_MS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn channel_transfer_with_timeout(
+        &mut self,
+        address: u8,
+        endpoint: u8,
+        direction_in: bool,
+        endpoint_type: EndpointType,
+        pid: DataPid,
+        length: usize,
+        max_packet: u16,
+        nak_retries: usize,
+        timeout_ms: u64,
+    ) -> Result<usize, Error> {
         if length > DMA_BYTES || endpoint > 15 || address > 127 || max_packet == 0 {
             return Err(Error::BufferTooSmall);
         }
@@ -1193,7 +2224,7 @@ impl Controller {
         } else {
             length.div_ceil(packet_bytes)
         };
-        let dma_address = DMA.0.get() as usize;
+        let dma_address = self.dma.base();
 
         for _ in 0..nak_retries {
             if direction_in {
@@ -1239,7 +2270,7 @@ impl Controller {
             }
 
             let started = (self.time)();
-            let timeout = ticks_for_ms(self.timebase_hz, TRANSFER_TIMEOUT_MS);
+            let timeout = ticks_for_ms(self.timebase_hz, timeout_ms);
             loop {
                 let status = unsafe { channel_read(self.description, channel, HCINT) };
                 if status & HCINT_CHANNEL_HALTED != 0 {
@@ -1248,7 +2279,7 @@ impl Controller {
                         let remaining =
                             unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff }
                                 as usize;
-                        let actual = length.saturating_sub(remaining);
+                        let actual = completed_length(direction_in, length, remaining);
                         if direction_in {
                             invalidate_range(
                                 self.description.cache_line_bytes,
@@ -1432,7 +2463,7 @@ impl Controller {
         max_packet: u16,
         dma_offset: usize,
     ) -> Result<(u32, usize), Error> {
-        let dma_address = DMA.0.get() as usize + dma_offset;
+        let dma_address = self.dma.base() + dma_offset;
         if direction_in {
             invalidate_range(
                 self.description.cache_line_bytes,
@@ -1485,7 +2516,7 @@ impl Controller {
                 unsafe { channel_write(self.description, channel, HCINT, status) };
                 let remaining =
                     unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff } as usize;
-                let actual = length.saturating_sub(remaining);
+                let actual = completed_length(direction_in, length, remaining);
                 if direction_in && actual != 0 {
                     invalidate_range(self.description.cache_line_bytes, dma_address, actual);
                 }
@@ -1513,14 +2544,14 @@ impl Controller {
                 port & !(HPRT_CHANGE_BITS | HPRT_POWER),
             );
         }
-        CLAIMED.store(false, Ordering::Release);
+        self.state.claimed.store(false, Ordering::Release);
         core::mem::forget(self);
     }
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        CLAIMED.store(false, Ordering::Release);
+        self.state.claimed.store(false, Ordering::Release);
     }
 }
 
@@ -1528,6 +2559,7 @@ impl Drop for Controller {
 #[repr(u32)]
 enum EndpointType {
     Control = 0,
+    Bulk = 2,
     Interrupt = 3,
 }
 
@@ -1546,6 +2578,58 @@ impl DataPid {
             Self::Data1 => Self::Data0,
             Self::Setup => Self::Setup,
         }
+    }
+}
+
+fn advance_pid(pid: DataPid, bytes: usize, max_packet: u16) -> DataPid {
+    let packets = bytes.div_ceil(usize::from(max_packet));
+    if packets % 2 == 0 {
+        pid
+    } else {
+        pid.toggled()
+    }
+}
+
+fn read_10_cdb(sector: u32) -> [u8; 10] {
+    let mut cdb = [0; 10];
+    cdb[0] = 0x28;
+    cdb[2..6].copy_from_slice(&sector.to_be_bytes());
+    cdb[7..9].copy_from_slice(&1u16.to_be_bytes());
+    cdb
+}
+
+fn write_10_cdb(sector: u32) -> [u8; 10] {
+    let mut cdb = read_10_cdb(sector);
+    cdb[0] = 0x2a;
+    cdb
+}
+
+const fn bot_requires_reset_recovery(error: Error) -> bool {
+    matches!(
+        error,
+        Error::TransferTimedOut
+            | Error::TransferFailed(_)
+            | Error::Stalled
+            | Error::Nak
+            | Error::StorageProtocol
+            | Error::StorageCommandFailed(2)
+            | Error::StorageCswSignature(_)
+            | Error::StorageCswTag(_)
+            | Error::StorageCswResidue(_)
+            | Error::StorageCbwLength(_)
+            | Error::StorageDataLength { .. }
+            | Error::StorageCswLength(_)
+    )
+}
+
+const fn completed_length(direction_in: bool, requested: usize, remaining: usize) -> usize {
+    // CV1800B's DWC2 4.20a buffer-DMA path leaves XFRSIZ unchanged for a
+    // successfully completed OUT transaction. Transfer Complete is the OUT
+    // acknowledgement; only IN uses XFRSIZ to report a short packet.
+    if direction_in {
+        requested.saturating_sub(remaining)
+    } else {
+        requested
     }
 }
 
@@ -1568,6 +2652,69 @@ const fn hub_port_speed(status: u16) -> Speed {
         Speed::High
     } else {
         Speed::Full
+    }
+}
+
+fn transfer_target_for_child(child: HubChildInfo) -> TransferTarget {
+    TransferTarget {
+        address: child.device.address,
+        endpoint_zero_max_packet: u16::from(child.device.max_packet_size_0),
+        speed: child.device.speed,
+        split: child
+            .tt_hub_address
+            .zip(child.tt_port)
+            .map(|(hub_address, port)| SplitTarget { hub_address, port }),
+    }
+}
+
+fn usb_bus_path(
+    root: DeviceInfo,
+    children: &[Option<HubChildInfo>; MAX_HUB_CHILDREN],
+    address: u8,
+) -> Option<UsbBusPath> {
+    let mut ports = [0; MAX_USB_BUS_PATH_DEPTH];
+    ports[0] = 1;
+    if address == root.address {
+        return Some(UsbBusPath { ports, depth: 1 });
+    }
+
+    let mut reverse = [0; MAX_HUB_DEPTH as usize];
+    let mut count = 0usize;
+    let mut current = address;
+    while current != root.address {
+        if count == reverse.len() {
+            return None;
+        }
+        let child = children
+            .iter()
+            .flatten()
+            .find(|child| child.device.address == current)?;
+        reverse[count] = child.port;
+        count += 1;
+        current = child.parent_hub_address;
+    }
+    for index in 0..count {
+        ports[index + 1] = reverse[count - index - 1];
+    }
+    Some(UsbBusPath {
+        ports,
+        depth: (count + 1) as u8,
+    })
+}
+
+const fn split_target_for_child(
+    parent_split: Option<SplitTarget>,
+    parent_hub_address: u8,
+    port: u8,
+    speed: Speed,
+) -> Option<SplitTarget> {
+    match parent_split {
+        Some(target) => Some(target),
+        None if !matches!(speed, Speed::High) => Some(SplitTarget {
+            hub_address: parent_hub_address,
+            port,
+        }),
+        None => None,
     }
 }
 
@@ -1625,6 +2772,8 @@ fn parse_hid_keyboard_configuration(
                     bulk_out: None,
                     bulk_in_max_packet_size: 0,
                     bulk_out_max_packet_size: 0,
+                    cdc_mac_string_index: None,
+                    endpoints: [None; MAX_INTERFACE_ENDPOINTS],
                 };
                 current_interface = configuration.interfaces.iter().position(Option::is_none);
                 if let Some(index) = current_interface {
@@ -1654,11 +2803,30 @@ fn parse_hid_keyboard_configuration(
                     }
                 }
             }
+            0x24 if length >= 4 && descriptors[offset + 2] == 0x0f => {
+                if let Some(index) = current_interface {
+                    if let Some(info) = configuration.interfaces[index].as_mut() {
+                        info.cdc_mac_string_index = Some(descriptors[offset + 3]);
+                    }
+                }
+            }
             5 if length >= 7 => {
                 let address = descriptors[offset + 2];
                 let attributes = descriptors[offset + 3];
                 let max_packet =
                     u16::from_le_bytes([descriptors[offset + 4], descriptors[offset + 5]]) & 0x07ff;
+                if let Some(index) = current_interface {
+                    if let Some(info) = configuration.interfaces[index].as_mut() {
+                        if let Some(slot) = info.endpoints.iter_mut().find(|slot| slot.is_none()) {
+                            *slot = Some(EndpointInfo {
+                                address,
+                                attributes,
+                                max_packet_size: max_packet,
+                                interval: descriptors[offset + 6],
+                            });
+                        }
+                    }
+                }
                 if address & 0x80 != 0
                     && attributes & 0x03 == 3
                     && max_packet >= HID_REPORT_BYTES as u16
@@ -1726,8 +2894,188 @@ fn find_mass_storage(configuration: ConfigurationInfo) -> Option<MassStorageInfo
                 endpoint_out: interface.bulk_out?,
                 max_packet_size_in: interface.bulk_in_max_packet_size,
                 max_packet_size_out: interface.bulk_out_max_packet_size,
+                capacity_sectors: None,
+                block_size: None,
             })
         })
+}
+
+fn find_cdc_ecm(
+    configurations: [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS],
+    speed: Speed,
+) -> Option<CdcEcmInfo> {
+    configurations
+        .into_iter()
+        .flatten()
+        .find_map(|configuration| {
+            let control = configuration
+                .interfaces
+                .into_iter()
+                .flatten()
+                .find(|interface| interface.class == 0x02 && interface.subclass == 0x06)?;
+            let data = configuration
+                .interfaces
+                .into_iter()
+                .flatten()
+                .find(|interface| {
+                    interface.class == 0x0a
+                        && interface.alternate != 0
+                        && interface.bulk_in.is_some()
+                        && interface.bulk_out.is_some()
+                })?;
+            Some(CdcEcmInfo {
+                configuration: configuration.value,
+                control_interface: control.number,
+                data_interface: data.number,
+                data_alternate: data.alternate,
+                endpoint_in: data.bulk_in?,
+                endpoint_out: data.bulk_out?,
+                max_packet_size_in: data.bulk_in_max_packet_size,
+                max_packet_size_out: data.bulk_out_max_packet_size,
+                status_endpoint: control.interrupt_in,
+                status_max_packet_size: control.max_packet_size,
+                status_interval_ms: hid_poll_interval_ms(speed, control.interval),
+                mac_string_index: control.cdc_mac_string_index.unwrap_or(0),
+                mac_address: None,
+            })
+        })
+}
+
+fn parse_cdc_ecm_carrier_notification(bytes: &[u8]) -> Result<Option<bool>, Error> {
+    if bytes.len() < 8 {
+        return Err(Error::InvalidDescriptor);
+    }
+    let request_type = bytes[0];
+    let notification = bytes[1];
+    let value = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let length = usize::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+    if request_type != 0xa1 || bytes.len() < 8usize.saturating_add(length) {
+        return Err(Error::InvalidDescriptor);
+    }
+    match notification {
+        0x00 if length == 0 => Ok(Some(value != 0)),
+        0x2a if length == 8 => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+struct Rtl815xInstallTransport<'a> {
+    controller: &'a mut Controller,
+    target: TransferTarget,
+    storage: MassStorageInfo,
+}
+
+struct Rtl815xRegisterTransport<'a> {
+    controller: &'a mut Controller,
+    target: TransferTarget,
+}
+
+impl vibeos_driver_rtl815x::RegisterTransport for Rtl815xRegisterTransport<'_> {
+    type Error = Error;
+
+    fn read_registers(
+        &mut self,
+        value: u16,
+        index: u16,
+        output: &mut [u8; 4],
+    ) -> Result<(), Self::Error> {
+        self.controller.select_target(self.target);
+        let actual = self.controller.control_transfer(
+            SetupPacket {
+                request_type: vibeos_driver_rtl815x::GET_REGISTERS_REQUEST_TYPE,
+                request: vibeos_driver_rtl815x::GET_REGISTERS_REQUEST,
+                value,
+                index,
+                length: output.len() as u16,
+            },
+            output,
+        )?;
+        if actual != output.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        Ok(())
+    }
+}
+
+impl vibeos_driver_rtl815x::InstallModeTransport for Rtl815xInstallTransport<'_> {
+    type Error = Error;
+
+    fn select_configuration(&mut self) -> Result<(), Self::Error> {
+        self.controller.select_target(self.target);
+        self.controller.control_transfer(
+            SetupPacket {
+                request_type: 0,
+                request: 9,
+                value: u16::from(self.storage.configuration),
+                index: 0,
+                length: 0,
+            },
+            &mut [],
+        )?;
+        Ok(())
+    }
+
+    fn reset_bulk_data_toggles(&mut self) {
+        self.controller
+            .reset_bulk_pids(self.target.address, self.storage.endpoint_in);
+        self.controller
+            .reset_bulk_pids(self.target.address, self.storage.endpoint_out);
+    }
+
+    fn send_command(&mut self, command: &[u8]) -> Result<(), Self::Error> {
+        self.controller.bulk_out(
+            self.storage.endpoint_out,
+            self.storage.max_packet_size_out,
+            command,
+        )
+    }
+
+    fn receive_status(&mut self, status: &mut [u8; 13]) -> Result<(), Self::Error> {
+        self.controller
+            .bulk_in(
+                self.storage.endpoint_in,
+                self.storage.max_packet_size_in,
+                status,
+            )
+            .map(|_| ())
+    }
+
+    fn settle_after_disconnect(&mut self) {
+        delay_ms(self.controller.timebase_hz, self.controller.time, 100);
+    }
+}
+
+fn parse_mac_string_descriptor(descriptor: &[u8]) -> Result<[u8; 6], Error> {
+    if descriptor.len() < 26 || descriptor[1] != 3 || usize::from(descriptor[0]) > descriptor.len()
+    {
+        return Err(Error::InvalidDescriptor);
+    }
+    let mut nibbles = [0; 12];
+    let mut count = 0;
+    let (pairs, remainder) = descriptor[2..usize::from(descriptor[0])].as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(Error::InvalidDescriptor);
+    }
+    for pair in pairs {
+        if pair[1] != 0 || count == nibbles.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        nibbles[count] = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            b'A'..=b'F' => pair[0] - b'A' + 10,
+            _ => return Err(Error::InvalidDescriptor),
+        };
+        count += 1;
+    }
+    if count != nibbles.len() {
+        return Err(Error::InvalidDescriptor);
+    }
+    let mut mac = [0; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        *byte = nibbles[index * 2] << 4 | nibbles[index * 2 + 1];
+    }
+    Ok(mac)
 }
 
 fn is_apple_report_keyboard_descriptor(descriptor: &[u8]) -> bool {
@@ -1936,6 +3284,7 @@ fn parse_device_descriptor(
         vendor_id: u16::from_le_bytes([descriptor[8], descriptor[9]]),
         product_id: u16::from_le_bytes([descriptor[10], descriptor[11]]),
         max_packet_size_0: descriptor[7],
+        configuration_count: descriptor[17],
     })
 }
 
@@ -2036,10 +3385,6 @@ fn delay_us(timebase_hz: u64, time: fn() -> u64, microseconds: u64) {
     while time().wrapping_sub(started) < duration {
         core::hint::spin_loop();
     }
-}
-
-unsafe fn dma_bytes() -> &'static mut [u8; DMA_BYTES] {
-    unsafe { &mut *DMA.0.get() }
 }
 
 fn clean_range(line: usize, start: usize, size: usize) {
@@ -2197,6 +3542,13 @@ mod tests {
     #[test]
     fn cv1800b_description_covers_every_register() {
         assert!(validate_description(VALID));
+        assert_eq!(core::mem::size_of::<DmaStorage>(), DMA_BYTES);
+        assert_eq!(core::mem::align_of::<DmaStorage>(), 64);
+        let state = InstanceState::new();
+        assert!(state
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
         let mut short = VALID;
         short.registers.end = short.registers.start + HPRT0;
         assert!(!validate_description(short));
@@ -2223,6 +3575,89 @@ mod tests {
         assert_eq!(hub_port_speed(USB_PORT_STAT_LOW_SPEED), Speed::Low);
         assert_eq!(hub_port_speed(USB_PORT_STAT_HIGH_SPEED), Speed::High);
         assert_eq!(hub_port_speed(USB_PORT_STAT_ENABLE), Speed::Full);
+        let child = HubChildInfo {
+            device: DeviceInfo {
+                address: 3,
+                speed: Speed::Full,
+                usb_version: 0x0200,
+                device_class: 0,
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                max_packet_size_0: 64,
+                configuration_count: 1,
+            },
+            parent_hub_address: 2,
+            port: 4,
+            port_status: USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE,
+            depth: 2,
+            tt_hub_address: Some(2),
+            tt_port: Some(4),
+        };
+        let nested_target = transfer_target_for_child(child);
+        assert_eq!(nested_target.address, 3);
+        assert_eq!(nested_target.speed, Speed::Full);
+        assert_eq!(
+            nested_target.split,
+            Some(SplitTarget {
+                hub_address: 2,
+                port: 4,
+            })
+        );
+        assert_eq!(
+            transfer_target_for_child(HubChildInfo {
+                device: DeviceInfo {
+                    speed: Speed::High,
+                    ..child.device
+                },
+                tt_hub_address: None,
+                tt_port: None,
+                ..child
+            })
+            .split,
+            None
+        );
+        let upstream_tt = SplitTarget {
+            hub_address: 1,
+            port: 2,
+        };
+        assert_eq!(
+            split_target_for_child(None, 1, 2, Speed::Full),
+            Some(upstream_tt)
+        );
+        assert_eq!(
+            split_target_for_child(Some(upstream_tt), 3, 4, Speed::Full),
+            Some(upstream_tt)
+        );
+        assert_eq!(split_target_for_child(None, 1, 2, Speed::High), None);
+        let root = DeviceInfo {
+            address: 1,
+            speed: Speed::High,
+            ..child.device
+        };
+        let hub_child = HubChildInfo {
+            device: DeviceInfo {
+                address: 2,
+                speed: Speed::High,
+                device_class: USB_CLASS_HUB,
+                ..child.device
+            },
+            parent_hub_address: 1,
+            port: 2,
+            depth: 1,
+            tt_hub_address: None,
+            tt_port: None,
+            ..child
+        };
+        let mut children = [None; MAX_HUB_CHILDREN];
+        children[0] = Some(hub_child);
+        children[1] = Some(child);
+        assert_eq!(
+            usb_bus_path(root, &children, 3),
+            Some(UsbBusPath {
+                ports: [1, 2, 4, 0, 0],
+                depth: 3,
+            })
+        );
         let target = SplitTarget {
             hub_address: 1,
             port: 1,
@@ -2253,6 +3688,7 @@ mod tests {
         assert_eq!(info.vendor_id, 0x1234);
         assert_eq!(info.product_id, 0x5678);
         assert_eq!(info.max_packet_size_0, 64);
+        assert_eq!(info.configuration_count, 1);
         assert_eq!(port_speed(0), Ok(Speed::High));
         assert_eq!(port_speed(1 << HPRT_SPEED_SHIFT), Ok(Speed::Full));
         assert_eq!(port_speed(2 << HPRT_SPEED_SHIFT), Ok(Speed::Low));
@@ -2287,6 +3723,22 @@ mod tests {
                 bulk_out: None,
                 bulk_in_max_packet_size: 0,
                 bulk_out_max_packet_size: 0,
+                cdc_mac_string_index: None,
+                endpoints: [
+                    Some(EndpointInfo {
+                        address: 0x81,
+                        attributes: 3,
+                        max_packet_size: 8,
+                        interval: 10,
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
             })
         );
         assert_eq!(
@@ -2323,7 +3775,94 @@ mod tests {
                 endpoint_out: 0x02,
                 max_packet_size_in: 64,
                 max_packet_size_out: 64,
+                capacity_sectors: None,
+                block_size: None,
             })
+        );
+        assert_eq!(advance_pid(DataPid::Data0, 512, 64), DataPid::Data0);
+        assert_eq!(advance_pid(DataPid::Data0, 31, 64), DataPid::Data1);
+        assert_eq!(Controller::bulk_pid_index(2, false), 2);
+        assert_eq!(Controller::bulk_pid_index(2, true), 18);
+        assert_eq!(completed_length(false, 31, 31), 31);
+        assert_eq!(completed_length(true, 512, 128), 384);
+        assert_eq!(
+            read_10_cdb(0x1234_5678),
+            [0x28, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 1, 0]
+        );
+        assert_eq!(
+            write_10_cdb(0x1234_5678),
+            [0x2a, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 1, 0]
+        );
+        assert!(!bot_requires_reset_recovery(Error::StorageCommandFailed(1)));
+        assert!(bot_requires_reset_recovery(Error::StorageCommandFailed(2)));
+    }
+
+    #[test]
+    fn finds_cdc_ecm_alternate_and_parses_mac_string() {
+        let descriptors = [
+            9, 2, 88, 0, 2, 2, 0, 0x80, 50, // configuration
+            8, 11, 0, 2, 2, 6, 0, 0, // interface association
+            9, 4, 0, 0, 1, 2, 6, 0, 0, // CDC-ECM control
+            5, 0x24, 0, 0x10, 0x01, // CDC header
+            5, 0x24, 6, 0, 1, // CDC union
+            13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, // Ethernet
+            7, 5, 0x83, 3, 16, 0, 8, // status interrupt
+            9, 4, 1, 0, 0, 0x0a, 0, 0, 0, // inactive data alt
+            9, 4, 1, 1, 2, 0x0a, 0, 0, 0, // active data alt
+            7, 5, 0x81, 2, 0, 2, 0, // bulk IN 512
+            7, 5, 0x02, 2, 0, 2, 0, // bulk OUT 512
+        ];
+        let (configuration, keyboard) =
+            parse_hid_keyboard_configuration(&descriptors, Speed::High).unwrap();
+        assert_eq!(keyboard, None);
+        let mut configurations = [None; MAX_DEVICE_CONFIGURATIONS];
+        configurations[1] = Some(configuration);
+        assert_eq!(
+            find_cdc_ecm(configurations, Speed::High),
+            Some(CdcEcmInfo {
+                configuration: 2,
+                control_interface: 0,
+                data_interface: 1,
+                data_alternate: 1,
+                endpoint_in: 0x81,
+                endpoint_out: 0x02,
+                max_packet_size_in: 512,
+                max_packet_size_out: 512,
+                status_endpoint: Some(0x83),
+                status_max_packet_size: 16,
+                status_interval_ms: 16,
+                mac_string_index: 4,
+                mac_address: None,
+            })
+        );
+        assert_eq!(
+            parse_mac_string_descriptor(&[
+                26, 3, b'0', 0, b'2', 0, b'1', 0, b'2', 0, b'3', 0, b'4', 0, b'5', 0, b'6', 0,
+                b'7', 0, b'8', 0, b'9', 0, b'a', 0,
+            ]),
+            Ok([0x02, 0x12, 0x34, 0x56, 0x78, 0x9a])
+        );
+    }
+
+    #[test]
+    fn parses_cdc_ecm_network_connection_notifications() {
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[0xa1, 0, 1, 0, 0, 0, 0, 0]),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[0xa1, 0, 0, 0, 0, 0, 0, 0]),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[
+                0xa1, 0x2a, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_cdc_ecm_carrier_notification(&[0xa1, 0, 1, 0]),
+            Err(Error::InvalidDescriptor)
         );
     }
 

@@ -300,6 +300,7 @@ impl FsSnapshotLease {
 /// the only way a task can obtain a snapshot or start a writer.
 pub struct FileTreeRoot {
     state: SpinLock<Arc<NamespaceState>>,
+    persistent_root: SpinLock<Option<vibeos_segment_store::FsPersistentRoot>>,
     writer_claim: SpinLock<Option<FileWriterClaim>>,
     next_writer_token: AtomicU64,
 }
@@ -318,6 +319,7 @@ impl FileTreeRoot {
         }
         Ok(Self {
             state: SpinLock::new(Arc::new(NamespaceState::empty(namespace))),
+            persistent_root: SpinLock::new(None),
             writer_claim: SpinLock::new(None),
             next_writer_token: AtomicU64::new(1),
         })
@@ -341,6 +343,7 @@ impl FileTreeRoot {
             return Err(FileError::InvalidPath);
         }
         let snapshot = self.state.lock().clone();
+        let previous_root = self.persistent_root.lock().clone();
         let claim = FileWriterClaim {
             owner,
             token,
@@ -355,6 +358,7 @@ impl FileTreeRoot {
         Ok(FsTransaction {
             root: self,
             claim,
+            previous_root,
             base_generation: snapshot.generation,
             working: (*snapshot).clone(),
             edits: 0,
@@ -397,6 +401,7 @@ impl Resource for FileTreeRoot {
 pub struct FsTransaction<'a> {
     root: &'a FileTreeRoot,
     claim: FileWriterClaim,
+    previous_root: Option<vibeos_segment_store::FsPersistentRoot>,
     base_generation: u64,
     working: NamespaceState,
     edits: usize,
@@ -814,6 +819,7 @@ impl FsTransaction<'_> {
             return Err(FileError::Conflict);
         }
         *published = Arc::new(self.working.clone());
+        *self.root.persistent_root.lock() = None;
         self.committed = true;
         assert!(self.root.release_writer_claim(self.claim));
         Ok(generation)

@@ -12,9 +12,9 @@ use vibeos_segment_store::{
 
 use crate::{
     decode_dirent_key, decode_dirent_value, decode_inode_key, decode_inode_value,
-    encode_dirent_key, encode_dirent_value, encode_inode_key, encode_inode_value, plan_btree_pages,
-    BtreePagePlan, Content, FileError, FileId, FileTreeRoot, FileType, FsTransaction, Inode,
-    NamespaceState, PersistedInodeV1,
+    encode_dirent_key, encode_dirent_value, encode_inode_key, encode_inode_value, Content,
+    FileError, FileId, FileTreeRoot, FileType, FsTransaction, Inode, NamespaceState,
+    PersistedInodeV1,
 };
 
 #[derive(Debug)]
@@ -73,11 +73,6 @@ impl<E> From<FsRootPublishError<E>> for PersistentCommitError<E> {
     }
 }
 
-struct BuiltNode {
-    minimum_key: Vec<u8>,
-    object: AuthorizedObject<CasObjectHandle>,
-}
-
 fn inode_size(inode: &Inode) -> u64 {
     match &inode.content {
         Content::None => 0,
@@ -111,60 +106,26 @@ async fn commit_content<D: PageDevice>(
 
 async fn commit_tree<D: PageDevice>(
     store: &mut SegmentStore<D>,
+    previous: Option<&vibeos_segment_store::FsPersistentRoot>,
     tree: FsTreeKind,
     generation: u64,
     entries: &[(Vec<u8>, Vec<u8>)],
     content: Option<&BTreeMap<FileId, AuthorizedObject<CasObjectHandle>>>,
-    plan: &BtreePagePlan,
-) -> Result<AuthorizedObject<CasObjectHandle>, PersistentCommitError<D::Error>> {
-    let mut nodes = Vec::new();
-    for range in &plan.levels[0] {
-        let mut inputs = Vec::new();
-        for (key, value) in &entries[range.clone()] {
-            let child = if let Some(content) = content {
-                let file_id = crate::decode_inode_key(key).map_err(|_| FileError::InvalidType)?;
-                content.get(&file_id)
-            } else {
-                None
-            };
-            inputs.push(FsNodeEntryInput { key, value, child });
-        }
-        let object = store
-            .commit_fs_btree_node(tree, 0, generation, &inputs)
-            .await?;
-        nodes.push(BuiltNode {
-            minimum_key: entries
-                .get(range.start)
-                .map(|entry| entry.0.clone())
-                .unwrap_or_default(),
-            object,
-        });
+) -> Result<alloc::sync::Arc<AuthorizedObject<CasObjectHandle>>, PersistentCommitError<D::Error>> {
+    let mut inputs = Vec::new();
+    for (key, value) in entries {
+        let child = if let Some(content) = content {
+            let file_id = crate::decode_inode_key(key).map_err(|_| FileError::InvalidType)?;
+            content.get(&file_id)
+        } else {
+            None
+        };
+        inputs.push(FsNodeEntryInput { key, value, child });
     }
-    for (level, ranges) in plan.levels.iter().enumerate().skip(1) {
-        let mut parents = Vec::new();
-        for range in ranges {
-            let mut inputs = Vec::new();
-            for child in &nodes[range.clone()] {
-                inputs.push(FsNodeEntryInput {
-                    key: &child.minimum_key,
-                    value: &[],
-                    child: Some(&child.object),
-                });
-            }
-            let object = store
-                .commit_fs_btree_node(tree, level as u8, generation, &inputs)
-                .await?;
-            parents.push(BuiltNode {
-                minimum_key: nodes[range.start].minimum_key.clone(),
-                object,
-            });
-        }
-        nodes = parents;
-    }
-    if nodes.len() != 1 {
-        return Err(FileError::InvalidType.into());
-    }
-    Ok(nodes.pop().unwrap().object)
+    store
+        .commit_fs_cow_tree(previous, tree, generation, &inputs)
+        .await
+        .map_err(Into::into)
 }
 
 fn encode_namespace(
@@ -216,35 +177,42 @@ impl FsTransaction<'_> {
     ) -> Result<u64, PersistentCommitError<D::Error>> {
         let generation = self.next_generation()?;
         self.working.generation = generation;
+        for inode in self.working.inodes.values_mut() {
+            if inode.change_generation == 0 {
+                inode.change_generation = generation;
+            }
+        }
         if self.root.state.lock().generation != self.base_generation {
             return Err(FileError::Conflict.into());
         }
 
         let mut content = BTreeMap::new();
         for (file_id, inode) in &self.working.inodes {
-            if let Some(object) = commit_content(store, inode).await? {
-                content.insert(*file_id, object);
+            if inode.file_type != FileType::Directory
+                && (self.base_generation == 0 || inode.change_generation == generation)
+            {
+                if let Some(object) = commit_content(store, inode).await? {
+                    content.insert(*file_id, object);
+                }
             }
         }
         let (inode_entries, dirent_entries) = encode_namespace(&self.working)?;
-        let inode_plan = plan_btree_pages(&inode_entries).map_err(|_| FileError::InvalidType)?;
-        let dirent_plan = plan_btree_pages(&dirent_entries).map_err(|_| FileError::InvalidType)?;
         let inode_root = commit_tree(
             store,
+            self.previous_root.as_ref(),
             FsTreeKind::Inode,
             generation,
             &inode_entries,
             Some(&content),
-            &inode_plan,
         )
         .await?;
         let dirent_root = commit_tree(
             store,
+            self.previous_root.as_ref(),
             FsTreeKind::Dirent,
             generation,
             &dirent_entries,
             None,
-            &dirent_plan,
         )
         .await?;
         let new_root = store
@@ -260,8 +228,13 @@ impl FsTransaction<'_> {
         store
             .compare_exchange_fs_root(self.working.namespace, self.base_generation, &new_root)
             .await?;
+        let persisted = store
+            .recover_fs_root(self.working.namespace)
+            .await?
+            .ok_or(FileError::InvalidType)?;
 
         *self.root.state.lock() = alloc::sync::Arc::new(self.working.clone());
+        *self.root.persistent_root.lock() = Some(persisted);
         self.committed = true;
         assert!(self.root.release_writer_claim(self.claim));
         Ok(generation)
@@ -382,6 +355,7 @@ impl FileTreeRoot {
         }
         Ok(Some(Self {
             state: vibeos_core::sync::SpinLock::new(alloc::sync::Arc::new(state)),
+            persistent_root: vibeos_core::sync::SpinLock::new(Some(root)),
             writer_claim: vibeos_core::sync::SpinLock::new(None),
             next_writer_token: core::sync::atomic::AtomicU64::new(1),
         }))
@@ -532,12 +506,41 @@ mod tests {
             1
         );
         assert_eq!(root.snapshot().generation(), 1);
+        let objects_after_first = store.info().unwrap().object_count;
+        let transaction = root.begin().unwrap();
+        assert_eq!(
+            block_on(transaction.commit_persistent(&mut store)).unwrap(),
+            2
+        );
+        assert_eq!(
+            store.info().unwrap().object_count,
+            objects_after_first + 1,
+            "an unchanged transaction reuses both B+tree roots and data"
+        );
+        let objects_before_overwrite = store.info().unwrap().object_count;
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .write_chunks(
+                &crate::RelPath::parse("etc/config").unwrap(),
+                [b"updated"],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            block_on(transaction.commit_persistent(&mut store)).unwrap(),
+            3
+        );
+        assert_eq!(
+            store.info().unwrap().object_count,
+            objects_before_overwrite + 3,
+            "overwrite writes data, the affected inode leaf, and the root only"
+        );
         drop(store);
 
         let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
         block_on(cold.mount()).unwrap();
         let recovered = block_on(cold.recover_fs_root(NAMESPACE)).unwrap().unwrap();
-        assert_eq!(recovered.generation(), 1);
+        assert_eq!(recovered.generation(), 3);
         assert_eq!(recovered.next_file_id(), 4);
         let recovered_tree = block_on(crate::FileTreeRoot::recover_persistent(
             &cold, NAMESPACE, 128,
@@ -552,7 +555,7 @@ mod tests {
                 .flatten()
                 .copied()
                 .collect::<Vec<_>>(),
-            b"durable"
+            b"updated"
         );
     }
 }

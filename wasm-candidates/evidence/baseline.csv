@@ -1,0 +1,16 @@
+environment,metric,value,unit
+apple-arm64-nightly-2026-08-01-release-debug,iterations,10000,count
+apple-arm64-nightly-2026-08-01-release-debug,wasmi_engine_inline,8,bytes
+apple-arm64-nightly-2026-08-01-release-debug,wasmi_store_inline,344,bytes
+apple-arm64-nightly-2026-08-01-release-debug,dlr_store_inline,168,bytes
+apple-arm64-nightly-2026-08-01-release-debug,component_validator_inline,1360,bytes
+apple-arm64-nightly-2026-08-01-release-debug,wasmi_validate,4175,ns/op
+apple-arm64-nightly-2026-08-01-release-debug,dlr_validate,887,ns/op
+apple-arm64-nightly-2026-08-01-release-debug,component_validate,11462,ns/op
+apple-arm64-nightly-2026-08-01-release-debug,wasmi_integer_call,48,ns/op
+apple-arm64-nightly-2026-08-01-release-debug,dlr_integer_call,369,ns/op
+apple-arm64-nightly-2026-08-01-release-debug,c0_baseline_executable,3773192,bytes
+apple-arm64-nightly-2026-08-01-release-debug,wasmi_rlib_with_debug,27226048,bytes
+apple-arm64-nightly-2026-08-01-release-debug,dlr_rlib_with_debug,8710040,bytes
+apple-arm64-nightly-2026-08-01-release-debug,wasmparser_0_255_rlib_with_debug,33224512,bytes
+apple-arm64-nightly-2026-08-01-release-debug,wit_parser_rlib_with_debug,17954008,bytes

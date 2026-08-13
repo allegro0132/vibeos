@@ -400,6 +400,7 @@ its process owns. Here, authority is not a property of the code.
 | `compiler/` | lexer, parser, RV64 code generator (its own crate, host-testable) |
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
 | `durable-format/` | zero-dependency sealed-log codec, stable IDs, and fail-closed recovery (`no_std`) |
+| `blob-format/` | canonical immutable Merkle blob encoding and chunk proofs (`no_std`) |
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
 | `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |

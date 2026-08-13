@@ -1,0 +1,9 @@
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> blob test
+  BlobFS commit + full verification: 4203 bytes, 2 leaves
+  BlobFS chunk proof: leaf 1, 107 bytes, 1 sibling(s), root bound
+  BlobFS namespace: immutable capability; no path lookup
+vibe> halt
+  powering off.

@@ -29,6 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate as journal;
 use vibeos_durable_format as authority;
 
+use vibeos_blob_format::{BlobDescriptor, BlobError, BlobView, MerkleProof, LEAF_SIZE};
 use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::exec::{self, TaskId};
 use vibeos_core::heap::{self, AllocationDomain, OwnerId};
@@ -204,6 +205,59 @@ impl From<BackendError> for StoreError {
     fn from(error: BackendError) -> Self {
         Self::Backend(error)
     }
+}
+
+/// Error boundary for the canonical Merkle-blob profile. Journal failures and
+/// format/integrity failures remain distinguishable to callers and tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobStoreError {
+    Store(StoreError),
+    Format(BlobError),
+    ObjectKindMismatch,
+}
+
+impl core::fmt::Display for BlobStoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "Merkle blob store failed: {error}"),
+            Self::Format(error) => write!(f, "Merkle blob verification failed: {error}"),
+            Self::ObjectKindMismatch => {
+                f.write_str("Merkle descriptor kind does not match durable object kind")
+            }
+        }
+    }
+}
+
+impl From<StoreError> for BlobStoreError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<BlobError> for BlobStoreError {
+    fn from(error: BlobError) -> Self {
+        Self::Format(error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobPublication {
+    pub capability: Cap,
+    pub descriptor: BlobDescriptor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedBlob {
+    pub descriptor: BlobDescriptor,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedBlobChunk {
+    pub descriptor: BlobDescriptor,
+    pub index: u32,
+    pub bytes: Vec<u8>,
+    pub proof: MerkleProof,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -901,6 +955,110 @@ pub async fn get_with(
     }
     let inner = service.with(|store| store.inner.clone());
     read_committed_object(inner, object).await
+}
+
+/// Encode content into the canonical Merkle-blob profile after enforcing the
+/// current journal object's physical size limit. This preflight avoids a large
+/// doomed allocation when the durable v1 journal cannot hold the result.
+pub fn encode_blob_object(
+    object_kind: journal::ObjectKind,
+    bytes: &[u8],
+) -> Result<Vec<u8>, BlobStoreError> {
+    let encoded_len = vibeos_blob_format::encoded_len(bytes.len())?;
+    if encoded_len > journal::MAX_OBJECT_SIZE {
+        return Err(BlobStoreError::Store(StoreError::ObjectTooLarge));
+    }
+    Ok(vibeos_blob_format::encode_blob(object_kind.get(), bytes)?)
+}
+
+/// Strictly decode and verify every data and tree node in one stored Merkle
+/// blob. The durable journal kind is an independent outer binding and must
+/// agree with the descriptor's content kind.
+pub fn verify_blob_object(
+    object_kind: journal::ObjectKind,
+    encoded: &[u8],
+) -> Result<VerifiedBlob, BlobStoreError> {
+    let blob = BlobView::decode(encoded)?;
+    if blob.descriptor().object_kind != object_kind.get() {
+        return Err(BlobStoreError::ObjectKindMismatch);
+    }
+    blob.verify_all()?;
+    Ok(VerifiedBlob {
+        descriptor: blob.descriptor(),
+        bytes: blob.data().to_vec(),
+    })
+}
+
+/// Verify one chunk and its sibling path without requiring all other data
+/// chunks to be rehashed. The returned proof can be rechecked independently
+/// against the returned descriptor.
+pub fn verify_blob_object_chunk(
+    object_kind: journal::ObjectKind,
+    encoded: &[u8],
+    index: u32,
+) -> Result<VerifiedBlobChunk, BlobStoreError> {
+    let blob = BlobView::decode(encoded)?;
+    if blob.descriptor().object_kind != object_kind.get() {
+        return Err(BlobStoreError::ObjectKindMismatch);
+    }
+    blob.verify_chunk(index)?;
+    Ok(VerifiedBlobChunk {
+        descriptor: blob.descriptor(),
+        index,
+        bytes: blob.chunk(index)?.to_vec(),
+        proof: blob.proof(index)?,
+    })
+}
+
+/// Commit one immutable canonical Merkle blob through the existing audited
+/// object transaction, then publish the ordinary StoredObject capability. The
+/// journal's exact-byte readback therefore covers the descriptor, content, and
+/// complete hash tree before this function returns success.
+pub async fn put_blob_with(
+    lease: InvocationLease<StoreService>,
+    target: Arc<dyn PublicationTarget>,
+    object_kind: journal::ObjectKind,
+    bytes: &[u8],
+) -> Result<BlobPublication, BlobStoreError> {
+    let encoded = encode_blob_object(object_kind, bytes)?;
+    let descriptor = BlobView::decode(&encoded)?.descriptor();
+    let capability = put_with(lease, target, object_kind, &encoded).await?;
+    Ok(BlobPublication {
+        capability,
+        descriptor,
+    })
+}
+
+/// Read a Merkle blob through both required capabilities, erase the redundant
+/// encoded envelope, and return content only after complete tree validation.
+pub async fn get_blob_with(
+    service: InvocationLease<StoreService>,
+    object: InvocationLease<StoredObject>,
+) -> Result<VerifiedBlob, BlobStoreError> {
+    let object_kind = object.with(|stored| stored.object_kind);
+    let mut encoded = get_with(service, object).await?;
+    let result = verify_blob_object(object_kind, &encoded);
+    erase_bytes(&mut encoded);
+    result
+}
+
+/// Read and authenticate one logical 4 KiB blob chunk. The v1 journal backend
+/// still recovers the enclosing object in full; the API and proof semantics are
+/// intentionally stable for a later extent-addressed backend.
+pub async fn get_blob_chunk_with(
+    service: InvocationLease<StoreService>,
+    object: InvocationLease<StoredObject>,
+    index: u32,
+) -> Result<VerifiedBlobChunk, BlobStoreError> {
+    let object_kind = object.with(|stored| stored.object_kind);
+    let mut encoded = get_with(service, object).await?;
+    let result = verify_blob_object_chunk(object_kind, &encoded, index);
+    erase_bytes(&mut encoded);
+    result
+}
+
+pub const fn blob_leaf_size() -> usize {
+    LEAF_SIZE
 }
 
 async fn read_committed_object(

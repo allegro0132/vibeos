@@ -96,6 +96,7 @@ pub struct NetInfo {
     pub timeouts: u64,
     pub rx_inflight: u8,
     pub tx_inflight: u8,
+    pub ethernet_address: [u8; 6],
 }
 
 /// Capability naming exactly one discovered 4 KiB MMIO transport window.
@@ -186,6 +187,7 @@ impl NetDevice {
             timeouts: TIMEOUT_COUNT.load(Ordering::Acquire),
             rx_inflight: control.rx_inflight,
             tx_inflight: control.tx_inflight,
+            ethernet_address: GUEST_MAC,
         }
     }
 }
@@ -371,6 +373,7 @@ pub(crate) fn request_driver_fault_for_test() {
 }
 
 pub struct NetResources {
+    pub location: crate::net_device::NetworkLocation,
     pub mmio: Arc<MmioWindow>,
     pub dma: Arc<DmaRegion>,
     pub control: Arc<NetDevice>,
@@ -383,6 +386,9 @@ pub fn discover() -> Option<NetResources> {
     // the kernel's identity address space before device discovery begins.
     let transport = unsafe { MmioTransport::scan_network(crate::platform::VIRTIO_MMIO) }?;
     Some(NetResources {
+        location: crate::net_device::NetworkLocation::Mmio {
+            base: transport.base(),
+        },
         mmio: MmioWindow::new(transport),
         dma: Arc::new(DmaRegion),
         control: NetDevice::new(),

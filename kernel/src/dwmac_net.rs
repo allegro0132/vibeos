@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use vibeos_driver_dwmac_net::{Engine, Error as HardwareError};
+use vibeos_driver_dwmac_net::{DmaStorage, Engine, Error as HardwareError, InstanceState};
 
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
@@ -26,6 +26,10 @@ const TX_TIMEOUT_MS: u64 = 2_000;
 
 const DWMAC: vibeos_hal::DwmacDescription = crate::platform::DWMAC;
 const IRQ: u32 = DWMAC.irq;
+
+#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
+static DMA: DmaStorage = DmaStorage::new();
+static INSTANCE: InstanceState = InstanceState::new();
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -92,6 +96,7 @@ pub struct NetInfo {
     pub timeouts: u64,
     pub rx_inflight: u8,
     pub tx_inflight: u8,
+    pub ethernet_address: [u8; 6],
     pub phy_link_up: bool,
     pub tx_descriptor_status: u32,
     pub dma_status: u32,
@@ -117,7 +122,15 @@ impl Resource for MmioWindow {
     }
 }
 
-pub struct DmaRegion;
+pub struct DmaRegion {
+    storage: &'static DmaStorage,
+}
+
+impl DmaRegion {
+    fn storage(&self) -> &'static DmaStorage {
+        self.storage
+    }
+}
 impl Resource for DmaRegion {
     fn kind(&self) -> &'static str {
         "dma-region"
@@ -125,7 +138,7 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "DWMAC stable cache-isolated two-descriptor slab @ {:#x}",
-            vibeos_driver_dwmac_net::dma_region_base()
+            vibeos_driver_dwmac_net::dma_region_base(self.storage)
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -141,7 +154,7 @@ impl NetDevice {
         // apertures for the firmware lifetime. CONTROL serializes this
         // diagnostic snapshot with kernel packet-engine operations; the
         // selected status registers are non-destructive reads.
-        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC) };
+        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC, &INSTANCE) };
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
@@ -167,6 +180,7 @@ impl NetDevice {
             timeouts: TIMEOUTS.load(Ordering::Acquire),
             rx_inflight: u8::from(state.online),
             tx_inflight: u8::from(state.tx_inflight),
+            ethernet_address: GUEST_MAC,
             phy_link_up: hardware.phy_link_up,
             tx_descriptor_status: hardware.tx_descriptor_status,
             dma_status: hardware.dma_status,
@@ -194,6 +208,7 @@ impl Resource for NetDevice {
 }
 
 pub struct NetResources {
+    pub location: crate::net_device::NetworkLocation,
     pub mmio: Arc<MmioWindow>,
     pub dma: Arc<DmaRegion>,
     pub control: Arc<NetDevice>,
@@ -201,8 +216,11 @@ pub struct NetResources {
 
 pub fn discover() -> Option<NetResources> {
     Some(NetResources {
+        location: crate::net_device::NetworkLocation::Mmio {
+            base: DWMAC.registers.start,
+        },
         mmio: Arc::new(MmioWindow),
-        dma: Arc::new(DmaRegion),
+        dma: Arc::new(DmaRegion { storage: &DMA }),
         control: Arc::new(NetDevice),
     })
 }
@@ -298,6 +316,7 @@ pub async fn driver_task(
         )
     };
     let (Ok(mmio), Ok(dma), Ok(outbound), Ok(inbound), Ok(control)) = authority else {
+        crate::println!("  dwmac net driver capability lookup failed");
         return;
     };
 
@@ -305,14 +324,20 @@ pub async fn driver_task(
     DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
     DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
 
+    let storage = match dma.try_with(DmaRegion::storage) {
+        Ok(storage) => storage,
+        Err(_) => return,
+    };
     let engine = match with_device_authority(&mmio, &dma, &control, || {
         // SAFETY: the retained and currently live capabilities authorize the
-        // identity-mapped BSP apertures and crate-owned `.dma` slab. The
+        // identity-mapped BSP apertures and this resource's `.dma` storage. The
         // firmware linker keeps that slab physically contiguous and below the
         // board's 32-bit DMA limit for this engine's lifetime.
         unsafe {
             Engine::claim(
                 DWMAC,
+                storage,
+                &INSTANCE,
                 GUEST_MAC,
                 crate::sbi::time,
                 crate::exec::timebase_hz(),
@@ -322,6 +347,7 @@ pub async fn driver_task(
     }) {
         Ok(engine) => engine,
         Err(_) => {
+            crate::println!("  dwmac net driver claim failed");
             shutdown_driver_policy(false);
             return;
         }
@@ -342,10 +368,17 @@ pub async fn driver_task(
     })
     .is_err()
     {
+        crate::println!("  dwmac net driver device attach failed");
         let reset = engine.shutdown();
         shutdown_driver_policy(reset);
         return;
     }
+    crate::println!(
+        "  dwmac net online, IRQ {}, DMA {:#x}, epoch {}",
+        engine.irq(),
+        storage.base(),
+        CONTROL.lock().sessions.device_epoch(),
+    );
     let mut session = DriverSession {
         engine: Some(engine),
     };
@@ -357,7 +390,7 @@ pub async fn driver_task(
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
-        if with_device_authority(&mmio, &dma, &control, || {
+        if let Err(error) = with_device_authority(&mmio, &dma, &control, || {
             driver_turn(
                 session.engine_mut(),
                 &outbound,
@@ -366,9 +399,8 @@ pub async fn driver_task(
                 &mut tx_deadline,
                 &mut link_poll,
             )
-        })
-        .is_err()
-        {
+        }) {
+            crate::println!("  dwmac net driver stopped: {error:?}");
             return;
         }
         crate::exec::sleep_ms(1).await;
@@ -390,7 +422,7 @@ impl Drop for DriverSession {
         let reset = self
             .engine
             .take()
-            .map_or(true, vibeos_driver_dwmac_net::Engine::shutdown);
+            .is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
         shutdown_driver_policy(reset);
     }
 }
@@ -446,7 +478,8 @@ fn driver_turn(
             }
         }
         if let Some(packet) = pending_tx.as_ref() {
-            match engine.transmit(packet.as_bytes()) {
+            let transmitted = engine.transmit(packet.as_bytes());
+            match transmitted {
                 Ok(()) => {
                     *pending_tx = None;
                     state.tx_inflight = true;
@@ -469,7 +502,8 @@ fn driver_turn(
         // exact session stamping, endpoint publication, and RX rearm. A stack
         // restart cannot relabel a raw frame after the driver consumes it.
         let mut frame = [0u8; MAX_PACKET_LEN];
-        if let Some(length) = engine.receive(&mut frame) {
+        let received = engine.receive(&mut frame);
+        if let Some(length) = received {
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
             match send_inbound(inbound, &state.sessions, packet) {
                 Ok(()) => {}
@@ -595,7 +629,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
-    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC) };
+    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC, &INSTANCE) };
     shutdown_driver_policy(reset);
 }
 

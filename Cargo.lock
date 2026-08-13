@@ -788,6 +788,7 @@ dependencies = [
 name = "vibeos-driver-dwc2-host"
 version = "0.1.0"
 dependencies = [
+ "vibeos-driver-rtl815x",
  "vibeos-hal",
 ]
 
@@ -811,6 +812,10 @@ version = "0.1.0"
 dependencies = [
  "vibeos-hal",
 ]
+
+[[package]]
+name = "vibeos-driver-rtl815x"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-driver-sdhci-blk"
@@ -887,6 +892,14 @@ name = "vibeos-image-policy"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-iperf3-server"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-net-api",
+]
+
+[[package]]
 name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -909,6 +922,7 @@ dependencies = [
  "vibeos-durable-format",
  "vibeos-hal",
  "vibeos-image-policy",
+ "vibeos-iperf3-server",
  "vibeos-kernel-acceptance",
  "vibeos-net-api",
  "vibeos-net-echo",

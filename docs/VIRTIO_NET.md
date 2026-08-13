@@ -62,6 +62,27 @@ stale-packet controls remain compiled only into the N2 recovery image. This is
 a source/dependency boundary inside the shared S-mode image, not hardware
 isolation from the kernel or driver.
 
+The component interface is multi-NIC even though the present QEMU image policy
+discovers and grants one VirtIO device. `task_with_interfaces` accepts the
+runtime-discovered slice of `NetworkInterfaceCapabilities` bundles rather than
+a fixed-size table. Each bundle names one boot-local `netN` index, distinct
+ingress/egress endpoints, one device-control capability, and its own listener
+capabilities. The image policy derives the index by sorting stable bus-topology
+keys; it does not reserve an ordinal for a driver class. The task creates one
+smoltcp `Interface` and `SocketSet` per bundle and polls them fairly; link loss,
+quarantine, malformed state, or capability revocation retires that interface
+without terminating the others. `ip link|addr|route` and `dhclient` carry the
+selected `netN` identity through parsing and reconciliation. In a static image,
+the interface that owns the service listener receives the static configuration;
+DHCP-policy interfaces run independent clients.
+
+This does not turn names into ambient device lookup and does not merge separate
+route tables into a POSIX socket namespace. A service reachable through two
+NICs needs a distinct listener frontend in each interface bundle, and the boot
+policy must explicitly provision both. Adding a second QEMU VirtIO transport
+also requires an instance-owned DMA/IRQ driver allocation; the current fixed
+VirtIO network DMA slab remains a single-device hardware-policy limit.
+
 ## Queue lifecycle and DMA safety
 
 RX and TX have independent wrapping `u16` available/used indices but share one

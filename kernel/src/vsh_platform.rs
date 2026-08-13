@@ -6,6 +6,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::fmt::Write as _;
 
 use vibeos_core::cap::{Cap, Rights};
 #[cfg(feature = "milkv-ssh")]
@@ -107,7 +108,9 @@ fn install_shared_commands(session: &mut Session) {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
     #[cfg(feature = "milkv-ssh")]
@@ -120,7 +123,9 @@ fn install_shared_commands(session: &mut Session) {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 pub fn install_remote_commands(session: &mut Session) {
     install_shared_commands(session);
@@ -241,19 +246,29 @@ const QEMU_COMMANDS: &[CommandSpec] = &[
 ];
 
 #[cfg(feature = "milkv-duo")]
-const MILKV_USB_COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "lsusb",
-    min_args: 0,
-    max_args: 0,
-    handler: vsh_lsusb,
-}];
+const MILKV_USB_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "lsusb",
+        min_args: 0,
+        max_args: 0,
+        handler: vsh_lsusb,
+    },
+    CommandSpec {
+        name: "usb",
+        min_args: 0,
+        max_args: 2,
+        handler: vsh_milkv_usb,
+    },
+];
 
 #[cfg(any(
     feature = "tcp-echo",
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 const NETWORK_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -446,7 +461,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         return Ok(output);
     };
     output.push_str(&format!(
-        "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={}\n",
+        "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} configurations={}\n",
         device.address,
         device.vendor_id,
         device.product_id,
@@ -454,36 +469,66 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
         device.usb_version,
         device.device_class,
         device.max_packet_size_0,
+        device.configuration_count,
     ));
     if let Some(hub) = snapshot.hub {
-        match (hub.active_port, hub.child_speed) {
-            (Some(port), Some(speed)) => output.push_str(&format!(
-                "  Hub ports={} downstream port={} speed={:?} status={:#06x}\n",
-                hub.ports, port, speed, hub.port_status,
-            )),
-            _ => output.push_str(&format!(
-                "  Hub ports={} no enabled downstream device\n",
-                hub.ports,
-            )),
+        let child_count = snapshot.children.iter().flatten().count();
+        output.push_str(&format!(
+            "  Hub ports={} descendants={}\n",
+            hub.ports, child_count,
+        ));
+        for child in snapshot.children.into_iter().flatten() {
+            output.push_str(&format!(
+                "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} configurations={} parent={:03} port={} status={:#06x}\n",
+                child.device.address,
+                child.device.vendor_id,
+                child.device.product_id,
+                child.device.speed,
+                child.device.usb_version,
+                child.device.device_class,
+                child.device.max_packet_size_0,
+                child.device.configuration_count,
+                child.parent_hub_address,
+                child.port,
+                child.port_status,
+            ));
+            if let (Some(tt_hub), Some(tt_port)) = (child.tt_hub_address, child.tt_port) {
+                output.push_str(&format!(
+                    "  Transaction Translator hub={tt_hub:03} port={tt_port}\n"
+                ));
+            }
+            if let Some(child_hub) = snapshot
+                .hubs
+                .iter()
+                .flatten()
+                .find(|candidate| candidate.address == child.device.address)
+            {
+                output.push_str(&format!(
+                    "  Hub device={:03} ports={} depth={}\n",
+                    child_hub.address, child_hub.ports, child.depth,
+                ));
+            }
         }
     }
-    if let Some(child) = snapshot.child {
+    if let Some(address) = snapshot.configuration_device_address {
         output.push_str(&format!(
-            "Bus 001 Device {:03}: ID {:04x}:{:04x} speed={:?} usb={:#06x} class={:#04x} ep0={} parent=001 port={}\n",
-            child.address,
-            child.vendor_id,
-            child.product_id,
-            child.speed,
-            child.usb_version,
-            child.device_class,
-            child.max_packet_size_0,
-            snapshot.hub.and_then(|hub| hub.active_port).unwrap_or(0),
+            "  Descriptor configurations for device={address:03}\n"
         ));
     }
-    if let Some(configuration) = snapshot.configuration {
+    for (descriptor_index, configuration) in snapshot
+        .configurations
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, configuration)| {
+            configuration.map(|configuration| (index, configuration))
+        })
+    {
         output.push_str(&format!(
-            "  Configuration {} length={} interfaces={}\n",
-            configuration.value, configuration.total_length, configuration.declared_interfaces,
+            "  Configuration index={} value={} length={} interfaces={}\n",
+            descriptor_index,
+            configuration.value,
+            configuration.total_length,
+            configuration.declared_interfaces,
         ));
         for interface in configuration.interfaces.into_iter().flatten() {
             output.push_str(&format!(
@@ -516,6 +561,22 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
                 ));
             }
             output.push_str("\n");
+            for endpoint in interface.endpoints.into_iter().flatten() {
+                let transfer_type = match endpoint.attributes & 0x03 {
+                    0 => "control",
+                    1 => "isochronous",
+                    2 => "bulk",
+                    _ => "interrupt",
+                };
+                output.push_str(&format!(
+                    "      Endpoint {:#04x} type={} attributes={:#04x} mps={} interval={}\n",
+                    endpoint.address,
+                    transfer_type,
+                    endpoint.attributes,
+                    endpoint.max_packet_size,
+                    endpoint.interval,
+                ));
+            }
         }
     }
     if let Some(report) = snapshot.report_descriptor {
@@ -535,7 +596,8 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     }
     match snapshot.keyboard {
         Some(keyboard) => output.push_str(&format!(
-            "  HID keyboard protocol={:?} interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            "  HID keyboard device={} protocol={:?} interface={} endpoint={:#04x} mps={} interval={}ms\n",
+            snapshot.keyboard_device_address.unwrap_or(0),
             keyboard.protocol,
             keyboard.interface,
             keyboard.endpoint_in,
@@ -546,7 +608,8 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     }
     if let Some(storage) = snapshot.mass_storage {
         output.push_str(&format!(
-            "  Mass Storage SCSI/Bulk-Only interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} detected\n",
+            "  Mass Storage device={} SCSI/Bulk-Only interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} detected\n",
+            snapshot.storage_device_address.unwrap_or(0),
             storage.interface,
             storage.endpoint_in,
             storage.max_packet_size_in,
@@ -554,7 +617,145 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
             storage.max_packet_size_out,
         ));
     }
+    if let Some(ecm) = snapshot.cdc_ecm {
+        output.push_str(&format!(
+            "  CDC ECM device={} configuration={} control-interface={} data-interface={} alt={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} status={:?} mac={:?}\n",
+            snapshot.cdc_ecm_device_address.unwrap_or(0),
+            ecm.configuration,
+            ecm.control_interface,
+            ecm.data_interface,
+            ecm.data_alternate,
+            ecm.endpoint_in,
+            ecm.max_packet_size_in,
+            ecm.endpoint_out,
+            ecm.max_packet_size_out,
+            ecm.status_endpoint,
+            ecm.mac_address,
+        ));
+    }
     Ok(output)
+}
+
+#[cfg(feature = "milkv-duo")]
+fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
+    if args.first().is_some_and(|argument| argument == "net-rx") {
+        if args.len() != 1 {
+            return Err(Status::Usage);
+        }
+        let mut frame = [0; vibeos_driver_dwc2_host::MAX_ETHERNET_FRAME_BYTES];
+        for _ in 0..100 {
+            match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
+                Ok(length) => {
+                    let mut output = format!("CDC-ECM received Ethernet frame length={length}\n");
+                    for (line, chunk) in frame[..length].chunks(16).enumerate() {
+                        write!(&mut output, "{:04x}  ", line * 16).map_err(|_| Status::Faulted)?;
+                        for byte in chunk {
+                            write!(&mut output, "{byte:02x} ").map_err(|_| Status::Faulted)?;
+                        }
+                        output.push('\n');
+                    }
+                    return Ok(output);
+                }
+                Err(vibeos_driver_dwc2_host::Error::Nak) => {}
+                Err(_) => return Err(Status::Unavailable),
+            }
+        }
+        return Ok(String::from(
+            "CDC-ECM receive queue empty after 100 polls\n",
+        ));
+    }
+    if args.first().is_some_and(|argument| argument == "read") {
+        let sector = args
+            .get(1)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(Status::Usage)?;
+        let bytes = crate::dwc2_host::read_sector(sector).map_err(|_| Status::Unavailable)?;
+        let mut output = format!("USB sector {sector}:\n");
+        for (line, chunk) in bytes.chunks(16).enumerate() {
+            write!(&mut output, "{:08x}  ", line * 16).map_err(|_| Status::Faulted)?;
+            for byte in chunk {
+                write!(&mut output, "{byte:02x} ").map_err(|_| Status::Faulted)?;
+            }
+            output.push_str(" | ");
+            for byte in chunk {
+                output.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                    char::from(*byte)
+                } else {
+                    '.'
+                });
+            }
+            output.push('\n');
+        }
+        return Ok(output);
+    }
+    if args
+        .first()
+        .is_some_and(|argument| argument == "write-test")
+    {
+        const TEST_SECTOR: u64 = 4_000_000;
+        if args.get(1).map(String::as_str) != Some("CONFIRM") || args.len() != 2 {
+            return Err(Status::Usage);
+        }
+
+        let original =
+            crate::dwc2_host::read_sector(TEST_SECTOR).map_err(|_| Status::Unavailable)?;
+        let mut pattern = [0; 512];
+        let prefix = b"VIBEOS USB WRITE TEST";
+        pattern[..prefix.len()].copy_from_slice(prefix);
+        pattern[24..32].copy_from_slice(&TEST_SECTOR.to_le_bytes());
+        for (index, byte) in pattern[32..].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(0x5a);
+        }
+
+        if crate::dwc2_host::write_sector(TEST_SECTOR, &pattern).is_err() {
+            let _ = crate::dwc2_host::write_sector(TEST_SECTOR, &original);
+            return Err(Status::Unavailable);
+        }
+        let observed = match crate::dwc2_host::read_sector(TEST_SECTOR) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let _ = crate::dwc2_host::write_sector(TEST_SECTOR, &original);
+                return Err(Status::Unavailable);
+            }
+        };
+        if observed != pattern {
+            let _ = crate::dwc2_host::write_sector(TEST_SECTOR, &original);
+            return Err(Status::Faulted);
+        }
+        crate::dwc2_host::write_sector(TEST_SECTOR, &original).map_err(|_| Status::Unavailable)?;
+        let restored =
+            crate::dwc2_host::read_sector(TEST_SECTOR).map_err(|_| Status::Unavailable)?;
+        if restored != original {
+            return Err(Status::Faulted);
+        }
+        return Ok(format!(
+            "USB sector {TEST_SECTOR} WRITE(10) readback passed; original data restored\n"
+        ));
+    }
+    if args.first().is_some_and(|argument| argument != "info") || args.len() > 1 {
+        return Err(Status::Usage);
+    }
+    let Some(storage) = crate::dwc2_host::snapshot().and_then(|snapshot| snapshot.mass_storage)
+    else {
+        return Ok(String::from("USB mass storage not detected\n"));
+    };
+    let (Some(sectors), Some(block_size)) = (storage.capacity_sectors, storage.block_size) else {
+        return Ok(format!(
+            "USB mass storage interface {} detected, capacity not configured\n",
+            storage.interface,
+        ));
+    };
+    Ok(format!(
+        "USB mass storage SCSI/BOT interface={} bulk-in={:#04x}/{} bulk-out={:#04x}/{} sectors={} block-size={} bytes={}\n",
+        storage.interface,
+        storage.endpoint_in,
+        storage.max_packet_size_in,
+        storage.endpoint_out,
+        storage.max_packet_size_out,
+        sectors,
+        block_size,
+        sectors.saturating_mul(u64::from(block_size)),
+    ))
 }
 
 fn vsh_quiet(_args: &[String]) -> Result<String, Status> {

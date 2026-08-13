@@ -201,6 +201,7 @@ ssh_acceptance=false
 jitterentropy_probe=false
 jitterentropy_ssh_probe=false
 selftest=false
+iperf3_server=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -209,10 +210,11 @@ for arg in "$@"; do
     --jitterentropy-probe) jitterentropy_probe=true ;;
     --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
     --selftest) selftest=true ;;
-    -*) usage; exit 2 ;;
+    --iperf3-server) iperf3_server=true ;;
+    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        usage
+        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server] <duo-buildroot-sdk-root>" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -224,9 +226,10 @@ mode_count=0
 [[ "$ssh_acceptance" == true ]] && ((mode_count += 1))
 [[ "$jitterentropy_probe" == true ]] && ((mode_count += 1))
 [[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
+[[ "$iperf3_server" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
   echo "verify-milkv-duo-image.sh: image mode options are mutually exclusive" >&2
-  usage
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 if [[ "$selftest" == true ]]; then
@@ -243,7 +246,7 @@ if [[ "$selftest" == true ]]; then
   exit 0
 fi
 if [[ -z "$sdk_arg" ]]; then
-  usage
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
@@ -265,6 +268,9 @@ elif [[ "$jitterentropy_probe" == true ]]; then
 elif [[ "$jitterentropy_ssh_probe" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-jitterentropy-ssh-probe"
   image_name="vibeos-milkv-duo-jitterentropy-ssh-probe-sd.img"
+elif [[ "$iperf3_server" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-iperf3-server"
+  image_name="vibeos-milkv-duo-iperf3-server-sd.img"
 fi
 image="$output_dir/$image_name"
 expected_fit="$output_dir/boot.sd"

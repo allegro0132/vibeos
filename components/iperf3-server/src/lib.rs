@@ -57,6 +57,7 @@ pub trait Platform: Sync {
         connection: TcpConnectionToken,
         input: &[u8],
     ) -> Result<TcpIoResult, SocketError>;
+    fn tcp_close(&self, listener: Cap, connection: TcpConnectionToken) -> Result<(), SocketError>;
     fn tcp_reset(&self, listener: Cap, connection: TcpConnectionToken) -> Result<(), SocketError>;
     fn now_ms(&self) -> u64;
     fn event(&self, event: &'static str);
@@ -256,6 +257,16 @@ impl Server {
                     // appear far lower than the bytes actually put on wire.
                     self.test_elapsed_ms = space.now_ms().saturating_sub(self.test_started_ms);
                     if self.parameters.reverse {
+                        // Match the reference iperf3 server: close the data
+                        // stream before starting the result exchange.  A
+                        // graceful TCP close drains already-queued payload and
+                        // then sends FIN, so the reverse-mode client does not
+                        // spend its receive timeout waiting for an EOF that
+                        // never arrives.
+                        let Some(data) = self.data else {
+                            return Err(SocketError::Failed);
+                        };
+                        space.tcp_close(data_listener, data)?;
                         self.control_tx.push_back(EXCHANGE_RESULTS);
                         self.phase = Phase::ClientResults;
                     } else {

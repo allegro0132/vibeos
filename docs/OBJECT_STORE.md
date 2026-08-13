@@ -88,6 +88,11 @@ atomically reinstalls its typed `StoredObject` capabilities. There is still no
 ambient `ObjectId` lookup or enumeration path. See
 [PERSISTENT_CSPACE.md](PERSISTENT_CSPACE.md).
 
+Immutable content that needs end-to-end SHA-256 authentication uses the
+canonical Merkle envelope and typed helper API described in
+[BLOB_STORE.md](BLOB_STORE.md). It preserves this journal's capability-only
+namespace and commit/publication boundary.
+
 ## Acceptance evidence
 
 The harness seeds a valid 506-record journal containing one 180,720-byte object.

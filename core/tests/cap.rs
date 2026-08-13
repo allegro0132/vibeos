@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use vibeos_core::cap::{
-    grant, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource, Rights,
-    ScopedResource, CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
+    grant, move_cap, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource,
+    Rights, ScopedResource, CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
 };
 use vibeos_core::heap::{current_owner, enter_owner, OwnerId};
 use vibeos_durable_format::{
@@ -111,6 +111,104 @@ impl Resource for Liar {
 
 fn space() -> (CSpace, Arc<Widget>) {
     (CSpace::new("test"), Arc::new(Widget("w")))
+}
+
+#[test]
+fn cspace_identity_is_unique_redacted_and_stable_across_reset() {
+    let mut first = CSpace::new("first");
+    let second = CSpace::new("second");
+    let first_identity = first.identity();
+
+    assert_ne!(first_identity, second.identity());
+    assert_eq!(format!("{first_identity:?}"), "CSpaceIdentity(<redacted>)");
+    assert!(!format!("{first_identity:?}").contains(char::is_numeric));
+
+    assert_eq!(first.incarnation(), 1);
+    assert_eq!(first.reset(), 0);
+    assert_eq!(first.identity(), first_identity);
+    assert_eq!(first.incarnation(), 2);
+}
+
+#[test]
+fn supervisor_move_relocates_without_copying_widening_or_breaking_ancestry() {
+    let mut source = CSpace::new("move-source");
+    let mut target = CSpace::new("move-target");
+    let root = source.mint(
+        Arc::new(Widget("moved")),
+        Rights::READ.union(Rights::WRITE).union(Rights::REVOKE),
+    );
+    let moved = move_cap(&mut source, root, Rights::READ, &mut target).unwrap();
+
+    assert_eq!(
+        source.lookup(root, Rights::NONE).err(),
+        Some(CapError::Invalid)
+    );
+    assert_eq!(source.list().len(), 0);
+    assert_eq!(target.list().len(), 1);
+    assert_eq!(target.rights_of(moved), Ok(Rights::READ));
+    assert_eq!(
+        target.lookup_as::<Widget>(moved, Rights::READ).unwrap().0,
+        "moved",
+    );
+    assert_eq!(
+        target.lookup(moved, Rights::WRITE).err(),
+        Some(CapError::InsufficientRights),
+    );
+}
+
+#[test]
+fn supervisor_move_retains_the_exact_derivation_node() {
+    let mut source = CSpace::new("move-derived-source");
+    let mut target = CSpace::new("move-derived-target");
+    let ancestor = source.mint(
+        Arc::new(Widget("derived")),
+        Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+    );
+    let child = source.derive(ancestor, Rights::READ).unwrap();
+    let moved = move_cap(&mut source, child, Rights::READ, &mut target).unwrap();
+
+    assert_eq!(source.revoke(ancestor), Ok(1));
+    assert_eq!(
+        target.lookup(moved, Rights::READ).err(),
+        Some(CapError::Invalid),
+    );
+    assert!(target.list().is_empty());
+}
+
+#[test]
+fn failed_supervisor_move_leaves_source_exactly_live() {
+    let mut source = CSpace::new("move-failure-source");
+    let mut target = CSpace::new("move-failure-target");
+    let cap = source.mint(Arc::new(Widget("still-live")), Rights::READ);
+
+    assert_eq!(
+        move_cap(&mut source, cap, Rights::WRITE, &mut target),
+        Err(CapError::Amplification),
+    );
+    assert_eq!(
+        source.lookup_as::<Widget>(cap, Rights::READ).unwrap().0,
+        "still-live"
+    );
+    assert!(target.list().is_empty());
+}
+
+#[test]
+fn exact_admin_revoke_never_targets_a_reused_slot() {
+    let mut space = CSpace::new("exact-admin-revoke");
+    let stale = space.mint(Arc::new(Widget("old")), Rights::READ);
+    assert_eq!(space.revoke_slot(stale.slot()), 1);
+    let replacement = space.mint(Arc::new(Widget("replacement")), Rights::READ);
+    assert_eq!(replacement.slot(), stale.slot());
+    assert_ne!(replacement, stale);
+
+    assert_eq!(space.revoke_exact_admin(stale), Err(CapError::Invalid));
+    assert_eq!(
+        space
+            .lookup_as::<Widget>(replacement, Rights::READ)
+            .unwrap()
+            .0,
+        "replacement",
+    );
 }
 
 fn stable<T>(value: u128, constructor: fn(u128) -> Option<T>) -> T {

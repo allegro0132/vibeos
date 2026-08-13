@@ -2,7 +2,6 @@ package vibe:random@1.0.0;
 
 interface random {
     resource random-source;
+    enum random-error { denied, exhausted }
     fill: func(source: borrow<random-source>, len: u32) -> result<list<u8>, random-error>;
 }
-
-enum random-error { denied, exhausted }

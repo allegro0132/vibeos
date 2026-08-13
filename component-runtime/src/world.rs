@@ -532,13 +532,25 @@ fn normalize_wit_type_id(
     }
 }
 
-pub(crate) fn normalize_component_entities(
+pub(crate) fn normalize_component_world_entities(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
+    let mut resource_names = Vec::new();
+    collect_component_resource_names(types, import_names, true, &mut resource_names)?;
+    collect_component_resource_names(types, export_names, false, &mut resource_names)?;
+    let imports = normalize_component_entities(types, import_names, true, &resource_names)?;
+    let exports = normalize_component_entities(types, export_names, false, &resource_names)?;
+    Ok((imports, exports))
+}
+
+fn collect_component_resource_names(
     types: &Types,
     names: &[String],
     imports: bool,
-) -> Result<Vec<NamedEntityShape>, WorldError> {
-    let mut budget = ShapeBudget::default();
-    let mut resource_names = Vec::new();
+    resources: &mut Vec<(ResourceId, String)>,
+) -> Result<(), WorldError> {
     for name in names {
         let item = if imports {
             types.component_item_for_import(name)
@@ -546,17 +558,53 @@ pub(crate) fn normalize_component_entities(
             types.component_item_for_export(name)
         }
         .ok_or(WorldError::TypeMismatch)?;
-        if let ComponentEntityType::Type {
-            referenced: ComponentAnyTypeId::Resource(resource),
-            ..
-        } = item.ty
-        {
-            resource_names
-                .try_reserve(1)
-                .map_err(|_| WorldError::Allocation)?;
-            resource_names.push((resource.resource(), copied(name)?));
+        match item.ty {
+            ComponentEntityType::Type {
+                referenced: ComponentAnyTypeId::Resource(resource),
+                ..
+            } => push_component_resource(resources, resource.resource(), name)?,
+            ComponentEntityType::Instance(id) => {
+                for (member_name, member) in &types[id].exports {
+                    if let ComponentEntityType::Type {
+                        referenced: ComponentAnyTypeId::Resource(resource),
+                        ..
+                    } = member.ty
+                    {
+                        push_component_resource(resources, resource.resource(), member_name)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    Ok(())
+}
+
+fn push_component_resource(
+    resources: &mut Vec<(ResourceId, String)>,
+    resource: ResourceId,
+    name: &str,
+) -> Result<(), WorldError> {
+    if resources
+        .iter()
+        .any(|(id, existing)| *id == resource && existing == name)
+    {
+        return Ok(());
+    }
+    resources
+        .try_reserve(1)
+        .map_err(|_| WorldError::Allocation)?;
+    resources.push((resource, copied(name)?));
+    Ok(())
+}
+
+fn normalize_component_entities(
+    types: &Types,
+    names: &[String],
+    imports: bool,
+    resource_names: &[(ResourceId, String)],
+) -> Result<Vec<NamedEntityShape>, WorldError> {
+    let mut budget = ShapeBudget::default();
     let mut result = Vec::new();
     result
         .try_reserve_exact(names.len())
@@ -568,7 +616,7 @@ pub(crate) fn normalize_component_entities(
             types.component_item_for_export(name)
         }
         .ok_or(WorldError::TypeMismatch)?;
-        let entity = normalize_component_entity(types, item.ty, &resource_names, &mut budget, 1)?;
+        let entity = normalize_component_entity(types, item.ty, resource_names, &mut budget, 1)?;
         push_named_entity(&mut result, name, entity)?;
     }
     Ok(result)

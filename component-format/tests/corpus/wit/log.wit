@@ -1,0 +1,18 @@
+package vibe:log@1.0.0;
+
+interface structured {
+    resource structured-log;
+    enum level { trace, debug, info, warn, error }
+    record field {
+        key: string,
+        value: string,
+    }
+    record event {
+        level: level,
+        target: string,
+        message: string,
+        fields: list<field>,
+    }
+    enum log-error { denied, invalid, failed }
+    write: func(log: borrow<structured-log>, event: event) -> result<_, log-error>;
+}

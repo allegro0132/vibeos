@@ -1,20 +1,26 @@
 //! Bounded, portable Core WebAssembly execution for Vibe Component Profile 1.
 //!
 //! Untrusted bytes are counted before either `wasmparser::Validator` or wasmi
-//! may reserve storage.  The wrapper exposes no imports and meters each call in
-//! resumable quanta while retaining a separate, monotonic total-fuel account.
+//! may reserve storage. Imports are denied by default and can only be linked
+//! through an exact, typed allowlist. Calls are metered in resumable quanta
+//! while retaining a separate, monotonic total-fuel account.
 
 #![no_std]
 
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::cmp::min;
+use core::{
+    cmp::min,
+    fmt,
+    sync::atomic::{AtomicU32, Ordering},
+};
 use vibeos_component_format::{LimitKind, ProfileLimits, TrapCode, PROFILE_1_LIMITS};
 use wasmi::{
-    CompilationMode, Config, EnforcedLimits, Engine, Error as WasmiError, Func, Instance, Linker,
-    Memory, Module, ResumableCall, ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder,
-    Val,
+    errors::HostError, CompilationMode, Config, EnforcedLimits, Engine, Error as WasmiError,
+    ExternType, Func, FuncType, Instance, Linker, Memory, Module, ResumableCall,
+    ResumableCallHostTrap, ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder, Val,
+    ValType,
 };
 use wasmparser::{Encoding, Operator, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
@@ -27,6 +33,7 @@ pub enum AdmissionDetail {
     MissingMaximum,
     Limit(LimitKind),
     AllocationReservation,
+    HostImportMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -537,6 +544,83 @@ impl OwnerAllocationReservation {
     }
 }
 
+/// Integer value types admitted at the Core/host boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreValueType {
+    I32,
+    I64,
+}
+
+impl CoreValueType {
+    const fn into_wasmi(self) -> ValType {
+        match self {
+            Self::I32 => ValType::I32,
+            Self::I64 => ValType::I64,
+        }
+    }
+}
+
+/// One exact Core host import admitted for a single module instantiation.
+///
+/// The module and field names, signature, and application-assigned identifier
+/// are all part of the allowlist. The descriptor is inert: host work is not
+/// performed by a Wasmi callback, but is surfaced as [`PollResult::HostCall`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreHostImport<'a> {
+    pub id: u32,
+    pub module: &'a str,
+    pub name: &'a str,
+    pub params: &'a [CoreValueType],
+    pub results: &'a [CoreValueType],
+}
+
+/// One exact module import linked from an already-instantiated Core instance
+/// in the same Component principal and Wasmi store.
+///
+/// `instance` must name a prior entry in [`CoreComponentGroup`]. Only integer
+/// functions and memory32 memories are admitted; tables and globals remain
+/// closed even if the source instance exports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreInstanceExportImport<'a> {
+    pub module: &'a str,
+    pub name: &'a str,
+    pub instance: usize,
+    pub export: &'a str,
+}
+
+/// Closed source allowlist for one embedded module import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreModuleImport<'a> {
+    Host(CoreHostImport<'a>),
+    InstanceExport(CoreInstanceExportImport<'a>),
+}
+
+impl<'a> CoreModuleImport<'a> {
+    const fn module(&self) -> &'a str {
+        match self {
+            Self::Host(import) => import.module,
+            Self::InstanceExport(import) => import.module,
+        }
+    }
+
+    const fn name(&self) -> &'a str {
+        match self {
+            Self::Host(import) => import.name,
+            Self::InstanceExport(import) => import.name,
+        }
+    }
+}
+
+/// A suspended Core call requesting one exact host operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreHostCall {
+    /// Instance that defined the host import, which can differ from the outer
+    /// active continuation when a prior-instance export calls the host.
+    pub origin_instance: usize,
+    pub id: u32,
+    pub arguments: Vec<CoreValue>,
+}
+
 #[derive(Debug)]
 pub struct ValidatedCore {
     engine: Engine,
@@ -608,10 +692,72 @@ impl ValidatedCore {
                 AdmissionDetail::ImportRequiresLinker,
             ));
         }
+        self.instantiate_with_imports(&[])
+    }
+
+    /// Instantiates with an exact, closed allowlist of integer host functions.
+    ///
+    /// Every module import must have one descriptor with the same module name,
+    /// field name, parameter types, and result types. Extra descriptors,
+    /// duplicate names, duplicate identifiers, and non-function imports are
+    /// rejected before the store is made executable.
+    pub fn instantiate_with_imports(
+        &self,
+        imports: &[CoreHostImport<'_>],
+    ) -> Result<CoreInstance, AdmissionError> {
+        self.check_host_imports(imports)?;
         let limits = profile_store_limits(1);
-        let mut store = Store::new(&self.engine, HostState { limits });
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                limits,
+                pending_host: None,
+            },
+        );
         store.limiter(|state| &mut state.limits);
-        let linker = Linker::new(&self.engine);
+        let mut linker: Linker<HostState> = Linker::new(&self.engine);
+        for module_import in self.module.imports() {
+            let descriptor = imports
+                .iter()
+                .find(|candidate| {
+                    candidate.module == module_import.module()
+                        && candidate.name == module_import.name()
+                })
+                .ok_or_else(host_import_error)?;
+            let ty = module_import
+                .ty()
+                .func()
+                .cloned()
+                .ok_or_else(host_import_error)?;
+            let id = descriptor.id;
+            linker
+                .func_new(
+                    descriptor.module,
+                    descriptor.name,
+                    ty,
+                    move |mut caller, inputs, _outputs| {
+                        if caller.data().pending_host.is_some() {
+                            return Err(WasmiError::host(HostBridgeError::Busy));
+                        }
+                        let mut arguments = Vec::new();
+                        arguments
+                            .try_reserve_exact(inputs.len())
+                            .map_err(|_| WasmiError::host(HostBridgeError::Allocation))?;
+                        for input in inputs {
+                            let value = CoreValue::from_wasmi(input)
+                                .ok_or_else(|| WasmiError::host(HostBridgeError::Type))?;
+                            arguments.push(value);
+                        }
+                        caller.data_mut().pending_host = Some(PendingHostCall {
+                            origin_instance: 0,
+                            id,
+                            arguments,
+                        });
+                        Err(WasmiError::host(HostBridgeError::Yield { id }))
+                    },
+                )
+                .map_err(|_| host_import_error())?;
+        }
         let instance = linker
             .instantiate_and_start(&mut store, &self.module)
             .map_err(|error| AdmissionError {
@@ -625,6 +771,56 @@ impl ValidatedCore {
             last_call: None,
         })
     }
+
+    fn check_host_imports(&self, imports: &[CoreHostImport<'_>]) -> Result<(), AdmissionError> {
+        if self.module.imports().len() != imports.len()
+            || imports.len() > PROFILE_1_LIMITS.max_imports as usize
+        {
+            return Err(host_import_error());
+        }
+        for (index, descriptor) in imports.iter().enumerate() {
+            if descriptor.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize
+                || descriptor.results.len() > PROFILE_1_LIMITS.max_results_per_function as usize
+                || imports[..index].iter().any(|previous| {
+                    previous.id == descriptor.id
+                        || (previous.module == descriptor.module
+                            && previous.name == descriptor.name)
+                })
+            {
+                return Err(host_import_error());
+            }
+        }
+        for module_import in self.module.imports() {
+            let descriptor = imports
+                .iter()
+                .find(|candidate| {
+                    candidate.module == module_import.module()
+                        && candidate.name == module_import.name()
+                })
+                .ok_or_else(host_import_error)?;
+            let actual = module_import.ty().func().ok_or_else(host_import_error)?;
+            let expected = FuncType::new(
+                descriptor
+                    .params
+                    .iter()
+                    .copied()
+                    .map(CoreValueType::into_wasmi),
+                descriptor
+                    .results
+                    .iter()
+                    .copied()
+                    .map(CoreValueType::into_wasmi),
+            );
+            if actual != &expected {
+                return Err(host_import_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn host_import_error() -> AdmissionError {
+    AdmissionError::validation(AdmissionDetail::HostImportMismatch)
 }
 
 pub fn profile_store_limits(instances: usize) -> StoreLimits {
@@ -632,8 +828,8 @@ pub fn profile_store_limits(instances: usize) -> StoreLimits {
         .memory_size(PROFILE_1_LIMITS.max_memory_pages as usize * 65_536)
         .table_elements(PROFILE_1_LIMITS.max_table_elements as usize)
         .instances(instances)
-        .tables(PROFILE_1_LIMITS.max_tables as usize)
-        .memories(PROFILE_1_LIMITS.max_memories as usize)
+        .tables((PROFILE_1_LIMITS.max_tables as usize).saturating_mul(instances))
+        .memories((PROFILE_1_LIMITS.max_memories as usize).saturating_mul(instances))
         .trap_on_grow_failure(true)
         .build()
 }
@@ -641,7 +837,36 @@ pub fn profile_store_limits(instances: usize) -> StoreLimits {
 #[derive(Debug)]
 struct HostState {
     limits: StoreLimits,
+    pending_host: Option<PendingHostCall>,
 }
+
+#[derive(Debug)]
+struct PendingHostCall {
+    origin_instance: usize,
+    id: u32,
+    arguments: Vec<CoreValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostBridgeError {
+    Yield { id: u32 },
+    Busy,
+    Allocation,
+    Type,
+}
+
+impl fmt::Display for HostBridgeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Yield { id } => write!(formatter, "host import {id} yielded"),
+            Self::Busy => formatter.write_str("host import mailbox is busy"),
+            Self::Allocation => formatter.write_str("host import mailbox allocation failed"),
+            Self::Type => formatter.write_str("host import received a disabled value type"),
+        }
+    }
+}
+
+impl HostError for HostBridgeError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreValue {
@@ -662,6 +887,13 @@ impl CoreValue {
             Val::I32(value) => Some(Self::I32(*value)),
             Val::I64(value) => Some(Self::I64(*value)),
             _ => None,
+        }
+    }
+
+    pub const fn value_type(self) -> CoreValueType {
+        match self {
+            Self::I32(_) => CoreValueType::I32,
+            Self::I64(_) => CoreValueType::I64,
         }
     }
 }
@@ -716,17 +948,31 @@ impl CoreInstance {
         {
             return Err(TrapCode::Validation);
         }
-        let inputs = inputs.iter().copied().map(CoreValue::into_wasmi).collect();
-        let outputs = ty.results().iter().copied().map(Val::default).collect();
+        let mut core_inputs = Vec::new();
+        core_inputs
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        core_inputs.extend(inputs.iter().copied().map(CoreValue::into_wasmi));
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(ty.results().len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        outputs.extend(ty.results().iter().copied().map(Val::default));
+        let mut result_values = Vec::new();
+        result_values
+            .try_reserve_exact(ty.results().len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
         self.last_call = None;
         self.active_call = Some(ActiveCall {
             function,
-            inputs,
+            inputs: core_inputs,
             outputs,
+            result_values,
             continuation: None,
             remaining_fuel: total_fuel,
             poll_quantum,
             consumed_fuel: 0,
+            external_debit: 0,
             started: false,
             cancelled: false,
         });
@@ -742,7 +988,7 @@ impl CoreInstance {
             return PollResult::Trapped(TrapCode::Validation);
         };
         let result = call.poll(&mut self.store);
-        if !matches!(result, PollResult::Pending { .. }) {
+        if !matches!(result, PollResult::Pending { .. } | PollResult::HostCall(_)) {
             let call = self
                 .active_call
                 .take()
@@ -750,6 +996,21 @@ impl CoreInstance {
             self.last_call = Some(call.metrics());
         }
         result
+    }
+
+    /// Supplies the exact results for the currently suspended host import.
+    ///
+    /// This only records validated values. Guest execution resumes on the next
+    /// [`CoreInstance::poll_call`], so the caller retains an explicit
+    /// scheduling and fuel-accounting boundary around host work.
+    pub fn resume_host_call(&mut self, id: u32, results: &[CoreValue]) -> Result<(), TrapCode> {
+        if self.store.data().pending_host.is_some() {
+            return Err(TrapCode::Validation);
+        }
+        self.active_call
+            .as_mut()
+            .ok_or(TrapCode::Validation)?
+            .resume_host_call(&self.store, id, results)
     }
 
     /// Requests cancellation of the active call. The next poll reports the
@@ -871,16 +1132,729 @@ impl CoreInstance {
     }
 }
 
+/// A bounded set of Core instances belonging to one Component principal.
+///
+/// Every instance uses the same Wasmi engine, store, limits, and host mailbox.
+/// Calls still have per-instance continuation and fuel state, which permits an
+/// outer guest call to remain suspended on a host import while a distinct,
+/// prior provider instance executes a canonical realloc callback.
+pub struct CoreComponentGroup {
+    reservation_owner: u32,
+    engine: Engine,
+    store: Store<HostState>,
+    instances: Vec<GroupInstance>,
+    host_ids: Vec<u32>,
+    instance_limit: usize,
+    state: ComponentGroupState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComponentGroupState {
+    Building,
+    Sealed,
+    Poisoned,
+}
+
+struct GroupInstance {
+    instance: Instance,
+    active_call: Option<ActiveCall>,
+    last_call: Option<CallMetrics>,
+}
+
+/// Allocation-backed storage for one exact group call.
+///
+/// Reservations are intentionally neither cloneable nor reusable. Creating
+/// one performs every fallible allocation needed to construct the active
+/// call; [`CoreComponentGroup::start_call_reserved`] consumes it by value.
+pub struct CoreCallReservation {
+    owner: u32,
+    instance: usize,
+    export: Vec<u8>,
+    function: Func,
+    inputs: Vec<Val>,
+    outputs: Vec<Val>,
+    result_values: Vec<CoreValue>,
+}
+
+impl CoreComponentGroup {
+    pub fn new(engine: &ProfileEngine, instance_limit: usize) -> Result<Self, AdmissionError> {
+        if instance_limit > PROFILE_1_LIMITS.max_component_instances as usize {
+            return Err(AdmissionError::limit(LimitKind::ComponentInstances));
+        }
+        let mut instances = Vec::new();
+        instances
+            .try_reserve_exact(instance_limit)
+            .map_err(|_| allocation_error())?;
+        let mut store = Store::new(
+            &engine.inner,
+            HostState {
+                limits: profile_store_limits(instance_limit.max(1)),
+                pending_host: None,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        Ok(Self {
+            reservation_owner: next_group_reservation_owner()?,
+            engine: engine.inner.clone(),
+            store,
+            instances,
+            host_ids: Vec::new(),
+            instance_limit,
+            state: ComponentGroupState::Building,
+        })
+    }
+
+    pub fn add_instance(
+        &mut self,
+        validated: &ValidatedCore,
+        imports: &[CoreModuleImport<'_>],
+    ) -> Result<usize, AdmissionError> {
+        if self.state != ComponentGroupState::Building
+            || self.any_active_call()
+            || self.instances.len() >= self.instance_limit
+            || !Engine::same(&self.engine, validated.engine())
+        {
+            return Err(host_import_error());
+        }
+        self.check_module_imports(validated, imports)?;
+        let origin_instance = self.instances.len();
+        let host_count = imports
+            .iter()
+            .filter(|import| matches!(import, CoreModuleImport::Host(_)))
+            .count();
+        self.host_ids
+            .try_reserve(host_count)
+            .map_err(|_| allocation_error())?;
+        let mut linker: Linker<HostState> = Linker::new(&self.engine);
+        for import in imports {
+            match import {
+                CoreModuleImport::Host(descriptor) => {
+                    let module_import = validated
+                        .module
+                        .imports()
+                        .find(|candidate| {
+                            candidate.module() == descriptor.module
+                                && candidate.name() == descriptor.name
+                        })
+                        .ok_or_else(host_import_error)?;
+                    let ty = module_import
+                        .ty()
+                        .func()
+                        .cloned()
+                        .ok_or_else(host_import_error)?;
+                    let id = descriptor.id;
+                    linker
+                        .func_new(
+                            descriptor.module,
+                            descriptor.name,
+                            ty,
+                            move |mut caller, inputs, _outputs| {
+                                if caller.data().pending_host.is_some() {
+                                    return Err(WasmiError::host(HostBridgeError::Busy));
+                                }
+                                let mut arguments = Vec::new();
+                                arguments
+                                    .try_reserve_exact(inputs.len())
+                                    .map_err(|_| WasmiError::host(HostBridgeError::Allocation))?;
+                                for input in inputs {
+                                    let value = CoreValue::from_wasmi(input)
+                                        .ok_or_else(|| WasmiError::host(HostBridgeError::Type))?;
+                                    arguments.push(value);
+                                }
+                                caller.data_mut().pending_host = Some(PendingHostCall {
+                                    origin_instance,
+                                    id,
+                                    arguments,
+                                });
+                                Err(WasmiError::host(HostBridgeError::Yield { id }))
+                            },
+                        )
+                        .map_err(|_| host_import_error())?;
+                }
+                CoreModuleImport::InstanceExport(descriptor) => {
+                    let source = self
+                        .instances
+                        .get(descriptor.instance)
+                        .ok_or_else(host_import_error)?;
+                    let export = source
+                        .instance
+                        .get_export(&self.store, descriptor.export)
+                        .ok_or_else(host_import_error)?;
+                    linker
+                        .define(descriptor.module, descriptor.name, export)
+                        .map_err(|_| host_import_error())?;
+                }
+            }
+        }
+        self.store.data_mut().pending_host = None;
+        let instance = match linker.instantiate_and_start(&mut self.store, validated.module()) {
+            Ok(instance) => instance,
+            Err(error) => {
+                self.store.data_mut().pending_host = None;
+                // Instantiation is not assumed to be transactional: active
+                // data segments or a start function may already have mutated
+                // an imported prior-instance memory before the failure.
+                self.state = ComponentGroupState::Poisoned;
+                return Err(AdmissionError {
+                    trap: map_wasmi_error(&error),
+                    detail: AdmissionDetail::Malformed,
+                });
+            }
+        };
+        let index = self.instances.len();
+        self.instances.push(GroupInstance {
+            instance,
+            active_call: None,
+            last_call: None,
+        });
+        for import in imports {
+            if let CoreModuleImport::Host(host) = import {
+                self.host_ids.push(host.id);
+            }
+        }
+        Ok(index)
+    }
+
+    fn check_module_imports(
+        &self,
+        validated: &ValidatedCore,
+        imports: &[CoreModuleImport<'_>],
+    ) -> Result<(), AdmissionError> {
+        if validated.module.imports().len() != imports.len()
+            || imports.len() > PROFILE_1_LIMITS.max_imports as usize
+        {
+            return Err(host_import_error());
+        }
+        for (index, descriptor) in imports.iter().enumerate() {
+            if imports[..index].iter().any(|previous| {
+                previous.module() == descriptor.module() && previous.name() == descriptor.name()
+            }) {
+                return Err(host_import_error());
+            }
+            if let CoreModuleImport::Host(host) = descriptor {
+                if host.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize
+                    || host.results.len() > PROFILE_1_LIMITS.max_results_per_function as usize
+                    || self.host_ids.contains(&host.id)
+                    || imports[..index]
+                        .iter()
+                        .any(|previous| matches!(previous, CoreModuleImport::Host(value) if value.id == host.id))
+                {
+                    return Err(host_import_error());
+                }
+            }
+        }
+        for module_import in validated.module.imports() {
+            let descriptor = imports
+                .iter()
+                .find(|candidate| {
+                    candidate.module() == module_import.module()
+                        && candidate.name() == module_import.name()
+                })
+                .ok_or_else(host_import_error)?;
+            match descriptor {
+                CoreModuleImport::Host(host) => {
+                    let actual = module_import.ty().func().ok_or_else(host_import_error)?;
+                    let expected = FuncType::new(
+                        host.params.iter().copied().map(CoreValueType::into_wasmi),
+                        host.results.iter().copied().map(CoreValueType::into_wasmi),
+                    );
+                    if actual != &expected {
+                        return Err(host_import_error());
+                    }
+                }
+                CoreModuleImport::InstanceExport(source) => {
+                    if source.instance >= self.instances.len() {
+                        return Err(host_import_error());
+                    }
+                    let export = self.instances[source.instance]
+                        .instance
+                        .get_export(&self.store, source.export)
+                        .ok_or_else(host_import_error)?;
+                    if !exact_group_export_type(module_import.ty(), &export.ty(&self.store)) {
+                        return Err(host_import_error());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Permanently closes construction. Execution also seals automatically.
+    pub fn seal(&mut self) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned || self.any_active_call() {
+            return Err(TrapCode::Validation);
+        }
+        self.state = ComponentGroupState::Sealed;
+        Ok(())
+    }
+
+    pub fn has_active_call(&self, instance: usize) -> bool {
+        self.instances
+            .get(instance)
+            .is_some_and(|instance| instance.active_call.is_some())
+    }
+
+    pub fn any_active_call(&self) -> bool {
+        self.instances
+            .iter()
+            .any(|instance| instance.active_call.is_some())
+    }
+
+    pub fn start_call(
+        &mut self,
+        instance: usize,
+        export: &str,
+        inputs: &[CoreValue],
+        total_fuel: u64,
+        poll_quantum: u64,
+    ) -> Result<(), TrapCode> {
+        let reservation = self.reserve_call(instance, export)?;
+        self.start_call_reserved(
+            reservation,
+            instance,
+            export,
+            inputs,
+            total_fuel,
+            poll_quantum,
+        )
+    }
+
+    /// Preallocates the complete active-call shell for one exact export.
+    ///
+    /// This method is intended to run before an irreversible host side
+    /// effect. The returned opaque value can subsequently be consumed without
+    /// allocating, while still revalidating all caller-controlled metadata.
+    pub fn reserve_call(
+        &self,
+        instance: usize,
+        export: &str,
+    ) -> Result<CoreCallReservation, TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let state = self.instances.get(instance).ok_or(TrapCode::Validation)?;
+        if state.active_call.is_some() {
+            return Err(TrapCode::Validation);
+        }
+        let function = state
+            .instance
+            .get_func(&self.store, export)
+            .ok_or(TrapCode::Validation)?;
+        let ty = function.ty(&self.store);
+        if ty
+            .params()
+            .iter()
+            .chain(ty.results())
+            .any(|ty| !matches!(ty, ValType::I32 | ValType::I64))
+        {
+            return Err(TrapCode::Validation);
+        }
+        let mut reserved_export = Vec::new();
+        reserved_export
+            .try_reserve_exact(export.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        reserved_export.extend_from_slice(export.as_bytes());
+        let mut reserved_inputs = Vec::new();
+        reserved_inputs
+            .try_reserve_exact(ty.params().len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        reserved_inputs.extend(ty.params().iter().copied().map(Val::default));
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(ty.results().len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        outputs.extend(ty.results().iter().copied().map(Val::default));
+        let mut result_values = Vec::new();
+        result_values
+            .try_reserve_exact(ty.results().len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        Ok(CoreCallReservation {
+            owner: self.reservation_owner,
+            instance,
+            export: reserved_export,
+            function,
+            inputs: reserved_inputs,
+            outputs,
+            result_values,
+        })
+    }
+
+    /// Starts a call using storage allocated by [`Self::reserve_call`].
+    ///
+    /// Every validation completes before group or per-instance state changes,
+    /// so all failures leave the group with no newly active call.
+    pub fn start_call_reserved(
+        &mut self,
+        mut reservation: CoreCallReservation,
+        instance: usize,
+        export: &str,
+        inputs: &[CoreValue],
+        total_fuel: u64,
+        poll_quantum: u64,
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned
+            || reservation.owner != self.reservation_owner
+            || reservation.instance != instance
+            || reservation.export.as_slice() != export.as_bytes()
+        {
+            return Err(TrapCode::Validation);
+        }
+        let state = self.instances.get(instance).ok_or(TrapCode::Validation)?;
+        if state.active_call.is_some()
+            || reservation.inputs.len() != inputs.len()
+            || reservation
+                .inputs
+                .iter()
+                .zip(inputs)
+                .any(|(slot, input)| slot.ty() != input.value_type().into_wasmi())
+        {
+            return Err(TrapCode::Validation);
+        }
+        let current = state
+            .instance
+            .get_func(&self.store, export)
+            .ok_or(TrapCode::Validation)?;
+        let current_type = current.ty(&self.store);
+        if current_type.params().len() != reservation.inputs.len()
+            || current_type.results().len() != reservation.outputs.len()
+            || !current_type
+                .params()
+                .iter()
+                .zip(&reservation.inputs)
+                .all(|(expected, slot)| *expected == slot.ty())
+            || !current_type
+                .results()
+                .iter()
+                .zip(&reservation.outputs)
+                .all(|(expected, slot)| *expected == slot.ty())
+        {
+            return Err(TrapCode::Validation);
+        }
+        if total_fuel == 0
+            || total_fuel > PROFILE_1_LIMITS.total_fuel
+            || poll_quantum == 0
+            || poll_quantum > PROFILE_1_LIMITS.poll_quantum
+            || poll_quantum > total_fuel
+        {
+            return Err(TrapCode::LimitExceeded);
+        }
+        for (slot, input) in reservation.inputs.iter_mut().zip(inputs.iter().copied()) {
+            *slot = input.into_wasmi();
+        }
+        let call = ActiveCall {
+            function: reservation.function,
+            inputs: reservation.inputs,
+            outputs: reservation.outputs,
+            result_values: reservation.result_values,
+            continuation: None,
+            remaining_fuel: total_fuel,
+            poll_quantum,
+            consumed_fuel: 0,
+            external_debit: 0,
+            started: false,
+            cancelled: false,
+        };
+        let state = self
+            .instances
+            .get_mut(instance)
+            .expect("the validated group instance remains present");
+        state.last_call = None;
+        state.active_call = Some(call);
+        self.state = ComponentGroupState::Sealed;
+        Ok(())
+    }
+
+    pub fn poll_call(&mut self, instance: usize) -> PollResult {
+        if self.state == ComponentGroupState::Poisoned {
+            return PollResult::Trapped(TrapCode::Validation);
+        }
+        let Some(state) = self.instances.get_mut(instance) else {
+            return PollResult::Trapped(TrapCode::Validation);
+        };
+        let Some(call) = state.active_call.as_mut() else {
+            return PollResult::Trapped(TrapCode::Validation);
+        };
+        let result = call.poll(&mut self.store);
+        if !matches!(result, PollResult::Pending { .. } | PollResult::HostCall(_)) {
+            let call = state
+                .active_call
+                .take()
+                .expect("the active group call was present before polling");
+            state.last_call = Some(call.metrics());
+        }
+        result
+    }
+
+    pub fn resume_host_call(
+        &mut self,
+        instance: usize,
+        id: u32,
+        results: &[CoreValue],
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned || self.store.data().pending_host.is_some() {
+            return Err(TrapCode::Validation);
+        }
+        self.instances
+            .get_mut(instance)
+            .ok_or(TrapCode::Validation)?
+            .active_call
+            .as_mut()
+            .ok_or(TrapCode::Validation)?
+            .resume_host_call(&self.store, id, results)
+    }
+
+    /// Removes reserved fuel from an active continuation without executing
+    /// guest instructions. Component runtimes use this when host/canonical
+    /// work shares the same top-level ledger as the suspended Core call.
+    pub fn debit_call_fuel(&mut self, instance: usize, amount: u64) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let call = self
+            .instances
+            .get_mut(instance)
+            .and_then(|state| state.active_call.as_mut())
+            .ok_or(TrapCode::Validation)?;
+        let remaining_fuel = call
+            .remaining_fuel
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let consumed_fuel = call
+            .consumed_fuel
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let external_debit = call
+            .external_debit
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        call.remaining_fuel = remaining_fuel;
+        call.consumed_fuel = consumed_fuel;
+        call.external_debit = external_debit;
+        Ok(())
+    }
+
+    /// Atomically releases unused fuel previously charged by
+    /// [`Self::debit_call_fuel`]. Guest-executed fuel cannot be credited.
+    pub fn credit_call_fuel(&mut self, instance: usize, amount: u64) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let call = self
+            .instances
+            .get_mut(instance)
+            .and_then(|state| state.active_call.as_mut())
+            .ok_or(TrapCode::Validation)?;
+        let remaining_fuel = call
+            .remaining_fuel
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let consumed_fuel = call
+            .consumed_fuel
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let external_debit = call
+            .external_debit
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        call.remaining_fuel = remaining_fuel;
+        call.consumed_fuel = consumed_fuel;
+        call.external_debit = external_debit;
+        Ok(())
+    }
+
+    pub fn cancel_call(&mut self, instance: usize) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let call = self
+            .instances
+            .get_mut(instance)
+            .ok_or(TrapCode::Validation)?
+            .active_call
+            .as_mut()
+            .ok_or(TrapCode::Validation)?;
+        call.cancelled = true;
+        Ok(())
+    }
+
+    pub fn discard_call(&mut self, instance: usize) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let state = self
+            .instances
+            .get_mut(instance)
+            .ok_or(TrapCode::Validation)?;
+        let call = state.active_call.take().ok_or(TrapCode::Validation)?;
+        state.last_call = Some(call.metrics());
+        Ok(())
+    }
+
+    /// Discards every suspended continuation in the principal without
+    /// executing further guest instructions.
+    pub fn discard_all_calls(&mut self) {
+        self.store.data_mut().pending_host = None;
+        for state in &mut self.instances {
+            if let Some(call) = state.active_call.take() {
+                state.last_call = Some(call.metrics());
+            }
+        }
+    }
+
+    /// Marks every active continuation cancelled. Each can then be polled at
+    /// most once to observe the stable cancellation terminal.
+    pub fn cancel_all_calls(&mut self) {
+        for state in &mut self.instances {
+            if let Some(call) = state.active_call.as_mut() {
+                call.cancelled = true;
+            }
+        }
+    }
+
+    pub fn call_metrics(&self, instance: usize) -> Option<CallMetrics> {
+        if self.state == ComponentGroupState::Poisoned {
+            return None;
+        }
+        let state = self.instances.get(instance)?;
+        state
+            .active_call
+            .as_ref()
+            .map(ActiveCall::metrics)
+            .or(state.last_call)
+    }
+
+    pub fn read_memory(
+        &self,
+        instance: usize,
+        export: &str,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        self.memory(instance, export)?
+            .read(&self.store, offset, output)
+            .map_err(|_| TrapCode::MemoryOutOfBounds)
+    }
+
+    pub fn write_memory(
+        &mut self,
+        instance: usize,
+        export: &str,
+        offset: usize,
+        input: &[u8],
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        self.memory(instance, export)?
+            .write(&mut self.store, offset, input)
+            .map_err(|_| TrapCode::MemoryOutOfBounds)
+    }
+
+    pub fn memory_size(&self, instance: usize, export: &str) -> Result<usize, TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        Ok(self.memory(instance, export)?.data_size(&self.store))
+    }
+
+    pub fn grow_memory_to(
+        &mut self,
+        instance: usize,
+        export: &str,
+        minimum_bytes: usize,
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let memory = self.memory(instance, export)?;
+        let current = memory.data_size(&self.store);
+        if minimum_bytes <= current {
+            return Ok(());
+        }
+        let additional_pages = minimum_bytes
+            .checked_sub(current)
+            .and_then(|bytes| bytes.checked_add(65_535))
+            .ok_or(TrapCode::MemoryOutOfBounds)?
+            / 65_536;
+        memory
+            .grow(&mut self.store, additional_pages as u64)
+            .map_err(|_| TrapCode::MemoryOutOfBounds)?;
+        Ok(())
+    }
+
+    fn memory(&self, instance: usize, export: &str) -> Result<Memory, TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        self.instances
+            .get(instance)
+            .and_then(|instance| instance.instance.get_memory(&self.store, export))
+            .ok_or(TrapCode::Validation)
+    }
+}
+
+fn exact_group_export_type(expected: &ExternType, actual: &ExternType) -> bool {
+    match (expected, actual) {
+        (ExternType::Func(expected), ExternType::Func(actual)) => {
+            expected == actual
+                && expected
+                    .params()
+                    .iter()
+                    .chain(expected.results())
+                    .all(|ty| matches!(ty, ValType::I32 | ValType::I64))
+        }
+        (ExternType::Memory(expected), ExternType::Memory(actual)) => expected == actual,
+        _ => false,
+    }
+}
+
+fn allocation_error() -> AdmissionError {
+    AdmissionError::validation(AdmissionDetail::AllocationReservation)
+}
+
+static NEXT_GROUP_RESERVATION_OWNER: AtomicU32 = AtomicU32::new(1);
+
+fn next_group_reservation_owner() -> Result<u32, AdmissionError> {
+    NEXT_GROUP_RESERVATION_OWNER
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| allocation_error())
+}
+
 struct ActiveCall {
     function: Func,
     inputs: Vec<Val>,
     outputs: Vec<Val>,
-    continuation: Option<ResumableCallOutOfFuel>,
+    /// Reserved before guest execution; terminal result materialization is
+    /// allocation-free even after a host side effect has completed.
+    result_values: Vec<CoreValue>,
+    continuation: Option<ActiveContinuation>,
     remaining_fuel: u64,
     poll_quantum: u64,
     consumed_fuel: u64,
+    /// Fuel explicitly charged by the embedding runtime and therefore
+    /// eligible for a later credit if the pre-reserved work was unused.
+    external_debit: u64,
     started: bool,
     cancelled: bool,
+}
+
+enum ActiveContinuation {
+    OutOfFuel(ResumableCallOutOfFuel),
+    Host {
+        invocation: ResumableCallHostTrap,
+        id: u32,
+        response: Vec<Val>,
+        response_ready: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -897,10 +1871,58 @@ impl ActiveCall {
         }
     }
 
+    fn resume_host_call(
+        &mut self,
+        store: &Store<HostState>,
+        id: u32,
+        results: &[CoreValue],
+    ) -> Result<(), TrapCode> {
+        if self.cancelled {
+            return Err(TrapCode::Cancelled);
+        }
+        let Some(ActiveContinuation::Host {
+            invocation,
+            id: expected_id,
+            response,
+            response_ready,
+        }) = self.continuation.as_mut()
+        else {
+            return Err(TrapCode::Validation);
+        };
+        let marker = invocation
+            .host_error()
+            .downcast_ref::<HostBridgeError>()
+            .ok_or(TrapCode::Validation)?;
+        if marker != &(HostBridgeError::Yield { id: *expected_id })
+            || id != *expected_id
+            || *response_ready
+        {
+            return Err(TrapCode::Validation);
+        }
+        let expected = invocation.host_func().ty(store);
+        if !core_values_match(results, expected.results()) {
+            return Err(TrapCode::Validation);
+        }
+        if response.len() != results.len() {
+            return Err(TrapCode::Validation);
+        }
+        for (slot, value) in response.iter_mut().zip(results.iter().copied()) {
+            *slot = value.into_wasmi();
+        }
+        *response_ready = true;
+        Ok(())
+    }
+
     fn poll(&mut self, store: &mut Store<HostState>) -> PollResult {
         if self.cancelled {
             self.continuation = None;
+            store.data_mut().pending_host = None;
             return PollResult::Trapped(TrapCode::Cancelled);
+        }
+        if store.data().pending_host.is_some() {
+            self.continuation = None;
+            store.data_mut().pending_host = None;
+            return PollResult::Trapped(TrapCode::Validation);
         }
         if self.remaining_fuel == 0 {
             self.continuation = None;
@@ -912,16 +1934,35 @@ impl ActiveCall {
             return PollResult::Trapped(TrapCode::FuelExhausted);
         }
         let call = if let Some(continuation) = self.continuation.take() {
-            if continuation.required_fuel() > grant {
-                return PollResult::Trapped(
-                    if continuation.required_fuel() > self.remaining_fuel {
-                        TrapCode::FuelExhausted
-                    } else {
-                        TrapCode::LimitExceeded
-                    },
-                );
+            match continuation {
+                ActiveContinuation::OutOfFuel(continuation) => {
+                    if continuation.required_fuel() > grant {
+                        return PollResult::Trapped(
+                            if continuation.required_fuel() > self.remaining_fuel {
+                                TrapCode::FuelExhausted
+                            } else {
+                                TrapCode::LimitExceeded
+                            },
+                        );
+                    }
+                    continuation.resume(&mut *store, &mut self.outputs)
+                }
+                ActiveContinuation::Host {
+                    invocation,
+                    id,
+                    response,
+                    response_ready,
+                } => {
+                    let marker = invocation.host_error().downcast_ref::<HostBridgeError>();
+                    if marker != Some(&HostBridgeError::Yield { id }) {
+                        return PollResult::Trapped(TrapCode::Validation);
+                    }
+                    if !response_ready {
+                        return PollResult::Trapped(TrapCode::Validation);
+                    }
+                    invocation.resume(&mut *store, &response, &mut self.outputs)
+                }
             }
-            continuation.resume(&mut *store, &mut self.outputs)
         } else if !self.started {
             self.started = true;
             self.function
@@ -936,14 +1977,15 @@ impl ActiveCall {
         self.remaining_fuel = self.remaining_fuel.saturating_sub(used);
         match call {
             Ok(ResumableCall::Finished) => {
-                let mut values = Vec::with_capacity(self.outputs.len());
+                self.result_values.clear();
                 for value in &self.outputs {
                     let Some(value) = CoreValue::from_wasmi(value) else {
                         return PollResult::Trapped(TrapCode::Validation);
                     };
-                    values.push(value);
+                    debug_assert!(self.result_values.len() < self.result_values.capacity());
+                    self.result_values.push(value);
                 }
-                PollResult::Ready(values)
+                PollResult::Ready(core::mem::take(&mut self.result_values))
             }
             Ok(ResumableCall::OutOfFuel(continuation)) => {
                 if self.remaining_fuel == 0 {
@@ -951,17 +1993,79 @@ impl ActiveCall {
                 } else if continuation.required_fuel() > self.poll_quantum {
                     PollResult::Trapped(TrapCode::LimitExceeded)
                 } else {
-                    self.continuation = Some(continuation);
+                    self.continuation = Some(ActiveContinuation::OutOfFuel(continuation));
                     PollResult::Pending {
                         consumed_fuel: self.consumed_fuel,
                         remaining_fuel: self.remaining_fuel,
                     }
                 }
             }
-            Ok(ResumableCall::HostTrap(_)) => PollResult::Trapped(TrapCode::Validation),
-            Err(error) => PollResult::Trapped(map_wasmi_error(&error)),
+            Ok(ResumableCall::HostTrap(invocation)) => self.suspend_host(store, invocation),
+            Err(error) => {
+                store.data_mut().pending_host = None;
+                PollResult::Trapped(map_wasmi_error(&error))
+            }
         }
     }
+
+    fn suspend_host(
+        &mut self,
+        store: &mut Store<HostState>,
+        invocation: ResumableCallHostTrap,
+    ) -> PollResult {
+        let marker_id = match invocation.host_error().downcast_ref::<HostBridgeError>() {
+            Some(HostBridgeError::Yield { id }) => *id,
+            _ => {
+                store.data_mut().pending_host = None;
+                return PollResult::Trapped(TrapCode::Validation);
+            }
+        };
+        let Some(mailbox) = store.data_mut().pending_host.take() else {
+            return PollResult::Trapped(TrapCode::Validation);
+        };
+        let host_type = invocation.host_func().ty(&*store);
+        if marker_id != mailbox.id
+            || !core_values_match(&mailbox.arguments, host_type.params())
+            || host_type
+                .results()
+                .iter()
+                .any(|ty| !matches!(ty, ValType::I32 | ValType::I64))
+            || self.remaining_fuel == 0
+        {
+            return PollResult::Trapped(if self.remaining_fuel == 0 {
+                TrapCode::FuelExhausted
+            } else {
+                TrapCode::Validation
+            });
+        }
+        let mut response = Vec::new();
+        if response
+            .try_reserve_exact(host_type.results().len())
+            .is_err()
+        {
+            return PollResult::Trapped(TrapCode::LimitExceeded);
+        }
+        response.extend(host_type.results().iter().copied().map(Val::default));
+        self.continuation = Some(ActiveContinuation::Host {
+            invocation,
+            id: marker_id,
+            response,
+            response_ready: false,
+        });
+        PollResult::HostCall(CoreHostCall {
+            origin_instance: mailbox.origin_instance,
+            id: marker_id,
+            arguments: mailbox.arguments,
+        })
+    }
+}
+
+fn core_values_match(values: &[CoreValue], expected: &[ValType]) -> bool {
+    values.len() == expected.len()
+        && values
+            .iter()
+            .zip(expected)
+            .all(|(value, expected)| value.value_type().into_wasmi() == *expected)
 }
 
 pub struct Invocation<'a> {
@@ -977,6 +2081,7 @@ pub enum PollResult {
         consumed_fuel: u64,
         remaining_fuel: u64,
     },
+    HostCall(CoreHostCall),
     Ready(Vec<CoreValue>),
     Trapped(TrapCode),
 }
@@ -996,6 +2101,13 @@ impl Invocation<'_> {
         self.remaining_fuel
     }
 
+    pub fn resume_host_call(&mut self, id: u32, results: &[CoreValue]) -> Result<(), TrapCode> {
+        if self.terminal {
+            return Err(TrapCode::Validation);
+        }
+        self.instance.resume_host_call(id, results)
+    }
+
     pub fn poll(&mut self) -> PollResult {
         if self.terminal {
             return PollResult::Trapped(TrapCode::Cancelled);
@@ -1005,7 +2117,7 @@ impl Invocation<'_> {
             self.consumed_fuel = metrics.consumed_fuel;
             self.remaining_fuel = metrics.remaining_fuel;
         }
-        self.terminal = !matches!(result, PollResult::Pending { .. });
+        self.terminal = !matches!(result, PollResult::Pending { .. } | PollResult::HostCall(_));
         result
     }
 }

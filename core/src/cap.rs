@@ -19,9 +19,10 @@ use core::any::Any;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem;
+use core::num::NonZeroU64;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::heap::{self, OwnerId};
 use vibeos_durable_format::{
@@ -31,6 +32,32 @@ use vibeos_durable_format::{
 
 pub const MAX_PERSISTENT_SLOTS: u32 = 4096;
 pub const CAPABILITY_TABLE_PAGE_SIZE: usize = 4096;
+
+/// Unforgeable process-local identity of one capability space.
+///
+/// Unlike a [`Cap`], this identity is stable across [`CSpace::reset`]. It lets
+/// service adapters reject a cap from another CSpace even when both spaces
+/// happen to contain the same slot and generation in the same incarnation.
+/// The scalar is intentionally private and redacted from diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CSpaceIdentity(NonZeroU64);
+
+impl fmt::Debug for CSpaceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CSpaceIdentity(<redacted>)")
+    }
+}
+
+static NEXT_CSPACE_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_cspace_identity() -> CSpaceIdentity {
+    let raw = NEXT_CSPACE_IDENTITY
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("CSpace identity space exhausted");
+    CSpaceIdentity(NonZeroU64::new(raw).expect("CSpace identity counter reached zero"))
+}
 
 pub type AllocateCapabilityTablePages = fn(page_count: usize) -> *mut u8;
 pub type ProtectCapabilityTablePages = fn(start: usize, page_count: usize, read_only: bool);
@@ -964,6 +991,7 @@ impl fmt::Display for PersistentInstallError {
 /// A task's capability space. Owning one *is* the task's entire authority.
 pub struct CSpace {
     pub name: String,
+    identity: CSpaceIdentity,
     slots: CapTable,
     incarnation: u64,
     persistent_space: Option<SpaceId>,
@@ -985,12 +1013,20 @@ impl CSpace {
         })
     }
 
-    fn publish_slots(&mut self, candidate: Vec<Slot>) {
+    fn prepare_slots(candidate: Vec<Slot>) -> CapTable {
         // The detached candidate is moved into a fresh writable page run under
-        // SYSTEM accounting. Protection completes before the pointer becomes
-        // authoritative; the old backing is retired only after replacement.
-        let next = system_allocation(|| CapTable::from_slots(candidate)).publish_read_only();
-        let retired = mem::replace(&mut self.slots, next);
+        // SYSTEM accounting. Protection completes before it can become an
+        // authoritative CSpace table.
+        system_allocation(|| CapTable::from_slots(candidate)).publish_read_only()
+    }
+
+    fn replace_slots(&mut self, next: CapTable) -> CapTable {
+        mem::replace(&mut self.slots, next)
+    }
+
+    fn publish_slots(&mut self, candidate: Vec<Slot>) {
+        let next = Self::prepare_slots(candidate);
+        let retired = self.replace_slots(next);
         drop(retired);
     }
 
@@ -1588,6 +1624,7 @@ impl CSpace {
     pub fn new(name: &str) -> Self {
         system_allocation(|| Self {
             name: String::from(name),
+            identity: allocate_cspace_identity(),
             slots: CapTable::empty(),
             incarnation: 1,
             persistent_space: None,
@@ -1602,6 +1639,7 @@ impl CSpace {
     pub fn new_persistent(name: &str, space: SpaceId) -> Self {
         system_allocation(|| Self {
             name: String::from(name),
+            identity: allocate_cspace_identity(),
             slots: CapTable::empty(),
             incarnation: 1,
             persistent_space: Some(space),
@@ -1612,6 +1650,11 @@ impl CSpace {
 
     pub const fn persistent_space_id(&self) -> Option<SpaceId> {
         self.persistent_space
+    }
+
+    /// Exact process-local identity of this CSpace allocation.
+    pub const fn identity(&self) -> CSpaceIdentity {
+        self.identity
     }
 
     /// Whether this durable space has been fail-closed after an in-memory
@@ -1900,6 +1943,22 @@ impl CSpace {
         self.collect()
     }
 
+    /// Supervisor-only exact revocation of one volatile capability.
+    ///
+    /// Unlike [`CSpace::revoke_slot`], this validates the complete opaque
+    /// handle, including its generation, before touching the derivation node.
+    /// It is therefore safe for a trusted owner to retire an authority removed
+    /// from an external handle table even if its old CSpace slot was reused.
+    pub fn revoke_exact_admin(&mut self, cap: Cap) -> Result<usize, CapError> {
+        let entry = self.entry(cap)?;
+        if entry.node.persistent.is_some() {
+            return Err(CapError::PersistentLifecycleRequired);
+        }
+        let node = entry.node.clone();
+        node.kill();
+        Ok(self.collect())
+    }
+
     /// Revoke everything in this space. What an operator means by "revoke that
     /// component": not one handle, but all of its authority.
     pub fn revoke_all(&mut self) -> usize {
@@ -2049,4 +2108,57 @@ pub fn grant(src: &CSpace, cap: Cap, rights: Rights, dst: &mut CSpace) -> Result
     };
     dst.publish_slots(candidate);
     Ok(granted)
+}
+
+/// Supervisor-only relocation of one volatile capability between CSpaces.
+///
+/// Unlike [`grant`], this consumes the source slot and preserves the exact
+/// derivation node. Holding both exclusive CSpace guards is the authority to
+/// relocate; the cap does not need `GRANT`. `rights` may only attenuate. Every
+/// fallible validation and target-table construction completes before either
+/// authoritative table is published, so an error leaves the source unchanged.
+pub fn move_cap(
+    src: &mut CSpace,
+    cap: Cap,
+    rights: Rights,
+    dst: &mut CSpace,
+) -> Result<Cap, CapError> {
+    if ptr::eq(src, dst) {
+        return Err(CapError::PersistentLifecycleRequired);
+    }
+    let source_index = cap.slot as usize;
+    let source_entry = src.entry(cap)?;
+    if source_entry.node.persistent.is_some() {
+        return Err(CapError::PersistentLifecycleRequired);
+    }
+    if !source_entry.rights.contains(rights) {
+        return Err(CapError::Amplification);
+    }
+    let moved_entry = Entry {
+        obj: source_entry.obj.clone(),
+        rights,
+        node: source_entry.node.clone(),
+    };
+
+    let mut target_candidate = dst.candidate_slots(1);
+    let target_slot = CSpace::alloc_candidate_slot(&mut target_candidate);
+    target_candidate[target_slot as usize].entry = Some(moved_entry);
+    let moved = Cap {
+        slot: target_slot,
+        generation: target_candidate[target_slot as usize].generation,
+    };
+    let mut source_candidate = src.candidate_slots(0);
+    CSpace::invalidate(&mut source_candidate[source_index]);
+
+    // Prepare and protect both page runs before either CSpace changes. Once
+    // both preparations succeed, the two swaps are allocation-free and
+    // infallible. A preparation failure is fail-stop before publication and
+    // therefore cannot leave two live copies or consume only the source.
+    let target_next = CSpace::prepare_slots(target_candidate);
+    let source_next = CSpace::prepare_slots(source_candidate);
+    let target_retired = dst.replace_slots(target_next);
+    let source_retired = src.replace_slots(source_next);
+    drop(target_retired);
+    drop(source_retired);
+    Ok(moved)
 }

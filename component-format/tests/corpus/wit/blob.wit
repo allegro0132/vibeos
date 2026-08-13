@@ -1,0 +1,8 @@
+package vibe:blob@1.0.0;
+
+interface blob {
+    resource blob;
+    enum blob-error { denied, invalid, failed }
+    len: func(blob: borrow<blob>) -> u64;
+    read: func(blob: borrow<blob>, offset: u64, len: u32) -> result<list<u8>, blob-error>;
+}

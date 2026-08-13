@@ -1,5 +1,8 @@
 const WORLD: &str = include_str!("corpus/wit/world.wit");
 const RESOURCES: &str = include_str!("corpus/wit/resources.wit");
+const CLOCK: &str = include_str!("corpus/wit/clock.wit");
+const BLOB: &str = include_str!("corpus/wit/blob.wit");
+const LOG: &str = include_str!("corpus/wit/log.wit");
 const VALID_CORE: &str = include_str!("corpus/core/integer.wat");
 const LIMIT_CORE: &str = include_str!("corpus/core/limits.wat");
 const UNSUPPORTED_CORE: &str = include_str!("corpus/core/unsupported-float.wat");
@@ -22,6 +25,28 @@ fn corpus_covers_the_profile_contract() {
             WORLD.contains(marker) || RESOURCES.contains(marker),
             "{marker}"
         );
+    }
+    for marker in [
+        "package vibe:clock@1.0.0",
+        "now: func(clock: borrow<clock>) -> u64",
+    ] {
+        assert!(CLOCK.contains(marker), "{marker}");
+    }
+    for marker in [
+        "package vibe:blob@1.0.0",
+        "len: func(blob: borrow<blob>) -> u64",
+        "read: func(blob: borrow<blob>, offset: u64, len: u32)",
+        "enum blob-error { denied, invalid, failed }",
+    ] {
+        assert!(BLOB.contains(marker), "{marker}");
+    }
+    for marker in [
+        "package vibe:log@1.0.0",
+        "record event",
+        "write: func(log: borrow<structured-log>, event: event)",
+        "enum log-error { denied, invalid, failed }",
+    ] {
+        assert!(LOG.contains(marker), "{marker}");
     }
     assert!(VALID_CORE.contains("i32.add"));
     assert!(LIMIT_CORE.contains("memory 1 256"));

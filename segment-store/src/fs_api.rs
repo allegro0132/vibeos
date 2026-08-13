@@ -8,13 +8,16 @@ use alloc::vec::Vec;
 use vibeos_segment_format::PAGE_SIZE;
 
 use crate::authority::AuthorizedObject;
-use crate::cas::{recover_persistent_cas_object, CasObjectHandle, CasStoreError};
+use crate::cas::{
+    recover_persistent_cas_object, recover_promotable_cas_object, CasObjectHandle, CasStoreError,
+};
 use crate::cas_codec::{ObjectMapping, REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW};
 use crate::device::PageDevice;
 use crate::gc::GcStoreError;
 use crate::{
-    encode_fs_btree_node_v1, encode_fs_root_v1, FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError,
-    FsRootV1, FsTreeKind, SegmentStore, StoreError, TypedObjectReference, FS_BTREE_NODE_V1_KIND,
+    decode_fs_btree_node_v1, encode_fs_btree_node_v1, encode_fs_root_v1, FsBtreeEntryV1,
+    FsBtreeNodeV1, FsCodecError, FsRootV1, FsTreeKind, SegmentStore, StoreError,
+    TypedObjectReference, FS_BTREE_MAX_HEIGHT, FS_BTREE_NODE_V1_KIND, FS_DATA_V1_KIND,
     FS_ROOT_V1_KIND,
 };
 
@@ -85,6 +88,27 @@ pub struct FsPersistentRoot {
     decoded: FsRootV1,
 }
 
+#[derive(Clone)]
+pub struct FsPersistentData {
+    object: Arc<AuthorizedObject<CasObjectHandle>>,
+}
+
+impl FsPersistentData {
+    pub fn exact_len(&self) -> u64 {
+        self.object.exact_len()
+    }
+
+    pub fn chunk_count(&self) -> u64 {
+        self.object.exact_len().div_ceil(PAGE_SIZE as u64)
+    }
+}
+
+pub struct FsPersistentTreeEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub content: Option<FsPersistentData>,
+}
+
 impl FsPersistentRoot {
     pub const fn namespace_uuid(&self) -> u128 {
         self.decoded.namespace_uuid
@@ -101,6 +125,47 @@ impl FsPersistentRoot {
 }
 
 impl<D: PageDevice> SegmentStore<D> {
+    fn recover_fs_reference(
+        &self,
+        reference: TypedObjectReference,
+        expected_kind: u32,
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsRootPublishError<D::Error>> {
+        if reference.object_kind != expected_kind {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        let mapping = self
+            .require_current_generation()?
+            .cas
+            .as_ref()
+            .and_then(|cas| {
+                cas.objects
+                    .binary_search_by_key(&reference.object_id, |item| item.object_id)
+                    .ok()
+                    .map(|index| cas.objects[index])
+            })
+            .filter(|mapping| {
+                mapping.commit_generation == reference.commit_generation
+                    && mapping.blob_key.object_kind() == expected_kind
+                    && match expected_kind {
+                        FS_BTREE_NODE_V1_KIND => mapping.reference_codec == REFERENCE_CODEC_FS_V1,
+                        FS_DATA_V1_KIND => mapping.reference_codec == REFERENCE_CODEC_RAW,
+                        _ => false,
+                    }
+            })
+            .ok_or(FsRootPublishError::InvalidRoot)?;
+        Ok(Arc::new(
+            recover_promotable_cas_object(
+                self.require_current_generation()?
+                    .superblock
+                    .binding
+                    .store_uuid,
+                mapping,
+                &self.pins,
+            )
+            .map_err(|_| StoreError::ObjectUnavailable)?,
+        ))
+    }
+
     fn fs_reference_for(
         &self,
         child: &AuthorizedObject<CasObjectHandle>,
@@ -369,6 +434,87 @@ impl<D: PageDevice> SegmentStore<D> {
             _object: object,
             decoded,
         }))
+    }
+
+    /// Traverse only typed children reachable from the supplied opaque root.
+    /// The caller chooses a fixed entry budget before any allocation growth.
+    pub async fn read_fs_tree(
+        &self,
+        root: &FsPersistentRoot,
+        tree: FsTreeKind,
+        max_entries: usize,
+    ) -> Result<Vec<FsPersistentTreeEntry>, FsRootPublishError<D::Error>> {
+        let reference = match tree {
+            FsTreeKind::Inode => root.decoded.inode_tree,
+            FsTreeKind::Dirent => root.decoded.dirent_tree,
+        };
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(1)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        pending.push((reference, None::<Vec<u8>>));
+        let mut output = Vec::new();
+        while let Some((reference, expected_minimum)) = pending.pop() {
+            let object = self.recover_fs_reference(reference, FS_BTREE_NODE_V1_KIND)?;
+            let node = decode_fs_btree_node_v1(&self.read_fs_object_bytes(&object).await?)?;
+            if node.tree != tree
+                || node.level > FS_BTREE_MAX_HEIGHT
+                || node.commit_generation > root.decoded.commit_generation
+                || expected_minimum.as_ref().is_some_and(|minimum| {
+                    node.entries.first().map(|entry| &entry.key) != Some(minimum)
+                })
+            {
+                return Err(FsRootPublishError::InvalidRoot);
+            }
+            if node.level == 0 {
+                if output.len().saturating_add(node.entries.len()) > max_entries {
+                    return Err(StoreError::MemoryLimit.into());
+                }
+                output
+                    .try_reserve(node.entries.len())
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                for entry in node.entries {
+                    let content = match entry.reference {
+                        Some(reference) => Some(FsPersistentData {
+                            object: self.recover_fs_reference(reference, FS_DATA_V1_KIND)?,
+                        }),
+                        None => None,
+                    };
+                    output.push(FsPersistentTreeEntry {
+                        key: entry.key,
+                        value: entry.value,
+                        content,
+                    });
+                }
+            } else {
+                if pending.len().saturating_add(node.entries.len()) > max_entries.max(1) {
+                    return Err(StoreError::MemoryLimit.into());
+                }
+                pending
+                    .try_reserve(node.entries.len())
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                for entry in node.entries.into_iter().rev() {
+                    let child = entry.reference.ok_or(FsRootPublishError::InvalidRoot)?;
+                    pending.push((child, Some(entry.key)));
+                }
+            }
+        }
+        if output.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        Ok(output)
+    }
+
+    pub async fn read_fs_data_chunk(
+        &self,
+        data: &FsPersistentData,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>, FsRootPublishError<D::Error>> {
+        if index >= data.chunk_count() {
+            return Ok(None);
+        }
+        let index = u32::try_from(index).map_err(|_| FsRootPublishError::InvalidRoot)?;
+        Ok(Some(self.get_blob_chunk(&data.object, index).await?.bytes))
     }
 }
 

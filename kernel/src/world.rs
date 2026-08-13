@@ -473,6 +473,8 @@ pub struct World {
     /// init's client authority on the discovered block service. The transport
     /// and DMA roots remain private supervisor grants.
     pub block: Option<Cap>,
+    #[cfg(not(feature = "legacy-shell"))]
+    pub vsh_block: Option<Cap>,
     /// init's authority on the capability-addressed persistent object service.
     pub store: Option<Cap>,
     /// init's explicit operation capability for the fixed durable `hello`
@@ -1992,6 +1994,7 @@ pub fn build() {
 
     let (
         block_root,
+        vsh_block_root,
         store_block_grants,
         block_mmio_root,
         block_dma_root,
@@ -2060,6 +2063,18 @@ pub fn build() {
                 &mut cs,
             )
             .unwrap();
+            #[cfg(not(feature = "legacy-shell"))]
+            let vsh_diagnostic = Some(
+                cap::grant(
+                    &policy,
+                    diagnostic_policy,
+                    Rights::READ.union(Rights::GRANT),
+                    &mut vsh.0.lock(),
+                )
+                .expect("local vsh receives one delegatable diagnostic block range"),
+            );
+            #[cfg(feature = "legacy-shell")]
+            let vsh_diagnostic: Option<Cap> = None;
 
             // The old boot remains writable before migration. Explicit V2
             // activation revokes this private grant; it is never copied into a
@@ -2150,6 +2165,7 @@ pub fn build() {
             drop(target);
             (
                 Some(diagnostic),
+                vsh_diagnostic,
                 Some(StoreBlockGrants {
                     legacy_active,
                     legacy_read,
@@ -2162,7 +2178,7 @@ pub fn build() {
                 Some(grants),
             )
         }
-        (None, None, None, None) => (None, None, None, None, None, None),
+        (None, None, None, None) => (None, None, None, None, None, None, None),
         _ => unreachable!("block resources, policy, backend, and CSpace are constructed together"),
     };
     let (
@@ -2754,7 +2770,14 @@ pub fn build() {
         (None, None, None, None) => None,
         _ => unreachable!("iperf3 app grants exist exactly with both listeners"),
     };
-    let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root, storage_v2, storage_migration) = match (
+    let (
+        store_root,
+        durable_cspace_root,
+        durable_cspace_service,
+        saved_program_root,
+        storage_v2,
+        storage_migration,
+    ) = match (
         store_block_grants,
         store_backend.as_ref(),
         persistent_test.as_ref(),
@@ -2938,6 +2961,8 @@ pub fn build() {
         prog_memory: prog_mem,
         region: init_region,
         block: block_root,
+        #[cfg(not(feature = "legacy-shell"))]
+        vsh_block: vsh_block_root,
         store: store_root,
         saved_program: saved_program_root,
         durable_cspace: durable_cspace_root,

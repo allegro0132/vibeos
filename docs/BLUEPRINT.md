@@ -24,7 +24,11 @@ Unix decided that reaching a resource means *naming* it (a path, a pid, a uid) a
 asking a global policy oracle for permission. Every confused-deputy bug lives in the
 gap between the name you asked about and the object you got.
 
-VibeOS has no global namespace. No paths, no uids, no root, no ambient authority.
+VibeOS has no global namespace. No ambient paths, no uids, no superuser, no
+ambient authority. A path-like selector may exist only *inside an already-held
+capability*: `@home/etc/config` first selects the literal `home` capability and
+then selects `etc/config` below that authority boundary. The selector is not
+authority and cannot be resolved without the capability.
 A component acts on a resource only by presenting a handle from its own capability
 space, and every operation names the rights it requires.
 
@@ -640,8 +644,10 @@ Stated so they stop being re-litigated:
 
 - **POSIX compatibility.** The entire point is that the POSIX object model is what
   we are replacing. A compatibility layer would reintroduce ambient authority.
-- **A path-based filesystem.** Persistence, when it arrives, is capability-addressed
-  (§Roadmap M4). Paths are a global namespace by another name.
+- **An ambient path-based filesystem.** Persistence is capability-addressed
+  (§Roadmap M4). VibeOS may expose relative selectors within an explicit
+  `FileTreeRoot`, but there is no global `/`, cwd, `PATH`, `~`, mount namespace,
+  or string-to-authority conversion.
 - **Per-process page tables.** The MMU is wanted eventually for *integrity* — guard
   pages, W^X — not for isolation.
 - **A general-purpose Rust compiler.** The in-kernel compiler exists to explore

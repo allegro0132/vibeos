@@ -602,6 +602,11 @@ pub extern "C" fn kmain() -> ! {
         let space = world.spaces["vsh"].clone();
         let mut session = vsh::Session::with_cspace(space.0.clone());
         vsh_platform::install_standard_commands(&mut session);
+        if let Some(block) = world.vsh_block {
+            session
+                .bind_capability("diagnostic", block)
+                .expect("fixed vsh block binding name is valid");
+        }
         #[cfg(feature = "tcp-echo-recovery-test")]
         session.install_host_command("tcp-fault", 0, 0, netstack_platform::vsh_inject_fault);
         #[cfg(feature = "tcp-echo-recovery-test")]

@@ -380,6 +380,32 @@ impl Packet {
         })
     }
 
+    /// Construct a frame directly in its owned fixed-size storage.
+    ///
+    /// This is intended for packet producers such as a protocol stack whose
+    /// serializer already writes every logical byte. The unused tail remains
+    /// zeroed, preserving the same representation invariant as [`copy_from`].
+    pub fn write_with<R>(
+        len: usize,
+        write: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<(Self, R), PacketError> {
+        if len == 0 {
+            return Err(PacketError::Empty);
+        }
+        if len > Self::MAX_LEN {
+            return Err(PacketError::TooLong {
+                len,
+                max: Self::MAX_LEN,
+            });
+        }
+        let mut packet = Self {
+            bytes: [0; MAX_PACKET_LEN],
+            len: len as u16,
+        };
+        let result = write(&mut packet.bytes[..len]);
+        Ok((packet, result))
+    }
+
     /// Number of meaningful frame bytes.
     pub const fn len(&self) -> usize {
         self.len as usize

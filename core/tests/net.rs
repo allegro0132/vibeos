@@ -70,6 +70,30 @@ fn packet_rejects_zero_and_every_representative_oversize() {
 }
 
 #[test]
+fn packet_writer_constructs_directly_and_preserves_bounds() {
+    let (packet, marker) = Packet::write_with(64, |bytes| {
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        7u8
+    })
+    .unwrap();
+    assert_eq!(marker, 7);
+    assert_eq!(packet.len(), 64);
+    assert_eq!(packet.as_bytes()[0], 0);
+    assert_eq!(packet.as_bytes()[63], 63);
+
+    assert_eq!(Packet::write_with(0, |_| ()), Err(PacketError::Empty));
+    assert_eq!(
+        Packet::write_with(Packet::MAX_LEN + 1, |_| ()),
+        Err(PacketError::TooLong {
+            len: Packet::MAX_LEN + 1,
+            max: Packet::MAX_LEN,
+        })
+    );
+}
+
+#[test]
 fn packet_storage_is_exactly_payload_plus_u16_length() {
     assert_eq!(Packet::MAX_LEN, MAX_ETHERNET_FRAME_LEN);
     assert_eq!(Packet::MAX_LEN, MAX_PACKET_LEN);

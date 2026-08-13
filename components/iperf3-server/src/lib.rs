@@ -22,6 +22,7 @@ pub const MAX_CONTROL_JSON_BYTES: usize = 4 * 1024;
 pub const MAX_TEST_SECONDS: u64 = 60;
 
 const IO_CHUNK_BYTES: usize = 32 * 1024;
+static TEST_PAYLOAD: [u8; IO_CHUNK_BYTES] = [0xa5; IO_CHUNK_BYTES];
 const IDLE_POLL_MS: u64 = 1;
 const TEST_END_GRACE_MS: u64 = 5_000;
 
@@ -440,8 +441,7 @@ impl Server {
         // iperf3 measures byte transport and does not validate payload entropy.
         // A fixed pattern avoids spending three xorshift operations per byte on
         // the small core while retaining a full-sized, deterministic payload.
-        let payload = [0xa5u8; IO_CHUNK_BYTES];
-        match space.tcp_send(listener, connection, &payload)? {
+        match space.tcp_send(listener, connection, &TEST_PAYLOAD)? {
             TcpIoResult::Progress(length) => {
                 self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);
                 Ok(length != 0)

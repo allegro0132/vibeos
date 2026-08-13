@@ -333,9 +333,9 @@ impl TcpListener {
         if length == 0 {
             return Ok(TcpIoResult::WouldBlock);
         }
-        inner
-            .transmit
-            .extend(input[..length].iter().copied());
+        // Passing the slice iterator directly selects VecDeque's specialized
+        // wrapped bulk-copy implementation for Copy elements.
+        inner.transmit.extend(&input[..length]);
         Ok(TcpIoResult::Progress(length))
     }
 
@@ -398,7 +398,7 @@ impl TcpListener {
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
             .min(self.receive_capacity.saturating_sub(inner.receive.len()));
-        inner.receive.extend(input[..length].iter().copied());
+        inner.receive.extend(&input[..length]);
         length
     }
 

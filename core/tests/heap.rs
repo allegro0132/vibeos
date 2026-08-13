@@ -216,7 +216,8 @@ fn domain_scopes_restore_both_owner_and_arena() {
     assert_eq!(current_domain(), AllocationDomain::new(owner, arena));
 
     outer.restore();
-    h.close_empty_arena(arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
     assert_eq!(current_domain(), AllocationDomain::SYSTEM);
 }
@@ -259,8 +260,8 @@ fn owner_and_arena_scopes_are_isolated_by_hart() {
     first_scope.restore();
     assert_eq!(current_domain(), AllocationDomain::SYSTEM);
 
-    h.close_empty_arena(first_arena).unwrap();
-    h.close_empty_arena(second_arena).unwrap();
+    h.close_empty_domain(first_domain).unwrap();
+    h.close_empty_domain(second_domain).unwrap();
     h.unregister_owner(first_owner).unwrap();
     h.unregister_owner(second_owner).unwrap();
 }
@@ -582,6 +583,68 @@ fn owner_slots_unregister_only_after_provenance_is_gone() {
 }
 
 #[test]
+fn empty_domain_close_rejects_wrong_owner_without_consuming_arena() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(4096).unwrap();
+    let wrong_owner = h.create_owner(4096).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let before = h.arena_stats(arena).unwrap();
+
+    assert_eq!(
+        h.close_empty_domain(AllocationDomain::new(wrong_owner, arena)),
+        Err(ArenaError::OwnerMismatch {
+            expected: wrong_owner,
+            actual: owner,
+        })
+    );
+    assert_eq!(h.arena_stats(arena), Some(before));
+
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
+    h.unregister_owner(owner).unwrap();
+    h.unregister_owner(wrong_owner).unwrap();
+}
+
+#[test]
+fn fault_reclaim_rejects_wrong_owner_without_touching_allocation() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(8192).unwrap();
+    let wrong_owner = h.create_owner(8192).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let allocation = layout(48, 16);
+    let pointer = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { h.alloc(allocation) }
+    };
+    assert!(!pointer.is_null());
+    unsafe { pointer.write(0x6d) };
+    let arena_before = h.arena_stats(arena).unwrap();
+    let owner_before = h.account_stats(owner).unwrap();
+    let heap_before = h.stats();
+
+    assert_eq!(
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(wrong_owner, arena)) },
+        Err(ArenaError::OwnerMismatch {
+            expected: wrong_owner,
+            actual: owner,
+        })
+    );
+    assert_eq!(h.arena_stats(arena), Some(arena_before));
+    assert_eq!(h.account_stats(owner), Some(owner_before));
+    assert_eq!(h.stats(), heap_before);
+    assert_eq!(unsafe { pointer.read() }, 0x6d);
+
+    let reclaimed =
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
+    assert_eq!(reclaimed.reclaimed_allocations, 1);
+    assert_eq!(h.arena_stats(arena), None);
+    h.unregister_owner(owner).unwrap();
+    h.unregister_owner(wrong_owner).unwrap();
+}
+
+#[test]
 fn arenas_isolate_incarnations_under_one_owner() {
     let _serial = serial();
     let h = heap_of(128 * 1024);
@@ -603,7 +666,8 @@ fn arenas_isolate_incarnations_under_one_owner() {
     unsafe { second_ptr.write(0xA7) };
     assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge * 2);
 
-    let reclaimed = unsafe { h.reclaim_faulted_arena(first) }.unwrap();
+    let reclaimed =
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, first)) }.unwrap();
     assert_eq!(reclaimed.reclaimed_bytes, charge);
     assert_eq!(reclaimed.reclaimed_allocations, 1);
     assert_eq!(h.arena_stats(first), None);
@@ -616,7 +680,8 @@ fn arenas_isolate_incarnations_under_one_owner() {
     );
 
     unsafe { h.dealloc(second_ptr, l) };
-    h.close_empty_arena(second).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, second))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -643,7 +708,8 @@ fn tracked_deallocation_unlinks_head_middle_and_tail() {
         0,
         "all intrusive links were removed"
     );
-    h.close_empty_arena(arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -661,7 +727,8 @@ fn fault_reclaim_returns_every_block_to_its_size_class() {
     };
     assert!(pointers.iter().all(|pointer| !pointer.is_null()));
 
-    let reclaimed = unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    let reclaimed =
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
     assert_eq!(reclaimed.reclaimed_bytes, charge * pointers.len());
     assert_eq!(reclaimed.reclaimed_allocations, pointers.len());
     assert_eq!(h.account_stats(owner).unwrap().live_bytes, 0);
@@ -680,7 +747,8 @@ fn fault_reclaim_returns_every_block_to_its_size_class() {
     for pointer in replacements {
         unsafe { h.dealloc(pointer, l) };
     }
-    h.close_empty_arena(replacement_arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, replacement_arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -698,7 +766,7 @@ fn fault_reclaim_scrubs_payload_before_same_address_reuse() {
     assert!(!abandoned.is_null());
     unsafe { abandoned.write_bytes(0xa5, l.size()) };
 
-    unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
     let replacement_arena = h.create_arena(owner).unwrap();
     let replacement = {
         let _scope = unsafe { enter_domain(AllocationDomain::new(owner, replacement_arena)) };
@@ -712,7 +780,8 @@ fn fault_reclaim_scrubs_payload_before_same_address_reuse() {
     );
 
     unsafe { h.dealloc(replacement, l) };
-    h.close_empty_arena(replacement_arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, replacement_arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -729,7 +798,7 @@ fn busy_or_active_arenas_block_close_and_owner_unregister() {
     };
 
     assert!(matches!(
-        h.close_empty_arena(arena),
+        h.close_empty_domain(AllocationDomain::new(owner, arena)),
         Err(ArenaError::ArenaBusy {
             live_allocations: 1,
             ..
@@ -748,7 +817,8 @@ fn busy_or_active_arenas_block_close_and_owner_unregister() {
         h.unregister_owner(owner),
         Err(OwnerError::ArenasActive { active_arenas: 1 })
     );
-    h.close_empty_arena(arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -770,12 +840,12 @@ fn arena_reclaim_never_touches_untracked_owner_allocations() {
     };
     unsafe { untracked.write(0x5C) };
 
-    unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
     assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge);
     assert_eq!(unsafe { untracked.read() }, 0x5C);
     assert_eq!(h.arena_stats(ArenaId::UNTRACKED), None);
     assert_eq!(
-        unsafe { h.reclaim_faulted_arena(ArenaId::UNTRACKED) },
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, ArenaId::UNTRACKED)) },
         Err(ArenaError::UntrackedArenaReserved)
     );
 

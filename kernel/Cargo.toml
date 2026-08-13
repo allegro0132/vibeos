@@ -11,6 +11,7 @@ milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vib
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
+file-tree = ["dep:vibeos-file-store", "vibeos-vsh/file-tree"]
 # Dedicated N1 acceptance image: static IPv4 plus one bounded TCP echo
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
@@ -123,6 +124,7 @@ vibeos-segment-format = { path = "../segment-format" }
 vibeos-segment-store = { path = "../segment-store" }
 vibeos-storage-device = { path = "../storage-device" }
 vibeos-authority-store = { path = "../services/authority-store" }
+vibeos-file-store = { path = "../services/file-store", optional = true }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }
 vibeos-iperf3-server = { path = "../components/iperf3-server", optional = true }
 vibeos-net-api = { path = "../components/net-api", optional = true }

@@ -18,7 +18,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use vibeos_core::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
+use vibeos_core::cap::{self, CSpace, Cap, CapError, InvocationLease, Resource, Revocable, Rights};
 use vibeos_core::exec::{self, TaskHandle, TaskState, WaitQueue};
 use vibeos_core::sync::SpinLock;
 
@@ -83,7 +83,18 @@ pub struct Word {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Argument {
     Word(Word),
-    Capability { name: String, span: Span },
+    Capability {
+        name: String,
+        span: Span,
+    },
+    /// A selector whose authority-bearing root was present literally in shell
+    /// source. Only `tail` is subject to value expansion; expansion can never
+    /// manufacture `root`.
+    CapabilityPath {
+        root: String,
+        tail: Word,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +188,7 @@ enum Operator {
 enum TokenKind {
     Word(Word),
     Cap(String),
+    CapPath { root: String, tail: Word },
     Op(Operator),
 }
 
@@ -268,7 +280,15 @@ fn lex(source: &str, max_input_bytes: usize) -> Result<Vec<Token>, Diagnostic> {
             while i < bytes.len() && is_name_continue(bytes[i]) {
                 i += 1;
             }
-            if i == bytes.len() || is_delimiter(bytes[i]) {
+            if bytes.get(i) == Some(&b'/') {
+                let root = source[start + 1..i].to_string();
+                i += 1;
+                let tail = lex_word(source, &mut i)?;
+                out.push(Token {
+                    kind: TokenKind::CapPath { root, tail },
+                    span: Span { start, end: i },
+                });
+            } else if i == bytes.len() || is_delimiter(bytes[i]) {
                 out.push(Token {
                     kind: TokenKind::Cap(source[start + 1..i].to_string()),
                     span: Span { start, end: i },
@@ -538,7 +558,7 @@ pub fn validate_ssh_exec(source: &str) -> Result<(), Diagnostic> {
                     "SSH exec substitution is not allowed",
                 ));
             }
-            Argument::Capability { span, .. } => {
+            Argument::Capability { span, .. } | Argument::CapabilityPath { span, .. } => {
                 return Err(Diagnostic::new(
                     span.start,
                     span.end,
@@ -935,6 +955,15 @@ impl Parser {
                         span: next.span,
                     });
                 }
+                TokenKind::CapPath { root, tail } => {
+                    self.at += 1;
+                    end = next.span.end;
+                    args.push(Argument::CapabilityPath {
+                        root,
+                        tail,
+                        span: next.span,
+                    });
+                }
                 TokenKind::Op(op @ (Operator::In | Operator::Out | Operator::Err)) => {
                     self.at += 1;
                     let target = self.take().ok_or_else(|| {
@@ -1035,10 +1064,86 @@ pub enum StreamMode {
     Closed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum ArgumentMode {
     ValuesOnly,
     ValuesOrCapabilities,
+    CapabilityPaths(CapabilityPathPlanner),
+    BoundResources(BoundResourcePlanner),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpandedArgument {
+    Value {
+        value: String,
+        span: Span,
+    },
+    CapabilityPath {
+        root: String,
+        tail: String,
+        span: Span,
+    },
+}
+
+impl ExpandedArgument {
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Self::Value { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+    pub fn path(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::CapabilityPath { root, tail, .. } => Some((root, tail)),
+            _ => None,
+        }
+    }
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Value { span, .. } | Self::CapabilityPath { span, .. } => *span,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathRequirement {
+    pub argument: usize,
+    pub rights: Rights,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannerError {
+    pub span: Span,
+    pub message: &'static str,
+}
+
+pub type CapabilityPathPlanner =
+    fn(&[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundResourcePlan {
+    pub kind: &'static str,
+    pub rights: Rights,
+    pub explicit_arguments: Vec<usize>,
+    pub enumerate_if_empty: bool,
+}
+
+pub type BoundResourcePlanner = fn(&[ExpandedArgument]) -> Result<BoundResourcePlan, PlannerError>;
+
+#[derive(Clone, Debug)]
+pub enum ResolvedArgument {
+    Value(String),
+    CapabilityPath {
+        root: Cap,
+        label: String,
+        tail: String,
+        rights: Rights,
+    },
+    CapabilityBinding {
+        resource: Cap,
+        label: String,
+        writable: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1067,6 +1172,42 @@ enum Applet {
     Spin,
     Host(fn(&[String]) -> Result<String, Status>),
     AsyncHost(fn(Vec<String>) -> crate::AsyncCommandFuture),
+    CapabilityHost(fn(CapabilityCommandContext) -> crate::CapabilityCommandFuture),
+}
+
+pub struct CapabilityCommandContext {
+    pub args: Vec<ResolvedArgument>,
+    cspace: Arc<SpinLock<CSpace>>,
+    stdin: LocalIo,
+    stdout: LocalIo,
+    job: JobControl,
+}
+
+impl CapabilityCommandContext {
+    pub fn lookup<T: Resource>(
+        &self,
+        cap: Cap,
+        rights: Rights,
+    ) -> Result<InvocationLease<T>, Status> {
+        self.cspace
+            .lock()
+            .lookup_lease::<T>(cap, rights)
+            .map_err(|_| Status::Denied)
+    }
+    pub async fn read_stdin_chunk(&self) -> Result<Option<Vec<u8>>, Status> {
+        read_chunk(&self.cspace, &self.stdin).await
+    }
+    pub async fn write_stdout(&self, bytes: Vec<u8>) -> Status {
+        write_all(&self.cspace, &self.stdout, bytes, &self.job).await
+    }
+    pub fn block_range_info(&self, cap: Cap) -> Result<vibeos_core::cap::BlockRangeInfo, Status> {
+        self.cspace
+            .lock()
+            .lookup(cap, Rights::READ)
+            .map_err(|_| Status::Denied)?
+            .block_range_info()
+            .ok_or(Status::Faulted)
+    }
 }
 
 pub struct Command {
@@ -1404,6 +1545,7 @@ struct PlannedStage {
     cspace: Arc<SpinLock<CSpace>>,
     command: Cap,
     args: Vec<String>,
+    resolved_args: Option<Vec<ResolvedArgument>>,
     stdin: LocalIo,
     stdout: LocalIo,
     _stderr: LocalIo,
@@ -1647,6 +1789,74 @@ impl Session {
             StreamMode::Closed,
             false,
         );
+    }
+
+    pub fn install_capability_host_command(
+        &mut self,
+        name: &'static str,
+        min_args: usize,
+        max_args: usize,
+        stdin: StreamMode,
+        planner: CapabilityPathPlanner,
+        command: fn(CapabilityCommandContext) -> crate::CapabilityCommandFuture,
+    ) {
+        if self.profile == SessionProfile::SshExec {
+            return;
+        }
+        let resource = Arc::new(Command {
+            manifest: CommandManifest {
+                name,
+                abi: 1,
+                min_args,
+                max_args,
+                argument_mode: ArgumentMode::CapabilityPaths(planner),
+                stdin,
+                stdout: StreamMode::Required,
+                stderr: StreamMode::Optional,
+                memory_bytes: DEFAULT_STAGE_MEMORY,
+                operation_budget: 65_536,
+                early_close_is_success: false,
+            },
+            applet: Applet::CapabilityHost(command),
+        });
+        let cap = self.cspace.lock().mint(
+            resource,
+            Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
+        );
+        self.commands.insert(name.to_string(), cap);
+    }
+    pub fn install_bound_resource_command(
+        &mut self,
+        name: &'static str,
+        min_args: usize,
+        max_args: usize,
+        planner: BoundResourcePlanner,
+        command: fn(CapabilityCommandContext) -> crate::CapabilityCommandFuture,
+    ) {
+        if self.profile == SessionProfile::SshExec {
+            return;
+        }
+        let resource = Arc::new(Command {
+            manifest: CommandManifest {
+                name,
+                abi: 1,
+                min_args,
+                max_args,
+                argument_mode: ArgumentMode::BoundResources(planner),
+                stdin: StreamMode::Closed,
+                stdout: StreamMode::Required,
+                stderr: StreamMode::Optional,
+                memory_bytes: DEFAULT_STAGE_MEMORY,
+                operation_budget: 65_536,
+                early_close_is_success: false,
+            },
+            applet: Applet::CapabilityHost(command),
+        });
+        let cap = self.cspace.lock().mint(
+            resource,
+            Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
+        );
+        self.commands.insert(name.to_string(), cap);
     }
     pub fn set_value(&mut self, name: &str, value: &str) -> Result<(), Diagnostic> {
         if !valid_name(name) {
@@ -2121,7 +2331,7 @@ impl Session {
         for arg in &command.args {
             match arg {
                 Argument::Word(word) => args.push(self.expand_word(word).await?),
-                Argument::Capability { span, .. } => {
+                Argument::Capability { span, .. } | Argument::CapabilityPath { span, .. } => {
                     return Err(Diagnostic::new(
                         span.start,
                         span.end,
@@ -2403,6 +2613,7 @@ impl Session {
                 ));
             }
             let mut args = Vec::new();
+            let mut expanded_arguments = Vec::new();
             let mut expanded_bytes = 0usize;
             for arg in &command_ast.args {
                 match arg {
@@ -2416,18 +2627,62 @@ impl Session {
                                     "expanded argument size overflow",
                                 )
                             })?;
-                        args.push(value);
+                        args.push(value.clone());
+                        expanded_arguments.push(ExpandedArgument::Value {
+                            value,
+                            span: word.span,
+                        });
                     }
-                    Argument::Capability { span, .. } => {
-                        return Err(Diagnostic::new(
-                            span.start,
-                            span.end,
-                            "command accepts value arguments only",
-                        ))
+                    Argument::Capability { name, span } => {
+                        if matches!(
+                            manifest.argument_mode,
+                            ArgumentMode::CapabilityPaths(_) | ArgumentMode::BoundResources(_)
+                        ) {
+                            expanded_arguments.push(ExpandedArgument::CapabilityPath {
+                                root: name.clone(),
+                                tail: String::new(),
+                                span: *span,
+                            });
+                        } else {
+                            return Err(Diagnostic::new(
+                                span.start,
+                                span.end,
+                                "command accepts value arguments only",
+                            ));
+                        }
+                    }
+                    Argument::CapabilityPath { root, tail, span } => {
+                        if matches!(
+                            manifest.argument_mode,
+                            ArgumentMode::CapabilityPaths(_) | ArgumentMode::BoundResources(_)
+                        ) {
+                            let value = self.expand_word(tail).await?;
+                            expanded_bytes =
+                                expanded_bytes.checked_add(value.len()).ok_or_else(|| {
+                                    Diagnostic::new(
+                                        span.start,
+                                        span.end,
+                                        "expanded argument size overflow",
+                                    )
+                                })?;
+                            expanded_arguments.push(ExpandedArgument::CapabilityPath {
+                                root: root.clone(),
+                                tail: value,
+                                span: *span,
+                            });
+                        } else {
+                            return Err(Diagnostic::new(
+                                span.start,
+                                span.end,
+                                "command accepts value arguments only",
+                            ));
+                        }
                     }
                 }
             }
-            if args.len() < manifest.min_args || args.len() > manifest.max_args {
+            if expanded_arguments.len() < manifest.min_args
+                || expanded_arguments.len() > manifest.max_args
+            {
                 return Err(Diagnostic::new(
                     command_ast.span.start,
                     command_ast.span.end,
@@ -2455,6 +2710,189 @@ impl Session {
                     "missing GRANT on command",
                 )
             })?;
+            let resolved_args = if let ArgumentMode::CapabilityPaths(planner) =
+                manifest.argument_mode
+            {
+                let requirements = planner(&expanded_arguments).map_err(|error| {
+                    Diagnostic::new(error.span.start, error.span.end, error.message)
+                })?;
+                let mut by_argument = BTreeMap::new();
+                for requirement in requirements {
+                    if requirement.argument >= expanded_arguments.len()
+                        || by_argument
+                            .insert(requirement.argument, requirement.rights)
+                            .is_some()
+                    {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "command planner returned an invalid path contract",
+                        ));
+                    }
+                }
+                let mut resolved = Vec::new();
+                for (argument_index, argument) in expanded_arguments.iter().enumerate() {
+                    match argument {
+                        ExpandedArgument::Value { value, .. } => {
+                            if by_argument.contains_key(&argument_index) {
+                                return Err(Diagnostic::new(
+                                    argument.span().start,
+                                    argument.span().end,
+                                    "command planner treated a value as path authority",
+                                ));
+                            }
+                            resolved.push(ResolvedArgument::Value(value.clone()));
+                        }
+                        ExpandedArgument::CapabilityPath { root, tail, span } => {
+                            let rights = by_argument.remove(&argument_index).ok_or_else(|| {
+                                Diagnostic::new(
+                                    span.start,
+                                    span.end,
+                                    "path operand has no planner contract",
+                                )
+                            })?;
+                            let source = self.capabilities.get(root).copied().ok_or_else(|| {
+                                Diagnostic::new(
+                                    span.start,
+                                    span.end,
+                                    "unknown path-root capability",
+                                )
+                            })?;
+                            let object =
+                                self.cspace.lock().lookup(source, rights).map_err(|_| {
+                                    Diagnostic::new(
+                                        span.start,
+                                        span.end,
+                                        "path-root capability lacks required rights",
+                                    )
+                                })?;
+                            if object.kind() != "file-tree-root" {
+                                return Err(Diagnostic::new(
+                                    span.start,
+                                    span.end,
+                                    "path-root capability has wrong resource kind",
+                                ));
+                            }
+                            let local = cap::grant(&self.cspace.lock(), source, rights, &mut stage)
+                                .map_err(|_| {
+                                    Diagnostic::new(
+                                        span.start,
+                                        span.end,
+                                        "path-root capability cannot be delegated",
+                                    )
+                                })?;
+                            resolved.push(ResolvedArgument::CapabilityPath {
+                                root: local,
+                                label: root.clone(),
+                                tail: tail.clone(),
+                                rights,
+                            });
+                        }
+                    }
+                }
+                if !by_argument.is_empty() {
+                    return Err(Diagnostic::new(
+                        command_ast.span.start,
+                        command_ast.span.end,
+                        "command planner returned unused path requirements",
+                    ));
+                }
+                Some(resolved)
+            } else if let ArgumentMode::BoundResources(planner) = manifest.argument_mode {
+                let plan = planner(&expanded_arguments).map_err(|error| {
+                    Diagnostic::new(error.span.start, error.span.end, error.message)
+                })?;
+                let explicit: BTreeSet<usize> = plan.explicit_arguments.iter().copied().collect();
+                if explicit.len() != plan.explicit_arguments.len()
+                    || explicit
+                        .iter()
+                        .any(|argument| *argument >= expanded_arguments.len())
+                {
+                    return Err(Diagnostic::new(
+                        command_ast.span.start,
+                        command_ast.span.end,
+                        "resource planner returned an invalid contract",
+                    ));
+                }
+                let mut resolved = Vec::new();
+                let mut selected = Vec::new();
+                for (argument_index, argument) in expanded_arguments.iter().enumerate() {
+                    match argument {
+                        ExpandedArgument::Value { value, .. } => {
+                            if explicit.contains(&argument_index) {
+                                return Err(Diagnostic::new(
+                                    argument.span().start,
+                                    argument.span().end,
+                                    "resource planner treated a value as authority",
+                                ));
+                            }
+                            resolved.push(ResolvedArgument::Value(value.clone()));
+                        }
+                        ExpandedArgument::CapabilityPath { root, tail, span } => {
+                            if !explicit.contains(&argument_index) || !tail.is_empty() {
+                                return Err(Diagnostic::new(
+                                    span.start,
+                                    span.end,
+                                    "resource operand must be an explicit @NAME binding",
+                                ));
+                            }
+                            let source = self.capabilities.get(root).copied().ok_or_else(|| {
+                                Diagnostic::new(span.start, span.end, "unknown capability binding")
+                            })?;
+                            let object =
+                                self.cspace
+                                    .lock()
+                                    .lookup(source, plan.rights)
+                                    .map_err(|_| {
+                                        Diagnostic::new(
+                                            span.start,
+                                            span.end,
+                                            "capability binding lacks required rights",
+                                        )
+                                    })?;
+                            if object.kind() != plan.kind {
+                                return Err(Diagnostic::new(
+                                    span.start,
+                                    span.end,
+                                    "capability binding has wrong resource kind",
+                                ));
+                            }
+                            selected.push((root.clone(), source, *span));
+                        }
+                    }
+                }
+                if selected.is_empty() && plan.enumerate_if_empty {
+                    for (label, source) in &self.capabilities {
+                        let admitted = self
+                            .cspace
+                            .lock()
+                            .lookup(*source, plan.rights.union(Rights::GRANT))
+                            .is_ok_and(|object| object.kind() == plan.kind);
+                        if admitted {
+                            selected.push((label.clone(), *source, command_ast.span));
+                        }
+                    }
+                }
+                for (label, source, span) in selected {
+                    let writable = self.cspace.lock().lookup(source, Rights::WRITE).is_ok();
+                    let local = cap::grant(&self.cspace.lock(), source, plan.rights, &mut stage)
+                        .map_err(|_| {
+                            Diagnostic::new(
+                                span.start,
+                                span.end,
+                                "capability binding cannot be delegated",
+                            )
+                        })?;
+                    resolved.push(ResolvedArgument::CapabilityBinding {
+                        resource: local,
+                        label,
+                        writable,
+                    });
+                }
+                Some(resolved)
+            } else {
+                None
+            };
             let stdin = if index > 0 {
                 LocalIo::Stream(
                     cap::grant(&admission, roots[index - 1], Rights::RECV, &mut stage).map_err(
@@ -2626,6 +3064,7 @@ impl Session {
                 cspace: Arc::new(SpinLock::new(stage)),
                 command,
                 args,
+                resolved_args,
                 stdin,
                 stdout,
                 _stderr: stderr,
@@ -2826,6 +3265,13 @@ fn collect_pipeline_requirements(
                         span.start,
                         span.end,
                         "script capability argument has no manifest contract",
+                    ));
+                }
+                Argument::CapabilityPath { span, .. } => {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "script capability-path argument has no manifest contract",
                     ));
                 }
             }
@@ -3038,6 +3484,26 @@ async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
             Ok(output) => write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await,
             Err(status) => status,
         },
+        Applet::CapabilityHost(command) => {
+            let Some(args) = stage.resolved_args.clone() else {
+                return Status::Faulted;
+            };
+            match command(CapabilityCommandContext {
+                args,
+                cspace: stage.cspace.clone(),
+                stdin: stage.stdin.clone(),
+                stdout: stage.stdout.clone(),
+                job: job.clone(),
+            })
+            .await
+            {
+                Ok(output) if output.is_empty() => Status::Success,
+                Ok(output) => {
+                    write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await
+                }
+                Err(status) => status,
+            }
+        }
     }
 }
 

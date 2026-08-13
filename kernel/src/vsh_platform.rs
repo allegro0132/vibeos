@@ -92,6 +92,25 @@ pub async fn run_legacy_source(source: &str, session: &mut Session) {
 
 pub fn install_standard_commands(session: &mut Session) {
     install_shared_commands(session);
+    vibeos_vsh::install_lsblk_command(session);
+    #[cfg(feature = "file-tree")]
+    {
+        vibeos_vsh::install_file_commands(session);
+        let home = Arc::new(
+            vibeos_file_store::FileTreeRoot::new_empty(0x5649_4245_4f53_2d46_494c_4554_5245_4501)
+                .expect("fixed file-tree namespace is non-zero"),
+        );
+        session
+            .install_capability(
+                "home",
+                home,
+                Rights::READ
+                    .union(Rights::WRITE)
+                    .union(Rights::GRANT)
+                    .union(Rights::REVOKE),
+            )
+            .expect("local file-tree capability binding must be valid");
+    }
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
 }

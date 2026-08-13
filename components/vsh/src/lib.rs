@@ -9,10 +9,16 @@
 
 extern crate alloc;
 
+mod block_commands;
 mod engine;
+#[cfg(feature = "file-tree")]
+mod file_commands;
 pub mod terminal;
 
+pub use block_commands::*;
 pub use engine::*;
+#[cfg(feature = "file-tree")]
+pub use file_commands::*;
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -30,6 +36,8 @@ pub type ReadByteFuture<'a> = Pin<Box<dyn Future<Output = u8> + Send + 'a>>;
 pub type CommandHandler = fn(&[String]) -> Result<String, Status>;
 pub type AsyncCommandFuture = Pin<Box<dyn Future<Output = Result<String, Status>> + Send>>;
 pub type AsyncCommandHandler = fn(Vec<String>) -> AsyncCommandFuture;
+pub type CapabilityCommandFuture = Pin<Box<dyn Future<Output = Result<String, Status>> + Send>>;
+pub type CapabilityCommandHandler = fn(CapabilityCommandContext) -> CapabilityCommandFuture;
 
 pub enum InputEvent {
     Line(String),
@@ -62,6 +70,16 @@ pub struct AsyncCommandSpec {
     pub handler: AsyncCommandHandler,
 }
 
+#[derive(Clone, Copy)]
+pub struct CapabilityCommandSpec {
+    pub name: &'static str,
+    pub min_args: usize,
+    pub max_args: usize,
+    pub stdin: StreamMode,
+    pub planner: CapabilityPathPlanner,
+    pub handler: CapabilityCommandHandler,
+}
+
 /// Install audited commands selected by boot policy. Registration happens in
 /// this component; kernel code supplies only the capability-service adapters.
 pub fn install_commands(session: &mut Session, commands: &[CommandSpec]) {
@@ -81,6 +99,19 @@ pub fn install_async_commands(session: &mut Session, commands: &[AsyncCommandSpe
             command.name,
             command.min_args,
             command.max_args,
+            command.handler,
+        );
+    }
+}
+
+pub fn install_capability_commands(session: &mut Session, commands: &[CapabilityCommandSpec]) {
+    for command in commands {
+        session.install_capability_host_command(
+            command.name,
+            command.min_args,
+            command.max_args,
+            command.stdin,
+            command.planner,
             command.handler,
         );
     }

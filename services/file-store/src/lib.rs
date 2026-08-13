@@ -559,9 +559,6 @@ impl FsTransaction<'_> {
                 inode.change_generation = generation;
             }
             Err(FileError::NotFound) => {
-                if append {
-                    return Err(FileError::NotFound);
-                }
                 let (parent, name) = self.parent(path)?;
                 if self.working.dirents.contains_key(&(parent, name.clone())) {
                     return Err(FileError::Exists);
@@ -629,6 +626,7 @@ impl FsTransaction<'_> {
         destination: &RelPath,
         recursive: bool,
         follow_source_symlink: bool,
+        follow_all_symlinks: bool,
     ) -> Result<(), FileError> {
         let source_id = source.state.resolve(source_path, follow_source_symlink)?;
         let (parent, name) = self.parent(destination)?;
@@ -639,6 +637,25 @@ impl FsTransaction<'_> {
             .get(&source_id)
             .ok_or(FileError::NotFound)?
             .clone();
+        if source.state.namespace == self.working.namespace
+            && source_inode.file_type == FileType::Directory
+        {
+            let mut cursor = parent;
+            loop {
+                if cursor == source_id {
+                    return Err(FileError::EscapeRoot);
+                }
+                if cursor == ROOT_FILE_ID {
+                    break;
+                }
+                cursor = self
+                    .working
+                    .dirents
+                    .iter()
+                    .find_map(|((candidate, _), child)| (*child == cursor).then_some(*candidate))
+                    .ok_or(FileError::NotFound)?;
+            }
+        }
         if let Some(destination_id) = self.working.dirents.get(&(parent, name.clone())).copied() {
             if source_inode.file_type == FileType::Directory {
                 return Err(FileError::Exists);
@@ -662,10 +679,13 @@ impl FsTransaction<'_> {
             tx: &mut FsTransaction<'_>,
             source: &NamespaceState,
             source_id: FileId,
+            source_path: &RelPath,
             parent: FileId,
             name: String,
             recursive: bool,
             generation: u64,
+            follow_all_symlinks: bool,
+            active_directories: &mut BTreeSet<FileId>,
         ) -> Result<(), FileError> {
             let inode = source
                 .inodes
@@ -684,14 +704,35 @@ impl FsTransaction<'_> {
             })?;
             tx.working.dirents.insert((parent, name), new_id);
             if kind == FileType::Directory {
+                if !active_directories.insert(source_id) {
+                    return Err(FileError::SymlinkLoop);
+                }
                 let children: Vec<(String, FileId)> = source
                     .dirents
                     .iter()
                     .filter_map(|((p, n), c)| (*p == source_id).then_some((n.clone(), *c)))
                     .collect();
                 for (child_name, child_id) in children {
-                    clone_inode(tx, source, child_id, new_id, child_name, true, generation)?;
+                    let child_path = source_path.joined_name(&child_name)?;
+                    let child_id = if follow_all_symlinks {
+                        source.resolve(&child_path, true)?
+                    } else {
+                        child_id
+                    };
+                    clone_inode(
+                        tx,
+                        source,
+                        child_id,
+                        &child_path,
+                        new_id,
+                        child_name,
+                        true,
+                        generation,
+                        follow_all_symlinks,
+                        active_directories,
+                    )?;
                 }
+                active_directories.remove(&source_id);
             }
             Ok(())
         }
@@ -699,10 +740,13 @@ impl FsTransaction<'_> {
             self,
             &source.state,
             source_id,
+            source_path,
             parent,
             name,
             recursive,
             generation,
+            follow_all_symlinks,
+            &mut BTreeSet::new(),
         )
     }
     fn collect_subtree(
@@ -783,6 +827,22 @@ impl FsTransaction<'_> {
         if self.working.dirents.contains_key(&(dp, dn.clone())) {
             if no_clobber {
                 return Ok(());
+            }
+            let source_kind = self
+                .working
+                .inodes
+                .get(&source_id)
+                .ok_or(FileError::NotFound)?
+                .file_type;
+            let destination_id = self.working.lookup_child(dp, &dn)?;
+            let destination_kind = self
+                .working
+                .inodes
+                .get(&destination_id)
+                .ok_or(FileError::NotFound)?
+                .file_type;
+            if (source_kind == FileType::Directory) != (destination_kind == FileType::Directory) {
+                return Err(FileError::InvalidType);
             }
             let destination_path = destination.clone();
             self.remove(&destination_path, false, true)?;
@@ -969,5 +1029,29 @@ mod tests {
         assert!(root.recover_writer_claim(7, 11));
         core::mem::forget(transaction);
         assert!(root.begin_with_claim(8, 13).is_ok());
+    }
+
+    #[test]
+    fn append_creates_and_rename_rejects_directory_type_mismatch() {
+        let root = FileTreeRoot::new_empty(16).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .write_chunks(&path("created"), [b"append"], true)
+            .unwrap();
+        transaction.mkdir(&path("directory"), false).unwrap();
+        assert_eq!(
+            transaction.rename(&path("created"), &path("directory"), false),
+            Err(FileError::InvalidType)
+        );
+        transaction.commit().unwrap();
+        assert_eq!(
+            root.snapshot()
+                .read_chunks(&path("created"))
+                .unwrap()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"append"
+        );
     }
 }

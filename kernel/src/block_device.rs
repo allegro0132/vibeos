@@ -12,7 +12,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::cap::{InvocationLease, Resource, Rights, ScopedResource};
+use crate::cap::{
+    BlockRangeInfo, BlockRangeState, InvocationLease, Resource, Rights, ScopedResource,
+};
 use vibeos_storage_device::{
     successful_write_durability, validate_flush, validate_request, BlockRange, ContractError,
     DeviceGeometry, DeviceId, DeviceInfo, DeviceSession, MutationFailure, MutationResult,
@@ -74,6 +76,24 @@ impl Resource for BlockDevice {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn block_range_info(&self) -> Option<BlockRangeInfo> {
+        let raw = backend::raw_info();
+        Some(BlockRangeInfo {
+            start_block: self.range.first_block(),
+            block_count: self.range.block_count(),
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            device_read_only: raw.read_only,
+            state: if raw.quarantined {
+                BlockRangeState::Quarantined
+            } else if raw.online {
+                BlockRangeState::Online
+            } else {
+                BlockRangeState::Offline
+            },
+        })
     }
 }
 

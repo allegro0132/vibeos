@@ -700,7 +700,7 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
         code_pool::recover_faulted_domain(domain);
-        HEAP.reclaim_faulted_arena(domain.arena)
+        HEAP.reclaim_faulted_domain(domain)
             .expect("a faulted audited arena must reclaim atomically");
     }
 }

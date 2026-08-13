@@ -229,6 +229,27 @@ pub struct SpinLockStats {
     pub fault_recoveries: u64,
 }
 
+/// Result of claiming an abandoned exact-task guard and validating the value
+/// while the lock is exclusively held in its recovery phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalRecovery {
+    /// The lock was already free, so no abandoned-task provenance exists and
+    /// the protected value was deliberately not inspected. Callers must
+    /// validate a separate SYSTEM-owned immutable/atomic witness before
+    /// reclaim; this result is never evidence that the value matched.
+    NotHeldUnvalidated,
+    /// The lock kind, phase, allocation domain, task, or acquisition
+    /// generation did not match. No lock state was changed.
+    ProvenanceMismatch,
+    /// Provenance matched and the value predicate accepted the abandoned
+    /// state. The lock was released for later lifecycle use.
+    Recovered,
+    /// Provenance matched but the value predicate rejected the abandoned
+    /// state. The lock remains permanently in `RECOVERING` as a fail-stop
+    /// quarantine and must never be acquired or recovered again.
+    ValueMismatch,
+}
+
 pub struct SpinLock<T> {
     /// Lean acquire/release word for locks that never use fault recovery.
     fast_locked: AtomicBool,
@@ -516,6 +537,74 @@ impl<T> SpinLock<T> {
         }
         irq_restore(irq);
         recovered_token.is_some()
+    }
+
+    /// Recover an exact-task guard only if its protected value still matches
+    /// immutable lifecycle evidence.
+    ///
+    /// The predicate runs after the exact HELD acquisition generation has been
+    /// atomically claimed as RECOVERING, so another hart cannot mutate the
+    /// value between validation and release. A false predicate deliberately
+    /// leaves that generation in RECOVERING forever. This supplies the
+    /// fail-stop primitive needed when releasing the lock would make a
+    /// mismatched CSpace or registry entry reachable again.
+    ///
+    /// A FREE lock has no current owner/domain/task tuple to authenticate, so
+    /// this method returns [`ConditionalRecovery::NotHeldUnvalidated`] without
+    /// calling the predicate. Lifecycle code must pair that result with a
+    /// separate SYSTEM-owned witness whose publication cannot race reset.
+    ///
+    /// # Safety
+    ///
+    /// The exact-task terminal and all-hart quiescence requirements of
+    /// [`Self::recover_after_task_fault`] apply. `predicate` must not allocate,
+    /// block, acquire a lock, or panic. It may only inspect `value` and stable
+    /// immutable evidence. On [`ConditionalRecovery::ValueMismatch`], the
+    /// caller must quarantine every lifecycle record that could name this lock
+    /// and conservatively leak the protected value.
+    pub unsafe fn recover_after_task_fault_if<F>(
+        &self,
+        expected_domain: AllocationDomain,
+        expected_task: TaskRecoveryKey,
+        predicate: F,
+    ) -> ConditionalRecovery
+    where
+        F: FnOnce(&T) -> bool,
+    {
+        let irq = irq_save();
+        if !self.recoverable {
+            irq_restore(irq);
+            return ConditionalRecovery::ProvenanceMismatch;
+        }
+
+        let held_token = self.state.load(Ordering::Acquire);
+        if token_phase(held_token) == FREE {
+            irq_restore(irq);
+            return ConditionalRecovery::NotHeldUnvalidated;
+        }
+        if token_phase(held_token) != HELD
+            || self.owner.load(Ordering::Relaxed) != expected_domain.owner.get()
+            || self.arena.load(Ordering::Relaxed) != expected_domain.arena.get()
+            || self.recovery_key.load(Ordering::Relaxed) != expected_task.get()
+            || !self.claim_recovery_token(held_token)
+        {
+            irq_restore(irq);
+            return ConditionalRecovery::ProvenanceMismatch;
+        }
+
+        // Safety: the exact HELD generation is now exclusively RECOVERING and
+        // the caller established permanent task quiescence. No guard can
+        // access the UnsafeCell until this method either releases or fail-stops
+        // the lock.
+        let matches = predicate(unsafe { &*self.data.get() });
+        let result = if matches {
+            self.finish_recovery(held_token);
+            ConditionalRecovery::Recovered
+        } else {
+            ConditionalRecovery::ValueMismatch
+        };
+        irq_restore(irq);
+        result
     }
 }
 

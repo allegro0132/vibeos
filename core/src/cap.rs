@@ -988,6 +988,32 @@ impl fmt::Display for PersistentInstallError {
     }
 }
 
+/// Why an exact volatile CSpace lifecycle transition was refused.
+///
+/// Every error is fail-closed: the authoritative table, derivations, slot
+/// generations, identity, and incarnation remain unchanged. Callers must not
+/// treat an identity or incarnation mismatch as evidence that reset happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CSpaceResetError {
+    IdentityMismatch,
+    IncarnationMismatch,
+    PersistentLifecycleRequired,
+    IncarnationExhausted,
+}
+
+impl fmt::Display for CSpaceResetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::IdentityMismatch => "CSpace identity changed",
+            Self::IncarnationMismatch => "CSpace incarnation changed",
+            Self::PersistentLifecycleRequired => {
+                "CSpace contains durable capability lifecycle state"
+            }
+            Self::IncarnationExhausted => "CSpace incarnation space exhausted",
+        })
+    }
+}
+
 /// A task's capability space. Owning one *is* the task's entire authority.
 pub struct CSpace {
     pub name: String,
@@ -1979,13 +2005,24 @@ impl CSpace {
         self.collect()
     }
 
-    /// Retire every capability in preparation for a fresh component
+    /// Retire every capability in one exactly identified volatile CSpace
     /// incarnation.
     ///
-    /// Vacant slots are deliberately retained with their incremented
-    /// generations. Replacing the table with `CSpace::new` would let an old
-    /// `Cap { slot, generation }` alias the first grant in the new incarnation.
-    pub fn reset(&mut self) -> usize {
+    /// All preconditions are checked before any derivation is killed. A stale
+    /// lifecycle token therefore cannot reset a different CSpace or a newer
+    /// incarnation, and durable state cannot be crossed by this volatile
+    /// lifecycle operation.
+    pub fn reset_exact(
+        &mut self,
+        expected_identity: CSpaceIdentity,
+        expected_incarnation: u64,
+    ) -> Result<usize, CSpaceResetError> {
+        if self.identity != expected_identity {
+            return Err(CSpaceResetError::IdentityMismatch);
+        }
+        if self.incarnation != expected_incarnation {
+            return Err(CSpaceResetError::IncarnationMismatch);
+        }
         if self.slots.iter().any(|slot| {
             slot.reservation.is_some()
                 || slot
@@ -1993,14 +2030,37 @@ impl CSpace {
                     .as_ref()
                     .is_some_and(|entry| entry.node.persistent.is_some())
         }) {
-            return 0;
+            return Err(CSpaceResetError::PersistentLifecycleRequired);
         }
-        let killed = self.revoke_all();
-        self.incarnation = self
+        let next_incarnation = self
             .incarnation
             .checked_add(1)
-            .expect("CSpace incarnation space exhausted");
-        killed
+            .ok_or(CSpaceResetError::IncarnationExhausted)?;
+        let killed = self.revoke_all();
+        self.incarnation = next_incarnation;
+        Ok(killed)
+    }
+
+    /// Retire every capability in preparation for a fresh component
+    /// incarnation.
+    ///
+    /// Vacant slots are deliberately retained with their incremented
+    /// generations. Replacing the table with `CSpace::new` would let an old
+    /// `Cap { slot, generation }` alias the first grant in the new incarnation.
+    /// New lifecycle code should use [`CSpace::reset_exact`] and handle every
+    /// mismatch explicitly. This compatibility wrapper preserves the historic
+    /// durable-state refusal and exhaustion panic.
+    pub fn reset(&mut self) -> usize {
+        match self.reset_exact(self.identity, self.incarnation) {
+            Ok(killed) => killed,
+            Err(CSpaceResetError::PersistentLifecycleRequired) => 0,
+            Err(CSpaceResetError::IncarnationExhausted) => {
+                panic!("CSpace incarnation space exhausted")
+            }
+            Err(CSpaceResetError::IdentityMismatch | CSpaceResetError::IncarnationMismatch) => {
+                unreachable!("CSpace reset wrapper supplied its own exact identity")
+            }
+        }
     }
 
     /// Finalize an already-durable tombstone. This is the only operation which

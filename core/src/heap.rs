@@ -389,6 +389,10 @@ pub enum ArenaError {
     SystemOwnerReserved,
     UnknownOwner,
     UnknownArena,
+    OwnerMismatch {
+        expected: OwnerId,
+        actual: OwnerId,
+    },
     TableFull,
     ArenaIdExhausted,
     ArenaBusy {
@@ -790,16 +794,27 @@ impl Heap {
         find_arena(&h, arena).map(|index| h.arenas[index].stats())
     }
 
-    /// Close an arena after normal Drop has returned every tracked block.
-    pub fn close_empty_arena(&self, arena: ArenaId) -> Result<(), ArenaError> {
-        if !arena.is_tracked() {
+    /// Close an exact allocation domain after normal Drop has returned every
+    /// tracked block.
+    ///
+    /// Owner and arena are checked together under the allocator lock. A stale
+    /// lifecycle record therefore cannot close a later arena merely because a
+    /// caller performed a separate `arena_stats` preflight.
+    pub fn close_empty_domain(&self, domain: AllocationDomain) -> Result<(), ArenaError> {
+        if !domain.arena.is_tracked() {
             return Err(ArenaError::UntrackedArenaReserved);
         }
         let mut h = self.0.lock();
-        let Some(index) = find_arena(&h, arena) else {
+        let Some(index) = find_arena(&h, domain.arena) else {
             return Err(ArenaError::UnknownArena);
         };
         let record = h.arenas[index];
+        if record.owner != domain.owner {
+            return Err(ArenaError::OwnerMismatch {
+                expected: domain.owner,
+                actual: record.owner,
+            });
+        }
         if record.live_bytes != 0 || record.live_allocations != 0 || record.head.is_some() {
             return Err(ArenaError::ArenaBusy {
                 live_bytes: record.live_bytes,
@@ -810,7 +825,7 @@ impl Heap {
         Ok(())
     }
 
-    /// Raw-reclaim every allocation belonging to a faulted incarnation.
+    /// Raw-reclaim every allocation belonging to one exact faulted domain.
     ///
     /// Every complete size-class block is scrubbed before it enters a free
     /// list. This is required because fault recovery deliberately skips Rust
@@ -818,19 +833,28 @@ impl Heap {
     /// payload bytes abandoned by the faulted incarnation.
     ///
     /// # Safety
-    /// The caller must have permanently quiesced every task in `arena`, raw
+    /// The caller must have permanently quiesced every task in `domain`, raw
     /// deallocated their future envelopes, removed runtime registrations, and
     /// proved that no pointer or reference into an arena allocation escaped.
     /// No destructor is run here.
-    pub unsafe fn reclaim_faulted_arena(&self, arena: ArenaId) -> Result<ReclaimStats, ArenaError> {
-        if !arena.is_tracked() {
+    pub unsafe fn reclaim_faulted_domain(
+        &self,
+        domain: AllocationDomain,
+    ) -> Result<ReclaimStats, ArenaError> {
+        if !domain.arena.is_tracked() {
             return Err(ArenaError::UntrackedArenaReserved);
         }
         let mut h = self.0.lock();
-        let Some(arena_index) = find_arena(&h, arena) else {
+        let Some(arena_index) = find_arena(&h, domain.arena) else {
             return Err(ArenaError::UnknownArena);
         };
         let record = h.arenas[arena_index];
+        if record.owner != domain.owner {
+            return Err(ArenaError::OwnerMismatch {
+                expected: domain.owner,
+                actual: record.owner,
+            });
+        }
         let Some(owner_index) = find_owner(&h, record.owner) else {
             return Err(ArenaError::UnknownOwner);
         };
@@ -857,7 +881,7 @@ impl Heap {
             let header = unsafe { &*header_ptr.as_ptr() };
             if header.magic != HEADER_MAGIC
                 || header.owner != record.owner
-                || header.arena != arena
+                || header.arena != domain.arena
                 || header.class >= NUM_CLASSES
                 || header.arena_prev != previous
             {
@@ -926,7 +950,7 @@ impl Heap {
         h.live_bytes = global_live;
         h.arenas[arena_index] = ArenaRecord::EMPTY;
         Ok(ReclaimStats {
-            arena,
+            arena: domain.arena,
             owner: record.owner,
             reclaimed_bytes: bytes,
             reclaimed_allocations: allocations,

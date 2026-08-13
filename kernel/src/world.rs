@@ -1123,7 +1123,10 @@ impl World {
 
         match before.state {
             exec::TaskState::Exited | exec::TaskState::Cancelled => HEAP
-                .close_empty_arena(before.arena)
+                .close_empty_domain(AllocationDomain::new(
+                    component.memory_owner(),
+                    before.arena,
+                ))
                 .expect("a normally terminated audited arena must be empty"),
             exec::TaskState::Faulted => {
                 debug_assert!(HEAP.arena_stats(before.arena).is_none());
@@ -1189,8 +1192,11 @@ impl World {
             return false;
         }
         if normal && snapshot.arena.is_tracked() {
-            HEAP.close_empty_arena(snapshot.arena)
-                .expect("a normal terminal arena must be empty");
+            HEAP.close_empty_domain(AllocationDomain::new(
+                component.memory_owner(),
+                snapshot.arena,
+            ))
+            .expect("a normal terminal arena must be empty");
         }
         if reclaimed_fault {
             // Fault teardown recovered the abandoned guard before publishing

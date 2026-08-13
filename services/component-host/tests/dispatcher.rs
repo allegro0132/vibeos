@@ -9,6 +9,7 @@ use vibeos_component_host::{
     StructuredLogSinkFault, ValidatedLogEvent, VibeHostManifest, RANDOM_INTERFACE,
 };
 use vibeos_component_runtime::decode::inspect_component;
+use vibeos_component_runtime::host::HostError;
 use vibeos_component_runtime::resource::{ResourceTable, ResourceToken, ResourceTypeId};
 use vibeos_component_runtime::sync::{
     SyncError, SynchronousComponent, TypedCallMetrics, TypedPoll,
@@ -56,13 +57,19 @@ fn insert(
     table.insert_owned(RESOURCE_TYPE, authority).unwrap()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvokeFailure {
+    Host(HostError),
+    Trap(TrapCode),
+}
+
 fn invoke(
     component: &mut SynchronousComponent,
     table: &mut ResourceTable<ComponentAuthority>,
     dispatcher: &mut ComponentHostDispatcher,
     export: &str,
     arguments: Vec<CanonicalValue>,
-) -> Result<CanonicalValue, TrapCode> {
+) -> Result<CanonicalValue, InvokeFailure> {
     let mut call = component
         .start_typed_call_with_host(table, dispatcher, export, arguments, 100_000, 100)
         .unwrap();
@@ -70,7 +77,8 @@ fn invoke(
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Ready(value) => return Ok(value),
-            TypedPoll::Trapped(trap) => return Err(trap),
+            TypedPoll::HostFailed(error) => return Err(InvokeFailure::Host(error)),
+            TypedPoll::Trapped(trap) => return Err(InvokeFailure::Trap(trap)),
         }
     }
     panic!("bounded component host call did not terminate")
@@ -82,7 +90,7 @@ fn invoke_with_monotonic_metrics(
     dispatcher: &mut ComponentHostDispatcher,
     export: &str,
     arguments: Vec<CanonicalValue>,
-) -> (Result<CanonicalValue, TrapCode>, TypedCallMetrics) {
+) -> (Result<CanonicalValue, InvokeFailure>, TypedCallMetrics) {
     let mut call = component
         .start_typed_call_with_host(table, dispatcher, export, arguments, 100_000, 100)
         .unwrap();
@@ -97,7 +105,8 @@ fn invoke_with_monotonic_metrics(
                 None
             }
             TypedPoll::Ready(value) => Some(Ok(value)),
-            TypedPoll::Trapped(trap) => Some(Err(trap)),
+            TypedPoll::HostFailed(error) => Some(Err(InvokeFailure::Host(error))),
+            TypedPoll::Trapped(trap) => Some(Err(InvokeFailure::Trap(trap))),
         };
         if let Some(terminal) = terminal {
             let metrics = call.metrics();
@@ -239,7 +248,7 @@ fn clock_dispatch_is_exact_and_wrong_kind_rights_or_revocation_are_denied() {
             "run",
             vec![CanonicalValue::Resource(token)],
         ),
-        Err(TrapCode::Validation),
+        Err(InvokeFailure::Host(HostError::Denied)),
     );
 
     let (wrong_space, wrong_binding) = space("clock-wrong-rights");
@@ -402,7 +411,7 @@ fn random_provider_span_overlapping_the_host_retptr_traps_before_dispatch() {
             "run",
             vec![CanonicalValue::Resource(token), CanonicalValue::U32(3)],
         ),
-        Err(TrapCode::CanonicalAbi),
+        Err(InvokeFailure::Trap(TrapCode::CanonicalAbi)),
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
 }

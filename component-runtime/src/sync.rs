@@ -126,6 +126,24 @@ impl SynchronousComponent {
         engine: &ProfileEngine,
         reservation_per_module: OwnerAllocationReservation,
     ) -> Result<Self, SyncError> {
+        Self::instantiate_with_memory_limit(
+            plan,
+            engine,
+            reservation_per_module,
+            PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+        )
+    }
+
+    /// Instantiates with a policy-selected execution-time memory ceiling.
+    /// This ceiling is installed in the wasmi store and therefore constrains
+    /// initial memory and every later `memory.grow`; it is not merely an
+    /// allocation estimate used while compiling embedded modules.
+    pub fn instantiate_with_memory_limit(
+        plan: &ComponentPlan<'_>,
+        engine: &ProfileEngine,
+        reservation_per_module: OwnerAllocationReservation,
+        memory_bytes: usize,
+    ) -> Result<Self, SyncError> {
         let execution = &plan.execution;
         if execution
             .host_imports()
@@ -138,8 +156,12 @@ impl SynchronousComponent {
             // the backend effect. Both remain fail-closed for this milestone.
             return Err(SyncError::InvalidWiring);
         }
-        let mut modules = CoreComponentGroup::new(engine, execution.instances().len())
-            .map_err(|_| SyncError::CoreInstantiation)?;
+        let mut modules = CoreComponentGroup::new_with_memory_limit(
+            engine,
+            execution.instances().len(),
+            memory_bytes,
+        )
+        .map_err(|_| SyncError::CoreInstantiation)?;
         for (runtime_instance, instance) in execution.instances().iter().enumerate() {
             let bytes = plan
                 .embedded_modules()
@@ -831,17 +853,6 @@ fn zero_baselines(count: usize) -> Result<Vec<u64>, SyncError> {
     Ok(baselines)
 }
 
-const fn host_error_trap(error: HostError) -> TrapCode {
-    match error {
-        HostError::BudgetExceeded => TrapCode::FuelExhausted,
-        HostError::Exhausted => TrapCode::LimitExceeded,
-        HostError::InvalidArgument => TrapCode::CanonicalAbi,
-        HostError::Denied | HostError::Unavailable | HostError::BackendFault => {
-            TrapCode::Validation
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TypedCallMetrics {
     pub consumed_work: u64,
@@ -852,7 +863,29 @@ pub struct TypedCallMetrics {
 pub enum TypedPoll {
     Pending(TypedCallMetrics),
     Ready(CanonicalValue),
+    /// A typed failure returned by the trusted host boundary. This is kept
+    /// distinct from a guest/runtime trap so supervisors can preserve denied,
+    /// unavailable, and backend-fault terminal semantics.
+    HostFailed(HostError),
     Trapped(TrapCode),
+}
+
+#[derive(Clone, Copy)]
+enum CallFailure {
+    Host(HostError),
+    Trap(TrapCode),
+}
+
+impl From<HostError> for CallFailure {
+    fn from(error: HostError) -> Self {
+        Self::Host(error)
+    }
+}
+
+impl From<TrapCode> for CallFailure {
+    fn from(trap: TrapCode) -> Self {
+        Self::Trap(trap)
+    }
 }
 
 enum TypedStage {
@@ -916,7 +949,7 @@ struct PendingHostLower {
     free_index: usize,
     resume_results: Option<Vec<CoreValue>>,
     resume_after_free: Option<Vec<CoreValue>>,
-    trap_after_free: Option<TrapCode>,
+    failure_after_free: Option<CallFailure>,
     lowering_journal: LoweringJournal,
     flat_results: Option<PreparedFlatResults>,
 }
@@ -1104,11 +1137,12 @@ impl<'a, A> TypedCall<'a, A> {
     fn handle_host_call(&mut self, call: CoreHostCall) -> TypedPoll {
         match self.handle_host_call_inner(call) {
             Ok(()) => TypedPoll::Pending(self.metrics()),
-            Err(trap) => self.finish_trap(trap),
+            Err(CallFailure::Host(error)) => self.finish_host_failure(error),
+            Err(CallFailure::Trap(trap)) => self.finish_trap(trap),
         }
     }
 
-    fn handle_host_call_inner(&mut self, call: CoreHostCall) -> Result<(), TrapCode> {
+    fn handle_host_call_inner(&mut self, call: CoreHostCall) -> Result<(), CallFailure> {
         let import_index = usize::try_from(call.id).map_err(|_| TrapCode::Validation)?;
         let active_instance = self
             .component
@@ -1123,7 +1157,7 @@ impl<'a, A> TypedCall<'a, A> {
                 .get(import_index)
                 .ok_or(TrapCode::Validation)?;
             if call.origin_instance != import.core_instance {
-                return Err(TrapCode::Validation);
+                return Err(TrapCode::Validation.into());
             }
             crate::types::try_clone_function_type(&import.function_type)
                 .map_err(|_| TrapCode::LimitExceeded)?
@@ -1148,12 +1182,12 @@ impl<'a, A> TypedCall<'a, A> {
             .checked_add(usize::from(has_retptr))
             .ok_or(TrapCode::LimitExceeded)?;
         if call.arguments.len() != expected_arguments {
-            return Err(TrapCode::CanonicalAbi);
+            return Err(TrapCode::CanonicalAbi.into());
         }
         let caller_retptr = if has_retptr {
             match call.arguments.last() {
                 Some(CoreValue::I32(pointer)) => Some(*pointer as u32),
-                _ => return Err(TrapCode::CanonicalAbi),
+                _ => return Err(TrapCode::CanonicalAbi.into()),
             }
         } else {
             None
@@ -1220,10 +1254,10 @@ impl<'a, A> TypedCall<'a, A> {
                 .ok_or(TrapCode::Validation)?;
             dispatcher
                 .required_work(import, &arguments)
-                .map_err(host_error_trap)?
+                .map_err(CallFailure::Host)?
         };
         if required_host_work == 0 {
-            return Err(TrapCode::Validation);
+            return Err(TrapCode::Validation.into());
         }
         let planned_allocations = {
             let dispatcher = self.dispatcher.as_deref().ok_or(TrapCode::Validation)?;
@@ -1234,10 +1268,10 @@ impl<'a, A> TypedCall<'a, A> {
                 .ok_or(TrapCode::Validation)?;
             dispatcher
                 .result_allocations(import, &arguments)
-                .map_err(host_error_trap)?
+                .map_err(CallFailure::Host)?
         };
         if planned_allocations.len() > PROFILE_1_LIMITS.max_abi_allocations as usize {
-            return Err(TrapCode::LimitExceeded);
+            return Err(TrapCode::LimitExceeded.into());
         }
         let mut allocations = Vec::new();
         allocations
@@ -1248,7 +1282,7 @@ impl<'a, A> TypedCall<'a, A> {
                 || allocation.alignment == 0
                 || !allocation.alignment.is_power_of_two()
             {
-                return Err(TrapCode::Validation);
+                return Err(TrapCode::Validation.into());
             }
             allocations.push(AllocationRequest {
                 size: allocation.size,
@@ -1267,10 +1301,10 @@ impl<'a, A> TypedCall<'a, A> {
             )
         };
         if (!allocations.is_empty() || caller_retptr.is_some()) && memory.is_none() {
-            return Err(TrapCode::Validation);
+            return Err(TrapCode::Validation.into());
         }
         if !allocations.is_empty() && realloc.is_none() {
-            return Err(TrapCode::Validation);
+            return Err(TrapCode::Validation.into());
         }
         if let Some(pointer) = caller_retptr {
             validate_host_retptr(&self.component.modules, memory.as_ref(), &function, pointer)?;
@@ -1291,7 +1325,7 @@ impl<'a, A> TypedCall<'a, A> {
             .and_then(|work| work.checked_add(provider_reservation))
             .ok_or(TrapCode::LimitExceeded)?;
         if self.remaining_work <= reserved_work {
-            return Err(TrapCode::FuelExhausted);
+            return Err(TrapCode::FuelExhausted.into());
         }
         self.component
             .modules
@@ -1359,7 +1393,7 @@ impl<'a, A> TypedCall<'a, A> {
             free_index: 0,
             resume_results: Some(resume_results),
             resume_after_free: None,
-            trap_after_free: None,
+            failure_after_free: None,
             lowering_journal,
             flat_results,
         });
@@ -1482,7 +1516,7 @@ impl<'a, A> TypedCall<'a, A> {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                return self.defer_host_trap_after_cleanup(pending, host_error_trap(error));
+                return self.defer_host_failure_after_cleanup(pending, CallFailure::Host(error));
             }
         };
         let (mut values, host_work) = response.into_parts();
@@ -1554,15 +1588,23 @@ impl<'a, A> TypedCall<'a, A> {
 
     fn defer_host_trap_after_cleanup(
         &mut self,
-        mut pending: PendingHostLower,
+        pending: PendingHostLower,
         trap: TrapCode,
     ) -> TypedPoll {
+        self.defer_host_failure_after_cleanup(pending, CallFailure::Trap(trap))
+    }
+
+    fn defer_host_failure_after_cleanup(
+        &mut self,
+        mut pending: PendingHostLower,
+        failure: CallFailure,
+    ) -> TypedPoll {
         if pending.pointers.is_empty() {
-            return self.finish_trap(trap);
+            return self.finish_failure(failure);
         }
         pending.free_index = pending.pointers.len();
         pending.allocation_index = 0;
-        pending.trap_after_free = Some(trap);
+        pending.failure_after_free = Some(failure);
         self.host_lower = Some(pending);
         self.stage = TypedStage::HostFreeUnused;
         TypedPoll::Pending(self.metrics())
@@ -1575,8 +1617,8 @@ impl<'a, A> TypedCall<'a, A> {
         };
         if cleanup_complete {
             let mut pending = self.host_lower.take().expect("pending host lower");
-            if let Some(trap) = pending.trap_after_free.take() {
-                return self.finish_trap(trap);
+            if let Some(failure) = pending.failure_after_free.take() {
+                return self.finish_failure(failure);
             }
             let Some(results) = pending.resume_after_free.take() else {
                 self.host_lower = Some(pending);
@@ -1976,11 +2018,22 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     fn finish_trap(&mut self, trap: TrapCode) -> TypedPoll {
+        self.finish_failure(CallFailure::Trap(trap))
+    }
+
+    fn finish_host_failure(&mut self, error: HostError) -> TypedPoll {
+        self.finish_failure(CallFailure::Host(error))
+    }
+
+    fn finish_failure(&mut self, failure: CallFailure) -> TypedPoll {
         self.component.poisoned = true;
         self.component.modules.discard_all_calls();
         let _ = self.close_resources(false);
         self.stage = TypedStage::Complete;
-        TypedPoll::Trapped(trap)
+        match failure {
+            CallFailure::Host(error) => TypedPoll::HostFailed(error),
+            CallFailure::Trap(trap) => TypedPoll::Trapped(trap),
+        }
     }
 
     fn close_resources(&mut self, commit: bool) -> Result<(), ()> {

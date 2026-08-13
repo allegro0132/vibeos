@@ -28,6 +28,8 @@ static OWNER_SEEN_BY_FAULT_GUARD: Mutex<Option<OwnerId>> = Mutex::new(None);
 static RECLAIMED_DOMAINS: Mutex<Vec<AllocationDomain>> = Mutex::new(Vec::new());
 static CLEANED_TASKS: Mutex<Vec<(exec::TaskId, AllocationDomain)>> = Mutex::new(Vec::new());
 static FAULT_WAIT_QUEUE: WaitQueue = WaitQueue::new();
+static NOTIFY_EXPECTED_IDS: Mutex<Vec<exec::TaskId>> = Mutex::new(Vec::new());
+static NOTIFY_CALLS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn record_fault_reclaim(domain: AllocationDomain) {
     RECLAIMED_DOMAINS.lock().unwrap().push(domain);
@@ -76,6 +78,23 @@ fn fault_after_guarded_calls(poll: &mut dyn FnMut()) -> bool {
 fn fault_once_and_record_owner(poll: &mut dyn FnMut()) -> bool {
     *OWNER_SEEN_BY_FAULT_GUARD.lock().unwrap() = Some(heap::current_owner());
     fault_once_then_passthrough(poll)
+}
+
+fn assert_batch_published_from_notify(_hart: exec::HartId) {
+    let ids = NOTIFY_EXPECTED_IDS.lock().unwrap().clone();
+    assert!(!ids.is_empty());
+    for id in ids {
+        assert!(exec::task_report().iter().any(|task| task.id == id));
+        assert_ne!(
+            exec::wake_with_disposition(id),
+            exec::WakeDisposition::Inactive
+        );
+    }
+    NOTIFY_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn panic_after_batch_publication(_hart: exec::HartId) {
+    panic!("synthetic ready notification failure after publication")
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -265,6 +284,247 @@ impl Drop for TestHartScope {
 }
 
 const BUDGET: usize = 10_000;
+
+#[test]
+fn prepared_batch_is_invisible_until_atomic_publication() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let ran = Arc::new(AtomicU64::new(0));
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.try_reserve(2).unwrap();
+    let first_ran = ran.clone();
+    let first = batch.prepare("prepared-first", async move {
+        first_ran.fetch_add(1, Ordering::SeqCst);
+    });
+    let first_id = first.id();
+    let second_ran = ran.clone();
+    let second = batch.prepare("prepared-second", async move {
+        second_ran.fetch_add(1, Ordering::SeqCst);
+    });
+    let second_id = second.id();
+
+    for hart in 0..exec::MAX_HARTS {
+        let _hart = TestHartScope::enter(hart);
+        assert_eq!(
+            exec::wake_with_disposition(first_id),
+            exec::WakeDisposition::Inactive
+        );
+        assert_eq!(
+            exec::wake_with_disposition(second_id),
+            exec::WakeDisposition::Inactive
+        );
+        assert_eq!(exec::task_queue_owner(first_id), None);
+        assert_eq!(exec::task_queue_owner(second_id), None);
+        assert!(exec::task_report()
+            .iter()
+            .all(|task| task.id != first_id && task.id != second_id));
+        assert!(
+            !exec::poll_once(),
+            "a prepared task became runnable on hart {hart}"
+        );
+    }
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+    let handles = batch.publish().unwrap();
+    assert!(matches!(
+        batch.publish(),
+        Err(exec::PreparedTaskBatchError::AlreadyPublished)
+    ));
+    assert_eq!(handles.len(), 2);
+    assert!(exec::task_report().iter().any(|task| task.id == first_id));
+    assert!(exec::task_report().iter().any(|task| task.id == second_id));
+    exec::run_until_idle(BUDGET);
+    assert_eq!(ran.load(Ordering::SeqCst), 2);
+    assert!(handles
+        .iter()
+        .all(|handle| handle.state() == TaskState::Exited));
+}
+
+#[test]
+fn dropping_prepared_batch_rolls_back_every_future() {
+    let _g = scheduler();
+    let drops = Arc::new(AtomicU64::new(0));
+    let mut batch = exec::PreparedTaskBatch::new();
+    let first = batch.prepare(
+        "rollback-first",
+        DropBombFuture {
+            drops: drops.clone(),
+        },
+    );
+    let first_id = first.id();
+    let second = batch.prepare(
+        "rollback-second",
+        DropBombFuture {
+            drops: drops.clone(),
+        },
+    );
+    let second_id = second.id();
+    drop(batch);
+
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        exec::wake_with_disposition(first_id),
+        exec::WakeDisposition::Inactive
+    );
+    assert_eq!(
+        exec::wake_with_disposition(second_id),
+        exec::WakeDisposition::Inactive
+    );
+    assert!(exec::task_report()
+        .iter()
+        .all(|task| task.id != first_id && task.id != second_id));
+}
+
+#[test]
+fn prepared_handles_are_inert_until_the_whole_batch_is_published() {
+    let _g = scheduler();
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.prepare("prepared-inert-first", std::future::pending::<()>());
+    batch.prepare("prepared-inert-second", std::future::pending::<()>());
+    let handles: Vec<_> = batch.prepared_handles().to_vec();
+
+    assert!(handles.iter().all(|handle| !handle.is_published()));
+    assert!(handles.iter().all(|handle| handle.try_exit().is_none()));
+    assert!(handles
+        .iter()
+        .all(|handle| handle.cancel() == CancelOutcome::NotPublished));
+
+    let published = batch.publish().unwrap();
+    assert!(handles.iter().all(exec::TaskHandle::is_published));
+    assert_eq!(
+        handles.iter().map(exec::TaskHandle::id).collect::<Vec<_>>(),
+        published
+            .iter()
+            .map(exec::TaskHandle::id)
+            .collect::<Vec<_>>()
+    );
+    for handle in published {
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    }
+}
+
+#[test]
+fn every_notify_observes_the_complete_multi_hart_batch_publication() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.prepare("notify-first", std::future::pending::<()>());
+    batch.prepare("notify-second", std::future::pending::<()>());
+    let handles = batch.prepared_handles().to_vec();
+    *NOTIFY_EXPECTED_IDS.lock().unwrap() = handles.iter().map(exec::TaskHandle::id).collect();
+    NOTIFY_CALLS.store(0, Ordering::SeqCst);
+    exec::set_ready_notify_hook(assert_batch_published_from_notify);
+
+    batch.publish().unwrap();
+    exec::clear_ready_notify_hook();
+    assert_eq!(NOTIFY_CALLS.load(Ordering::SeqCst), handles.len() as u64);
+
+    for hart in 0..exec::MAX_HARTS {
+        let _hart = TestHartScope::enter(hart);
+        assert!(handles.iter().all(exec::TaskHandle::is_published));
+    }
+    for handle in handles {
+        let _ = handle.cancel();
+    }
+    NOTIFY_EXPECTED_IDS.lock().unwrap().clear();
+}
+
+#[test]
+fn notification_panic_cannot_roll_back_an_already_published_batch() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let ran = Arc::new(AtomicU64::new(0));
+    let ran_task = ran.clone();
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.prepare("notify-panic", async move {
+        ran_task.fetch_add(1, Ordering::SeqCst);
+    });
+    let handle = batch.prepared_handles()[0].clone();
+    exec::set_ready_notify_hook(panic_after_batch_publication);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch.publish()));
+    exec::clear_ready_notify_hook();
+    assert!(panic.is_err());
+    assert!(handle.is_published());
+    drop(batch);
+    exec::run_until_idle(BUDGET);
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.state(), TaskState::Exited);
+}
+
+#[test]
+fn faulting_prepared_rollback_leaks_conservatively_without_scheduler_visibility() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    exec::set_fault_cleanup(record_fault_cleanup);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    CLEANED_TASKS.lock().unwrap().clear();
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+
+    let first_drops = Arc::new(AtomicU64::new(0));
+    let second_drops = Arc::new(AtomicU64::new(0));
+    let mut batch = exec::PreparedTaskBatch::new();
+    let first = batch.prepare(
+        "prepared-faulting-drop",
+        DropBombFuture {
+            drops: first_drops.clone(),
+        },
+    );
+    let first_id = first.id();
+    let domain = batch.prepared_handles()[0].allocation_domain();
+    let second = batch.prepare(
+        "prepared-normal-drop",
+        DropBombFuture {
+            drops: second_drops.clone(),
+        },
+    );
+    let second_id = second.id();
+    let tombstones = batch.prepared_handles().to_vec();
+
+    FAULT_NEXT_POLL.store(true, Ordering::SeqCst);
+    drop(batch);
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        CLEANED_TASKS.lock().unwrap().as_slice(),
+        &[(first_id, domain)]
+    );
+    assert!(RECLAIMED_DOMAINS.lock().unwrap().is_empty());
+    for id in [first_id, second_id] {
+        assert_eq!(
+            exec::wake_with_disposition(id),
+            exec::WakeDisposition::Inactive
+        );
+        assert!(exec::task_report().iter().all(|task| task.id != id));
+    }
+    assert!(tombstones.iter().all(|handle| !handle.is_published()));
+    assert!(tombstones.iter().all(|handle| handle.try_exit().is_none()));
+    exec::set_fault_cleanup(ignore_fault_cleanup);
+}
+
+#[test]
+fn prepared_batch_reservation_failure_has_no_scheduler_effect() {
+    let _g = scheduler();
+    let reports_before = exec::task_report();
+    let mut batch = exec::PreparedTaskBatch::new();
+    assert!(batch.try_reserve(usize::MAX).is_err());
+    drop(batch);
+    assert_eq!(exec::task_report(), reports_before);
+}
+
+#[test]
+fn empty_prepared_batch_fails_without_scheduler_effect() {
+    let _g = scheduler();
+    let reports_before = exec::task_report();
+    assert!(matches!(
+        exec::PreparedTaskBatch::new().publish(),
+        Err(exec::PreparedTaskBatchError::Empty)
+    ));
+    assert_eq!(exec::task_report(), reports_before);
+}
 
 #[test]
 fn a_spawned_task_runs_to_completion() {

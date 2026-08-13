@@ -40,9 +40,9 @@ pub use resources::{
     MAX_LOG_FIELD_VALUE_BYTES, MAX_LOG_MESSAGE_BYTES, MAX_LOG_TARGET_BYTES, MAX_RANDOM_FILL_BYTES,
 };
 pub use runtime_dispatch::{
-    ComponentHostDispatcher, HostManifestError, VibeHostManifest, BLOB_INTERFACE,
-    BLOB_LEN_FUNCTION, BLOB_READ_FUNCTION, CLOCK_INTERFACE, CLOCK_NOW_FUNCTION, LOG_INTERFACE,
-    LOG_WRITE_FUNCTION, RANDOM_FILL_FUNCTION, RANDOM_INTERFACE,
+    ComponentHostDispatcher, HostManifestError, VibeHostManifest, VibeHostRequirement,
+    BLOB_INTERFACE, BLOB_LEN_FUNCTION, BLOB_READ_FUNCTION, CLOCK_INTERFACE, CLOCK_NOW_FUNCTION,
+    LOG_INTERFACE, LOG_WRITE_FUNCTION, RANDOM_FILL_FUNCTION, RANDOM_INTERFACE,
 };
 pub use service::{ComponentCallError, ComponentHostServices};
 pub use transfer::{transfer_owned, OwnedTransferError};

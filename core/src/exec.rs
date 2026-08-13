@@ -18,7 +18,7 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
@@ -180,6 +180,7 @@ enum CancelRequest {
 }
 
 struct TaskStatus {
+    published: Arc<AtomicBool>,
     polls: AtomicU64,
     state: AtomicU8,
     next_joiner: AtomicU64,
@@ -189,8 +190,9 @@ struct TaskStatus {
 }
 
 impl TaskStatus {
-    fn new() -> Self {
+    fn new(published: Arc<AtomicBool>) -> Self {
         Self {
+            published,
             polls: AtomicU64::new(0),
             state: AtomicU8::new(TaskState::Running as u8),
             next_joiner: AtomicU64::new(1),
@@ -198,6 +200,10 @@ impl TaskStatus {
             next_registration: AtomicU64::new(1),
             registrations: SpinLock::new(Vec::new()),
         }
+    }
+
+    fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
     }
 
     fn state(&self) -> TaskState {
@@ -567,6 +573,8 @@ pub enum CancelOutcome {
     /// The executor already committed return, fault, or cancellation and is
     /// finishing reclamation before publishing the terminal report.
     TooLate(TaskState),
+    /// The task identity exists but its prepared batch has not published it.
+    NotPublished,
 }
 
 /// A persistent view of one task's identity and lifecycle.
@@ -598,11 +606,23 @@ impl TaskHandle {
         self.domain
     }
 
+    pub fn is_published(&self) -> bool {
+        self.status.is_published()
+    }
+
     pub fn state(&self) -> TaskState {
+        assert!(
+            self.is_published(),
+            "an unpublished task has no public state"
+        );
         self.status.state()
     }
 
     pub fn polls(&self) -> u64 {
+        assert!(
+            self.is_published(),
+            "an unpublished task has no public poll count"
+        );
         self.status.polls.load(Ordering::Acquire)
     }
 
@@ -610,6 +630,10 @@ impl TaskHandle {
     ///
     /// This is exposed for runtime diagnostics and reclamation invariants.
     pub fn joiner_count(&self) -> usize {
+        assert!(
+            self.is_published(),
+            "an unpublished task has no public join ledger"
+        );
         self.status.joiners.lock().len()
     }
 
@@ -625,10 +649,17 @@ impl TaskHandle {
     }
 
     pub fn cancellation_requested(&self) -> bool {
+        assert!(
+            self.is_published(),
+            "an unpublished task has no public cancellation state"
+        );
         self.status.cancellation_requested()
     }
 
     pub fn try_exit(&self) -> Option<TaskExit> {
+        if !self.is_published() {
+            return None;
+        }
         let state = self.status.state();
         (state != TaskState::Running)
             .then(|| TaskExit::new(self.id, state, self.status.polls.load(Ordering::Acquire)))
@@ -637,6 +668,7 @@ impl TaskHandle {
     /// Wait for return, fault, or cancellation without losing terminal state
     /// when completion races waiter registration.
     pub fn join(&self) -> Join {
+        assert!(self.is_published(), "an unpublished task cannot be joined");
         Join {
             id: self.id,
             status: self.status.clone(),
@@ -768,6 +800,19 @@ struct Task {
     queue_owner: HartId,
     ready: bool,
     stealable: bool,
+    publication: TaskPublication,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskPublication {
+    Prepared(u64),
+    Published,
+}
+
+impl Task {
+    const fn is_published(&self) -> bool {
+        matches!(self.publication, TaskPublication::Published)
+    }
 }
 
 /// Runs `f` with a landing pad installed, returning true if `f` faulted.
@@ -860,6 +905,14 @@ pub fn set_fault_cleanup(cleanup: FaultCleanup) {
 
 pub fn set_ready_notify_hook(hook: ReadyNotifyHook) {
     READY_NOTIFY_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Remove the ready notification hook while the executor is quiescent.
+/// Host tests use this to isolate publication-order probes; kernels normally
+/// install their immutable IPI hook once during bootstrap.
+#[cfg(not(target_arch = "riscv64"))]
+pub fn clear_ready_notify_hook() {
+    READY_NOTIFY_HOOK.store(0, Ordering::Release);
 }
 
 fn notify_ready_hart(hart: HartId) {
@@ -987,7 +1040,7 @@ fn assert_sched_invariants(s: &Sched) {
             .get(&id)
             .expect("ready task is absent from the task map");
         debug_assert!(
-            task.ready && task.queue_owner == owner,
+            task.is_published() && task.ready && task.queue_owner == owner,
             "ready task {id} metadata disagrees with hart {}",
             owner.index()
         );
@@ -1012,9 +1065,15 @@ fn assert_sched_invariants(s: &Sched) {
             task.ready.then_some(task.queue_owner),
             "task {id} queue metadata has a second or missing owner"
         );
+        if let TaskPublication::Prepared(_) = task.publication {
+            debug_assert!(
+                !task.ready,
+                "unpublished task {id} acquired ready ownership"
+            );
+        }
         if raw == CANCEL_REQUESTED {
             debug_assert!(
-                task.ready,
+                task.is_published() && task.ready,
                 "cancel-requested mapped task {id} is not queued for its boundary"
             );
         }
@@ -1163,12 +1222,19 @@ macro_rules! check_active_poll {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PREPARED_BATCH: AtomicU64 = AtomicU64::new(1);
 
 fn next_task_id() -> TaskId {
     let id = NEXT_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("TaskId space exhausted");
     TaskId(id)
+}
+
+fn next_prepared_batch_id() -> u64 {
+    NEXT_PREPARED_BATCH
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("prepared task batch identity space exhausted")
 }
 
 fn current_queue_hart() -> HartId {
@@ -1323,6 +1389,274 @@ pub unsafe fn spawn_reclaimable_owned(
     spawn_tracked_domain(domain, current_queue_hart(), false, name, fut)
 }
 
+/// One future whose task envelope and lifecycle identity have been allocated,
+/// but which is not yet visible to ready queues, wakes, cancellation, task
+/// reports, or queue-owner lookup. Prepared tasks can only become runnable by
+/// publishing their complete batch through [`PreparedTaskBatch::publish`].
+pub struct PreparedTask {
+    id: TaskId,
+    queue_owner: HartId,
+    task: Option<Task>,
+}
+
+impl PreparedTask {
+    pub const fn id(&self) -> TaskId {
+        self.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedTaskBatchError {
+    Empty,
+    AlreadyPublished,
+    Capacity,
+}
+
+/// A bounded collection of task envelopes held entirely outside the global
+/// scheduler until [`publish`](Self::publish). If the preparing task faults,
+/// these candidates may be conservatively leaked with that task, but no hidden
+/// scheduler node, wake target, or partial pipeline is left behind.
+pub struct PreparedTaskBatch {
+    id: u64,
+    tasks: Vec<PreparedTask>,
+    handles: Vec<TaskHandle>,
+    published: bool,
+    publication: Arc<AtomicBool>,
+}
+
+impl PreparedTaskBatch {
+    pub fn new() -> Self {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let publication = Arc::new(AtomicBool::new(false));
+        system.restore();
+        Self {
+            id: next_prepared_batch_id(),
+            tasks: Vec::new(),
+            handles: Vec::new(),
+            published: false,
+            publication,
+        }
+    }
+
+    pub fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        assert!(!self.published, "a published task batch is immutable");
+        self.tasks.try_reserve_exact(additional)?;
+        self.handles.try_reserve_exact(additional)
+    }
+
+    /// Borrow opaque, non-owning lifecycle tokens for the candidates already
+    /// prepared in this batch. Before publication these handles expose only
+    /// identity/domain data and `is_published == false`; state, polls, joins,
+    /// and cancellation remain unavailable. The batch retains every future
+    /// and is the only object that can publish or roll it back.
+    pub fn prepared_handles(&self) -> &[TaskHandle] {
+        &self.handles
+    }
+
+    pub fn prepare(
+        &mut self,
+        name: &str,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> &PreparedTask {
+        assert!(!self.published, "a published task batch is immutable");
+        let domain = heap::current_domain();
+        assert!(
+            !domain.arena.is_tracked(),
+            "safe prepared tasks cannot enter a raw-reclaimable arena"
+        );
+        self.prepare_domain(domain, current_queue_hart(), true, name, fut)
+    }
+
+    fn prepare_domain(
+        &mut self,
+        domain: AllocationDomain,
+        queue_owner: HartId,
+        stealable: bool,
+        name: &str,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> &PreparedTask {
+        self.tasks
+            .try_reserve_exact(1)
+            .unwrap_or_else(|_| panic!("prepared task metadata allocation failed"));
+        self.handles
+            .try_reserve_exact(1)
+            .unwrap_or_else(|_| panic!("prepared task handle allocation failed"));
+        let (mut task, handle) = make_task(
+            domain,
+            queue_owner,
+            stealable,
+            name,
+            fut,
+            self.publication.clone(),
+        );
+        task.publication = TaskPublication::Prepared(self.id);
+        let id = task.id;
+
+        self.tasks.push(PreparedTask {
+            id,
+            queue_owner,
+            task: Some(task),
+        });
+        self.handles.push(handle);
+        self.tasks.last().expect("the prepared task was appended")
+    }
+
+    /// Publish every member under one scheduler lock. Recoverable ready-queue
+    /// capacity is reserved before mutation. BTreeMap nodes are then allocated
+    /// only under SYSTEM ownership; target global OOM is fail-stop, so it can
+    /// never return through a component landing pad after partial mutation.
+    /// Returned handles have the same order as the preceding `prepare` calls.
+    pub fn publish(&mut self) -> Result<Vec<TaskHandle>, PreparedTaskBatchError> {
+        if self.published {
+            return Err(PreparedTaskBatchError::AlreadyPublished);
+        }
+        if self.tasks.is_empty() {
+            return Err(PreparedTaskBatchError::Empty);
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut s = SCHED.lock();
+        let live_after_publish = s
+            .tasks
+            .len()
+            .checked_add(s.running_count())
+            .and_then(|live| live.checked_add(self.tasks.len()))
+            .expect("live task count overflow");
+        if s.ready.reserve_live_bound(live_after_publish).is_err() {
+            drop(s);
+            system.restore();
+            return Err(PreparedTaskBatchError::Capacity);
+        }
+
+        // Validate every local candidate before the first scheduler mutation.
+        for prepared in &self.tasks {
+            let task = prepared
+                .task
+                .as_ref()
+                .expect("unpublished batch retains every candidate");
+            assert_eq!(task.publication, TaskPublication::Prepared(self.id));
+            assert!(!task.ready);
+            assert!(!s.tasks.contains_key(&prepared.id));
+            assert!(!s.ready.contains(prepared.id));
+        }
+
+        // Install every still-hidden map node before any task becomes ready.
+        // BTreeMap node allocation is charged to SYSTEM. Target global OOM is
+        // a machine fail-stop in the kernel allocator, never a component
+        // longjmp that could continue after a partially installed batch.
+        for prepared in &mut self.tasks {
+            let task = prepared
+                .task
+                .take()
+                .expect("validated candidate remains batch-local");
+            assert!(
+                s.tasks.insert(prepared.id, task).is_none(),
+                "fresh TaskId collided during batch publication"
+            );
+        }
+
+        // Linearization point. Every future, map node, handle, and ready slot
+        // now exists; this loop performs only fixed scheduler mutations.
+        for prepared in &self.tasks {
+            let (owner, stealable) = {
+                let task = s
+                    .tasks
+                    .get_mut(&prepared.id)
+                    .expect("validated prepared task remains installed");
+                task.publication = TaskPublication::Published;
+                task.ready = true;
+                (task.queue_owner, task.stealable)
+            };
+            s.ready
+                .enqueue(owner, prepared.id, stealable)
+                .expect("prepared task has unique reserved queue capacity");
+        }
+        // One shared release flag makes every pre-registered handle visible at
+        // the same linearization point after the complete batch is runnable.
+        self.publication.store(true, Ordering::Release);
+        // Publication is irreversible before any notification hook can run.
+        // A target IPI failure or test-hook panic must never make Drop treat
+        // already-runnable tasks as unpublished rollback candidates.
+        self.published = true;
+        check_sched!(&s);
+        drop(s);
+        system.restore();
+        for prepared in &self.tasks {
+            notify_ready_hart(prepared.queue_owner);
+        }
+        Ok(core::mem::take(&mut self.handles))
+    }
+}
+
+impl Default for PreparedTaskBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PreparedTaskBatch {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        for prepared in &mut self.tasks {
+            if let Some(task) = prepared.task.take() {
+                rollback_unpublished_task(task);
+            }
+        }
+    }
+}
+
+/// Reclaim a safe, unpublished future without ever entering raw arena
+/// teardown. Prepared batches reject tracked domains at their public boundary;
+/// if user Drop itself faults, retain the ordinary executor policy of leaking
+/// its untracked allocation while still running exact-task cleanup once.
+fn rollback_unpublished_task(task: Task) {
+    debug_assert!(!task.domain.arena.is_tracked());
+    let result = reclaim_task(task);
+    if result.faulted {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        notify_fault_cleanup(result.id, result.domain);
+        system.restore();
+    }
+}
+
+fn make_task(
+    domain: AllocationDomain,
+    queue_owner: HartId,
+    stealable: bool,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+    publication: Arc<AtomicBool>,
+) -> (Task, TaskHandle) {
+    let id = next_task_id();
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let status = Arc::new(TaskStatus::new(publication));
+    let task_name = Arc::<str>::from(name);
+    system.restore();
+
+    let mut allocation = unsafe { heap::enter_domain(domain) };
+    let future = ManuallyDrop::new(Box::pin(fut) as Pin<Box<dyn Future<Output = ()> + Send>>);
+    allocation.restore();
+
+    let task = Task {
+        id,
+        domain,
+        name: task_name,
+        future,
+        status: status.clone(),
+        queue_owner,
+        ready: false,
+        stealable,
+        publication: TaskPublication::Prepared(0),
+    };
+    let handle = TaskHandle { id, domain, status };
+    (task, handle)
+}
+
 fn spawn_tracked_domain(
     domain: AllocationDomain,
     queue_owner: HartId,
@@ -1332,7 +1666,7 @@ fn spawn_tracked_domain(
 ) -> TaskHandle {
     let id = next_task_id();
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    let status = Arc::new(TaskStatus::new());
+    let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(true))));
     let task_name = Arc::<str>::from(name);
     system.restore();
 
@@ -1354,6 +1688,7 @@ fn spawn_tracked_domain(
         queue_owner,
         ready: true,
         stealable,
+        publication: TaskPublication::Published,
     };
     let mut s = SCHED.lock();
     // Every live task can migrate to any queue after a steal and then become
@@ -1620,6 +1955,10 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
         InvariantViolation,
     }
 
+    if !handle.is_published() {
+        return CancelOutcome::NotPublished;
+    }
+
     // Reclamation may enter arbitrary user Drop code. Never do that while this
     // hart already owns a user poll/Drop landing pad; for tracked arenas, also
     // require complete same-domain quiescence across every hart. Otherwise a
@@ -1777,7 +2116,7 @@ pub fn wake_with_disposition(id: TaskId) -> WakeDisposition {
     // Parked/ready tasks dominate ordinary channel and timer wakes. Resolve
     // the indexed task map first; only a detached running task requires the
     // bounded four-slot scan.
-    let disposition = if let Some(task) = s.tasks.get(&id) {
+    let disposition = if let Some(task) = s.tasks.get(&id).filter(|task| task.is_published()) {
         let owner = task.queue_owner;
         let ready = task.ready;
         let stealable = task.stealable;
@@ -1827,11 +2166,14 @@ pub fn task_report() -> Vec<TaskReport> {
     {
         let s = SCHED.lock();
         check_sched!(&s);
-        let total = s.tasks.len() + s.running_count();
+        let total = s.tasks.values().filter(|task| task.is_published()).count() + s.running_count();
         if out.try_reserve(total).is_err() {
             allocation_failed = true;
         } else {
             for (id, task) in &s.tasks {
+                if !task.is_published() {
+                    continue;
+                }
                 let mut name = String::new();
                 if name.try_reserve(task.name.len()).is_err() {
                     allocation_failed = true;
@@ -1921,8 +2263,12 @@ pub fn scheduler_lock_stats() -> crate::sync::SpinLockStats {
 /// the executing hart; a ready or parked task owns its metadata hart.
 pub fn task_queue_owner(id: TaskId) -> Option<HartId> {
     let s = SCHED.lock();
-    s.running_hart_for(id)
-        .or_else(|| s.tasks.get(&id).map(|task| task.queue_owner))
+    s.running_hart_for(id).or_else(|| {
+        s.tasks
+            .get(&id)
+            .filter(|task| task.is_published())
+            .map(|task| task.queue_owner)
+    })
 }
 
 /// True when `hart` has neither local work nor stealable remote work.

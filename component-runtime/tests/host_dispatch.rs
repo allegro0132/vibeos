@@ -70,6 +70,36 @@ impl HostDispatcher<()> for PairDispatcher {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FailurePoint {
+    RequiredWork,
+    Dispatch,
+}
+
+struct FailingDispatcher {
+    error: HostError,
+    point: FailurePoint,
+    calls: u32,
+}
+
+impl HostDispatcher<u32> for FailingDispatcher {
+    fn required_work(
+        &self,
+        _import: &HostImportInfo,
+        _arguments: &[CanonicalValue],
+    ) -> Result<u64, HostError> {
+        match self.point {
+            FailurePoint::RequiredWork => Err(self.error),
+            FailurePoint::Dispatch => Ok(1),
+        }
+    }
+
+    fn dispatch(&mut self, _request: HostRequest<'_, u32>) -> Result<HostResponse, HostError> {
+        self.calls += 1;
+        Err(self.error)
+    }
+}
+
 fn instantiate() -> SynchronousComponent {
     let bytes = wat::parse_str(HOST_CLOCK_COMPONENT).unwrap();
     let plan = inspect_component(&bytes).unwrap();
@@ -113,6 +143,7 @@ fn transform_host_call_lifts_borrow_dispatches_charges_and_resumes() {
                 result = Some(value);
                 break;
             }
+            TypedPoll::HostFailed(error) => panic!("clock host failed: {error:?}"),
             TypedPoll::Trapped(trap) => panic!("clock call trapped: {trap:?}"),
         }
     }
@@ -157,6 +188,9 @@ fn prior_instance_host_wrapper_resumes_the_outer_consumer() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Ready(value) => break value,
+            TypedPoll::HostFailed(error) => {
+                panic!("transitive host call failed: {error:?}")
+            }
             TypedPoll::Trapped(trap) => panic!("transitive host call trapped: {trap:?}"),
         }
     };
@@ -185,6 +219,7 @@ fn absent_dispatcher_and_oversized_host_work_fail_closed() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Trapped(trap) => break trap,
+            TypedPoll::HostFailed(error) => panic!("hostless call failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("hostless call returned {value:?}"),
         }
     };
@@ -216,6 +251,7 @@ fn absent_dispatcher_and_oversized_host_work_fail_closed() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Trapped(trap) => break trap,
+            TypedPoll::HostFailed(error) => panic!("over-budget host call failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("over-budget host call returned {value:?}"),
         }
     };
@@ -250,6 +286,7 @@ fn indirect_host_result_uses_the_callers_retptr_in_its_bound_memory() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Ready(value) => break value,
+            TypedPoll::HostFailed(error) => panic!("indirect host result failed: {error:?}"),
             TypedPoll::Trapped(trap) => panic!("indirect host result trapped: {trap:?}"),
         }
     };
@@ -277,12 +314,66 @@ fn result_lowering_budget_is_reserved_before_dispatch() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Trapped(trap) => break trap,
+            TypedPoll::HostFailed(error) => {
+                panic!("under-budget pair call failed: {error:?}")
+            }
             TypedPoll::Ready(value) => panic!("under-budget pair call returned {value:?}"),
         }
     };
     assert_eq!(trap, TrapCode::FuelExhausted);
     drop(call);
     assert_eq!(dispatcher.calls, 0);
+}
+
+#[test]
+fn every_host_boundary_failure_remains_typed_at_the_supervisor_boundary() {
+    const ERRORS: [HostError; 6] = [
+        HostError::Denied,
+        HostError::Unavailable,
+        HostError::Exhausted,
+        HostError::InvalidArgument,
+        HostError::BackendFault,
+        HostError::BudgetExceeded,
+    ];
+
+    for error in ERRORS {
+        for point in [FailurePoint::RequiredWork, FailurePoint::Dispatch] {
+            let mut component = instantiate();
+            let mut resources = ResourceTable::new(400 + u64::from(error.code()), 4).unwrap();
+            let clock = resources.insert_owned(CLOCK, 77).unwrap();
+            let mut dispatcher = FailingDispatcher {
+                error,
+                point,
+                calls: 0,
+            };
+            let mut call = component
+                .start_typed_call_with_host(
+                    &mut resources,
+                    &mut dispatcher,
+                    "run",
+                    vec![CanonicalValue::Resource(clock)],
+                    10_000,
+                    100,
+                )
+                .unwrap();
+            let observed = loop {
+                match call.poll() {
+                    TypedPoll::Pending(_) => {}
+                    TypedPoll::HostFailed(observed) => break observed,
+                    TypedPoll::Ready(value) => panic!("failing host returned {value:?}"),
+                    TypedPoll::Trapped(trap) => panic!("host failure collapsed to {trap:?}"),
+                }
+            };
+            assert_eq!(observed, error);
+            drop(call);
+            assert!(component.is_poisoned());
+            assert!(resources.contains(clock, CLOCK).is_ok());
+            assert_eq!(
+                dispatcher.calls,
+                u32::from(matches!(point, FailurePoint::Dispatch))
+            );
+        }
+    }
 }
 
 #[test]

@@ -52,6 +52,35 @@ pub struct VibeHostManifest {
     log: Option<ResourceTypeId>,
 }
 
+/// One capability requirement derived from an exact, validator-produced host
+/// import. This is inert policy metadata: it contains neither a capability
+/// handle, a guest resource token, nor a CSpace identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VibeHostRequirement {
+    interface: &'static str,
+    resource: &'static str,
+    kind: crate::HostResourceKind,
+    rights: vibeos_core::cap::Rights,
+}
+
+impl VibeHostRequirement {
+    pub const fn interface(self) -> &'static str {
+        self.interface
+    }
+
+    pub const fn resource(self) -> &'static str {
+        self.resource
+    }
+
+    pub const fn kind(self) -> crate::HostResourceKind {
+        self.kind
+    }
+
+    pub const fn rights(self) -> vibeos_core::cap::Rights {
+        self.rights
+    }
+}
+
 impl VibeHostManifest {
     /// Derive nominal resource bindings from the validator-produced plan.
     /// Every callable host import must match the exact versioned allowlist,
@@ -130,6 +159,43 @@ impl VibeHostManifest {
             }
         }
         Ok(manifest)
+    }
+
+    /// Iterate the exact resource requirements represented by this manifest.
+    ///
+    /// Resource type IDs deliberately remain private because they are nominal
+    /// to one decode. Admission persists only the versioned interface,
+    /// semantic kind, and operation rights; a later re-decode derives fresh
+    /// nominal IDs before instantiation.
+    pub fn requirements(self) -> impl Iterator<Item = VibeHostRequirement> {
+        [
+            self.clock.map(|_| VibeHostRequirement {
+                interface: CLOCK_INTERFACE,
+                resource: "clock",
+                kind: crate::HostResourceKind::Clock,
+                rights: vibeos_core::cap::Rights::READ,
+            }),
+            self.random.map(|_| VibeHostRequirement {
+                interface: RANDOM_INTERFACE,
+                resource: "random-source",
+                kind: crate::HostResourceKind::Random,
+                rights: vibeos_core::cap::Rights::READ,
+            }),
+            self.blob.map(|_| VibeHostRequirement {
+                interface: BLOB_INTERFACE,
+                resource: "blob",
+                kind: crate::HostResourceKind::Blob,
+                rights: vibeos_core::cap::Rights::READ,
+            }),
+            self.log.map(|_| VibeHostRequirement {
+                interface: LOG_INTERFACE,
+                resource: "structured-log",
+                kind: crate::HostResourceKind::StructuredLog,
+                rights: vibeos_core::cap::Rights::WRITE,
+            }),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 

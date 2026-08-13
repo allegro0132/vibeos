@@ -112,6 +112,7 @@ pub struct Server {
     control_tx: VecDeque<u8>,
     parameters: Parameters,
     test_started_ms: u64,
+    test_elapsed_ms: u64,
     bytes_transferred: u64,
     payload_state: u32,
 }
@@ -133,6 +134,7 @@ impl Server {
                 duration_seconds: 0,
             },
             test_started_ms: 0,
+            test_elapsed_ms: 0,
             bytes_transferred: 0,
             payload_state: 0x6d2b_79f5,
         }
@@ -248,6 +250,12 @@ impl Server {
                     worked = true;
                 } else if self.control_rx.first().copied() == Some(TEST_END) {
                     self.control_rx.remove(0);
+                    // Freeze the data-test interval at TEST_END.  The result
+                    // exchange may arrive much later (iperf3 commonly waits
+                    // about ten seconds for the reverse sender), and charging
+                    // that protocol tail to end_time makes the sender bitrate
+                    // appear far lower than the bytes actually put on wire.
+                    self.test_elapsed_ms = space.now_ms().saturating_sub(self.test_started_ms);
                     if self.parameters.reverse {
                         self.control_tx.push_back(EXCHANGE_RESULTS);
                         self.phase = Phase::ClientResults;
@@ -284,9 +292,11 @@ impl Server {
                 let control_listener = self.control_listener(first_listener, second_listener);
                 worked |= self.read_control(space, control_listener)?;
                 if take_json_frame(&mut self.control_rx)?.is_some() {
-                    let elapsed_ms = space.now_ms().saturating_sub(self.test_started_ms);
-                    let result =
-                        result_json(self.bytes_transferred, elapsed_ms, self.parameters.reverse);
+                    let result = result_json(
+                        self.bytes_transferred,
+                        self.test_elapsed_ms,
+                        self.parameters.reverse,
+                    );
                     queue_json_frame(&mut self.control_tx, result.as_bytes())?;
                     self.control_tx.push_back(DISPLAY_RESULTS);
                     self.phase = Phase::AwaitDone;

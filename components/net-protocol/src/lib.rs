@@ -681,6 +681,13 @@ impl SharedIpv4TcpStack {
         let mut socket = tcp::Socket::new(receive, transmit);
         socket.set_congestion_control(tcp::CongestionControl::Reno);
         socket.set_nagle_enabled(false);
+        // The packet backends are polled and currently cannot wake this task
+        // when a frame arrives.  smoltcp's default 10 ms delayed ACK would
+        // therefore be observed only on a later protocol poll.  On the Duo's
+        // one-descriptor DWMAC receive path that turns TCP into stop-and-wait:
+        // one MSS followed by roughly 20 ms of silence.  ACK immediately so
+        // the peer can refill the deliberately bounded receive window.
+        socket.set_ack_delay(None);
         socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
         socket
             .listen(port)

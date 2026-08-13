@@ -69,7 +69,10 @@ const GUEST_IPV4: [u8; 4] = config::DEFAULT_IPV4;
 const GATEWAY_IPV4: [u8; 4] = config::DEFAULT_GATEWAY;
 const PREFIX_LEN: u8 = config::DEFAULT_PREFIX_LEN;
 const TCP_TEST_SEED: u64 = 0x5649_4245_4f53_4e31;
-const IDLE_POLL_CEILING_MS: u64 = 10;
+// Packet endpoints are synchronous bounded queues, not async wait sources.
+// Keep the timer fallback short enough that ingress and TCP ACK work does not
+// acquire an additional 10 ms of latency on polling-only hardware backends.
+const IDLE_POLL_CEILING_MS: u64 = 1;
 
 pub const COMPONENT_NAME: &str = "net-stack";
 pub const MAX_SERVICE_LISTENERS: usize = MAX_TCP_LISTENERS;

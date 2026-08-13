@@ -189,7 +189,10 @@ pub fn decode_fs_root_v1(input: &[u8]) -> Result<FsRootV1, FsCodecError> {
 }
 
 fn validate_node(node: &FsBtreeNodeV1) -> Result<usize, FsCodecError> {
-    if node.level > FS_BTREE_MAX_HEIGHT || node.commit_generation == 0 || node.entries.is_empty() {
+    if node.level > FS_BTREE_MAX_HEIGHT
+        || node.commit_generation == 0
+        || (node.level > 0 && node.entries.is_empty())
+    {
         return Err(FsCodecError::InvalidField);
     }
     let mut length = FS_BTREE_HEADER_LEN;

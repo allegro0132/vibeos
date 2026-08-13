@@ -566,7 +566,17 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         if object.reference_codec == 0 {
             continue;
         }
-        if object.reference_codec != crate::cas_codec::REFERENCE_CODEC_TYPED_V1 {
+        if object.reference_codec != crate::cas_codec::REFERENCE_CODEC_TYPED_V1
+            && object.reference_codec != crate::cas_codec::REFERENCE_CODEC_FS_V1
+        {
+            return Err(GcError::Corrupt.into());
+        }
+        if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
+            && !matches!(
+                object.blob_key.object_kind(),
+                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND
+            )
+        {
             return Err(GcError::Corrupt.into());
         }
         if typed_reference_kinds
@@ -716,11 +726,12 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             return Err(GcError::MemoryLimit.into());
         }
         let object_kind = object.blob_key.object_kind();
-        let decoded = if matches!(
-            object_kind,
-            crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND
-        ) {
-            crate::decode_fs_typed_references(object_kind, view.data())
+        let decoded = if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
+            && matches!(
+                object_kind,
+                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND
+            ) {
+            crate::decode_fs_typed_references(object_kind, view.data(), object.commit_generation)
                 .map_err(|_| GcError::Corrupt)?
         } else {
             let admission =
@@ -729,7 +740,9 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
                 .decode(object_kind, view.data())
                 .map_err(|_| GcError::Corrupt)?
         };
-        if decoded.manifest_commit_generation != object.commit_generation {
+        if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_TYPED_V1
+            && decoded.manifest_commit_generation != object.commit_generation
+        {
             return Err(GcError::Corrupt.into());
         }
         if decoded.references().len() > GC_CHILD_BUDGET {

@@ -47,10 +47,12 @@ DELTA_FLAG_NEW_BLOB = 1
 EXTENT_CATALOG_DELTA = 5
 
 AUTHORITY_MAGIC = b"VIBEAUT2"
-AUTHORITY_VERSION = 1
+LEGACY_AUTHORITY_VERSION = 1
+AUTHORITY_VERSION = 2
 AUTHORITY_HEADER_LEN = 0x80
 AUTHORITY_OBJECT_LEN = 0x30
 AUTHORITY_PRINCIPAL_LEN = 0x40
+AUTHORITY_EXTERNAL_ROOT_LEN = 0x20
 MAX_AUTHORITY_BYTES = 256 * PAGE
 MAX_PRINCIPALS = 256
 EXTERNAL_POLICY = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801"
@@ -64,6 +66,16 @@ SYSTEM_PRINCIPAL = b"VIBE-M4-SYSTEM!!"
 NATIVE_STORE_UUID = b"VIBEOS-STOR-V2!!"
 PERSISTENT_ROOT_RIGHTS = 0x01 | 0x10 | 0x20
 PROGRAM_ROOT_RIGHTS = 0x01
+
+FS_ROOT_V1_KIND = 0x46530101
+FS_BTREE_NODE_V1_KIND = 0x46530102
+FS_DATA_V1_KIND = 0x46530103
+FS_REFERENCE_CODEC = 2
+FS_ROOT_LEN = 0xB0
+FS_NODE_HEADER_LEN = 0x40
+FS_ENTRY_HEADER_LEN = 0x30
+FS_DATA_HEADER_LEN = 0x40
+FS_REFERENCE_LEN = 0x28
 
 
 class Violation(ValueError):
@@ -577,12 +589,13 @@ def parse_authority_snapshot(payload: bytes, checkpoint_generation: int) -> dict
         "persistent authority payload length is invalid",
     )
     require(payload[:8] == AUTHORITY_MAGIC, "persistent authority magic is invalid")
+    version = u16(payload, 0x08)
     require(
-        u16(payload, 0x08) == AUTHORITY_VERSION
+        version in (LEGACY_AUTHORITY_VERSION, AUTHORITY_VERSION)
         and u16(payload, 0x0A) == AUTHORITY_HEADER_LEN,
         "persistent authority version/header is invalid",
     )
-    require(not any(payload[0x0C:0x10]) and not any(payload[0x70:0x80]), "persistent authority reserved header is non-zero")
+    require(not any(payload[0x0C:0x10]), "persistent authority reserved header is non-zero")
     generation = u64(payload, 0x10)
     policy_sha256 = bytes(payload[0x18:0x38])
     object_count = u32(payload, 0x38)
@@ -604,10 +617,21 @@ def parse_authority_snapshot(payload: bytes, checkpoint_generation: int) -> dict
     principal_offset = u64(payload, 0x58)
     record_offset = u64(payload, 0x60)
     encoded_len = u64(payload, 0x68)
+    external_root_count = 0 if version == LEGACY_AUTHORITY_VERSION else u32(payload, 0x70)
+    external_root_len = 0 if version == LEGACY_AUTHORITY_VERSION else u32(payload, 0x74)
+    external_root_offset = record_offset if version == LEGACY_AUTHORITY_VERSION else u64(payload, 0x78)
+    if version == LEGACY_AUTHORITY_VERSION:
+        require(not any(payload[0x70:0x80]), "legacy authority reserved header is non-zero")
+    else:
+        require(
+            external_root_len == AUTHORITY_EXTERNAL_ROOT_LEN,
+            "persistent authority external-root geometry is invalid",
+        )
     require(object_offset == AUTHORITY_HEADER_LEN, "persistent authority object offset is invalid")
     require(
         principal_offset == object_offset + object_count * AUTHORITY_OBJECT_LEN
-        and record_offset == principal_offset + principal_count * AUTHORITY_PRINCIPAL_LEN
+        and external_root_offset == principal_offset + principal_count * AUTHORITY_PRINCIPAL_LEN
+        and record_offset == external_root_offset + external_root_count * AUTHORITY_EXTERNAL_ROOT_LEN
         and encoded_len == record_offset + record_count * BLOCK
         and encoded_len == len(payload),
         "persistent authority tables are non-canonical",
@@ -636,6 +660,27 @@ def parse_authority_snapshot(payload: bytes, checkpoint_generation: int) -> dict
         previous_stable = binding["stable_object_id"]
         v2_object_ids.add(binding["v2_object_id"])
         objects.append(binding)
+
+    external_roots = []
+    previous_root_id = 0
+    for index in range(external_root_count):
+        at = external_root_offset + index * AUTHORITY_EXTERNAL_ROOT_LEN
+        root = {
+            "object_id": u128(payload, at),
+            "commit_generation": u64(payload, at + 0x10),
+            "object_kind": u32(payload, at + 0x18),
+        }
+        require(
+            u32(payload, at + 0x1C) == 0
+            and root["object_id"] > previous_root_id
+            and root["object_id"] not in v2_object_ids
+            and 0 < root["commit_generation"] <= generation
+            and root["object_kind"] != 0,
+            "persistent authority external roots are invalid, unsorted, or duplicate",
+        )
+        previous_root_id = root["object_id"]
+        v2_object_ids.add(root["object_id"])
+        external_roots.append(root)
 
     principals = []
     previous_principal = bytes(16)
@@ -671,7 +716,9 @@ def parse_authority_snapshot(payload: bytes, checkpoint_generation: int) -> dict
     record_stream = bytes(payload[record_offset:])
     require(record_stream, "persistent authority record stream is empty")
     return {
+        "version": version,
         "objects": objects,
+        "external_roots": external_roots,
         "principals": principals,
         "record_stream": record_stream,
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -1214,7 +1261,7 @@ def reconstruct_v2_checkpoint(
             "object_kind": binding["object_kind"],
         }
         for binding in authority["objects"]
-    ]
+    ] + authority["external_roots"]
     gc_verifier.validate_raw_object_graph(objects, contents, roots, [])
     return {
         "checkpoint_generation": generation,
@@ -1433,10 +1480,27 @@ def verify_v2_checkpoint_fallbacks(
     return len(sealed)
 
 
+def v2_managed_end(image: bytes | bytearray) -> int:
+    first = V2_FIRST * BLOCK
+    available = len(image) - first
+    require(available >= 0 and available % PAGE == 0, "V2 suffix is not page aligned")
+    pages = available // PAGE
+    require(pages >= gc_verifier.storage.ANCHOR_PAGES, "V2 suffix is shorter than its anchors")
+    segments = (
+        pages - gc_verifier.storage.ANCHOR_PAGES
+    ) // gc_verifier.storage.SEGMENT_PAGES
+    managed_pages = (
+        gc_verifier.storage.ANCHOR_PAGES
+        + segments * gc_verifier.storage.SEGMENT_PAGES
+    )
+    end = first + managed_pages * PAGE
+    require(not any(image[end:]), "unaligned suffix after the managed V2 range is non-zero")
+    return end
+
+
 def probe_v2(image: bytes | bytearray) -> tuple[str, dict[str, Any] | None]:
     first = V2_FIRST * BLOCK
-    end = (V2_FIRST + V2_COUNT) * BLOCK
-    region = memoryview(image)[first:end]
+    region = memoryview(image)[first:v2_managed_end(image)]
     if not any(region):
         return "absent", None
     try:
@@ -1483,11 +1547,366 @@ def probe_v2(image: bytes | bytearray) -> tuple[str, dict[str, Any] | None]:
             "recovered": recovered,
             "verified_checkpoint_copies": fallback_copies,
         }
-    except Exception:
-        return "corrupt", None
+    except Exception as error:
+        return "corrupt", {"error": str(error)}
 
 
-def verify_authority_bindings(v2: dict[str, Any]) -> dict[str, Any]:
+def parse_fs_reference(raw: bytes, label: str) -> dict[str, int]:
+    require(len(raw) == FS_REFERENCE_LEN, f"{label} reference length is invalid")
+    require(not any(raw[0x1C:]), f"{label} reference reserved bytes are non-zero")
+    reference = {
+        "object_id": u128(raw, 0),
+        "commit_generation": u64(raw, 0x10),
+        "object_kind": u32(raw, 0x18),
+    }
+    require(
+        all(reference.values()),
+        f"{label} reference contains a zero identity field",
+    )
+    return reference
+
+
+def fs_object(
+    recovered: dict[str, Any], reference: dict[str, int], expected_kind: int, label: str
+) -> bytes:
+    require(reference["object_kind"] == expected_kind, f"{label} has the wrong ObjectKind")
+    mapping = recovered["objects"].get(reference["object_id"])
+    require(mapping is not None, f"{label} has no CAS ObjectMapping")
+    require(
+        mapping["commit_generation"] == reference["commit_generation"]
+        and mapping["object_kind"] == expected_kind
+        and mapping["reference_codec"] == FS_REFERENCE_CODEC,
+        f"{label} identity or FS reference codec differs from CAS",
+    )
+    content = recovered["contents"].get(
+        gc_verifier.blob_key_identity(mapping["blob_key"])
+    )
+    require(
+        content is not None and len(content) == mapping["exact_len"],
+        f"{label} content is absent or has the wrong length",
+    )
+    return content
+
+
+def parse_fs_root(payload: bytes) -> dict[str, Any]:
+    require(len(payload) == FS_ROOT_LEN and payload[:8] == b"VIBEFSR1", "FsRootV1 framing is invalid")
+    require(
+        u16(payload, 0x08) == 1
+        and u16(payload, 0x0A) == 0x60
+        and u32(payload, 0x0C) == FS_ROOT_LEN
+        and u16(payload, 0x38) == 2
+        and not any(payload[0x3A:0x60]),
+        "FsRootV1 header is non-canonical",
+    )
+    root = {
+        "namespace_uuid": u128(payload, 0x10),
+        "generation": u64(payload, 0x20),
+        "next_file_id": u64(payload, 0x28),
+        "root_file_id": u64(payload, 0x30),
+        "inode_tree": parse_fs_reference(payload[0x60:0x88], "inode tree"),
+        "dirent_tree": parse_fs_reference(payload[0x88:0xB0], "dirent tree"),
+    }
+    require(
+        root["namespace_uuid"] != 0
+        and root["generation"] != 0
+        and root["next_file_id"] >= 2
+        and 0 < root["root_file_id"] < root["next_file_id"],
+        "FsRootV1 namespace fields are invalid",
+    )
+    require(
+        root["inode_tree"]["object_kind"] == FS_BTREE_NODE_V1_KIND
+        and root["dirent_tree"]["object_kind"] == FS_BTREE_NODE_V1_KIND,
+        "FsRootV1 does not name two B+tree nodes",
+    )
+    return root
+
+
+def parse_fs_node(payload: bytes) -> dict[str, Any]:
+    require(
+        FS_NODE_HEADER_LEN <= len(payload) <= PAGE
+        and payload[:8] == b"VIBEFSN1",
+        "FsBtreeNodeV1 framing is invalid",
+    )
+    require(
+        u16(payload, 0x08) == 1
+        and u16(payload, 0x0A) == FS_NODE_HEADER_LEN
+        and u32(payload, 0x0C) == len(payload)
+        and payload[0x10] in (1, 2)
+        and payload[0x11] <= 8
+        and not any(payload[0x14:0x18])
+        and not any(payload[0x20:FS_NODE_HEADER_LEN]),
+        "FsBtreeNodeV1 header is non-canonical",
+    )
+    level = payload[0x11]
+    count = u16(payload, 0x12)
+    require(level == 0 or count > 0, "internal FsBtreeNodeV1 is empty")
+    entries = []
+    offset_at = FS_NODE_HEADER_LEN
+    previous = None
+    for index in range(count):
+        header_end = offset_at + FS_ENTRY_HEADER_LEN
+        require(header_end <= len(payload), "FsBtreeNodeV1 entry header is truncated")
+        key_len = u16(payload, offset_at)
+        value_len = u16(payload, offset_at + 2)
+        require(key_len > 0 and not any(payload[offset_at + 4:offset_at + 8]), "FsBtreeNodeV1 entry header is invalid")
+        raw_reference = payload[offset_at + 8:header_end]
+        reference = None if not any(raw_reference) else parse_fs_reference(raw_reference, f"node entry {index}")
+        offset_at = header_end
+        end = offset_at + key_len + value_len
+        require(end <= len(payload), "FsBtreeNodeV1 entry body is truncated")
+        key = bytes(payload[offset_at:offset_at + key_len])
+        value = bytes(payload[offset_at + key_len:end])
+        require(previous is None or previous < key, "FsBtreeNodeV1 keys are not strictly ordered")
+        previous = key
+        if level:
+            require(
+                not value
+                and reference is not None
+                and reference["object_kind"] == FS_BTREE_NODE_V1_KIND,
+                "internal FsBtreeNodeV1 entry is not one child edge",
+            )
+        else:
+            require(
+                reference is None or reference["object_kind"] == FS_DATA_V1_KIND,
+                "leaf FsBtreeNodeV1 has a non-data edge",
+            )
+            require(payload[0x10] == 1 or reference is None, "dirent leaf carries a data edge")
+        entries.append({"key": key, "value": value, "reference": reference})
+        offset_at = end
+    require(offset_at == len(payload), "FsBtreeNodeV1 has a trailing suffix")
+    return {
+        "tree": payload[0x10],
+        "level": level,
+        "generation": u64(payload, 0x18),
+        "entries": entries,
+    }
+
+
+def read_fs_tree(
+    recovered: dict[str, Any], reference: dict[str, int], tree: int, generation: int
+) -> tuple[list[dict[str, Any]], set[int]]:
+    visited: set[int] = set()
+
+    def visit(current: dict[str, int], expected_level: int | None) -> list[dict[str, Any]]:
+        require(current["object_id"] not in visited, "FsBtreeNodeV1 graph contains a cycle or duplicate child")
+        visited.add(current["object_id"])
+        node = parse_fs_node(fs_object(recovered, current, FS_BTREE_NODE_V1_KIND, "B+tree node"))
+        require(
+            node["tree"] == tree
+            and 0 < node["generation"] <= generation
+            and (expected_level is None or node["level"] == expected_level),
+            "FsBtreeNodeV1 tree, level, or generation is inconsistent",
+        )
+        if node["level"] == 0:
+            return node["entries"]
+        flattened = []
+        for entry in node["entries"]:
+            child = visit(entry["reference"], node["level"] - 1)
+            require(child and child[0]["key"] == entry["key"], "B+tree separator differs from child minimum")
+            flattened.extend(child)
+        require(
+            all(left["key"] < right["key"] for left, right in zip(flattened, flattened[1:])),
+            "B+tree child ranges overlap or are unordered",
+        )
+        return flattened
+
+    return visit(reference, None), visited
+
+
+def parse_fs_data(payload: bytes) -> dict[str, Any]:
+    require(len(payload) >= FS_DATA_HEADER_LEN and payload[:8] == b"VIBEFSD1", "FsDataV1 framing is invalid")
+    require(
+        u16(payload, 0x08) == 1
+        and u16(payload, 0x0A) == FS_DATA_HEADER_LEN
+        and u32(payload, 0x0C) == len(payload)
+        and not any(payload[0x26:FS_DATA_HEADER_LEN]),
+        "FsDataV1 header is non-canonical",
+    )
+    chunk_index = u64(payload, 0x10)
+    total_len = u64(payload, 0x18)
+    bytes_len = u32(payload, 0x20)
+    ancestor_count = u16(payload, 0x24)
+    require(ancestor_count == chunk_index.bit_length(), "FsDataV1 ancestor count is invalid")
+    bytes_at = FS_DATA_HEADER_LEN + ancestor_count * FS_REFERENCE_LEN
+    require(bytes_at + bytes_len == len(payload) and bytes_len <= PAGE, "FsDataV1 body length is invalid")
+    ancestors = [
+        parse_fs_reference(
+            payload[FS_DATA_HEADER_LEN + index * FS_REFERENCE_LEN:FS_DATA_HEADER_LEN + (index + 1) * FS_REFERENCE_LEN],
+            f"data ancestor {index}",
+        )
+        for index in range(ancestor_count)
+    ]
+    require(
+        all(item["object_kind"] == FS_DATA_V1_KIND for item in ancestors),
+        "FsDataV1 ancestor has the wrong ObjectKind",
+    )
+    data = bytes(payload[bytes_at:])
+    require(
+        (total_len == 0 and chunk_index == 0 and not ancestors and not data)
+        or (
+            total_len >= len(data) > 0
+            and (chunk_index != 0 or total_len == len(data))
+            and (chunk_index == 0 or total_len > len(data))
+        ),
+        "FsDataV1 length fields are inconsistent",
+    )
+    return {"chunk_index": chunk_index, "total_len": total_len, "ancestors": ancestors, "bytes": data}
+
+
+def verify_fs_content(
+    recovered: dict[str, Any], tail: dict[str, int], expected_len: int, cache: dict[int, dict[str, Any]]
+) -> bytes:
+    def load(reference: dict[str, int]) -> dict[str, Any]:
+        cached = cache.get(reference["object_id"])
+        if cached is not None:
+            require(
+                cached["reference"] == reference,
+                "one FsDataV1 ObjectId is referenced with two identities",
+            )
+            return cached
+        node = parse_fs_data(fs_object(recovered, reference, FS_DATA_V1_KIND, "data node"))
+        cached = {**node, "reference": reference}
+        cache[reference["object_id"]] = cached
+        for index, ancestor in enumerate(node["ancestors"]):
+            target = load(ancestor)
+            require(
+                target["chunk_index"] == node["chunk_index"] - (1 << index)
+                and target["total_len"] < node["total_len"],
+                "FsDataV1 skip edge names the wrong prior chunk",
+            )
+        if node["chunk_index"]:
+            previous = load(node["ancestors"][0])
+            require(
+                previous["total_len"] + len(node["bytes"]) == node["total_len"],
+                "FsDataV1 cumulative length is invalid",
+            )
+        return cached
+
+    node = load(tail)
+    require(node["total_len"] == expected_len, "inode size differs from its FsDataV1 tail")
+    chunks = []
+    while True:
+        chunks.append(node["bytes"])
+        if node["chunk_index"] == 0:
+            break
+        node = load(node["ancestors"][0])
+    content = b"".join(reversed(chunks))
+    require(len(content) == expected_len, "FsDataV1 chain does not reconstruct the inode size")
+    return content
+
+
+def verify_file_tree(v2: dict[str, Any], require_present: bool) -> dict[str, Any] | None:
+    recovered = v2["recovered"]
+    roots = recovered["authority"]["external_roots"]
+    require(
+        len(roots) <= 1 and all(root["object_kind"] == FS_ROOT_V1_KIND for root in roots),
+        "VIBEAUT2 contains extra or non-file-tree external roots",
+    )
+    if not roots:
+        require(not require_present, "VIBEAUT2 does not contain a file-tree root")
+        return None
+    root_reference = roots[0]
+    root = parse_fs_root(fs_object(recovered, root_reference, FS_ROOT_V1_KIND, "file-tree root"))
+    inode_entries, inode_nodes = read_fs_tree(recovered, root["inode_tree"], 1, root["generation"])
+    dirent_entries, dirent_nodes = read_fs_tree(recovered, root["dirent_tree"], 2, root["generation"])
+    require(not inode_nodes.intersection(dirent_nodes), "inode and dirent trees share a structural node")
+
+    inodes: dict[int, dict[str, Any]] = {}
+    content_cache: dict[int, dict[str, Any]] = {}
+    for entry in inode_entries:
+        require(len(entry["key"]) == 8 and len(entry["value"]) == 32, "inode record geometry is invalid")
+        file_id = int.from_bytes(entry["key"], "big")
+        value = entry["value"]
+        require(file_id != 0 and not any(value[2:8]) and value[0] in (1, 2, 3) and value[1] in (0, 1), "inode record is non-canonical")
+        inode = {
+            "type": value[0],
+            "has_content": value[1] == 1,
+            "size": u64(value, 8),
+            "links": u64(value, 16),
+            "change_generation": u64(value, 24),
+            "reference": entry["reference"],
+        }
+        require(
+            file_id < root["next_file_id"]
+            and inode["links"] > 0
+            and 0 < inode["change_generation"] <= root["generation"]
+            and (
+                (inode["type"] == 2 and inode["size"] == 0 and not inode["has_content"] and inode["reference"] is None)
+                or (inode["type"] != 2 and inode["has_content"] and inode["reference"] is not None)
+            ),
+            "inode fields or typed data edge are invalid",
+        )
+        require(file_id not in inodes, "inode FileId is duplicated")
+        inodes[file_id] = inode
+
+    require(root["root_file_id"] in inodes and inodes[root["root_file_id"]]["type"] == 2, "namespace root inode is absent or not a directory")
+    dirents: list[tuple[int, str, int]] = []
+    for entry in dirent_entries:
+        require(len(entry["key"]) > 8 and len(entry["value"]) == 8 and entry["reference"] is None, "dirent record geometry is invalid")
+        parent = int.from_bytes(entry["key"][:8], "big")
+        child = int.from_bytes(entry["value"], "big")
+        try:
+            name = entry["key"][8:].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Violation("dirent name is not UTF-8") from error
+        require(
+            0 < len(name.encode()) <= 255
+            and name not in (".", "..")
+            and "/" not in name
+            and all(ord(character) >= 0x20 and ord(character) != 0x7F for character in name)
+            and parent in inodes
+            and inodes[parent]["type"] == 2
+            and child in inodes,
+            "dirent name, parent, or child is invalid",
+        )
+        dirents.append((parent, name, child))
+
+    incoming = {file_id: 0 for file_id in inodes}
+    child_dirs = {file_id: 0 for file_id in inodes}
+    children: dict[int, list[int]] = {file_id: [] for file_id in inodes}
+    for parent, _name, child in dirents:
+        incoming[child] += 1
+        children[parent].append(child)
+        if inodes[child]["type"] == 2:
+            child_dirs[parent] += 1
+    reachable: set[int] = set()
+    work = [root["root_file_id"]]
+    while work:
+        current = work.pop()
+        require(current not in reachable, "directory namespace contains a cycle or duplicate directory link")
+        reachable.add(current)
+        work.extend(child for child in children[current] if inodes[child]["type"] == 2)
+    require(
+        incoming[root["root_file_id"]] == 0
+        and all(file_id == root["root_file_id"] or incoming[file_id] > 0 for file_id in inodes),
+        "namespace contains an orphan inode or a linked root inode",
+    )
+    for file_id, inode in inodes.items():
+        expected_links = 2 + child_dirs[file_id] if inode["type"] == 2 else incoming[file_id]
+        require(inode["links"] == expected_links, "inode link count differs from namespace structure")
+        if inode["type"] == 2:
+            require(file_id == root["root_file_id"] or incoming[file_id] == 1, "directory has a hard link")
+        else:
+            content = verify_fs_content(recovered, inode["reference"], inode["size"], content_cache)
+            if inode["type"] == 3:
+                try:
+                    target = content.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise Violation("symlink target is not UTF-8") from error
+                require(target and not target.startswith(("/", "@")) and "\x00" not in target, "symlink target is not root-relative")
+    return {
+        "verified": True,
+        "namespace_uuid": f"{root['namespace_uuid']:032x}",
+        "generation": root["generation"],
+        "next_file_id": root["next_file_id"],
+        "inodes": len(inodes),
+        "dirents": len(dirents),
+        "tree_nodes": len(inode_nodes | dirent_nodes),
+        "data_nodes": len(content_cache),
+    }
+
+
+def verify_authority_bindings(v2: dict[str, Any], require_file_tree: bool = False) -> dict[str, Any]:
     recovered = v2["recovered"]
     authority = recovered["authority"]
     expected = recovered["authority_objects"]
@@ -1539,6 +1958,7 @@ def verify_authority_bindings(v2: dict[str, Any]) -> dict[str, Any]:
         == physical,
         "persistent principal totals differ from the exact bound object set",
     )
+    file_tree = verify_file_tree(v2, require_file_tree)
     return {
         "verified": True,
         "authority_objects": len(bindings),
@@ -1546,6 +1966,7 @@ def verify_authority_bindings(v2: dict[str, Any]) -> dict[str, Any]:
         "unique_blobs": len(recovered["contents"]),
         "logical_bytes": logical,
         "attributable_physical_bytes": physical,
+        "file_tree": file_tree,
     }
 
 
@@ -1571,6 +1992,8 @@ def canonical_empty_authority_payload(checkpoint_generation: int) -> bytes:
     put_u64(payload, 0x58, principal_at)
     put_u64(payload, 0x60, record_at)
     put_u64(payload, 0x68, len(payload))
+    struct.pack_into("<II", payload, 0x70, 0, AUTHORITY_EXTERNAL_ROOT_LEN)
+    put_u64(payload, 0x78, record_at)
     payload[principal_at:principal_at + 16] = SYSTEM_PRINCIPAL
     put_u64(payload, principal_at + 0x10, (1 << 64) - 1)
     put_u64(payload, principal_at + 0x18, (1 << 64) - 1)
@@ -1587,6 +2010,7 @@ def verify_image(
     unmanaged_prefix_baseline: bytes,
     frozen_m4_baseline: bytes | None = None,
     expect_native: bool = False,
+    expect_file_tree: bool = False,
 ) -> dict[str, Any]:
     require(len(image) % BLOCK == 0, "image is not logical-block aligned")
     require(
@@ -1603,10 +2027,6 @@ def verify_image(
     require(
         not any(image[(CONTROL_FIRST + CONTROL_COUNT) * BLOCK:V2_FIRST * BLOCK]),
         "reserved range between migration control and V2 is non-zero",
-    )
-    require(
-        not any(image[(V2_FIRST + V2_COUNT) * BLOCK:]),
-        "unmanaged suffix after the fixed V2 range is non-zero",
     )
     slots = [
         parse_control(
@@ -1650,7 +2070,15 @@ def verify_image(
             "M4 rollback range differs from its powered-off V2Staged baseline",
         )
     formats = {"m4": m4, "v2": v2}
-    require(m4 != "corrupt" and v2 != "corrupt", "a storage format is corrupt")
+    v2_error = (
+        f": {v2_evidence['error']}"
+        if v2 == "corrupt" and v2_evidence is not None
+        else ""
+    )
+    require(
+        m4 != "corrupt" and v2 != "corrupt",
+        f"a storage format is corrupt{v2_error}",
+    )
     equivalence: dict[str, Any] | None = None
     if selected is not None:
         if v2 == "valid" and v2_evidence is not None:
@@ -1688,7 +2116,7 @@ def verify_image(
                     selected["activation_authority_sha256"] == v2_evidence["authority_sha256"],
                     "native selector floor differs from the selected authority",
                 )
-            equivalence = verify_authority_bindings(v2_evidence)
+            equivalence = verify_authority_bindings(v2_evidence, expect_file_tree)
             empty_stream = canonical_empty_record_stream()
             empty_state = recover_record_stream(empty_stream)
             current_stream = v2_evidence["recovered"]["authority"]["record_stream"]
@@ -1736,7 +2164,7 @@ def verify_image(
                     == v2_evidence["authority_sha256"],
                     "activation-floor authority commitment differs from current V2",
                 )
-            equivalence = verify_authority_bindings(v2_evidence)
+            equivalence = verify_authority_bindings(v2_evidence, expect_file_tree)
             m4_stream, m4_state = canonical_m4_stream(image)
             current_stream = v2_evidence["recovered"]["authority"]["record_stream"]
             current_state = v2_evidence["recovered"]["authority_state"]
@@ -1787,7 +2215,7 @@ def verify_image(
                 else None
             ),
             "control": [CONTROL_FIRST, CONTROL_FIRST + CONTROL_COUNT],
-            "v2": [V2_FIRST, V2_FIRST + V2_COUNT],
+            "v2": [V2_FIRST, v2_managed_end(image) // BLOCK],
             "isolated": True,
         },
         "control": {"slots": slots, "selected": selected},
@@ -1979,6 +2407,8 @@ def selftest() -> dict[str, Any]:
     put_u64(authority_payload, 0x58, AUTHORITY_HEADER_LEN)
     put_u64(authority_payload, 0x60, AUTHORITY_HEADER_LEN + AUTHORITY_PRINCIPAL_LEN)
     put_u64(authority_payload, 0x68, len(authority_payload))
+    struct.pack_into("<II", authority_payload, 0x70, 0, AUTHORITY_EXTERNAL_ROOT_LEN)
+    put_u64(authority_payload, 0x78, AUTHORITY_HEADER_LEN + AUTHORITY_PRINCIPAL_LEN)
     principal_at = AUTHORITY_HEADER_LEN
     authority_payload[principal_at:principal_at + 16] = b"VIBE-M4-SYSTEM!!"
     put_u64(authority_payload, principal_at + 0x10, (1 << 64) - 1)
@@ -2013,6 +2443,11 @@ def selftest() -> dict[str, Any]:
     put_u64(
         two_binding_payload,
         0x60,
+        AUTHORITY_HEADER_LEN + 2 * AUTHORITY_OBJECT_LEN + AUTHORITY_PRINCIPAL_LEN,
+    )
+    put_u64(
+        two_binding_payload,
+        0x78,
         AUTHORITY_HEADER_LEN + 2 * AUTHORITY_OBJECT_LEN + AUTHORITY_PRINCIPAL_LEN,
     )
     put_u64(two_binding_payload, 0x68, len(two_binding_payload))
@@ -2242,6 +2677,11 @@ def main() -> int:
         help="require a generation-1 native rollback-closed V2 store with no M4 source",
     )
     parser.add_argument(
+        "--expect-file-tree",
+        action="store_true",
+        help="require and fully verify the sole VIBEAUT2 external file-tree root",
+    )
+    parser.add_argument(
         "--unmanaged-prefix-baseline",
         type=Path,
         help="pre-migration image or exact [0,64) logical-block prefix",
@@ -2285,6 +2725,7 @@ def main() -> int:
                 baseline_image[:M4_FIRST * BLOCK],
                 frozen_m4,
                 expect_native=args.expect_native,
+                expect_file_tree=args.expect_file_tree,
             )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 0

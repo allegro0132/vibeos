@@ -60,3 +60,23 @@ retains one chunk and at most 64 opaque references independent of file size;
 an inode publishes only the final node. Cancellation leaves those nodes
 unreachable, while a successful command publishes data, COW namespace nodes,
 and the new root through one persistent-root compare/exchange.
+
+## Powered-off verification
+
+The independent host verifier understands both legacy `VIBEAUT2` v1 snapshots
+and v2 snapshots containing opaque service roots. For a file-tree image it
+must be run while QEMU is stopped:
+
+```sh
+python3 -B scripts/verify-storage-v2-migration.py \
+  --expect-native --expect-file-tree \
+  --unmanaged-prefix-baseline target/file-tree-prefix.baseline \
+  target/file-tree.raw
+```
+
+Besides the Storage V2 checkpoint, allocation, CAS, Blob, and authority
+invariants, `--expect-file-tree` requires exactly one external `FsRootV1` and
+walks its typed closure. It independently checks canonical B+tree ordering and
+levels, inode/dirent structure, FileId bounds, link counts, directory acyclicity,
+data skip edges, reconstructed file sizes, and UTF-8 relative symlink targets.
+Unreachable transaction objects are not authority and may remain until GC.

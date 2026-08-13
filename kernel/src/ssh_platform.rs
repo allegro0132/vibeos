@@ -88,6 +88,15 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     listener_label: "ssh-test",
 };
 
+#[cfg(any(
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh"
+))]
+fn ssh_service_policy() -> SshServicePolicy {
+    SSH_SERVICE_POLICY
+}
+
 #[cfg(feature = "milkv-ssh-acceptance")]
 const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     ethernet_address: [0x02, 0, 0, 0, 0, 1],
@@ -280,8 +289,8 @@ impl SshdPlatform for SshPlatform {
             .lock()
             .lookup_revocable::<TcpListener>(listener, Rights::READ)
             .ok()?;
-        listener_authority.try_with(|_| ()).ok()?;
-        Some(vibeos_netstack::config::runtime_status())
+        let listener_id = listener_authority.try_with(TcpListener::id).ok()?.get();
+        vibeos_netstack::config::runtime_status_for_listener(listener_id)
     }
 
     fn entropy<'a>(
@@ -462,7 +471,7 @@ pub async fn capability_task(
     ));
     vibeos_sshd::capability_task(
         &platform,
-        SSH_SERVICE_POLICY,
+        ssh_service_policy(),
         listener,
         random,
         signer_read,
@@ -499,7 +508,7 @@ pub async fn task(
     ));
     vibeos_sshd::task(
         &platform,
-        SSH_SERVICE_POLICY,
+        ssh_service_policy(),
         outbound,
         inbound,
         control,

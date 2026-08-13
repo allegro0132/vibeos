@@ -84,6 +84,28 @@ impl TcpListenerId {
     }
 }
 
+/// Image-policy identity for a bounded set of sockets sharing one TCP port.
+///
+/// A shared group is required by protocols such as iperf3 which use one
+/// control connection and one or more data connections on the same port. The
+/// identifier is policy metadata, not a network-visible or forgeable socket
+/// handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpPortGroupId(NonZeroU64);
+
+impl TcpPortGroupId {
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// An unforgeable-in-safe-Rust reference to the currently accepted peer.
 ///
 /// It is intentionally not a reusable integer socket id. Listener identity
@@ -130,6 +152,7 @@ pub struct TcpListener {
     name: String,
     id: TcpListenerId,
     port: u16,
+    port_group: Option<TcpPortGroupId>,
     receive_capacity: usize,
     transmit_capacity: usize,
     inner: SpinLock<Inner>,
@@ -142,6 +165,35 @@ impl TcpListener {
         port: u16,
         receive_capacity: usize,
         transmit_capacity: usize,
+    ) -> Result<Arc<Self>, TcpFrontendError> {
+        Self::new_with_port_group(name, id, port, receive_capacity, transmit_capacity, None)
+    }
+
+    pub fn new_shared(
+        name: &str,
+        id: TcpListenerId,
+        port: u16,
+        receive_capacity: usize,
+        transmit_capacity: usize,
+        port_group: TcpPortGroupId,
+    ) -> Result<Arc<Self>, TcpFrontendError> {
+        Self::new_with_port_group(
+            name,
+            id,
+            port,
+            receive_capacity,
+            transmit_capacity,
+            Some(port_group),
+        )
+    }
+
+    fn new_with_port_group(
+        name: &str,
+        id: TcpListenerId,
+        port: u16,
+        receive_capacity: usize,
+        transmit_capacity: usize,
+        port_group: Option<TcpPortGroupId>,
     ) -> Result<Arc<Self>, TcpFrontendError> {
         if port == 0 {
             return Err(TcpFrontendError::InvalidPort);
@@ -159,6 +211,7 @@ impl TcpListener {
             name: name.to_string(),
             id,
             port,
+            port_group,
             receive_capacity,
             transmit_capacity,
             inner: SpinLock::new(Inner {
@@ -180,6 +233,10 @@ impl TcpListener {
 
     pub const fn port(&self) -> u16 {
         self.port
+    }
+
+    pub const fn port_group(&self) -> Option<TcpPortGroupId> {
+        self.port_group
     }
 
     pub fn snapshot(&self) -> TcpListenerSnapshot {
@@ -401,11 +458,15 @@ impl Resource for TcpListener {
     fn describe(&self) -> String {
         let snapshot = self.snapshot();
         format!(
-            "{} tcp :{} {:?} generation={} rx={}/{} tx={}/{}",
+            "{} tcp :{} {:?} generation={} group={} rx={}/{} tx={}/{}",
             self.name,
             self.port,
             snapshot.state,
             snapshot.connection_generation,
+            match self.port_group {
+                Some(group) => group.get(),
+                None => 0,
+            },
             snapshot.readable_bytes,
             self.receive_capacity,
             snapshot.queued_send_bytes,

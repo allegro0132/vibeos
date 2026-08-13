@@ -1,8 +1,8 @@
 //! Kernel adapters for the separately compiled IPv4 stack component.
 
-#[cfg(feature = "tcp-echo-recovery-test")]
 extern crate alloc;
 
+use alloc::vec::Vec;
 #[cfg(feature = "tcp-echo-recovery-test")]
 use alloc::{format, string::String};
 
@@ -32,10 +32,7 @@ impl Platform for NetstackPlatform {
         &self,
         outbound: Cap,
         inbound: Cap,
-    ) -> Option<(
-        vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
-        vibeos_core::cap::Revocable<Endpoint<StampedPacket>>,
-    )> {
+    ) -> Option<vibeos_netstack::PacketEndpoints> {
         let cspace = self.space.0.lock();
         let outbound = cspace
             .lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
@@ -47,35 +44,61 @@ impl Platform for NetstackPlatform {
     }
 
     fn bind_stack(&self, control: Cap) -> Result<vibeos_core::net::PacketStamp, NetworkBindError> {
-        let lease = self
-            .space
-            .0
-            .lock()
-            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
-            .map_err(|_| NetworkBindError::Denied)?;
-        crate::net_device::bind_stack_with(&lease).map_err(|error| match error {
-            crate::net_device::NetError::Offline => NetworkBindError::Offline,
-            crate::net_device::NetError::SessionBusy => NetworkBindError::SessionBusy,
-            crate::net_device::NetError::AuthorityRevoked
-            | crate::net_device::NetError::PermissionDenied => NetworkBindError::Denied,
-            _ => NetworkBindError::Failed,
-        })
+        let cspace = self.space.0.lock();
+        if let Ok(lease) =
+            cspace.lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
+        {
+            return crate::net_device::bind_stack_with(&lease).map_err(|error| match error {
+                crate::net_device::NetError::Offline => NetworkBindError::Offline,
+                crate::net_device::NetError::SessionBusy => NetworkBindError::SessionBusy,
+                crate::net_device::NetError::AuthorityRevoked
+                | crate::net_device::NetError::PermissionDenied => NetworkBindError::Denied,
+                _ => NetworkBindError::Failed,
+            });
+        }
+        #[cfg(feature = "milkv-duo")]
+        if let Ok(lease) =
+            cspace.lookup_lease::<crate::usb_ecm_net::NetDevice>(control, Rights::INVOKE)
+        {
+            return crate::usb_ecm_net::bind_stack_with(&lease).map_err(|error| match error {
+                crate::usb_ecm_net::NetError::Offline => NetworkBindError::Offline,
+                crate::usb_ecm_net::NetError::SessionBusy => NetworkBindError::SessionBusy,
+                crate::usb_ecm_net::NetError::AuthorityRevoked
+                | crate::usb_ecm_net::NetError::PermissionDenied => NetworkBindError::Denied,
+                _ => NetworkBindError::Failed,
+            });
+        }
+        Err(NetworkBindError::Denied)
     }
 
     fn network_info(&self, control: Cap) -> Option<NetworkInfo> {
-        let lease = self
-            .space
-            .0
-            .lock()
-            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
-            .ok()?;
-        let info = crate::net_device::info_with(&lease).ok()?;
-        Some(NetworkInfo {
-            online: info.online,
-            quarantined: info.quarantined,
-            session_epoch: info.session_epoch,
-            phy_link_up: crate::net_device::carrier_up(&info),
-        })
+        let cspace = self.space.0.lock();
+        if let Ok(lease) =
+            cspace.lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
+        {
+            let info = crate::net_device::info_with(&lease).ok()?;
+            return Some(NetworkInfo {
+                online: info.online,
+                quarantined: info.quarantined,
+                session_epoch: info.session_epoch,
+                phy_link_up: crate::net_device::carrier_up(&info),
+                ethernet_address: info.ethernet_address,
+            });
+        }
+        #[cfg(feature = "milkv-duo")]
+        if let Ok(lease) =
+            cspace.lookup_lease::<crate::usb_ecm_net::NetDevice>(control, Rights::READ)
+        {
+            let info = crate::usb_ecm_net::info_with(&lease).ok()?;
+            return Some(NetworkInfo {
+                online: info.online,
+                quarantined: info.quarantined,
+                session_epoch: info.session_epoch,
+                phy_link_up: info.carrier_up,
+                ethernet_address: info.ethernet_address,
+            });
+        }
+        None
     }
 
     fn tcp_listener(&self, listener: Cap) -> Option<vibeos_core::cap::Revocable<TcpListener>> {
@@ -88,15 +111,31 @@ impl Platform for NetstackPlatform {
 }
 
 pub async fn task(space: &'static Space, outbound: Cap, inbound: Cap, control: Cap, listener: Cap) {
-    let platform = NetstackPlatform::new(space);
-    vibeos_netstack::task(
-        &platform,
+    let interfaces = [vibeos_netstack::NetworkInterfaceCapabilities::new(
+        vibeos_netstack::NetworkInterfaceId::FIRST,
         outbound,
         inbound,
         control,
         vibeos_netstack::one_tcp_listener(listener),
-    )
-    .await;
+    )];
+    task_with_interfaces(space, &interfaces).await;
+}
+
+/// Kernel adapter for a policy-provided set of NIC capability bundles. The
+/// boot world still decides which devices and listeners are admitted.
+pub async fn task_with_interfaces(
+    space: &'static Space,
+    interfaces: &[vibeos_netstack::NetworkInterfaceCapabilities],
+) {
+    let platform = NetstackPlatform::new(space);
+    vibeos_netstack::task_with_interfaces(&platform, interfaces).await;
+}
+
+pub async fn task_with_discovered(
+    space: &'static Space,
+    interfaces: Vec<vibeos_netstack::NetworkInterfaceCapabilities>,
+) {
+    task_with_interfaces(space, &interfaces).await;
 }
 
 /// Test-image-only stack fault trigger. Hardware staging remains kernel-only.

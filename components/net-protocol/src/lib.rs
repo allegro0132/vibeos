@@ -547,6 +547,7 @@ impl From<TcpFrontendError> for TcpFrontendDriveError {
 struct TcpListenerEntry {
     socket: SocketHandle,
     port: u16,
+    port_group: Option<u64>,
     generation: u64,
     connection_active: bool,
     reset_requested: bool,
@@ -633,11 +634,42 @@ impl SharedIpv4TcpStack {
 
     /// Allocate one exclusive passive port from this shared stack.
     pub fn add_tcp_listener(&mut self, port: u16) -> Result<TcpListenerHandle, StackError> {
+        self.add_tcp_listener_with_group(port, None)
+    }
+
+    /// Allocate another passive socket in an explicitly shared port group.
+    ///
+    /// All sockets on a repeated port must carry the same non-zero group id.
+    /// This keeps ordinary service ports exclusive while supporting protocols
+    /// whose control and data connections intentionally share one port.
+    pub fn add_shared_tcp_listener(
+        &mut self,
+        port: u16,
+        port_group: u64,
+    ) -> Result<TcpListenerHandle, StackError> {
+        if port_group == 0 {
+            return Err(StackError::ListenPortInUse);
+        }
+        self.add_tcp_listener_with_group(port, Some(port_group))
+    }
+
+    fn add_tcp_listener_with_group(
+        &mut self,
+        port: u16,
+        port_group: Option<u64>,
+    ) -> Result<TcpListenerHandle, StackError> {
         self.device.revalidate_authority()?;
         if port == 0 {
             return Err(StackError::InvalidListenPort);
         }
-        if self.listeners.iter().any(|listener| listener.port == port) {
+        if self
+            .listeners
+            .iter()
+            .any(|listener| listener.port == port && listener.port_group != port_group)
+        {
+            return Err(StackError::ListenPortInUse);
+        }
+        if port_group.is_none() && self.listeners.iter().any(|listener| listener.port == port) {
             return Err(StackError::ListenPortInUse);
         }
         if self.listeners.len() >= MAX_TCP_LISTENERS {
@@ -665,6 +697,7 @@ impl SharedIpv4TcpStack {
         self.listeners.push(TcpListenerEntry {
             socket,
             port,
+            port_group,
             generation,
             connection_active: false,
             reset_requested: false,

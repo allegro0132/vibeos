@@ -26,6 +26,7 @@ pub struct FsNodeEntryInput<'a> {
     pub key: &'a [u8],
     pub value: &'a [u8],
     pub child: Option<&'a AuthorizedObject<CasObjectHandle>>,
+    pub data: Option<&'a FsPersistentData>,
 }
 
 #[derive(Debug)]
@@ -386,12 +387,17 @@ impl<D: PageDevice> SegmentStore<D> {
             .try_reserve_exact(entries.len())
             .map_err(|_| FsCodecError::OutOfBounds)?;
         for entry in entries {
+            if entry.child.is_some() && entry.data.is_some() {
+                return Err(FsStructuralCommitError::InvalidChild);
+            }
             canonical.push(FsBtreeEntryV1 {
                 key: entry.key.to_vec(),
                 value: entry.value.to_vec(),
-                reference: match entry.child {
-                    Some(child) => Some(self.fs_reference_for(child)?),
-                    None => None,
+                reference: match (entry.child, entry.data) {
+                    (Some(child), None) => Some(self.fs_reference_for(child)?),
+                    (None, Some(data)) => Some(self.fs_reference_for(&data.object)?),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => unreachable!(),
                 },
             });
         }
@@ -508,9 +514,14 @@ impl<D: PageDevice> SegmentStore<D> {
             .try_reserve_exact(entries.len())
             .map_err(|_| FsCodecError::OutOfBounds)?;
         for input in entries {
-            let mut reference = match input.child {
-                Some(child) => Some(self.fs_reference_for(child)?),
-                None => None,
+            if input.child.is_some() && input.data.is_some() {
+                return Err(FsStructuralCommitError::InvalidChild);
+            }
+            let mut reference = match (input.child, input.data) {
+                (Some(child), None) => Some(self.fs_reference_for(child)?),
+                (None, Some(data)) => Some(self.fs_reference_for(&data.object)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!(),
             };
             if reference.is_none() && tree == FsTreeKind::Inode {
                 reference = old_nodes

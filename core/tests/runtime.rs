@@ -30,13 +30,86 @@ static CLEANED_TASKS: Mutex<Vec<(exec::TaskId, AllocationDomain)>> = Mutex::new(
 static FAULT_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 static NOTIFY_EXPECTED_IDS: Mutex<Vec<exec::TaskId>> = Mutex::new(Vec::new());
 static NOTIFY_CALLS: AtomicU64 = AtomicU64::new(0);
+static EXPECTED_EXCLUSIVE_FAULT: Mutex<Option<exec::TaskHandle>> = Mutex::new(None);
+static EXCLUSIVE_FAULT_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+static SHARED_TEARDOWN_SIBLING: Mutex<Option<exec::TaskHandle>> = Mutex::new(None);
+static SHARED_TEARDOWN_PROBES: AtomicU64 = AtomicU64::new(0);
 
-unsafe fn record_fault_reclaim(domain: AllocationDomain) {
+unsafe fn record_fault_reclaim(
+    _primary_task: exec::TaskId,
+    domain: AllocationDomain,
+) -> exec::FaultReclaimOutcome {
     RECLAIMED_DOMAINS.lock().unwrap().push(domain);
+    exec::FaultReclaimOutcome::Reclaimed
 }
 
 unsafe fn record_fault_cleanup(task: exec::TaskId, domain: AllocationDomain) {
     CLEANED_TASKS.lock().unwrap().push((task, domain));
+}
+
+fn observe_exclusive_fault_gate(task: exec::TaskId, domain: AllocationDomain) {
+    let handle = EXPECTED_EXCLUSIVE_FAULT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("exclusive fault test installed no expected handle")
+        .clone();
+    assert_eq!(handle.id(), task);
+    assert_eq!(handle.allocation_domain(), domain);
+    assert_eq!(handle.state(), TaskState::Running);
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(domain),
+        Some(exec::ReclaimableDomainSnapshot {
+            home_hart: exec::HartId::new(current_hart_id()).unwrap(),
+            live_tasks: 1,
+            exclusive: true,
+            phase: exec::ReclaimableDomainPhase::TearingDown,
+        })
+    );
+    assert_eq!(exec::task_queue_owner(task), None);
+    assert_eq!(
+        exec::wake_with_disposition(task),
+        exec::WakeDisposition::Inactive
+    );
+    assert_eq!(handle.cancel(), CancelOutcome::TooLate(TaskState::Faulted));
+    EXCLUSIVE_FAULT_HOOK_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe fn observe_and_reclaim_exclusive_fault(
+    task: exec::TaskId,
+    domain: AllocationDomain,
+) -> exec::FaultReclaimOutcome {
+    observe_exclusive_fault_gate(task, domain);
+    exec::FaultReclaimOutcome::Reclaimed
+}
+
+unsafe fn observe_and_quarantine_exclusive_fault(
+    task: exec::TaskId,
+    domain: AllocationDomain,
+) -> exec::FaultReclaimOutcome {
+    observe_exclusive_fault_gate(task, domain);
+    exec::FaultReclaimOutcome::Quarantined
+}
+
+fn cancel_committed_shared_sibling(domain: AllocationDomain) {
+    let sibling = SHARED_TEARDOWN_SIBLING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("shared teardown probe installed no sibling")
+        .clone();
+    assert_eq!(sibling.allocation_domain(), domain);
+    assert_eq!(sibling.state(), TaskState::Running);
+    assert_eq!(
+        sibling.cancel(),
+        CancelOutcome::TooLate(TaskState::Faulted),
+        "a committed arena sibling accepted cancellation before detach"
+    );
+    assert_eq!(
+        exec::wake_with_disposition(sibling.id()),
+        exec::WakeDisposition::Inactive
+    );
+    SHARED_TEARDOWN_PROBES.fetch_add(1, Ordering::SeqCst);
 }
 
 unsafe fn ignore_fault_cleanup(_task: exec::TaskId, _domain: AllocationDomain) {}
@@ -772,6 +845,262 @@ fn a_reclaimable_poll_fault_skips_drop_and_invokes_the_reclaimer() {
 }
 
 #[test]
+fn an_exclusive_reclaimable_domain_is_single_home_and_retires_after_publication() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let domains_before = exec::reclaimable_domain_count();
+    let home = exec::HartId::new(2).unwrap();
+    let domain = AllocationDomain::new(OwnerId::new(20_101), ArenaId::new(30_101));
+    let handle = {
+        let _hart = TestHartScope::enter(home.index());
+        unsafe { exec::spawn_exclusive_reclaimable_owned(domain, "exclusive-home", async {}) }
+    };
+
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(domain),
+        Some(exec::ReclaimableDomainSnapshot {
+            home_hart: home,
+            live_tasks: 1,
+            exclusive: true,
+            phase: exec::ReclaimableDomainPhase::Active,
+        })
+    );
+    assert_eq!(exec::reclaimable_domain_count(), domains_before + 1);
+    assert!(!exec::poll_once(), "hart 0 stole an exclusive task");
+    {
+        let _hart = TestHartScope::enter(1);
+        assert!(!exec::poll_once(), "hart 1 stole an exclusive task");
+    }
+    assert_eq!(handle.polls(), 0);
+    {
+        let _hart = TestHartScope::enter(home.index());
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(
+            exec::reclaimable_domain_snapshot(domain),
+            None,
+            "the scheduler record retired before terminal publication returned"
+        );
+    }
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+}
+
+#[test]
+fn a_reclaimable_domain_rejects_cross_hart_and_exclusive_siblings() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let domains_before = exec::reclaimable_domain_count();
+    let shared_domain = AllocationDomain::new(OwnerId::new(20_102), ArenaId::new(30_102));
+    let shared = unsafe {
+        exec::spawn_reclaimable_owned(shared_domain, "shared-home", std::future::pending::<()>())
+    };
+
+    let remote = {
+        let _hart = TestHartScope::enter(1);
+        std::panic::catch_unwind(|| unsafe {
+            exec::spawn_reclaimable_owned(
+                shared_domain,
+                "shared-remote-sibling",
+                std::future::pending::<()>(),
+            )
+        })
+    };
+    assert!(remote.is_err());
+    assert_eq!(shared.polls(), 0);
+    assert_eq!(shared.cancel(), CancelOutcome::Requested);
+    assert_eq!(shared.state(), TaskState::Cancelled);
+
+    let exclusive_domain = AllocationDomain::new(OwnerId::new(20_103), ArenaId::new(30_103));
+    let exclusive = unsafe {
+        exec::spawn_exclusive_reclaimable_owned(
+            exclusive_domain,
+            "exclusive-only",
+            std::future::pending::<()>(),
+        )
+    };
+    let sibling = std::panic::catch_unwind(|| unsafe {
+        exec::spawn_reclaimable_owned(
+            exclusive_domain,
+            "exclusive-forbidden-sibling",
+            std::future::pending::<()>(),
+        )
+    });
+    assert!(sibling.is_err());
+    assert_eq!(exclusive.polls(), 0);
+    assert_eq!(exclusive.cancel(), CancelOutcome::Requested);
+    assert_eq!(exclusive.state(), TaskState::Cancelled);
+    assert_eq!(exec::reclaimable_domain_snapshot(shared_domain), None);
+    assert_eq!(exec::reclaimable_domain_snapshot(exclusive_domain), None);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+}
+
+#[test]
+fn an_exclusive_fault_closes_dispatch_before_reclaim_and_rejects_stale_events() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let domains_before = exec::reclaimable_domain_count();
+    EXCLUSIVE_FAULT_HOOK_CALLS.store(0, Ordering::SeqCst);
+    exec::set_fault_reclaimer(observe_and_reclaim_exclusive_fault);
+    exec::set_fault_guard(fault_after_poll);
+    let home = exec::HartId::new(3).unwrap();
+    let domain = AllocationDomain::new(OwnerId::new(20_104), ArenaId::new(30_104));
+    let handle = {
+        let _hart = TestHartScope::enter(home.index());
+        unsafe {
+            exec::spawn_exclusive_reclaimable_owned(
+                domain,
+                "exclusive-fault-gate",
+                std::future::pending::<()>(),
+            )
+        }
+    };
+    *EXPECTED_EXCLUSIVE_FAULT.lock().unwrap() = Some(handle.clone());
+
+    assert!(!exec::poll_once(), "hart 0 stole the faulting task");
+    {
+        let _hart = TestHartScope::enter(home.index());
+        assert!(exec::poll_once());
+    }
+    exec::set_fault_guard(fault_once_then_passthrough);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    EXPECTED_EXCLUSIVE_FAULT.lock().unwrap().take();
+
+    assert_eq!(EXCLUSIVE_FAULT_HOOK_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+    assert!(matches!(
+        handle.cancel(),
+        CancelOutcome::AlreadyTerminal(exit) if exit.state() == TaskState::Faulted
+    ));
+    for _ in 0..3 {
+        assert_eq!(
+            exec::wake_with_disposition(handle.id()),
+            exec::WakeDisposition::Inactive
+        );
+    }
+    assert_eq!(EXCLUSIVE_FAULT_HOOK_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_refused_exclusive_reclaim_is_sticky_and_never_reopens_the_domain() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let domains_before = exec::reclaimable_domain_count();
+    EXCLUSIVE_FAULT_HOOK_CALLS.store(0, Ordering::SeqCst);
+    exec::set_fault_reclaimer(observe_and_quarantine_exclusive_fault);
+    exec::set_fault_guard(fault_after_poll);
+    let domain = AllocationDomain::new(OwnerId::new(20_105), ArenaId::new(30_105));
+    let handle = unsafe {
+        exec::spawn_exclusive_reclaimable_owned(
+            domain,
+            "exclusive-quarantine",
+            std::future::pending::<()>(),
+        )
+    };
+    *EXPECTED_EXCLUSIVE_FAULT.lock().unwrap() = Some(handle.clone());
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    EXPECTED_EXCLUSIVE_FAULT.lock().unwrap().take();
+
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(EXCLUSIVE_FAULT_HOOK_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(domain),
+        Some(exec::ReclaimableDomainSnapshot {
+            home_hart: exec::HartId::new(0).unwrap(),
+            live_tasks: 1,
+            exclusive: true,
+            phase: exec::ReclaimableDomainPhase::Quarantined,
+        })
+    );
+    assert_eq!(exec::reclaimable_domain_count(), domains_before + 1);
+    assert_eq!(exec::task_queue_owner(handle.id()), None);
+    assert_eq!(
+        exec::wake_with_disposition(handle.id()),
+        exec::WakeDisposition::Inactive
+    );
+    assert!(matches!(
+        handle.cancel(),
+        CancelOutcome::AlreadyTerminal(exit) if exit.state() == TaskState::Faulted
+    ));
+
+    let replacement = std::panic::catch_unwind(|| unsafe {
+        exec::spawn_exclusive_reclaimable_owned(
+            domain,
+            "exclusive-quarantine-replacement",
+            std::future::pending::<()>(),
+        )
+    });
+    assert!(replacement.is_err());
+    let wrong_owner = AllocationDomain::new(OwnerId::new(20_205), domain.arena);
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(wrong_owner),
+        None,
+        "a quarantined arena aliased a different owner"
+    );
+    let owner_replacement = std::panic::catch_unwind(|| unsafe {
+        exec::spawn_exclusive_reclaimable_owned(
+            wrong_owner,
+            "exclusive-quarantine-owner-mismatch",
+            std::future::pending::<()>(),
+        )
+    });
+    assert!(owner_replacement.is_err());
+    assert_eq!(EXCLUSIVE_FAULT_HOOK_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(domain)
+            .expect("quarantine disappeared")
+            .phase,
+        exec::ReclaimableDomainPhase::Quarantined
+    );
+}
+
+#[test]
+fn a_reused_exclusive_domain_ignores_the_previous_task_identity() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let domains_before = exec::reclaimable_domain_count();
+    let arena = ArenaId::new(30_106);
+    let domain = AllocationDomain::new(OwnerId::new(20_106), arena);
+    let first = unsafe {
+        exec::spawn_exclusive_reclaimable_owned(domain, "exclusive-generation-one", async {})
+    };
+    assert!(exec::poll_once());
+    assert_eq!(first.state(), TaskState::Exited);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+
+    let next_domain = AllocationDomain::new(OwnerId::new(20_206), arena);
+    let second = unsafe {
+        exec::spawn_exclusive_reclaimable_owned(
+            next_domain,
+            "exclusive-generation-two",
+            std::future::pending::<()>(),
+        )
+    };
+    assert_ne!(first.id(), second.id());
+    assert_eq!(
+        exec::wake_with_disposition(first.id()),
+        exec::WakeDisposition::Inactive
+    );
+    assert!(matches!(
+        first.cancel(),
+        CancelOutcome::AlreadyTerminal(exit) if exit.id() == first.id()
+    ));
+    assert_eq!(second.polls(), 0);
+    assert_eq!(second.cancel(), CancelOutcome::Requested);
+    assert_eq!(second.state(), TaskState::Cancelled);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    assert_eq!(exec::reclaimable_domain_snapshot(next_domain), None);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+}
+
+#[test]
 fn a_reclaimable_fault_detaches_every_sibling_in_the_same_arena() {
     let _g = scheduler();
     exec::run_until_idle(BUDGET);
@@ -824,6 +1153,41 @@ fn a_reclaimable_fault_detaches_every_sibling_in_the_same_arena() {
         .all(|task| task.id != primary.id() && task.id != sibling.id()));
     assert!(!exec::poll_once(), "a detached sibling remained ready");
     exec::set_fault_cleanup(ignore_fault_cleanup);
+}
+
+#[test]
+fn shared_fault_commits_every_sibling_before_the_cancel_window() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    exec::set_fault_guard(fault_after_poll);
+    SHARED_TEARDOWN_PROBES.store(0, Ordering::SeqCst);
+    let domain = AllocationDomain::new(OwnerId::new(20_107), ArenaId::new(30_107));
+    let primary =
+        unsafe { exec::spawn_reclaimable_owned(domain, "shared-commit-primary", async {}) };
+    let sibling = unsafe {
+        exec::spawn_reclaimable_owned(
+            domain,
+            "shared-commit-sibling",
+            std::future::pending::<()>(),
+        )
+    };
+    *SHARED_TEARDOWN_SIBLING.lock().unwrap() = Some(sibling.clone());
+    exec::set_reclaimable_teardown_test_hook(cancel_committed_shared_sibling);
+
+    assert!(exec::poll_once());
+    exec::clear_reclaimable_teardown_test_hook();
+    exec::set_fault_guard(fault_once_then_passthrough);
+    SHARED_TEARDOWN_SIBLING.lock().unwrap().take();
+
+    assert_eq!(SHARED_TEARDOWN_PROBES.load(Ordering::SeqCst), 1);
+    assert_eq!(primary.state(), TaskState::Faulted);
+    assert_eq!(sibling.state(), TaskState::Faulted);
+    assert_eq!(sibling.polls(), 0);
+    assert!(matches!(
+        sibling.cancel(),
+        CancelOutcome::AlreadyTerminal(exit) if exit.state() == TaskState::Faulted
+    ));
 }
 
 #[test]
@@ -2077,6 +2441,55 @@ fn a_fault_on_one_hart_does_not_detach_another_harts_running_task() {
     assert!(exec::poll_once());
     exec::set_fault_guard(fault_once_then_passthrough);
     assert_eq!(faulted.state(), TaskState::Faulted);
+    assert_eq!(outer.state(), TaskState::Exited);
+    assert!(outer_survived.load(Ordering::SeqCst));
+}
+
+#[test]
+fn an_exclusive_fault_on_one_hart_preserves_another_harts_running_task() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+    exec::set_fault_guard(fault_only_hart_one);
+
+    let victim_domain = AllocationDomain::new(OwnerId::new(31_121), ArenaId::new(41_121));
+    let victim = {
+        let _hart = TestHartScope::enter(1);
+        unsafe {
+            exec::spawn_exclusive_reclaimable_owned(
+                victim_domain,
+                "m54-exclusive-hart1-fault",
+                std::future::pending::<()>(),
+            )
+        }
+    };
+    let outer_survived = Arc::new(AtomicBool::new(false));
+    let survived = outer_survived.clone();
+    let outer = exec::spawn_tracked_owned(OwnerId::new(31_120), "m54-hart0-survivor", async move {
+        let this = exec::current_task_id().unwrap();
+        {
+            let _hart = TestHartScope::enter(1);
+            assert!(exec::poll_once());
+        }
+        assert_eq!(exec::current_task_id(), Some(this));
+        assert!(exec::task_report().iter().any(|report| report.id == this));
+        survived.store(true, Ordering::SeqCst);
+    });
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(victim.state(), TaskState::Faulted);
+    assert_eq!(
+        victim.polls(),
+        0,
+        "the synthetic hart fault guard fired before entering the poll closure"
+    );
+    assert_eq!(exec::reclaimable_domain_snapshot(victim_domain), None);
+    assert_eq!(
+        RECLAIMED_DOMAINS.lock().unwrap().as_slice(),
+        &[victim_domain]
+    );
     assert_eq!(outer.state(), TaskState::Exited);
     assert!(outer_survived.load(Ordering::SeqCst));
 }

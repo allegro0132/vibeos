@@ -14,12 +14,16 @@ use crate::cas::{
 use crate::cas_codec::{ObjectMapping, REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW};
 use crate::device::PageDevice;
 use crate::gc::GcStoreError;
+use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
+use crate::persistent_authority::PersistentAuthorityError;
+use crate::root_codec::PersistentRootEntry;
 use crate::{
     decode_fs_btree_node_v1, decode_fs_data_node_v1, encode_fs_btree_node_v1,
     encode_fs_data_node_v1, encode_fs_root_v1, FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError,
-    FsDataNodeV1, FsRootV1, FsTreeKind, SegmentStore, StoreError, TypedObjectReference,
-    FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT, FS_BTREE_NODE_V1_KIND,
-    FS_DATA_CHUNK_MAX_LEN, FS_DATA_V1_KIND, FS_OBJECT_MAX_LEN, FS_ROOT_V1_KIND,
+    FsDataNodeV1, FsRootV1, FsTreeKind, SegmentStore, StoragePrincipal, StoreError,
+    TypedObjectReference, FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT,
+    FS_BTREE_NODE_V1_KIND, FS_DATA_CHUNK_MAX_LEN, FS_DATA_V1_KIND, FS_OBJECT_MAX_LEN,
+    FS_ROOT_V1_KIND,
 };
 
 pub struct FsNodeEntryInput<'a> {
@@ -32,6 +36,7 @@ pub struct FsNodeEntryInput<'a> {
 #[derive(Debug)]
 pub enum FsStructuralCommitError<E> {
     Store(CasStoreError<E>),
+    Gc(GcStoreError<E>),
     Codec(FsCodecError),
     InvalidChild,
 }
@@ -39,6 +44,11 @@ pub enum FsStructuralCommitError<E> {
 impl<E> From<CasStoreError<E>> for FsStructuralCommitError<E> {
     fn from(value: CasStoreError<E>) -> Self {
         Self::Store(value)
+    }
+}
+impl<E> From<GcStoreError<E>> for FsStructuralCommitError<E> {
+    fn from(value: GcStoreError<E>) -> Self {
+        Self::Gc(value)
     }
 }
 impl<E> From<StoreError<E>> for FsStructuralCommitError<E> {
@@ -60,6 +70,7 @@ pub enum FsRootPublishError<E> {
     Conflict,
     InvalidRoot,
     MultipleRoots,
+    Authority(PersistentAuthorityError<E>),
 }
 
 impl<E> From<CasStoreError<E>> for FsRootPublishError<E> {
@@ -80,6 +91,11 @@ impl<E> From<GcStoreError<E>> for FsRootPublishError<E> {
 impl<E> From<FsCodecError> for FsRootPublishError<E> {
     fn from(value: FsCodecError) -> Self {
         Self::Codec(value)
+    }
+}
+impl<E> From<PersistentAuthorityError<E>> for FsRootPublishError<E> {
+    fn from(value: PersistentAuthorityError<E>) -> Self {
+        Self::Authority(value)
     }
 }
 
@@ -177,6 +193,94 @@ impl FsPersistentRoot {
 }
 
 impl<D: PageDevice> SegmentStore<D> {
+    async fn commit_fs_payload(
+        &mut self,
+        object_kind: u32,
+        payload: &[u8],
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        if principal.is_some() && maintenance.is_some() {
+            return Err(FsStructuralCommitError::InvalidChild);
+        }
+        if let Some(maintenance) = maintenance {
+            let maximum_cycles = self.info()?.admitted_segments;
+            let mut cycles = 0_u64;
+            loop {
+                let lease = self
+                    .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
+                    .ok_or(FsStructuralCommitError::InvalidChild)?;
+                let admission = self
+                    .begin_blob_with_reference_codec_for_maintenance(
+                        &lease,
+                        object_kind,
+                        payload.len() as u64,
+                        None,
+                        REFERENCE_CODEC_FS_V1,
+                    )
+                    .map(drop);
+                match admission {
+                    Ok(()) => {
+                        drop(lease);
+                        let lease = self
+                            .acquire_maintenance(
+                                maintenance,
+                                MaintenanceOperation::ExplicitMaintenance,
+                            )
+                            .ok_or(FsStructuralCommitError::InvalidChild)?;
+                        let mut writer = self.begin_blob_with_reference_codec_for_maintenance(
+                            &lease,
+                            object_kind,
+                            payload.len() as u64,
+                            None,
+                            REFERENCE_CODEC_FS_V1,
+                        )?;
+                        for chunk in payload.chunks(PAGE_SIZE) {
+                            writer.write_chunk(chunk).await?;
+                        }
+                        return writer.commit().await.map_err(Into::into);
+                    }
+                    Err(
+                        error @ CasStoreError::Store(
+                            StoreError::GcResumeRequired
+                            | StoreError::Capacity(
+                                crate::CapacityClass::Metadata
+                                | crate::CapacityClass::CleanerReserve,
+                            ),
+                        ),
+                    ) => {
+                        drop(lease);
+                        if cycles == maximum_cycles {
+                            return Err(error.into());
+                        }
+                        self.collect_garbage().await?;
+                        cycles += 1;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        let mut writer = match principal {
+            Some(principal) => self.begin_blob_with_reference_codec_for_principal(
+                principal,
+                object_kind,
+                payload.len() as u64,
+                None,
+                REFERENCE_CODEC_FS_V1,
+            )?,
+            None => self.begin_blob_with_reference_codec(
+                object_kind,
+                payload.len() as u64,
+                None,
+                REFERENCE_CODEC_FS_V1,
+            )?,
+        };
+        for chunk in payload.chunks(PAGE_SIZE) {
+            writer.write_chunk(chunk).await?;
+        }
+        writer.commit().await.map_err(Into::into)
+    }
+
     fn fs_mapping_for_reference(
         &self,
         reference: TypedObjectReference,
@@ -301,6 +405,37 @@ impl<D: PageDevice> SegmentStore<D> {
         previous: Option<&FsPersistentData>,
         bytes: &[u8],
     ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_data_chunk_inner(previous, bytes, None, None)
+            .await
+    }
+
+    pub async fn commit_fs_data_chunk_for_principal(
+        &mut self,
+        principal: &StoragePrincipal,
+        previous: Option<&FsPersistentData>,
+        bytes: &[u8],
+    ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_data_chunk_inner(previous, bytes, Some(principal), None)
+            .await
+    }
+
+    pub async fn commit_fs_data_chunk_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentData>,
+        bytes: &[u8],
+    ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_data_chunk_inner(previous, bytes, None, Some(maintenance))
+            .await
+    }
+
+    async fn commit_fs_data_chunk_inner(
+        &mut self,
+        previous: Option<&FsPersistentData>,
+        bytes: &[u8],
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
+    ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
         if bytes.len() > FS_DATA_CHUNK_MAX_LEN
             || (bytes.is_empty() && previous.is_some_and(|data| data.exact_len() != 0))
         {
@@ -360,17 +495,11 @@ impl<D: PageDevice> SegmentStore<D> {
             bytes: bytes.to_vec(),
         };
         let payload = encode_fs_data_node_v1(&decoded)?;
-        let mut writer = self.begin_blob_with_reference_codec(
-            FS_DATA_V1_KIND,
-            payload.len() as u64,
-            None,
-            REFERENCE_CODEC_FS_V1,
-        )?;
-        for chunk in payload.chunks(PAGE_SIZE) {
-            writer.write_chunk(chunk).await?;
-        }
         Ok(FsPersistentData {
-            object: Arc::new(writer.commit().await?),
+            object: Arc::new(
+                self.commit_fs_payload(FS_DATA_V1_KIND, &payload, principal, maintenance)
+                    .await?,
+            ),
             layout: FsPersistentDataLayout::Stream(decoded),
         })
     }
@@ -454,6 +583,8 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         node: FsBtreeNodeV1,
         old_nodes: &[RecoverableFsNode],
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
     ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
         if let Some(reused) = old_nodes
             .iter()
@@ -477,16 +608,10 @@ impl<D: PageDevice> SegmentStore<D> {
             ));
         }
         let payload = encode_fs_btree_node_v1(&node)?;
-        let mut writer = self.begin_blob_with_reference_codec(
-            FS_BTREE_NODE_V1_KIND,
-            payload.len() as u64,
-            None,
-            REFERENCE_CODEC_FS_V1,
-        )?;
-        for chunk in payload.chunks(PAGE_SIZE) {
-            writer.write_chunk(chunk).await?;
-        }
-        Ok(Arc::new(writer.commit().await?))
+        Ok(Arc::new(
+            self.commit_fs_payload(FS_BTREE_NODE_V1_KIND, &payload, principal, maintenance)
+                .await?,
+        ))
     }
 
     /// Build a deterministic B+tree while reusing byte-equivalent nodes and
@@ -497,6 +622,57 @@ impl<D: PageDevice> SegmentStore<D> {
         tree: FsTreeKind,
         namespace_generation: u64,
         entries: &[FsNodeEntryInput<'_>],
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_cow_tree_inner(previous, tree, namespace_generation, entries, None, None)
+            .await
+    }
+
+    pub async fn commit_fs_cow_tree_for_principal(
+        &mut self,
+        principal: &StoragePrincipal,
+        previous: Option<&FsPersistentRoot>,
+        tree: FsTreeKind,
+        namespace_generation: u64,
+        entries: &[FsNodeEntryInput<'_>],
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_cow_tree_inner(
+            previous,
+            tree,
+            namespace_generation,
+            entries,
+            Some(principal),
+            None,
+        )
+        .await
+    }
+
+    pub async fn commit_fs_cow_tree_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        tree: FsTreeKind,
+        namespace_generation: u64,
+        entries: &[FsNodeEntryInput<'_>],
+    ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_cow_tree_inner(
+            previous,
+            tree,
+            namespace_generation,
+            entries,
+            None,
+            Some(maintenance),
+        )
+        .await
+    }
+
+    async fn commit_fs_cow_tree_inner(
+        &mut self,
+        previous: Option<&FsPersistentRoot>,
+        tree: FsTreeKind,
+        namespace_generation: u64,
+        entries: &[FsNodeEntryInput<'_>],
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
     ) -> Result<Arc<AuthorizedObject<CasObjectHandle>>, FsStructuralCommitError<D::Error>> {
         let old_nodes = match previous {
             Some(root) => self
@@ -548,6 +724,8 @@ impl<D: PageDevice> SegmentStore<D> {
                         entries: leaves[range.clone()].to_vec(),
                     },
                     &old_nodes,
+                    principal,
+                    maintenance,
                 )
                 .await?;
             built.push(CowBuiltNode {
@@ -582,6 +760,8 @@ impl<D: PageDevice> SegmentStore<D> {
                             entries: internal[range.clone()].to_vec(),
                         },
                         &old_nodes,
+                        principal,
+                        maintenance,
                     )
                     .await?;
                 parents.push(CowBuiltNode {
@@ -607,6 +787,77 @@ impl<D: PageDevice> SegmentStore<D> {
         inode_tree: &AuthorizedObject<CasObjectHandle>,
         dirent_tree: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_root_inner(
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_tree,
+            dirent_tree,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn commit_fs_root_for_principal(
+        &mut self,
+        principal: &StoragePrincipal,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_tree: &AuthorizedObject<CasObjectHandle>,
+        dirent_tree: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_root_inner(
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_tree,
+            dirent_tree,
+            Some(principal),
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_fs_root_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_tree: &AuthorizedObject<CasObjectHandle>,
+        dirent_tree: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_root_inner(
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_tree,
+            dirent_tree,
+            None,
+            Some(maintenance),
+        )
+        .await
+    }
+
+    async fn commit_fs_root_inner(
+        &mut self,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_tree: &AuthorizedObject<CasObjectHandle>,
+        dirent_tree: &AuthorizedObject<CasObjectHandle>,
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
         let inode_tree = self.fs_reference_for(inode_tree)?;
         let dirent_tree = self.fs_reference_for(dirent_tree)?;
         let payload = encode_fs_root_v1(&FsRootV1 {
@@ -617,16 +868,8 @@ impl<D: PageDevice> SegmentStore<D> {
             inode_tree,
             dirent_tree,
         })?;
-        let mut writer = self.begin_blob_with_reference_codec(
-            FS_ROOT_V1_KIND,
-            payload.len() as u64,
-            None,
-            REFERENCE_CODEC_FS_V1,
-        )?;
-        for chunk in payload.chunks(PAGE_SIZE) {
-            writer.write_chunk(chunk).await?;
-        }
-        writer.commit().await.map_err(Into::into)
+        self.commit_fs_payload(FS_ROOT_V1_KIND, &payload, principal, maintenance)
+            .await
     }
 
     async fn read_fs_object_bytes(
@@ -689,6 +932,33 @@ impl<D: PageDevice> SegmentStore<D> {
         expected_generation: u64,
         new_root: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<u64, FsRootPublishError<D::Error>> {
+        self.compare_exchange_fs_root_inner(namespace_uuid, expected_generation, new_root, None)
+            .await
+    }
+
+    pub async fn compare_exchange_fs_root_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        namespace_uuid: u128,
+        expected_generation: u64,
+        new_root: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<u64, FsRootPublishError<D::Error>> {
+        self.compare_exchange_fs_root_inner(
+            namespace_uuid,
+            expected_generation,
+            new_root,
+            Some(maintenance),
+        )
+        .await
+    }
+
+    async fn compare_exchange_fs_root_inner(
+        &mut self,
+        namespace_uuid: u128,
+        expected_generation: u64,
+        new_root: &AuthorizedObject<CasObjectHandle>,
+        maintenance: Option<&StoreMaintenance>,
+    ) -> Result<u64, FsRootPublishError<D::Error>> {
         if new_root.object_kind() != FS_ROOT_V1_KIND {
             return Err(FsRootPublishError::InvalidRoot);
         }
@@ -740,7 +1010,28 @@ impl<D: PageDevice> SegmentStore<D> {
             }
             None => return Err(FsRootPublishError::Conflict),
         }
-        self.synchronize_gc_roots(&[new_root]).await?;
+        if let Some(maintenance) = maintenance {
+            let mut external_roots = self
+                .require_current_generation()?
+                .persistent_authority
+                .as_ref()
+                .ok_or(FsRootPublishError::InvalidRoot)?
+                .external_roots()
+                .iter()
+                .copied()
+                .filter(|root| root.object_kind != FS_ROOT_V1_KIND)
+                .collect::<Vec<_>>();
+            external_roots.push(PersistentRootEntry {
+                object_id: new_key.object_id(),
+                commit_generation: new_key.commit_generation(),
+                object_kind: FS_ROOT_V1_KIND,
+            });
+            external_roots.sort_unstable_by_key(|root| root.object_id);
+            self.replace_persistent_external_roots(maintenance, external_roots)
+                .await?;
+        } else {
+            self.synchronize_gc_roots(&[new_root]).await?;
+        }
         // Re-read the checkpoint and the selected root before acknowledging.
         let mapping = self
             .current_fs_root_mapping()?

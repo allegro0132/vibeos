@@ -293,7 +293,9 @@ pub fn link_paths_planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequireme
 fn status(error: FileError) -> Status {
     match error {
         FileError::BudgetExceeded => Status::BudgetExceeded,
-        FileError::Busy | FileError::Conflict => Status::Unavailable,
+        FileError::Busy | FileError::Conflict | FileError::ServiceUnavailable => {
+            Status::Unavailable
+        }
         _ => Status::Returned(1),
     }
 }
@@ -578,12 +580,15 @@ fn cat_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
     Box::pin(async move {
         for (cap, _label, tail) in resolved_paths(&ctx.args)? {
             let path = RelPath::parse(&tail).map_err(status)?;
-            let chunks = ctx
-                .lookup::<FileTreeRoot>(cap, Rights::READ)?
-                .with(|root| root.snapshot().read_owned_chunks(&path))
-                .map_err(status)?;
-            for chunk in chunks {
-                let result = ctx.write_stdout(chunk.as_ref().to_vec()).await;
+            let lease = ctx.lookup::<FileTreeRoot>(cap, Rights::READ)?;
+            let reader = lease.with(|root| root.reader(&path)).map_err(status)?;
+            for index in 0..reader.chunk_count() {
+                let chunk = reader
+                    .read_chunk(index)
+                    .await
+                    .map_err(status)?
+                    .ok_or(Status::Faulted)?;
+                let result = ctx.write_stdout(chunk).await;
                 if result != Status::Success {
                     return Err(result);
                 }
@@ -625,23 +630,42 @@ fn write_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
         let (cap, _, tail) = resolved_paths(&ctx.args)?
             .pop()
             .ok_or(Status::Returned(2))?;
-        let mut chunks = Vec::new();
-        while let Some(chunk) = ctx.read_stdin_chunk().await? {
-            chunks.push(chunk);
-        }
         let path = RelPath::parse(&tail).map_err(status)?;
         let rights = if append {
             Rights::READ.union(Rights::WRITE)
         } else {
             Rights::WRITE
         };
-        ctx.lookup::<FileTreeRoot>(cap, rights)?
-            .with(|root| {
-                let mut tx = root.begin()?;
-                tx.write_chunks(&path, chunks, append)?;
-                tx.commit()
-            })
-            .map_err(status)?;
+        let lease = ctx.lookup::<FileTreeRoot>(cap, rights)?;
+        if lease.with(FileTreeRoot::is_persistent) {
+            let mut stager = lease
+                .with(|root| root.begin_content_stager(&path, append))
+                .map_err(status)?;
+            while let Some(chunk) = ctx.read_stdin_chunk().await? {
+                stager.push(&chunk).await.map_err(status)?;
+            }
+            let staged = stager.finish().await.map_err(status)?;
+            let transaction = lease
+                .with(|root| {
+                    let mut tx = root.begin()?;
+                    tx.write_staged(&path, staged)?;
+                    Ok::<_, FileError>(tx)
+                })
+                .map_err(status)?;
+            transaction.commit_authoritative().await.map_err(status)?;
+        } else {
+            let mut chunks = Vec::new();
+            while let Some(chunk) = ctx.read_stdin_chunk().await? {
+                chunks.push(chunk);
+            }
+            lease
+                .with(|root| {
+                    let mut tx = root.begin()?;
+                    tx.write_chunks(&path, chunks, append)?;
+                    tx.commit()
+                })
+                .map_err(status)?;
+        }
         Ok(String::new())
     })
 }
@@ -657,7 +681,8 @@ fn mkdir_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             .map(|(_, _, tail)| RelPath::parse(tail))
             .collect();
         let parsed = parsed.map_err(status)?;
-        ctx.lookup::<FileTreeRoot>(first, Rights::WRITE)?
+        let transaction = ctx
+            .lookup::<FileTreeRoot>(first, Rights::WRITE)?
             .with(|root| {
                 let namespace = root.snapshot().namespace();
                 for (cap, _, _) in &paths {
@@ -672,9 +697,9 @@ fn mkdir_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                 for path in &parsed {
                     tx.mkdir(path, parents).map_err(status)?;
                 }
-                tx.commit().map_err(status)?;
-                Ok(())
+                Ok::<_, Status>(tx)
             })?;
+        transaction.commit_authoritative().await.map_err(status)?;
         Ok(String::new())
     })
 }
@@ -691,7 +716,8 @@ fn rm_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             .map(|(_, _, tail)| RelPath::parse(tail))
             .collect();
         let parsed = parsed.map_err(status)?;
-        ctx.lookup::<FileTreeRoot>(*first, Rights::WRITE)?
+        let transaction = ctx
+            .lookup::<FileTreeRoot>(*first, Rights::WRITE)?
             .with(|root| {
                 let namespace = root.snapshot().namespace();
                 for (cap, _, _) in &paths {
@@ -711,9 +737,9 @@ fn rm_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                         }
                     }
                 }
-                tx.commit().map_err(status)?;
-                Ok(())
+                Ok::<_, Status>(tx)
             })?;
+        transaction.commit_authoritative().await.map_err(status)?;
         Ok(String::new())
     })
 }
@@ -744,7 +770,8 @@ fn cp_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                 .with(|root| root.snapshot());
             sources.push((snapshot, path));
         }
-        ctx.lookup::<FileTreeRoot>(destination_cap, Rights::WRITE)?
+        let transaction = ctx
+            .lookup::<FileTreeRoot>(destination_cap, Rights::WRITE)?
             .with(|root| {
                 let before = root.snapshot();
                 let destination_is_directory = before
@@ -775,9 +802,9 @@ fn cp_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                     )
                     .map_err(status)?;
                 }
-                tx.commit().map_err(status)?;
-                Ok(())
+                Ok::<_, Status>(tx)
             })?;
+        transaction.commit_authoritative().await.map_err(status)?;
         Ok(String::new())
     })
 }
@@ -801,7 +828,7 @@ fn mv_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
         if source_namespace != destination_namespace {
             return Err(Status::Returned(1));
         }
-        destination_lease
+        let transaction = destination_lease
             .with(|root| {
                 if !no_target_directory
                     && root
@@ -814,9 +841,10 @@ fn mv_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                 }
                 let mut tx = root.begin()?;
                 tx.rename(&source, &destination, no_clobber)?;
-                tx.commit()
+                Ok::<_, FileError>(tx)
             })
             .map_err(status)?;
+        transaction.commit_authoritative().await.map_err(status)?;
         Ok(String::new())
     })
 }
@@ -864,7 +892,8 @@ fn ln_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                 }
                 target.ok_or(Status::Returned(2))?
             };
-            ctx.lookup::<FileTreeRoot>(*destination_cap, Rights::WRITE)?
+            let transaction = ctx
+                .lookup::<FileTreeRoot>(*destination_cap, Rights::WRITE)?
                 .with(|root| {
                     let mut tx = root.begin()?;
                     if force {
@@ -874,9 +903,10 @@ fn ln_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                         }
                     }
                     tx.symlink(&target, &destination)?;
-                    tx.commit()
+                    Ok::<_, FileError>(tx)
                 })
                 .map_err(status)?;
+            transaction.commit_authoritative().await.map_err(status)?;
         } else {
             if paths.len() != 2 {
                 return Err(Status::Returned(2));
@@ -890,7 +920,7 @@ fn ln_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             if destination_lease.with(|root| root.snapshot().namespace()) != source_namespace {
                 return Err(Status::Returned(1));
             }
-            destination_lease
+            let transaction = destination_lease
                 .with(|root| {
                     let mut tx = root.begin()?;
                     if force {
@@ -900,9 +930,10 @@ fn ln_command(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                         }
                     }
                     tx.hard_link(&source, &destination, follow)?;
-                    tx.commit()
+                    Ok::<_, FileError>(tx)
                 })
                 .map_err(status)?;
+            transaction.commit_authoritative().await.map_err(status)?;
         }
         Ok(String::new())
     })

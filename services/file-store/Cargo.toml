@@ -8,5 +8,6 @@ vibeos-core = { path = "../../core" }
 vibeos-segment-store = { path = "../../segment-store" }
 
 [dev-dependencies]
+vibeos-durable-format = { path = "../../durable-format" }
 vibeos-segment-format = { path = "../../segment-format" }
 vibeos-storage-device = { path = "../../storage-device" }

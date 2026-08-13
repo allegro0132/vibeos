@@ -49,6 +49,14 @@ cross-namespace operands; `cp` may stream/clone from read-only source snapshots
 into one writable destination namespace.
 
 The local kernel profile binds RW `@home` only when the `file-tree` feature is
-explicitly selected. Shared/SSH command installation does not bind a file root.
-The current binding is volatile; Storage V2 persistent-root publication and
-power-cut recovery remain the gate before enabling this feature by default.
+explicitly selected. Its VSH task waits for the boot probe to select and prove
+Storage V2, cold-recovers the single policy-fixed namespace, and creates an
+empty generation-zero tree only when that namespace has no persistent root.
+Shared/SSH command installation does not bind a file root.
+
+Unknown-length `write` input is split into 4 KiB `FsDataV1` nodes as it arrives.
+Each immutable node carries a bounded binary-lifting ancestor table, so staging
+retains one chunk and at most 64 opaque references independent of file size;
+an inode publishes only the final node. Cancellation leaves those nodes
+unreachable, while a successful command publishes data, COW namespace nodes,
+and the new root through one persistent-root compare/exchange.

@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 
 use vibeos_segment_store::{
     AuthorizedObject, CasObjectHandle, CasStoreError, FsNodeEntryInput, FsPersistentData,
-    FsRootPublishError, FsStructuralCommitError, FsTreeKind, PageDevice, SegmentStore, StoreError,
+    FsRootPublishError, FsStructuralCommitError, FsTreeKind, PageDevice, SegmentStore,
+    StoragePrincipal, StoreError, StoreMaintenance,
 };
 
 use crate::{
@@ -85,6 +86,8 @@ fn inode_size(inode: &Inode) -> u64 {
 async fn commit_content<D: PageDevice>(
     store: &mut SegmentStore<D>,
     inode: &Inode,
+    principal: Option<&StoragePrincipal>,
+    maintenance: Option<&StoreMaintenance>,
 ) -> Result<Option<FsPersistentData>, PersistentCommitError<D::Error>> {
     let data = match &inode.content {
         Content::None => return Ok(None),
@@ -92,14 +95,53 @@ async fn commit_content<D: PageDevice>(
         Content::File(chunks) => {
             let mut tail = None;
             if chunks.is_empty() {
-                tail = Some(store.commit_fs_data_chunk(None, &[]).await?);
+                tail = Some(match (principal, maintenance) {
+                    (Some(principal), None) => {
+                        store
+                            .commit_fs_data_chunk_for_principal(principal, None, &[])
+                            .await?
+                    }
+                    (None, Some(maintenance)) => {
+                        store
+                            .commit_fs_data_chunk_for_maintenance(maintenance, None, &[])
+                            .await?
+                    }
+                    (None, None) => store.commit_fs_data_chunk(None, &[]).await?,
+                    (Some(_), Some(_)) => return Err(FileError::InvalidType.into()),
+                });
             }
             for chunk in chunks {
-                tail = Some(store.commit_fs_data_chunk(tail.as_ref(), chunk).await?);
+                tail = Some(match (principal, maintenance) {
+                    (Some(principal), None) => {
+                        store
+                            .commit_fs_data_chunk_for_principal(principal, tail.as_ref(), chunk)
+                            .await?
+                    }
+                    (None, Some(maintenance)) => {
+                        store
+                            .commit_fs_data_chunk_for_maintenance(maintenance, tail.as_ref(), chunk)
+                            .await?
+                    }
+                    (None, None) => store.commit_fs_data_chunk(tail.as_ref(), chunk).await?,
+                    (Some(_), Some(_)) => return Err(FileError::InvalidType.into()),
+                });
             }
             tail.ok_or(FileError::InvalidType)?
         }
-        Content::Symlink(target) => store.commit_fs_data_chunk(None, target.as_bytes()).await?,
+        Content::Symlink(target) => match (principal, maintenance) {
+            (Some(principal), None) => {
+                store
+                    .commit_fs_data_chunk_for_principal(principal, None, target.as_bytes())
+                    .await?
+            }
+            (None, Some(maintenance)) => {
+                store
+                    .commit_fs_data_chunk_for_maintenance(maintenance, None, target.as_bytes())
+                    .await?
+            }
+            (None, None) => store.commit_fs_data_chunk(None, target.as_bytes()).await?,
+            (Some(_), Some(_)) => return Err(FileError::InvalidType.into()),
+        },
     };
     Ok(Some(data))
 }
@@ -111,6 +153,8 @@ async fn commit_tree<D: PageDevice>(
     generation: u64,
     entries: &[(Vec<u8>, Vec<u8>)],
     content: Option<&BTreeMap<FileId, FsPersistentData>>,
+    principal: Option<&StoragePrincipal>,
+    maintenance: Option<&StoreMaintenance>,
 ) -> Result<alloc::sync::Arc<AuthorizedObject<CasObjectHandle>>, PersistentCommitError<D::Error>> {
     let mut inputs = Vec::new();
     for (key, value) in entries {
@@ -127,10 +171,21 @@ async fn commit_tree<D: PageDevice>(
             data,
         });
     }
-    store
-        .commit_fs_cow_tree(previous, tree, generation, &inputs)
-        .await
-        .map_err(Into::into)
+    match (principal, maintenance) {
+        (Some(principal), None) => store
+            .commit_fs_cow_tree_for_principal(principal, previous, tree, generation, &inputs)
+            .await
+            .map_err(Into::into),
+        (None, Some(maintenance)) => store
+            .commit_fs_cow_tree_for_maintenance(maintenance, previous, tree, generation, &inputs)
+            .await
+            .map_err(Into::into),
+        (None, None) => store
+            .commit_fs_cow_tree(previous, tree, generation, &inputs)
+            .await
+            .map_err(Into::into),
+        (Some(_), Some(_)) => Err(FileError::InvalidType.into()),
+    }
 }
 
 fn encode_namespace(
@@ -171,14 +226,41 @@ fn encode_namespace(
     Ok((inode_entries, dirent_entries))
 }
 
-impl FsTransaction<'_> {
+impl FsTransaction {
     /// Persist all staged data and structural nodes, atomically switch the
     /// namespace root, then publish the same immutable state to local readers.
     /// Any error or cancellation before the root switch leaves only unreachable
     /// objects for GC and keeps the old namespace visible.
     pub async fn commit_persistent<D: PageDevice>(
+        self,
+        store: &mut SegmentStore<D>,
+    ) -> Result<u64, PersistentCommitError<D::Error>> {
+        self.commit_persistent_inner(store, None, None).await
+    }
+
+    pub async fn commit_persistent_for_principal<D: PageDevice>(
+        self,
+        store: &mut SegmentStore<D>,
+        principal: &StoragePrincipal,
+    ) -> Result<u64, PersistentCommitError<D::Error>> {
+        self.commit_persistent_inner(store, Some(principal), None)
+            .await
+    }
+
+    pub async fn commit_persistent_for_maintenance<D: PageDevice>(
+        self,
+        store: &mut SegmentStore<D>,
+        maintenance: &StoreMaintenance,
+    ) -> Result<u64, PersistentCommitError<D::Error>> {
+        self.commit_persistent_inner(store, None, Some(maintenance))
+            .await
+    }
+
+    async fn commit_persistent_inner<D: PageDevice>(
         mut self,
         store: &mut SegmentStore<D>,
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
     ) -> Result<u64, PersistentCommitError<D::Error>> {
         let generation = self.next_generation()?;
         self.working.generation = generation;
@@ -191,24 +273,27 @@ impl FsTransaction<'_> {
             return Err(FileError::Conflict.into());
         }
 
-        let changed: Vec<FileId> = self
+        // Every inode leaf is encoded from the complete namespace model, so
+        // every non-directory entry must carry its content edge even when a
+        // metadata-only edit (for example hard-link count) left the bytes
+        // unchanged. PersistentFile returns the existing opaque handle and
+        // therefore preserves COW reuse without reopening object identity.
+        let content_inodes: Vec<FileId> = self
             .working
             .inodes
             .iter()
             .filter_map(|(file_id, inode)| {
-                (inode.file_type != FileType::Directory
-                    && (self.base_generation == 0 || inode.change_generation == generation))
-                    .then_some(*file_id)
+                (inode.file_type != FileType::Directory).then_some(*file_id)
             })
             .collect();
         let mut content = BTreeMap::new();
-        for file_id in changed {
+        for file_id in content_inodes {
             let inode = self
                 .working
                 .inodes
                 .get(&file_id)
                 .ok_or(FileError::NotFound)?;
-            if let Some(data) = commit_content(store, inode).await? {
+            if let Some(data) = commit_content(store, inode, principal, maintenance).await? {
                 if inode.file_type == FileType::Regular {
                     self.working
                         .inodes
@@ -227,6 +312,8 @@ impl FsTransaction<'_> {
             generation,
             &inode_entries,
             Some(&content),
+            principal,
+            maintenance,
         )
         .await?;
         let dirent_root = commit_tree(
@@ -236,21 +323,72 @@ impl FsTransaction<'_> {
             generation,
             &dirent_entries,
             None,
+            principal,
+            maintenance,
         )
         .await?;
-        let new_root = store
-            .commit_fs_root(
-                self.working.namespace,
-                generation,
-                self.working.next_file_id,
-                crate::ROOT_FILE_ID,
-                &inode_root,
-                &dirent_root,
-            )
-            .await?;
-        store
-            .compare_exchange_fs_root(self.working.namespace, self.base_generation, &new_root)
-            .await?;
+        let new_root = match (principal, maintenance) {
+            (Some(principal), None) => {
+                store
+                    .commit_fs_root_for_principal(
+                        principal,
+                        self.working.namespace,
+                        generation,
+                        self.working.next_file_id,
+                        crate::ROOT_FILE_ID,
+                        &inode_root,
+                        &dirent_root,
+                    )
+                    .await?
+            }
+            (None, Some(maintenance)) => {
+                store
+                    .commit_fs_root_for_maintenance(
+                        maintenance,
+                        self.working.namespace,
+                        generation,
+                        self.working.next_file_id,
+                        crate::ROOT_FILE_ID,
+                        &inode_root,
+                        &dirent_root,
+                    )
+                    .await?
+            }
+            (None, None) => {
+                store
+                    .commit_fs_root(
+                        self.working.namespace,
+                        generation,
+                        self.working.next_file_id,
+                        crate::ROOT_FILE_ID,
+                        &inode_root,
+                        &dirent_root,
+                    )
+                    .await?
+            }
+            (Some(_), Some(_)) => return Err(FileError::InvalidType.into()),
+        };
+        match maintenance {
+            Some(maintenance) => {
+                store
+                    .compare_exchange_fs_root_for_maintenance(
+                        maintenance,
+                        self.working.namespace,
+                        self.base_generation,
+                        &new_root,
+                    )
+                    .await?;
+            }
+            None => {
+                store
+                    .compare_exchange_fs_root(
+                        self.working.namespace,
+                        self.base_generation,
+                        &new_root,
+                    )
+                    .await?;
+            }
+        }
         let persisted = store
             .recover_fs_root(self.working.namespace)
             .await?
@@ -369,10 +507,13 @@ impl FileTreeRoot {
             return Err(FileError::InvalidType.into());
         }
         Ok(Some(Self {
-            state: vibeos_core::sync::SpinLock::new(alloc::sync::Arc::new(state)),
-            persistent_root: vibeos_core::sync::SpinLock::new(Some(root)),
-            writer_claim: vibeos_core::sync::SpinLock::new(None),
-            next_writer_token: core::sync::atomic::AtomicU64::new(1),
+            inner: alloc::sync::Arc::new(crate::FileTreeInner {
+                state: vibeos_core::sync::SpinLock::new(alloc::sync::Arc::new(state)),
+                persistent_root: vibeos_core::sync::SpinLock::new(Some(root)),
+                writer_claim: vibeos_core::sync::SpinLock::new(None),
+                next_writer_token: core::sync::atomic::AtomicU64::new(1),
+                backend: None,
+            }),
         }))
     }
 }
@@ -388,6 +529,7 @@ mod tests {
     use core::task::{Context, Poll, Waker};
     use std::collections::BTreeMap;
     use std::fmt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use vibeos_segment_format::{admitted_pages, Page, StoreUuid, PAGE_SIZE};
@@ -493,6 +635,234 @@ mod tests {
         .unwrap()
     }
 
+    struct TestBackend {
+        store: Mutex<SegmentStore<MemoryDevice>>,
+        maximum_staged_chunk: AtomicUsize,
+    }
+
+    impl crate::FileTreeBackend for TestBackend {
+        fn stage_chunk<'a>(
+            &'a self,
+            previous: Option<vibeos_segment_store::FsPersistentData>,
+            bytes: Vec<u8>,
+        ) -> crate::FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+            self.maximum_staged_chunk
+                .fetch_max(bytes.len(), Ordering::Relaxed);
+            let result = block_on(
+                self.store
+                    .lock()
+                    .unwrap()
+                    .commit_fs_data_chunk(previous.as_ref(), &bytes),
+            )
+            .map_err(|_| crate::FileError::ServiceUnavailable);
+            Box::pin(async move { result })
+        }
+
+        fn read_chunk<'a>(
+            &'a self,
+            data: vibeos_segment_store::FsPersistentData,
+            index: u64,
+        ) -> crate::FileTreeFuture<'a, Option<Vec<u8>>> {
+            let result = block_on(self.store.lock().unwrap().read_fs_data_chunk(&data, index))
+                .map_err(|_| crate::FileError::ServiceUnavailable);
+            Box::pin(async move { result })
+        }
+
+        fn commit<'a>(
+            &'a self,
+            transaction: crate::FsTransaction,
+        ) -> crate::FileTreeFuture<'a, u64> {
+            let result = block_on(transaction.commit_persistent(&mut self.store.lock().unwrap()))
+                .map_err(|error| match error {
+                    PersistentCommitError::File(error) => error,
+                    _ => crate::FileError::ServiceUnavailable,
+                });
+            Box::pin(async move { result })
+        }
+    }
+
+    #[test]
+    fn backend_stager_bounds_unknown_input_and_publishes_only_on_commit() {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d53_5441_4745_5445_53;
+        let device = MemoryDevice::blank(96);
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-STAGING!").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: limits(),
+        }))
+        .unwrap();
+        let backend = Arc::new(TestBackend {
+            store: Mutex::new(store),
+            maximum_staged_chunk: AtomicUsize::new(0),
+        });
+        let mut root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        root.attach_backend(backend.clone()).unwrap();
+        let path = crate::RelPath::parse("stream").unwrap();
+
+        let mut abandoned = root.begin_content_stager(&path, false).unwrap();
+        block_on(abandoned.push(&alloc::vec![0xaa; 9000])).unwrap();
+        drop(abandoned);
+        assert_eq!(root.snapshot().generation(), 0);
+        assert!(matches!(
+            root.snapshot().stat(&path, true),
+            Err(crate::FileError::NotFound)
+        ));
+
+        let mut expected = Vec::new();
+        let mut stager = root.begin_content_stager(&path, false).unwrap();
+        for length in [1, 7000, 3, 8193, 4095] {
+            let bytes = alloc::vec![(length % 251) as u8; length];
+            expected.extend_from_slice(&bytes);
+            block_on(stager.push(&bytes)).unwrap();
+        }
+        let staged = block_on(stager.finish()).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction.write_staged(&path, staged).unwrap();
+        assert_eq!(block_on(transaction.commit_authoritative()).unwrap(), 1);
+        assert!(backend.maximum_staged_chunk.load(Ordering::Relaxed) <= crate::DATA_CHUNK_SIZE);
+
+        let reader = root.reader(&path).unwrap();
+        let mut actual = Vec::new();
+        for index in 0..reader.chunk_count() {
+            actual.extend(block_on(reader.read_chunk(index)).unwrap().unwrap());
+        }
+        assert_eq!(actual, expected);
+
+        let mut stager = root.begin_content_stager(&path, true).unwrap();
+        block_on(stager.push(b"tail")).unwrap();
+        let staged = block_on(stager.finish()).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction.write_staged(&path, staged).unwrap();
+        assert_eq!(block_on(transaction.commit_authoritative()).unwrap(), 2);
+        let reader = root.reader(&path).unwrap();
+        let mut appended = Vec::new();
+        for index in 0..reader.chunk_count() {
+            appended.extend(block_on(reader.read_chunk(index)).unwrap().unwrap());
+        }
+        expected.extend_from_slice(b"tail");
+        assert_eq!(appended, expected);
+    }
+
+    #[test]
+    fn governed_store_rejects_a_boot_local_file_tree_principal_from_persistent_policy() {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d51_554f_5441_5445_53;
+        let device = MemoryDevice::blank(48);
+        let (context, quota, _maintenance) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let principal = quota
+            .admit_principal(vibeos_segment_store::PrincipalQuotaLimits {
+                logical_bytes: 8 * 1024 * 1024,
+                physical_bytes: 32 * 1024 * 1024,
+            })
+            .unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), context);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-QUOTAS!!").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: limits(),
+        }))
+        .unwrap();
+        let root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .mkdir(&crate::RelPath::parse("governed").unwrap(), false)
+            .unwrap();
+        assert!(matches!(
+            block_on(transaction.commit_persistent_for_principal(&mut store, &principal)),
+            Err(PersistentCommitError::Publish(FsRootPublishError::Gc(_)))
+        ));
+        assert!(block_on(store.recover_fs_root(NAMESPACE))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn governed_authority_and_file_tree_share_one_durable_checkpoint_root() {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d41_5554_4846_5352_54;
+        const POLICY: &[u8] = b"test authority plus opaque file-tree root v1";
+        let device = MemoryDevice::blank(64);
+        let (context, _quota, maintenance_provisioner) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), context);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-AUTHROOT").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: limits(),
+        }))
+        .unwrap();
+        let maintenance = store
+            .provision_maintenance_root(&maintenance_provisioner)
+            .unwrap();
+        let import = vibeos_segment_store::PersistentAuthorityImport::empty(
+            vibeos_durable_format::StoreId::new(91).unwrap(),
+            POLICY,
+            Vec::new(),
+        )
+        .unwrap();
+        block_on(store.import_persistent_authority(&maintenance, import)).unwrap();
+
+        let root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .mkdir(&crate::RelPath::parse("etc").unwrap(), false)
+            .unwrap();
+        transaction
+            .write_chunks(
+                &crate::RelPath::parse("etc/config").unwrap(),
+                [b"authority-preserved"],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            block_on(transaction.commit_persistent_for_maintenance(&mut store, &maintenance,))
+                .unwrap(),
+            1
+        );
+        let authority = block_on(
+            store
+                .recover_persistent_authority(vibeos_segment_store::root_policy_commitment(POLICY)),
+        )
+        .unwrap();
+        assert!(!authority.record_stream().is_empty());
+        drop(authority);
+        drop(store);
+
+        let (cold_context, _cold_quota, _cold_maintenance) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), cold_context);
+        block_on(cold.mount()).unwrap();
+        let authority = block_on(
+            cold.recover_persistent_authority(vibeos_segment_store::root_policy_commitment(POLICY)),
+        )
+        .unwrap();
+        assert_eq!(authority.principals().len(), 1);
+        let recovered = block_on(crate::FileTreeRoot::recover_persistent(
+            &cold, NAMESPACE, 128,
+        ))
+        .unwrap()
+        .unwrap();
+        let data = recovered
+            .snapshot()
+            .persistent_data(&crate::RelPath::parse("etc/config").unwrap())
+            .unwrap();
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&data, 0))
+                .unwrap()
+                .unwrap(),
+            b"authority-preserved"
+        );
+    }
+
     #[test]
     fn persistent_commit_switches_one_root_and_cold_recovers_generation() {
         const NAMESPACE: u128 = 0x5649_4245_4f53_2d46_494c_4554_5245_45;
@@ -550,12 +920,24 @@ mod tests {
             objects_before_overwrite + 3,
             "overwrite writes data, the affected inode leaf, and the root only"
         );
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .hard_link(
+                &crate::RelPath::parse("etc/config").unwrap(),
+                &crate::RelPath::parse("etc/hard").unwrap(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            block_on(transaction.commit_persistent(&mut store)).unwrap(),
+            4
+        );
         drop(store);
 
         let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
         block_on(cold.mount()).unwrap();
         let recovered = block_on(cold.recover_fs_root(NAMESPACE)).unwrap().unwrap();
-        assert_eq!(recovered.generation(), 3);
+        assert_eq!(recovered.generation(), 4);
         assert_eq!(recovered.next_file_id(), 4);
         let recovered_tree = block_on(crate::FileTreeRoot::recover_persistent(
             &cold, NAMESPACE, 128,
@@ -575,5 +957,14 @@ mod tests {
             );
         }
         assert_eq!(bytes, b"updated");
+        let snapshot = recovered_tree.snapshot();
+        let config = snapshot
+            .stat(&crate::RelPath::parse("etc/config").unwrap(), false)
+            .unwrap();
+        let hard = snapshot
+            .stat(&crate::RelPath::parse("etc/hard").unwrap(), false)
+            .unwrap();
+        assert_eq!(config.file_id, hard.file_id);
+        assert_eq!(config.link_count, 2);
     }
 }

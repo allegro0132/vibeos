@@ -16,11 +16,14 @@ pub use path::*;
 pub use persistence::*;
 pub use storage::*;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use vibeos_core::cap::Resource;
 use vibeos_core::sync::SpinLock;
@@ -47,6 +50,7 @@ pub enum FileError {
     NotFound,
     PathTooLong,
     RootProtected,
+    ServiceUnavailable,
     SymlinkLoop,
 }
 
@@ -315,13 +319,109 @@ impl FsSnapshotLease {
     }
 }
 
+pub struct FsFileReader {
+    source: FsFileReaderSource,
+}
+
+enum FsFileReaderSource {
+    Volatile(Vec<Arc<[u8]>>),
+    Persistent {
+        backend: Arc<dyn FileTreeBackend>,
+        data: vibeos_segment_store::FsPersistentData,
+    },
+}
+
+impl FsFileReader {
+    pub fn chunk_count(&self) -> u64 {
+        match &self.source {
+            FsFileReaderSource::Volatile(chunks) => chunks.len() as u64,
+            FsFileReaderSource::Persistent { data, .. } => data.chunk_count(),
+        }
+    }
+
+    pub async fn read_chunk(&self, index: u64) -> Result<Option<Vec<u8>>, FileError> {
+        match &self.source {
+            FsFileReaderSource::Volatile(chunks) => Ok(chunks
+                .get(usize::try_from(index).map_err(|_| FileError::BudgetExceeded)?)
+                .map(|chunk| chunk.to_vec())),
+            FsFileReaderSource::Persistent { backend, data } => {
+                backend.read_chunk(data.clone(), index).await
+            }
+        }
+    }
+}
+
+pub struct FsContentStager {
+    backend: Arc<dyn FileTreeBackend>,
+    tail: Option<vibeos_segment_store::FsPersistentData>,
+    pending: Vec<u8>,
+}
+
+pub struct StagedFileContent {
+    data: vibeos_segment_store::FsPersistentData,
+}
+
+impl FsContentStager {
+    pub async fn push(&mut self, mut bytes: &[u8]) -> Result<(), FileError> {
+        while !bytes.is_empty() {
+            let take = core::cmp::min(DATA_CHUNK_SIZE - self.pending.len(), bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.pending.len() == DATA_CHUNK_SIZE {
+                let chunk = core::mem::take(&mut self.pending);
+                self.tail = Some(self.backend.stage_chunk(self.tail.clone(), chunk).await?);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn finish(mut self) -> Result<StagedFileContent, FileError> {
+        if !self.pending.is_empty() || self.tail.is_none() {
+            self.tail = Some(
+                self.backend
+                    .stage_chunk(self.tail.clone(), core::mem::take(&mut self.pending))
+                    .await?,
+            );
+        }
+        Ok(StagedFileContent {
+            data: self.tail.ok_or(FileError::InvalidType)?,
+        })
+    }
+}
+
 /// The capability resource. Holding an authorized capability to this value is
 /// the only way a task can obtain a snapshot or start a writer.
 pub struct FileTreeRoot {
+    inner: Arc<FileTreeInner>,
+}
+
+struct FileTreeInner {
     state: SpinLock<Arc<NamespaceState>>,
     persistent_root: SpinLock<Option<vibeos_segment_store::FsPersistentRoot>>,
     writer_claim: SpinLock<Option<FileWriterClaim>>,
     next_writer_token: AtomicU64,
+    backend: Option<Arc<dyn FileTreeBackend>>,
+}
+
+pub type FileTreeFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FileError>> + Send + 'a>>;
+
+/// Opaque adapter implemented by the boot-policy-selected Storage V2 runtime.
+/// It exposes file operations, never the store, object IDs, keys, or physical
+/// pointers, and therefore cannot be used for ambient catalog lookup.
+pub trait FileTreeBackend: Send + Sync {
+    fn stage_chunk<'a>(
+        &'a self,
+        previous: Option<vibeos_segment_store::FsPersistentData>,
+        bytes: Vec<u8>,
+    ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData>;
+
+    fn read_chunk<'a>(
+        &'a self,
+        data: vibeos_segment_store::FsPersistentData,
+        index: u64,
+    ) -> FileTreeFuture<'a, Option<Vec<u8>>>;
+
+    fn commit<'a>(&'a self, transaction: FsTransaction) -> FileTreeFuture<'a, u64>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,19 +437,98 @@ impl FileTreeRoot {
             return Err(FileError::InvalidPath);
         }
         Ok(Self {
-            state: SpinLock::new(Arc::new(NamespaceState::empty(namespace))),
-            persistent_root: SpinLock::new(None),
-            writer_claim: SpinLock::new(None),
-            next_writer_token: AtomicU64::new(1),
+            inner: Arc::new(FileTreeInner {
+                state: SpinLock::new(Arc::new(NamespaceState::empty(namespace))),
+                persistent_root: SpinLock::new(None),
+                writer_claim: SpinLock::new(None),
+                next_writer_token: AtomicU64::new(1),
+                backend: None,
+            }),
         })
+    }
+    pub fn attach_backend(&mut self, backend: Arc<dyn FileTreeBackend>) -> Result<(), FileError> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(FileError::Busy)?;
+        if inner.backend.is_some() {
+            return Err(FileError::Exists);
+        }
+        inner.backend = Some(backend);
+        Ok(())
     }
     pub fn snapshot(&self) -> FsSnapshotLease {
         FsSnapshotLease {
-            state: self.state.lock().clone(),
+            state: self.inner.state.lock().clone(),
         }
     }
-    pub fn begin(&self) -> Result<FsTransaction<'_>, FileError> {
+    pub fn is_persistent(&self) -> bool {
+        self.inner.backend.is_some()
+    }
+    pub fn reader(&self, path: &RelPath) -> Result<FsFileReader, FileError> {
+        let snapshot = self.inner.state.lock().clone();
+        let id = snapshot.resolve(path, true)?;
+        match &snapshot.inodes.get(&id).ok_or(FileError::NotFound)?.content {
+            Content::File(chunks) => Ok(FsFileReader {
+                source: FsFileReaderSource::Volatile(chunks.clone()),
+            }),
+            Content::PersistentFile(data) => Ok(FsFileReader {
+                source: FsFileReaderSource::Persistent {
+                    backend: self
+                        .inner
+                        .backend
+                        .clone()
+                        .ok_or(FileError::ServiceUnavailable)?,
+                    data: data.clone(),
+                },
+            }),
+            Content::None => Err(FileError::IsDirectory),
+            Content::Symlink(_) => Err(FileError::InvalidType),
+        }
+    }
+    pub fn begin_content_stager(
+        &self,
+        path: &RelPath,
+        append: bool,
+    ) -> Result<FsContentStager, FileError> {
+        let backend = self
+            .inner
+            .backend
+            .clone()
+            .ok_or(FileError::ServiceUnavailable)?;
+        let snapshot = self.inner.state.lock().clone();
+        let tail = match snapshot.resolve(path, true) {
+            Ok(id) => {
+                let inode = snapshot.inodes.get(&id).ok_or(FileError::NotFound)?;
+                if inode.file_type == FileType::Directory {
+                    return Err(FileError::IsDirectory);
+                }
+                if inode.file_type != FileType::Regular {
+                    return Err(FileError::InvalidType);
+                }
+                if append {
+                    match &inode.content {
+                        Content::PersistentFile(data) => Some(data.clone()),
+                        _ => return Err(FileError::ServiceUnavailable),
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(FileError::NotFound) => {
+                if snapshot.resolve(path, false).is_ok() {
+                    return Err(FileError::NotFound);
+                }
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(FsContentStager {
+            backend,
+            tail,
+            pending: Vec::with_capacity(DATA_CHUNK_SIZE),
+        })
+    }
+    pub fn begin(&self) -> Result<FsTransaction, FileError> {
         let token = self
+            .inner
             .next_writer_token
             .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
@@ -357,25 +536,25 @@ impl FileTreeRoot {
             .map_err(|_| FileError::FileIdExhausted)?;
         self.begin_with_claim(0, token)
     }
-    pub fn begin_with_claim(&self, owner: u64, token: u64) -> Result<FsTransaction<'_>, FileError> {
+    pub fn begin_with_claim(&self, owner: u64, token: u64) -> Result<FsTransaction, FileError> {
         if token == 0 {
             return Err(FileError::InvalidPath);
         }
-        let snapshot = self.state.lock().clone();
-        let previous_root = self.persistent_root.lock().clone();
+        let snapshot = self.inner.state.lock().clone();
+        let previous_root = self.inner.persistent_root.lock().clone();
         let claim = FileWriterClaim {
             owner,
             token,
             base_generation: snapshot.generation,
         };
-        let mut active = self.writer_claim.lock();
+        let mut active = self.inner.writer_claim.lock();
         if active.is_some() {
             return Err(FileError::Busy);
         }
         *active = Some(claim);
         drop(active);
         Ok(FsTransaction {
-            root: self,
+            root: self.inner.clone(),
             claim,
             previous_root,
             base_generation: snapshot.generation,
@@ -385,7 +564,7 @@ impl FileTreeRoot {
         })
     }
     pub fn recover_writer_claim(&self, owner: u64, token: u64) -> bool {
-        let mut active = self.writer_claim.lock();
+        let mut active = self.inner.writer_claim.lock();
         if active.is_some_and(|claim| claim.owner == owner && claim.token == token) {
             *active = None;
             true
@@ -393,6 +572,9 @@ impl FileTreeRoot {
             false
         }
     }
+}
+
+impl FileTreeInner {
     fn release_writer_claim(&self, expected: FileWriterClaim) -> bool {
         let mut active = self.writer_claim.lock();
         if *active == Some(expected) {
@@ -409,7 +591,7 @@ impl Resource for FileTreeRoot {
         "file-tree-root"
     }
     fn describe(&self) -> String {
-        let state = self.state.lock();
+        let state = self.inner.state.lock();
         alloc::format!("file tree generation {}", state.generation)
     }
     fn as_any(&self) -> &dyn Any {
@@ -417,8 +599,8 @@ impl Resource for FileTreeRoot {
     }
 }
 
-pub struct FsTransaction<'a> {
-    root: &'a FileTreeRoot,
+pub struct FsTransaction {
+    root: Arc<FileTreeInner>,
     claim: FileWriterClaim,
     previous_root: Option<vibeos_segment_store::FsPersistentRoot>,
     base_generation: u64,
@@ -427,7 +609,23 @@ pub struct FsTransaction<'a> {
     committed: bool,
 }
 
-impl FsTransaction<'_> {
+impl FsTransaction {
+    pub async fn commit_authoritative(self) -> Result<u64, FileError> {
+        let backend = self.root.backend.clone();
+        match backend {
+            Some(backend) => backend.commit(self).await,
+            None => self.commit(),
+        }
+    }
+
+    pub async fn commit_durable(self) -> Result<u64, FileError> {
+        let backend = self
+            .root
+            .backend
+            .clone()
+            .ok_or(FileError::ServiceUnavailable)?;
+        backend.commit(self).await
+    }
     fn charge(&mut self, count: usize) -> Result<(), FileError> {
         self.edits = self
             .edits
@@ -594,6 +792,46 @@ impl FsTransaction<'_> {
         }
         Ok(())
     }
+    pub fn write_staged(
+        &mut self,
+        path: &RelPath,
+        staged: StagedFileContent,
+    ) -> Result<(), FileError> {
+        let generation = self.next_generation()?;
+        match self.working.resolve(path, true) {
+            Ok(id) => {
+                self.charge(1)?;
+                let inode = self
+                    .working
+                    .inodes
+                    .get_mut(&id)
+                    .ok_or(FileError::NotFound)?;
+                if inode.file_type == FileType::Directory {
+                    return Err(FileError::IsDirectory);
+                }
+                if inode.file_type != FileType::Regular {
+                    return Err(FileError::InvalidType);
+                }
+                inode.content = Content::PersistentFile(staged.data);
+                inode.change_generation = generation;
+            }
+            Err(FileError::NotFound) => {
+                let (parent, name) = self.parent(path)?;
+                if self.working.dirents.contains_key(&(parent, name.clone())) {
+                    return Err(FileError::Exists);
+                }
+                self.charge(2)?;
+                let id = self.working.allocate(Inode {
+                    file_type: FileType::Regular,
+                    change_generation: generation,
+                    content: Content::PersistentFile(staged.data),
+                })?;
+                self.working.dirents.insert((parent, name), id);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
     pub fn symlink(&mut self, target: &str, link: &RelPath) -> Result<(), FileError> {
         let (link_parent, _) = link.parent_and_name()?;
         // Validate the stored relative target in the directory where the link
@@ -695,7 +933,7 @@ impl FsTransaction<'_> {
             return Ok(());
         }
         fn clone_inode(
-            tx: &mut FsTransaction<'_>,
+            tx: &mut FsTransaction,
             source: &NamespaceState,
             source_id: FileId,
             source_path: &RelPath,
@@ -905,7 +1143,7 @@ impl FsTransaction<'_> {
     }
 }
 
-impl Drop for FsTransaction<'_> {
+impl Drop for FsTransaction {
     fn drop(&mut self) {
         if !self.committed {
             let _ = self.root.release_writer_claim(self.claim);

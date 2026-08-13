@@ -2192,6 +2192,8 @@ pub fn build() {
         (None, None, None, None) => (None, None, None, None, None, None, None),
         _ => unreachable!("block resources, policy, backend, and CSpace are constructed together"),
     };
+    #[cfg(feature = "legacy-shell")]
+    let _ = vsh_block_root;
     let (
         net_outbound,
         net_inbound,

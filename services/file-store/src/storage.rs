@@ -6,8 +6,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use vibeos_segment_store::{
-    AuthorizedObject, CasObjectHandle, CasStoreError, FsNodeEntryInput, FsRootPublishError,
-    FsStructuralCommitError, FsTreeKind, PageDevice, SegmentStore, StoreError, FS_DATA_V1_KIND,
+    AuthorizedObject, CasObjectHandle, CasStoreError, FsNodeEntryInput, FsPersistentData,
+    FsRootPublishError, FsStructuralCommitError, FsTreeKind, PageDevice, SegmentStore, StoreError,
 };
 
 use crate::{
@@ -78,30 +78,30 @@ fn inode_size(inode: &Inode) -> u64 {
         Content::None => 0,
         Content::Symlink(target) => target.len() as u64,
         Content::File(chunks) => chunks.iter().map(|chunk| chunk.len() as u64).sum(),
+        Content::PersistentFile(data) => data.exact_len(),
     }
 }
 
 async fn commit_content<D: PageDevice>(
     store: &mut SegmentStore<D>,
     inode: &Inode,
-) -> Result<Option<AuthorizedObject<CasObjectHandle>>, PersistentCommitError<D::Error>> {
-    let exact_len = inode_size(inode);
-    let mut writer = match &inode.content {
+) -> Result<Option<FsPersistentData>, PersistentCommitError<D::Error>> {
+    let data = match &inode.content {
         Content::None => return Ok(None),
-        Content::File(_) | Content::Symlink(_) => {
-            store.begin_blob(FS_DATA_V1_KIND, exact_len, None)?
-        }
-    };
-    match &inode.content {
+        Content::PersistentFile(data) => return Ok(Some(data.clone())),
         Content::File(chunks) => {
-            for chunk in chunks {
-                writer.write_chunk(chunk).await?;
+            let mut tail = None;
+            if chunks.is_empty() {
+                tail = Some(store.commit_fs_data_chunk(None, &[]).await?);
             }
+            for chunk in chunks {
+                tail = Some(store.commit_fs_data_chunk(tail.as_ref(), chunk).await?);
+            }
+            tail.ok_or(FileError::InvalidType)?
         }
-        Content::Symlink(target) => writer.write_chunk(target.as_bytes()).await?,
-        Content::None => unreachable!(),
-    }
-    Ok(Some(writer.commit().await?))
+        Content::Symlink(target) => store.commit_fs_data_chunk(None, target.as_bytes()).await?,
+    };
+    Ok(Some(data))
 }
 
 async fn commit_tree<D: PageDevice>(
@@ -110,17 +110,22 @@ async fn commit_tree<D: PageDevice>(
     tree: FsTreeKind,
     generation: u64,
     entries: &[(Vec<u8>, Vec<u8>)],
-    content: Option<&BTreeMap<FileId, AuthorizedObject<CasObjectHandle>>>,
+    content: Option<&BTreeMap<FileId, FsPersistentData>>,
 ) -> Result<alloc::sync::Arc<AuthorizedObject<CasObjectHandle>>, PersistentCommitError<D::Error>> {
     let mut inputs = Vec::new();
     for (key, value) in entries {
-        let child = if let Some(content) = content {
+        let data = if let Some(content) = content {
             let file_id = crate::decode_inode_key(key).map_err(|_| FileError::InvalidType)?;
             content.get(&file_id)
         } else {
             None
         };
-        inputs.push(FsNodeEntryInput { key, value, child });
+        inputs.push(FsNodeEntryInput {
+            key,
+            value,
+            child: None,
+            data,
+        });
     }
     store
         .commit_fs_cow_tree(previous, tree, generation, &inputs)
@@ -186,14 +191,32 @@ impl FsTransaction<'_> {
             return Err(FileError::Conflict.into());
         }
 
+        let changed: Vec<FileId> = self
+            .working
+            .inodes
+            .iter()
+            .filter_map(|(file_id, inode)| {
+                (inode.file_type != FileType::Directory
+                    && (self.base_generation == 0 || inode.change_generation == generation))
+                    .then_some(*file_id)
+            })
+            .collect();
         let mut content = BTreeMap::new();
-        for (file_id, inode) in &self.working.inodes {
-            if inode.file_type != FileType::Directory
-                && (self.base_generation == 0 || inode.change_generation == generation)
-            {
-                if let Some(object) = commit_content(store, inode).await? {
-                    content.insert(*file_id, object);
+        for file_id in changed {
+            let inode = self
+                .working
+                .inodes
+                .get(&file_id)
+                .ok_or(FileError::NotFound)?;
+            if let Some(data) = commit_content(store, inode).await? {
+                if inode.file_type == FileType::Regular {
+                    self.working
+                        .inodes
+                        .get_mut(&file_id)
+                        .ok_or(FileError::NotFound)?
+                        .content = Content::PersistentFile(data.clone());
                 }
+                content.insert(file_id, data);
             }
         }
         let (inode_entries, dirent_entries) = encode_namespace(&self.working)?;
@@ -273,18 +296,10 @@ impl FileTreeRoot {
             let content = match (metadata.file_type, entry.content) {
                 (FileType::Directory, None) => Content::None,
                 (FileType::Regular, Some(data)) => {
-                    let mut chunks = Vec::new();
-                    for index in 0..data.chunk_count() {
-                        let bytes = store
-                            .read_fs_data_chunk(&data, index)
-                            .await?
-                            .ok_or(FileError::InvalidType)?;
-                        chunks.push(alloc::sync::Arc::<[u8]>::from(bytes));
-                    }
-                    if chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>() != metadata.size {
+                    if data.exact_len() != metadata.size {
                         return Err(FileError::InvalidType.into());
                     }
-                    Content::File(chunks)
+                    Content::PersistentFile(data)
                 }
                 (FileType::Symlink, Some(data)) => {
                     let mut bytes = Vec::new();
@@ -547,15 +562,18 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(
-            recovered_tree
-                .snapshot()
-                .read_chunks(&crate::RelPath::parse("etc/config").unwrap())
-                .unwrap()
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>(),
-            b"updated"
-        );
+        let data = recovered_tree
+            .snapshot()
+            .persistent_data(&crate::RelPath::parse("etc/config").unwrap())
+            .unwrap();
+        let mut bytes = Vec::new();
+        for index in 0..data.chunk_count() {
+            bytes.extend(
+                block_on(cold.read_fs_data_chunk(&data, index))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(bytes, b"updated");
     }
 }

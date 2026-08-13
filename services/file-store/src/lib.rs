@@ -66,21 +66,22 @@ pub struct Metadata {
     pub change_generation: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 enum Content {
     None,
     File(Vec<Arc<[u8]>>),
+    PersistentFile(vibeos_segment_store::FsPersistentData),
     Symlink(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 struct Inode {
     file_type: FileType,
     change_generation: u64,
     content: Content,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 struct NamespaceState {
     namespace: u128,
     generation: u64,
@@ -197,6 +198,7 @@ impl NamespaceState {
             Content::None => 0,
             Content::Symlink(target) => target.len() as u64,
             Content::File(chunks) => chunks.iter().map(|c| c.len() as u64).sum(),
+            Content::PersistentFile(data) => data.exact_len(),
         };
         Ok(Metadata {
             file_id: id,
@@ -249,7 +251,7 @@ impl FsSnapshotLease {
         {
             Content::File(chunks) => Ok(chunks.iter().map(|chunk| chunk.as_ref())),
             Content::None => Err(FileError::IsDirectory),
-            Content::Symlink(_) => Err(FileError::InvalidType),
+            Content::PersistentFile(_) | Content::Symlink(_) => Err(FileError::InvalidType),
         }
     }
     pub fn read_owned_chunks(&self, path: &RelPath) -> Result<Vec<Arc<[u8]>>, FileError> {
@@ -263,7 +265,24 @@ impl FsSnapshotLease {
         {
             Content::File(chunks) => Ok(chunks.clone()),
             Content::None => Err(FileError::IsDirectory),
-            Content::Symlink(_) => Err(FileError::InvalidType),
+            Content::PersistentFile(_) | Content::Symlink(_) => Err(FileError::InvalidType),
+        }
+    }
+    pub fn persistent_data(
+        &self,
+        path: &RelPath,
+    ) -> Result<vibeos_segment_store::FsPersistentData, FileError> {
+        let id = self.state.resolve(path, true)?;
+        match &self
+            .state
+            .inodes
+            .get(&id)
+            .ok_or(FileError::NotFound)?
+            .content
+        {
+            Content::PersistentFile(data) => Ok(data.clone()),
+            Content::None => Err(FileError::IsDirectory),
+            Content::File(_) | Content::Symlink(_) => Err(FileError::InvalidType),
         }
     }
     pub fn canonical_path(&self, path: &RelPath) -> Result<String, FileError> {
@@ -523,10 +542,10 @@ impl FsTransaction<'_> {
                 if inode.file_type != FileType::Regular {
                     return Err(FileError::InvalidType);
                 }
-                let Content::File(existing) = &mut inode.content else {
-                    return Err(FileError::InvalidType);
-                };
                 if append {
+                    let Content::File(existing) = &mut inode.content else {
+                        return Err(FileError::InvalidType);
+                    };
                     if let Some(last) = existing
                         .last()
                         .filter(|chunk| chunk.len() < DATA_CHUNK_SIZE)
@@ -554,7 +573,7 @@ impl FsTransaction<'_> {
                         existing.extend(data);
                     }
                 } else {
-                    *existing = data;
+                    inode.content = Content::File(data);
                 }
                 inode.change_generation = generation;
             }

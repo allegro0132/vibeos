@@ -1,0 +1,6 @@
+package vibe:clock@1.0.0;
+
+interface monotonic {
+    resource clock;
+    now: func(clock: borrow<clock>) -> u64;
+}

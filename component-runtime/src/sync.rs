@@ -3,11 +3,16 @@
 
 use crate::{
     abi_value::{
-        lift_results, lower_parameters, CodecError, CodecUsage, LoweredParameters,
-        PayloadAllocator, ResourceBinder,
+        flat_signature, lift_parameters, lift_results, lower_flat_results_prepared,
+        lower_parameters, lower_results_into_prepared, CodecError, CodecUsage, FlatKind,
+        LoweredParameters, LoweringJournal, PayloadAllocator, PreparedFlatResults, ResourceBinder,
+        MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
     },
     decode::ComponentPlan,
-    execution::ExecutableExportPlan,
+    execution::{
+        CoreImportPlan, ExecutableExportPlan, HostCoreExportInfo, HostImportInfo, HostImportPlan,
+    },
+    host::{HostDispatcher, HostError, HostRequest},
     memory::{AbiError, GuestMemory},
     resource::{GuestCallResources, ResourceTable, ResourceToken, ResourceTypeId},
     types::FunctionType,
@@ -18,7 +23,9 @@ use crate::{
 use alloc::{string::String, vec::Vec};
 use vibeos_component_format::{TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
-    CoreInstance, CoreValue, OwnerAllocationReservation, PollResult, ProfileEngine, ValidatedCore,
+    CoreCallReservation, CoreComponentGroup, CoreHostCall, CoreHostImport,
+    CoreInstanceExportImport, CoreModuleImport, CoreValue, CoreValueType,
+    OwnerAllocationReservation, PollResult, ProfileEngine, ValidatedCore,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,8 +55,9 @@ impl SyncError {
 
 /// One principal's validated Core instances and immutable Component wiring.
 pub struct SynchronousComponent {
-    modules: Vec<CoreInstance>,
+    modules: CoreComponentGroup,
     exports: Vec<RuntimeExport>,
+    host_imports: Vec<HostImportInfo>,
     poisoned: bool,
 }
 
@@ -63,6 +71,55 @@ struct RuntimeExport {
     post_return: Option<String>,
 }
 
+struct OwnedCoreHostImport {
+    id: u32,
+    module: String,
+    name: String,
+    parameters: Vec<CoreValueType>,
+    results: Vec<CoreValueType>,
+}
+
+enum OwnedCoreModuleImport {
+    Host(OwnedCoreHostImport),
+    InstanceExport {
+        module: String,
+        name: String,
+        instance: usize,
+        export: String,
+    },
+}
+
+impl OwnedCoreModuleImport {
+    fn descriptor(&self) -> CoreModuleImport<'_> {
+        match self {
+            Self::Host(import) => CoreModuleImport::Host(import.descriptor()),
+            Self::InstanceExport {
+                module,
+                name,
+                instance,
+                export,
+            } => CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+                module,
+                name,
+                instance: *instance,
+                export,
+            }),
+        }
+    }
+}
+
+impl OwnedCoreHostImport {
+    fn descriptor(&self) -> CoreHostImport<'_> {
+        CoreHostImport {
+            id: self.id,
+            module: &self.module,
+            name: &self.name,
+            params: &self.parameters,
+            results: &self.results,
+        }
+    }
+}
+
 impl SynchronousComponent {
     pub fn instantiate(
         plan: &ComponentPlan<'_>,
@@ -70,23 +127,47 @@ impl SynchronousComponent {
         reservation_per_module: OwnerAllocationReservation,
     ) -> Result<Self, SyncError> {
         let execution = &plan.execution;
-        let mut modules = Vec::new();
-        modules
-            .try_reserve_exact(execution.instances().len())
-            .map_err(|_| SyncError::Allocation)?;
-        for instance in execution.instances() {
+        if execution
+            .host_imports()
+            .iter()
+            .any(|import| host_function_requires_resource_transfer(&import.info.function_type))
+        {
+            // C3 host imports deliberately expose borrow-only input authority.
+            // Owning parameters need an explicit dispatcher consumption API,
+            // while any resource result would create or escape authority after
+            // the backend effect. Both remain fail-closed for this milestone.
+            return Err(SyncError::InvalidWiring);
+        }
+        let mut modules = CoreComponentGroup::new(engine, execution.instances().len())
+            .map_err(|_| SyncError::CoreInstantiation)?;
+        for (runtime_instance, instance) in execution.instances().iter().enumerate() {
             let bytes = plan
                 .embedded_modules()
                 .get(instance.module())
                 .ok_or(SyncError::MissingModule)?;
             let validated = ValidatedCore::new_in(engine, bytes, reservation_per_module)
                 .map_err(|_| SyncError::CoreAdmission)?;
-            modules.push(
-                validated
-                    .instantiate()
-                    .map_err(|_| SyncError::CoreInstantiation)?,
-            );
+            let owned_imports = owned_core_module_imports(
+                runtime_instance,
+                instance.imports(),
+                execution.host_imports(),
+            )?;
+            let mut imports = Vec::new();
+            imports
+                .try_reserve_exact(owned_imports.len())
+                .map_err(|_| SyncError::Allocation)?;
+            for import in &owned_imports {
+                imports.push(import.descriptor());
+            }
+            if modules
+                .add_instance(&validated, &imports)
+                .map_err(|_| SyncError::CoreInstantiation)?
+                != runtime_instance
+            {
+                return Err(SyncError::InvalidWiring);
+            }
         }
+        modules.seal().map_err(|_| SyncError::CoreInstantiation)?;
         let mut exports = Vec::new();
         exports
             .try_reserve_exact(execution.exports().len())
@@ -94,15 +175,23 @@ impl SynchronousComponent {
         for export in execution.exports() {
             exports.push(runtime_export(export)?);
         }
+        let mut host_imports = Vec::new();
+        host_imports
+            .try_reserve_exact(execution.host_imports().len())
+            .map_err(|_| SyncError::Allocation)?;
+        for import in execution.host_imports() {
+            host_imports.push(runtime_host_import(&import.info)?);
+        }
         Ok(Self {
             modules,
             exports,
+            host_imports,
             poisoned: false,
         })
     }
 
     pub fn module_count(&self) -> usize {
-        self.modules.len()
+        self.modules.instance_count()
     }
 
     /// Whether execution crossed into guest state and then failed before full
@@ -129,6 +218,40 @@ impl SynchronousComponent {
         &'a mut self,
         resources: &'a mut ResourceTable<A>,
         export: &str,
+        arguments: Vec<CanonicalValue>,
+        total_work: u64,
+        poll_quantum: u64,
+    ) -> Result<TypedCall<'a, A>, SyncError> {
+        self.start_typed_call_inner(resources, None, export, arguments, total_work, poll_quantum)
+    }
+
+    /// Starts a typed Component export call with one call-scoped host-import
+    /// dispatcher. The dispatcher is borrowed for the whole continuation and
+    /// can only receive values after Canonical ABI and resource validation.
+    pub fn start_typed_call_with_host<'a, A, D: HostDispatcher<A> + 'a>(
+        &'a mut self,
+        resources: &'a mut ResourceTable<A>,
+        dispatcher: &'a mut D,
+        export: &str,
+        arguments: Vec<CanonicalValue>,
+        total_work: u64,
+        poll_quantum: u64,
+    ) -> Result<TypedCall<'a, A>, SyncError> {
+        self.start_typed_call_inner(
+            resources,
+            Some(dispatcher),
+            export,
+            arguments,
+            total_work,
+            poll_quantum,
+        )
+    }
+
+    fn start_typed_call_inner<'a, A>(
+        &'a mut self,
+        resources: &'a mut ResourceTable<A>,
+        dispatcher: Option<&'a mut dyn HostDispatcher<A>>,
+        export: &str,
         mut arguments: Vec<CanonicalValue>,
         total_work: u64,
         poll_quantum: u64,
@@ -136,7 +259,7 @@ impl SynchronousComponent {
         if self.poisoned {
             return Err(SyncError::Poisoned);
         }
-        if self.modules.iter().any(CoreInstance::has_active_call) {
+        if self.modules.any_active_call() {
             return Err(SyncError::Busy);
         }
         if total_work == 0
@@ -153,9 +276,6 @@ impl SynchronousComponent {
             .position(|binding| binding.name == export)
             .ok_or(SyncError::MissingExport)?;
         let binding = &self.exports[export];
-        if binding.memory.is_none() || binding.realloc.is_none() {
-            return Err(SyncError::InvalidWiring);
-        }
         if binding.function_type.parameters.len() != arguments.len() {
             return Err(SyncError::Value);
         }
@@ -170,6 +290,7 @@ impl SynchronousComponent {
         }
 
         let parameter_types = clone_parameter_types(&binding.function_type)?;
+        let active_baselines = zero_baselines(self.module_count())?;
         let mut guest_resources = resources
             .begin_guest_call()
             .map_err(|_| SyncError::Resource)?;
@@ -205,11 +326,16 @@ impl SynchronousComponent {
                 return Err(error);
             }
         };
+        if !planner.requests.is_empty() && (binding.memory.is_none() || binding.realloc.is_none()) {
+            let _ = resources.close_guest_call(guest_resources);
+            return Err(SyncError::InvalidWiring);
+        }
         if usage.work > total_work {
             let _ = resources.close_guest_call(guest_resources);
             return Ok(TypedCall::terminal(
                 self,
                 resources,
+                dispatcher,
                 export,
                 total_work,
                 poll_quantum,
@@ -222,20 +348,27 @@ impl SynchronousComponent {
             return Ok(TypedCall::terminal(
                 self,
                 resources,
+                dispatcher,
                 export,
                 total_work,
                 poll_quantum,
                 TrapCode::FuelExhausted,
             ));
         }
+        let mut pointers = Vec::new();
+        if pointers.try_reserve_exact(planner.requests.len()).is_err() {
+            let _ = resources.close_guest_call(guest_resources);
+            return Err(SyncError::Allocation);
+        }
         Ok(TypedCall {
             component: self,
             resources,
+            dispatcher,
             export,
             arguments,
             allocations: planner.requests,
             allocation_index: 0,
-            pointers: Vec::new(),
+            pointers,
             replay_arguments: None,
             core_results: None,
             result: None,
@@ -243,7 +376,8 @@ impl SynchronousComponent {
             total_work,
             remaining_work,
             poll_quantum,
-            active_baseline: 0,
+            active_baselines,
+            host_lower: None,
             cancelled: false,
             guest_started: false,
             guest_resources: Some(guest_resources),
@@ -265,9 +399,7 @@ impl SynchronousComponent {
             .ok_or(SyncError::MissingExport)?;
         let memory = binding.memory.as_deref().ok_or(SyncError::InvalidWiring)?;
         self.modules
-            .get(binding.core_instance)
-            .ok_or(SyncError::InvalidWiring)?
-            .read_memory(memory, offset as usize, destination)
+            .read_memory(binding.core_instance, memory, offset as usize, destination)
             .map_err(|_| SyncError::Memory)
     }
 }
@@ -285,6 +417,402 @@ fn runtime_export(export: &ExecutableExportPlan) -> Result<RuntimeExport, SyncEr
     })
 }
 
+fn runtime_host_import(import: &HostImportInfo) -> Result<HostImportInfo, SyncError> {
+    Ok(HostImportInfo {
+        interface: copied(&import.interface)?,
+        function: copied(&import.function)?,
+        function_type: crate::types::try_clone_function_type(&import.function_type)
+            .map_err(|_| SyncError::Allocation)?,
+        core_instance: import.core_instance,
+        core_module: copied(&import.core_module)?,
+        core_field: copied(&import.core_field)?,
+        string_encoding: import.string_encoding,
+        memory: import
+            .memory
+            .as_ref()
+            .map(runtime_host_core_export)
+            .transpose()?,
+        realloc: import
+            .realloc
+            .as_ref()
+            .map(runtime_host_core_export)
+            .transpose()?,
+    })
+}
+
+fn runtime_host_core_export(export: &HostCoreExportInfo) -> Result<HostCoreExportInfo, SyncError> {
+    Ok(HostCoreExportInfo {
+        core_instance: export.core_instance,
+        export: copied(&export.export)?,
+    })
+}
+
+fn clone_host_binding(
+    binding: Option<&HostCoreExportInfo>,
+) -> Result<Option<HostCoreExportInfo>, TrapCode> {
+    binding
+        .map(|binding| {
+            let mut export = String::new();
+            export
+                .try_reserve_exact(binding.export.len())
+                .map_err(|_| TrapCode::LimitExceeded)?;
+            export.push_str(&binding.export);
+            Ok(HostCoreExportInfo {
+                core_instance: binding.core_instance,
+                export,
+            })
+        })
+        .transpose()
+}
+
+fn validate_host_retptr(
+    modules: &CoreComponentGroup,
+    memory: Option<&HostCoreExportInfo>,
+    function: &FunctionType,
+    pointer: u32,
+) -> Result<(), TrapCode> {
+    let result = function.result.as_ref().ok_or(TrapCode::CanonicalAbi)?;
+    let layout = crate::value::validate_type(result)
+        .map_err(|_| TrapCode::CanonicalAbi)?
+        .layout;
+    if pointer as usize & (layout.alignment - 1) != 0 {
+        return Err(TrapCode::CanonicalAbi);
+    }
+    let memory = memory.ok_or(TrapCode::Validation)?;
+    let length = modules
+        .memory_size(memory.core_instance, &memory.export)
+        .map_err(|_| TrapCode::MemoryOutOfBounds)?;
+    let end = usize::try_from(pointer)
+        .ok()
+        .and_then(|start| start.checked_add(layout.size))
+        .ok_or(TrapCode::MemoryOutOfBounds)?;
+    if end > length {
+        return Err(TrapCode::MemoryOutOfBounds);
+    }
+    Ok(())
+}
+
+fn host_retptr_span(function: &FunctionType, pointer: u32) -> Result<(u32, u32), TrapCode> {
+    let result = function.result.as_ref().ok_or(TrapCode::CanonicalAbi)?;
+    let size = crate::value::validate_type(result)
+        .map_err(|_| TrapCode::CanonicalAbi)?
+        .layout
+        .size;
+    Ok((
+        pointer,
+        u32::try_from(size).map_err(|_| TrapCode::LimitExceeded)?,
+    ))
+}
+
+fn valid_bound_allocation(
+    modules: &CoreComponentGroup,
+    memory: Option<&HostCoreExportInfo>,
+    pointers: &[u32],
+    requests: &[AllocationRequest],
+    pointer: u32,
+    size: u32,
+    protected: Option<(u32, u32)>,
+) -> bool {
+    let Some(memory) = memory else {
+        return false;
+    };
+    let Ok(length) = modules.memory_size(memory.core_instance, &memory.export) else {
+        return false;
+    };
+    let start = u64::from(pointer);
+    let end = start + u64::from(size);
+    if end > length as u64 {
+        return false;
+    }
+    if let Some((protected_pointer, protected_size)) = protected {
+        let protected_start = u64::from(protected_pointer);
+        let protected_end = protected_start + u64::from(protected_size);
+        if start < protected_end && protected_start < end {
+            return false;
+        }
+    }
+    for (index, previous) in pointers.iter().copied().enumerate() {
+        let Some(request) = requests.get(index) else {
+            return false;
+        };
+        let previous_start = u64::from(previous);
+        let previous_end = previous_start + u64::from(request.size);
+        if start < previous_end && previous_start < end {
+            return false;
+        }
+    }
+    true
+}
+
+fn lower_host_response(
+    modules: &mut CoreComponentGroup,
+    pending: &mut PendingHostLower,
+    values: &[CanonicalValue],
+) -> Result<(Vec<CoreValue>, CodecUsage, usize), TrapCode> {
+    let mut replay = ReplayAllocator {
+        pointers: &pending.pointers,
+        requests: &pending.allocations,
+        cursor: 0,
+    };
+    let usage = match pending.caller_retptr {
+        Some(pointer) => {
+            let memory = pending.memory.as_ref().ok_or(TrapCode::Validation)?;
+            let mut guest = CoreGuestMemory::new(modules, memory.core_instance, &memory.export)
+                .map_err(|_| TrapCode::MemoryOutOfBounds)?;
+            lower_results_into_prepared(
+                &mut guest,
+                &mut replay,
+                pending.function.result.as_slice(),
+                values,
+                pointer,
+                &mut pending.lowering_journal,
+            )
+            .map_err(|_| TrapCode::CanonicalAbi)?
+        }
+        None => {
+            let mut no_memory = NoGuestMemory;
+            let prepared = pending.flat_results.as_mut().ok_or(TrapCode::Validation)?;
+            let (values, usage) = lower_flat_results_prepared(
+                &mut no_memory,
+                &mut replay,
+                pending.function.result.as_slice(),
+                values,
+                prepared,
+            )
+            .map_err(|_| TrapCode::CanonicalAbi)?;
+            return Ok((values, usage, replay.cursor));
+        }
+    };
+    let results = pending.resume_results.take().ok_or(TrapCode::Validation)?;
+    Ok((results, usage, replay.cursor))
+}
+
+fn owned_core_module_imports(
+    runtime_instance: usize,
+    bindings: &[CoreImportPlan],
+    host_imports: &[HostImportPlan],
+) -> Result<Vec<OwnedCoreModuleImport>, SyncError> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(bindings.len())
+        .map_err(|_| SyncError::Allocation)?;
+    for binding in bindings {
+        match binding {
+            CoreImportPlan::Host {
+                module,
+                field,
+                host_import,
+            } => {
+                let import = host_imports
+                    .get(*host_import)
+                    .ok_or(SyncError::InvalidWiring)?;
+                if import.info.core_instance != runtime_instance
+                    || import.info.core_module != *module
+                    || import.info.core_field != *field
+                {
+                    return Err(SyncError::InvalidWiring);
+                }
+                let (parameters, results) = core_host_signature(&import.info.function_type)?;
+                result.push(OwnedCoreModuleImport::Host(OwnedCoreHostImport {
+                    id: u32::try_from(*host_import).map_err(|_| SyncError::InvalidWiring)?,
+                    module: copied(module)?,
+                    name: copied(field)?,
+                    parameters,
+                    results,
+                }));
+            }
+            CoreImportPlan::InstanceExport {
+                module,
+                field,
+                core_instance,
+                export,
+            } => {
+                if *core_instance >= runtime_instance {
+                    return Err(SyncError::InvalidWiring);
+                }
+                result.push(OwnedCoreModuleImport::InstanceExport {
+                    module: copied(module)?,
+                    name: copied(field)?,
+                    instance: *core_instance,
+                    export: copied(export)?,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn core_host_signature(
+    function: &FunctionType,
+) -> Result<(Vec<CoreValueType>, Vec<CoreValueType>), SyncError> {
+    let parameter_types = clone_parameter_types(function)?;
+    let flat_parameters = flat_signature(&parameter_types).map_err(|_| SyncError::InvalidWiring)?;
+    let mut parameters = if flat_parameters.len() <= MAX_FLAT_PARAMS {
+        core_value_types(&flat_parameters)?
+    } else {
+        let mut indirect = Vec::new();
+        indirect
+            .try_reserve_exact(1)
+            .map_err(|_| SyncError::Allocation)?;
+        indirect.push(CoreValueType::I32);
+        indirect
+    };
+    let flat_results = match function.result.as_ref() {
+        Some(result) => {
+            flat_signature(core::slice::from_ref(result)).map_err(|_| SyncError::InvalidWiring)?
+        }
+        None => Vec::new(),
+    };
+    let results = if flat_results.len() <= MAX_FLAT_RESULTS {
+        core_value_types(&flat_results)?
+    } else {
+        parameters
+            .try_reserve(1)
+            .map_err(|_| SyncError::Allocation)?;
+        parameters.push(CoreValueType::I32);
+        Vec::new()
+    };
+    Ok((parameters, results))
+}
+
+fn core_value_types(flat: &[FlatKind]) -> Result<Vec<CoreValueType>, SyncError> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(flat.len())
+        .map_err(|_| SyncError::Allocation)?;
+    for kind in flat {
+        result.push(match kind {
+            FlatKind::I32 => CoreValueType::I32,
+            FlatKind::I64 => CoreValueType::I64,
+        });
+    }
+    Ok(result)
+}
+
+fn host_function_requires_resource_transfer(function: &FunctionType) -> bool {
+    function
+        .parameters
+        .iter()
+        .any(|parameter| contains_owned_resource(&parameter.value))
+        || function.result.as_ref().is_some_and(contains_resource)
+}
+
+fn contains_resource(value: &ValueType) -> bool {
+    match value {
+        ValueType::Resource { .. } => true,
+        ValueType::List(value) | ValueType::Option(value) => contains_resource(value),
+        ValueType::Tuple(values) | ValueType::Record(values) => {
+            values.iter().any(contains_resource)
+        }
+        ValueType::Result { ok, error } => ok
+            .iter()
+            .chain(error.iter())
+            .any(|value| contains_resource(value)),
+        ValueType::Variant(cases) => cases.iter().flatten().any(contains_resource),
+        _ => false,
+    }
+}
+
+fn contains_owned_resource(value: &ValueType) -> bool {
+    match value {
+        ValueType::Resource {
+            ownership: ResourceOwnership::Own,
+            ..
+        } => true,
+        ValueType::List(value) | ValueType::Option(value) => contains_owned_resource(value),
+        ValueType::Tuple(values) | ValueType::Record(values) => {
+            values.iter().any(contains_owned_resource)
+        }
+        ValueType::Result { ok, error } => ok
+            .iter()
+            .chain(error.iter())
+            .any(|value| contains_owned_resource(value)),
+        ValueType::Variant(cases) => cases.iter().flatten().any(contains_owned_resource),
+        _ => false,
+    }
+}
+
+fn contains_payload_allocation(value: &ValueType) -> bool {
+    match value {
+        ValueType::String | ValueType::List(_) => true,
+        ValueType::Tuple(values) | ValueType::Record(values) => {
+            values.iter().any(contains_payload_allocation)
+        }
+        ValueType::Option(value) => contains_payload_allocation(value),
+        ValueType::Result { ok, error } => ok
+            .iter()
+            .chain(error.iter())
+            .any(|value| contains_payload_allocation(value)),
+        ValueType::Variant(cases) => cases.iter().flatten().any(contains_payload_allocation),
+        _ => false,
+    }
+}
+
+fn result_lower_work_reservation(function: &FunctionType) -> Result<u64, TrapCode> {
+    let Some(result) = function.result.as_ref() else {
+        return Ok(0);
+    };
+    let dynamic = contains_payload_allocation(result);
+    let nodes = if dynamic {
+        u64::from(PROFILE_1_LIMITS.max_canonical_values)
+    } else {
+        max_selected_nodes(result)?
+    };
+    let payload_bytes = if dynamic {
+        u64::try_from(PROFILE_1_LIMITS.max_canonical_value_bytes)
+            .map_err(|_| TrapCode::LimitExceeded)?
+    } else {
+        0
+    };
+    let flat = flat_signature(core::slice::from_ref(result)).map_err(|_| TrapCode::CanonicalAbi)?;
+    if flat.len() <= MAX_FLAT_RESULTS {
+        return nodes
+            .checked_add(payload_bytes)
+            .ok_or(TrapCode::LimitExceeded);
+    }
+    let bytes = u64::try_from(
+        crate::value::validate_type(result)
+            .map_err(|_| TrapCode::CanonicalAbi)?
+            .layout
+            .size,
+    )
+    .map_err(|_| TrapCode::LimitExceeded)?;
+    nodes
+        .checked_add(payload_bytes)
+        .and_then(|work| work.checked_add(bytes))
+        .ok_or(TrapCode::LimitExceeded)
+}
+
+fn max_selected_nodes(value: &ValueType) -> Result<u64, TrapCode> {
+    let descendants = match value {
+        ValueType::List(value) | ValueType::Option(value) => max_selected_nodes(value)?,
+        ValueType::Tuple(values) | ValueType::Record(values) => {
+            let mut total = 0_u64;
+            for value in values {
+                total = total
+                    .checked_add(max_selected_nodes(value)?)
+                    .ok_or(TrapCode::LimitExceeded)?;
+            }
+            total
+        }
+        ValueType::Result { ok, error } => max_optional_selected_nodes(ok.as_deref())?
+            .max(max_optional_selected_nodes(error.as_deref())?),
+        ValueType::Variant(cases) => {
+            let mut maximum = 0_u64;
+            for case in cases {
+                maximum = maximum.max(max_optional_selected_nodes(case.as_ref())?);
+            }
+            maximum
+        }
+        _ => 0,
+    };
+    descendants.checked_add(1).ok_or(TrapCode::LimitExceeded)
+}
+
+fn max_optional_selected_nodes(value: Option<&ValueType>) -> Result<u64, TrapCode> {
+    value.map_or(Ok(0), max_selected_nodes)
+}
+
 fn copied(value: &str) -> Result<String, SyncError> {
     let mut result = String::new();
     result
@@ -292,6 +820,26 @@ fn copied(value: &str) -> Result<String, SyncError> {
         .map_err(|_| SyncError::Allocation)?;
     result.push_str(value);
     Ok(result)
+}
+
+fn zero_baselines(count: usize) -> Result<Vec<u64>, SyncError> {
+    let mut baselines = Vec::new();
+    baselines
+        .try_reserve_exact(count)
+        .map_err(|_| SyncError::Allocation)?;
+    baselines.resize(count, 0);
+    Ok(baselines)
+}
+
+const fn host_error_trap(error: HostError) -> TrapCode {
+    match error {
+        HostError::BudgetExceeded => TrapCode::FuelExhausted,
+        HostError::Exhausted => TrapCode::LimitExceeded,
+        HostError::InvalidArgument => TrapCode::CanonicalAbi,
+        HostError::Denied | HostError::Unavailable | HostError::BackendFault => {
+            TrapCode::Validation
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +859,9 @@ enum TypedStage {
     Allocate,
     Replay,
     Transform,
+    HostAllocate,
+    HostDispatch,
+    HostFreeUnused,
     Lift,
     PostReturn,
     Cleanup,
@@ -323,6 +874,7 @@ enum TypedStage {
 pub struct TypedCall<'a, A> {
     component: &'a mut SynchronousComponent,
     resources: &'a mut ResourceTable<A>,
+    dispatcher: Option<&'a mut dyn HostDispatcher<A>>,
     export: usize,
     arguments: Vec<CanonicalValue>,
     allocations: Vec<AllocationRequest>,
@@ -335,16 +887,45 @@ pub struct TypedCall<'a, A> {
     total_work: u64,
     remaining_work: u64,
     poll_quantum: u64,
-    active_baseline: u64,
+    active_baselines: Vec<u64>,
+    host_lower: Option<PendingHostLower>,
     cancelled: bool,
     guest_started: bool,
     guest_resources: Option<GuestCallResources>,
+}
+
+struct PendingHostLower {
+    call_id: u32,
+    outer_instance: usize,
+    import_index: usize,
+    function: FunctionType,
+    arguments: Vec<CanonicalValue>,
+    caller_retptr: Option<u32>,
+    memory: Option<HostCoreExportInfo>,
+    realloc: Option<HostCoreExportInfo>,
+    allocations: Vec<AllocationRequest>,
+    pointers: Vec<u32>,
+    free_reservations: Vec<CoreCallReservation>,
+    allocation_index: usize,
+    required_host_work: u64,
+    lower_reservation: u64,
+    actual_lower_work: u64,
+    provider_reservation: u64,
+    provider_consumed: u64,
+    provider_fuel_per_call: u64,
+    free_index: usize,
+    resume_results: Option<Vec<CoreValue>>,
+    resume_after_free: Option<Vec<CoreValue>>,
+    trap_after_free: Option<TrapCode>,
+    lowering_journal: LoweringJournal,
+    flat_results: Option<PreparedFlatResults>,
 }
 
 impl<'a, A> TypedCall<'a, A> {
     fn terminal(
         component: &'a mut SynchronousComponent,
         resources: &'a mut ResourceTable<A>,
+        dispatcher: Option<&'a mut dyn HostDispatcher<A>>,
         export: usize,
         total_work: u64,
         poll_quantum: u64,
@@ -353,6 +934,7 @@ impl<'a, A> TypedCall<'a, A> {
         Self {
             component,
             resources,
+            dispatcher,
             export,
             arguments: Vec::new(),
             allocations: Vec::new(),
@@ -365,7 +947,8 @@ impl<'a, A> TypedCall<'a, A> {
             total_work,
             remaining_work: 0,
             poll_quantum,
-            active_baseline: 0,
+            active_baselines: Vec::new(),
+            host_lower: None,
             cancelled: false,
             guest_started: false,
             guest_resources: None,
@@ -385,13 +968,11 @@ impl<'a, A> TypedCall<'a, A> {
         }
         self.cancelled = true;
         self.component.poisoned = true;
-        if let Some(instance) = self.active_instance_mut() {
-            let _ = instance.cancel_call();
-        }
+        self.component.modules.discard_all_calls();
     }
 
     pub fn poll(&mut self) -> TypedPoll {
-        if self.cancelled && self.active_instance_mut().is_none() {
+        if self.cancelled {
             self.stage = TypedStage::Terminal(TrapCode::Cancelled);
         }
         match self.stage {
@@ -406,6 +987,9 @@ impl<'a, A> TypedCall<'a, A> {
             TypedStage::Allocate => self.poll_allocate(),
             TypedStage::Replay => self.replay(),
             TypedStage::Transform => self.poll_transform(),
+            TypedStage::HostAllocate => self.poll_host_allocate(),
+            TypedStage::HostDispatch => self.dispatch_host_call(),
+            TypedStage::HostFreeUnused => self.poll_host_free_unused(),
             TypedStage::Lift => self.lift(),
             TypedStage::PostReturn => self.poll_post_return(),
             TypedStage::Cleanup => self.poll_cleanup(),
@@ -413,7 +997,7 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     fn poll_allocate(&mut self) -> TypedPoll {
-        if self.active_instance_mut().is_none() {
+        if self.active_instance().is_none() {
             if self.allocation_index >= self.allocations.len() {
                 self.stage = TypedStage::Replay;
                 return TypedPoll::Pending(self.metrics());
@@ -431,6 +1015,7 @@ impl<'a, A> TypedCall<'a, A> {
         }
         match self.poll_subcall() {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
             PollResult::Trapped(trap) => self.finish_trap(trap),
             PollResult::Ready(values) => match values.as_slice() {
                 [CoreValue::I32(pointer)] if *pointer != 0 => {
@@ -456,31 +1041,37 @@ impl<'a, A> TypedCall<'a, A> {
     fn replay(&mut self) -> TypedPoll {
         let binding = &self.component.exports[self.export];
         let instance_index = binding.core_instance;
-        let Some(memory_name) = binding.memory.as_deref() else {
-            return self.finish_trap(TrapCode::Validation);
-        };
         let parameter_types =
             match clone_parameter_types(&self.component.exports[self.export].function_type) {
                 Ok(types) => types,
                 Err(_) => return self.finish_trap(TrapCode::LimitExceeded),
             };
-        let Some(instance) = self.component.modules.get_mut(instance_index) else {
-            return self.finish_trap(TrapCode::Validation);
-        };
-        let mut memory = match CoreGuestMemory::new(instance, memory_name) {
-            Ok(memory) => memory,
-            Err(_) => return self.finish_trap(TrapCode::MemoryOutOfBounds),
-        };
         let mut replay = ReplayAllocator {
             pointers: &self.pointers,
             requests: &self.allocations,
             cursor: 0,
         };
-        let lowered =
-            match lower_parameters(&mut memory, &mut replay, &parameter_types, &self.arguments) {
-                Ok(lowered) if replay.cursor == replay.requests.len() => lowered,
-                _ => return self.finish_trap(TrapCode::CanonicalAbi),
-            };
+        let lowered = match binding.memory.as_deref() {
+            Some(memory_name) => {
+                let mut memory = match CoreGuestMemory::new(
+                    &mut self.component.modules,
+                    instance_index,
+                    memory_name,
+                ) {
+                    Ok(memory) => memory,
+                    Err(_) => return self.finish_trap(TrapCode::MemoryOutOfBounds),
+                };
+                lower_parameters(&mut memory, &mut replay, &parameter_types, &self.arguments)
+            }
+            None => {
+                let mut memory = NoGuestMemory;
+                lower_parameters(&mut memory, &mut replay, &parameter_types, &self.arguments)
+            }
+        };
+        let lowered = match lowered {
+            Ok(lowered) if replay.cursor == replay.requests.len() => lowered,
+            _ => return self.finish_trap(TrapCode::CanonicalAbi),
+        };
         self.replay_arguments = match lowered_parts(lowered) {
             Ok((arguments, _)) => Some(arguments),
             Err(_) => return self.finish_trap(TrapCode::LimitExceeded),
@@ -490,7 +1081,7 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     fn poll_transform(&mut self) -> TypedPoll {
-        if self.active_instance_mut().is_none() {
+        if self.active_instance().is_none() {
             let Some(arguments) = self.replay_arguments.take() else {
                 return self.finish_trap(TrapCode::Validation);
             };
@@ -500,12 +1091,580 @@ impl<'a, A> TypedCall<'a, A> {
         }
         match self.poll_subcall() {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(call) => self.handle_host_call(call),
             PollResult::Trapped(trap) => self.finish_trap(trap),
             PollResult::Ready(results) => {
                 self.core_results = Some(results);
                 self.stage = TypedStage::Lift;
                 TypedPoll::Pending(self.metrics())
             }
+        }
+    }
+
+    fn handle_host_call(&mut self, call: CoreHostCall) -> TypedPoll {
+        match self.handle_host_call_inner(call) {
+            Ok(()) => TypedPoll::Pending(self.metrics()),
+            Err(trap) => self.finish_trap(trap),
+        }
+    }
+
+    fn handle_host_call_inner(&mut self, call: CoreHostCall) -> Result<(), TrapCode> {
+        let import_index = usize::try_from(call.id).map_err(|_| TrapCode::Validation)?;
+        let active_instance = self
+            .component
+            .exports
+            .get(self.export)
+            .map(|export| export.core_instance)
+            .ok_or(TrapCode::Validation)?;
+        let function = {
+            let import = self
+                .component
+                .host_imports
+                .get(import_index)
+                .ok_or(TrapCode::Validation)?;
+            if call.origin_instance != import.core_instance {
+                return Err(TrapCode::Validation);
+            }
+            crate::types::try_clone_function_type(&import.function_type)
+                .map_err(|_| TrapCode::LimitExceeded)?
+        };
+        let parameter_types =
+            clone_parameter_types(&function).map_err(|_| TrapCode::LimitExceeded)?;
+        let flat_parameters =
+            flat_signature(&parameter_types).map_err(|_| TrapCode::CanonicalAbi)?;
+        let parameter_arity = if flat_parameters.len() <= MAX_FLAT_PARAMS {
+            flat_parameters.len()
+        } else {
+            1
+        };
+        let flat_results = match function.result.as_ref() {
+            Some(result) => {
+                flat_signature(core::slice::from_ref(result)).map_err(|_| TrapCode::CanonicalAbi)?
+            }
+            None => Vec::new(),
+        };
+        let has_retptr = flat_results.len() > MAX_FLAT_RESULTS;
+        let expected_arguments = parameter_arity
+            .checked_add(usize::from(has_retptr))
+            .ok_or(TrapCode::LimitExceeded)?;
+        if call.arguments.len() != expected_arguments {
+            return Err(TrapCode::CanonicalAbi);
+        }
+        let caller_retptr = if has_retptr {
+            match call.arguments.last() {
+                Some(CoreValue::I32(pointer)) => Some(*pointer as u32),
+                _ => return Err(TrapCode::CanonicalAbi),
+            }
+        } else {
+            None
+        };
+
+        let (mut arguments, lift_usage) = {
+            let import = self
+                .component
+                .host_imports
+                .get(import_index)
+                .ok_or(TrapCode::Validation)?;
+            let scope = self.guest_resources.as_ref().ok_or(TrapCode::Validation)?;
+            let binder = HostParameterBinder {
+                table: &*self.resources,
+                scope,
+            };
+            let core_arguments = &call.arguments[..parameter_arity];
+            match import.memory.as_ref() {
+                Some(binding) => {
+                    let memory = CoreGuestMemory::new(
+                        &mut self.component.modules,
+                        binding.core_instance,
+                        &binding.export,
+                    )
+                    .map_err(|_| TrapCode::MemoryOutOfBounds)?;
+                    lift_parameters(&memory, &binder, &parameter_types, core_arguments)
+                        .map_err(|_| TrapCode::CanonicalAbi)?
+                }
+                None => {
+                    let memory = NoGuestMemory;
+                    lift_parameters(&memory, &binder, &parameter_types, core_arguments)
+                        .map_err(|_| TrapCode::CanonicalAbi)?
+                }
+            }
+        };
+        self.charge(lift_usage.work)
+            .map_err(|_| TrapCode::FuelExhausted)?;
+        self.component
+            .modules
+            .debit_call_fuel(active_instance, lift_usage.work)
+            .map_err(|_| TrapCode::FuelExhausted)?;
+        let baseline = self
+            .active_baselines
+            .get_mut(active_instance)
+            .ok_or(TrapCode::Validation)?;
+        *baseline = baseline
+            .checked_add(lift_usage.work)
+            .ok_or(TrapCode::LimitExceeded)?;
+        lift_host_argument_resources(
+            &parameter_types,
+            &mut arguments,
+            self.resources,
+            self.guest_resources.as_mut().ok_or(TrapCode::Validation)?,
+        )
+        .map_err(|_| TrapCode::ResourceMisuse)?;
+        let lower_reservation = result_lower_work_reservation(&function)?;
+
+        let required_host_work = {
+            let dispatcher = self.dispatcher.as_deref().ok_or(TrapCode::Validation)?;
+            let import = self
+                .component
+                .host_imports
+                .get(import_index)
+                .ok_or(TrapCode::Validation)?;
+            dispatcher
+                .required_work(import, &arguments)
+                .map_err(host_error_trap)?
+        };
+        if required_host_work == 0 {
+            return Err(TrapCode::Validation);
+        }
+        let planned_allocations = {
+            let dispatcher = self.dispatcher.as_deref().ok_or(TrapCode::Validation)?;
+            let import = self
+                .component
+                .host_imports
+                .get(import_index)
+                .ok_or(TrapCode::Validation)?;
+            dispatcher
+                .result_allocations(import, &arguments)
+                .map_err(host_error_trap)?
+        };
+        if planned_allocations.len() > PROFILE_1_LIMITS.max_abi_allocations as usize {
+            return Err(TrapCode::LimitExceeded);
+        }
+        let mut allocations = Vec::new();
+        allocations
+            .try_reserve_exact(planned_allocations.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        for allocation in planned_allocations {
+            if allocation.size == 0
+                || allocation.alignment == 0
+                || !allocation.alignment.is_power_of_two()
+            {
+                return Err(TrapCode::Validation);
+            }
+            allocations.push(AllocationRequest {
+                size: allocation.size,
+                alignment: allocation.alignment,
+            });
+        }
+        let (memory, realloc) = {
+            let import = self
+                .component
+                .host_imports
+                .get(import_index)
+                .ok_or(TrapCode::Validation)?;
+            (
+                clone_host_binding(import.memory.as_ref())?,
+                clone_host_binding(import.realloc.as_ref())?,
+            )
+        };
+        if (!allocations.is_empty() || caller_retptr.is_some()) && memory.is_none() {
+            return Err(TrapCode::Validation);
+        }
+        if !allocations.is_empty() && realloc.is_none() {
+            return Err(TrapCode::Validation);
+        }
+        if let Some(pointer) = caller_retptr {
+            validate_host_retptr(&self.component.modules, memory.as_ref(), &function, pointer)?;
+        }
+        let provider_fuel_per_call = self.poll_quantum;
+        // Reserve allocation plus worst-case rollback free fuel before any
+        // provider or backend side effect. The unused portion is released
+        // only after result lowering and rollback have completed.
+        let provider_calls = u64::try_from(allocations.len())
+            .map_err(|_| TrapCode::LimitExceeded)?
+            .checked_mul(2)
+            .ok_or(TrapCode::LimitExceeded)?;
+        let provider_reservation = provider_calls
+            .checked_mul(provider_fuel_per_call)
+            .ok_or(TrapCode::LimitExceeded)?;
+        let reserved_work = required_host_work
+            .checked_add(lower_reservation)
+            .and_then(|work| work.checked_add(provider_reservation))
+            .ok_or(TrapCode::LimitExceeded)?;
+        if self.remaining_work <= reserved_work {
+            return Err(TrapCode::FuelExhausted);
+        }
+        self.component
+            .modules
+            .debit_call_fuel(active_instance, reserved_work)
+            .map_err(|_| TrapCode::FuelExhausted)?;
+        let baseline = self
+            .active_baselines
+            .get_mut(active_instance)
+            .ok_or(TrapCode::Validation)?;
+        *baseline = baseline
+            .checked_add(reserved_work)
+            .ok_or(TrapCode::LimitExceeded)?;
+        let mut pointers = Vec::new();
+        pointers
+            .try_reserve_exact(allocations.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        let mut free_reservations = Vec::new();
+        free_reservations
+            .try_reserve_exact(allocations.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        if let Some(provider) = realloc.as_ref() {
+            for _ in &allocations {
+                free_reservations.push(
+                    self.component
+                        .modules
+                        .reserve_call(provider.core_instance, &provider.export)?,
+                );
+            }
+        }
+        let lowering_journal = LoweringJournal::try_with_capacity(allocations.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        let flat_results = if caller_retptr.is_none() {
+            Some(
+                PreparedFlatResults::try_new(function.result.as_slice())
+                    .map_err(|_| TrapCode::CanonicalAbi)?,
+            )
+        } else {
+            None
+        };
+        let mut resume_results = Vec::new();
+        resume_results
+            .try_reserve_exact(usize::from(
+                caller_retptr.is_none() && function.result.is_some(),
+            ))
+            .map_err(|_| TrapCode::LimitExceeded)?;
+        self.host_lower = Some(PendingHostLower {
+            call_id: call.id,
+            outer_instance: active_instance,
+            import_index,
+            function,
+            arguments,
+            caller_retptr,
+            memory,
+            realloc,
+            allocations,
+            pointers,
+            free_reservations,
+            allocation_index: 0,
+            required_host_work,
+            lower_reservation,
+            actual_lower_work: 0,
+            provider_reservation,
+            provider_consumed: 0,
+            provider_fuel_per_call,
+            free_index: 0,
+            resume_results: Some(resume_results),
+            resume_after_free: None,
+            trap_after_free: None,
+            lowering_journal,
+            flat_results,
+        });
+        self.stage = if self
+            .host_lower
+            .as_ref()
+            .is_some_and(|pending| pending.allocations.is_empty())
+        {
+            TypedStage::HostDispatch
+        } else {
+            TypedStage::HostAllocate
+        };
+        Ok(())
+    }
+
+    fn poll_host_allocate(&mut self) -> TypedPoll {
+        let Some(pending) = self.host_lower.as_ref() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        if pending.allocation_index >= pending.allocations.len() {
+            self.stage = TypedStage::HostDispatch;
+            return TypedPoll::Pending(self.metrics());
+        }
+        let provider = match pending.realloc.as_ref() {
+            Some(provider) => provider,
+            None => return self.finish_trap(TrapCode::Validation),
+        };
+        let provider_instance = provider.core_instance;
+        if !self.component.modules.has_active_call(provider_instance) {
+            let request = pending.allocations[pending.allocation_index];
+            let inputs = [
+                CoreValue::I32(0),
+                CoreValue::I32(0),
+                CoreValue::I32(request.alignment as i32),
+                CoreValue::I32(request.size as i32),
+            ];
+            if self
+                .component
+                .modules
+                .start_call(
+                    provider_instance,
+                    &provider.export,
+                    &inputs,
+                    pending.provider_fuel_per_call,
+                    self.poll_quantum.min(pending.provider_fuel_per_call),
+                )
+                .is_err()
+            {
+                return self.finish_trap(TrapCode::Validation);
+            }
+            let Some(baseline) = self.active_baselines.get_mut(provider_instance) else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            *baseline = 0;
+            self.guest_started = true;
+        }
+        let (result, consumed) = self.poll_instance_measured(provider_instance, true);
+        let pending = self.host_lower.as_mut().expect("pending host lower");
+        pending.provider_consumed = match pending.provider_consumed.checked_add(consumed) {
+            Some(consumed) => consumed,
+            None => return self.finish_trap(TrapCode::FuelExhausted),
+        };
+        match result {
+            PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
+            PollResult::Trapped(trap) => self.finish_trap(trap),
+            PollResult::Ready(values) => match values.as_slice() {
+                [CoreValue::I32(pointer)] if *pointer != 0 => {
+                    let pointer = *pointer as u32;
+                    let pending = self.host_lower.as_mut().expect("pending host lower");
+                    let request = pending.allocations[pending.allocation_index];
+                    if pointer & (request.alignment - 1) != 0
+                        || !valid_bound_allocation(
+                            &self.component.modules,
+                            pending.memory.as_ref(),
+                            &pending.pointers,
+                            &pending.allocations,
+                            pointer,
+                            request.size,
+                            pending.caller_retptr.and_then(|retptr| {
+                                host_retptr_span(&pending.function, retptr).ok()
+                            }),
+                        )
+                    {
+                        return self.finish_trap(TrapCode::CanonicalAbi);
+                    }
+                    pending.pointers.push(pointer);
+                    pending.allocation_index += 1;
+                    TypedPoll::Pending(self.metrics())
+                }
+                _ => self.finish_trap(TrapCode::CanonicalAbi),
+            },
+        }
+    }
+
+    fn dispatch_host_call(&mut self) -> TypedPoll {
+        let Some(mut pending) = self.host_lower.take() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        let response = {
+            let Some(dispatcher) = self.dispatcher.as_deref_mut() else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(import) = self.component.host_imports.get(pending.import_index) else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(scope) = self.guest_resources.as_ref() else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            dispatcher.dispatch(HostRequest::new(
+                import,
+                &pending.arguments,
+                &*self.resources,
+                scope,
+            ))
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                return self.defer_host_trap_after_cleanup(pending, host_error_trap(error));
+            }
+        };
+        let (mut values, host_work) = response.into_parts();
+        if host_work != pending.required_host_work {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+        }
+        let shape = match pending.function.result.as_ref() {
+            Some(result) if values.len() == 1 => validate_value_with_resources(
+                result,
+                &values[0],
+                self.resources,
+                ValuePosition::Result,
+            ),
+            None if values.is_empty() => Ok(Default::default()),
+            _ => {
+                return self.defer_host_trap_after_cleanup(pending, TrapCode::CanonicalAbi);
+            }
+        };
+        if shape.is_err() {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::ResourceMisuse);
+        }
+        if let Some(result) = pending.function.result.as_ref() {
+            if rewrite_lowered_resources(
+                result,
+                values.first_mut().expect("one validated result"),
+                self.resources,
+                self.guest_resources.as_mut().expect("live guest scope"),
+            )
+            .is_err()
+            {
+                return self.defer_host_trap_after_cleanup(pending, TrapCode::ResourceMisuse);
+            }
+        }
+        let lowered = lower_host_response(&mut self.component.modules, &mut pending, &values);
+        let (core_results, usage, used_allocations) = match lowered {
+            Ok(lowered) => lowered,
+            Err(trap) => {
+                return self.defer_host_trap_after_cleanup(pending, trap);
+            }
+        };
+        if usage.work > pending.lower_reservation || used_allocations > pending.pointers.len() {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+        }
+        pending.actual_lower_work = usage.work;
+        // Only spans consumed by the selected response branch transfer to the
+        // guest. Preallocated inactive-branch spans are rolled back first.
+        if used_allocations < pending.pointers.len() {
+            pending.free_index = pending.pointers.len();
+            pending.allocation_index = used_allocations;
+            pending.resume_after_free = Some(core_results);
+            self.host_lower = Some(pending);
+            self.stage = TypedStage::HostFreeUnused;
+            return TypedPoll::Pending(self.metrics());
+        }
+        if self.release_host_reservation(&pending, usage.work).is_err() {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+        }
+        if self
+            .component
+            .modules
+            .resume_host_call(pending.outer_instance, pending.call_id, &core_results)
+            .is_err()
+        {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+        }
+        self.stage = TypedStage::Transform;
+        TypedPoll::Pending(self.metrics())
+    }
+
+    fn defer_host_trap_after_cleanup(
+        &mut self,
+        mut pending: PendingHostLower,
+        trap: TrapCode,
+    ) -> TypedPoll {
+        if pending.pointers.is_empty() {
+            return self.finish_trap(trap);
+        }
+        pending.free_index = pending.pointers.len();
+        pending.allocation_index = 0;
+        pending.trap_after_free = Some(trap);
+        self.host_lower = Some(pending);
+        self.stage = TypedStage::HostFreeUnused;
+        TypedPoll::Pending(self.metrics())
+    }
+
+    fn poll_host_free_unused(&mut self) -> TypedPoll {
+        let cleanup_complete = match self.host_lower.as_ref() {
+            Some(pending) => pending.free_index <= pending.allocation_index,
+            None => return self.finish_trap(TrapCode::Validation),
+        };
+        if cleanup_complete {
+            let mut pending = self.host_lower.take().expect("pending host lower");
+            if let Some(trap) = pending.trap_after_free.take() {
+                return self.finish_trap(trap);
+            }
+            let Some(results) = pending.resume_after_free.take() else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let actual_lower_work = pending.actual_lower_work;
+            debug_assert!(actual_lower_work <= pending.lower_reservation);
+            if self
+                .release_host_reservation(&pending, actual_lower_work)
+                .is_err()
+            {
+                return self.finish_trap(TrapCode::Validation);
+            }
+            if self
+                .component
+                .modules
+                .resume_host_call(pending.outer_instance, pending.call_id, &results)
+                .is_err()
+            {
+                pending.pointers.truncate(pending.allocation_index);
+                pending.allocations.truncate(pending.allocation_index);
+                return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+            }
+            self.stage = TypedStage::Transform;
+            return TypedPoll::Pending(self.metrics());
+        }
+        let poll_quantum = self.poll_quantum;
+        let provider_instance = {
+            let modules = &mut self.component.modules;
+            let active_baselines = &mut self.active_baselines;
+            let Some(pending) = self.host_lower.as_mut() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(provider) = pending.realloc.as_ref() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let provider_instance = provider.core_instance;
+            if !modules.has_active_call(provider_instance) {
+                let index = pending.free_index - 1;
+                let request = pending.allocations[index];
+                let pointer = pending.pointers[index];
+                let inputs = [
+                    CoreValue::I32(pointer as i32),
+                    CoreValue::I32(request.size as i32),
+                    CoreValue::I32(request.alignment as i32),
+                    CoreValue::I32(0),
+                ];
+                let Some(reservation) = pending.free_reservations.pop() else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                if modules
+                    .start_call_reserved(
+                        reservation,
+                        provider_instance,
+                        &provider.export,
+                        &inputs,
+                        pending.provider_fuel_per_call,
+                        poll_quantum.min(pending.provider_fuel_per_call),
+                    )
+                    .is_err()
+                {
+                    return self.finish_trap(TrapCode::Validation);
+                }
+                let Some(baseline) = active_baselines.get_mut(provider_instance) else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                *baseline = 0;
+            }
+            provider_instance
+        };
+        let (result, consumed) = self.poll_instance_measured(provider_instance, true);
+        let pending = self.host_lower.as_mut().expect("pending host lower");
+        pending.provider_consumed = match pending.provider_consumed.checked_add(consumed) {
+            Some(consumed) => consumed,
+            None => return self.finish_trap(TrapCode::FuelExhausted),
+        };
+        match result {
+            PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
+            PollResult::Trapped(trap) => self.finish_trap(trap),
+            PollResult::Ready(values) if values == [CoreValue::I32(0)] => {
+                let pending = self.host_lower.as_mut().expect("pending host lower");
+                pending.free_index -= 1;
+                pending.pointers.pop();
+                pending.allocations.pop();
+                TypedPoll::Pending(self.metrics())
+            }
+            PollResult::Ready(_) => self.finish_trap(TrapCode::CanonicalAbi),
         }
     }
 
@@ -523,27 +1682,38 @@ impl<'a, A> TypedCall<'a, A> {
             Some(results) => results,
             None => return self.finish_trap(TrapCode::Validation),
         };
-        let binding = &self.component.exports[self.export];
-        let instance_index = binding.core_instance;
-        let Some(memory_name) = binding.memory.as_deref() else {
-            return self.finish_trap(TrapCode::Validation);
-        };
-        let Some(instance) = self.component.modules.get_mut(instance_index) else {
-            return self.finish_trap(TrapCode::Validation);
-        };
-        let memory = match CoreGuestMemory::new(instance, memory_name) {
-            Ok(memory) => memory,
-            Err(_) => return self.finish_trap(TrapCode::MemoryOutOfBounds),
-        };
         let binder = TableBinder {
             table: &*self.resources,
         };
-        let (mut values, usage) = match lift_results(
-            &memory,
-            &binder,
-            core::slice::from_ref(result_type),
-            results,
-        ) {
+        let lifted = match self.component.exports[self.export].memory.as_deref() {
+            Some(memory_name) => {
+                let instance_index = self.component.exports[self.export].core_instance;
+                let memory = match CoreGuestMemory::new(
+                    &mut self.component.modules,
+                    instance_index,
+                    memory_name,
+                ) {
+                    Ok(memory) => memory,
+                    Err(_) => return self.finish_trap(TrapCode::MemoryOutOfBounds),
+                };
+                lift_results(
+                    &memory,
+                    &binder,
+                    core::slice::from_ref(result_type),
+                    results,
+                )
+            }
+            None => {
+                let memory = NoGuestMemory;
+                lift_results(
+                    &memory,
+                    &binder,
+                    core::slice::from_ref(result_type),
+                    results,
+                )
+            }
+        };
+        let (mut values, usage) = match lifted {
             Ok(value) => value,
             Err(_) => return self.finish_trap(TrapCode::CanonicalAbi),
         };
@@ -574,7 +1744,7 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     fn poll_post_return(&mut self) -> TypedPoll {
-        if self.active_instance_mut().is_none() {
+        if self.active_instance().is_none() {
             let Some(results) = self.core_results.as_ref() else {
                 return self.finish_trap(TrapCode::Validation);
             };
@@ -589,6 +1759,7 @@ impl<'a, A> TypedCall<'a, A> {
         }
         match self.poll_subcall() {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
             PollResult::Trapped(trap) => self.finish_trap(trap),
             PollResult::Ready(values) if values.is_empty() => {
                 self.stage = TypedStage::Cleanup;
@@ -599,7 +1770,7 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     fn poll_cleanup(&mut self) -> TypedPoll {
-        if self.active_instance_mut().is_none() {
+        if self.active_instance().is_none() {
             if self.allocation_index == 0 {
                 if self.close_resources(true).is_err() {
                     return self.finish_trap(TrapCode::CanonicalAbi);
@@ -621,6 +1792,7 @@ impl<'a, A> TypedCall<'a, A> {
         }
         match self.poll_subcall() {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
             PollResult::Trapped(trap) => self.finish_trap(trap),
             PollResult::Ready(values) if values == [CoreValue::I32(0)] => {
                 self.allocation_index -= 1;
@@ -642,43 +1814,74 @@ impl<'a, A> TypedCall<'a, A> {
             Subcall::Free => binding.realloc.as_deref(),
         }
         .ok_or(TrapCode::Validation)?;
-        let instance = self
-            .component
-            .modules
-            .get_mut(binding.core_instance)
-            .ok_or(TrapCode::Validation)?;
-        instance.start_call(
+        self.component.modules.start_call(
+            binding.core_instance,
             name,
             inputs,
             self.remaining_work,
             self.poll_quantum.min(self.remaining_work),
         )?;
         // Each Core call starts a fresh continuation whose consumed-fuel
-        // counter begins at zero. Metrics retained from an earlier completed
-        // call must not become the baseline for this one.
-        self.active_baseline = 0;
+        // counter begins at zero. Baselines are instance-local because a
+        // provider realloc may run while the outer caller remains suspended.
+        *self
+            .active_baselines
+            .get_mut(binding.core_instance)
+            .ok_or(TrapCode::Validation)? = 0;
         self.guest_started = true;
         Ok(())
     }
 
     fn poll_subcall(&mut self) -> PollResult {
-        let Some(instance) = self.active_instance_mut() else {
+        let Some(instance) = self.active_instance() else {
             return PollResult::Trapped(TrapCode::Validation);
         };
-        let result = instance.poll_call();
-        let consumed = instance
-            .call_metrics()
-            .map_or(0, |metrics| metrics.consumed_fuel)
-            .saturating_sub(self.active_baseline);
-        self.active_baseline = self.active_baseline.saturating_add(consumed);
-        self.remaining_work = self.remaining_work.saturating_sub(consumed);
-        result
+        self.poll_instance(instance, false)
     }
 
-    fn active_instance_mut(&mut self) -> Option<&mut CoreInstance> {
+    fn poll_instance(&mut self, instance: usize, precharged: bool) -> PollResult {
+        self.poll_instance_measured(instance, precharged).0
+    }
+
+    fn poll_instance_measured(&mut self, instance: usize, precharged: bool) -> (PollResult, u64) {
+        let result = self.component.modules.poll_call(instance);
+        let baseline = self.active_baselines.get_mut(instance);
+        let Some(baseline) = baseline else {
+            return (PollResult::Trapped(TrapCode::Validation), 0);
+        };
+        let Some(consumed) = self
+            .component
+            .modules
+            .call_metrics(instance)
+            .map_or(Some(0), |metrics| {
+                metrics.consumed_fuel.checked_sub(*baseline)
+            })
+        else {
+            return (PollResult::Trapped(TrapCode::Validation), 0);
+        };
+        let Some(next_baseline) = baseline.checked_add(consumed) else {
+            return (PollResult::Trapped(TrapCode::FuelExhausted), 0);
+        };
+        *baseline = next_baseline;
+        if !precharged {
+            match self.remaining_work.checked_sub(consumed) {
+                Some(remaining) => self.remaining_work = remaining,
+                None => {
+                    self.component.modules.discard_all_calls();
+                    self.component.poisoned = true;
+                    return (PollResult::Trapped(TrapCode::FuelExhausted), consumed);
+                }
+            }
+        }
+        (result, consumed)
+    }
+
+    fn active_instance(&self) -> Option<usize> {
         let index = self.component.exports.get(self.export)?.core_instance;
-        let instance = self.component.modules.get_mut(index)?;
-        instance.has_active_call().then_some(instance)
+        self.component
+            .modules
+            .has_active_call(index)
+            .then_some(index)
     }
 
     fn memory_binding(&self) -> Result<(usize, &str), TrapCode> {
@@ -697,10 +1900,7 @@ impl<'a, A> TypedCall<'a, A> {
         let Ok((instance, memory)) = self.memory_binding() else {
             return false;
         };
-        let Some(instance) = self.component.modules.get(instance) else {
-            return false;
-        };
-        let Ok(length) = instance.memory_size(memory) else {
+        let Ok(length) = self.component.modules.memory_size(instance, memory) else {
             return false;
         };
         u64::from(pointer)
@@ -732,11 +1932,52 @@ impl<'a, A> TypedCall<'a, A> {
         Ok(())
     }
 
+    fn release_host_reservation(
+        &mut self,
+        pending: &PendingHostLower,
+        actual_lower_work: u64,
+    ) -> Result<(), TrapCode> {
+        let unused_lower = pending
+            .lower_reservation
+            .checked_sub(actual_lower_work)
+            .ok_or(TrapCode::Validation)?;
+        let unused_provider = pending
+            .provider_reservation
+            .checked_sub(pending.provider_consumed)
+            .ok_or(TrapCode::Validation)?;
+        let unused = unused_lower
+            .checked_add(unused_provider)
+            .ok_or(TrapCode::Validation)?;
+        let exact_work = pending
+            .required_host_work
+            .checked_add(actual_lower_work)
+            .and_then(|work| work.checked_add(pending.provider_consumed))
+            .ok_or(TrapCode::Validation)?;
+        let remaining = self
+            .remaining_work
+            .checked_sub(exact_work)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let baseline = self
+            .active_baselines
+            .get(pending.outer_instance)
+            .copied()
+            .ok_or(TrapCode::Validation)?
+            .checked_sub(unused)
+            .ok_or(TrapCode::Validation)?;
+        self.component
+            .modules
+            .credit_call_fuel(pending.outer_instance, unused)?;
+        self.remaining_work = remaining;
+        *self
+            .active_baselines
+            .get_mut(pending.outer_instance)
+            .expect("validated host-call baseline remains present") = baseline;
+        Ok(())
+    }
+
     fn finish_trap(&mut self, trap: TrapCode) -> TypedPoll {
         self.component.poisoned = true;
-        if let Some(instance) = self.active_instance_mut() {
-            let _ = instance.discard_call();
-        }
+        self.component.modules.discard_all_calls();
         let _ = self.close_resources(false);
         self.stage = TypedStage::Complete;
         TypedPoll::Trapped(trap)
@@ -759,9 +2000,7 @@ impl<A> Drop for TypedCall<'_, A> {
         if self.guest_started && !matches!(self.stage, TypedStage::Complete) {
             self.component.poisoned = true;
         }
-        if let Some(instance) = self.active_instance_mut() {
-            let _ = instance.discard_call();
-        }
+        self.component.modules.discard_all_calls();
         let _ = self.close_resources(false);
     }
 }
@@ -832,6 +2071,22 @@ impl GuestMemory for PlanningMemory {
     }
 }
 
+struct NoGuestMemory;
+
+impl GuestMemory for NoGuestMemory {
+    fn len(&self) -> u64 {
+        0
+    }
+
+    fn read_exact(&self, _pointer: u32, _destination: &mut [u8]) -> Result<(), AbiError> {
+        Err(AbiError::OutOfBounds)
+    }
+
+    fn write_exact(&mut self, _pointer: u32, _source: &[u8]) -> Result<(), AbiError> {
+        Err(AbiError::OutOfBounds)
+    }
+}
+
 struct ReplayAllocator<'a> {
     pointers: &'a [u32],
     requests: &'a [AllocationRequest],
@@ -858,17 +2113,23 @@ impl<M: GuestMemory> PayloadAllocator<M> for ReplayAllocator<'_> {
 
 /// Copy-only view of one exact Core memory named by canonical options.
 struct CoreGuestMemory<'a> {
-    instance: &'a mut CoreInstance,
+    group: &'a mut CoreComponentGroup,
+    instance: usize,
     export: &'a str,
     length: usize,
 }
 
 impl<'a> CoreGuestMemory<'a> {
-    fn new(instance: &'a mut CoreInstance, export: &'a str) -> Result<Self, SyncError> {
-        let length = instance
-            .memory_size(export)
+    fn new(
+        group: &'a mut CoreComponentGroup,
+        instance: usize,
+        export: &'a str,
+    ) -> Result<Self, SyncError> {
+        let length = group
+            .memory_size(instance, export)
             .map_err(|_| SyncError::Memory)?;
         Ok(Self {
+            group,
             instance,
             export,
             length,
@@ -882,20 +2143,51 @@ impl GuestMemory for CoreGuestMemory<'_> {
     }
 
     fn read_exact(&self, pointer: u32, destination: &mut [u8]) -> Result<(), AbiError> {
-        self.instance
-            .read_memory(self.export, pointer as usize, destination)
+        self.group
+            .read_memory(self.instance, self.export, pointer as usize, destination)
             .map_err(|_| AbiError::OutOfBounds)
     }
 
     fn write_exact(&mut self, pointer: u32, source: &[u8]) -> Result<(), AbiError> {
-        self.instance
-            .write_memory(self.export, pointer as usize, source)
+        self.group
+            .write_memory(self.instance, self.export, pointer as usize, source)
             .map_err(|_| AbiError::OutOfBounds)
     }
 }
 
 struct TableBinder<'a, A> {
     table: &'a ResourceTable<A>,
+}
+
+struct HostParameterBinder<'a, A> {
+    table: &'a ResourceTable<A>,
+    scope: &'a GuestCallResources,
+}
+
+impl<A> ResourceBinder for HostParameterBinder<'_, A> {
+    fn bind(
+        &self,
+        guest_index: u32,
+        expected: ResourceTypeId,
+        ownership: ResourceOwnership,
+        position: ValuePosition,
+    ) -> Result<ResourceToken, CodecError> {
+        if position != ValuePosition::Parameter {
+            return Err(CodecError::ResourceBinding);
+        }
+        match ownership {
+            ResourceOwnership::Borrow => self
+                .table
+                .with_guest_borrow(self.scope, guest_index, expected, |_| ())
+                .map_err(|_| CodecError::ResourceBinding)?,
+            ResourceOwnership::Own => self
+                .table
+                .contains_guest_owned_index(guest_index, expected)
+                .map(|_| ())
+                .map_err(|_| CodecError::ResourceBinding)?,
+        }
+        Ok(self.table.token_from_guest_index(guest_index))
+    }
 }
 
 impl<A> ResourceBinder for TableBinder<'_, A> {
@@ -966,6 +2258,88 @@ fn lower_argument_resources<A>(
         rewrite_lowered_resources(ty, value, table, scope)?;
     }
     Ok(())
+}
+
+fn lift_host_argument_resources<A>(
+    types: &[ValueType],
+    values: &mut [CanonicalValue],
+    table: &mut ResourceTable<A>,
+    scope: &mut GuestCallResources,
+) -> Result<(), ()> {
+    if types.len() != values.len() {
+        return Err(());
+    }
+    for (ty, value) in types.iter().zip(values) {
+        rewrite_host_argument_resources(ty, value, table, scope)?;
+    }
+    Ok(())
+}
+
+fn rewrite_host_argument_resources<A>(
+    ty: &ValueType,
+    value: &mut CanonicalValue,
+    table: &mut ResourceTable<A>,
+    scope: &mut GuestCallResources,
+) -> Result<(), ()> {
+    match (ty, value) {
+        (
+            ValueType::Resource {
+                resource_type,
+                ownership: ResourceOwnership::Own,
+            },
+            CanonicalValue::Resource(token),
+        ) => {
+            *token = table
+                .lift_owned_from_guest(scope, token.guest_index(), *resource_type)
+                .map_err(|_| ())?;
+            Ok(())
+        }
+        (
+            ValueType::Resource {
+                ownership: ResourceOwnership::Borrow,
+                ..
+            },
+            CanonicalValue::Resource(_),
+        ) => Ok(()),
+        (ValueType::List(item), CanonicalValue::List(values)) => {
+            for value in values {
+                rewrite_host_argument_resources(item, value, table, scope)?;
+            }
+            Ok(())
+        }
+        (ValueType::Tuple(types), CanonicalValue::Tuple(values))
+        | (ValueType::Record(types), CanonicalValue::Record(values)) => {
+            lift_host_argument_resources(types, values, table, scope)
+        }
+        (ValueType::Option(inner), CanonicalValue::Option(Some(value))) => {
+            rewrite_host_argument_resources(inner, value, table, scope)
+        }
+        (ValueType::Option(_), CanonicalValue::Option(None)) => Ok(()),
+        (ValueType::Result { ok, .. }, CanonicalValue::Result(Ok(value))) => {
+            rewrite_optional_host_argument(ok.as_deref(), value.as_deref_mut(), table, scope)
+        }
+        (ValueType::Result { error, .. }, CanonicalValue::Result(Err(value))) => {
+            rewrite_optional_host_argument(error.as_deref(), value.as_deref_mut(), table, scope)
+        }
+        (ValueType::Variant(cases), CanonicalValue::Variant { case, payload }) => {
+            let ty = cases.get(*case as usize).ok_or(())?.as_ref();
+            rewrite_optional_host_argument(ty, payload.as_deref_mut(), table, scope)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_optional_host_argument<A>(
+    ty: Option<&ValueType>,
+    value: Option<&mut CanonicalValue>,
+    table: &mut ResourceTable<A>,
+    scope: &mut GuestCallResources,
+) -> Result<(), ()> {
+    match (ty, value) {
+        (None, None) => Ok(()),
+        (Some(ty), Some(value)) => rewrite_host_argument_resources(ty, value, table, scope),
+        _ => Err(()),
+    }
 }
 
 fn rewrite_lowered_resources<A>(

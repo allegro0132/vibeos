@@ -1,7 +1,8 @@
 use vibeos_component_runtime::abi_value::{
-    flat_signature, lift_flat_values, lift_parameters, lift_results, lift_value, lower_parameters,
-    lower_results, lower_value, CodecError, CodecUsage, FlatKind, LoweredParameters,
-    LoweredResults, PayloadAllocator, RejectResources, MAX_FLAT_PARAMS,
+    flat_signature, lift_flat_values, lift_parameters, lift_results, lift_value,
+    lower_flat_results_prepared, lower_parameters, lower_results, lower_results_into, lower_value,
+    CodecError, CodecUsage, FlatKind, LoweredParameters, LoweredResults, PayloadAllocator,
+    PreparedFlatResults, RejectResources, MAX_FLAT_PARAMS,
 };
 use vibeos_component_runtime::memory::{AbiError, GuestMemory, VecMemory};
 use vibeos_component_runtime::resource::{ResourceTable, ResourceTypeId};
@@ -436,6 +437,37 @@ fn flat_and_indirect_calling_conventions_lift_back_exactly() {
 }
 
 #[test]
+fn lowered_import_writes_indirect_results_into_the_callers_retptr() {
+    let (mut memory, mut allocator) = memory_and_allocator();
+    let types = [ValueType::Result {
+        ok: Some(Box::new(ValueType::List(Box::new(ValueType::U8)))),
+        error: Some(Box::new(ValueType::Enum(2))),
+    }];
+    let values = [CanonicalValue::Result(Ok(Some(Box::new(
+        CanonicalValue::List(vec![CanonicalValue::U8(0x12), CanonicalValue::U8(0x34)]),
+    ))))];
+
+    let usage = lower_results_into(&mut memory, &mut allocator, &types, &values, 128).unwrap();
+    assert_eq!(usage.allocations, 1, "only the nested list uses realloc");
+    assert!(usage.work > 0);
+    let (lifted, _) =
+        lift_results(&memory, &RejectResources, &types, &[CoreValue::I32(128)]).unwrap();
+    assert_eq!(lifted, values);
+
+    assert_eq!(
+        lower_results_into(
+            &mut memory,
+            &mut allocator,
+            &[ValueType::U64],
+            &[CanonicalValue::U64(1)],
+            128,
+        ),
+        Err(CodecError::FlatLimit),
+        "flat host results do not accept a forged retptr",
+    );
+}
+
+#[test]
 fn flat_lift_rejects_noncanonical_values_and_binds_exact_resources() {
     let (memory, _) = memory_and_allocator();
     assert_eq!(
@@ -732,6 +764,51 @@ fn allocator_cannot_alias_root_or_another_payload() {
         ),
         Err(CodecError::Allocation)
     );
+}
+
+#[test]
+fn prepared_flat_discriminants_lower_without_variant_scratch() {
+    let mut memory = VecMemory::new(0, 0).unwrap();
+    let mut allocator = Bump {
+        next: 0,
+        allocations: 0,
+    };
+    let cases = [
+        (
+            ValueType::Option(Box::new(ValueType::Tuple(Vec::new()))),
+            CanonicalValue::Option(None),
+            CoreValue::I32(0),
+        ),
+        (
+            ValueType::Result {
+                ok: None,
+                error: None,
+            },
+            CanonicalValue::Result(Err(None)),
+            CoreValue::I32(1),
+        ),
+        (
+            ValueType::Variant(vec![None, None]),
+            CanonicalValue::Variant {
+                case: 1,
+                payload: None,
+            },
+            CoreValue::I32(1),
+        ),
+    ];
+    for (ty, value, expected) in cases {
+        let mut prepared = PreparedFlatResults::try_new(core::slice::from_ref(&ty)).unwrap();
+        let (lowered, usage) = lower_flat_results_prepared(
+            &mut memory,
+            &mut allocator,
+            core::slice::from_ref(&ty),
+            core::slice::from_ref(&value),
+            &mut prepared,
+        )
+        .unwrap();
+        assert_eq!(lowered, [expected]);
+        assert_eq!(usage.allocations, 0);
+    }
 }
 
 #[test]

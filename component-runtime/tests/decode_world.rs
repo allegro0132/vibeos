@@ -8,6 +8,7 @@ use vibeos_component_runtime::{
 const COMPONENT: &str =
     include_str!("../../component-format/tests/corpus/component/typed.component.wat");
 const RICH_EXECUTABLE_COMPONENT: &str = include_str!("fixtures/rich.component.wat");
+const HOST_CLOCK_COMPONENT: &str = include_str!("fixtures/host-clock.component.wat");
 const PROFILE_WORLD: &str = include_str!("../../component-format/tests/corpus/wit/world.wit");
 
 const WORLD: &str = r#"
@@ -245,6 +246,170 @@ fn local_instance_function_alias_preserves_the_validated_lift() {
     assert_eq!(exports[0].core_instance, 0);
     assert_eq!(exports[0].core_function, "f");
     assert_eq!(exports[0].function.result, Some(ValueType::S32));
+}
+
+#[test]
+fn clock_import_plan_preserves_exact_component_and_core_wiring() {
+    let bytes = wat::parse_str(HOST_CLOCK_COMPONENT).unwrap();
+    let mut features = wasmparser::WasmFeatures::empty();
+    features.set(wasmparser::WasmFeatures::COMPONENT_MODEL, true);
+    wasmparser::Validator::new_with_features(features)
+        .validate_all(&bytes)
+        .unwrap();
+
+    let plan = inspect_component(&bytes).unwrap();
+    assert_eq!(plan.summary.core_instances, 2);
+    let imports: Vec<_> = plan.host_imports().collect();
+    assert_eq!(imports.len(), 1);
+    let import = imports[0];
+    assert_eq!(import.interface, "vibe:clock/monotonic@1.0.0");
+    assert_eq!(import.function, "now");
+    assert_eq!(import.core_instance, 0);
+    assert_eq!(import.core_module, "vibe:clock/monotonic@1.0.0");
+    assert_eq!(import.core_field, "now");
+    assert_eq!(import.string_encoding, None);
+    assert_eq!(import.memory, None);
+    assert_eq!(import.realloc, None);
+    assert_eq!(import.function_type.parameters[0].name, "clock");
+    assert_eq!(
+        import.function_type.parameters[0].value,
+        ValueType::Resource {
+            resource_type: ResourceTypeId(1),
+            ownership: ResourceOwnership::Borrow,
+        }
+    );
+    assert_eq!(import.function_type.result, Some(ValueType::U64));
+
+    let exports: Vec<_> = plan.executable_exports().collect();
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0].name, "run");
+    assert_eq!(exports[0].core_instance, 0);
+    assert_eq!(
+        exports[0].function.parameters[0].value,
+        import.function_type.parameters[0].value,
+    );
+    assert_eq!(exports[0].function.result, Some(ValueType::U64));
+}
+
+#[test]
+fn clock_import_plan_rejects_missing_extra_and_wrong_kind_wiring() {
+    let missing = HOST_CLOCK_COMPONENT.replace(
+        "    (instantiate $guest\n      (with \"vibe:clock/monotonic@1.0.0\" (instance $clock-core))))",
+        "    (instantiate $guest))",
+    );
+    let bytes = wat::parse_str(&missing).unwrap();
+    assert!(matches!(
+        inspect_component(&bytes),
+        Err(DecodeError::Malformed | DecodeError::InvalidWiring)
+    ));
+
+    let extra = HOST_CLOCK_COMPONENT.replace(
+        "    (export \"now\" (func $lowered-now)))",
+        "    (export \"now\" (func $lowered-now))\n    (export \"extra\" (func $lowered-now)))",
+    );
+    let bytes = wat::parse_str(&extra).unwrap();
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .unwrap();
+    assert!(matches!(
+        inspect_component(&bytes),
+        Err(DecodeError::InvalidWiring)
+    ));
+
+    let non_function = wat::parse_str(
+        r#"(component
+              (core module $provider (memory (export "memory") 1 1))
+              (core module $guest (import "host" "memory" (memory 1 1)))
+              (core instance $provider-instance (instantiate $provider))
+              (alias core export $provider-instance "memory" (core memory $memory))
+              (core instance $host (export "memory" (memory $memory)))
+              (core instance $guest-instance
+                (instantiate $guest (with "host" (instance $host)))))"#,
+    )
+    .unwrap();
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&non_function)
+        .unwrap();
+    let plan = inspect_component(&non_function).unwrap();
+    assert_eq!(plan.host_imports().count(), 0);
+    assert_eq!(plan.summary().core_instances, 3);
+}
+
+#[test]
+fn clock_import_plan_rejects_wrong_names_types_and_cross_instance_options() {
+    let wrong_module = HOST_CLOCK_COMPONENT.replacen(
+        "    (import \"vibe:clock/monotonic@1.0.0\" \"now\"",
+        "    (import \"vibe:clock/wrong@1.0.0\" \"now\"",
+        1,
+    );
+    let bytes = wat::parse_str(&wrong_module).unwrap();
+    assert!(matches!(
+        inspect_component(&bytes),
+        Err(DecodeError::Malformed | DecodeError::InvalidWiring)
+    ));
+
+    let wrong_field = HOST_CLOCK_COMPONENT.replacen(
+        "    (import \"vibe:clock/monotonic@1.0.0\" \"now\"",
+        "    (import \"vibe:clock/monotonic@1.0.0\" \"wrong\"",
+        1,
+    );
+    let bytes = wat::parse_str(&wrong_field).unwrap();
+    assert!(matches!(
+        inspect_component(&bytes),
+        Err(DecodeError::Malformed | DecodeError::InvalidWiring)
+    ));
+
+    let wrong_type = HOST_CLOCK_COMPONENT
+        .replacen(
+            "    (type $now-type (func (param i32) (result i64)))",
+            "    (type $now-type (func (param i32) (result i32)))",
+            1,
+        )
+        .replacen(
+            "    (func (export \"run\") (param $clock i32) (result i64)",
+            "    (func (export \"run\") (param $clock i32) (result i32)",
+            1,
+        );
+    let bytes = wat::parse_str(&wrong_type).unwrap();
+    assert!(matches!(
+        inspect_component(&bytes),
+        Err(DecodeError::Malformed | DecodeError::InvalidWiring)
+    ));
+
+    let cross_instance_options = wat::parse_str(
+        r#"(component
+              (type $read-type (func (result string)))
+              (import "read" (func $read (type $read-type)))
+              (core module $memory-provider
+                (memory (export "memory") 1 1))
+              (core module $realloc-provider
+                (func (export "realloc")
+                  (param i32 i32 i32 i32) (result i32)
+                  i32.const 0))
+              (core module $guest
+                (type $read-type (func (param i32)))
+                (import "$root" "read" (func (type $read-type))))
+              (core instance $memory-instance (instantiate $memory-provider))
+              (alias core export $memory-instance "memory" (core memory $memory))
+              (core instance $realloc-instance (instantiate $realloc-provider))
+              (alias core export $realloc-instance "realloc" (core func $realloc))
+              (core func $lowered-read
+                (canon lower (func $read)
+                  (memory $memory)
+                  (realloc $realloc)
+                  string-encoding=utf8))
+              (core instance $host (export "read" (func $lowered-read)))
+              (core instance $guest-instance
+                (instantiate $guest (with "$root" (instance $host)))))"#,
+    )
+    .unwrap();
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&cross_instance_options)
+        .unwrap();
+    assert!(matches!(
+        inspect_component(&cross_instance_options),
+        Err(DecodeError::InvalidWiring)
+    ));
 }
 
 #[test]

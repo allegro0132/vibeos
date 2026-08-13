@@ -3,13 +3,24 @@ use dlr_wasm_interpreter::{
 };
 use vibeos_component_format::{LimitKind, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
-    inspect_core, inspect_core_with_limits, AdmissionDetail, CoreValue, OwnerAllocationReservation,
-    PollResult, ValidatedCore,
+    inspect_core, inspect_core_with_limits, AdmissionDetail, CoreComponentGroup, CoreHostCall,
+    CoreHostImport, CoreInstanceExportImport, CoreModuleImport, CoreValue, CoreValueType,
+    OwnerAllocationReservation, PollResult, ProfileEngine, ValidatedCore,
 };
 
 fn compile(wat: &str) -> ValidatedCore {
     let bytes = wat::parse_str(wat).unwrap();
     ValidatedCore::new(&bytes, OwnerAllocationReservation::profile_default()).unwrap()
+}
+
+fn compile_in(engine: &ProfileEngine, wat: &str) -> ValidatedCore {
+    let bytes = wat::parse_str(wat).unwrap();
+    ValidatedCore::new_in(
+        engine,
+        &bytes,
+        OwnerAllocationReservation::profile_default(),
+    )
+    .unwrap()
 }
 
 fn run(
@@ -42,6 +53,766 @@ fn poll_to_terminal(call: &mut vibeos_wasm_runtime::Invocation<'_>) -> PollResul
     }
 }
 
+fn poll_instance_to_host(instance: &mut vibeos_wasm_runtime::CoreInstance) -> CoreHostCall {
+    loop {
+        match instance.poll_call() {
+            PollResult::Pending { .. } => {}
+            PollResult::HostCall(call) => return call,
+            other => panic!("expected host call, got {other:?}"),
+        }
+    }
+}
+
+fn poll_instance_to_terminal(instance: &mut vibeos_wasm_runtime::CoreInstance) -> PollResult {
+    loop {
+        match instance.poll_call() {
+            PollResult::Pending { .. } => {}
+            result @ (PollResult::Ready(_) | PollResult::Trapped(_)) => return result,
+            PollResult::HostCall(call) => panic!("unexpected host call: {call:?}"),
+        }
+    }
+}
+
+fn poll_group_to_terminal(group: &mut CoreComponentGroup, instance: usize) -> PollResult {
+    loop {
+        match group.poll_call(instance) {
+            PollResult::Pending { .. } => {}
+            result @ (PollResult::Ready(_) | PollResult::Trapped(_)) => return result,
+            PollResult::HostCall(call) => panic!("unexpected host call: {call:?}"),
+        }
+    }
+}
+
+#[test]
+fn reserved_group_start_is_exact_linear_and_failure_atomic() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (func (export "identity") (param i32) (result i32)
+                local.get 0)
+              (func (export "same-type") (param i32) (result i32)
+                local.get 0)
+              (func (export "wide") (param i64) (result i64)
+                local.get 0))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+
+    let reservation = group.reserve_call(0, "identity").unwrap();
+    assert_eq!(
+        group.start_call_reserved(reservation, 1, "identity", &[CoreValue::I32(1)], 100, 10,),
+        Err(TrapCode::Validation),
+    );
+    assert!(!group.any_active_call());
+
+    let reservation = group.reserve_call(0, "identity").unwrap();
+    assert_eq!(
+        group.start_call_reserved(reservation, 0, "same-type", &[CoreValue::I32(1)], 100, 10,),
+        Err(TrapCode::Validation),
+    );
+    assert!(!group.any_active_call());
+
+    let reservation = group.reserve_call(0, "identity").unwrap();
+    assert_eq!(
+        group.start_call_reserved(reservation, 0, "identity", &[], 100, 10),
+        Err(TrapCode::Validation),
+    );
+    assert!(!group.any_active_call());
+
+    let reservation = group.reserve_call(0, "identity").unwrap();
+    assert_eq!(
+        group.start_call_reserved(reservation, 0, "identity", &[CoreValue::I64(1)], 100, 10,),
+        Err(TrapCode::Validation),
+    );
+    assert!(!group.any_active_call());
+
+    for (total, quantum) in [(0, 10), (100, 0), (10, 11)] {
+        let reservation = group.reserve_call(0, "identity").unwrap();
+        assert_eq!(
+            group.start_call_reserved(
+                reservation,
+                0,
+                "identity",
+                &[CoreValue::I32(1)],
+                total,
+                quantum,
+            ),
+            Err(TrapCode::LimitExceeded),
+        );
+        assert!(!group.any_active_call());
+    }
+
+    let mut other_group = CoreComponentGroup::new(&engine, 1).unwrap();
+    other_group.add_instance(&module, &[]).unwrap();
+    let wrong_owner = group.reserve_call(0, "identity").unwrap();
+    assert_eq!(
+        other_group.start_call_reserved(wrong_owner, 0, "identity", &[CoreValue::I32(7)], 100, 10,),
+        Err(TrapCode::Validation),
+    );
+    assert!(!other_group.any_active_call());
+
+    let reservation = group.reserve_call(0, "identity").unwrap();
+    group
+        .start_call_reserved(reservation, 0, "identity", &[CoreValue::I32(42)], 100, 10)
+        .unwrap();
+    // The reservation was consumed by value, and active state excludes a
+    // second reservation until this exact call reaches a terminal result.
+    assert_eq!(
+        group.reserve_call(0, "identity").err(),
+        Some(TrapCode::Validation)
+    );
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 0),
+        PollResult::Ready(vec![CoreValue::I32(42)])
+    );
+}
+
+#[test]
+fn external_fuel_debit_and_credit_are_atomic_and_conservative() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (func (export "identity") (param i32) (result i32)
+                local.get 0))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 1).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    group
+        .start_call(0, "identity", &[CoreValue::I32(9)], 100, 10)
+        .unwrap();
+
+    assert_eq!(group.call_metrics(0).unwrap().consumed_fuel, 0);
+    group.debit_call_fuel(0, 40).unwrap();
+    assert_eq!(
+        group.call_metrics(0).unwrap(),
+        vibeos_wasm_runtime::CallMetrics {
+            consumed_fuel: 40,
+            remaining_fuel: 60,
+        }
+    );
+    let before_failed_debit = group.call_metrics(0).unwrap();
+    assert_eq!(group.debit_call_fuel(0, 61), Err(TrapCode::FuelExhausted));
+    assert_eq!(group.call_metrics(0), Some(before_failed_debit));
+
+    group.debit_call_fuel(0, 10).unwrap();
+    group.credit_call_fuel(0, 20).unwrap();
+    assert_eq!(
+        group.call_metrics(0).unwrap(),
+        vibeos_wasm_runtime::CallMetrics {
+            consumed_fuel: 30,
+            remaining_fuel: 70,
+        }
+    );
+    let before_over_credit = group.call_metrics(0).unwrap();
+    assert_eq!(group.credit_call_fuel(0, 31), Err(TrapCode::FuelExhausted));
+    assert_eq!(group.call_metrics(0), Some(before_over_credit));
+
+    group.credit_call_fuel(0, 30).unwrap();
+    assert_eq!(
+        group.call_metrics(0).unwrap(),
+        vibeos_wasm_runtime::CallMetrics {
+            consumed_fuel: 0,
+            remaining_fuel: 100,
+        }
+    );
+    let before_guest_credit = group.call_metrics(0).unwrap();
+    assert_eq!(group.credit_call_fuel(0, 1), Err(TrapCode::FuelExhausted));
+    assert_eq!(group.call_metrics(0), Some(before_guest_credit));
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 0),
+        PollResult::Ready(vec![CoreValue::I32(9)])
+    );
+    let terminal = group.call_metrics(0).unwrap();
+    assert_eq!(terminal.consumed_fuel + terminal.remaining_fuel, 100);
+}
+
+#[test]
+fn group_host_ids_are_global_and_transitive_origin_is_definition_exact() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "value" (func $value (result i32)))
+              (func (export "wrapper") (result i32)
+                call $value
+                i32.const 1
+                i32.add))"#,
+    );
+    let outer = compile_in(
+        &engine,
+        r#"(module
+              (import "provider" "wrapper" (func $wrapper (result i32)))
+              (func (export "run") (result i32)
+                call $wrapper))"#,
+    );
+    let results = [CoreValueType::I32];
+    let host = CoreHostImport {
+        id: 313,
+        module: "host",
+        name: "value",
+        params: &[],
+        results: &results,
+    };
+    let mut group = CoreComponentGroup::new(&engine, 3).unwrap();
+    group
+        .add_instance(&provider, &[CoreModuleImport::Host(host)])
+        .unwrap();
+    let collision = group
+        .add_instance(&provider, &[CoreModuleImport::Host(host)])
+        .unwrap_err();
+    assert_eq!(collision.detail, AdmissionDetail::HostImportMismatch);
+    group
+        .add_instance(
+            &outer,
+            &[CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+                module: "provider",
+                name: "wrapper",
+                instance: 0,
+                export: "wrapper",
+            })],
+        )
+        .unwrap();
+
+    group.start_call(1, "run", &[], 1_000, 100).unwrap();
+    assert_eq!(
+        group.poll_call(1),
+        PollResult::HostCall(CoreHostCall {
+            origin_instance: 0,
+            id: 313,
+            arguments: vec![],
+        })
+    );
+    assert!(!group.has_active_call(0));
+    assert!(group.has_active_call(1));
+    group
+        .resume_host_call(1, 313, &[CoreValue::I32(41)])
+        .unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 1),
+        PollResult::Ready(vec![CoreValue::I32(42)])
+    );
+}
+
+#[test]
+fn component_group_links_exact_prior_functions_and_shared_memory() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (memory (export "memory") 1 1)
+              (func (export "realloc")
+                (param i32 i32 i32 i32) (result i32)
+                i32.const 64))"#,
+    );
+    let guest = compile_in(
+        &engine,
+        r#"(module
+              (import "env" "memory" (memory 1 1))
+              (import "env" "realloc"
+                (func $realloc (param i32 i32 i32 i32) (result i32)))
+              (func (export "run") (result i32)
+                (local $pointer i32)
+                i32.const 0
+                i32.const 0
+                i32.const 4
+                i32.const 4
+                call $realloc
+                local.tee $pointer
+                i32.const 0x12345678
+                i32.store
+                local.get $pointer
+                i32.load))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    assert_eq!(group.add_instance(&provider, &[]).unwrap(), 0);
+    let imports = [
+        CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+            module: "env",
+            name: "memory",
+            instance: 0,
+            export: "memory",
+        }),
+        CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+            module: "env",
+            name: "realloc",
+            instance: 0,
+            export: "realloc",
+        }),
+    ];
+    assert_eq!(group.add_instance(&guest, &imports).unwrap(), 1);
+    group.start_call(1, "run", &[], 10_000, 100).unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 1),
+        PollResult::Ready(vec![CoreValue::I32(0x1234_5678)])
+    );
+    let mut bytes = [0_u8; 4];
+    group.read_memory(0, "memory", 64, &mut bytes).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes), 0x1234_5678);
+}
+
+#[test]
+fn component_group_polls_provider_while_guest_host_call_is_suspended() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (memory (export "memory") 1 1)
+              (func (export "realloc")
+                (param i32 i32 i32 i32) (result i32)
+                i32.const 128))"#,
+    );
+    let guest = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "value" (func $value (result i32)))
+              (func (export "run") (result i32)
+                call $value
+                i32.const 1
+                i32.add))"#,
+    );
+    let host_results = [CoreValueType::I32];
+    let host = CoreHostImport {
+        id: 71,
+        module: "host",
+        name: "value",
+        params: &[],
+        results: &host_results,
+    };
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group.add_instance(&provider, &[]).unwrap();
+    group
+        .add_instance(&guest, &[CoreModuleImport::Host(host)])
+        .unwrap();
+    group.start_call(1, "run", &[], 10_000, 100).unwrap();
+    let call = loop {
+        match group.poll_call(1) {
+            PollResult::Pending { .. } => {}
+            PollResult::HostCall(call) => break call,
+            other => panic!("expected guest host call, got {other:?}"),
+        }
+    };
+    assert_eq!(call.id, 71);
+    assert!(group.has_active_call(1));
+
+    group
+        .start_call(
+            0,
+            "realloc",
+            &[
+                CoreValue::I32(0),
+                CoreValue::I32(0),
+                CoreValue::I32(1),
+                CoreValue::I32(4),
+            ],
+            1_000,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 0),
+        PollResult::Ready(vec![CoreValue::I32(128)])
+    );
+    group.write_memory(0, "memory", 128, &[9, 8, 7, 6]).unwrap();
+    group
+        .resume_host_call(1, 71, &[CoreValue::I32(41)])
+        .unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 1),
+        PollResult::Ready(vec![CoreValue::I32(42)])
+    );
+}
+
+#[test]
+fn component_group_keeps_suspended_host_calls_instance_exact() {
+    let engine = ProfileEngine::new();
+    let first = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "first" (func $host (result i32)))
+              (func (export "run") (result i32) call $host))"#,
+    );
+    let second = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "second" (func $host (result i32)))
+              (func (export "run") (result i32) call $host))"#,
+    );
+    let results = [CoreValueType::I32];
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group
+        .add_instance(
+            &first,
+            &[CoreModuleImport::Host(CoreHostImport {
+                id: 81,
+                module: "host",
+                name: "first",
+                params: &[],
+                results: &results,
+            })],
+        )
+        .unwrap();
+    group
+        .add_instance(
+            &second,
+            &[CoreModuleImport::Host(CoreHostImport {
+                id: 82,
+                module: "host",
+                name: "second",
+                params: &[],
+                results: &results,
+            })],
+        )
+        .unwrap();
+
+    group.start_call(0, "run", &[], 1_000, 100).unwrap();
+    group.start_call(1, "run", &[], 1_000, 100).unwrap();
+    assert_eq!(
+        group.poll_call(0),
+        PollResult::HostCall(CoreHostCall {
+            origin_instance: 0,
+            id: 81,
+            arguments: vec![]
+        })
+    );
+    assert_eq!(
+        group.poll_call(1),
+        PollResult::HostCall(CoreHostCall {
+            origin_instance: 1,
+            id: 82,
+            arguments: vec![]
+        })
+    );
+
+    assert_eq!(
+        group.resume_host_call(0, 82, &[CoreValue::I32(1)]),
+        Err(TrapCode::Validation),
+    );
+    assert_eq!(
+        group.resume_host_call(1, 81, &[CoreValue::I32(2)]),
+        Err(TrapCode::Validation),
+    );
+    group
+        .resume_host_call(1, 82, &[CoreValue::I32(22)])
+        .unwrap();
+    group
+        .resume_host_call(0, 81, &[CoreValue::I32(11)])
+        .unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 1),
+        PollResult::Ready(vec![CoreValue::I32(22)]),
+    );
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 0),
+        PollResult::Ready(vec![CoreValue::I32(11)]),
+    );
+}
+
+#[test]
+fn provider_host_reentry_is_exposed_for_the_component_to_reject() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "nested" (func $nested (result i32)))
+              (func (export "realloc")
+                (param i32 i32 i32 i32) (result i32)
+                call $nested))"#,
+    );
+    let outer = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "outer" (func $outer (result i32)))
+              (func (export "run") (result i32) call $outer))"#,
+    );
+    let results = [CoreValueType::I32];
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group
+        .add_instance(
+            &provider,
+            &[CoreModuleImport::Host(CoreHostImport {
+                id: 91,
+                module: "host",
+                name: "nested",
+                params: &[],
+                results: &results,
+            })],
+        )
+        .unwrap();
+    group
+        .add_instance(
+            &outer,
+            &[CoreModuleImport::Host(CoreHostImport {
+                id: 92,
+                module: "host",
+                name: "outer",
+                params: &[],
+                results: &results,
+            })],
+        )
+        .unwrap();
+
+    group.start_call(1, "run", &[], 1_000, 100).unwrap();
+    assert_eq!(
+        group.poll_call(1),
+        PollResult::HostCall(CoreHostCall {
+            origin_instance: 1,
+            id: 92,
+            arguments: vec![]
+        })
+    );
+    group
+        .start_call(
+            0,
+            "realloc",
+            &[
+                CoreValue::I32(0),
+                CoreValue::I32(0),
+                CoreValue::I32(1),
+                CoreValue::I32(4),
+            ],
+            1_000,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        group.poll_call(0),
+        PollResult::HostCall(CoreHostCall {
+            origin_instance: 0,
+            id: 91,
+            arguments: vec![]
+        })
+    );
+    assert!(group.has_active_call(0));
+    assert!(group.has_active_call(1));
+
+    // The portable Core layer surfaces the nested call without running it.
+    // The Component host-lowering state machine treats this as re-entry,
+    // poisons the principal, and uses this bounded teardown primitive.
+    group.discard_all_calls();
+    assert!(!group.any_active_call());
+    assert_eq!(
+        group.resume_host_call(0, 91, &[CoreValue::I32(64)]),
+        Err(TrapCode::Validation),
+    );
+    assert_eq!(
+        group.resume_host_call(1, 92, &[CoreValue::I32(7)]),
+        Err(TrapCode::Validation),
+    );
+}
+
+#[test]
+fn component_group_rejects_forward_wrong_kind_and_cross_engine_sources() {
+    let engine = ProfileEngine::new();
+    let memory_provider = compile_in(&engine, r#"(module (memory (export "memory") 1 1))"#);
+    let memory_guest = compile_in(&engine, r#"(module (import "env" "memory" (memory 1 1)))"#);
+    let function_guest = compile_in(&engine, r#"(module (import "env" "memory" (func)))"#);
+    let mut group = CoreComponentGroup::new(&engine, 3).unwrap();
+    let forward = CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+        module: "env",
+        name: "memory",
+        instance: 0,
+        export: "memory",
+    });
+    assert_eq!(
+        group
+            .add_instance(&memory_guest, &[forward])
+            .unwrap_err()
+            .detail,
+        AdmissionDetail::HostImportMismatch
+    );
+    group.add_instance(&memory_provider, &[]).unwrap();
+    assert_eq!(
+        group
+            .add_instance(&function_guest, &[forward])
+            .unwrap_err()
+            .detail,
+        AdmissionDetail::HostImportMismatch
+    );
+
+    let other_engine = ProfileEngine::new();
+    let foreign = compile_in(&other_engine, "(module)");
+    assert_eq!(
+        group.add_instance(&foreign, &[]).unwrap_err().detail,
+        AdmissionDetail::HostImportMismatch
+    );
+}
+
+#[test]
+fn component_group_seal_and_first_start_permanently_close_construction() {
+    let engine = ProfileEngine::new();
+    let runnable = compile_in(
+        &engine,
+        r#"(module (func (export "run") (result i32) i32.const 7))"#,
+    );
+    let late = compile_in(&engine, "(module)");
+
+    let mut explicitly_sealed = CoreComponentGroup::new(&engine, 2).unwrap();
+    explicitly_sealed.add_instance(&runnable, &[]).unwrap();
+    explicitly_sealed.seal().unwrap();
+    assert_eq!(
+        explicitly_sealed
+            .add_instance(&late, &[])
+            .unwrap_err()
+            .detail,
+        AdmissionDetail::HostImportMismatch,
+    );
+
+    let mut execution_sealed = CoreComponentGroup::new(&engine, 2).unwrap();
+    execution_sealed.add_instance(&runnable, &[]).unwrap();
+    execution_sealed
+        .start_call(0, "run", &[], 1_000, 100)
+        .unwrap();
+    assert_eq!(
+        execution_sealed
+            .add_instance(&late, &[])
+            .unwrap_err()
+            .detail,
+        AdmissionDetail::HostImportMismatch,
+    );
+    assert_eq!(
+        poll_group_to_terminal(&mut execution_sealed, 0),
+        PollResult::Ready(vec![CoreValue::I32(7)]),
+    );
+    assert_eq!(
+        execution_sealed
+            .add_instance(&late, &[])
+            .unwrap_err()
+            .detail,
+        AdmissionDetail::HostImportMismatch,
+    );
+}
+
+#[test]
+fn failed_shared_memory_initialization_poisons_every_group_operation() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (memory (export "memory") 1 1)
+              (func (export "run")))"#,
+    );
+    let partially_mutating_guest = compile_in(
+        &engine,
+        r#"(module
+              (import "env" "memory" (memory 1 1))
+              ;; Wasmi applies active segments in order. This write succeeds,
+              ;; then the following segment traps after shared state changed.
+              (data (i32.const 0) "\aa")
+              (data (i32.const 65536) "\bb"))"#,
+    );
+    let late = compile_in(&engine, "(module)");
+    let memory = CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+        module: "env",
+        name: "memory",
+        instance: 0,
+        export: "memory",
+    });
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group.add_instance(&provider, &[]).unwrap();
+
+    assert_eq!(
+        group
+            .add_instance(&partially_mutating_guest, &[memory])
+            .unwrap_err()
+            .detail,
+        AdmissionDetail::Malformed,
+    );
+    assert_eq!(group.instance_count(), 1);
+    assert!(!group.any_active_call());
+    assert_eq!(group.call_metrics(0), None);
+    assert_eq!(group.seal(), Err(TrapCode::Validation));
+    assert_eq!(
+        group.add_instance(&late, &[]).unwrap_err().detail,
+        AdmissionDetail::HostImportMismatch,
+    );
+    assert_eq!(
+        group.start_call(0, "run", &[], 1_000, 100),
+        Err(TrapCode::Validation),
+    );
+    assert_eq!(
+        group.poll_call(0),
+        PollResult::Trapped(TrapCode::Validation)
+    );
+    assert_eq!(group.resume_host_call(0, 0, &[]), Err(TrapCode::Validation),);
+    assert_eq!(group.cancel_call(0), Err(TrapCode::Validation));
+    assert_eq!(group.discard_call(0), Err(TrapCode::Validation));
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        group.read_memory(0, "memory", 0, &mut byte),
+        Err(TrapCode::Validation),
+    );
+    assert_eq!(
+        group.write_memory(0, "memory", 0, &[0]),
+        Err(TrapCode::Validation),
+    );
+    assert_eq!(group.memory_size(0, "memory"), Err(TrapCode::Validation),);
+    assert_eq!(
+        group.grow_memory_to(0, "memory", 2 * 65_536),
+        Err(TrapCode::Validation),
+    );
+
+    // Teardown helpers remain safe, but cannot make poisoned state reusable.
+    group.cancel_all_calls();
+    group.discard_all_calls();
+    assert_eq!(
+        group.start_call(0, "run", &[], 1_000, 100),
+        Err(TrapCode::Validation),
+    );
+}
+
+#[test]
+fn component_group_requires_exact_imported_memory_minimum_and_maximum() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(&engine, r#"(module (memory (export "memory") 1 2))"#);
+    let lower_minimum = compile_in(&engine, r#"(module (import "env" "memory" (memory 0 2)))"#);
+    let wider_maximum = compile_in(&engine, r#"(module (import "env" "memory" (memory 1 3)))"#);
+    let higher_minimum = compile_in(&engine, r#"(module (import "env" "memory" (memory 2 2)))"#);
+    let narrower_maximum = compile_in(&engine, r#"(module (import "env" "memory" (memory 1 1)))"#);
+    let exact = compile_in(
+        &engine,
+        r#"(module
+              (import "env" "memory" (memory 1 2))
+              (func (export "load") (result i32)
+                i32.const 0
+                i32.load))"#,
+    );
+    let memory = CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+        module: "env",
+        name: "memory",
+        instance: 0,
+        export: "memory",
+    });
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group.add_instance(&provider, &[]).unwrap();
+
+    // The first two are valid Wasm import subtypes, but Profile 1 requires
+    // nominally exact limits instead of accepting the broader Core relation.
+    for non_exact in [
+        &lower_minimum,
+        &wider_maximum,
+        &higher_minimum,
+        &narrower_maximum,
+    ] {
+        assert_eq!(
+            group.add_instance(non_exact, &[memory]).unwrap_err().detail,
+            AdmissionDetail::HostImportMismatch,
+        );
+    }
+
+    assert_eq!(group.add_instance(&exact, &[memory]).unwrap(), 1);
+    group
+        .write_memory(0, "memory", 0, &0x1234_5678_u32.to_le_bytes())
+        .unwrap();
+    group.start_call(1, "load", &[], 1_000, 100).unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 1),
+        PollResult::Ready(vec![CoreValue::I32(0x1234_5678)]),
+    );
+}
+
 #[test]
 fn integer_corpus_executes_and_matches_the_reference_engine() {
     let source = include_str!("../../component-format/tests/corpus/core/integer.wat");
@@ -71,6 +842,263 @@ fn integer_corpus_executes_and_matches_the_reference_engine() {
     }
     .unwrap();
     assert_eq!(result.as_slice(), &[Value::I32(42)]);
+}
+
+#[test]
+fn host_import_allowlist_is_exact_and_default_instantiation_stays_closed() {
+    let module = compile(
+        r#"
+        (module
+          (import "vibe:fixture/random@1.0.0" "fill"
+            (func $fill (param i32 i64) (result i64)))
+          (func (export "run") (param i32 i64) (result i64)
+            local.get 0
+            local.get 1
+            call $fill))
+        "#,
+    );
+    assert_eq!(
+        module.instantiate().err().unwrap().detail,
+        AdmissionDetail::ImportRequiresLinker
+    );
+
+    let params = [CoreValueType::I32, CoreValueType::I64];
+    let results = [CoreValueType::I64];
+    let exact = CoreHostImport {
+        id: 41,
+        module: "vibe:fixture/random@1.0.0",
+        name: "fill",
+        params: &params,
+        results: &results,
+    };
+    assert!(module.instantiate_with_imports(&[exact]).is_ok());
+
+    let wrong_module = CoreHostImport {
+        module: "vibe:fixture/random@2.0.0",
+        ..exact
+    };
+    let wrong_name = CoreHostImport {
+        name: "fill-unchecked",
+        ..exact
+    };
+    let wrong_params = [CoreValueType::I64, CoreValueType::I64];
+    let wrong_param_type = CoreHostImport {
+        params: &wrong_params,
+        ..exact
+    };
+    let wrong_results = [CoreValueType::I32];
+    let wrong_result_type = CoreHostImport {
+        results: &wrong_results,
+        ..exact
+    };
+    for descriptors in [
+        &[][..],
+        core::slice::from_ref(&wrong_module),
+        core::slice::from_ref(&wrong_name),
+        core::slice::from_ref(&wrong_param_type),
+        core::slice::from_ref(&wrong_result_type),
+    ] {
+        assert_eq!(
+            module
+                .instantiate_with_imports(descriptors)
+                .err()
+                .unwrap()
+                .detail,
+            AdmissionDetail::HostImportMismatch
+        );
+    }
+
+    let extra = CoreHostImport {
+        id: 42,
+        module: "other",
+        name: "other",
+        params: &[],
+        results: &[],
+    };
+    assert_eq!(
+        module
+            .instantiate_with_imports(&[exact, extra])
+            .err()
+            .unwrap()
+            .detail,
+        AdmissionDetail::HostImportMismatch
+    );
+
+    let memory_import = compile(
+        r#"
+        (module
+          (import "env" "memory" (memory 1 1))
+          (func (export "run")))
+        "#,
+    );
+    let fake_function = CoreHostImport {
+        id: 7,
+        module: "env",
+        name: "memory",
+        params: &[],
+        results: &[],
+    };
+    assert_eq!(
+        memory_import
+            .instantiate_with_imports(&[fake_function])
+            .err()
+            .unwrap()
+            .detail,
+        AdmissionDetail::HostImportMismatch
+    );
+}
+
+#[test]
+fn host_call_yields_outside_wasmi_and_resumes_with_exact_typed_results() {
+    let module = compile(
+        r#"
+        (module
+          (import "vibe:clock@1.0.0" "now"
+            (func $now (param i32 i64) (result i64)))
+          (func (export "run") (param i32 i64) (result i64)
+            local.get 0
+            local.get 1
+            call $now
+            i64.const 1
+            i64.add))
+        "#,
+    );
+    let params = [CoreValueType::I32, CoreValueType::I64];
+    let results = [CoreValueType::I64];
+    let import = CoreHostImport {
+        id: 9,
+        module: "vibe:clock@1.0.0",
+        name: "now",
+        params: &params,
+        results: &results,
+    };
+    let mut instance = module.instantiate_with_imports(&[import]).unwrap();
+    instance
+        .start_call(
+            "run",
+            &[CoreValue::I32(3), CoreValue::I64(5)],
+            10_000,
+            1_000,
+        )
+        .unwrap();
+    let request = poll_instance_to_host(&mut instance);
+    assert_eq!(request.id, 9);
+    assert_eq!(
+        request.arguments,
+        vec![CoreValue::I32(3), CoreValue::I64(5)]
+    );
+    let suspended = instance.call_metrics().unwrap();
+    assert!(suspended.consumed_fuel > 0);
+    assert_eq!(suspended.consumed_fuel + suspended.remaining_fuel, 10_000);
+
+    assert_eq!(
+        instance.resume_host_call(10, &[CoreValue::I64(40)]),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(instance.resume_host_call(9, &[]), Err(TrapCode::Validation));
+    assert_eq!(
+        instance.resume_host_call(9, &[CoreValue::I32(40)]),
+        Err(TrapCode::Validation)
+    );
+    instance.resume_host_call(9, &[CoreValue::I64(40)]).unwrap();
+    assert_eq!(
+        instance.resume_host_call(9, &[CoreValue::I64(41)]),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        poll_instance_to_terminal(&mut instance),
+        PollResult::Ready(vec![CoreValue::I64(41)])
+    );
+    let completed = instance.call_metrics().unwrap();
+    assert!(completed.consumed_fuel >= suspended.consumed_fuel);
+    assert_eq!(completed.consumed_fuel + completed.remaining_fuel, 10_000);
+}
+
+#[test]
+fn sequential_host_yields_cancel_and_drop_preserve_linear_continuations() {
+    let module = compile(
+        r#"
+        (module
+          (import "host" "first" (func $first (param i32) (result i32)))
+          (import "host" "second" (func $second (param i32) (result i64)))
+          (func (export "run") (param i32) (result i64)
+            local.get 0
+            call $first
+            call $second))
+        "#,
+    );
+    let i32_type = [CoreValueType::I32];
+    let i64_type = [CoreValueType::I64];
+    let imports = [
+        CoreHostImport {
+            id: 1,
+            module: "host",
+            name: "first",
+            params: &i32_type,
+            results: &i32_type,
+        },
+        CoreHostImport {
+            id: 2,
+            module: "host",
+            name: "second",
+            params: &i32_type,
+            results: &i64_type,
+        },
+    ];
+    let mut instance = module.instantiate_with_imports(&imports).unwrap();
+    instance
+        .start_call("run", &[CoreValue::I32(4)], 10_000, 1_000)
+        .unwrap();
+    assert_eq!(
+        poll_instance_to_host(&mut instance),
+        CoreHostCall {
+            origin_instance: 0,
+            id: 1,
+            arguments: vec![CoreValue::I32(4)]
+        }
+    );
+    instance.resume_host_call(1, &[CoreValue::I32(7)]).unwrap();
+    assert_eq!(
+        poll_instance_to_host(&mut instance),
+        CoreHostCall {
+            origin_instance: 0,
+            id: 2,
+            arguments: vec![CoreValue::I32(7)]
+        }
+    );
+    instance.resume_host_call(2, &[CoreValue::I64(99)]).unwrap();
+    assert_eq!(
+        poll_instance_to_terminal(&mut instance),
+        PollResult::Ready(vec![CoreValue::I64(99)])
+    );
+
+    instance
+        .start_call("run", &[CoreValue::I32(1)], 10_000, 1_000)
+        .unwrap();
+    let _ = poll_instance_to_host(&mut instance);
+    instance.cancel_call().unwrap();
+    assert_eq!(
+        instance.poll_call(),
+        PollResult::Trapped(TrapCode::Cancelled)
+    );
+    assert!(!instance.has_active_call());
+
+    instance
+        .start_call("run", &[CoreValue::I32(2)], 10_000, 1_000)
+        .unwrap();
+    let _ = poll_instance_to_host(&mut instance);
+    instance.discard_call().unwrap();
+    assert!(!instance.has_active_call());
+
+    instance
+        .start_call("run", &[CoreValue::I32(3)], 10_000, 1_000)
+        .unwrap();
+    let _ = poll_instance_to_host(&mut instance);
+    assert_eq!(
+        instance.poll_call(),
+        PollResult::Trapped(TrapCode::Validation)
+    );
+    assert!(!instance.has_active_call());
 }
 
 #[test]

@@ -874,6 +874,18 @@ name = "vibeos-component-format"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-component-host"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-core",
+ "vibeos-durable-format",
+ "vibeos-wasm-runtime",
+ "wat",
+]
+
+[[package]]
 name = "vibeos-component-runtime"
 version = "0.1.0"
 dependencies = [

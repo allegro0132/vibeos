@@ -102,12 +102,52 @@ struct Budget {
     usage: CodecUsage,
     allocations: Vec<AllocationSpan>,
     protected: Option<AllocationSpan>,
+    allocations_fixed: bool,
 }
 
 #[derive(Clone, Copy)]
 struct AllocationSpan {
     start: u32,
     size: u32,
+}
+
+/// Pre-reserved scratch for result lowering performed after an external host
+/// side effect. Construction is fallible; replay with this journal does not
+/// grow its overlap-tracking vector.
+pub struct LoweringJournal {
+    allocations: Vec<AllocationSpan>,
+}
+
+pub struct PreparedFlatResults {
+    signature: Vec<FlatKind>,
+    values: Vec<CoreValue>,
+}
+
+impl PreparedFlatResults {
+    pub fn try_new(types: &[ValueType]) -> Result<Self, CodecError> {
+        let signature = flat_signature(types)?;
+        if signature.len() > MAX_FLAT_RESULTS {
+            return Err(CodecError::FlatLimit);
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(signature.len())
+            .map_err(|_| CodecError::Allocation)?;
+        Ok(Self { signature, values })
+    }
+}
+
+impl LoweringJournal {
+    pub fn try_with_capacity(capacity: usize) -> Result<Self, CodecError> {
+        if capacity > PROFILE_1_LIMITS.max_abi_allocations as usize {
+            return Err(CodecError::AllocationLimit);
+        }
+        let mut allocations = Vec::new();
+        allocations
+            .try_reserve_exact(capacity)
+            .map_err(|_| CodecError::Allocation)?;
+        Ok(Self { allocations })
+    }
 }
 
 impl Budget {
@@ -764,10 +804,15 @@ fn allocate_payload<M: GuestMemory, A: PayloadAllocator<M>>(
     budget.allocation()?;
     // Reserve the host journal entry before invoking the guest allocator. Once
     // guest state can have changed, recording the returned span is infallible.
-    budget
-        .allocations
-        .try_reserve(1)
-        .map_err(|_| CodecError::Allocation)?;
+    if budget.allocations.len() == budget.allocations.capacity() {
+        if budget.allocations_fixed {
+            return Err(CodecError::AllocationLimit);
+        }
+        budget
+            .allocations
+            .try_reserve(1)
+            .map_err(|_| CodecError::Allocation)?;
+    }
     let size = u32::try_from(size).map_err(|_| CodecError::ByteLimit)?;
     let alignment = u32::try_from(alignment).map_err(|_| CodecError::Misaligned)?;
     let pointer = allocator.allocate(memory, size, alignment)?;
@@ -1429,6 +1474,230 @@ pub fn lower_results<M: GuestMemory, A: PayloadAllocator<M>>(
         pointer,
         usage: budget.usage,
     })
+}
+
+pub fn lower_flat_results_prepared<M: GuestMemory, A: PayloadAllocator<M>>(
+    _memory: &mut M,
+    _allocator: &mut A,
+    types: &[ValueType],
+    values: &[CanonicalValue],
+    prepared: &mut PreparedFlatResults,
+) -> Result<(Vec<CoreValue>, CodecUsage), CodecError> {
+    if types.len() != values.len() {
+        return Err(CodecError::TypeMismatch);
+    }
+    validate_sequence(types, values, ValuePosition::Result)?;
+    prepared.values.clear();
+    let mut budget = Budget::default();
+    let expected_len = prepared.signature.len();
+    for (ty, value) in types.iter().zip(values) {
+        flatten_value_prepared(
+            ty,
+            value,
+            1,
+            &mut prepared.values,
+            expected_len,
+            &mut budget,
+        )?;
+    }
+    if prepared.values.len() != prepared.signature.len() {
+        return Err(CodecError::FlatLimit);
+    }
+    let mut result = Vec::new();
+    core::mem::swap(&mut result, &mut prepared.values);
+    Ok((result, budget.usage))
+}
+
+/// Allocation-free flat lowering for a result whose final Core shape was
+/// reserved by [`PreparedFlatResults::try_new`] before host dispatch.
+///
+/// A one-slot result cannot contain the payload words of a variant, option,
+/// or result: only its discriminant can remain flat. Selected zero-flat
+/// payloads are still traversed so their canonical work is accounted exactly.
+fn flatten_value_prepared(
+    ty: &ValueType,
+    value: &CanonicalValue,
+    depth: u32,
+    output: &mut Vec<CoreValue>,
+    output_limit: usize,
+    budget: &mut Budget,
+) -> Result<(), CodecError> {
+    budget.enter(depth)?;
+    let scalar = match (ty, value) {
+        (ValueType::Bool, CanonicalValue::Bool(value)) => Some(CoreValue::I32(i32::from(*value))),
+        (ValueType::U8, CanonicalValue::U8(value)) => Some(CoreValue::I32(i32::from(*value))),
+        (ValueType::U16, CanonicalValue::U16(value)) => Some(CoreValue::I32(i32::from(*value))),
+        (ValueType::U32, CanonicalValue::U32(value)) => Some(CoreValue::I32(*value as i32)),
+        (ValueType::S8, CanonicalValue::S8(value)) => Some(CoreValue::I32(i32::from(*value))),
+        (ValueType::S16, CanonicalValue::S16(value)) => Some(CoreValue::I32(i32::from(*value))),
+        (ValueType::S32, CanonicalValue::S32(value)) => Some(CoreValue::I32(*value)),
+        (ValueType::U64, CanonicalValue::U64(value)) => Some(CoreValue::I64(*value as i64)),
+        (ValueType::S64, CanonicalValue::S64(value)) => Some(CoreValue::I64(*value)),
+        (ValueType::Char, CanonicalValue::Char(value)) => Some(CoreValue::I32(*value as i32)),
+        (ValueType::Enum(_), CanonicalValue::Enum(case)) => Some(CoreValue::I32(*case as i32)),
+        (ValueType::Resource { .. }, CanonicalValue::Resource(token)) => {
+            Some(CoreValue::I32(token.guest_index() as i32))
+        }
+        (ValueType::String, CanonicalValue::String(_))
+        | (ValueType::List(_), CanonicalValue::List(_)) => return Err(CodecError::FlatLimit),
+        (ValueType::Tuple(types), CanonicalValue::Tuple(values))
+        | (ValueType::Record(types), CanonicalValue::Record(values)) => {
+            for (ty, value) in types.iter().zip(values) {
+                flatten_value_prepared(ty, value, depth + 1, output, output_limit, budget)?;
+            }
+            None
+        }
+        (ValueType::Flags(_), CanonicalValue::Flags(words)) => {
+            for word in words {
+                push_core_prepared(output, output_limit, CoreValue::I32(*word as i32))?;
+            }
+            None
+        }
+        (ValueType::Option(inner), CanonicalValue::Option(selected)) => {
+            push_core_prepared(
+                output,
+                output_limit,
+                CoreValue::I32(i32::from(selected.is_some())),
+            )?;
+            if let Some(selected) = selected.as_deref() {
+                flatten_value_prepared(inner, selected, depth + 1, output, output_limit, budget)?;
+            }
+            None
+        }
+        (ValueType::Result { ok, error }, CanonicalValue::Result(selected)) => {
+            let (discriminant, ty, value) = match selected {
+                Ok(value) => (0, ok.as_deref(), value.as_deref()),
+                Err(value) => (1, error.as_deref(), value.as_deref()),
+            };
+            push_core_prepared(output, output_limit, CoreValue::I32(discriminant))?;
+            if let (Some(ty), Some(value)) = (ty, value) {
+                flatten_value_prepared(ty, value, depth + 1, output, output_limit, budget)?;
+            }
+            None
+        }
+        (ValueType::Variant(cases), CanonicalValue::Variant { case, payload }) => {
+            push_core_prepared(output, output_limit, CoreValue::I32(*case as i32))?;
+            if let (Some(ty), Some(value)) = (
+                cases.get(*case as usize).and_then(Option::as_ref),
+                payload.as_deref(),
+            ) {
+                flatten_value_prepared(ty, value, depth + 1, output, output_limit, budget)?;
+            }
+            None
+        }
+        _ => return Err(CodecError::TypeMismatch),
+    };
+    if let Some(value) = scalar {
+        push_core_prepared(output, output_limit, value)?;
+    }
+    Ok(())
+}
+
+fn push_core_prepared(
+    output: &mut Vec<CoreValue>,
+    output_limit: usize,
+    value: CoreValue,
+) -> Result<(), CodecError> {
+    if output.len() >= output_limit || output.len() >= output.capacity() {
+        return Err(CodecError::FlatLimit);
+    }
+    output.push(value);
+    Ok(())
+}
+
+/// Lowers an indirect result tuple into the caller-provided Canonical ABI
+/// return area.
+///
+/// A lowered Component import receives this pointer as the final Core
+/// argument when its flattened result shape exceeds [`MAX_FLAT_RESULTS`]. The
+/// return area itself is owned by the caller and is therefore never allocated
+/// through `allocator`; only nested string/list payloads use `allocator`.
+pub fn lower_results_into<M: GuestMemory, A: PayloadAllocator<M>>(
+    memory: &mut M,
+    allocator: &mut A,
+    types: &[ValueType],
+    values: &[CanonicalValue],
+    pointer: u32,
+) -> Result<CodecUsage, CodecError> {
+    if types.len() != values.len() {
+        return Err(CodecError::TypeMismatch);
+    }
+    validate_sequence(types, values, ValuePosition::Result)?;
+    if flat_signature(types)?.len() <= MAX_FLAT_RESULTS {
+        return Err(CodecError::FlatLimit);
+    }
+    let layout = sequence_layout(types)?;
+    span(memory, pointer, layout)?;
+    let mut budget = Budget::default();
+    budget.bytes(layout.size)?;
+    budget.protect(pointer, layout.size)?;
+    zero(memory, pointer, layout.size)?;
+    let mut offset = 0usize;
+    for (ty, value) in types.iter().zip(values) {
+        let field = validate_type(ty)?.layout;
+        offset = align_to(offset, field.alignment)?;
+        lower_at(
+            memory,
+            allocator,
+            ty,
+            value,
+            add_pointer(pointer, offset)?,
+            1,
+            false,
+            &mut budget,
+        )?;
+        offset = offset.checked_add(field.size).ok_or(CodecError::Overflow)?;
+    }
+    Ok(budget.usage)
+}
+
+/// Allocation-stable counterpart to [`lower_results_into`]. The caller must
+/// create `journal` before invoking any external backend.
+pub fn lower_results_into_prepared<M: GuestMemory, A: PayloadAllocator<M>>(
+    memory: &mut M,
+    allocator: &mut A,
+    types: &[ValueType],
+    values: &[CanonicalValue],
+    pointer: u32,
+    journal: &mut LoweringJournal,
+) -> Result<CodecUsage, CodecError> {
+    if types.len() != values.len() {
+        return Err(CodecError::TypeMismatch);
+    }
+    validate_sequence(types, values, ValuePosition::Result)?;
+    let layout = sequence_layout(types)?;
+    span(memory, pointer, layout)?;
+    let allocations = core::mem::take(&mut journal.allocations);
+    let mut budget = Budget {
+        allocations,
+        allocations_fixed: true,
+        ..Budget::default()
+    };
+    budget.allocations.clear();
+    let result = (|| {
+        budget.bytes(layout.size)?;
+        budget.protect(pointer, layout.size)?;
+        zero(memory, pointer, layout.size)?;
+        let mut offset = 0usize;
+        for (ty, value) in types.iter().zip(values) {
+            let field = validate_type(ty)?.layout;
+            offset = align_to(offset, field.alignment)?;
+            lower_at(
+                memory,
+                allocator,
+                ty,
+                value,
+                add_pointer(pointer, offset)?,
+                1,
+                false,
+                &mut budget,
+            )?;
+            offset = offset.checked_add(field.size).ok_or(CodecError::Overflow)?;
+        }
+        Ok(budget.usage)
+    })();
+    journal.allocations = budget.allocations;
+    result
 }
 
 fn append_flat_types(ty: &ValueType, output: &mut Vec<FlatKind>) -> Result<(), CodecError> {

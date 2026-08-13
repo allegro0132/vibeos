@@ -1,16 +1,21 @@
 //! Allocation-bounded decoding for Vibe Component Profile 1.
 
-pub use crate::execution::{CanonicalStringEncoding, ExecutableExportInfo};
+pub use crate::execution::{
+    CanonicalStringEncoding, ExecutableExportInfo, HostCoreExportInfo, HostImportInfo,
+};
 use crate::{
     abi_value::{flat_signature, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS},
     execution::{
-        ComponentExecutionPlan, CoreExportRef, CoreInstancePlan, ExecutableExportPlan, LiftDraft,
-        LiftOptionsDraft,
+        ComponentExecutionPlan, ComponentFunctionDraft, ComponentInstanceDraft, CoreExportRef,
+        CoreFunctionDraft, CoreImportPlan, CoreInstanceDraft, CoreInstanceExportDraft,
+        CoreInstanceExportItemDraft, CoreInstancePlan, CoreInstantiationArgDraft,
+        ExecutableExportPlan, HostImportPlan, ImportedFunctionDraft, LiftDraft, LiftOptionsDraft,
+        LowerDraft,
     },
     predecode::{predecode_component, PredecodeError},
     types::TypeBuilder,
     value::ValueType,
-    world::{normalize_component_entities, NamedEntityShape, WorldContract, WorldError},
+    world::{normalize_component_world_entities, NamedEntityShape, WorldContract, WorldError},
 };
 use alloc::{string::String, vec::Vec};
 use vibeos_component_format::{LimitKind, PROFILE_1_LIMITS};
@@ -19,7 +24,8 @@ use wasmparser::{
     component_types::ComponentEntityType, CanonicalFunction, CanonicalOption, ComponentAlias,
     ComponentDefinedType as RawDefinedType, ComponentExternalKind, ComponentInstance,
     ComponentType as RawComponentType, ComponentTypeRef, Encoding, ExternalKind, Instance,
-    InstanceTypeDeclaration, Parser, Payload, PrimitiveValType, ValType, Validator, WasmFeatures,
+    InstanceTypeDeclaration, Parser, Payload, PrimitiveValType, TypeRef, ValType, Validator,
+    WasmFeatures,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +96,13 @@ impl ComponentPlan<'_> {
         self.execution.exports.iter().map(|export| &export.info)
     }
 
+    pub fn host_imports(&self) -> impl Iterator<Item = &HostImportInfo> {
+        self.execution
+            .host_imports
+            .iter()
+            .map(|import| &import.info)
+    }
+
     pub fn check_world(&self, world: &WorldContract) -> Result<(), WorldError> {
         world.check_component(&self.imports, &self.exports)
     }
@@ -128,6 +141,18 @@ fn copied(value: &str) -> Result<String, DecodeError> {
     Ok(result)
 }
 
+struct CoreModuleImportDraft {
+    module: String,
+    field: String,
+    kind: CoreModuleImportKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreModuleImportKind {
+    Function,
+    Memory,
+}
+
 fn record_name(target: &mut Vec<String>, name: &str) -> Result<(), DecodeError> {
     if target.iter().any(|existing| existing == name) {
         return Err(DecodeError::DuplicateName);
@@ -150,11 +175,11 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
     };
     let mut modules = Vec::new();
     let mut core_modules = Vec::new();
-    let mut core_instances = Vec::new();
-    let mut core_functions: Vec<Option<CoreExportRef>> = Vec::new();
+    let mut core_instances: Vec<Option<CoreInstanceDraft>> = Vec::new();
+    let mut core_functions: Vec<Option<CoreFunctionDraft>> = Vec::new();
     let mut core_memories: Vec<Option<CoreExportRef>> = Vec::new();
-    let mut component_functions: Vec<Option<LiftDraft>> = Vec::new();
-    let mut component_instances: Vec<Option<Vec<(String, u32)>>> = Vec::new();
+    let mut component_functions: Vec<Option<ComponentFunctionDraft>> = Vec::new();
+    let mut component_instances: Vec<Option<ComponentInstanceDraft>> = Vec::new();
     let mut function_exports = Vec::new();
     let mut instance_exports = Vec::new();
     let mut import_names = Vec::new();
@@ -221,14 +246,67 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                         .try_reserve(1)
                         .map_err(|_| DecodeError::Allocation)?;
                     core_instances.push(match instance {
-                        Instance::Instantiate { module_index, args } if args.is_empty() => {
-                            core_modules
-                                .get(module_index as usize)
-                                .copied()
-                                .flatten()
-                                .map(|module| CoreInstancePlan { module })
+                        Instance::Instantiate { module_index, args } => {
+                            let module = core_modules.get(module_index as usize).copied().flatten();
+                            let mut arguments = Vec::new();
+                            arguments
+                                .try_reserve_exact(args.len())
+                                .map_err(|_| DecodeError::Allocation)?;
+                            let mut valid = module.is_some();
+                            for argument in args.iter() {
+                                if arguments
+                                    .iter()
+                                    .any(|existing: &CoreInstantiationArgDraft| {
+                                        existing.name == argument.name
+                                    })
+                                {
+                                    return Err(DecodeError::InvalidWiring);
+                                }
+                                let instance = usize::try_from(argument.index)
+                                    .map_err(|_| DecodeError::InvalidWiring)?;
+                                valid &= instance < core_instances.len();
+                                arguments.push(CoreInstantiationArgDraft {
+                                    name: copied(argument.name)?,
+                                    instance,
+                                });
+                            }
+                            module
+                                .filter(|_| valid)
+                                .map(|module| CoreInstanceDraft::Instantiate { module, arguments })
                         }
-                        Instance::Instantiate { .. } | Instance::FromExports(_) => None,
+                        Instance::FromExports(exports) => {
+                            let mut items = Vec::new();
+                            items
+                                .try_reserve_exact(exports.len())
+                                .map_err(|_| DecodeError::Allocation)?;
+                            for export in exports.iter() {
+                                if items
+                                    .iter()
+                                    .any(|item: &CoreInstanceExportDraft| item.name == export.name)
+                                {
+                                    return Err(DecodeError::InvalidWiring);
+                                }
+                                let item = match export.kind {
+                                    ExternalKind::Func => {
+                                        CoreInstanceExportItemDraft::Function(export.index)
+                                    }
+                                    ExternalKind::Memory => {
+                                        CoreInstanceExportItemDraft::Memory(export.index)
+                                    }
+                                    ExternalKind::Table
+                                    | ExternalKind::Global
+                                    | ExternalKind::Tag
+                                    | ExternalKind::FuncExact => {
+                                        return Err(DecodeError::InvalidWiring)
+                                    }
+                                };
+                                items.push(CoreInstanceExportDraft {
+                                    name: copied(export.name)?,
+                                    item,
+                                });
+                            }
+                            Some(CoreInstanceDraft::FromExports(items))
+                        }
                     });
                 }
             }
@@ -255,7 +333,7 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                                     functions.push((copied(export.name.name)?, export.index));
                                 }
                             }
-                            Some(functions)
+                            Some(ComponentInstanceDraft::FromExports(functions))
                         }
                         ComponentInstance::Instantiate { .. } => None,
                     });
@@ -293,7 +371,7 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                             name,
                         } => match kind {
                             ExternalKind::Func => {
-                                push_core_ref(&mut core_functions, instance_index, name)?
+                                push_core_function_ref(&mut core_functions, instance_index, name)?
                             }
                             ExternalKind::Memory => {
                                 push_core_ref(&mut core_memories, instance_index, name)?
@@ -309,17 +387,12 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                             name,
                         } => {
                             if kind == ComponentExternalKind::Func {
-                                let source = component_instances
-                                    .get(instance_index as usize)
-                                    .and_then(Option::as_ref)
-                                    .and_then(|members| {
-                                        members.iter().find_map(|(member, index)| {
-                                            (member == name).then_some(*index)
-                                        })
-                                    })
-                                    .and_then(|index| component_functions.get(index as usize))
-                                    .copied()
-                                    .flatten();
+                                let source = resolve_component_instance_function(
+                                    &component_instances,
+                                    &component_functions,
+                                    instance_index,
+                                    name,
+                                )?;
                                 component_functions
                                     .try_reserve(1)
                                     .map_err(|_| DecodeError::Allocation)?;
@@ -357,16 +430,33 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                             component_functions
                                 .try_reserve(1)
                                 .map_err(|_| DecodeError::Allocation)?;
-                            component_functions.push(Some(LiftDraft {
-                                core_function: core_func_index,
+                            component_functions.push(Some(ComponentFunctionDraft::Lift(
+                                LiftDraft {
+                                    core_function: core_func_index,
+                                    string_encoding: options.string_encoding,
+                                    memory: options.memory,
+                                    realloc: options.realloc,
+                                    post_return: options.post_return,
+                                },
+                            )));
+                        }
+                        CanonicalFunction::Lower {
+                            func_index,
+                            options,
+                        } => {
+                            let options = execution_options(&options)?;
+                            core_functions
+                                .try_reserve(1)
+                                .map_err(|_| DecodeError::Allocation)?;
+                            core_functions.push(Some(CoreFunctionDraft::Lower(LowerDraft {
+                                component_function: func_index,
                                 string_encoding: options.string_encoding,
                                 memory: options.memory,
                                 realloc: options.realloc,
                                 post_return: options.post_return,
-                            }));
+                            })));
                         }
-                        CanonicalFunction::Lower { .. }
-                        | CanonicalFunction::ResourceNew { .. }
+                        CanonicalFunction::ResourceNew { .. }
                         | CanonicalFunction::ResourceDrop { .. }
                         | CanonicalFunction::ResourceRep { .. } => {
                             core_functions
@@ -389,27 +479,29 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                     let import = import.map_err(|_| DecodeError::Malformed)?;
                     record_name(&mut import_names, import.name.name)?;
                     match import.ty {
-                        ComponentTypeRef::Module(_) => {
-                            core_modules
-                                .try_reserve(1)
-                                .map_err(|_| DecodeError::Allocation)?;
-                            core_modules.push(None);
-                        }
+                        ComponentTypeRef::Module(_) => return Err(DecodeError::Unsupported),
                         ComponentTypeRef::Func(_) => {
                             component_functions
                                 .try_reserve(1)
                                 .map_err(|_| DecodeError::Allocation)?;
-                            component_functions.push(None);
+                            component_functions.push(Some(ComponentFunctionDraft::Import(
+                                ImportedFunctionDraft {
+                                    interface: None,
+                                    function: copied(import.name.name)?,
+                                },
+                            )));
                         }
                         ComponentTypeRef::Instance(_) => {
                             component_instances
                                 .try_reserve(1)
                                 .map_err(|_| DecodeError::Allocation)?;
-                            component_instances.push(None);
+                            component_instances.push(Some(ComponentInstanceDraft::Import {
+                                name: copied(import.name.name)?,
+                            }));
                         }
                         ComponentTypeRef::Value(_)
                         | ComponentTypeRef::Type(_)
-                        | ComponentTypeRef::Component(_) => {}
+                        | ComponentTypeRef::Component(_) => return Err(DecodeError::Unsupported),
                     }
                 }
             }
@@ -473,21 +565,23 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
             return Err(DecodeError::Malformed);
         }
     };
-    let imports = normalize_component_entities(&types, &import_names, true).map_err(shape_error)?;
-    let exports =
-        normalize_component_entities(&types, &export_names, false).map_err(shape_error)?;
-    let mut instances = Vec::new();
-    instances
-        .try_reserve_exact(core_instances.len())
-        .map_err(|_| DecodeError::Allocation)?;
-    for instance in core_instances {
-        instances.push(instance.ok_or(DecodeError::Unsupported)?);
-    }
+    let (imports, exports) =
+        normalize_component_world_entities(&types, &import_names, &export_names)
+            .map_err(shape_error)?;
+    let mut type_builder = TypeBuilder::default();
+    let (instances, component_to_runtime, host_imports) = build_execution_instances(
+        &modules,
+        &core_instances,
+        &core_functions,
+        &core_memories,
+        &component_functions,
+        &types,
+        &mut type_builder,
+    )?;
     let mut executable_exports = Vec::new();
     executable_exports
         .try_reserve_exact(function_exports.len())
         .map_err(|_| DecodeError::Allocation)?;
-    let mut type_builder = TypeBuilder::default();
     for (name, function_index) in function_exports {
         let item = types
             .component_item_for_export(&name)
@@ -505,14 +599,17 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
             &component_functions,
             &core_functions,
             &core_memories,
-            instances.len(),
+            &component_to_runtime,
         )?;
     }
     for (interface_name, instance_index) in instance_exports {
-        let members = component_instances
+        let instance = component_instances
             .get(instance_index as usize)
             .and_then(Option::as_ref)
             .ok_or(DecodeError::InvalidWiring)?;
+        let ComponentInstanceDraft::FromExports(members) = instance else {
+            return Err(DecodeError::InvalidWiring);
+        };
         let item = types
             .component_item_for_export(&interface_name)
             .ok_or(DecodeError::InvalidWiring)?;
@@ -544,7 +641,7 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                 &component_functions,
                 &core_functions,
                 &core_memories,
-                instances.len(),
+                &component_to_runtime,
             )?;
         }
     }
@@ -556,6 +653,7 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
         execution: ComponentExecutionPlan {
             instances,
             exports: executable_exports,
+            host_imports,
         },
     })
 }
@@ -567,6 +665,404 @@ fn predecode_error(error: PredecodeError) -> DecodeError {
         PredecodeError::Unsupported => DecodeError::Unsupported,
         PredecodeError::Limit => DecodeError::Limit,
     }
+}
+
+type ExecutionInstances = (
+    Vec<CoreInstancePlan>,
+    Vec<Option<usize>>,
+    Vec<HostImportPlan>,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn build_execution_instances(
+    modules: &[&[u8]],
+    drafts: &[Option<CoreInstanceDraft>],
+    core_functions: &[Option<CoreFunctionDraft>],
+    core_memories: &[Option<CoreExportRef>],
+    component_functions: &[Option<ComponentFunctionDraft>],
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+) -> Result<ExecutionInstances, DecodeError> {
+    let mut instances = Vec::new();
+    instances
+        .try_reserve_exact(drafts.len())
+        .map_err(|_| DecodeError::Allocation)?;
+    let mut component_to_runtime = Vec::new();
+    component_to_runtime
+        .try_reserve_exact(drafts.len())
+        .map_err(|_| DecodeError::Allocation)?;
+    for draft in drafts {
+        match draft.as_ref().ok_or(DecodeError::InvalidWiring)? {
+            CoreInstanceDraft::Instantiate { module, .. } => {
+                if *module >= modules.len() {
+                    return Err(DecodeError::InvalidWiring);
+                }
+                let runtime = instances.len();
+                component_to_runtime.push(Some(runtime));
+                instances.push(CoreInstancePlan {
+                    module: *module,
+                    imports: Vec::new(),
+                });
+            }
+            CoreInstanceDraft::FromExports(_) => component_to_runtime.push(None),
+        }
+    }
+
+    let mut host_imports = Vec::new();
+    for (component_instance, draft) in drafts.iter().enumerate() {
+        let Some(CoreInstanceDraft::Instantiate { module, arguments }) = draft.as_ref() else {
+            continue;
+        };
+        let runtime_instance = component_to_runtime
+            .get(component_instance)
+            .copied()
+            .flatten()
+            .ok_or(DecodeError::InvalidWiring)?;
+        let module_imports = core_module_imports(modules[*module])?;
+        for argument in arguments {
+            if argument.instance >= component_instance
+                || !module_imports
+                    .iter()
+                    .any(|import| import.module == argument.name)
+            {
+                return Err(DecodeError::InvalidWiring);
+            }
+            let source = drafts
+                .get(argument.instance)
+                .and_then(Option::as_ref)
+                .ok_or(DecodeError::InvalidWiring)?;
+            match source {
+                CoreInstanceDraft::Instantiate { .. } => {
+                    let source_runtime = component_to_runtime
+                        .get(argument.instance)
+                        .copied()
+                        .flatten()
+                        .ok_or(DecodeError::InvalidWiring)?;
+                    if source_runtime >= runtime_instance {
+                        return Err(DecodeError::InvalidWiring);
+                    }
+                }
+                CoreInstanceDraft::FromExports(exports) => {
+                    for export in exports {
+                        let import = module_imports
+                            .iter()
+                            .find(|import| {
+                                import.module == argument.name && import.field == export.name
+                            })
+                            .ok_or(DecodeError::InvalidWiring)?;
+                        if !core_export_kind_matches(import.kind, &export.item) {
+                            return Err(DecodeError::InvalidWiring);
+                        }
+                    }
+                }
+            }
+        }
+
+        instances
+            .get_mut(runtime_instance)
+            .ok_or(DecodeError::InvalidWiring)?
+            .imports
+            .try_reserve_exact(module_imports.len())
+            .map_err(|_| DecodeError::Allocation)?;
+        for module_import in module_imports {
+            let argument = arguments
+                .iter()
+                .find(|argument| argument.name == module_import.module)
+                .ok_or(DecodeError::InvalidWiring)?;
+            let source = drafts
+                .get(argument.instance)
+                .and_then(Option::as_ref)
+                .ok_or(DecodeError::InvalidWiring)?;
+            let import_plan = match source {
+                CoreInstanceDraft::Instantiate { .. } => {
+                    let source_runtime = component_to_runtime
+                        .get(argument.instance)
+                        .copied()
+                        .flatten()
+                        .ok_or(DecodeError::InvalidWiring)?;
+                    if source_runtime >= runtime_instance {
+                        return Err(DecodeError::InvalidWiring);
+                    }
+                    CoreImportPlan::InstanceExport {
+                        module: module_import.module,
+                        field: copied(&module_import.field)?,
+                        core_instance: source_runtime,
+                        export: module_import.field,
+                    }
+                }
+                CoreInstanceDraft::FromExports(exports) => {
+                    let export = exports
+                        .iter()
+                        .find(|export| export.name == module_import.field)
+                        .ok_or(DecodeError::InvalidWiring)?;
+                    if !core_export_kind_matches(module_import.kind, &export.item) {
+                        return Err(DecodeError::InvalidWiring);
+                    }
+                    match &export.item {
+                        CoreInstanceExportItemDraft::Function(index) => {
+                            let function = core_functions
+                                .get(*index as usize)
+                                .and_then(Option::as_ref)
+                                .ok_or(DecodeError::InvalidWiring)?;
+                            match function {
+                                CoreFunctionDraft::Export(reference) => {
+                                    let source =
+                                        host_core_export(reference, &component_to_runtime)?;
+                                    if source.core_instance >= runtime_instance {
+                                        return Err(DecodeError::InvalidWiring);
+                                    }
+                                    CoreImportPlan::InstanceExport {
+                                        module: module_import.module,
+                                        field: module_import.field,
+                                        core_instance: source.core_instance,
+                                        export: source.export,
+                                    }
+                                }
+                                CoreFunctionDraft::Lower(lower) => {
+                                    let imported =
+                                        imported_component_function(component_functions, *lower)?;
+                                    let function_type =
+                                        imported_function_type(types, type_builder, imported)?;
+                                    require_lower_options(&function_type, lower)?;
+                                    let memory = lower
+                                        .memory
+                                        .map(|index| {
+                                            resolve_core_ref(core_memories, index).and_then(
+                                                |reference| {
+                                                    host_core_export(
+                                                        reference,
+                                                        &component_to_runtime,
+                                                    )
+                                                },
+                                            )
+                                        })
+                                        .transpose()?;
+                                    let realloc = lower
+                                        .realloc
+                                        .map(|index| {
+                                            resolve_core_function_ref(core_functions, index)
+                                                .and_then(|reference| {
+                                                    host_core_export(
+                                                        reference,
+                                                        &component_to_runtime,
+                                                    )
+                                                })
+                                        })
+                                        .transpose()?;
+                                    if memory
+                                        .as_ref()
+                                        .into_iter()
+                                        .chain(realloc.as_ref())
+                                        .any(|binding| binding.core_instance >= runtime_instance)
+                                        || memory.as_ref().zip(realloc.as_ref()).is_some_and(
+                                            |(memory, realloc)| {
+                                                memory.core_instance != realloc.core_instance
+                                            },
+                                        )
+                                    {
+                                        return Err(DecodeError::InvalidWiring);
+                                    }
+                                    if host_imports.len() >= PROFILE_1_LIMITS.max_imports as usize {
+                                        return Err(DecodeError::Limit);
+                                    }
+                                    let host_import = host_imports.len();
+                                    host_imports
+                                        .try_reserve(1)
+                                        .map_err(|_| DecodeError::Allocation)?;
+                                    host_imports.push(HostImportPlan {
+                                        info: HostImportInfo {
+                                            interface: copied(
+                                                imported
+                                                    .interface
+                                                    .as_deref()
+                                                    .unwrap_or(&imported.function),
+                                            )?,
+                                            function: copied(&imported.function)?,
+                                            function_type,
+                                            core_instance: runtime_instance,
+                                            core_module: copied(&module_import.module)?,
+                                            core_field: copied(&module_import.field)?,
+                                            string_encoding: lower.string_encoding,
+                                            memory,
+                                            realloc,
+                                        },
+                                    });
+                                    CoreImportPlan::Host {
+                                        module: module_import.module,
+                                        field: module_import.field,
+                                        host_import,
+                                    }
+                                }
+                            }
+                        }
+                        CoreInstanceExportItemDraft::Memory(index) => {
+                            let source = host_core_export(
+                                resolve_core_ref(core_memories, *index)?,
+                                &component_to_runtime,
+                            )?;
+                            if source.core_instance >= runtime_instance {
+                                return Err(DecodeError::InvalidWiring);
+                            }
+                            CoreImportPlan::InstanceExport {
+                                module: module_import.module,
+                                field: module_import.field,
+                                core_instance: source.core_instance,
+                                export: source.export,
+                            }
+                        }
+                    }
+                }
+            };
+            instances[runtime_instance].imports.push(import_plan);
+        }
+    }
+    Ok((instances, component_to_runtime, host_imports))
+}
+
+fn core_module_imports(bytes: &[u8]) -> Result<Vec<CoreModuleImportDraft>, DecodeError> {
+    let mut imports = Vec::new();
+    let mut parser = Parser::new(0);
+    parser.set_features(WasmFeatures::all());
+    for payload in parser.parse_all(bytes) {
+        let payload = payload.map_err(|_| DecodeError::InvalidEmbeddedCore)?;
+        if let Payload::ImportSection(reader) = payload {
+            for import in reader.into_imports() {
+                let import = import.map_err(|_| DecodeError::InvalidEmbeddedCore)?;
+                let kind = match import.ty {
+                    TypeRef::Func(_) => CoreModuleImportKind::Function,
+                    TypeRef::Memory(_) => CoreModuleImportKind::Memory,
+                    TypeRef::Table(_)
+                    | TypeRef::Global(_)
+                    | TypeRef::Tag(_)
+                    | TypeRef::FuncExact(_) => return Err(DecodeError::InvalidWiring),
+                };
+                if imports.len() >= PROFILE_1_LIMITS.max_imports as usize {
+                    return Err(DecodeError::Limit);
+                }
+                if imports.iter().any(|existing: &CoreModuleImportDraft| {
+                    existing.module == import.module && existing.field == import.name
+                }) {
+                    return Err(DecodeError::InvalidWiring);
+                }
+                imports
+                    .try_reserve(1)
+                    .map_err(|_| DecodeError::Allocation)?;
+                imports.push(CoreModuleImportDraft {
+                    module: copied(import.module)?,
+                    field: copied(import.name)?,
+                    kind,
+                });
+            }
+        }
+    }
+    Ok(imports)
+}
+
+fn core_export_kind_matches(
+    import: CoreModuleImportKind,
+    export: &CoreInstanceExportItemDraft,
+) -> bool {
+    matches!(
+        (import, export),
+        (
+            CoreModuleImportKind::Function,
+            CoreInstanceExportItemDraft::Function(_)
+        ) | (
+            CoreModuleImportKind::Memory,
+            CoreInstanceExportItemDraft::Memory(_)
+        )
+    )
+}
+
+fn imported_component_function(
+    functions: &[Option<ComponentFunctionDraft>],
+    lower: LowerDraft,
+) -> Result<&ImportedFunctionDraft, DecodeError> {
+    let Some(ComponentFunctionDraft::Import(imported)) = functions
+        .get(lower.component_function as usize)
+        .and_then(Option::as_ref)
+    else {
+        return Err(DecodeError::InvalidWiring);
+    };
+    Ok(imported)
+}
+
+fn imported_function_type(
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+    imported: &ImportedFunctionDraft,
+) -> Result<crate::types::FunctionType, DecodeError> {
+    let function_type = if let Some(interface_name) = imported.interface.as_deref() {
+        let item = types
+            .component_item_for_import(interface_name)
+            .ok_or(DecodeError::InvalidWiring)?;
+        let ComponentEntityType::Instance(instance_type) = item.ty else {
+            return Err(DecodeError::InvalidWiring);
+        };
+        let member = types[instance_type]
+            .exports
+            .get(&imported.function)
+            .ok_or(DecodeError::InvalidWiring)?;
+        let ComponentEntityType::Func(function_type) = member.ty else {
+            return Err(DecodeError::InvalidWiring);
+        };
+        function_type
+    } else {
+        let item = types
+            .component_item_for_import(&imported.function)
+            .ok_or(DecodeError::InvalidWiring)?;
+        let ComponentEntityType::Func(function_type) = item.ty else {
+            return Err(DecodeError::InvalidWiring);
+        };
+        function_type
+    };
+    type_builder
+        .function(types, function_type)
+        .map_err(|error| match error {
+            crate::types::TypeError::Unsupported => DecodeError::Unsupported,
+            crate::types::TypeError::NestingLimit | crate::types::TypeError::DefinitionLimit => {
+                DecodeError::Limit
+            }
+            crate::types::TypeError::Allocation => DecodeError::Allocation,
+            crate::types::TypeError::InvalidFunction => DecodeError::InvalidWiring,
+        })
+}
+
+fn host_core_export(
+    reference: &CoreExportRef,
+    component_to_runtime: &[Option<usize>],
+) -> Result<HostCoreExportInfo, DecodeError> {
+    let core_instance = component_to_runtime
+        .get(reference.instance)
+        .copied()
+        .flatten()
+        .ok_or(DecodeError::InvalidWiring)?;
+    Ok(HostCoreExportInfo {
+        core_instance,
+        export: copied(&reference.name)?,
+    })
+}
+
+fn require_lower_options(
+    function: &crate::types::FunctionType,
+    lower: &LowerDraft,
+) -> Result<(), DecodeError> {
+    let parameter_flat = flat_count(function.parameters.iter().map(|parameter| &parameter.value))?;
+    let result_flat = flat_count(function.result.iter())?;
+    let parameter_needs_memory = function
+        .parameters
+        .iter()
+        .any(|parameter| uses_memory(&parameter.value))
+        || parameter_flat > MAX_FLAT_PARAMS;
+    let result_dynamic = function.result.as_ref().is_some_and(uses_memory);
+    let result_needs_memory = result_dynamic || result_flat > MAX_FLAT_RESULTS;
+    if (parameter_needs_memory || result_needs_memory) && lower.memory.is_none()
+        || result_dynamic && lower.realloc.is_none()
+        || lower.post_return.is_some()
+    {
+        return Err(DecodeError::InvalidWiring);
+    }
+    Ok(())
 }
 
 fn push_core_ref(
@@ -582,6 +1078,51 @@ fn push_core_ref(
     Ok(())
 }
 
+fn push_core_function_ref(
+    target: &mut Vec<Option<CoreFunctionDraft>>,
+    instance_index: u32,
+    name: &str,
+) -> Result<(), DecodeError> {
+    target.try_reserve(1).map_err(|_| DecodeError::Allocation)?;
+    target.push(Some(CoreFunctionDraft::Export(CoreExportRef {
+        instance: usize::try_from(instance_index).map_err(|_| DecodeError::InvalidWiring)?,
+        name: copied(name)?,
+    })));
+    Ok(())
+}
+
+fn resolve_component_instance_function(
+    instances: &[Option<ComponentInstanceDraft>],
+    functions: &[Option<ComponentFunctionDraft>],
+    instance_index: u32,
+    member: &str,
+) -> Result<Option<ComponentFunctionDraft>, DecodeError> {
+    let instance = instances
+        .get(instance_index as usize)
+        .and_then(Option::as_ref)
+        .ok_or(DecodeError::InvalidWiring)?;
+    let source = match instance {
+        ComponentInstanceDraft::Import { name } => {
+            ComponentFunctionDraft::Import(ImportedFunctionDraft {
+                interface: Some(copied(name)?),
+                function: copied(member)?,
+            })
+        }
+        ComponentInstanceDraft::FromExports(members) => {
+            let function_index = members
+                .iter()
+                .find_map(|(name, index)| (name == member).then_some(*index))
+                .ok_or(DecodeError::InvalidWiring)?;
+            functions
+                .get(function_index as usize)
+                .and_then(Option::as_ref)
+                .cloned()
+                .ok_or(DecodeError::InvalidWiring)?
+        }
+    };
+    Ok(Some(source))
+}
+
 fn resolve_core_ref(
     refs: &[Option<CoreExportRef>],
     index: u32,
@@ -589,6 +1130,18 @@ fn resolve_core_ref(
     refs.get(index as usize)
         .and_then(Option::as_ref)
         .ok_or(DecodeError::InvalidWiring)
+}
+
+fn resolve_core_function_ref(
+    refs: &[Option<CoreFunctionDraft>],
+    index: u32,
+) -> Result<&CoreExportRef, DecodeError> {
+    let Some(CoreFunctionDraft::Export(reference)) =
+        refs.get(index as usize).and_then(Option::as_ref)
+    else {
+        return Err(DecodeError::InvalidWiring);
+    };
+    Ok(reference)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,39 +1152,50 @@ fn push_executable_export(
     function_type: wasmparser::component_types::ComponentFuncTypeId,
     type_builder: &mut TypeBuilder,
     types: &wasmparser::types::Types,
-    component_functions: &[Option<LiftDraft>],
-    core_functions: &[Option<CoreExportRef>],
+    component_functions: &[Option<ComponentFunctionDraft>],
+    core_functions: &[Option<CoreFunctionDraft>],
     core_memories: &[Option<CoreExportRef>],
-    instance_count: usize,
+    component_to_runtime: &[Option<usize>],
 ) -> Result<(), DecodeError> {
-    let lift = component_functions
+    let Some(ComponentFunctionDraft::Lift(lift)) = component_functions
         .get(function_index as usize)
         .and_then(Option::as_ref)
-        .ok_or(DecodeError::InvalidWiring)?;
-    let function = resolve_core_ref(core_functions, lift.core_function)?;
+    else {
+        return Err(DecodeError::InvalidWiring);
+    };
+    let function = resolve_core_function_ref(core_functions, lift.core_function)?;
     let memory = lift
         .memory
         .map(|index| resolve_core_ref(core_memories, index))
         .transpose()?;
     let realloc = lift
         .realloc
-        .map(|index| resolve_core_ref(core_functions, index))
+        .map(|index| resolve_core_function_ref(core_functions, index))
         .transpose()?;
     let post_return = lift
         .post_return
-        .map(|index| resolve_core_ref(core_functions, index))
+        .map(|index| resolve_core_function_ref(core_functions, index))
         .transpose()?;
     for option in [memory, realloc, post_return].into_iter().flatten() {
         if option.instance != function.instance {
             return Err(DecodeError::InvalidWiring);
         }
     }
-    if function.instance >= instance_count {
-        return Err(DecodeError::InvalidWiring);
-    }
+    let runtime_instance = component_to_runtime
+        .get(function.instance)
+        .copied()
+        .flatten()
+        .ok_or(DecodeError::InvalidWiring)?;
     let normalized_function = type_builder
         .function(types, function_type)
-        .map_err(|_| DecodeError::TypeGraph)?;
+        .map_err(|error| match error {
+            crate::types::TypeError::Unsupported => DecodeError::Unsupported,
+            crate::types::TypeError::NestingLimit | crate::types::TypeError::DefinitionLimit => {
+                DecodeError::Limit
+            }
+            crate::types::TypeError::Allocation => DecodeError::Allocation,
+            crate::types::TypeError::InvalidFunction => DecodeError::InvalidWiring,
+        })?;
     require_canonical_options(&normalized_function, lift)?;
     if target.len() >= PROFILE_1_LIMITS.max_canonical_functions as usize
         || target.iter().any(|export| export.info.name == name)
@@ -643,7 +1207,7 @@ fn push_executable_export(
         info: ExecutableExportInfo {
             name,
             function: normalized_function,
-            core_instance: function.instance,
+            core_instance: runtime_instance,
             core_function: copied(&function.name)?,
             string_encoding: lift.string_encoding,
             memory: memory.map(|binding| copied(&binding.name)).transpose()?,
@@ -652,7 +1216,7 @@ fn push_executable_export(
                 .map(|binding| copied(&binding.name))
                 .transpose()?,
         },
-        core_instance: function.instance,
+        core_instance: runtime_instance,
         function: copied(&function.name)?,
         memory: memory.map(|binding| copied(&binding.name)).transpose()?,
         realloc: realloc.map(|binding| copied(&binding.name)).transpose()?,
@@ -717,6 +1281,8 @@ fn shape_error(error: WorldError) -> DecodeError {
     match error {
         WorldError::Allocation => DecodeError::Allocation,
         WorldError::UnsupportedType => DecodeError::Unsupported,
+        WorldError::TypeGraphLimit => DecodeError::Limit,
+        WorldError::TypeMismatch => DecodeError::InvalidWiring,
         _ => DecodeError::TypeGraph,
     }
 }

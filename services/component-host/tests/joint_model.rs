@@ -161,6 +161,7 @@ fn invoke(
         .find_map(|_| match call.poll() {
             TypedPoll::Pending(_) => None,
             TypedPoll::Ready(value) => Some(Ok(value)),
+            TypedPoll::HostFailed(error) => panic!("joint-model host failed: {error:?}"),
             TypedPoll::Trapped(trap) => Some(Err(trap)),
         })
         .expect("bounded model call terminates");

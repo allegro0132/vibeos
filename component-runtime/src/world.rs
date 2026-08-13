@@ -104,6 +104,10 @@ impl WorldError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct WorldContract {
+    /// Normalized fields remain public for low-level runtime fixtures and
+    /// generated policy adapters. They carry no provenance: security policy
+    /// must not fill them by reflecting the component being admitted. Prefer
+    /// [`WorldContract::parse`] over direct construction at trust boundaries.
     pub identity: String,
     pub imports: Vec<NamedEntityShape>,
     pub exports: Vec<NamedEntityShape>,

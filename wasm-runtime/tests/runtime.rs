@@ -84,6 +84,52 @@ fn poll_group_to_terminal(group: &mut CoreComponentGroup, instance: usize) -> Po
 }
 
 #[test]
+fn component_group_enforces_the_image_memory_ceiling_at_runtime() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (memory 1 4)
+              (func (export "grow") (param i32) (result i32)
+                local.get 0
+                memory.grow))"#,
+    );
+
+    // Two pages are permitted. The first grow reaches the exact ceiling; a
+    // second grow is trapped by the store limiter instead of silently relying
+    // on the outer owner reservation or host allocator to fail.
+    let mut group = CoreComponentGroup::new_with_memory_limit(&engine, 1, 2 * 65_536).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    group
+        .start_call(0, "grow", &[CoreValue::I32(1)], 100_000, 10_000)
+        .unwrap();
+    assert_eq!(
+        poll_group_to_terminal(&mut group, 0),
+        PollResult::Ready(vec![CoreValue::I32(1)])
+    );
+    group
+        .start_call(0, "grow", &[CoreValue::I32(1)], 100_000, 10_000)
+        .unwrap();
+    assert!(matches!(
+        poll_group_to_terminal(&mut group, 0),
+        PollResult::Trapped(_)
+    ));
+
+    // A non-page-aligned ceiling below the module's initial page also fails
+    // closed during instantiation.
+    let mut too_small = CoreComponentGroup::new_with_memory_limit(&engine, 1, 65_535).unwrap();
+    assert!(too_small.add_instance(&module, &[]).is_err());
+
+    assert!(CoreComponentGroup::new_with_memory_limit(&engine, 1, 0).is_err());
+    assert!(CoreComponentGroup::new_with_memory_limit(
+        &engine,
+        1,
+        PROFILE_1_LIMITS.max_memory_pages as usize * 65_536 + 1,
+    )
+    .is_err());
+}
+
+#[test]
 fn reserved_group_start_is_exact_linear_and_failure_atomic() {
     let engine = ProfileEngine::new();
     let module = compile_in(

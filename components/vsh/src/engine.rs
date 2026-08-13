@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use vibeos_core::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
 use vibeos_core::exec::{self, TaskHandle, TaskState, WaitQueue};
+use vibeos_core::heap;
 use vibeos_core::sync::SpinLock;
 
 pub const MAX_INPUT_BYTES: usize = 4 * 1024;
@@ -37,6 +38,7 @@ pub const STREAM_BUFFER_CHUNKS: usize = 8;
 pub const MAX_CAPTURED_OUTPUT: usize = 64 * 1024;
 pub const DEFAULT_STAGE_MEMORY: usize = 256 * 1024;
 pub const MAX_STAGE_MEMORY: usize = 2 * 1024 * 1024;
+pub const MAX_COMPONENT_RESOURCES: u16 = 256;
 pub const MAX_FUNCTIONS: usize = 64;
 pub const MAX_FUNCTION_CALL_DEPTH: usize = 32;
 pub const MAX_LOOP_ITERATIONS: usize = 256;
@@ -461,6 +463,29 @@ pub fn parse_script(source: &str) -> Result<Script, Diagnostic> {
 /// `false`. Words may use quoting and escaping to produce literals, but no
 /// shell value/capability expansion or command substitution is performed.
 pub fn validate_ssh_exec(source: &str) -> Result<(), Diagnostic> {
+    validate_ssh_exec_with_policy(source, |_| false).map(|_| ())
+}
+
+/// Validate the restricted SSH exec grammar while allowing one exact command
+/// name selected by trusted image/session policy.
+///
+/// This does not install the command or grant authority. The session must
+/// still install an exactly matching [`SshExecComponentPolicy`] before
+/// execution. Keeping parsing here lets an SSH protocol frontend decide
+/// whether to acknowledge an exec request without reimplementing or weakening
+/// the syntax restrictions. `Ok(true)` means the policy name was selected;
+/// `Ok(false)` means one of the built-in SSH commands was selected.
+pub fn validate_ssh_exec_with_component_name(
+    source: &str,
+    component_name: &str,
+) -> Result<bool, Diagnostic> {
+    validate_ssh_exec_with_policy(source, |name| name == component_name)
+}
+
+fn validate_ssh_exec_with_policy(
+    source: &str,
+    policy_command: impl Fn(&str) -> bool,
+) -> Result<bool, Diagnostic> {
     let script = parse_with_limit(source, SSH_EXEC_MAX_INPUT_BYTES)?;
     let item = match script.statements.as_slice() {
         [Statement::Command(item)] => item,
@@ -517,7 +542,9 @@ pub fn validate_ssh_exec(source: &str) -> Result<(), Diagnostic> {
             "SSH exec command name must be literal",
         ));
     };
-    if !matches!(name, "echo" | "true" | "false") {
+    let builtin = matches!(name, "echo" | "true" | "false");
+    let selected_policy_command = !builtin && policy_command(name);
+    if !builtin && !selected_policy_command {
         return Err(Diagnostic::new(
             command.name.span.start,
             command.name.span.end,
@@ -554,7 +581,7 @@ pub fn validate_ssh_exec(source: &str) -> Result<(), Diagnostic> {
             "command argument count rejected by SSH exec profile",
         ));
     }
-    Ok(())
+    Ok(selected_policy_command)
 }
 
 fn parse_with_limit(source: &str, max_input_bytes: usize) -> Result<Script, Diagnostic> {
@@ -1018,6 +1045,7 @@ pub enum Status {
     Usage,
     Unavailable,
     Denied,
+    BackendFault,
     BudgetExceeded,
     Faulted,
     Cancelled,
@@ -1041,9 +1069,9 @@ pub enum ArgumentMode {
     ValuesOrCapabilities,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandManifest {
-    pub name: &'static str,
+    pub name: String,
     pub abi: u16,
     pub min_args: usize,
     pub max_args: usize,
@@ -1056,7 +1084,595 @@ pub struct CommandManifest {
     pub early_close_is_success: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Immutable, policy-owned description of a Component command.
+///
+/// This is deliberately independent of the Component decoder's borrowed plan:
+/// an image-policy adapter must copy the validated fields into this value and
+/// may retain the admitted artifact privately in its runner. No byte slice,
+/// decoded-plan pointer, capability handle, or backend pointer is stored here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentCommandManifest {
+    name: String,
+    abi: u16,
+    artifact: ComponentArtifactIdentity,
+    world: String,
+    entrypoint: String,
+    min_args: usize,
+    max_args: usize,
+    stdin: StreamMode,
+    stdout: StreamMode,
+    stderr: StreamMode,
+    memory_bytes: usize,
+    total_fuel: u64,
+    poll_quantum: u64,
+    resource_limit: u16,
+    requirements: Vec<ComponentAuthorityRequirement>,
+}
+
+/// Exact trusted-setup description for one Component command admitted into an
+/// SSH exec session.
+///
+/// This is not an unforgeable capability: the actual authorization boundary is
+/// the image-private SSH platform hook that chooses whether to call
+/// installation for a committed profile. This value prevents that trusted
+/// setup path from using a zero-sized "enable Components" switch:
+/// it must independently copy every pinned manifest field, which installation
+/// compares with the runner's immutable admitted manifest. There is no
+/// constructor that accepts a runner or an existing [`ComponentCommandManifest`],
+/// so setup cannot accidentally bless bytes by reflecting their self-reported
+/// identity back into the policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshExecComponentPolicy {
+    pinned: ComponentCommandManifest,
+}
+
+impl SshExecComponentPolicy {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_image_pin(
+        name: &str,
+        abi: u16,
+        artifact: ComponentArtifactIdentity,
+        world: &str,
+        entrypoint: &str,
+        min_args: usize,
+        max_args: usize,
+        stdin: StreamMode,
+        stdout: StreamMode,
+        stderr: StreamMode,
+        memory_bytes: usize,
+        total_fuel: u64,
+        poll_quantum: u64,
+        resource_limit: u16,
+        requirements: Vec<ComponentAuthorityRequirement>,
+    ) -> Result<Self, Diagnostic> {
+        Ok(Self {
+            pinned: ComponentCommandManifest::try_from_borrowed(
+                name,
+                abi,
+                artifact,
+                world,
+                entrypoint,
+                min_args,
+                max_args,
+                stdin,
+                stdout,
+                stderr,
+                memory_bytes,
+                total_fuel,
+                poll_quantum,
+                resource_limit,
+                requirements,
+            )?,
+        })
+    }
+
+    fn admits(&self, manifest: &ComponentCommandManifest) -> bool {
+        self.pinned == *manifest
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ComponentArtifactIdentity([u8; 32]);
+
+impl ComponentArtifactIdentity {
+    pub const fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for ComponentArtifactIdentity {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ComponentArtifactIdentity(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentAuthorityRequirement {
+    label: String,
+    interface: String,
+    resource: String,
+    resource_kind: String,
+    rights: Rights,
+}
+
+impl ComponentAuthorityRequirement {
+    pub fn new(
+        label: impl Into<String>,
+        interface: impl Into<String>,
+        resource: impl Into<String>,
+        resource_kind: impl Into<String>,
+        rights: Rights,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            interface: interface.into(),
+            resource: resource.into(),
+            resource_kind: resource_kind.into(),
+            rights,
+        }
+    }
+
+    pub fn try_from_borrowed(
+        label: &str,
+        interface: &str,
+        resource: &str,
+        resource_kind: &str,
+        rights: Rights,
+    ) -> Result<Self, Diagnostic> {
+        Ok(Self {
+            label: try_component_string(label)?,
+            interface: try_component_string(interface)?,
+            resource: try_component_string(resource)?,
+            resource_kind: try_component_string(resource_kind)?,
+            rights,
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn resource_kind(&self) -> &str {
+        &self.resource_kind
+    }
+
+    pub fn interface(&self) -> &str {
+        &self.interface
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub const fn rights(&self) -> Rights {
+        self.rights
+    }
+}
+
+impl ComponentCommandManifest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: impl Into<String>,
+        abi: u16,
+        artifact: ComponentArtifactIdentity,
+        world: impl Into<String>,
+        entrypoint: impl Into<String>,
+        min_args: usize,
+        max_args: usize,
+        stdin: StreamMode,
+        stdout: StreamMode,
+        stderr: StreamMode,
+        memory_bytes: usize,
+        total_fuel: u64,
+        poll_quantum: u64,
+        resource_limit: u16,
+        requirements: impl IntoIterator<Item = ComponentAuthorityRequirement>,
+    ) -> Result<Self, Diagnostic> {
+        let manifest = Self {
+            name: name.into(),
+            abi,
+            artifact,
+            world: world.into(),
+            entrypoint: entrypoint.into(),
+            min_args,
+            max_args,
+            stdin,
+            stdout,
+            stderr,
+            memory_bytes,
+            total_fuel,
+            poll_quantum,
+            resource_limit,
+            requirements: requirements.into_iter().collect(),
+        };
+        manifest.validate(Span { start: 0, end: 0 })?;
+        Ok(manifest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_borrowed(
+        name: &str,
+        abi: u16,
+        artifact: ComponentArtifactIdentity,
+        world: &str,
+        entrypoint: &str,
+        min_args: usize,
+        max_args: usize,
+        stdin: StreamMode,
+        stdout: StreamMode,
+        stderr: StreamMode,
+        memory_bytes: usize,
+        total_fuel: u64,
+        poll_quantum: u64,
+        resource_limit: u16,
+        requirements: Vec<ComponentAuthorityRequirement>,
+    ) -> Result<Self, Diagnostic> {
+        let manifest = Self {
+            name: try_component_string(name)?,
+            abi,
+            artifact,
+            world: try_component_string(world)?,
+            entrypoint: try_component_string(entrypoint)?,
+            min_args,
+            max_args,
+            stdin,
+            stdout,
+            stderr,
+            memory_bytes,
+            total_fuel,
+            poll_quantum,
+            resource_limit,
+            requirements,
+        };
+        manifest.validate(Span { start: 0, end: 0 })?;
+        Ok(manifest)
+    }
+
+    fn validate(&self, span: Span) -> Result<(), Diagnostic> {
+        if !valid_name(&self.name)
+            || self.abi == 0
+            || self.world.is_empty()
+            || self.entrypoint.is_empty()
+            || self.min_args > self.max_args
+            || self.max_args > MAX_ARGS
+            || self.memory_bytes == 0
+            || self.memory_bytes > MAX_STAGE_MEMORY
+            || self.total_fuel == 0
+            || self.poll_quantum == 0
+            || self.poll_quantum > self.total_fuel
+            || self.resource_limit == 0
+            || self.resource_limit > MAX_COMPONENT_RESOURCES
+        {
+            return Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "invalid component command manifest",
+            ));
+        }
+        let mut labels = BTreeSet::new();
+        for requirement in &self.requirements {
+            if !valid_name(&requirement.label)
+                || !valid_component_manifest_text(&requirement.interface)
+                || !valid_component_manifest_text(&requirement.resource)
+                || !valid_component_manifest_text(&requirement.resource_kind)
+                || requirement.rights == Rights::NONE
+                || requirement.rights.contains(Rights::GRANT)
+                || requirement.rights.contains(Rights::REVOKE)
+                || requirement.rights.contains(Rights::INVOKE)
+                || !labels.insert(requirement.label.clone())
+            {
+                return Err(Diagnostic::new(
+                    span.start,
+                    span.end,
+                    "invalid component authority requirement",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn command_manifest(&self) -> CommandManifest {
+        CommandManifest {
+            name: self.name.clone(),
+            abi: self.abi,
+            min_args: self.min_args,
+            max_args: self.max_args,
+            argument_mode: ArgumentMode::ValuesOnly,
+            stdin: self.stdin,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            memory_bytes: self.memory_bytes,
+            operation_budget: self.total_fuel,
+            early_close_is_success: false,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn abi(&self) -> u16 {
+        self.abi
+    }
+
+    pub const fn artifact(&self) -> ComponentArtifactIdentity {
+        self.artifact
+    }
+
+    pub fn world(&self) -> &str {
+        &self.world
+    }
+
+    pub fn entrypoint(&self) -> &str {
+        &self.entrypoint
+    }
+
+    pub const fn min_args(&self) -> usize {
+        self.min_args
+    }
+
+    pub const fn max_args(&self) -> usize {
+        self.max_args
+    }
+
+    pub const fn stdin(&self) -> StreamMode {
+        self.stdin
+    }
+
+    pub const fn stdout(&self) -> StreamMode {
+        self.stdout
+    }
+
+    pub const fn stderr(&self) -> StreamMode {
+        self.stderr
+    }
+
+    pub const fn memory_bytes(&self) -> usize {
+        self.memory_bytes
+    }
+
+    pub const fn total_fuel(&self) -> u64 {
+        self.total_fuel
+    }
+
+    pub const fn poll_quantum(&self) -> u64 {
+        self.poll_quantum
+    }
+
+    pub const fn resource_limit(&self) -> u16 {
+        self.resource_limit
+    }
+
+    pub fn requirements(&self) -> &[ComponentAuthorityRequirement] {
+        &self.requirements
+    }
+}
+
+/// Stable VSH-side trap detail. The numeric value is the Component ABI trap
+/// code, not an address or a capability identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentTrapCode(u16);
+
+impl ComponentTrapCode {
+    pub const fn new(code: u16) -> Self {
+        Self(code)
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentTerminal {
+    Success,
+    Returned(u8),
+    Denied,
+    Unavailable,
+    BackendFault,
+    BudgetExceeded,
+    Cancelled,
+    RunnerFault,
+    Trapped(ComponentTrapCode),
+}
+
+impl ComponentTerminal {
+    pub const fn status(self) -> Status {
+        match self {
+            Self::Success => Status::Success,
+            Self::Returned(code) => Status::Returned(code),
+            Self::Denied => Status::Denied,
+            Self::Unavailable => Status::Unavailable,
+            Self::BackendFault => Status::BackendFault,
+            Self::BudgetExceeded => Status::BudgetExceeded,
+            Self::Cancelled => Status::Cancelled,
+            Self::RunnerFault => Status::Faulted,
+            Self::Trapped(_) => Status::Faulted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentCommandResult {
+    terminal: ComponentTerminal,
+    output: Vec<u8>,
+}
+
+impl ComponentCommandResult {
+    /// Construct a bounded result envelope. Fault terminals cannot smuggle
+    /// bytes past a failed component invocation, while successful and
+    /// non-zero returned statuses may publish at most the shell capture bound.
+    pub fn try_new(
+        terminal: ComponentTerminal,
+        output: Vec<u8>,
+    ) -> Result<Self, ComponentCommandResultError> {
+        if output.len() > MAX_CAPTURED_OUTPUT {
+            return Err(ComponentCommandResultError::OutputLimit);
+        }
+        if !matches!(
+            terminal,
+            ComponentTerminal::Success | ComponentTerminal::Returned(_)
+        ) && !output.is_empty()
+        {
+            return Err(ComponentCommandResultError::OutputForFailure);
+        }
+        Ok(Self { terminal, output })
+    }
+
+    pub const fn terminal(&self) -> ComponentTerminal {
+        self.terminal
+    }
+
+    pub fn output(&self) -> &[u8] {
+        &self.output
+    }
+
+    pub fn into_parts(self) -> (ComponentTerminal, Vec<u8>) {
+        (self.terminal, self.output)
+    }
+
+    pub const fn budget_exceeded() -> Self {
+        Self {
+            terminal: ComponentTerminal::BudgetExceeded,
+            output: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentCommandResultError {
+    OutputLimit,
+    OutputForFailure,
+}
+
+#[derive(Clone)]
+pub struct ComponentCancellation {
+    live: Arc<AtomicBool>,
+}
+
+impl ComponentCancellation {
+    pub fn is_cancelled(&self) -> bool {
+        !self.live.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
+pub struct PreparedComponentAuthority {
+    label: String,
+    resource_kind: String,
+    rights: Rights,
+    cap: Cap,
+}
+
+impl core::fmt::Debug for PreparedComponentAuthority {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PreparedComponentAuthority")
+            .field("label", &self.label)
+            .field("resource_kind", &self.resource_kind)
+            .field("rights", &self.rights)
+            .field("authority", &"<stage-local>")
+            .finish()
+    }
+}
+
+impl PreparedComponentAuthority {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn resource_kind(&self) -> &str {
+        &self.resource_kind
+    }
+
+    pub const fn rights(&self) -> Rights {
+        self.rights
+    }
+
+    /// Return the stage-local handle to the trusted runner adapter. This value
+    /// is never serialized or accepted from shell text.
+    pub const fn stage_cap(&self) -> Cap {
+        self.cap
+    }
+}
+
+pub struct PreparedComponentStage {
+    manifest: Arc<ComponentCommandManifest>,
+    arguments: Vec<String>,
+    input: Vec<u8>,
+    cspace: Arc<SpinLock<CSpace>>,
+    authorities: Vec<PreparedComponentAuthority>,
+    cancellation: ComponentCancellation,
+}
+
+impl core::fmt::Debug for PreparedComponentStage {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PreparedComponentStage")
+            .field("manifest", &self.manifest)
+            .field("arguments", &self.arguments)
+            .field("input_bytes", &self.input.len())
+            .field("execution_context", &"<stage-local>")
+            .field("authorities", &self.authorities)
+            .field("cancelled", &self.cancellation.is_cancelled())
+            .finish()
+    }
+}
+
+impl PreparedComponentStage {
+    pub fn manifest(&self) -> &ComponentCommandManifest {
+        &self.manifest
+    }
+
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub fn input(&self) -> &[u8] {
+        &self.input
+    }
+
+    pub fn authorities(&self) -> &[PreparedComponentAuthority] {
+        &self.authorities
+    }
+
+    pub fn authority(&self, label: &str) -> Option<&PreparedComponentAuthority> {
+        self.authorities
+            .iter()
+            .find(|authority| authority.label == label)
+    }
+
+    pub fn stage_cspace(&self) -> Arc<SpinLock<CSpace>> {
+        self.cspace.clone()
+    }
+
+    pub fn cancellation(&self) -> ComponentCancellation {
+        self.cancellation.clone()
+    }
+}
+
+pub type ComponentCommandFuture<'a> =
+    Pin<Box<dyn Future<Output = ComponentCommandResult> + Send + 'a>>;
+
+/// Kernel adapters implement this seam around an already admitted immutable
+/// Component. `preflight` must be synchronous and side-effect-free; `run` is
+/// called only after the complete pipeline has prepared and committed.
+pub trait ComponentCommandRunner: Send + Sync {
+    /// The one immutable manifest owned by this admitted runner. Session
+    /// installation copies this value; callers cannot pair arbitrary artifact
+    /// and manifest objects at the registration boundary.
+    fn manifest(&self) -> &ComponentCommandManifest;
+
+    fn preflight(&self, manifest: &ComponentCommandManifest) -> Result<(), ComponentTerminal>;
+
+    fn run<'a>(&'a self, stage: PreparedComponentStage) -> ComponentCommandFuture<'a>;
+}
+
+#[derive(Clone)]
 enum Applet {
     Echo,
     Wc,
@@ -1065,8 +1681,18 @@ enum Applet {
     Deny,
     Fault,
     Spin,
-    Host(fn(&[String]) -> Result<String, Status>),
-    AsyncHost(fn(Vec<String>) -> crate::AsyncCommandFuture),
+    Host {
+        command: fn(&[String]) -> Result<String, Status>,
+        observability: bool,
+    },
+    AsyncHost {
+        command: fn(Vec<String>) -> crate::AsyncCommandFuture,
+        observability: bool,
+    },
+    Component {
+        manifest: Arc<ComponentCommandManifest>,
+        runner: Arc<dyn ComponentCommandRunner>,
+    },
 }
 
 pub struct Command {
@@ -1400,19 +2026,88 @@ enum LocalIo {
     Stream(Cap),
     Sink(Cap),
 }
-struct PlannedStage {
+
+struct PreflightStage {
+    command: CommandAst,
+    command_name: String,
+    command_source: Cap,
+    manifest: CommandManifest,
+    component: Option<Arc<ComponentCommandManifest>>,
+}
+
+/// Synchronous, inert result of validating every stage in one pipeline.
+/// It owns the syntax and immutable manifest snapshots but no candidate task,
+/// stream, CSpace, or live object pointer that can perform an operation.
+pub struct PipelinePreflight {
+    stages: Vec<PreflightStage>,
+}
+
+impl PipelinePreflight {
+    pub fn stage_count(&self) -> usize {
+        self.stages.len()
+    }
+
+    pub fn command_names(&self) -> impl Iterator<Item = &str> {
+        self.stages.iter().map(|stage| stage.command_name.as_str())
+    }
+
+    pub fn manifests(&self) -> impl Iterator<Item = &CommandManifest> {
+        self.stages.iter().map(|stage| &stage.manifest)
+    }
+}
+
+struct PreparedStage {
     cspace: Arc<SpinLock<CSpace>>,
     command: Cap,
     args: Vec<String>,
     stdin: LocalIo,
     stdout: LocalIo,
     _stderr: LocalIo,
-    result: Arc<SpinLock<Option<Status>>>,
+    component_authorities: Vec<PreparedComponentAuthority>,
+    is_component: bool,
+    result: Arc<SpinLock<Option<StageExit>>>,
 }
+
+/// Fully admitted but unpublished pipeline candidates. Construction may await
+/// bounded value expansion, but no stage task or runner is started until
+/// [`PreparedPipeline::commit`].
+pub struct PreparedPipeline {
+    owner: Arc<SpinLock<CSpace>>,
+    id: u64,
+    admission: CSpace,
+    pipes: Vec<Arc<ByteStream>>,
+    stages: Vec<PreparedStage>,
+}
+
+impl PreparedPipeline {
+    pub fn stage_count(&self) -> usize {
+        self.stages.len()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalDetail {
+    Command(Status),
+    Component(ComponentTerminal),
+}
+
+#[derive(Clone, Copy)]
+enum StageFlavor {
+    Command,
+    Component,
+}
+
+#[derive(Clone)]
+struct StageExit {
+    status: Status,
+    detail: TerminalDetail,
+}
+
 type RunningStage = (
     TaskHandle,
-    Arc<SpinLock<Option<Status>>>,
+    Arc<SpinLock<Option<StageExit>>>,
     Arc<SpinLock<CSpace>>,
+    StageFlavor,
 );
 
 struct BackgroundJob {
@@ -1428,6 +2123,7 @@ impl BackgroundJob {
         for stage in &self.stages {
             let _ = stage.cancel();
         }
+        let _ = self.supervisor.cancel();
     }
 }
 
@@ -1437,10 +2133,24 @@ struct FunctionDef {
     body: Script,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StageReport {
-    pub task: exec::TaskId,
+    /// Pipeline-local stage ordinal. Executor task identity is supervisor-only
+    /// and never enters shell-facing observability.
+    pub stage: usize,
     pub status: Status,
+    pub detail: TerminalDetail,
+}
+
+impl core::fmt::Debug for StageReport {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("StageReport")
+            .field("stage", &self.stage)
+            .field("status", &self.status)
+            .field("detail", &self.detail)
+            .finish()
+    }
 }
 #[derive(Clone, Debug)]
 pub struct JobReport {
@@ -1489,6 +2199,7 @@ pub struct Session {
     substitution_depth: usize,
     script_depth: usize,
     active_script_caps: Option<BTreeSet<String>>,
+    ssh_exec_policy_commands: BTreeSet<String>,
     profile: SessionProfile,
 }
 
@@ -1543,6 +2254,7 @@ impl Session {
             substitution_depth: 0,
             script_depth: 0,
             active_script_caps: None,
+            ssh_exec_policy_commands: BTreeSet::new(),
             profile,
         };
         session.install("echo", Applet::Echo, 0, MAX_ARGS, StreamMode::Closed, true);
@@ -1573,7 +2285,7 @@ impl Session {
     }
     fn install(
         &mut self,
-        name: &'static str,
+        name: &str,
         applet: Applet,
         min_args: usize,
         max_args: usize,
@@ -1582,7 +2294,7 @@ impl Session {
     ) {
         let command = Arc::new(Command {
             manifest: CommandManifest {
-                name,
+                name: name.to_string(),
                 abi: 1,
                 min_args,
                 max_args,
@@ -1601,6 +2313,147 @@ impl Session {
             Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
         );
         self.commands.insert(name.to_string(), cap);
+    }
+
+    /// Install an image-policy-provided Component as a session-local command.
+    /// The manifest is moved into immutable command state; the runner is a
+    /// trusted adapter around an already admitted artifact and cannot be
+    /// selected or replaced by shell text.
+    pub fn install_component_command(
+        &mut self,
+        runner: Arc<dyn ComponentCommandRunner>,
+    ) -> Result<(), Diagnostic> {
+        let source_manifest = runner.manifest();
+        if self.profile == SessionProfile::SshExec {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "component commands are outside the SSH exec profile",
+            ));
+        }
+        let manifest = Self::snapshot_component_manifest(source_manifest)?;
+        self.install_component_command_inner(manifest, runner)
+    }
+
+    /// Install one exact image-policy-pinned Component command into this SSH
+    /// exec session. Ordinary [`Self::install_component_command`] remains
+    /// closed for `SshExec`; only trusted setup holding a full independent
+    /// policy witness can make the pinned name visible to this session.
+    pub fn install_ssh_exec_component_command(
+        &mut self,
+        policy: &SshExecComponentPolicy,
+        runner: Arc<dyn ComponentCommandRunner>,
+    ) -> Result<(), Diagnostic> {
+        let source_manifest = runner.manifest();
+        if self.profile != SessionProfile::SshExec {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "SSH component policy requires an SSH exec session",
+            ));
+        }
+        if !policy.admits(source_manifest) {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "component runner does not match SSH image policy",
+            ));
+        }
+        // Copy exactly the manifest that passed the independent image-policy
+        // comparison. A stateful runner must not get a second manifest query
+        // between authorization and immutable command installation.
+        let manifest = Self::snapshot_component_manifest(source_manifest)?;
+        let name = manifest.name.clone();
+        self.install_component_command_inner(manifest, runner)?;
+        self.ssh_exec_policy_commands.insert(name);
+        Ok(())
+    }
+
+    fn snapshot_component_manifest(
+        source_manifest: &ComponentCommandManifest,
+    ) -> Result<ComponentCommandManifest, Diagnostic> {
+        source_manifest.validate(Span {
+            start: 0,
+            end: source_manifest.name.len(),
+        })?;
+        let mut requirements = Vec::new();
+        requirements
+            .try_reserve_exact(source_manifest.requirements.len())
+            .map_err(|_| Diagnostic::new(0, 0, "component manifest allocation failed"))?;
+        for requirement in &source_manifest.requirements {
+            requirements.push(ComponentAuthorityRequirement::try_from_borrowed(
+                &requirement.label,
+                &requirement.interface,
+                &requirement.resource,
+                &requirement.resource_kind,
+                requirement.rights,
+            )?);
+        }
+        ComponentCommandManifest::try_from_borrowed(
+            &source_manifest.name,
+            source_manifest.abi,
+            source_manifest.artifact,
+            &source_manifest.world,
+            &source_manifest.entrypoint,
+            source_manifest.min_args,
+            source_manifest.max_args,
+            source_manifest.stdin,
+            source_manifest.stdout,
+            source_manifest.stderr,
+            source_manifest.memory_bytes,
+            source_manifest.total_fuel,
+            source_manifest.poll_quantum,
+            source_manifest.resource_limit,
+            requirements,
+        )
+    }
+
+    fn install_component_command_inner(
+        &mut self,
+        manifest: ComponentCommandManifest,
+        runner: Arc<dyn ComponentCommandRunner>,
+    ) -> Result<(), Diagnostic> {
+        manifest.validate(Span {
+            start: 0,
+            end: manifest.name.len(),
+        })?;
+        if self.commands.contains_key(&manifest.name)
+            || self.functions.contains_key(&manifest.name)
+            || is_special_form(&manifest.name)
+        {
+            return Err(Diagnostic::new(
+                0,
+                manifest.name.len(),
+                "component command name is already registered",
+            ));
+        }
+        if self.commands.len() >= 128 {
+            return Err(Diagnostic::new(
+                0,
+                manifest.name.len(),
+                "visible command limit exceeded",
+            ));
+        }
+        let name = manifest.name.clone();
+        let general = manifest.command_manifest();
+        let manifest = Arc::new(manifest);
+        let command = Arc::new(Command {
+            manifest: general,
+            applet: Applet::Component { manifest, runner },
+        });
+        let cap = self.cspace.lock().mint(
+            command,
+            Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
+        );
+        self.commands.insert(name, cap);
+        Ok(())
+    }
+
+    /// Number of live entries in this session's local CSpace. This exposes no
+    /// handle, slot, generation, or object identity and is suitable for
+    /// admission/cleanup observability.
+    pub fn local_authority_count(&self) -> usize {
+        self.cspace.lock().list().len()
     }
     /// Boot-policy hook for one audited, in-tree control command. Possession
     /// of the resulting Command capability is the authority to invoke the
@@ -1621,7 +2474,10 @@ impl Session {
         }
         self.install(
             name,
-            Applet::Host(command),
+            Applet::Host {
+                command,
+                observability: is_observability_command(name),
+            },
             min_args,
             max_args,
             StreamMode::Closed,
@@ -1641,7 +2497,10 @@ impl Session {
         }
         self.install(
             name,
-            Applet::AsyncHost(command),
+            Applet::AsyncHost {
+                command,
+                observability: is_observability_command(name),
+            },
             min_args,
             max_args,
             StreamMode::Closed,
@@ -1781,7 +2640,9 @@ impl Session {
 
     pub async fn execute(&mut self, source: &str) -> Result<Vec<JobReport>, Diagnostic> {
         if self.profile == SessionProfile::SshExec {
-            validate_ssh_exec(source)?;
+            let _ = validate_ssh_exec_with_policy(source, |name| {
+                self.ssh_exec_policy_commands.contains(name)
+            })?;
         }
         let script = parse(source)?;
         Ok(self.execute_block(&script, true).await?.reports)
@@ -1814,7 +2675,9 @@ impl Session {
                 "session does not use the SSH exec profile",
             ));
         }
-        validate_ssh_exec(source)?;
+        let _ = validate_ssh_exec_with_policy(source, |name| {
+            self.ssh_exec_policy_commands.contains(name)
+        })?;
         self.execute_cancellable(source, cancel).await
     }
 
@@ -2126,7 +2989,7 @@ impl Session {
                         span.start,
                         span.end,
                         "special form requires value arguments",
-                    ))
+                    ));
                 }
             }
         }
@@ -2152,7 +3015,9 @@ impl Session {
                 }
                 let mut output = String::new();
                 for (id, job) in &self.jobs {
-                    let state = if job.supervisor.try_exit().is_some() {
+                    let state = if !job.supervisor.is_published() {
+                        "prepared"
+                    } else if job.supervisor.try_exit().is_some() {
                         "done"
                     } else {
                         "running"
@@ -2351,30 +3216,18 @@ impl Session {
         })
     }
 
-    async fn run_pipeline(
-        &mut self,
-        ast: &PipelineAst,
-        background: bool,
-    ) -> Result<Option<JobReport>, Diagnostic> {
-        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
-        let mut admission = CSpace::new("vsh-admission");
-        let mut pipes = Vec::new();
-        let mut roots = Vec::new();
-        for _ in 1..ast.commands.len() {
-            let p = ByteStream::new();
-            let root = admission.mint(
-                p.clone(),
-                Rights::SEND
-                    .union(Rights::RECV)
-                    .union(Rights::GRANT)
-                    .union(Rights::REVOKE),
-            );
-            pipes.push(p);
-            roots.push(root);
-        }
+    /// Resolve and validate the complete literal pipeline without awaiting,
+    /// allocating candidate execution state, or invoking a runner. In
+    /// particular, no argument expansion or command substitution happens here.
+    pub fn preflight_pipeline(&self, ast: &PipelineAst) -> Result<PipelinePreflight, Diagnostic> {
         let mut stages = Vec::new();
+        let mut component_preflights = Vec::new();
+        stages.try_reserve_exact(ast.commands.len()).map_err(|_| {
+            Diagnostic::new(ast.span.start, ast.span.end, "pipeline allocation failed")
+        })?;
+
         for (index, command_ast) in ast.commands.iter().enumerate() {
-            let command_name = self.expand_word(&command_ast.name).await?;
+            let command_name = self.preflight_command_name(&command_ast.name)?;
             let command_source = self.commands.get(&command_name).copied().ok_or_else(|| {
                 Diagnostic::new(
                     command_ast.name.span.start,
@@ -2382,69 +3235,500 @@ impl Session {
                     "unknown command",
                 )
             })?;
-            let manifest = self
-                .cspace
-                .lock()
-                .lookup_as::<Command>(command_source, Rights::INVOKE)
-                .map_err(|_| {
+            let (command, command_rights) = {
+                let cspace = self.cspace.lock();
+                let rights = cspace.rights_of(command_source).map_err(|_| {
                     Diagnostic::new(
                         command_ast.name.span.start,
                         command_ast.name.span.end,
                         "command is not invokable",
                     )
-                })?
-                .manifest
-                .clone();
-            if manifest.memory_bytes > MAX_STAGE_MEMORY {
+                })?;
+                let command = cspace
+                    .lookup_as::<Command>(command_source, Rights::INVOKE)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.name.span.start,
+                            command_ast.name.span.end,
+                            "command is not invokable",
+                        )
+                    })?;
+                (command, rights)
+            };
+            if !command_rights.contains(Rights::GRANT) {
                 return Err(Diagnostic::new(
                     command_ast.span.start,
                     command_ast.span.end,
-                    "stage memory request exceeds policy",
+                    "missing GRANT on command",
                 ));
             }
-            let mut args = Vec::new();
-            let mut expanded_bytes = 0usize;
-            for arg in &command_ast.args {
-                match arg {
-                    Argument::Word(word) => {
-                        let value = self.expand_word(word).await?;
-                        expanded_bytes =
-                            expanded_bytes.checked_add(value.len()).ok_or_else(|| {
-                                Diagnostic::new(
-                                    word.span.start,
-                                    word.span.end,
-                                    "expanded argument size overflow",
-                                )
-                            })?;
-                        args.push(value);
-                    }
-                    Argument::Capability { span, .. } => {
-                        return Err(Diagnostic::new(
-                            span.start,
-                            span.end,
-                            "command accepts value arguments only",
-                        ))
-                    }
-                }
-            }
-            if args.len() < manifest.min_args || args.len() > manifest.max_args {
+            let manifest = command.manifest.clone();
+            validate_command_manifest(&command_name, &manifest, command_ast.span)?;
+            if command_ast.args.len() < manifest.min_args
+                || command_ast.args.len() > manifest.max_args
+            {
                 return Err(Diagnostic::new(
                     command_ast.span.start,
                     command_ast.span.end,
                     "command argument count rejected by manifest",
                 ));
             }
-            if expanded_bytes > MAX_EXPANDED_BYTES {
+            for argument in &command_ast.args {
+                if let Argument::Capability { span, .. } = argument {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "command accepts value arguments only",
+                    ));
+                }
+            }
+
+            let has_stdin_redirect = command_ast
+                .redirects
+                .iter()
+                .any(|redirect| redirect.kind == RedirectKind::Stdin);
+            let stdin_present = index > 0 || has_stdin_redirect;
+            if manifest.stdin == StreamMode::Required && !stdin_present {
                 return Err(Diagnostic::new(
                     command_ast.span.start,
                     command_ast.span.end,
-                    "expanded arguments exceed 16 KiB",
+                    "command requires stdin",
                 ));
             }
+            if manifest.stdin == StreamMode::Closed && stdin_present {
+                return Err(Diagnostic::new(
+                    command_ast.span.start,
+                    command_ast.span.end,
+                    "command requires closed stdin",
+                ));
+            }
+
+            // Candidate construction installs inherited defaults before
+            // applying redirects, so validate those exact grants as well.
+            if index + 1 == ast.commands.len() {
+                self.preflight_console(command_ast.span, "default stdout cannot be delegated")?;
+            }
+            self.preflight_console(command_ast.span, "default stderr cannot be delegated")?;
+            for redirect in &command_ast.redirects {
+                self.preflight_redirect(redirect)?;
+            }
+
+            let component = match &command.applet {
+                Applet::Component { manifest, runner } => {
+                    manifest.validate(command_ast.span)?;
+                    if runner.manifest() != manifest.as_ref() {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "component runner manifest changed after installation",
+                        ));
+                    }
+                    for requirement in manifest.requirements() {
+                        self.preflight_component_authority(requirement, command_ast.span)?;
+                    }
+                    component_preflights.push((command_ast.span, manifest.clone(), runner.clone()));
+                    Some(manifest.clone())
+                }
+                _ => None,
+            };
+            stages.push(PreflightStage {
+                command: command_ast.clone(),
+                command_name,
+                command_source,
+                manifest,
+                component,
+            });
+        }
+
+        if stages.iter().any(|stage| stage.component.is_some()) {
+            for stage in &stages {
+                self.preflight_component_pipeline_substitutions(&stage.command)?;
+            }
+        }
+
+        // Trusted adapter hooks run only after every shell-controlled check has
+        // succeeded, so an unauthorized later stage cannot even enter an
+        // earlier component's adapter preflight.
+        for (span, manifest, runner) in component_preflights {
+            runner
+                .preflight(&manifest)
+                .map_err(|terminal| component_preflight_diagnostic(span, terminal))?;
+        }
+        Ok(PipelinePreflight { stages })
+    }
+
+    fn preflight_command_name(&self, word: &Word) -> Result<String, Diagnostic> {
+        let mut name = String::new();
+        for part in &word.parts {
+            match part {
+                WordPart::Literal(value) => name.push_str(value),
+                WordPart::Value(value) => {
+                    name.push_str(self.values.get(value).map(String::as_str).unwrap_or(""));
+                }
+                WordPart::Command { span, .. } => {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "command substitution cannot select a pipeline command",
+                    ));
+                }
+            }
+            if name.len() > MAX_BINDING_BYTES {
+                return Err(Diagnostic::new(
+                    word.span.start,
+                    word.span.end,
+                    "expanded command name exceeds 4 KiB",
+                ));
+            }
+        }
+        Ok(name)
+    }
+
+    fn preflight_component_pipeline_substitutions(
+        &self,
+        command: &CommandAst,
+    ) -> Result<(), Diagnostic> {
+        for argument in &command.args {
+            if let Argument::Word(word) = argument {
+                self.preflight_component_word(word, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_component_word(&self, word: &Word, depth: usize) -> Result<(), Diagnostic> {
+        for part in &word.parts {
+            if let WordPart::Command { source, span } = part {
+                if depth >= MAX_COMMAND_SUBSTITUTION_DEPTH {
+                    return Err(Diagnostic::new(
+                        span.start,
+                        span.end,
+                        "command substitution nesting limit exceeded",
+                    ));
+                }
+                let script = parse(source).map_err(|_| {
+                    Diagnostic::new(span.start, span.end, "invalid command substitution")
+                })?;
+                self.preflight_pure_substitution_script(&script, depth + 1, *span)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_pure_substitution_script(
+        &self,
+        script: &Script,
+        depth: usize,
+        outer_span: Span,
+    ) -> Result<(), Diagnostic> {
+        for statement in &script.statements {
+            match statement {
+                Statement::Command(item) => {
+                    if item.background {
+                        return Err(Diagnostic::new(
+                            outer_span.start,
+                            outer_span.end,
+                            "component pipeline substitution cannot start a background job",
+                        ));
+                    }
+                    self.preflight_pure_substitution_and_or(&item.command, depth, outer_span)?;
+                }
+                Statement::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.preflight_pure_substitution_and_or(condition, depth, outer_span)?;
+                    self.preflight_pure_substitution_script(then_branch, depth, outer_span)?;
+                    if let Some(else_branch) = else_branch {
+                        self.preflight_pure_substitution_script(else_branch, depth, outer_span)?;
+                    }
+                }
+                Statement::While {
+                    condition, body, ..
+                } => {
+                    self.preflight_pure_substitution_and_or(condition, depth, outer_span)?;
+                    self.preflight_pure_substitution_script(body, depth, outer_span)?;
+                }
+                Statement::Function { body, .. } => {
+                    self.preflight_pure_substitution_script(body, depth, outer_span)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_pure_substitution_and_or(
+        &self,
+        command: &AndOrAst,
+        depth: usize,
+        outer_span: Span,
+    ) -> Result<(), Diagnostic> {
+        self.preflight_pure_substitution_pipeline(&command.first, depth, outer_span)?;
+        for (_, pipeline) in &command.rest {
+            self.preflight_pure_substitution_pipeline(pipeline, depth, outer_span)?;
+        }
+        Ok(())
+    }
+
+    fn preflight_pure_substitution_pipeline(
+        &self,
+        pipeline: &PipelineAst,
+        depth: usize,
+        outer_span: Span,
+    ) -> Result<(), Diagnostic> {
+        for command in &pipeline.commands {
+            if !command.redirects.is_empty() {
+                return Err(Diagnostic::new(
+                    outer_span.start,
+                    outer_span.end,
+                    "component pipeline substitution cannot redirect authority",
+                ));
+            }
+            let Some(name) = literal_word(&command.name) else {
+                return Err(Diagnostic::new(
+                    outer_span.start,
+                    outer_span.end,
+                    "component pipeline substitution command must be literal",
+                ));
+            };
+            if is_special_form(name) {
+                if name != "let" {
+                    return Err(Diagnostic::new(
+                        outer_span.start,
+                        outer_span.end,
+                        "component pipeline substitution cannot control jobs or scripts",
+                    ));
+                }
+            } else {
+                let cap = self.commands.get(name).copied().ok_or_else(|| {
+                    Diagnostic::new(
+                        outer_span.start,
+                        outer_span.end,
+                        "unknown command substitution command",
+                    )
+                })?;
+                let command_resource = self
+                    .cspace
+                    .lock()
+                    .lookup_as::<Command>(cap, Rights::INVOKE)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            outer_span.start,
+                            outer_span.end,
+                            "command substitution command is not invokable",
+                        )
+                    })?;
+                if matches!(
+                    command_resource.applet,
+                    Applet::Host { .. } | Applet::AsyncHost { .. } | Applet::Component { .. }
+                ) {
+                    return Err(Diagnostic::new(
+                        outer_span.start,
+                        outer_span.end,
+                        "component pipeline substitution must be side-effect-free",
+                    ));
+                }
+            }
+            for argument in &command.args {
+                match argument {
+                    Argument::Word(word) => self.preflight_component_word(word, depth)?,
+                    Argument::Capability { .. } => {
+                        return Err(Diagnostic::new(
+                            outer_span.start,
+                            outer_span.end,
+                            "component pipeline substitution cannot use authority",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_console(&self, span: Span, message: &'static str) -> Result<(), Diagnostic> {
+        let console = self
+            .capabilities
+            .get("console")
+            .copied()
+            .ok_or_else(|| Diagnostic::new(span.start, span.end, message))?;
+        let cspace = self.cspace.lock();
+        let rights = cspace
+            .rights_of(console)
+            .map_err(|_| Diagnostic::new(span.start, span.end, message))?;
+        if !rights.contains(Rights::WRITE.union(Rights::GRANT))
+            || cspace
+                .lookup(console, Rights::WRITE)
+                .map_or(true, |object| object.kind() != "byte-sink")
+        {
+            return Err(Diagnostic::new(span.start, span.end, message));
+        }
+        Ok(())
+    }
+
+    fn preflight_redirect(&self, redirect: &Redirect) -> Result<(), Diagnostic> {
+        if self
+            .active_script_caps
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&redirect.target))
+        {
+            return Err(Diagnostic::new(
+                redirect.span.start,
+                redirect.span.end,
+                "capability is outside the script authority manifest",
+            ));
+        }
+        let source = self
+            .capabilities
+            .get(&redirect.target)
+            .copied()
+            .ok_or_else(|| {
+                Diagnostic::new(redirect.span.start, redirect.span.end, "unknown capability")
+            })?;
+        let (rights, object) = {
+            let cspace = self.cspace.lock();
+            let need = if redirect.kind == RedirectKind::Stdin {
+                Rights::RECV
+            } else {
+                Rights::WRITE
+            };
+            let rights = cspace.rights_of(source).map_err(|_| {
+                Diagnostic::new(
+                    redirect.span.start,
+                    redirect.span.end,
+                    if redirect.kind == RedirectKind::Stdin {
+                        "input capability lacks required rights"
+                    } else {
+                        "output capability lacks required rights"
+                    },
+                )
+            })?;
+            let object = cspace.lookup(source, need).map_err(|_| {
+                Diagnostic::new(
+                    redirect.span.start,
+                    redirect.span.end,
+                    if redirect.kind == RedirectKind::Stdin {
+                        "input capability lacks required rights"
+                    } else {
+                        "output capability lacks required rights"
+                    },
+                )
+            })?;
+            (rights, object)
+        };
+        let expected = if redirect.kind == RedirectKind::Stdin {
+            "byte-stream"
+        } else {
+            "byte-sink"
+        };
+        if object.kind() != expected {
+            return Err(Diagnostic::new(
+                redirect.span.start,
+                redirect.span.end,
+                if redirect.kind == RedirectKind::Stdin {
+                    "input capability has wrong resource kind"
+                } else {
+                    "output capability has wrong resource kind"
+                },
+            ));
+        }
+        if !rights.contains(Rights::GRANT) {
+            return Err(Diagnostic::new(
+                redirect.span.start,
+                redirect.span.end,
+                if redirect.kind == RedirectKind::Stdin {
+                    "input capability cannot be delegated"
+                } else {
+                    "output capability cannot be delegated"
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn preflight_component_authority(
+        &self,
+        requirement: &ComponentAuthorityRequirement,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if self
+            .active_script_caps
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(requirement.label()))
+        {
+            return Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "component authority is outside the script manifest",
+            ));
+        }
+        let source = self
+            .capabilities
+            .get(requirement.label())
+            .copied()
+            .ok_or_else(|| {
+                Diagnostic::new(span.start, span.end, "component authority is unavailable")
+            })?;
+        let cspace = self.cspace.lock();
+        let rights = cspace
+            .rights_of(source)
+            .map_err(|_| Diagnostic::new(span.start, span.end, "component authority is denied"))?;
+        if !rights.contains(requirement.rights().union(Rights::GRANT)) {
+            return Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "component authority is denied",
+            ));
+        }
+        let object = cspace
+            .lookup(source, requirement.rights())
+            .map_err(|_| Diagnostic::new(span.start, span.end, "component authority is denied"))?;
+        if object.kind() != requirement.resource_kind() {
+            return Err(Diagnostic::new(
+                span.start,
+                span.end,
+                "component authority has wrong resource kind",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Allocate and populate every unpublished candidate only after synchronous
+    /// preflight has completed. All live authority is revalidated before the
+    /// first argument expansion or command substitution.
+    pub async fn prepare_pipeline(
+        &mut self,
+        preflight: PipelinePreflight,
+    ) -> Result<PreparedPipeline, Diagnostic> {
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let preflight_stages = preflight.stages;
+        let mut admission = CSpace::new("vsh-admission");
+        let mut pipes = Vec::new();
+        let mut roots = Vec::new();
+        for _ in 1..preflight_stages.len() {
+            let pipe = ByteStream::new();
+            let root = admission.mint(
+                pipe.clone(),
+                Rights::SEND
+                    .union(Rights::RECV)
+                    .union(Rights::GRANT)
+                    .union(Rights::REVOKE),
+            );
+            pipes.push(pipe);
+            roots.push(root);
+        }
+
+        let mut stages = Vec::new();
+        stages
+            .try_reserve_exact(preflight_stages.len())
+            .map_err(|_| Diagnostic::new(0, 0, "pipeline candidate allocation failed"))?;
+        for (index, preflight_stage) in preflight_stages.iter().enumerate() {
+            let command_ast = &preflight_stage.command;
             let mut stage = CSpace::new(&format!("vsh-job-{id}-stage-{index}"));
             let command = cap::grant(
                 &self.cspace.lock(),
-                command_source,
+                preflight_stage.command_source,
                 Rights::INVOKE,
                 &mut stage,
             )
@@ -2455,7 +3739,7 @@ impl Session {
                     "missing GRANT on command",
                 )
             })?;
-            let stdin = if index > 0 {
+            let mut stdin = if index > 0 {
                 LocalIo::Stream(
                     cap::grant(&admission, roots[index - 1], Rights::RECV, &mut stage).map_err(
                         |_| {
@@ -2470,7 +3754,7 @@ impl Session {
             } else {
                 LocalIo::Closed
             };
-            let stdout = if index + 1 < ast.commands.len() {
+            let mut stdout = if index + 1 < preflight_stages.len() {
                 LocalIo::Stream(
                     cap::grant(&admission, roots[index], Rights::SEND, &mut stage).map_err(
                         |_| {
@@ -2496,8 +3780,6 @@ impl Session {
                     )?,
                 )
             };
-            let mut stdin = stdin;
-            let mut stdout = stdout;
             let console = self.capabilities["console"];
             let mut stderr = LocalIo::Sink(
                 cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage).map_err(
@@ -2511,48 +3793,9 @@ impl Session {
                 )?,
             );
             for redirect in &command_ast.redirects {
-                if self
-                    .active_script_caps
-                    .as_ref()
-                    .is_some_and(|allowed| !allowed.contains(&redirect.target))
-                {
-                    return Err(Diagnostic::new(
-                        redirect.span.start,
-                        redirect.span.end,
-                        "capability is outside the script authority manifest",
-                    ));
-                }
-                let source = self
-                    .capabilities
-                    .get(&redirect.target)
-                    .copied()
-                    .ok_or_else(|| {
-                        Diagnostic::new(
-                            redirect.span.start,
-                            redirect.span.end,
-                            "unknown capability",
-                        )
-                    })?;
+                let source = self.capabilities[&redirect.target];
                 match redirect.kind {
                     RedirectKind::Stdin => {
-                        let object =
-                            self.cspace
-                                .lock()
-                                .lookup(source, Rights::RECV)
-                                .map_err(|_| {
-                                    Diagnostic::new(
-                                        redirect.span.start,
-                                        redirect.span.end,
-                                        "input capability lacks required rights",
-                                    )
-                                })?;
-                        if object.kind() != "byte-stream" {
-                            return Err(Diagnostic::new(
-                                redirect.span.start,
-                                redirect.span.end,
-                                "input capability has wrong resource kind",
-                            ));
-                        }
                         stdin = LocalIo::Stream(
                             cap::grant(&self.cspace.lock(), source, Rights::RECV, &mut stage)
                                 .map_err(|_| {
@@ -2565,24 +3808,6 @@ impl Session {
                         );
                     }
                     RedirectKind::Stdout | RedirectKind::Stderr => {
-                        let object =
-                            self.cspace
-                                .lock()
-                                .lookup(source, Rights::WRITE)
-                                .map_err(|_| {
-                                    Diagnostic::new(
-                                        redirect.span.start,
-                                        redirect.span.end,
-                                        "output capability lacks required rights",
-                                    )
-                                })?;
-                        if object.kind() != "byte-sink" {
-                            return Err(Diagnostic::new(
-                                redirect.span.start,
-                                redirect.span.end,
-                                "output capability has wrong resource kind",
-                            ));
-                        }
                         let local = LocalIo::Sink(
                             cap::grant(&self.cspace.lock(), source, Rights::WRITE, &mut stage)
                                 .map_err(|_| {
@@ -2601,72 +3826,370 @@ impl Session {
                     }
                 }
             }
-            if manifest.stdin == StreamMode::Required && matches!(stdin, LocalIo::Closed) {
-                return Err(Diagnostic::new(
-                    command_ast.span.start,
-                    command_ast.span.end,
-                    "command requires stdin",
-                ));
+            let mut component_authorities = Vec::new();
+            if let Some(manifest) = &preflight_stage.component {
+                component_authorities
+                    .try_reserve_exact(manifest.requirements().len())
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "component authority allocation failed",
+                        )
+                    })?;
+                for requirement in manifest.requirements() {
+                    let source = self.capabilities[requirement.label()];
+                    let cap = cap::grant(
+                        &self.cspace.lock(),
+                        source,
+                        requirement.rights(),
+                        &mut stage,
+                    )
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "component authority cannot be delegated",
+                        )
+                    })?;
+                    component_authorities.push(PreparedComponentAuthority {
+                        label: requirement.label.clone(),
+                        resource_kind: requirement.resource_kind.clone(),
+                        rights: requirement.rights,
+                        cap,
+                    });
+                }
             }
-            if manifest.stdin == StreamMode::Closed && !matches!(stdin, LocalIo::Closed) {
-                return Err(Diagnostic::new(
-                    command_ast.span.start,
-                    command_ast.span.end,
-                    "command requires closed stdin",
-                ));
-            }
-            if manifest.stdout == StreamMode::Required && matches!(stdout, LocalIo::Closed) {
-                return Err(Diagnostic::new(
-                    command_ast.span.start,
-                    command_ast.span.end,
-                    "command requires stdout or redirection",
-                ));
-            }
-            stages.push(PlannedStage {
+            stages.push(PreparedStage {
                 cspace: Arc::new(SpinLock::new(stage)),
                 command,
-                args,
+                args: Vec::new(),
                 stdin,
                 stdout,
                 _stderr: stderr,
+                component_authorities,
+                is_component: preflight_stage.component.is_some(),
                 result: Arc::new(SpinLock::new(None)),
             });
+        }
+
+        // Candidate authority and topology are now complete. Expansion may
+        // await and may run a separately preflighted command substitution, but
+        // it can no longer discover a bad later command or redirect.
+        for (preflight_stage, stage) in preflight_stages.iter().zip(&mut stages) {
+            let mut args = Vec::new();
+            let mut expanded_bytes = 0usize;
+            for argument in &preflight_stage.command.args {
+                let Argument::Word(word) = argument else {
+                    unreachable!("capability arguments were rejected by preflight")
+                };
+                let value = self.expand_word(word).await?;
+                expanded_bytes = expanded_bytes.checked_add(value.len()).ok_or_else(|| {
+                    Diagnostic::new(
+                        word.span.start,
+                        word.span.end,
+                        "expanded argument size overflow",
+                    )
+                })?;
+                args.push(value);
+            }
+            if expanded_bytes > MAX_EXPANDED_BYTES {
+                return Err(Diagnostic::new(
+                    preflight_stage.command.span.start,
+                    preflight_stage.command.span.end,
+                    "expanded arguments exceed 16 KiB",
+                ));
+            }
+            stage.args = args;
+        }
+        Ok(PreparedPipeline {
+            owner: self.cspace.clone(),
+            id,
+            admission,
+            pipes,
+            stages,
+        })
+    }
+
+    async fn run_pipeline(
+        &mut self,
+        ast: &PipelineAst,
+        background: bool,
+    ) -> Result<Option<JobReport>, Diagnostic> {
+        let preflight = self.preflight_pipeline(ast)?;
+        let prepared = self.prepare_pipeline(preflight).await?;
+        Ok(Some(prepared.commit(self, background).await?))
+    }
+}
+
+impl PreparedPipeline {
+    /// Atomically publish all prepared stage tasks. This method performs no
+    /// name resolution, manifest validation, expansion, or runner preflight.
+    pub async fn commit(
+        self,
+        session: &mut Session,
+        background: bool,
+    ) -> Result<JobReport, Diagnostic> {
+        let Self {
+            owner,
+            id,
+            admission,
+            pipes,
+            stages,
+        } = self;
+        if !Arc::ptr_eq(&owner, &session.cspace) {
+            return Err(Diagnostic::new(
+                0,
+                0,
+                "prepared pipeline belongs to another session",
+            ));
         }
         let job = JobControl {
             live: Arc::new(AtomicBool::new(true)),
             pipes: pipes.clone(),
         };
-        let mut running: Vec<RunningStage> = Vec::new();
+        if heap::current_domain().arena.is_tracked() {
+            // Existing kernel VSH/SSH supervisors run in audited raw-reclaim
+            // arenas. Ordinary child commands inherit that exact domain and
+            // are hart-pinned: while this parent is polling, sequential spawn
+            // cannot run a child, and any intervening allocation fault causes
+            // the established whole-domain teardown to detach every sibling.
+            //
+            // WASM Component children require the separate C4.8 generational
+            // instance registry and CSpace identity gate. Until that lifecycle
+            // is installed, keep this production path explicitly closed.
+            if stages.iter().any(|stage| stage.is_component) {
+                return Err(Diagnostic::new(
+                    0,
+                    0,
+                    "component lifecycle registry is not installed",
+                ));
+            }
+            return commit_tracked_pipeline(session, id, admission, pipes, stages, job, background)
+                .await;
+        }
+        let mut prepared_running = Vec::new();
+        prepared_running
+            .try_reserve_exact(stages.len())
+            .map_err(|_| Diagnostic::new(0, 0, "stage publication allocation failed"))?;
+        let mut task_batch = exec::PreparedTaskBatch::new();
+        let mut stage_reports = Vec::new();
+        stage_reports
+            .try_reserve_exact(stages.len())
+            .map_err(|_| Diagnostic::new(0, 0, "stage report allocation failed"))?;
+        let auxiliary_tasks =
+            usize::from(!background && session.external_cancel.is_some()) + usize::from(background);
+        task_batch
+            .try_reserve(stages.len().saturating_add(auxiliary_tasks))
+            .map_err(|_| Diagnostic::new(0, 0, "stage publication allocation failed"))?;
         for stage in stages {
             let result = stage.result.clone();
             let cspace = stage.cspace.clone();
+            let flavor = if stage.is_component {
+                StageFlavor::Component
+            } else {
+                StageFlavor::Command
+            };
             let control = job.clone();
-            let handle = exec::spawn_tracked("vsh-stage", async move {
-                let status = run_stage(&stage, &control).await;
-                *stage.result.lock() = Some(status);
-                close_stage_outputs(&stage, status);
-                if severe(status) {
-                    control.fail(status);
+            task_batch.prepare("vsh-stage", async move {
+                let exit = run_stage(&stage, &control).await;
+                *stage.result.lock() = Some(exit.clone());
+                close_stage_outputs(&stage, exit.status);
+                if severe(exit.status) {
+                    control.fail(exit.status);
                 }
             });
-            running.push((handle, result, cspace));
+            prepared_running.push((result, cspace, flavor));
         }
-        if let Some(cap) = self.revoke_next_job.take() {
-            let _ = self.cspace.lock().revoke(cap);
+        let stage_count = prepared_running.len();
+        let mut running: Vec<RunningStage> = Vec::new();
+        running
+            .try_reserve_exact(stage_count)
+            .map_err(|_| Diagnostic::new(0, 0, "stage publication allocation failed"))?;
+        for (handle, (result, cspace, flavor)) in task_batch
+            .prepared_handles()
+            .iter()
+            .take(stage_count)
+            .cloned()
+            .zip(prepared_running)
+        {
+            running.push((handle, result, cspace, flavor));
         }
-        if core::mem::take(&mut self.cancel_next_job) {
+
+        // Parent revocation and injected cancellation are committed before a
+        // stage can become runnable. Every stage checks `job.live` on its first
+        // poll, so cancellation needs no post-publication handle walk.
+        if let Some(cap) = session.revoke_next_job.take() {
+            let _ = session.cspace.lock().revoke(cap);
+        }
+        if core::mem::take(&mut session.cancel_next_job) {
             job.fail(Status::Cancelled);
-            for (handle, _, _) in &running {
-                let _ = handle.cancel();
+            for (handle, _, _, _) in &running {
+                // Pre-publication cancellation is intentionally inert at the
+                // executor layer; `job.live` is the first-poll cancellation
+                // gate that preserves the stage's typed Component identity.
+                debug_assert_eq!(handle.cancel(), exec::CancelOutcome::NotPublished);
             }
         }
-        if let Some(cancel) = self.external_cancel.clone() {
+
+        // Background Jobs have their own cancellation domain. A Ctrl-C token
+        // belongs only to the foreground request that is currently awaiting.
+        if !background {
+            if let Some(cancel) = session.external_cancel.clone() {
+                let control = job.clone();
+                let handles: Vec<_> = running
+                    .iter()
+                    .map(|(handle, _, _, _)| handle.clone())
+                    .collect();
+                task_batch.prepare("vsh-ctrl-c", async move {
+                    while control.live.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                        exec::yield_now().await;
+                    }
+                    if cancel.load(Ordering::Acquire) {
+                        control.fail(Status::Cancelled);
+                        for handle in &handles {
+                            let _ = handle.cancel();
+                        }
+                    }
+                });
+            }
+        }
+
+        if background {
+            let mut acknowledgement = String::new();
+            use core::fmt::Write as _;
+            write!(&mut acknowledgement, "[%{id}]\n")
+                .map_err(|_| Diagnostic::new(0, 0, "job acknowledgement allocation failed"))?;
+            let admitted_report = JobReport {
+                id,
+                status: Status::Success,
+                stages: Vec::new(),
+                output: acknowledgement,
+                peak_pipe_depth: 0,
+            };
+            let report = Arc::new(SpinLock::new(None));
+            let report_task = report.clone();
+            let handles = running
+                .iter()
+                .map(|(handle, _, _, _)| handle.clone())
+                .collect();
+            let control = job.clone();
+            let console = session.console.clone();
+            task_batch.prepare("vsh-job-supervisor", async move {
+                *report_task.lock() = Some(
+                    finish_job(id, running, admission, job, pipes, console, stage_reports).await,
+                );
+            });
+            let supervisor = task_batch
+                .prepared_handles()
+                .get(stage_count)
+                .expect("the background supervisor was prepared")
+                .clone();
+            let replaced = session.jobs.insert(
+                id,
+                BackgroundJob {
+                    supervisor,
+                    stages: handles,
+                    control,
+                    report,
+                },
+            );
+            assert!(replaced.is_none(), "fresh background Job id collided");
+            if let Err(error) = task_batch.publish() {
+                session.jobs.remove(&id);
+                return Err(Diagnostic::new(
+                    0,
+                    0,
+                    match error {
+                        exec::PreparedTaskBatchError::Empty => "empty stage publication batch",
+                        exec::PreparedTaskBatchError::AlreadyPublished => {
+                            "stage publication repeated"
+                        }
+                        exec::PreparedTaskBatchError::Capacity => {
+                            "stage publication capacity failed"
+                        }
+                    },
+                ));
+            }
+            return Ok(admitted_report);
+        }
+
+        // Foreground stages and the optional Ctrl-C watcher become runnable in
+        // one executor transaction. No allocation or authority mutation occurs
+        // after this point before we start awaiting the already-owned handles.
+        task_batch
+            .publish()
+            .map_err(|_| Diagnostic::new(0, 0, "stage publication failed"))?;
+        Ok(finish_job(
+            id,
+            running,
+            admission,
+            job,
+            pipes,
+            session.console.clone(),
+            stage_reports,
+        )
+        .await)
+    }
+}
+
+/// Commit the existing kernel's tracked-arena builtin-command path without
+/// exporting any child state outside that arena. Children are non-stealable
+/// and inherit the parent's exact domain, so none can run until this parent
+/// yields after all control state and background registration are complete.
+/// A fault at any intermediate allocation invokes the executor's established
+/// whole-domain sibling teardown rather than returning a partial commit.
+async fn commit_tracked_pipeline(
+    session: &mut Session,
+    id: u64,
+    admission: CSpace,
+    pipes: Vec<Arc<ByteStream>>,
+    stages: Vec<PreparedStage>,
+    job: JobControl,
+    background: bool,
+) -> Result<JobReport, Diagnostic> {
+    debug_assert!(heap::current_domain().arena.is_tracked());
+    debug_assert!(stages.iter().all(|stage| !stage.is_component));
+
+    let mut running: Vec<RunningStage> = Vec::new();
+    running
+        .try_reserve_exact(stages.len())
+        .map_err(|_| Diagnostic::new(0, 0, "stage publication allocation failed"))?;
+    let mut stage_reports = Vec::new();
+    stage_reports
+        .try_reserve_exact(stages.len())
+        .map_err(|_| Diagnostic::new(0, 0, "stage report allocation failed"))?;
+
+    if let Some(cap) = session.revoke_next_job.take() {
+        let _ = session.cspace.lock().revoke(cap);
+    }
+    if core::mem::take(&mut session.cancel_next_job) {
+        job.fail(Status::Cancelled);
+    }
+
+    for stage in stages {
+        let result = stage.result.clone();
+        let cspace = stage.cspace.clone();
+        let control = job.clone();
+        let handle = exec::spawn_tracked("vsh-stage", async move {
+            let exit = run_stage(&stage, &control).await;
+            *stage.result.lock() = Some(exit.clone());
+            close_stage_outputs(&stage, exit.status);
+            if severe(exit.status) {
+                control.fail(exit.status);
+            }
+        });
+        running.push((handle, result, cspace, StageFlavor::Command));
+    }
+
+    if !background {
+        if let Some(cancel) = session.external_cancel.clone() {
             let control = job.clone();
             let handles: Vec<_> = running
                 .iter()
-                .map(|(handle, _, _)| handle.clone())
+                .map(|(handle, _, _, _)| handle.clone())
                 .collect();
-            exec::spawn("vsh-ctrl-c", async move {
+            exec::spawn_tracked("vsh-ctrl-c", async move {
                 while control.live.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
                     exec::yield_now().await;
                 }
@@ -2678,40 +4201,55 @@ impl Session {
                 }
             });
         }
-        if background {
-            let report = Arc::new(SpinLock::new(None));
-            let report_task = report.clone();
-            let handles = running
-                .iter()
-                .map(|(handle, _, _)| handle.clone())
-                .collect();
-            let control = job.clone();
-            let console = self.console.clone();
-            let supervisor = exec::spawn_tracked("vsh-job-supervisor", async move {
-                *report_task.lock() =
-                    Some(finish_job(id, running, admission, job, pipes, console).await);
-            });
-            self.jobs.insert(
-                id,
-                BackgroundJob {
-                    supervisor,
-                    stages: handles,
-                    control,
-                    report,
-                },
-            );
-            return Ok(Some(JobReport {
-                id,
-                status: Status::Success,
-                stages: Vec::new(),
-                output: format!("[%{id}]\n"),
-                peak_pipe_depth: 0,
-            }));
-        }
-        Ok(Some(
-            finish_job(id, running, admission, job, pipes, self.console.clone()).await,
-        ))
     }
+
+    if background {
+        let mut acknowledgement = String::new();
+        use core::fmt::Write as _;
+        write!(&mut acknowledgement, "[%{id}]\n")
+            .map_err(|_| Diagnostic::new(0, 0, "job acknowledgement allocation failed"))?;
+        let admitted_report = JobReport {
+            id,
+            status: Status::Success,
+            stages: Vec::new(),
+            output: acknowledgement,
+            peak_pipe_depth: 0,
+        };
+        let report = Arc::new(SpinLock::new(None));
+        let report_task = report.clone();
+        let handles = running
+            .iter()
+            .map(|(handle, _, _, _)| handle.clone())
+            .collect();
+        let control = job.clone();
+        let console = session.console.clone();
+        let supervisor = exec::spawn_tracked("vsh-job-supervisor", async move {
+            *report_task.lock() =
+                Some(finish_job(id, running, admission, job, pipes, console, stage_reports).await);
+        });
+        let replaced = session.jobs.insert(
+            id,
+            BackgroundJob {
+                supervisor,
+                stages: handles,
+                control,
+                report,
+            },
+        );
+        assert!(replaced.is_none(), "fresh background Job id collided");
+        return Ok(admitted_report);
+    }
+
+    Ok(finish_job(
+        id,
+        running,
+        admission,
+        job,
+        pipes,
+        session.console.clone(),
+        stage_reports,
+    )
+    .await)
 }
 
 fn literal_word(word: &Word) -> Option<&str> {
@@ -2905,23 +4443,48 @@ async fn finish_job(
     job: JobControl,
     pipes: Vec<Arc<ByteStream>>,
     console: Arc<OutputSink>,
+    mut stage_reports: Vec<StageReport>,
 ) -> JobReport {
-    let mut stage_reports = Vec::new();
-    for (handle, result, cspace) in &running {
+    for (stage_index, (handle, result, cspace, flavor)) in running.iter().enumerate() {
         let exit = handle.join().await;
-        let status = if exit.state() == TaskState::Faulted {
-            Status::Faulted
+        let stage_exit = if exit.state() == TaskState::Faulted {
+            StageExit {
+                status: Status::Faulted,
+                detail: match flavor {
+                    StageFlavor::Command => TerminalDetail::Command(Status::Faulted),
+                    StageFlavor::Component => {
+                        TerminalDetail::Component(ComponentTerminal::RunnerFault)
+                    }
+                },
+            }
         } else if exit.state() == TaskState::Cancelled {
-            Status::Cancelled
+            StageExit {
+                status: Status::Cancelled,
+                detail: match flavor {
+                    StageFlavor::Command => TerminalDetail::Command(Status::Cancelled),
+                    StageFlavor::Component => {
+                        TerminalDetail::Component(ComponentTerminal::Cancelled)
+                    }
+                },
+            }
         } else {
-            (*result.lock()).unwrap_or(Status::Faulted)
+            result.lock().clone().unwrap_or(StageExit {
+                status: Status::Faulted,
+                detail: match flavor {
+                    StageFlavor::Command => TerminalDetail::Command(Status::Faulted),
+                    StageFlavor::Component => {
+                        TerminalDetail::Component(ComponentTerminal::RunnerFault)
+                    }
+                },
+            })
         };
         stage_reports.push(StageReport {
-            task: handle.id(),
-            status,
+            stage: stage_index,
+            status: stage_exit.status,
+            detail: stage_exit.detail,
         });
-        if severe(status) {
-            job.fail(status);
+        if severe(stage_exit.status) {
+            job.fail(stage_exit.status);
         }
         cspace.lock().revoke_all();
     }
@@ -2940,18 +4503,104 @@ fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     b.first().copied().is_some_and(is_name_start) && b[1..].iter().copied().all(is_name_continue)
 }
+
+fn valid_component_manifest_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn try_component_string(value: &str) -> Result<String, Diagnostic> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| Diagnostic::new(0, 0, "component manifest allocation failed"))?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn is_observability_command(name: &str) -> bool {
+    matches!(name, "ps" | "caps" | "mem")
+}
+
+/// Fail closed when an observability adapter attempts to serialize an opaque
+/// capability/resource identity or an address. Numeric counters and budgets
+/// remain valid; the forbidden prefixes are the stable renderings used by the
+/// kernel's opaque identity types.
+pub fn validate_observability_output(output: &str) -> Result<(), Status> {
+    const FORBIDDEN: &[&str] = &[
+        "cap:",
+        "component:",
+        "task:",
+        "cspace:",
+        "slot:",
+        "generation:",
+        "object-id:",
+        "object_id:",
+        "pointer:",
+        "address:",
+        "0x",
+    ];
+    let lower = output.to_ascii_lowercase();
+    if FORBIDDEN.iter().any(|marker| lower.contains(marker)) {
+        Err(Status::BackendFault)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_command_manifest(
+    resolved_name: &str,
+    manifest: &CommandManifest,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    if manifest.abi == 0
+        || manifest.name != resolved_name
+        || manifest.min_args > manifest.max_args
+        || manifest.max_args > MAX_ARGS
+        || manifest.memory_bytes == 0
+        || manifest.memory_bytes > MAX_STAGE_MEMORY
+        || manifest.operation_budget == 0
+    {
+        return Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "invalid command manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn component_preflight_diagnostic(span: Span, terminal: ComponentTerminal) -> Diagnostic {
+    let message = match terminal {
+        ComponentTerminal::Denied => "component runner preflight denied",
+        ComponentTerminal::Unavailable => "component runner is unavailable",
+        ComponentTerminal::BackendFault => "component runner backend fault",
+        ComponentTerminal::BudgetExceeded => "component runner budget rejected",
+        ComponentTerminal::Cancelled => "component runner preflight cancelled",
+        ComponentTerminal::RunnerFault => "component runner preflight faulted",
+        ComponentTerminal::Trapped(_) => "component runner preflight trapped",
+        ComponentTerminal::Returned(_) => "component runner preflight returned failure",
+        ComponentTerminal::Success => "component runner preflight returned invalid success",
+    };
+    Diagnostic::new(span.start, span.end, message)
+}
+
 fn severe(status: Status) -> bool {
     matches!(
         status,
-        Status::Faulted | Status::BudgetExceeded | Status::Denied | Status::Cancelled
+        Status::Faulted
+            | Status::BackendFault
+            | Status::BudgetExceeded
+            | Status::Denied
+            | Status::Cancelled
     )
 }
 fn rank(status: Status) -> u8 {
     match status {
         Status::Faulted => 5,
-        Status::BudgetExceeded => 4,
-        Status::Denied => 3,
-        Status::Cancelled => 2,
+        Status::BackendFault => 4,
+        Status::BudgetExceeded => 3,
+        Status::Denied => 2,
+        Status::Cancelled => 1,
         Status::Success => 0,
         _ => 1,
     }
@@ -2969,19 +4618,25 @@ fn aggregate(stages: &[StageReport]) -> Status {
     winner
 }
 
-async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
+async fn run_stage(stage: &PreparedStage, job: &JobControl) -> StageExit {
     let command = match stage
         .cspace
         .lock()
         .lookup_as::<Command>(stage.command, Rights::INVOKE)
     {
         Ok(c) => c,
-        Err(_) => return Status::Denied,
+        Err(_) => return command_exit(Status::Denied),
     };
     if !job.live.load(Ordering::Acquire) {
-        return Status::Cancelled;
+        return match &command.applet {
+            Applet::Component { .. } => StageExit {
+                status: Status::Cancelled,
+                detail: TerminalDetail::Component(ComponentTerminal::Cancelled),
+            },
+            _ => command_exit(Status::Cancelled),
+        };
     }
-    match command.applet {
+    let status = match &command.applet {
         Applet::Echo => {
             let mut bytes = stage.args.join(" ").into_bytes();
             bytes.push(b'\n');
@@ -2996,7 +4651,7 @@ async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
                 let chunk = match read_chunk(&stage.cspace, &stage.stdin).await {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
-                    Err(s) => return s,
+                    Err(status) => return command_exit(status),
                 };
                 bytes += chunk.len();
                 for b in chunk {
@@ -3028,16 +4683,127 @@ async fn run_stage(stage: &PlannedStage, job: &JobControl) -> Status {
             }
             Status::Cancelled
         }
-        Applet::Host(command) => match command(&stage.args) {
+        Applet::Host {
+            command,
+            observability,
+        } => match command(&stage.args) {
+            Ok(output) if *observability && validate_observability_output(&output).is_err() => {
+                Status::BackendFault
+            }
             Ok(output) if output.is_empty() => Status::Success,
             Ok(output) => write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await,
             Err(status) => status,
         },
-        Applet::AsyncHost(command) => match command(stage.args.clone()).await {
+        Applet::AsyncHost {
+            command,
+            observability,
+        } => match command(stage.args.clone()).await {
+            Ok(output) if *observability && validate_observability_output(&output).is_err() => {
+                Status::BackendFault
+            }
             Ok(output) if output.is_empty() => Status::Success,
             Ok(output) => write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await,
             Err(status) => status,
         },
+        Applet::Component { manifest, runner } => {
+            return run_component_stage(stage, job, manifest.clone(), runner.clone()).await;
+        }
+    };
+    command_exit(status)
+}
+
+const fn command_exit(status: Status) -> StageExit {
+    StageExit {
+        status,
+        detail: TerminalDetail::Command(status),
+    }
+}
+
+async fn run_component_stage(
+    stage: &PreparedStage,
+    job: &JobControl,
+    manifest: Arc<ComponentCommandManifest>,
+    runner: Arc<dyn ComponentCommandRunner>,
+) -> StageExit {
+    if runner.manifest() != manifest.as_ref() {
+        return StageExit {
+            status: Status::BackendFault,
+            detail: TerminalDetail::Component(ComponentTerminal::BackendFault),
+        };
+    }
+    let input = match collect_component_input(&stage.cspace, &stage.stdin, job).await {
+        Ok(input) => input,
+        Err(status) => return command_exit(status),
+    };
+    if !job.live.load(Ordering::Acquire) {
+        return StageExit {
+            status: Status::Cancelled,
+            detail: TerminalDetail::Component(ComponentTerminal::Cancelled),
+        };
+    }
+    let prepared = PreparedComponentStage {
+        manifest,
+        arguments: stage.args.clone(),
+        input,
+        cspace: stage.cspace.clone(),
+        authorities: stage.component_authorities.clone(),
+        cancellation: ComponentCancellation {
+            live: job.live.clone(),
+        },
+    };
+    let result = runner.run(prepared).await;
+    let (mut terminal, output) = result.into_parts();
+    if output.len() > MAX_CAPTURED_OUTPUT {
+        terminal = ComponentTerminal::BudgetExceeded;
+    } else if matches!(
+        terminal,
+        ComponentTerminal::Success | ComponentTerminal::Returned(_)
+    ) && !output.is_empty()
+    {
+        let write = write_all(&stage.cspace, &stage.stdout, output, job).await;
+        if write != Status::Success {
+            terminal = match write {
+                Status::Denied => ComponentTerminal::Denied,
+                Status::Unavailable => ComponentTerminal::Unavailable,
+                Status::BackendFault => ComponentTerminal::BackendFault,
+                Status::BudgetExceeded => ComponentTerminal::BudgetExceeded,
+                Status::Cancelled => ComponentTerminal::Cancelled,
+                _ => ComponentTerminal::RunnerFault,
+            };
+        }
+    }
+    StageExit {
+        status: terminal.status(),
+        detail: TerminalDetail::Component(terminal),
+    }
+}
+
+async fn collect_component_input(
+    space: &Arc<SpinLock<CSpace>>,
+    io: &LocalIo,
+    job: &JobControl,
+) -> Result<Vec<u8>, Status> {
+    let mut input = Vec::new();
+    loop {
+        match read_chunk(space, io).await? {
+            Some(chunk) => {
+                let next = input
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(Status::BudgetExceeded)?;
+                if next > MAX_CAPTURED_OUTPUT {
+                    return Err(Status::BudgetExceeded);
+                }
+                input
+                    .try_reserve_exact(chunk.len())
+                    .map_err(|_| Status::BudgetExceeded)?;
+                input.extend_from_slice(&chunk);
+            }
+            None => return Ok(input),
+        }
+        if !job.live.load(Ordering::Acquire) {
+            return Err(Status::Cancelled);
+        }
     }
 }
 
@@ -3105,7 +4871,7 @@ async fn write_all(
     }
 }
 
-fn close_stage_outputs(stage: &PlannedStage, status: Status) {
+fn close_stage_outputs(stage: &PreparedStage, status: Status) {
     let reason = if status == Status::Success {
         CloseReason::Normal
     } else if status == Status::Cancelled {

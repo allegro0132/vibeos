@@ -824,14 +824,34 @@ fn host_import_error() -> AdmissionError {
 }
 
 pub fn profile_store_limits(instances: usize) -> StoreLimits {
-    StoreLimitsBuilder::new()
-        .memory_size(PROFILE_1_LIMITS.max_memory_pages as usize * 65_536)
+    profile_store_limits_with_memory(
+        instances,
+        PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+    )
+    .expect("the static Profile-1 memory ceiling is valid")
+}
+
+/// Builds the Profile-1 store limiter with an image-selected per-memory
+/// ceiling. The caller may tighten the profile limit, but can never widen it
+/// or disable it with zero. This is an execution limit enforced by wasmi on
+/// both instantiation and `memory.grow`; it is independent of compile-time
+/// allocation reservation accounting.
+pub fn profile_store_limits_with_memory(
+    instances: usize,
+    memory_bytes: usize,
+) -> Result<StoreLimits, AdmissionError> {
+    let profile_memory_bytes = PROFILE_1_LIMITS.max_memory_pages as usize * 65_536;
+    if memory_bytes == 0 || memory_bytes > profile_memory_bytes {
+        return Err(AdmissionError::limit(LimitKind::MemoryPages));
+    }
+    Ok(StoreLimitsBuilder::new()
+        .memory_size(memory_bytes)
         .table_elements(PROFILE_1_LIMITS.max_table_elements as usize)
         .instances(instances)
         .tables((PROFILE_1_LIMITS.max_tables as usize).saturating_mul(instances))
         .memories((PROFILE_1_LIMITS.max_memories as usize).saturating_mul(instances))
         .trap_on_grow_failure(true)
-        .build()
+        .build())
 }
 
 #[derive(Debug)]
@@ -1178,6 +1198,21 @@ pub struct CoreCallReservation {
 
 impl CoreComponentGroup {
     pub fn new(engine: &ProfileEngine, instance_limit: usize) -> Result<Self, AdmissionError> {
+        Self::new_with_memory_limit(
+            engine,
+            instance_limit,
+            PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+        )
+    }
+
+    /// Creates a Component group whose Core memories are constrained by the
+    /// exact image/session policy ceiling. The same limiter remains attached
+    /// to the shared store for the group's full lifetime.
+    pub fn new_with_memory_limit(
+        engine: &ProfileEngine,
+        instance_limit: usize,
+        memory_bytes: usize,
+    ) -> Result<Self, AdmissionError> {
         if instance_limit > PROFILE_1_LIMITS.max_component_instances as usize {
             return Err(AdmissionError::limit(LimitKind::ComponentInstances));
         }
@@ -1188,7 +1223,7 @@ impl CoreComponentGroup {
         let mut store = Store::new(
             &engine.inner,
             HostState {
-                limits: profile_store_limits(instance_limit.max(1)),
+                limits: profile_store_limits_with_memory(instance_limit.max(1), memory_bytes)?,
                 pending_host: None,
             },
         );

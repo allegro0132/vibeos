@@ -15,3 +15,9 @@ vibeos-random = { path = "../../random" }
 vibeos-ssh-identity = { path = "../../services/ssh-identity" }
 vibeos-vsh = { path = "../vsh", default-features = false }
 sunset = { path = "../../vendor/sunset", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+vibeos-component-admission = { path = "../../services/component-admission" }
+vibeos-component-command = { path = "../../services/component-command" }
+vibeos-component-runtime = { path = "../../component-runtime" }
+vibeos-image-policy = { path = "../../policy/image" }

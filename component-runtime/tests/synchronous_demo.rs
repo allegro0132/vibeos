@@ -73,6 +73,7 @@ fn drive(call: &mut TypedCall<'_, u32>) -> (CanonicalValue, usize) {
                 previous = metrics;
             }
             TypedPoll::Ready(value) => return (value, pending),
+            TypedPoll::HostFailed(error) => panic!("unexpected host failure: {error:?}"),
             TypedPoll::Trapped(trap) => panic!("unexpected typed-call trap: {trap:?}"),
         }
     }
@@ -384,6 +385,7 @@ fn overlapping_realloc_result_traps_and_permanently_poisons() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Trapped(trap) => break trap,
+            TypedPoll::HostFailed(error) => panic!("hostile allocator host failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("hostile allocator returned {value:?}"),
         }
     };
@@ -430,6 +432,9 @@ fn post_return_trap_is_observed_and_permanently_poisons() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Trapped(trap) => break trap,
+            TypedPoll::HostFailed(error) => {
+                panic!("hostile post-return host failed: {error:?}")
+            }
             TypedPoll::Ready(value) => panic!("hostile post-return returned {value:?}"),
         }
     };
@@ -477,6 +482,7 @@ fn argument_free_trap_after_post_return_permanently_poisons() {
         match call.poll() {
             TypedPoll::Pending(_) => {}
             TypedPoll::Trapped(trap) => break trap,
+            TypedPoll::HostFailed(error) => panic!("hostile free host failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("hostile free returned {value:?}"),
         }
     };

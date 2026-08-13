@@ -184,7 +184,7 @@ impl<'call, A> HostRequest<'call, A> {
 /// This trait is object-safe so one component call can borrow a dispatcher
 /// across bounded Core polls without storing platform-specific types in the
 /// portable runtime.
-pub trait HostDispatcher<A> {
+pub trait HostDispatcher<A>: Send {
     /// Returns the deterministic charge for this exact validated shape before
     /// any authority lookup or backend side effect is permitted.
     ///

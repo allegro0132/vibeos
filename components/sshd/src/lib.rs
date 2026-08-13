@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt;
 use core::future::Future;
+use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
@@ -258,6 +259,30 @@ pub trait Platform: Sync {
         false
     }
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool);
+    /// Explicit per-connection hook for image-policy-pinned Component commands
+    /// admitted to the restricted SSH exec profile. The default installs
+    /// nothing; it is never called for onboarding credentials or interactive
+    /// PTY sessions. An implementation must re-read its policy atomically and
+    /// match this complete captured descriptor immediately before installing
+    /// anything; the runner pin alone is not authentication authority. A
+    /// rotation between the protocol's check and this hook must fail closed.
+    fn install_ssh_exec_component_commands(
+        &self,
+        _session: &mut vibeos_vsh::Session,
+        _policy: SshExecComponentSessionPolicy,
+    ) -> Result<(), vibeos_vsh::Diagnostic> {
+        Ok(())
+    }
+    /// Return the exact image/session-policy Component descriptor admitted for
+    /// this already committed profile. The default exposes nothing. The
+    /// protocol copies it into the accepted exec request, then compares all
+    /// fields again before invoking the independent installation hook.
+    fn ssh_exec_component_policy(
+        &self,
+        _profile: AuthorizedProfile,
+    ) -> Option<SshExecComponentSessionPolicy> {
+        None
+    }
     #[cfg(feature = "qualification-stream")]
     fn accepts_streaming_exec(&self, _command: &str) -> bool {
         false
@@ -270,6 +295,66 @@ pub trait Platform: Sync {
 }
 
 type Space = dyn Platform;
+
+/// One image-selected Component command bound to an exact authorized SSH
+/// profile incarnation. Both exec-request acknowledgement and session-local
+/// installation consume this same descriptor so the two gates cannot select
+/// different names, artifacts, profile generations, or policy incarnations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SshExecComponentSessionPolicy {
+    profile: AuthorizedProfile,
+    incarnation: NonZeroU64,
+    command_name: &'static str,
+    artifact_sha256: [u8; 32],
+}
+
+impl SshExecComponentSessionPolicy {
+    pub const fn new(
+        profile: AuthorizedProfile,
+        incarnation: NonZeroU64,
+        command_name: &'static str,
+        artifact_sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            profile,
+            incarnation,
+            command_name,
+            artifact_sha256,
+        }
+    }
+
+    pub const fn profile(self) -> AuthorizedProfile {
+        self.profile
+    }
+
+    pub const fn command_name(self) -> &'static str {
+        self.command_name
+    }
+
+    pub const fn incarnation(self) -> NonZeroU64 {
+        self.incarnation
+    }
+
+    pub const fn artifact_sha256(self) -> [u8; 32] {
+        self.artifact_sha256
+    }
+
+    fn matches(self, profile: AuthorizedProfile) -> bool {
+        self.profile == profile
+    }
+}
+
+impl fmt::Debug for SshExecComponentSessionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SshExecComponentSessionPolicy")
+            .field("profile", &self.profile)
+            .field("incarnation", &self.incarnation)
+            .field("command_name", &self.command_name)
+            .field("artifact_sha256", &"<redacted>")
+            .finish()
+    }
+}
 
 macro_rules! component_log {
     ($platform:expr, $($arg:tt)*) => {
@@ -409,14 +494,14 @@ struct ProtocolState {
 enum ProtocolSignal {
     Idle,
     Progressed,
-    Exec(String),
+    Exec(String, Option<SshExecComponentSessionPolicy>),
     Shell,
     Interrupt,
     Defunct,
 }
 
 enum SessionStart {
-    Exec(String),
+    Exec(String, Option<SshExecComponentSessionPolicy>),
     Shell,
 }
 
@@ -512,7 +597,7 @@ struct CapabilityTcpTransport<'a> {
 
 impl<'a> CapabilityTcpTransport<'a> {
     fn new(space: &'a Space, listener: Cap, ipv4_status: Ipv4RuntimeStatus) -> Result<Self, ()> {
-        let snapshot = space.tcp_listener_snapshot(listener).ok_or(())?;
+        let _snapshot = space.tcp_listener_snapshot(listener).ok_or(())?;
         Ok(Self {
             space,
             listener,
@@ -1430,11 +1515,13 @@ async fn serve_connection(
             Err(reason) => return reset_connection(stack, reason),
         };
         match signal {
-            ProtocolSignal::Exec(command) => break SessionStart::Exec(command),
+            ProtocolSignal::Exec(command, component) => {
+                break SessionStart::Exec(command, component);
+            }
             ProtocolSignal::Shell => break SessionStart::Shell,
             ProtocolSignal::Interrupt => pending_input.signal_interrupt = true,
             ProtocolSignal::Defunct => {
-                return ConnectionEnd::Reset("SSH peer disconnected before session start")
+                return ConnectionEnd::Reset("SSH peer disconnected before session start");
             }
             ProtocolSignal::Idle | ProtocolSignal::Progressed => {}
         }
@@ -1464,9 +1551,13 @@ async fn serve_connection(
     };
 
     match start {
-        SessionStart::Exec(command) => {
+        SessionStart::Exec(command, accepted_component) => {
             #[cfg(feature = "qualification-stream")]
-            if let Some(opened) = space.open_streaming_exec(&command) {
+            if let Some(opened) = accepted_component
+                .is_none()
+                .then(|| space.open_streaming_exec(&command))
+                .flatten()
+            {
                 let status = match opened {
                     Ok(stream) => match execute_stream_with_network(
                         stream,
@@ -1485,7 +1576,7 @@ async fn serve_connection(
                     {
                         Ok(status) => status,
                         Err(ConnectionEnd::Reset(reason)) => {
-                            return reset_connection(stack, reason)
+                            return reset_connection(stack, reason);
                         }
                         Err(other) => return other,
                     },
@@ -1524,6 +1615,7 @@ async fn serve_connection(
                 &mut bridge,
                 &mut protocol,
                 require_carrier,
+                accepted_component,
             )
             .await;
             let (reports, timed_out) = match execution {
@@ -1806,25 +1898,34 @@ fn progress_protocol(
                             .command()
                             .map_err(|_| "exec command was not valid UTF-8")?
                             .to_string();
-                        if vibeos_vsh::validate_ssh_exec(&value).is_ok() || {
-                            #[cfg(feature = "qualification-stream")]
-                            {
-                                space.accepts_streaming_exec(&value)
+                        let accepted_component = accepted_ssh_component_policy(
+                            space,
+                            candidate.profile,
+                            matches!(candidate.credential, AuthCredential::PublicKey(_)),
+                            &value,
+                        );
+                        if vibeos_vsh::validate_ssh_exec(&value).is_ok()
+                            || accepted_component.is_some()
+                            || {
+                                #[cfg(feature = "qualification-stream")]
+                                {
+                                    space.accepts_streaming_exec(&value)
+                                }
+                                #[cfg(not(feature = "qualification-stream"))]
+                                {
+                                    false
+                                }
                             }
-                            #[cfg(not(feature = "qualification-stream"))]
-                            {
-                                false
-                            }
-                        } {
-                            command = Some(value);
+                        {
+                            command = Some((value, accepted_component));
                         }
                     }
                 }
-                if let Some(command) = command {
+                if let Some((command, accepted_component)) = command {
                     event
                         .succeed()
                         .map_err(|_| "exec acceptance response failed")?;
-                    return Ok(ProtocolSignal::Exec(command));
+                    return Ok(ProtocolSignal::Exec(command, accepted_component));
                 }
                 event.fail().map_err(|_| "exec rejection failed")?;
                 progressed = true;
@@ -1968,6 +2069,24 @@ fn revalidate_candidate(
     }
 }
 
+fn accepted_ssh_component_policy(
+    space: &Space,
+    profile: AuthorizedProfile,
+    public_key_credential: bool,
+    source: &str,
+) -> Option<SshExecComponentSessionPolicy> {
+    if !public_key_credential {
+        return None;
+    }
+    space
+        .ssh_exec_component_policy(profile)
+        .filter(|policy| policy.matches(profile))
+        .filter(|policy| {
+            vibeos_vsh::validate_ssh_exec_with_component_name(source, policy.command_name())
+                == Ok(true)
+        })
+}
+
 fn discard_channel_input(
     runner: &mut Runner<'_, Server>,
     state: &ProtocolState,
@@ -2097,7 +2216,7 @@ fn drive_shell_turn(
         ProtocolSignal::Defunct => {
             return Err(ConnectionEnd::Reset("SSH shell became defunct"));
         }
-        ProtocolSignal::Exec(_) | ProtocolSignal::Shell => {
+        ProtocolSignal::Exec(_, _) | ProtocolSignal::Shell => {
             return Err(ConnectionEnd::Reset(
                 "duplicate SSH session start was accepted",
             ));
@@ -2371,7 +2490,7 @@ async fn execute_shell_command(
                 ));
                 continue;
             }
-            ProtocolSignal::Exec(_) | ProtocolSignal::Shell => {
+            ProtocolSignal::Exec(_, _) | ProtocolSignal::Shell => {
                 cancel.store(true, Ordering::Release);
                 cancellation = Some((
                     ExecutionCancellation::Reset("duplicate SSH session start during command"),
@@ -2795,6 +2914,7 @@ async fn execute_with_network(
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
     require_carrier: bool,
+    accepted_component: Option<SshExecComponentSessionPolicy>,
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
@@ -2803,6 +2923,27 @@ async fn execute_with_network(
         Some(AuthCredential::OnboardingPassword)
     );
     space.install_vsh_commands(&mut session, onboarding);
+    let Some(profile) = protocol.committed.map(|candidate| candidate.profile) else {
+        return ExecutionEnd::Reset("SSH exec session has no committed profile");
+    };
+    if let Err(error) = install_accepted_ssh_component(
+        space,
+        &mut session,
+        profile,
+        onboarding,
+        command,
+        accepted_component,
+    ) {
+        return match error {
+            AcceptedComponentInstallError::PolicyChanged => {
+                ExecutionEnd::Reset("SSH Component policy changed after exec acceptance")
+            }
+            AcceptedComponentInstallError::Install(error) => ExecutionEnd::Complete {
+                reports: Err(error),
+                timed_out: false,
+            },
+        };
+    }
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
@@ -2910,6 +3051,37 @@ async fn execute_with_network(
     outcome
 }
 
+#[derive(Debug)]
+enum AcceptedComponentInstallError {
+    PolicyChanged,
+    Install(vibeos_vsh::Diagnostic),
+}
+
+fn install_accepted_ssh_component(
+    space: &Space,
+    session: &mut vibeos_vsh::Session,
+    profile: AuthorizedProfile,
+    onboarding: bool,
+    command: &str,
+    accepted: Option<SshExecComponentSessionPolicy>,
+) -> Result<(), AcceptedComponentInstallError> {
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
+    let selected =
+        vibeos_vsh::validate_ssh_exec_with_component_name(command, accepted.command_name());
+    if onboarding
+        || !accepted.matches(profile)
+        || selected != Ok(true)
+        || space.ssh_exec_component_policy(profile) != Some(accepted)
+    {
+        return Err(AcceptedComponentInstallError::PolicyChanged);
+    }
+    space
+        .install_ssh_exec_component_commands(session, accepted)
+        .map_err(AcceptedComponentInstallError::Install)
+}
+
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());
     future.poll(&mut context)
@@ -2949,6 +3121,7 @@ fn ssh_exit_status(status: vibeos_vsh::Status) -> u32 {
         vibeos_vsh::Status::Unavailable => 127,
         vibeos_vsh::Status::Denied => 126,
         vibeos_vsh::Status::BudgetExceeded => 124,
+        vibeos_vsh::Status::BackendFault => 125,
         vibeos_vsh::Status::Faulted => 125,
         vibeos_vsh::Status::Cancelled => 130,
     }
@@ -3232,4 +3405,498 @@ fn wipe(bytes: &mut [u8]) {
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{string::String, vec};
+    use vibeos_component_admission::{
+        admit, AdmissionPolicy, ArtifactTrust, CallerAuthority, CommandStreamMode,
+        ComponentArtifact, InstanceLimits, ProfileIdentity,
+    };
+    use vibeos_component_command::SynchronousCommandRunner;
+    use vibeos_component_runtime::world::WorldContract;
+    use vibeos_image_policy::{ComponentCommandPin, ComponentStreamMode, SSH_EXEC_COMPONENT};
+    use vibeos_vsh::{
+        ComponentCommandRunner, ComponentTerminal, JobReport, StageReport, Status, TerminalDetail,
+    };
+
+    struct TestPolicyPlatform {
+        component_policy: Option<SshExecComponentSessionPolicy>,
+        component_runner: Option<Arc<SynchronousCommandRunner>>,
+    }
+
+    fn component_policy(
+        profile: AuthorizedProfile,
+        incarnation: u64,
+        artifact_sha256: [u8; 32],
+    ) -> SshExecComponentSessionPolicy {
+        SshExecComponentSessionPolicy::new(
+            profile,
+            NonZeroU64::new(incarnation).unwrap(),
+            "case-filter",
+            artifact_sha256,
+        )
+    }
+
+    impl Platform for TestPolicyPlatform {
+        fn packet_endpoints(
+            &self,
+            _outbound: Cap,
+            _inbound: Cap,
+        ) -> Option<(
+            Revocable<Endpoint<StampedPacket>>,
+            Revocable<Endpoint<StampedPacket>>,
+        )> {
+            None
+        }
+
+        fn bind_stack(&self, _control: Cap) -> Result<PacketStamp, NetworkBindError> {
+            Err(NetworkBindError::Denied)
+        }
+
+        fn network_info(&self, _control: Cap) -> Option<NetworkInfo> {
+            None
+        }
+
+        fn entropy<'a>(
+            &'a self,
+            _random: Cap,
+            _length: usize,
+        ) -> PlatformFuture<'a, Result<SecretBytes, ()>> {
+            Box::pin(async { Err(()) })
+        }
+
+        fn host_public_key(&self, _read: Cap) -> Result<HostPublicKeySnapshot, ()> {
+            Err(())
+        }
+
+        fn sign_exchange_hash(
+            &self,
+            _invoke: Cap,
+            _exchange_hash: &[u8; 32],
+        ) -> Result<HostSignatureResult, ()> {
+            Err(())
+        }
+
+        fn authorized_profile(
+            &self,
+            _policy: Cap,
+            _key: &SshEd25519PublicKey,
+        ) -> Result<Option<AuthorizedProfile>, ()> {
+            Ok(None)
+        }
+
+        fn install_vsh_commands(&self, _session: &mut vibeos_vsh::Session, _onboarding: bool) {}
+
+        fn install_ssh_exec_component_commands(
+            &self,
+            session: &mut vibeos_vsh::Session,
+            policy: SshExecComponentSessionPolicy,
+        ) -> Result<(), vibeos_vsh::Diagnostic> {
+            let Some(runner) = self.component_runner.clone() else {
+                return Ok(());
+            };
+            if self.component_policy != Some(policy)
+                || policy.command_name() != SSH_EXEC_COMPONENT.command_name()
+                || policy.artifact_sha256() != SSH_EXEC_COMPONENT.expected_sha256()
+            {
+                return vibeos_vsh::validate_ssh_exec(policy.command_name());
+            }
+            let image_policy = ssh_component_policy(SSH_EXEC_COMPONENT)?;
+            session.install_ssh_exec_component_command(&image_policy, runner)
+        }
+
+        fn ssh_exec_component_policy(
+            &self,
+            profile: AuthorizedProfile,
+        ) -> Option<SshExecComponentSessionPolicy> {
+            self.component_policy
+                .filter(|policy| policy.matches(profile))
+        }
+
+        fn log(&self, _args: fmt::Arguments<'_>) {}
+    }
+
+    #[test]
+    fn default_platform_policy_installs_no_ssh_component_command() {
+        let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+        let profile = AuthorizedProfile {
+            generation: 1,
+            profile: CapabilityProfileId::new(1).unwrap(),
+        };
+        TestPolicyPlatform {
+            component_policy: None,
+            component_runner: None,
+        }
+        .install_ssh_exec_component_commands(&mut session, component_policy(profile, 1, [0x11; 32]))
+        .unwrap();
+
+        assert_eq!(
+            vibeos_vsh::validate_ssh_exec("case-filter")
+                .unwrap_err()
+                .message,
+            "command is outside the SSH exec profile"
+        );
+        assert!(!session
+            .completion_candidates()
+            .iter()
+            .any(|name| name == "case-filter"));
+    }
+
+    #[test]
+    fn ssh_component_session_policy_binds_profile_and_generation_exactly() {
+        let admitted = AuthorizedProfile {
+            generation: 7,
+            profile: CapabilityProfileId::new(3).unwrap(),
+        };
+        let policy = component_policy(admitted, 7, [0x33; 32]);
+        assert!(policy.matches(admitted));
+        assert!(!policy.matches(AuthorizedProfile {
+            generation: 8,
+            profile: admitted.profile,
+        }));
+        assert!(!policy.matches(AuthorizedProfile {
+            generation: admitted.generation,
+            profile: CapabilityProfileId::new(4).unwrap(),
+        }));
+        assert_eq!(policy.profile(), admitted);
+        assert_eq!(policy.incarnation(), NonZeroU64::new(7).unwrap());
+        assert_eq!(policy.command_name(), "case-filter");
+        assert_eq!(policy.artifact_sha256(), [0x33; 32]);
+    }
+
+    #[test]
+    fn ssh_component_request_requires_exact_profile_public_key_and_simple_syntax() {
+        let admitted = AuthorizedProfile {
+            generation: 7,
+            profile: CapabilityProfileId::new(3).unwrap(),
+        };
+        let platform = TestPolicyPlatform {
+            component_policy: Some(component_policy(admitted, 7, [0x33; 32])),
+            component_runner: None,
+        };
+        assert!(accepted_ssh_component_policy(&platform, admitted, true, "case-filter").is_some());
+        assert!(accepted_ssh_component_policy(&platform, admitted, false, "case-filter").is_none());
+        assert!(accepted_ssh_component_policy(
+            &platform,
+            AuthorizedProfile {
+                generation: 8,
+                profile: admitted.profile,
+            },
+            true,
+            "case-filter"
+        )
+        .is_none());
+        assert!(accepted_ssh_component_policy(
+            &platform,
+            AuthorizedProfile {
+                generation: admitted.generation,
+                profile: CapabilityProfileId::new(4).unwrap(),
+            },
+            true,
+            "case-filter"
+        )
+        .is_none());
+        for source in [
+            "case-filter | true",
+            "case-filter > @console",
+            "case-filter $(true)",
+            "$case-filter",
+        ] {
+            assert!(accepted_ssh_component_policy(&platform, admitted, true, source).is_none());
+        }
+    }
+
+    #[test]
+    fn accepted_component_policy_fails_closed_across_rotation_and_revocation() {
+        let profile = AuthorizedProfile {
+            generation: 7,
+            profile: CapabilityProfileId::new(3).unwrap(),
+        };
+        let accepted = component_policy(profile, 10, [0x33; 32]);
+        let gate = TestPolicyPlatform {
+            component_policy: Some(accepted),
+            component_runner: None,
+        };
+        assert_eq!(
+            accepted_ssh_component_policy(&gate, profile, true, "case-filter"),
+            Some(accepted)
+        );
+
+        let changed = [
+            None,
+            Some(component_policy(profile, 11, [0x33; 32])),
+            Some(component_policy(profile, 10, [0x44; 32])),
+            Some(component_policy(
+                AuthorizedProfile {
+                    generation: 8,
+                    profile: profile.profile,
+                },
+                10,
+                [0x33; 32],
+            )),
+            Some(component_policy(
+                AuthorizedProfile {
+                    generation: profile.generation,
+                    profile: CapabilityProfileId::new(4).unwrap(),
+                },
+                10,
+                [0x33; 32],
+            )),
+        ];
+        for current in changed {
+            let platform = TestPolicyPlatform {
+                component_policy: current,
+                component_runner: None,
+            };
+            let mut session =
+                vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+            assert!(matches!(
+                install_accepted_ssh_component(
+                    &platform,
+                    &mut session,
+                    profile,
+                    false,
+                    "case-filter",
+                    Some(accepted),
+                ),
+                Err(AcceptedComponentInstallError::PolicyChanged)
+            ));
+            assert!(!session
+                .completion_candidates()
+                .iter()
+                .any(|name| name == "case-filter"));
+        }
+    }
+
+    #[test]
+    fn stable_policy_for_a_different_artifact_is_not_installed() {
+        let runner = Arc::new(
+            SynchronousCommandRunner::new(admit_image_component(SSH_EXEC_COMPONENT)).unwrap(),
+        );
+        let profile = AuthorizedProfile {
+            generation: 7,
+            profile: CapabilityProfileId::new(3).unwrap(),
+        };
+        let wrong_artifact = component_policy(profile, 10, [0x44; 32]);
+        let platform = TestPolicyPlatform {
+            component_policy: Some(wrong_artifact),
+            component_runner: Some(runner.clone()),
+        };
+        assert_eq!(
+            accepted_ssh_component_policy(&platform, profile, true, "case-filter"),
+            Some(wrong_artifact)
+        );
+
+        let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+        assert!(matches!(
+            install_accepted_ssh_component(
+                &platform,
+                &mut session,
+                profile,
+                false,
+                "case-filter",
+                Some(wrong_artifact),
+            ),
+            Err(AcceptedComponentInstallError::Install(_))
+        ));
+        assert!(!session
+            .completion_candidates()
+            .iter()
+            .any(|name| name == "case-filter"));
+        assert_eq!(runner.started_invocations(), 0);
+    }
+
+    #[test]
+    fn builtin_exec_carries_no_component_descriptor_or_installation() {
+        let profile = AuthorizedProfile {
+            generation: 7,
+            profile: CapabilityProfileId::new(3).unwrap(),
+        };
+        let platform = TestPolicyPlatform {
+            component_policy: Some(component_policy(profile, 10, [0x33; 32])),
+            component_runner: None,
+        };
+        let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+        install_accepted_ssh_component(&platform, &mut session, profile, false, "true", None)
+            .unwrap();
+        assert!(!session
+            .completion_candidates()
+            .iter()
+            .any(|name| name == "case-filter"));
+    }
+
+    #[test]
+    fn component_backend_fault_is_preserved_as_ssh_exit_125() {
+        let reports = vec![JobReport {
+            id: 1,
+            status: Status::BackendFault,
+            stages: vec![StageReport {
+                stage: 0,
+                status: Status::BackendFault,
+                detail: TerminalDetail::Component(ComponentTerminal::BackendFault),
+            }],
+            output: String::new(),
+            peak_pipe_depth: 0,
+        }];
+
+        let (output, status) = collect_execution(Ok(reports), false);
+        assert!(output.is_empty());
+        assert_eq!(status, 125);
+    }
+
+    fn admission_stream(mode: ComponentStreamMode) -> CommandStreamMode {
+        match mode {
+            ComponentStreamMode::Required => CommandStreamMode::Required,
+            ComponentStreamMode::Optional => CommandStreamMode::Optional,
+            ComponentStreamMode::Closed => CommandStreamMode::Closed,
+        }
+    }
+
+    fn vsh_stream(mode: ComponentStreamMode) -> vibeos_vsh::StreamMode {
+        match mode {
+            ComponentStreamMode::Required => vibeos_vsh::StreamMode::Required,
+            ComponentStreamMode::Optional => vibeos_vsh::StreamMode::Optional,
+            ComponentStreamMode::Closed => vibeos_vsh::StreamMode::Closed,
+        }
+    }
+
+    fn admit_image_component(
+        pin: ComponentCommandPin,
+    ) -> Arc<vibeos_component_admission::AdmittedComponent> {
+        // Parse the separately pinned WIT policy instead of reflecting the
+        // artifact's decoded shape back as its own expected contract.
+        let world = WorldContract::parse(pin.wit_source(), pin.world()).unwrap();
+        let artifact = ComponentArtifact::copy_from(pin.artifact_bytes()).unwrap();
+        let identity = artifact.identity();
+        assert_eq!(identity.as_bytes(), &pin.expected_sha256());
+        let limits = pin.limits();
+        Arc::new(
+            admit(
+                artifact,
+                &AdmissionPolicy {
+                    command_name: pin.command_name(),
+                    entrypoint: pin.entrypoint(),
+                    min_args: pin.min_args(),
+                    max_args: pin.max_args(),
+                    exact_world: &world,
+                    profile: ProfileIdentity::PROFILE_1,
+                    trust: ArtifactTrust::ImagePinned(identity),
+                    limits: InstanceLimits {
+                        memory_bytes: limits.memory_bytes,
+                        total_fuel: limits.total_fuel,
+                        poll_quantum: limits.poll_quantum,
+                        resources: limits.resources,
+                    },
+                    stdin: admission_stream(pin.stdin()),
+                    stdout: admission_stream(pin.stdout()),
+                    stderr: admission_stream(pin.stderr()),
+                    interfaces: &[],
+                },
+                &CallerAuthority { offers: &[] },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn ssh_component_policy(
+        pin: ComponentCommandPin,
+    ) -> Result<vibeos_vsh::SshExecComponentPolicy, vibeos_vsh::Diagnostic> {
+        let limits = pin.limits();
+        vibeos_vsh::SshExecComponentPolicy::from_image_pin(
+            pin.command_name(),
+            pin.abi(),
+            vibeos_vsh::ComponentArtifactIdentity::new(pin.expected_sha256()),
+            pin.world(),
+            pin.entrypoint(),
+            pin.min_args(),
+            pin.max_args(),
+            vsh_stream(pin.stdin()),
+            vsh_stream(pin.stdout()),
+            vsh_stream(pin.stderr()),
+            limits.memory_bytes,
+            limits.total_fuel,
+            limits.poll_quantum,
+            limits.resources,
+            Vec::new(),
+        )
+    }
+
+    fn execute_ssh(
+        mut session: vibeos_vsh::Session,
+        source: &'static str,
+    ) -> Result<Vec<JobReport>, vibeos_vsh::Diagnostic> {
+        let result = Arc::new(SpinLock::new(None));
+        let published = result.clone();
+        let task = vibeos_core::exec::spawn_tracked("ssh-component-e2e", async move {
+            let report = session
+                .execute_ssh_cancellable(source, Arc::new(AtomicBool::new(false)))
+                .await;
+            *published.lock() = Some(report);
+        });
+        vibeos_core::exec::run_until_idle(100_000);
+        assert!(
+            task.try_exit().is_some(),
+            "SSH Component exec did not finish"
+        );
+        let report = result.lock().take().unwrap();
+        report
+    }
+
+    #[test]
+    fn image_pin_requires_explicit_ssh_policy_then_executes_closed_stdin_filter() {
+        let runner = Arc::new(
+            SynchronousCommandRunner::new(admit_image_component(SSH_EXEC_COMPONENT)).unwrap(),
+        );
+        assert_eq!(runner.manifest().stdin(), vibeos_vsh::StreamMode::Closed);
+        let profile = AuthorizedProfile {
+            generation: 41,
+            profile: CapabilityProfileId::new(9).unwrap(),
+        };
+
+        let no_policy = TestPolicyPlatform {
+            component_policy: None,
+            component_runner: Some(runner.clone()),
+        };
+        assert!(accepted_ssh_component_policy(&no_policy, profile, true, "case-filter").is_none());
+        let rejected = execute_ssh(
+            vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec),
+            "case-filter",
+        )
+        .unwrap_err();
+        assert_eq!(rejected.message, "command is outside the SSH exec profile");
+        assert_eq!(runner.started_invocations(), 0);
+
+        let platform = TestPolicyPlatform {
+            component_policy: Some(component_policy(
+                profile,
+                41,
+                SSH_EXEC_COMPONENT.expected_sha256(),
+            )),
+            component_runner: Some(runner.clone()),
+        };
+        let accepted =
+            accepted_ssh_component_policy(&platform, profile, true, "case-filter").unwrap();
+        let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+        install_accepted_ssh_component(
+            &platform,
+            &mut session,
+            profile,
+            false,
+            "case-filter",
+            Some(accepted),
+        )
+        .unwrap();
+        let reports = execute_ssh(session, "case-filter").unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, Status::Success);
+        assert!(reports[0].output.is_empty());
+        assert_eq!(
+            reports[0].stages[0].detail,
+            TerminalDetail::Component(ComponentTerminal::Success)
+        );
+        assert_eq!(runner.started_invocations(), 1);
+    }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "vibeos-component-command"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-component-admission = { path = "../component-admission" }
+vibeos-component-format = { path = "../../component-format" }
+vibeos-component-host = { path = "../component-host" }
+vibeos-component-runtime = { path = "../../component-runtime" }
+vibeos-core = { path = "../../core" }
+vibeos-vsh = { path = "../../components/vsh" }
+vibeos-wasm-runtime = { path = "../../wasm-runtime" }
+
+[dev-dependencies]
+wat = { version = "=1.255.0", features = ["component-model"] }

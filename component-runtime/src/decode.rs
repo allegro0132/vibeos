@@ -96,6 +96,13 @@ impl ComponentPlan<'_> {
         self.execution.exports.iter().map(|export| &export.info)
     }
 
+    /// Number of Core runtime instances this Component would instantiate.
+    /// Admission adapters use this to apply aggregate ceilings which cannot be
+    /// safely multiplied once per instance.
+    pub fn runtime_instance_count(&self) -> usize {
+        self.execution.instances().len()
+    }
+
     pub fn host_imports(&self) -> impl Iterator<Item = &HostImportInfo> {
         self.execution
             .host_imports

@@ -1,0 +1,15 @@
+[package]
+name = "vibeos-component-admission"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = { version = "=0.11.0", default-features = false }
+vibeos-component-format = { path = "../../component-format" }
+vibeos-component-host = { path = "../component-host" }
+vibeos-component-runtime = { path = "../../component-runtime" }
+vibeos-core = { path = "../../core" }
+vibeos-wasm-runtime = { path = "../../wasm-runtime" }
+
+[dev-dependencies]
+wat = { version = "=1.255.0", features = ["component-model"] }

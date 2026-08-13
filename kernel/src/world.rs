@@ -100,6 +100,8 @@ enum ComponentTemplate {
     Guest,
     BlockDriver,
     NetDriver,
+    #[cfg(feature = "milkv-duo")]
+    UsbEcmNetDriver,
     #[cfg(feature = "qemu-virt")]
     VirtioRng,
     #[cfg(feature = "ssh-security-test")]
@@ -111,11 +113,15 @@ enum ComponentTemplate {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     Ipv4Stack,
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     TcpEcho,
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    Iperf3Server,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -135,6 +141,13 @@ enum ComponentGrants {
     NetDriver {
         mmio: Cap,
         dma: Cap,
+        outbound: Cap,
+        inbound: Cap,
+        control: Cap,
+    },
+    #[cfg(feature = "milkv-duo")]
+    UsbEcmNetDriver {
+        transport: Cap,
         outbound: Cap,
         inbound: Cap,
         control: Cap,
@@ -165,20 +178,92 @@ enum ComponentGrants {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
-    Ipv4Stack {
-        outbound: Cap,
-        inbound: Cap,
-        control: Cap,
-        listener: Cap,
-    },
+    Ipv4Stack(Vec<vibeos_netstack::NetworkInterfaceCapabilities>),
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     TcpEcho {
         listener: Cap,
     },
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    Iperf3Server {
+        control: Cap,
+        data: Cap,
+    },
     StoreFaultProbe(Cap),
     FaultProbe,
+}
+
+#[cfg(any(
+    feature = "tcp-echo",
+    feature = "net-shell",
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
+))]
+#[derive(Clone)]
+struct NetworkStackRoot {
+    location: net_device::NetworkLocation,
+    driver: &'static str,
+    policy: Arc<Space>,
+    outbound: Cap,
+    inbound: Cap,
+    control: Cap,
+    listeners: vibeos_netstack::TcpListenerCapabilities,
+}
+
+#[cfg(any(
+    feature = "tcp-echo",
+    feature = "net-shell",
+    feature = "ssh-test",
+    feature = "milkv-ssh-acceptance",
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
+))]
+fn grant_network_stack(
+    roots: &[NetworkStackRoot],
+    stack_space: &Arc<Space>,
+) -> Vec<vibeos_netstack::NetworkInterfaceCapabilities> {
+    let mut interfaces = Vec::new();
+    interfaces
+        .try_reserve_exact(roots.len())
+        .expect("network interface grant table allocation failed");
+    let mut target = stack_space.0.lock();
+    for (index, root) in roots.iter().enumerate() {
+        let policy = root.policy.0.lock();
+        let outbound = cap::grant(&policy, root.outbound, Rights::SEND, &mut target)
+            .expect("network policy retains the outbound root");
+        let inbound = cap::grant(&policy, root.inbound, Rights::RECV, &mut target)
+            .expect("network policy retains the inbound root");
+        let control = cap::grant(
+            &policy,
+            root.control,
+            Rights::READ.union(Rights::INVOKE),
+            &mut target,
+        )
+        .expect("network policy retains the control root");
+        let mut listeners = vibeos_netstack::no_tcp_listeners();
+        for (index, listener) in root.listeners.into_iter().enumerate() {
+            listeners[index] = listener.map(|listener| {
+                cap::grant(&policy, listener, Rights::INVOKE, &mut target)
+                    .expect("network policy retains the listener root")
+            });
+        }
+        let index = u16::try_from(index).expect("network interface identity space exhausted");
+        interfaces.push(vibeos_netstack::NetworkInterfaceCapabilities::new(
+            vibeos_netstack::NetworkInterfaceId::new(index),
+            outbound,
+            inbound,
+            control,
+            listeners,
+        ));
+    }
+    interfaces
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -420,9 +505,33 @@ pub struct World {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
+    ))]
+    network_stack_roots: Vec<NetworkStackRoot>,
+    #[cfg(feature = "milkv-duo")]
+    usb_net_policy: Option<Arc<Space>>,
+    #[cfg(feature = "milkv-duo")]
+    usb_net_transport: Option<Cap>,
+    #[cfg(feature = "milkv-duo")]
+    usb_net_outbound_root: Option<Cap>,
+    #[cfg(feature = "milkv-duo")]
+    usb_net_inbound_root: Option<Cap>,
+    #[cfg(feature = "milkv-duo")]
+    usb_net_control_root: Option<Cap>,
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     tcp_listener_root: Option<Cap>,
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    iperf_data_listener_root: Option<Cap>,
     #[cfg(any(
         feature = "qemu-virt",
         feature = "milkv-ssh-acceptance",
@@ -805,53 +914,64 @@ impl World {
             };
         }
 
+        #[cfg(feature = "milkv-duo")]
+        if template == ComponentTemplate::UsbEcmNetDriver {
+            let policy = self
+                .usb_net_policy
+                .as_ref()
+                .expect("USB network policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            return ComponentGrants::UsbEcmNetDriver {
+                transport: cap::grant(
+                    &policy,
+                    self.usb_net_transport
+                        .expect("USB ECM transport root exists"),
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .expect("USB network policy retains the transport root"),
+                outbound: cap::grant(
+                    &policy,
+                    self.usb_net_outbound_root
+                        .expect("USB network outbound root exists"),
+                    Rights::RECV,
+                    &mut target,
+                )
+                .expect("USB network policy retains the outbound root"),
+                inbound: cap::grant(
+                    &policy,
+                    self.usb_net_inbound_root
+                        .expect("USB network inbound root exists"),
+                    Rights::SEND,
+                    &mut target,
+                )
+                .expect("USB network policy retains the inbound root"),
+                control: cap::grant(
+                    &policy,
+                    self.usb_net_control_root
+                        .expect("USB network control root exists"),
+                    Rights::READ,
+                    &mut target,
+                )
+                .expect("USB network policy retains the control root"),
+            };
+        }
+
         #[cfg(any(
             feature = "tcp-echo",
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
         ))]
         if template == ComponentTemplate::Ipv4Stack {
-            let policy = self
-                .net_policy
-                .as_ref()
-                .expect("network policy CSpace exists");
-            let policy = policy.0.lock();
-            let mut target = space.0.lock();
-            return ComponentGrants::Ipv4Stack {
-                outbound: cap::grant(
-                    &policy,
-                    self.net_outbound_root
-                        .expect("network outbound endpoint root exists"),
-                    Rights::SEND,
-                    &mut target,
-                )
-                .expect("network policy retains the outbound grant root"),
-                inbound: cap::grant(
-                    &policy,
-                    self.net_inbound_root
-                        .expect("network inbound endpoint root exists"),
-                    Rights::RECV,
-                    &mut target,
-                )
-                .expect("network policy retains the inbound grant root"),
-                control: cap::grant(
-                    &policy,
-                    self.net_control_root.expect("network control root exists"),
-                    Rights::READ.union(Rights::INVOKE),
-                    &mut target,
-                )
-                .expect("network policy retains the control grant root"),
-                listener: cap::grant(
-                    &policy,
-                    self.tcp_listener_root
-                        .expect("TCP listener frontend root exists"),
-                    Rights::INVOKE,
-                    &mut target,
-                )
-                .expect("network policy retains the listener frontend root"),
-            };
+            return ComponentGrants::Ipv4Stack(grant_network_stack(
+                &self.network_stack_roots,
+                space,
+            ));
         }
 
         #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
@@ -874,6 +994,38 @@ impl World {
                     &mut target,
                 )
                 .expect("network policy retains the listener frontend root"),
+            };
+        }
+
+        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        if template == ComponentTemplate::Iperf3Server {
+            let policy = self
+                .net_policy
+                .as_ref()
+                .expect("network policy CSpace exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            let rights = Rights::READ
+                .union(Rights::WRITE)
+                .union(Rights::RECV)
+                .union(Rights::INVOKE);
+            return ComponentGrants::Iperf3Server {
+                control: cap::grant(
+                    &policy,
+                    self.tcp_listener_root
+                        .expect("iperf3 control listener root exists"),
+                    rights,
+                    &mut target,
+                )
+                .expect("network policy retains the iperf3 control root"),
+                data: cap::grant(
+                    &policy,
+                    self.iperf_data_listener_root
+                        .expect("iperf3 data listener root exists"),
+                    rights,
+                    &mut target,
+                )
+                .expect("network policy retains the iperf3 data root"),
             };
         }
 
@@ -901,6 +1053,10 @@ impl World {
             ComponentTemplate::NetDriver => {
                 unreachable!("network grants come from the private policy CSpace")
             }
+            #[cfg(feature = "milkv-duo")]
+            ComponentTemplate::UsbEcmNetDriver => {
+                unreachable!("USB network grants come from the private policy CSpace")
+            }
             #[cfg(feature = "qemu-virt")]
             ComponentTemplate::VirtioRng => {
                 unreachable!("entropy grants come from the private policy CSpace")
@@ -918,7 +1074,9 @@ impl World {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh"
+                feature = "milkv-ssh",
+                feature = "iperf3-server",
+                feature = "milkv-iperf3-server"
             ))]
             ComponentTemplate::Ipv4Stack => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
@@ -926,6 +1084,10 @@ impl World {
             #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
             ComponentTemplate::TcpEcho => {
                 unreachable!("TCP echo app grants come from the private policy CSpace")
+            }
+            #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+            ComponentTemplate::Iperf3Server => {
+                unreachable!("iperf3 grants come from the private policy CSpace")
             }
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
                 cap::grant(
@@ -987,6 +1149,25 @@ impl World {
                     net_device::driver_task(space.get(), mmio, dma, outbound, inbound, control),
                 )
             },
+            #[cfg(feature = "milkv-duo")]
+            ComponentGrants::UsbEcmNetDriver {
+                transport,
+                outbound,
+                inbound,
+                control,
+            } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    crate::usb_ecm_net::driver_task(
+                        space.get(),
+                        transport,
+                        outbound,
+                        inbound,
+                        control,
+                    ),
+                )
+            },
             #[cfg(feature = "qemu-virt")]
             ComponentGrants::VirtioRng { mmio, dma, source } => unsafe {
                 exec::spawn_reclaimable_owned(
@@ -1040,24 +1221,15 @@ impl World {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh"
+                feature = "milkv-ssh",
+                feature = "iperf3-server",
+                feature = "milkv-iperf3-server"
             ))]
-            ComponentGrants::Ipv4Stack {
-                outbound,
-                inbound,
-                control,
-                listener,
-            } => unsafe {
+            ComponentGrants::Ipv4Stack(interfaces) => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
-                    crate::netstack_platform::task(
-                        space.get(),
-                        outbound,
-                        inbound,
-                        control,
-                        listener,
-                    ),
+                    crate::netstack_platform::task_with_discovered(space.get(), interfaces),
                 )
             },
             #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
@@ -1066,6 +1238,14 @@ impl World {
                     domain,
                     &component.name,
                     crate::net_echo_platform::task(space.get(), listener),
+                )
+            },
+            #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+            ComponentGrants::Iperf3Server { control, data } => unsafe {
+                exec::spawn_reclaimable_owned(
+                    domain,
+                    &component.name,
+                    crate::iperf3_platform::task(space.get(), control, data),
                 )
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
@@ -1464,6 +1644,40 @@ pub fn start_net_supervisor() {
     });
 }
 
+/// Restart the USB ECM frontend independently from both DWC2 host service and
+/// the native DWMAC component. Synchronous class transactions leave no DMA
+/// ownership behind when this component faults.
+#[cfg(feature = "milkv-duo")]
+pub fn start_usb_net_supervisor() {
+    let world = world();
+    let Some(component) = world.component_named("usb-ecm-net") else {
+        return;
+    };
+    exec::spawn("supervisor:usb-ecm-net", async move {
+        let mut attempts = 0u32;
+        loop {
+            let (generation, join) = component.join_current();
+            let exit = join.await;
+            match exit.state() {
+                exec::TaskState::Faulted if attempts < 3 => {
+                    exec::sleep_ms(10u64 << attempts).await;
+                    attempts += 1;
+                    if world.restart_component("usb-ecm-net").is_err() {
+                        return;
+                    }
+                }
+                exec::TaskState::Cancelled | exec::TaskState::Exited => loop {
+                    if component.snapshot().generation > generation {
+                        break;
+                    }
+                    exec::sleep_ms(100).await;
+                },
+                exec::TaskState::Faulted | exec::TaskState::Running => return,
+            }
+        }
+    });
+}
+
 /// Restart only faulted entropy-driver incarnations. A failed or unconfirmed
 /// device reset remains quarantined inside the driver and cannot be converted
 /// into synthetic output by the supervisor.
@@ -1506,7 +1720,9 @@ pub fn start_rng_supervisor() {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 pub fn start_ipv4_stack_supervisor() {
     let world = world();
@@ -1599,10 +1815,45 @@ pub fn build() {
     let block_space = block_resources.as_ref().map(|_| Space::new("virtio-blk"));
     let block_policy = block_resources.as_ref().map(|_| Space::new("block-policy"));
     let net_resources = net_device::discover();
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
+    ))]
+    let net_location = net_resources.as_ref().map(|resources| resources.location);
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
     let net_policy = net_resources
         .as_ref()
         .map(|_| Space::new("virtio-net-policy"));
+    #[cfg(feature = "milkv-duo")]
+    let usb_net_resources = crate::usb_ecm_net::discover();
+    #[cfg(all(
+        feature = "milkv-duo",
+        any(
+            feature = "tcp-echo",
+            feature = "net-shell",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
+        )
+    ))]
+    let usb_net_location = usb_net_resources
+        .as_ref()
+        .map(|resources| resources.location);
+    #[cfg(feature = "milkv-duo")]
+    let usb_net_space = usb_net_resources
+        .as_ref()
+        .map(|_| Space::new("usb-ecm-net"));
+    #[cfg(feature = "milkv-duo")]
+    let usb_net_policy = usb_net_resources
+        .as_ref()
+        .map(|_| Space::new("usb-ecm-net-policy"));
     #[cfg(feature = "qemu-virt")]
     let rng_resources = virtio_rng::discover();
     #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
@@ -1650,15 +1901,34 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
+    #[cfg(not(feature = "milkv-duo"))]
     let ipv4_stack_space = net_resources
         .as_ref()
         .map(|_| Space::new(crate::netstack_platform::COMPONENT_NAME));
+    #[cfg(all(
+        feature = "milkv-duo",
+        any(
+            feature = "tcp-echo",
+            feature = "net-shell",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
+        )
+    ))]
+    let ipv4_stack_space = (net_resources.is_some() || usb_net_resources.is_some())
+        .then(|| Space::new(crate::netstack_platform::COMPONENT_NAME));
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_app_space = net_resources
         .as_ref()
         .map(|_| Space::new("tcp-echo-service"));
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    let iperf3_app_space = net_resources.as_ref().map(|_| Space::new("iperf3-server"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -1924,7 +2194,9 @@ pub fn build() {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh"
+                feature = "milkv-ssh",
+                feature = "iperf3-server",
+                feature = "milkv-iperf3-server"
             )))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
@@ -1944,7 +2216,9 @@ pub fn build() {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh"
+                feature = "milkv-ssh",
+                feature = "iperf3-server",
+                feature = "milkv-iperf3-server"
             ))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
@@ -1985,12 +2259,64 @@ pub fn build() {
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
     };
+    #[cfg(feature = "milkv-duo")]
+    let (
+        usb_net_transport_root,
+        usb_net_outbound_root,
+        usb_net_inbound_root,
+        usb_net_control_root,
+        usb_net_grants,
+    ) = match (
+        usb_net_resources,
+        usb_net_space.as_ref(),
+        usb_net_policy.as_ref(),
+    ) {
+        (Some(resources), Some(driver_space), Some(policy_space)) => {
+            let outbound: Arc<NetEndpoint<StampedPacket>> = NetEndpoint::new(
+                "usb-cdc-ecm-outbound",
+                crate::net_device::FRONTEND_QUEUE_DEPTH,
+            );
+            let inbound: Arc<NetEndpoint<StampedPacket>> = NetEndpoint::new(
+                "usb-cdc-ecm-inbound",
+                crate::net_device::FRONTEND_QUEUE_DEPTH,
+            );
+            let mut policy = policy_space.0.lock();
+            let transport_root = policy.mint(resources.transport, Rights::ALL);
+            let outbound_root = policy.mint(outbound, Rights::ALL);
+            let inbound_root = policy.mint(inbound, Rights::ALL);
+            let control_root = policy.mint(resources.control, Rights::ALL_VOLATILE);
+            let mut target = driver_space.0.lock();
+            let grants = (
+                cap::grant(
+                    &policy,
+                    transport_root,
+                    Rights::READ.union(Rights::WRITE),
+                    &mut target,
+                )
+                .unwrap(),
+                cap::grant(&policy, outbound_root, Rights::RECV, &mut target).unwrap(),
+                cap::grant(&policy, inbound_root, Rights::SEND, &mut target).unwrap(),
+                cap::grant(&policy, control_root, Rights::READ, &mut target).unwrap(),
+            );
+            (
+                Some(transport_root),
+                Some(outbound_root),
+                Some(inbound_root),
+                Some(control_root),
+                Some(grants),
+            )
+        }
+        (None, None, None) => (None, None, None, None, None),
+        _ => unreachable!("USB network resources and CSpaces are constructed together"),
+    };
     #[cfg(any(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     let tcp_listener_root = net_policy.as_ref().map(|policy_space| {
         let listener_label = if cfg!(any(
@@ -1999,21 +2325,59 @@ pub fn build() {
             feature = "milkv-ssh"
         )) {
             "sshd"
+        } else if cfg!(any(
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
+        )) {
+            "iperf3-control"
         } else {
             "tcp-echo"
         };
         #[cfg(feature = "milkv-ssh")]
         let listen_port = 22;
-        #[cfg(not(feature = "milkv-ssh"))]
+        #[cfg(all(
+            not(feature = "milkv-ssh"),
+            any(feature = "iperf3-server", feature = "milkv-iperf3-server")
+        ))]
+        let listen_port = vibeos_iperf3_server::DEFAULT_PORT;
+        #[cfg(not(any(
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
+        )))]
         let listen_port = 2222;
+        let id = vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero");
+        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        let listener = vibeos_net_api::TcpListener::new_shared(
+            listener_label,
+            id,
+            listen_port,
+            vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
+        );
+        #[cfg(not(any(feature = "iperf3-server", feature = "milkv-iperf3-server")))]
         let listener = vibeos_net_api::TcpListener::new(
             listener_label,
-            vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero"),
+            id,
             listen_port,
             vibeos_net_api::DEFAULT_TCP_FRONTEND_BUFFER_BYTES,
             vibeos_net_api::DEFAULT_TCP_FRONTEND_BUFFER_BYTES,
+        );
+        let listener = listener.expect("the image TCP listener policy is valid");
+        policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
+    });
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    let iperf_data_listener_root = net_policy.as_ref().map(|policy_space| {
+        let listener = vibeos_net_api::TcpListener::new_shared(
+            "iperf3-data",
+            vibeos_net_api::TcpListenerId::new(2).expect("listener identity is non-zero"),
+            vibeos_iperf3_server::DEFAULT_PORT,
+            vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
         )
-        .expect("the image TCP listener policy is valid");
+        .expect("the iperf3 data listener policy is valid");
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
     #[cfg(feature = "qemu-virt")]
@@ -2228,42 +2592,118 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
-    let ipv4_stack_grants = match (
+    let mut network_stack_roots = Vec::new();
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
+    ))]
+    if let (Some(location), Some(policy), Some(outbound), Some(inbound), Some(control)) = (
+        net_location,
         net_policy.as_ref(),
-        ipv4_stack_space.as_ref(),
         net_outbound_root,
         net_inbound_root,
         net_control_root,
-        tcp_listener_root,
     ) {
-        (
-            Some(policy_space),
-            Some(stack_space),
-            Some(outbound),
-            Some(inbound),
-            Some(control),
-            Some(listener),
-        ) => {
-            let policy = policy_space.0.lock();
-            let mut target = stack_space.0.lock();
-            Some((
-                cap::grant(&policy, outbound, Rights::SEND, &mut target).unwrap(),
-                cap::grant(&policy, inbound, Rights::RECV, &mut target).unwrap(),
-                cap::grant(
-                    &policy,
-                    control,
-                    Rights::READ.union(Rights::INVOKE),
-                    &mut target,
-                )
-                .unwrap(),
-                cap::grant(&policy, listener, Rights::INVOKE, &mut target).unwrap(),
-            ))
+        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        let listeners = vibeos_netstack::two_tcp_listeners(
+            tcp_listener_root.expect("iperf3 control listener root"),
+            iperf_data_listener_root.expect("iperf3 data listener root"),
+        );
+        #[cfg(not(any(feature = "iperf3-server", feature = "milkv-iperf3-server")))]
+        let listeners = match tcp_listener_root {
+            Some(listener) => vibeos_netstack::one_tcp_listener(listener),
+            None => vibeos_netstack::no_tcp_listeners(),
+        };
+        network_stack_roots.push(NetworkStackRoot {
+            location,
+            driver: if cfg!(feature = "milkv-duo") {
+                "dwmac"
+            } else {
+                "virtio-mmio"
+            },
+            policy: policy.clone(),
+            outbound,
+            inbound,
+            control,
+            listeners,
+        });
+    }
+    #[cfg(all(
+        feature = "milkv-duo",
+        any(
+            feature = "tcp-echo",
+            feature = "net-shell",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
+        )
+    ))]
+    if let (Some(location), Some(policy), Some(outbound), Some(inbound), Some(control)) = (
+        usb_net_location,
+        usb_net_policy.as_ref(),
+        usb_net_outbound_root,
+        usb_net_inbound_root,
+        usb_net_control_root,
+    ) {
+        network_stack_roots.push(NetworkStackRoot {
+            location,
+            driver: "usb-cdc-ecm",
+            policy: policy.clone(),
+            outbound,
+            inbound,
+            control,
+            listeners: vibeos_netstack::no_tcp_listeners(),
+        });
+    }
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
+    ))]
+    {
+        network_stack_roots.sort_by_key(|root| root.location);
+        for pair in network_stack_roots.windows(2) {
+            assert!(
+                pair[0].location != pair[1].location,
+                "duplicate network bus location"
+            );
         }
-        (None, None, None, None, None, None) => None,
-        _ => unreachable!("IPv4 stack grants exist exactly when a network device exists"),
-    };
+        for (index, root) in network_stack_roots.iter().enumerate() {
+            crate::println!(
+                "  net map   net{} <- {} ({})",
+                index,
+                root.location.describe(),
+                root.driver,
+            );
+        }
+    }
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
+    ))]
+    let ipv4_stack_grants = ipv4_stack_space
+        .as_ref()
+        .map(|space| grant_network_stack(&network_stack_roots, space));
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_app_grant = match (
         net_policy.as_ref(),
@@ -2289,14 +2729,29 @@ pub fn build() {
         (None, None, None) => None,
         _ => unreachable!("TCP echo app grant exists exactly with its listener"),
     };
-    let (
-        store_root,
-        durable_cspace_root,
-        durable_cspace_service,
-        saved_program_root,
-        storage_v2,
-        storage_migration,
-    ) = match (
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    let iperf3_app_grants = match (
+        net_policy.as_ref(),
+        iperf3_app_space.as_ref(),
+        tcp_listener_root,
+        iperf_data_listener_root,
+    ) {
+        (Some(policy_space), Some(app_space), Some(control), Some(data)) => {
+            let policy = policy_space.0.lock();
+            let mut target = app_space.0.lock();
+            let rights = Rights::READ
+                .union(Rights::WRITE)
+                .union(Rights::RECV)
+                .union(Rights::INVOKE);
+            Some((
+                cap::grant(&policy, control, rights, &mut target).unwrap(),
+                cap::grant(&policy, data, rights, &mut target).unwrap(),
+            ))
+        }
+        (None, None, None, None) => None,
+        _ => unreachable!("iperf3 app grants exist exactly with both listeners"),
+    };
+    let (store_root, durable_cspace_root, durable_cspace_service, saved_program_root, storage_v2, storage_migration) = match (
         store_block_grants,
         store_backend.as_ref(),
         persistent_test.as_ref(),
@@ -2390,6 +2845,14 @@ pub fn build() {
     if let Some(space) = net_policy.as_ref() {
         spaces.insert("virtio-net-policy", space.clone());
     }
+    #[cfg(feature = "milkv-duo")]
+    if let Some(space) = usb_net_space.as_ref() {
+        spaces.insert("usb-ecm-net", space.clone());
+    }
+    #[cfg(feature = "milkv-duo")]
+    if let Some(space) = usb_net_policy.as_ref() {
+        spaces.insert("usb-ecm-net-policy", space.clone());
+    }
     #[cfg(feature = "qemu-virt")]
     if let Some(space) = rng_space.as_ref() {
         spaces.insert("virtio-rng", space.clone());
@@ -2431,7 +2894,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     if let Some(space) = ipv4_stack_space.as_ref() {
         spaces.insert(crate::netstack_platform::COMPONENT_NAME, space.clone());
@@ -2439,6 +2904,10 @@ pub fn build() {
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     if let Some(space) = tcp_echo_app_space.as_ref() {
         spaces.insert("tcp-echo-service", space.clone());
+    }
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    if let Some(space) = iperf3_app_space.as_ref() {
+        spaces.insert("iperf3-server", space.clone());
     }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
@@ -2491,9 +2960,33 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
+        ))]
+        network_stack_roots,
+        #[cfg(feature = "milkv-duo")]
+        usb_net_policy,
+        #[cfg(feature = "milkv-duo")]
+        usb_net_transport: usb_net_transport_root,
+        #[cfg(feature = "milkv-duo")]
+        usb_net_outbound_root,
+        #[cfg(feature = "milkv-duo")]
+        usb_net_inbound_root,
+        #[cfg(feature = "milkv-duo")]
+        usb_net_control_root,
+        #[cfg(any(
+            feature = "tcp-echo",
+            feature = "net-shell",
+            feature = "ssh-test",
+            feature = "milkv-ssh-acceptance",
+            feature = "milkv-ssh",
+            feature = "iperf3-server",
+            feature = "milkv-iperf3-server"
         ))]
         tcp_listener_root,
+        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        iperf_data_listener_root,
         #[cfg(any(
             feature = "qemu-virt",
             feature = "milkv-ssh-acceptance",
@@ -2581,6 +3074,25 @@ pub fn build() {
         );
     }
 
+    #[cfg(feature = "milkv-duo")]
+    if let (Some(space), Some((transport, outbound, inbound, control))) =
+        (usb_net_space, usb_net_grants)
+    {
+        world.spawn_component_inner(
+            "usb-ecm-net",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::UsbEcmNetDriver),
+            crate::usb_ecm_net::driver_task(
+                SpaceRef::new(&space).get(),
+                transport,
+                outbound,
+                inbound,
+                control,
+            ),
+        );
+    }
+
     #[cfg(feature = "qemu-virt")]
     if let (Some(space), Some((mmio, dma, source))) = (rng_space, rng_grants) {
         world.spawn_component_inner(
@@ -2647,23 +3159,26 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
-    if let (Some(space), Some((outbound, inbound, control, listener))) =
-        (ipv4_stack_space, ipv4_stack_grants)
-    {
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
+    ))]
+    if let (Some(space), Some(interfaces)) = (ipv4_stack_space, ipv4_stack_grants) {
         world.spawn_component_inner(
             crate::netstack_platform::COMPONENT_NAME,
             space.clone(),
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::Ipv4Stack),
-            crate::netstack_platform::task(
-                SpaceRef::new(&space).get(),
-                outbound,
-                inbound,
-                control,
-                listener,
-            ),
+            crate::netstack_platform::task_with_discovered(SpaceRef::new(&space).get(), interfaces),
         );
     }
 
@@ -2675,6 +3190,17 @@ pub fn build() {
             BACKGROUND_MEMORY_BUDGET,
             Some(ComponentTemplate::TcpEcho),
             crate::net_echo_platform::task(SpaceRef::new(&space).get(), listener),
+        );
+    }
+
+    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    if let (Some(space), Some((control, data))) = (iperf3_app_space, iperf3_app_grants) {
+        world.spawn_component_inner(
+            "iperf3-server",
+            space.clone(),
+            BACKGROUND_MEMORY_BUDGET,
+            Some(ComponentTemplate::Iperf3Server),
+            crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
         );
     }
 

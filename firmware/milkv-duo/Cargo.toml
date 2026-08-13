@@ -7,6 +7,7 @@ build = "build.rs"
 [features]
 default = ["milkv-ssh"]
 net-shell = ["vibeos-kernel/net-shell"]
+milkv-iperf3-server = ["vibeos-kernel/milkv-iperf3-server"]
 milkv-ssh = ["vibeos-kernel/milkv-ssh"]
 legacy-shell = ["vibeos-kernel/legacy-shell"]
 milkv-ssh-acceptance = ["vibeos-kernel/milkv-ssh-acceptance"]

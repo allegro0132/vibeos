@@ -1,8 +1,10 @@
-//! Capability-confined shared IPv4 stack service.
+//! Capability-confined multi-interface IPv4 stack service.
 //!
-//! The image selects a static or DHCP address policy and grants a bounded set
-//! of TCP listener frontends. Applications remain separate components and
-//! never receive this service's packet endpoints or smoltcp objects.
+//! The image grants a boot-discovered list of independent NIC capability
+//! bundles. Each bundle owns its own smoltcp interface, address policy, routes,
+//! DHCP client, packet session, and bounded set of TCP listener frontends.
+//! Applications remain separate components and never receive packet endpoints
+//! or smoltcp objects.
 
 #![no_std]
 
@@ -23,8 +25,10 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{PacketStamp, StampedPacket};
 use vibeos_net_api::TcpListener;
 use vibeos_net_protocol::{
-    Ipv4StackConfig, SharedIpv4TcpStack, StackError, TcpListenerHandle, MAX_TCP_LISTENERS,
+    Ipv4StackConfig, SharedIpv4TcpStack, TcpListenerHandle, MAX_TCP_LISTENERS,
 };
+
+pub use vibeos_net_protocol::command::NetworkInterfaceId;
 
 pub mod command;
 pub mod config;
@@ -35,6 +39,7 @@ pub struct NetworkInfo {
     pub quarantined: bool,
     pub session_epoch: u64,
     pub phy_link_up: bool,
+    pub ethernet_address: [u8; 6],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,16 +50,14 @@ pub enum NetworkBindError {
     Failed,
 }
 
+pub type PacketEndpoints = (
+    Revocable<Endpoint<StampedPacket>>,
+    Revocable<Endpoint<StampedPacket>>,
+);
+
 /// Privileged packet and network-control operations consumed by this component.
 pub trait Platform: Sync {
-    fn packet_endpoints(
-        &self,
-        outbound: Cap,
-        inbound: Cap,
-    ) -> Option<(
-        Revocable<Endpoint<StampedPacket>>,
-        Revocable<Endpoint<StampedPacket>>,
-    )>;
+    fn packet_endpoints(&self, outbound: Cap, inbound: Cap) -> Option<PacketEndpoints>;
     fn bind_stack(&self, control: Cap) -> Result<PacketStamp, NetworkBindError>;
     fn network_info(&self, control: Cap) -> Option<NetworkInfo>;
     fn tcp_listener(&self, listener: Cap) -> Option<Revocable<TcpListener>>;
@@ -62,7 +65,6 @@ pub trait Platform: Sync {
 
 type Space = dyn Platform;
 
-const GUEST_MAC: [u8; 6] = config::DEFAULT_MAC;
 const GUEST_IPV4: [u8; 4] = config::DEFAULT_IPV4;
 const GATEWAY_IPV4: [u8; 4] = config::DEFAULT_GATEWAY;
 const PREFIX_LEN: u8 = config::DEFAULT_PREFIX_LEN;
@@ -73,9 +75,50 @@ pub const COMPONENT_NAME: &str = "net-stack";
 pub const MAX_SERVICE_LISTENERS: usize = MAX_TCP_LISTENERS;
 pub type TcpListenerCapabilities = [Option<Cap>; MAX_SERVICE_LISTENERS];
 
+/// Complete authority bundle for one independently configured IP interface.
+/// A second NIC must arrive with a distinct bundle; sharing packet endpoints,
+/// control capabilities, or listener frontends is never inferred by index.
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkInterfaceCapabilities {
+    pub interface: NetworkInterfaceId,
+    pub outbound: Cap,
+    pub inbound: Cap,
+    pub control: Cap,
+    pub listeners: TcpListenerCapabilities,
+}
+
+impl NetworkInterfaceCapabilities {
+    pub const fn new(
+        interface: NetworkInterfaceId,
+        outbound: Cap,
+        inbound: Cap,
+        control: Cap,
+        listeners: TcpListenerCapabilities,
+    ) -> Self {
+        Self {
+            interface,
+            outbound,
+            inbound,
+            control,
+            listeners,
+        }
+    }
+}
+
+pub const fn no_tcp_listeners() -> TcpListenerCapabilities {
+    [None; MAX_SERVICE_LISTENERS]
+}
+
 pub const fn one_tcp_listener(listener: Cap) -> TcpListenerCapabilities {
-    let mut listeners = [None; MAX_SERVICE_LISTENERS];
+    let mut listeners = no_tcp_listeners();
     listeners[0] = Some(listener);
+    listeners
+}
+
+pub const fn two_tcp_listeners(first: Cap, second: Cap) -> TcpListenerCapabilities {
+    let mut listeners = no_tcp_listeners();
+    listeners[0] = Some(first);
+    listeners[1] = Some(second);
     listeners
 }
 
@@ -111,136 +154,288 @@ pub async fn task(
     control_cap: Cap,
     listener_caps: TcpListenerCapabilities,
 ) {
-    let (outbound, inbound) = match space.packet_endpoints(outbound_cap, inbound_cap) {
-        Some(endpoints) => endpoints,
-        None => return,
-    };
-    let mut listeners = Vec::new();
-    if listeners.try_reserve_exact(MAX_SERVICE_LISTENERS).is_err() {
+    let interfaces = [NetworkInterfaceCapabilities::new(
+        NetworkInterfaceId::FIRST,
+        outbound_cap,
+        inbound_cap,
+        control_cap,
+        listener_caps,
+    )];
+    task_with_interfaces(space, &interfaces).await;
+}
+
+/// Run a fair, bounded protocol loop over every explicitly admitted NIC.
+///
+/// Each entry owns a separate smoltcp interface, address/route/DHCP state,
+/// packet-session generation, and listener set. A revoked or quarantined NIC
+/// is retired without taking healthy interfaces down with it.
+pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterfaceCapabilities]) {
+    let mut interfaces = Vec::new();
+    if interfaces.try_reserve_exact(interface_caps.len()).is_err() {
         return;
     }
-    for listener_cap in listener_caps.into_iter().flatten() {
-        let Some(listener) = space.tcp_listener(listener_cap) else {
-            return;
-        };
-        listeners.push(listener);
+    let mut seen = Vec::new();
+    if seen.try_reserve_exact(interface_caps.len()).is_err() {
+        return;
     }
-    if listeners.is_empty() {
+    for caps in interface_caps.iter().copied() {
+        if seen.contains(&caps.interface) {
+            continue;
+        }
+        seen.push(caps.interface);
+        let Some((outbound, inbound)) = space.packet_endpoints(caps.outbound, caps.inbound) else {
+            continue;
+        };
+        let mut listeners = Vec::new();
+        if listeners.try_reserve_exact(MAX_SERVICE_LISTENERS).is_err() {
+            continue;
+        }
+        let mut valid = true;
+        for listener_cap in caps.listeners.into_iter().flatten() {
+            let Some(listener) = space.tcp_listener(listener_cap) else {
+                valid = false;
+                break;
+            };
+            let listener_id = match listener.try_with(TcpListener::id) {
+                Ok(listener_id) => listener_id.get(),
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            };
+            if !config::register_listener(caps.interface, listener_id) {
+                valid = false;
+                break;
+            }
+            listeners.push(listener);
+        }
+        if !valid {
+            continue;
+        }
+        if !config::register_interface(caps.interface, !listeners.is_empty()) {
+            continue;
+        }
+        interfaces.push(InterfaceTask {
+            interface: caps.interface,
+            outbound,
+            inbound,
+            control: caps.control,
+            listeners,
+            observed_epoch: None,
+            observed_ethernet_address: None,
+            observed_config_revision: 0,
+            stack: None,
+            retired: false,
+        });
+    }
+    if interfaces.is_empty() {
         return;
     }
 
-    let mut observed_epoch = None;
-    let mut observed_config_revision = 0;
-    let mut stack = None;
     loop {
         #[cfg(feature = "tcp-echo-recovery-test")]
         if FAULT_REQUESTED.swap(false, Ordering::AcqRel) {
             panic!("injected TCP stack fault");
         }
 
-        let Some(info) = device_info(space, control_cap) else {
-            return;
-        };
-        config::publish_carrier(info.online && info.phy_link_up);
-        if info.quarantined {
-            return;
-        }
-        if !info.online {
-            vibeos_core::exec::sleep_ms(1).await;
-            continue;
+        let now_ms = monotonic_ms();
+        let mut live_interfaces = 0usize;
+        let mut more_work = false;
+        let mut next_poll_delay_ms = IDLE_POLL_CEILING_MS;
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        let mut rejected_device_epoch_ingress = 0u64;
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        let mut rejected_stack_generation_ingress = 0u64;
+
+        for interface in &mut interfaces {
+            if interface.retired {
+                continue;
+            }
+            live_interfaces += 1;
+            match interface.poll(space, now_ms) {
+                Ok(report) => {
+                    more_work |= report.more_work;
+                    next_poll_delay_ms = next_poll_delay_ms.min(report.next_poll_delay_ms);
+                }
+                Err(InterfaceError::Retired) => {
+                    interface.retired = true;
+                    config::publish_link_down(interface.interface);
+                    live_interfaces -= 1;
+                }
+            }
+
+            #[cfg(feature = "tcp-echo-recovery-test")]
+            if let Some(active_stack) = interface.stack.as_ref() {
+                let device_stats = active_stack.core.device_stats();
+                rejected_device_epoch_ingress = rejected_device_epoch_ingress
+                    .saturating_add(device_stats.rejected_device_epoch_frames);
+                rejected_stack_generation_ingress = rejected_stack_generation_ingress
+                    .saturating_add(device_stats.rejected_stack_generation_frames);
+            }
         }
 
-        if observed_epoch != Some(info.session_epoch) {
-            let stamp = match bind_stack(space, control_cap) {
+        #[cfg(feature = "tcp-echo-recovery-test")]
+        {
+            REJECTED_DEVICE_EPOCH_INGRESS.store(rejected_device_epoch_ingress, Ordering::Release);
+            REJECTED_STACK_GENERATION_INGRESS
+                .store(rejected_stack_generation_ingress, Ordering::Release);
+        }
+
+        if live_interfaces == 0 {
+            return;
+        }
+        if more_work {
+            vibeos_core::exec::yield_now().await;
+        } else {
+            let delay = next_poll_delay_ms.clamp(1, IDLE_POLL_CEILING_MS);
+            vibeos_core::exec::sleep_ms(delay).await;
+        }
+    }
+}
+
+struct InterfaceTask {
+    interface: NetworkInterfaceId,
+    outbound: Revocable<Endpoint<StampedPacket>>,
+    inbound: Revocable<Endpoint<StampedPacket>>,
+    control: Cap,
+    listeners: Vec<Revocable<TcpListener>>,
+    observed_epoch: Option<u64>,
+    observed_ethernet_address: Option<[u8; 6]>,
+    observed_config_revision: u64,
+    stack: Option<BoundStack>,
+    retired: bool,
+}
+
+impl InterfaceTask {
+    fn poll(&mut self, space: &Space, now_ms: u64) -> Result<InterfacePollReport, InterfaceError> {
+        let Some(info) = device_info(space, self.control) else {
+            return Err(InterfaceError::Retired);
+        };
+        config::publish_ethernet_address(self.interface, info.ethernet_address);
+        if info.quarantined {
+            return Err(InterfaceError::Retired);
+        }
+        if !info.online || !info.phy_link_up {
+            self.drop_carrier();
+            return Ok(InterfacePollReport::idle(1));
+        }
+        config::publish_carrier(self.interface, true);
+
+        if self.observed_epoch != Some(info.session_epoch)
+            || self.observed_ethernet_address != Some(info.ethernet_address)
+        {
+            let stamp = match bind_stack(space, self.control) {
                 Ok(stamp) => stamp,
                 Err(NetworkBindError::SessionBusy | NetworkBindError::Offline) => {
-                    vibeos_core::exec::sleep_ms(1).await;
-                    continue;
+                    return Ok(InterfacePollReport::idle(1));
                 }
-                Err(_) => return,
+                Err(_) => return Err(InterfaceError::Retired),
             };
-            let config = Ipv4StackConfig::new(
-                GUEST_MAC,
+            let stack_config = Ipv4StackConfig::new(
+                info.ethernet_address,
                 GUEST_IPV4,
                 PREFIX_LEN,
-                TCP_TEST_SEED ^ stamp.device_epoch(),
+                TCP_TEST_SEED ^ stamp.device_epoch() ^ ((self.interface.index() as u64) << 32),
             )
             .with_default_gateway(GATEWAY_IPV4);
-            let mut next =
-                match SharedIpv4TcpStack::new(config, stamp, inbound.clone(), outbound.clone()) {
-                    Ok(stack) => stack,
-                    Err(_) => return,
-                };
+            let mut next = SharedIpv4TcpStack::new(
+                stack_config,
+                stamp,
+                self.inbound.clone(),
+                self.outbound.clone(),
+            )
+            .map_err(|_| InterfaceError::Retired)?;
             let mut bound_listeners = Vec::new();
-            if bound_listeners.try_reserve_exact(listeners.len()).is_err() {
-                return;
+            if bound_listeners
+                .try_reserve_exact(self.listeners.len())
+                .is_err()
+            {
+                return Err(InterfaceError::Retired);
             }
-            for listener in &listeners {
-                let port = match listener.try_with(TcpListener::port) {
-                    Ok(port) => port,
-                    Err(_) => return,
-                };
-                let socket = match next.add_tcp_listener(port) {
-                    Ok(socket) => socket,
-                    Err(_) => return,
-                };
+            for listener in &self.listeners {
+                let port = listener
+                    .try_with(TcpListener::port)
+                    .map_err(|_| InterfaceError::Retired)?;
+                let port_group = listener
+                    .try_with(TcpListener::port_group)
+                    .map_err(|_| InterfaceError::Retired)?;
+                let socket = match port_group {
+                    Some(group) => next.add_shared_tcp_listener(port, group.get()),
+                    None => next.add_tcp_listener(port),
+                }
+                .map_err(|_| InterfaceError::Retired)?;
                 bound_listeners.push(BoundListener {
                     frontend: listener.clone(),
                     socket,
                 });
             }
-            stack = Some(BoundStack {
+            self.stack = Some(BoundStack {
                 core: next,
                 listeners: bound_listeners,
             });
-            observed_epoch = Some(stamp.device_epoch());
-            observed_config_revision = 0;
+            self.observed_epoch = Some(stamp.device_epoch());
+            self.observed_ethernet_address = Some(info.ethernet_address);
+            self.observed_config_revision = 0;
         }
 
-        let active_stack = stack
+        let active_stack = self
+            .stack
             .as_mut()
             .expect("an observed network epoch has a protocol stack");
-        if config::reconcile(&mut active_stack.core, &mut observed_config_revision).is_err() {
-            return;
-        }
-        let now_ms = monotonic_ms();
-        let mut frontend_work = match drive_frontends(active_stack) {
-            Ok(worked) => worked,
-            Err(DriveError::AuthorityRevoked) => return,
-            Err(DriveError::Failed) => return,
-        };
-        let report = match active_stack.core.poll_network(now_ms) {
-            Ok(report) => report,
-            Err(StackError::AuthorityRevoked) => return,
-            Err(_) => return,
-        };
-        frontend_work |= match drive_frontends(active_stack) {
-            Ok(worked) => worked,
-            Err(DriveError::AuthorityRevoked) => return,
-            Err(DriveError::Failed) => return,
-        };
-        config::publish_stack_status(observed_config_revision, active_stack.core.ipv4_status());
-        #[cfg(feature = "tcp-echo-recovery-test")]
-        {
-            let device_stats = active_stack.core.device_stats();
-            REJECTED_DEVICE_EPOCH_INGRESS
-                .store(device_stats.rejected_device_epoch_frames, Ordering::Release);
-            REJECTED_STACK_GENERATION_INGRESS.store(
-                device_stats.rejected_stack_generation_frames,
-                Ordering::Release,
-            );
-        }
-
-        if report.more_work || frontend_work {
-            vibeos_core::exec::yield_now().await;
-        } else {
-            let delay = report
+        config::reconcile(
+            self.interface,
+            &mut active_stack.core,
+            &mut self.observed_config_revision,
+        )
+        .map_err(|_| InterfaceError::Retired)?;
+        let mut frontend_work =
+            drive_frontends(active_stack).map_err(|_| InterfaceError::Retired)?;
+        let report = active_stack
+            .core
+            .poll_network(now_ms)
+            .map_err(|_| InterfaceError::Retired)?;
+        frontend_work |= drive_frontends(active_stack).map_err(|_| InterfaceError::Retired)?;
+        config::publish_stack_status(
+            self.interface,
+            self.observed_config_revision,
+            active_stack.core.ipv4_status(),
+        );
+        Ok(InterfacePollReport {
+            more_work: report.more_work || frontend_work,
+            next_poll_delay_ms: report
                 .next_poll_delay_ms
                 .unwrap_or(IDLE_POLL_CEILING_MS)
-                .clamp(1, IDLE_POLL_CEILING_MS);
-            vibeos_core::exec::sleep_ms(delay).await;
+                .clamp(1, IDLE_POLL_CEILING_MS),
+        })
+    }
+
+    fn drop_carrier(&mut self) {
+        config::publish_link_down(self.interface);
+        self.stack = None;
+        self.observed_epoch = None;
+        self.observed_ethernet_address = None;
+        self.observed_config_revision = 0;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InterfacePollReport {
+    more_work: bool,
+    next_poll_delay_ms: u64,
+}
+
+impl InterfacePollReport {
+    const fn idle(next_poll_delay_ms: u64) -> Self {
+        Self {
+            more_work: false,
+            next_poll_delay_ms,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum InterfaceError {
+    Retired,
 }
 
 struct BoundStack {

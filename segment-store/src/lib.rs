@@ -86,7 +86,10 @@ pub use codec::{
 };
 pub use compat::PutGetAdapter;
 pub use device::{BlockPageDevice, BlockPageError, GrowablePageDevice, PageDevice, PageDeviceInfo};
-pub use fs_api::{FsNodeEntryInput, FsPersistentRoot, FsRootPublishError, FsStructuralCommitError};
+pub use fs_api::{
+    FsNodeEntryInput, FsPersistentData, FsPersistentRoot, FsPersistentTreeEntry,
+    FsRootPublishError, FsStructuralCommitError,
+};
 pub use fs_codec::{
     decode_fs_btree_node_v1, decode_fs_root_v1, encode_fs_btree_node_v1, encode_fs_root_v1,
     FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError, FsRootV1, FsTreeKind, FS_BTREE_HEADER_LEN,

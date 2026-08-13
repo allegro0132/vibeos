@@ -1,0 +1,12 @@
+[package]
+name = "vibeos-file-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-core = { path = "../../core" }
+vibeos-segment-store = { path = "../../segment-store" }
+
+[dev-dependencies]
+vibeos-segment-format = { path = "../../segment-format" }
+vibeos-storage-device = { path = "../../storage-device" }

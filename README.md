@@ -15,8 +15,19 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/BLUEPRINT.md](docs/BLUEPRINT.md)** — architecture, the four bets, the
   capability model's invariants, the compiler's confinement argument and where it
   leaks, and the trust model.
-- **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M6,
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — the developer plan: milestones M1–M7,
   workstreams, testing strategy, metrics, and the risk register.
+- **[docs/STORAGE_V2_ROADMAP.md](docs/STORAGE_V2_ROADMAP.md)** — the post-v1
+  managed-block Blob CAS plan: `sha2`, segment/checkpoint format, root-based GC,
+  online growth, quotas, scrub, and M4 migration.
+- **[docs/STORAGE_V2_FORMAT.md](docs/STORAGE_V2_FORMAT.md)** — the frozen v1
+  segment, seal, checkpoint, and power-cut recovery ABI.
+- **[docs/STORAGE_V2_STORE.md](docs/STORAGE_V2_STORE.md)** — the append-only
+  segment writer, catalog/allocation payload ABI, bounded recovery, and fault model.
+- **[docs/STORAGE_V2_CAS.md](docs/STORAGE_V2_CAS.md)** — the canonical streaming
+  Blob layout, CAS catalog ABI, complete-Blob deduplication, and authority rules.
+- **[docs/STORAGE_V2_GC.md](docs/STORAGE_V2_GC.md)** — persistent/runtime roots,
+  typed edges, generation pins, and the crash-safe G/G+1/G+2 reuse barrier.
 - **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
   Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
   cancellation, and fail-closed admission.
@@ -41,6 +52,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/PROGRAM_PERSISTENCE.md](docs/PROGRAM_PERSISTENCE.md)** — canonical
   source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
   restored least authority.
+- **[docs/WASM_ROADMAP.md](docs/WASM_ROADMAP.md)** — the Component Model-first
+  admitted-code plan: WIT contracts, bounded Core-WASM execution, CSpace-backed
+  resources, native async, composition, durable installation, and later adapters/AOT.
 - **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw
@@ -81,6 +95,7 @@ python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/build-milkv-duo.sh --iperf3-server # DHCP iperf3 server image for Duo
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
+python3 -B scripts/storage-v2-image.py --selftest # independent format verifier
 ./scripts/status.sh --check  # derive inventory and verify the active rustc pin
 ```
 
@@ -401,6 +416,9 @@ its process owns. Here, authority is not a property of the code.
 | `core/` | capabilities, channels, scheduler, allocator, lock (host-testable) |
 | `durable-format/` | zero-dependency sealed-log codec, stable IDs, and fail-closed recovery (`no_std`) |
 | `blob-format/` | canonical immutable Merkle blob encoding and chunk proofs (`no_std`) |
+| `storage-device/` | capability-scoped block ranges, geometry, sessions, and mutation certainty (`no_std`) |
+| `segment-format/` | allocation-free Storage V2 segment/checkpoint codec and verifier (`no_std`) |
+| `segment-store/` | bounded streaming Storage V2 Blob CAS, complete-Blob deduplication, root-based cleaning, and opaque authority publication (`no_std + alloc`) |
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
 | `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |

@@ -5,9 +5,9 @@ For *why* the system is shaped this way, see [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
-> **Current status (2026-08-09):** M1, M2, and the M3.5 lifecycle/evidence
-> sequence through 3.16, M4.5, M5.5, and M6 are complete. The original M3
-> language-expansion items remain partial. Run
+> **Current status (2026-08-12):** M1, M2, and the M3.5 lifecycle/evidence
+> sequence through 3.16, M4.5, M5.5, M6, and Storage V2 M7.0--M7.6 are
+> complete. The original M3 language-expansion items remain partial. Run
 > `scripts/status.sh` for the live host-test and corpus inventory; the
 > QEMU harness reports target check counts from the boot it actually observed.
 > See [TESTING.md](../TESTING.md).
@@ -58,6 +58,36 @@ builds. Normal images boot a separately supervised `vsh` CSpace/component.
 | S4 | ✅ | Safe-Rust `echo`/`wc`, host negative acceptance, and QEMU `echo hello \| wc > @console` plus foreground Ctrl-C. |
 | S5 | ✅ | Bounded `if`/`while`, scoped value-only functions, command substitution, and immutable exact-manifest script artifacts. |
 
+## Component Model admitted-code track
+
+**C0--C8 are planned.** WIT and the WebAssembly Component Model are the
+developer-facing application contract; bounded Core-WASM interpretation remains
+the private execution substrate, and CSpace remains the only source of host
+authority. The sequence closes single-component Canonical ABI and resource
+semantics, adds supervised VSH execution, then adds native async,
+multi-principal composition, crash-safe installation, and only afterward legacy
+WASIp1 adapters or measured AOT. Readable component/Core bytes are never
+executable by possession alone, and neither WIT nor WASI may introduce ambient
+paths, sockets, devices, object IDs, or environment state.
+
+| Stage | Status | Outcome |
+|---|:---:|---|
+| C0 | ⬜ | Freeze Vibe Component Profile 1, WIT packages, Core profile, corpus, limits, metrics, and pinned implementation foundations. |
+| C1 | ⬜ | Portable bounded Core-WASM validation and interpretation with fuel, quantum yield, limits, traps, differential tests, and fuzzing. |
+| C2 | ⬜ | One component principal with synchronous Canonical ABI, rich values, inert resources, adapters, realloc, cleanup, and exact bounds. |
+| C3 | ⬜ | Map WIT resources to exact CSpace capabilities with operation-time checks and reviewed `own`/`borrow` semantics. |
+| C4 | ⬜ | Supervised `ComponentCommand` instances and atomic VSH/SSH Job admission with fresh CSpaces, arenas, budgets, and terminal reports. |
+| C5 | ⬜ | Native async functions, `stream<T>`, and `future<T>` mapped to VibeOS backpressure, cancellation, and revocation. |
+| C6 | ⬜ | Bounded typed composition with one separately admitted CSpace/budget per security principal and atomic graph admission. |
+| C7 | ⬜ | Canonical component artifacts, authenticated policy, two-boot recovery, and bounded graph upgrade with fresh runtime identities. |
+| C8 | ⬜ | Legacy WASIp1-to-component adapters, published costs, optional rebuildable AOT, and individually gated wider profiles. |
+
+The normative architecture, invariants, milestone items, acceptance demos,
+evidence matrix, metrics, risks, and v1 definition of done are in
+[WASM_ROADMAP.md](WASM_ROADMAP.md). C0--C5 are the minimum Component Model
+direction proof, C6 proves multi-principal composition, and C7 completes
+Component v1. Compatibility and optimization in C8 do not block that release.
+
 ## 0. The one thing to fix first
 
 *(Written before M1. Kept as the rationale.)*
@@ -94,6 +124,8 @@ M1 Foundations ──┬─► M2 Confinement ──┬─► M3 Memory & Types
                                       │         M6 MMU integrity
                                       └──────┬──────┘
                                            v1.0
+                                             │
+                              M7 scalable Blob CAS storage
 ```
 
 M2 comes before M3 because adding language features to a compiler whose generated
@@ -785,6 +817,32 @@ exactly. Every QEMU boot must also publish the `.rodata`/4 MiB COW-pool marker.
 5. Programs survive reboot with exactly the authority that was persisted.
 6. Published measurements for every number in §5.
 
+### M7 — Scalable capability-addressed storage (post-v1)
+
+**Status (2026-08-13): complete.** M7.0--M7.7 now cover SHA compatibility,
+capability-scoped block contracts, the canonical segment format, append-only
+storage, streaming CAS, root-based crash-safe cleaning, online maintenance and
+quotas, explicit M4 migration/rollback, and native Storage V2 initialization on
+blank managed media. The migration gate drives one raw image through seven
+cold boots and every selector state, while a separate two-boot case proves the
+native default without touching M4. See
+[STORAGE_V2_MAINTENANCE.md](STORAGE_V2_MAINTENANCE.md) for maintenance and
+accounting and [STORAGE_V2_MIGRATION.md](STORAGE_V2_MIGRATION.md) for cutover.
+
+M7 replaces the fixed 512-sector M4 journal backend with a managed-block-device
+Blob CAS backed by immutable segments, dual checkpoints, root-based garbage
+collection, quotas, scrub, and capability-scoped online growth. It preserves the
+existing `StoredObject` API and keeps content digests separate from authority.
+The logical Merkle format moves to the pure-Rust `sha2` implementation without
+changing any encoded byte or root.
+
+The ordered stages are M7.0 SHA compatibility, M7.1 block-range and geometry
+contracts, M7.2 canonical segment format, M7.3 append-only segment storage, M7.4
+streaming CAS, M7.5 GC, M7.6 growth/quotas/scrub, and M7.7 M4 migration and
+cutover. Raw NOR/NAND, paths, chunk-level deduplication, encryption, multi-device
+RAID, and online shrink are outside this milestone. The complete dependency and
+acceptance plan is in [STORAGE_V2_ROADMAP.md](STORAGE_V2_ROADMAP.md).
+
 ---
 
 ## 3. Workstreams
@@ -796,7 +854,7 @@ The continuing tracks after the partial M3 milestone are:
 | **Lifecycle** | `exec`, `cap`, `heap`, `world` | M3.5 supervision, cancellation, ownership, and reclamation; gates persistent services and multicore |
 | **Evidence** | `tests`, `scripts`, CI, `bench` | Reproducible builds, real-rustc oracle execution, regression budgets, and dated metrics |
 | **Compiler** | `compiler`, `kernel/rustc`, trampoline | Resolved-cap lease semantics are complete; 3.4–3.6 remain evidence-driven language-track work rather than a persistence prerequisite |
-| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.5 durable model, virtio block/network, object store, fixed persistent CSpace, and verified source/binary persistence |
+| **Platform** | drivers, storage, `tty`, `shell` | M4.0--M4.5 durable model followed by M7 segment/checkpoint storage, GC, growth, and migration |
 | **Scaling/integrity** | scheduler, `sync`, trap, boot, page tables | M5/M6 after single-hart lifecycle transitions are model-tested |
 
 The lifecycle track is the integration spine: a driver, persisted program, or remote

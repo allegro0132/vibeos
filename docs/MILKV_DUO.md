@@ -588,7 +588,7 @@ fixed peer source and guest destination checked by VibeOS. The QEMU socket peer
 and its unicast frame contract are unchanged.
 
 The image contains a bootable, type `0x0c`, 128 MiB FAT partition followed by a
-4 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
+64 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
 rootfs. The native block backend translates the data partition's first LBA to
 logical sector zero, so shell block tests and the persistent journal cannot
 overwrite FAT, `fip.bin`, or `boot.sd`. You can use read-only mounts to validate
@@ -727,7 +727,7 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
 - [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
       native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
       generates `target/milkv-duo/boot.sd`, with no FIT validation errors.
-- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 4 MiB raw
+- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 64 MiB raw
       VibeOS data partition. Its `fip.bin` and `boot.sd` are byte-for-byte
       identical to this build, and no Linux/rootfs partition exists.
 - [x] The serial console displays the FSBL, OpenSBI, U-Boot, and VibeOS banners.

@@ -757,6 +757,9 @@ dependencies = [
 [[package]]
 name = "vibeos-blob-format"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "vibeos-bsp-milkv-duo"
@@ -929,8 +932,11 @@ dependencies = [
  "vibeos-random",
  "vibeos-runtime-riscv",
  "vibeos-rustc",
+ "vibeos-segment-format",
+ "vibeos-segment-store",
  "vibeos-ssh-identity",
  "vibeos-sshd",
+ "vibeos-storage-device",
  "vibeos-vsh",
 ]
 
@@ -986,6 +992,7 @@ dependencies = [
  "vibeos-blob-format",
  "vibeos-core",
  "vibeos-durable-format",
+ "vibeos-storage-device",
 ]
 
 [[package]]
@@ -1019,6 +1026,24 @@ name = "vibeos-rustc"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-segment-format"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "vibeos-segment-store"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "vibeos-blob-format",
+ "vibeos-durable-format",
+ "vibeos-segment-format",
+ "vibeos-storage-device",
+]
+
+[[package]]
 name = "vibeos-ssh-identity"
 version = "0.1.0"
 dependencies = [
@@ -1040,6 +1065,10 @@ dependencies = [
  "vibeos-ssh-identity",
  "vibeos-vsh",
 ]
+
+[[package]]
+name = "vibeos-storage-device"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-vsh"

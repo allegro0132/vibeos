@@ -7,3 +7,4 @@ edition = "2021"
 vibeos-blob-format = { path = "../../blob-format" }
 vibeos-core = { path = "../../core" }
 vibeos-durable-format = { path = "../../durable-format" }
+vibeos-storage-device = { path = "../../storage-device" }

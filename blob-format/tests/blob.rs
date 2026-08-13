@@ -1,5 +1,6 @@
 use vibeos_blob_format::{
-    encode_blob, encoded_len, sha256, verify_proof, BlobError, BlobView, HEADER_SIZE, LEAF_SIZE,
+    BlobDescriptor, BlobError, BlobView, HEADER_SIZE, LEAF_SIZE, encode_blob, encoded_len, sha256,
+    verify_proof,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -110,6 +111,60 @@ fn strict_decoder_rejects_header_tree_data_and_suffix_mutations() {
 }
 
 #[test]
+fn standalone_header_decoder_is_strict_without_requiring_blob_tail() {
+    let encoded = encode_blob(21, &vec![0x6d; LEAF_SIZE + 3]).unwrap();
+    let header: [u8; HEADER_SIZE] = encoded[..HEADER_SIZE].try_into().unwrap();
+    let expected = BlobView::decode(&encoded).unwrap().descriptor();
+    assert_eq!(BlobDescriptor::decode_header(&header), Ok(expected));
+
+    for (offset, error) in [
+        (0, BlobError::BadMagic),
+        (8, BlobError::UnsupportedVersion),
+        (10, BlobError::UnsupportedVersion),
+        (12, BlobError::UnsupportedHash),
+        (14, BlobError::NonCanonical),
+        (15, BlobError::NonCanonical),
+        (20, BlobError::NonCanonical),
+        (23, BlobError::NonCanonical),
+        (32, BlobError::NonCanonical),
+        (36, BlobError::NonCanonical),
+        (72, BlobError::NonCanonical),
+        (80, BlobError::NonCanonical),
+        (88, BlobError::NonCanonical),
+        (96, BlobError::NonCanonical),
+        (127, BlobError::NonCanonical),
+    ] {
+        let mut mutated = header;
+        mutated[offset] ^= 1;
+        assert_eq!(
+            BlobDescriptor::decode_header(&mutated),
+            Err(error),
+            "accepted header mutation at byte {offset}"
+        );
+    }
+
+    let mut zero_kind = header;
+    zero_kind[16..20].fill(0);
+    assert_eq!(
+        BlobDescriptor::decode_header(&zero_kind),
+        Err(BlobError::EmptyObjectKind)
+    );
+
+    // Header-only decoding carries the declared root; the full view is what
+    // binds it to the canonical tree root.
+    let mut wrong_root = header;
+    wrong_root[40] ^= 1;
+    let declared = BlobDescriptor::decode_header(&wrong_root).unwrap();
+    assert_ne!(declared.root, expected.root);
+    let mut wrong_blob = encoded;
+    wrong_blob[..HEADER_SIZE].copy_from_slice(&wrong_root);
+    assert!(matches!(
+        BlobView::decode(&wrong_blob),
+        Err(BlobError::RootMismatch)
+    ));
+}
+
+#[test]
 fn roots_change_at_all_domain_boundaries() {
     let a = encode_blob(1, b"same").unwrap();
     let b = encode_blob(2, b"same").unwrap();
@@ -203,4 +258,65 @@ fn encoded_length_preflight_is_exact_across_tree_boundaries() {
             encode_blob(1, &vec![0; len]).unwrap().len()
         );
     }
+}
+
+fn fixture_pattern(len: usize, multiplier: usize, addend: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| ((index * multiplier + addend) % 251) as u8)
+        .collect()
+}
+
+#[test]
+fn frozen_m4_blobs_remain_byte_identical() {
+    const MAXIMUM_M4_CONTENT: usize = 360_352;
+    const MAXIMUM_M4_ENCODED: usize = 360 * 1024;
+    type FixtureCase = (&'static str, u32, Vec<u8>, &'static [u8], &'static str);
+
+    let cases: [FixtureCase; 4] = [
+        (
+            "empty",
+            0x4d34_0001,
+            vec![],
+            include_bytes!("fixtures/m4/empty.blob"),
+            "6a9a6ad612151e663835d1f29fb26a3b4f5ae59ef17787dd292df1b957e2e4b8",
+        ),
+        (
+            "one-leaf",
+            0x4d34_0002,
+            fixture_pattern(37, 17, 3),
+            include_bytes!("fixtures/m4/one-leaf.blob"),
+            "7b5e65a208b097fe36ce72d6ae47e0172a742740103d6620ed332907344f4290",
+        ),
+        (
+            "multi-leaf",
+            0x4d34_0003,
+            fixture_pattern(LEAF_SIZE * 3 + 17, 29, 7),
+            include_bytes!("fixtures/m4/multi-leaf.blob"),
+            "7b4044dbe5f78c6666c49e91c519e64cf81a9ec9b310154cfea9469805532f98",
+        ),
+        (
+            "maximum-m4",
+            0x4d34_0004,
+            fixture_pattern(MAXIMUM_M4_CONTENT, 43, 11),
+            include_bytes!("fixtures/m4/maximum-m4.blob"),
+            "61f308f72b3762308f8078f564cd28c4858b05496ea9b87f2a0b814e776f26c4",
+        ),
+    ];
+
+    for (name, object_kind, content, frozen, expected_root) in cases {
+        assert_eq!(
+            encode_blob(object_kind, &content).unwrap(),
+            frozen,
+            "{name}"
+        );
+        let view = BlobView::decode(frozen).unwrap();
+        assert_eq!(view.data(), content, "{name}");
+        assert_eq!(hex(&view.descriptor().root), expected_root, "{name}");
+        view.verify_all().unwrap();
+    }
+
+    assert_eq!(
+        include_bytes!("fixtures/m4/maximum-m4.blob").len(),
+        MAXIMUM_M4_ENCODED
+    );
 }

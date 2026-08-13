@@ -16,7 +16,7 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::Poll;
 
-use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
+use crate::cap::{Cap, Resource, Revocable, Rights};
 use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::plic;
@@ -26,6 +26,7 @@ use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;
 use vibeos_driver_virtio_blk::{self as block_driver, BlockEngine, HardwareError};
+use vibeos_storage_device::{MutationFailure, MutationResult};
 
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
 
@@ -185,52 +186,35 @@ impl Resource for BlockDevice {
     }
 }
 
-pub fn info_with(lease: &InvocationLease<BlockDevice>) -> Result<BlockInfo, BlockError> {
-    if !lease.authorizes(Rights::READ) {
-        return Err(BlockError::PermissionDenied);
-    }
-    Ok(lease.with(BlockDevice::info))
+/// Raw backend entry points used only by the capability-scoped facade. The
+/// facade validates a `BlockRange` invocation before calling these functions;
+/// no client module receives the raw `BlockDevice` capability.
+pub(crate) fn raw_info() -> BlockInfo {
+    BlockDevice.info()
 }
 
-pub async fn read_with(
-    lease: InvocationLease<BlockDevice>,
-    sector: u64,
-) -> Result<[u8; 512], BlockError> {
-    if !lease.authorizes(Rights::READ) {
-        return Err(BlockError::PermissionDenied);
-    }
-    // Retain the non-cloneable invocation authority until the hardware request
-    // has completed or reset. Revocation blocks the next acquisition.
-    lease.with(|_| ());
-    let result = request(BlockOperation::Read { sector }, [0; 512]).await;
-    drop(lease);
-    result
+pub(crate) async fn raw_read_at(expected_epoch: u64, sector: u64) -> Result<[u8; 512], BlockError> {
+    request_at(expected_epoch, BlockOperation::Read { sector }, [0; 512])
+        .await
+        .map_err(|failure| failure.error)
 }
 
-pub async fn write_with(
-    lease: InvocationLease<BlockDevice>,
+pub(crate) async fn raw_write_at(
+    expected_epoch: u64,
     sector: u64,
     data: [u8; 512],
-) -> Result<(), BlockError> {
-    if !lease.authorizes(Rights::WRITE) {
-        return Err(BlockError::PermissionDenied);
-    }
-    lease.with(|_| ());
-    let result = request(BlockOperation::Write { sector }, data)
+) -> MutationResult<(), BlockError> {
+    request_at(expected_epoch, BlockOperation::Write { sector }, data)
         .await
-        .map(|_| ());
-    drop(lease);
-    result
+        .map_err(RequestFailure::into_mutation)
+        .map(|_| ())
 }
 
-pub async fn flush_with(lease: InvocationLease<BlockDevice>) -> Result<(), BlockError> {
-    if !lease.authorizes(Rights::WRITE) {
-        return Err(BlockError::PermissionDenied);
-    }
-    lease.with(|_| ());
-    let result = request(BlockOperation::Flush, [0; 512]).await.map(|_| ());
-    drop(lease);
-    result
+pub(crate) async fn raw_flush_at(expected_epoch: u64) -> MutationResult<(), BlockError> {
+    request_at(expected_epoch, BlockOperation::Flush, [0; 512])
+        .await
+        .map_err(RequestFailure::into_mutation)
+        .map(|_| ())
 }
 
 pub struct BlockResources {
@@ -255,11 +239,53 @@ pub fn discover() -> Option<BlockResources> {
 #[derive(Clone, Copy)]
 struct PendingRequest {
     id: u64,
+    expected_epoch: u64,
     operation: BlockOperation,
     data: [u8; 512],
     abandoned: bool,
+    submitted: bool,
     requester: AllocationDomain,
 }
+
+#[derive(Clone, Copy)]
+struct RequestFailure {
+    error: BlockError,
+    submitted: bool,
+}
+
+impl RequestFailure {
+    const fn not_submitted(error: BlockError) -> Self {
+        Self {
+            error,
+            submitted: false,
+        }
+    }
+
+    const fn ambiguous(error: BlockError) -> Self {
+        Self {
+            error,
+            submitted: true,
+        }
+    }
+
+    const fn for_phase(error: BlockError, submitted: bool) -> Self {
+        if submitted {
+            Self::ambiguous(error)
+        } else {
+            Self::not_submitted(error)
+        }
+    }
+
+    fn into_mutation(self) -> MutationFailure<BlockError> {
+        if self.submitted {
+            MutationFailure::ambiguous(self.error)
+        } else {
+            MutationFailure::not_submitted(self.error)
+        }
+    }
+}
+
+type RequestResult = Result<[u8; 512], RequestFailure>;
 
 #[derive(Clone, Copy)]
 enum RequestSlot {
@@ -268,7 +294,7 @@ enum RequestSlot {
     InFlight(PendingRequest),
     Completed {
         id: u64,
-        result: Result<[u8; 512], BlockError>,
+        result: RequestResult,
         requester: AllocationDomain,
     },
 }
@@ -311,8 +337,12 @@ static DRIVER_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 static FAULT_AFTER_PUBLISH: AtomicBool = AtomicBool::new(false);
 static SUPPRESS_NEXT_NOTIFY: AtomicBool = AtomicBool::new(false);
 
-async fn request(operation: BlockOperation, data: [u8; 512]) -> Result<[u8; 512], BlockError> {
-    validate_operation(operation)?;
+async fn request_at(
+    expected_epoch: u64,
+    operation: BlockOperation,
+    data: [u8; 512],
+) -> RequestResult {
+    validate_operation(expected_epoch, operation).map_err(RequestFailure::not_submitted)?;
 
     let id = NEXT_REQUEST_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -320,13 +350,15 @@ async fn request(operation: BlockOperation, data: [u8; 512]) -> Result<[u8; 512]
     {
         let mut slot = REQUEST.lock();
         if !matches!(*slot, RequestSlot::Empty) {
-            return Err(BlockError::QueueFull);
+            return Err(RequestFailure::not_submitted(BlockError::QueueFull));
         }
         *slot = RequestSlot::Queued(PendingRequest {
             id,
+            expected_epoch,
             operation,
             data,
             abandoned: false,
+            submitted: false,
             requester: crate::heap::current_domain(),
         });
     }
@@ -357,13 +389,16 @@ async fn request(operation: BlockOperation, data: [u8; 512]) -> Result<[u8; 512]
     }
 }
 
-fn validate_operation(operation: BlockOperation) -> Result<(), BlockError> {
+fn validate_operation(expected_epoch: u64, operation: BlockOperation) -> Result<(), BlockError> {
     let info = BlockDevice.info();
     if info.quarantined {
         return Err(BlockError::Quarantined);
     }
     if !info.online {
         return Err(BlockError::Offline);
+    }
+    if info.session_epoch != expected_epoch {
+        return Err(BlockError::DriverRestarted);
     }
     match operation {
         BlockOperation::Read { sector } | BlockOperation::Write { sector }
@@ -428,11 +463,11 @@ pub async fn driver_task(space: &'static Space, mmio_cap: Cap, dma_cap: Cap, ser
         }
     };
     let Some(authority) = authority else {
-        complete_active(Err(BlockError::AuthorityRevoked));
+        complete_active(BlockError::AuthorityRevoked);
         return;
     };
     let Ok(transport) = authority.mmio.try_with(|window| window.transport) else {
-        complete_active(Err(BlockError::AuthorityRevoked));
+        complete_active(BlockError::AuthorityRevoked);
         return;
     };
 
@@ -443,7 +478,7 @@ pub async fn driver_task(space: &'static Space, mmio_cap: Cap, dma_cap: Cap, ser
     loop {
         let listener = REQUEST_WAIT.wait();
         if let Err(error) = session.service_device_events() {
-            complete_active(Err(error));
+            complete_active(error);
             return;
         }
         let request = take_queued();
@@ -451,7 +486,12 @@ pub async fn driver_task(space: &'static Space, mmio_cap: Cap, dma_cap: Cap, ser
             let result = session.perform(request).await;
             let terminal = matches!(
                 result,
-                Err(BlockError::Quarantined | BlockError::AuthorityRevoked | BlockError::Offline)
+                Err(RequestFailure {
+                    error: BlockError::Quarantined
+                        | BlockError::AuthorityRevoked
+                        | BlockError::Offline,
+                    ..
+                })
             );
             finish_request(request, result);
             if terminal {
@@ -478,7 +518,18 @@ fn take_queued() -> Option<PendingRequest> {
     }
 }
 
-fn finish_request(request: PendingRequest, result: Result<[u8; 512], BlockError>) {
+fn mark_submitted(id: u64) {
+    let mut slot = REQUEST.lock();
+    match *slot {
+        RequestSlot::InFlight(mut request) if request.id == id => {
+            request.submitted = true;
+            *slot = RequestSlot::InFlight(request);
+        }
+        _ => panic!("published block request lost its in-flight slot"),
+    }
+}
+
+fn finish_request(request: PendingRequest, result: RequestResult) {
     let mut notify = false;
     let mut slot = REQUEST.lock();
     if let RequestSlot::InFlight(current) = *slot {
@@ -501,7 +552,7 @@ fn finish_request(request: PendingRequest, result: Result<[u8; 512], BlockError>
     }
 }
 
-fn complete_active(result: Result<[u8; 512], BlockError>) {
+fn complete_active(error: BlockError) {
     let mut notify = false;
     let mut slot = REQUEST.lock();
     match *slot {
@@ -511,7 +562,7 @@ fn complete_active(result: Result<[u8; 512], BlockError>) {
             } else {
                 *slot = RequestSlot::Completed {
                     id: request.id,
-                    result,
+                    result: Err(RequestFailure::for_phase(error, request.submitted)),
                     requester: request.requester,
                 };
                 notify = true;
@@ -533,13 +584,13 @@ struct DriverSession {
 impl DriverSession {
     fn attach(transport: MmioTransport, authority: DriverAuthority) -> Option<Self> {
         if CONTROL.lock().quarantined {
-            complete_active(Err(BlockError::Quarantined));
+            complete_active(BlockError::Quarantined);
             return None;
         }
         {
             let mut installed = AUTHORITY.lock();
             if installed.is_some() {
-                complete_active(Err(BlockError::DriverRestarted));
+                complete_active(BlockError::DriverRestarted);
                 return None;
             }
             *installed = Some(authority);
@@ -561,7 +612,7 @@ impl DriverSession {
                     CONTROL.lock().quarantined = true;
                 }
                 *AUTHORITY.lock() = None;
-                complete_active(Err(map_hardware_error(error)));
+                complete_active(map_hardware_error(error));
                 return None;
             }
         };
@@ -594,11 +645,11 @@ impl DriverSession {
                     control.quarantined = true;
                 }
             }
-            complete_active(Err(if reset {
+            complete_active(if reset {
                 BlockError::DriverCancelled
             } else {
                 BlockError::Quarantined
-            }));
+            });
             *AUTHORITY.lock() = None;
             if reset {
                 DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
@@ -626,23 +677,28 @@ impl DriverSession {
             .expect("armed block session has engine")
     }
 
-    async fn perform(&mut self, request: PendingRequest) -> Result<[u8; 512], BlockError> {
+    async fn perform(&mut self, request: PendingRequest) -> RequestResult {
         // Process status/configuration interrupts again after claiming the
         // request. This closes the race between the idle check and descriptor
         // publication without trusting an IRQ as proof of completion.
-        self.service_device_events()?;
+        self.service_device_events()
+            .map_err(RequestFailure::not_submitted)?;
         // Capacity and negotiated feature state may have changed while this
         // request waited in the client slot. Revalidate after draining device
         // events and before exposing another descriptor.
-        validate_operation(request.operation)?;
+        validate_operation(request.expected_epoch, request.operation)
+            .map_err(RequestFailure::not_submitted)?;
         let transport = self.engine().transport();
         if !authority_live(transport) {
-            return Err(BlockError::AuthorityRevoked);
+            return Err(RequestFailure::not_submitted(BlockError::AuthorityRevoked));
         }
         let submission = self
             .engine_mut()
-            .submit(request.operation, request.data)
-            .map_err(map_hardware_error)?;
+            .submit_tracked(request.operation, request.data, || {
+                mark_submitted(request.id)
+            })
+            .map_err(map_hardware_error)
+            .map_err(RequestFailure::not_submitted)?;
         if !SUPPRESS_NEXT_NOTIFY.swap(false, Ordering::AcqRel) {
             self.engine().notify();
         }
@@ -658,13 +714,15 @@ impl DriverSession {
                 self.engine_mut()
                     .timeout(submission)
                     .expect("the active block submission must time out");
-                self.reset_required_transport()?;
-                return Err(BlockError::TimedOut);
+                self.reset_required_transport()
+                    .map_err(RequestFailure::ambiguous)?;
+                return Err(RequestFailure::ambiguous(BlockError::TimedOut));
             }
             WaitOutcome::DeviceNeedsReset => {
                 self.engine_mut().require_device_reset();
-                self.reset_required_transport()?;
-                return Err(BlockError::DriverRestarted);
+                self.reset_required_transport()
+                    .map_err(RequestFailure::ambiguous)?;
+                return Err(RequestFailure::ambiguous(BlockError::DriverRestarted));
             }
         };
 
@@ -673,17 +731,19 @@ impl DriverSession {
         // device has declared this session unreliable.
         if self.engine().device_needs_reset() {
             self.engine_mut().require_device_reset();
-            self.reset_required_transport()?;
-            return Err(BlockError::DriverRestarted);
+            self.reset_required_transport()
+                .map_err(RequestFailure::ambiguous)?;
+            return Err(RequestFailure::ambiguous(BlockError::DriverRestarted));
         }
 
         match self.engine_mut().complete(submission, observed_used, used) {
             Ok(data) => Ok(data),
             Err(HardwareError::Protocol) => {
-                self.reset_required_transport()?;
-                Err(BlockError::Protocol)
+                self.reset_required_transport()
+                    .map_err(RequestFailure::ambiguous)?;
+                Err(RequestFailure::ambiguous(BlockError::Protocol))
             }
-            Err(error) => Err(map_hardware_error(error)),
+            Err(error) => Err(RequestFailure::ambiguous(map_hardware_error(error))),
         }
     }
 
@@ -816,11 +876,11 @@ impl Drop for DriverSession {
                     control.quarantined = true;
                 }
             }
-            complete_active(Err(if reset {
+            complete_active(if reset {
                 BlockError::DriverCancelled
             } else {
                 BlockError::Quarantined
-            }));
+            });
             *AUTHORITY.lock() = None;
             if reset {
                 DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
@@ -845,11 +905,11 @@ fn shutdown_transport(transport: MmioTransport, reason: BlockError) {
             control.quarantined = true;
         }
     }
-    complete_active(Err(if reset {
+    complete_active(if reset {
         reason
     } else {
         BlockError::Quarantined
-    }));
+    });
     *AUTHORITY.lock() = None;
     if reset {
         DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
@@ -1023,7 +1083,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     if let Some(transport) = transport {
         shutdown_transport(transport, BlockError::DriverFault);
     } else {
-        complete_active(Err(BlockError::DriverFault));
+        complete_active(BlockError::DriverFault);
     }
 }
 

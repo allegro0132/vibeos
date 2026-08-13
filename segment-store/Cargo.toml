@@ -1,0 +1,11 @@
+[package]
+name = "vibeos-segment-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = { version = "0.11.0", default-features = false }
+vibeos-blob-format = { path = "../blob-format" }
+vibeos-durable-format = { path = "../durable-format" }
+vibeos-segment-format = { path = "../segment-format" }
+vibeos-storage-device = { path = "../storage-device" }

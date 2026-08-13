@@ -488,6 +488,18 @@ def seed(path: Path) -> None:
         disk.write(image[start:end])
 
 
+def seed_empty(path: Path) -> None:
+    """Seed the canonical one-record M4 authority used by migration tests."""
+    if path.stat().st_size < STORE_END_SECTOR * SECTOR_SIZE:
+        fail("seed target is smaller than the fixed object-store region")
+    image = fixture_image([(1, b"", 0)])
+    start = STORE_FIRST_SECTOR * SECTOR_SIZE
+    end = STORE_END_SECTOR * SECTOR_SIZE
+    with path.open("r+b") as disk:
+        disk.seek(start)
+        disk.write(image[start:end])
+
+
 def expect_fixture_failure(
     name: str,
     specs: list[tuple[int, bytes, int]],
@@ -506,6 +518,10 @@ def expect_fixture_failure(
 def self_test() -> None:
     format_record = (1, b"", 0)
     high_water = (2, (100).to_bytes(16, "little"), 0)
+
+    empty_records = verify_image(fixture_image([format_record]), [])
+    if len(empty_records) != 1 or empty_records[0]["kind"] != 1:
+        fail("canonical empty M4 seed is not exactly one Format record")
 
     expect_fixture_failure(
         "store-trust-anchor",
@@ -659,16 +675,19 @@ def main() -> int:
             print(f"FAIL store verifier selftest: {error}", file=sys.stderr)
             return 1
         return 0
-    if len(sys.argv) == 3 and sys.argv[1] == "--seed":
+    if len(sys.argv) == 3 and sys.argv[1] in ("--seed", "--seed-empty"):
         try:
-            seed(Path(sys.argv[2]))
+            if sys.argv[1] == "--seed":
+                seed(Path(sys.argv[2]))
+            else:
+                seed_empty(Path(sys.argv[2]))
         except (OSError, ValueError) as error:
             print(f"FAIL store prefill: {error}", file=sys.stderr)
             return 1
         return 0
     if len(sys.argv) != 2:
         print(
-            f"usage: {Path(sys.argv[0]).name} [--seed] DISK.raw",
+            f"usage: {Path(sys.argv[0]).name} [--seed|--seed-empty] DISK.raw",
             file=sys.stderr,
         )
         return 2

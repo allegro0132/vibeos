@@ -1,0 +1,8 @@
+quiet
+run hello
+storage status
+pcspace test
+store test
+blob test
+@sleep 25
+halt

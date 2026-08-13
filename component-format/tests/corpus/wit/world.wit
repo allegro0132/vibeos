@@ -1,0 +1,33 @@
+package vibe:fixture@1.0.0;
+
+interface random {
+    resource random-source;
+    enum random-error { denied, exhausted }
+    fill: func(source: borrow<random-source>, len: u32) -> result<list<u8>, random-error>;
+}
+
+interface filter {
+    use random.{random-source};
+
+    flags flags-value { urgent, audited }
+
+    enum error-code { denied, invalid, exhausted }
+
+    record request {
+        label: string,
+        payload: list<u8>,
+        attributes: flags-value,
+    }
+
+    variant response {
+        accepted(tuple<string, list<u8>>),
+        rejected(error-code),
+    }
+
+    transform: func(value: request, source: borrow<random-source>) -> response;
+}
+
+world typed-filter {
+    import random;
+    export filter;
+}

@@ -715,11 +715,20 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         if typed_decode_peak > limits.recovery_memory_bytes {
             return Err(GcError::MemoryLimit.into());
         }
-        let admission = ReferenceCodecAdmission::refs_v1(object.blob_key.object_kind())
-            .map_err(|_| GcError::Corrupt)?;
-        let decoded = admission
-            .decode(object.blob_key.object_kind(), view.data())
-            .map_err(|_| GcError::Corrupt)?;
+        let object_kind = object.blob_key.object_kind();
+        let decoded = if matches!(
+            object_kind,
+            crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND
+        ) {
+            crate::decode_fs_typed_references(object_kind, view.data())
+                .map_err(|_| GcError::Corrupt)?
+        } else {
+            let admission =
+                ReferenceCodecAdmission::refs_v1(object_kind).map_err(|_| GcError::Corrupt)?;
+            admission
+                .decode(object_kind, view.data())
+                .map_err(|_| GcError::Corrupt)?
+        };
         if decoded.manifest_commit_generation != object.commit_generation {
             return Err(GcError::Corrupt.into());
         }

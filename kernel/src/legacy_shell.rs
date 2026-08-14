@@ -136,6 +136,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  echo <text>     write via init's console capability");
             println!("  vsh             enter an interactive capability-native shell");
             println!("  vsh <list>      run a capability-native command list");
+            println!("  reboot          cold reboot the machine");
             println!("  halt            shut the machine down");
         }
 
@@ -542,6 +543,11 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 Ok(c) => c.write(&alloc::format!("  {}\n", rest.join(" "))),
                 Err(e) => println!("  refused: {}", e),
             }
+        }
+
+        "reboot" => {
+            println!("  rebooting.");
+            sbi::reboot();
         }
 
         "halt" => {

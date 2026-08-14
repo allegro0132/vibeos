@@ -277,6 +277,12 @@ const BASE_COMMANDS: &[CommandSpec] = &[
         handler: vsh_verbose,
     },
     CommandSpec {
+        name: "reboot",
+        min_args: 0,
+        max_args: 0,
+        handler: vsh_reboot,
+    },
+    CommandSpec {
         name: "poweroff",
         min_args: 0,
         max_args: 0,
@@ -821,6 +827,10 @@ fn vsh_quiet(_args: &[String]) -> Result<String, Status> {
 fn vsh_verbose(_args: &[String]) -> Result<String, Status> {
     crate::tty::set_quiet(false);
     Ok(String::from("background component output restored\n"))
+}
+
+fn vsh_reboot(_args: &[String]) -> Result<String, Status> {
+    crate::sbi::reboot()
 }
 
 fn vsh_poweroff(_args: &[String]) -> Result<String, Status> {

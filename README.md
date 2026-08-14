@@ -464,6 +464,7 @@ caps [space]    sanitized capability summary
 mem             bounded-memory accounts
 quiet           mute background component output
 verbose         restore background component output
+reboot          cold reboot
 poweroff        power off
 ```
 
@@ -542,6 +543,7 @@ quiet           mute background components (`verbose` restores)
 mem             kernel heap usage
 uptime          seconds since boot
 echo <text>     write via init's console capability
+reboot          cold reboot the machine
 halt            shut the machine down
 ```
 

@@ -16,7 +16,10 @@ use core::task::{Context, Poll};
 use crate::heap::ArenaId;
 use crate::println;
 use vibeos_core::exec::AcceptanceWitnessMismatch;
-use vibeos_core::instance::{AcceptanceInstanceProbe, AcceptanceSealMismatch, InstancePhase};
+use vibeos_core::instance::{
+    AcceptanceInstanceProbe, AcceptanceSealMismatch, InstanceContinuationSignal,
+    InstanceContinuationToken, InstancePhase,
+};
 
 use super::*;
 
@@ -28,12 +31,17 @@ const WAIT_SECONDS: u64 = 10;
 const POS_FREE: u8 = 0;
 const POS_ARMED: u8 = 1;
 const POS_RUNTIME_READY: u8 = 2;
-const POS_RAW_RECLAIMED: u8 = 3;
-const POS_TERMINAL_VISIBLE: u8 = 4;
-const POS_OWNER_RETIRED: u8 = 5;
-const POS_CSPACE_RESET: u8 = 6;
-const POS_COMPLETE: u8 = 7;
-const POS_DONE: u8 = 8;
+const POS_CONTINUATION_PARKED: u8 = 3;
+const POS_CONTINUATION_SIGNALLED: u8 = 4;
+const POS_CONTINUATION_RESUMED: u8 = 5;
+const POS_STALE_REJECTED: u8 = 6;
+const POS_FAULT_WAIT_PARKED: u8 = 7;
+const POS_RAW_RECLAIMED: u8 = 8;
+const POS_TERMINAL_VISIBLE: u8 = 9;
+const POS_OWNER_RETIRED: u8 = 10;
+const POS_CSPACE_RESET: u8 = 11;
+const POS_COMPLETE: u8 = 12;
+const POS_DONE: u8 = 13;
 
 const NEG_FREE: u8 = 0;
 const NEG_ARMED: u8 = 1;
@@ -58,14 +66,21 @@ const ERROR_NEGATIVE_RESULT: u64 = 1 << 10;
 const ERROR_ABA: u64 = 1 << 11;
 const ERROR_NORMAL_PROBE: u64 = 1 << 12;
 const ERROR_POLICY_GATE: u64 = 1 << 13;
+const ERROR_CONTINUATION_FAULT: u64 = 1 << 14;
 
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 static POSITIVE_RAW_RECLAIMS: AtomicUsize = AtomicUsize::new(0);
 static POSITIVE_RESETS: AtomicUsize = AtomicUsize::new(0);
 static POSITIVE_REGISTRATION_DRAINS: AtomicUsize = AtomicUsize::new(0);
+static C52_PARKS: AtomicUsize = AtomicUsize::new(0);
+static C52_RESUMES: AtomicUsize = AtomicUsize::new(0);
+static C52_CROSS_HART_SIGNALS: AtomicUsize = AtomicUsize::new(0);
+static C52_STALE_REJECTS: AtomicUsize = AtomicUsize::new(0);
+static C52_LIVE_FAULTS: AtomicUsize = AtomicUsize::new(0);
 static FAULT_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
 static HART_FAULTS: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 static READY_MASKS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
+static PARKED_MASKS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
 static ROUND_DONE: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
 
 struct PositiveSlot {
@@ -75,7 +90,11 @@ struct PositiveSlot {
     arena: AtomicU64,
     round: AtomicU8,
     hart: AtomicU8,
+    signal_hart: AtomicU8,
+    park_polls: AtomicU64,
     token: UnsafeCell<MaybeUninit<InstanceToken>>,
+    continuation: UnsafeCell<MaybeUninit<InstanceContinuationToken>>,
+    handle: UnsafeCell<MaybeUninit<TaskHandle>>,
     before: UnsafeCell<MaybeUninit<AcceptanceInstanceProbe>>,
 }
 
@@ -90,7 +109,11 @@ impl PositiveSlot {
             arena: AtomicU64::new(0),
             round: AtomicU8::new(0),
             hart: AtomicU8::new(0),
+            signal_hart: AtomicU8::new(u8::MAX),
+            park_polls: AtomicU64::new(0),
             token: UnsafeCell::new(MaybeUninit::uninit()),
+            continuation: UnsafeCell::new(MaybeUninit::uninit()),
+            handle: UnsafeCell::new(MaybeUninit::uninit()),
             before: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
@@ -104,6 +127,18 @@ impl PositiveSlot {
 
     fn token(&self) -> InstanceToken {
         unsafe { (*self.token.get()).assume_init() }
+    }
+
+    fn continuation(&self) -> InstanceContinuationToken {
+        unsafe { (*self.continuation.get()).assume_init() }
+    }
+
+    fn handle(&self) -> TaskHandle {
+        unsafe { (*self.handle.get()).assume_init_ref().clone() }
+    }
+
+    unsafe fn release_handle(&self) {
+        unsafe { (*self.handle.get()).assume_init_drop() };
     }
 
     fn before(&self) -> AcceptanceInstanceProbe {
@@ -209,6 +244,7 @@ pub(super) fn arm_positive(
     }
     unsafe {
         (*slot.token.get()).write(token);
+        (*slot.handle.get()).write(handle.clone());
         (*slot.before.get()).write(probe.expect("validated acceptance probe exists"));
     }
     slot.task.store(handle.id().0, Ordering::Relaxed);
@@ -220,7 +256,7 @@ pub(super) fn arm_positive(
     true
 }
 
-pub(super) async fn fault_after_runtime_barrier(round: u8, hart: u8) {
+async fn fault_after_runtime_barrier(round: u8, hart: u8) {
     let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
         fail(ERROR_POSITIVE_RUNTIME);
         return;
@@ -259,6 +295,260 @@ pub(super) async fn fault_after_runtime_barrier(round: u8, hart: u8) {
     }
 }
 
+struct ResumableContinuation {
+    continuation: InstanceContinuation<'static>,
+    operation: InstanceContinuationToken,
+    token: InstanceToken,
+    round: u8,
+    hart: u8,
+    parked: bool,
+}
+
+impl Future for ResumableContinuation {
+    type Output = Result<(), ()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let polled = Pin::new(&mut self.continuation).poll(context);
+        let Some(index) = positive_index(self.round, self.hart) else {
+            fail(ERROR_CONTINUATION_FAULT);
+            return Poll::Ready(Err(()));
+        };
+        let slot = &POSITIVE[index];
+        match polled {
+            Poll::Pending if !self.parked => {
+                let witness = crate::exec::current_reclaimable_task_witness();
+                let exact = witness.is_some_and(|witness| {
+                    witness.instance_token() == Some(self.token)
+                        && witness.task_id().0 == slot.task.load(Ordering::Relaxed)
+                        && witness.home_hart().index() == usize::from(self.hart)
+                        && witness.current_hart().index() == usize::from(self.hart)
+                        && slot.matches(witness.task_id(), witness.allocation_domain())
+                });
+                let handle = slot.handle();
+                if !exact
+                    || handle.id().0 != slot.task.load(Ordering::Relaxed)
+                    || handle.allocation_domain().owner.get() != slot.owner.load(Ordering::Relaxed)
+                    || handle.allocation_domain().arena.get() != slot.arena.load(Ordering::Relaxed)
+                {
+                    fail(ERROR_CONTINUATION_FAULT);
+                    return Poll::Ready(Err(()));
+                }
+                let polls = handle.polls();
+                unsafe { (*slot.continuation.get()).write(self.operation) };
+                slot.park_polls.store(polls, Ordering::Relaxed);
+                if slot
+                    .stage
+                    .compare_exchange(
+                        POS_RUNTIME_READY,
+                        POS_CONTINUATION_PARKED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    fail(ERROR_CONTINUATION_FAULT);
+                    return Poll::Ready(Err(()));
+                }
+                self.parked = true;
+                C52_PARKS.fetch_add(1, Ordering::AcqRel);
+                PARKED_MASKS[usize::from(self.round)].fetch_or(1 << self.hart, Ordering::AcqRel);
+                Poll::Pending
+            }
+            Poll::Pending => {
+                // An External continuation has no self-wake. Any second poll
+                // before its one exact signal is observable spin.
+                fail(ERROR_CONTINUATION_FAULT);
+                Poll::Ready(Err(()))
+            }
+            Poll::Ready(Ok(())) if self.parked => {
+                let witness = crate::exec::current_reclaimable_task_witness();
+                let resume_polls = slot.handle().polls();
+                let exact = witness.is_some_and(|witness| {
+                    witness.instance_token() == Some(self.token)
+                        && witness.task_id().0 == slot.task.load(Ordering::Relaxed)
+                        && witness.home_hart().index() == usize::from(self.hart)
+                        && witness.current_hart().index() == usize::from(self.hart)
+                        && slot.matches(witness.task_id(), witness.allocation_domain())
+                }) && slot.signal_hart.load(Ordering::Acquire) != self.hart
+                    && usize::from(slot.signal_hart.load(Ordering::Relaxed))
+                        == (usize::from(self.hart) + HARTS - 1) % HARTS
+                    && slot.park_polls.load(Ordering::Relaxed).checked_add(1) == Some(resume_polls);
+                if !exact
+                    || slot
+                        .stage
+                        .compare_exchange(
+                            POS_CONTINUATION_SIGNALLED,
+                            POS_CONTINUATION_RESUMED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                {
+                    fail(ERROR_CONTINUATION_FAULT);
+                    return Poll::Ready(Err(()));
+                }
+                C52_RESUMES.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                fail(ERROR_CONTINUATION_FAULT);
+                Poll::Ready(Err(()))
+            }
+        }
+    }
+}
+
+struct PendingContinuationFault {
+    continuation: InstanceContinuation<'static>,
+    token: InstanceToken,
+    round: u8,
+    hart: u8,
+}
+
+impl Future for PendingContinuationFault {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.continuation).poll(context) {
+            Poll::Pending => {
+                let witness = crate::exec::current_reclaimable_task_witness();
+                let Some(index) = positive_index(self.round, self.hart) else {
+                    fail(ERROR_CONTINUATION_FAULT);
+                    return Poll::Ready(());
+                };
+                let slot = &POSITIVE[index];
+                let exact = witness.is_some_and(|witness| {
+                    witness.instance_token() == Some(self.token)
+                        && witness.task_id().0 == slot.task.load(Ordering::Relaxed)
+                        && witness.home_hart().index() == usize::from(self.hart)
+                        && witness.current_hart().index() == usize::from(self.hart)
+                        && slot.matches(witness.task_id(), witness.allocation_domain())
+                });
+                let registrations = slot.handle().acceptance_registration_stats();
+                if !exact
+                    || registrations.total != 1
+                    || registrations.waits != 1
+                    || registrations.timers != 0
+                    || registrations.joins != 0
+                    || registrations.irq_poll_probes != 0
+                    || slot
+                        .stage
+                        .compare_exchange(
+                            POS_STALE_REJECTED,
+                            POS_FAULT_WAIT_PARKED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                {
+                    fail(ERROR_CONTINUATION_FAULT);
+                    return Poll::Ready(());
+                }
+                C52_LIVE_FAULTS.fetch_add(1, Ordering::AcqRel);
+                // Deliberately fault with the one-shot listener still owned by
+                // this task. The executor must drain it before the instance
+                // registry may mark the continuation Abandoned and authorize
+                // raw arena reclamation.
+                panic!("deliberate C5.2 fault with a live continuation wait");
+            }
+            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                fail(ERROR_CONTINUATION_FAULT);
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round: u8, hart: u8) {
+    fault_after_runtime_barrier(round, hart).await;
+    let operation =
+        match registry().arm_continuation_current(token, InstanceContinuationKind::External) {
+            Ok(operation) => operation,
+            Err(_) => {
+                fail(ERROR_CONTINUATION_FAULT);
+                return;
+            }
+        };
+    let continuation = match registry().wait_continuation(operation) {
+        Ok(continuation) => continuation,
+        Err(_) => {
+            fail(ERROR_CONTINUATION_FAULT);
+            return;
+        }
+    };
+    if (ResumableContinuation {
+        continuation,
+        operation,
+        token,
+        round,
+        hart,
+        parked: false,
+    })
+    .await
+    .is_err()
+    {
+        fail(ERROR_CONTINUATION_FAULT);
+        return;
+    }
+
+    // A completed operation token must be stale, and probing before/after the
+    // rejection proves that no instance, Space, or CSpace projection changed.
+    let before_stale = registry().acceptance_probe(token);
+    let stale = registry().signal_continuation(operation);
+    let after_stale = registry().acceptance_probe(token);
+    let Some(index) = positive_index(round, hart) else {
+        fail(ERROR_CONTINUATION_FAULT);
+        return;
+    };
+    if stale != InstanceContinuationSignal::Stale
+        || before_stale.is_none()
+        || before_stale != after_stale
+        || !after_stale.is_some_and(|probe| {
+            probe.is_exact()
+                && probe.exact_phase() == Some(InstancePhase::Active)
+                && probe.seal_matches_space()
+                && probe.seal_matches_cspace()
+        })
+        || POSITIVE[index]
+            .stage
+            .compare_exchange(
+                POS_CONTINUATION_RESUMED,
+                POS_STALE_REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        fail(ERROR_CONTINUATION_FAULT);
+        return;
+    }
+    C52_STALE_REJECTS.fetch_add(1, Ordering::AcqRel);
+
+    let fault_operation =
+        match registry().arm_continuation_current(token, InstanceContinuationKind::External) {
+            Ok(fault_operation) if fault_operation != operation => fault_operation,
+            Ok(_) | Err(_) => {
+                fail(ERROR_CONTINUATION_FAULT);
+                return;
+            }
+        };
+    let continuation = match registry().wait_continuation(fault_operation) {
+        Ok(continuation) => continuation,
+        Err(_) => {
+            fail(ERROR_CONTINUATION_FAULT);
+            return;
+        }
+    };
+    PendingContinuationFault {
+        continuation,
+        token,
+        round,
+        hart,
+    }
+    .await;
+    fail(ERROR_CONTINUATION_FAULT);
+}
+
 pub(super) fn record_raw_reclaimed(witness: ReclaimableFaultWitness) {
     let Some(slot) = positive_for(witness.task_id(), witness.allocation_domain()) else {
         return;
@@ -270,7 +560,7 @@ pub(super) fn record_raw_reclaimed(witness: ReclaimableFaultWitness) {
         || slot
             .stage
             .compare_exchange(
-                POS_RUNTIME_READY,
+                POS_FAULT_WAIT_PARKED,
                 POS_RAW_RECLAIMED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -316,6 +606,10 @@ pub(super) fn record_terminal_visible(
         fail(ERROR_POSITIVE_TERMINAL);
     } else {
         POSITIVE_REGISTRATION_DRAINS.fetch_add(1, Ordering::AcqRel);
+        // The static slot only needs this observer through the park/resume and
+        // terminal-ledger checks. Release the Arc here so round baselines also
+        // prove the gate does not retain completed TaskStatus objects.
+        unsafe { slot.release_handle() };
     }
 }
 
@@ -624,7 +918,7 @@ fn start_negative(kind: NegativeCase, pending: bool) -> Result<NegativeInstance,
     }
     let mut control = NEG_CONTROL.try_lock().map_err(|_| ())?;
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
-    let key = control.reserve().ok_or(())?;
+    let key = control.reserve(&NEG_CONTROL).ok_or(())?;
     let owner = HEAP.create_owner(INSTANCE_HEAP_QUOTA).map_err(|_| ())?;
     let arena = HEAP.create_arena(owner).map_err(|_| ())?;
     let domain = AllocationDomain::new(owner, arena);
@@ -978,6 +1272,57 @@ async fn finish_positive_round(round: usize) {
     }
 }
 
+async fn signal_cross_hart_continuation(round: usize, source_hart: usize) -> bool {
+    let started = crate::sbi::time();
+    while PARKED_MASKS[round].load(Ordering::Acquire) != 0x0f {
+        if deadline_expired(started) {
+            fail(ERROR_CONTINUATION_FAULT);
+            return false;
+        }
+        crate::exec::yield_now().await;
+    }
+
+    // Each pinned SYSTEM worker signals the next hart's component. Give the
+    // scheduler two opportunities before signalling and require the parked
+    // task's poll count to remain unchanged across both: an External wait must
+    // not self-wake or spin.
+    let target_hart = (source_hart + 1) % HARTS;
+    let slot = &POSITIVE[round * HARTS + target_hart];
+    let parked_polls = slot.park_polls.load(Ordering::Relaxed);
+    let mut no_spin = slot.stage.load(Ordering::Acquire) == POS_CONTINUATION_PARKED
+        && slot.handle().polls() == parked_polls;
+    for _ in 0..2 {
+        crate::exec::yield_now().await;
+        no_spin &= slot.stage.load(Ordering::Acquire) == POS_CONTINUATION_PARKED
+            && slot.handle().polls() == parked_polls;
+    }
+    let cross_hart = crate::ipi::current_logical_hart()
+        .is_some_and(|current| current.index() == source_hart)
+        && source_hart != target_hart;
+    let operation = slot.continuation();
+    slot.signal_hart.store(source_hart as u8, Ordering::Relaxed);
+    if slot
+        .stage
+        .compare_exchange(
+            POS_CONTINUATION_PARKED,
+            POS_CONTINUATION_SIGNALLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        fail(ERROR_CONTINUATION_FAULT);
+        return false;
+    }
+    let signalled = registry().signal_continuation(operation);
+    if !no_spin || !cross_hart || signalled != InstanceContinuationSignal::Signalled {
+        fail(ERROR_CONTINUATION_FAULT);
+        return false;
+    }
+    C52_CROSS_HART_SIGNALS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
 async fn positive_worker(hart: usize) {
     for round in 0..ROUNDS {
         let Some(token) = start_positive(round as u8, hart as u8).await else {
@@ -986,6 +1331,9 @@ async fn positive_worker(hart: usize) {
             finish_positive_round(round).await;
             continue;
         };
+        if !signal_cross_hart_continuation(round, hart).await {
+            fail(ERROR_POSITIVE_WORKER);
+        }
         let index = round * HARTS + hart;
         if !wait_for_terminal(token, ComponentTerminal::RunnerFault).await
             || !positive_postconditions(index)
@@ -1100,11 +1448,19 @@ async fn run_positive_matrix() {
     if POSITIVE_RAW_RECLAIMS.load(Ordering::Acquire) != POSITIVE_CYCLES
         || POSITIVE_RESETS.load(Ordering::Acquire) != POSITIVE_CYCLES
         || POSITIVE_REGISTRATION_DRAINS.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C52_PARKS.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C52_RESUMES.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C52_CROSS_HART_SIGNALS.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C52_STALE_REJECTS.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C52_LIVE_FAULTS.load(Ordering::Acquire) != POSITIVE_CYCLES
         || FAULT_PAYLOAD_DROPS.load(Ordering::Acquire) != 0
         || HART_FAULTS
             .iter()
             .any(|faults| faults.load(Ordering::Acquire) != ROUNDS)
         || READY_MASKS
+            .iter()
+            .any(|mask| mask.load(Ordering::Acquire) != 0x0f)
+        || PARKED_MASKS
             .iter()
             .any(|mask| mask.load(Ordering::Acquire) != 0x0f)
         || ROUND_DONE
@@ -1538,6 +1894,14 @@ pub(super) async fn run() -> bool {
     if ERRORS.load(Ordering::Acquire) == 0 && open_production_policy_gate().await {
         RUN_STATE.store(2, Ordering::Release);
         println!(
+            "WASM_C52_ACCEPTANCE PASS parks={} resumes={} cross_hart_signals={} stale_rejects={} live_faults={}",
+            C52_PARKS.load(Ordering::Acquire),
+            C52_RESUMES.load(Ordering::Acquire),
+            C52_CROSS_HART_SIGNALS.load(Ordering::Acquire),
+            C52_STALE_REJECTS.load(Ordering::Acquire),
+            C52_LIVE_FAULTS.load(Ordering::Acquire),
+        );
+        println!(
             "WASM_C48_ACCEPTANCE PASS faults={} harts={} policy=passed",
             POSITIVE_RAW_RECLAIMS.load(Ordering::Acquire),
             HARTS
@@ -1564,6 +1928,15 @@ pub(super) async fn run() -> bool {
                 );
             }
         }
+        println!(
+            "WASM_C52_ACCEPTANCE FAIL errors={:#x} parks={} resumes={} cross_hart_signals={} stale_rejects={} live_faults={}",
+            ERRORS.load(Ordering::Acquire),
+            C52_PARKS.load(Ordering::Acquire),
+            C52_RESUMES.load(Ordering::Acquire),
+            C52_CROSS_HART_SIGNALS.load(Ordering::Acquire),
+            C52_STALE_REJECTS.load(Ordering::Acquire),
+            C52_LIVE_FAULTS.load(Ordering::Acquire),
+        );
         println!(
             "WASM_C48_ACCEPTANCE FAIL errors={:#x}",
             ERRORS.load(Ordering::Acquire)

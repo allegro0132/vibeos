@@ -21,11 +21,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt;
-use core::future::Future;
+use core::future::{poll_fn, Future};
 use core::num::NonZeroU64;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::sync::atomic::Ordering;
+use core::task::Poll;
+#[cfg(any(test, feature = "qualification-stream"))]
+use core::task::{Context, Waker};
 
 use sunset::{
     ChanData, ChanFail, ChanHandle, Ed25519HostSigner, Event, PubKey, Runner, ServEvent, Server,
@@ -2349,10 +2351,10 @@ async fn next_shell_event(
 fn mark_running_interrupts(
     frontend: &mut TerminalFrontend,
     input: &mut PendingInput,
-    cancel: &AtomicBool,
+    cancel: &vibeos_vsh::CancellationSignal,
 ) -> Result<bool, &'static str> {
     if input.signal_interrupt {
-        cancel.store(true, Ordering::Release);
+        cancel.cancel();
         match frontend.interrupt() {
             Ok(_) => {
                 input.signal_interrupt = false;
@@ -2371,7 +2373,7 @@ fn mark_running_interrupts(
     else {
         return Ok(true);
     };
-    cancel.store(true, Ordering::Release);
+    cancel.cancel();
     match frontend.interrupt() {
         Ok(_) => {
             input.bytes.remove(position);
@@ -2399,7 +2401,7 @@ async fn execute_shell_command(
     frontend: &mut TerminalFrontend,
     require_carrier: bool,
 ) -> Result<Result<Vec<vibeos_vsh::JobReport>, vibeos_vsh::Diagnostic>, ConnectionEnd> {
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(vibeos_vsh::CancellationSignal::new());
     // Ordinary bytes queued after Enter remain typeahead for the next prompt.
     // Ctrl-C is different: SSH byte ordering proves every queued byte follows
     // the submitted line, so it must interrupt the command even when both
@@ -2407,19 +2409,42 @@ async fn execute_shell_command(
     let mut execution = Box::pin(session.execute_cancellable(command, cancel.clone()));
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
     let mut transport_eof_deadline = None;
+    let mut completed = None;
 
     loop {
         if let Some((kind, deadline)) = cancellation {
-            if let Poll::Ready(_reports) = poll_once(execution.as_mut()) {
-                return match kind {
-                    ExecutionCancellation::Reset(reason) => Err(ConnectionEnd::Reset(reason)),
-                    ExecutionCancellation::Rebind(reason) => Err(ConnectionEnd::Rebind(reason)),
-                    ExecutionCancellation::Timeout => {
-                        Err(ConnectionEnd::Reset("unexpected shell execution timeout"))
+            if completed.is_none() {
+                match wait_for_execution_or(
+                    execution.as_mut(),
+                    vibeos_core::exec::sleep_ms(deadline.saturating_sub(monotonic_ms())),
+                )
+                .await
+                {
+                    ExecutionWait::Complete(_reports) => {
+                        return match kind {
+                            ExecutionCancellation::Reset(reason) => {
+                                Err(ConnectionEnd::Reset(reason))
+                            }
+                            ExecutionCancellation::Rebind(reason) => {
+                                Err(ConnectionEnd::Rebind(reason))
+                            }
+                            ExecutionCancellation::Timeout => {
+                                Err(ConnectionEnd::Reset("unexpected shell execution timeout"))
+                            }
+                        };
                     }
-                };
+                    ExecutionWait::DelayElapsed => {
+                        return Err(match kind {
+                            ExecutionCancellation::Reset(reason) => ConnectionEnd::Reset(reason),
+                            ExecutionCancellation::Rebind(reason) => ConnectionEnd::Rebind(reason),
+                            ExecutionCancellation::Timeout => {
+                                ConnectionEnd::Reset("unexpected shell execution timeout")
+                            }
+                        });
+                    }
+                }
             }
-            if monotonic_ms() >= deadline {
+            if completed.is_some() {
                 return Err(match kind {
                     ExecutionCancellation::Reset(reason) => ConnectionEnd::Reset(reason),
                     ExecutionCancellation::Rebind(reason) => ConnectionEnd::Rebind(reason),
@@ -2428,14 +2453,13 @@ async fn execute_shell_command(
                     }
                 });
             }
-            vibeos_core::exec::yield_now().await;
             continue;
         }
 
         let controls_rendered = mark_running_interrupts(frontend, input, cancel.as_ref())
             .map_err(ConnectionEnd::Reset)?;
         if controls_rendered {
-            if let Poll::Ready(reports) = poll_once(execution.as_mut()) {
+            if let Some(reports) = completed.take() {
                 return Ok(reports);
             }
         }
@@ -2449,20 +2473,20 @@ async fn execute_shell_command(
         if let Err(reason) =
             validate_network_authority(space, control, bound_epoch, require_carrier)
         {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
             continue;
         }
         let wire = match bridge.drive(runner, stack, now) {
             Ok(turn) => turn,
             Err(reason) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
         };
         if wire.ended {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((
                 ExecutionCancellation::Reset("peer disconnected during SSH shell command"),
                 now + CANCEL_GRACE_MS,
@@ -2472,7 +2496,7 @@ async fn execute_shell_command(
         let signal = match progress_protocol(runner, signer, space, policy, protocol) {
             Ok(signal) => signal,
             Err(reason) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
@@ -2480,10 +2504,10 @@ async fn execute_shell_command(
         match signal {
             ProtocolSignal::Interrupt => {
                 input.signal_interrupt = true;
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
             }
             ProtocolSignal::Defunct => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((
                     ExecutionCancellation::Reset("SSH shell became defunct during command"),
                     now + CANCEL_GRACE_MS,
@@ -2491,7 +2515,7 @@ async fn execute_shell_command(
                 continue;
             }
             ProtocolSignal::Exec(_, _) | ProtocolSignal::Shell => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((
                     ExecutionCancellation::Reset("duplicate SSH session start during command"),
                     now + CANCEL_GRACE_MS,
@@ -2505,7 +2529,7 @@ async fn execute_shell_command(
             .as_ref()
             .is_some_and(|channel| runner.is_channel_closed(channel))
         {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((
                 ExecutionCancellation::Reset("SSH shell channel closed during command"),
                 now + CANCEL_GRACE_MS,
@@ -2515,7 +2539,7 @@ async fn execute_shell_command(
         let output_work = match flush_terminal_output(runner, protocol, frontend) {
             Ok(worked) => worked,
             Err(reason) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
@@ -2523,7 +2547,7 @@ async fn execute_shell_command(
         let input_work = match read_shell_channel_input(runner, protocol, input) {
             Ok(worked) => worked,
             Err(reason) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
@@ -2540,23 +2564,34 @@ async fn execute_shell_command(
             // the grace interval to complete without misreading piped input.
             transport_eof_deadline.get_or_insert(now + CANCEL_GRACE_MS);
             if input.bytes.is_empty() {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
             }
         }
         if input.signal_interrupt || input.bytes.iter().any(|byte| *byte == 0x03) {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
         }
-        cooperate(
-            wire.worked
-                || output_work
-                || input_work
-                || matches!(
-                    signal,
-                    ProtocolSignal::Progressed | ProtocolSignal::Interrupt
-                ),
+        let worked = wire.worked
+            || output_work
+            || input_work
+            || matches!(
+                signal,
+                ProtocolSignal::Progressed | ProtocolSignal::Interrupt
+            );
+        if completed.is_some() {
+            cooperate(worked, wire.next_poll_delay_ms).await;
+        } else if let Some(reports) = wait_for_execution_turn(
+            execution.as_mut(),
+            worked,
             wire.next_poll_delay_ms,
+            transport_eof_deadline,
         )
-        .await;
+        .await
+        {
+            if controls_rendered {
+                return Ok(reports);
+            }
+            completed = Some(reports);
+        }
     }
 }
 
@@ -2916,7 +2951,7 @@ async fn execute_with_network(
     require_carrier: bool,
     accepted_component: Option<SshExecComponentSessionPolicy>,
 ) -> ExecutionEnd {
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(vibeos_vsh::CancellationSignal::new());
     let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
     let Some(candidate) = protocol.committed else {
         return ExecutionEnd::Reset("SSH exec session has no committed profile");
@@ -2953,40 +2988,41 @@ async fn execute_with_network(
     }
     let mut execution = Box::pin(session.execute_ssh_cancellable(command, cancel.clone()));
     let started = monotonic_ms();
+    let execution_deadline = started.saturating_add(EXEC_TIMEOUT_MS);
     let mut cancellation: Option<(ExecutionCancellation, u64)> = None;
 
     let outcome = loop {
-        if let Poll::Ready(reports) = poll_once(execution.as_mut()) {
-            break match cancellation.map(|(kind, _)| kind) {
-                Some(ExecutionCancellation::Timeout) => ExecutionEnd::Complete {
-                    reports,
-                    timed_out: true,
-                },
-                Some(ExecutionCancellation::Reset(reason)) => ExecutionEnd::Reset(reason),
-                Some(ExecutionCancellation::Rebind(reason)) => ExecutionEnd::Rebind(reason),
-                None => ExecutionEnd::Complete {
-                    reports,
-                    timed_out: false,
-                },
-            };
-        }
-
         let now = monotonic_ms();
         if let Some((kind, deadline)) = cancellation {
-            if now >= deadline {
-                break match kind {
-                    ExecutionCancellation::Timeout => {
-                        ExecutionEnd::Reset("VSH exec cancellation timed out")
+            match wait_for_execution_or(
+                execution.as_mut(),
+                vibeos_core::exec::sleep_ms(deadline.saturating_sub(now)),
+            )
+            .await
+            {
+                ExecutionWait::Complete(reports) => {
+                    break match kind {
+                        ExecutionCancellation::Timeout => ExecutionEnd::Complete {
+                            reports,
+                            timed_out: true,
+                        },
+                        ExecutionCancellation::Reset(reason) => ExecutionEnd::Reset(reason),
+                        ExecutionCancellation::Rebind(reason) => ExecutionEnd::Rebind(reason),
+                    };
+                }
+                ExecutionWait::DelayElapsed => {
+                    break match kind {
+                        ExecutionCancellation::Timeout => {
+                            ExecutionEnd::Reset("VSH exec cancellation timed out")
+                        }
+                        ExecutionCancellation::Reset(reason) => ExecutionEnd::Reset(reason),
+                        ExecutionCancellation::Rebind(reason) => ExecutionEnd::Rebind(reason),
                     }
-                    ExecutionCancellation::Reset(reason) => ExecutionEnd::Reset(reason),
-                    ExecutionCancellation::Rebind(reason) => ExecutionEnd::Rebind(reason),
-                };
+                }
             }
-            vibeos_core::exec::yield_now().await;
-            continue;
         }
-        if now.saturating_sub(started) > EXEC_TIMEOUT_MS {
-            cancel.store(true, Ordering::Release);
+        if now >= execution_deadline {
+            cancel.cancel();
             cancellation = Some((ExecutionCancellation::Timeout, now + CANCEL_GRACE_MS));
             continue;
         }
@@ -2994,20 +3030,20 @@ async fn execute_with_network(
         if let Err(reason) =
             validate_network_authority(space, control, bound_epoch, require_carrier)
         {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((ExecutionCancellation::Rebind(reason), now + CANCEL_GRACE_MS));
             continue;
         }
         let wire = match bridge.drive(runner, stack, now) {
             Ok(turn) => turn,
             Err(reason) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
         };
         if wire.ended {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((
                 ExecutionCancellation::Reset("peer disconnected during exec"),
                 now + CANCEL_GRACE_MS,
@@ -3017,13 +3053,13 @@ async fn execute_with_network(
         let signal = match progress_protocol(runner, signer, space, policy, protocol) {
             Ok(signal) => signal,
             Err(reason) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
                 continue;
             }
         };
         if matches!(signal, ProtocolSignal::Interrupt) {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
         }
         if matches!(signal, ProtocolSignal::Defunct)
             || protocol
@@ -3031,7 +3067,7 @@ async fn execute_with_network(
                 .as_ref()
                 .is_some_and(|channel| runner.is_channel_closed(channel))
         {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((
                 ExecutionCancellation::Reset("SSH channel closed during exec"),
                 now + CANCEL_GRACE_MS,
@@ -3039,19 +3075,27 @@ async fn execute_with_network(
             continue;
         }
         if let Err(reason) = discard_channel_input(runner, protocol) {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
             cancellation = Some((ExecutionCancellation::Reset(reason), now + CANCEL_GRACE_MS));
             continue;
         }
-        cooperate(
+        if let Some(reports) = wait_for_execution_turn(
+            execution.as_mut(),
             wire.worked
                 || matches!(
                     signal,
                     ProtocolSignal::Progressed | ProtocolSignal::Interrupt
                 ),
             wire.next_poll_delay_ms,
+            Some(execution_deadline),
         )
-        .await;
+        .await
+        {
+            break ExecutionEnd::Complete {
+                reports,
+                timed_out: false,
+            };
+        }
     };
     drop(execution);
     session.shutdown().await;
@@ -3089,9 +3133,57 @@ fn install_accepted_ssh_component(
         .map_err(AcceptedComponentInstallError::Install)
 }
 
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.poll(&mut context)
+enum ExecutionWait<T> {
+    Complete(T),
+    DelayElapsed,
+}
+
+/// Poll a nested VSH execution with the SSH task's real waker while also
+/// registering the network/deadline wait which bounds the next transport turn.
+/// A Component lifecycle wake can therefore resume this task immediately; it
+/// does not have to wait for periodic network polling to notice completion.
+async fn wait_for_execution_or<F, D>(
+    mut execution: Pin<&mut F>,
+    delay: D,
+) -> ExecutionWait<F::Output>
+where
+    F: Future + ?Sized,
+    D: Future<Output = ()>,
+{
+    let mut delay = core::pin::pin!(delay);
+    poll_fn(|cx| {
+        if let Poll::Ready(output) = execution.as_mut().poll(cx) {
+            return Poll::Ready(ExecutionWait::Complete(output));
+        }
+        if delay.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(ExecutionWait::DelayElapsed);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+async fn wait_for_execution_turn<F: Future + ?Sized>(
+    execution: Pin<&mut F>,
+    worked: bool,
+    next_poll_delay_ms: Option<u64>,
+    deadline: Option<u64>,
+) -> Option<F::Output> {
+    let event = if worked {
+        wait_for_execution_or(execution, vibeos_core::exec::yield_now()).await
+    } else {
+        let mut delay = next_poll_delay_ms
+            .unwrap_or(IDLE_POLL_CEILING_MS)
+            .clamp(1, IDLE_POLL_CEILING_MS);
+        if let Some(deadline) = deadline {
+            delay = delay.min(deadline.saturating_sub(monotonic_ms()));
+        }
+        wait_for_execution_or(execution, vibeos_core::exec::sleep_ms(delay)).await
+    };
+    match event {
+        ExecutionWait::Complete(output) => Some(output),
+        ExecutionWait::DelayElapsed => None,
+    }
 }
 
 fn collect_execution(
@@ -3417,7 +3509,8 @@ fn wipe(bytes: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{string::String, vec};
+    use alloc::{string::String, task::Wake, vec};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use vibeos_component_admission::{
         admit, AdmissionPolicy, ArtifactTrust, CallerAuthority, CommandStreamMode,
         ComponentArtifact, InstanceLimits,
@@ -3428,6 +3521,88 @@ mod tests {
     use vibeos_vsh::{
         ComponentCommandRunner, ComponentTerminal, JobReport, StageReport, Status, TerminalDetail,
     };
+
+    struct WakeDrivenState {
+        ready: AtomicBool,
+        polls: AtomicUsize,
+        waker: SpinLock<Option<Waker>>,
+    }
+
+    struct WakeDrivenExecution {
+        state: Arc<WakeDrivenState>,
+    }
+
+    impl Future for WakeDrivenExecution {
+        type Output = u32;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.state.polls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.state.ready.load(AtomicOrdering::SeqCst) {
+                Poll::Ready(37)
+            } else {
+                *self.state.waker.lock() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    struct PassiveDelay(Arc<AtomicUsize>);
+
+    impl Future for PassiveDelay {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn nested_execution_wait_registers_the_current_task_without_self_waking() {
+        let state = Arc::new(WakeDrivenState {
+            ready: AtomicBool::new(false),
+            polls: AtomicUsize::new(0),
+            waker: SpinLock::new(None),
+        });
+        let delay_polls = Arc::new(AtomicUsize::new(0));
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(wake_count.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut execution = WakeDrivenExecution {
+            state: state.clone(),
+        };
+        let mut wait = Box::pin(wait_for_execution_or(
+            Pin::new(&mut execution),
+            PassiveDelay(delay_polls.clone()),
+        ));
+
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        assert_eq!(state.polls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(delay_polls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(wake_count.0.load(AtomicOrdering::SeqCst), 0);
+
+        state.ready.store(true, AtomicOrdering::SeqCst);
+        state.waker.lock().take().unwrap().wake();
+        assert_eq!(wake_count.0.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            wait.as_mut().poll(&mut context),
+            Poll::Ready(ExecutionWait::Complete(37))
+        ));
+        assert_eq!(state.polls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(delay_polls.load(AtomicOrdering::SeqCst), 1);
+    }
 
     struct TestPolicyPlatform {
         component_policy: Option<SshExecComponentSessionPolicy>,
@@ -3839,7 +4014,7 @@ mod tests {
         let published = result.clone();
         let task = vibeos_core::exec::spawn_tracked("ssh-component-e2e", async move {
             let report = session
-                .execute_ssh_cancellable(source, Arc::new(AtomicBool::new(false)))
+                .execute_ssh_cancellable(source, Arc::new(vibeos_vsh::CancellationSignal::new()))
                 .await;
             *published.lock() = Some(report);
         });

@@ -21,7 +21,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::{poll_fn, Future};
 use core::pin::{pin, Pin};
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
 use vibeos_core::sync::SpinLock;
@@ -111,7 +110,7 @@ pub async fn interactive(
 }
 
 pub async fn run_source(platform: &dyn Platform, source: &str, session: &mut Session) {
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(CancellationSignal::new());
     let completed = Arc::new(SpinLock::new(None));
     let completed_task = completed.clone();
     let cancel_task = cancel.clone();
@@ -134,7 +133,9 @@ pub async fn run_source(platform: &dyn Platform, source: &str, session: &mut Ses
         .await;
         match event {
             Ok(_) => break,
-            Err(0x03) => cancel.store(true, Ordering::Release),
+            Err(0x03) => {
+                cancel.cancel();
+            }
             Err(_) => {}
         }
     }

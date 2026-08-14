@@ -146,6 +146,7 @@ struct JoinWaiter {
 #[derive(Clone)]
 enum OwnedRegistration {
     Wait { queue: usize, id: u64 },
+    OneShotWait { queue: usize, generation: u64 },
     Timer { id: u64 },
     Join { status: Arc<TaskStatus>, id: u64 },
     IrqPollProbe { generation: u64 },
@@ -363,6 +364,10 @@ impl TaskStatus {
 
 static CURRENT_TASK_STATUS: [SpinLock<Option<Arc<TaskStatus>>>; MAX_HARTS] =
     [const { SpinLock::new(None) }; MAX_HARTS];
+static CURRENT_TASK_ID: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+
+#[cfg(test)]
+pub(crate) static EXECUTOR_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Resolve the scheduler identity of this CPU without ever aliasing an
 /// unmapped target hart onto the boot slot. Host tests use dense physical ids
@@ -395,7 +400,9 @@ fn current_task_status() -> Option<Arc<TaskStatus>> {
 
 struct CurrentTaskScope {
     slot: &'static SpinLock<Option<Arc<TaskStatus>>>,
+    id_slot: &'static AtomicU64,
     previous: Option<Arc<TaskStatus>>,
+    previous_id: u64,
     recovery: TaskRecoveryContext,
     active: bool,
     // A current-task scope changes hart-local scheduler and recovery state.
@@ -429,7 +436,13 @@ unsafe fn enter_current_task_on_hart(
 ) -> CurrentTaskScope {
     debug_assert_eq!(current_scheduler_hart(), Some(hart));
     let slot = &CURRENT_TASK_STATUS[hart.index()];
-    let previous = core::mem::replace(&mut *slot.lock(), Some(status));
+    let id_slot = &CURRENT_TASK_ID[hart.index()];
+    let (previous, previous_id) = {
+        let mut current = slot.lock();
+        let previous = core::mem::replace(&mut *current, Some(status));
+        let previous_id = id_slot.swap(id.0, Ordering::AcqRel);
+        (previous, previous_id)
+    };
     let recovery = unsafe {
         crate::sync::enter_task_recovery_context_on_hart(
             hart,
@@ -438,7 +451,9 @@ unsafe fn enter_current_task_on_hart(
     };
     CurrentTaskScope {
         slot,
+        id_slot,
         previous,
+        previous_id,
         recovery,
         active: true,
         not_send: PhantomData,
@@ -455,7 +470,11 @@ impl CurrentTaskScope {
                 self.recovery.restore();
                 unreachable!("task recovery restore must reject the wrong hart");
             }
-            *self.slot.lock() = self.previous.take();
+            {
+                let mut current = self.slot.lock();
+                *current = self.previous.take();
+                self.id_slot.store(self.previous_id, Ordering::Release);
+            }
             self.active = false;
             // Safety: the physical-hart check above covers both hart-local
             // scopes, and logical mappings are immutable once installed.
@@ -482,6 +501,13 @@ pub fn current_task_id() -> Option<TaskId> {
         .as_ref()
         .filter(|running| Arc::ptr_eq(&running.status, &status))
         .map(|running| running.id)
+}
+
+fn current_task_scope_id() -> Option<TaskId> {
+    let hart = current_scheduler_hart()?;
+    let current = CURRENT_TASK_STATUS[hart.index()].lock();
+    let id = CURRENT_TASK_ID[hart.index()].load(Ordering::Acquire);
+    (id != 0 && current.is_some()).then_some(TaskId(id))
 }
 
 /// Resolve the complete active reclaimable-task proof for the current poll.
@@ -545,7 +571,9 @@ fn disarm_owned_for_task(task: TaskId, token: Option<u64>) {
     let Some(token) = token else {
         return;
     };
-    let status = {
+    let status = if current_task_scope_id() == Some(task) {
+        current_task_status()
+    } else {
         let sched = SCHED.lock();
         sched
             .harts
@@ -696,6 +724,11 @@ impl TaskHandle {
         self.status.joiners.lock().len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn owned_registration_count_for_test(&self) -> usize {
+        self.status.registrations.lock().len()
+    }
+
     /// Inspect only the exact TaskStatus-owned outbound registration ledger.
     ///
     /// This API is absent from production builds. C4.8 samples it after the
@@ -718,7 +751,9 @@ impl TaskHandle {
         };
         for entry in registrations.iter() {
             match entry.registration {
-                OwnedRegistration::Wait { .. } => stats.waits += 1,
+                OwnedRegistration::Wait { .. } | OwnedRegistration::OneShotWait { .. } => {
+                    stats.waits += 1;
+                }
                 OwnedRegistration::Timer { .. } => stats.timers += 1,
                 OwnedRegistration::Join { .. } => stats.joins += 1,
                 OwnedRegistration::IrqPollProbe { .. } => stats.irq_poll_probes += 1,
@@ -4182,6 +4217,7 @@ fn poll_once_on(hart: HartId) -> bool {
     // model (and real SMP execution) to drive a different hart concurrently.
     assert!(
         CURRENT_TASK_STATUS[hart.index()].lock().is_none()
+            && CURRENT_TASK_ID[hart.index()].load(Ordering::Acquire) == 0
             && SCHED.lock().harts[hart.index()].running.is_none(),
         "a hart cannot drive the executor recursively from task poll or Drop"
     );
@@ -4656,6 +4692,337 @@ impl Drop for WaitFuture<'_> {
     }
 }
 
+/// A fixed-capacity, SYSTEM-stable handoff for exactly one parked task.
+///
+/// Unlike [`WaitQueue`], this primitive never grows a waiter collection. The
+/// queue must live in SYSTEM or equally stable supervisor storage for longer
+/// than every future returned by [`Self::wait`]. A reclaimable task records
+/// its exact registration in `TaskStatus`, so cancellation and fault detach
+/// remove the wake edge before the task arena can be reclaimed.
+pub struct OneShotWaitQueue {
+    inner: SpinLock<OneShotWaitQueueInner>,
+}
+
+struct OneShotWaitQueueInner {
+    /// Highest caller-supplied event generation published by this stable
+    /// queue. Callers must allocate strictly increasing, non-zero generations.
+    /// Keeping this independently from registration generations prevents a
+    /// delayed completion from touching a replacement operation's waiter.
+    published_generation: u64,
+    /// Independent registration generation. A listener may be dropped and a
+    /// replacement registered without an event, so epoch alone is not an ABA
+    /// barrier for task-owned cleanup.
+    next_generation: u64,
+    waiter: Option<OneShotWaiter>,
+}
+
+struct OneShotWaiter {
+    registration_generation: u64,
+    event_generation: u64,
+    waker: Waker,
+}
+
+/// A waker detached from one exact event while the caller still held its
+/// authoritative state lock.
+///
+/// The caller must invoke [`Self::dispatch`] only after releasing every state
+/// and queue lock. A delayed dispatch can schedule only the task captured by
+/// the matching registration; it cannot inspect or remove a later waiter.
+#[must_use = "a published one-shot event must dispatch its detached waker"]
+pub struct OneShotWake {
+    waker: Option<Waker>,
+}
+
+impl OneShotWake {
+    pub fn dispatch(mut self) -> bool {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let dispatched = match self.waker.take() {
+            Some(waker) => {
+                waker.wake();
+                true
+            }
+            None => false,
+        };
+        system.restore();
+        dispatched
+    }
+}
+
+impl Drop for OneShotWake {
+    fn drop(&mut self) {
+        let Some(waker) = self.waker.take() else {
+            return;
+        };
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        drop(waker);
+        system.restore();
+    }
+}
+
+/// Fail-closed outcomes from registering a [`OneShotWaitFuture`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OneShotWaitError {
+    /// Another future already owns the queue's sole waiter slot.
+    CapacityExceeded,
+    /// Registrations must belong to the currently executing scheduler task.
+    NotInTask,
+    /// The task cleanup ledger could not reserve its ownership record.
+    RegistrationFailed,
+    /// No fresh registration generation remains; reuse would permit ABA.
+    GenerationExhausted,
+    /// This future's opaque generation no longer names the installed waiter.
+    RegistrationMismatch,
+}
+
+impl OneShotWaitQueue {
+    pub const fn new() -> Self {
+        Self {
+            inner: SpinLock::new(OneShotWaitQueueInner {
+                published_generation: 0,
+                next_generation: 1,
+                waiter: None,
+            }),
+        }
+    }
+
+    /// Publish one exact event while the caller still holds the state lock
+    /// which proves that generation authoritative.
+    ///
+    /// The returned waker is detached under the queue lock but is not invoked
+    /// or dropped there. A generation older than the last publication, or a
+    /// publication which does not name the installed waiter, fails closed
+    /// without changing either the waiter or publication watermark.
+    pub fn publish(&self, event_generation: u64) -> Result<OneShotWake, OneShotWaitError> {
+        let mut inner = self.inner.lock();
+        if event_generation == 0 || event_generation < inner.published_generation {
+            return Err(OneShotWaitError::RegistrationMismatch);
+        }
+        if event_generation == inner.published_generation {
+            return Ok(OneShotWake { waker: None });
+        }
+        if inner
+            .waiter
+            .as_ref()
+            .is_some_and(|waiter| waiter.event_generation != event_generation)
+        {
+            return Err(OneShotWaitError::RegistrationMismatch);
+        }
+        inner.published_generation = event_generation;
+        Ok(OneShotWake {
+            waker: inner.waiter.take().map(|waiter| waiter.waker),
+        })
+    }
+
+    /// Number of futures installed in the fixed waiter slot (zero or one).
+    pub fn waiter_count(&self) -> usize {
+        usize::from(self.inner.lock().waiter.is_some())
+    }
+
+    /// Construct a listener before rechecking the condition it protects.
+    ///
+    /// If [`Self::publish`] wins before the first poll, the generation
+    /// watermark makes the future immediately ready without installing a
+    /// stale wake edge.
+    pub fn wait(&self, event_generation: u64) -> OneShotWaitFuture<'_> {
+        OneShotWaitFuture {
+            queue: self,
+            event_generation,
+            registration_generation: None,
+            owned_registration: None,
+            owner_task: None,
+            terminal: None,
+        }
+    }
+
+    fn unregister(&self, generation: u64) -> Option<Waker> {
+        let mut inner = self.inner.lock();
+        if inner
+            .waiter
+            .as_ref()
+            .is_some_and(|waiter| waiter.registration_generation == generation)
+        {
+            inner.waiter.take().map(|waiter| waiter.waker)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for OneShotWaitQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A non-owning listener for one exact [`OneShotWaitQueue`] event generation.
+///
+/// The future owns neither the stable queue nor its task status. Its two
+/// numeric tokens only let normal completion/Drop disarm the executor-owned
+/// cleanup ledger and remove the matching waiter generation.
+pub struct OneShotWaitFuture<'a> {
+    queue: &'a OneShotWaitQueue,
+    event_generation: u64,
+    registration_generation: Option<u64>,
+    owned_registration: Option<u64>,
+    owner_task: Option<TaskId>,
+    terminal: Option<Result<(), OneShotWaitError>>,
+}
+
+impl Future for OneShotWaitFuture<'_> {
+    type Output = Result<(), OneShotWaitError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(result) = this.terminal {
+            return Poll::Ready(result);
+        }
+        if this.event_generation == 0 {
+            this.terminal = Some(Err(OneShotWaitError::RegistrationMismatch));
+            return Poll::Ready(Err(OneShotWaitError::RegistrationMismatch));
+        }
+
+        let current_owner = current_task_scope_id();
+        if this.owner_task.is_some() && this.owner_task != current_owner {
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            disarm_owned_for_task(
+                this.owner_task
+                    .take()
+                    .expect("registered wait lost its owner"),
+                this.owned_registration.take(),
+            );
+            if let Some(generation) = this.registration_generation.take() {
+                drop(this.queue.unregister(generation));
+            }
+            system.restore();
+            this.terminal = Some(Err(OneShotWaitError::RegistrationMismatch));
+            return Poll::Ready(Err(OneShotWaitError::RegistrationMismatch));
+        }
+
+        // Custom RawWakers may allocate or re-enter this queue from clone or
+        // Drop. Both operations, as well as wake(), stay outside `inner`.
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut candidate = Some(cx.waker().clone());
+        let mut discarded = None;
+        let mut disarm = None;
+
+        let result = {
+            let mut inner = this.queue.inner.lock();
+            if inner.published_generation >= this.event_generation {
+                disarm = this.owner_task.take().zip(this.owned_registration.take());
+                if let Some(generation) = this.registration_generation.take() {
+                    if inner.waiter.as_ref().is_some_and(|waiter| {
+                        waiter.registration_generation == generation
+                            && waiter.event_generation == this.event_generation
+                    }) {
+                        discarded = inner.waiter.take().map(|waiter| waiter.waker);
+                    }
+                }
+                if inner.published_generation == this.event_generation {
+                    Ok(())
+                } else {
+                    Err(OneShotWaitError::RegistrationMismatch)
+                }
+            } else if let Some(generation) = this.registration_generation {
+                match inner.waiter.as_mut() {
+                    Some(waiter)
+                        if waiter.registration_generation == generation
+                            && waiter.event_generation == this.event_generation =>
+                    {
+                        if !waiter.waker.will_wake(cx.waker()) {
+                            discarded = Some(core::mem::replace(
+                                &mut waiter.waker,
+                                candidate.take().expect("waker candidate exists"),
+                            ));
+                        }
+                        drop(inner);
+                        drop(discarded);
+                        drop(candidate);
+                        system.restore();
+                        return Poll::Pending;
+                    }
+                    _ => {
+                        // Never remove a different generation. A stale future
+                        // cannot consume a replacement waiter after slot reuse.
+                        disarm = this.owner_task.take().zip(this.owned_registration.take());
+                        this.registration_generation = None;
+                        Err(OneShotWaitError::RegistrationMismatch)
+                    }
+                }
+            } else if inner.waiter.is_some() {
+                Err(OneShotWaitError::CapacityExceeded)
+            } else {
+                let generation = match inner.next_generation.checked_add(1) {
+                    Some(next) => {
+                        let generation = inner.next_generation;
+                        inner.next_generation = next;
+                        generation
+                    }
+                    None => {
+                        drop(inner);
+                        drop(candidate);
+                        system.restore();
+                        this.terminal = Some(Err(OneShotWaitError::GenerationExhausted));
+                        return Poll::Ready(Err(OneShotWaitError::GenerationExhausted));
+                    }
+                };
+                let Some(owner_task) = current_owner else {
+                    drop(inner);
+                    drop(candidate);
+                    system.restore();
+                    this.terminal = Some(Err(OneShotWaitError::NotInTask));
+                    return Poll::Ready(Err(OneShotWaitError::NotInTask));
+                };
+                match register_owned_for_current(OwnedRegistration::OneShotWait {
+                    queue: this.queue as *const OneShotWaitQueue as usize,
+                    generation,
+                }) {
+                    Ok(Some(token)) => {
+                        inner.waiter = Some(OneShotWaiter {
+                            registration_generation: generation,
+                            event_generation: this.event_generation,
+                            waker: candidate.take().expect("waker candidate exists"),
+                        });
+                        this.registration_generation = Some(generation);
+                        this.owned_registration = Some(token);
+                        this.owner_task = Some(owner_task);
+                        drop(inner);
+                        drop(candidate);
+                        system.restore();
+                        return Poll::Pending;
+                    }
+                    Ok(None) => Err(OneShotWaitError::NotInTask),
+                    Err(_) => Err(OneShotWaitError::RegistrationFailed),
+                }
+            }
+        };
+
+        // Disarm after releasing the queue lock. Task teardown takes the
+        // registration vector and then calls back into this queue, so keeping
+        // the lock ordering flat makes that cleanup trivially deadlock-free.
+        if let Some((task, token)) = disarm {
+            disarm_owned_for_task(task, Some(token));
+        }
+        drop(discarded);
+        drop(candidate);
+        system.restore();
+        this.terminal = Some(result);
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for OneShotWaitFuture<'_> {
+    fn drop(&mut self) {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        if let Some(task) = self.owner_task.take() {
+            disarm_owned_for_task(task, self.owned_registration.take());
+        }
+        if let Some(generation) = self.registration_generation.take() {
+            drop(self.queue.unregister(generation));
+        }
+        system.restore();
+    }
+}
+
 // --- One-shot timer IRQ -> task poll profiling ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4918,6 +5285,13 @@ fn cleanup_owned_registration(registration: OwnedRegistration) {
             let queue = unsafe { &*(queue as *const WaitQueue) };
             drop(queue.unregister(id));
         }
+        OwnedRegistration::OneShotWait { queue, generation } => {
+            // Safety: the future containing this token remains allocated until
+            // the executor drains its TaskStatus ledger. The queue itself is
+            // required to live in SYSTEM-stable supervisor storage.
+            let queue = unsafe { &*(queue as *const OneShotWaitQueue) };
+            drop(queue.unregister(generation));
+        }
         OwnedRegistration::Timer { id } => drop(unregister_timer(id)),
         OwnedRegistration::Join { status, id } => drop(status.unregister_joiner(id)),
         OwnedRegistration::IrqPollProbe { generation } => clear_irq_poll_probe(generation),
@@ -5127,6 +5501,283 @@ impl Future for Yield {
         self.yielded = true;
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod one_shot_wait_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    struct CountWake(AtomicUsize);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct QueueInspectWake {
+        queue: Arc<OneShotWaitQueue>,
+        wakes: Arc<AtomicUsize>,
+        waiters_seen: Arc<AtomicUsize>,
+    }
+
+    impl Wake for QueueInspectWake {
+        fn wake(self: Arc<Self>) {
+            self.waiters_seen
+                .store(self.queue.waiter_count(), Ordering::SeqCst);
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct QueueInspectDrop {
+        queue: Arc<OneShotWaitQueue>,
+        drops: Arc<AtomicUsize>,
+        waiters_seen: Arc<AtomicUsize>,
+    }
+
+    impl Wake for QueueInspectDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for QueueInspectDrop {
+        fn drop(&mut self) {
+            self.waiters_seen
+                .store(self.queue.waiter_count(), Ordering::SeqCst);
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn one_shot_wait_is_bounded_generation_safe_and_task_owned() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(true))));
+        // Safety: this host test remains on physical/logical hart zero until
+        // the scope is dropped and installs no competing current-task scope.
+        let _task =
+            unsafe { enter_current_task_on_hart(HartId::BOOT, TaskId(90_001), status.clone()) };
+
+        let queue = Arc::new(OneShotWaitQueue::new());
+        let first = Arc::new(CountWake(AtomicUsize::new(0)));
+        let second = Arc::new(CountWake(AtomicUsize::new(0)));
+        let first_waker = Waker::from(first.clone());
+        let second_waker = Waker::from(second.clone());
+        let first_baseline = Arc::strong_count(&first);
+        let second_baseline = Arc::strong_count(&second);
+        let mut listener = Box::pin(queue.wait(1));
+
+        assert_eq!(
+            listener
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Pending
+        );
+        assert_eq!(queue.waiter_count(), 1);
+        assert_eq!(status.registrations.lock().len(), 1);
+        assert_eq!(Arc::strong_count(&first), first_baseline + 1);
+
+        assert_eq!(
+            listener
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker)),
+            Poll::Pending
+        );
+        assert_eq!(queue.waiter_count(), 1, "repoll keeps the same slot");
+        assert_eq!(status.registrations.lock().len(), 1);
+        assert_eq!(Arc::strong_count(&first), first_baseline);
+        assert_eq!(Arc::strong_count(&second), second_baseline + 1);
+
+        let mut contender = Box::pin(queue.wait(1));
+        assert_eq!(
+            contender
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Ready(Err(OneShotWaitError::CapacityExceeded))
+        );
+        assert_eq!(queue.waiter_count(), 1);
+        assert_eq!(status.registrations.lock().len(), 1);
+
+        assert!(queue.publish(1).unwrap().dispatch());
+        assert_eq!(queue.waiter_count(), 0);
+        assert_eq!(second.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            listener
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert!(status.registrations.lock().is_empty());
+
+        // Listener-before-recheck observes an event that lands before poll and
+        // never installs a waiter or cleanup edge.
+        let mut prewake = Box::pin(queue.wait(2));
+        assert!(!queue.publish(2).unwrap().dispatch());
+        assert_eq!(
+            prewake
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(queue.waiter_count(), 0);
+        assert!(status.registrations.lock().is_empty());
+
+        // A stale cleanup token cannot remove a replacement registered after
+        // a wake advanced the event epoch.
+        let mut stale = Box::pin(queue.wait(3));
+        assert_eq!(
+            stale.as_mut().poll(&mut Context::from_waker(&first_waker)),
+            Poll::Pending
+        );
+        let stale_generation = stale
+            .registration_generation
+            .expect("pending listener has a generation");
+        let delayed = queue.publish(3).unwrap();
+        let mut replacement = Box::pin(queue.wait(4));
+        assert_eq!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker)),
+            Poll::Pending
+        );
+        cleanup_owned_registration(OwnedRegistration::OneShotWait {
+            queue: Arc::as_ptr(&queue) as usize,
+            generation: stale_generation,
+        });
+        assert_eq!(queue.waiter_count(), 1, "stale generation is inert");
+        assert!(delayed.dispatch());
+        assert_eq!(second.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            queue.waiter_count(),
+            1,
+            "delayed wake preserves replacement"
+        );
+        assert!(
+            matches!(
+                queue.publish(5),
+                Err(OneShotWaitError::RegistrationMismatch)
+            ),
+            "a different event cannot consume the installed waiter"
+        );
+        assert_eq!(
+            stale.as_mut().poll(&mut Context::from_waker(&first_waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert!(queue.publish(4).unwrap().dispatch());
+        assert_eq!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert!(status.registrations.lock().is_empty());
+
+        // Permanent task detach drains the TaskStatus edge and the queue slot
+        // before the future itself is destroyed. Its Drop remains idempotent.
+        let mut detached = Box::pin(queue.wait(5));
+        assert_eq!(
+            detached
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Pending
+        );
+        assert_eq!(queue.waiter_count(), 1);
+        drain_task_registrations(&status);
+        assert_eq!(queue.waiter_count(), 0);
+        assert!(status.registrations.lock().is_empty());
+        drop(detached);
+        assert_eq!(queue.waiter_count(), 0);
+
+        drop(_task);
+        let unowned_queue = OneShotWaitQueue::new();
+        let mut unowned = Box::pin(unowned_queue.wait(1));
+        assert_eq!(
+            unowned
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Ready(Err(OneShotWaitError::NotInTask))
+        );
+        assert_eq!(unowned_queue.waiter_count(), 0);
+
+        let mut zero = Box::pin(unowned_queue.wait(0));
+        assert_eq!(
+            zero.as_mut().poll(&mut Context::from_waker(&first_waker)),
+            Poll::Ready(Err(OneShotWaitError::RegistrationMismatch))
+        );
+        assert_eq!(unowned_queue.waiter_count(), 0);
+    }
+
+    #[test]
+    fn one_shot_wake_and_replaced_waker_drop_reenter_outside_the_lock() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(true))));
+        // Safety: this host test remains on physical/logical hart zero until
+        // the scope is dropped and installs no competing current-task scope.
+        let _task =
+            unsafe { enter_current_task_on_hart(HartId::BOOT, TaskId(90_002), status.clone()) };
+        let queue = Arc::new(OneShotWaitQueue::new());
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let drop_waiters = Arc::new(AtomicUsize::new(usize::MAX));
+        let first_waker = Waker::from(Arc::new(QueueInspectDrop {
+            queue: queue.clone(),
+            drops: drops.clone(),
+            waiters_seen: drop_waiters.clone(),
+        }));
+        let replacement_counter = Arc::new(CountWake(AtomicUsize::new(0)));
+        let replacement_waker = Waker::from(replacement_counter.clone());
+        let mut listener = Box::pin(queue.wait(1));
+
+        assert_eq!(
+            listener
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker)),
+            Poll::Pending
+        );
+        drop(first_waker);
+        assert_eq!(
+            listener
+                .as_mut()
+                .poll(&mut Context::from_waker(&replacement_waker)),
+            Poll::Pending
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            drop_waiters.load(Ordering::SeqCst),
+            1,
+            "replaced Waker Drop re-entered after installing its replacement"
+        );
+        assert!(queue.publish(1).unwrap().dispatch());
+        assert_eq!(replacement_counter.0.load(Ordering::SeqCst), 1);
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_waiters = Arc::new(AtomicUsize::new(usize::MAX));
+        let inspect_waker = Waker::from(Arc::new(QueueInspectWake {
+            queue: queue.clone(),
+            wakes: wakes.clone(),
+            waiters_seen: wake_waiters.clone(),
+        }));
+        let mut inspect_listener = Box::pin(queue.wait(2));
+        assert_eq!(
+            inspect_listener
+                .as_mut()
+                .poll(&mut Context::from_waker(&inspect_waker)),
+            Poll::Pending
+        );
+        assert!(queue.publish(2).unwrap().dispatch());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wake_waiters.load(Ordering::SeqCst),
+            0,
+            "wake callback re-entered the already-drained queue"
+        );
     }
 }
 

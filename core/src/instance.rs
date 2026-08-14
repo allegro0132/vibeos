@@ -13,7 +13,9 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::fmt;
+use core::future::Future;
 use core::mem::ManuallyDrop;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
@@ -21,8 +23,9 @@ use core::task::{Context, Poll};
 use crate::cap::CapabilityTableRange;
 use crate::cap::{CSpace, CSpaceIdentity};
 use crate::exec::{
-    PreparedReclaimableActivation, PreparedReclaimableBinding, ReclaimableFaultWitness,
-    ReclaimableSchedulerIdentity, ReclaimableTaskWitness, TaskHandle, TaskId, TaskState,
+    OneShotWaitFuture, OneShotWaitQueue, PreparedReclaimableActivation, PreparedReclaimableBinding,
+    ReclaimableFaultWitness, ReclaimableSchedulerIdentity, ReclaimableTaskWitness, TaskHandle,
+    TaskId, TaskState,
 };
 use crate::heap::{self, AllocationDomain, OwnerId};
 use crate::runqueue::HartId;
@@ -71,6 +74,58 @@ impl fmt::Debug for InstanceToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("InstanceToken(<opaque>)")
     }
+}
+
+/// One exact suspension of one managed instance generation.
+///
+/// This is deliberately an opaque, copy-only lookup key. It owns neither the
+/// continuation state nor its SYSTEM wait registration, and its operation
+/// generation prevents a late completion from aliasing a later suspension in
+/// the same stable instance slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InstanceContinuationToken {
+    instance: InstanceToken,
+    generation: u64,
+}
+
+impl fmt::Debug for InstanceContinuationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InstanceContinuationToken(<opaque>)")
+    }
+}
+
+/// Scheduling contract selected before a continuation becomes visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceContinuationKind {
+    /// Bounded interpreter/canonical work remains. The wait future publishes
+    /// exactly one self-wake and yields one executor turn.
+    Quantum,
+    /// Progress requires an external SYSTEM operation. No self-wake occurs;
+    /// the task remains parked until the exact token is signalled.
+    External,
+}
+
+/// Result of publishing completion for an opaque continuation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceContinuationSignal {
+    Signalled,
+    AlreadySignalled,
+    /// The instance or operation generation is no longer current. No current
+    /// slot, task, continuation, or wake queue was changed.
+    Stale,
+    /// The token named the current record but its full lifecycle seal did not
+    /// match. The instance is sticky-quarantined and is not woken.
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceContinuationError {
+    IdentityMismatch,
+    Busy,
+    GenerationExhausted,
+    Cancelled,
+    WrongPhase,
+    Quarantined,
 }
 
 /// Stable SYSTEM object which contains the capability space for an instance.
@@ -408,6 +463,73 @@ struct InstanceSpaceSeal {
     cspace_incarnation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuationPhase {
+    Idle,
+    Armed,
+    Signalled,
+    Consumed,
+    Cancelled,
+    /// The executor permanently detached the exact task and drained its
+    /// TaskStatus-owned wait edge before raw arena reclamation.
+    Abandoned,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContinuationSeal {
+    instance: InstanceToken,
+    operation_generation: u64,
+    kind: InstanceContinuationKind,
+    task: TaskId,
+    domain: AllocationDomain,
+    scheduler: ReclaimableSchedulerIdentity,
+    home_hart: HartId,
+    space: InstanceSpaceSeal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContinuationRecord {
+    generation: u64,
+    phase: ContinuationPhase,
+    kind: Option<InstanceContinuationKind>,
+    seal: Option<ContinuationSeal>,
+}
+
+impl ContinuationRecord {
+    const fn idle() -> Self {
+        Self {
+            generation: 0,
+            phase: ContinuationPhase::Idle,
+            kind: None,
+            seal: None,
+        }
+    }
+
+    const fn terminal_phase_safe(self) -> bool {
+        matches!(
+            self.phase,
+            ContinuationPhase::Idle | ContinuationPhase::Consumed | ContinuationPhase::Cancelled
+        )
+    }
+
+    const fn fault_phase_safe(self) -> bool {
+        matches!(
+            self.phase,
+            ContinuationPhase::Idle | ContinuationPhase::Abandoned
+        )
+    }
+
+    fn retire(&mut self) {
+        // Keep the monotonic operation generation across instance-slot reuse.
+        // The enclosing instance generation is a second, independent ABA
+        // barrier, not a reason to recycle the inner counter.
+        self.phase = ContinuationPhase::Idle;
+        self.kind = None;
+        self.seal = None;
+    }
+}
+
 impl InstanceSpaceSeal {
     fn capture(space: &InstanceSpace) -> Self {
         let cspace = space.cspace.lock();
@@ -454,6 +576,7 @@ struct SlotRecord {
     payload_abandoned: bool,
     payload_completion: Option<u64>,
     payload_cancel: Option<u64>,
+    continuation: ContinuationRecord,
 }
 
 impl SlotRecord {
@@ -473,6 +596,7 @@ impl SlotRecord {
             payload_abandoned: false,
             payload_completion: None,
             payload_cancel: None,
+            continuation: ContinuationRecord::idle(),
         }
     }
 
@@ -492,6 +616,7 @@ impl SlotRecord {
         self.payload_abandoned = false;
         self.payload_completion = None;
         self.payload_cancel = None;
+        self.continuation.retire();
     }
 }
 
@@ -501,6 +626,9 @@ struct InstanceSlot {
     /// Recoverable by construction, although component code is never allowed
     /// to retain this guard across an untrusted poll.
     record: SpinLock<SlotRecord>,
+    /// Stable, fixed-single-waiter handoff for the one continuation admitted
+    /// per instance. The wait object survives arena faults and slot reuse.
+    continuation_wait: OneShotWaitQueue,
 }
 
 impl InstanceSlot {
@@ -508,6 +636,7 @@ impl InstanceSlot {
         Self {
             header: AtomicU64::new(encode_header(0, InstancePhase::Vacant)),
             record: SpinLock::new_recoverable(SlotRecord::vacant()),
+            continuation_wait: OneShotWaitQueue::new(),
         }
     }
 }
@@ -525,6 +654,20 @@ const fn encode_header(generation: u64, phase: InstancePhase) -> u64 {
 pub struct InstanceRegistry {
     transaction: SpinLock<()>,
     slots: [InstanceSlot; MAX_INSTANCE_SLOTS],
+}
+
+/// Awaiter for one registry-owned continuation operation.
+///
+/// The future retains only opaque copy tokens plus a non-owning listener into
+/// the stable SYSTEM slot. It never owns a component, CSpace, resource table,
+/// allocator guard, task handle, or backend object.
+pub struct InstanceContinuation<'a> {
+    registry: &'a InstanceRegistry,
+    token: InstanceContinuationToken,
+    listener: Option<OneShotWaitFuture<'a>>,
+    kind: InstanceContinuationKind,
+    self_wake_published: bool,
+    terminal: bool,
 }
 
 impl InstanceRegistry {
@@ -589,7 +732,11 @@ impl InstanceRegistry {
             let projections = Self::projected_domains(&record);
             if Self::domain_projections_disagree(projections)
                 || (record.phase == InstancePhase::Vacant
-                    && projections.iter().any(Option::is_some))
+                    && (projections.iter().any(Option::is_some)
+                        || record.continuation.phase != ContinuationPhase::Idle
+                        || record.continuation.kind.is_some()
+                        || record.continuation.seal.is_some()
+                        || slot.continuation_wait.waiter_count() != 0))
             {
                 Self::quarantine_locked(slot, &mut record);
             }
@@ -612,6 +759,14 @@ impl InstanceRegistry {
                 continue;
             }
             if record.phase != InstancePhase::Vacant {
+                continue;
+            }
+            if record.continuation.phase != ContinuationPhase::Idle
+                || record.continuation.kind.is_some()
+                || record.continuation.seal.is_some()
+                || slot.continuation_wait.waiter_count() != 0
+            {
+                Self::quarantine_locked(slot, &mut record);
                 continue;
             }
             if record.generation == MAX_INSTANCE_GENERATION {
@@ -647,6 +802,7 @@ impl InstanceRegistry {
             record.payload_abandoned = false;
             record.payload_completion = None;
             record.payload_cancel = None;
+            record.continuation.retire();
             Self::publish_header(slot, &record);
             let token = InstanceToken {
                 slot: index as u8,
@@ -711,6 +867,10 @@ impl InstanceRegistry {
                     && !record.payload_abandoned
                     && record.payload_completion.is_none()
                     && record.payload_cancel.is_none()
+                    && record.continuation.phase == ContinuationPhase::Idle
+                    && record.continuation.kind.is_none()
+                    && record.continuation.seal.is_none()
+                    && slot.continuation_wait.waiter_count() == 0
                     && record.space.as_deref().zip(record.space_seal).is_some_and(
                         |(space, seal)| {
                             if !seal.immutable_objects_match(space) {
@@ -772,6 +932,10 @@ impl InstanceRegistry {
             && !record.payload_abandoned
             && record.payload_completion.is_none()
             && record.payload_cancel.is_none()
+            && record.continuation.phase == ContinuationPhase::Idle
+            && record.continuation.kind.is_none()
+            && record.continuation.seal.is_none()
+            && slot.continuation_wait.waiter_count() == 0
             && record.space.as_deref().is_some_and(|space| {
                 if !expected_seal.immutable_objects_match(space) {
                     return false;
@@ -836,6 +1000,10 @@ impl InstanceRegistry {
             && !record.payload_abandoned
             && record.payload_completion.is_none()
             && record.payload_cancel.is_none()
+            && record.continuation.phase == ContinuationPhase::Idle
+            && record.continuation.kind.is_none()
+            && record.continuation.seal.is_none()
+            && slot.continuation_wait.waiter_count() == 0
             && record
                 .space
                 .as_deref()
@@ -909,6 +1077,10 @@ impl InstanceRegistry {
                 && !record.payload_abandoned
                 && record.payload_completion.is_none()
                 && record.payload_cancel.is_none()
+                && record.continuation.phase == ContinuationPhase::Idle
+                && record.continuation.kind.is_none()
+                && record.continuation.seal.is_none()
+                && slot.continuation_wait.waiter_count() == 0
                 && record
                     .space
                     .as_deref()
@@ -1121,6 +1293,8 @@ impl InstanceRegistry {
                 && record.payload.is_none()
                 && !record.payload_abandoned
                 && record.payload_cancel.is_none()
+                && Self::continuation_terminal_safe(&record)
+                && slot.continuation_wait.waiter_count() == 0
             {
                 let Some(completion) = record.payload_completion else {
                     Self::quarantine_locked(slot, &mut record);
@@ -1148,6 +1322,7 @@ impl InstanceRegistry {
             if record.payload_abandoned
                 || record.payload_completion.is_some()
                 || record.payload.is_none()
+                || !Self::continuation_projection_matches(&record)
                 || !Self::sealed_cspace_matches(&record)
             {
                 Self::quarantine_locked(slot, &mut record);
@@ -1224,6 +1399,7 @@ impl InstanceRegistry {
                 || record.payload_abandoned
                 || record.payload_completion.is_some()
                 || !same_payload
+                || !Self::continuation_projection_matches(&record)
                 || !Self::sealed_cspace_matches(&record)
             {
                 Self::quarantine_locked(slot, &mut record);
@@ -1289,6 +1465,8 @@ impl InstanceRegistry {
             && record.payload.is_none()
             && !record.payload_abandoned
             && record.payload_completion.is_none()
+            && Self::continuation_terminal_safe(&record)
+            && slot.continuation_wait.waiter_count() == 0
             && Self::sealed_cspace_matches(&record);
         assert!(
             post_matches,
@@ -1413,6 +1591,49 @@ impl InstanceRegistry {
                 return FaultGateOutcome::Quarantined;
             }
 
+            // The executor drained every TaskStatus-owned wait edge before it
+            // invoked this fault gate. A retained waiter means the arena still
+            // has an outbound wake edge and therefore cannot be reclaimed.
+            if slot.continuation_wait.waiter_count() != 0 {
+                Self::quarantine_locked(slot, &mut record);
+                drop(record);
+                drop(_transaction);
+                system.restore();
+                return FaultGateOutcome::Quarantined;
+            }
+            match record.continuation.phase {
+                ContinuationPhase::Idle if Self::continuation_projection_matches(&record) => {}
+                ContinuationPhase::Armed
+                | ContinuationPhase::Signalled
+                | ContinuationPhase::Consumed
+                | ContinuationPhase::Cancelled => {
+                    let Some(continuation_seal) = record.continuation.seal else {
+                        Self::quarantine_locked(slot, &mut record);
+                        drop(record);
+                        drop(_transaction);
+                        system.restore();
+                        return FaultGateOutcome::Quarantined;
+                    };
+                    if !Self::continuation_seal_projection_matches(&record, continuation_seal) {
+                        Self::quarantine_locked(slot, &mut record);
+                        drop(record);
+                        drop(_transaction);
+                        system.restore();
+                        return FaultGateOutcome::Quarantined;
+                    }
+                    record.continuation.phase = ContinuationPhase::Abandoned;
+                }
+                ContinuationPhase::Idle
+                | ContinuationPhase::Abandoned
+                | ContinuationPhase::Quarantined => {
+                    Self::quarantine_locked(slot, &mut record);
+                    drop(record);
+                    drop(_transaction);
+                    system.restore();
+                    return FaultGateOutcome::Quarantined;
+                }
+            }
+
             // This is the fault-path ownership linearization point.  The
             // pointer is removed from the stable record before any raw arena
             // operation, but remains ManuallyDrop so even a returning hook
@@ -1446,6 +1667,8 @@ impl InstanceRegistry {
         ) && record.domain == Some(domain)
             && record.payload.is_none()
             && record.payload_abandoned
+            && Self::continuation_fault_safe(&record)
+            && slot.continuation_wait.waiter_count() == 0
             && record
                 .space
                 .as_deref()
@@ -1572,7 +1795,9 @@ impl InstanceRegistry {
                 TaskState::Faulted
                     if record.phase == InstancePhase::FaultReclaimed
                         && record.payload.is_none()
-                        && record.payload_abandoned =>
+                        && record.payload_abandoned
+                        && Self::continuation_fault_safe(&record)
+                        && slot.continuation_wait.waiter_count() == 0 =>
                 {
                     (
                         TerminalRetireKind::FaultReclaimed,
@@ -1586,13 +1811,17 @@ impl InstanceRegistry {
                         && record.payload.is_none()
                         && !record.payload_abandoned
                         && record.payload_completion.is_some()
-                        && record.payload_cancel.is_none())
+                        && record.payload_cancel.is_none()
+                        && Self::continuation_terminal_safe(&record)
+                        && slot.continuation_wait.waiter_count() == 0)
                         || (!record.payload_installed
                             && record.phase == InstancePhase::Active
                             && record.payload.is_none()
                             && !record.payload_abandoned
                             && record.payload_completion.is_none()
-                            && record.payload_cancel.is_none()) =>
+                            && record.payload_cancel.is_none()
+                            && Self::continuation_terminal_safe(&record)
+                            && slot.continuation_wait.waiter_count() == 0) =>
                 {
                     (
                         TerminalRetireKind::Normal,
@@ -1606,7 +1835,9 @@ impl InstanceRegistry {
                         && record.payload.is_none()
                         && !record.payload_abandoned
                         && record.payload_completion.is_none()
-                        && record.payload_cancel.is_none() =>
+                        && record.payload_cancel.is_none()
+                        && Self::continuation_terminal_safe(&record)
+                        && slot.continuation_wait.waiter_count() == 0 =>
                 {
                     (
                         TerminalRetireKind::Normal,
@@ -1656,6 +1887,11 @@ impl InstanceRegistry {
         if !Self::terminal_identity_matches(slot, &record, token, handle)
             || record.phase != retiring_phase
             || record.domain != Some(domain)
+            || slot.continuation_wait.waiter_count() != 0
+            || match retire_kind {
+                TerminalRetireKind::Normal => !Self::continuation_terminal_safe(&record),
+                TerminalRetireKind::FaultReclaimed => !Self::continuation_fault_safe(&record),
+            }
             || !post_unique
         {
             panic!("managed instance identity changed after irreversible terminal retirement");
@@ -1775,6 +2011,367 @@ impl InstanceRegistry {
         // Safety: the caller promises exact-task liveness across this call;
         // lifecycle finalization is therefore excluded until operation ends.
         Ok(operation(unsafe { &*pointer }))
+    }
+
+    /// Reserve the sole bounded continuation slot for the managed instance
+    /// executing in this exact poll.
+    ///
+    /// All complete lifecycle identity and CSpace-incarnation checks happen
+    /// before the operation token is published. A subsequent await stores its
+    /// waker only in the stable one-shot queue and the executor's TaskStatus
+    /// cleanup ledger; no arena ownership escapes this call.
+    pub fn arm_continuation_current(
+        &self,
+        instance: InstanceToken,
+        kind: InstanceContinuationKind,
+    ) -> Result<InstanceContinuationToken, InstanceContinuationError> {
+        let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        if witness.instance_token() != Some(instance)
+            || heap::current_domain() != witness.allocation_domain()
+        {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        }
+
+        let _transaction = self.transaction.lock();
+        let Some(slot) = self.slot(instance) else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        let mut record = slot.record.lock();
+        if !Self::active_witness_identity_matches(
+            slot,
+            &record,
+            instance,
+            witness,
+            InstancePhase::Active,
+        ) || !Self::sealed_cspace_matches(&record)
+        {
+            Self::quarantine_locked(slot, &mut record);
+            return Err(InstanceContinuationError::Quarantined);
+        }
+        match record.continuation.phase {
+            ContinuationPhase::Armed | ContinuationPhase::Signalled => {
+                return Err(InstanceContinuationError::Busy);
+            }
+            ContinuationPhase::Abandoned | ContinuationPhase::Quarantined => {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(InstanceContinuationError::Quarantined);
+            }
+            ContinuationPhase::Idle
+            | ContinuationPhase::Consumed
+            | ContinuationPhase::Cancelled
+                if Self::continuation_terminal_safe(&record) => {}
+            ContinuationPhase::Idle
+            | ContinuationPhase::Consumed
+            | ContinuationPhase::Cancelled => {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(InstanceContinuationError::Quarantined);
+            }
+        }
+        if slot.continuation_wait.waiter_count() != 0 {
+            Self::quarantine_locked(slot, &mut record);
+            return Err(InstanceContinuationError::Quarantined);
+        }
+        let Some(generation) = record.continuation.generation.checked_add(1) else {
+            Self::quarantine_locked(slot, &mut record);
+            return Err(InstanceContinuationError::GenerationExhausted);
+        };
+        let seal = ContinuationSeal {
+            instance,
+            operation_generation: generation,
+            kind,
+            task: witness.task_id(),
+            domain: witness.allocation_domain(),
+            scheduler: witness.scheduler_identity(),
+            home_hart: witness.home_hart(),
+            space: record
+                .space_seal
+                .expect("validated active instance lost its Space seal"),
+        };
+        record.continuation = ContinuationRecord {
+            generation,
+            phase: ContinuationPhase::Armed,
+            kind: Some(kind),
+            seal: Some(seal),
+        };
+        Ok(InstanceContinuationToken {
+            instance,
+            generation,
+        })
+    }
+
+    /// Construct the non-owning wait future for an already armed operation.
+    /// The listener is created before state is rechecked, closing completion's
+    /// signal-before-register race.
+    pub fn wait_continuation(
+        &self,
+        token: InstanceContinuationToken,
+    ) -> Result<InstanceContinuation<'_>, InstanceContinuationError> {
+        let Some(slot) = self.slot(token.instance) else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        let listener = slot.continuation_wait.wait(token.generation);
+        let kind = {
+            let _transaction = self.transaction.lock();
+            let mut record = slot.record.lock();
+            if !Self::token_matches(slot, &record, token.instance)
+                || record.continuation.generation != token.generation
+            {
+                return Err(InstanceContinuationError::IdentityMismatch);
+            }
+            if record.phase == InstancePhase::Quarantined
+                || record.continuation.phase == ContinuationPhase::Quarantined
+            {
+                return Err(InstanceContinuationError::Quarantined);
+            }
+            let Some(seal) = record.continuation.seal else {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(InstanceContinuationError::Quarantined);
+            };
+            if !matches!(
+                record.continuation.phase,
+                ContinuationPhase::Armed | ContinuationPhase::Signalled
+            ) || !Self::continuation_live_seal_matches(&record, seal)
+            {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(InstanceContinuationError::WrongPhase);
+            }
+            record
+                .continuation
+                .kind
+                .ok_or(InstanceContinuationError::WrongPhase)?
+        };
+        Ok(InstanceContinuation {
+            registry: self,
+            token,
+            listener: Some(listener),
+            kind,
+            self_wake_published: false,
+            terminal: false,
+        })
+    }
+
+    /// Convenience path for bounded interpreter/canonical progress. Every
+    /// call creates a fresh generation and its future self-wakes exactly once.
+    pub fn yield_continuation_current(
+        &self,
+        instance: InstanceToken,
+    ) -> Result<InstanceContinuation<'_>, InstanceContinuationError> {
+        let token = self.arm_continuation_current(instance, InstanceContinuationKind::Quantum)?;
+        self.wait_continuation(token)
+    }
+
+    /// Publish an external operation's readiness. This never executes guest
+    /// code; it only changes the exact SYSTEM record and wakes after all
+    /// registry locks have been released. Guest resume remains behind
+    /// the next fresh `poll_payload` witness check.
+    pub fn signal_continuation(
+        &self,
+        token: InstanceContinuationToken,
+    ) -> InstanceContinuationSignal {
+        let Some(slot) = self.slot(token.instance) else {
+            return InstanceContinuationSignal::Stale;
+        };
+        let wake = {
+            let _transaction = self.transaction.lock();
+            let mut record = slot.record.lock();
+            if !Self::token_matches(slot, &record, token.instance)
+                || record.continuation.generation != token.generation
+            {
+                return InstanceContinuationSignal::Stale;
+            }
+            if record.phase == InstancePhase::Quarantined
+                || record.continuation.phase == ContinuationPhase::Quarantined
+            {
+                return InstanceContinuationSignal::Quarantined;
+            }
+            match record.continuation.phase {
+                ContinuationPhase::Idle
+                | ContinuationPhase::Consumed
+                | ContinuationPhase::Cancelled
+                | ContinuationPhase::Abandoned => {
+                    return InstanceContinuationSignal::Stale;
+                }
+                ContinuationPhase::Armed | ContinuationPhase::Signalled => {}
+                ContinuationPhase::Quarantined => {
+                    return InstanceContinuationSignal::Quarantined;
+                }
+            }
+            match record.phase {
+                InstancePhase::Active => {}
+                InstancePhase::PayloadDropping
+                | InstancePhase::PayloadDropped
+                | InstancePhase::FaultReclaiming
+                | InstancePhase::FaultReclaimed
+                | InstancePhase::FaultRetiring
+                | InstancePhase::FaultTerminal
+                | InstancePhase::NormalClosing
+                | InstancePhase::NormalTerminal => {
+                    return InstanceContinuationSignal::Stale;
+                }
+                InstancePhase::Vacant | InstancePhase::Reserved | InstancePhase::Bound => {
+                    Self::quarantine_locked(slot, &mut record);
+                    return InstanceContinuationSignal::Quarantined;
+                }
+                InstancePhase::Quarantined => {
+                    return InstanceContinuationSignal::Quarantined;
+                }
+            }
+            let Some(seal) = record.continuation.seal else {
+                Self::quarantine_locked(slot, &mut record);
+                return InstanceContinuationSignal::Quarantined;
+            };
+            if !Self::continuation_live_seal_matches(&record, seal) {
+                Self::quarantine_locked(slot, &mut record);
+                return InstanceContinuationSignal::Quarantined;
+            }
+            match record.continuation.phase {
+                ContinuationPhase::Armed => {
+                    let wake = match slot.continuation_wait.publish(token.generation) {
+                        Ok(wake) => wake,
+                        Err(_) => {
+                            Self::quarantine_locked(slot, &mut record);
+                            return InstanceContinuationSignal::Quarantined;
+                        }
+                    };
+                    record.continuation.phase = ContinuationPhase::Signalled;
+                    wake
+                }
+                ContinuationPhase::Signalled => {
+                    return InstanceContinuationSignal::AlreadySignalled;
+                }
+                ContinuationPhase::Idle
+                | ContinuationPhase::Consumed
+                | ContinuationPhase::Cancelled
+                | ContinuationPhase::Abandoned => unreachable!(
+                    "terminal continuation phases returned before live signal validation"
+                ),
+                ContinuationPhase::Quarantined => {
+                    return InstanceContinuationSignal::Quarantined;
+                }
+            }
+        };
+        let _ = wake.dispatch();
+        InstanceContinuationSignal::Signalled
+    }
+
+    fn poll_continuation_current(
+        &self,
+        token: InstanceContinuationToken,
+    ) -> Result<Poll<()>, InstanceContinuationError> {
+        let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        if witness.instance_token() != Some(token.instance)
+            || heap::current_domain() != witness.allocation_domain()
+        {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        }
+        let _transaction = self.transaction.lock();
+        let Some(slot) = self.slot(token.instance) else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        let mut record = slot.record.lock();
+        if !Self::token_matches(slot, &record, token.instance)
+            || record.continuation.generation != token.generation
+        {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        }
+        if !Self::active_witness_identity_matches(
+            slot,
+            &record,
+            token.instance,
+            witness,
+            InstancePhase::Active,
+        ) || !record
+            .continuation
+            .seal
+            .is_some_and(|seal| Self::continuation_live_seal_matches(&record, seal))
+            || !Self::sealed_cspace_matches(&record)
+        {
+            Self::quarantine_locked(slot, &mut record);
+            return Err(InstanceContinuationError::Quarantined);
+        }
+        match record.continuation.phase {
+            ContinuationPhase::Armed => Ok(Poll::Pending),
+            ContinuationPhase::Signalled => {
+                record.continuation.phase = ContinuationPhase::Consumed;
+                Ok(Poll::Ready(()))
+            }
+            ContinuationPhase::Cancelled => Err(InstanceContinuationError::Cancelled),
+            ContinuationPhase::Quarantined | ContinuationPhase::Abandoned => {
+                Err(InstanceContinuationError::Quarantined)
+            }
+            ContinuationPhase::Idle | ContinuationPhase::Consumed => {
+                Self::quarantine_locked(slot, &mut record);
+                Err(InstanceContinuationError::WrongPhase)
+            }
+        }
+    }
+
+    fn cancel_continuation_current(
+        &self,
+        token: InstanceContinuationToken,
+    ) -> Result<(), InstanceContinuationError> {
+        let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        if witness.instance_token() != Some(token.instance)
+            || heap::current_domain() != witness.allocation_domain()
+        {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        }
+        let Some(slot) = self.slot(token.instance) else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        let wake =
+            {
+                let _transaction = self.transaction.lock();
+                let mut record = slot.record.lock();
+                if !Self::token_matches(slot, &record, token.instance)
+                    || record.continuation.generation != token.generation
+                {
+                    return Err(InstanceContinuationError::IdentityMismatch);
+                }
+                let phase = record.phase;
+                if !matches!(
+                    phase,
+                    InstancePhase::Active | InstancePhase::PayloadDropping
+                ) || !Self::active_witness_identity_matches(
+                    slot,
+                    &record,
+                    token.instance,
+                    witness,
+                    phase,
+                ) || !record.continuation.seal.is_some_and(|seal| {
+                    Self::continuation_current_seal_matches(&record, seal, phase)
+                }) || !Self::sealed_cspace_matches(&record)
+                {
+                    Self::quarantine_locked(slot, &mut record);
+                    return Err(InstanceContinuationError::Quarantined);
+                }
+                match record.continuation.phase {
+                    ContinuationPhase::Armed | ContinuationPhase::Signalled => {
+                        let wake = match slot.continuation_wait.publish(token.generation) {
+                            Ok(wake) => wake,
+                            Err(_) => {
+                                Self::quarantine_locked(slot, &mut record);
+                                return Err(InstanceContinuationError::Quarantined);
+                            }
+                        };
+                        record.continuation.phase = ContinuationPhase::Cancelled;
+                        wake
+                    }
+                    ContinuationPhase::Cancelled | ContinuationPhase::Consumed => return Ok(()),
+                    ContinuationPhase::Idle => return Err(InstanceContinuationError::WrongPhase),
+                    ContinuationPhase::Abandoned | ContinuationPhase::Quarantined => {
+                        return Err(InstanceContinuationError::Quarantined);
+                    }
+                }
+            };
+        let _ = wake.dispatch();
+        Ok(())
     }
 
     /// Sticky-quarantine one generation after a publication or lifecycle
@@ -2019,6 +2616,7 @@ impl InstanceRegistry {
 
     fn quarantine_locked(slot: &InstanceSlot, record: &mut SlotRecord) {
         record.phase = InstancePhase::Quarantined;
+        record.continuation.phase = ContinuationPhase::Quarantined;
         Self::publish_header(slot, record);
     }
 
@@ -2320,6 +2918,91 @@ impl InstanceRegistry {
             })
     }
 
+    /// Compare a non-idle continuation's frozen projections with the current
+    /// stable record without acquiring the CSpace lock. This structural form
+    /// is safe for external readiness publication: a task fault cannot leave
+    /// the signal path holding the registry transaction while waiting for an
+    /// abandoned guest-held CSpace lock.
+    fn continuation_seal_projection_matches(record: &SlotRecord, seal: ContinuationSeal) -> bool {
+        let Some(handle) = record.task.as_ref() else {
+            return false;
+        };
+        let Some(binding) = record.prepared else {
+            return false;
+        };
+        record.continuation.generation != 0
+            && record.continuation.generation == seal.operation_generation
+            && record.continuation.seal == Some(seal)
+            && record.continuation.kind == Some(seal.kind)
+            && seal.instance.generation == record.generation
+            && record.domain == Some(seal.domain)
+            && handle.allocation_domain() == seal.domain
+            && binding.allocation_domain() == seal.domain
+            && handle.id() == seal.task
+            && binding.task_id() == seal.task
+            && binding.instance_token() == Some(seal.instance)
+            && binding.scheduler_identity().is_none()
+            && binding.matches_handle(handle)
+            && record.home_hart == Some(seal.home_hart)
+            && binding.home_hart() == seal.home_hart
+            && record.scheduler == Some(seal.scheduler)
+            && record
+                .scheduler
+                .map(ReclaimableSchedulerIdentity::generation)
+                == Some(seal.scheduler.generation())
+            && record.space_seal == Some(seal.space)
+            && record
+                .space
+                .as_deref()
+                .is_some_and(|space| seal.space.immutable_objects_match(space))
+    }
+
+    /// Validate the complete phase-specific continuation shape. Empty state
+    /// must carry no stale authority; every other operation phase must retain
+    /// one exact non-zero-generation seal. Quarantine is intentionally never
+    /// accepted by a reclaim or reset path.
+    fn continuation_projection_matches(record: &SlotRecord) -> bool {
+        match record.continuation.phase {
+            ContinuationPhase::Idle => {
+                record.continuation.kind.is_none() && record.continuation.seal.is_none()
+            }
+            ContinuationPhase::Armed
+            | ContinuationPhase::Signalled
+            | ContinuationPhase::Consumed
+            | ContinuationPhase::Cancelled
+            | ContinuationPhase::Abandoned => record
+                .continuation
+                .seal
+                .is_some_and(|seal| Self::continuation_seal_projection_matches(record, seal)),
+            ContinuationPhase::Quarantined => false,
+        }
+    }
+
+    fn continuation_live_seal_matches(record: &SlotRecord, seal: ContinuationSeal) -> bool {
+        Self::continuation_current_seal_matches(record, seal, InstancePhase::Active)
+    }
+
+    fn continuation_current_seal_matches(
+        record: &SlotRecord,
+        seal: ContinuationSeal,
+        phase: InstancePhase,
+    ) -> bool {
+        record.phase == phase
+            && record
+                .task
+                .as_ref()
+                .is_some_and(|handle| handle.is_published() && handle.try_exit().is_none())
+            && Self::continuation_seal_projection_matches(record, seal)
+    }
+
+    fn continuation_terminal_safe(record: &SlotRecord) -> bool {
+        record.continuation.terminal_phase_safe() && Self::continuation_projection_matches(record)
+    }
+
+    fn continuation_fault_safe(record: &SlotRecord) -> bool {
+        record.continuation.fault_phase_safe() && Self::continuation_projection_matches(record)
+    }
+
     fn terminal_identity_matches(
         slot: &InstanceSlot,
         record: &SlotRecord,
@@ -2375,6 +3058,93 @@ impl Default for InstanceRegistry {
     }
 }
 
+impl Future for InstanceContinuation<'_> {
+    type Output = Result<(), InstanceContinuationError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.terminal {
+            return Poll::Ready(Err(InstanceContinuationError::WrongPhase));
+        }
+
+        // At most one event recheck is needed to close the register/complete
+        // race. This bounded loop is not an interpreter or service spin loop.
+        for recheck in 0..2 {
+            match this.registry.poll_continuation_current(this.token) {
+                Ok(Poll::Ready(())) => {
+                    this.terminal = true;
+                    drop(this.listener.take());
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Poll::Pending) => {}
+                Err(error) => {
+                    this.terminal = true;
+                    drop(this.listener.take());
+                    return Poll::Ready(Err(error));
+                }
+            }
+
+            let Some(listener) = this.listener.as_mut() else {
+                this.terminal = true;
+                let _ = this.registry.quarantine(this.token.instance);
+                return Poll::Ready(Err(InstanceContinuationError::Quarantined));
+            };
+            match Pin::new(listener).poll(context) {
+                Poll::Ready(Ok(())) if recheck == 0 => continue,
+                Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                    this.terminal = true;
+                    drop(this.listener.take());
+                    let _ = this.registry.quarantine(this.token.instance);
+                    return Poll::Ready(Err(InstanceContinuationError::Quarantined));
+                }
+                Poll::Pending => {}
+            }
+
+            if this.kind == InstanceContinuationKind::Quantum && !this.self_wake_published {
+                this.self_wake_published = true;
+                match this.registry.signal_continuation(this.token) {
+                    InstanceContinuationSignal::Signalled
+                    | InstanceContinuationSignal::AlreadySignalled => {}
+                    InstanceContinuationSignal::Stale => {
+                        this.terminal = true;
+                        drop(this.listener.take());
+                        return Poll::Ready(Err(InstanceContinuationError::IdentityMismatch));
+                    }
+                    InstanceContinuationSignal::Quarantined => {
+                        this.terminal = true;
+                        drop(this.listener.take());
+                        return Poll::Ready(Err(InstanceContinuationError::Quarantined));
+                    }
+                }
+            }
+            return Poll::Pending;
+        }
+
+        this.terminal = true;
+        drop(this.listener.take());
+        let _ = this.registry.quarantine(this.token.instance);
+        Poll::Ready(Err(InstanceContinuationError::Quarantined))
+    }
+}
+
+impl Drop for InstanceContinuation<'_> {
+    fn drop(&mut self) {
+        // Remove the TaskStatus-owned edge before changing operation state, so
+        // normal cancellation leaves no stale waker. A target architecture
+        // fault skips this destructor; permanent-detach cleanup drains the
+        // ledger and `fault_reclaim` publishes Abandoned instead.
+        drop(self.listener.take());
+        if !self.terminal
+            && self
+                .registry
+                .cancel_continuation_current(self.token)
+                .is_err()
+        {
+            let _ = self.registry.quarantine(self.token.instance);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2385,7 +3155,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{Mutex, MutexGuard};
 
-    static EXECUTOR_SERIAL: Mutex<()> = Mutex::new(());
     static TEST_REGISTRY: AtomicPtr<InstanceRegistry> = AtomicPtr::new(core::ptr::null_mut());
     static TEST_FAULT_NEXT: AtomicBool = AtomicBool::new(false);
     static TEST_RECLAIM_SUCCEEDS: AtomicBool = AtomicBool::new(true);
@@ -2396,6 +3165,12 @@ mod tests {
     static TEST_PAYLOAD_DROPS: AtomicU64 = AtomicU64::new(0);
     static TEST_PAYLOAD_COMPLETION: AtomicU64 = AtomicU64::new(u64::MAX);
     static TEST_PAYLOAD_DROP_FAULT: AtomicBool = AtomicBool::new(false);
+    static TEST_CONTINUATION_TOKEN: Mutex<Option<InstanceContinuationToken>> = Mutex::new(None);
+    static TEST_CONTINUATION_BEFORE: Mutex<Option<ReclaimableTaskWitness>> = Mutex::new(None);
+    static TEST_CONTINUATION_AFTER: Mutex<Option<ReclaimableTaskWitness>> = Mutex::new(None);
+    static TEST_CONTINUATION_STAGE: AtomicU64 = AtomicU64::new(0);
+    static TEST_CONTINUATION_BUSY: AtomicBool = AtomicBool::new(false);
+    static TEST_CONTINUATION_PAYLOAD_DROPS: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn opaque_tokens_expose_only_stable_slot_alias_rejection() {
@@ -2566,6 +3341,65 @@ mod tests {
         }
     }
 
+    struct TestContinuationPayload {
+        token: InstanceToken,
+        kind: InstanceContinuationKind,
+        continuation: Option<InstanceContinuation<'static>>,
+        completion: u64,
+    }
+
+    // Safety: the only state retained across polls is the opaque instance
+    // token and a non-owning continuation listener into the SYSTEM registry.
+    // No Space, CSpace guard, resource, or arena-backed reference escapes.
+    unsafe impl InstancePayload for TestContinuationPayload {
+        fn poll_quantum(&mut self, _space: &InstanceSpace, context: &mut Context<'_>) -> Poll<u64> {
+            if self.continuation.is_none() {
+                let pointer = TEST_REGISTRY.load(AtomicOrdering::Acquire);
+                assert!(
+                    !pointer.is_null(),
+                    "continuation payload registry is absent"
+                );
+                // Safety: every caller retains the executor-serialized stack
+                // registry until the managed task is terminal and finalized.
+                let registry: &'static InstanceRegistry = unsafe { &*pointer };
+                let operation = registry
+                    .arm_continuation_current(self.token, self.kind)
+                    .expect("continuation payload could not arm its exact operation");
+                *TEST_CONTINUATION_TOKEN
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(operation);
+                self.continuation = Some(
+                    registry
+                        .wait_continuation(operation)
+                        .expect("continuation payload could not construct its listener"),
+                );
+            }
+            let continuation = self
+                .continuation
+                .as_mut()
+                .expect("continuation payload lost its armed future");
+            match Pin::new(continuation).poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    drop(self.continuation.take());
+                    Poll::Ready(self.completion)
+                }
+                Poll::Ready(Err(error)) => {
+                    panic!("continuation payload was quarantined: {error:?}")
+                }
+            }
+        }
+    }
+
+    impl Drop for TestContinuationPayload {
+        fn drop(&mut self) {
+            TEST_CONTINUATION_PAYLOAD_DROPS.fetch_add(1, AtomicOrdering::SeqCst);
+            if TEST_PAYLOAD_DROP_FAULT.swap(false, AtomicOrdering::SeqCst) {
+                panic!("injected continuation payload Drop fault");
+            }
+        }
+    }
+
     unsafe fn reject_unexpected_fault(_: ReclaimableFaultWitness) -> FaultReclaimOutcome {
         FaultReclaimOutcome::Quarantined
     }
@@ -2625,7 +3459,7 @@ mod tests {
     }
 
     fn executor() -> MutexGuard<'static, ()> {
-        let guard = EXECUTOR_SERIAL
+        let guard = exec::EXECUTOR_TEST_SERIAL
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         crate::arch::set_test_hart_id(0);
@@ -2648,6 +3482,21 @@ mod tests {
         TEST_PAYLOAD_DROPS.store(0, AtomicOrdering::SeqCst);
         TEST_PAYLOAD_COMPLETION.store(u64::MAX, AtomicOrdering::SeqCst);
         TEST_PAYLOAD_DROP_FAULT.store(false, AtomicOrdering::SeqCst);
+        TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        TEST_CONTINUATION_BEFORE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        TEST_CONTINUATION_AFTER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        TEST_CONTINUATION_STAGE.store(0, AtomicOrdering::SeqCst);
+        TEST_CONTINUATION_BUSY.store(false, AtomicOrdering::SeqCst);
+        TEST_CONTINUATION_PAYLOAD_DROPS.store(0, AtomicOrdering::SeqCst);
         guard
     }
 
@@ -2683,6 +3532,62 @@ mod tests {
             .expect("managed publication returned no task handle")
     }
 
+    fn publish_continuation_managed(
+        registry: &InstanceRegistry,
+        token: InstanceToken,
+        allocation: AllocationDomain,
+        name: &str,
+        kind: InstanceContinuationKind,
+    ) -> TaskHandle {
+        let mut batch = PreparedTaskBatch::new();
+        // Safety: the task captures only copy tokens. The registry reference
+        // is recovered from the test-static pointer after exact activation and
+        // remains valid until this executor-serialized test finalizes it.
+        unsafe {
+            batch.prepare_managed_instance_owned(token, allocation, name, async move {
+                let pointer = TEST_REGISTRY.load(AtomicOrdering::Acquire);
+                assert!(!pointer.is_null(), "continuation test registry is absent");
+                let registry: &'static InstanceRegistry = &*pointer;
+                let before = exec::current_reclaimable_task_witness()
+                    .expect("continuation task has no first-poll witness");
+                *TEST_CONTINUATION_BEFORE
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(before);
+                let operation = registry
+                    .arm_continuation_current(token, kind)
+                    .expect("exact continuation arm failed");
+                *TEST_CONTINUATION_TOKEN
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(operation);
+                TEST_CONTINUATION_BUSY.store(
+                    registry.arm_continuation_current(token, kind)
+                        == Err(InstanceContinuationError::Busy),
+                    AtomicOrdering::SeqCst,
+                );
+                TEST_CONTINUATION_STAGE.store(1, AtomicOrdering::Release);
+                registry
+                    .wait_continuation(operation)
+                    .expect("exact continuation wait failed")
+                    .await
+                    .expect("exact continuation resume failed");
+                let after = exec::current_reclaimable_task_witness()
+                    .expect("continuation task has no resume witness");
+                *TEST_CONTINUATION_AFTER
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(after);
+                TEST_CONTINUATION_STAGE.store(2, AtomicOrdering::Release);
+            });
+        }
+        let prepared = batch.prepared_handles()[0].clone();
+        let binding = batch.prepared_reclaimable_bindings()[0];
+        registry.bind(token, binding, &prepared).unwrap();
+        unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+        }
+        .unwrap()
+        .remove(0)
+    }
+
     unsafe fn install_test_payload(
         registry: &InstanceRegistry,
         token: InstanceToken,
@@ -2693,6 +3598,26 @@ mod tests {
         unsafe {
             registry
                 .install_payload(token, || TestPayload { ready })
+                .unwrap();
+        }
+    }
+
+    unsafe fn install_continuation_payload(
+        registry: &InstanceRegistry,
+        token: InstanceToken,
+        kind: InstanceContinuationKind,
+        completion: u64,
+    ) {
+        // Safety: TestContinuationPayload obeys the registry's non-owning
+        // continuation and arena no-escape contract.
+        unsafe {
+            registry
+                .install_payload(token, || TestContinuationPayload {
+                    token,
+                    kind,
+                    continuation: None,
+                    completion,
+                })
                 .unwrap();
         }
     }
@@ -2807,6 +3732,24 @@ mod tests {
         record.space_seal = Some(projection.space_seal);
         record.home_hart = Some(projection.home_hart);
         record.scheduler = Some(projection.scheduler);
+        record.continuation.retire();
+        InstanceRegistry::publish_header(slot, &record);
+    }
+
+    fn restore_continuation_projection_for_test(
+        registry: &InstanceRegistry,
+        token: InstanceToken,
+        projection: TestRecordProjection,
+        continuation: ContinuationRecord,
+    ) {
+        let _transaction = registry.transaction.lock();
+        let slot = registry.slot(token).unwrap();
+        let mut record = slot.record.lock();
+        record.phase = InstancePhase::Active;
+        record.space_seal = Some(projection.space_seal);
+        record.home_hart = Some(projection.home_hart);
+        record.scheduler = Some(projection.scheduler);
+        record.continuation = continuation;
         InstanceRegistry::publish_header(slot, &record);
     }
 
@@ -2899,6 +3842,813 @@ mod tests {
             "{case} mismatch changed CSpace identity/incarnation/list"
         );
         restore_active_projection_for_test(registry, token, projection);
+    }
+
+    fn assert_continuation_fault_mismatch_is_inert(
+        registry: &InstanceRegistry,
+        token: InstanceToken,
+        witness: ReclaimableFaultWitness,
+        projection: TestRecordProjection,
+        continuation: ContinuationRecord,
+        expected_cspace: (CSpaceIdentity, u64, usize),
+        mutate: impl FnOnce(&mut ContinuationRecord),
+    ) {
+        mutate_active_record_for_test(registry, token, |record| mutate(&mut record.continuation));
+        let mut raw_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.fault_reclaim(witness, |_| {
+                    raw_calls += 1;
+                    true
+                })
+            },
+            FaultGateOutcome::Quarantined
+        );
+        assert_eq!(raw_calls, 0, "continuation mismatch authorized raw reclaim");
+        assert_eq!(cspace_state(registry, token), expected_cspace);
+        assert_eq!(
+            registry.slot(token).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            0
+        );
+        restore_continuation_projection_for_test(registry, token, projection, continuation);
+    }
+
+    #[test]
+    fn external_continuation_parks_without_spinning_and_resumes_on_exact_task_hart() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(52_001);
+        let token = registry.reserve(allocation).unwrap();
+        let incarnation = cspace_incarnation(&registry, token);
+        let handle = publish_continuation_managed(
+            &registry,
+            token,
+            allocation,
+            "external-continuation",
+            InstanceContinuationKind::External,
+        );
+
+        assert!(exec::poll_once());
+        assert_eq!(TEST_CONTINUATION_STAGE.load(AtomicOrdering::Acquire), 1);
+        assert!(TEST_CONTINUATION_BUSY.load(AtomicOrdering::Acquire));
+        assert_eq!(handle.polls(), 1);
+        assert_eq!(handle.owned_registration_count_for_test(), 1);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            1
+        );
+        assert_eq!(
+            cspace_incarnation(&registry, token),
+            incarnation,
+            "suspension retained a registry or CSpace lock"
+        );
+        for _ in 0..8 {
+            assert!(!exec::poll_once(), "parked continuation remained runnable");
+        }
+        assert_eq!(handle.polls(), 1, "idle executor repolled a parked task");
+
+        let operation = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("external continuation did not publish its opaque token");
+        let forged = InstanceContinuationToken {
+            instance: token,
+            generation: operation.generation + 1,
+        };
+        assert_eq!(
+            registry.signal_continuation(forged),
+            InstanceContinuationSignal::Stale
+        );
+        assert_eq!(handle.polls(), 1);
+
+        let projection = record_projection(&registry, token);
+        let continuation = registry.slot(token).unwrap().record.lock().continuation;
+        mutate_active_record_for_test(&registry, token, |record| {
+            record.phase = InstancePhase::PayloadDropping;
+        });
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Stale,
+            "completion racing payload tombstone must not quarantine or detach its waiter"
+        );
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            1
+        );
+        restore_continuation_projection_for_test(&registry, token, projection, continuation);
+
+        crate::arch::set_test_hart_id(1);
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Signalled
+        );
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::AlreadySignalled
+        );
+        assert!(
+            !exec::poll_once(),
+            "a remote hart polled a pinned continuation"
+        );
+        crate::arch::set_test_hart_id(0);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(handle.polls(), 2);
+        assert_eq!(TEST_CONTINUATION_STAGE.load(AtomicOrdering::Acquire), 2);
+        assert_eq!(handle.owned_registration_count_for_test(), 0);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            0
+        );
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Stale
+        );
+
+        let before = TEST_CONTINUATION_BEFORE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("first continuation witness is absent");
+        let after = TEST_CONTINUATION_AFTER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("resume continuation witness is absent");
+        assert_eq!(before.task_id(), after.task_id());
+        assert_eq!(before.allocation_domain(), after.allocation_domain());
+        assert_eq!(before.instance_token(), after.instance_token());
+        assert_eq!(before.scheduler_identity(), after.scheduler_identity());
+        assert_eq!(before.home_hart(), HartId::BOOT);
+        assert_eq!(after.home_hart(), HartId::BOOT);
+        assert_eq!(before.current_hart(), HartId::BOOT);
+        assert_eq!(after.current_hart(), HartId::BOOT);
+
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
+                assert_eq!(cspace_incarnation(&registry, token), incarnation);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(finalized.next_cspace_incarnation, incarnation + 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn quantum_continuation_self_wakes_once_and_uses_two_exact_polls() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(52_002);
+        let token = registry.reserve(allocation).unwrap();
+        let handle = publish_continuation_managed(
+            &registry,
+            token,
+            allocation,
+            "quantum-continuation",
+            InstanceContinuationKind::Quantum,
+        );
+
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Running);
+        assert_eq!(handle.polls(), 1);
+        assert_eq!(handle.owned_registration_count_for_test(), 1);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            0
+        );
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(handle.polls(), 2);
+        assert_eq!(handle.owned_registration_count_for_test(), 0);
+        assert!(
+            !exec::poll_once(),
+            "quantum continuation self-woke more than once"
+        );
+
+        let operation = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("quantum continuation token is absent");
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Stale
+        );
+        unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
+                true
+            })
+        }
+        .unwrap();
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn terminal_continuation_mismatch_never_retires_or_resets_cspace() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(52_009);
+        let token = registry.reserve(allocation).unwrap();
+        let handle = publish_continuation_managed(
+            &registry,
+            token,
+            allocation,
+            "continuation-terminal-mismatch",
+            InstanceContinuationKind::External,
+        );
+        assert!(exec::poll_once());
+        let operation = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("terminal mismatch operation is absent");
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Signalled
+        );
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        let before = cspace_state(&registry, token);
+        mutate_active_record_for_test(&registry, token, |record| {
+            record.continuation.generation += 1;
+        });
+        let mut retire_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.finalize(token, &handle, |_, _| {
+                    retire_calls += 1;
+                    true
+                })
+            },
+            Err(RegistryError::WrongPhase)
+        );
+        assert_eq!(retire_calls, 0);
+        assert_eq!(cspace_state(&registry, token), before);
+        assert_eq!(
+            registry.slot(token).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn stale_continuation_cannot_wake_a_reused_instance_slot() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+
+        let first_domain = domain(52_003);
+        let first = registry.reserve(first_domain).unwrap();
+        let first_cspace = cspace_state(&registry, first);
+        let first_handle = publish_continuation_managed(
+            &registry,
+            first,
+            first_domain,
+            "continuation-aba-first",
+            InstanceContinuationKind::External,
+        );
+        assert!(exec::poll_once());
+        let stale = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("first continuation token is absent");
+        assert_eq!(
+            registry.signal_continuation(stale),
+            InstanceContinuationSignal::Signalled
+        );
+        assert!(exec::poll_once());
+        unsafe { registry.finalize(first, &first_handle, |_, _| true) }.unwrap();
+
+        TEST_CONTINUATION_STAGE.store(0, AtomicOrdering::Release);
+        TEST_CONTINUATION_BUSY.store(false, AtomicOrdering::Release);
+        TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let replacement_domain = domain(52_004);
+        let replacement = registry.reserve(replacement_domain).unwrap();
+        assert!(first.shares_stable_slot(replacement));
+        assert_ne!(first, replacement);
+        let replacement_cspace = cspace_state(&registry, replacement);
+        assert_eq!(replacement_cspace.0, first_cspace.0);
+        assert_eq!(replacement_cspace.1, first_cspace.1 + 1);
+        let replacement_handle = publish_continuation_managed(
+            &registry,
+            replacement,
+            replacement_domain,
+            "continuation-aba-replacement",
+            InstanceContinuationKind::External,
+        );
+        assert!(exec::poll_once());
+        let current = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("replacement continuation token is absent");
+        assert_ne!(stale.generation, current.generation);
+        let forged_old_operation = InstanceContinuationToken {
+            instance: replacement,
+            generation: stale.generation,
+        };
+        let before = cspace_state(&registry, replacement);
+        assert_eq!(
+            registry.signal_continuation(stale),
+            InstanceContinuationSignal::Stale
+        );
+        assert_eq!(
+            registry.signal_continuation(forged_old_operation),
+            InstanceContinuationSignal::Stale
+        );
+        assert_eq!(replacement_handle.polls(), 1);
+        assert_eq!(cspace_state(&registry, replacement), before);
+        assert_eq!(
+            registry
+                .slot(replacement)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            1
+        );
+
+        assert_eq!(
+            registry.signal_continuation(current),
+            InstanceContinuationSignal::Signalled
+        );
+        assert!(exec::poll_once());
+        assert_eq!(replacement_handle.state(), TaskState::Exited);
+        unsafe { registry.finalize(replacement, &replacement_handle, |_, _| true) }.unwrap();
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn fault_detach_drains_a_parked_continuation_before_raw_reclaim_and_reset() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        exec::set_fault_reclaimer(reclaim_test_instance);
+        exec::set_fault_guard(fault_after_payload_poll_guard);
+        let allocation = domain(52_005);
+        let token = registry.reserve(allocation).unwrap();
+        let before = cspace_state(&registry, token);
+        let handle = publish_continuation_managed(
+            &registry,
+            token,
+            allocation,
+            "continuation-live-fault",
+            InstanceContinuationKind::External,
+        );
+
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        assert_eq!(handle.owned_registration_count_for_test(), 0);
+        assert_eq!(TEST_RAW_RECLAIMS.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            0
+        );
+        {
+            let record = registry.slot(token).unwrap().record.lock();
+            assert_eq!(record.phase, InstancePhase::FaultReclaimed);
+            assert_eq!(record.continuation.phase, ContinuationPhase::Abandoned);
+        }
+        let operation = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("faulted continuation token is absent");
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Stale
+        );
+        assert_eq!(cspace_state(&registry, token), before);
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                assert_eq!(cspace_state(&registry, token), before);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(finalized.next_cspace_incarnation, before.1 + 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn continuation_fault_gate_rejects_every_frozen_projection_mismatch() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        exec::set_fault_reclaimer(capture_fault_witness);
+        exec::set_fault_guard(fault_after_payload_poll_guard);
+        let allocation = domain(52_008);
+        let token = registry.reserve(allocation).unwrap();
+        let expected_cspace = cspace_state(&registry, token);
+        let handle = publish_continuation_managed(
+            &registry,
+            token,
+            allocation,
+            "continuation-fault-mismatch-matrix",
+            InstanceContinuationKind::External,
+        );
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        assert_eq!(handle.owned_registration_count_for_test(), 0);
+        let witness = TEST_FAULT_WITNESS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("continuation mismatch test lost its fault witness");
+        let projection = record_projection(&registry, token);
+        let continuation = registry.slot(token).unwrap().record.lock().continuation;
+        assert_eq!(continuation.phase, ContinuationPhase::Armed);
+
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.generation += 1,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.phase = ContinuationPhase::Idle,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.kind = Some(InstanceContinuationKind::Quantum),
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.kind = None,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal = None,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().operation_generation += 1,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().kind = InstanceContinuationKind::Quantum,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().instance.generation ^= 1,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| {
+                let seal = record.seal.as_mut().unwrap();
+                seal.task = TaskId(seal.task.0 + 1);
+            },
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| {
+                let seal = record.seal.as_mut().unwrap();
+                seal.domain.owner = OwnerId::new(seal.domain.owner.get() + 1);
+            },
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| {
+                let seal = record.seal.as_mut().unwrap();
+                seal.domain.arena = ArenaId::new(seal.domain.arena.get() + 1);
+            },
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().home_hart = HartId::new(1).unwrap(),
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().space.object_identity ^= 1,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().space.lock_identity ^= 1,
+        );
+        assert_continuation_fault_mismatch_is_inert(
+            &registry,
+            token,
+            witness,
+            projection,
+            continuation,
+            expected_cspace,
+            |record| record.seal.as_mut().unwrap().space.cspace_incarnation += 1,
+        );
+
+        mutate_active_record_for_test(&registry, token, |record| {
+            record.space_seal.as_mut().unwrap().cspace_incarnation += 1;
+        });
+        let mut raw_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.fault_reclaim(witness, |_| {
+                    raw_calls += 1;
+                    true
+                })
+            },
+            FaultGateOutcome::Quarantined
+        );
+        assert_eq!(raw_calls, 0);
+        assert_eq!(cspace_state(&registry, token), expected_cspace);
+        restore_continuation_projection_for_test(&registry, token, projection, continuation);
+
+        let mut raw_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.fault_reclaim(witness, |reclaimed| {
+                    assert_eq!(reclaimed, allocation);
+                    raw_calls += 1;
+                    true
+                })
+            },
+            FaultGateOutcome::ManagedReclaimed
+        );
+        assert_eq!(raw_calls, 1);
+        assert_eq!(cspace_state(&registry, token), expected_cspace);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .record
+                .lock()
+                .continuation
+                .phase,
+            ContinuationPhase::Abandoned
+        );
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(finalized.next_cspace_incarnation, expected_cspace.1 + 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn cooperative_cancel_drops_a_parked_payload_without_quarantine() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(52_006);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe {
+            install_continuation_payload(
+                &registry,
+                token,
+                InstanceContinuationKind::External,
+                0x52_006,
+            )
+        };
+        let handle =
+            publish_payload_managed(&registry, token, allocation, "continuation-cancel-payload");
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Running);
+        assert_eq!(handle.polls(), 1);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            1
+        );
+        let operation = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("payload continuation token is absent");
+
+        let task = match registry
+            .request_cooperative_cancel(token, &handle, 0xCA_52)
+            .unwrap()
+        {
+            CooperativeCancelOutcome::Requested(task) => task,
+            CooperativeCancelOutcome::AlreadyCompleting => {
+                panic!("parked payload unexpectedly completed before cancellation")
+            }
+        };
+        exec::wake(task);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(
+            TEST_PAYLOAD_COMPLETION.load(AtomicOrdering::Acquire),
+            0xCA_52
+        );
+        assert_eq!(
+            TEST_CONTINUATION_PAYLOAD_DROPS.load(AtomicOrdering::Acquire),
+            1
+        );
+        assert_eq!(handle.owned_registration_count_for_test(), 0);
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            0
+        );
+        {
+            let record = registry.slot(token).unwrap().record.lock();
+            assert_eq!(record.phase, InstancePhase::PayloadDropped);
+            assert_eq!(record.continuation.phase, ContinuationPhase::Cancelled);
+        }
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Stale
+        );
+        let finalized = unsafe { registry.finalize(token, &handle, |_, _| true) }.unwrap();
+        assert_eq!(finalized.detached_completion, Some(0xCA_52));
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn consumed_continuation_survives_payload_drop_fault_without_second_drop() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        exec::set_fault_reclaimer(reclaim_test_instance);
+        exec::set_fault_guard(catch_payload_drop_fault_guard);
+        let allocation = domain(52_007);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe {
+            install_continuation_payload(
+                &registry,
+                token,
+                InstanceContinuationKind::Quantum,
+                0x52_007,
+            )
+        };
+        let handle = publish_payload_managed(
+            &registry,
+            token,
+            allocation,
+            "continuation-consumed-drop-fault",
+        );
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Running);
+        TEST_PAYLOAD_DROP_FAULT.store(true, AtomicOrdering::Release);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        assert_eq!(
+            TEST_CONTINUATION_PAYLOAD_DROPS.load(AtomicOrdering::Acquire),
+            1
+        );
+        assert_eq!(TEST_RAW_RECLAIMS.load(AtomicOrdering::Acquire), 1);
+        {
+            let record = registry.slot(token).unwrap().record.lock();
+            assert_eq!(record.phase, InstancePhase::FaultReclaimed);
+            assert_eq!(record.continuation.phase, ContinuationPhase::Abandoned);
+            assert!(record.payload.is_none());
+            assert!(record.payload_abandoned);
+        }
+        unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(
+            TEST_CONTINUATION_PAYLOAD_DROPS.load(AtomicOrdering::Acquire),
+            1
+        );
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
     }
 
     #[test]

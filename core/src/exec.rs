@@ -628,6 +628,18 @@ pub struct TaskHandle {
     status: Arc<TaskStatus>,
 }
 
+/// Allocation-free C4.8 evidence that one terminal task retained no outbound
+/// wake edge after the executor's permanent-detach drain.
+#[cfg(feature = "wasm-c48-target-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptanceTaskRegistrationStats {
+    pub total: usize,
+    pub waits: usize,
+    pub timers: usize,
+    pub joins: usize,
+    pub irq_poll_probes: usize,
+}
+
 impl TaskHandle {
     pub fn id(&self) -> TaskId {
         self.id
@@ -643,6 +655,14 @@ impl TaskHandle {
 
     pub fn allocation_domain(&self) -> AllocationDomain {
         self.domain
+    }
+
+    /// Compare the stable, unforgeable status object behind two retained
+    /// handles without exposing its address. Lifecycle registries use this to
+    /// reject cross-slot aliases even if other scalar projections were
+    /// corrupted independently.
+    pub fn shares_status_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.status, &other.status)
     }
 
     pub fn is_published(&self) -> bool {
@@ -674,6 +694,37 @@ impl TaskHandle {
             "an unpublished task has no public join ledger"
         );
         self.status.joiners.lock().len()
+    }
+
+    /// Inspect only the exact TaskStatus-owned outbound registration ledger.
+    ///
+    /// This API is absent from production builds. C4.8 samples it after the
+    /// executor has published a terminal state, proving that fault detach
+    /// drained this task's wait/timer/join/IRQ edges without relying on noisy
+    /// machine-global service counters.
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    pub fn acceptance_registration_stats(&self) -> AcceptanceTaskRegistrationStats {
+        assert!(
+            self.is_published(),
+            "an unpublished task has no registration ledger"
+        );
+        let registrations = self.status.registrations.lock();
+        let mut stats = AcceptanceTaskRegistrationStats {
+            total: registrations.len(),
+            waits: 0,
+            timers: 0,
+            joins: 0,
+            irq_poll_probes: 0,
+        };
+        for entry in registrations.iter() {
+            match entry.registration {
+                OwnedRegistration::Wait { .. } => stats.waits += 1,
+                OwnedRegistration::Timer { .. } => stats.timers += 1,
+                OwnedRegistration::Join { .. } => stats.joins += 1,
+                OwnedRegistration::IrqPollProbe { .. } => stats.irq_poll_probes += 1,
+            }
+        }
+        stats
     }
 
     /// Request cooperative cancellation.
@@ -919,6 +970,70 @@ impl ReclaimableFaultWitness {
             && self.domain == handle.domain
             && self.status_identity == Arc::as_ptr(&handle.status) as usize
     }
+
+    /// Produce one deliberately invalid projection for the C4.8 target
+    /// acceptance matrix.
+    ///
+    /// This API is absent from production builds. Each enum case changes
+    /// exactly one proof component by a fixed, non-caller-selected transform;
+    /// it cannot be used to assemble a chosen witness or restore authority.
+    /// `None` is returned only when [`AcceptanceWitnessMismatch::Generation`]
+    /// is requested for a witness which does not name a managed instance.
+    ///
+    /// # Safety model
+    ///
+    /// The returned value is intentionally invalid and may only be submitted
+    /// to a fail-closed acceptance gate after the original witness's task has
+    /// crossed the executor's permanent-detach boundary. It must never replace
+    /// the original witness in normal lifecycle control flow.
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    pub fn with_acceptance_mismatch(mut self, mismatch: AcceptanceWitnessMismatch) -> Option<Self> {
+        match mismatch {
+            AcceptanceWitnessMismatch::Generation => {
+                self.instance = Some(self.instance?.with_mismatched_generation_for_acceptance());
+            }
+            AcceptanceWitnessMismatch::Task => {
+                self.task = TaskId(self.task.0 ^ 1);
+            }
+            AcceptanceWitnessMismatch::Status => {
+                self.status_identity ^= 1;
+            }
+            AcceptanceWitnessMismatch::Owner => {
+                self.domain.owner = OwnerId::new(self.domain.owner.get() ^ 1);
+            }
+            AcceptanceWitnessMismatch::Arena => {
+                self.domain.arena = ArenaId::new(self.domain.arena.get() ^ 1);
+            }
+            AcceptanceWitnessMismatch::CurrentHart => {
+                let next = (self.current_hart.index() + 1) % MAX_HARTS;
+                self.current_hart =
+                    HartId::new(next).expect("acceptance hart transform stays in range");
+            }
+        }
+        Some(self)
+    }
+}
+
+/// Single-field corruptions available to the C4.8 target acceptance image.
+///
+/// The variants deliberately carry no values: acceptance code may prove that
+/// each registry predicate rejects a mismatch, but cannot forge arbitrary
+/// task, allocator, scheduler, or hart authority.
+#[cfg(feature = "wasm-c48-target-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptanceWitnessMismatch {
+    /// Change only the managed [`InstanceToken`] generation.
+    Generation,
+    /// Change only the [`TaskId`].
+    Task,
+    /// Change only the private TaskStatus object identity.
+    Status,
+    /// Change only the allocation owner projection.
+    Owner,
+    /// Change only the allocation arena projection.
+    Arena,
+    /// Change only the physical/logical hart-at-fault projection.
+    CurrentHart,
 }
 
 #[cfg(test)]
@@ -5044,9 +5159,12 @@ mod reclaimable_domain_tests {
             domain,
             status: Arc::new(TaskStatus::new(publication)),
         };
+        let retained = handle.clone();
 
         assert!(binding.matches_handle(&handle));
         assert!(!binding.matches_handle(&counterfeit));
+        assert!(handle.shares_status_with(&retained));
+        assert!(!handle.shares_status_with(&counterfeit));
     }
 
     #[test]

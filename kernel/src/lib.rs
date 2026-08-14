@@ -23,6 +23,11 @@ compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 #[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-test` is the QEMU-only N4 acceptance image");
+#[cfg(all(
+    feature = "wasm-c48-qemu-acceptance",
+    not(all(feature = "qemu-virt", feature = "ssh-test"))
+))]
+compile_error!("feature `wasm-c48-qemu-acceptance` requires the QEMU-only `ssh-test` image");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
@@ -489,6 +494,9 @@ pub extern "C" fn kmain() -> ! {
         cap_table_pool::CAP_TABLE_POOL_BYTES / 1024,
     );
 
+    #[cfg(feature = "ssh-component-command")]
+    component_instances::init();
+
     world::build();
 
     let world = world::world();
@@ -725,6 +733,21 @@ unsafe fn reclaim_faulted_component(
 /// audited arena faults. The executor has detached the task permanently before
 /// entering this non-allocating hook.
 unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomain) {
+    unsafe {
+        #[cfg(feature = "ssh-component-command")]
+        component_instances::recover_faulted_task(task, domain);
+        cleanup_faulted_task_after_component_gate(task, domain);
+    }
+}
+
+/// Shared exact-task cleanup after a managed instance has already locked and
+/// validated its independent CONTROL projection. Calling CONTROL recovery a
+/// second time there would mistake the detached validation guard for the
+/// abandoned guard of the faulted child and poison a valid lifecycle.
+unsafe fn cleanup_faulted_task_after_component_gate(
+    task: exec::TaskId,
+    domain: heap::AllocationDomain,
+) {
     unsafe {
         store::recover_faulted_task(task, domain);
         // Durable boot recovery installs and fail-closes the saved-program

@@ -200,10 +200,13 @@ def require_result(
     returncodes: set[int],
     stdout: bytes | None = None,
     stderr_pattern: str | None = None,
+    stderr_exact: bytes | None = None,
 ) -> None:
     if result.returncode not in returncodes:
         raise PeerError(_display_failure(label, result))
     if stdout is not None and result.stdout != stdout:
+        raise PeerError(_display_failure(label, result))
+    if stderr_exact is not None and result.stderr != stderr_exact:
         raise PeerError(_display_failure(label, result))
     if stderr_pattern is not None:
         stderr = result.stderr.decode("utf-8", errors="replace")
@@ -369,6 +372,20 @@ def run_acceptance(
     true_result = invoke("authorized true", accepted_key, ["-T"], ["true"])
     require_result("authorized true", true_result, {0}, b"")
 
+    case_filter = invoke(
+        "authorized WASM case-filter",
+        accepted_key,
+        ["-T"],
+        ["case-filter"],
+    )
+    require_result(
+        "authorized WASM case-filter",
+        case_filter,
+        {0},
+        b"",
+        stderr_exact=b"",
+    )
+
     false_result = invoke("authorized false", accepted_key, ["-T"], ["false"])
     require_result("authorized false", false_result, {1}, b"")
 
@@ -470,6 +487,29 @@ def selftest() -> None:
     )
     require_negotiated_profile(synthetic)
     require_expected_host_identity(synthetic)
+    require_result(
+        "empty WASM command",
+        subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=b"", stderr=b""
+        ),
+        {0},
+        b"",
+        stderr_exact=b"",
+    )
+    try:
+        require_result(
+            "noisy WASM command",
+            subprocess.CompletedProcess(
+                args=["ssh"], returncode=0, stdout=b"", stderr=b"unexpected"
+            ),
+            {0},
+            b"",
+            stderr_exact=b"",
+        )
+    except PeerError:
+        pass
+    else:
+        raise PeerError("strict WASM stderr check accepted unexpected output")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -583,8 +623,9 @@ def main() -> int:
                 arguments.command_timeout,
             )
             print(
-                "PASS openssh-peer: forced crypto, authorized exec statuses, interactive "
-                "PTY/shell, rejected key, and invalid request denial"
+                "PASS openssh-peer: forced crypto, authorized exec statuses including "
+                "WASM case-filter, interactive PTY/shell, rejected key, and invalid "
+                "request denial"
             )
         return 0
     except (OSError, PeerError, subprocess.SubprocessError) as error:

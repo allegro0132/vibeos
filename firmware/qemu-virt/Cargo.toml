@@ -10,7 +10,10 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
-ssh-test = ["vibeos-kernel/ssh-test"]
+ssh-test = [
+    "vibeos-kernel/ssh-test",
+    "vibeos-kernel/wasm-c48-qemu-acceptance",
+]
 
 [[bin]]
 name = "vibeos-qemu-virt"

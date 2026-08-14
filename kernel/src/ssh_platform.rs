@@ -54,7 +54,7 @@ use vibeos_ssh_identity::SshEd25519PublicKey;
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
     Ipv4RuntimeStatus, NetworkBindError, NetworkInfo, Platform as SshdPlatform, PlatformFuture,
-    SecretBytes, SshServicePolicy, StaticIpv4Address,
+    SecretBytes, SshExecComponentSessionPolicy, SshServicePolicy, StaticIpv4Address,
 };
 
 #[cfg(any(
@@ -420,6 +420,21 @@ impl SshdPlatform for SshPlatform {
         }
     }
 
+    fn install_ssh_exec_component_commands(
+        &self,
+        session: &mut vibeos_vsh::Session,
+        policy: SshExecComponentSessionPolicy,
+    ) -> Result<(), vibeos_vsh::Diagnostic> {
+        crate::component_instances::install_ssh_exec_component(session, policy)
+    }
+
+    fn ssh_exec_component_policy(
+        &self,
+        profile: AuthorizedProfile,
+    ) -> Option<SshExecComponentSessionPolicy> {
+        crate::component_instances::ssh_exec_policy(profile)
+    }
+
     #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
     fn accepts_streaming_exec(&self, command: &str) -> bool {
         crate::jitterentropy_probe::accepts_ssh_stream(command)
@@ -451,6 +466,11 @@ pub async fn capability_task(
     signer_invoke: Cap,
     policy: Cap,
 ) {
+    #[cfg(feature = "wasm-c48-qemu-acceptance")]
+    if !crate::component_instances::run_qemu_acceptance().await {
+        crate::sbi::shutdown(true);
+    }
+
     let platform = SshPlatform::new(space);
     #[cfg(feature = "milkv-ssh-acceptance")]
     crate::uart::_print(format_args!(

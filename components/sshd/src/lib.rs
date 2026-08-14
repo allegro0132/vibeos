@@ -2918,14 +2918,21 @@ async fn execute_with_network(
 ) -> ExecutionEnd {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
-    let onboarding = matches!(
-        protocol.committed.map(|candidate| candidate.credential),
-        Some(AuthCredential::OnboardingPassword)
-    );
-    space.install_vsh_commands(&mut session, onboarding);
-    let Some(profile) = protocol.committed.map(|candidate| candidate.profile) else {
+    let Some(candidate) = protocol.committed else {
         return ExecutionEnd::Reset("SSH exec session has no committed profile");
     };
+    let onboarding = matches!(candidate.credential, AuthCredential::OnboardingPassword);
+    let profile = candidate.profile;
+    space.install_vsh_commands(&mut session, onboarding);
+    match revalidate_candidate(space, policy, signer, candidate) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ExecutionEnd::Reset(
+                "authorized profile changed before SSH exec command installation",
+            );
+        }
+        Err(reason) => return ExecutionEnd::Reset(reason),
+    }
     if let Err(error) = install_accepted_ssh_component(
         space,
         &mut session,

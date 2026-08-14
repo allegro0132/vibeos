@@ -1047,6 +1047,10 @@ dependencies = [
  "vibeos-authority-store",
  "vibeos-bsp-milkv-duo",
  "vibeos-bsp-qemu-virt",
+ "vibeos-component-admission",
+ "vibeos-component-command",
+ "vibeos-component-format",
+ "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-driver-dwc2-host",
  "vibeos-driver-dwmac-net",
@@ -1075,6 +1079,7 @@ dependencies = [
  "vibeos-sshd",
  "vibeos-storage-device",
  "vibeos-vsh",
+ "vibeos-wasm-runtime",
 ]
 
 [[package]]

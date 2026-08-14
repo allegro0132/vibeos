@@ -32,11 +32,20 @@ pub struct NetworkFrontendPolicy {
 /// device backend's descriptor-ring size.
 pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 64 };
 
-/// The default QEMU image admits the exact 64 MiB managed slice created by the
-/// run and acceptance harnesses. Storage V2 initially formats only its policy
-/// range within this slice; the unused suffix is not ambient store capacity and
-/// may be admitted only by an explicit maintenance growth operation.
-#[cfg(all(feature = "qemu-default", not(feature = "file-tree")))]
+/// The default QEMU image admits a bounded managed slice. Storage V2 initially
+/// formats only its policy range within this slice; unused suffix capacity is
+/// not ambient store capacity and may be admitted only by explicit growth.
+#[cfg(all(feature = "qemu-default", feature = "storage-bench"))]
+pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
+    first_sector: 0,
+    sector_count: 393_216,
+});
+
+#[cfg(all(
+    feature = "qemu-default",
+    not(feature = "storage-bench"),
+    not(feature = "file-tree")
+))]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 0,
     sector_count: 131_072,
@@ -45,7 +54,11 @@ pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
 /// The capability-rooted file-tree acceptance image uses a dedicated 128 MiB
 /// managed slice. The initial V2 ABI remains the same 8-segment window; the
 /// aligned suffix becomes usable only through the maintenance growth protocol.
-#[cfg(all(feature = "qemu-default", feature = "file-tree"))]
+#[cfg(all(
+    feature = "qemu-default",
+    feature = "file-tree",
+    not(feature = "storage-bench")
+))]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 0,
     sector_count: 262_144,
@@ -73,7 +86,9 @@ mod tests {
     fn qemu_data_slice_is_exact_and_checked() {
         assert_eq!(
             BLOCK_DATA_SLICE.unwrap().end_sector(),
-            Some(if cfg!(feature = "file-tree") {
+            Some(if cfg!(feature = "storage-bench") {
+                393_216
+            } else if cfg!(feature = "file-tree") {
                 262_144
             } else {
                 131_072

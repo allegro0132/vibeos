@@ -473,6 +473,8 @@ pub struct World {
     /// init's client authority on the discovered block service. The transport
     /// and DMA roots remain private supervisor grants.
     pub block: Option<Cap>,
+    /// Benchmark-only raw block range. It is `None` in production images.
+    pub block_bench: Option<Cap>,
     #[cfg(not(feature = "legacy-shell"))]
     pub vsh_block: Option<Cap>,
     /// init's authority on the capability-addressed persistent object service.
@@ -2000,6 +2002,7 @@ pub fn build() {
         block_dma_root,
         block_raw_root,
         block_grants,
+        block_bench_root,
     ) = match (
         block_resources,
         block_space.as_ref(),
@@ -2018,6 +2021,10 @@ pub fn build() {
             const STORAGE_V2_BLOCKS: u64 = crate::segment_store_platform::STORAGE_V2_BLOCK_COUNT;
             const STORAGE_V2_GRANULE: u64 =
                 crate::segment_store_platform::STORAGE_V2_GROWTH_GRANULE_BLOCKS;
+            #[cfg(feature = "storage-bench")]
+            const BENCHMARK_BLOCK_FIRST: u64 = 262_144;
+            #[cfg(feature = "storage-bench")]
+            const BENCHMARK_BLOCKS: u64 = 131_072;
 
             let managed_range = resources.managed_range.range();
             let diagnostic_range = managed_range
@@ -2029,10 +2036,15 @@ pub fn build() {
             let migration_control_range = managed_range
                 .attenuate(MIGRATION_CONTROL_FIRST, MIGRATION_CONTROL_BLOCKS)
                 .expect("image block range contains the migration-control window");
-            let storage_v2_available = managed_range
-                .block_count()
-                .checked_sub(STORAGE_V2_FIRST)
-                .expect("image block range contains Storage V2 start");
+            let storage_v2_available = {
+                #[cfg(feature = "storage-bench")]
+                let capacity = managed_range.block_count().min(BENCHMARK_BLOCK_FIRST);
+                #[cfg(not(feature = "storage-bench"))]
+                let capacity = managed_range.block_count();
+                capacity
+                    .checked_sub(STORAGE_V2_FIRST)
+                    .expect("image block range contains Storage V2 start")
+            };
             let storage_v2_extra = storage_v2_available
                 .checked_sub(STORAGE_V2_BLOCKS)
                 .expect("image block range contains the initial Storage V2 window");
@@ -2041,16 +2053,27 @@ pub fn build() {
             let storage_v2_range = managed_range
                 .attenuate(STORAGE_V2_FIRST, storage_v2_provisioned_blocks)
                 .expect("image block range contains the initial Storage V2 window");
-            vibeos_storage_device::validate_grant_layout(
-                managed_range,
-                &[
-                    diagnostic_range,
-                    store_range,
-                    migration_control_range,
-                    storage_v2_range,
-                ],
-            )
-            .expect("image block grants are contained and pairwise disjoint");
+            #[cfg(feature = "storage-bench")]
+            let benchmark_range = managed_range
+                .attenuate(BENCHMARK_BLOCK_FIRST, BENCHMARK_BLOCKS)
+                .expect("benchmark image contains its dedicated raw-block range");
+            #[cfg(feature = "storage-bench")]
+            let grant_ranges = [
+                diagnostic_range,
+                store_range,
+                migration_control_range,
+                storage_v2_range,
+                benchmark_range,
+            ];
+            #[cfg(not(feature = "storage-bench"))]
+            let grant_ranges = [
+                diagnostic_range,
+                store_range,
+                migration_control_range,
+                storage_v2_range,
+            ];
+            vibeos_storage_device::validate_grant_layout(managed_range, &grant_ranges)
+                .expect("image block grants are contained and pairwise disjoint");
 
             let mut policy = policy_space.0.lock();
             let mmio_root = policy.mint(resources.mmio, Rights::ALL);
@@ -2074,6 +2097,31 @@ pub fn build() {
                 &mut cs,
             )
             .unwrap();
+            let benchmark = {
+                #[cfg(feature = "storage-bench")]
+                {
+                    let benchmark_policy = policy
+                        .derive_scoped::<block_device::BlockDevice>(
+                            range_root,
+                            (BENCHMARK_BLOCK_FIRST, BENCHMARK_BLOCKS),
+                            Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+                        )
+                        .expect("benchmark image contains its dedicated raw-block range");
+                    Some(
+                        cap::grant(
+                            &policy,
+                            benchmark_policy,
+                            Rights::READ.union(Rights::WRITE),
+                            &mut cs,
+                        )
+                        .unwrap(),
+                    )
+                }
+                #[cfg(not(feature = "storage-bench"))]
+                {
+                    None
+                }
+            };
             #[cfg(not(feature = "legacy-shell"))]
             let vsh_diagnostic = Some(
                 cap::grant(
@@ -2187,9 +2235,10 @@ pub fn build() {
                 Some(dma_root),
                 Some(raw_root),
                 Some(grants),
+                benchmark,
             )
         }
-        (None, None, None, None) => (None, None, None, None, None, None, None),
+        (None, None, None, None) => (None, None, None, None, None, None, None, None),
         _ => unreachable!("block resources, policy, backend, and CSpace are constructed together"),
     };
     #[cfg(feature = "legacy-shell")]
@@ -2974,6 +3023,7 @@ pub fn build() {
         prog_memory: prog_mem,
         region: init_region,
         block: block_root,
+        block_bench: block_bench_root,
         #[cfg(not(feature = "legacy-shell"))]
         vsh_block: vsh_block_root,
         store: store_root,

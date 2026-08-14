@@ -19,6 +19,9 @@ use crate::world::{world, Reading, Space};
 use crate::HEAP;
 use crate::{exec, ipi, mmu, println, sbi, sync::SpinLock, tty, uart};
 
+#[cfg(feature = "file-tree")]
+use vibeos_file_store::{FileError, RelPath, DATA_CHUNK_SIZE};
+
 struct ReadOnlyCapProbe(u64);
 
 impl Resource for ReadOnlyCapProbe {
@@ -1852,12 +1855,17 @@ async fn block_command(args: &[&str]) {
     const WRITTEN: &[u8] = b"VIBEOS-BLK-SECTOR-8-WRITE-v1";
 
     let w = world();
-    let Some(block_cap) = w.block else {
+    #[cfg(feature = "storage-bench")]
+    let block_cap = w.block_bench.or(w.block);
+    #[cfg(not(feature = "storage-bench"))]
+    let block_cap = w.block;
+    let Some(block_cap) = block_cap else {
         println!("  virtio-blk: offline (no modern block transport discovered)");
         return;
     };
     let init = w.spaces["init"].clone();
     match args.first().copied().unwrap_or("info") {
+        "bench" => block_benchmark(&init, block_cap, &args[1..]).await,
         "info" => {
             let lease = init
                 .0
@@ -2271,6 +2279,219 @@ async fn block_command(args: &[&str]) {
     }
 }
 
+/// Run the guest-side QD1 raw block workload.  This deliberately uses the
+/// capability-scoped multi-block facade, not the raw virtio entry points, so
+/// range, session-incarnation, mutation-certainty and DMA lifetime checks are
+/// included in the measurement.
+async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
+    let Some(workload) = args.first().copied() else {
+        println!("  usage: blk bench <workload> [seed]");
+        return;
+    };
+    let seed = args
+        .get(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1);
+    let queue_depth = args
+        .get(2)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let (object_bytes, operations, transfer_bytes) = match workload {
+        "block-random-read" | "block-random-write" => (4096_u64, 256_u64, 256 * 4096),
+        "block-flush" => (0, 128, 0),
+        "block-sequential-128k" => (128 * 1024, 512, 128 * 1024 * 1024),
+        "block-sequential-64m" => (64 * 1024 * 1024, 512, 128 * 1024 * 1024),
+        _ => {
+            println!("  unsupported block workload: {}", workload);
+            return;
+        }
+    };
+    if queue_depth != 1 {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"storage-v2\",\"layer\":\"block\",\"workload\":\"{}\",\"object_bytes\":{},\"seed\":{},\"queue_depth\":{},\"status\":\"unsupported\",\"reason\":\"current virtio facade has one in-flight request slot\"}}",
+            workload, object_bytes, seed, queue_depth
+        );
+        return;
+    }
+
+    #[cfg(feature = "qemu-virt")]
+    let before = crate::virtio_blk::telemetry();
+    let started = crate::sbi::time();
+    let result = match workload {
+        "block-random-read" => {
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
+            let lease = lease.map_err(|_| crate::block_device::BlockError::AuthorityRevoked);
+            let result = async {
+                let lease = lease?;
+                let expected = crate::block_device::range_info_with(&lease)?.session();
+                let mut output = alloc::vec![0_u8; 4096];
+                let mut state = seed;
+                for _ in 0..operations {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let relative = (state % (131_072 - 8)) & !7;
+                    crate::block_device::read_blocks_with_session(
+                        &lease,
+                        expected,
+                        relative,
+                        8,
+                        &mut output,
+                    )
+                    .await?;
+                }
+                Ok::<(), crate::block_device::BlockError>(())
+            };
+            result.await
+        }
+        "block-random-write" => {
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::WRITE);
+            let lease = lease.map_err(|_| crate::block_device::BlockError::AuthorityRevoked);
+            let result = async {
+                let lease = lease?;
+                let session = crate::block_device::begin_mutation(&lease)
+                    .map_err(|failure| *failure.error())?;
+                let mut data = alloc::vec![0_u8; 4096];
+                let mut state = seed;
+                for _ in 0..operations {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    data[0..8].copy_from_slice(&state.to_le_bytes());
+                    let relative = (state % (131_072 - 8)) & !7;
+                    crate::block_device::write_blocks_with_session(
+                        &lease, session, relative, 8, &data, false,
+                    )
+                    .await
+                    .map_err(|failure| *failure.error())?;
+                    crate::block_device::flush_with_session(&lease, session)
+                        .await
+                        .map_err(|failure| *failure.error())?;
+                }
+                Ok::<(), crate::block_device::BlockError>(())
+            };
+            result.await
+        }
+        "block-flush" => {
+            let lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::WRITE);
+            let lease = lease.map_err(|_| crate::block_device::BlockError::AuthorityRevoked);
+            let result = async {
+                let lease = lease?;
+                let session = crate::block_device::begin_mutation(&lease)
+                    .map_err(|failure| *failure.error())?;
+                for _ in 0..operations {
+                    crate::block_device::flush_with_session(&lease, session)
+                        .await
+                        .map_err(|failure| *failure.error())?;
+                }
+                Ok::<(), crate::block_device::BlockError>(())
+            };
+            result.await
+        }
+        "block-sequential-128k" | "block-sequential-64m" => {
+            let write_lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::WRITE);
+            let read_lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::block_device::BlockDevice>(block_cap, Rights::READ);
+            let result = async {
+                let write_lease =
+                    write_lease.map_err(|_| crate::block_device::BlockError::AuthorityRevoked)?;
+                let read_lease =
+                    read_lease.map_err(|_| crate::block_device::BlockError::AuthorityRevoked)?;
+                let write_session = crate::block_device::begin_mutation(&write_lease)
+                    .map_err(|failure| *failure.error())?;
+                let read_session = crate::block_device::range_info_with(&read_lease)?.session();
+                let mut data = alloc::vec![0_u8; 128 * 1024];
+                for chunk in 0..operations {
+                    let value = seed.wrapping_add(chunk);
+                    data[0..8].copy_from_slice(&value.to_le_bytes());
+                    let relative = chunk * 256;
+                    crate::block_device::write_blocks_with_session(
+                        &write_lease,
+                        write_session,
+                        relative,
+                        256,
+                        &data,
+                        false,
+                    )
+                    .await
+                    .map_err(|failure| *failure.error())?;
+                }
+                crate::block_device::flush_with_session(&write_lease, write_session)
+                    .await
+                    .map_err(|failure| *failure.error())?;
+                for chunk in 0..operations {
+                    let relative = chunk * 256;
+                    crate::block_device::read_blocks_with_session(
+                        &read_lease,
+                        read_session,
+                        relative,
+                        256,
+                        &mut data,
+                    )
+                    .await?;
+                }
+                Ok::<(), crate::block_device::BlockError>(())
+            };
+            result.await
+        }
+        _ => unreachable!(),
+    };
+    let elapsed = crate::sbi::time().saturating_sub(started).max(1);
+    #[cfg(feature = "qemu-virt")]
+    let io = {
+        let delta = crate::virtio_blk::telemetry().saturating_sub(before);
+        (
+            delta.requests,
+            delta.read_requests,
+            delta.write_requests,
+            delta.flush_requests,
+            delta.read_bytes,
+            delta.write_bytes,
+            delta.used_interrupts,
+        )
+    };
+    #[cfg(feature = "milkv-duo")]
+    let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    let status = if result.is_ok() {
+        "ok"
+    } else {
+        "failed-closed"
+    };
+    println!(
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"storage-v2\",\"layer\":\"block\",\"workload\":\"{}\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
+        workload,
+        object_bytes,
+        seed,
+        crate::exec::timebase_hz(),
+        operations,
+        transfer_bytes,
+        elapsed,
+        (elapsed / operations.max(1)).max(1),
+        io.0,
+        io.1,
+        io.2,
+        io.3,
+        io.4,
+        io.5,
+        io.6,
+        status,
+    );
+}
+
 async fn store_command(args: &[&str]) {
     const OBJECT_KIND: u32 = 1;
     const MARKER: &[u8] = b"VIBEOS-STORE-OBJECT-v1";
@@ -2465,7 +2686,16 @@ async fn storage_v2_command(args: &[&str]) {
                 Err(_) => println!("  Storage V2: boot fail-closed, migration control corrupt"),
             }
         }
-        "bench" => storage_object_bench(storage, &args[1..]).await,
+        "bench" => {
+            #[cfg(feature = "file-tree")]
+            if args.get(3).is_some_and(|workload| workload.starts_with("file-")) {
+                storage_file_tree_bench(storage, &args[1..]).await;
+            } else {
+                storage_object_bench(storage, &args[1..]).await;
+            }
+            #[cfg(not(feature = "file-tree"))]
+            storage_object_bench(storage, &args[1..]).await;
+        }
         raw_action @ ("migrate" | "migrate-stage" | "rollback" | "close-rollback") => {
             let action = match raw_action {
                 "migrate" => StorageV2OperatorAction::Migrate,
@@ -2564,7 +2794,7 @@ async fn storage_object_bench(
     const MAX_BENCH_BYTES: usize = 1024 * 1024;
     const OBJECT_KIND_RAW: u32 = 0x4245_4e43;
     let Some(raw_size) = args.first() else {
-        println!("  usage: storage bench BYTES [SEED]");
+        println!("  usage: storage bench BYTES [SEED] [WORKLOAD] [CONTENT_CLASS]");
         return;
     };
     let Ok(size) = raw_size.parse::<usize>() else {
@@ -2581,6 +2811,8 @@ async fn storage_object_bench(
         },
         None => 1,
     };
+    let workload = args.get(2).copied().unwrap_or("object-durable-put-get");
+    let content_class = args.get(3).copied().unwrap_or("unique");
     let selection_deadline =
         crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
     let selection = loop {
@@ -2601,10 +2833,33 @@ async fn storage_object_bench(
         Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => "fail-closed",
         None => "pending",
     };
-    if size > MAX_BENCH_BYTES {
+    if size > MAX_BENCH_BYTES && workload != "object-v2-large" {
         println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\"}}",
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"object size exceeds the v2 journal benchmark envelope\"}}",
             backend,
+            workload,
+            size,
+            seed,
+            exec::timebase_hz(),
+        );
+        return;
+    }
+    if workload == "object-cold-recovery" {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"cold recovery requires a powered-off remount outside the timed guest command\"}}",
+            backend,
+            workload,
+            size,
+            seed,
+            exec::timebase_hz(),
+        );
+        return;
+    }
+    if workload == "object-v2-large" && size > 368_640 {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"compatibility journal max object size is 368640 bytes\"}}",
+            backend,
+            workload,
             size,
             seed,
             exec::timebase_hz(),
@@ -2614,8 +2869,9 @@ async fn storage_object_bench(
     let w = world();
     let Some(store_cap) = w.store else {
         println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\"}}",
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\",\"reason\":\"object store capability is unavailable\"}}",
             backend,
+            workload,
             size,
             seed,
             exec::timebase_hz(),
@@ -2625,8 +2881,9 @@ async fn storage_object_bench(
     let mut payload = Vec::new();
     if payload.try_reserve_exact(size).is_err() {
         println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\"}}",
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\",\"reason\":\"payload allocation failed\"}}",
             backend,
+            workload,
             size,
             seed,
             exec::timebase_hz(),
@@ -2634,10 +2891,15 @@ async fn storage_object_bench(
         return;
     }
     payload.extend((0..size).map(|index| {
+        let class_seed = match content_class {
+            "all-duplicate" => 0,
+            "half-duplicate" if index / 4096 % 2 == 0 => 0,
+            _ => seed,
+        };
         (index as u64)
             .wrapping_mul(131)
             .wrapping_add((index as u64) >> 7)
-            .wrapping_add(seed.wrapping_mul(17))
+            .wrapping_add(class_seed.wrapping_mul(17))
             .wrapping_add(0x5a) as u8
     }));
     let init = w.spaces["init"].clone();
@@ -2667,6 +2929,89 @@ async fn storage_object_bench(
     }
     let object_kind = crate::store::journal_object_kind(OBJECT_KIND_RAW)
         .expect("storage benchmark kind is non-zero");
+    if workload == "v2-dedup-gc" {
+        const OBJECT_COUNT: u64 = 8;
+        #[cfg(feature = "qemu-virt")]
+        let io_started = crate::virtio_blk::telemetry();
+        let started = crate::sbi::time();
+        let mut ok = true;
+        for index in 0..OBJECT_COUNT {
+            let class_seed = match content_class {
+                "all-duplicate" => 0,
+                "half-duplicate" if index % 2 == 0 => 0,
+                _ => seed.wrapping_add(index),
+            };
+            for (offset, byte) in payload.iter_mut().enumerate() {
+                *byte = (offset as u64)
+                    .wrapping_mul(131)
+                    .wrapping_add((offset as u64) >> 7)
+                    .wrapping_add(class_seed.wrapping_mul(17))
+                    .wrapping_add(0x5a) as u8;
+            }
+            let put_lease = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoreService>(store_cap, Rights::NONE);
+            let publication = match put_lease {
+                Ok(lease) => crate::store::put_blob_with(
+                    lease,
+                    init.clone(),
+                    object_kind,
+                    &payload,
+                )
+                .await,
+                Err(_) => Err(crate::store::BlobStoreError::Store(
+                    crate::store::StoreError::PermissionDenied,
+                )),
+            };
+            let Ok(publication) = publication else {
+                ok = false;
+                break;
+            };
+            let service = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ);
+            let object = init
+                .0
+                .lock()
+                .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+            let verified = match (service, object) {
+                (Ok(service), Ok(object)) => crate::store::get_blob_with(service, object)
+                    .await
+                    .is_ok_and(|value| value.bytes == payload),
+                _ => false,
+            };
+            init.0.lock().revoke_slot(publication.capability.slot());
+            ok &= verified;
+        }
+        let elapsed = crate::sbi::time().saturating_sub(started).max(1);
+        #[cfg(feature = "qemu-virt")]
+        let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
+        #[cfg(feature = "milkv-duo")]
+        let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+        #[cfg(feature = "qemu-virt")]
+        let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
+            io.read_bytes, io.write_bytes, io.used_interrupts);
+        let (
+            authority_objects,
+            authority_records,
+            cas_payloads_verified,
+            allocated_segments,
+            free_segments,
+            cleaner_reserved_segments,
+        ) = storage.benchmark_authority_shape().await.unwrap_or((0, 0, false, 0, 0, 0));
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"v2-dedup-gc\",\"content_class\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"authority_objects\":{},\"authority_records\":{},\"cas_payloads_verified\":{},\"allocated_segments\":{},\"free_segments\":{},\"cleaner_reserved_segments\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
+            backend, content_class, size, OBJECT_COUNT, seed, exec::timebase_hz(),
+            OBJECT_COUNT, (size as u64).saturating_mul(OBJECT_COUNT).saturating_mul(2),
+            elapsed, (elapsed / OBJECT_COUNT).max(1), authority_objects, authority_records,
+            u8::from(cas_payloads_verified), allocated_segments, free_segments,
+            cleaner_reserved_segments, io.0, io.1, io.2, io.3, io.4, io.5, io.6,
+            if ok { "ok" } else { "failed-closed" }
+        );
+        return;
+    }
     let put_lease = init
         .0
         .lock()
@@ -2713,8 +3058,9 @@ async fn storage_object_bench(
             "failed-closed"
         };
         println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\"}}",
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\",\"reason\":\"publication failed\"}}",
             backend,
+            workload,
             size,
             seed,
             exec::timebase_hz(),
@@ -2733,19 +3079,51 @@ async fn storage_object_bench(
         .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
     let get_started = crate::sbi::time();
     let read_back = match (service, object) {
+        (Ok(service), Ok(object)) if workload == "object-range-get" => {
+            let leaf = (seed as u32) % ((size.max(1) + 4095) / 4096) as u32;
+            crate::store::get_blob_chunk_with(service, object, leaf)
+                .await
+                .map(|chunk| crate::store::VerifiedBlob {
+                    descriptor: chunk.descriptor,
+                    bytes: chunk.bytes,
+                })
+        }
         (Ok(service), Ok(object)) => crate::store::get_blob_with(service, object).await,
         _ => Err(crate::store::BlobStoreError::Store(
             crate::store::StoreError::ObjectUnavailable,
         )),
     };
     let get_ticks = crate::sbi::time().saturating_sub(get_started).max(1);
-    let status = if read_back.as_ref().is_ok_and(|verified| {
+    let mut status = if read_back.as_ref().is_ok_and(|verified| {
         verified.bytes == payload && verified.descriptor == publication.descriptor
     }) {
         "ok"
     } else {
         "failed-closed"
     };
+    if workload == "object-range-get" {
+        // Range-get authenticates one 4 KiB leaf, so its returned bytes are
+        // intentionally shorter than the full payload.  The descriptor is
+        // still checked above; the proof verifier has already checked the
+        // leaf and sibling path.
+        status = if read_back
+            .as_ref()
+            .is_ok_and(|verified| verified.descriptor == publication.descriptor)
+        {
+            "ok"
+        } else {
+            "failed-closed"
+        };
+    }
+    if workload == "object-revoke" {
+        let revoked = init.0.lock().revoke_slot(publication.capability.slot()) != 0;
+        let denied = init
+            .0
+            .lock()
+            .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ)
+            .is_err();
+        status = if revoked && denied { "ok" } else { "failed-closed" };
+    }
     #[cfg(feature = "qemu-virt")]
     let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
     #[cfg(feature = "milkv-duo")]
@@ -2761,8 +3139,10 @@ async fn storage_object_bench(
         io.used_interrupts,
     );
     println!(
-        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"authority_objects\":{},\"authority_records\":{},\"cas_payloads_verified\":{},\"allocated_segments\":{},\"free_segments\":{},\"cleaner_reserved_segments\":{},\"put_ticks\":{},\"get_ticks\":{},\"put_block_requests\":{},\"put_block_read_requests\":{},\"put_block_write_requests\":{},\"put_block_flush_requests\":{},\"put_block_read_bytes\":{},\"put_block_write_bytes\":{},\"put_block_used_interrupts\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"content_class\":\"{}\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"authority_objects\":{},\"authority_records\":{},\"cas_payloads_verified\":{},\"allocated_segments\":{},\"free_segments\":{},\"cleaner_reserved_segments\":{},\"put_ticks\":{},\"get_ticks\":{},\"latency_ticks\":{},\"put_block_requests\":{},\"put_block_read_requests\":{},\"put_block_write_requests\":{},\"put_block_flush_requests\":{},\"put_block_read_bytes\":{},\"put_block_write_bytes\":{},\"put_block_used_interrupts\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
         backend,
+        workload,
+        content_class,
         size,
         seed,
         exec::timebase_hz(),
@@ -2774,6 +3154,7 @@ async fn storage_object_bench(
         cleaner_reserved_segments,
         put_ticks,
         get_ticks,
+        put_ticks.saturating_add(get_ticks),
         put_io.0,
         put_io.1,
         put_io.2,
@@ -2789,6 +3170,218 @@ async fn storage_object_bench(
         io.5,
         io.6,
         status,
+    );
+}
+
+#[cfg(feature = "file-tree")]
+async fn storage_file_tree_bench(
+    storage: &Arc<crate::segment_store_platform::StorageV2Devices>,
+    args: &[&str],
+) {
+    const HOME_NAMESPACE: u128 = 0x5649_4245_4f53_2d46_494c_4554_5245_4501;
+    let size = args.first().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    let seed = args.get(1).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
+    let workload = args.get(2).copied().unwrap_or("file-durable-mutations");
+    let count = args.get(3).and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
+    // Reuse one namespace for mutation workloads so the catalog/root cache is
+    // warm across samples. Directory runs use a seed-scoped namespace because
+    // each sample intentionally creates a fresh directory population before
+    // measuring lookup/list and recovery.
+    let namespace = if workload == "file-directory" {
+        HOME_NAMESPACE ^ (seed as u128)
+    } else {
+        HOME_NAMESPACE ^ 0x5a5a_0000_0000_0000_0000_0000_0000_0001
+    };
+    let backend = "storage-v2";
+    let unsupported = |reason: &str| {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"{}\"}}",
+            backend, workload, size, count, seed, crate::exec::timebase_hz(), reason
+        );
+    };
+    if count > vibeos_file_store::MAX_TRANSACTION_EDITS / 2 {
+        unsupported("requested file count exceeds the bounded transaction edit budget");
+        return;
+    }
+    if (workload == "file-sequential" && size > 1024 * 1024)
+        || (workload == "file-overwrite-1m" && size >= 1024 * 1024)
+        || (workload == "file-batch-create" && count > 100) {
+        unsupported("4 KiB staged persistence path exceeds the bounded guest benchmark budget");
+        return;
+    }
+    let root = match storage.recover_file_tree_root(namespace).await {
+        Ok(root) => root,
+        Err(_) => {
+            println!(
+                "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\",\"reason\":\"file-tree root recovery failed\"}}",
+                backend, workload, size, count, seed, crate::exec::timebase_hz()
+            );
+            return;
+        }
+    };
+    let mut payload = Vec::with_capacity(size.min(1024 * 1024));
+    payload.extend((0..size).map(|index| {
+        (index as u64)
+            .wrapping_mul(131)
+            .wrapping_add(seed.wrapping_mul(17))
+            .wrapping_add(0x5a) as u8
+    }));
+    let started = crate::sbi::time();
+    let mut transferred = 0_u64;
+    let mut operations = 0_u64;
+    let mut recovery_ticks = 0_u64;
+    let result: Result<(), FileError> = async {
+        match workload {
+        "file-durable-mutations" => {
+            let path = RelPath::parse(&alloc::format!("bench-file-{seed:016x}"))?;
+            let mut stager = root.begin_content_stager(&path, false)?;
+            stager.push(&payload).await?;
+            let staged = stager.finish().await?;
+            let mut tx = root.begin()?;
+            tx.write_staged(&path, staged)?;
+            tx.commit_durable().await?;
+            operations += 1;
+            let reader = root.reader(&path)?;
+            let chunks = reader.read_chunk(0).await?.unwrap_or_default();
+            if chunks != payload {
+                return Err(FileError::Conflict);
+            }
+            let mut tx = root.begin()?;
+            tx.remove(&path, false, false)?;
+            tx.commit_durable().await?;
+            operations += 1;
+            transferred = (size as u64).saturating_mul(2);
+            Ok(())
+        }
+        "file-overwrite-4k" | "file-overwrite-1m" => {
+            let path = RelPath::parse(&alloc::format!("bench-overwrite-{seed:016x}"))?;
+            let mut stager = root.begin_content_stager(&path, false)?;
+            stager.push(&payload).await?;
+            let staged = stager.finish().await?;
+            let mut tx = root.begin()?;
+            tx.write_staged(&path, staged)?;
+            tx.commit_durable().await?;
+            let mut stager = root.begin_content_stager(&path, false)?;
+            stager.push(&payload).await?;
+            let staged = stager.finish().await?;
+            let mut tx = root.begin()?;
+            tx.write_staged(&path, staged)?;
+            tx.commit_durable().await?;
+            operations = 2;
+            transferred = (size as u64).saturating_mul(2);
+            Ok(())
+        }
+        "file-batch-create" => {
+            let mut staged_files = Vec::with_capacity(count);
+            for index in 0..count {
+                let name = alloc::format!("bench-{seed:016x}-{index:04}");
+                let path = RelPath::parse(&name)?;
+                let mut stager = root.begin_content_stager(&path, false)?;
+                stager.push(&payload).await?;
+                let staged = stager.finish().await?;
+                staged_files.push((path, staged));
+            }
+            let mut tx = root.begin()?;
+            for (path, staged) in staged_files {
+                tx.write_staged(&path, staged)?;
+            }
+            tx.commit_durable().await?;
+            operations = count as u64;
+            transferred = (size as u64).saturating_mul(count as u64);
+            Ok(())
+        }
+        "file-sequential" => {
+            let path = RelPath::parse(&alloc::format!("bench-sequential-{seed:016x}"))?;
+            let mut stager = root.begin_content_stager(&path, false)?;
+            let mut chunk = alloc::vec![0_u8; DATA_CHUNK_SIZE];
+            for index in 0..size.div_ceil(DATA_CHUNK_SIZE) {
+                for (offset, byte) in chunk.iter_mut().enumerate() {
+                    *byte = (seed.wrapping_add((index * DATA_CHUNK_SIZE + offset) as u64) & 0xff) as u8;
+                }
+                let len = core::cmp::min(DATA_CHUNK_SIZE, size.saturating_sub(index * DATA_CHUNK_SIZE));
+                stager.push(&chunk[..len]).await?;
+            }
+            let staged = stager.finish().await?;
+            let mut tx = root.begin()?;
+            tx.write_staged(&path, staged)?;
+            tx.commit_durable().await?;
+            let reader = root.reader(&path)?;
+            let mut read = 0_u64;
+            for index in 0..reader.chunk_count() {
+                read = read.saturating_add(reader.read_chunk(index).await?.map(|chunk| chunk.len() as u64).unwrap_or(0));
+            }
+            operations = 2;
+            transferred = (size as u64).saturating_add(read);
+            Ok(())
+        }
+        "file-directory" => {
+            let mut staged_files = Vec::with_capacity(count);
+            for index in 0..count {
+                let name = alloc::format!("dir-{seed:016x}-{index:04}");
+                let path = RelPath::parse(&name)?;
+                let mut stager = root.begin_content_stager(&path, false)?;
+                stager.push(&payload).await?;
+                let staged = stager.finish().await?;
+                staged_files.push((path, staged));
+            }
+            let mut tx = root.begin()?;
+            for (path, staged) in staged_files {
+                tx.write_staged(&path, staged)?;
+            }
+            tx.commit_durable().await?;
+            let listed = root.snapshot().list(&RelPath::root(), true)?;
+            if listed.len() != count {
+                return Err(FileError::Conflict);
+            }
+            let recovery_started = crate::sbi::time();
+            drop(root);
+            let recovered = storage.recover_file_tree_root(namespace).await?;
+            recovery_ticks = crate::sbi::time().saturating_sub(recovery_started).max(1);
+            if recovered.snapshot().list(&RelPath::root(), true)?.len() != count {
+                return Err(FileError::Conflict);
+            }
+            operations = count as u64 + 2;
+            transferred = (size as u64).saturating_mul(count as u64);
+            Ok(())
+        }
+            _ => Err(FileError::ServiceUnavailable),
+        }
+    }
+    .await;
+    let elapsed = crate::sbi::time().saturating_sub(started).max(1);
+    #[cfg(feature = "qemu-virt")]
+    let io = crate::virtio_blk::telemetry();
+    #[cfg(feature = "milkv-duo")]
+    let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    #[cfg(feature = "qemu-virt")]
+    let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
+        io.read_bytes, io.write_bytes, io.used_interrupts);
+    let status = if result.is_ok() { "ok" } else { "failed-closed" };
+    let reason = match result {
+        Ok(()) => "",
+        Err(error) => match error {
+            FileError::Busy => "busy",
+            FileError::BudgetExceeded => "budget-exceeded",
+            FileError::Conflict => "conflict-or-readback-mismatch",
+            FileError::DirectoryNotEmpty => "directory-not-empty",
+            FileError::Exists => "exists",
+            FileError::FileIdExhausted => "file-id-exhausted",
+            FileError::InvalidName | FileError::InvalidPath => "invalid-path",
+            FileError::InvalidType => "invalid-type",
+            FileError::IsDirectory => "is-directory",
+            FileError::NotDirectory => "not-directory",
+            FileError::NotFound => "not-found",
+            FileError::PathTooLong => "path-too-long",
+            FileError::RootProtected => "root-protected",
+            FileError::ServiceUnavailable => "service-unavailable",
+            FileError::EscapeRoot | FileError::SymlinkLoop => "path-resolution-failed",
+        },
+    };
+    println!(
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"}}",
+        backend, workload, size, count, seed, crate::exec::timebase_hz(), operations,
+        transferred, elapsed, (elapsed / operations.max(1)).max(1), recovery_ticks,
+        io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason
     );
 }
 

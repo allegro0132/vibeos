@@ -11,6 +11,9 @@ milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vib
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
+# Dedicated raw-block benchmark authority. This is only enabled by the
+# benchmark image and is absent from production capability layouts.
+storage-bench = ["vibeos-image-policy/storage-bench"]
 file-tree = [
     "dep:vibeos-file-store",
     "vibeos-vsh/file-tree",

@@ -37,6 +37,7 @@ use crate::cas_codec::{
 use crate::codec::{encode_allocation, AllocationState};
 use crate::device::PageDevice;
 use crate::gc::{GcStoreError, GcTelemetry, GcTimeSource};
+use crate::maintenance::MaintenanceOperationLease;
 use crate::pins::{
     OwnedObjectReadPin, OwnedRuntimeRootPin, PinAdmission, PinRegistry, RootKey,
     RootRetentionHandle, RuntimeRootClass,
@@ -889,6 +890,26 @@ impl<D: PageDevice> SegmentStore<D> {
         )
     }
 
+    /// Trusted-service writer used only while an exact store maintenance
+    /// lease is held. This keeps system-owned typed roots out of application
+    /// quota domains without reopening the unprincipal public write path.
+    pub(crate) fn begin_blob_with_reference_codec_for_maintenance(
+        &mut self,
+        _lease: &MaintenanceOperationLease,
+        object_kind: u32,
+        exact_len: u64,
+        expected_root: Option<Hash>,
+        reference_codec: u16,
+    ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
+        self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            exact_len,
+            expected_root,
+            reference_codec,
+            None,
+        )
+    }
+
     pub(crate) fn begin_blob_with_reference_codec_for_principal(
         &mut self,
         principal: &StoragePrincipal,
@@ -963,6 +984,7 @@ impl<D: PageDevice> SegmentStore<D> {
     ) -> Result<BlobWriter<'_, D>, CasStoreError<D::Error>> {
         if reference_codec != REFERENCE_CODEC_RAW
             && reference_codec != crate::cas_codec::REFERENCE_CODEC_TYPED_V1
+            && reference_codec != crate::cas_codec::REFERENCE_CODEC_FS_V1
         {
             return Err(StoreError::InvalidConfig.into());
         }

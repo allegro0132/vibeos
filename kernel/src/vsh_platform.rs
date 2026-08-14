@@ -6,6 +6,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+#[cfg(feature = "milkv-duo")]
 use core::fmt::Write as _;
 
 use vibeos_core::cap::{Cap, Rights};
@@ -74,6 +75,12 @@ impl Platform for VshPlatform {
 }
 
 pub async fn task(space: Arc<Space>, console: Cap, session: Session) {
+    #[cfg(feature = "file-tree")]
+    let session = {
+        let mut session = session;
+        bind_persistent_file_tree(&mut session).await;
+        session
+    };
     let platform = VshPlatform::capability_front(space, console);
     vibeos_vsh::task(&platform, session).await;
 }
@@ -92,8 +99,56 @@ pub async fn run_legacy_source(source: &str, session: &mut Session) {
 
 pub fn install_standard_commands(session: &mut Session) {
     install_shared_commands(session);
+    vibeos_vsh::install_lsblk_command(session);
+    #[cfg(feature = "file-tree")]
+    vibeos_vsh::install_file_commands(session);
     #[cfg(feature = "milkv-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
+}
+
+#[cfg(feature = "file-tree")]
+pub async fn bind_persistent_file_tree(session: &mut Session) {
+    const HOME_NAMESPACE: u128 = 0x5649_4245_4f53_2d46_494c_4554_5245_4501;
+    let Some(storage) = world().storage_v2.clone() else {
+        return;
+    };
+    loop {
+        match storage.selected_boot_store() {
+            None => vibeos_core::exec::yield_now().await,
+            Some(crate::segment_store_platform::BootStoreSelection::StorageV2) => {
+                let home = match storage.recover_file_tree_root(HOME_NAMESPACE).await {
+                    Ok(home) => home,
+                    Err(vibeos_file_store::FileError::Busy) => {
+                        vibeos_core::exec::yield_now().await;
+                        continue;
+                    }
+                    Err(error) => {
+                        crate::uart::_print(format_args!(
+                            "  file-tree persistent root unavailable: {error:?}\n"
+                        ));
+                        return;
+                    }
+                };
+                session
+                    .install_capability(
+                        "home",
+                        Arc::new(home),
+                        Rights::READ
+                            .union(Rights::WRITE)
+                            .union(Rights::GRANT)
+                            .union(Rights::REVOKE),
+                    )
+                    .expect("local persistent file-tree capability binding must be valid");
+                return;
+            }
+            Some(selection) => {
+                crate::uart::_print(format_args!(
+                    "  file-tree not bound: boot policy selected {selection:?}\n"
+                ));
+                return;
+            }
+        }
+    }
 }
 
 /// Install commands shared by the physical console and authenticated SSH.

@@ -446,6 +446,26 @@ pub trait Resource: Any + Send + Sync {
         String::from(self.kind())
     }
     fn as_any(&self) -> &dyn Any;
+    fn block_range_info(&self) -> Option<BlockRangeInfo> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRangeInfo {
+    pub start_block: u64,
+    pub block_count: u64,
+    pub logical_sector_size: u32,
+    pub physical_sector_size: u32,
+    pub device_read_only: bool,
+    pub state: BlockRangeState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockRangeState {
+    Online,
+    Offline,
+    Quarantined,
 }
 
 /// A resource whose semantic authority can be narrowed while preserving the

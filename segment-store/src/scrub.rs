@@ -18,7 +18,8 @@ use vibeos_segment_format::{
 use crate::allocation_v2::SegmentAllocation;
 use crate::cas::verify_manifest_blob;
 use crate::cas_codec::{
-    decode_blob_manifest, BlobMapping, CasCodecContext, ObjectMapping, REFERENCE_CODEC_TYPED_V1,
+    decode_blob_manifest, BlobMapping, CasCodecContext, ObjectMapping, REFERENCE_CODEC_FS_V1,
+    REFERENCE_CODEC_TYPED_V1,
 };
 use crate::device::PageDevice;
 use crate::gc::{decode_typed_children, GcError, GcStoreError};
@@ -647,10 +648,12 @@ async fn verify_durable_authority_closure<D: PageDevice>(
         .objects
         .iter()
         .filter(|object| {
-            object.reference_codec == REFERENCE_CODEC_TYPED_V1
-                && typed_reference_kinds
-                    .binary_search(&object.blob_key.object_kind())
-                    .is_ok()
+            matches!(
+                object.reference_codec,
+                REFERENCE_CODEC_TYPED_V1 | REFERENCE_CODEC_FS_V1
+            ) && typed_reference_kinds
+                .binary_search(&object.blob_key.object_kind())
+                .is_ok()
         })
         .count();
     let state_resident = state.resident_heap_bytes().ok_or(StepError::MemoryLimit)?;
@@ -670,10 +673,12 @@ async fn verify_durable_authority_closure<D: PageDevice>(
         .try_reserve_exact(semantic_root_count)
         .map_err(|_| StepError::MemoryLimit)?;
     for object in &cas.objects {
-        if object.reference_codec != REFERENCE_CODEC_TYPED_V1
-            || typed_reference_kinds
-                .binary_search(&object.blob_key.object_kind())
-                .is_err()
+        if !matches!(
+            object.reference_codec,
+            REFERENCE_CODEC_TYPED_V1 | REFERENCE_CODEC_FS_V1
+        ) || typed_reference_kinds
+            .binary_search(&object.blob_key.object_kind())
+            .is_err()
         {
             continue;
         }

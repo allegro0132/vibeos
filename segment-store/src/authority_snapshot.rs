@@ -21,8 +21,10 @@ use vibeos_durable_format::{
 };
 
 use crate::quota::canonical_attributable_physical_bytes;
+use crate::root_codec::{PersistentRootEntry, PERSISTENT_ROOT_ENTRY_LEN};
 
-pub const PERSISTENT_AUTHORITY_SNAPSHOT_VERSION: u16 = 1;
+pub const PERSISTENT_AUTHORITY_SNAPSHOT_VERSION: u16 = 2;
+const LEGACY_PERSISTENT_AUTHORITY_SNAPSHOT_VERSION: u16 = 1;
 pub const PERSISTENT_AUTHORITY_HEADER_LEN: usize = 0x80;
 pub const PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN: usize = 0x30;
 pub const PERSISTENT_AUTHORITY_PRINCIPAL_LEN: usize = 0x40;
@@ -308,6 +310,7 @@ pub struct PersistentAuthoritySnapshot {
     record_stream: Vec<u8>,
     pub(crate) objects: Vec<PersistentObjectBinding>,
     principals: Vec<PersistentPrincipalPolicy>,
+    external_roots: Vec<PersistentRootEntry>,
 }
 
 impl PersistentAuthoritySnapshot {
@@ -324,6 +327,7 @@ impl PersistentAuthoritySnapshot {
             record_stream,
             objects,
             principals,
+            external_roots: Vec::new(),
         };
         validate(&value)?;
         Ok(value)
@@ -345,6 +349,22 @@ impl PersistentAuthoritySnapshot {
         &self.principals
     }
 
+    /// Opaque roots owned by trusted services rather than the logical M4
+    /// capability graph. They are deliberately crate-private: media identity
+    /// is GC policy, never an object lookup interface.
+    pub(crate) fn external_roots(&self) -> &[PersistentRootEntry] {
+        &self.external_roots
+    }
+
+    pub(crate) fn with_external_roots(
+        mut self,
+        external_roots: Vec<PersistentRootEntry>,
+    ) -> Result<Self, AuthoritySnapshotError> {
+        self.external_roots = external_roots;
+        validate(&self)?;
+        Ok(self)
+    }
+
     pub fn record_sectors(&self) -> impl ExactSizeIterator<Item = &[u8; RECORD_SIZE]> {
         self.record_stream
             .chunks_exact(RECORD_SIZE)
@@ -363,6 +383,11 @@ impl PersistentAuthoritySnapshot {
                 self.principals
                     .capacity()
                     .checked_mul(core::mem::size_of::<PersistentPrincipalPolicy>())?,
+            )?
+            .checked_add(
+                self.external_roots
+                    .capacity()
+                    .checked_mul(core::mem::size_of::<PersistentRootEntry>())?,
             )
     }
 
@@ -376,7 +401,8 @@ impl PersistentAuthoritySnapshot {
             self.record_stream.clone(),
             self.objects.clone(),
             self.principals.clone(),
-        )
+        )?
+        .with_external_roots(self.external_roots.clone())
     }
 }
 
@@ -444,6 +470,16 @@ pub fn encode_persistent_authority_snapshot(
                 .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
         )
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    let external_root_offset = record_offset;
+    let record_offset = external_root_offset
+        .checked_add(
+            value
+                .external_roots
+                .len()
+                .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
+                .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
+        )
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
     let encoded_len = record_offset
         .checked_add(value.record_stream.len())
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
@@ -474,6 +510,9 @@ pub fn encode_persistent_authority_snapshot(
     put_u64(&mut output, 0x58, principal_offset as u64);
     put_u64(&mut output, 0x60, record_offset as u64);
     put_u64(&mut output, 0x68, encoded_len as u64);
+    put_u32(&mut output, 0x70, value.external_roots.len() as u32);
+    put_u32(&mut output, 0x74, PERSISTENT_ROOT_ENTRY_LEN as u32);
+    put_u64(&mut output, 0x78, external_root_offset as u64);
     for (index, binding) in value.objects.iter().enumerate() {
         let offset = object_offset + index * PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN;
         put_u128(&mut output, offset, binding.stable_object_id);
@@ -490,6 +529,12 @@ pub fn encode_persistent_authority_snapshot(
         put_u64(&mut output, offset + 0x28, policy.committed_physical_bytes);
         output[offset + 0x30] = u8::from(policy.admission_revoked);
     }
+    for (index, root) in value.external_roots.iter().enumerate() {
+        let offset = external_root_offset + index * PERSISTENT_ROOT_ENTRY_LEN;
+        put_u128(&mut output, offset, root.object_id);
+        put_u64(&mut output, offset + 0x10, root.commit_generation);
+        put_u32(&mut output, offset + 0x18, root.object_kind);
+    }
     output[record_offset..].copy_from_slice(&value.record_stream);
     Ok(output)
 }
@@ -505,8 +550,11 @@ pub fn decode_persistent_authority_snapshot(
     if &input[..8] != MAGIC {
         return Err(AuthoritySnapshotError::InvalidMagic);
     }
-    if get_u16(input, 0x08) != PERSISTENT_AUTHORITY_SNAPSHOT_VERSION
-        || get_u16(input, 0x0a) as usize != PERSISTENT_AUTHORITY_HEADER_LEN
+    let version = get_u16(input, 0x08);
+    if !matches!(
+        version,
+        LEGACY_PERSISTENT_AUTHORITY_SNAPSHOT_VERSION | PERSISTENT_AUTHORITY_SNAPSHOT_VERSION
+    ) || get_u16(input, 0x0a) as usize != PERSISTENT_AUTHORITY_HEADER_LEN
         || get_u32(input, 0x44) as usize != PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN
         || get_u32(input, 0x48) as usize != PERSISTENT_AUTHORITY_PRINCIPAL_LEN
         || get_u32(input, 0x4c) as usize != RECORD_SIZE
@@ -514,12 +562,24 @@ pub fn decode_persistent_authority_snapshot(
     {
         return Err(AuthoritySnapshotError::InvalidField);
     }
-    if !is_zero(&input[0x0c..0x10]) || !is_zero(&input[0x70..0x80]) {
+    if !is_zero(&input[0x0c..0x10])
+        || (version == LEGACY_PERSISTENT_AUTHORITY_SNAPSHOT_VERSION && !is_zero(&input[0x70..0x80]))
+    {
         return Err(AuthoritySnapshotError::NonZeroReserved);
     }
     let object_count = get_u32(input, 0x38) as usize;
     let principal_count = get_u32(input, 0x3c) as usize;
     let record_count = get_u32(input, 0x40) as usize;
+    let external_root_count = if version == PERSISTENT_AUTHORITY_SNAPSHOT_VERSION {
+        get_u32(input, 0x70) as usize
+    } else {
+        0
+    };
+    if version == PERSISTENT_AUTHORITY_SNAPSHOT_VERSION
+        && get_u32(input, 0x74) as usize != PERSISTENT_ROOT_ENTRY_LEN
+    {
+        return Err(AuthoritySnapshotError::InvalidField);
+    }
     if principal_count > MAX_STABLE_PRINCIPALS {
         return Err(AuthoritySnapshotError::OutOfBounds);
     }
@@ -536,13 +596,25 @@ pub fn decode_persistent_authority_snapshot(
                 .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
         )
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    let expected_record = expected_principal
+    let expected_external_root = expected_principal
         .checked_add(
             principal_count
                 .checked_mul(PERSISTENT_AUTHORITY_PRINCIPAL_LEN)
                 .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
         )
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    let expected_record = expected_external_root
+        .checked_add(
+            external_root_count
+                .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
+                .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
+        )
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    let external_root_offset = if version == PERSISTENT_AUTHORITY_SNAPSHOT_VERSION {
+        usize::try_from(get_u64(input, 0x78)).map_err(|_| AuthoritySnapshotError::InvalidLength)?
+    } else {
+        expected_external_root
+    };
     let expected_len = expected_record
         .checked_add(
             record_count
@@ -552,6 +624,7 @@ pub fn decode_persistent_authority_snapshot(
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
     if object_offset != PERSISTENT_AUTHORITY_HEADER_LEN
         || principal_offset != expected_principal
+        || external_root_offset != expected_external_root
         || record_offset != expected_record
         || expected_len != input.len()
     {
@@ -597,6 +670,21 @@ pub fn decode_persistent_authority_snapshot(
             admission_revoked: input[offset + 0x30] != 0,
         });
     }
+    let mut external_roots = Vec::new();
+    external_roots
+        .try_reserve_exact(external_root_count)
+        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    for index in 0..external_root_count {
+        let offset = external_root_offset + index * PERSISTENT_ROOT_ENTRY_LEN;
+        if get_u32(input, offset + 0x1c) != 0 {
+            return Err(AuthoritySnapshotError::NonZeroReserved);
+        }
+        external_roots.push(PersistentRootEntry {
+            object_id: get_u128(input, offset),
+            commit_generation: get_u64(input, offset + 0x10),
+            object_kind: get_u32(input, offset + 0x18),
+        });
+    }
     let record_stream = input[record_offset..].to_vec();
     let snapshot = PersistentAuthoritySnapshot {
         checkpoint_generation: get_u64(input, 0x10),
@@ -604,6 +692,7 @@ pub fn decode_persistent_authority_snapshot(
         record_stream,
         objects,
         principals,
+        external_roots,
     };
     validate(&snapshot)?;
     Ok(snapshot)
@@ -642,6 +731,19 @@ fn validate(value: &PersistentAuthoritySnapshot) -> Result<(), AuthoritySnapshot
         return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
     }
     validate_principals(&value.principals)?;
+    let mut previous_external = None;
+    for root in &value.external_roots {
+        if root.object_id == 0
+            || root.commit_generation == 0
+            || root.commit_generation > value.checkpoint_generation
+            || root.object_kind == 0
+            || previous_external.is_some_and(|id| id >= root.object_id)
+            || v2_object_ids.binary_search(&root.object_id).is_ok()
+        {
+            return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
+        }
+        previous_external = Some(root.object_id);
+    }
     let encoded_len = PERSISTENT_AUTHORITY_HEADER_LEN
         .checked_add(
             value
@@ -658,6 +760,13 @@ fn validate(value: &PersistentAuthoritySnapshot) -> Result<(), AuthoritySnapshot
                 .and_then(|more| bytes.checked_add(more))
         })
         .and_then(|bytes| bytes.checked_add(value.record_stream.len()))
+        .and_then(|bytes| {
+            value
+                .external_roots
+                .len()
+                .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
+                .and_then(|more| bytes.checked_add(more))
+        })
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
     if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
         return Err(AuthoritySnapshotError::OutOfBounds);
@@ -856,7 +965,7 @@ mod tests {
             decode_persistent_authority_snapshot(&bytes).unwrap(),
             sample
         );
-        for offset in [0x0c, 0x70, 0x80 + 0x2c, 0xb0 + 0x31] {
+        for offset in [0x0c, 0x80 + 0x2c, 0xb0 + 0x31] {
             let mut corrupt = bytes.clone();
             corrupt[offset] = 1;
             assert_eq!(
@@ -864,6 +973,30 @@ mod tests {
                 Err(AuthoritySnapshotError::NonZeroReserved)
             );
         }
+    }
+
+    #[test]
+    fn external_roots_round_trip_without_becoming_authority_objects() {
+        let sample = sample()
+            .with_external_roots(vec![PersistentRootEntry {
+                object_id: 17,
+                commit_generation: 8,
+                object_kind: 0x4653_0001,
+            }])
+            .unwrap();
+        let bytes = encode_persistent_authority_snapshot(&sample).unwrap();
+        let decoded = decode_persistent_authority_snapshot(&bytes).unwrap();
+        assert_eq!(decoded, sample);
+        assert_eq!(decoded.objects.len(), 1);
+        assert_eq!(decoded.external_roots().len(), 1);
+
+        let root_offset = get_u64(&bytes, 0x78) as usize;
+        let mut corrupt = bytes;
+        corrupt[root_offset + 0x1c] = 1;
+        assert_eq!(
+            decode_persistent_authority_snapshot(&corrupt),
+            Err(AuthoritySnapshotError::NonZeroReserved)
+        );
     }
 
     #[test]

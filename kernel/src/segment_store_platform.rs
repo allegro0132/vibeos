@@ -23,17 +23,22 @@ use alloc::vec::Vec;
 
 use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::heap::OwnerId;
+#[cfg(feature = "file-tree")]
+use vibeos_file_store::{FileError, FileTreeBackend, FileTreeFuture, FileTreeRoot, FsTransaction};
 use vibeos_segment_format::{Page, StoreUuid, PAGE_SIZE};
 use vibeos_segment_store::{
-    ColdScrubEvidence, FormatOptions, FormatProbe, LegacyFormatProbe, MigrationControl,
-    MigrationController, MigrationError, MigrationState, MigrationTransition, PageDevice,
-    PageDeviceInfo, PersistentAuthorityAppendResult, PersistentAuthorityError,
+    ColdScrubEvidence, FormatOptions, FormatProbe, GrowablePageDevice, LegacyFormatProbe,
+    MigrationControl, MigrationController, MigrationError, MigrationState, MigrationTransition,
+    PageDevice, PageDeviceInfo, PersistentAuthorityAppendResult, PersistentAuthorityError,
     PersistentAuthorityImport, PersistentAuthorityTransientObjects, PersistentAuthorityView,
     PersistentObjectHandle, ScrubStatus, SegmentStore, StoragePrincipal, StorageQuotaProvisioner,
     StorageV2FormatProbe, StoreLimits, StoreMaintenance, StoreMaintenanceProvisioner,
     StoreRuntimeContext,
 };
-use vibeos_storage_device::{DeviceSession, MutationCertainty, MutationFailure, MutationResult};
+use vibeos_storage_device::{
+    BlockRangeCapability, BlockRangeProvisioner, DeviceSession, MutationCertainty, MutationFailure,
+    MutationResult,
+};
 
 use crate::block_device::{self, BlockDevice, BlockError};
 use crate::world::Space;
@@ -41,6 +46,8 @@ use crate::{exec, heap, sync::SpinLock};
 
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
+pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
+    vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
 
 /// Poll one storage future with supervisor allocation provenance. `SegmentStore`
@@ -110,7 +117,9 @@ impl fmt::Display for PageIoError {
 pub(crate) struct CapabilityPageDevice {
     backend: Arc<Space>,
     block: Cap,
-    info: PageDeviceInfo,
+    info: Arc<SpinLock<PageDeviceInfo>>,
+    initial_block_count: u64,
+    provisioned_block_count: u64,
     active: Arc<SpinLock<Option<ActivePageSession>>>,
 }
 
@@ -168,13 +177,52 @@ impl CapabilityPageDevice {
         Ok(Self {
             backend,
             block,
-            info: PageDeviceInfo {
+            info: system_arc(SpinLock::new(PageDeviceInfo {
                 device_id: range.device_id().get().to_le_bytes(),
                 range_first_logical_block: range.first_block(),
                 logical_block_count: range.block_count(),
                 logical_block_size: LOGICAL_BLOCK_SIZE as u32,
                 page_count: range.block_count() / BLOCKS_PER_PAGE,
-            },
+            })),
+            initial_block_count: range.block_count(),
+            provisioned_block_count: range.block_count(),
+            active: system_arc(SpinLock::new_recoverable(None)),
+        })
+    }
+
+    pub(crate) fn new_preprovisioned(
+        backend: Arc<Space>,
+        block: Cap,
+        expected_first_block: u64,
+        initial_block_count: u64,
+    ) -> Result<Self, PageIoError> {
+        if initial_block_count == 0 || !initial_block_count.is_multiple_of(BLOCKS_PER_PAGE) {
+            return Err(PageIoError::InvalidRange);
+        }
+        let lease = backend
+            .0
+            .lock()
+            .lookup_lease::<BlockDevice>(block, Rights::READ)
+            .map_err(|_| PageIoError::AuthorityRevoked)?;
+        let range = lease.with(BlockDevice::range);
+        if range.first_block() != expected_first_block
+            || range.block_count() < initial_block_count
+            || !range.block_count().is_multiple_of(BLOCKS_PER_PAGE)
+        {
+            return Err(PageIoError::InvalidRange);
+        }
+        Ok(Self {
+            backend,
+            block,
+            info: system_arc(SpinLock::new(PageDeviceInfo {
+                device_id: range.device_id().get().to_le_bytes(),
+                range_first_logical_block: range.first_block(),
+                logical_block_count: initial_block_count,
+                logical_block_size: LOGICAL_BLOCK_SIZE as u32,
+                page_count: initial_block_count / BLOCKS_PER_PAGE,
+            })),
+            initial_block_count,
+            provisioned_block_count: range.block_count(),
             active: system_arc(SpinLock::new_recoverable(None)),
         })
     }
@@ -303,11 +351,51 @@ impl CapabilityPageDevice {
     }
 
     fn first_sector(&self, page: u64) -> Result<u64, PageIoError> {
-        if page >= self.info.page_count {
+        if page >= self.info.lock().page_count {
             return Err(PageIoError::InvalidRange);
         }
         page.checked_mul(BLOCKS_PER_PAGE)
             .ok_or(PageIoError::InvalidRange)
+    }
+
+    fn expose_preprovisioned_range(&self) {
+        let mut info = self.info.lock();
+        info.logical_block_count = self.provisioned_block_count;
+        info.page_count = self.provisioned_block_count / BLOCKS_PER_PAGE;
+    }
+
+    fn restrict_to_initial_range(&self) {
+        let mut info = self.info.lock();
+        info.logical_block_count = self.initial_block_count;
+        info.page_count = self.initial_block_count / BLOCKS_PER_PAGE;
+    }
+
+    fn growth_capability(
+        &self,
+        durable_block_count: u64,
+    ) -> Result<Option<BlockRangeCapability>, PageIoError> {
+        if durable_block_count > self.provisioned_block_count {
+            return Err(PageIoError::InvalidRange);
+        }
+        let additional = self.provisioned_block_count - durable_block_count;
+        if additional == 0 {
+            return Ok(None);
+        }
+        let lease = self.lease(Rights::READ)?;
+        let session = block_device::range_info_with(&lease)
+            .map_err(PageIoError::Block)?
+            .session();
+        let range = lease.with(BlockDevice::range);
+        // SAFETY: the trusted storage service owns the sole CSpace grant for
+        // this preprovisioned range and derives only its exact adjacent suffix.
+        let provisioner = unsafe {
+            BlockRangeProvisioner::new(session, range.first_block(), range.block_count())
+        }
+        .map_err(|_| PageIoError::InvalidRange)?;
+        provisioner
+            .derive(durable_block_count, additional)
+            .map(Some)
+            .map_err(|_| PageIoError::InvalidRange)
     }
 }
 
@@ -601,6 +689,91 @@ struct ActiveV2Operation {
 
 struct StableSegmentStore(UnsafeCell<SegmentStore<CapabilityPageDevice>>);
 
+#[cfg(feature = "file-tree")]
+struct KernelFileTreeBackend {
+    runtime: Arc<StorageV2Runtime>,
+}
+
+#[cfg(feature = "file-tree")]
+fn map_file_runtime_error(error: V2RuntimeError) -> FileError {
+    match error {
+        V2RuntimeError::Busy | V2RuntimeError::JournalChanged => FileError::Busy,
+        V2RuntimeError::OutsideTask
+        | V2RuntimeError::Unformatted
+        | V2RuntimeError::AuthorityMissing
+        | V2RuntimeError::ObjectUnavailable
+        | V2RuntimeError::Corrupt => FileError::ServiceUnavailable,
+    }
+}
+
+#[cfg(feature = "file-tree")]
+impl FileTreeBackend for KernelFileTreeBackend {
+    fn stage_chunk<'a>(
+        &'a self,
+        previous: Option<vibeos_segment_store::FsPersistentData>,
+        bytes: Vec<u8>,
+    ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+        Box::pin(async move {
+            let maintenance = self
+                .runtime
+                .maintenance
+                .lock()
+                .clone()
+                .ok_or(FileError::ServiceUnavailable)?;
+            let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
+            let result = poll_as_system(operation.store().commit_fs_data_chunk_for_maintenance(
+                &maintenance,
+                previous.as_ref(),
+                &bytes,
+            ))
+            .await
+            .map_err(|_| FileError::ServiceUnavailable);
+            operation.finish();
+            result
+        })
+    }
+
+    fn read_chunk<'a>(
+        &'a self,
+        data: vibeos_segment_store::FsPersistentData,
+        index: u64,
+    ) -> FileTreeFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
+            let result = poll_as_system(operation.store().read_fs_data_chunk(&data, index))
+                .await
+                .map_err(|_| FileError::ServiceUnavailable);
+            operation.finish();
+            result
+        })
+    }
+
+    fn commit<'a>(&'a self, transaction: FsTransaction) -> FileTreeFuture<'a, u64> {
+        Box::pin(async move {
+            let maintenance = self
+                .runtime
+                .maintenance
+                .lock()
+                .clone()
+                .ok_or(FileError::ServiceUnavailable)?;
+            let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
+            let result = poll_as_system(
+                transaction.commit_persistent_for_maintenance(operation.store(), &maintenance),
+            )
+            .await
+            .map_err(|error| match error {
+                vibeos_file_store::PersistentCommitError::File(error) => error,
+                vibeos_file_store::PersistentCommitError::Publish(
+                    vibeos_segment_store::FsRootPublishError::Conflict,
+                ) => FileError::Conflict,
+                _ => FileError::ServiceUnavailable,
+            });
+            operation.finish();
+            result
+        })
+    }
+}
+
 // Safety: access is serialized by `StorageV2Runtime::active`. Fault cleanup
 // releases only the exact detached task's claim before another task may enter.
 unsafe impl Sync for StableSegmentStore {}
@@ -666,9 +839,16 @@ impl Drop for V2Operation {
 
 impl StorageV2Runtime {
     fn new(device: CapabilityPageDevice) -> Arc<Self> {
+        let typed_kinds: &[u32] = if cfg!(feature = "file-tree") {
+            &vibeos_segment_store::fs_typed_reference_kinds()
+        } else {
+            &[]
+        };
         let (context, quota, maintenance) =
-            StoreRuntimeContext::governed_with_maintenance_provisioner()
-                .expect("fixed Storage V2 governed runtime policy is valid");
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                typed_kinds,
+            )
+            .expect("fixed Storage V2 governed runtime policy is valid");
         let runtime = Arc::new(Self {
             store: StableSegmentStore(UnsafeCell::new(SegmentStore::new_with_runtime_context(
                 device.clone(),
@@ -820,6 +1000,7 @@ impl StorageV2Runtime {
     pub(crate) async fn ensure_formatted_for_migration(
         self: &Arc<Self>,
     ) -> Result<vibeos_segment_store::StoreInfo, V2RuntimeError> {
+        self.device.restrict_to_initial_range();
         let mut operation = self.begin()?;
         let mounted = poll_as_system(operation.store().mount()).await;
         let result = match mounted {
@@ -849,6 +1030,7 @@ impl StorageV2Runtime {
     pub(crate) async fn ensure_native_initial_format(
         self: &Arc<Self>,
     ) -> Result<vibeos_segment_store::StoreInfo, V2RuntimeError> {
+        self.device.restrict_to_initial_range();
         let mut operation = self.begin()?;
         let options = storage_v2_format_options();
         let mounted = poll_as_system(operation.store().mount()).await;
@@ -988,6 +1170,11 @@ impl StorageV2Runtime {
         self: &Arc<Self>,
         expected_policy_sha256: [u8; 32],
     ) -> Result<(Arc<PersistentAuthorityView>, ColdScrubEvidence), V2RuntimeError> {
+        // The preprovisioned parent range is not allocatable merely because it
+        // is addressable. Mount still enforces the checkpoint's admitted
+        // segment count; exposing the parent here lets a previously grown
+        // checkpoint be read after reboot without widening durable policy.
+        self.device.expose_preprovisioned_range();
         let mut operation = self.begin()?;
         // Once a new cold proof starts, no caller may consume the preceding
         // boot's cached view. Success publishes a replacement before releasing
@@ -1050,8 +1237,8 @@ impl StorageV2Runtime {
             }
             let evidence = ColdScrubEvidence {
                 device_id: self.device.info().device_id,
-                v2_first_logical_block: self.device.info().range_first_logical_block,
-                v2_logical_block_count: self.device.info().logical_block_count,
+                v2_first_logical_block: STORAGE_V2_FIRST_BLOCK,
+                v2_logical_block_count: STORAGE_V2_BLOCK_COUNT,
                 store_uuid: StoreUuid::new(view.store_uuid())
                     .map_err(|_| V2RuntimeError::Corrupt)?,
                 checkpoint_generation: view.checkpoint_generation(),
@@ -1089,6 +1276,63 @@ impl StorageV2Runtime {
             .map_err(map_persistent_read_error)?;
         operation.finish();
         Ok(bytes)
+    }
+
+    #[cfg(feature = "file-tree")]
+    async fn ensure_file_tree_capacity(self: &Arc<Self>) -> Result<(), FileError> {
+        let mut operation = self.begin().map_err(map_file_runtime_error)?;
+        let info = operation
+            .store()
+            .info()
+            .map_err(|_| FileError::ServiceUnavailable)?;
+        let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
+            .ok()
+            .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
+            .ok_or(FileError::ServiceUnavailable)?;
+        let additional = self
+            .device
+            .growth_capability(durable_blocks)
+            .map_err(|_| FileError::ServiceUnavailable)?;
+        if let Some(additional) = additional {
+            let maintenance = self
+                .maintenance
+                .lock()
+                .clone()
+                .ok_or(FileError::ServiceUnavailable)?;
+            poll_as_system(operation.store().grow(&maintenance, additional))
+                .await
+                .map_err(|_| FileError::ServiceUnavailable)?;
+        }
+        operation.finish();
+        Ok(())
+    }
+
+    #[cfg(feature = "file-tree")]
+    async fn recover_file_tree(
+        self: &Arc<Self>,
+        namespace: u128,
+    ) -> Result<FileTreeRoot, FileError> {
+        if self.boot_proved_authority().is_none()
+            || BootStoreSelection::decode(self.boot_selection.load(Ordering::Acquire))
+                != Some(BootStoreSelection::StorageV2)
+        {
+            return Err(FileError::ServiceUnavailable);
+        }
+        self.ensure_file_tree_capacity().await?;
+        let mut operation = self.begin().map_err(map_file_runtime_error)?;
+        let recovered = poll_as_system(FileTreeRoot::recover_persistent(
+            operation.store(),
+            namespace,
+            vibeos_file_store::MAX_TRANSACTION_EDITS,
+        ))
+        .await
+        .map_err(|_| FileError::ServiceUnavailable);
+        operation.finish();
+        let mut root = recovered?.unwrap_or(FileTreeRoot::new_empty(namespace)?);
+        root.attach_backend(Arc::new(KernelFileTreeBackend {
+            runtime: self.clone(),
+        }))?;
+        Ok(root)
     }
 
     async fn read_transient_object(
@@ -1159,7 +1403,7 @@ impl StorageV2Devices {
         migration_control: Cap,
         store: Cap,
     ) -> Result<Self, PageIoError> {
-        let store_device = CapabilityPageDevice::new(
+        let store_device = CapabilityPageDevice::new_preprovisioned(
             backend.clone(),
             store,
             STORAGE_V2_FIRST_BLOCK,
@@ -1202,6 +1446,14 @@ impl StorageV2Devices {
 
     pub(crate) fn selected_boot_store(&self) -> Option<BootStoreSelection> {
         BootStoreSelection::decode(self.runtime.boot_selection.load(Ordering::Acquire))
+    }
+
+    #[cfg(feature = "file-tree")]
+    pub(crate) async fn recover_file_tree_root(
+        &self,
+        namespace: u128,
+    ) -> Result<FileTreeRoot, FileError> {
+        self.runtime.recover_file_tree(namespace).await
     }
 
     /// Bind the sole unified facade so migration can prove no legacy journal
@@ -2694,7 +2946,7 @@ impl PageDevice for CapabilityPageDevice {
     type Error = PageIoError;
 
     fn info(&self) -> PageDeviceInfo {
-        self.info
+        *self.info.lock()
     }
 
     async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
@@ -2779,5 +3031,37 @@ impl PageDevice for CapabilityPageDevice {
             self.clear_submitted_mutation();
         }
         result
+    }
+}
+
+impl GrowablePageDevice for CapabilityPageDevice {
+    fn validate_growth(
+        &self,
+        durable_logical_block_count: u64,
+        additional: BlockRangeCapability,
+    ) -> Result<(), Self::Error> {
+        let expected = self
+            .growth_capability(durable_logical_block_count)?
+            .ok_or(PageIoError::InvalidRange)?;
+        if expected != additional {
+            return Err(PageIoError::InvalidRange);
+        }
+        Ok(())
+    }
+
+    fn admit_growth(
+        &mut self,
+        durable_logical_block_count: u64,
+        additional: BlockRangeCapability,
+    ) -> Result<PageDeviceInfo, Self::Error> {
+        self.validate_growth(durable_logical_block_count, additional)?;
+        let enlarged = durable_logical_block_count
+            .checked_add(additional.range().block_count())
+            .ok_or(PageIoError::InvalidRange)?;
+        if enlarged != self.provisioned_block_count {
+            return Err(PageIoError::InvalidRange);
+        }
+        self.expose_preprovisioned_range();
+        Ok(self.info())
     }
 }

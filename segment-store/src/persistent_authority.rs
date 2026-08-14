@@ -28,6 +28,7 @@ use crate::gc::{
 };
 use crate::maintenance::{MaintenanceOperation, MaintenanceOperationLease, StoreMaintenance};
 use crate::quota::{canonical_attributable_physical_bytes, QuotaReservation, StoragePrincipal};
+use crate::root_codec::PersistentRootEntry;
 use crate::store::{CapacityClass, MountedState, SegmentStore, StoreError};
 
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
@@ -342,6 +343,55 @@ fn gc_can_relieve_persistent_import<E>(error: &PersistentAuthorityError<E>) -> b
 }
 
 impl<D: PageDevice> SegmentStore<D> {
+    /// Atomically replace trusted-service roots while preserving the exact M4
+    /// authority graph, object bindings, and persistent quota policy. The
+    /// caller must already hold the store-bound maintenance root; ordinary
+    /// object or path capabilities cannot invoke this checkpoint operation.
+    pub(crate) async fn replace_persistent_external_roots(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        external_roots: Vec<PersistentRootEntry>,
+    ) -> Result<u64, PersistentAuthorityError<D::Error>> {
+        let _lease = self
+            .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
+            .ok_or(PersistentAuthorityError::Unauthorized)?;
+        let state = self.require_current_generation()?.clone();
+        if !state.allocation.retired_segments().is_empty() {
+            return Err(PersistentAuthorityError::Store(
+                StoreError::GcResumeRequired,
+            ));
+        }
+        let current = state
+            .persistent_authority
+            .as_ref()
+            .ok_or(PersistentAuthorityError::NotInitialized)?;
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(PersistentAuthorityError::Gc(GcError::InvalidGeneration))?;
+        let snapshot = current
+            .relocated(generation)
+            .and_then(|snapshot| snapshot.with_external_roots(external_roots))
+            .map_err(PersistentAuthorityError::Snapshot)?;
+        self.preflight_persistent_quota(snapshot.principals(), &snapshot.objects)?;
+        let bytes = encode_persistent_authority_snapshot(&snapshot)
+            .map_err(PersistentAuthorityError::Snapshot)?;
+        self.publish_persistent_snapshot(state, generation, bytes, &snapshot)
+            .await?;
+        Box::pin(self.mount()).await?;
+        let observed = self
+            .require_current_generation()?
+            .persistent_authority
+            .as_ref()
+            .ok_or(PersistentAuthorityError::NotInitialized)?;
+        if observed.checkpoint_generation() != generation
+            || observed.external_roots() != snapshot.external_roots()
+        {
+            return Err(PersistentAuthorityError::PolicyMismatch);
+        }
+        Ok(generation)
+    }
+
     pub fn derive_persistent_authority_writer(
         &self,
         maintenance: &StoreMaintenance,
@@ -863,6 +913,11 @@ impl<D: PageDevice> SegmentStore<D> {
             .as_ref()
             .filter(|snapshot| import.record_stream.starts_with(snapshot.record_stream()))
             .map_or_else(Vec::new, |snapshot| snapshot.objects.clone());
+        let external_roots = self
+            .require_current_generation()?
+            .persistent_authority
+            .as_ref()
+            .map_or_else(Vec::new, |snapshot| snapshot.external_roots().to_vec());
         let mut claimed_v2_object_ids = BTreeSet::new();
         for binding in &reusable_bindings {
             claimed_v2_object_ids.insert(binding.v2_object_id);
@@ -1113,6 +1168,7 @@ impl<D: PageDevice> SegmentStore<D> {
             bindings,
             import.principals,
         )
+        .and_then(|snapshot| snapshot.with_external_roots(external_roots))
         .map_err(PersistentAuthorityError::Snapshot)?;
         let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
             .map_err(PersistentAuthorityError::Snapshot)?;

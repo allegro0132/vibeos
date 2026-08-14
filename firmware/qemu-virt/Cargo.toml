@@ -6,6 +6,7 @@ build = "build.rs"
 
 [features]
 default = []
+file-tree = ["vibeos-kernel/file-tree"]
 legacy-shell = ["vibeos-kernel/legacy-shell"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]

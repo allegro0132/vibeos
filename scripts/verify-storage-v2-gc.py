@@ -83,6 +83,7 @@ CANONICAL_CONTENT_EXTENT_LEN = MAX_METADATA_PAYLOAD_LEN
 HASH_ALGORITHM_SHA256 = 1
 REFERENCE_CODEC_RAW = 0
 REFERENCE_CODEC_TYPED_V1 = 1
+REFERENCE_CODEC_FS_V1 = 2
 BLOB_MAGIC = b"VIBEBLB\0"
 BLOB_HEADER_LEN = 0x80
 BLOB_VERSION = 1
@@ -468,7 +469,8 @@ def parse_object_mapping_v2(
         "CAS v2 ObjectMapping commit generation is invalid",
     )
     require(
-        reference_codec in (REFERENCE_CODEC_RAW, REFERENCE_CODEC_TYPED_V1),
+        reference_codec
+        in (REFERENCE_CODEC_RAW, REFERENCE_CODEC_TYPED_V1, REFERENCE_CODEC_FS_V1),
         "CAS v2 ObjectMapping reference codec is unknown",
     )
     if codec_version == CAS_GC_CODEC_VERSION:
@@ -2094,7 +2096,7 @@ def run_selftest() -> dict[str, Any]:
         ("object-mapping-blob-key-reserved", mutated_byte(object_mapping_bytes, 0x40)),
         ("object-mapping-commit-generation-min", mutated_integer(object_mapping_bytes, 0x50, 8, 0)),
         ("object-mapping-commit-generation-future", mutated_integer(object_mapping_bytes, 0x50, 8, 10)),
-        ("object-mapping-reference-codec", mutated_integer(object_mapping_bytes, 0x58, 2, 2)),
+        ("object-mapping-reference-codec", mutated_integer(object_mapping_bytes, 0x58, 2, 3)),
         ("object-mapping-reserved", mutated_byte(object_mapping_bytes, 0x5A)),
     ]
     mutation_cases += expect_payload_matrix(
@@ -2184,7 +2186,7 @@ def run_selftest() -> dict[str, Any]:
         "typed-length-binding",
     )
     bad_mapping = encode_object_mapping_fixture(
-        1, 0x44, 9, len(refs_payload), 2, canonical_blob_root(0x44, refs_payload)
+        1, 0x44, 9, len(refs_payload), 3, canonical_blob_root(0x44, refs_payload)
     )
     expect_violation(lambda: parse_object_mapping_v2(bad_mapping, 9), "typed-mapping-tag")
     maximum_children = [(index + 1, 9, 0x51) for index in range(GC_CHILD_BUDGET)]

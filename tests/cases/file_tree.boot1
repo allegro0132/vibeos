@@ -1,0 +1,12 @@
+quiet
+mkdir @home/etc
+echo VIBE_FILE_TREE_OLD | write @home/etc/config
+ln @home/etc/config @home/etc/hard
+echo VIBE_FILE_TREE_UPDATED | write @home/etc/hard
+cat @home/etc/config
+stat -c cfg:%i:%h:%s @home/etc/config
+stat -c hard:%i:%h:%s @home/etc/hard
+ln -s config @home/etc/link
+readlink @home/etc/link
+cat @home/etc/link
+@quit

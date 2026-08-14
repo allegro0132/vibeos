@@ -543,6 +543,13 @@ pub struct SegmentStore<D> {
     /// already the fatal hash-collision path, so one verification per key per
     /// process carries the same guarantee as re-scanning on every duplicate.
     pub(crate) dedup_verified: alloc::collections::BTreeSet<crate::cas_codec::BlobKey>,
+    /// Runtime cache of logical-object Merkle roots keyed by stable M4
+    /// ObjectId with the (kind, exact length) they were computed for. A valid
+    /// record stream never redefines an ObjectId's content, and every
+    /// non-successor authority installation clears this cache, so an append
+    /// does not re-hash the whole logical history on every commit.
+    pub(crate) logical_roots:
+        alloc::collections::BTreeMap<u128, (u32, u64, vibeos_blob_format::Hash)>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -568,6 +575,7 @@ impl<D: PageDevice> SegmentStore<D> {
             quota: runtime.quota,
             promotion_verified: alloc::collections::BTreeSet::new(),
             dedup_verified: alloc::collections::BTreeSet::new(),
+            logical_roots: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -798,6 +806,11 @@ impl<D: PageDevice> SegmentStore<D> {
 
     pub async fn mount(&mut self) -> Result<StoreInfo, StoreError<D::Error>> {
         self.verified_cas_generation.store(0, Ordering::Release);
+        // A fresh mount may observe different media; runtime verification
+        // caches must not outlive the mounted state they were built against.
+        self.promotion_verified.clear();
+        self.dedup_verified.clear();
+        self.logical_roots.clear();
         self.mounted = None;
         self.poisoned = false;
         validate_limits(self.limits)?;
@@ -938,17 +951,20 @@ impl<D: PageDevice> SegmentStore<D> {
 
         let device_info = self.device.info();
         segments_for_page_count(device_info.page_count)?;
+        // One batched read serves both superblock pairs and both checkpoint
+        // slots; the decode path below is unchanged.
+        let anchor = crate::cas::SpanSnapshotDevice::capture(&self.device, &[(0, 8)]).await?;
         let selected_super = select_superblock(
-            read_superblock(&self.device, 0).await?,
-            read_superblock(&self.device, 2).await?,
+            read_superblock(&anchor, 0).await?,
+            read_superblock(&anchor, 2).await?,
         )?
         .ok_or(StoreError::Unformatted)?;
         if selected_super.value() != &previous.superblock {
             return Err(StoreError::Corrupt);
         }
 
-        let left = read_checkpoint(&self.device, 4).await?;
-        let right = read_checkpoint(&self.device, 6).await?;
+        let left = read_checkpoint(&anchor, 4).await?;
+        let right = read_checkpoint(&anchor, 6).await?;
         let selected =
             select_checkpoint_for_superblock(selected_super, left, right, device_info.page_count)?
                 .ok_or(StoreError::Unformatted)?;

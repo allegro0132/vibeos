@@ -148,3 +148,18 @@ pub use typed_manifest::{
     MAX_TYPED_REFERENCES, MAX_TYPED_REFS_PAYLOAD_LEN, REFERENCE_CODEC_TAG_LEN,
     REFS_V1_ADMISSION_TAG, TYPED_REFERENCE_ENTRY_LEN, TYPED_REFS_HEADER_LEN, TYPED_REFS_VERSION,
 };
+
+/// Temporary latency-attribution probe for the storage benchmark. The host
+/// installs a function pointer; staged stage marks fire on the durable
+/// append path. Zero when unset; the call is a single relaxed load.
+pub static BENCH_PROBE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+pub fn bench_mark(stage: u8) {
+    let raw = BENCH_PROBE.load(core::sync::atomic::Ordering::Relaxed);
+    if raw != 0 {
+        let probe: fn(u8) = unsafe { core::mem::transmute(raw) };
+        probe(stage);
+    }
+}

@@ -252,7 +252,8 @@ vibeos_kernel_start:
     addi t0, t0, 8
     j .Lbss
 .Ldone:
-    j kmain
+    // See the secondary path: `tail` avoids the +-1 MiB JAL range limit.
+    tail kmain
 
 .align 4
 .global _secondary_start
@@ -280,7 +281,10 @@ _secondary_start:
     li t1, 1
     slli t1, t1, 18
     add sp, sp, t1
-    j secondary_kmain
+    // A plain `j` limits the kernel to +-1 MiB between this boot stub and
+    // secondary_kmain; `tail` expands to auipc+jalr and never becomes a
+    // link-time range constraint on text layout.
+    tail secondary_kmain
 
 .Lsecondary_park:
     wfi

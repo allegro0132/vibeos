@@ -3557,11 +3557,13 @@ async fn commit_snapshot<D: PageDevice>(
         sink.as_mut(),
     )
     .await?;
+    crate::bench_mark(7);
     // Batched publication: everything staged above lands as a few large
     // contiguous requests before the checkpoint slot protocol's barrier.
     if let Some(sink) = sink.take() {
         sink.drain(device).await?;
     }
+    crate::bench_mark(8);
 
     let slot = ((checkpoint_generation - 1) & 1) as u8;
     let checkpoint = Checkpoint {
@@ -3587,6 +3589,7 @@ async fn commit_snapshot<D: PageDevice>(
         replay_tail: PhysicalPointer::Null,
     };
     write_checkpoint(device, &checkpoint, true).await?;
+    crate::bench_mark(9);
     // Verify the complete newly selected state after the checkpoint itself has
     // been durably read back. This catches a misdirected/torn checkpoint write
     // that damaged a data segment, while avoiding a scan of unchanged history.
@@ -3689,6 +3692,7 @@ async fn commit_snapshot<D: PageDevice>(
     {
         return Err(StoreError::Corrupt.into());
     }
+    crate::bench_mark(10);
     let next_physical_segment = (0..state.admitted_segments)
         .find(|segment_no| allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free))
         .unwrap_or(state.admitted_segments);

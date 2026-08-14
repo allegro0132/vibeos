@@ -1246,6 +1246,7 @@ pub enum RecoveryError {
     InvalidRootConstraint,
     MissingRootConstraint,
     AmbiguousRootConstraint,
+    AllocationFailed,
 }
 
 struct PreparedGrant {
@@ -1291,10 +1292,17 @@ pub fn preflight_recovery(
     store_id: StoreId,
 ) -> Result<RecoveryPreflight, RecoveryError> {
     // Decode-only preflight rejects every sealed malformed sector without
-    // retaining ObjectChunk Vecs for the full journal.
+    // retaining ObjectChunk Vecs for the full journal. Decoded records are
+    // kept for the two validation passes below so each sector's CRC and
+    // parse cost is paid exactly once.
+    let mut decoded_records: Vec<Option<DecodedRecord>> = Vec::new();
+    decoded_records
+        .try_reserve_exact(sectors.len())
+        .map_err(|_| RecoveryError::AllocationFailed)?;
     for (sector, bytes) in sectors.iter().enumerate() {
         match LogRecord::decode(bytes) {
-            Ok(DecodeStatus::Empty | DecodeStatus::Torn | DecodeStatus::Valid(_)) => {}
+            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => decoded_records.push(None),
+            Ok(DecodeStatus::Valid(decoded)) => decoded_records.push(Some(decoded)),
             Err(source) => return Err(RecoveryError::SealedRecord { sector, source }),
         }
     }
@@ -1302,12 +1310,8 @@ pub fn preflight_recovery(
     let mut previous_sequence = 0u64;
     let mut previous_crc = 0u32;
     let mut valid_index = 0usize;
-    for (sector, bytes) in sectors.iter().enumerate() {
-        let decoded = match LogRecord::decode(bytes) {
-            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
-            Ok(DecodeStatus::Valid(decoded)) => decoded,
-            Err(_) => unreachable!("decode-only preflight accepted this sector"),
-        };
+    for (sector, entry) in decoded_records.iter().enumerate() {
+        let Some(decoded) = entry else { continue };
         let record = &decoded.record;
         if valid_index == 0 && (record.sequence != 1 || !matches!(record.body, RecordBody::Format))
         {
@@ -1345,14 +1349,9 @@ pub fn preflight_recovery(
     let mut committed_objects: Vec<RecoveredObject> = Vec::new();
     let mut tombstone_sequence: BTreeMap<DerivationId, u64> = BTreeMap::new();
 
-    // Decode and validate one record at a time. At most one <=360-byte chunk
-    // Vec is transiently owned here; no per-record decoded catalog survives.
-    for bytes in sectors {
-        let decoded = match LogRecord::decode(bytes) {
-            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
-            Ok(DecodeStatus::Valid(decoded)) => decoded,
-            Err(_) => unreachable!("decode-only preflight accepted this sector"),
-        };
+    // Validate one record at a time from the single decode pass above.
+    for entry in decoded_records {
+        let Some(decoded) = entry else { continue };
         let sequence = decoded.record.sequence;
         match &decoded.record.body {
             RecordBody::Format => {}

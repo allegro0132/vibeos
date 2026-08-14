@@ -245,13 +245,16 @@ pub(crate) fn storage_v2_migration_import(
         .iter()
         .any(|object| object.object_kind == ssh_kind)
         .then_some(ssh_kind);
-    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_sealed_singletons(
+    // The preflight above already validated this exact stream; hand it to
+    // the import so the stream is not decoded a second time.
+    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_sealed_singletons_preflighted(
         records,
         store_id,
         &roots,
         sealed_singletons.as_slice(),
         STORAGE_V2_EXTERNAL_POLICY,
         Vec::new(),
+        preflight,
     )
     .map_err(|_| DurableCSpaceError::RootPolicy)
 }

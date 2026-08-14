@@ -1,15 +1,18 @@
 use std::any::Any;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use vibeos_core::cap::{Resource, Rights};
+use vibeos_core::cap::{CSpace, Resource, Rights};
 use vibeos_core::exec;
 use vibeos_core::heap::{AllocationDomain, ArenaId, OwnerId};
+use vibeos_core::sync::SpinLock;
 use vibeos_vsh::{
     ComponentArtifactIdentity, ComponentAuthorityRequirement, ComponentCommandFuture,
     ComponentCommandManifest, ComponentCommandResult, ComponentCommandRunner, ComponentTerminal,
-    ComponentTrapCode, PreparedComponentStage, Session, SessionProfile, SshExecComponentPolicy,
+    ComponentTrapCode, ManagedComponentCancel, ManagedComponentLifecycle, ManagedComponentState,
+    ManagedComponentToken, PreparedComponentStage, Session, SessionProfile, SshExecComponentPolicy,
     Status, StreamMode, TerminalDetail,
 };
 
@@ -18,6 +21,7 @@ static SUBSTITUTION_EFFECTS: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_BUILTIN_OK: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_COMPONENT_CLOSED: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_COMPONENT_RUNS: AtomicUsize = AtomicUsize::new(0);
+static TRACKED_MANAGED_OK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn unexpected_tracked_test_reclaim(
     _witness: exec::ReclaimableFaultWitness,
@@ -49,6 +53,34 @@ fn execute(
     (session, report)
 }
 
+fn execute_with_delayed_cancel(
+    mut session: Session,
+    source: &'static str,
+    lifecycle: &'static ManagedProbe,
+) -> Vec<vibeos_vsh::JobReport> {
+    let result = Arc::new(Mutex::new(None));
+    let result_task = result.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_task = cancel.clone();
+    let task = exec::spawn_tracked("managed-cancel-vsh", async move {
+        let reports = session.execute_cancellable(source, cancel_task).await;
+        *result_task.lock().unwrap() = Some(reports);
+    });
+    let cancel_task = cancel.clone();
+    let canceller = exec::spawn_tracked("managed-cancel-signal", async move {
+        while lifecycle.starts.load(Ordering::Acquire) == 0 {
+            exec::yield_now().await;
+        }
+        cancel_task.store(true, Ordering::Release);
+    });
+
+    exec::run_until_idle(100_000);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    assert_eq!(canceller.state(), exec::TaskState::Exited);
+    let reports = result.lock().unwrap().take().unwrap().unwrap();
+    reports
+}
+
 #[derive(Clone, Copy)]
 enum Behavior {
     TransformUppercase,
@@ -64,6 +96,154 @@ struct ProbeRunner {
     behavior: Behavior,
     preflight_failure: Option<ComponentTerminal>,
     prepared_debug: Mutex<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ManagedBehavior {
+    Complete(ComponentTerminal),
+    WaitForCancellation,
+    CancelLost,
+    CancelAlreadyComplete(ComponentTerminal),
+    Lost,
+    StartError(ComponentTerminal),
+}
+
+struct ManagedProbe {
+    manifest: ComponentCommandManifest,
+    starts: AtomicUsize,
+    state_reads: AtomicUsize,
+    cancels: AtomicUsize,
+    cancelled: AtomicBool,
+    behavior: ManagedBehavior,
+    token_raw: NonZeroU64,
+}
+
+impl ManagedProbe {
+    fn leaked(manifest: ComponentCommandManifest, behavior: ManagedBehavior) -> &'static Self {
+        Box::leak(Box::new(Self {
+            manifest,
+            starts: AtomicUsize::new(0),
+            state_reads: AtomicUsize::new(0),
+            cancels: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            behavior,
+            token_raw: NonZeroU64::new(1).unwrap(),
+        }))
+    }
+
+    fn recognizes(&self, token: ManagedComponentToken) -> bool {
+        // SAFETY: only this trusted test lifecycle decodes tokens that it
+        // issued, and it validates the exact lifecycle-private nonce.
+        unsafe { token.trusted_raw() == self.token_raw }
+    }
+}
+
+// SAFETY: this leaked test service is globally stable, owns all mutable state,
+// retains no VSH references, and exposes only copy-only token/status scalars.
+unsafe impl ManagedComponentLifecycle for ManagedProbe {
+    fn manifest(&self) -> &ComponentCommandManifest {
+        &self.manifest
+    }
+
+    fn start(&self) -> Result<ManagedComponentToken, ComponentTerminal> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        if let ManagedBehavior::StartError(terminal) = self.behavior {
+            return Err(terminal);
+        }
+        // SAFETY: the leaked probe never reuses its single nonce for a second
+        // concurrently live invocation in these serialized tests.
+        Ok(unsafe { ManagedComponentToken::from_trusted_raw(self.token_raw) })
+    }
+
+    fn state(&self, token: ManagedComponentToken) -> ManagedComponentState {
+        self.state_reads.fetch_add(1, Ordering::SeqCst);
+        if !self.recognizes(token) {
+            return ManagedComponentState::Lost;
+        }
+        match self.behavior {
+            ManagedBehavior::Complete(terminal) => ManagedComponentState::Complete(terminal),
+            ManagedBehavior::WaitForCancellation => {
+                if self.cancelled.load(Ordering::Acquire) {
+                    ManagedComponentState::Complete(ComponentTerminal::Cancelled)
+                } else {
+                    ManagedComponentState::Running
+                }
+            }
+            ManagedBehavior::CancelLost => {
+                if self.cancelled.load(Ordering::Acquire) {
+                    ManagedComponentState::Lost
+                } else {
+                    ManagedComponentState::Running
+                }
+            }
+            ManagedBehavior::CancelAlreadyComplete(terminal) => {
+                if self.cancelled.load(Ordering::Acquire) {
+                    ManagedComponentState::Complete(terminal)
+                } else {
+                    ManagedComponentState::Running
+                }
+            }
+            ManagedBehavior::Lost => ManagedComponentState::Lost,
+            ManagedBehavior::StartError(_) => ManagedComponentState::Lost,
+        }
+    }
+
+    fn request_cancel(&self, token: ManagedComponentToken) -> ManagedComponentCancel {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        if !self.recognizes(token) {
+            return ManagedComponentCancel::Lost;
+        }
+        match self.behavior {
+            ManagedBehavior::Complete(_) => ManagedComponentCancel::AlreadyComplete,
+            ManagedBehavior::WaitForCancellation => {
+                self.cancelled.store(true, Ordering::Release);
+                ManagedComponentCancel::Requested
+            }
+            ManagedBehavior::CancelLost => {
+                self.cancelled.store(true, Ordering::Release);
+                ManagedComponentCancel::Lost
+            }
+            ManagedBehavior::CancelAlreadyComplete(_) => {
+                self.cancelled.store(true, Ordering::Release);
+                ManagedComponentCancel::AlreadyComplete
+            }
+            ManagedBehavior::Lost | ManagedBehavior::StartError(_) => ManagedComponentCancel::Lost,
+        }
+    }
+}
+
+struct FlippingManagedProbe {
+    selected: AtomicUsize,
+    starts: AtomicUsize,
+    pinned: ComponentCommandManifest,
+    replacement: ComponentCommandManifest,
+}
+
+// SAFETY: this deliberately adversarial test implementation is static and
+// retains no caller state. It violates the semantic immutable-manifest rule so
+// VSH's redundant pre-start equality gate can be exercised; `start` must and
+// does remain unreachable.
+unsafe impl ManagedComponentLifecycle for FlippingManagedProbe {
+    fn manifest(&self) -> &ComponentCommandManifest {
+        if self.selected.fetch_add(1, Ordering::SeqCst) == 0 {
+            &self.pinned
+        } else {
+            &self.replacement
+        }
+    }
+
+    fn start(&self) -> Result<ManagedComponentToken, ComponentTerminal> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Err(ComponentTerminal::BackendFault)
+    }
+
+    fn state(&self, _token: ManagedComponentToken) -> ManagedComponentState {
+        ManagedComponentState::Lost
+    }
+
+    fn request_cancel(&self, _token: ManagedComponentToken) -> ManagedComponentCancel {
+        ManagedComponentCancel::Lost
+    }
 }
 
 impl ProbeRunner {
@@ -182,6 +362,51 @@ fn runner(
     )
 }
 
+fn managed_manifest(name: &str) -> ComponentCommandManifest {
+    manifest(name, 0, 0, StreamMode::Closed, Vec::new())
+}
+
+fn managed_policy(name: &str) -> SshExecComponentPolicy {
+    component_policy(name, 0, 0, StreamMode::Closed, Vec::new())
+}
+
+fn component_policy(
+    name: &str,
+    min_args: usize,
+    max_args: usize,
+    stdin: StreamMode,
+    requirements: Vec<ComponentAuthorityRequirement>,
+) -> SshExecComponentPolicy {
+    SshExecComponentPolicy::from_image_pin(
+        name,
+        1,
+        ComponentArtifactIdentity::new([0xab; 32]),
+        "test:component/demo@1.0.0",
+        "run",
+        min_args,
+        max_args,
+        stdin,
+        StreamMode::Required,
+        StreamMode::Optional,
+        vibeos_vsh::DEFAULT_STAGE_MEMORY,
+        10_000,
+        100,
+        256,
+        requirements,
+    )
+    .unwrap()
+}
+
+fn blob_requirement() -> ComponentAuthorityRequirement {
+    ComponentAuthorityRequirement::new(
+        "blob",
+        "vibe:blob/blob@1.0.0",
+        "blob",
+        "component-blob",
+        Rights::READ,
+    )
+}
+
 fn substitution_effect(_args: &[String]) -> Result<String, Status> {
     SUBSTITUTION_EFFECTS.fetch_add(1, Ordering::SeqCst);
     Ok(String::from("effect"))
@@ -259,9 +484,16 @@ fn tracked_kernel_domain_keeps_builtins_working_and_components_fail_closed() {
             let runner = Arc::new(TrackedProbeRunner {
                 manifest: manifest("tracked-component", 0, 0, StreamMode::Closed, Vec::new()),
             });
-            session.install_component_command(runner).unwrap();
+            let policy = managed_policy("tracked-component");
+            session.install_component_command(runner.clone()).unwrap();
             let rejected = session.execute("tracked-component").await.unwrap_err();
-            if rejected.message == "component lifecycle registry is not installed" {
+            let mut ssh = Session::with_profile(SessionProfile::SshExec);
+            ssh.install_ssh_exec_component_command(&policy, runner)
+                .unwrap();
+            let ssh_rejected = ssh.execute("tracked-component").await.unwrap_err();
+            if rejected.message == "component lifecycle registry is not installed"
+                && ssh_rejected.message == "component lifecycle registry is not installed"
+            {
                 TRACKED_COMPONENT_CLOSED.store(1, Ordering::SeqCst);
             }
         })
@@ -724,6 +956,427 @@ fn ps_caps_mem_boundary_rejects_opaque_identifiers_before_output() {
         report.output,
         "worker state=running polls=17 budget=262144\n"
     );
+}
+
+#[test]
+fn tracked_ssh_exec_uses_only_the_explicit_managed_lifecycle() {
+    let _serial = SERIAL.lock().unwrap();
+    TRACKED_MANAGED_OK.store(0, Ordering::SeqCst);
+    exec::set_fault_reclaimer(unexpected_tracked_test_reclaim);
+
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-remote"),
+        ManagedBehavior::Complete(ComponentTerminal::Success),
+    );
+    let policy: &'static SshExecComponentPolicy =
+        Box::leak(Box::new(managed_policy("managed-remote")));
+    let domain = AllocationDomain::new(OwnerId::new(40_002), ArenaId::new(50_002));
+    // SAFETY: the task owns its exact reclaimable domain, and the nested
+    // installer call models the trusted SSH platform hook after an exact
+    // accepted-profile plus independently constructed full-pin match. The
+    // leaked lifecycle satisfies the managed test contract.
+    let handle = unsafe {
+        exec::spawn_reclaimable_owned(domain, "tracked-managed-vsh", async move {
+            let mut session = Session::with_profile(SessionProfile::SshExec);
+            session
+                .install_ssh_exec_managed_component_command(policy, lifecycle)
+                .unwrap();
+            let reports = session.execute("managed-remote").await.unwrap();
+            if reports.len() == 1
+                && reports[0].status == Status::Success
+                && reports[0].output.is_empty()
+                && reports[0].stages.len() == 1
+                && reports[0].stages[0].detail
+                    == TerminalDetail::Component(ComponentTerminal::Success)
+            {
+                TRACKED_MANAGED_OK.store(1, Ordering::SeqCst);
+            }
+        })
+    };
+
+    exec::run_until_idle(100_000);
+    assert_eq!(handle.state(), exec::TaskState::Exited);
+    assert_eq!(TRACKED_MANAGED_OK.load(Ordering::SeqCst), 1);
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn managed_installer_requires_exact_image_and_session_policy() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-policy"),
+        ManagedBehavior::Complete(ComponentTerminal::Success),
+    );
+    let exact = managed_policy("managed-policy");
+
+    let mut interactive = Session::new();
+    // SAFETY: this is a negative boundary test using a static inert lifecycle;
+    // it deliberately models a compromised hook and verifies the profile gate
+    // rejects before consulting or starting the lifecycle.
+    assert_eq!(
+        unsafe { interactive.install_ssh_exec_managed_component_command(&exact, lifecycle) }
+            .unwrap_err()
+            .message,
+        "managed SSH component policy requires an SSH exec session"
+    );
+
+    let wrong = SshExecComponentPolicy::from_image_pin(
+        "managed-policy",
+        1,
+        ComponentArtifactIdentity::new([0xcd; 32]),
+        "test:component/demo@1.0.0",
+        "run",
+        0,
+        0,
+        StreamMode::Closed,
+        StreamMode::Required,
+        StreamMode::Optional,
+        vibeos_vsh::DEFAULT_STAGE_MEMORY,
+        10_000,
+        100,
+        256,
+        Vec::new(),
+    )
+    .unwrap();
+    let mut ssh = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: this negative test deliberately supplies a mismatched image pin
+    // to the otherwise inert trusted-hook seam and verifies rejection occurs
+    // before lifecycle start; no production caller may do this.
+    assert_eq!(
+        unsafe { ssh.install_ssh_exec_managed_component_command(&wrong, lifecycle) }
+            .unwrap_err()
+            .message,
+        "managed component lifecycle does not match SSH image policy"
+    );
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        execute(ssh, "managed-policy").1.unwrap_err().message,
+        "command is outside the SSH exec profile"
+    );
+}
+
+#[test]
+fn managed_manifest_change_after_installation_is_rejected_before_start() {
+    let _serial = SERIAL.lock().unwrap();
+    let pinned = managed_manifest("managed-flip");
+    let replacement = ComponentCommandManifest::new(
+        "managed-flip",
+        1,
+        ComponentArtifactIdentity::new([0xcd; 32]),
+        "test:component/replacement@1.0.0",
+        "run",
+        0,
+        0,
+        StreamMode::Closed,
+        StreamMode::Required,
+        StreamMode::Optional,
+        vibeos_vsh::DEFAULT_STAGE_MEMORY,
+        10_000,
+        100,
+        256,
+        Vec::new(),
+    )
+    .unwrap();
+    let lifecycle: &'static FlippingManagedProbe = Box::leak(Box::new(FlippingManagedProbe {
+        selected: AtomicUsize::new(0),
+        starts: AtomicUsize::new(0),
+        pinned,
+        replacement,
+    }));
+    let policy = managed_policy("managed-flip");
+    let mut session = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: this negative test deliberately installs a static adversarial
+    // lifecycle whose first manifest exactly matches an independently built
+    // pin. The second read changes identity; the test verifies VSH rejects it
+    // before `start`, and no child or runtime payload exists.
+    unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+
+    let (_, result) = execute(session, "managed-flip");
+    assert_eq!(
+        result.unwrap_err().message,
+        "managed component manifest changed after installation"
+    );
+    assert_eq!(lifecycle.selected.load(Ordering::SeqCst), 2);
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn managed_preparation_is_bound_to_the_exact_authorized_session() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-session"),
+        ManagedBehavior::Complete(ComponentTerminal::Success),
+    );
+    let policy: &'static SshExecComponentPolicy =
+        Box::leak(Box::new(managed_policy("managed-session")));
+    let rejected = Arc::new(AtomicBool::new(false));
+    let rejected_task = rejected.clone();
+    let task = exec::spawn_tracked("managed-session-binding", async move {
+        let shared = Arc::new(SpinLock::new(CSpace::new("shared-ssh-test")));
+        let mut authorized = Session::with_cspace_profile(shared.clone(), SessionProfile::SshExec);
+        // SAFETY: the authorized test session models the exact accepted SSH
+        // descriptor and independent full image pin; the second session is
+        // intentionally not given this installation authority.
+        unsafe { authorized.install_ssh_exec_managed_component_command(policy, lifecycle) }
+            .unwrap();
+        let mut foreign = Session::with_cspace_profile(shared, SessionProfile::SshExec);
+        let script = vibeos_vsh::parse("managed-session").unwrap();
+        let vibeos_vsh::Statement::Command(item) = &script.statements[0] else {
+            unreachable!()
+        };
+        let preflight = authorized.preflight_pipeline(&item.command.first).unwrap();
+        let prepare_error = match foreign.prepare_pipeline(preflight).await {
+            Ok(_) => panic!("foreign session prepared an authorized managed pipeline"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            prepare_error.message,
+            "pipeline preflight belongs to another session"
+        );
+
+        let preflight = authorized.preflight_pipeline(&item.command.first).unwrap();
+        let prepared = authorized.prepare_pipeline(preflight).await.unwrap();
+        let error = prepared.commit(&mut foreign, false).await.unwrap_err();
+        rejected_task.store(
+            error.message == "prepared pipeline belongs to another session",
+            Ordering::Release,
+        );
+    });
+
+    exec::run_until_idle(100_000);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    assert!(rejected.load(Ordering::Acquire));
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn managed_installer_rejects_non_scalar_component_contracts() {
+    let _serial = SERIAL.lock().unwrap();
+    let cases = [
+        (
+            manifest("managed-args", 0, 1, StreamMode::Closed, Vec::new()),
+            component_policy("managed-args", 0, 1, StreamMode::Closed, Vec::new()),
+        ),
+        (
+            manifest("managed-input", 0, 0, StreamMode::Optional, Vec::new()),
+            component_policy("managed-input", 0, 0, StreamMode::Optional, Vec::new()),
+        ),
+        (
+            manifest(
+                "managed-authority",
+                0,
+                0,
+                StreamMode::Closed,
+                vec![blob_requirement()],
+            ),
+            component_policy(
+                "managed-authority",
+                0,
+                0,
+                StreamMode::Closed,
+                vec![blob_requirement()],
+            ),
+        ),
+    ];
+
+    for (component_manifest, policy) in cases {
+        let lifecycle = ManagedProbe::leaked(
+            component_manifest,
+            ManagedBehavior::Complete(ComponentTerminal::Success),
+        );
+        let mut session = Session::with_profile(SessionProfile::SshExec);
+        // SAFETY: the fake hook supplies an exact independent pin but an
+        // intentionally unsupported scalar contract, allowing the VSH gate to
+        // be tested before lifecycle start without any live child.
+        assert_eq!(
+            unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }
+                .unwrap_err()
+                .message,
+            "managed SSH component contract is not scalar-only"
+        );
+        assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn managed_grammar_denials_happen_before_lifecycle_start() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-grammar"),
+        ManagedBehavior::Complete(ComponentTerminal::Success),
+    );
+    let policy = managed_policy("managed-grammar");
+    let mut session = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: the test models an exact accepted SSH descriptor and independent
+    // full image pin backed by a globally stable fake lifecycle.
+    unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+
+    for source in [
+        "managed-grammar | true",
+        "managed-grammar > @console",
+        "managed-grammar &",
+        "managed-grammar $(true)",
+        "$managed-grammar",
+        "managed-grammar && true",
+        "managed-grammar; true",
+    ] {
+        let (returned, result) = execute(session, source);
+        session = returned;
+        assert!(
+            result.is_err(),
+            "managed grammar unexpectedly admitted: {source}"
+        );
+        assert_eq!(
+            lifecycle.starts.load(Ordering::SeqCst),
+            0,
+            "lifecycle started for denied grammar: {source}"
+        );
+        assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn managed_completion_scalars_preserve_terminal_status() {
+    let _serial = SERIAL.lock().unwrap();
+    let cases = [
+        (
+            "managed-returned",
+            ManagedBehavior::Complete(ComponentTerminal::Returned(7)),
+            Status::Returned(7),
+            ComponentTerminal::Returned(7),
+        ),
+        (
+            "managed-backend",
+            ManagedBehavior::Complete(ComponentTerminal::BackendFault),
+            Status::BackendFault,
+            ComponentTerminal::BackendFault,
+        ),
+        (
+            "managed-fault",
+            ManagedBehavior::Complete(ComponentTerminal::RunnerFault),
+            Status::Faulted,
+            ComponentTerminal::RunnerFault,
+        ),
+        (
+            "managed-lost",
+            ManagedBehavior::Lost,
+            Status::Faulted,
+            ComponentTerminal::RunnerFault,
+        ),
+        (
+            "managed-start-denied",
+            ManagedBehavior::StartError(ComponentTerminal::Denied),
+            Status::Denied,
+            ComponentTerminal::Denied,
+        ),
+    ];
+
+    for (name, behavior, status, terminal) in cases {
+        let lifecycle = ManagedProbe::leaked(managed_manifest(name), behavior);
+        let policy = managed_policy(name);
+        let mut session = Session::with_profile(SessionProfile::SshExec);
+        // SAFETY: each case models an exact accepted SSH descriptor and
+        // independently pinned immutable manifest with a static fake service.
+        unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+        let (_, reports) = execute(session, name);
+        let report = &reports.unwrap()[0];
+        assert_eq!(report.status, status);
+        assert_eq!(report.stages[0].status, status);
+        assert_eq!(report.stages[0].detail, TerminalDetail::Component(terminal));
+        assert!(report.output.is_empty());
+        assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn managed_foreground_cancellation_is_cooperative_and_token_only() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-cancel"),
+        ManagedBehavior::WaitForCancellation,
+    );
+    let policy = managed_policy("managed-cancel");
+    let mut initial = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: this test models an exact accepted SSH descriptor and independent
+    // full image pin backed by a globally stable fake lifecycle.
+    unsafe { initial.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+
+    let reports = execute_with_delayed_cancel(initial, "managed-cancel", lifecycle);
+    assert_eq!(reports[0].status, Status::Cancelled);
+    assert_eq!(
+        reports[0].stages[0].detail,
+        TerminalDetail::Component(ComponentTerminal::Cancelled)
+    );
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 1);
+    assert!(lifecycle.state_reads.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn managed_prepublication_cancellation_never_starts_a_child() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-pre-cancel"),
+        ManagedBehavior::Complete(ComponentTerminal::Success),
+    );
+    let policy = managed_policy("managed-pre-cancel");
+    let mut session = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: this test models an exact accepted SSH descriptor and independent
+    // full image pin backed by a globally stable fake lifecycle.
+    unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+    session.cancel_next_job_for_test();
+
+    let (_, reports) = execute(session, "managed-pre-cancel");
+    let reports = reports.unwrap();
+    assert_eq!(reports[0].status, Status::Cancelled);
+    assert_eq!(
+        reports[0].stages[0].detail,
+        TerminalDetail::Component(ComponentTerminal::Cancelled)
+    );
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn managed_cancel_lost_and_already_complete_fail_closed_without_retry() {
+    let _serial = SERIAL.lock().unwrap();
+    let cases = [
+        (
+            "managed-cancel-lost",
+            ManagedBehavior::CancelLost,
+            Status::Faulted,
+            ComponentTerminal::RunnerFault,
+        ),
+        (
+            "managed-cancel-complete",
+            ManagedBehavior::CancelAlreadyComplete(ComponentTerminal::Success),
+            Status::Success,
+            ComponentTerminal::Success,
+        ),
+    ];
+
+    for (name, behavior, status, terminal) in cases {
+        let lifecycle = ManagedProbe::leaked(managed_manifest(name), behavior);
+        let policy = managed_policy(name);
+        let mut session = Session::with_profile(SessionProfile::SshExec);
+        // SAFETY: each test case models an exact accepted SSH descriptor and
+        // independently built full image pin with a static fake lifecycle.
+        unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+
+        let reports = execute_with_delayed_cancel(session, name, lifecycle);
+        assert_eq!(reports[0].status, status);
+        assert_eq!(
+            reports[0].stages[0].detail,
+            TerminalDetail::Component(terminal)
+        );
+        assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[test]

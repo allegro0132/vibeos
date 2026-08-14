@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibeos.dev/schema/storage-bench-record-v1.json",
+  "title": "VibeOS storage benchmark record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "run_id", "backend", "layer", "workload",
+    "status", "vm_index", "sample_index", "warmup", "seed",
+    "queue_depth", "metrics", "counters", "phases", "environment"
+  ],
+  "properties": {
+    "schema": { "const": "vibeos.storage-bench.record" },
+    "version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "backend": { "enum": ["m4", "storage-v2", "linux-ext4"] },
+    "layer": { "enum": ["block", "object", "file-tree"] },
+    "workload": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["ok", "unsupported", "failed-closed", "inconclusive"] },
+    "reason": { "type": "string" },
+    "vm_index": { "type": "integer", "minimum": 0 },
+    "sample_index": { "type": "integer", "minimum": 0 },
+    "warmup": { "type": "boolean" },
+    "seed": { "type": "integer", "minimum": 0 },
+    "queue_depth": { "type": "integer", "minimum": 1 },
+    "object_bytes": { "type": "integer", "minimum": 0 },
+    "object_count": { "type": "integer", "minimum": 0 },
+    "content_class": { "enum": ["unique", "half-duplicate", "all-duplicate"] },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "phases": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["git_commit", "qemu_version", "qemu_args", "cache_state"],
+      "properties": {
+        "git_commit": { "type": "string", "minLength": 7 },
+        "rust_version": { "type": "string" },
+        "qemu_version": { "type": "string", "minLength": 1 },
+        "linux_version": { "type": "string" },
+        "buildroot_version": { "type": "string" },
+        "host_cpu": { "type": "string" },
+        "host_os": { "type": "string" },
+        "qemu_args": { "type": "array", "items": { "type": "string" } },
+        "cache_state": { "enum": ["cold", "warm", "mixed", "unknown"] }
+      },
+      "additionalProperties": true
+    }
+  }
+}

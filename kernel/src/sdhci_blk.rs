@@ -173,6 +173,19 @@ pub(crate) async fn raw_read_at(expected_epoch: u64, sector: u64) -> Result<[u8;
     with_card_at(expected_epoch, |card| card.read_sector(sector))
 }
 
+pub(crate) async fn raw_read_blocks_at(
+    expected_epoch: u64,
+    sector: u64,
+    block_count: u32,
+    output: &mut [u8],
+) -> Result<(), BlockError> {
+    if block_count != 1 || output.len() != 512 {
+        return Err(BlockError::Unsupported);
+    }
+    output.copy_from_slice(&raw_read_at(expected_epoch, sector).await?);
+    Ok(())
+}
+
 pub(crate) async fn raw_write_at(
     expected_epoch: u64,
     sector: u64,
@@ -183,6 +196,20 @@ pub(crate) async fn raw_write_at(
         card.write_sector_tracked(sector, &data, || submitted.set(true))
     })
     .map_err(|error| mutation_failure(error, submitted.get()))
+}
+
+pub(crate) async fn raw_write_blocks_at(
+    expected_epoch: u64,
+    sector: u64,
+    block_count: u32,
+    data: &[u8],
+) -> MutationResult<(), BlockError> {
+    if block_count != 1 || data.len() != 512 {
+        return Err(MutationFailure::not_submitted(BlockError::Unsupported));
+    }
+    let mut block = [0; 512];
+    block.copy_from_slice(data);
+    raw_write_at(expected_epoch, sector, block).await
 }
 
 pub(crate) async fn raw_flush_at(expected_epoch: u64) -> MutationResult<(), BlockError> {

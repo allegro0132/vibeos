@@ -1,0 +1,21 @@
+{
+  "schema": "vibeos.storage-bench.linux-environment",
+  "version": 1,
+  "distribution": "Debian 13 (trixie) nocloud",
+  "debian_cloud_build": "20260810-2566",
+  "architecture": "riscv64",
+  "kernel": "6.12.101+deb13-riscv64",
+  "image": "debian-13-nocloud-riscv64-20260810-2566.qcow2",
+  "image_sha512": "cfd1a935ba054a641ebea26dcf2713844d0e757944a9f575d26b26a04c94e4994a637c99517b39c313c98dcc4eb13ccca8dcccd4062519457a2f2816836d4cf6",
+  "container_image": "debian:trixie-slim",
+  "container_manifest_sha256": "3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258",
+  "ext4": {
+    "size_bytes": 1073741824,
+    "block_size": 4096,
+    "label": "VIBE_BENCH_DATA",
+    "uuid": "0f21c8d5-c551-41ae-a9f8-9d15d45af175",
+    "features": ["metadata_csum", "64bit"],
+    "lazy_itable_init": false,
+    "lazy_journal_init": false
+  }
+}

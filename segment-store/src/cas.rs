@@ -1636,11 +1636,6 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             .write_page(physical, page)
             .await
             .map_err(StoreError::Mutation)?;
-        self.store
-            .device
-            .flush()
-            .await
-            .map_err(StoreError::Mutation)?;
         Ok(())
     }
 
@@ -1684,11 +1679,6 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             self.store
                 .device
                 .write_page(physical, &page)
-                .await
-                .map_err(StoreError::Mutation)?;
-            self.store
-                .device
-                .flush()
                 .await
                 .map_err(StoreError::Mutation)?;
             self.tree_initialized[tree_page] = true;
@@ -1791,6 +1781,15 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         let mut header_page = heap_page();
         header_page[..HEADER_SIZE].copy_from_slice(&streaming.header);
         self.write_exact_page(0, &header_page).await?;
+        // Scratch content, tree emissions, and the canonical header are still
+        // unreachable from every sealed extent and checkpoint. They may share
+        // one data-dependency barrier before hashing and metadata publication;
+        // cancellation or a power cut before this point can expose no object.
+        self.store
+            .device
+            .flush()
+            .await
+            .map_err(StoreError::Mutation)?;
         Ok(streaming.descriptor.root)
     }
 
@@ -2868,17 +2867,23 @@ pub(crate) async fn write_payload_record<D: PageDevice>(
     payload: &[u8],
 ) -> Result<(), StoreError<D::Error>> {
     let mut copied = 0_usize;
-    for page_index in 0..record.value.payload_pages {
-        let mut page = heap_page();
-        let take = (payload.len() - copied).min(PAGE_SIZE);
-        page[..take].copy_from_slice(&payload[copied..copied + take]);
-        write_page(
-            device,
-            base + u64::from(record.value.payload_first_relative_page + page_index),
-            &page,
-        )
-        .await?;
-        copied += take;
+    let mut page_index = 0_u32;
+    while page_index < record.value.payload_pages {
+        let batch_pages = (record.value.payload_pages - page_index).min(32) as usize;
+        let mut pages = alloc::vec![[0; PAGE_SIZE]; batch_pages];
+        for page in &mut pages {
+            let take = (payload.len() - copied).min(PAGE_SIZE);
+            page[..take].copy_from_slice(&payload[copied..copied + take]);
+            copied += take;
+        }
+        device
+            .write_pages(
+                base + u64::from(record.value.payload_first_relative_page + page_index),
+                &pages,
+            )
+            .await
+            .map_err(StoreError::Mutation)?;
+        page_index += batch_pages as u32;
     }
     flush(device).await?;
     let descriptor_relative = record.value.payload_first_relative_page - 2;

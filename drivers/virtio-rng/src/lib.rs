@@ -10,7 +10,7 @@ use core::cell::UnsafeCell;
 
 use vibeos_driver_virtio_core as virtio;
 use vibeos_driver_virtio_core::{
-    AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE, SPLIT_QUEUE_SIZE,
+    AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE, ENTROPY_QUEUE_SIZE,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
 
@@ -114,7 +114,7 @@ impl QueueModel {
 
 #[repr(C, align(4096))]
 struct DmaSlab {
-    descriptors: [Descriptor; SPLIT_QUEUE_SIZE as usize],
+    descriptors: [Descriptor; ENTROPY_QUEUE_SIZE as usize],
     available: AvailableRing,
     used: UsedRing,
     data: [u8; MAX_RANDOM_BYTES],
@@ -122,16 +122,16 @@ struct DmaSlab {
 
 impl DmaSlab {
     const ZERO: Self = Self {
-        descriptors: [Descriptor::new(0, 0, 0, 0); SPLIT_QUEUE_SIZE as usize],
+        descriptors: [Descriptor::new(0, 0, 0, 0); ENTROPY_QUEUE_SIZE as usize],
         available: AvailableRing {
             flags: 0,
             index: 0,
-            ring: [0; SPLIT_QUEUE_SIZE as usize],
+            ring: [0; vibeos_driver_virtio_core::SPLIT_QUEUE_SIZE as usize],
         },
         used: UsedRing {
             flags: 0,
             index: 0,
-            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
+            ring: [UsedElement::new(0, 0); vibeos_driver_virtio_core::SPLIT_QUEUE_SIZE as usize],
         },
         data: [0; MAX_RANDOM_BYTES],
     };
@@ -303,11 +303,11 @@ fn initialize_transport(
     init.confirm_features(transport.status())
         .map_err(|_| Error::Unsupported)?;
     transport.select_queue(ENTROPY_QUEUE);
-    if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
+    if transport.queue_ready() || transport.queue_num_max() < ENTROPY_QUEUE_SIZE {
         return Err(Error::Unsupported);
     }
     let (descriptors, available, used) = dma_addresses();
-    transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
+    transport.configure_queue(ENTROPY_QUEUE_SIZE, descriptors, available, used);
     let ready = init.set_driver_ok().map_err(|_| Error::Protocol)?;
     Ok((features.accepted(), ready))
 }

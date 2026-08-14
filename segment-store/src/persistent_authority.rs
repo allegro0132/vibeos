@@ -1008,6 +1008,179 @@ impl<D: PageDevice> SegmentStore<D> {
                 quota_reservations.sort_unstable_by_key(|(stable_id, _)| *stable_id);
             }
         }
+        // Fused fast path: exactly one logical object needs a fresh CAS
+        // commit — the shape of every ordinary durable append. Stage its blob
+        // payload, then publish the object mapping and the authority snapshot
+        // under one metadata segment and one checkpoint instead of two
+        // independent durable segment transactions and checkpoint pairs.
+        let mut fresh = Vec::new();
+        for recovered in &import.recovered.objects {
+            let stable_id = recovered.object_id.get();
+            if !(import.is_admitted(stable_id) || transient_ids.contains(&stable_id)) {
+                continue;
+            }
+            if reusable_bindings
+                .binary_search_by_key(&stable_id, |binding| binding.stable_object_id)
+                .is_ok()
+                || promoted
+                    .binary_search_by_key(&stable_id, |(id, _)| *id)
+                    .is_ok()
+            {
+                continue;
+            }
+            fresh.push(recovered);
+        }
+        if fresh.len() == 1 {
+            let recovered = fresh[0];
+            let stable_id = recovered.object_id.get();
+            // Reusable bindings get the same validation as the general path.
+            for admitted in import.admitted_objects() {
+                if let Ok(index) = reusable_bindings.binary_search_by_key(
+                    &admitted.object_id.get(),
+                    |binding| binding.stable_object_id,
+                ) {
+                    Self::validate_reusable_binding(
+                        self.require_current_generation()?,
+                        reusable_bindings[index],
+                        admitted,
+                    )?;
+                }
+            }
+            // Partition already-promoted objects into admitted bindings and
+            // transient handles; other promotions only reserved claim order.
+            let mut committed = Vec::new();
+            let mut transient_promoted = Vec::new();
+            for (stable, object) in promoted.drain(..) {
+                if import.is_admitted(stable) {
+                    committed.push((stable, object));
+                } else if transient_ids.contains(&stable) {
+                    transient_promoted.push((stable, object));
+                }
+            }
+            let (generation, staged_v2_object_id) = {
+                let current = self.require_current_generation()?;
+                (
+                    current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(PersistentAuthorityError::Gc(GcError::InvalidGeneration))?,
+                    current.next_object_id,
+                )
+            };
+            let mut writer = if let Ok(index) =
+                quota_reservations.binary_search_by_key(&stable_id, |(id, _)| *id)
+            {
+                let (_, reservation) = quota_reservations.remove(index);
+                self.begin_blob_with_quota_reservation(
+                    recovered.object_kind.get(),
+                    recovered.bytes.len() as u64,
+                    reservation,
+                )?
+            } else {
+                match admission_principal {
+                    Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
+                    None => self.begin_blob_for_persistent_import(
+                        recovered.object_kind.get(),
+                        recovered.bytes.len() as u64,
+                    )?,
+                }
+            };
+            for chunk in recovered.bytes.chunks(LEAF_SIZE) {
+                writer.write_chunk(chunk).await?;
+            }
+            let staged = Box::pin(writer.stage_commit()).await?;
+            let mut bindings: Vec<PersistentObjectBinding> = reusable_bindings
+                .into_iter()
+                .filter(|binding| import.is_admitted(binding.stable_object_id))
+                .collect();
+            bindings
+                .try_reserve_exact(committed.len() + 1)
+                .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+            for (stable, object) in &committed {
+                let (v2_object_id, commit_generation, object_kind) =
+                    object.backend_handle().persistent_binding_parts();
+                bindings.push(PersistentObjectBinding {
+                    stable_object_id: *stable,
+                    v2_object_id,
+                    commit_generation,
+                    object_kind,
+                });
+            }
+            if import.is_admitted(stable_id) {
+                bindings.push(PersistentObjectBinding {
+                    stable_object_id: stable_id,
+                    v2_object_id: staged_v2_object_id,
+                    commit_generation: generation,
+                    object_kind: staged.object_kind,
+                });
+            }
+            bindings.sort_unstable_by_key(|binding| binding.stable_object_id);
+            let snapshot = PersistentAuthoritySnapshot::new(
+                generation,
+                import.root_policy_sha256,
+                import.record_stream,
+                bindings,
+                import.principals,
+            )
+            .and_then(|snapshot| snapshot.with_external_roots(external_roots))
+            .map_err(PersistentAuthorityError::Snapshot)?;
+            let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
+                .map_err(PersistentAuthorityError::Snapshot)?;
+            let mut root_entries: Vec<PersistentRootEntry> = snapshot
+                .objects
+                .iter()
+                .map(|binding| PersistentRootEntry {
+                    object_id: binding.v2_object_id,
+                    commit_generation: binding.commit_generation,
+                    object_kind: binding.object_kind,
+                })
+                .collect();
+            root_entries.extend_from_slice(snapshot.external_roots());
+            root_entries.sort_unstable_by_key(|entry| entry.object_id);
+            let persistent_roots = PersistentRootSet::new(generation, root_entries)
+                .map_err(|_| PersistentAuthorityError::Store(StoreError::Corrupt))?;
+            // Same ordering contract as publish_persistent_snapshot: the pure
+            // quota installation precedes the first media mutation of the
+            // fused publication.
+            self.install_persistent_quota_snapshot(&snapshot)?;
+            let object = self
+                .publish_staged_object_with_authority(
+                    staged,
+                    crate::cas::FusedAuthorityPublication {
+                        authority_bytes,
+                        persistent_authority: snapshot.clone(),
+                        persistent_roots,
+                    },
+                )
+                .await?;
+            object
+                .backend_handle()
+                .bind_persistent_quota_candidate(stable_id)
+                .map_err(|_| PersistentAuthorityError::InvalidQuotaPolicy)?;
+            let mut transient_objects = Vec::new();
+            transient_objects
+                .try_reserve_exact(transient_promoted.len() + 1)
+                .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+            for (stable, object) in transient_promoted {
+                transient_objects.push(PersistentObjectHandle {
+                    stable_object_id: stable,
+                    object: Arc::new(object),
+                });
+            }
+            if transient_ids.contains(&stable_id) {
+                transient_objects.push(PersistentObjectHandle {
+                    stable_object_id: stable_id,
+                    object: Arc::new(object),
+                });
+            }
+            // Admitted fused objects are durably named by the checkpoint's
+            // authority snapshot and root set; their runtime handles may drop.
+            drop(committed);
+            let view = self
+                .build_persistent_view(self.require_current_generation()?, snapshot, false)
+                .await?;
+            return Ok((view, transient_objects));
+        }
         let mut committed = Vec::new();
         committed
             .try_reserve_exact(import.admitted_object_count())
@@ -1462,7 +1635,7 @@ impl<D: PageDevice> SegmentStore<D> {
     }
 
     async fn promote_existing_logical_object(
-        &self,
+        &mut self,
         recovered: &vibeos_durable_format::RecoveredObject,
         claimed_v2_object_ids: &BTreeSet<u128>,
         require_active_quota_candidate: bool,
@@ -1496,12 +1669,17 @@ impl<D: PageDevice> SegmentStore<D> {
                 &self.pins,
             )
             .map_err(|_| PersistentAuthorityError::Store(StoreError::ObjectUnavailable))?;
+            let previously_verified = self.promotion_verified.contains(&mapping.blob_key);
             if !cas_payloads_verified
+                && !previously_verified
                 && !self
                     .persistent_object_matches_recovered(&object, recovered)
                     .await?
             {
                 continue;
+            }
+            if !previously_verified {
+                self.promotion_verified.insert(mapping.blob_key);
             }
             if let Some(reservation) = quota_reservation.take() {
                 if !object.backend_handle_mut().can_attach_quota_charge() {

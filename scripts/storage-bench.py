@@ -188,22 +188,44 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
     require(sample.get("backend") in BACKENDS, "bad guest backend")
     require(sample.get("seed", seed) == seed, "guest seed mismatch")
     hz = sample.get("timebase_hz")
-    require(isinstance(hz, int) and hz > 0, "bad guest timebase")
+    if sample["status"] == "ok":
+        require(isinstance(hz, int) and hz > 0, "bad guest timebase")
     metrics: dict[str, float] = {}
     counters: dict[str, int] = {}
     phases: dict[str, int] = {}
     if sample["status"] == "ok":
+        if "latency_ticks" in sample:
+            ticks = sample["latency_ticks"]
+            require(isinstance(ticks, int) and ticks > 0, "missing latency_ticks")
+            metrics["latency_ns"] = ticks * 1_000_000_000 / hz
+            phases["latency_total_ns"] = round(metrics["latency_ns"])
         for source, target in (("put_ticks", "put_latency_ns"), ("get_ticks", "get_latency_ns")):
-            ticks = sample.get(source)
-            require(isinstance(ticks, int) and ticks > 0, f"missing {source}")
-            metrics[target] = ticks * 1_000_000_000 / hz
-            phases[target.removesuffix("_latency_ns") + "_total_ns"] = round(metrics[target])
+            if source in sample:
+                ticks = sample[source]
+                require(isinstance(ticks, int) and ticks > 0, f"missing {source}")
+                metrics[target] = ticks * 1_000_000_000 / hz
+                phases[target.removesuffix("_latency_ns") + "_total_ns"] = round(metrics[target])
+        if "elapsed_ticks" in sample:
+            elapsed = sample["elapsed_ticks"]
+            transferred = sample.get("transferred_bytes")
+            require(isinstance(elapsed, int) and elapsed > 0, "bad elapsed_ticks")
+            require(isinstance(transferred, int) and transferred >= 0, "bad transferred_bytes")
+            if transferred > 0:
+                metrics["throughput_bytes_per_second"] = transferred * hz / elapsed
+            phases["elapsed_ticks"] = elapsed
+            phases["transferred_bytes"] = transferred
+        for name in ("operations", "transferred_bytes", "elapsed_ticks"):
+            if name in sample and name not in phases:
+                value = sample[name]
+                require(isinstance(value, int) and value >= 0, f"bad {name}")
+                phases[name] = value
         for name in ("block_requests", "block_read_requests", "block_write_requests",
                      "block_flush_requests", "block_read_bytes", "block_write_bytes",
                      "block_used_interrupts"):
             value = sample.get(name)
-            require(isinstance(value, int) and value >= 0, f"missing {name}")
-            counters[name.removeprefix("block_")] = value
+            if value is not None:
+                require(isinstance(value, int) and value >= 0, f"bad {name}")
+                counters[name.removeprefix("block_")] = value
         if "put_block_requests" in sample:
             for name in ("put_block_requests", "put_block_read_requests",
                          "put_block_write_requests", "put_block_flush_requests",
@@ -230,8 +252,8 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
         "sample_index": sample_index,
         "warmup": warmup,
         "seed": seed,
-        "queue_depth": 1,
-        "object_bytes": sample["object_bytes"],
+        "queue_depth": sample.get("queue_depth", 1),
+        "object_bytes": sample.get("object_bytes", 0),
         "metrics": metrics,
         "counters": counters,
         "phases": phases,
@@ -239,6 +261,10 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
     }
     if sample["status"] != "ok":
         result["reason"] = sample.get("reason", "guest reported " + sample["status"])
+    if "object_count" in sample:
+        result["object_count"] = sample["object_count"]
+    if "content_class" in sample:
+        result["content_class"] = sample["content_class"]
     validate_record(result)
     return result
 
@@ -254,27 +280,52 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
     counters: dict[str, int] = {}
     phases: dict[str, int] = {}
     if status == "ok":
-        for source, target in (("put_ns", "put_latency_ns"), ("get_ns", "get_latency_ns")):
-            value = sample.get(source)
-            require(isinstance(value, int) and value > 0, f"missing {source}")
-            metrics[target] = float(value)
-            phases[target.removesuffix("_latency_ns") + "_total_ns"] = value
+        if "latency_ns" in sample:
+            value = sample["latency_ns"]
+            require(isinstance(value, int) and value > 0, "missing latency_ns")
+            metrics["latency_ns"] = float(value)
+            phases["latency_total_ns"] = value
+        else:
+            for source, target in (("put_ns", "put_latency_ns"), ("get_ns", "get_latency_ns")):
+                value = sample.get(source)
+                require(isinstance(value, int) and value > 0, f"missing {source}")
+                metrics[target] = float(value)
+                phases[target.removesuffix("_latency_ns") + "_total_ns"] = value
+        if "elapsed_ns" in sample:
+            elapsed = sample["elapsed_ns"]
+            transferred = sample.get("transferred_bytes")
+            require(isinstance(elapsed, int) and elapsed > 0, "bad elapsed_ns")
+            require(isinstance(transferred, int) and transferred >= 0, "bad transferred_bytes")
+            if transferred > 0:
+                metrics["throughput_bytes_per_second"] = transferred * 1_000_000_000 / elapsed
+            phases["elapsed_ns"] = elapsed
+            phases["transferred_bytes"] = transferred
+        for name in ("operations", "transferred_bytes", "elapsed_ns"):
+            if name in sample and name not in phases:
+                value = sample[name]
+                require(isinstance(value, int) and value >= 0, f"bad {name}")
+                phases[name] = value
         for name in ("block_requests", "block_read_requests", "block_write_requests",
                      "block_flush_requests", "block_read_bytes", "block_write_bytes"):
             value = sample.get(name)
-            require(isinstance(value, int) and value >= 0, f"missing {name}")
-            counters[name.removeprefix("block_")] = value
+            if value is not None:
+                require(isinstance(value, int) and value >= 0, f"bad {name}")
+                counters[name.removeprefix("block_")] = value
     result: dict[str, Any] = {
         "schema": RECORD_SCHEMA, "version": RECORD_VERSION, "run_id": run_id,
         "backend": "linux-ext4", "layer": sample["layer"],
         "workload": sample["workload"], "status": status, "vm_index": vm_index,
         "sample_index": sample["sample_index"], "warmup": sample["warmup"],
-        "seed": sample["seed"], "queue_depth": 1,
-        "object_bytes": sample["object_bytes"], "metrics": metrics,
+        "seed": sample["seed"], "queue_depth": sample.get("queue_depth", 1),
+        "object_bytes": sample.get("object_bytes", 0), "metrics": metrics,
         "counters": counters, "phases": phases, "environment": env,
     }
     if status != "ok":
         result["reason"] = sample.get("reason", "Linux guest reported " + status)
+    if "object_count" in sample:
+        result["object_count"] = sample["object_count"]
+    if "content_class" in sample:
+        result["content_class"] = sample["content_class"]
     validate_record(result)
     return result
 
@@ -343,11 +394,34 @@ def run_vibeos(args: argparse.Namespace) -> int:
                 try:
                     assert process.stdin is not None and process.stdout is not None
                     wait_for(process.stdout, process, b"VibeOS shell ready", args.boot_timeout)
+                    # The shell-ready banner is emitted before the async
+                    # virtio task has necessarily published its online
+                    # session. Keep this bootstrap wait outside the timed
+                    # operation and probe the block command once.
+                    time.sleep(1.0)
+                    process.stdin.write(b"blk info\n")
+                    process.stdin.flush()
+                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout)
                     process.stdin.write(b"quiet\n")
                     process.stdin.flush()
+                    # Wait for the shell to finish the quiet command before
+                    # submitting the timed workload. Sending both lines in
+                    # one UART burst can otherwise race the legacy parser and
+                    # produce a valid but failed-closed guest record.
+                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout)
                     for index in range(total):
                         seed = (args.seed + vm_index * total + index) & ((1 << 64) - 1)
-                        command = f"storage bench {args.object_bytes} {seed}\n".encode()
+                        if args.workload.startswith("block-"):
+                            command = f"blk bench {args.workload} {seed} {args.queue_depth}\n".encode()
+                        else:
+                            extra = ""
+                            if args.workload.startswith("file-"):
+                                extra = f" {args.workload} {args.object_count}"
+                            else:
+                                extra = f" {args.workload}"
+                                if getattr(args, "content_class", None):
+                                    extra += f" {args.content_class}"
+                            command = f"storage bench {args.object_bytes} {seed}{extra}\n".encode()
                         process.stdin.write(command)
                         process.stdin.flush()
                         data = wait_for(process.stdout, process, PREFIX.encode(), args.sample_timeout)
@@ -433,22 +507,30 @@ def run_linux(args: argparse.Namespace) -> int:
                     process.stdin.write(b"stty -echo\n")
                     process.stdin.flush()
                     wait_for(process.stdout, process, b"root@localhost:", 30)
+                    block_mode = args.workload.startswith("block-")
                     setup = (
-                        "mkdir -p /mnt/data /mnt/host; "
-                        "data_device=$(readlink -f /dev/disk/by-id/virtio-vibeos-bench-data); "
-                        "block_name=$(basename \"$data_device\"); "
-                        "mount -t ext4 -o data=ordered,barrier=1 \"$data_device\" /mnt/data && "
-                        "mount -t 9p -o trans=virtio,version=9p2000.L bench /mnt/host && "
-                        f"test -x /mnt/host/{args.agent.name} && echo BENCH_SETUP_READY\n"
+                        ("mkdir -p /mnt/host; " if block_mode else "mkdir -p /mnt/data /mnt/host; ")
+                        + "data_device=$(readlink -f /dev/disk/by-id/virtio-vibeos-bench-data); "
+                        + "block_name=$(basename \"$data_device\"); "
+                        + ("" if block_mode else
+                           "mount -t ext4 -o data=ordered,barrier=1 \"$data_device\" /mnt/data && ")
+                        + "mount -t 9p -o trans=virtio,version=9p2000.L bench /mnt/host && "
+                        + f"test -x /mnt/host/{args.agent.name} && echo BENCH_SETUP_READY\n"
                     )
                     process.stdin.write(setup.encode())
                     process.stdin.flush()
                     wait_for(process.stdout, process, b"BENCH_SETUP_READY", 60)
                     command = (
-                        f"/mnt/host/{args.agent.name} --directory /mnt/data "
-                        ' --block-stat "/sys/class/block/$block_name/stat" '
-                        f"--bytes {args.object_bytes} --seed {seed} "
-                        f"--warmups {args.warmups} --samples {args.samples}; echo BENCH_RUN_DONE\n"
+                        f"/mnt/host/{args.agent.name} "
+                        + (f"--workload {args.workload} --queue-depth {args.queue_depth} --block-device \"$data_device\" "
+                           if block_mode else
+                           f"--directory /mnt/data --bytes {args.object_bytes} "
+                           f"--object-count {args.object_count} --workload {args.workload} "
+                           + (f"--content-class {args.content_class} "
+                              if args.content_class else ""))
+                        + ' --block-stat "/sys/class/block/$block_name/stat" '
+                        + f"--seed {seed} --warmups {args.warmups} --samples {args.samples}; "
+                        "echo BENCH_RUN_DONE\n"
                     )
                     process.stdin.write(command.encode())
                     process.stdin.flush()
@@ -466,10 +548,12 @@ def run_linux(args: argparse.Namespace) -> int:
                                                       vm_index=vm_index, env=env)
                         output.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
                     output.flush()
-                    process.stdin.write(
-                        b"sync; umount /mnt/data; if e2fsck -fn \"$data_device\" >/dev/null 2>&1; "
-                        b"then echo BENCH_FSCK_OK; else echo BENCH_FSCK_FAILED; fi\n"
+                    verify_command = (
+                        ("sync; umount /mnt/data; " if not block_mode else "sync; ")
+                        + 'if e2fsck -fn "$data_device" >/dev/null 2>&1; '
+                        + "then echo BENCH_FSCK_OK; else echo BENCH_FSCK_FAILED; fi\n"
                     )
+                    process.stdin.write(verify_command.encode())
                     process.stdin.flush()
                     check = wait_for(process.stdout, process, b"BENCH_FSCK_", 120)
                     check += wait_for(process.stdout, process, b"root@localhost:", 30)
@@ -680,6 +764,10 @@ def main() -> int:
                      help="powered-off verified backend template; cloned once per VM")
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--object-bytes", type=int, required=True)
+    run.add_argument("--object-count", type=int, default=1)
+    run.add_argument("--content-class", choices=("unique", "half-duplicate", "all-duplicate"))
+    run.add_argument("--queue-depth", type=int, default=1)
+    run.add_argument("--workload", default="object-durable-put-get")
     run.add_argument("--backend", choices=("storage-v2", "m4"), default="storage-v2")
     run.add_argument("--vms", type=int, default=5)
     run.add_argument("--warmups", type=int, default=5)
@@ -698,6 +786,10 @@ def main() -> int:
     linux.add_argument("--data-image", type=Path, required=True)
     linux.add_argument("--output", type=Path, required=True)
     linux.add_argument("--object-bytes", type=int, required=True)
+    linux.add_argument("--object-count", type=int, default=1)
+    linux.add_argument("--content-class", choices=("unique", "half-duplicate", "all-duplicate"))
+    linux.add_argument("--queue-depth", type=int, default=1)
+    linux.add_argument("--workload", default="object-durable-put-get")
     linux.add_argument("--vms", type=int, default=5)
     linux.add_argument("--warmups", type=int, default=5)
     linux.add_argument("--samples", type=int, default=20)

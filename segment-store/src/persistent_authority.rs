@@ -420,6 +420,8 @@ impl<D: PageDevice> SegmentStore<D> {
         if self.require_current_generation()?.authority_root != PhysicalPointer::Null {
             return Err(PersistentAuthorityError::AlreadyInitialized);
         }
+        // The incoming stream is not a strict successor of any cached state.
+        self.logical_roots.clear();
         self.install_persistent_import(import, BTreeSet::new(), BTreeSet::new(), lease, None)
             .await
             .map(|(view, _)| view)
@@ -445,6 +447,8 @@ impl<D: PageDevice> SegmentStore<D> {
         if current.checkpoint_generation() != expected_generation {
             return Err(PersistentAuthorityError::GenerationMismatch);
         }
+        // A replacement may redefine logical content behind existing IDs.
+        self.logical_roots.clear();
         self.install_persistent_import(update, BTreeSet::new(), BTreeSet::new(), lease, None)
             .await
             .map(|(view, _)| view)
@@ -882,6 +886,14 @@ impl<D: PageDevice> SegmentStore<D> {
         PersistentAuthorityError<D::Error>,
     > {
         validate_quota_totals(&import, None)?;
+        // Merkle roots for every logical object, from the cache where the
+        // stable ObjectId was already hashed by an earlier installation.
+        let mut logical_roots: alloc::collections::BTreeMap<u128, vibeos_blob_format::Hash> =
+            alloc::collections::BTreeMap::new();
+        for recovered in &import.recovered.objects {
+            let root = self.cached_logical_root(recovered)?;
+            logical_roots.insert(recovered.object_id.get(), root);
+        }
         // A strict logical-stream successor cannot redefine an existing M4
         // ObjectId. Reuse its already authenticated V2 binding instead of
         // consuming a new CAS mapping/segment on every authority append.
@@ -934,16 +946,16 @@ impl<D: PageDevice> SegmentStore<D> {
                 {
                     continue;
                 }
-                let descriptor =
-                    BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
-                        .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+                let root = *logical_roots
+                    .get(&stable_id)
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?;
                 let has_active_exact_candidate = state.cas.as_ref().is_some_and(|cas| {
                     cas.objects.iter().any(|mapping| {
                         !claimed_v2_object_ids.contains(&mapping.object_id)
                             && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                             && mapping.blob_key.object_kind() == recovered.object_kind.get()
                             && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
-                            && mapping.blob_key.merkle_root() == descriptor.root
+                            && mapping.blob_key.merkle_root() == root
                             && table.has_active_persistent_candidate(stable_id, mapping.object_id)
                     })
                 });
@@ -991,12 +1003,16 @@ impl<D: PageDevice> SegmentStore<D> {
             let require_active_candidate = admission_principal.is_some()
                 && import.is_admitted(recovered.object_id.get())
                 && reservation.is_none();
+            let root = *logical_roots
+                .get(&recovered.object_id.get())
+                .ok_or(PersistentAuthorityError::PolicyMismatch)?;
             if let Some(object) = self
                 .promote_existing_logical_object(
                     recovered,
                     &claimed_v2_object_ids,
                     require_active_candidate,
                     &mut reservation,
+                    root,
                 )
                 .await?
             {
@@ -1039,10 +1055,14 @@ impl<D: PageDevice> SegmentStore<D> {
                     &admitted.object_id.get(),
                     |binding| binding.stable_object_id,
                 ) {
+                    let root = *logical_roots
+                        .get(&admitted.object_id.get())
+                        .ok_or(PersistentAuthorityError::PolicyMismatch)?;
                     Self::validate_reusable_binding(
                         self.require_current_generation()?,
                         reusable_bindings[index],
                         admitted,
+                        root,
                     )?;
                 }
             }
@@ -1085,6 +1105,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     )?,
                 }
             };
+            writer.enable_staged_batching();
             for chunk in recovered.bytes.chunks(LEAF_SIZE) {
                 writer.write_chunk(chunk).await?;
             }
@@ -1193,10 +1214,14 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok()
                 .map(|index| reusable_bindings[index])
             {
+                let root = *logical_roots
+                    .get(&recovered.object_id.get())
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?;
                 Self::validate_reusable_binding(
                     self.require_current_generation()?,
                     binding,
                     recovered,
+                    root,
                 )?;
                 continue;
             }
@@ -1605,14 +1630,36 @@ impl<D: PageDevice> SegmentStore<D> {
         }
     }
 
+    /// Return the Merkle root of one logical object, computing and caching it
+    /// on first sight. A valid record stream never redefines an ObjectId's
+    /// content, and non-successor installations clear the cache, so the hit
+    /// path is sound without re-hashing the object bytes.
+    fn cached_logical_root(
+        &mut self,
+        recovered: &vibeos_durable_format::RecoveredObject,
+    ) -> Result<vibeos_blob_format::Hash, PersistentAuthorityError<D::Error>> {
+        let stable_id = recovered.object_id.get();
+        let kind = recovered.object_kind.get();
+        let len = recovered.bytes.len() as u64;
+        if let Some((cached_kind, cached_len, root)) = self.logical_roots.get(&stable_id) {
+            if *cached_kind == kind && *cached_len == len {
+                return Ok(*root);
+            }
+        }
+        let descriptor = BlobDescriptor::from_content(kind, &recovered.bytes)
+            .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+        self.logical_roots
+            .insert(stable_id, (kind, len, descriptor.root));
+        Ok(descriptor.root)
+    }
+
     fn validate_reusable_binding(
         state: &MountedState,
         binding: PersistentObjectBinding,
         recovered: &vibeos_durable_format::RecoveredObject,
+        root: vibeos_blob_format::Hash,
     ) -> Result<(), PersistentAuthorityError<D::Error>> {
-        let descriptor =
-            BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
-                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+        let descriptor_root = root;
         state
             .cas
             .as_ref()
@@ -1628,7 +1675,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     && mapping.blob_key.object_kind() == binding.object_kind
                     && binding.object_kind == recovered.object_kind.get()
                     && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
-                    && mapping.blob_key.merkle_root() == descriptor.root
+                    && mapping.blob_key.merkle_root() == descriptor_root
             })
             .ok_or(PersistentAuthorityError::PolicyMismatch)?;
         Ok(())
@@ -1640,15 +1687,13 @@ impl<D: PageDevice> SegmentStore<D> {
         claimed_v2_object_ids: &BTreeSet<u128>,
         require_active_quota_candidate: bool,
         quota_reservation: &mut Option<QuotaReservation>,
+        root: vibeos_blob_format::Hash,
     ) -> Result<Option<AuthorizedObject<CasObjectHandle>>, PersistentAuthorityError<D::Error>> {
         let state = self.require_current_generation()?;
         let Some(cas) = state.cas.as_ref() else {
             return Ok(None);
         };
         let cas_payloads_verified = self.cas_payloads_verified(state.generation);
-        let descriptor =
-            BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
-                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
         for mapping in cas.objects.iter().copied().filter(|mapping| {
             !claimed_v2_object_ids.contains(&mapping.object_id)
                 && (!require_active_quota_candidate
@@ -1661,7 +1706,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                 && mapping.blob_key.object_kind() == recovered.object_kind.get()
                 && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
-                && mapping.blob_key.merkle_root() == descriptor.root
+                && mapping.blob_key.merkle_root() == root
         }) {
             let mut object = recover_promotable_cas_object(
                 state.superblock.binding.store_uuid,

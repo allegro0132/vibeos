@@ -1872,7 +1872,8 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &[(&record, bytes)], false).await?;
+        write_payload_records_with_header(device, base, header, &[(&record, bytes)], false, None)
+            .await?;
         self.relative = self
             .relative
             .checked_add(record.value.record_span_pages)
@@ -1979,7 +1980,7 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &writes, false).await?;
+        write_payload_records_with_header(device, base, header, &writes, false, None).await?;
         let mut pointers = Vec::new();
         pointers
             .try_reserve_exact(records.len())

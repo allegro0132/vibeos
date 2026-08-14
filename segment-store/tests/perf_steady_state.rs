@@ -49,6 +49,8 @@ struct Counters {
     flushes: u64,
     read_bytes: u64,
     write_bytes: u64,
+    read_requests: u64,
+    write_requests: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +172,7 @@ impl PageDevice for CountingDevice {
         let mut counters = self.counters.lock().unwrap();
         counters.reads += 1;
         counters.read_bytes += PAGE_BYTES;
+        counters.read_requests += 1;
         drop(counters);
         self.note("read");
         Ok(())
@@ -178,6 +181,10 @@ impl PageDevice for CountingDevice {
     async fn read_pages(&self, first: u64, output: &mut [Page]) -> Result<(), Self::Error> {
         for (index, page) in output.iter_mut().enumerate() {
             self.read_page(first + index as u64, page).await?;
+        }
+        // read_page counted one request per page; collapse to one batch.
+        if output.len() > 1 {
+            self.counters.lock().unwrap().read_requests -= output.len() as u64 - 1;
         }
         Ok(())
     }
@@ -194,6 +201,7 @@ impl PageDevice for CountingDevice {
         let mut counters = self.counters.lock().unwrap();
         counters.writes += 1;
         counters.write_bytes += PAGE_BYTES;
+        counters.write_requests += 1;
         drop(counters);
         self.note("write");
         Ok(())
@@ -206,6 +214,9 @@ impl PageDevice for CountingDevice {
     ) -> Result<(), MutationFailure<Self::Error>> {
         for (index, page) in input.iter().enumerate() {
             self.write_page(first + index as u64, page).await?;
+        }
+        if input.len() > 1 {
+            self.counters.lock().unwrap().write_requests -= input.len() as u64 - 1;
         }
         Ok(())
     }
@@ -350,7 +361,7 @@ fn steady_state_replace_attribution() {
         .collect();
     let mut generation = first_view.checkpoint_generation();
     let bench_principal = first_view.principals()[0].clone();
-    println!("append,kind,read_pages,write_pages,flush,read_bytes,write_bytes");
+    println!("append,kind,read_pages,write_pages,flush,read_req,write_req");
     for round in 0..40 {
         let (next_records, _object_id) = append_records(&records, &payload);
         let update = import(&next_records);
@@ -381,7 +392,7 @@ fn steady_state_replace_attribution() {
         println!(
             "{},{},{},{},{},{},{}",
             round, kind_label, counters.reads, counters.writes, counters.flushes,
-            counters.read_bytes, counters.write_bytes
+            counters.read_requests, counters.write_requests
         );
         // Regression budget for the fused durable-append fast path: one
         // metadata segment and one checkpoint per append. The zero-seal reuse

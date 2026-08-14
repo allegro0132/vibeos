@@ -769,6 +769,7 @@ impl InstanceRegistry {
         if !Self::structural_identity_matches(slot, &record, token, handle) {
             Self::quarantine_locked(slot, &mut record);
             drop(record);
+            self.quarantine_terminal_candidates_locked(handle);
             drop(_transaction);
             system.restore();
             return Err(RegistryError::IdentityMismatch);
@@ -1609,6 +1610,70 @@ impl InstanceRegistry {
         })
     }
 
+    /// Observe one retained lifecycle record only after matching the executor's
+    /// exact, unforgeable status handle and every stable structural projection.
+    ///
+    /// This is the read-only gate for a SYSTEM control table which publishes a
+    /// scalar `Running` state.  It verifies token generation/header, TaskId and
+    /// TaskStatus object identity, owner/arena domain, prepared binding, home
+    /// hart, scheduler incarnation, and the stable [`InstanceSpace`] plus
+    /// CSpace-lock object addresses.  It deliberately does not acquire or
+    /// recover the CSpace lock: no observation authorizes payload access,
+    /// terminal publication, owner retirement, reset, or raw reclamation.
+    /// Those irreversible operations retain their separate complete CSpace
+    /// identity/incarnation gates.
+    ///
+    /// A mismatch sticky-quarantines both the addressed generation and every
+    /// retained record which aliases the supplied handle.  It never attempts a
+    /// best-effort lookup by TaskId or allocation domain.
+    pub fn observe_structural(
+        &self,
+        token: InstanceToken,
+        handle: &TaskHandle,
+    ) -> Result<InstanceSnapshot, RegistryError> {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let _transaction = self.transaction.lock();
+        let Some(slot) = self.slot(token) else {
+            self.quarantine_terminal_candidates_locked(handle);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        };
+        let mut record = slot.record.lock();
+        if !Self::structural_identity_matches(slot, &record, token, handle)
+            || matches!(
+                record.phase,
+                InstancePhase::Vacant | InstancePhase::Reserved | InstancePhase::Bound
+            )
+        {
+            Self::quarantine_locked(slot, &mut record);
+            drop(record);
+            self.quarantine_terminal_candidates_locked(handle);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        }
+        if record.phase == InstancePhase::Quarantined {
+            drop(record);
+            self.quarantine_terminal_candidates_locked(handle);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::Quarantined);
+        }
+        let snapshot = InstanceSnapshot {
+            phase: record.phase,
+            domain: record
+                .domain
+                .expect("a structurally observed record retains its domain"),
+            task: record.task.as_ref().map(TaskHandle::id),
+            home_hart: record.home_hart,
+        };
+        drop(record);
+        drop(_transaction);
+        system.restore();
+        Ok(snapshot)
+    }
+
     fn slot(&self, token: InstanceToken) -> Option<&InstanceSlot> {
         self.slots.get(token.slot as usize)
     }
@@ -2402,6 +2467,124 @@ mod tests {
         assert_eq!(
             registry.reserve(AllocationDomain::new(OwnerId::SYSTEM, ArenaId::new(8))),
             Err(ReserveError::InvalidDomain)
+        );
+    }
+
+    #[test]
+    fn structural_observation_checks_status_domain_and_space_without_touching_cspace() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let allocation = domain(7);
+        let token = registry.reserve(allocation).unwrap();
+        let handle = publish_pending_managed(
+            &registry,
+            token,
+            allocation,
+            "managed-structural-observation",
+        );
+        let expected_cspace = cspace_state(&registry, token);
+
+        assert_eq!(
+            registry.observe_structural(token, &handle),
+            Ok(InstanceSnapshot {
+                phase: InstancePhase::Active,
+                domain: allocation,
+                task: Some(handle.id()),
+                home_hart: Some(HartId::BOOT),
+            })
+        );
+        assert_eq!(cspace_state(&registry, token), expected_cspace);
+
+        mutate_active_record_for_test(&registry, token, |record| {
+            record
+                .space_seal
+                .as_mut()
+                .expect("active observation record lost its Space seal")
+                .object_identity ^= 1;
+        });
+        assert_eq!(
+            registry.observe_structural(token, &handle),
+            Err(RegistryError::IdentityMismatch)
+        );
+        assert_eq!(
+            registry.slot(token).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(cspace_state(&registry, token), expected_cspace);
+        assert_eq!(handle.cancel(), crate::exec::CancelOutcome::Requested);
+    }
+
+    #[test]
+    fn structural_observation_rejects_a_different_status_handle_without_reset() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let first_domain = domain(70);
+        let second_domain = domain(71);
+        let first = registry.reserve(first_domain).unwrap();
+        let second = registry.reserve(second_domain).unwrap();
+        let first_handle =
+            publish_pending_managed(&registry, first, first_domain, "managed-observe-first");
+        let second_handle =
+            publish_pending_managed(&registry, second, second_domain, "managed-observe-second");
+        let first_cspace = cspace_state(&registry, first);
+        let second_cspace = cspace_state(&registry, second);
+        assert!(registry.quarantine(first));
+
+        assert_eq!(
+            registry.observe_structural(first, &second_handle),
+            Err(RegistryError::IdentityMismatch),
+            "an already-quarantined addressed slot must not hide the live handle alias"
+        );
+        assert_eq!(
+            registry.slot(first).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(
+            registry.slot(second).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(cspace_state(&registry, first), first_cspace);
+        assert_eq!(cspace_state(&registry, second), second_cspace);
+        assert_eq!(first_handle.cancel(), crate::exec::CancelOutcome::Requested);
+        assert_eq!(
+            second_handle.cancel(),
+            crate::exec::CancelOutcome::Requested
+        );
+    }
+
+    #[test]
+    fn cooperative_cancel_mismatched_handle_quarantines_both_without_cspace_change() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let first_domain = domain(72);
+        let second_domain = domain(73);
+        let first = registry.reserve(first_domain).unwrap();
+        let second = registry.reserve(second_domain).unwrap();
+        let first_handle =
+            publish_pending_managed(&registry, first, first_domain, "managed-cancel-first");
+        let second_handle =
+            publish_pending_managed(&registry, second, second_domain, "managed-cancel-second");
+        let first_cspace = cspace_state(&registry, first);
+        let second_cspace = cspace_state(&registry, second);
+
+        assert_eq!(
+            registry.request_cooperative_cancel(first, &second_handle, 0xcafe),
+            Err(RegistryError::IdentityMismatch)
+        );
+        assert_eq!(
+            registry.slot(first).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(
+            registry.slot(second).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(cspace_state(&registry, first), first_cspace);
+        assert_eq!(cspace_state(&registry, second), second_cspace);
+        assert_eq!(first_handle.cancel(), crate::exec::CancelOutcome::Requested);
+        assert_eq!(
+            second_handle.cancel(),
+            crate::exec::CancelOutcome::Requested
         );
     }
 

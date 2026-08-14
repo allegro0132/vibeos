@@ -1137,65 +1137,6 @@ impl PrincipalQuotaTable {
                     .is_some_and(|charge| charge.status.load(Ordering::Acquire) == CHARGE_ACTIVE)
         })
     }
-
-    /// Convert an admission reservation into a rollback-owned committed
-    /// charge for a multi-object checkpoint transaction. Until `finish()` is
-    /// called, dropping the guard performs the same accounting release as an
-    /// explicit authority revocation. This is deliberately separate from an
-    /// ordinary committed charge, whose `Drop` must never mint quota.
-    pub(crate) fn stage_reserved_charge(
-        &self,
-        reservation: QuotaReservation,
-        unique_physical_bytes: u64,
-    ) -> Result<StagedQuotaCharge, QuotaError> {
-        if !Arc::ptr_eq(&self.state, &reservation.state) {
-            return Err(QuotaError::ChargeFromDifferentTable);
-        }
-        let charge = reservation.commit_with_unique_physical(unique_physical_bytes)?;
-        Ok(StagedQuotaCharge {
-            table: self.clone(),
-            charge: Some(charge),
-        })
-    }
-}
-
-/// Rollback guard spanning quota-candidate installation and final checkpoint
-/// publication. It owns the only strong charge reference until publication
-/// succeeds, so cancellation cannot leave an ACTIVE anonymous charge behind.
-#[must_use = "dropping a staged charge rolls back its transient accounting"]
-pub(crate) struct StagedQuotaCharge {
-    table: PrincipalQuotaTable,
-    charge: Option<CommittedQuotaCharge>,
-}
-
-impl StagedQuotaCharge {
-    pub(crate) fn bind_persistent_candidate(
-        &self,
-        stable_object_id: u128,
-        v2_object_id: u128,
-    ) -> Result<(), QuotaError> {
-        self.table.bind_persistent_candidate(
-            stable_object_id,
-            v2_object_id,
-            self.charge
-                .as_ref()
-                .ok_or(QuotaError::InvalidConfiguration)?,
-        )
-    }
-
-    pub(crate) fn finish(mut self) -> CommittedQuotaCharge {
-        self.charge
-            .take()
-            .expect("a staged quota charge finishes at most once")
-    }
-}
-
-impl Drop for StagedQuotaCharge {
-    fn drop(&mut self) {
-        if let Some(charge) = self.charge.take() {
-            let _ = self.table.account_authority_revoked(charge);
-        }
-    }
 }
 
 /// A pending quota transaction.  It is detached from a borrow of the table so
@@ -1489,44 +1430,6 @@ mod tests {
         let table = PrincipalQuotaTable::new(1).unwrap();
         let principal = table.admit_principal(limits(100, 100)).unwrap();
         let charge = table.reserve(&principal, 40, 60, 60).unwrap().commit();
-        drop(charge);
-        let usage = table.principal_usage(&principal).unwrap();
-        assert_eq!(usage.committed_logical_bytes, 40);
-        assert_eq!(usage.committed_physical_bytes, 60);
-    }
-
-    #[test]
-    fn staged_charge_drop_releases_active_accounting_and_candidate() {
-        let table = PrincipalQuotaTable::new(1).unwrap();
-        let principal = table.admit_principal(limits(100, 100)).unwrap();
-        {
-            let staged = table
-                .stage_reserved_charge(table.reserve(&principal, 40, 60, 60).unwrap(), 60)
-                .unwrap();
-            staged.bind_persistent_candidate(7, 11).unwrap();
-            assert!(table.has_active_persistent_candidate(7, 11));
-            assert_eq!(
-                table
-                    .principal_usage(&principal)
-                    .unwrap()
-                    .committed_logical_bytes,
-                40
-            );
-        }
-        let usage = table.principal_usage(&principal).unwrap();
-        assert_eq!(usage.committed_logical_bytes, 0);
-        assert_eq!(usage.committed_physical_bytes, 0);
-        assert!(!table.has_active_persistent_candidate(7, 11));
-    }
-
-    #[test]
-    fn finishing_staged_charge_restores_normal_non_releasing_drop_contract() {
-        let table = PrincipalQuotaTable::new(1).unwrap();
-        let principal = table.admit_principal(limits(100, 100)).unwrap();
-        let staged = table
-            .stage_reserved_charge(table.reserve(&principal, 40, 60, 60).unwrap(), 60)
-            .unwrap();
-        let charge = staged.finish();
         drop(charge);
         let usage = table.principal_usage(&principal).unwrap();
         assert_eq!(usage.committed_logical_bytes, 40);

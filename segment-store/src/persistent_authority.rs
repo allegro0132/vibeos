@@ -777,38 +777,19 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let expected = BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
             .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
-        let verified = self.verify_blob(object).await?;
-        if verified.descriptor != expected {
-            return Ok(false);
-        }
-        let mut offset = 0_usize;
-        for index in 0..verified.descriptor.leaf_count {
-            let chunk = self.get_blob_chunk(object, index).await?;
-            let end = offset
-                .checked_add(chunk.bytes.len())
-                .ok_or(PersistentAuthorityError::PolicyMismatch)?;
-            if recovered.bytes.get(offset..end) != Some(chunk.bytes.as_slice()) {
-                return Ok(false);
-            }
-            offset = end;
-        }
-        Ok(offset == recovered.bytes.len())
+        let bytes = self.read_verified_blob(object).await?;
+        Ok(BlobDescriptor::from_content(object.object_kind(), &bytes)
+            .is_ok_and(|observed| observed == expected)
+            && bytes == recovered.bytes)
     }
 
     pub async fn read_persistent_object(
         &self,
         object: &PersistentObjectHandle,
     ) -> Result<Vec<u8>, PersistentAuthorityError<D::Error>> {
-        let verified = self.verify_blob(object.object.as_ref()).await?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(object.exact_len() as usize)
-            .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
-        for index in 0..verified.descriptor.leaf_count {
-            let chunk = self.get_blob_chunk(object.object.as_ref(), index).await?;
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-        Ok(bytes)
+        self.read_verified_blob(object.object.as_ref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Read an object obtained from this append result. The logical recovered
@@ -825,16 +806,9 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok_or(PersistentAuthorityError::Store(
                     StoreError::ObjectUnavailable,
                 ))?;
-        let verified = self.verify_blob(object.object.as_ref()).await?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(object.exact_len() as usize)
-            .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
-        for index in 0..verified.descriptor.leaf_count {
-            let chunk = self.get_blob_chunk(object.object.as_ref(), index).await?;
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-        Ok(bytes)
+        self.read_verified_blob(object.object.as_ref())
+            .await
+            .map_err(Into::into)
     }
 
     /// Read a boot-local object retained by a transient append witness. The

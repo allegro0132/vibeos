@@ -810,12 +810,66 @@ pub(crate) struct StorageV2Runtime {
     active: SpinLock<Option<ActiveV2Operation>>,
     maintenance: SpinLock<Option<StoreMaintenance>>,
     authority: SpinLock<Option<Arc<PersistentAuthorityView>>>,
+    hot_reads: HotReadCache,
     authority_boot_proved: AtomicBool,
     last_info: SpinLock<Option<vibeos_segment_store::StoreInfo>>,
     boot_selection: AtomicU8,
     needs_rebuild: AtomicBool,
     maintenance_provisioner: StoreMaintenanceProvisioner,
     _quota_provisioner: StorageQuotaProvisioner,
+}
+
+const STORAGE_V2_HOT_READ_CACHE_BYTES: usize = 256 * 1024;
+// Object-store tokens retain the encoded Merkle envelope, so a 64 KiB user
+// blob is slightly larger than 64 KiB at this layer.
+const STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES: usize = 72 * 1024;
+const STORAGE_V2_HOT_READ_CACHE_ENTRIES: usize = 64;
+
+struct HotReadCacheState {
+    bytes: usize,
+    entries: Vec<Arc<[u8]>>,
+}
+
+struct HotReadCache {
+    state: SpinLock<HotReadCacheState>,
+}
+
+impl HotReadCache {
+    fn new() -> Self {
+        Self {
+            state: SpinLock::new_recoverable(HotReadCacheState {
+                bytes: 0,
+                entries: Vec::new(),
+            }),
+        }
+    }
+
+    fn insert(&self, bytes: &[u8]) -> Option<Weak<[u8]>> {
+        if bytes.len() > STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES {
+            return None;
+        }
+        let value: Arc<[u8]> = Arc::from(bytes);
+        let mut state = self.state.lock();
+        while state.entries.len() >= STORAGE_V2_HOT_READ_CACHE_ENTRIES
+            || state.bytes.saturating_add(value.len()) > STORAGE_V2_HOT_READ_CACHE_BYTES
+        {
+            if state.entries.is_empty() {
+                return None;
+            }
+            let evicted = state.entries.remove(0);
+            state.bytes = state.bytes.saturating_sub(evicted.len());
+        }
+        state.bytes += value.len();
+        let weak = Arc::downgrade(&value);
+        state.entries.push(value);
+        Some(weak)
+    }
+
+    fn clear(&self) {
+        let mut state = self.state.lock();
+        state.entries.clear();
+        state.bytes = 0;
+    }
 }
 
 static NEXT_V2_OPERATION: AtomicU64 = AtomicU64::new(1);
@@ -885,6 +939,7 @@ impl StorageV2Runtime {
             active: SpinLock::new_recoverable(None),
             maintenance: SpinLock::new_recoverable(None),
             authority: SpinLock::new_recoverable(None),
+            hot_reads: HotReadCache::new(),
             authority_boot_proved: AtomicBool::new(false),
             last_info: SpinLock::new_recoverable(None),
             boot_selection: AtomicU8::new(0),
@@ -967,6 +1022,43 @@ impl StorageV2Runtime {
         }
     }
 
+    /// Return a previously verified object only while no media operation can
+    /// advance or invalidate the authority generation. Holding `active` for
+    /// the check and copy gives the cache path the same publication ordering
+    /// as a normal store operation without opening a page-device epoch.
+    fn read_hot_bytes(
+        &self,
+        cached: &Weak<[u8]>,
+        expected_generation: u64,
+    ) -> Result<Option<Vec<u8>>, vibeos_object_store::StoreError> {
+        let Some(bytes) = cached.upgrade() else {
+            return Ok(None);
+        };
+        let active = self.active.lock();
+        if active.is_some() {
+            return Err(vibeos_object_store::StoreError::Busy);
+        }
+        let selection = BootStoreSelection::decode(self.boot_selection.load(Ordering::Acquire));
+        let proved = self.authority_boot_proved.load(Ordering::Acquire);
+        let authority = self.authority.lock();
+        let current = authority.as_ref().is_some_and(|view| {
+            view.checkpoint_generation() == expected_generation
+                && cache_metadata_matches_boot_proof(
+                    selection,
+                    proved,
+                    view.root_policy_sha256(),
+                    view.store_uuid(),
+                )
+        });
+        if !current {
+            return Err(vibeos_object_store::StoreError::ObjectUnavailable);
+        }
+        let output = bytes.as_ref().to_vec();
+        drop(authority);
+        drop(active);
+        Ok(Some(output))
+    }
+
     fn install_maintenance_if_missing(
         &self,
         operation: &mut V2Operation,
@@ -991,6 +1083,7 @@ impl StorageV2Runtime {
         self.authority_boot_proved.store(false, Ordering::Release);
         *self.authority.lock() = None;
         *self.last_info.lock() = None;
+        self.hot_reads.clear();
     }
 
     /// Invalidate every proof derived from the current in-memory store after
@@ -2439,6 +2532,38 @@ mod storage_v2_transition_tests {
         }
     }
 
+    #[cfg_attr(test, test)]
+    pub(crate) fn hot_read_cache_has_byte_and_entry_bounds_and_clear_revokes_tokens() {
+        let cache = HotReadCache::new();
+        let mut page = Vec::new();
+        page.resize(64 * 1024, 0x5a);
+        let first = cache.insert(&page).unwrap();
+        for _ in 1..=STORAGE_V2_HOT_READ_CACHE_BYTES / page.len() {
+            cache.insert(&page).unwrap();
+        }
+        assert!(first.upgrade().is_none());
+        {
+            let state = cache.state.lock();
+            assert_eq!(state.bytes, STORAGE_V2_HOT_READ_CACHE_BYTES);
+            assert_eq!(
+                state.entries.len(),
+                STORAGE_V2_HOT_READ_CACHE_BYTES / page.len()
+            );
+        }
+
+        cache.clear();
+        let first_empty = cache.insert(&[]).unwrap();
+        for _ in 1..=STORAGE_V2_HOT_READ_CACHE_ENTRIES {
+            cache.insert(&[]).unwrap();
+        }
+        assert!(first_empty.upgrade().is_none());
+        let survivor = cache.insert(&[1]).unwrap();
+        cache.clear();
+        assert!(survivor.upgrade().is_none());
+        page.resize(STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES + 1, 0);
+        assert!(cache.insert(&page).is_none());
+    }
+
     fn frozen_predecessor(staged: MigrationControl) -> MigrationControl {
         let mut frozen = MigrationControl::frozen(staged.device_id);
         frozen.generation = staged.generation - 1;
@@ -2710,6 +2835,8 @@ pub(crate) fn run_storage_v2_transition_selftests() {
     storage_v2_transition_tests::append_failures_revoke_cache_unless_proved_pre_mutation();
     storage_v2_transition_tests::concurrent_migration_actions_are_busy_without_changing_boot_selection();
     storage_v2_transition_tests::terminal_task_cleanup_releases_only_its_migration_claim();
+    storage_v2_transition_tests::hot_read_cache_has_byte_and_entry_bounds_and_clear_revokes_tokens(
+    );
 }
 
 fn map_facade_error(error: V2RuntimeError) -> vibeos_object_store::StoreError {
@@ -2756,24 +2883,38 @@ fn append_error_requires_cold_recovery(error: V2RuntimeError) -> bool {
 
 fn recovered_v2_snapshot(
     view: &PersistentAuthorityView,
+    hot_reads: &HotReadCache,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
-    recovered_v2_snapshot_with(view.record_stream(), |object| {
+    let authority_generation = view.checkpoint_generation();
+    recovered_v2_snapshot_with(view.record_stream(), hot_reads, |object| {
         view.object_for_recovered(object)
-            .map(|handle| StorageV2ReadToken::Persistent(handle.clone()))
+            .map(|handle| StorageV2ReadToken::Persistent {
+                handle: handle.clone(),
+                authority_generation,
+                cached: None,
+            })
     })
 }
 
 fn appended_v2_snapshot(
     view: &PersistentAuthorityView,
     transient: Arc<PersistentAuthorityTransientObjects>,
+    hot_reads: &HotReadCache,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
-    recovered_v2_snapshot_with(view.record_stream(), |object| {
+    let authority_generation = view.checkpoint_generation();
+    recovered_v2_snapshot_with(view.record_stream(), hot_reads, |object| {
         if let Some(handle) = view.object_for_recovered(object) {
-            Some(StorageV2ReadToken::Persistent(handle.clone()))
+            Some(StorageV2ReadToken::Persistent {
+                handle: handle.clone(),
+                authority_generation,
+                cached: None,
+            })
         } else if transient.object_for_recovered(object).is_some() {
             Some(StorageV2ReadToken::Transient {
                 witness: transient.clone(),
                 recovered: system_arc(object.clone()),
+                authority_generation,
+                cached: None,
             })
         } else {
             None
@@ -2783,11 +2924,45 @@ fn appended_v2_snapshot(
 
 #[derive(Clone)]
 enum StorageV2ReadToken {
-    Persistent(PersistentObjectHandle),
+    Persistent {
+        handle: PersistentObjectHandle,
+        authority_generation: u64,
+        cached: Option<Weak<[u8]>>,
+    },
     Transient {
         witness: Arc<PersistentAuthorityTransientObjects>,
         recovered: Arc<vibeos_durable_format::RecoveredObject>,
+        authority_generation: u64,
+        cached: Option<Weak<[u8]>>,
     },
+}
+
+impl StorageV2ReadToken {
+    fn cache_verified_bytes(
+        &mut self,
+        recovered: &vibeos_durable_format::RecoveredObject,
+        cache: &HotReadCache,
+    ) {
+        match self {
+            Self::Persistent { handle, cached, .. }
+                if handle.object_kind() == recovered.object_kind.get()
+                    && handle.exact_len() == recovered.bytes.len() as u64 =>
+            {
+                *cached = cache.insert(&recovered.bytes);
+            }
+            Self::Transient {
+                recovered: token_object,
+                cached,
+                ..
+            } if token_object.object_id == recovered.object_id
+                && token_object.object_kind == recovered.object_kind
+                && token_object.bytes.len() == recovered.bytes.len() =>
+            {
+                *cached = cache.insert(&recovered.bytes);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn decode_authority_records(
@@ -2813,16 +2988,18 @@ fn decode_authority_records(
 
 fn recovered_v2_snapshot_with(
     record_stream: &[u8],
+    hot_reads: &HotReadCache,
     resolve: impl Fn(&vibeos_durable_format::RecoveredObject) -> Option<StorageV2ReadToken>,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    let result = build_recovered_v2_snapshot(record_stream, resolve);
+    let result = build_recovered_v2_snapshot(record_stream, hot_reads, resolve);
     system.restore();
     result
 }
 
 fn build_recovered_v2_snapshot(
     record_stream: &[u8],
+    hot_reads: &HotReadCache,
     resolve: impl Fn(&vibeos_durable_format::RecoveredObject) -> Option<StorageV2ReadToken>,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     use vibeos_durable_format::StoreId;
@@ -2836,7 +3013,8 @@ fn build_recovered_v2_snapshot(
         .try_reserve_exact(preflight.committed_objects().len())
         .map_err(|_| vibeos_object_store::StoreError::InsufficientMemory)?;
     for recovered in preflight.committed_objects() {
-        if let Some(token) = resolve(recovered) {
+        if let Some(mut token) = resolve(recovered) {
+            token.cache_verified_bytes(recovered, hot_reads);
             objects.push(vibeos_object_store::StorageV2RecoveredObject::new(
                 recovered,
                 vibeos_object_store::StorageV2ObjectToken::new(token),
@@ -2896,7 +3074,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             let view = runtime
                 .boot_proved_authority()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
-            recovered_v2_snapshot(&view)
+            recovered_v2_snapshot(&view, &runtime.hot_reads)
         })
     }
 
@@ -2955,7 +3133,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .map_err(map_facade_error)?;
             let (view, transient) = appended.into_parts();
             let transient = system_arc(transient);
-            let snapshot = match appended_v2_snapshot(&view, transient) {
+            let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     runtime.invalidate_recovery_cache();
@@ -2972,24 +3150,62 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
         object: &'a vibeos_object_store::StorageV2ObjectToken,
     ) -> vibeos_object_store::StorageV2Future<'a, Vec<u8>> {
         Box::pin(async move {
-            let runtime = INSTALLED_V2_RUNTIME
-                .lock()
-                .as_ref()
-                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
-                .cloned()
-                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let installed_current = {
+                let installed = INSTALLED_V2_RUNTIME.lock();
+                installed
+                    .as_ref()
+                    .is_some_and(|runtime| core::ptr::eq(runtime.as_ref(), self))
+            };
+            if !installed_current {
+                return Err(vibeos_object_store::StoreError::Corrupt);
+            }
             let token = object
                 .downcast_ref::<StorageV2ReadToken>()
                 .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
             match token {
-                StorageV2ReadToken::Persistent(handle) => runtime
-                    .read_persistent_object(handle)
-                    .await
-                    .map_err(map_facade_error),
-                StorageV2ReadToken::Transient { witness, recovered } => runtime
-                    .read_transient_object(witness, recovered)
-                    .await
-                    .map_err(map_facade_error),
+                StorageV2ReadToken::Persistent {
+                    handle,
+                    authority_generation,
+                    cached,
+                } => {
+                    if let Some(bytes) = cached.as_ref() {
+                        if let Some(output) = self.read_hot_bytes(bytes, *authority_generation)? {
+                            return Ok(output);
+                        }
+                    }
+                    let runtime = INSTALLED_V2_RUNTIME
+                        .lock()
+                        .as_ref()
+                        .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                        .cloned()
+                        .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+                    runtime
+                        .read_persistent_object(handle)
+                        .await
+                        .map_err(map_facade_error)
+                }
+                StorageV2ReadToken::Transient {
+                    witness,
+                    recovered,
+                    authority_generation,
+                    cached,
+                } => {
+                    if let Some(bytes) = cached.as_ref() {
+                        if let Some(output) = self.read_hot_bytes(bytes, *authority_generation)? {
+                            return Ok(output);
+                        }
+                    }
+                    let runtime = INSTALLED_V2_RUNTIME
+                        .lock()
+                        .as_ref()
+                        .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                        .cloned()
+                        .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+                    runtime
+                        .read_transient_object(witness, recovered)
+                        .await
+                        .map_err(map_facade_error)
+                }
             }
         })
     }

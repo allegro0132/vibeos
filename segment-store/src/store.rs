@@ -524,6 +524,10 @@ pub struct SegmentStore<D> {
     pub(crate) poisoned: bool,
     pub(crate) pins: SharedStorePinRegistry,
     pub(crate) published_generation: alloc::sync::Arc<AtomicU64>,
+    /// Runtime-only proof that every CAS payload/tree in this exact mounted
+    /// generation passed a complete scrub or an equivalent verified successor.
+    /// It is never reconstructed from checkpoint metadata alone.
+    pub(crate) verified_cas_generation: AtomicU64,
     pub(crate) typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
     pub(crate) maintenance_domain: alloc::sync::Arc<MaintenanceDomain>,
     pub(crate) quota: Option<PrincipalQuotaTable>,
@@ -546,6 +550,7 @@ impl<D: PageDevice> SegmentStore<D> {
             poisoned: false,
             pins: runtime.pins,
             published_generation: runtime.published_generation,
+            verified_cas_generation: AtomicU64::new(0),
             typed_reference_kinds: runtime.typed_reference_kinds,
             maintenance_domain: runtime.maintenance_domain,
             quota: runtime.quota,
@@ -778,6 +783,7 @@ impl<D: PageDevice> SegmentStore<D> {
     }
 
     pub async fn mount(&mut self) -> Result<StoreInfo, StoreError<D::Error>> {
+        self.verified_cas_generation.store(0, Ordering::Release);
         self.mounted = None;
         self.poisoned = false;
         validate_limits(self.limits)?;
@@ -891,13 +897,16 @@ impl<D: PageDevice> SegmentStore<D> {
     }
 
     /// Install an ordinary commit successor without decoding the already
-    /// mounted predecessor from media a second time. The successor itself is
-    /// still recovered exclusively from durable bytes, and the resident
-    /// predecessor is reduced to the same allocation witness used by mount().
+    /// mounted predecessor from media a second time. The successor is built
+    /// only from the transaction bytes that were durably read back before its
+    /// checkpoint was published; this method re-reads the publication pair and
+    /// reduces the predecessor to the same allocation witness used by mount().
     pub(crate) async fn mount_verified_successor(
         &mut self,
         previous: MountedState,
         expected: Checkpoint,
+        mut successor: MountedState,
+        verifies_all_cas: bool,
     ) -> Result<StoreInfo, StoreError<D::Error>> {
         self.mounted = None;
         self.poisoned = true;
@@ -937,26 +946,15 @@ impl<D: PageDevice> SegmentStore<D> {
         if !checkpoint_matches_mounted(predecessor.value(), &previous, self.limits) {
             return Err(StoreError::Corrupt);
         }
+        if !checkpoint_matches_mounted(&expected, &successor, self.limits) {
+            return Err(StoreError::Corrupt);
+        }
 
+        let predecessor_cas_verified =
+            self.verified_cas_generation.load(Ordering::Acquire) == previous.generation;
         let previous_peak = previous.recovery_peak_bytes;
         let witness = CheckpointTransitionWitness::from_mounted(previous);
         let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
-        let remaining = self
-            .limits
-            .recovery_memory_bytes
-            .checked_sub(witness_bytes)
-            .ok_or(StoreError::MemoryLimit)?;
-        let successor_limits = StoreLimits {
-            recovery_memory_bytes: remaining,
-            ..self.limits
-        };
-        let mut successor = recover_state(
-            &self.device,
-            *selected_super.value(),
-            selected,
-            successor_limits,
-        )
-        .await?;
         validate_checkpoint_transition(&witness, &successor)?;
         let pair_peak = witness_bytes
             .checked_add(successor.recovery_peak_bytes)
@@ -974,8 +972,20 @@ impl<D: PageDevice> SegmentStore<D> {
             return Err(StoreError::RecoveryRequired);
         }
         self.mounted = Some(successor);
+        self.verified_cas_generation.store(
+            if predecessor_cas_verified && verifies_all_cas {
+                expected.binding.generation
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
         self.poisoned = false;
         Ok(info)
+    }
+
+    pub(crate) fn cas_payloads_verified(&self, generation: u64) -> bool {
+        self.verified_cas_generation.load(Ordering::Acquire) == generation
     }
 
     pub async fn put(

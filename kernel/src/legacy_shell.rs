@@ -2681,6 +2681,20 @@ async fn storage_object_bench(
         )),
     };
     let put_ticks = crate::sbi::time().saturating_sub(put_started).max(1);
+    #[cfg(feature = "qemu-virt")]
+    let put_io = crate::virtio_blk::telemetry().saturating_sub(io_started);
+    #[cfg(feature = "milkv-duo")]
+    let put_io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    #[cfg(feature = "qemu-virt")]
+    let put_io = (
+        put_io.requests,
+        put_io.read_requests,
+        put_io.write_requests,
+        put_io.flush_requests,
+        put_io.read_bytes,
+        put_io.write_bytes,
+        put_io.used_interrupts,
+    );
     let Ok(publication) = publication else {
         let status = if backend == "m4" && size > 360 * 1024 {
             "unsupported"
@@ -2736,13 +2750,20 @@ async fn storage_object_bench(
         io.used_interrupts,
     );
     println!(
-        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"get_ticks\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"get_ticks\":{},\"put_block_requests\":{},\"put_block_read_requests\":{},\"put_block_write_requests\":{},\"put_block_flush_requests\":{},\"put_block_read_bytes\":{},\"put_block_write_bytes\":{},\"put_block_used_interrupts\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
         backend,
         size,
         seed,
         exec::timebase_hz(),
         put_ticks,
         get_ticks,
+        put_io.0,
+        put_io.1,
+        put_io.2,
+        put_io.3,
+        put_io.4,
+        put_io.5,
+        put_io.6,
         io.0,
         io.1,
         io.2,

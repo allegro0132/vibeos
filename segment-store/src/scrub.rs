@@ -516,6 +516,8 @@ impl<D: PageDevice> SegmentStore<D> {
             }
             (None, None) => return Ok(report.corrupt(ScrubCorruptionDomain::Anchor)),
         }
+        self.verified_cas_generation
+            .store(current.generation, core::sync::atomic::Ordering::Release);
         Ok(report)
     }
 }

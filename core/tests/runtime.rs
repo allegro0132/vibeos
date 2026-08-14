@@ -30,6 +30,9 @@ static CLEANED_TASKS: Mutex<Vec<(exec::TaskId, AllocationDomain)>> = Mutex::new(
 static FAULT_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 static NOTIFY_EXPECTED_IDS: Mutex<Vec<exec::TaskId>> = Mutex::new(Vec::new());
 static NOTIFY_CALLS: AtomicU64 = AtomicU64::new(0);
+static EXCLUSIVE_REGISTRY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EXCLUSIVE_NOTIFY_EXPECTED: Mutex<Vec<(exec::TaskId, AllocationDomain, exec::HartId)>> =
+    Mutex::new(Vec::new());
 static EXPECTED_EXCLUSIVE_FAULT: Mutex<Option<exec::TaskHandle>> = Mutex::new(None);
 static EXCLUSIVE_FAULT_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
 static SHARED_TEARDOWN_SIBLING: Mutex<Option<exec::TaskHandle>> = Mutex::new(None);
@@ -168,6 +171,29 @@ fn assert_batch_published_from_notify(_hart: exec::HartId) {
 
 fn panic_after_batch_publication(_hart: exec::HartId) {
     panic!("synthetic ready notification failure after publication")
+}
+
+fn assert_exclusive_batch_active_from_notify(_hart: exec::HartId) {
+    assert!(
+        EXCLUSIVE_REGISTRY_ACTIVE.load(Ordering::Acquire),
+        "ready notification preceded registry activation"
+    );
+    let expected = EXCLUSIVE_NOTIFY_EXPECTED.lock().unwrap().clone();
+    assert!(!expected.is_empty());
+    for (id, domain, home_hart) in expected {
+        assert!(exec::task_report().iter().any(|task| task.id == id));
+        assert_eq!(exec::task_queue_owner(id), Some(home_hart));
+        assert_eq!(
+            exec::reclaimable_domain_snapshot(domain),
+            Some(exec::ReclaimableDomainSnapshot {
+                home_hart,
+                live_tasks: 1,
+                exclusive: true,
+                phase: exec::ReclaimableDomainPhase::Active,
+            })
+        );
+    }
+    NOTIFY_CALLS.fetch_add(1, Ordering::SeqCst);
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -597,6 +623,595 @@ fn empty_prepared_batch_fails_without_scheduler_effect() {
         Err(exec::PreparedTaskBatchError::Empty)
     ));
     assert_eq!(exec::task_report(), reports_before);
+}
+
+#[test]
+fn exclusive_prepared_task_is_inert_until_exact_registry_activation() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let home = exec::HartId::new(2).unwrap();
+    let domain = AllocationDomain::new(OwnerId::new(21_001), ArenaId::new(31_001));
+    let registry_active = Arc::new(AtomicBool::new(false));
+    let observed_active = registry_active.clone();
+    let mut batch = exec::PreparedTaskBatch::new();
+    {
+        let _hart = TestHartScope::enter(home.index());
+        unsafe {
+            batch.prepare_exclusive_reclaimable_owned(
+                domain,
+                "prepared-exclusive-inert",
+                async move {
+                    assert!(observed_active.load(Ordering::Acquire));
+                },
+            );
+        }
+    }
+    let handle = batch.prepared_handles()[0].clone();
+    let binding = batch.prepared_reclaimable_bindings()[0];
+    assert!(binding.matches_handle(&handle));
+    assert_eq!(binding.task_id(), handle.id());
+    assert_eq!(binding.allocation_domain(), domain);
+    assert_eq!(binding.home_hart(), home);
+    assert!(!handle.is_published());
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+
+    for hart in 0..exec::MAX_HARTS {
+        let _hart = TestHartScope::enter(hart);
+        assert_eq!(
+            exec::wake_with_disposition(handle.id()),
+            exec::WakeDisposition::Inactive
+        );
+        assert_eq!(exec::task_queue_owner(handle.id()), None);
+        assert!(exec::task_report()
+            .iter()
+            .all(|task| task.id != handle.id()));
+        let _ = exec::poll_once();
+        assert!(!handle.is_published());
+    }
+    assert!(matches!(
+        batch.publish(),
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRequired)
+    ));
+    assert!(!handle.is_published());
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+
+    let activation_calls = AtomicU64::new(0);
+    let published = unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| {
+            activation_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(bindings, &[binding]);
+            assert!(bindings[0].matches_handle(&handle));
+            assert!(!handle.is_published());
+            registry_active.store(true, Ordering::Release);
+            exec::PreparedReclaimableActivation::Activated
+        })
+    }
+    .unwrap();
+    assert_eq!(activation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(published.len(), 1);
+    assert!(handle.is_published());
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(domain),
+        Some(exec::ReclaimableDomainSnapshot {
+            home_hart: home,
+            live_tasks: 1,
+            exclusive: true,
+            phase: exec::ReclaimableDomainPhase::Active,
+        })
+    );
+    let _ = exec::poll_once();
+    assert_eq!(handle.polls(), 0, "hart 0 stole the exclusive task");
+    {
+        let _hart = TestHartScope::enter(home.index());
+        for _ in 0..BUDGET {
+            if handle.state() != TaskState::Running {
+                break;
+            }
+            let _ = exec::poll_once();
+        }
+    }
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+}
+
+#[test]
+fn exclusive_prepared_aliases_are_rejected_before_registry_callback() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let drops = Arc::new(AtomicU64::new(0));
+    let domain = AllocationDomain::new(OwnerId::new(21_002), ArenaId::new(31_002));
+    let mut duplicate = exec::PreparedTaskBatch::new();
+    for name in [
+        "prepared-exclusive-duplicate-a",
+        "prepared-exclusive-duplicate-b",
+    ] {
+        unsafe {
+            duplicate.prepare_exclusive_reclaimable_owned(
+                domain,
+                name,
+                DropBombFuture {
+                    drops: drops.clone(),
+                },
+            );
+        }
+    }
+    let duplicate_calls = AtomicU64::new(0);
+    assert!(matches!(
+        unsafe {
+            duplicate.publish_exclusive_reclaimable_with(|_| {
+                duplicate_calls.fetch_add(1, Ordering::SeqCst);
+                exec::PreparedReclaimableActivation::Activated
+            })
+        },
+        Err(exec::PreparedTaskBatchError::DuplicateReclaimableArena)
+    ));
+    assert_eq!(duplicate_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        unsafe {
+            duplicate.publish_exclusive_reclaimable_with(|_| {
+                duplicate_calls.fetch_add(1, Ordering::SeqCst);
+                exec::PreparedReclaimableActivation::Activated
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    assert!(duplicate
+        .prepared_handles()
+        .iter()
+        .all(|handle| !handle.is_published()));
+    drop(duplicate);
+
+    let arena = ArenaId::new(31_003);
+    let first = AllocationDomain::new(OwnerId::new(21_003), arena);
+    let second = AllocationDomain::new(OwnerId::new(21_004), arena);
+    let mut owner_alias = exec::PreparedTaskBatch::new();
+    unsafe {
+        owner_alias.prepare_exclusive_reclaimable_owned(
+            first,
+            "prepared-exclusive-owner-a",
+            DropBombFuture {
+                drops: drops.clone(),
+            },
+        );
+        owner_alias.prepare_exclusive_reclaimable_owned(
+            second,
+            "prepared-exclusive-owner-b",
+            DropBombFuture {
+                drops: drops.clone(),
+            },
+        );
+    }
+    let alias_calls = AtomicU64::new(0);
+    assert!(matches!(
+        unsafe {
+            owner_alias.publish_exclusive_reclaimable_with(|_| {
+                alias_calls.fetch_add(1, Ordering::SeqCst);
+                exec::PreparedReclaimableActivation::Activated
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ReclaimableDomainMismatch)
+    ));
+    assert_eq!(alias_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        unsafe {
+            owner_alias.publish_exclusive_reclaimable_with(|_| {
+                alias_calls.fetch_add(1, Ordering::SeqCst);
+                exec::PreparedReclaimableActivation::Activated
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    assert_eq!(exec::reclaimable_domain_snapshot(first), None);
+    assert_eq!(exec::reclaimable_domain_snapshot(second), None);
+    drop(owner_alias);
+    assert_eq!(drops.load(Ordering::SeqCst), 0, "tracked rollback ran Drop");
+}
+
+#[test]
+fn exclusive_admission_mismatch_stays_closed_after_the_conflict_retires() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let domain = AllocationDomain::new(OwnerId::new(21_009), ArenaId::new(31_009));
+    let active = unsafe {
+        exec::spawn_exclusive_reclaimable_owned(
+            domain,
+            "prepared-exclusive-existing-conflict",
+            std::future::pending::<()>(),
+        )
+    };
+    let drops = Arc::new(AtomicU64::new(0));
+    let mut batch = exec::PreparedTaskBatch::new();
+    unsafe {
+        // This is an adversarial host test of the unsafe admission boundary:
+        // the live scheduler record, not caller discipline, must reject it.
+        batch.prepare_exclusive_reclaimable_owned(
+            domain,
+            "prepared-exclusive-conflicting-candidate",
+            DropBombFuture {
+                drops: drops.clone(),
+            },
+        );
+    }
+    let callback_calls = AtomicU64::new(0);
+    let first_error = match unsafe {
+        batch.publish_exclusive_reclaimable_with(|_| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            exec::PreparedReclaimableActivation::Activated
+        })
+    } {
+        Err(error) => error,
+        Ok(_) => panic!("a live exclusive domain accepted a second incarnation"),
+    };
+    assert_eq!(
+        first_error,
+        exec::PreparedTaskBatchError::ReclaimableDomainUnavailable
+    );
+    assert!(first_error.requires_registry_quarantine());
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+
+    assert_eq!(active.cancel(), CancelOutcome::Requested);
+    assert_eq!(active.state(), TaskState::Cancelled);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    assert!(matches!(
+        unsafe {
+            batch.publish_exclusive_reclaimable_with(|_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                exec::PreparedReclaimableActivation::Activated
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+    drop(batch);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn rejected_exclusive_binding_is_sticky_and_leaks_conservatively() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+    let drops = Arc::new(AtomicU64::new(0));
+    let domain = AllocationDomain::new(OwnerId::new(21_005), ArenaId::new(31_005));
+    let mut batch = exec::PreparedTaskBatch::new();
+    unsafe {
+        batch.prepare_exclusive_reclaimable_owned(
+            domain,
+            "prepared-exclusive-rejected",
+            DropBombFuture {
+                drops: drops.clone(),
+            },
+        );
+    }
+    let handle = batch.prepared_handles()[0].clone();
+    let calls = AtomicU64::new(0);
+    assert!(matches!(
+        unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(bindings.len(), 1);
+                exec::PreparedReclaimableActivation::Quarantined
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    assert!(matches!(
+        unsafe {
+            batch.publish_exclusive_reclaimable_with(|_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                exec::PreparedReclaimableActivation::Activated
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!handle.is_published());
+    assert_eq!(exec::task_queue_owner(handle.id()), None);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    drop(batch);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(RECLAIMED_DOMAINS.lock().unwrap().is_empty());
+}
+
+#[test]
+fn rejected_mixed_batch_drops_only_the_safe_future() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let safe_drops = Arc::new(AtomicU64::new(0));
+    let tracked_drops = Arc::new(AtomicU64::new(0));
+    let domain = AllocationDomain::new(OwnerId::new(21_010), ArenaId::new(31_010));
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.prepare(
+        "prepared-mixed-safe",
+        DropBombFuture {
+            drops: safe_drops.clone(),
+        },
+    );
+    unsafe {
+        batch.prepare_exclusive_reclaimable_owned(
+            domain,
+            "prepared-mixed-tracked",
+            DropBombFuture {
+                drops: tracked_drops.clone(),
+            },
+        );
+    }
+    let handles = batch.prepared_handles().to_vec();
+    assert!(matches!(
+        unsafe {
+            batch.publish_exclusive_reclaimable_with(|_| {
+                exec::PreparedReclaimableActivation::Quarantined
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    for handle in &handles {
+        assert!(!handle.is_published());
+        assert_eq!(
+            exec::wake_with_disposition(handle.id()),
+            exec::WakeDisposition::Inactive
+        );
+        assert_eq!(exec::task_queue_owner(handle.id()), None);
+    }
+    drop(batch);
+    assert_eq!(safe_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(tracked_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+}
+
+#[test]
+fn mixed_batch_publishes_safe_and_exclusive_members_together() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let ran = Arc::new(AtomicU64::new(0));
+    let safe_ran = ran.clone();
+    let tracked_ran = ran.clone();
+    let registry_active = Arc::new(AtomicBool::new(false));
+    let observed_active = registry_active.clone();
+    let domain = AllocationDomain::new(OwnerId::new(21_013), ArenaId::new(31_013));
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.prepare("prepared-mixed-success-safe", async move {
+        safe_ran.fetch_or(1, Ordering::SeqCst);
+    });
+    unsafe {
+        batch.prepare_exclusive_reclaimable_owned(
+            domain,
+            "prepared-mixed-success-exclusive",
+            async move {
+                assert!(observed_active.load(Ordering::Acquire));
+                tracked_ran.fetch_or(2, Ordering::SeqCst);
+            },
+        );
+    }
+    let handles = batch.prepared_handles().to_vec();
+    let tracked_binding = batch.prepared_reclaimable_bindings()[0];
+    assert_eq!(tracked_binding.task_id(), handles[1].id());
+
+    let published = unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| {
+            assert_eq!(bindings, &[tracked_binding]);
+            assert!(bindings[0].matches_handle(&handles[1]));
+            assert!(!bindings[0].matches_handle(&handles[0]));
+            registry_active.store(true, Ordering::Release);
+            exec::PreparedReclaimableActivation::Activated
+        })
+    }
+    .unwrap();
+    assert_eq!(published.len(), 2);
+    assert!(handles.iter().all(exec::TaskHandle::is_published));
+    assert!(handles.iter().all(|handle| exec::task_report()
+        .iter()
+        .any(|task| task.id == handle.id())));
+    exec::run_until_idle(BUDGET);
+    assert_eq!(ran.load(Ordering::SeqCst), 3);
+    assert!(handles
+        .iter()
+        .all(|handle| handle.state() == TaskState::Exited));
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+}
+
+#[test]
+fn panicking_exclusive_activation_cannot_strand_a_scheduler_node_on_host() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let drops = Arc::new(AtomicU64::new(0));
+    let domain = AllocationDomain::new(OwnerId::new(21_011), ArenaId::new(31_011));
+    let mut batch = exec::PreparedTaskBatch::new();
+    unsafe {
+        batch.prepare_exclusive_reclaimable_owned(
+            domain,
+            "prepared-exclusive-activation-panic",
+            DropBombFuture {
+                drops: drops.clone(),
+            },
+        );
+    }
+    let handle = batch.prepared_handles()[0].clone();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        batch.publish_exclusive_reclaimable_with(|_| panic!("synthetic registry activation panic"))
+    }));
+    assert!(panic.is_err());
+    assert!(!handle.is_published());
+    assert_eq!(
+        exec::wake_with_disposition(handle.id()),
+        exec::WakeDisposition::Inactive
+    );
+    assert_eq!(exec::task_queue_owner(handle.id()), None);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    drop(batch);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    let probe = exec::spawn_tracked("scheduler-after-activation-panic", async {});
+    exec::run_until_idle(BUDGET);
+    assert_eq!(probe.state(), TaskState::Exited);
+}
+
+#[test]
+fn exclusive_multi_hart_batch_is_complete_before_every_notification() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    EXCLUSIVE_REGISTRY_ACTIVE.store(false, Ordering::Release);
+    NOTIFY_CALLS.store(0, Ordering::SeqCst);
+    let mut batch = exec::PreparedTaskBatch::new();
+    let domains = [
+        AllocationDomain::new(OwnerId::new(21_006), ArenaId::new(31_006)),
+        AllocationDomain::new(OwnerId::new(21_007), ArenaId::new(31_007)),
+    ];
+    let homes = [exec::HartId::new(1).unwrap(), exec::HartId::new(3).unwrap()];
+    for (index, (domain, home)) in domains.into_iter().zip(homes).enumerate() {
+        let _hart = TestHartScope::enter(home.index());
+        unsafe {
+            batch.prepare_exclusive_reclaimable_owned(
+                domain,
+                if index == 0 {
+                    "prepared-exclusive-hart-one"
+                } else {
+                    "prepared-exclusive-hart-three"
+                },
+                std::future::pending::<()>(),
+            );
+        }
+    }
+    let handles = batch.prepared_handles().to_vec();
+    *EXCLUSIVE_NOTIFY_EXPECTED.lock().unwrap() = handles
+        .iter()
+        .zip(domains)
+        .zip(homes)
+        .map(|((handle, domain), home)| (handle.id(), domain, home))
+        .collect();
+    exec::set_ready_notify_hook(assert_exclusive_batch_active_from_notify);
+
+    unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| {
+            assert_eq!(bindings.len(), 2);
+            assert!(bindings
+                .iter()
+                .zip(&handles)
+                .all(|(binding, handle)| binding.matches_handle(handle)));
+            EXCLUSIVE_REGISTRY_ACTIVE.store(true, Ordering::Release);
+            exec::PreparedReclaimableActivation::Activated
+        })
+    }
+    .unwrap();
+    exec::clear_ready_notify_hook();
+    assert_eq!(NOTIFY_CALLS.load(Ordering::SeqCst), 2);
+    let _ = exec::poll_once();
+    assert!(handles.iter().all(|handle| handle.polls() == 0));
+    for (handle, home) in handles.iter().zip(homes) {
+        {
+            let _hart = TestHartScope::enter(home.index());
+            for _ in 0..BUDGET {
+                if handle.polls() != 0 {
+                    break;
+                }
+                let _ = exec::poll_once();
+            }
+        }
+        assert_eq!(handle.polls(), 1);
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        {
+            let _hart = TestHartScope::enter(home.index());
+            for _ in 0..BUDGET {
+                if handle.state() != TaskState::Running {
+                    break;
+                }
+                let _ = exec::poll_once();
+            }
+        }
+        assert_eq!(handle.state(), TaskState::Cancelled);
+    }
+    EXCLUSIVE_NOTIFY_EXPECTED.lock().unwrap().clear();
+}
+
+#[test]
+fn exclusive_publication_merges_with_a_nonempty_scheduler_map() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let resident = exec::spawn_tracked(
+        "prepared-exclusive-map-resident",
+        std::future::pending::<()>(),
+    );
+    assert!(exec::poll_once());
+    assert_eq!(resident.polls(), 1);
+
+    let domain = AllocationDomain::new(OwnerId::new(21_012), ArenaId::new(31_012));
+    let mut batch = exec::PreparedTaskBatch::new();
+    unsafe {
+        batch.prepare_exclusive_reclaimable_owned(
+            domain,
+            "prepared-exclusive-nonempty-map",
+            async {},
+        );
+    }
+    let handle = batch.prepared_handles()[0].clone();
+    unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| {
+            assert_eq!(bindings.len(), 1);
+            exec::PreparedReclaimableActivation::Activated
+        })
+    }
+    .unwrap();
+    assert_eq!(resident.state(), TaskState::Running);
+    assert!(exec::task_report()
+        .iter()
+        .any(|task| task.id == resident.id()));
+    assert!(exec::task_report()
+        .iter()
+        .any(|task| task.id == handle.id()));
+    exec::run_until_idle(BUDGET);
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(resident.state(), TaskState::Running);
+    assert_eq!(resident.cancel(), CancelOutcome::Requested);
+    assert_eq!(resident.state(), TaskState::Cancelled);
+}
+
+#[test]
+fn exclusive_notification_panic_cannot_roll_back_registry_publication() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let home = exec::HartId::new(1).unwrap();
+    let domain = AllocationDomain::new(OwnerId::new(21_008), ArenaId::new(31_008));
+    let mut batch = exec::PreparedTaskBatch::new();
+    {
+        let _hart = TestHartScope::enter(home.index());
+        unsafe {
+            batch.prepare_exclusive_reclaimable_owned(
+                domain,
+                "prepared-exclusive-notify-panic",
+                async {},
+            );
+        }
+    }
+    let handle = batch.prepared_handles()[0].clone();
+    exec::set_ready_notify_hook(panic_after_batch_publication);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| {
+            assert_eq!(bindings.len(), 1);
+            exec::PreparedReclaimableActivation::Activated
+        })
+    }));
+    exec::clear_ready_notify_hook();
+    assert!(panic.is_err());
+    assert!(handle.is_published());
+    drop(batch);
+    {
+        let _hart = TestHartScope::enter(home.index());
+        assert!(exec::poll_once());
+    }
+    assert_eq!(handle.state(), TaskState::Exited);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
 }
 
 #[test]

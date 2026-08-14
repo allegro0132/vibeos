@@ -4108,6 +4108,27 @@ impl PreparedPipeline {
                         exec::PreparedTaskBatchError::Capacity => {
                             "stage publication capacity failed"
                         }
+                        exec::PreparedTaskBatchError::ExclusiveBindingRequired => {
+                            "component stage publication requires lifecycle binding"
+                        }
+                        exec::PreparedTaskBatchError::ExclusiveBindingRejected => {
+                            "component lifecycle binding was rejected"
+                        }
+                        exec::PreparedTaskBatchError::DuplicateReclaimableArena => {
+                            "component stages share one exclusive arena"
+                        }
+                        exec::PreparedTaskBatchError::ReclaimableDomainMismatch => {
+                            "component arena owner mismatch"
+                        }
+                        exec::PreparedTaskBatchError::ReclaimableWrongHome => {
+                            "component task home hart mismatch"
+                        }
+                        exec::PreparedTaskBatchError::ReclaimableDomainUnavailable => {
+                            "component arena is unavailable"
+                        }
+                        exec::PreparedTaskBatchError::ReclaimableCapacity => {
+                            "component lifecycle capacity failed"
+                        }
                     },
                 ));
             }

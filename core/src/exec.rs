@@ -1037,6 +1037,7 @@ impl ReclaimableDomainRecord {
 
 /// Fixed SYSTEM-owned scheduler metadata for every active allocator arena.
 /// The table never allocates while SCHED is held or during fault teardown.
+#[derive(Clone, Copy)]
 struct ReclaimableDomains {
     records: [Option<ReclaimableDomainRecord>; heap::MAX_ALLOCATION_ARENAS],
     generations: [u64; heap::MAX_ALLOCATION_ARENAS],
@@ -2004,6 +2005,7 @@ pub unsafe fn spawn_exclusive_reclaimable_owned(
 pub struct PreparedTask {
     id: TaskId,
     queue_owner: HartId,
+    exclusive_reclaimable: bool,
     task: Option<Task>,
 }
 
@@ -2011,13 +2013,104 @@ impl PreparedTask {
     pub const fn id(&self) -> TaskId {
         self.id
     }
+
+    pub const fn is_exclusive_reclaimable(&self) -> bool {
+        self.exclusive_reclaimable
+    }
+}
+
+/// Exact executor identity presented to the SYSTEM-owned instance registry
+/// before one prepared raw-reclaimable task can become runnable.
+///
+/// The status seal is deliberately private: callers can compare this value to
+/// the exact [`TaskHandle`] minted by the same preparation, but cannot assemble
+/// a replacement binding from a recycled TaskId or allocation domain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PreparedReclaimableBinding {
+    batch: u64,
+    task: TaskId,
+    domain: AllocationDomain,
+    home_hart: HartId,
+    status_identity: usize,
+}
+
+impl PreparedReclaimableBinding {
+    pub const fn task_id(self) -> TaskId {
+        self.task
+    }
+
+    pub const fn allocation_domain(self) -> AllocationDomain {
+        self.domain
+    }
+
+    pub const fn home_hart(self) -> HartId {
+        self.home_hart
+    }
+
+    /// Check the complete executor identity, including the exact TaskStatus
+    /// object rather than only its externally visible TaskId and domain.
+    pub fn matches_handle(self, handle: &TaskHandle) -> bool {
+        self.task == handle.id
+            && self.domain == handle.domain
+            && self.status_identity == Arc::as_ptr(&handle.status) as usize
+    }
+}
+
+impl fmt::Debug for PreparedReclaimableBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedReclaimableBinding")
+            .field("batch", &self.batch)
+            .field("task", &self.task)
+            .field("domain", &self.domain)
+            .field("home_hart", &self.home_hart)
+            .field("status_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Result of the panic-free SYSTEM registry activation transaction executed at
+/// the prepared scheduler publication boundary.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedReclaimableActivation {
+    Activated,
+    /// Every involved stable registry entry is already sticky-quarantined.
+    Quarantined,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedTaskBatchError {
     Empty,
     AlreadyPublished,
+    /// A raw-reclaimable candidate may only use the registry-aware publication
+    /// entry point.
+    ExclusiveBindingRequired,
+    /// The registry rejected the exact prepared identity. This state is sticky
+    /// and the tracked futures will be abandoned without running Drop.
+    ExclusiveBindingRejected,
+    DuplicateReclaimableArena,
+    ReclaimableDomainMismatch,
+    ReclaimableWrongHome,
+    ReclaimableDomainUnavailable,
+    ReclaimableCapacity,
     Capacity,
+}
+
+impl PreparedTaskBatchError {
+    /// Whether a caller that already bound stable instance records must leave
+    /// them quarantined and abandon every tracked candidate. Pure capacity and
+    /// API-order errors do not claim an identity mismatch.
+    pub const fn requires_registry_quarantine(self) -> bool {
+        matches!(
+            self,
+            Self::ExclusiveBindingRejected
+                | Self::DuplicateReclaimableArena
+                | Self::ReclaimableDomainMismatch
+                | Self::ReclaimableWrongHome
+                | Self::ReclaimableDomainUnavailable
+        )
+    }
 }
 
 /// A bounded collection of task envelopes held entirely outside the global
@@ -2028,7 +2121,9 @@ pub struct PreparedTaskBatch {
     id: u64,
     tasks: Vec<PreparedTask>,
     handles: Vec<TaskHandle>,
+    reclaimable_bindings: Vec<PreparedReclaimableBinding>,
     published: bool,
+    binding_rejected: bool,
     publication: Arc<AtomicBool>,
 }
 
@@ -2041,7 +2136,9 @@ impl PreparedTaskBatch {
             id: next_prepared_batch_id(),
             tasks: Vec::new(),
             handles: Vec::new(),
+            reclaimable_bindings: Vec::new(),
             published: false,
+            binding_rejected: false,
             publication,
         }
     }
@@ -2050,9 +2147,13 @@ impl PreparedTaskBatch {
         &mut self,
         additional: usize,
     ) -> Result<(), alloc::collections::TryReserveError> {
-        assert!(!self.published, "a published task batch is immutable");
+        assert!(
+            !self.published && !self.binding_rejected,
+            "a closed task batch is immutable"
+        );
         self.tasks.try_reserve_exact(additional)?;
-        self.handles.try_reserve_exact(additional)
+        self.handles.try_reserve_exact(additional)?;
+        self.reclaimable_bindings.try_reserve_exact(additional)
     }
 
     /// Borrow opaque, non-owning lifecycle tokens for the candidates already
@@ -2064,18 +2165,67 @@ impl PreparedTaskBatch {
         &self.handles
     }
 
+    /// Exact, non-owning executor identities for the raw-reclaimable members
+    /// of this batch. A SYSTEM registry binds these to its reserved stable
+    /// slots before calling `publish_exclusive_reclaimable_with`.
+    pub fn prepared_reclaimable_bindings(&self) -> &[PreparedReclaimableBinding] {
+        &self.reclaimable_bindings
+    }
+
     pub fn prepare(
         &mut self,
         name: &str,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> &PreparedTask {
-        assert!(!self.published, "a published task batch is immutable");
+        assert!(
+            !self.published && !self.binding_rejected,
+            "a closed task batch is immutable"
+        );
         let domain = heap::current_domain();
         assert!(
             !domain.arena.is_tracked(),
             "safe prepared tasks cannot enter a raw-reclaimable arena"
         );
-        self.prepare_domain(domain, current_queue_hart(), true, name, fut)
+        self.prepare_domain(domain, current_queue_hart(), true, false, name, fut)
+    }
+
+    /// Prepare one hart-affine task whose future allocation belongs to an
+    /// audited raw-reclaimable arena. The task stays absent from every global
+    /// scheduler projection until the exact binding above has been accepted by
+    /// the SYSTEM instance registry during special publication.
+    ///
+    /// # Safety
+    ///
+    /// `domain` must name a live, exclusively reserved component incarnation.
+    /// The future and everything it captures must remain inside that arena or
+    /// in stable SYSTEM objects represented only by opaque non-owning tokens.
+    /// The caller must bind the returned task identity to exactly one stable
+    /// registry slot before special publication. Dropping an unpublished batch
+    /// deliberately leaks this future; no Rust destructor is run in the raw
+    /// arena and this function never authorizes reset or reclamation.
+    pub unsafe fn prepare_exclusive_reclaimable_owned(
+        &mut self,
+        domain: AllocationDomain,
+        name: &str,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> &PreparedTask {
+        assert!(
+            !self.published && !self.binding_rejected,
+            "a closed task batch is immutable"
+        );
+        assert!(
+            domain.arena.is_tracked(),
+            "an exclusive prepared task needs a tracked arena"
+        );
+        assert!(
+            domain.owner != OwnerId::SYSTEM,
+            "SYSTEM cannot be a raw-reclaimable component arena"
+        );
+        assert!(
+            load_fault_reclaimer().is_some(),
+            "an exclusive prepared task needs an installed fault reclaimer"
+        );
+        self.prepare_domain(domain, current_queue_hart(), false, true, name, fut)
     }
 
     fn prepare_domain(
@@ -2083,6 +2233,7 @@ impl PreparedTaskBatch {
         domain: AllocationDomain,
         queue_owner: HartId,
         stealable: bool,
+        exclusive_reclaimable: bool,
         name: &str,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> &PreparedTask {
@@ -2092,6 +2243,11 @@ impl PreparedTaskBatch {
         self.handles
             .try_reserve_exact(1)
             .unwrap_or_else(|_| panic!("prepared task handle allocation failed"));
+        if exclusive_reclaimable {
+            self.reclaimable_bindings
+                .try_reserve_exact(1)
+                .unwrap_or_else(|_| panic!("prepared task binding allocation failed"));
+        }
         let (mut task, handle) = make_task(
             domain,
             queue_owner,
@@ -2103,9 +2259,20 @@ impl PreparedTaskBatch {
         task.publication = TaskPublication::Prepared(self.id);
         let id = task.id;
 
+        if exclusive_reclaimable {
+            self.reclaimable_bindings.push(PreparedReclaimableBinding {
+                batch: self.id,
+                task: id,
+                domain,
+                home_hart: queue_owner,
+                status_identity: Arc::as_ptr(&handle.status) as usize,
+            });
+        }
+
         self.tasks.push(PreparedTask {
             id,
             queue_owner,
+            exclusive_reclaimable,
             task: Some(task),
         });
         self.handles.push(handle);
@@ -2121,8 +2288,14 @@ impl PreparedTaskBatch {
         if self.published {
             return Err(PreparedTaskBatchError::AlreadyPublished);
         }
+        if self.binding_rejected {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRejected);
+        }
         if self.tasks.is_empty() {
             return Err(PreparedTaskBatchError::Empty);
+        }
+        if !self.reclaimable_bindings.is_empty() {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRequired);
         }
 
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
@@ -2197,6 +2370,229 @@ impl PreparedTaskBatch {
         }
         Ok(core::mem::take(&mut self.handles))
     }
+
+    /// Publish a mixed batch containing one or more exclusive raw-reclaimable
+    /// tasks after a SYSTEM-owned registry has already bound their exact
+    /// identities. Ordinary safe candidates in the same batch share the same
+    /// all-or-none scheduler publication.
+    ///
+    /// The executor first simulates every tracked admission in a private copy
+    /// of its fixed domain table, reserves all queues, and constructs a private
+    /// BTree node set. It then calls `activate` while holding `SCHED`, but before
+    /// changing any global scheduler projection. Only an accepted, complete
+    /// registry transaction is followed by the map/ready/publication commit
+    /// and post-lock notifications. The map merge remains SYSTEM-charged; a
+    /// target allocation failure takes the kernel's explicit fatal allocator
+    /// path and cannot return through a component landing pad.
+    ///
+    /// # Safety
+    ///
+    /// `activate` must validate every supplied binding against already-bound
+    /// stable registry records and atomically transition the complete set to
+    /// its active phase. It must not allocate, block, panic, acquire a CSpace or
+    /// heap lock, or call any executor operation; its only permitted lock order
+    /// is `SCHED -> registry`. On
+    /// [`PreparedReclaimableActivation::Quarantined`], it must leave every
+    /// involved record sticky-quarantined. It must never reset or reclaim an
+    /// arena. Code that holds the registry lock must never call this method.
+    pub unsafe fn publish_exclusive_reclaimable_with(
+        &mut self,
+        activate: impl FnOnce(&[PreparedReclaimableBinding]) -> PreparedReclaimableActivation,
+    ) -> Result<Vec<TaskHandle>, PreparedTaskBatchError> {
+        if self.published {
+            return Err(PreparedTaskBatchError::AlreadyPublished);
+        }
+        if self.binding_rejected {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRejected);
+        }
+        if self.tasks.is_empty() {
+            return Err(PreparedTaskBatchError::Empty);
+        }
+        if self.reclaimable_bindings.is_empty() {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRequired);
+        }
+
+        // Reject aliases before entering the scheduler or invoking registry
+        // code. Equality by ArenaId is deliberate: a wrong OwnerId must not
+        // turn the same raw allocation incarnation into a second domain.
+        for (index, binding) in self.reclaimable_bindings.iter().enumerate() {
+            for other in &self.reclaimable_bindings[index + 1..] {
+                if binding.domain.arena != other.domain.arena {
+                    continue;
+                }
+                self.binding_rejected = true;
+                return Err(if binding.domain == other.domain {
+                    PreparedTaskBatchError::DuplicateReclaimableArena
+                } else {
+                    PreparedTaskBatchError::ReclaimableDomainMismatch
+                });
+            }
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut s = SCHED.lock();
+
+        // Validate all batch-local envelopes before planning any admission.
+        for prepared in &self.tasks {
+            let task = prepared
+                .task
+                .as_ref()
+                .expect("unpublished batch retains every candidate");
+            assert_eq!(task.publication, TaskPublication::Prepared(self.id));
+            assert!(!task.ready);
+            assert_eq!(
+                task.domain.arena.is_tracked(),
+                prepared.exclusive_reclaimable
+            );
+            assert_eq!(task.stealable, !prepared.exclusive_reclaimable);
+            assert!(!s.tasks.contains_key(&prepared.id));
+            assert!(!s.ready.contains(prepared.id));
+        }
+
+        // `staged` owns the complete generational admission plan. Failure of a
+        // later member cannot leave an earlier domain record in global state.
+        let mut staged = s.reclaimable_domains;
+        for prepared in &self.tasks {
+            if !prepared.exclusive_reclaimable {
+                continue;
+            }
+            let task = prepared
+                .task
+                .as_ref()
+                .expect("validated tracked candidate remains batch-local");
+            if let Err(error) = staged.admit(
+                task.domain,
+                task.queue_owner,
+                ReclaimableDomainMode::Exclusive,
+                task.id,
+                &task.status,
+            ) {
+                let error = map_prepared_reclaimable_error(error);
+                if error.requires_registry_quarantine() {
+                    self.binding_rejected = true;
+                }
+                drop(s);
+                system.restore();
+                return Err(error);
+            }
+        }
+
+        let live_after_publish = s
+            .tasks
+            .len()
+            .checked_add(s.running_count())
+            .and_then(|live| live.checked_add(self.tasks.len()))
+            .expect("live task count overflow");
+        if s.ready.reserve_live_bound(live_after_publish).is_err() {
+            drop(s);
+            system.restore();
+            return Err(PreparedTaskBatchError::Capacity);
+        }
+
+        // Attach the opaque scheduler generation and build a private BTree
+        // before registry activation. Appending into a nonempty global tree may
+        // still split SYSTEM nodes; its only failure path is the target fatal
+        // allocator handler. A callback panic on a host drops only this private
+        // envelope map (whose futures are ManuallyDrop) and cannot strand a
+        // hidden node or unmatched generation in global SCHED.
+        let mut staged_tasks = BTreeMap::new();
+        for prepared in &mut self.tasks {
+            let mut task = prepared
+                .task
+                .take()
+                .expect("validated candidate remains batch-local");
+            if prepared.exclusive_reclaimable {
+                task.reclaimable_domain = Some(
+                    staged
+                        .record(task.domain)
+                        .expect("staged exclusive admission remains exact")
+                        .key,
+                );
+            }
+            assert!(
+                staged_tasks.insert(prepared.id, task).is_none(),
+                "fresh TaskId collided during exclusive batch staging"
+            );
+        }
+
+        // Sticky-close before entering trusted registry code. On host unwind
+        // the scheduler guard is released and tracked futures remain forgotten;
+        // target callbacks are additionally required to be panic-free because
+        // task fault landing pads use non-local return rather than Rust unwind.
+        self.binding_rejected = true;
+        if activate(&self.reclaimable_bindings) != PreparedReclaimableActivation::Activated {
+            // Registry rejection is sticky, while global executor state was
+            // never changed. Restore local envelopes without allocation so
+            // Drop forgets tracked futures and normally reclaims safe ones.
+            for prepared in &mut self.tasks {
+                prepared.task = Some(
+                    staged_tasks
+                        .remove(&prepared.id)
+                        .expect("rejected staged candidate remains private"),
+                );
+            }
+            debug_assert!(staged_tasks.is_empty());
+            check_sched!(&s);
+            drop(s);
+            system.restore();
+            return Err(PreparedTaskBatchError::ExclusiveBindingRejected);
+        }
+
+        // No recoverable branch follows registry activation. BTreeMap::append
+        // may split a nonempty SYSTEM tree; target SYSTEM OOM is an explicit
+        // machine fail-stop, not a component fault. The SCHED lock keeps every
+        // internally ready task undispatchable until the shared publication
+        // flag and complete domain table agree.
+        s.tasks.append(&mut staged_tasks);
+        debug_assert!(staged_tasks.is_empty());
+        s.reclaimable_domains = staged;
+        for prepared in &self.tasks {
+            let (owner, stealable) = {
+                let task = s
+                    .tasks
+                    .get_mut(&prepared.id)
+                    .expect("activated prepared task remains installed");
+                task.publication = TaskPublication::Published;
+                task.ready = true;
+                (task.queue_owner, task.stealable)
+            };
+            s.ready
+                .enqueue(owner, prepared.id, stealable)
+                .expect("activated task has unique reserved queue capacity");
+        }
+        self.publication.store(true, Ordering::Release);
+        self.published = true;
+        self.binding_rejected = false;
+        check_sched!(&s);
+        drop(s);
+        system.restore();
+        for prepared in &self.tasks {
+            notify_ready_hart(prepared.queue_owner);
+        }
+        Ok(core::mem::take(&mut self.handles))
+    }
+}
+
+fn map_prepared_reclaimable_error(error: ReclaimableDomainError) -> PreparedTaskBatchError {
+    match error {
+        ReclaimableDomainError::TableFull | ReclaimableDomainError::GenerationExhausted => {
+            PreparedTaskBatchError::ReclaimableCapacity
+        }
+        ReclaimableDomainError::DomainMismatch => PreparedTaskBatchError::ReclaimableDomainMismatch,
+        ReclaimableDomainError::WrongHome => PreparedTaskBatchError::ReclaimableWrongHome,
+        ReclaimableDomainError::Missing
+        | ReclaimableDomainError::NotActive
+        | ReclaimableDomainError::Exclusive
+        | ReclaimableDomainError::LiveTaskOverflow
+        | ReclaimableDomainError::LiveTaskMismatch
+        | ReclaimableDomainError::RemoteRunning
+        | ReclaimableDomainError::KeyMismatch
+        | ReclaimableDomainError::TaskMismatch
+        | ReclaimableDomainError::StatusMismatch
+        | ReclaimableDomainError::LifecycleMismatch => {
+            PreparedTaskBatchError::ReclaimableDomainUnavailable
+        }
+    }
 }
 
 impl Default for PreparedTaskBatch {
@@ -2212,7 +2608,11 @@ impl Drop for PreparedTaskBatch {
         }
         for prepared in &mut self.tasks {
             if let Some(task) = prepared.task.take() {
-                rollback_unpublished_task(task);
+                if prepared.exclusive_reclaimable {
+                    abandon_task_without_drop(task);
+                } else {
+                    rollback_unpublished_task(task);
+                }
             }
         }
     }
@@ -4240,6 +4640,107 @@ impl Future for Yield {
 #[cfg(test)]
 mod reclaimable_domain_tests {
     use super::*;
+
+    #[test]
+    fn prepared_binding_rejects_a_same_number_counterfeit_status() {
+        let domain = AllocationDomain::new(OwnerId::new(90), ArenaId::new(91));
+        let publication = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(TaskStatus::new(publication.clone()));
+        let task = TaskId(9_000);
+        let handle = TaskHandle {
+            id: task,
+            domain,
+            status: status.clone(),
+        };
+        let binding = PreparedReclaimableBinding {
+            batch: 7,
+            task,
+            domain,
+            home_hart: HartId::BOOT,
+            status_identity: Arc::as_ptr(&status) as usize,
+        };
+        let counterfeit = TaskHandle {
+            id: task,
+            domain,
+            status: Arc::new(TaskStatus::new(publication)),
+        };
+
+        assert!(binding.matches_handle(&handle));
+        assert!(!binding.matches_handle(&counterfeit));
+    }
+
+    #[test]
+    fn failed_staged_batch_admission_does_not_advance_the_live_table() {
+        let first_domain = AllocationDomain::new(OwnerId::new(94), ArenaId::new(95));
+        let conflicting_domain = AllocationDomain::new(OwnerId::new(96), first_domain.arena);
+        let home = HartId::BOOT;
+        let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(false))));
+        let live = ReclaimableDomains::new();
+        let generations_before = live.generations;
+        let mut staged = live;
+
+        staged
+            .admit(
+                first_domain,
+                home,
+                ReclaimableDomainMode::Exclusive,
+                TaskId(9_003),
+                &status,
+            )
+            .unwrap();
+        assert!(matches!(
+            staged.admit(
+                conflicting_domain,
+                home,
+                ReclaimableDomainMode::Exclusive,
+                TaskId(9_004),
+                &status,
+            ),
+            Err(ReclaimableDomainError::DomainMismatch)
+        ));
+
+        assert_eq!(live.active_count(), 0);
+        assert_eq!(live.generations, generations_before);
+        assert!(live.record(first_domain).is_none());
+        assert!(live.record(conflicting_domain).is_none());
+    }
+
+    #[test]
+    fn full_staged_domain_table_fails_without_touching_the_source_copy() {
+        let home = HartId::BOOT;
+        let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(false))));
+        let mut live = ReclaimableDomains::new();
+        for index in 0..heap::MAX_ALLOCATION_ARENAS {
+            live.admit(
+                AllocationDomain::new(
+                    OwnerId::new(10_000 + index as u64),
+                    ArenaId::new(20_000 + index as u64),
+                ),
+                home,
+                ReclaimableDomainMode::Exclusive,
+                TaskId(30_000 + index as u64),
+                &status,
+            )
+            .unwrap();
+        }
+        let generations_before = live.generations;
+        let mut staged = live;
+        let overflow = AllocationDomain::new(OwnerId::new(40_000), ArenaId::new(50_000));
+
+        assert!(matches!(
+            staged.admit(
+                overflow,
+                home,
+                ReclaimableDomainMode::Exclusive,
+                TaskId(60_000),
+                &status,
+            ),
+            Err(ReclaimableDomainError::TableFull)
+        ));
+        assert_eq!(live.active_count(), heap::MAX_ALLOCATION_ARENAS);
+        assert_eq!(live.generations, generations_before);
+        assert!(live.record(overflow).is_none());
+    }
 
     #[test]
     fn stale_domain_generation_cannot_resolve_a_reused_slot() {

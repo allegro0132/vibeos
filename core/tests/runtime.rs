@@ -21,7 +21,8 @@ use vibeos_core::chan::Endpoint;
 use vibeos_core::exec::{self, CancelOutcome, TaskExit, TaskState, WaitQueue};
 use vibeos_core::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use vibeos_core::instance::{
-    FaultGateOutcome, InstancePhase, InstanceRegistry, InstanceToken, RegistryError,
+    CooperativeCancelOutcome, FaultGateOutcome, InstancePayload, InstancePhase, InstanceRegistry,
+    InstanceSpace, InstanceToken, RegistryError, TerminalRetireKind,
 };
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -49,6 +50,16 @@ static MANAGED_SECOND_POLLS: AtomicU64 = AtomicU64::new(0);
 static MANAGED_DROPS: AtomicU64 = AtomicU64::new(0);
 static MANAGED_ABANDONED_GUARD_READY: AtomicBool = AtomicBool::new(false);
 static MANAGED_EARLY_FINALIZE_DONE: AtomicBool = AtomicBool::new(false);
+
+struct PendingManagedPayload;
+
+// Safety: this test payload is synchronous, retains neither argument, exports
+// no authority, and has a trivial non-reentrant destructor.
+unsafe impl InstancePayload for PendingManagedPayload {
+    fn poll_quantum(&mut self, _space: &InstanceSpace, _context: &mut Context<'_>) -> Poll<u64> {
+        Poll::Pending
+    }
+}
 
 unsafe fn record_fault_reclaim(
     witness: exec::ReclaimableFaultWitness,
@@ -217,7 +228,7 @@ fn fault_after_abandoning_cspace(poll: &mut dyn FnMut()) -> bool {
     }
     assert!(
         MANAGED_EARLY_FINALIZE_DONE.load(Ordering::Acquire),
-        "concurrent pre-terminal finalize did not return promptly"
+        "concurrent cancel/finalize probe did not return promptly"
     );
     true
 }
@@ -1776,8 +1787,10 @@ fn a_managed_fault_uses_the_exact_registry_witness_and_resets_only_after_termina
     assert_ne!(incarnation, 0);
 
     let finalized = unsafe {
-        registry.finalize(token, handle, |_| {
-            panic!("fault finalization attempted normal arena close")
+        registry.finalize(token, handle, |retired, kind| {
+            assert_eq!(retired, domain);
+            assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+            true
         })
     }
     .unwrap();
@@ -1865,7 +1878,7 @@ fn a_managed_fault_witness_replay_before_finalize_never_reclaims_or_resets_twice
     assert_eq!(registry.snapshot(token), Err(RegistryError::Quarantined));
     assert_eq!(
         unsafe {
-            registry.finalize(token, &handle, |_| {
+            registry.finalize(token, &handle, |_, _| {
                 panic!("a replay-quarantined fault authorized normal close")
             })
         },
@@ -1921,8 +1934,10 @@ fn an_old_managed_fault_witness_cannot_reclaim_or_reset_a_reused_slot() {
         .take()
         .expect("old managed fault retained no witness");
     let finalized = unsafe {
-        registry.finalize(old_token, &old_handle, |_| {
-            panic!("fault finalization attempted normal close")
+        registry.finalize(old_token, &old_handle, |retired, kind| {
+            assert_eq!(retired, old_domain);
+            assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+            true
         })
     }
     .unwrap();
@@ -2098,8 +2113,10 @@ fn managed_instances_on_two_harts_fault_independently() {
         InstancePhase::Active
     );
     unsafe {
-        registry.finalize(second_token, &second, |_| {
-            panic!("fault finalization attempted normal close")
+        registry.finalize(second_token, &second, |retired, kind| {
+            assert_eq!(retired, second_domain);
+            assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+            true
         })
     }
     .unwrap();
@@ -2107,7 +2124,14 @@ fn managed_instances_on_two_harts_fault_independently() {
         let _hart = TestHartScope::enter(1);
         assert_eq!(first.cancel(), CancelOutcome::Requested);
     }
-    unsafe { registry.finalize(first_token, &first, |_| true) }.unwrap();
+    unsafe {
+        registry.finalize(first_token, &first, |retired, kind| {
+            assert_eq!(retired, first_domain);
+            assert_eq!(kind, TerminalRetireKind::Normal);
+            true
+        })
+    }
+    .unwrap();
 
     restore_managed_test_hooks();
 }
@@ -2150,8 +2174,10 @@ fn a_managed_destructor_fault_uses_the_registry_gate() {
         InstancePhase::FaultReclaimed
     );
     unsafe {
-        registry.finalize(token, &handle, |_| {
-            panic!("managed destructor fault attempted normal close")
+        registry.finalize(token, &handle, |retired, kind| {
+            assert_eq!(retired, domain);
+            assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+            true
         })
     }
     .unwrap();
@@ -2160,10 +2186,9 @@ fn a_managed_destructor_fault_uses_the_registry_gate() {
 }
 
 #[test]
-fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize() {
-    const CHILD_ENV: &str = "VIBEOS_MANAGED_ABANDONED_CSPACE_CHILD";
-    const TEST_NAME: &str =
-        "managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize";
+fn managed_cancel_does_not_deadlock_abandoned_cspace_fault_recovery() {
+    const CHILD_ENV: &str = "VIBEOS_MANAGED_CANCEL_ABANDONED_CSPACE_CHILD";
+    const TEST_NAME: &str = "managed_cancel_does_not_deadlock_abandoned_cspace_fault_recovery";
 
     if std::env::var_os(CHILD_ENV).is_none() {
         let executable = std::env::current_exe().expect("runtime test binary has no path");
@@ -2184,7 +2209,7 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("abandoned-CSpace recovery or concurrent finalize deadlocked");
+                panic!("abandoned-CSpace recovery or concurrent cancel deadlocked");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -2205,6 +2230,11 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
     let home = exec::HartId::new(1).unwrap();
     let domain = AllocationDomain::new(OwnerId::new(20_147), ArenaId::new(30_147));
     let token = registry.reserve(domain).unwrap();
+    unsafe {
+        registry
+            .install_payload(token, || PendingManagedPayload)
+            .unwrap();
+    }
     let handle = {
         let _hart = TestHartScope::enter(home.index());
         let future = async move {
@@ -2235,11 +2265,10 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
         publish_managed_test_instance(&registry, token, domain, "managed-abandoned-cspace", future)
     };
 
-    let (early_finalize, elapsed) = std::thread::scope(|scope| {
+    let (cancel_outcome, early_finalize, elapsed) = std::thread::scope(|scope| {
         let concurrent_handle = handle.clone();
         let registry_ref = &registry;
         let attempt = scope.spawn(move || {
-            let hart_scope = TestHartScope::enter(3);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while !MANAGED_ABANDONED_GUARD_READY.load(Ordering::Acquire)
                 && std::time::Instant::now() < deadline
@@ -2250,10 +2279,23 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
                 MANAGED_ABANDONED_GUARD_READY.load(Ordering::Acquire),
                 "managed task never reached the abandoned-guard point"
             );
+            // Do not change the process-global host hart selector until the
+            // child poll has installed its exact hart-1 witness and abandoned
+            // the guard.  The polling thread is now stopped in its fault-guard
+            // barrier, so hart 3 can model the remote cancel deterministically.
+            let hart_scope = TestHartScope::enter(3);
             assert_eq!(concurrent_handle.state(), TaskState::Running);
             let started = std::time::Instant::now();
+            let cancel = registry_ref
+                .request_cooperative_cancel(token, &concurrent_handle, 0x147)
+                .expect("exact concurrent cooperative cancel was rejected");
+            if let CooperativeCancelOutcome::Requested(task) = cancel {
+                // The API returns without any registry lock held.  A caller
+                // may therefore wake only after the stable word is published.
+                exec::wake(task);
+            }
             let result = unsafe {
-                registry_ref.finalize(token, &concurrent_handle, |_| {
+                registry_ref.finalize(token, &concurrent_handle, |_, _| {
                     panic!("pre-terminal finalize attempted arena close")
                 })
             };
@@ -2264,7 +2306,7 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
             // hart 3 and make this ordering test flaky.
             drop(hart_scope);
             MANAGED_EARLY_FINALIZE_DONE.store(true, Ordering::Release);
-            (result, elapsed)
+            (cancel, result, elapsed)
         });
         {
             let _hart = TestHartScope::enter(home.index());
@@ -2273,6 +2315,10 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
         attempt.join().expect("concurrent finalize thread panicked")
     });
 
+    assert_eq!(
+        cancel_outcome,
+        CooperativeCancelOutcome::Requested(handle.id())
+    );
     assert_eq!(early_finalize, Err(RegistryError::TaskNotTerminal));
     assert!(
         elapsed < std::time::Duration::from_secs(1),
@@ -2288,8 +2334,10 @@ fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize
     let incarnation = MANAGED_CSPACE_INCARNATION.load(Ordering::SeqCst);
     assert_ne!(incarnation, 0);
     let finalized = unsafe {
-        registry.finalize(token, &handle, |_| {
-            panic!("fault finalization attempted normal arena close")
+        registry.finalize(token, &handle, |retired, kind| {
+            assert_eq!(retired, domain);
+            assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+            true
         })
     }
     .unwrap();

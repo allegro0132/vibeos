@@ -13,7 +13,9 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::fmt;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Context, Poll};
 
 use crate::cap::{CSpace, CSpaceIdentity};
 use crate::exec::{
@@ -71,6 +73,47 @@ impl InstanceSpace {
     }
 }
 
+/// Arena-owned component state driven one bounded quantum at a time.
+///
+/// The registry, rather than the executor future, owns the boxed trait object.
+/// Implementations must not retain `space`, a CSpace guard, or authority
+/// derived from either argument after [`Self::poll_quantum`] returns.  A
+/// quantum is synchronous: it must not await, block, migrate harts, or arrange
+/// for `self` or `space` to escape through a waker.  It must return with the
+/// same allocation domain installed.  Detached completion data is deliberately
+/// restricted to `u64` so it cannot carry arena ownership.
+///
+/// # Safety
+///
+/// Implementors must obey the no-escape rules above during construction, every
+/// poll, and Drop.  Any allocation, reference, `Arc` control block, trait
+/// object, pointer, or ownership whose storage can be raw-reclaimed with the
+/// instance arena must remain wholly inside the payload.  It must never be
+/// written into a CSpace, SYSTEM/static object, another task, channel, waker or
+/// external callback.  In particular, an arena-backed [`crate::cap::Resource`]
+/// must never be installed into the stable instance CSpace.  External wake,
+/// timer, join, probe, or wait registrations are permitted only through the
+/// exact TaskStatus-owned executor paths which are synchronously drained before
+/// raw fault reclaim; implementors may not create an independent registration
+/// escape path.
+///
+/// The registry exclusively owns CSpace lifecycle.  A payload may use a
+/// short-lived guarded borrow during its quantum, but must not call CSpace
+/// reset APIs, advance its incarnation, enable or alter durable/persistent
+/// lifecycle state, or replace stable authority ownership.  Those operations
+/// remain reserved for the exact terminal registry path.
+///
+/// The destructor is run at most once inside the exact child poll, before
+/// terminal publication.  It must obey the same arena no-escape rules and be
+/// bounded and non-reentrant.  Drop must not change or leak allocator-domain or
+/// arena state, re-enter instance lifecycle APIs, publish ownership, block, or
+/// deliberately unwind.  An architecture fault may non-returningly interrupt
+/// any Drop instruction; the exact fault gate then abandons the tombstoned
+/// allocation and never retries the destructor.
+pub unsafe trait InstancePayload: Send {
+    fn poll_quantum(&mut self, space: &InstanceSpace, context: &mut Context<'_>) -> Poll<u64>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum InstancePhase {
@@ -87,6 +130,16 @@ pub enum InstancePhase {
     NormalClosing = 6,
     NormalTerminal = 7,
     Quarantined = 8,
+    /// The exact child poll has tombstoned the payload and is running its
+    /// normal destructor behind that child's fault landing pad.
+    PayloadDropping = 9,
+    /// The payload destructor completed in the exact child domain.  The
+    /// detached completion word is now stable until terminal finalization.
+    PayloadDropped = 10,
+    /// A fault-reclaimed arena is in its external owner-retirement hook.
+    FaultRetiring = 11,
+    /// Both raw arena reclaim and external owner retirement are complete.
+    FaultTerminal = 12,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +159,7 @@ pub enum RegistryError {
     WrongPhase,
     TaskNotTerminal,
     NormalCloseFailed,
+    TerminalRetireFailed,
     CSpaceResetRejected,
     Quarantined,
 }
@@ -124,6 +178,28 @@ pub enum FaultGateOutcome {
     Quarantined,
 }
 
+/// Allocator/owner action required before a terminal CSpace reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalRetireKind {
+    /// Drop already completed in the child poll (or no payload was installed);
+    /// the hook must close the empty arena and retire its owner registration.
+    Normal,
+    /// Raw arena reclaim already completed; the hook must retire the remaining
+    /// owner registration without attempting a second arena traversal.
+    FaultReclaimed,
+}
+
+/// Result of recording a cooperative payload cancellation request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CooperativeCancelOutcome {
+    /// The stable completion word is installed; wake this task after the
+    /// registry call returns.
+    Requested(TaskId),
+    /// Normal completion already tombstoned or dropped the payload.  The
+    /// caller lost the completion race and must not mutate or wake this slot.
+    AlreadyCompleting,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalizeOutcome {
     /// Number of live volatile capabilities revoked by the exact reset.
@@ -131,6 +207,9 @@ pub struct FinalizeOutcome {
     /// Incarnation installed by the reset.  This is diagnostic evidence, not
     /// an authority token.
     pub next_cspace_incarnation: u64,
+    /// Copy-only value detached from the instance arena by its last completed
+    /// payload quantum, if one completed before terminal publication.
+    pub detached_completion: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +266,14 @@ struct SlotRecord {
     task: Option<TaskHandle>,
     scheduler: Option<ReclaimableSchedulerIdentity>,
     home_hart: Option<HartId>,
+    /// The trait object and its allocation both belong to `domain`.  Wrapping
+    /// the box in ManuallyDrop makes quarantine and raw fault teardown a
+    /// conservative leak rather than an accidental destructor call.
+    payload: Option<ManuallyDrop<Box<dyn InstancePayload>>>,
+    payload_installed: bool,
+    payload_abandoned: bool,
+    payload_completion: Option<u64>,
+    payload_cancel: Option<u64>,
 }
 
 impl SlotRecord {
@@ -201,6 +288,11 @@ impl SlotRecord {
             task: None,
             scheduler: None,
             home_hart: None,
+            payload: None,
+            payload_installed: false,
+            payload_abandoned: false,
+            payload_completion: None,
+            payload_cancel: None,
         }
     }
 
@@ -215,6 +307,11 @@ impl SlotRecord {
         self.task = None;
         self.scheduler = None;
         self.home_hart = None;
+        debug_assert!(self.payload.is_none());
+        self.payload_installed = false;
+        self.payload_abandoned = false;
+        self.payload_completion = None;
+        self.payload_cancel = None;
     }
 }
 
@@ -342,6 +439,11 @@ impl InstanceRegistry {
             record.task = None;
             record.scheduler = None;
             record.home_hart = None;
+            record.payload = None;
+            record.payload_installed = false;
+            record.payload_abandoned = false;
+            record.payload_completion = None;
+            record.payload_cancel = None;
             Self::publish_header(slot, &record);
             let token = InstanceToken {
                 slot: index as u8,
@@ -355,6 +457,141 @@ impl InstanceRegistry {
         drop(_transaction);
         system.restore();
         Err(ReserveError::Capacity)
+    }
+
+    /// Construct and install arena-owned component state in a reserved slot.
+    ///
+    /// Validation is deliberately split around construction.  The first pass
+    /// resolves the exact reserved domain without allocating.  Construction
+    /// then runs in that domain with no registry lock held.  A second pass
+    /// proves that the same token, generation, domain, Space, and CSpace seal
+    /// are still reserved before the registry accepts ownership.  If that
+    /// proof fails, the newly allocated box is abandoned without running its
+    /// destructor and the addressed generation is quarantined.
+    ///
+    /// # Safety
+    ///
+    /// `construct` and `P` must obey the complete tracked-arena no-escape
+    /// contract documented by [`InstancePayload`], including its prohibition
+    /// on publishing arena-backed ownership into the stable CSpace or any
+    /// SYSTEM/static/external object.  Construction must not block, fault, or
+    /// panic after publishing external ownership.  The caller must serialize
+    /// lifecycle coordination so a successful installation precedes
+    /// binding/publication.
+    pub unsafe fn install_payload<P>(
+        &self,
+        token: InstanceToken,
+        construct: impl FnOnce() -> P,
+    ) -> Result<(), RegistryError>
+    where
+        P: InstancePayload + 'static,
+    {
+        let (domain, expected_seal) = {
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            let _transaction = self.transaction.lock();
+            let Some(slot) = self.slot(token) else {
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let mut record = slot.record.lock();
+            let exact_reserved =
+                Self::token_matches(slot, &record, token)
+                    && record.phase == InstancePhase::Reserved
+                    && record.domain.is_some()
+                    && record.prepared.is_none()
+                    && record.task.is_none()
+                    && record.scheduler.is_none()
+                    && record.home_hart.is_none()
+                    && record.payload.is_none()
+                    && !record.payload_installed
+                    && !record.payload_abandoned
+                    && record.payload_completion.is_none()
+                    && record.payload_cancel.is_none()
+                    && record.space.as_deref().zip(record.space_seal).is_some_and(
+                        |(space, seal)| {
+                            if !seal.immutable_objects_match(space) {
+                                return false;
+                            }
+                            let cspace = space.cspace().lock();
+                            seal.reset_preflight_matches(&cspace)
+                        },
+                    );
+            if !exact_reserved {
+                Self::quarantine_locked(slot, &mut record);
+                drop(record);
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::IdentityMismatch);
+            }
+            let result = (
+                record
+                    .domain
+                    .expect("validated reserved payload slot has a domain"),
+                record
+                    .space_seal
+                    .expect("validated reserved payload slot has a Space seal"),
+            );
+            drop(record);
+            drop(_transaction);
+            system.restore();
+            result
+        };
+
+        // Safety: the first pass proved the exact tracked domain retained by
+        // this registry generation; the caller supplies the arena no-escape
+        // proof required by this unsafe installation boundary.
+        let mut allocation = unsafe { heap::enter_domain(domain) };
+        let payload = ManuallyDrop::new(Box::new(construct()) as Box<dyn InstancePayload>);
+        allocation.restore();
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let _transaction = self.transaction.lock();
+        let Some(slot) = self.slot(token) else {
+            // `token` was in range in pass one; retain this fail-stop arm for
+            // completeness if the fixed table representation ever changes.
+            core::mem::forget(payload);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        };
+        let mut record = slot.record.lock();
+        let exact_reserved = Self::token_matches(slot, &record, token)
+            && record.phase == InstancePhase::Reserved
+            && record.domain == Some(domain)
+            && record.space_seal == Some(expected_seal)
+            && record.prepared.is_none()
+            && record.task.is_none()
+            && record.scheduler.is_none()
+            && record.home_hart.is_none()
+            && record.payload.is_none()
+            && !record.payload_installed
+            && !record.payload_abandoned
+            && record.payload_completion.is_none()
+            && record.payload_cancel.is_none()
+            && record.space.as_deref().is_some_and(|space| {
+                if !expected_seal.immutable_objects_match(space) {
+                    return false;
+                }
+                let cspace = space.cspace().lock();
+                expected_seal.reset_preflight_matches(&cspace)
+            });
+        if !exact_reserved {
+            Self::quarantine_locked(slot, &mut record);
+            // The box belongs to the possibly corrupted/revoked arena.  Do
+            // not execute P::drop or deallocate through a mismatched owner.
+            core::mem::forget(payload);
+            drop(record);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        }
+        record.payload = Some(payload);
+        record.payload_installed = true;
+        drop(record);
+        drop(_transaction);
+        system.restore();
+        Ok(())
     }
 
     /// Bind the executor's pre-publication identity and retained status handle
@@ -393,6 +630,9 @@ impl InstanceRegistry {
             && binding.scheduler_identity().is_none()
             && binding.matches_handle(handle)
             && !handle.is_published()
+            && !record.payload_abandoned
+            && record.payload_completion.is_none()
+            && record.payload_cancel.is_none()
             && record
                 .space
                 .as_deref()
@@ -463,6 +703,9 @@ impl InstanceRegistry {
                     .as_ref()
                     .is_some_and(|handle| binding.matches_handle(handle) && !handle.is_published())
                 && record.scheduler.is_none()
+                && !record.payload_abandoned
+                && record.payload_completion.is_none()
+                && record.payload_cancel.is_none()
                 && record
                     .space
                     .as_deref()
@@ -492,6 +735,366 @@ impl InstanceRegistry {
             Self::publish_header(slot, &record);
         }
         PreparedReclaimableActivation::Activated
+    }
+
+    /// Record a cooperative terminal word for an active payload.
+    ///
+    /// This method deliberately does not wake the executor while holding a
+    /// registry lock.  For [`CooperativeCancelOutcome::Requested`], the caller
+    /// must wake the returned TaskId after this method returns.  On the next
+    /// exact child poll, [`Self::poll_payload`]
+    /// tombstones and drops the payload behind that child's fault landing pad,
+    /// then returns the supplied detached word as `Ready`.
+    pub fn request_cooperative_cancel(
+        &self,
+        token: InstanceToken,
+        handle: &TaskHandle,
+        detached_completion: u64,
+    ) -> Result<CooperativeCancelOutcome, RegistryError> {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let _transaction = self.transaction.lock();
+        let Some(slot) = self.slot(token) else {
+            self.quarantine_terminal_candidates_locked(handle);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        };
+        let mut record = slot.record.lock();
+        // Do not acquire the CSpace lock here.  A faulting task may have
+        // abandoned its guard while another hart races cancellation; holding
+        // transaction+slot while waiting for that guard would prevent the
+        // fault reclaimer from entering the registry to recover it.  The next
+        // exact child poll repeats the full sealed CSpace gate before reading
+        // the stable cancellation word.
+        if !Self::structural_identity_matches(slot, &record, token, handle) {
+            Self::quarantine_locked(slot, &mut record);
+            drop(record);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        }
+
+        let outcome = match record.phase {
+            InstancePhase::Active
+                if record.payload_installed
+                    && record.payload.is_some()
+                    && !record.payload_abandoned
+                    && record.payload_completion.is_none() =>
+            {
+                match record.payload_cancel {
+                    Some(existing) if existing != detached_completion => {
+                        CooperativeCancelOutcome::AlreadyCompleting
+                    }
+                    Some(_) => CooperativeCancelOutcome::Requested(handle.id()),
+                    None => {
+                        record.payload_cancel = Some(detached_completion);
+                        CooperativeCancelOutcome::Requested(handle.id())
+                    }
+                }
+            }
+            InstancePhase::PayloadDropping
+                if record.payload_installed
+                    && record.payload.is_none()
+                    && !record.payload_abandoned
+                    && record.payload_completion.is_none() =>
+            {
+                CooperativeCancelOutcome::AlreadyCompleting
+            }
+            InstancePhase::PayloadDropped
+                if record.payload_installed
+                    && record.payload.is_none()
+                    && !record.payload_abandoned
+                    && record.payload_completion.is_some()
+                    && record.payload_cancel.is_none() =>
+            {
+                CooperativeCancelOutcome::AlreadyCompleting
+            }
+            InstancePhase::Quarantined => {
+                drop(record);
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::Quarantined);
+            }
+            InstancePhase::FaultReclaiming
+            | InstancePhase::FaultReclaimed
+            | InstancePhase::FaultRetiring
+            | InstancePhase::FaultTerminal
+                if record.payload.is_none() && record.payload_abandoned =>
+            {
+                CooperativeCancelOutcome::AlreadyCompleting
+            }
+            InstancePhase::NormalClosing | InstancePhase::NormalTerminal
+                if record.payload.is_none()
+                    && !record.payload_abandoned
+                    && ((record.payload_installed
+                        && record.payload_completion.is_some()
+                        && record.payload_cancel.is_none())
+                        || (!record.payload_installed
+                            && record.payload_completion.is_none()
+                            && record.payload_cancel.is_none())) =>
+            {
+                CooperativeCancelOutcome::AlreadyCompleting
+            }
+            InstancePhase::Active
+            | InstancePhase::PayloadDropping
+            | InstancePhase::PayloadDropped
+            | InstancePhase::FaultReclaiming
+            | InstancePhase::FaultReclaimed
+            | InstancePhase::FaultRetiring
+            | InstancePhase::FaultTerminal
+            | InstancePhase::NormalClosing
+            | InstancePhase::NormalTerminal => {
+                Self::quarantine_locked(slot, &mut record);
+                drop(record);
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::IdentityMismatch);
+            }
+            InstancePhase::Vacant | InstancePhase::Reserved | InstancePhase::Bound => {
+                drop(record);
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::WrongPhase);
+            }
+        };
+        drop(record);
+        drop(_transaction);
+        system.restore();
+        Ok(outcome)
+    }
+
+    /// Poll one bounded payload quantum using a witness minted for this exact
+    /// child-task poll.  Registry locks are released before both target code
+    /// and its normal destructor run.
+    ///
+    /// A `Ready` result is not published until the payload has been
+    /// tombstoned, dropped once in its exact arena, and the complete registry
+    /// identity has passed a post-check.  Consequently a token-only executor
+    /// future may return immediately after observing `Ready`; external
+    /// finalization never needs to run component Drop code.
+    ///
+    /// # Safety
+    ///
+    /// `witness` must have been freshly minted by the executor in the current
+    /// child poll.  The caller must remain inside that poll's fault guard for
+    /// this entire synchronous call and must not finalize the task
+    /// concurrently.  `context` belongs to that same poll.  The future may
+    /// retain only its opaque token between calls.  The installed payload and
+    /// all code it invokes must satisfy [`InstancePayload`]'s full arena
+    /// no-escape and TaskStatus-registration contract.
+    pub unsafe fn poll_payload(
+        &self,
+        witness: ReclaimableTaskWitness,
+        context: &mut Context<'_>,
+    ) -> Result<Poll<u64>, RegistryError> {
+        let Some(token) = witness.instance_token() else {
+            return Err(RegistryError::IdentityMismatch);
+        };
+        if heap::current_domain() != witness.allocation_domain() {
+            let _transaction = self.transaction.lock();
+            if let Some(slot) = self.slot(token) {
+                let mut record = slot.record.lock();
+                Self::quarantine_locked(slot, &mut record);
+            }
+            return Err(RegistryError::Quarantined);
+        }
+
+        let (space_pointer, payload_pointer) = {
+            let _transaction = self.transaction.lock();
+            let Some(slot) = self.slot(token) else {
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let mut record = slot.record.lock();
+            if record.phase == InstancePhase::PayloadDropped
+                && Self::active_witness_identity_matches(
+                    slot,
+                    &record,
+                    token,
+                    witness,
+                    InstancePhase::PayloadDropped,
+                )
+                && record.payload_installed
+                && record.payload.is_none()
+                && !record.payload_abandoned
+                && record.payload_cancel.is_none()
+            {
+                let Some(completion) = record.payload_completion else {
+                    Self::quarantine_locked(slot, &mut record);
+                    return Err(RegistryError::Quarantined);
+                };
+                if !Self::sealed_cspace_matches(&record) {
+                    Self::quarantine_locked(slot, &mut record);
+                    return Err(RegistryError::Quarantined);
+                }
+                return Ok(Poll::Ready(completion));
+            }
+            if !Self::active_witness_identity_matches(
+                slot,
+                &record,
+                token,
+                witness,
+                InstancePhase::Active,
+            ) {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(RegistryError::Quarantined);
+            }
+            if !record.payload_installed {
+                return Err(RegistryError::WrongPhase);
+            }
+            if record.payload_abandoned
+                || record.payload_completion.is_some()
+                || record.payload.is_none()
+                || !Self::sealed_cspace_matches(&record)
+            {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(RegistryError::Quarantined);
+            }
+
+            let space_pointer = record
+                .space
+                .as_deref()
+                .map(core::ptr::from_ref)
+                .expect("exact active payload record has no Space");
+            let payload_pointer = record
+                .payload
+                .as_mut()
+                .map(|payload| {
+                    let boxed: &mut Box<dyn InstancePayload> = &mut **payload;
+                    boxed.as_mut() as *mut dyn InstancePayload
+                })
+                .expect("exact active payload record has no payload");
+
+            if let Some(completion) = record.payload_cancel {
+                let payload = record
+                    .payload
+                    .take()
+                    .expect("cooperative payload cancel lost its payload");
+                record.phase = InstancePhase::PayloadDropping;
+                Self::publish_header(slot, &record);
+                drop(record);
+                drop(_transaction);
+                return unsafe { self.drop_payload_and_publish(witness, payload, completion) };
+            }
+            (space_pointer, payload_pointer)
+        };
+
+        // Safety: the exact witness and stable record exclude lifecycle
+        // mutation for this child poll.  Neither pointer may escape this
+        // synchronous quantum under InstancePayload's unsafe contract.
+        let polled = unsafe { (&mut *payload_pointer).poll_quantum(&*space_pointer, context) };
+
+        if heap::current_domain() != witness.allocation_domain() {
+            let _transaction = self.transaction.lock();
+            let slot = self
+                .slot(token)
+                .expect("opaque poll token retained its fixed in-range slot");
+            let mut record = slot.record.lock();
+            // Target code changed allocator provenance.  Preserve the payload
+            // allocation and refuse to enter either normal Drop or raw
+            // reclamation from this poll-time boundary.
+            Self::quarantine_locked(slot, &mut record);
+            return Err(RegistryError::Quarantined);
+        }
+
+        let mut ready = match polled {
+            Poll::Ready(completion) => Some(completion),
+            Poll::Pending => None,
+        };
+        let payload = {
+            let _transaction = self.transaction.lock();
+            let slot = self
+                .slot(token)
+                .expect("opaque poll token retained its fixed in-range slot");
+            let mut record = slot.record.lock();
+            let same_payload = record.payload.as_ref().is_some_and(|payload| {
+                let boxed: &Box<dyn InstancePayload> = &**payload;
+                core::ptr::eq(boxed.as_ref(), unsafe { &*payload_pointer })
+            });
+            if !Self::active_witness_identity_matches(
+                slot,
+                &record,
+                token,
+                witness,
+                InstancePhase::Active,
+            ) || !record.payload_installed
+                || record.payload_abandoned
+                || record.payload_completion.is_some()
+                || !same_payload
+                || !Self::sealed_cspace_matches(&record)
+            {
+                Self::quarantine_locked(slot, &mut record);
+                return Err(RegistryError::Quarantined);
+            }
+            if let Some(cancelled) = record.payload_cancel {
+                ready = Some(cancelled);
+            }
+            let Some(completion) = ready else {
+                return Ok(Poll::Pending);
+            };
+            let payload = record
+                .payload
+                .take()
+                .expect("post-checked ready payload disappeared");
+            record.phase = InstancePhase::PayloadDropping;
+            Self::publish_header(slot, &record);
+            (payload, completion)
+        };
+        unsafe { self.drop_payload_and_publish(witness, payload.0, payload.1) }
+    }
+
+    /// Complete the normal payload tombstone outside registry locks but still
+    /// inside the exact child poll and its architecture fault guard.
+    unsafe fn drop_payload_and_publish(
+        &self,
+        witness: ReclaimableTaskWitness,
+        payload: ManuallyDrop<Box<dyn InstancePayload>>,
+        completion: u64,
+    ) -> Result<Poll<u64>, RegistryError> {
+        let token = witness
+            .instance_token()
+            .expect("payload drop witness lost its instance token");
+        assert_eq!(
+            heap::current_domain(),
+            witness.allocation_domain(),
+            "managed payload Drop lost the exact child allocation domain"
+        );
+        // Safety: the same exact witness proved this tracked domain before the
+        // payload was tombstoned.  Drop and deallocation therefore retain the
+        // child's fault attribution and allocator provenance.
+        let mut allocation = unsafe { heap::enter_domain(witness.allocation_domain()) };
+        drop(ManuallyDrop::into_inner(payload));
+        allocation.restore();
+        assert_eq!(
+            heap::current_domain(),
+            witness.allocation_domain(),
+            "managed payload Drop did not restore the exact child allocation domain"
+        );
+
+        let _transaction = self.transaction.lock();
+        let slot = self
+            .slot(token)
+            .expect("opaque payload drop token retained its fixed slot");
+        let mut record = slot.record.lock();
+        let post_matches = Self::active_witness_identity_matches(
+            slot,
+            &record,
+            token,
+            witness,
+            InstancePhase::PayloadDropping,
+        ) && record.payload_installed
+            && record.payload.is_none()
+            && !record.payload_abandoned
+            && record.payload_completion.is_none()
+            && Self::sealed_cspace_matches(&record);
+        assert!(
+            post_matches,
+            "managed payload identity changed after irreversible normal Drop"
+        );
+        record.payload_completion = Some(completion);
+        record.payload_cancel = None;
+        record.phase = InstancePhase::PayloadDropped;
+        Self::publish_header(slot, &record);
+        Ok(Poll::Ready(completion))
     }
 
     /// Validate and reclaim one permanently detached managed fault arena.
@@ -525,7 +1128,7 @@ impl InstanceRegistry {
         };
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
 
-        let domain = {
+        let (domain, abandoned_payload) = {
             let _transaction = self.transaction.lock();
             let Some(slot) = self.slot(token) else {
                 self.quarantine_exact_fault_candidates_locked(witness);
@@ -606,10 +1209,18 @@ impl InstanceRegistry {
                 return FaultGateOutcome::Quarantined;
             }
 
+            // This is the fault-path ownership linearization point.  The
+            // pointer is removed from the stable record before any raw arena
+            // operation, but remains ManuallyDrop so even a returning hook
+            // cannot run target code or deallocate reclaimed memory.
+            let abandoned_payload = record.payload.take();
+            record.payload_abandoned = true;
             record.phase = InstancePhase::FaultReclaiming;
             Self::publish_header(slot, &record);
-            domain
+            (domain, abandoned_payload)
         };
+
+        core::mem::forget(abandoned_payload);
 
         // No registry lock is held across the target's allocator operation.
         // FaultReclaiming prevents a replay from authorizing a second reclaim.
@@ -629,6 +1240,8 @@ impl InstanceRegistry {
             witness,
             InstancePhase::FaultReclaiming,
         ) && record.domain == Some(domain)
+            && record.payload.is_none()
+            && record.payload_abandoned
             && record
                 .space
                 .as_deref()
@@ -665,27 +1278,33 @@ impl InstanceRegistry {
         FaultGateOutcome::ManagedReclaimed
     }
 
-    /// Publish normal/fault terminal proof, perform the one exact CSpace
-    /// reset, and finally make the slot reusable with a newer token generation.
+    /// Publish normal/fault terminal proof, retire the allocator/owner state,
+    /// perform the one exact CSpace reset, and finally make the slot reusable
+    /// with a newer token generation.
     ///
-    /// `normal_close` is called only for `Exited`/`Cancelled`; a faulted task
-    /// must already carry the `FaultReclaimed` proof produced above.
+    /// Installed payloads are never dropped here.  Normal `Exited` is accepted
+    /// only after [`Self::poll_payload`] published `PayloadDropped`; an
+    /// unexpected executor `Cancelled` while a payload remains live is
+    /// quarantined.  Fault finalization requires the payload-abandon proof
+    /// published before raw reclaim.
     ///
     /// # Safety
     ///
-    /// For a normal terminal state, `normal_close` must close only the exact
-    /// supplied domain and return `true` only after that arena is proven empty
-    /// and irreversibly retired.  It must not allocate, block, panic, reset a
-    /// CSpace, or call the executor.  A production caller must obtain this
-    /// proof from the allocator; `true` is not a forgeable safe-code receipt.
+    /// `retire` must act only on the supplied exact domain.  For `Normal`, it
+    /// must close the proven-empty arena and unregister its owner.  For
+    /// `FaultReclaimed`, it must only unregister the owner after the earlier
+    /// raw arena reclaim.  It may return `true` only after that action is
+    /// irreversible, and must not allocate, block, panic, reset a CSpace, run
+    /// payload code, or call the executor.  `true` is not a forgeable
+    /// safe-code receipt.
     pub unsafe fn finalize<F>(
         &self,
         token: InstanceToken,
         handle: &TaskHandle,
-        normal_close: F,
+        retire: F,
     ) -> Result<FinalizeOutcome, RegistryError>
     where
-        F: FnOnce(AllocationDomain) -> bool,
+        F: FnOnce(AllocationDomain, TerminalRetireKind) -> bool,
     {
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
 
@@ -716,8 +1335,7 @@ impl InstanceRegistry {
             return Err(RegistryError::TaskNotTerminal);
         };
 
-        let mut close = Some(normal_close);
-        let domain = {
+        let (domain, retire_kind, retiring_phase, terminal_phase) = {
             let _transaction = self.transaction.lock();
             let Some(slot) = self.slot(token) else {
                 system.restore();
@@ -746,14 +1364,51 @@ impl InstanceRegistry {
                 system.restore();
                 return Err(RegistryError::IdentityMismatch);
             }
-            match exit.state() {
-                TaskState::Faulted if record.phase == InstancePhase::FaultReclaimed => domain,
-                TaskState::Exited | TaskState::Cancelled
-                    if record.phase == InstancePhase::Active =>
+            let transition = match exit.state() {
+                TaskState::Faulted
+                    if record.phase == InstancePhase::FaultReclaimed
+                        && record.payload.is_none()
+                        && record.payload_abandoned =>
                 {
-                    record.phase = InstancePhase::NormalClosing;
-                    Self::publish_header(slot, &record);
-                    domain
+                    (
+                        TerminalRetireKind::FaultReclaimed,
+                        InstancePhase::FaultRetiring,
+                        InstancePhase::FaultTerminal,
+                    )
+                }
+                TaskState::Exited
+                    if (record.payload_installed
+                        && record.phase == InstancePhase::PayloadDropped
+                        && record.payload.is_none()
+                        && !record.payload_abandoned
+                        && record.payload_completion.is_some()
+                        && record.payload_cancel.is_none())
+                        || (!record.payload_installed
+                            && record.phase == InstancePhase::Active
+                            && record.payload.is_none()
+                            && !record.payload_abandoned
+                            && record.payload_completion.is_none()
+                            && record.payload_cancel.is_none()) =>
+                {
+                    (
+                        TerminalRetireKind::Normal,
+                        InstancePhase::NormalClosing,
+                        InstancePhase::NormalTerminal,
+                    )
+                }
+                TaskState::Cancelled
+                    if !record.payload_installed
+                        && record.phase == InstancePhase::Active
+                        && record.payload.is_none()
+                        && !record.payload_abandoned
+                        && record.payload_completion.is_none()
+                        && record.payload_cancel.is_none() =>
+                {
+                    (
+                        TerminalRetireKind::Normal,
+                        InstancePhase::NormalClosing,
+                        InstancePhase::NormalTerminal,
+                    )
                 }
                 TaskState::Running => unreachable!("TaskExit cannot contain Running"),
                 _ => {
@@ -763,62 +1418,46 @@ impl InstanceRegistry {
                     system.restore();
                     return Err(RegistryError::WrongPhase);
                 }
-            }
+            };
+            record.phase = transition.1;
+            Self::publish_header(slot, &record);
+            (domain, transition.0, transition.1, transition.2)
         };
 
-        if matches!(exit.state(), TaskState::Exited | TaskState::Cancelled) {
-            let closed =
-                close
-                    .take()
-                    .expect("normal finalization retains its close hook")(domain);
-            let _transaction = self.transaction.lock();
-            let slot = self
-                .slot(token)
-                .expect("opaque token retained its fixed in-range slot");
-            let mut record = slot.record.lock();
-            if !closed {
-                Self::quarantine_locked(slot, &mut record);
-                drop(record);
-                drop(_transaction);
-                system.restore();
-                return Err(RegistryError::NormalCloseFailed);
-            }
-            let post_unique = !self.quarantine_identity_conflicts_locked(
-                token,
-                domain.arena,
-                handle.id(),
-                record.scheduler,
-            );
-            if !Self::terminal_identity_matches(slot, &record, token, handle)
-                || record.phase != InstancePhase::NormalClosing
-                || record.domain != Some(domain)
-                || !post_unique
-            {
-                panic!("managed instance identity changed after irreversible normal arena close");
-            }
-            record.phase = InstancePhase::NormalTerminal;
-            Self::publish_header(slot, &record);
-        }
-
+        // The terminal TaskExit was already published before this callback.
+        // No registry lock is held while the allocator/owner performs its
+        // irreversible close or unregister operation.
+        let retired = retire(domain, retire_kind);
         let _transaction = self.transaction.lock();
         let slot = self
             .slot(token)
             .expect("opaque token retained its fixed in-range slot");
         let mut record = slot.record.lock();
-        let expected_phase = match exit.state() {
-            TaskState::Faulted => InstancePhase::FaultReclaimed,
-            TaskState::Exited | TaskState::Cancelled => InstancePhase::NormalTerminal,
-            TaskState::Running => unreachable!("TaskExit cannot contain Running"),
-        };
-        if !Self::terminal_identity_matches(slot, &record, token, handle)
-            || record.phase != expected_phase
-        {
+        if !retired {
             Self::quarantine_locked(slot, &mut record);
             drop(record);
             drop(_transaction);
             system.restore();
-            return Err(RegistryError::IdentityMismatch);
+            return Err(match retire_kind {
+                TerminalRetireKind::Normal => RegistryError::NormalCloseFailed,
+                TerminalRetireKind::FaultReclaimed => RegistryError::TerminalRetireFailed,
+            });
         }
+        let post_unique = !self.quarantine_identity_conflicts_locked(
+            token,
+            domain.arena,
+            handle.id(),
+            record.scheduler,
+        );
+        if !Self::terminal_identity_matches(slot, &record, token, handle)
+            || record.phase != retiring_phase
+            || record.domain != Some(domain)
+            || !post_unique
+        {
+            panic!("managed instance identity changed after irreversible terminal retirement");
+        }
+        record.phase = terminal_phase;
+        Self::publish_header(slot, &record);
         if record.generation == MAX_INSTANCE_GENERATION {
             Self::quarantine_locked(slot, &mut record);
             drop(record);
@@ -852,6 +1491,7 @@ impl InstanceRegistry {
             .cspace_incarnation
             .checked_add(1)
             .expect("reset_exact rejected CSpace incarnation exhaustion");
+        let detached_completion = record.payload_completion;
         record.retire_after_reset();
         Self::publish_header(slot, &record);
         drop(record);
@@ -860,6 +1500,7 @@ impl InstanceRegistry {
         Ok(FinalizeOutcome {
             revoked_capabilities: revoked,
             next_cspace_incarnation,
+            detached_completion,
         })
     }
 
@@ -885,25 +1526,27 @@ impl InstanceRegistry {
         let Some(token) = witness.instance_token() else {
             return Err(RegistryError::IdentityMismatch);
         };
+        if heap::current_domain() != witness.allocation_domain() {
+            let _transaction = self.transaction.lock();
+            if let Some(slot) = self.slot(token) {
+                let mut record = slot.record.lock();
+                Self::quarantine_locked(slot, &mut record);
+            }
+            return Err(RegistryError::Quarantined);
+        }
         let pointer = {
             let _transaction = self.transaction.lock();
             let Some(slot) = self.slot(token) else {
                 return Err(RegistryError::IdentityMismatch);
             };
             let mut record = slot.record.lock();
-            let exact_task = record.task.as_ref().is_some_and(|handle| {
-                handle.id() == witness.task_id()
-                    && handle.allocation_domain() == witness.allocation_domain()
-                    && witness.matches_handle(handle)
-            });
-            if !Self::token_matches(slot, &record, token)
-                || record.phase != InstancePhase::Active
-                || record.domain != Some(witness.allocation_domain())
-                || record.home_hart != Some(witness.home_hart())
-                || witness.current_hart() != witness.home_hart()
-                || record.scheduler != Some(witness.scheduler_identity())
-                || !exact_task
-            {
+            if !Self::active_witness_identity_matches(
+                slot,
+                &record,
+                token,
+                witness,
+                InstancePhase::Active,
+            ) {
                 Self::quarantine_locked(slot, &mut record);
                 return Err(RegistryError::Quarantined);
             }
@@ -1162,7 +1805,33 @@ impl InstanceRegistry {
         token: InstanceToken,
         witness: ReclaimableFaultWitness,
     ) -> bool {
-        Self::fault_identity_matches_in_phase(slot, record, token, witness, InstancePhase::Active)
+        let lifecycle_matches = match record.phase {
+            InstancePhase::Active => {
+                !record.payload_abandoned
+                    && record.payload_completion.is_none()
+                    && if record.payload_installed {
+                        record.payload.is_some()
+                    } else {
+                        record.payload.is_none() && record.payload_cancel.is_none()
+                    }
+            }
+            InstancePhase::PayloadDropping => {
+                record.payload_installed
+                    && record.payload.is_none()
+                    && !record.payload_abandoned
+                    && record.payload_completion.is_none()
+            }
+            InstancePhase::PayloadDropped => {
+                record.payload_installed
+                    && record.payload.is_none()
+                    && !record.payload_abandoned
+                    && record.payload_completion.is_some()
+                    && record.payload_cancel.is_none()
+            }
+            _ => false,
+        };
+        lifecycle_matches
+            && Self::fault_identity_matches_in_phase(slot, record, token, witness, record.phase)
     }
 
     fn fault_identity_matches_in_phase(
@@ -1205,6 +1874,62 @@ impl InstanceRegistry {
                 .map(ReclaimableSchedulerIdentity::generation)
                 == Some(witness.scheduler_identity().generation())
             && seal.immutable_objects_match(space)
+    }
+
+    fn active_witness_identity_matches(
+        slot: &InstanceSlot,
+        record: &SlotRecord,
+        token: InstanceToken,
+        witness: ReclaimableTaskWitness,
+        expected_phase: InstancePhase,
+    ) -> bool {
+        let Some(handle) = record.task.as_ref() else {
+            return false;
+        };
+        let Some(binding) = record.prepared else {
+            return false;
+        };
+        let Some(seal) = record.space_seal else {
+            return false;
+        };
+        let Some(space) = record.space.as_deref() else {
+            return false;
+        };
+        Self::token_matches(slot, record, token)
+            && record.phase == expected_phase
+            && witness.instance_token() == Some(token)
+            && binding.instance_token() == Some(token)
+            && binding.scheduler_identity().is_none()
+            && record.domain == Some(witness.allocation_domain())
+            && handle.allocation_domain() == witness.allocation_domain()
+            && binding.allocation_domain() == witness.allocation_domain()
+            && handle.id() == witness.task_id()
+            && binding.task_id() == witness.task_id()
+            && witness.matches_handle(handle)
+            && binding.matches_handle(handle)
+            && record.home_hart == Some(witness.home_hart())
+            && binding.home_hart() == witness.home_hart()
+            && witness.current_hart() == witness.home_hart()
+            && record.scheduler == Some(witness.scheduler_identity())
+            && record
+                .scheduler
+                .map(ReclaimableSchedulerIdentity::generation)
+                == Some(witness.scheduler_identity().generation())
+            && seal.immutable_objects_match(space)
+    }
+
+    fn sealed_cspace_matches(record: &SlotRecord) -> bool {
+        record
+            .space
+            .as_deref()
+            .zip(record.space_seal)
+            .is_some_and(|(space, seal)| {
+                if !seal.immutable_objects_match(space) {
+                    return false;
+                }
+                let cspace = space.cspace().lock();
+                seal.reset_preflight_matches(&cspace)
+            })
     }
 
     fn terminal_identity_matches(
@@ -1278,6 +2003,44 @@ mod tests {
     static TEST_RECLAIM_SUCCEEDS: AtomicBool = AtomicBool::new(true);
     static TEST_RAW_RECLAIMS: AtomicU64 = AtomicU64::new(0);
     static TEST_FAULT_WITNESS: Mutex<Option<ReclaimableFaultWitness>> = Mutex::new(None);
+    static TEST_TASK_WITNESS: Mutex<Option<ReclaimableTaskWitness>> = Mutex::new(None);
+    static TEST_PAYLOAD_POLLS: AtomicU64 = AtomicU64::new(0);
+    static TEST_PAYLOAD_DROPS: AtomicU64 = AtomicU64::new(0);
+    static TEST_PAYLOAD_COMPLETION: AtomicU64 = AtomicU64::new(u64::MAX);
+    static TEST_PAYLOAD_DROP_FAULT: AtomicBool = AtomicBool::new(false);
+
+    struct TestPayload {
+        ready: Option<u64>,
+    }
+
+    // Safety: in normal mode the test payload neither retains its borrowed
+    // Space/Context nor exports arena ownership, and its destructor performs
+    // one bounded atomic increment.  One dedicated test enables an injected
+    // panic solely so the host fault guard can model a non-returning target
+    // fault after PayloadDropping publication; that unwind is not treated as
+    // a conforming production InstancePayload destructor.
+    unsafe impl InstancePayload for TestPayload {
+        fn poll_quantum(
+            &mut self,
+            _space: &InstanceSpace,
+            _context: &mut Context<'_>,
+        ) -> Poll<u64> {
+            TEST_PAYLOAD_POLLS.fetch_add(1, AtomicOrdering::SeqCst);
+            match self.ready {
+                Some(completion) => Poll::Ready(completion),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for TestPayload {
+        fn drop(&mut self) {
+            TEST_PAYLOAD_DROPS.fetch_add(1, AtomicOrdering::SeqCst);
+            if TEST_PAYLOAD_DROP_FAULT.swap(false, AtomicOrdering::SeqCst) {
+                panic!("injected managed payload Drop fault");
+            }
+        }
+    }
 
     unsafe fn reject_unexpected_fault(_: ReclaimableFaultWitness) -> FaultReclaimOutcome {
         FaultReclaimOutcome::Quarantined
@@ -1305,6 +2068,15 @@ mod tests {
             operation();
             false
         }
+    }
+
+    fn catch_payload_drop_fault_guard(operation: &mut dyn FnMut()) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation())).is_err()
+    }
+
+    fn fault_after_payload_poll_guard(operation: &mut dyn FnMut()) -> bool {
+        operation();
+        true
     }
 
     unsafe fn reclaim_test_instance(witness: ReclaimableFaultWitness) -> FaultReclaimOutcome {
@@ -1344,6 +2116,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
+        TEST_TASK_WITNESS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        TEST_PAYLOAD_POLLS.store(0, AtomicOrdering::SeqCst);
+        TEST_PAYLOAD_DROPS.store(0, AtomicOrdering::SeqCst);
+        TEST_PAYLOAD_COMPLETION.store(u64::MAX, AtomicOrdering::SeqCst);
+        TEST_PAYLOAD_DROP_FAULT.store(false, AtomicOrdering::SeqCst);
         guard
     }
 
@@ -1377,6 +2157,61 @@ mod tests {
             .into_iter()
             .next()
             .expect("managed publication returned no task handle")
+    }
+
+    unsafe fn install_test_payload(
+        registry: &InstanceRegistry,
+        token: InstanceToken,
+        ready: Option<u64>,
+    ) {
+        // Safety: TestPayload obeys the no-escape contract and construction is
+        // allocation-free apart from the registry-owned box itself.
+        unsafe {
+            registry
+                .install_payload(token, || TestPayload { ready })
+                .unwrap();
+        }
+    }
+
+    fn publish_payload_managed(
+        registry: &InstanceRegistry,
+        token: InstanceToken,
+        allocation: AllocationDomain,
+        name: &str,
+    ) -> TaskHandle {
+        let mut batch = PreparedTaskBatch::new();
+        // Safety: the executor future retains only the opaque token.  Every
+        // payload access reacquires a current-poll witness and routes through
+        // the registry's exact gate.
+        unsafe {
+            batch.prepare_managed_instance_owned(token, allocation, name, async move {
+                let completion = core::future::poll_fn(|context| {
+                    let witness = exec::current_reclaimable_task_witness()
+                        .expect("payload task poll has no reclaimable witness");
+                    assert_eq!(witness.instance_token(), Some(token));
+                    let registry = TEST_REGISTRY.load(AtomicOrdering::Acquire);
+                    assert!(!registry.is_null(), "payload test registry is absent");
+                    // Safety: this call remains in the current child poll and
+                    // behind the executor test fault guard.
+                    (&*registry)
+                        .poll_payload(witness, context)
+                        .expect("exact payload poll was rejected")
+                })
+                .await;
+                TEST_PAYLOAD_COMPLETION.store(completion, AtomicOrdering::SeqCst);
+            });
+        }
+        let prepared = batch.prepared_handles()[0].clone();
+        let binding = batch.prepared_reclaimable_bindings()[0];
+        registry.bind(token, binding, &prepared).unwrap();
+        let handles = unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+        }
+        .unwrap();
+        handles
+            .into_iter()
+            .next()
+            .expect("payload publication returned no task handle")
     }
 
     fn cspace_incarnation(registry: &InstanceRegistry, token: InstanceToken) -> u64 {
@@ -1520,7 +2355,7 @@ mod tests {
         let mut close_calls = 0;
         assert_eq!(
             unsafe {
-                registry.finalize(token, handle, |_| {
+                registry.finalize(token, handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -1544,6 +2379,7 @@ mod tests {
 
     #[test]
     fn fixed_table_never_allocates_a_seventeenth_slot() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         for index in 0..MAX_INSTANCE_SLOTS {
             let token = registry.reserve(domain(index as u64)).unwrap();
@@ -1557,6 +2393,7 @@ mod tests {
 
     #[test]
     fn only_non_system_tracked_domains_are_admitted() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         assert_eq!(
             registry.reserve(AllocationDomain::untracked(OwnerId::new(7))),
@@ -1570,6 +2407,7 @@ mod tests {
 
     #[test]
     fn one_arena_cannot_be_registered_again_under_a_different_owner() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         let first_domain = domain(8);
         let first = registry.reserve(first_domain).unwrap();
@@ -1716,6 +2554,7 @@ mod tests {
 
     #[test]
     fn token_loss_with_an_arena_owner_alias_quarantines_without_legacy_reclaim() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         let registered_domain = domain(9);
         let token = registry.reserve(registered_domain).unwrap();
@@ -1754,6 +2593,7 @@ mod tests {
 
     #[test]
     fn stale_generation_quarantines_the_new_occupant_without_aliasing_it() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         let stale = registry.reserve(domain(1)).unwrap();
 
@@ -1789,6 +2629,7 @@ mod tests {
 
     #[test]
     fn atomic_header_mismatch_is_sticky_quarantine() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         let token = registry.reserve(domain(3)).unwrap();
         let slot = registry.slot(token).unwrap();
@@ -1807,6 +2648,7 @@ mod tests {
 
     #[test]
     fn explicit_quarantine_never_vacates_or_resets_the_space() {
+        let _executor = executor();
         let registry = InstanceRegistry::new();
         let token = registry.reserve(domain(4)).unwrap();
         let slot = registry.slot(token).unwrap();
@@ -1867,8 +2709,9 @@ mod tests {
 
         let mut close_calls = 0;
         let finalized = unsafe {
-            registry.finalize(token, handle, |closed_domain| {
+            registry.finalize(token, handle, |closed_domain, kind| {
                 assert_eq!(closed_domain, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
                 assert!(
                     handle.try_exit().is_some(),
                     "close preceded terminal publication"
@@ -2382,8 +3225,9 @@ mod tests {
 
         let mut close_calls = 0;
         let finalized = unsafe {
-            registry.finalize(token, &handle, |closed| {
+            registry.finalize(token, &handle, |closed, kind| {
                 assert_eq!(closed, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
                 close_calls += 1;
                 true
             })
@@ -2409,7 +3253,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                registry.finalize(wrong, &handle, |_| {
+                registry.finalize(wrong, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2429,7 +3273,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                registry.finalize(actual, &handle, |_| {
+                registry.finalize(actual, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2459,7 +3303,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                registry.finalize(out_of_range, &handle, |_| {
+                registry.finalize(out_of_range, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2475,7 +3319,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                registry.finalize(actual, &handle, |_| {
+                registry.finalize(actual, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2516,7 +3360,7 @@ mod tests {
         let mut close_calls = 0;
         assert_eq!(
             unsafe {
-                registry.finalize(token, &handle, |_| {
+                registry.finalize(token, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2543,7 +3387,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                registry.finalize(token, &handle, |_| {
+                registry.finalize(token, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2560,8 +3404,9 @@ mod tests {
         assert_eq!(handle.cancel(), CancelOutcome::Requested);
         assert_eq!(handle.state(), TaskState::Cancelled);
         let finalized = unsafe {
-            registry.finalize(token, &handle, |closed| {
+            registry.finalize(token, &handle, |closed, kind| {
                 assert_eq!(closed, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
                 assert!(
                     handle.try_exit().is_some(),
                     "close preceded terminal publication"
@@ -2588,7 +3433,7 @@ mod tests {
         // boundary a second time.
         assert_eq!(
             unsafe {
-                registry.finalize(token, &handle, |_| {
+                registry.finalize(token, &handle, |_, _| {
                     close_calls += 1;
                     true
                 })
@@ -2650,7 +3495,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                registry.finalize(token, &handle, |_| {
+                registry.finalize(token, &handle, |_, _| {
                     panic!("fault finalization attempted normal close")
                 })
             },
@@ -2661,6 +3506,476 @@ mod tests {
         TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
         exec::set_fault_guard(pass_fault_guard);
         exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn payload_normal_completion_drops_once_in_child_poll_and_detaches_word() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(90);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, Some(0x5a)) };
+        let handle = publish_payload_managed(&registry, token, allocation, "payload-ready");
+
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_COMPLETION.load(AtomicOrdering::SeqCst), 0x5a);
+        {
+            let record = registry.slot(token).unwrap().record.lock();
+            assert_eq!(record.phase, InstancePhase::PayloadDropped);
+            assert!(record.payload.is_none());
+            assert!(record.payload_installed);
+            assert!(!record.payload_abandoned);
+            assert_eq!(record.payload_completion, Some(0x5a));
+        }
+
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(finalized.detached_completion, Some(0x5a));
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn cooperative_cancel_tombstones_and_drops_on_next_exact_child_poll() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(91);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, None) };
+        let handle = publish_payload_managed(&registry, token, allocation, "payload-cancel");
+
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Running);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        let CooperativeCancelOutcome::Requested(task) = registry
+            .request_cooperative_cancel(token, &handle, 0xcafe)
+            .unwrap()
+        else {
+            panic!("first cooperative cancel unexpectedly lost completion race");
+        };
+        exec::wake(task);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(finalized.detached_completion, Some(0xcafe));
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn cooperative_cancel_loses_to_payload_dropping_without_mutation() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let allocation = domain(98);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, None) };
+        let handle =
+            publish_payload_managed(&registry, token, allocation, "payload-dropping-cancel");
+        let expected_cspace = cspace_state(&registry, token);
+
+        // Model the exact linearization point immediately after the child
+        // tombstones the box and before its normal Drop returns.  The box is
+        // ManuallyDrop, so removing this test value cannot run target code.
+        let tombstone = {
+            let _transaction = registry.transaction.lock();
+            let slot = registry.slot(token).unwrap();
+            let mut record = slot.record.lock();
+            let payload = record.payload.take();
+            record.payload_cancel = Some(0x11);
+            record.phase = InstancePhase::PayloadDropping;
+            InstanceRegistry::publish_header(slot, &record);
+            payload
+        };
+        core::mem::forget(tombstone);
+
+        assert_eq!(
+            registry.request_cooperative_cancel(token, &handle, 0x11),
+            Ok(CooperativeCancelOutcome::AlreadyCompleting)
+        );
+        assert_eq!(
+            registry.request_cooperative_cancel(token, &handle, 0x22),
+            Ok(CooperativeCancelOutcome::AlreadyCompleting)
+        );
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::PayloadDropping);
+        assert!(record.payload.is_none());
+        assert!(!record.payload_abandoned);
+        assert_eq!(record.payload_cancel, Some(0x11));
+        assert_eq!(record.payload_completion, None);
+        drop(record);
+        assert_eq!(cspace_state(&registry, token), expected_cspace);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    }
+
+    #[test]
+    fn cooperative_cancel_after_payload_drop_is_inert_and_does_not_reset() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(99);
+        let token = registry.reserve(allocation).unwrap();
+        let incarnation = cspace_incarnation(&registry, token);
+        unsafe { install_test_payload(&registry, token, Some(0x44)) };
+        let handle =
+            publish_payload_managed(&registry, token, allocation, "payload-dropped-cancel");
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        let expected_cspace = cspace_state(&registry, token);
+
+        assert_eq!(
+            registry.request_cooperative_cancel(token, &handle, 0x44),
+            Ok(CooperativeCancelOutcome::AlreadyCompleting)
+        );
+        assert_eq!(
+            registry.request_cooperative_cancel(token, &handle, 0x55),
+            Ok(CooperativeCancelOutcome::AlreadyCompleting)
+        );
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::PayloadDropped);
+        assert!(record.payload.is_none());
+        assert!(!record.payload_abandoned);
+        assert_eq!(record.payload_cancel, None);
+        assert_eq!(record.payload_completion, Some(0x44));
+        drop(record);
+        assert_eq!(cspace_state(&registry, token), expected_cspace);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(finalized.detached_completion, Some(0x44));
+        assert_eq!(finalized.next_cspace_incarnation, incarnation + 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn exact_fault_abandons_payload_without_drop_and_retires_owner_before_reset() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        exec::set_fault_reclaimer(reclaim_test_instance);
+        exec::set_fault_guard(fault_next_guard);
+        let allocation = domain(92);
+        let token = registry.reserve(allocation).unwrap();
+        let incarnation = cspace_incarnation(&registry, token);
+        unsafe { install_test_payload(&registry, token, None) };
+        let handle = publish_payload_managed(&registry, token, allocation, "payload-fault");
+
+        TEST_FAULT_NEXT.store(true, AtomicOrdering::SeqCst);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        assert_eq!(TEST_RAW_RECLAIMS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        {
+            let record = registry.slot(token).unwrap().record.lock();
+            assert_eq!(record.phase, InstancePhase::FaultReclaimed);
+            assert!(record.payload.is_none());
+            assert!(record.payload_abandoned);
+        }
+
+        let mut retire_calls = 0;
+        let finalized = unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                assert_eq!(cspace_incarnation(&registry, token), incarnation);
+                retire_calls += 1;
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(retire_calls, 1);
+        assert_eq!(finalized.detached_completion, None);
+        assert_eq!(finalized.next_cspace_incarnation, incarnation + 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn fault_after_real_pending_quantum_abandons_without_payload_drop() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        exec::set_fault_reclaimer(reclaim_test_instance);
+        exec::set_fault_guard(fault_after_payload_poll_guard);
+        let allocation = domain(1000);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, None) };
+        let handle =
+            publish_payload_managed(&registry, token, allocation, "payload-post-poll-fault");
+
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(TEST_RAW_RECLAIMS.load(AtomicOrdering::SeqCst), 1);
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::FaultReclaimed);
+        assert!(record.payload.is_none());
+        assert!(record.payload_abandoned);
+        drop(record);
+
+        unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn payload_drop_fault_reaches_exact_dropping_gate_without_second_drop() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        exec::set_fault_reclaimer(reclaim_test_instance);
+        exec::set_fault_guard(catch_payload_drop_fault_guard);
+        let allocation = domain(97);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, Some(0x97)) };
+        let handle = publish_payload_managed(&registry, token, allocation, "payload-drop-fault");
+
+        // Host tests cannot model the target's non-unwinding longjmp.  Catching
+        // this injected destructor panic at the executor guard nevertheless
+        // exercises the real child path after poll_payload published
+        // PayloadDropping and removed the box from the stable record.
+        TEST_PAYLOAD_DROP_FAULT.store(true, AtomicOrdering::SeqCst);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(TEST_RAW_RECLAIMS.load(AtomicOrdering::SeqCst), 1);
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::FaultReclaimed);
+        assert!(record.payload.is_none());
+        assert!(record.payload_abandoned);
+        drop(record);
+        unsafe {
+            registry.finalize(token, &handle, |retired, kind| {
+                assert_eq!(retired, allocation);
+                assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                true
+            })
+        }
+        .unwrap();
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn fault_identity_mismatch_keeps_payload_and_never_polls_or_reclaims() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        exec::set_fault_reclaimer(capture_fault_witness);
+        exec::set_fault_guard(fault_next_guard);
+        let allocation = domain(93);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, None) };
+        let handle = publish_payload_managed(&registry, token, allocation, "payload-mismatch");
+
+        TEST_FAULT_NEXT.store(true, AtomicOrdering::SeqCst);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        let exact = TEST_FAULT_WITNESS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("capture-only fault hook lost its witness");
+        let mismatched = exact.with_task_for_test(TaskId(exact.task_id().0 + 1));
+        let mut raw_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.fault_reclaim(mismatched, |_| {
+                    raw_calls += 1;
+                    true
+                })
+            },
+            FaultGateOutcome::Quarantined
+        );
+        assert_eq!(raw_calls, 0);
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::Quarantined);
+        assert!(record.payload.is_some());
+        assert!(!record.payload_abandoned);
+        drop(record);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn stale_poll_witness_quarantines_without_poll_or_payload_tombstone() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let allocation = domain(94);
+        let token = registry.reserve(allocation).unwrap();
+        unsafe { install_test_payload(&registry, token, None) };
+
+        let mut batch = PreparedTaskBatch::new();
+        unsafe {
+            batch.prepare_managed_instance_owned(
+                token,
+                allocation,
+                "payload-stale-witness",
+                async move {
+                    let witness = exec::current_reclaimable_task_witness()
+                        .expect("managed task did not mint a poll witness");
+                    assert_eq!(witness.instance_token(), Some(token));
+                    *TEST_TASK_WITNESS
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(witness);
+                    core::future::pending::<()>().await;
+                },
+            );
+        }
+        let prepared = batch.prepared_handles()[0].clone();
+        registry
+            .bind(token, batch.prepared_reclaimable_bindings()[0], &prepared)
+            .unwrap();
+        let handle = unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+        }
+        .unwrap()
+        .remove(0);
+        assert!(exec::poll_once());
+        let stale = TEST_TASK_WITNESS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("test task did not retain its first-poll witness");
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert_eq!(
+            unsafe { registry.poll_payload(stale, &mut context) },
+            Err(RegistryError::Quarantined)
+        );
+        assert_eq!(TEST_PAYLOAD_POLLS.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::Quarantined);
+        assert!(record.payload.is_some());
+        assert!(!record.payload_abandoned);
+        drop(record);
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    }
+
+    #[test]
+    fn failed_normal_retire_does_not_reset_after_child_drop() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        TEST_REGISTRY.store(
+            core::ptr::from_ref(&registry).cast_mut(),
+            AtomicOrdering::Release,
+        );
+        let allocation = domain(95);
+        let token = registry.reserve(allocation).unwrap();
+        let incarnation = cspace_incarnation(&registry, token);
+        unsafe { install_test_payload(&registry, token, Some(7)) };
+        let handle = publish_payload_managed(&registry, token, allocation, "payload-close-false");
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Exited);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+
+        let mut retire_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.finalize(token, &handle, |retired, kind| {
+                    assert_eq!(retired, allocation);
+                    assert_eq!(kind, TerminalRetireKind::Normal);
+                    retire_calls += 1;
+                    false
+                })
+            },
+            Err(RegistryError::NormalCloseFailed)
+        );
+        assert_eq!(retire_calls, 1);
+        assert_eq!(cspace_incarnation(&registry, token), incarnation);
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::Quarantined);
+        assert!(record.payload.is_none());
+        assert_eq!(record.payload_completion, Some(7));
+        drop(record);
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 1);
+        TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn second_install_validation_mismatch_leaks_without_payload_drop() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let token = registry.reserve(domain(96)).unwrap();
+        assert_eq!(
+            unsafe {
+                registry.install_payload(token, || {
+                    assert!(registry.quarantine(token));
+                    TestPayload { ready: Some(1) }
+                })
+            },
+            Err(RegistryError::IdentityMismatch)
+        );
+        assert_eq!(TEST_PAYLOAD_DROPS.load(AtomicOrdering::SeqCst), 0);
+        let record = registry.slot(token).unwrap().record.lock();
+        assert_eq!(record.phase, InstancePhase::Quarantined);
+        assert!(record.payload.is_none());
+        assert!(!record.payload_installed);
     }
 
     #[test]
@@ -2726,8 +4041,10 @@ mod tests {
             assert_eq!(cspace_incarnation(&registry, token), expected_incarnation);
 
             let finalized = unsafe {
-                registry.finalize(token, &handle, |_| {
-                    panic!("fault generation attempted normal arena close")
+                registry.finalize(token, &handle, |closed, kind| {
+                    assert_eq!(closed, allocation);
+                    assert_eq!(kind, TerminalRetireKind::FaultReclaimed);
+                    true
                 })
             }
             .unwrap();

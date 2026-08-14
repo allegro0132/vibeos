@@ -3420,7 +3420,7 @@ mod tests {
     use alloc::{string::String, vec};
     use vibeos_component_admission::{
         admit, AdmissionPolicy, ArtifactTrust, CallerAuthority, CommandStreamMode,
-        ComponentArtifact, InstanceLimits, ProfileIdentity,
+        ComponentArtifact, InstanceLimits,
     };
     use vibeos_component_command::SynchronousCommandRunner;
     use vibeos_component_runtime::world::WorldContract;
@@ -3776,7 +3776,7 @@ mod tests {
         // Parse the separately pinned WIT policy instead of reflecting the
         // artifact's decoded shape back as its own expected contract.
         let world = WorldContract::parse(pin.wit_source(), pin.world()).unwrap();
-        let artifact = ComponentArtifact::copy_from(pin.artifact_bytes()).unwrap();
+        let artifact = ComponentArtifact::copy_from(pin.artifact_bytes(), pin.profile()).unwrap();
         let identity = artifact.identity();
         assert_eq!(identity.as_bytes(), &pin.expected_sha256());
         let limits = pin.limits();
@@ -3789,7 +3789,7 @@ mod tests {
                     min_args: pin.min_args(),
                     max_args: pin.max_args(),
                     exact_world: &world,
-                    profile: ProfileIdentity::PROFILE_1,
+                    profile: pin.profile(),
                     trust: ArtifactTrust::ImagePinned(identity),
                     limits: InstanceLimits {
                         memory_bytes: limits.memory_bytes,

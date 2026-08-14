@@ -43,7 +43,20 @@ pub(crate) enum PredecodeError {
 /// a truncated vector body once its declared length has been decoded. That is
 /// intentional: an attacker cannot make the preflight walk a million claimed
 /// entries just to discover that the last one is absent.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn predecode_component(bytes: &[u8]) -> Result<(), PredecodeError> {
+    predecode_component_for_profile(
+        bytes,
+        vibeos_component_format::ProfileIdentity::PROFILE_1
+            == vibeos_component_format::ProfileIdentity::PROFILE_1_ASYNC,
+    )
+}
+
+pub(crate) fn predecode_component_for_profile(
+    bytes: &[u8],
+    async_profile: bool,
+) -> Result<(), PredecodeError> {
     if bytes.len() > PROFILE_1_LIMITS.max_component_bytes {
         return Err(PredecodeError::Limit);
     }
@@ -64,8 +77,8 @@ pub(crate) fn predecode_component(bytes: &[u8]) -> Result<(), PredecodeError> {
         let length = reader.var_u32()? as usize;
         let mut section = reader.subreader(length)?;
         match id {
-            CUSTOM_SECTION | CORE_MODULE_SECTION | ALIAS_SECTION | CANONICAL_SECTION
-            | IMPORT_SECTION | EXPORT_SECTION => {}
+            CUSTOM_SECTION | CORE_MODULE_SECTION | ALIAS_SECTION | IMPORT_SECTION
+            | EXPORT_SECTION => {}
             CORE_INSTANCE_SECTION => scan_core_instances(&mut section, &mut budget)?,
             CORE_TYPE_SECTION => {
                 // Profile 1 rejects component-level core type declarations.
@@ -78,7 +91,12 @@ pub(crate) fn predecode_component(bytes: &[u8]) -> Result<(), PredecodeError> {
             }
             COMPONENT_SECTION | START_SECTION => return Err(PredecodeError::Unsupported),
             COMPONENT_INSTANCE_SECTION => scan_component_instances(&mut section, &mut budget)?,
-            COMPONENT_TYPE_SECTION => scan_component_types(&mut section, &mut budget)?,
+            COMPONENT_TYPE_SECTION => {
+                scan_component_types(&mut section, &mut budget, async_profile)?
+            }
+            CANONICAL_SECTION => {
+                scan_canonical_functions(&mut section, &mut budget, async_profile)?
+            }
             _ => return Err(PredecodeError::Unsupported),
         }
     }
@@ -92,6 +110,11 @@ struct Budget {
     component_instances: u32,
     aliases: u32,
     resources: u32,
+    canonical_functions: u32,
+    canonical_options: u32,
+    async_functions: u32,
+    future_types: u32,
+    stream_types: u32,
 }
 
 impl Budget {
@@ -125,6 +148,38 @@ impl Budget {
 
     fn resource(&mut self) -> Result<(), PredecodeError> {
         charge(&mut self.resources, 1, PROFILE_1_LIMITS.max_resources)
+    }
+
+    fn canonical_functions(&mut self, amount: u32) -> Result<(), PredecodeError> {
+        charge(
+            &mut self.canonical_functions,
+            amount,
+            PROFILE_1_LIMITS.max_canonical_functions,
+        )
+    }
+
+    fn canonical_options(&mut self, amount: u32) -> Result<(), PredecodeError> {
+        charge(
+            &mut self.canonical_options,
+            amount,
+            PROFILE_1_LIMITS.max_canonical_options,
+        )
+    }
+
+    fn async_function(&mut self) -> Result<(), PredecodeError> {
+        charge(
+            &mut self.async_functions,
+            1,
+            PROFILE_1_LIMITS.max_async_functions,
+        )
+    }
+
+    fn future_type(&mut self) -> Result<(), PredecodeError> {
+        charge(&mut self.future_types, 1, PROFILE_1_LIMITS.max_future_types)
+    }
+
+    fn stream_type(&mut self) -> Result<(), PredecodeError> {
+        charge(&mut self.stream_types, 1, PROFILE_1_LIMITS.max_stream_types)
     }
 }
 
@@ -175,6 +230,212 @@ fn scan_core_export(reader: &mut Reader<'_>) -> Result<(), PredecodeError> {
     Ok(())
 }
 
+#[derive(Default)]
+struct CanonicalOptions {
+    async_: bool,
+    callback: bool,
+}
+
+fn scan_canonical_functions(
+    reader: &mut Reader<'_>,
+    budget: &mut Budget,
+    async_profile: bool,
+) -> Result<(), PredecodeError> {
+    let count = reader.limited_count(PROFILE_1_LIMITS.max_canonical_functions)?;
+    budget.canonical_functions(count)?;
+    for _ in 0..count {
+        scan_canonical_function(reader, budget, async_profile)?;
+    }
+    reader.finish()
+}
+
+fn scan_canonical_function(
+    reader: &mut Reader<'_>,
+    budget: &mut Budget,
+    async_profile: bool,
+) -> Result<(), PredecodeError> {
+    match reader.byte()? {
+        0x00 => {
+            if reader.byte()? != 0x00 {
+                return Err(PredecodeError::Malformed);
+            }
+            reader.var_u32()?;
+            let options = scan_canonical_options(reader, budget)?;
+            reader.var_u32()?;
+            validate_lift_options(options, async_profile)
+        }
+        0x01 => {
+            if reader.byte()? != 0x00 {
+                return Err(PredecodeError::Malformed);
+            }
+            reader.var_u32()?;
+            let options = scan_canonical_options(reader, budget)?;
+            validate_lower_options(options, async_profile)
+        }
+        0x02..=0x04 => {
+            reader.var_u32()?;
+            Ok(())
+        }
+        0x05 | 0x0d | 0x1f | 0x22 | 0x23 | 0x24 | 0x25 => require_async_profile(async_profile),
+        0x06 => {
+            require_async_profile(async_profile)?;
+            // The selected profile keeps the blocking/base spelling; the
+            // async cancellation spelling is CM_MORE_ASYNC_BUILTINS.
+            if reader.bool()? {
+                Err(PredecodeError::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
+        0x09 => {
+            require_async_profile(async_profile)?;
+            scan_result_list(reader)?;
+            let options = scan_canonical_options(reader, budget)?;
+            if options.async_ || options.callback {
+                Err(PredecodeError::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
+        0x0a | 0x0b => {
+            require_async_profile(async_profile)?;
+            // Profile 1 has one i32 task-context slot. i64 is CM64 and any
+            // nonzero slot is gated by CM_THREADING upstream.
+            if reader.byte()? != 0x7f || reader.var_u32()? != 0 {
+                return Err(PredecodeError::Unsupported);
+            }
+            Ok(())
+        }
+        0x0c => {
+            require_async_profile(async_profile)?;
+            reader.bool()?;
+            Ok(())
+        }
+        0x0e | 0x13 | 0x14 | 0x15 | 0x1a | 0x1b => {
+            require_async_profile(async_profile)?;
+            reader.var_u32()?;
+            Ok(())
+        }
+        0x0f | 0x10 | 0x16 | 0x17 => {
+            require_async_profile(async_profile)?;
+            reader.var_u32()?;
+            let options = scan_canonical_options(reader, budget)?;
+            if !options.async_ || options.callback {
+                return Err(PredecodeError::Unsupported);
+            }
+            Ok(())
+        }
+        0x11 | 0x12 | 0x18 | 0x19 => {
+            require_async_profile(async_profile)?;
+            reader.var_u32()?;
+            // `true` is the CM_MORE_ASYNC_BUILTINS spelling.
+            if reader.bool()? {
+                Err(PredecodeError::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
+        0x20 | 0x21 => {
+            require_async_profile(async_profile)?;
+            reader.bool()?;
+            reader.var_u32()?;
+            Ok(())
+        }
+        // Removed/adjacent async draft opcodes, error-context, and every
+        // threading intrinsic are outside the selected revision/feature set.
+        0x07 | 0x08 | 0x1c..=0x1e | 0x26..=0x2d | 0x40..=0x42 => Err(PredecodeError::Unsupported),
+        _ => Err(PredecodeError::Unsupported),
+    }
+}
+
+fn require_async_profile(enabled: bool) -> Result<(), PredecodeError> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(PredecodeError::Unsupported)
+    }
+}
+
+fn scan_result_list(reader: &mut Reader<'_>) -> Result<(), PredecodeError> {
+    match reader.byte()? {
+        0x00 => scan_component_val_type(reader),
+        0x01 if reader.byte()? == 0 => Ok(()),
+        0x01 => Err(PredecodeError::Malformed),
+        _ => Err(PredecodeError::Malformed),
+    }
+}
+
+fn validate_lift_options(
+    options: CanonicalOptions,
+    async_profile: bool,
+) -> Result<(), PredecodeError> {
+    if options.async_ {
+        require_async_profile(async_profile)?;
+        if !options.callback {
+            // Callback-free lift is the disabled stackful proposal.
+            return Err(PredecodeError::Unsupported);
+        }
+    } else if options.callback {
+        return Err(PredecodeError::Unsupported);
+    }
+    Ok(())
+}
+
+fn validate_lower_options(
+    options: CanonicalOptions,
+    async_profile: bool,
+) -> Result<(), PredecodeError> {
+    if options.callback {
+        return Err(PredecodeError::Unsupported);
+    }
+    if options.async_ {
+        require_async_profile(async_profile)?;
+    }
+    Ok(())
+}
+
+fn scan_canonical_options(
+    reader: &mut Reader<'_>,
+    budget: &mut Budget,
+) -> Result<CanonicalOptions, PredecodeError> {
+    let count = reader.limited_count(PROFILE_1_LIMITS.max_canonical_options_per_function)?;
+    budget.canonical_options(count)?;
+    let mut result = CanonicalOptions::default();
+    let mut utf8 = false;
+    let mut memory = false;
+    let mut realloc = false;
+    let mut post_return = false;
+    for _ in 0..count {
+        let duplicate = match reader.byte()? {
+            0x00 => core::mem::replace(&mut utf8, true),
+            0x03 => {
+                reader.var_u32()?;
+                core::mem::replace(&mut memory, true)
+            }
+            0x04 => {
+                reader.var_u32()?;
+                core::mem::replace(&mut realloc, true)
+            }
+            0x05 => {
+                reader.var_u32()?;
+                core::mem::replace(&mut post_return, true)
+            }
+            0x06 => core::mem::replace(&mut result.async_, true),
+            0x07 => {
+                reader.var_u32()?;
+                core::mem::replace(&mut result.callback, true)
+            }
+            // UTF-16, core-type and GC are explicit profile rejections.
+            0x01 | 0x02 | 0x08 | 0x09 => return Err(PredecodeError::Unsupported),
+            _ => return Err(PredecodeError::Malformed),
+        };
+        if duplicate {
+            return Err(PredecodeError::Malformed);
+        }
+    }
+    Ok(result)
+}
+
 fn scan_component_instances(
     reader: &mut Reader<'_>,
     budget: &mut Budget,
@@ -209,11 +470,12 @@ fn scan_component_instances(
 fn scan_component_types(
     reader: &mut Reader<'_>,
     budget: &mut Budget,
+    async_profile: bool,
 ) -> Result<(), PredecodeError> {
     let count = reader.limited_count(PROFILE_1_LIMITS.max_component_definitions)?;
     budget.definitions(count)?;
     for _ in 0..count {
-        scan_component_type(reader, budget, 1)?;
+        scan_component_type(reader, budget, async_profile, 1)?;
     }
     reader.finish()
 }
@@ -221,6 +483,7 @@ fn scan_component_types(
 fn scan_component_type(
     reader: &mut Reader<'_>,
     budget: &mut Budget,
+    async_profile: bool,
     depth: u32,
 ) -> Result<(), PredecodeError> {
     if depth > PROFILE_1_LIMITS.max_component_nesting {
@@ -242,6 +505,10 @@ fn scan_component_type(
             budget.resource()
         }
         0x40 => scan_component_func_type(reader),
+        0x43 if async_profile => {
+            budget.async_function()?;
+            scan_component_func_type(reader)
+        }
         0x43 => Err(PredecodeError::Unsupported),
         0x41 => {
             // Component types allocate a declaration vector and are outside
@@ -252,7 +519,7 @@ fn scan_component_type(
         0x42 => {
             let declarations = reader.limited_count(PROFILE_1_LIMITS.max_component_definitions)?;
             for _ in 0..declarations {
-                scan_instance_type_declaration(reader, budget, depth)?;
+                scan_instance_type_declaration(reader, budget, async_profile, depth)?;
             }
             Ok(())
         }
@@ -299,8 +566,17 @@ fn scan_component_type(
             reader.var_u32()?;
             Ok(())
         }
-        // map, fixed-length-list, future, and stream are not in Profile 1.
-        0x63 | 0x67 | 0x66 | 0x65 => Err(PredecodeError::Unsupported),
+        // map and fixed-length-list are not in Profile 1.
+        0x63 | 0x67 => Err(PredecodeError::Unsupported),
+        0x65 if async_profile => {
+            budget.future_type()?;
+            scan_optional_component_val_type(reader)
+        }
+        0x66 if async_profile => {
+            budget.stream_type()?;
+            scan_optional_component_val_type(reader)
+        }
+        0x65 | 0x66 => Err(PredecodeError::Unsupported),
         _ => Err(PredecodeError::Malformed),
     }
 }
@@ -324,6 +600,7 @@ fn scan_component_func_type(reader: &mut Reader<'_>) -> Result<(), PredecodeErro
 fn scan_instance_type_declaration(
     reader: &mut Reader<'_>,
     budget: &mut Budget,
+    async_profile: bool,
     depth: u32,
 ) -> Result<(), PredecodeError> {
     match reader.byte()? {
@@ -333,7 +610,7 @@ fn scan_instance_type_declaration(
         0x01 => {
             budget.definitions(1)?;
             let next_depth = depth.checked_add(1).ok_or(PredecodeError::Limit)?;
-            scan_component_type(reader, budget, next_depth)
+            scan_component_type(reader, budget, async_profile, next_depth)
         }
         0x02 => {
             budget.alias()?;
@@ -496,6 +773,14 @@ impl<'a> Reader<'a> {
         let byte = self.peek()?;
         self.position += 1;
         Ok(byte)
+    }
+
+    fn bool(&mut self) -> Result<bool, PredecodeError> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(PredecodeError::Malformed),
+        }
     }
 
     fn subreader(&mut self, length: usize) -> Result<Reader<'a>, PredecodeError> {

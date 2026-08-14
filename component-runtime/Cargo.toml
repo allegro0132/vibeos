@@ -12,3 +12,4 @@ wit-parser = { version = "=0.255.0", default-features = false }
 [dev-dependencies]
 dlr-wasm-interpreter = { version = "=0.2.0", default-features = false }
 wat = { version = "=1.255.0", features = ["component-model"] }
+wasm-encoder = { version = "=0.255.0", default-features = false, features = ["component-model"] }

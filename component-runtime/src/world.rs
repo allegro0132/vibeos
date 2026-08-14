@@ -50,12 +50,21 @@ pub enum ValueShape {
         error: Option<Box<ValueShape>>,
     },
     Variant(Vec<NamedCaseShape>),
+    Future(Option<Box<ValueShape>>),
+    Stream(Option<Box<ValueShape>>),
     Own(String),
     Borrow(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionEffect {
+    Sync,
+    Async,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct FunctionShape {
+    pub effect: FunctionEffect,
     pub parameters: Vec<NamedValueShape>,
     pub result: Option<ValueShape>,
 }
@@ -332,9 +341,7 @@ fn normalize_wit_function(
     depth: u32,
 ) -> Result<FunctionShape, WorldError> {
     budget.enter(depth)?;
-    if function.kind.is_async()
-        || function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize
-    {
+    if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
         return Err(WorldError::UnsupportedType);
     }
     let mut parameters = Vec::new();
@@ -349,7 +356,15 @@ fn normalize_wit_function(
         .result
         .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
         .transpose()?;
-    Ok(FunctionShape { parameters, result })
+    Ok(FunctionShape {
+        effect: if function.kind.is_async() {
+            FunctionEffect::Async
+        } else {
+            FunctionEffect::Sync
+        },
+        parameters,
+        result,
+    })
 }
 
 fn normalize_wit_type_entity(
@@ -527,11 +542,21 @@ fn normalize_wit_type_id(
             depth + 1,
         )?))),
         TypeDefKind::Type(ty) => normalize_wit_value(resolve, *ty, resources, budget, depth + 1),
+        TypeDefKind::Future(payload) => Ok(ValueShape::Future(
+            payload
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                .transpose()?
+                .map(Box::new),
+        )),
+        TypeDefKind::Stream(payload) => Ok(ValueShape::Stream(
+            payload
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                .transpose()?
+                .map(Box::new),
+        )),
         TypeDefKind::Resource
         | TypeDefKind::Map(_, _)
         | TypeDefKind::FixedLengthList(_, _)
-        | TypeDefKind::Future(_)
-        | TypeDefKind::Stream(_)
         | TypeDefKind::Unknown => Err(WorldError::UnsupportedType),
     }
 }
@@ -637,9 +662,7 @@ fn normalize_component_entity(
     match entity {
         ComponentEntityType::Func(id) => {
             let function = &types[id];
-            if function.async_
-                || function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize
-            {
+            if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
                 return Err(WorldError::UnsupportedType);
             }
             let mut parameters = Vec::new();
@@ -655,7 +678,15 @@ fn normalize_component_entity(
                 .result
                 .map(|ty| normalize_component_value(types, ty, outer_resources, budget, depth + 1))
                 .transpose()?;
-            Ok(EntityShape::Function(FunctionShape { parameters, result }))
+            Ok(EntityShape::Function(FunctionShape {
+                effect: if function.async_ {
+                    FunctionEffect::Async
+                } else {
+                    FunctionEffect::Sync
+                },
+                parameters,
+                result,
+            }))
         }
         ComponentEntityType::Instance(id) => {
             let instance = &types[id];
@@ -841,9 +872,18 @@ fn normalize_component_defined(
                 ValueShape::Borrow(copied(name)?)
             })
         }
-        ComponentDefinedType::Map { .. }
-        | ComponentDefinedType::FixedLengthList { .. }
-        | ComponentDefinedType::Future { .. }
-        | ComponentDefinedType::Stream { .. } => Err(WorldError::UnsupportedType),
+        ComponentDefinedType::Future { ty, .. } => Ok(ValueShape::Future(
+            ty.map(|ty| normalize_component_value(types, ty, resources, budget, depth + 1))
+                .transpose()?
+                .map(Box::new),
+        )),
+        ComponentDefinedType::Stream { ty, .. } => Ok(ValueShape::Stream(
+            ty.map(|ty| normalize_component_value(types, ty, resources, budget, depth + 1))
+                .transpose()?
+                .map(Box::new),
+        )),
+        ComponentDefinedType::Map { .. } | ComponentDefinedType::FixedLengthList { .. } => {
+            Err(WorldError::UnsupportedType)
+        }
     }
 }

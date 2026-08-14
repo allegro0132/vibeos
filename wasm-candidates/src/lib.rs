@@ -8,7 +8,10 @@
 
 extern crate alloc;
 
-use vibeos_component_format::PROFILE_1_LIMITS;
+use vibeos_component_format::{
+    ASYNC_CANONICAL_ABI_REVISION, ASYNC_COMPONENT_MODEL_REVISION, ASYNC_WASM_TOOLS_REVISION,
+    CANONICAL_ABI_REVISION, PROFILE_1_LIMITS, WASI_API_REVISION,
+};
 use wasmparser::{Encoding, Parser, Payload, Validator, WasmFeatures};
 use wit_parser::Resolve;
 
@@ -90,6 +93,10 @@ pub struct FrontendDecision {
     pub binary_frontend: &'static str,
     pub wit_frontend: &'static str,
     pub component_revision: &'static str,
+    pub selected_async_component_revision: &'static str,
+    pub selected_async_canonical_revision: &'static str,
+    pub wasm_tools_revision: &'static str,
+    pub wasi_revision: &'static str,
     pub no_std_alloc: bool,
     pub parser_is_runtime: bool,
     pub policy_is_in_tree: bool,
@@ -98,7 +105,11 @@ pub struct FrontendDecision {
 pub const FRONTEND_DECISION: FrontendDecision = FrontendDecision {
     binary_frontend: "wasmparser=0.255.0",
     wit_frontend: "wit-parser=0.255.0",
-    component_revision: "component-model-0.255.0-sync",
+    component_revision: CANONICAL_ABI_REVISION,
+    selected_async_component_revision: ASYNC_COMPONENT_MODEL_REVISION,
+    selected_async_canonical_revision: ASYNC_CANONICAL_ABI_REVISION,
+    wasm_tools_revision: ASYNC_WASM_TOOLS_REVISION,
+    wasi_revision: WASI_API_REVISION,
     no_std_alloc: true,
     parser_is_runtime: false,
     policy_is_in_tree: true,

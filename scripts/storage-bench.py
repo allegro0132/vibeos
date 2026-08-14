@@ -204,6 +204,14 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
             value = sample.get(name)
             require(isinstance(value, int) and value >= 0, f"missing {name}")
             counters[name.removeprefix("block_")] = value
+        if "put_block_requests" in sample:
+            for name in ("put_block_requests", "put_block_read_requests",
+                         "put_block_write_requests", "put_block_flush_requests",
+                         "put_block_read_bytes", "put_block_write_bytes",
+                         "put_block_used_interrupts"):
+                value = sample.get(name)
+                require(isinstance(value, int) and value >= 0, f"missing {name}")
+                phases["put_" + name.removeprefix("put_block_")] = value
     result: dict[str, Any] = {
         "schema": RECORD_SCHEMA,
         "version": RECORD_VERSION,

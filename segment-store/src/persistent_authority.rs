@@ -10,9 +10,9 @@ use core::fmt;
 
 use sha2::{Digest, Sha256};
 use vibeos_blob_format::{BlobDescriptor, LEAF_SIZE};
-use vibeos_segment_format::{payload_sha256, ExtentKind, PhysicalPointer};
+use vibeos_segment_format::{payload_sha256, ExtentKind, PhysicalPointer, ANCHOR_SEGMENT_NO};
 
-use crate::allocation_v2::{encode_allocation_v2, AllocationTransition};
+use crate::allocation_v2::{encode_allocation_v2, AllocationTransition, SegmentAllocation};
 use crate::authority::AuthorizedObject;
 use crate::authority_snapshot::{
     encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthorityImport,
@@ -28,8 +28,8 @@ use crate::gc::{
 };
 use crate::maintenance::{MaintenanceOperation, MaintenanceOperationLease, StoreMaintenance};
 use crate::quota::{canonical_attributable_physical_bytes, QuotaReservation, StoragePrincipal};
-use crate::root_codec::PersistentRootEntry;
-use crate::store::{CapacityClass, MountedState, SegmentStore, StoreError};
+use crate::root_codec::{PersistentRootEntry, PersistentRootSet};
+use crate::store::{CapacityClass, CasMountedState, MountedState, SegmentStore, StoreError};
 
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
@@ -713,7 +713,7 @@ impl<D: PageDevice> SegmentStore<D> {
         if snapshot.root_policy_sha256() != expected_policy_sha256 {
             return Err(PersistentAuthorityError::PolicyMismatch);
         }
-        self.build_persistent_view(state, snapshot).await
+        self.build_persistent_view(state, snapshot, true).await
     }
 
     /// Prove that a cold-recovered authority view is the exact object binding
@@ -1042,12 +1042,11 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok()
                 .map(|index| reusable_bindings[index])
             {
-                self.validate_reusable_binding(
+                Self::validate_reusable_binding(
                     self.require_current_generation()?,
                     binding,
                     recovered,
-                )
-                .await?;
+                )?;
                 continue;
             }
             if let Ok(index) = promoted
@@ -1178,12 +1177,8 @@ impl<D: PageDevice> SegmentStore<D> {
         self.publish_persistent_snapshot(state, generation, authority_bytes, &snapshot)
             .await?;
         drop(committed);
-        // The raw mount future is below the kernel stack ceiling, but this
-        // importer also retains the authenticated snapshot and object roots.
-        // Heap-pin the bounded child to keep the parent phase below the limit.
-        Box::pin(self.mount()).await?;
         let view = self
-            .recover_persistent_authority(snapshot.root_policy_sha256())
+            .build_persistent_view(self.require_current_generation()?, snapshot, false)
             .await?;
         Ok((view, transient_objects))
     }
@@ -1301,7 +1296,22 @@ impl<D: PageDevice> SegmentStore<D> {
                 &allocation_bytes,
             )
             .await?;
-        builder.finish(&self.device).await?;
+        let last_segment = builder.finish(&self.device).await?;
+        let checkpoint = publish_checkpoint(
+            &self.device,
+            &state,
+            self.limits,
+            generation,
+            next_segment_generation,
+            catalog_root,
+            authority_root,
+            allocation_root,
+        )
+        .await?;
+        // All transaction payloads are verified after the checkpoint write is
+        // durable, so a misdirected anchor write cannot evade the final
+        // read-back. Unchanged CAS/catalog state remains covered by the
+        // predecessor witness and the exact checkpoint transition.
         if let (Some(bytes), PhysicalPointer::Value(_)) =
             (empty_cas_snapshot.as_ref(), catalog_root)
         {
@@ -1339,17 +1349,67 @@ impl<D: PageDevice> SegmentStore<D> {
             self.limits.recovery_memory_bytes,
         )
         .await?;
-        publish_checkpoint(
-            &self.device,
-            &state,
-            self.limits,
+        let mut root_entries: Vec<PersistentRootEntry> = snapshot
+            .objects
+            .iter()
+            .map(|binding| PersistentRootEntry {
+                object_id: binding.v2_object_id,
+                commit_generation: binding.commit_generation,
+                object_kind: binding.object_kind,
+            })
+            .collect();
+        root_entries.extend_from_slice(snapshot.external_roots());
+        root_entries.sort_unstable_by_key(|entry| entry.object_id);
+        let persistent_roots = PersistentRootSet::new(generation, root_entries)
+            .map_err(|_| PersistentAuthorityError::Store(StoreError::Corrupt))?;
+        let next_physical_segment = (0..state.admitted_segments)
+            .find(|segment_no| {
+                allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free)
+            })
+            .unwrap_or(state.admitted_segments);
+        let mut successor = MountedState {
+            superblock: state.superblock,
             generation,
+            admitted_segments: state.admitted_segments,
+            next_physical_segment,
             next_segment_generation,
+            next_object_id: state.next_object_id.max(u128::from(generation)),
+            cleaner_reserve_segments: state.cleaner_reserve_segments,
+            replay_count: 0,
             catalog_root,
+            replay_tail: PhysicalPointer::Null,
             authority_root,
             allocation_root,
-        )
-        .await?;
+            allocation,
+            allocation_version: 2,
+            persistent_roots: Some(persistent_roots),
+            persistent_authority: Some(snapshot.clone()),
+            catalog: state.catalog.clone(),
+            cas: if empty_cas_snapshot.is_some() {
+                Some(CasMountedState {
+                    objects: Vec::new(),
+                    blobs: Vec::new(),
+                })
+            } else {
+                state.cas.clone()
+            },
+            recovery_peak_bytes: 0,
+            last_segment: Some(last_segment),
+            last_segment_previous: Some(state.last_segment.unwrap_or((
+                ANCHOR_SEGMENT_NO,
+                0,
+                [0; 32],
+            ))),
+            last_segment_target_checkpoint_generation: generation,
+        };
+        successor.recovery_peak_bytes = successor
+            .resident_heap_bytes()
+            .ok_or(PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+        if successor.recovery_peak_bytes > self.limits.recovery_memory_bytes {
+            return Err(PersistentAuthorityError::Store(StoreError::MemoryLimit));
+        }
+        self.mount_verified_successor(state, checkpoint, successor, true)
+            .await?;
         Ok(())
     }
 
@@ -1392,13 +1452,15 @@ impl<D: PageDevice> SegmentStore<D> {
         }
     }
 
-    async fn validate_reusable_binding(
-        &self,
+    fn validate_reusable_binding(
         state: &MountedState,
         binding: PersistentObjectBinding,
         recovered: &vibeos_durable_format::RecoveredObject,
     ) -> Result<(), PersistentAuthorityError<D::Error>> {
-        let mapping = state
+        let descriptor =
+            BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
+                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+        state
             .cas
             .as_ref()
             .and_then(|cas| {
@@ -1413,15 +1475,9 @@ impl<D: PageDevice> SegmentStore<D> {
                     && mapping.blob_key.object_kind() == binding.object_kind
                     && binding.object_kind == recovered.object_kind.get()
                     && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
+                    && mapping.blob_key.merkle_root() == descriptor.root
             })
             .ok_or(PersistentAuthorityError::PolicyMismatch)?;
-        let object = recover_persistent_cas_object(state.superblock.binding.store_uuid, mapping);
-        if !self
-            .persistent_object_matches_recovered(&object, recovered)
-            .await?
-        {
-            return Err(PersistentAuthorityError::PolicyMismatch);
-        }
         Ok(())
     }
 
@@ -1436,6 +1492,7 @@ impl<D: PageDevice> SegmentStore<D> {
         let Some(cas) = state.cas.as_ref() else {
             return Ok(None);
         };
+        let cas_payloads_verified = self.cas_payloads_verified(state.generation);
         let descriptor =
             BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
                 .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
@@ -1459,9 +1516,10 @@ impl<D: PageDevice> SegmentStore<D> {
                 &self.pins,
             )
             .map_err(|_| PersistentAuthorityError::Store(StoreError::ObjectUnavailable))?;
-            if !self
-                .persistent_object_matches_recovered(&object, recovered)
-                .await?
+            if !cas_payloads_verified
+                && !self
+                    .persistent_object_matches_recovered(&object, recovered)
+                    .await?
             {
                 continue;
             }
@@ -1498,6 +1556,7 @@ impl<D: PageDevice> SegmentStore<D> {
         &self,
         state: &MountedState,
         snapshot: PersistentAuthoritySnapshot,
+        verify_media: bool,
     ) -> Result<PersistentAuthorityView, PersistentAuthorityError<D::Error>> {
         let cas_objects = match state.cas.as_ref() {
             Some(cas) => cas.objects.as_slice(),
@@ -1527,7 +1586,9 @@ impl<D: PageDevice> SegmentStore<D> {
                 state.superblock.binding.store_uuid,
                 mapping,
             ));
-            self.verify_blob(object.as_ref()).await?;
+            if verify_media {
+                self.verify_blob(object.as_ref()).await?;
+            }
             objects.push(PersistentObjectHandle {
                 stable_object_id: binding.stable_object_id,
                 object,
@@ -1584,7 +1645,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 ))?;
             mapping.reference_codec = reference_codec;
         }
-        self.build_persistent_view(&state, view.snapshot.clone())
+        self.build_persistent_view(&state, view.snapshot.clone(), true)
             .await
     }
 }

@@ -23,7 +23,9 @@ use vibeos_segment_format::{
     SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
-use crate::allocation_v2::{encode_allocation_v2, AllocationTransition};
+use crate::allocation_v2::{
+    encode_allocation_v2, AllocationTransition, AllocationV2, SegmentAllocation,
+};
 use crate::authority::{
     AuthorizedObject, ObjectPublicationPersistence, ObjectPublicationTarget, PublicationIntent,
     PublishError,
@@ -48,7 +50,8 @@ use crate::quota::{
 };
 use crate::store::{
     read_pointer_payload, scan_segment, validate_cas_blob_descriptors, write_checkpoint,
-    CapacityClass, MountedState, SegmentStore, StoreError, READER_PIN_SLOTS, ROOT_PIN_SLOTS,
+    CapacityClass, CasMountedState, MountedState, SegmentStore, StoreError, READER_PIN_SLOTS,
+    ROOT_PIN_SLOTS,
 };
 
 const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
@@ -1697,7 +1700,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         let mut writer = Box::new(self);
         async move {
             let root = writer.finish_blob_encoding().await?;
-            let (pending, object_kind, exact_len, previous, checkpoint) =
+            let (pending, object_kind, exact_len, previous, checkpoint, successor) =
                 writer.commit_encoded_snapshot(root).await?;
             // The checkpoint is durable, but publication is still withheld. A
             // cold reread installs the exact selected successor before
@@ -1705,7 +1708,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             // the current mount and is retained only as a transition witness.
             writer
                 .store
-                .mount_verified_successor(previous, checkpoint)
+                .mount_verified_successor(previous, checkpoint, successor, true)
                 .await?;
             let quota_charge = match writer.quota_reservation.take() {
                 Some(reservation) => {
@@ -1804,8 +1807,17 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
     async fn commit_encoded_snapshot(
         &mut self,
         root: Hash,
-    ) -> Result<(PendingCasObjectHandle, u32, u64, MountedState, Checkpoint), CasStoreError<D::Error>>
-    {
+    ) -> Result<
+        (
+            PendingCasObjectHandle,
+            u32,
+            u64,
+            MountedState,
+            Checkpoint,
+            MountedState,
+        ),
+        CasStoreError<D::Error>,
+    > {
         let state = self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
         let blob_key = BlobKey::sha256(self.object_kind, self.geometry.exact_len(), root)?;
 
@@ -1867,7 +1879,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         };
 
         let state = self.state.take().ok_or(CasStoreError::WriterFailed)?;
-        let (pending, checkpoint) = commit_snapshot(
+        let (pending, checkpoint, successor) = commit_snapshot(
             &self.store.device,
             &state,
             self.store.limits,
@@ -1887,6 +1899,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             self.geometry.exact_len(),
             state,
             checkpoint,
+            successor,
         ))
     }
 
@@ -2526,7 +2539,7 @@ async fn commit_snapshot<D: PageDevice>(
     payload_hashes: &[Hash],
     pins: &crate::store::SharedStorePinRegistry,
     reference_codec: u16,
-) -> Result<(PendingCasObjectHandle, Checkpoint), CasStoreError<D::Error>> {
+) -> Result<(PendingCasObjectHandle, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
         .checked_add(1)
@@ -2700,7 +2713,7 @@ async fn commit_snapshot<D: PageDevice>(
     let catalog_root = snapshot_record.pointer();
     records.push(snapshot_record);
 
-    let allocation_bytes = if state.allocation_version == 2 {
+    let (allocation, allocation_version, allocation_bytes) = if state.allocation_version == 2 {
         let mut allocated_segments = Vec::new();
         allocated_segments
             .try_reserve_exact(data_segment_count + 1)
@@ -2719,18 +2732,22 @@ async fn commit_snapshot<D: PageDevice>(
                 reclaim: &[],
             })
             .map_err(|_| StoreError::Corrupt)?;
-        encode_allocation_v2(&allocation).map_err(|_| StoreError::Corrupt)?
+        let bytes = encode_allocation_v2(&allocation).map_err(|_| StoreError::Corrupt)?;
+        (allocation, 2, bytes)
     } else {
         let allocated_prefix_segments = metadata_segment_no + 1;
-        encode_allocation(AllocationState {
+        let legacy = AllocationState {
             checkpoint_generation,
             admitted_segments: state.admitted_segments,
             allocated_prefix_segments,
             next_segment_generation,
             cleaner_reserve_segments: state.cleaner_reserve_segments,
-        })
-        .map_err(|_| StoreError::Corrupt)?
-        .to_vec()
+        };
+        let allocation = AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?;
+        let bytes = encode_allocation(legacy)
+            .map_err(|_| StoreError::Corrupt)?
+            .to_vec();
+        (allocation, 1, bytes)
     };
     let allocation_record = build_record(
         state.superblock.binding.store_uuid,
@@ -2772,7 +2789,7 @@ async fn commit_snapshot<D: PageDevice>(
         &payload_records,
     )
     .await?;
-    finalize_segment(
+    let (_, _, metadata_seal_hash) = finalize_segment(
         device,
         state.superblock.binding.store_uuid,
         checkpoint_generation,
@@ -2783,9 +2800,35 @@ async fn commit_snapshot<D: PageDevice>(
     )
     .await?;
 
-    // Re-read every newly published root after the containing segment is fully
-    // sealed and before the checkpoint can name it. This mirrors the frozen
-    // M7.3 publication proof and also independently verifies Blob bytes/tree.
+    let slot = ((checkpoint_generation - 1) & 1) as u8;
+    let checkpoint = Checkpoint {
+        binding: RecordBinding {
+            store_uuid: state.superblock.binding.store_uuid,
+            generation: checkpoint_generation,
+            segment_no: ANCHOR_SEGMENT_NO,
+            ordinal: u32::from(slot),
+            self_page: 4 + u64::from(slot) * 2,
+            target_checkpoint_generation: checkpoint_generation,
+        },
+        slot,
+        previous_generation: state.generation,
+        admitted_range_pages: vibeos_segment_format::admitted_pages(state.admitted_segments)?,
+        admitted_segments: state.admitted_segments,
+        next_segment_generation,
+        replay_count: 0,
+        max_replay_records: limits.max_replay_records,
+        cleaner_reserve_segments: state.cleaner_reserve_segments,
+        catalog_root,
+        authority_root: state.authority_root,
+        allocation_root,
+        replay_tail: PhysicalPointer::Null,
+    };
+    write_checkpoint(device, &checkpoint, true).await?;
+    // Verify the complete newly selected state after the checkpoint itself has
+    // been durably read back. This catches a misdirected/torn checkpoint write
+    // that damaged a data segment, while avoiding a scan of unchanged history.
+    // Authority remains withheld until mount_verified_successor also re-reads
+    // and selects this exact checkpoint pair.
     if is_new {
         verify_staged_blob(
             device,
@@ -2841,31 +2884,51 @@ async fn commit_snapshot<D: PageDevice>(
     if observed_allocation.bytes != allocation_bytes {
         return Err(StoreError::Corrupt.into());
     }
-
-    let slot = ((checkpoint_generation - 1) & 1) as u8;
-    let checkpoint = Checkpoint {
-        binding: RecordBinding {
-            store_uuid: state.superblock.binding.store_uuid,
-            generation: checkpoint_generation,
-            segment_no: ANCHOR_SEGMENT_NO,
-            ordinal: u32::from(slot),
-            self_page: 4 + u64::from(slot) * 2,
-            target_checkpoint_generation: checkpoint_generation,
-        },
-        slot,
-        previous_generation: state.generation,
-        admitted_range_pages: vibeos_segment_format::admitted_pages(state.admitted_segments)?,
+    let next_physical_segment = (0..state.admitted_segments)
+        .find(|segment_no| allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free))
+        .unwrap_or(state.admitted_segments);
+    let next_object_id = state
+        .next_object_id
+        .checked_add(1)
+        .ok_or(StoreError::IdExhausted)?
+        .max(u128::from(checkpoint_generation));
+    let mut successor = MountedState {
+        superblock: state.superblock,
+        generation: checkpoint_generation,
         admitted_segments: state.admitted_segments,
+        next_physical_segment,
         next_segment_generation,
-        replay_count: 0,
-        max_replay_records: limits.max_replay_records,
+        next_object_id,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
+        replay_count: 0,
         catalog_root,
+        replay_tail: PhysicalPointer::Null,
         authority_root: state.authority_root,
         allocation_root,
-        replay_tail: PhysicalPointer::Null,
+        allocation,
+        allocation_version,
+        persistent_roots: state.persistent_roots.clone(),
+        persistent_authority: state.persistent_authority.clone(),
+        catalog: state.catalog.clone(),
+        cas: Some(CasMountedState {
+            objects: snapshot.objects,
+            blobs: snapshot.blobs,
+        }),
+        recovery_peak_bytes: 0,
+        last_segment: Some((metadata_segment_no, metadata_generation, metadata_seal_hash)),
+        last_segment_previous: Some((
+            previous_segment_no,
+            previous_segment_generation,
+            previous_hash,
+        )),
+        last_segment_target_checkpoint_generation: checkpoint_generation,
     };
-    write_checkpoint(device, &checkpoint, true).await?;
+    successor.recovery_peak_bytes = successor
+        .resident_heap_bytes()
+        .ok_or(StoreError::MemoryLimit)?;
+    if successor.recovery_peak_bytes > limits.recovery_memory_bytes {
+        return Err(StoreError::MemoryLimit.into());
+    }
     let root_key = RootKey::new(
         state.next_object_id,
         checkpoint_generation,
@@ -2894,6 +2957,7 @@ async fn commit_snapshot<D: PageDevice>(
             is_new_blob: is_new,
         },
         checkpoint,
+        successor,
     ))
 }
 

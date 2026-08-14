@@ -2464,7 +2464,7 @@ pub(crate) async fn publish_checkpoint<D: PageDevice>(
     catalog_root: PhysicalPointer,
     authority_root: PhysicalPointer,
     allocation_root: PhysicalPointer,
-) -> Result<(), GcStoreError<D::Error>> {
+) -> Result<Checkpoint, GcStoreError<D::Error>> {
     let slot = ((generation - 1) & 1) as u8;
     let checkpoint = Checkpoint {
         binding: RecordBinding {
@@ -2490,7 +2490,7 @@ pub(crate) async fn publish_checkpoint<D: PageDevice>(
         replay_tail: PhysicalPointer::Null,
     };
     write_checkpoint(device, &checkpoint, true).await?;
-    Ok(())
+    Ok(checkpoint)
 }
 
 async fn clear_old_checkpoint_seal<D: PageDevice>(

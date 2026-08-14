@@ -550,6 +550,10 @@ pub struct SegmentStore<D> {
     /// does not re-hash the whole logical history on every commit.
     pub(crate) logical_roots:
         alloc::collections::BTreeMap<u128, (u32, u64, vibeos_blob_format::Hash)>,
+    /// The committed M4 ObjectId set of the exact installed authority
+    /// generation, captured at installation so a strict-successor append does
+    /// not re-decode the whole predecessor stream to learn it.
+    pub(crate) committed_ids_cache: Option<(u64, alloc::collections::BTreeSet<u128>)>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -576,6 +580,7 @@ impl<D: PageDevice> SegmentStore<D> {
             promotion_verified: alloc::collections::BTreeSet::new(),
             dedup_verified: alloc::collections::BTreeSet::new(),
             logical_roots: alloc::collections::BTreeMap::new(),
+            committed_ids_cache: None,
         }
     }
 
@@ -811,6 +816,7 @@ impl<D: PageDevice> SegmentStore<D> {
         self.promotion_verified.clear();
         self.dedup_verified.clear();
         self.logical_roots.clear();
+        self.committed_ids_cache = None;
         self.mounted = None;
         self.poisoned = false;
         validate_limits(self.limits)?;

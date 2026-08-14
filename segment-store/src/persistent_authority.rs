@@ -466,6 +466,7 @@ impl<D: PageDevice> SegmentStore<D> {
         update: PersistentAuthorityImport,
         principal: &StoragePrincipal,
     ) -> Result<PersistentAuthorityAppendResult, PersistentAuthorityError<D::Error>> {
+        crate::bench_mark(0);
         let lease = self
             .acquire_maintenance(
                 &writer.maintenance,
@@ -493,22 +494,29 @@ impl<D: PageDevice> SegmentStore<D> {
         {
             return Err(PersistentAuthorityError::GenerationMismatch);
         }
-        let old_sectors: Vec<[u8; vibeos_durable_format::RECORD_SIZE]> =
-            current.record_sectors().copied().collect();
-        let store_id = decoded_store_id(&old_sectors).ok_or(PersistentAuthorityError::Snapshot(
-            AuthoritySnapshotError::InvalidAuthorityGraph,
-        ))?;
-        let old_object_ids: BTreeSet<u128> =
-            vibeos_durable_format::preflight_recovery(&old_sectors, store_id)
-                .map_err(|_| {
-                    PersistentAuthorityError::Snapshot(
+        let old_object_ids: BTreeSet<u128> = match &self.committed_ids_cache {
+            // The predecessor stream's committed set was captured when that
+            // exact generation was installed; no re-decode is needed.
+            Some((generation, ids)) if *generation == expected_generation => ids.clone(),
+            _ => {
+                let old_sectors: Vec<[u8; vibeos_durable_format::RECORD_SIZE]> =
+                    current.record_sectors().copied().collect();
+                let store_id =
+                    decoded_store_id(&old_sectors).ok_or(PersistentAuthorityError::Snapshot(
                         AuthoritySnapshotError::InvalidAuthorityGraph,
-                    )
-                })?
-                .committed_objects()
-                .iter()
-                .map(|object| object.object_id.get())
-                .collect();
+                    ))?;
+                vibeos_durable_format::preflight_recovery(&old_sectors, store_id)
+                    .map_err(|_| {
+                        PersistentAuthorityError::Snapshot(
+                            AuthoritySnapshotError::InvalidAuthorityGraph,
+                        )
+                    })?
+                    .committed_objects()
+                    .iter()
+                    .map(|object| object.object_id.get())
+                    .collect()
+            }
+        };
         let new_object_ids: BTreeSet<u128> = update
             .recovered
             .objects
@@ -521,6 +529,7 @@ impl<D: PageDevice> SegmentStore<D> {
             .copied()
             .filter(|object_id| !update.is_admitted(*object_id))
             .collect();
+        crate::bench_mark(1);
         let retry_update = update.clone();
         let retry_transient_ids = transient_ids.clone();
         let retry_new_object_ids = new_object_ids.clone();
@@ -886,6 +895,14 @@ impl<D: PageDevice> SegmentStore<D> {
         PersistentAuthorityError<D::Error>,
     > {
         validate_quota_totals(&import, None)?;
+        // Captured for the successor's committed-set cache before the import
+        // moves into the snapshot.
+        let imported_committed_ids: BTreeSet<u128> = import
+            .recovered
+            .objects
+            .iter()
+            .map(|object| object.object_id.get())
+            .collect();
         // Merkle roots for every logical object, from the cache where the
         // stable ObjectId was already hashed by an earlier installation.
         let mut logical_roots: alloc::collections::BTreeMap<u128, vibeos_blob_format::Hash> =
@@ -894,6 +911,7 @@ impl<D: PageDevice> SegmentStore<D> {
             let root = self.cached_logical_root(recovered)?;
             logical_roots.insert(recovered.object_id.get(), root);
         }
+        crate::bench_mark(2);
         // A strict logical-stream successor cannot redefine an existing M4
         // ObjectId. Reuse its already authenticated V2 binding instead of
         // consuming a new CAS mapping/segment on every authority append.
@@ -1046,6 +1064,7 @@ impl<D: PageDevice> SegmentStore<D> {
             }
             fresh.push(recovered);
         }
+        crate::bench_mark(3);
         if fresh.len() == 1 {
             let recovered = fresh[0];
             let stable_id = recovered.object_id.get();
@@ -1109,7 +1128,9 @@ impl<D: PageDevice> SegmentStore<D> {
             for chunk in recovered.bytes.chunks(LEAF_SIZE) {
                 writer.write_chunk(chunk).await?;
             }
+            crate::bench_mark(4);
             let staged = Box::pin(writer.stage_commit()).await?;
+            crate::bench_mark(5);
             let mut bindings: Vec<PersistentObjectBinding> = reusable_bindings
                 .into_iter()
                 .filter(|binding| import.is_admitted(binding.stable_object_id))
@@ -1136,14 +1157,14 @@ impl<D: PageDevice> SegmentStore<D> {
                 });
             }
             bindings.sort_unstable_by_key(|binding| binding.stable_object_id);
-            let snapshot = PersistentAuthoritySnapshot::new(
+            let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
                 generation,
                 import.root_policy_sha256,
                 import.record_stream,
                 bindings,
                 import.principals,
+                external_roots,
             )
-            .and_then(|snapshot| snapshot.with_external_roots(external_roots))
             .map_err(PersistentAuthorityError::Snapshot)?;
             let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
                 .map_err(PersistentAuthorityError::Snapshot)?;
@@ -1163,6 +1184,7 @@ impl<D: PageDevice> SegmentStore<D> {
             // Same ordering contract as publish_persistent_snapshot: the pure
             // quota installation precedes the first media mutation of the
             // fused publication.
+            crate::bench_mark(6);
             self.install_persistent_quota_snapshot(&snapshot)?;
             let object = self
                 .publish_staged_object_with_authority(
@@ -1194,12 +1216,15 @@ impl<D: PageDevice> SegmentStore<D> {
                     object: Arc::new(object),
                 });
             }
+            crate::bench_mark(11);
+            self.committed_ids_cache = Some((generation, imported_committed_ids));
             // Admitted fused objects are durably named by the checkpoint's
             // authority snapshot and root set; their runtime handles may drop.
             drop(committed);
             let view = self
                 .build_persistent_view(self.require_current_generation()?, snapshot, false)
                 .await?;
+            crate::bench_mark(12);
             return Ok((view, transient_objects));
         }
         let mut committed = Vec::new();
@@ -1336,14 +1361,14 @@ impl<D: PageDevice> SegmentStore<D> {
             });
         }
         bindings.sort_unstable_by_key(|binding| binding.stable_object_id);
-        let snapshot = PersistentAuthoritySnapshot::new(
+        let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
             generation,
             import.root_policy_sha256,
             import.record_stream,
             bindings,
             import.principals,
+            external_roots,
         )
-        .and_then(|snapshot| snapshot.with_external_roots(external_roots))
         .map_err(PersistentAuthorityError::Snapshot)?;
         let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
             .map_err(PersistentAuthorityError::Snapshot)?;
@@ -1352,6 +1377,7 @@ impl<D: PageDevice> SegmentStore<D> {
         // partially imported authority graph.
         self.publish_persistent_snapshot(state, generation, authority_bytes, &snapshot)
             .await?;
+        self.committed_ids_cache = Some((generation, imported_committed_ids));
         drop(committed);
         let view = self
             .build_persistent_view(self.require_current_generation()?, snapshot, false)

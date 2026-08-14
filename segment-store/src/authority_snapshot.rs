@@ -110,6 +110,49 @@ impl PersistentAuthorityImport {
         canonical_external_root_policy: &[u8],
         principals: Vec<PersistentPrincipalPolicy>,
     ) -> Result<Self, AuthoritySnapshotError> {
+        Self::from_m4_with_sealed_singletons_inner(
+            sectors,
+            store_id,
+            exact_roots,
+            sealed_singleton_kinds,
+            canonical_external_root_policy,
+            principals,
+            None,
+        )
+    }
+
+    /// Variant reusing an already-computed preflight of the exact same
+    /// `sectors`/`store_id`, avoiding one full stream re-validation.
+    pub fn from_m4_with_sealed_singletons_preflighted(
+        sectors: &[[u8; RECORD_SIZE]],
+        store_id: StoreId,
+        exact_roots: &[RootPolicy],
+        sealed_singleton_kinds: &[vibeos_durable_format::ObjectKind],
+        canonical_external_root_policy: &[u8],
+        principals: Vec<PersistentPrincipalPolicy>,
+        preflight: vibeos_durable_format::RecoveryPreflight,
+    ) -> Result<Self, AuthoritySnapshotError> {
+        Self::from_m4_with_sealed_singletons_inner(
+            sectors,
+            store_id,
+            exact_roots,
+            sealed_singleton_kinds,
+            canonical_external_root_policy,
+            principals,
+            Some(preflight),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_m4_with_sealed_singletons_inner(
+        sectors: &[[u8; RECORD_SIZE]],
+        store_id: StoreId,
+        exact_roots: &[RootPolicy],
+        sealed_singleton_kinds: &[vibeos_durable_format::ObjectKind],
+        canonical_external_root_policy: &[u8],
+        principals: Vec<PersistentPrincipalPolicy>,
+        preflight: Option<vibeos_durable_format::RecoveryPreflight>,
+    ) -> Result<Self, AuthoritySnapshotError> {
         let record_bytes = sectors
             .len()
             .checked_mul(RECORD_SIZE)
@@ -121,9 +164,12 @@ impl PersistentAuthorityImport {
             return Err(AuthoritySnapshotError::OutOfBounds);
         }
         validate_principals(&principals)?;
-        let recovered = preflight_recovery(sectors, store_id)
-            .and_then(|preflight| preflight.finish(exact_roots))
-            .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+        let recovered = match preflight {
+            Some(preflight) => preflight.finish(exact_roots),
+            None => preflight_recovery(sectors, store_id)
+                .and_then(|preflight| preflight.finish(exact_roots)),
+        }
+        .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
         let mut previous_kind = None;
         let mut kinds = sealed_singleton_kinds.to_vec();
         kinds.sort_unstable();
@@ -329,7 +375,31 @@ impl PersistentAuthoritySnapshot {
             principals,
             external_roots: Vec::new(),
         };
-        validate(&value)?;
+        validate(&value, true)?;
+        Ok(value)
+    }
+
+    /// Build a snapshot whose record stream is known to be validated because
+    /// it was taken verbatim from a [`PersistentAuthorityImport`], whose only
+    /// constructors preflight the stream. Every structural field check still
+    /// runs; only the per-record chain walk is skipped.
+    pub(crate) fn from_validated_import_parts(
+        checkpoint_generation: u64,
+        root_policy_sha256: [u8; 32],
+        record_stream: Vec<u8>,
+        objects: Vec<PersistentObjectBinding>,
+        principals: Vec<PersistentPrincipalPolicy>,
+        external_roots: Vec<PersistentRootEntry>,
+    ) -> Result<Self, AuthoritySnapshotError> {
+        let value = Self {
+            checkpoint_generation,
+            root_policy_sha256,
+            record_stream,
+            objects,
+            principals,
+            external_roots,
+        };
+        validate(&value, false)?;
         Ok(value)
     }
 
@@ -361,7 +431,7 @@ impl PersistentAuthoritySnapshot {
         external_roots: Vec<PersistentRootEntry>,
     ) -> Result<Self, AuthoritySnapshotError> {
         self.external_roots = external_roots;
-        validate(&self)?;
+        validate(&self, true)?;
         Ok(self)
     }
 
@@ -450,7 +520,9 @@ pub fn root_policy_commitment(canonical_policy: &[u8]) -> [u8; 32] {
 pub fn encode_persistent_authority_snapshot(
     value: &PersistentAuthoritySnapshot,
 ) -> Result<Vec<u8>, AuthoritySnapshotError> {
-    validate(value)?;
+    // Every constructor validated the snapshot, including its record chain;
+    // re-run only the cheap structural checks before encoding.
+    validate(value, false)?;
     let object_offset = PERSISTENT_AUTHORITY_HEADER_LEN;
     let principal_offset = object_offset
         .checked_add(
@@ -694,11 +766,14 @@ pub fn decode_persistent_authority_snapshot(
         principals,
         external_roots,
     };
-    validate(&snapshot)?;
+    validate(&snapshot, true)?;
     Ok(snapshot)
 }
 
-fn validate(value: &PersistentAuthoritySnapshot) -> Result<(), AuthoritySnapshotError> {
+fn validate(
+    value: &PersistentAuthoritySnapshot,
+    check_record_chain: bool,
+) -> Result<(), AuthoritySnapshotError> {
     if value.checkpoint_generation == 0
         || value.root_policy_sha256 == [0; 32]
         || value.record_stream.is_empty()
@@ -707,7 +782,9 @@ fn validate(value: &PersistentAuthoritySnapshot) -> Result<(), AuthoritySnapshot
     {
         return Err(AuthoritySnapshotError::InvalidField);
     }
-    validate_record_chain(&value.record_stream)?;
+    if check_record_chain {
+        validate_record_chain(&value.record_stream)?;
+    }
     let mut previous_stable = None;
     let mut v2_object_ids = Vec::new();
     v2_object_ids

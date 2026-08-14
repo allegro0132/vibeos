@@ -156,6 +156,13 @@ fn exact_cspace_reset_rejects_identity_incarnation_and_aba_without_mutation() {
     assert_eq!(space.incarnation(), incarnation);
     assert!(space.lookup_as::<Widget>(cap, Rights::READ).is_ok());
 
+    assert_eq!(space.preflight_reset_exact(identity, incarnation), Ok(()));
+    assert_eq!(space.incarnation(), incarnation);
+    assert!(
+        space.lookup_as::<Widget>(cap, Rights::READ).is_ok(),
+        "reset preflight must not revoke live authority"
+    );
+
     assert_eq!(space.reset_exact(identity, incarnation), Ok(1));
     assert_eq!(space.incarnation(), incarnation + 1);
     assert_eq!(
@@ -163,6 +170,11 @@ fn exact_cspace_reset_rejects_identity_incarnation_and_aba_without_mutation() {
         Some(CapError::Invalid)
     );
     let fresh = space.mint(Arc::new(Widget("fresh")), Rights::READ);
+
+    assert_eq!(
+        space.preflight_reset_exact(identity, incarnation),
+        Err(CSpaceResetError::IncarnationMismatch)
+    );
 
     assert_eq!(
         space.reset_exact(identity, incarnation),

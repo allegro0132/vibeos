@@ -10,7 +10,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -20,6 +20,9 @@ use vibeos_core::arch::{
 use vibeos_core::chan::Endpoint;
 use vibeos_core::exec::{self, CancelOutcome, TaskExit, TaskState, WaitQueue};
 use vibeos_core::heap::{self, AllocationDomain, ArenaId, OwnerId};
+use vibeos_core::instance::{
+    FaultGateOutcome, InstancePhase, InstanceRegistry, InstanceToken, RegistryError,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static FAULT_NEXT_POLL: AtomicBool = AtomicBool::new(false);
@@ -37,17 +40,88 @@ static EXPECTED_EXCLUSIVE_FAULT: Mutex<Option<exec::TaskHandle>> = Mutex::new(No
 static EXCLUSIVE_FAULT_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
 static SHARED_TEARDOWN_SIBLING: Mutex<Option<exec::TaskHandle>> = Mutex::new(None);
 static SHARED_TEARDOWN_PROBES: AtomicU64 = AtomicU64::new(0);
+static MANAGED_REGISTRY: AtomicPtr<InstanceRegistry> = AtomicPtr::new(core::ptr::null_mut());
+static MANAGED_RECLAIMS: AtomicU64 = AtomicU64::new(0);
+static MANAGED_CSPACE_INCARNATION: AtomicU64 = AtomicU64::new(0);
+static MANAGED_FAULT_WITNESS: Mutex<Option<exec::ReclaimableFaultWitness>> = Mutex::new(None);
+static MANAGED_FIRST_POLLS: AtomicU64 = AtomicU64::new(0);
+static MANAGED_SECOND_POLLS: AtomicU64 = AtomicU64::new(0);
+static MANAGED_DROPS: AtomicU64 = AtomicU64::new(0);
+static MANAGED_ABANDONED_GUARD_READY: AtomicBool = AtomicBool::new(false);
+static MANAGED_EARLY_FINALIZE_DONE: AtomicBool = AtomicBool::new(false);
 
 unsafe fn record_fault_reclaim(
-    _primary_task: exec::TaskId,
-    domain: AllocationDomain,
+    witness: exec::ReclaimableFaultWitness,
 ) -> exec::FaultReclaimOutcome {
+    let domain = witness.allocation_domain();
     RECLAIMED_DOMAINS.lock().unwrap().push(domain);
     exec::FaultReclaimOutcome::Reclaimed
 }
 
 unsafe fn record_fault_cleanup(task: exec::TaskId, domain: AllocationDomain) {
     CLEANED_TASKS.lock().unwrap().push((task, domain));
+}
+
+unsafe fn reclaim_managed_test_instance(
+    witness: exec::ReclaimableFaultWitness,
+) -> exec::FaultReclaimOutcome {
+    assert!(
+        CLEANED_TASKS.lock().unwrap().is_empty(),
+        "managed faults must reach the registry gate before generic fault cleanup"
+    );
+    *MANAGED_FAULT_WITNESS.lock().unwrap() = Some(witness);
+    let registry = MANAGED_REGISTRY.load(Ordering::Acquire);
+    assert!(
+        !registry.is_null(),
+        "managed registry test pointer is absent"
+    );
+    // Safety: the serialized test retains the pointed-to registry until the
+    // executor and every replay below have returned.
+    match unsafe {
+        (&*registry).fault_reclaim(witness, |domain| {
+            assert_eq!(domain, witness.allocation_domain());
+            MANAGED_RECLAIMS.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+    } {
+        FaultGateOutcome::ManagedReclaimed => exec::FaultReclaimOutcome::Reclaimed,
+        FaultGateOutcome::NotManaged | FaultGateOutcome::Quarantined => {
+            exec::FaultReclaimOutcome::Quarantined
+        }
+    }
+}
+
+fn publish_managed_test_instance(
+    registry: &InstanceRegistry,
+    token: InstanceToken,
+    domain: AllocationDomain,
+    name: &str,
+    future: impl Future<Output = ()> + Send + 'static,
+) -> exec::TaskHandle {
+    CLEANED_TASKS.lock().unwrap().clear();
+    exec::set_fault_cleanup(record_fault_cleanup);
+    let mut batch = exec::PreparedTaskBatch::new();
+    // Safety: each caller reserves `token` for exactly `domain`, passes a
+    // token-only test future, and binds that exact prepared identity before
+    // the special all-or-none publication below.
+    unsafe {
+        batch.prepare_managed_instance_owned(token, domain, name, future);
+    }
+    let prepared = batch.prepared_handles()[0].clone();
+    let binding = batch.prepared_reclaimable_bindings()[0];
+    registry.bind(token, binding, &prepared).unwrap();
+    unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+    }
+    .unwrap()
+    .remove(0)
+}
+
+fn restore_managed_test_hooks() {
+    MANAGED_REGISTRY.store(core::ptr::null_mut(), Ordering::Release);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    exec::set_fault_cleanup(ignore_fault_cleanup);
 }
 
 fn observe_exclusive_fault_gate(task: exec::TaskId, domain: AllocationDomain) {
@@ -79,18 +153,16 @@ fn observe_exclusive_fault_gate(task: exec::TaskId, domain: AllocationDomain) {
 }
 
 unsafe fn observe_and_reclaim_exclusive_fault(
-    task: exec::TaskId,
-    domain: AllocationDomain,
+    witness: exec::ReclaimableFaultWitness,
 ) -> exec::FaultReclaimOutcome {
-    observe_exclusive_fault_gate(task, domain);
+    observe_exclusive_fault_gate(witness.task_id(), witness.allocation_domain());
     exec::FaultReclaimOutcome::Reclaimed
 }
 
 unsafe fn observe_and_quarantine_exclusive_fault(
-    task: exec::TaskId,
-    domain: AllocationDomain,
+    witness: exec::ReclaimableFaultWitness,
 ) -> exec::FaultReclaimOutcome {
-    observe_exclusive_fault_gate(task, domain);
+    observe_exclusive_fault_gate(witness.task_id(), witness.allocation_domain());
     exec::FaultReclaimOutcome::Quarantined
 }
 
@@ -128,6 +200,25 @@ fn fault_once_then_passthrough(poll: &mut dyn FnMut()) -> bool {
 
 fn fault_after_poll(poll: &mut dyn FnMut()) -> bool {
     poll();
+    true
+}
+
+fn fault_after_abandoning_cspace(poll: &mut dyn FnMut()) -> bool {
+    poll();
+    assert!(
+        MANAGED_ABANDONED_GUARD_READY.load(Ordering::Acquire),
+        "managed poll returned without abandoning its CSpace guard"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !MANAGED_EARLY_FINALIZE_DONE.load(Ordering::Acquire)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(
+        MANAGED_EARLY_FINALIZE_DONE.load(Ordering::Acquire),
+        "concurrent pre-terminal finalize did not return promptly"
+    );
     true
 }
 
@@ -242,6 +333,27 @@ impl Future for DropBombFuture {
 impl Drop for DropBombFuture {
     fn drop(&mut self) {
         self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct ManagedDropBombFuture {
+    token: InstanceToken,
+}
+
+impl Future for ManagedDropBombFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        let witness = exec::current_reclaimable_task_witness()
+            .expect("managed destructor poll has no executor witness");
+        assert_eq!(witness.instance_token(), Some(self.token));
+        Poll::Pending
+    }
+}
+
+impl Drop for ManagedDropBombFuture {
+    fn drop(&mut self) {
+        MANAGED_DROPS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -680,7 +792,9 @@ fn exclusive_prepared_task_is_inert_until_exact_registry_activation() {
     let published = unsafe {
         batch.publish_exclusive_reclaimable_with(|bindings| {
             activation_calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(bindings, &[binding]);
+            assert_eq!(bindings.len(), 1);
+            assert!(bindings[0].matches_prepared_identity(binding));
+            assert!(bindings[0].scheduler_identity().is_some());
             assert!(bindings[0].matches_handle(&handle));
             assert!(!handle.is_published());
             registry_active.store(true, Ordering::Release);
@@ -997,7 +1111,9 @@ fn mixed_batch_publishes_safe_and_exclusive_members_together() {
 
     let published = unsafe {
         batch.publish_exclusive_reclaimable_with(|bindings| {
-            assert_eq!(bindings, &[tracked_binding]);
+            assert_eq!(bindings.len(), 1);
+            assert!(bindings[0].matches_prepared_identity(tracked_binding));
+            assert!(bindings[0].scheduler_identity().is_some());
             assert!(bindings[0].matches_handle(&handles[1]));
             assert!(!bindings[0].matches_handle(&handles[0]));
             registry_active.store(true, Ordering::Release);
@@ -1597,6 +1713,589 @@ fn an_exclusive_fault_closes_dispatch_before_reclaim_and_rejects_stale_events() 
         );
     }
     assert_eq!(EXCLUSIVE_FAULT_HOOK_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_managed_fault_uses_the_exact_registry_witness_and_resets_only_after_terminal() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let domains_before = exec::reclaimable_domain_count();
+    let registry = InstanceRegistry::new();
+    MANAGED_REGISTRY.store(core::ptr::from_ref(&registry).cast_mut(), Ordering::Release);
+    MANAGED_RECLAIMS.store(0, Ordering::SeqCst);
+    MANAGED_CSPACE_INCARNATION.store(0, Ordering::SeqCst);
+    MANAGED_FAULT_WITNESS.lock().unwrap().take();
+    CLEANED_TASKS.lock().unwrap().clear();
+    exec::set_fault_cleanup(record_fault_cleanup);
+    exec::set_fault_reclaimer(reclaim_managed_test_instance);
+    exec::set_fault_guard(fault_after_poll);
+
+    let domain = AllocationDomain::new(OwnerId::new(20_140), ArenaId::new(30_140));
+    let token = registry.reserve(domain).unwrap();
+    let mut batch = exec::PreparedTaskBatch::new();
+    let future = async move {
+        let witness = exec::current_reclaimable_task_witness()
+            .expect("managed poll has no exact executor witness");
+        let registry = MANAGED_REGISTRY.load(Ordering::Acquire);
+        assert!(!registry.is_null());
+        // Safety: the serialized test retains the registry and this exact
+        // task is still inside the poll named by `witness`.
+        unsafe {
+            (&*registry)
+                .with_active_space(witness, |space| {
+                    MANAGED_CSPACE_INCARNATION
+                        .store(space.cspace().lock().incarnation(), Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+        core::future::pending::<()>().await;
+    };
+    // Safety: the sole arena future captures only the opaque non-owning token;
+    // bind and activation complete before it becomes runnable.
+    unsafe {
+        batch.prepare_managed_instance_owned(token, domain, "managed-fault", future);
+    }
+    let prepared = batch.prepared_handles()[0].clone();
+    let binding = batch.prepared_reclaimable_bindings()[0];
+    registry.bind(token, binding, &prepared).unwrap();
+    let handles = unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+    }
+    .unwrap();
+    let handle = &handles[0];
+
+    assert!(exec::poll_once());
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert!(CLEANED_TASKS.lock().unwrap().is_empty());
+    assert_eq!(
+        registry.snapshot(token).unwrap().phase,
+        InstancePhase::FaultReclaimed
+    );
+    let incarnation = MANAGED_CSPACE_INCARNATION.load(Ordering::SeqCst);
+    assert_ne!(incarnation, 0);
+
+    let finalized = unsafe {
+        registry.finalize(token, handle, |_| {
+            panic!("fault finalization attempted normal arena close")
+        })
+    }
+    .unwrap();
+    assert_eq!(finalized.next_cspace_incarnation, incarnation + 1);
+
+    // Replaying the executor-forged old witness cannot raw-reclaim or reset a
+    // second time.  The generation mismatch is isolated as sticky quarantine.
+    let stale = MANAGED_FAULT_WITNESS
+        .lock()
+        .unwrap()
+        .take()
+        .expect("managed reclaimer did not retain its witness");
+    assert_eq!(
+        unsafe {
+            registry.fault_reclaim(stale, |_| {
+                MANAGED_RECLAIMS.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        },
+        FaultGateOutcome::Quarantined
+    );
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+
+    restore_managed_test_hooks();
+}
+
+#[test]
+fn a_managed_fault_witness_replay_before_finalize_never_reclaims_or_resets_twice() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let registry = InstanceRegistry::new();
+    MANAGED_REGISTRY.store(core::ptr::from_ref(&registry).cast_mut(), Ordering::Release);
+    MANAGED_RECLAIMS.store(0, Ordering::SeqCst);
+    MANAGED_CSPACE_INCARNATION.store(0, Ordering::SeqCst);
+    MANAGED_FAULT_WITNESS.lock().unwrap().take();
+    exec::set_fault_reclaimer(reclaim_managed_test_instance);
+    exec::set_fault_guard(fault_after_poll);
+
+    let domain = AllocationDomain::new(OwnerId::new(20_141), ArenaId::new(30_141));
+    let token = registry.reserve(domain).unwrap();
+    let future = async move {
+        let witness = exec::current_reclaimable_task_witness()
+            .expect("managed replay poll has no exact executor witness");
+        assert_eq!(witness.instance_token(), Some(token));
+        let registry = MANAGED_REGISTRY.load(Ordering::Acquire);
+        assert!(!registry.is_null());
+        unsafe {
+            (&*registry)
+                .with_active_space(witness, |space| {
+                    MANAGED_CSPACE_INCARNATION
+                        .store(space.cspace().lock().incarnation(), Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+        core::future::pending::<()>().await;
+    };
+    let handle = publish_managed_test_instance(&registry, token, domain, "managed-replay", future);
+
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert_ne!(MANAGED_CSPACE_INCARNATION.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.snapshot(token).unwrap().phase,
+        InstancePhase::FaultReclaimed
+    );
+
+    let replay = MANAGED_FAULT_WITNESS
+        .lock()
+        .unwrap()
+        .take()
+        .expect("managed reclaimer did not retain its witness");
+    assert_eq!(
+        unsafe {
+            registry.fault_reclaim(replay, |_| {
+                MANAGED_RECLAIMS.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        },
+        FaultGateOutcome::Quarantined
+    );
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.snapshot(token), Err(RegistryError::Quarantined));
+    assert_eq!(
+        unsafe {
+            registry.finalize(token, &handle, |_| {
+                panic!("a replay-quarantined fault authorized normal close")
+            })
+        },
+        Err(RegistryError::WrongPhase),
+        "quarantine must make the sole reset path unreachable"
+    );
+
+    restore_managed_test_hooks();
+}
+
+#[test]
+fn an_old_managed_fault_witness_cannot_reclaim_or_reset_a_reused_slot() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let registry = InstanceRegistry::new();
+    MANAGED_REGISTRY.store(core::ptr::from_ref(&registry).cast_mut(), Ordering::Release);
+    MANAGED_RECLAIMS.store(0, Ordering::SeqCst);
+    MANAGED_CSPACE_INCARNATION.store(0, Ordering::SeqCst);
+    MANAGED_FAULT_WITNESS.lock().unwrap().take();
+    exec::set_fault_reclaimer(reclaim_managed_test_instance);
+    exec::set_fault_guard(fault_after_poll);
+
+    let old_domain = AllocationDomain::new(OwnerId::new(20_142), ArenaId::new(30_142));
+    let old_token = registry.reserve(old_domain).unwrap();
+    let old_future = async move {
+        let witness = exec::current_reclaimable_task_witness()
+            .expect("old managed poll has no exact executor witness");
+        assert_eq!(witness.instance_token(), Some(old_token));
+        let registry = MANAGED_REGISTRY.load(Ordering::Acquire);
+        unsafe {
+            (&*registry)
+                .with_active_space(witness, |space| {
+                    MANAGED_CSPACE_INCARNATION
+                        .store(space.cspace().lock().incarnation(), Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+        core::future::pending::<()>().await;
+    };
+    let old_handle = publish_managed_test_instance(
+        &registry,
+        old_token,
+        old_domain,
+        "managed-aba-old",
+        old_future,
+    );
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    let old_incarnation = MANAGED_CSPACE_INCARNATION.load(Ordering::SeqCst);
+    let stale = MANAGED_FAULT_WITNESS
+        .lock()
+        .unwrap()
+        .take()
+        .expect("old managed fault retained no witness");
+    let finalized = unsafe {
+        registry.finalize(old_token, &old_handle, |_| {
+            panic!("fault finalization attempted normal close")
+        })
+    }
+    .unwrap();
+    assert_eq!(finalized.next_cspace_incarnation, old_incarnation + 1);
+
+    let new_domain = AllocationDomain::new(OwnerId::new(20_143), ArenaId::new(30_143));
+    let new_token = registry.reserve(new_domain).unwrap();
+    assert_ne!(
+        new_token, old_token,
+        "slot reuse must advance the generation"
+    );
+    MANAGED_CSPACE_INCARNATION.store(0, Ordering::SeqCst);
+    let new_future = async move {
+        let witness = exec::current_reclaimable_task_witness()
+            .expect("new managed poll has no exact executor witness");
+        assert_eq!(witness.instance_token(), Some(new_token));
+        let registry = MANAGED_REGISTRY.load(Ordering::Acquire);
+        unsafe {
+            (&*registry)
+                .with_active_space(witness, |space| {
+                    MANAGED_CSPACE_INCARNATION
+                        .store(space.cspace().lock().incarnation(), Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+        core::future::pending::<()>().await;
+    };
+    let new_handle = publish_managed_test_instance(
+        &registry,
+        new_token,
+        new_domain,
+        "managed-aba-new",
+        new_future,
+    );
+    assert!(exec::poll_once());
+    assert_eq!(
+        MANAGED_CSPACE_INCARNATION.load(Ordering::SeqCst),
+        finalized.next_cspace_incarnation
+    );
+    assert_eq!(
+        registry.snapshot(new_token).unwrap().phase,
+        InstancePhase::Active
+    );
+
+    assert_eq!(
+        unsafe {
+            registry.fault_reclaim(stale, |_| {
+                MANAGED_RECLAIMS.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        },
+        FaultGateOutcome::Quarantined
+    );
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert_eq!(new_handle.state(), TaskState::Running);
+    assert_eq!(
+        registry.snapshot(new_token),
+        Err(RegistryError::Quarantined)
+    );
+    assert_eq!(
+        exec::wake_with_disposition(new_handle.id()),
+        exec::WakeDisposition::Enqueued {
+            hart: exec::HartId::BOOT,
+        },
+        "an old witness must not detach the new executor incarnation"
+    );
+    assert!(exec::poll_once());
+    assert_eq!(new_handle.state(), TaskState::Running);
+    assert_eq!(new_handle.cancel(), CancelOutcome::Requested);
+    assert_eq!(new_handle.state(), TaskState::Cancelled);
+
+    restore_managed_test_hooks();
+}
+
+#[test]
+fn managed_instances_on_two_harts_fault_independently() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let registry = InstanceRegistry::new();
+    MANAGED_REGISTRY.store(core::ptr::from_ref(&registry).cast_mut(), Ordering::Release);
+    MANAGED_RECLAIMS.store(0, Ordering::SeqCst);
+    MANAGED_FIRST_POLLS.store(0, Ordering::SeqCst);
+    MANAGED_SECOND_POLLS.store(0, Ordering::SeqCst);
+    MANAGED_FAULT_WITNESS.lock().unwrap().take();
+    exec::set_fault_reclaimer(reclaim_managed_test_instance);
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    let first_domain = AllocationDomain::new(OwnerId::new(20_144), ArenaId::new(30_144));
+    let first_token = registry.reserve(first_domain).unwrap();
+    let first = {
+        let _hart = TestHartScope::enter(1);
+        let future = async move {
+            let witness = exec::current_reclaimable_task_witness()
+                .expect("hart-1 managed poll has no exact witness");
+            assert_eq!(witness.instance_token(), Some(first_token));
+            assert_eq!(witness.home_hart(), exec::HartId::new(1).unwrap());
+            MANAGED_FIRST_POLLS.fetch_add(1, Ordering::SeqCst);
+            core::future::pending::<()>().await;
+        };
+        publish_managed_test_instance(
+            &registry,
+            first_token,
+            first_domain,
+            "managed-hart-1",
+            future,
+        )
+    };
+
+    let second_domain = AllocationDomain::new(OwnerId::new(20_145), ArenaId::new(30_145));
+    let second_token = registry.reserve(second_domain).unwrap();
+    let second = {
+        let _hart = TestHartScope::enter(3);
+        let future = async move {
+            let witness = exec::current_reclaimable_task_witness()
+                .expect("hart-3 managed poll has no exact witness");
+            assert_eq!(witness.instance_token(), Some(second_token));
+            assert_eq!(witness.home_hart(), exec::HartId::new(3).unwrap());
+            MANAGED_SECOND_POLLS.fetch_add(1, Ordering::SeqCst);
+            core::future::pending::<()>().await;
+        };
+        publish_managed_test_instance(
+            &registry,
+            second_token,
+            second_domain,
+            "managed-hart-3",
+            future,
+        )
+    };
+
+    assert!(!exec::poll_once(), "hart 0 stole a managed instance");
+    {
+        let _hart = TestHartScope::enter(1);
+        assert!(exec::poll_once());
+    }
+    assert_eq!(MANAGED_FIRST_POLLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        registry.snapshot(first_token).unwrap().phase,
+        InstancePhase::Active
+    );
+
+    exec::set_fault_guard(fault_after_poll);
+    {
+        let _hart = TestHartScope::enter(3);
+        assert!(exec::poll_once());
+    }
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(MANAGED_SECOND_POLLS.load(Ordering::SeqCst), 1);
+    assert_eq!(second.state(), TaskState::Faulted);
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        registry.snapshot(second_token).unwrap().phase,
+        InstancePhase::FaultReclaimed
+    );
+    assert_eq!(first.state(), TaskState::Running);
+    assert_eq!(
+        registry.snapshot(first_token).unwrap().phase,
+        InstancePhase::Active
+    );
+
+    assert_eq!(
+        exec::wake_with_disposition(first.id()),
+        exec::WakeDisposition::Enqueued {
+            hart: exec::HartId::new(1).unwrap(),
+        }
+    );
+    {
+        let _hart = TestHartScope::enter(1);
+        assert!(exec::poll_once());
+    }
+    assert_eq!(first.state(), TaskState::Running);
+    assert_eq!(
+        registry.snapshot(first_token).unwrap().phase,
+        InstancePhase::Active
+    );
+    unsafe {
+        registry.finalize(second_token, &second, |_| {
+            panic!("fault finalization attempted normal close")
+        })
+    }
+    .unwrap();
+    {
+        let _hart = TestHartScope::enter(1);
+        assert_eq!(first.cancel(), CancelOutcome::Requested);
+    }
+    unsafe { registry.finalize(first_token, &first, |_| true) }.unwrap();
+
+    restore_managed_test_hooks();
+}
+
+#[test]
+fn a_managed_destructor_fault_uses_the_registry_gate() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let registry = InstanceRegistry::new();
+    MANAGED_REGISTRY.store(core::ptr::from_ref(&registry).cast_mut(), Ordering::Release);
+    MANAGED_RECLAIMS.store(0, Ordering::SeqCst);
+    MANAGED_DROPS.store(0, Ordering::SeqCst);
+    MANAGED_FAULT_WITNESS.lock().unwrap().take();
+    exec::set_fault_reclaimer(reclaim_managed_test_instance);
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    let domain = AllocationDomain::new(OwnerId::new(20_146), ArenaId::new(30_146));
+    let token = registry.reserve(domain).unwrap();
+    let handle = publish_managed_test_instance(
+        &registry,
+        token,
+        domain,
+        "managed-destructor-fault",
+        ManagedDropBombFuture { token },
+    );
+    assert!(exec::poll_once(), "the managed drop bomb must first park");
+    assert_eq!(
+        registry.snapshot(token).unwrap().phase,
+        InstancePhase::Active
+    );
+
+    exec::set_fault_guard(fault_after_poll);
+    assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(MANAGED_DROPS.load(Ordering::SeqCst), 1);
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(
+        registry.snapshot(token).unwrap().phase,
+        InstancePhase::FaultReclaimed
+    );
+    unsafe {
+        registry.finalize(token, &handle, |_| {
+            panic!("managed destructor fault attempted normal close")
+        })
+    }
+    .unwrap();
+
+    restore_managed_test_hooks();
+}
+
+#[test]
+fn managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize() {
+    const CHILD_ENV: &str = "VIBEOS_MANAGED_ABANDONED_CSPACE_CHILD";
+    const TEST_NAME: &str =
+        "managed_abandoned_cspace_recovery_does_not_deadlock_concurrent_early_finalize";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let executable = std::env::current_exe().expect("runtime test binary has no path");
+        let mut child = std::process::Command::new(executable)
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .spawn()
+            .expect("failed to spawn bounded abandoned-CSpace test child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if let Some(status) = child.try_wait().expect("failed to poll test child") {
+                assert!(
+                    status.success(),
+                    "abandoned-CSpace test child failed: {status}"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("abandoned-CSpace recovery or concurrent finalize deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let registry = InstanceRegistry::new();
+    MANAGED_REGISTRY.store(core::ptr::from_ref(&registry).cast_mut(), Ordering::Release);
+    MANAGED_RECLAIMS.store(0, Ordering::SeqCst);
+    MANAGED_CSPACE_INCARNATION.store(0, Ordering::SeqCst);
+    MANAGED_ABANDONED_GUARD_READY.store(false, Ordering::Release);
+    MANAGED_EARLY_FINALIZE_DONE.store(false, Ordering::Release);
+    MANAGED_FAULT_WITNESS.lock().unwrap().take();
+    exec::set_fault_reclaimer(reclaim_managed_test_instance);
+    exec::set_fault_guard(fault_after_abandoning_cspace);
+
+    let home = exec::HartId::new(1).unwrap();
+    let domain = AllocationDomain::new(OwnerId::new(20_147), ArenaId::new(30_147));
+    let token = registry.reserve(domain).unwrap();
+    let handle = {
+        let _hart = TestHartScope::enter(home.index());
+        let future = async move {
+            let witness = exec::current_reclaimable_task_witness()
+                .expect("abandoning managed poll has no exact witness");
+            assert_eq!(witness.instance_token(), Some(token));
+            assert_eq!(witness.home_hart(), home);
+            let registry = MANAGED_REGISTRY.load(Ordering::Acquire);
+            assert!(!registry.is_null());
+            unsafe {
+                (&*registry)
+                    .with_active_space(witness, |space| {
+                        let guard = space.cspace().lock();
+                        MANAGED_CSPACE_INCARNATION.store(guard.incarnation(), Ordering::SeqCst);
+                        // Safety: deliberately forgetting this exact-task
+                        // guard models a target fault that abandons a Rust
+                        // frame. The executor witness permanently detaches
+                        // this task before the registry alone recovers the
+                        // matching TaskId/domain lock provenance. The outer
+                        // process kills this child on any recovery deadlock.
+                        core::mem::forget(guard);
+                        MANAGED_ABANDONED_GUARD_READY.store(true, Ordering::Release);
+                    })
+                    .unwrap();
+            }
+            core::future::pending::<()>().await;
+        };
+        publish_managed_test_instance(&registry, token, domain, "managed-abandoned-cspace", future)
+    };
+
+    let (early_finalize, elapsed) = std::thread::scope(|scope| {
+        let concurrent_handle = handle.clone();
+        let registry_ref = &registry;
+        let attempt = scope.spawn(move || {
+            let hart_scope = TestHartScope::enter(3);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !MANAGED_ABANDONED_GUARD_READY.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            assert!(
+                MANAGED_ABANDONED_GUARD_READY.load(Ordering::Acquire),
+                "managed task never reached the abandoned-guard point"
+            );
+            assert_eq!(concurrent_handle.state(), TaskState::Running);
+            let started = std::time::Instant::now();
+            let result = unsafe {
+                registry_ref.finalize(token, &concurrent_handle, |_| {
+                    panic!("pre-terminal finalize attempted arena close")
+                })
+            };
+            let elapsed = started.elapsed();
+            // The host hart selector is process-global. Restore hart 1 before
+            // releasing the fault guard on the polling thread, otherwise its
+            // owner/current-task scope restoration could transiently observe
+            // hart 3 and make this ordering test flaky.
+            drop(hart_scope);
+            MANAGED_EARLY_FINALIZE_DONE.store(true, Ordering::Release);
+            (result, elapsed)
+        });
+        {
+            let _hart = TestHartScope::enter(home.index());
+            assert!(exec::poll_once());
+        }
+        attempt.join().expect("concurrent finalize thread panicked")
+    });
+
+    assert_eq!(early_finalize, Err(RegistryError::TaskNotTerminal));
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "pre-terminal finalize waited on abandoned CSpace for {elapsed:?}"
+    );
+    assert_eq!(handle.state(), TaskState::Faulted);
+    assert_eq!(MANAGED_RECLAIMS.load(Ordering::SeqCst), 1);
+    assert!(CLEANED_TASKS.lock().unwrap().is_empty());
+    assert_eq!(
+        registry.snapshot(token).unwrap().phase,
+        InstancePhase::FaultReclaimed
+    );
+    let incarnation = MANAGED_CSPACE_INCARNATION.load(Ordering::SeqCst);
+    assert_ne!(incarnation, 0);
+    let finalized = unsafe {
+        registry.finalize(token, &handle, |_| {
+            panic!("fault finalization attempted normal arena close")
+        })
+    }
+    .unwrap();
+    assert_eq!(finalized.next_cspace_incarnation, incarnation + 1);
+
+    restore_managed_test_hooks();
 }
 
 #[test]

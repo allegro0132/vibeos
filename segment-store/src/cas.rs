@@ -1697,11 +1697,16 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         let mut writer = Box::new(self);
         async move {
             let root = writer.finish_blob_encoding().await?;
-            let (pending, object_kind, exact_len) = writer.commit_encoded_snapshot(root).await?;
+            let (pending, object_kind, exact_len, previous, checkpoint) =
+                writer.commit_encoded_snapshot(root).await?;
             // The checkpoint is durable, but publication is still withheld. A
-            // cold reread installs the exact selected state before authority
-            // can escape.
-            writer.store.mount().await?;
+            // cold reread installs the exact selected successor before
+            // authority can escape. The predecessor was already verified by
+            // the current mount and is retained only as a transition witness.
+            writer
+                .store
+                .mount_verified_successor(previous, checkpoint)
+                .await?;
             let quota_charge = match writer.quota_reservation.take() {
                 Some(reservation) => {
                     let table = writer
@@ -1799,7 +1804,8 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
     async fn commit_encoded_snapshot(
         &mut self,
         root: Hash,
-    ) -> Result<(PendingCasObjectHandle, u32, u64), CasStoreError<D::Error>> {
+    ) -> Result<(PendingCasObjectHandle, u32, u64, MountedState, Checkpoint), CasStoreError<D::Error>>
+    {
         let state = self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
         let blob_key = BlobKey::sha256(self.object_kind, self.geometry.exact_len(), root)?;
 
@@ -1861,7 +1867,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         };
 
         let state = self.state.take().ok_or(CasStoreError::WriterFailed)?;
-        let pending = commit_snapshot(
+        let (pending, checkpoint) = commit_snapshot(
             &self.store.device,
             &state,
             self.store.limits,
@@ -1875,7 +1881,13 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             self.reference_codec,
         )
         .await?;
-        Ok((pending, self.object_kind, self.geometry.exact_len()))
+        Ok((
+            pending,
+            self.object_kind,
+            self.geometry.exact_len(),
+            state,
+            checkpoint,
+        ))
     }
 
     pub async fn commit_to<T>(
@@ -2329,10 +2341,6 @@ async fn seal_scratch_segment<D: PageDevice>(
     let mut header_seal = heap_page();
     let header_digest = encode_segment_header_body(&header, &mut header_body)?;
     encode_record_seal(header_digest, &mut header_seal)?;
-    write_page(device, base, &header_body).await?;
-    flush(device).await?;
-    write_page(device, base + 1, &header_seal).await?;
-    flush(device).await?;
 
     let mut records = Vec::new();
     records
@@ -2358,22 +2366,34 @@ async fn seal_scratch_segment<D: PageDevice>(
             blob_key.merkle_root(),
             payload_hashes[index],
         )?;
+        records.push(record);
+    }
+
+    // The scratch payload was made durable by finish_blob_encoding().  Publish
+    // this segment's descriptors as one transaction: no seal is written until
+    // every descriptor body is durable, and the segment summary is not written
+    // until every descriptor seal is durable.  A crash at either barrier leaves
+    // an unsealed segment, exactly as the former per-record barriers did.
+    write_page(device, base, &header_body).await?;
+    for record in &records {
         write_page(
             device,
-            base + u64::from(scratch.descriptor_relative_page),
+            base + u64::from(record.value.payload_first_relative_page - 2),
             &record.body,
         )
         .await?;
-        flush(device).await?;
+    }
+    flush(device).await?;
+    write_page(device, base + 1, &header_seal).await?;
+    for record in &records {
         write_page(
             device,
-            base + u64::from(scratch.descriptor_relative_page + 1),
+            base + u64::from(record.value.payload_first_relative_page - 1),
             &record.seal,
         )
         .await?;
-        flush(device).await?;
-        records.push(record);
     }
+    flush(device).await?;
     finalize_segment(
         device,
         state.superblock.binding.store_uuid,
@@ -2486,7 +2506,6 @@ pub(crate) async fn finalize_segment<D: PageDevice>(
     write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
     flush(device).await?;
     write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
-    flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
     flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
@@ -2507,7 +2526,7 @@ async fn commit_snapshot<D: PageDevice>(
     payload_hashes: &[Hash],
     pins: &crate::store::SharedStorePinRegistry,
     reference_codec: u16,
-) -> Result<PendingCasObjectHandle, CasStoreError<D::Error>> {
+) -> Result<(PendingCasObjectHandle, Checkpoint), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
         .checked_add(1)
@@ -2574,10 +2593,6 @@ async fn commit_snapshot<D: PageDevice>(
     let mut header_seal = heap_page();
     let header_digest = encode_segment_header_body(&header, &mut header_body)?;
     encode_record_seal(header_digest, &mut header_seal)?;
-    write_page(device, base, &header_body).await?;
-    flush(device).await?;
-    write_page(device, base + 1, &header_seal).await?;
-    flush(device).await?;
 
     let context = CasCodecContext::new(
         state.superblock.binding.store_uuid,
@@ -2587,6 +2602,7 @@ async fn commit_snapshot<D: PageDevice>(
     let mut relative = DATA_FIRST_PAGE;
     let mut ordinal = 1_u32;
     let mut records = Vec::new();
+    let mut manifest_record_and_bytes = None;
     let new_blob_mapping = if is_new {
         let manifest_bytes = encode_blob_manifest(&scratch_manifest, context)?;
         let record = build_record(
@@ -2607,14 +2623,18 @@ async fn commit_snapshot<D: PageDevice>(
             payload_sha256(&manifest_bytes),
             payload_sha256(&manifest_bytes),
         )?;
-        write_payload_record(device, base, &record, &manifest_bytes).await?;
         relative += record.value.record_span_pages;
         ordinal += 1;
         let mapping = BlobMapping {
             blob_key,
             manifest: record.pointer(),
         };
-        records.push(record);
+        manifest_record_and_bytes = Some((record, manifest_bytes));
+        let record = &manifest_record_and_bytes
+            .as_ref()
+            .ok_or(StoreError::Corrupt)?
+            .0;
+        records.push(record.clone());
         mapping
     } else {
         existing.ok_or(StoreError::Corrupt)?
@@ -2675,7 +2695,6 @@ async fn commit_snapshot<D: PageDevice>(
         payload_sha256(&snapshot_bytes),
         payload_sha256(&snapshot_bytes),
     )?;
-    write_payload_record(device, base, &snapshot_record, &snapshot_bytes).await?;
     relative += snapshot_record.value.record_span_pages;
     ordinal += 1;
     let catalog_root = snapshot_record.pointer();
@@ -2731,13 +2750,28 @@ async fn commit_snapshot<D: PageDevice>(
         payload_sha256(&allocation_bytes),
         payload_sha256(&allocation_bytes),
     )?;
-    write_payload_record(device, base, &allocation_record, &allocation_bytes).await?;
     relative += allocation_record.value.record_span_pages;
     let allocation_root = allocation_record.pointer();
     records.push(allocation_record);
     if relative > DATA_END_PAGE {
         return Err(StoreError::Capacity(CapacityClass::Metadata).into());
     }
+    let mut payload_records = Vec::new();
+    payload_records
+        .try_reserve_exact(records.len())
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+    if let Some((record, bytes)) = &manifest_record_and_bytes {
+        payload_records.push((record, bytes.as_slice()));
+    }
+    payload_records.push((&records[records.len() - 2], snapshot_bytes.as_slice()));
+    payload_records.push((&records[records.len() - 1], allocation_bytes.as_slice()));
+    write_payload_records_with_header(
+        device,
+        base,
+        Some((&header_body, &header_seal)),
+        &payload_records,
+    )
+    .await?;
     finalize_segment(
         device,
         state.superblock.binding.store_uuid,
@@ -2849,15 +2883,18 @@ async fn commit_snapshot<D: PageDevice>(
         PinAdmission::CompletionCritical,
     )
     .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
-    Ok(PendingCasObjectHandle {
-        store_uuid: state.superblock.binding.store_uuid,
-        object_id: state.next_object_id,
-        object_kind: blob_key.object_kind(),
-        exact_len: blob_key.exact_len(),
-        commit_generation: checkpoint_generation,
-        root_pin,
-        is_new_blob: is_new,
-    })
+    Ok((
+        PendingCasObjectHandle {
+            store_uuid: state.superblock.binding.store_uuid,
+            object_id: state.next_object_id,
+            object_kind: blob_key.object_kind(),
+            exact_len: blob_key.exact_len(),
+            commit_generation: checkpoint_generation,
+            root_pin,
+            is_new_blob: is_new,
+        },
+        checkpoint,
+    ))
 }
 
 pub(crate) async fn write_payload_record<D: PageDevice>(
@@ -2866,35 +2903,60 @@ pub(crate) async fn write_payload_record<D: PageDevice>(
     record: &FinalRecord,
     payload: &[u8],
 ) -> Result<(), StoreError<D::Error>> {
-    let mut copied = 0_usize;
-    let mut page_index = 0_u32;
-    while page_index < record.value.payload_pages {
-        let batch_pages = (record.value.payload_pages - page_index).min(32) as usize;
-        let mut pages = alloc::vec![[0; PAGE_SIZE]; batch_pages];
-        for page in &mut pages {
-            let take = (payload.len() - copied).min(PAGE_SIZE);
-            page[..take].copy_from_slice(&payload[copied..copied + take]);
-            copied += take;
+    write_payload_records_with_header(device, base, None, &[(record, payload)]).await
+}
+
+async fn write_payload_records_with_header<D: PageDevice>(
+    device: &D,
+    base: u64,
+    header: Option<(&Page, &Page)>,
+    records: &[(&FinalRecord, &[u8])],
+) -> Result<(), StoreError<D::Error>> {
+    // Payload, descriptor body, and descriptor seal are three dependency
+    // phases.  Records in the same segment transaction share each barrier.
+    // The single-record API above remains an exact adapter for existing users.
+    for (record, payload) in records {
+        let mut copied = 0_usize;
+        let mut page_index = 0_u32;
+        while page_index < record.value.payload_pages {
+            let batch_pages = (record.value.payload_pages - page_index).min(32) as usize;
+            let mut pages = alloc::vec![[0; PAGE_SIZE]; batch_pages];
+            for page in &mut pages {
+                let take = (payload.len() - copied).min(PAGE_SIZE);
+                page[..take].copy_from_slice(&payload[copied..copied + take]);
+                copied += take;
+            }
+            device
+                .write_pages(
+                    base + u64::from(record.value.payload_first_relative_page + page_index),
+                    &pages,
+                )
+                .await
+                .map_err(StoreError::Mutation)?;
+            page_index += batch_pages as u32;
         }
-        device
-            .write_pages(
-                base + u64::from(record.value.payload_first_relative_page + page_index),
-                &pages,
-            )
-            .await
-            .map_err(StoreError::Mutation)?;
-        page_index += batch_pages as u32;
+    }
+    if let Some((body, _)) = header {
+        write_page(device, base, body).await?;
     }
     flush(device).await?;
-    let descriptor_relative = record.value.payload_first_relative_page - 2;
-    write_page(device, base + u64::from(descriptor_relative), &record.body).await?;
+    if let Some((_, seal)) = header {
+        write_page(device, base + 1, seal).await?;
+    }
+    for (record, _) in records {
+        let descriptor_relative = record.value.payload_first_relative_page - 2;
+        write_page(device, base + u64::from(descriptor_relative), &record.body).await?;
+    }
     flush(device).await?;
-    write_page(
-        device,
-        base + u64::from(descriptor_relative + 1),
-        &record.seal,
-    )
-    .await?;
+    for (record, _) in records {
+        let descriptor_relative = record.value.payload_first_relative_page - 2;
+        write_page(
+            device,
+            base + u64::from(descriptor_relative + 1),
+            &record.seal,
+        )
+        .await?;
+    }
     flush(device).await
 }
 

@@ -890,6 +890,94 @@ impl<D: PageDevice> SegmentStore<D> {
         Ok(info)
     }
 
+    /// Install an ordinary commit successor without decoding the already
+    /// mounted predecessor from media a second time. The successor itself is
+    /// still recovered exclusively from durable bytes, and the resident
+    /// predecessor is reduced to the same allocation witness used by mount().
+    pub(crate) async fn mount_verified_successor(
+        &mut self,
+        previous: MountedState,
+        expected: Checkpoint,
+    ) -> Result<StoreInfo, StoreError<D::Error>> {
+        self.mounted = None;
+        self.poisoned = true;
+        validate_limits(self.limits)?;
+        let successor_generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or(StoreError::RecoveryRequired)?;
+        if self.published_generation.load(Ordering::Acquire) != previous.generation
+            || expected.previous_generation != previous.generation
+            || expected.binding.generation != successor_generation
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+
+        let device_info = self.device.info();
+        segments_for_page_count(device_info.page_count)?;
+        let selected_super = select_superblock(
+            read_superblock(&self.device, 0).await?,
+            read_superblock(&self.device, 2).await?,
+        )?
+        .ok_or(StoreError::Unformatted)?;
+        if selected_super.value() != &previous.superblock {
+            return Err(StoreError::Corrupt);
+        }
+
+        let left = read_checkpoint(&self.device, 4).await?;
+        let right = read_checkpoint(&self.device, 6).await?;
+        let selected =
+            select_checkpoint_for_superblock(selected_super, left, right, device_info.page_count)?
+                .ok_or(StoreError::Unformatted)?;
+        if selected.value() != &expected {
+            return Err(StoreError::Corrupt);
+        }
+        let predecessor =
+            if expected.slot == 0 { right } else { left }.ok_or(StoreError::Corrupt)?;
+        if !checkpoint_matches_mounted(predecessor.value(), &previous, self.limits) {
+            return Err(StoreError::Corrupt);
+        }
+
+        let previous_peak = previous.recovery_peak_bytes;
+        let witness = CheckpointTransitionWitness::from_mounted(previous);
+        let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
+        let remaining = self
+            .limits
+            .recovery_memory_bytes
+            .checked_sub(witness_bytes)
+            .ok_or(StoreError::MemoryLimit)?;
+        let successor_limits = StoreLimits {
+            recovery_memory_bytes: remaining,
+            ..self.limits
+        };
+        let mut successor = recover_state(
+            &self.device,
+            *selected_super.value(),
+            selected,
+            successor_limits,
+        )
+        .await?;
+        validate_checkpoint_transition(&witness, &successor)?;
+        let pair_peak = witness_bytes
+            .checked_add(successor.recovery_peak_bytes)
+            .ok_or(StoreError::MemoryLimit)?;
+        successor.recovery_peak_bytes = previous_peak.max(pair_peak).max(
+            successor
+                .resident_heap_bytes()
+                .ok_or(StoreError::MemoryLimit)?,
+        );
+        if successor.recovery_peak_bytes > self.limits.recovery_memory_bytes {
+            return Err(StoreError::MemoryLimit);
+        }
+        let info = successor.info();
+        if !publish_runtime_generation(&self.published_generation, successor.generation) {
+            return Err(StoreError::RecoveryRequired);
+        }
+        self.mounted = Some(successor);
+        self.poisoned = false;
+        Ok(info)
+    }
+
     pub async fn put(
         &mut self,
         object_kind: u32,
@@ -1035,6 +1123,31 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         Ok(resolved.bytes)
     }
+}
+
+fn checkpoint_matches_mounted(
+    checkpoint: &Checkpoint,
+    state: &MountedState,
+    limits: StoreLimits,
+) -> bool {
+    checkpoint.binding.store_uuid == state.superblock.binding.store_uuid
+        && checkpoint.binding.generation == state.generation
+        && checkpoint.binding.segment_no == ANCHOR_SEGMENT_NO
+        && checkpoint.binding.ordinal == u32::from(checkpoint.slot)
+        && checkpoint.binding.self_page == 4 + u64::from(checkpoint.slot) * 2
+        && checkpoint.binding.target_checkpoint_generation == state.generation
+        && checkpoint.slot == ((state.generation - 1) & 1) as u8
+        && admitted_pages(state.admitted_segments)
+            .is_ok_and(|pages| checkpoint.admitted_range_pages == pages)
+        && checkpoint.admitted_segments == state.admitted_segments
+        && checkpoint.next_segment_generation == state.next_segment_generation
+        && checkpoint.replay_count == state.replay_count
+        && checkpoint.max_replay_records == limits.max_replay_records
+        && checkpoint.cleaner_reserve_segments == state.cleaner_reserve_segments
+        && checkpoint.catalog_root == state.catalog_root
+        && checkpoint.authority_root == state.authority_root
+        && checkpoint.allocation_root == state.allocation_root
+        && checkpoint.replay_tail == state.replay_tail
 }
 
 impl MountedState {

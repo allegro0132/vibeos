@@ -30,19 +30,21 @@ use core::pin::Pin;
 #[cfg(feature = "ssh-component-command")]
 use core::ptr;
 #[cfg(feature = "ssh-component-command")]
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 #[cfg(feature = "ssh-component-command")]
 use core::task::{Context, Poll};
 
 use crate::exec::ReclaimableFaultWitness;
 #[cfg(feature = "ssh-component-command")]
-use crate::exec::{PreparedTaskBatch, TaskHandle, TaskId, TaskState};
+use crate::exec::{
+    OneShotWaitQueue, OneShotWake, PreparedTaskBatch, TaskHandle, TaskId, TaskState,
+};
 #[cfg(feature = "ssh-component-command")]
 use crate::heap::{AllocationDomain, OwnerId};
 #[cfg(feature = "ssh-component-command")]
 use crate::instance::{
-    CooperativeCancelOutcome, InstancePayload, InstancePhase, InstanceToken, ReserveError,
-    TerminalRetireKind,
+    CooperativeCancelOutcome, InstanceContinuation, InstanceContinuationKind, InstancePayload,
+    InstancePhase, InstanceToken, ReserveError, TerminalRetireKind,
 };
 use crate::instance::{FaultGateOutcome, InstanceRegistry};
 use crate::HEAP;
@@ -76,7 +78,8 @@ use vibeos_sshd::{AuthorizedProfile, SshExecComponentSessionPolicy};
 use vibeos_vsh::{
     ComponentArtifactIdentity, ComponentCommandManifest, ComponentTerminal, ComponentTrapCode,
     ManagedComponentCancel, ManagedComponentLifecycle, ManagedComponentState,
-    ManagedComponentToken, Session, SshExecComponentPolicy, StreamMode,
+    ManagedComponentStateFuture, ManagedComponentToken, Session, SshExecComponentPolicy,
+    StreamMode,
 };
 #[cfg(feature = "ssh-component-command")]
 use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
@@ -140,6 +143,7 @@ fn lifecycle_is_healthy() -> bool {
 fn lifecycle_fail_stop() {
     LIFECYCLE_HEALTH.store(LIFECYCLE_FAILED, Ordering::Release);
     SSH_POLICY_GATE.store(POLICY_FAILED, Ordering::Release);
+    CONTROL.request_fail_stop_wake();
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -210,7 +214,7 @@ impl ControlTable {
         }
     }
 
-    fn reserve(&mut self) -> Option<ControlKey> {
+    fn reserve(&mut self, gate: &ControlGate) -> Option<ControlKey> {
         for reuse_completed in [false, true] {
             for (index, record) in self.slots.iter_mut().enumerate() {
                 let reusable = if reuse_completed {
@@ -225,6 +229,13 @@ impl ControlTable {
                     record.phase == ControlPhase::Vacant
                 };
                 if !reusable {
+                    continue;
+                }
+                if gate.completion[index].waiter_count() != 0 {
+                    // A stale task still owns the prior generation's wake
+                    // edge. Never advance the slot generation underneath it.
+                    record.quarantine();
+                    lifecycle_fail_stop();
                     continue;
                 }
                 let generation = if record.generation == 0 {
@@ -242,10 +253,16 @@ impl ControlTable {
                 record.core_token = None;
                 record.handle = None;
                 record.domain = None;
-                return Some(ControlKey {
+                let key = ControlKey {
                     slot: index as u8,
                     generation,
-                });
+                };
+                if !gate.install_completion_generation(key) {
+                    record.quarantine();
+                    lifecycle_fail_stop();
+                    continue;
+                }
+                return Some(key);
             }
         }
         None
@@ -466,6 +483,9 @@ struct ControlGate {
     owner: AtomicU64,
     arena: AtomicU64,
     table: UnsafeCell<ControlTable>,
+    completion: [OneShotWaitQueue; CONTROL_SLOTS],
+    completion_generation: [AtomicU64; CONTROL_SLOTS],
+    fail_wake_pending: AtomicBool,
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -479,7 +499,68 @@ impl ControlGate {
             owner: AtomicU64::new(OwnerId::SYSTEM.get()),
             arena: AtomicU64::new(0),
             table: UnsafeCell::new(ControlTable::new()),
+            completion: [const { OneShotWaitQueue::new() }; CONTROL_SLOTS],
+            completion_generation: [const { AtomicU64::new(0) }; CONTROL_SLOTS],
+            fail_wake_pending: AtomicBool::new(false),
         }
+    }
+
+    fn completion(&self, key: ControlKey) -> Option<&OneShotWaitQueue> {
+        let index = key.slot as usize;
+        self.completion_generation
+            .get(index)
+            .is_some_and(|generation| generation.load(Ordering::Acquire) == key.generation)
+            .then(|| &self.completion[index])
+    }
+
+    /// Install the queue key while CONTROL serializes the matching record
+    /// generation. The monotonically increasing mirror lets a poisoned global
+    /// fail-stop wake current listeners without reading a possibly partial
+    /// table or guessing at a replacement generation.
+    fn install_completion_generation(&self, key: ControlKey) -> bool {
+        let Some(current) = self.completion_generation.get(key.slot as usize) else {
+            return false;
+        };
+        let previous = current.load(Ordering::Acquire);
+        if key.generation <= previous {
+            return false;
+        }
+        current.store(key.generation, Ordering::Release);
+        true
+    }
+
+    fn detach_fail_stop_wakes(&self) -> [Option<OneShotWake>; CONTROL_SLOTS] {
+        let mut wakes = [const { None }; CONTROL_SLOTS];
+        for (index, generation) in self.completion_generation.iter().enumerate() {
+            let generation = generation.load(Ordering::Acquire);
+            if generation != 0 {
+                wakes[index] = self.completion[index].publish(generation).ok();
+            }
+        }
+        wakes
+    }
+
+    fn dispatch_wakes(wakes: [Option<OneShotWake>; CONTROL_SLOTS]) {
+        for wake in wakes.into_iter().flatten() {
+            wake.dispatch();
+        }
+    }
+
+    fn request_fail_stop_wake(&self) {
+        self.fail_wake_pending.store(true, Ordering::Release);
+        let state = self.state.load(Ordering::Acquire);
+        if matches!(state & 0b11, CONTROL_ACQUIRING | CONTROL_HELD) {
+            // Never take SCHED while CONTROL is acquiring or held. The
+            // eventual ControlGuard::drop detaches under the exact control
+            // generation and dispatches after release; an acquiring-task
+            // fault first poisons the gate and invokes this path again.
+            return;
+        }
+        // A poisoned gate cannot safely expose its table. The generation
+        // mirrors were installed only while CONTROL was exact and are never
+        // decremented, so this global fail-stop path cannot target a stale or
+        // future replacement generation.
+        Self::dispatch_wakes(self.detach_fail_stop_wakes());
     }
 
     fn try_lock(&self) -> Result<ControlGuard<'_>, ControlGateError> {
@@ -626,7 +707,12 @@ impl DerefMut for ControlGuard<'_> {
 #[cfg(feature = "ssh-component-command")]
 impl Drop for ControlGuard<'_> {
     fn drop(&mut self) {
-        if self
+        let wakes = if self.gate.fail_wake_pending.swap(false, Ordering::AcqRel) {
+            self.gate.detach_fail_stop_wakes()
+        } else {
+            [const { None }; CONTROL_SLOTS]
+        };
+        let released = self
             .gate
             .state
             .compare_exchange(
@@ -635,10 +721,18 @@ impl Drop for ControlGuard<'_> {
                 Ordering::Release,
                 Ordering::Acquire,
             )
-            .is_err()
-        {
+            .is_ok();
+        if !released {
             self.gate.state.store(CONTROL_POISONED, Ordering::Release);
             lifecycle_fail_stop();
+        }
+        ControlGate::dispatch_wakes(wakes);
+        // Close the race where another task stores fail_wake_pending after
+        // the locked drain above but still observes this guard's HELD word.
+        // CONTROL is now FREE or POISONED, so the generation mirror is the
+        // conservative lock-independent source of truth.
+        if self.gate.fail_wake_pending.swap(false, Ordering::AcqRel) {
+            ControlGate::dispatch_wakes(self.gate.detach_fail_stop_wakes());
         }
     }
 }
@@ -688,6 +782,7 @@ enum PayloadMode {
 #[cfg(feature = "ssh-component-command")]
 struct LazyComponentPayload {
     root: &'static ImageRoot,
+    token: InstanceToken,
     resource_generation: u64,
     mode: PayloadMode,
     driver: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
@@ -722,9 +817,15 @@ impl Future for ManagedChildFuture {
 
 #[cfg(feature = "ssh-component-command")]
 impl LazyComponentPayload {
-    const fn new(root: &'static ImageRoot, resource_generation: u64, mode: PayloadMode) -> Self {
+    const fn new(
+        root: &'static ImageRoot,
+        token: InstanceToken,
+        resource_generation: u64,
+        mode: PayloadMode,
+    ) -> Self {
         Self {
             root,
+            token,
             resource_generation,
             mode,
             driver: None,
@@ -759,6 +860,7 @@ unsafe impl InstancePayload for LazyComponentPayload {
         if self.driver.is_none() {
             self.driver = Some(Box::pin(run_image_component(
                 self.root,
+                self.token,
                 self.resource_generation,
                 self.mode,
             )));
@@ -908,7 +1010,12 @@ const fn vsh_stream(mode: ComponentStreamMode) -> StreamMode {
 }
 
 #[cfg(feature = "ssh-component-command")]
-async fn run_image_component(root: &'static ImageRoot, generation: u64, mode: PayloadMode) -> u64 {
+async fn run_image_component(
+    root: &'static ImageRoot,
+    token: InstanceToken,
+    generation: u64,
+    mode: PayloadMode,
+) -> u64 {
     if !revalidate_image_root(root) {
         lifecycle_fail_stop();
         return terminal_word(ComponentTerminal::BackendFault);
@@ -954,7 +1061,19 @@ async fn run_image_component(root: &'static ImageRoot, generation: u64, mode: Pa
     };
     let value = loop {
         match call.poll() {
-            TypedPoll::Pending(_) => crate::exec::yield_now().await,
+            TypedPoll::Pending(_) => {
+                let continuation = match registry().yield_continuation_current(token) {
+                    Ok(continuation) => continuation,
+                    Err(_) => {
+                        lifecycle_fail_stop();
+                        return terminal_word(ComponentTerminal::RunnerFault);
+                    }
+                };
+                if continuation.await.is_err() {
+                    lifecycle_fail_stop();
+                    return terminal_word(ComponentTerminal::RunnerFault);
+                }
+            }
             TypedPoll::Ready(value) => break value,
             TypedPoll::HostFailed(error) => return terminal_word(host_error_terminal(error)),
             TypedPoll::Trapped(trap) => return terminal_word(trap_terminal(trap)),
@@ -962,8 +1081,8 @@ async fn run_image_component(root: &'static ImageRoot, generation: u64, mode: Pa
     };
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     if let PayloadMode::AcceptanceFault { round, hart } = mode {
-        acceptance::fault_after_runtime_barrier(round, hart).await;
-        panic!("deliberate C4.8 managed component fault after runtime execution");
+        acceptance::fault_with_pending_continuation(token, round, hart).await;
+        panic!("C5.2 continuation fault probe returned unexpectedly");
     }
     #[cfg(not(feature = "wasm-c48-qemu-acceptance"))]
     let _ = mode;
@@ -1130,7 +1249,7 @@ fn start_image_instance(
         system.restore();
         return Err(ComponentTerminal::BackendFault);
     }
-    let Some(key) = control.reserve() else {
+    let Some(key) = control.reserve(&CONTROL) else {
         system.restore();
         return Err(ComponentTerminal::Unavailable);
     };
@@ -1199,7 +1318,7 @@ fn start_image_instance(
     }
     if unsafe {
         registry().install_payload(core_token, || {
-            LazyComponentPayload::new(root, key.generation, mode)
+            LazyComponentPayload::new(root, core_token, key.generation, mode)
         })
     }
     .is_err()
@@ -1492,9 +1611,32 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
     record.core_token = None;
     record.handle = None;
     record.domain = None;
+    let Some(completion) = CONTROL.completion(key) else {
+        control
+            .exact_mut(key)
+            .expect("completed control slot exists")
+            .quarantine();
+        lifecycle_fail_stop();
+        system.restore();
+        return FinalizeControl::Lost;
+    };
+    let wake = match completion.publish(key.generation) {
+        Ok(wake) => wake,
+        Err(_) => {
+            control
+                .exact_mut(key)
+                .expect("completed control slot exists")
+                .quarantine();
+            lifecycle_fail_stop();
+            system.restore();
+            return FinalizeControl::Lost;
+        }
+    };
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     acceptance::record_outer_complete(tuple.handle.id(), tuple.domain, terminal);
     system.restore();
+    drop(control);
+    wake.dispatch();
     FinalizeControl::Complete
 }
 
@@ -1588,6 +1730,71 @@ fn observe_instance(token: ManagedComponentToken) -> ManagedComponentState {
         }
         ControlPhase::Vacant | ControlPhase::Starting | ControlPhase::Quarantined => {
             system.restore();
+            ManagedComponentState::Lost
+        }
+    }
+}
+
+#[cfg(feature = "ssh-component-command")]
+fn quarantine_wait_instance(key: ControlKey) {
+    let mut control = match CONTROL.try_lock_completion_ack() {
+        Ok(control) => control,
+        Err(_) => {
+            lifecycle_fail_stop();
+            return;
+        }
+    };
+    let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+    if control.exact(key).is_none() {
+        // A stale generation is observational only. It must not publish into,
+        // quarantine, or otherwise touch a replacement control record.
+        system.restore();
+        return;
+    }
+    control
+        .exact_mut(key)
+        .expect("exact wait control slot exists")
+        .quarantine();
+    lifecycle_fail_stop();
+    let wake = CONTROL
+        .completion(key)
+        .and_then(|completion| completion.publish(key.generation).ok());
+    system.restore();
+    drop(control);
+    if let Some(wake) = wake {
+        wake.dispatch();
+    }
+}
+
+#[cfg(feature = "ssh-component-command")]
+async fn wait_instance(token: ManagedComponentToken) -> ManagedComponentState {
+    let Some(key) = managed_token_key(token) else {
+        return ManagedComponentState::Lost;
+    };
+    let Some(completion) = CONTROL.completion(key) else {
+        return ManagedComponentState::Lost;
+    };
+
+    // Construct the listener before the scalar recheck. If terminal
+    // publication wins before the first listener poll, the queue's generation
+    // watermark makes that poll ready without installing a stale wake edge.
+    let listener = completion.wait(key.generation);
+    match observe_instance(token) {
+        ManagedComponentState::Running => {}
+        terminal => return terminal,
+    }
+    if listener.await.is_err() {
+        quarantine_wait_instance(key);
+        return ManagedComponentState::Lost;
+    }
+    match observe_instance(token) {
+        terminal @ ManagedComponentState::Complete(_) => terminal,
+        ManagedComponentState::Lost => ManagedComponentState::Lost,
+        ManagedComponentState::Running => {
+            // Only exact terminal publication can release this generation.
+            // Running after that edge means the control projection disagrees
+            // with its stable queue; fail-stop rather than polling again.
+            quarantine_wait_instance(key);
             ManagedComponentState::Lost
         }
     }
@@ -1730,6 +1937,13 @@ unsafe impl ManagedComponentLifecycle for ImageComponentLifecycle {
 
     fn state(&self, token: ManagedComponentToken) -> ManagedComponentState {
         observe_instance(token)
+    }
+
+    fn wait_state<'a>(&'a self, token: ManagedComponentToken) -> ManagedComponentStateFuture<'a> {
+        let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+        let future = Box::pin(wait_instance(token));
+        system.restore();
+        future
     }
 
     fn request_cancel(&self, token: ManagedComponentToken) -> ManagedComponentCancel {

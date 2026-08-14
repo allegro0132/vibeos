@@ -1,11 +1,13 @@
 use std::any::Any;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use vibeos_core::cap::{Resource, Rights};
 use vibeos_core::exec;
 use vibeos_vsh as vsh;
-use vibeos_vsh::{ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement, Status};
+use vibeos_vsh::{
+    CancellationSignal, ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement,
+    Status,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -41,7 +43,7 @@ fn execute_ssh(
     let task = exec::spawn_tracked("vsh-ssh-test", async move {
         let mut owned = session_task.lock().unwrap().take().unwrap();
         let report = owned
-            .execute_ssh_cancellable(source, Arc::new(AtomicBool::new(false)))
+            .execute_ssh_cancellable(source, Arc::new(CancellationSignal::new()))
             .await;
         *session_task.lock().unwrap() = Some(owned);
         *result_task.lock().unwrap() = Some(report);

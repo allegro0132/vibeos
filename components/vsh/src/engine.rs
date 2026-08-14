@@ -14,13 +14,16 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::future::Future;
+use core::future::{poll_fn, Future};
 use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::task::Poll;
 
 use vibeos_core::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
-use vibeos_core::exec::{self, TaskHandle, TaskState, WaitQueue};
+use vibeos_core::exec::{
+    self, OneShotWaitError, OneShotWaitQueue, TaskHandle, TaskState, WaitQueue,
+};
 use vibeos_core::heap;
 use vibeos_core::sync::SpinLock;
 
@@ -1571,6 +1574,79 @@ impl ComponentCancellation {
     }
 }
 
+struct CancellationSignalInner {
+    cancelled: AtomicBool,
+    waiter: OneShotWaitQueue,
+}
+
+#[derive(Clone)]
+/// A bounded, one-shot cancellation edge shared with one foreground request.
+///
+/// The signal owns exactly one fixed-capacity waiter slot. One VSH watcher
+/// fans cancellation out to every stage handle in a pipeline, so capacity is
+/// independent of the stage count. Calling [`cancel`](Self::cancel) before the
+/// watcher registers is remembered, repeated cancellation is idempotent, and
+/// a second concurrent watcher fails closed instead of growing a collection.
+pub struct CancellationSignal {
+    inner: Arc<CancellationSignalInner>,
+}
+
+impl CancellationSignal {
+    pub fn new() -> Self {
+        // TaskStatus may need to unregister the wait edge after reclaiming a
+        // faulting task's arena. Keep the queue itself in SYSTEM so even a
+        // caller-owned outer Arc may be conservatively leaked without leaving
+        // cleanup with an arena-backed pointer.
+        let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
+        let inner = Arc::new(CancellationSignalInner {
+            cancelled: AtomicBool::new(false),
+            waiter: OneShotWaitQueue::new(),
+        });
+        system.restore();
+        Self { inner }
+    }
+
+    /// Publish cancellation once and wake the exact registered task after the
+    /// queue lock has been released. Returns `true` only for the first signal.
+    pub fn cancel(&self) -> bool {
+        if self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let wake = self
+            .inner
+            .waiter
+            .publish(1)
+            .expect("cancellation signal generation is fixed and monotonic");
+        wake.dispatch();
+        true
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Wait without polling for the signal. Exactly one concurrent listener
+    /// is supported; callers receive the bounded queue error on misuse.
+    pub async fn cancelled(&self) -> Result<(), OneShotWaitError> {
+        let listener = self.inner.waiter.wait(1);
+        if self.is_cancelled() {
+            return Ok(());
+        }
+        listener.await?;
+        if self.is_cancelled() {
+            Ok(())
+        } else {
+            Err(OneShotWaitError::RegistrationMismatch)
+        }
+    }
+}
+
+impl Default for CancellationSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedComponentAuthority {
     label: String,
@@ -1725,8 +1801,8 @@ impl core::fmt::Debug for ManagedComponentToken {
 /// Copy-only state published by a trusted managed Component lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedComponentState {
-    /// The child remains live. VSH yields between bounded scalar reads; the
-    /// SSH supervisor must provide the enclosing timeout/cancellation bound.
+    /// The child remains live. VSH awaits the lifecycle's bounded state-change
+    /// future; the SSH supervisor provides the enclosing cancellation bound.
     Running,
     /// Stable terminal scalar. Until the sole VSH consumer explicitly
     /// acknowledges it, every later exact lookup must return the same value.
@@ -1735,6 +1811,9 @@ pub enum ManagedComponentState {
     /// the lifecycle to reclaim an ambiguous instance.
     Lost,
 }
+
+pub type ManagedComponentStateFuture<'a> =
+    Pin<Box<dyn Future<Output = ManagedComponentState> + Send + 'a>>;
 
 /// Result of a cooperative cancellation request for a managed invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1784,7 +1863,7 @@ pub enum ManagedComponentCancel {
 /// unregister, retire, or reset child state; those operations belong only to
 /// the independent SYSTEM lifecycle/child path.
 ///
-/// `state` and `request_cancel` must at least verify the lifecycle-token
+/// `state`, `wait_state`, and `request_cancel` must at least verify the lifecycle-token
 /// generation/control entry plus TaskId/status, owner/arena domain, and Space
 /// structural identity. Cancellation only writes the stable word and wakes;
 /// it must not hold a registry lock while waiting for CSpace access. The next
@@ -1811,6 +1890,13 @@ pub unsafe trait ManagedComponentLifecycle: Send + Sync + 'static {
     /// Read copy-only lifecycle state for a token. This is a completion-table
     /// lookup, not a future/WASM poll operation.
     fn state(&self, token: ManagedComponentToken) -> ManagedComponentState;
+
+    /// Await the first non-`Running` scalar for this exact token without
+    /// repeatedly scheduling the VSH task. The implementation may retain only
+    /// the opaque token and a fixed-capacity SYSTEM-owned registration. It
+    /// must close the register/recheck race, reject concurrent duplicate
+    /// listeners, and treat a stale generation or ABA mismatch as `Lost`.
+    fn wait_state<'a>(&'a self, token: ManagedComponentToken) -> ManagedComponentStateFuture<'a>;
 
     /// Request cooperative cancellation. The lifecycle wakes its owned child;
     /// VSH never cancels or retains that child's executor handle.
@@ -2160,6 +2246,7 @@ pub fn install_persistent_proxy<T: Resource>(
 #[derive(Clone)]
 struct JobControl {
     live: Arc<AtomicBool>,
+    completed: CancellationSignal,
     pipes: Vec<Arc<ByteStream>>,
 }
 impl JobControl {
@@ -2173,6 +2260,51 @@ impl JobControl {
             for p in &self.pipes {
                 p.close_write(reason.clone());
                 p.close_read(reason.clone());
+            }
+            self.completed.cancel();
+        }
+    }
+
+    fn finish(&self) {
+        if self.live.swap(false, Ordering::AcqRel) {
+            self.completed.cancel();
+        }
+    }
+}
+
+async fn watch_foreground_cancel(
+    cancel: Arc<CancellationSignal>,
+    control: JobControl,
+    handles: Vec<TaskHandle>,
+) {
+    enum Wake {
+        Cancelled(Result<(), OneShotWaitError>),
+        Completed(Result<(), OneShotWaitError>),
+    }
+
+    let cancelled = cancel.cancelled();
+    let completed = control.completed.cancelled();
+    let mut cancelled = core::pin::pin!(cancelled);
+    let mut completed = core::pin::pin!(completed);
+    let wake = poll_fn(|context| {
+        if let Poll::Ready(result) = cancelled.as_mut().poll(context) {
+            return Poll::Ready(Wake::Cancelled(result));
+        }
+        completed.as_mut().poll(context).map(Wake::Completed)
+    })
+    .await;
+    match wake {
+        Wake::Cancelled(Ok(())) => {
+            control.fail(Status::Cancelled);
+            for handle in &handles {
+                let _ = handle.cancel();
+            }
+        }
+        Wake::Completed(Ok(())) => {}
+        Wake::Cancelled(Err(_)) | Wake::Completed(Err(_)) => {
+            control.fail(Status::BackendFault);
+            for handle in &handles {
+                let _ = handle.cancel();
             }
         }
     }
@@ -2357,7 +2489,7 @@ pub struct Session {
     revoke_next_job: Option<Cap>,
     cancel_next_job: bool,
     jobs: BTreeMap<u64, BackgroundJob>,
-    external_cancel: Option<Arc<AtomicBool>>,
+    external_cancel: Option<Arc<CancellationSignal>>,
     function_depth: usize,
     substitution_depth: usize,
     script_depth: usize,
@@ -2907,7 +3039,7 @@ impl Session {
 
     fn request_shutdown(&mut self) {
         if let Some(cancel) = self.external_cancel.take() {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
         }
         for job in self.jobs.values() {
             job.request_cancel();
@@ -2927,7 +3059,7 @@ impl Session {
     pub async fn execute_cancellable(
         &mut self,
         source: &str,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<CancellationSignal>,
     ) -> Result<Vec<JobReport>, Diagnostic> {
         self.external_cancel = Some(cancel);
         let result = self.execute(source).await;
@@ -2942,7 +3074,7 @@ impl Session {
     pub async fn execute_ssh_cancellable(
         &mut self,
         source: &str,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<CancellationSignal>,
     ) -> Result<Vec<JobReport>, Diagnostic> {
         if self.profile != SessionProfile::SshExec {
             return Err(Diagnostic::new(
@@ -4297,6 +4429,7 @@ impl PreparedPipeline {
         }
         let job = JobControl {
             live: Arc::new(AtomicBool::new(true)),
+            completed: CancellationSignal::new(),
             pipes: pipes.clone(),
         };
         let managed_stages = stages
@@ -4421,15 +4554,7 @@ impl PreparedPipeline {
                     .map(|(handle, _, _, _)| handle.clone())
                     .collect();
                 task_batch.prepare("vsh-ctrl-c", async move {
-                    while control.live.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
-                        exec::yield_now().await;
-                    }
-                    if cancel.load(Ordering::Acquire) {
-                        control.fail(Status::Cancelled);
-                        for handle in &handles {
-                            let _ = handle.cancel();
-                        }
-                    }
+                    watch_foreground_cancel(cancel, control, handles).await;
                 });
             }
         }
@@ -4565,7 +4690,7 @@ async fn commit_managed_component(
     }
     stage.cspace.lock().revoke_all();
     admission.revoke_all();
-    job.live.store(false, Ordering::Release);
+    job.finish();
 
     Ok(JobReport {
         id,
@@ -4583,7 +4708,7 @@ async fn commit_managed_component(
 async fn run_managed_component_stage(
     stage: &PreparedStage,
     job: &JobControl,
-    external_cancel: Option<&Arc<AtomicBool>>,
+    external_cancel: Option<&Arc<CancellationSignal>>,
 ) -> StageExit {
     let command = match stage
         .cspace
@@ -4606,7 +4731,7 @@ async fn run_managed_component_stage(
     // `start` and subsequent yields. In particular, it does not keep the
     // stage-local Command Arc (and its manifest) live alongside the child.
     drop(command);
-    if external_cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+    if external_cancel.is_some_and(|cancel| cancel.is_cancelled()) {
         job.fail(Status::Cancelled);
     }
     if !job.live.load(Ordering::Acquire) {
@@ -4628,11 +4753,14 @@ async fn run_managed_component_stage(
             return managed_component_exit(ComponentTerminal::BackendFault);
         }
     };
+    enum ManagedWake {
+        State(ManagedComponentState),
+        Cancelled(Result<(), OneShotWaitError>),
+    }
+
     let mut cancel_requested = false;
+    let mut cancellation = external_cancel.map(|cancel| Box::pin(cancel.cancelled()));
     loop {
-        if external_cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
-            job.fail(Status::Cancelled);
-        }
         if !job.live.load(Ordering::Acquire) && !cancel_requested {
             match lifecycle.request_cancel(token) {
                 ManagedComponentCancel::Requested | ManagedComponentCancel::AlreadyComplete => {
@@ -4643,8 +4771,38 @@ async fn run_managed_component_stage(
                 }
             }
         }
-        match lifecycle.state(token) {
-            ManagedComponentState::Running => exec::yield_now().await,
+        let mut state = lifecycle.wait_state(token);
+        let observed = if cancel_requested || cancellation.is_none() {
+            ManagedWake::State(state.await)
+        } else {
+            poll_fn(|context| {
+                if let Some(wait) = cancellation.as_mut() {
+                    if let Poll::Ready(result) = wait.as_mut().poll(context) {
+                        return Poll::Ready(ManagedWake::Cancelled(result));
+                    }
+                }
+                state.as_mut().poll(context).map(ManagedWake::State)
+            })
+            .await
+        };
+        let observed = match observed {
+            ManagedWake::State(state) => state,
+            ManagedWake::Cancelled(Ok(())) => {
+                cancellation = None;
+                job.fail(Status::Cancelled);
+                continue;
+            }
+            ManagedWake::Cancelled(Err(_)) => {
+                return managed_component_exit(ComponentTerminal::RunnerFault);
+            }
+        };
+        match observed {
+            ManagedComponentState::Running => {
+                // A state-change future must never report a fresh Running
+                // value after parking. Treat a broken lifecycle adapter as a
+                // fail-closed protocol error rather than polling it again.
+                return managed_component_exit(ComponentTerminal::RunnerFault);
+            }
             ManagedComponentState::Complete(terminal) => {
                 lifecycle.acknowledge_complete(token);
                 return managed_component_exit(terminal);
@@ -4720,15 +4878,7 @@ async fn commit_tracked_pipeline(
                 .map(|(handle, _, _, _)| handle.clone())
                 .collect();
             exec::spawn_tracked("vsh-ctrl-c", async move {
-                while control.live.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
-                    exec::yield_now().await;
-                }
-                if cancel.load(Ordering::Acquire) {
-                    control.fail(Status::Cancelled);
-                    for handle in &handles {
-                        let _ = handle.cancel();
-                    }
-                }
+                watch_foreground_cancel(cancel, control, handles).await;
             });
         }
     }
@@ -5019,7 +5169,7 @@ async fn finish_job(
         cspace.lock().revoke_all();
     }
     admission.revoke_all();
-    job.live.store(false, Ordering::Release);
+    job.finish();
     JobReport {
         id,
         status: aggregate(&stage_reports),

@@ -1,17 +1,21 @@
 use std::any::Any;
 use std::fmt::Write as _;
+use std::future::{poll_fn, Future};
 use std::num::NonZeroU64;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use vibeos_core::cap::{CSpace, Resource, Rights};
-use vibeos_core::exec;
+use vibeos_core::exec::{self, OneShotWaitError, OneShotWaitQueue};
 use vibeos_core::heap::{AllocationDomain, ArenaId, OwnerId};
 use vibeos_core::sync::SpinLock;
 use vibeos_vsh::{
-    ComponentArtifactIdentity, ComponentAuthorityRequirement, ComponentCommandFuture,
-    ComponentCommandManifest, ComponentCommandResult, ComponentCommandRunner, ComponentTerminal,
-    ComponentTrapCode, ManagedComponentCancel, ManagedComponentLifecycle, ManagedComponentState,
+    CancellationSignal, ComponentArtifactIdentity, ComponentAuthorityRequirement,
+    ComponentCommandFuture, ComponentCommandManifest, ComponentCommandResult,
+    ComponentCommandRunner, ComponentTerminal, ComponentTrapCode, ManagedComponentCancel,
+    ManagedComponentLifecycle, ManagedComponentState, ManagedComponentStateFuture,
     ManagedComponentToken, PreparedComponentStage, Session, SessionProfile, SshExecComponentPolicy,
     Status, StreamMode, TerminalDetail,
 };
@@ -22,6 +26,14 @@ static TRACKED_BUILTIN_OK: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_COMPONENT_CLOSED: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_COMPONENT_RUNS: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_MANAGED_OK: AtomicUsize = AtomicUsize::new(0);
+static PIPELINE_PARK: OneShotWaitQueue = OneShotWaitQueue::new();
+
+fn park_pipeline_stage(_arguments: Vec<String>) -> vibeos_vsh::AsyncCommandFuture {
+    Box::pin(async {
+        let _ = PIPELINE_PARK.wait(1).await;
+        Ok(String::new())
+    })
+}
 
 unsafe fn unexpected_tracked_test_reclaim(
     _witness: exec::ReclaimableFaultWitness,
@@ -60,7 +72,7 @@ fn execute_with_delayed_cancel(
 ) -> Vec<vibeos_vsh::JobReport> {
     let result = Arc::new(Mutex::new(None));
     let result_task = result.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(CancellationSignal::new());
     let cancel_task = cancel.clone();
     let task = exec::spawn_tracked("managed-cancel-vsh", async move {
         let reports = session.execute_cancellable(source, cancel_task).await;
@@ -71,7 +83,7 @@ fn execute_with_delayed_cancel(
         while lifecycle.starts.load(Ordering::Acquire) == 0 {
             exec::yield_now().await;
         }
-        cancel_task.store(true, Ordering::Release);
+        cancel_task.cancel();
     });
 
     exec::run_until_idle(100_000);
@@ -79,6 +91,97 @@ fn execute_with_delayed_cancel(
     assert_eq!(canceller.state(), exec::TaskState::Exited);
     let reports = result.lock().unwrap().take().unwrap().unwrap();
     reports
+}
+
+#[test]
+fn cancellation_signal_is_pretriggered_idempotent_and_single_waiter_bounded() {
+    let _serial = SERIAL.lock().unwrap();
+
+    let pretriggered = Arc::new(CancellationSignal::new());
+    assert!(pretriggered.cancel());
+    assert!(!pretriggered.cancel());
+    let observed = Arc::new(Mutex::new(None));
+    let observed_task = observed.clone();
+    let pretriggered_task = pretriggered.clone();
+    let task = exec::spawn_tracked("cancellation-pretriggered", async move {
+        *observed_task.lock().unwrap() = Some(pretriggered_task.cancelled().await);
+    });
+    exec::run_until_idle(100);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    assert_eq!(*observed.lock().unwrap(), Some(Ok(())));
+
+    let bounded = Arc::new(CancellationSignal::new());
+    let bounded_task = bounded.clone();
+    let observed = Arc::new(Mutex::new(None));
+    let observed_task = observed.clone();
+    let task = exec::spawn_tracked("cancellation-capacity", async move {
+        let first = bounded_task.cancelled();
+        let second = bounded_task.cancelled();
+        let mut first = pin!(first);
+        let mut second = pin!(second);
+        let result = poll_fn(|context| {
+            assert!(matches!(first.as_mut().poll(context), Poll::Pending));
+            match second.as_mut().poll(context) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => panic!("a second cancellation waiter exceeded fixed capacity"),
+            }
+        })
+        .await;
+        *observed_task.lock().unwrap() = Some(result);
+    });
+    exec::run_until_idle(100);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(Err(OneShotWaitError::CapacityExceeded))
+    );
+}
+
+#[test]
+fn one_foreground_watcher_parks_and_fans_cancel_out_to_a_multistage_pipeline() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    session.install_async_host_command("park-for-cancel", 0, 0, park_pipeline_stage);
+    let cancel = Arc::new(CancellationSignal::new());
+    let cancel_task = cancel.clone();
+    let result = Arc::new(Mutex::new(None));
+    let result_task = result.clone();
+    let task = exec::spawn_tracked("multistage-cancel-vsh", async move {
+        *result_task.lock().unwrap() = Some(
+            session
+                .execute_cancellable("park-for-cancel | wc", cancel_task)
+                .await,
+        );
+    });
+
+    assert!(exec::run_until_idle(100) > 0);
+    assert_eq!(task.state(), exec::TaskState::Running);
+    let watchers: Vec<_> = exec::task_report()
+        .into_iter()
+        .filter(|report| report.name == "vsh-ctrl-c")
+        .collect();
+    assert_eq!(
+        watchers.len(),
+        1,
+        "pipeline installed more than one watcher"
+    );
+    assert_eq!(watchers[0].polls, 1);
+    let parent_polls = task.polls();
+    assert_eq!(exec::run_until_idle(100), 0);
+    assert_eq!(task.polls(), parent_polls);
+
+    assert!(cancel.cancel());
+    exec::run_until_idle(100);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    let reports = result.lock().unwrap().take().unwrap().unwrap();
+    assert_eq!(reports[0].stages.len(), 2);
+    assert_eq!(reports[0].status, Status::Cancelled);
+    assert!(
+        exec::task_report()
+            .into_iter()
+            .all(|report| report.name != "vsh-ctrl-c"),
+        "foreground cancellation watcher survived pipeline completion"
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +205,7 @@ struct ProbeRunner {
 enum ManagedBehavior {
     Complete(ComponentTerminal),
     WaitForCancellation,
+    WaitForFailure,
     CancelLost,
     CancelAlreadyComplete(ComponentTerminal),
     Lost,
@@ -115,6 +219,8 @@ struct ManagedProbe {
     cancels: AtomicUsize,
     acknowledgements: AtomicUsize,
     cancelled: AtomicBool,
+    failed: AtomicBool,
+    changed: OneShotWaitQueue,
     behavior: ManagedBehavior,
     token_raw: NonZeroU64,
 }
@@ -128,6 +234,8 @@ impl ManagedProbe {
             cancels: AtomicUsize::new(0),
             acknowledgements: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            changed: OneShotWaitQueue::new(),
             behavior,
             token_raw: NonZeroU64::new(1).unwrap(),
         }))
@@ -137,6 +245,11 @@ impl ManagedProbe {
         // SAFETY: only this trusted test lifecycle decodes tokens that it
         // issued, and it validates the exact lifecycle-private nonce.
         unsafe { token.trusted_raw() == self.token_raw }
+    }
+
+    fn fail_running(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.changed.publish(1).unwrap().dispatch();
     }
 }
 
@@ -171,6 +284,13 @@ unsafe impl ManagedComponentLifecycle for ManagedProbe {
                     ManagedComponentState::Running
                 }
             }
+            ManagedBehavior::WaitForFailure => {
+                if self.failed.load(Ordering::Acquire) {
+                    ManagedComponentState::Lost
+                } else {
+                    ManagedComponentState::Running
+                }
+            }
             ManagedBehavior::CancelLost => {
                 if self.cancelled.load(Ordering::Acquire) {
                     ManagedComponentState::Lost
@@ -190,17 +310,35 @@ unsafe impl ManagedComponentLifecycle for ManagedProbe {
         }
     }
 
+    fn wait_state<'a>(&'a self, token: ManagedComponentToken) -> ManagedComponentStateFuture<'a> {
+        Box::pin(async move {
+            let listener = self.changed.wait(1);
+            match self.state(token) {
+                ManagedComponentState::Running => {}
+                terminal => return terminal,
+            }
+            if listener.await.is_err() {
+                return ManagedComponentState::Lost;
+            }
+            match self.state(token) {
+                ManagedComponentState::Running => ManagedComponentState::Lost,
+                terminal => terminal,
+            }
+        })
+    }
+
     fn request_cancel(&self, token: ManagedComponentToken) -> ManagedComponentCancel {
         self.cancels.fetch_add(1, Ordering::SeqCst);
         if !self.recognizes(token) {
             return ManagedComponentCancel::Lost;
         }
-        match self.behavior {
+        let outcome = match self.behavior {
             ManagedBehavior::Complete(_) => ManagedComponentCancel::AlreadyComplete,
             ManagedBehavior::WaitForCancellation => {
                 self.cancelled.store(true, Ordering::Release);
                 ManagedComponentCancel::Requested
             }
+            ManagedBehavior::WaitForFailure => ManagedComponentCancel::Lost,
             ManagedBehavior::CancelLost => {
                 self.cancelled.store(true, Ordering::Release);
                 ManagedComponentCancel::Lost
@@ -210,7 +348,11 @@ unsafe impl ManagedComponentLifecycle for ManagedProbe {
                 ManagedComponentCancel::AlreadyComplete
             }
             ManagedBehavior::Lost | ManagedBehavior::StartError(_) => ManagedComponentCancel::Lost,
+        };
+        if self.cancelled.load(Ordering::Acquire) {
+            self.changed.publish(1).unwrap().dispatch();
         }
+        outcome
     }
 
     fn acknowledge_complete(&self, token: ManagedComponentToken) {
@@ -247,6 +389,10 @@ unsafe impl ManagedComponentLifecycle for FlippingManagedProbe {
 
     fn state(&self, _token: ManagedComponentToken) -> ManagedComponentState {
         ManagedComponentState::Lost
+    }
+
+    fn wait_state<'a>(&'a self, _token: ManagedComponentToken) -> ManagedComponentStateFuture<'a> {
+        Box::pin(async { ManagedComponentState::Lost })
     }
 
     fn request_cancel(&self, _token: ManagedComponentToken) -> ManagedComponentCancel {
@@ -1333,6 +1479,85 @@ fn managed_foreground_cancellation_is_cooperative_and_token_only() {
     assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 1);
     assert!(lifecycle.state_reads.load(Ordering::SeqCst) >= 1);
     assert_eq!(lifecycle.acknowledgements.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn managed_running_state_parks_until_an_exact_event_without_poll_spin() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-event-wait"),
+        ManagedBehavior::WaitForCancellation,
+    );
+    let policy = managed_policy("managed-event-wait");
+    let mut session = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: the leaked lifecycle owns its fixed-capacity event registration
+    // and recognizes the only token it issues.
+    unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+
+    let cancel = Arc::new(CancellationSignal::new());
+    let cancel_task = cancel.clone();
+    let result = Arc::new(Mutex::new(None));
+    let result_task = result.clone();
+    let task = exec::spawn_tracked("managed-event-vsh", async move {
+        *result_task.lock().unwrap() = Some(
+            session
+                .execute_cancellable("managed-event-wait", cancel_task)
+                .await,
+        );
+    });
+
+    assert!(exec::run_until_idle(100) > 0);
+    assert_eq!(task.state(), exec::TaskState::Running);
+    let parked_polls = task.polls();
+    assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(exec::run_until_idle(100), 0);
+    assert_eq!(task.polls(), parked_polls, "parked VSH task was repolled");
+
+    assert!(cancel.cancel());
+    exec::run_until_idle(100);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    assert_eq!(task.polls(), parked_polls + 1);
+    assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 2);
+    let reports = result.lock().unwrap().take().unwrap().unwrap();
+    assert_eq!(reports[0].status, Status::Cancelled);
+    assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(lifecycle.acknowledgements.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn managed_running_wait_is_woken_by_fail_stop_and_returns_lost() {
+    let _serial = SERIAL.lock().unwrap();
+    let lifecycle = ManagedProbe::leaked(
+        managed_manifest("managed-fail-wake"),
+        ManagedBehavior::WaitForFailure,
+    );
+    let policy = managed_policy("managed-fail-wake");
+    let mut session = Session::with_profile(SessionProfile::SshExec);
+    // SAFETY: the leaked probe models one exact stable lifecycle generation.
+    unsafe { session.install_ssh_exec_managed_component_command(&policy, lifecycle) }.unwrap();
+
+    let result = Arc::new(Mutex::new(None));
+    let result_task = result.clone();
+    let task = exec::spawn_tracked("managed-fail-wake-vsh", async move {
+        *result_task.lock().unwrap() = Some(session.execute("managed-fail-wake").await);
+    });
+    assert!(exec::run_until_idle(100) > 0);
+    assert_eq!(task.state(), exec::TaskState::Running);
+    let parked_polls = task.polls();
+    assert_eq!(exec::run_until_idle(100), 0);
+
+    lifecycle.fail_running();
+    exec::run_until_idle(100);
+    assert_eq!(task.state(), exec::TaskState::Exited);
+    assert_eq!(task.polls(), parked_polls + 1);
+    let reports = result.lock().unwrap().take().unwrap().unwrap();
+    assert_eq!(reports[0].status, Status::Faulted);
+    assert_eq!(
+        reports[0].stages[0].detail,
+        TerminalDetail::Component(ComponentTerminal::RunnerFault)
+    );
+    assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(lifecycle.acknowledgements.load(Ordering::SeqCst), 0);
 }
 
 #[test]

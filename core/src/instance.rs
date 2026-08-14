@@ -17,6 +17,8 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
+#[cfg(feature = "wasm-c48-target-acceptance")]
+use crate::cap::CapabilityTableRange;
 use crate::cap::{CSpace, CSpaceIdentity};
 use crate::exec::{
     PreparedReclaimableActivation, PreparedReclaimableBinding, ReclaimableFaultWitness,
@@ -43,6 +45,26 @@ const MAX_INSTANCE_GENERATION: u64 = u64::MAX >> PHASE_BITS;
 pub struct InstanceToken {
     slot: u8,
     generation: u64,
+}
+
+impl InstanceToken {
+    /// Compare the stable registry/Space slot without revealing its index.
+    /// Different generations of one slot must never be retained as two live
+    /// lifecycle owners; callers may use this only as an alias-rejection
+    /// predicate, never as authority for lookup, reclaim, or reset.
+    pub fn shares_stable_slot(self, other: Self) -> bool {
+        self.slot == other.slot
+    }
+
+    /// Produce a token for the same stable slot with a guaranteed-different
+    /// generation. This is crate-private and exists only so the executor can
+    /// construct the directed C4.8 rejection witness; acceptance code cannot
+    /// select a slot or generation.
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    pub(crate) fn with_mismatched_generation_for_acceptance(mut self) -> Self {
+        self.generation ^= 1;
+        self
+    }
 }
 
 impl fmt::Debug for InstanceToken {
@@ -142,6 +164,8 @@ pub enum InstancePhase {
     FaultTerminal = 12,
 }
 
+const INSTANCE_PHASE_COUNT: usize = InstancePhase::FaultTerminal as usize + 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveError {
     /// Managed instances require a non-SYSTEM tracked allocation arena.
@@ -218,6 +242,162 @@ pub struct InstanceSnapshot {
     pub domain: AllocationDomain,
     pub task: Option<TaskId>,
     pub home_hart: Option<HartId>,
+}
+
+/// Allocation-free occupancy telemetry for the stable instance table.
+///
+/// Counts contain no slot indexes, generations, addresses, task identities,
+/// or allocation-domain identities. A quarantined slot remains occupied until
+/// reboot and is therefore included in `occupied`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstanceRegistryStats {
+    /// Number of non-vacant stable slots, including sticky quarantines.
+    pub occupied: usize,
+    /// Number of record/header pairs which disagree at the sample point.
+    pub header_mismatches: usize,
+    phase_counts: [usize; INSTANCE_PHASE_COUNT],
+}
+
+impl InstanceRegistryStats {
+    /// Number of stable table slots in `phase` at the linearized sample.
+    pub const fn phase_count(self, phase: InstancePhase) -> usize {
+        self.phase_counts[phase as usize]
+    }
+
+    /// Fixed capacity of the registry sampled by this record.
+    pub const fn capacity(self) -> usize {
+        MAX_INSTANCE_SLOTS
+    }
+}
+
+/// Directed seal corruptions admitted only by the C4.8 QEMU acceptance image.
+///
+/// Variants carry no caller-selected identity. The acceptance harness can
+/// demonstrate fail-closed rejection, but cannot install a chosen Space or
+/// CSpace seal.
+#[cfg(feature = "wasm-c48-target-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptanceSealMismatch {
+    /// Corrupt only the sealed [`InstanceSpace`] object identity.
+    SpaceObject,
+    /// Corrupt only the sealed CSpace incarnation.
+    CSpaceIncarnation,
+}
+
+/// Allocation-free, read-only view of one stable acceptance slot.
+///
+/// Identity fields remain private and can only be compared through predicates,
+/// preventing acceptance diagnostics from becoming lookup or reset authority.
+/// This type and every constructor for it are absent from production builds.
+#[cfg(feature = "wasm-c48-target-acceptance")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AcceptanceInstanceProbe {
+    exact: bool,
+    phase: InstancePhase,
+    generation: u64,
+    space_object_identity: Option<usize>,
+    cspace_lock_identity: Option<usize>,
+    cspace_identity: Option<CSpaceIdentity>,
+    cspace_incarnation: Option<u64>,
+    capability_table: Option<CapabilityTableRange>,
+    seal_matches_space: bool,
+    seal_matches_cspace: bool,
+}
+
+#[cfg(feature = "wasm-c48-target-acceptance")]
+impl fmt::Debug for AcceptanceInstanceProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcceptanceInstanceProbe")
+            .field("exact", &self.exact)
+            .field("phase", &self.phase)
+            .field("generation", &self.generation)
+            .field("space_object_identity", &"<opaque>")
+            .field("cspace_lock_identity", &"<opaque>")
+            .field("cspace_identity", &"<opaque>")
+            .field("cspace_incarnation", &self.cspace_incarnation)
+            .field("capability_table_identity", &"<opaque>")
+            .field("capability_table_len", &self.capability_table_len())
+            .field("seal_matches_space", &self.seal_matches_space)
+            .field("seal_matches_cspace", &self.seal_matches_cspace)
+            .finish()
+    }
+}
+
+#[cfg(feature = "wasm-c48-target-acceptance")]
+impl AcceptanceInstanceProbe {
+    /// Whether the requested token still names the slot's exact generation and
+    /// the atomic header agrees with the locked record.
+    pub const fn is_exact(self) -> bool {
+        self.exact
+    }
+
+    /// Current record phase even when the requested token is stale.
+    pub const fn current_phase(self) -> InstancePhase {
+        self.phase
+    }
+
+    /// Current slot generation. This diagnostic scalar is not a token and
+    /// cannot be converted into one by acceptance code.
+    pub const fn current_generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Current phase only when the requested token is exact.
+    pub const fn exact_phase(self) -> Option<InstancePhase> {
+        if self.exact {
+            Some(self.phase)
+        } else {
+            None
+        }
+    }
+
+    pub fn same_space_object(self, other: Self) -> bool {
+        self.space_object_identity == other.space_object_identity
+    }
+
+    pub fn same_cspace_lock(self, other: Self) -> bool {
+        self.cspace_lock_identity == other.cspace_lock_identity
+    }
+
+    pub fn same_cspace_identity(self, other: Self) -> bool {
+        self.cspace_identity == other.cspace_identity
+    }
+
+    pub fn same_cspace_incarnation(self, other: Self) -> bool {
+        self.cspace_incarnation == other.cspace_incarnation
+    }
+
+    /// Monotonic CSpace incarnation, detached from reset authority.
+    pub const fn cspace_incarnation(self) -> Option<u64> {
+        self.cspace_incarnation
+    }
+
+    /// Compare the exact authoritative capability-table backing/range. Empty
+    /// tables compare equal as `None` and can be distinguished by length zero.
+    pub fn same_capability_table(self, other: Self) -> bool {
+        self.capability_table == other.capability_table
+    }
+
+    /// Current immutable capability-table slot count without allocating a
+    /// diagnostic `CSpace::list`.
+    pub const fn capability_table_len(self) -> usize {
+        match self.capability_table {
+            Some(range) => range.slot_count,
+            None => 0,
+        }
+    }
+
+    /// Whether the stored seal still names the actual stable Space and lock.
+    pub const fn seal_matches_space(self) -> bool {
+        self.seal_matches_space
+    }
+
+    /// Whether the stored seal still names the actual CSpace identity and
+    /// incarnation.
+    pub const fn seal_matches_cspace(self) -> bool {
+        self.seal_matches_cspace
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,6 +533,29 @@ impl InstanceRegistry {
             transaction: SpinLock::new(()),
             slots: [const { InstanceSlot::new() }; MAX_INSTANCE_SLOTS],
         }
+    }
+
+    /// Sample exact phase occupancy without allocating or exposing stable-slot
+    /// identity. The registry transaction makes the phase counts mutually
+    /// consistent; a previously corrupted header is reported, not repaired.
+    pub fn occupancy_stats(&self) -> InstanceRegistryStats {
+        let _transaction = self.transaction.lock();
+        let mut stats = InstanceRegistryStats {
+            occupied: 0,
+            header_mismatches: 0,
+            phase_counts: [0; INSTANCE_PHASE_COUNT],
+        };
+        for slot in &self.slots {
+            let record = slot.record.lock();
+            stats.phase_counts[record.phase as usize] += 1;
+            if record.phase != InstancePhase::Vacant {
+                stats.occupied += 1;
+            }
+            if !Self::header_matches(slot, &record) {
+                stats.header_mismatches += 1;
+            }
+        }
+        stats
     }
 
     /// Reserve one stable slot for a non-SYSTEM tracked allocation domain.
@@ -1610,6 +1813,126 @@ impl InstanceRegistry {
         })
     }
 
+    /// Observe the actual stable objects and current phase behind an opaque
+    /// token without allocating or changing lifecycle state.
+    ///
+    /// Unlike [`Self::snapshot`], this acceptance-only probe also returns the
+    /// current slot phase for a stale generation, allowing the ABA test to
+    /// prove that an old token did not alias a reused slot. Object identities
+    /// stay private in [`AcceptanceInstanceProbe`] and can only be compared.
+    ///
+    /// # Safety model
+    ///
+    /// The caller must invoke this only at an acceptance harness quiescence
+    /// point. The probe acquires the CSpace lock and therefore must not run
+    /// while the faulting task may have abandoned that lock; fault recovery
+    /// must complete first. The returned copy carries no lookup/reset authority
+    /// and may be retained only as diagnostic evidence.
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    pub fn acceptance_probe(&self, token: InstanceToken) -> Option<AcceptanceInstanceProbe> {
+        let _transaction = self.transaction.lock();
+        let slot = self.slot(token)?;
+        let record = slot.record.lock();
+        let exact = Self::token_matches(slot, &record, token);
+        let (space_object_identity, cspace_lock_identity, cspace) = match record.space.as_deref() {
+            Some(space) => {
+                let cspace = space.cspace().lock();
+                (
+                    Some(space as *const InstanceSpace as usize),
+                    Some(space.cspace() as *const SpinLock<CSpace> as usize),
+                    Some((
+                        cspace.identity(),
+                        cspace.incarnation(),
+                        cspace.capability_table_range(),
+                    )),
+                )
+            }
+            None => (None, None, None),
+        };
+        let cspace_identity = cspace.map(|value| value.0);
+        let cspace_incarnation = cspace.map(|value| value.1);
+        let capability_table = cspace.and_then(|value| value.2);
+        let seal_matches_space = record.space_seal.is_some_and(|seal| {
+            seal.object_identity == space_object_identity.unwrap_or(0)
+                && seal.lock_identity == cspace_lock_identity.unwrap_or(0)
+        });
+        let seal_matches_cspace = record.space_seal.is_some_and(|seal| {
+            Some(seal.cspace_identity) == cspace_identity
+                && Some(seal.cspace_incarnation) == cspace_incarnation
+        });
+        Some(AcceptanceInstanceProbe {
+            exact,
+            phase: record.phase,
+            generation: record.generation,
+            space_object_identity,
+            cspace_lock_identity,
+            cspace_identity,
+            cspace_incarnation,
+            capability_table,
+            seal_matches_space,
+            seal_matches_cspace,
+        })
+    }
+
+    /// Corrupt exactly one component of an otherwise valid Active seal for a
+    /// target acceptance rejection test.
+    ///
+    /// This API cannot select or install an identity: each mismatch is a
+    /// fixed transform of the already sealed value, and production builds do
+    /// not contain the method. No phase/header/domain/task field is changed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the C4.8 acceptance scenario for this exact token
+    /// and serialize against every lifecycle operation. After this returns
+    /// `Ok`, the task must enter the intended fault gate without another guest
+    /// quantum or normal finalization attempt. The resulting quarantined slot
+    /// is intentionally leaked until reboot; this method must never be used by
+    /// a production image or as a way to recover an already corrupt record.
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    pub unsafe fn corrupt_active_seal(
+        &self,
+        token: InstanceToken,
+        mismatch: AcceptanceSealMismatch,
+    ) -> Result<(), RegistryError> {
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let result = (|| {
+            let _transaction = self.transaction.lock();
+            let Some(slot) = self.slot(token) else {
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let mut record = slot.record.lock();
+            let structurally_active =
+                record.phase == InstancePhase::Active
+                    && record.task.as_ref().is_some_and(|handle| {
+                        Self::structural_identity_matches(slot, &record, token, handle)
+                    })
+                    && record.space.as_deref().zip(record.space_seal).is_some_and(
+                        |(space, seal)| {
+                            if !seal.immutable_objects_match(space) {
+                                return false;
+                            }
+                            let cspace = space.cspace().lock();
+                            seal.cspace_matches(&cspace)
+                        },
+                    );
+            if !structurally_active {
+                return Err(RegistryError::IdentityMismatch);
+            }
+            let seal = record
+                .space_seal
+                .as_mut()
+                .expect("validated active acceptance record has no seal");
+            match mismatch {
+                AcceptanceSealMismatch::SpaceObject => seal.object_identity ^= 1,
+                AcceptanceSealMismatch::CSpaceIncarnation => seal.cspace_incarnation ^= 1,
+            }
+            Ok(())
+        })();
+        system.restore();
+        result
+    }
+
     /// Observe one retained lifecycle record only after matching the executor's
     /// exact, unforgeable status handle and every stable structural projection.
     ///
@@ -2073,6 +2396,142 @@ mod tests {
     static TEST_PAYLOAD_DROPS: AtomicU64 = AtomicU64::new(0);
     static TEST_PAYLOAD_COMPLETION: AtomicU64 = AtomicU64::new(u64::MAX);
     static TEST_PAYLOAD_DROP_FAULT: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn opaque_tokens_expose_only_stable_slot_alias_rejection() {
+        let first = InstanceToken {
+            slot: 3,
+            generation: 7,
+        };
+        let replacement = InstanceToken {
+            slot: 3,
+            generation: 8,
+        };
+        let unrelated = InstanceToken {
+            slot: 4,
+            generation: 7,
+        };
+
+        assert_ne!(first, replacement);
+        assert!(first.shares_stable_slot(replacement));
+        assert!(!first.shares_stable_slot(unrelated));
+    }
+
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    #[test]
+    fn acceptance_probe_and_directed_seal_corruption_preserve_aba_evidence() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let empty = registry.occupancy_stats();
+        assert_eq!(empty.capacity(), MAX_INSTANCE_SLOTS);
+        assert_eq!(empty.occupied, 0);
+        assert_eq!(empty.header_mismatches, 0);
+        assert_eq!(empty.phase_count(InstancePhase::Vacant), MAX_INSTANCE_SLOTS);
+
+        let allocation = domain(48_001);
+        let token = registry.reserve(allocation).unwrap();
+        let handle = publish_pending_managed(&registry, token, allocation, "c48-acceptance-probe");
+        let projection = record_projection(&registry, token);
+        let before = registry
+            .acceptance_probe(token)
+            .expect("active acceptance token has no stable slot");
+        assert!(before.is_exact());
+        assert_eq!(before.exact_phase(), Some(InstancePhase::Active));
+        assert_eq!(before.current_phase(), InstancePhase::Active);
+        assert!(before.seal_matches_space());
+        assert!(before.seal_matches_cspace());
+        assert_eq!(before.capability_table_len(), 0);
+
+        // Safety: this executor-serialized host test restores the exact seal
+        // before allowing any task or lifecycle operation to proceed.
+        unsafe {
+            registry
+                .corrupt_active_seal(token, AcceptanceSealMismatch::SpaceObject)
+                .unwrap();
+        }
+        let space_mismatch = registry.acceptance_probe(token).unwrap();
+        assert!(space_mismatch.is_exact());
+        assert!(before.same_space_object(space_mismatch));
+        assert!(before.same_cspace_lock(space_mismatch));
+        assert!(before.same_cspace_identity(space_mismatch));
+        assert!(before.same_cspace_incarnation(space_mismatch));
+        assert!(before.same_capability_table(space_mismatch));
+        assert!(!space_mismatch.seal_matches_space());
+        assert!(space_mismatch.seal_matches_cspace());
+        install_space_seal_for_test(&registry, token, projection.space_seal);
+
+        // Safety: as above, no guest quantum or terminal path can race this
+        // intentional acceptance-only corruption.
+        unsafe {
+            registry
+                .corrupt_active_seal(token, AcceptanceSealMismatch::CSpaceIncarnation)
+                .unwrap();
+        }
+        let incarnation_mismatch = registry.acceptance_probe(token).unwrap();
+        assert!(incarnation_mismatch.seal_matches_space());
+        assert!(!incarnation_mismatch.seal_matches_cspace());
+        assert!(before.same_cspace_incarnation(incarnation_mismatch));
+        install_space_seal_for_test(&registry, token, projection.space_seal);
+
+        let active = registry.occupancy_stats();
+        assert_eq!(active.occupied, 1);
+        assert_eq!(active.phase_count(InstancePhase::Active), 1);
+        assert_eq!(active.header_mismatches, 0);
+
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        assert_eq!(handle.state(), TaskState::Cancelled);
+        unsafe {
+            registry.finalize(token, &handle, |closed, kind| {
+                assert_eq!(closed, allocation);
+                assert_eq!(kind, TerminalRetireKind::Normal);
+                true
+            })
+        }
+        .unwrap();
+
+        let retired = registry
+            .acceptance_probe(token)
+            .expect("retired stable slot disappeared");
+        assert!(!retired.is_exact());
+        assert_eq!(retired.exact_phase(), None);
+        assert_eq!(retired.current_phase(), InstancePhase::Vacant);
+        assert_eq!(
+            retired.current_generation(),
+            before.current_generation() + 1
+        );
+        assert!(before.same_space_object(retired));
+        assert!(before.same_cspace_lock(retired));
+        assert!(before.same_cspace_identity(retired));
+        assert!(!before.same_cspace_incarnation(retired));
+        assert!(before.same_capability_table(retired));
+
+        let vacant = registry.occupancy_stats();
+        assert_eq!(vacant.occupied, 0);
+        assert_eq!(
+            vacant.phase_count(InstancePhase::Vacant),
+            MAX_INSTANCE_SLOTS
+        );
+        assert_eq!(vacant.header_mismatches, 0);
+
+        let replacement = registry.reserve(domain(48_002)).unwrap();
+        assert!(token.shares_stable_slot(replacement));
+        let replacement_probe = registry.acceptance_probe(replacement).unwrap();
+        let stale_probe = registry.acceptance_probe(token).unwrap();
+        assert!(replacement_probe.is_exact());
+        assert_eq!(replacement_probe.current_phase(), InstancePhase::Reserved);
+        assert!(!stale_probe.is_exact());
+        assert_eq!(stale_probe.exact_phase(), None);
+        assert_eq!(stale_probe.current_phase(), InstancePhase::Reserved);
+        assert_eq!(
+            stale_probe.current_generation(),
+            replacement_probe.current_generation()
+        );
+        assert!(stale_probe.same_space_object(replacement_probe));
+        assert!(stale_probe.same_cspace_lock(replacement_probe));
+        assert!(stale_probe.same_cspace_identity(replacement_probe));
+        assert!(stale_probe.same_cspace_incarnation(replacement_probe));
+        assert!(stale_probe.same_capability_table(replacement_probe));
+    }
 
     struct TestPayload {
         ready: Option<u64>,
@@ -3073,6 +3532,38 @@ mod tests {
         let expected_cspace = cspace_state(&registry, token);
         let foreign_hart = HartId::new(1).unwrap();
         assert_ne!(foreign_hart, exact.home_hart());
+
+        #[cfg(feature = "wasm-c48-target-acceptance")]
+        for (case, mismatch) in [
+            (
+                "directed instance generation",
+                exec::AcceptanceWitnessMismatch::Generation,
+            ),
+            ("directed task id", exec::AcceptanceWitnessMismatch::Task),
+            (
+                "directed status identity",
+                exec::AcceptanceWitnessMismatch::Status,
+            ),
+            ("directed owner", exec::AcceptanceWitnessMismatch::Owner),
+            ("directed arena", exec::AcceptanceWitnessMismatch::Arena),
+            (
+                "directed current hart",
+                exec::AcceptanceWitnessMismatch::CurrentHart,
+            ),
+        ] {
+            let witness = exact
+                .with_acceptance_mismatch(mismatch)
+                .expect("managed exact witness accepts every directed mismatch");
+            assert_fault_mismatch_is_inert(
+                &registry,
+                token,
+                witness,
+                projection,
+                expected_cspace,
+                case,
+            );
+        }
+
         let stale_token = InstanceToken {
             slot: token.slot,
             generation: token.generation.checked_add(1).unwrap(),

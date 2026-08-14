@@ -113,6 +113,7 @@ struct ManagedProbe {
     starts: AtomicUsize,
     state_reads: AtomicUsize,
     cancels: AtomicUsize,
+    acknowledgements: AtomicUsize,
     cancelled: AtomicBool,
     behavior: ManagedBehavior,
     token_raw: NonZeroU64,
@@ -125,6 +126,7 @@ impl ManagedProbe {
             starts: AtomicUsize::new(0),
             state_reads: AtomicUsize::new(0),
             cancels: AtomicUsize::new(0),
+            acknowledgements: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
             behavior,
             token_raw: NonZeroU64::new(1).unwrap(),
@@ -208,6 +210,12 @@ unsafe impl ManagedComponentLifecycle for ManagedProbe {
                 ManagedComponentCancel::AlreadyComplete
             }
             ManagedBehavior::Lost | ManagedBehavior::StartError(_) => ManagedComponentCancel::Lost,
+        }
+    }
+
+    fn acknowledge_complete(&self, token: ManagedComponentToken) {
+        if self.recognizes(token) {
+            self.acknowledgements.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -1000,6 +1008,7 @@ fn tracked_ssh_exec_uses_only_the_explicit_managed_lifecycle() {
     assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
     assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 1);
     assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(lifecycle.acknowledgements.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1289,6 +1298,15 @@ fn managed_completion_scalars_preserve_terminal_status() {
         assert_eq!(report.stages[0].detail, TerminalDetail::Component(terminal));
         assert!(report.output.is_empty());
         assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
+        let expected_acknowledgements = match behavior {
+            ManagedBehavior::Complete(_) => 1,
+            ManagedBehavior::Lost | ManagedBehavior::StartError(_) => 0,
+            _ => unreachable!("completion table contains only terminal cases"),
+        };
+        assert_eq!(
+            lifecycle.acknowledgements.load(Ordering::SeqCst),
+            expected_acknowledgements
+        );
     }
 }
 
@@ -1314,6 +1332,7 @@ fn managed_foreground_cancellation_is_cooperative_and_token_only() {
     assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
     assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 1);
     assert!(lifecycle.state_reads.load(Ordering::SeqCst) >= 1);
+    assert_eq!(lifecycle.acknowledgements.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1340,6 +1359,7 @@ fn managed_prepublication_cancellation_never_starts_a_child() {
     assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
     assert_eq!(lifecycle.state_reads.load(Ordering::SeqCst), 0);
     assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(lifecycle.acknowledgements.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1376,6 +1396,15 @@ fn managed_cancel_lost_and_already_complete_fail_closed_without_retry() {
         );
         assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 1);
         assert_eq!(lifecycle.cancels.load(Ordering::SeqCst), 1);
+        let expected_acknowledgements = match behavior {
+            ManagedBehavior::CancelAlreadyComplete(_) => 1,
+            ManagedBehavior::CancelLost => 0,
+            _ => unreachable!("cancellation table contains only two cases"),
+        };
+        assert_eq!(
+            lifecycle.acknowledgements.load(Ordering::SeqCst),
+            expected_acknowledgements
+        );
     }
 }
 

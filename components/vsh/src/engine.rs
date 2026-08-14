@@ -467,6 +467,13 @@ pub fn validate_ssh_exec(source: &str) -> Result<(), Diagnostic> {
     validate_ssh_exec_with_policy(source, |_| false).map(|_| ())
 }
 
+/// Build the fail-closed diagnostic used when the trusted SSH platform's
+/// captured Component descriptor no longer matches current image/session
+/// policy immediately before installation.
+pub fn ssh_exec_component_policy_rejected(command_name: &str) -> Diagnostic {
+    Diagnostic::new(0, command_name.len(), "SSH component policy changed")
+}
+
 /// Validate the restricted SSH exec grammar while allowing one exact command
 /// name selected by trusted image/session policy.
 ///
@@ -1167,7 +1174,10 @@ impl SshExecComponentPolicy {
         })
     }
 
-    fn admits(&self, manifest: &ComponentCommandManifest) -> bool {
+    /// Check an independently constructed image pin against one immutable
+    /// admitted manifest. This comparison conveys no execution authority; the
+    /// trusted session-installation hook remains the authorization boundary.
+    pub fn admits_manifest(&self, manifest: &ComponentCommandManifest) -> bool {
         self.pinned == *manifest
     }
 }
@@ -1718,8 +1728,8 @@ pub enum ManagedComponentState {
     /// The child remains live. VSH yields between bounded scalar reads; the
     /// SSH supervisor must provide the enclosing timeout/cancellation bound.
     Running,
-    /// Stable terminal scalar. Once returned for a token, every later exact
-    /// lookup must return the same value.
+    /// Stable terminal scalar. Until the sole VSH consumer explicitly
+    /// acknowledges it, every later exact lookup must return the same value.
     Complete(ComponentTerminal),
     /// The token no longer resolves exactly. VSH fails closed and never asks
     /// the lifecycle to reclaim an ambiguous instance.
@@ -1805,6 +1815,15 @@ pub unsafe trait ManagedComponentLifecycle: Send + Sync + 'static {
     /// Request cooperative cancellation. The lifecycle wakes its owned child;
     /// VSH never cancels or retains that child's executor handle.
     fn request_cancel(&self, token: ManagedComponentToken) -> ManagedComponentCancel;
+
+    /// Acknowledge that VSH consumed the exact stable terminal scalar.
+    ///
+    /// This is the only permission to make a completed control-table entry
+    /// reusable. It must not reset a CSpace, reclaim an arena, drop a payload,
+    /// or otherwise participate in child teardown: all of those actions must
+    /// already have completed before `state` returned `Complete`. Unknown,
+    /// stale, running, or quarantined tokens are ignored conservatively.
+    fn acknowledge_complete(&self, _token: ManagedComponentToken) {}
 }
 
 #[derive(Clone)]
@@ -2502,7 +2521,7 @@ impl Session {
                 "SSH component policy requires an SSH exec session",
             ));
         }
-        if !policy.admits(source_manifest) {
+        if !policy.admits_manifest(source_manifest) {
             return Err(Diagnostic::new(
                 0,
                 source_manifest.name.len(),
@@ -2553,7 +2572,7 @@ impl Session {
             ));
         }
         let source_manifest = lifecycle.manifest();
-        if !policy.admits(source_manifest) {
+        if !policy.admits_manifest(source_manifest) {
             return Err(Diagnostic::new(
                 0,
                 source_manifest.name.len(),
@@ -4627,6 +4646,7 @@ async fn run_managed_component_stage(
         match lifecycle.state(token) {
             ManagedComponentState::Running => exec::yield_now().await,
             ManagedComponentState::Complete(terminal) => {
+                lifecycle.acknowledge_complete(token);
                 return managed_component_exit(terminal);
             }
             ManagedComponentState::Lost => {

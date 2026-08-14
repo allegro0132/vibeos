@@ -20,6 +20,9 @@ SSH_BOOT_TIMEOUT=${SSH_BOOT_TIMEOUT:-240}
 # patterns without weakening the OpenSSH wire-level readiness check.
 SSH_READY_LOG_PATTERN=${SSH_READY_LOG_PATTERN:-'ssh-test listening on 10\.0\.2\.15:2222'}
 SSH_FAILURE_LOG_PATTERN=${SSH_FAILURE_LOG_PATTERN:-'FAIL ssh-test:'}
+WASM_C48_PASS_MARKER='WASM_C48_ACCEPTANCE PASS'
+WASM_C48_POLICY_PATTERN='WASM_C48_ACCEPTANCE PASS.*policy=passed'
+WASM_C48_FAILURE_PATTERN='WASM_C48_ACCEPTANCE FAIL'
 
 TEST_TMP=""
 QEMU_PID=""
@@ -104,6 +107,44 @@ check_boot_log() {
   if grep -a -E -q "$SSH_FAILURE_LOG_PATTERN" "$QEMU_LOG"; then
     fail "boot $boot reported a component-fatal SSH error"
   fi
+  if grep -a -F -q "$WASM_C48_FAILURE_PATTERN" "$QEMU_LOG"; then
+    fail "boot $boot reported a C4.8 acceptance failure"
+  fi
+  c48_pass_count=$(grep -a -F -c "$WASM_C48_PASS_MARKER" "$QEMU_LOG" || true)
+  [ "$c48_pass_count" -eq 1 ] \
+    || fail "boot $boot did not publish exactly one C4.8 acceptance PASS marker"
+  c48_policy_count=$(grep -a -E -c "$WASM_C48_POLICY_PATTERN" "$QEMU_LOG" || true)
+  [ "$c48_policy_count" -eq 1 ] \
+    || fail "boot $boot C4.8 acceptance PASS did not publish policy=passed"
+}
+
+wait_for_c48_acceptance() {
+  boot=$1
+  remaining=$SSH_BOOT_TIMEOUT
+  while :; do
+    kill -0 "$QEMU_PID" 2>/dev/null \
+      || fail "QEMU exited while waiting for boot $boot C4.8 acceptance"
+    if grep -a -E -q "$SSH_FAILURE_LOG_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a component-fatal SSH error before boot $boot C4.8 acceptance"
+    fi
+    if grep -a -F -q "$WASM_C48_FAILURE_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a C4.8 acceptance failure during boot $boot"
+    fi
+    c48_pass_count=$(grep -a -F -c "$WASM_C48_PASS_MARKER" "$QEMU_LOG" || true)
+    if [ "$c48_pass_count" -gt 1 ]; then
+      fail "boot $boot published more than one C4.8 acceptance PASS marker"
+    fi
+    if [ "$c48_pass_count" -eq 1 ] \
+      && grep -a -E -q "$WASM_C48_POLICY_PATTERN" "$QEMU_LOG"; then
+      echo "ssh-test: boot $boot C4.8 lifecycle acceptance passed; starting OpenSSH"
+      return
+    fi
+    if [ "$remaining" -eq 0 ]; then
+      fail "boot $boot did not publish one C4.8 acceptance PASS with policy=passed"
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
 }
 
 wait_for_log_count() {
@@ -215,6 +256,8 @@ require_positive_integer "$SSH_PORT_ATTEMPTS" SSH_PORT_ATTEMPTS
 require_positive_integer "$SSH_READY_TIMEOUT" SSH_READY_TIMEOUT
 require_positive_integer "$SSH_COMMAND_TIMEOUT" SSH_COMMAND_TIMEOUT
 require_positive_integer "$SSH_BOOT_TIMEOUT" SSH_BOOT_TIMEOUT
+[ "$QEMU_SMP" -ge 4 ] \
+  || fail "QEMU_SMP must be at least 4 for the multi-hart C4.8 acceptance gate"
 if [ -n "$SSH_HOST_PORT" ]; then
   require_positive_integer "$SSH_HOST_PORT" SSH_HOST_PORT
   if [ "$SSH_HOST_PORT" -gt 65535 ]; then
@@ -266,10 +309,11 @@ python3 -B scripts/openssh-test-key.py \
   >/dev/null || fail "cannot generate the rejected OpenSSH fixture"
 
 start_qemu 1
+wait_for_c48_acceptance 1
 run_peer 1 functional "$KNOWN_HOSTS_ONE" "$HOST_KEY_ONE"
 
-wait_for_log_count 'ssh-test exec complete: status 0' 4 \
-  "boot 1 did not complete readiness true plus authorized echo/true and post-shell true commands"
+wait_for_log_count 'ssh-test exec complete: status 0' 5 \
+  "boot 1 did not complete readiness true plus authorized echo/true/case-filter and post-shell true commands"
 wait_for_log_count 'ssh-test exec complete: status 1' 1 \
   "boot 1 did not publish the authorized false exit status"
 wait_for_log_count 'ssh-test shell complete: status 0' 1 \
@@ -277,8 +321,8 @@ wait_for_log_count 'ssh-test shell complete: status 0' 1 \
 status_zero_count=$(grep -a -E -c 'ssh-test exec complete: status 0' "$QEMU_LOG" || true)
 status_one_count=$(grep -a -E -c 'ssh-test exec complete: status 1' "$QEMU_LOG" || true)
 shell_status_zero_count=$(grep -a -F -c 'ssh-test shell complete: status 0' "$QEMU_LOG" || true)
-[ "$status_zero_count" -ge 4 ] \
-  || fail "boot 1 did not complete readiness true plus authorized echo/true and post-shell true commands"
+[ "$status_zero_count" -ge 5 ] \
+  || fail "boot 1 did not complete readiness true plus authorized echo/true/case-filter and post-shell true commands"
 [ "$status_one_count" -ge 1 ] \
   || fail "boot 1 did not publish the authorized false exit status"
 [ "$shell_status_zero_count" -eq 1 ] \
@@ -286,6 +330,7 @@ shell_status_zero_count=$(grep -a -F -c 'ssh-test shell complete: status 0' "$QE
 stop_qemu
 
 start_qemu 2
+wait_for_c48_acceptance 2
 run_peer 2 scan "$KNOWN_HOSTS_TWO" "$HOST_KEY_TWO"
 wait_for_log_count 'ssh-test exec complete: status 0' 1 \
   "boot 2 did not complete its strict authenticated readiness command"
@@ -298,4 +343,4 @@ cmp -s "$HOST_KEY_ONE" "$HOST_KEY_TWO" \
   || fail "the deterministic SSH host identity changed across QEMU boots"
 
 RESULT_REPORTED=1
-echo "PASS qemu-ssh-test: exact test host key stable across boots; OpenSSH forced curve25519/Ed25519/ChaCha20-Poly1305; interactive PTY/shell, exec/auth, and request policy enforced"
+echo "PASS qemu-ssh-test: C4.8 lifecycle acceptance passed on both boots; exact test host key stable; OpenSSH forced curve25519/Ed25519/ChaCha20-Poly1305; WASM case-filter, interactive PTY/shell, exec/auth, and request policy enforced"

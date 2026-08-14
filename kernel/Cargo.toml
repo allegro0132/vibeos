@@ -30,6 +30,7 @@ ssh-security-test = [
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
 ssh-test = [
+    "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
@@ -42,6 +43,7 @@ ssh-test = [
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
 milkv-ssh-acceptance = [
+    "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
@@ -53,6 +55,7 @@ milkv-ssh-acceptance = [
 # Production SSH image. Device and client identities are provisioned locally;
 # no acceptance fixture is linked into this feature.
 milkv-ssh = [
+    "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
@@ -60,6 +63,24 @@ milkv-ssh = [
     "dep:jitterentropy",
     "vibeos-netstack/dhcp-service",
     "vibeos-vsh/network",
+]
+# Narrow image/session-policy-managed WASM command path shared by the three
+# SSH images. Keeping these dependencies behind an explicit image feature
+# prevents merely linking the reusable kernel archive from exposing a command.
+ssh-component-command = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-command",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-sshd",
+    "dep:vibeos-wasm-runtime",
+]
+# QEMU-only C4.8 proof image.  This is intentionally separate from both the
+# reusable SSH image feature and every Milk-V feature: only its target harness
+# may exercise fault injection and publish the one Closed -> Passed SSH gate.
+wasm-c48-qemu-acceptance = [
+    "ssh-component-command",
+    "vibeos-core/wasm-c48-target-acceptance",
 ]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
@@ -87,6 +108,10 @@ bench = false
 [dependencies]
 vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
 vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
+vibeos-component-admission = { path = "../services/component-admission", optional = true }
+vibeos-component-command = { path = "../services/component-command", optional = true }
+vibeos-component-format = { path = "../component-format", optional = true }
+vibeos-component-runtime = { path = "../component-runtime", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }
 vibeos-driver-dwmac-net = { path = "../drivers/dwmac-net", optional = true }
@@ -115,6 +140,7 @@ vibeos-random = { path = "../random" }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
+vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]

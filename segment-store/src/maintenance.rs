@@ -409,7 +409,12 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
             return Err(GrowError::InvalidGeometry);
         }
 
-        let carrier = state.find_free_run(1, false).ok_or(GrowError::Capacity)?;
+        // Growth is itself the operation that replenishes the free pool. It
+        // may stage its allocation delta in one cleaner-reserve segment: the
+        // admitted suffix replaces that free segment atomically in the same
+        // checkpoint, so no ordinary foreground writer is granted reserve
+        // access and a failed publication leaves the old reserve selected.
+        let carrier = state.find_free_run(1, true).ok_or(GrowError::Capacity)?;
         let generation = state
             .generation
             .checked_add(1)

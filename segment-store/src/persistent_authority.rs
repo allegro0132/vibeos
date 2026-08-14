@@ -1311,7 +1311,7 @@ impl<D: PageDevice> SegmentStore<D> {
             .get(allocation_index)
             .copied()
             .ok_or(PersistentAuthorityError::Store(StoreError::Corrupt))?;
-        let last_segment = builder.finish(&self.device).await?;
+        let last_segment = builder.finish_before_checkpoint(&self.device).await?;
         let checkpoint = publish_checkpoint(
             &self.device,
             &state,

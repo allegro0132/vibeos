@@ -2589,7 +2589,9 @@ pub(crate) async fn finalize_segment<D: PageDevice>(
     write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
     flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
-    flush(device).await?;
+    // The caller immediately begins either the next segment's first durable
+    // phase or checkpoint-slot clearing. That barrier also makes this final
+    // seal durable, so a standalone flush here would add no ordering edge.
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
 }
 

@@ -1354,14 +1354,63 @@ def validate_checkpoint_allocation_transition(
         new["binding"]["generation"] == old["binding"]["generation"] + 1
         and new["previous_generation"] == old["binding"]["generation"]
         and new["binding"]["store_uuid"] == old["binding"]["store_uuid"]
-        and new["admitted_segments"] == old["admitted_segments"]
         and new["cleaner_reserve_segments"] == old["cleaner_reserve_segments"],
-        "V2 checkpoint pair is not one fixed-range G+1 transition",
+        "V2 checkpoint pair is not one G+1 transition",
     )
     require(
         older_allocation_version in (1, gc_verifier.ALLOCATION_VERSION)
         and newer_allocation_version == gc_verifier.ALLOCATION_VERSION,
         "newer retained checkpoint did not complete allocation-v2 conversion",
+    )
+    if new["admitted_segments"] > old["admitted_segments"]:
+        old_states = older_allocation["states"]
+        new_states = newer_allocation["states"]
+        require(
+            len(old_states) == old["admitted_segments"]
+            and len(new_states) == new["admitted_segments"]
+            and not older_allocation["retired"]
+            and not newer_allocation["retired"]
+            and new.get("catalog_root") == old.get("catalog_root")
+            and new.get("replay_tail") == old.get("replay_tail")
+            and new.get("authority_root") == old.get("authority_root")
+            and new.get("replay_count") == old.get("replay_count"),
+            "V2 growth transition changes non-growth state",
+        )
+        carriers = [
+            segment_no
+            for segment_no, (before, after) in enumerate(zip(old_states, new_states))
+            if before != after
+            and before == gc_verifier.SEGMENT_FREE
+            and after == gc_verifier.SEGMENT_ALLOCATED
+        ]
+        require(
+            len(carriers) == 1
+            and all(
+                before == after
+                or segment_no == carriers[0]
+                for segment_no, (before, after) in enumerate(zip(old_states, new_states))
+            )
+            and all(
+                state == gc_verifier.SEGMENT_FREE
+                for state in new_states[len(old_states):]
+            )
+            and newer_allocation["next_segment_generation"]
+            == older_allocation["next_segment_generation"] + 1,
+            "V2 growth allocation transition is not one carrier plus a free suffix",
+        )
+        newer_root = new["allocation_root"]
+        require(
+            newer_root["status"] == "value"
+            and newer_root != old["allocation_root"]
+            and newer_root["segment_no"] == carriers[0]
+            and newer_root["segment_generation"]
+            == older_allocation["next_segment_generation"],
+            "V2 growth allocation root is not carried by the consumed free segment",
+        )
+        return
+    require(
+        new["admitted_segments"] == old["admitted_segments"],
+        "V2 checkpoint transition shrinks its admitted range",
     )
     allocate: list[int] = []
     retire: list[int] = []
@@ -2524,6 +2573,7 @@ def selftest() -> dict[str, Any]:
         previous_generation: int,
         next_segment_generation: int,
         root: dict[str, Any],
+        admitted_segments: int = 8,
     ) -> dict[str, Any]:
         return {
             "record": {
@@ -2532,7 +2582,7 @@ def selftest() -> dict[str, Any]:
                     "store_uuid": allocation_uuid,
                 },
                 "previous_generation": previous_generation,
-                "admitted_segments": 8,
+                "admitted_segments": admitted_segments,
                 "next_segment_generation": next_segment_generation,
                 "cleaner_reserve_segments": 2,
                 "allocation_root": root,
@@ -2595,6 +2645,48 @@ def selftest() -> dict[str, Any]:
         newer_version,
     )
     cases += 1
+
+    growth_older = allocation_checkpoint(8, 7, 9, allocation_pointer(5, 8))
+    growth_newer = allocation_checkpoint(
+        9, 8, 10, allocation_pointer(6, 9), admitted_segments=12
+    )
+    growth_old_allocation = {
+        "states": [gc_verifier.SEGMENT_ALLOCATED] * 6
+        + [gc_verifier.SEGMENT_FREE] * 2,
+        "retired": [],
+        "next_segment_generation": 9,
+    }
+    growth_new_allocation = {
+        "states": [gc_verifier.SEGMENT_ALLOCATED] * 7
+        + [gc_verifier.SEGMENT_FREE] * 5,
+        "retired": [],
+        "next_segment_generation": 10,
+    }
+    validate_checkpoint_allocation_transition(
+        growth_older,
+        growth_newer,
+        growth_old_allocation,
+        growth_new_allocation,
+        gc_verifier.ALLOCATION_VERSION,
+        gc_verifier.ALLOCATION_VERSION,
+    )
+    cases += 1
+    invalid_growth = dict(growth_new_allocation)
+    invalid_growth["states"] = list(growth_new_allocation["states"])
+    invalid_growth["states"][-1] = gc_verifier.SEGMENT_ALLOCATED
+    try:
+        validate_checkpoint_allocation_transition(
+            growth_older,
+            growth_newer,
+            growth_old_allocation,
+            invalid_growth,
+            gc_verifier.ALLOCATION_VERSION,
+            gc_verifier.ALLOCATION_VERSION,
+        )
+    except Violation:
+        cases += 1
+    else:
+        raise Violation("growth transition admitted a non-free suffix")
 
     invalid_legacy_payloads = []
     invalid_legacy_payloads.append(legacy_payload + b"\0")

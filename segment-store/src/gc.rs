@@ -1785,6 +1785,7 @@ impl SegmentBuilder {
     async fn finish_current<D: PageDevice>(
         &mut self,
         device: &D,
+        flush_final_seal: bool,
     ) -> Result<(), GcStoreError<D::Error>> {
         if self.summary.record_count == 0 {
             return Err(GcError::InvalidSegmentSet.into());
@@ -1799,6 +1800,7 @@ impl SegmentBuilder {
                 self.segment_generation()?,
                 self.header_digest.ok_or(GcError::Corrupt)?,
                 self.summary,
+                flush_final_seal,
             )
             .await?,
         );
@@ -1820,7 +1822,7 @@ impl SegmentBuilder {
         {
             return Ok(());
         }
-        self.finish_current(device).await?;
+        self.finish_current(device, true).await?;
         self.index = self
             .index
             .checked_add(1)
@@ -1995,7 +1997,22 @@ impl SegmentBuilder {
         mut self,
         device: &D,
     ) -> Result<(u64, u64, [u8; 32]), GcStoreError<D::Error>> {
-        self.finish_current(device).await?;
+        self.finish_current(device, true).await?;
+        if self.index + 1 != self.segments.len() {
+            return Err(GcError::InvalidSegmentSet.into());
+        }
+        self.previous.ok_or(GcError::Corrupt.into())
+    }
+
+    /// Finish the final segment without an otherwise redundant standalone
+    /// flush. The caller must immediately clear a checkpoint slot; that
+    /// operation's first barrier durably orders this final seal before the new
+    /// checkpoint body and seal can be published.
+    pub(crate) async fn finish_before_checkpoint<D: PageDevice>(
+        mut self,
+        device: &D,
+    ) -> Result<(u64, u64, [u8; 32]), GcStoreError<D::Error>> {
+        self.finish_current(device, false).await?;
         if self.index + 1 != self.segments.len() {
             return Err(GcError::InvalidSegmentSet.into());
         }
@@ -2012,6 +2029,7 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     segment_generation: u64,
     header_digest: BodyDigest,
     accumulated: SegmentSummaryAccumulator,
+    flush_final_seal: bool,
 ) -> Result<(u64, u64, [u8; 32]), GcStoreError<D::Error>> {
     if accumulated.record_count == 0
         || accumulated.first_target_checkpoint_generation == 0
@@ -2076,7 +2094,9 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
     flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
-    flush(device).await?;
+    if flush_final_seal {
+        flush(device).await?;
+    }
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
 }
 

@@ -212,6 +212,12 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
                 value = sample.get(name)
                 require(isinstance(value, int) and value >= 0, f"missing {name}")
                 phases["put_" + name.removeprefix("put_block_")] = value
+        for name in ("authority_objects", "authority_records", "cas_payloads_verified",
+                     "allocated_segments", "free_segments", "cleaner_reserved_segments"):
+            if name in sample:
+                value = sample[name]
+                require(isinstance(value, int) and value >= 0, f"bad {name}")
+                phases[name] = value
     result: dict[str, Any] = {
         "schema": RECORD_SCHEMA,
         "version": RECORD_VERSION,

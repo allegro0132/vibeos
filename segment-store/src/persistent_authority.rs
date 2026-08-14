@@ -23,8 +23,8 @@ use crate::cas::{
 };
 use crate::device::PageDevice;
 use crate::gc::{
-    publish_checkpoint, select_free_segments, verify_staged_payload, GcError, GcStoreError,
-    SegmentBuilder,
+    publish_checkpoint, select_free_segments, verify_staged_payloads, GcError, GcStoreError,
+    SegmentBuilder, SegmentPayload,
 };
 use crate::maintenance::{MaintenanceOperation, MaintenanceOperationLease, StoreMaintenance};
 use crate::quota::{canonical_attributable_physical_bytes, QuotaReservation, StoragePrincipal};
@@ -378,7 +378,11 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(PersistentAuthorityError::Snapshot)?;
         self.publish_persistent_snapshot(state, generation, bytes, &snapshot)
             .await?;
-        Box::pin(self.mount()).await?;
+        // `publish_persistent_snapshot` has already read back every newly
+        // written payload and both checkpoint anchors before installing the
+        // exact successor.  A generic mount here would rescan all historical
+        // CAS payloads and discard the scrub proof carried into that
+        // successor, even though no unverified state intervenes.
         let observed = self
             .require_current_generation()?
             .persistent_authority
@@ -1249,53 +1253,64 @@ impl<D: PageDevice> SegmentStore<D> {
         self.mounted = None;
         self.poisoned = true;
         let mut builder = SegmentBuilder::begin(&self.device, &state, generation, free).await?;
-        let catalog_root = match empty_cas_snapshot.as_ref() {
-            Some(bytes) => {
-                builder
-                    .payload(
-                        &self.device,
-                        ExtentKind::Catalog,
-                        0xffff_0011,
-                        0,
-                        1,
-                        bytes.len() as u64,
-                        bytes.len() as u64,
-                        0,
-                        payload_sha256(bytes),
-                        bytes,
-                    )
-                    .await?
-            }
-            None => state.catalog_root,
+        let mut payloads = Vec::new();
+        payloads
+            .try_reserve_exact(3)
+            .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+        if let Some(bytes) = empty_cas_snapshot.as_ref() {
+            payloads.push(SegmentPayload {
+                extent_kind: ExtentKind::Catalog,
+                object_kind: 0xffff_0011,
+                extent_index: 0,
+                extent_count: 1,
+                content_byte_len: bytes.len() as u64,
+                encoded_blob_len: bytes.len() as u64,
+                encoded_offset: 0,
+                merkle_root: payload_sha256(bytes),
+                bytes,
+            });
+        }
+        let authority_index = payloads.len();
+        payloads.push(SegmentPayload {
+            extent_kind: ExtentKind::Authority,
+            object_kind: METADATA_KIND_PERSISTENT_AUTHORITY,
+            extent_index: 0,
+            extent_count: 1,
+            content_byte_len: authority_bytes.len() as u64,
+            encoded_blob_len: authority_bytes.len() as u64,
+            encoded_offset: 0,
+            merkle_root: payload_sha256(&authority_bytes),
+            bytes: &authority_bytes,
+        });
+        let allocation_index = payloads.len();
+        payloads.push(SegmentPayload {
+            extent_kind: ExtentKind::Allocation,
+            object_kind: METADATA_KIND_ALLOCATION,
+            extent_index: 0,
+            extent_count: 1,
+            content_byte_len: allocation_bytes.len() as u64,
+            encoded_blob_len: allocation_bytes.len() as u64,
+            encoded_offset: 0,
+            merkle_root: payload_sha256(&allocation_bytes),
+            bytes: &allocation_bytes,
+        });
+        let pointers = builder.payload_batch(&self.device, &payloads).await?;
+        let catalog_root = if empty_cas_snapshot.is_some() {
+            pointers
+                .first()
+                .copied()
+                .ok_or(PersistentAuthorityError::Store(StoreError::Corrupt))?
+        } else {
+            state.catalog_root
         };
-        let authority_root = builder
-            .payload(
-                &self.device,
-                ExtentKind::Authority,
-                METADATA_KIND_PERSISTENT_AUTHORITY,
-                0,
-                1,
-                authority_bytes.len() as u64,
-                authority_bytes.len() as u64,
-                0,
-                payload_sha256(&authority_bytes),
-                &authority_bytes,
-            )
-            .await?;
-        let allocation_root = builder
-            .payload(
-                &self.device,
-                ExtentKind::Allocation,
-                METADATA_KIND_ALLOCATION,
-                0,
-                1,
-                allocation_bytes.len() as u64,
-                allocation_bytes.len() as u64,
-                0,
-                payload_sha256(&allocation_bytes),
-                &allocation_bytes,
-            )
-            .await?;
+        let authority_root = pointers
+            .get(authority_index)
+            .copied()
+            .ok_or(PersistentAuthorityError::Store(StoreError::Corrupt))?;
+        let allocation_root = pointers
+            .get(allocation_index)
+            .copied()
+            .ok_or(PersistentAuthorityError::Store(StoreError::Corrupt))?;
         let last_segment = builder.finish(&self.device).await?;
         let checkpoint = publish_checkpoint(
             &self.device,
@@ -1312,40 +1327,31 @@ impl<D: PageDevice> SegmentStore<D> {
         // durable, so a misdirected anchor write cannot evade the final
         // read-back. Unchanged CAS/catalog state remains covered by the
         // predecessor witness and the exact checkpoint transition.
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(3)
+            .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
         if let (Some(bytes), PhysicalPointer::Value(_)) =
             (empty_cas_snapshot.as_ref(), catalog_root)
         {
-            verify_staged_payload(
-                &self.device,
-                &state,
-                generation,
-                next_segment_generation,
-                catalog_root,
-                ExtentKind::Catalog,
-                bytes,
-                self.limits.recovery_memory_bytes,
-            )
-            .await?;
+            staged.push((catalog_root, ExtentKind::Catalog, bytes.as_slice()));
         }
-        verify_staged_payload(
-            &self.device,
-            &state,
-            generation,
-            next_segment_generation,
+        staged.push((
             authority_root,
             ExtentKind::Authority,
-            &authority_bytes,
-            self.limits.recovery_memory_bytes,
-        )
-        .await?;
-        verify_staged_payload(
+            authority_bytes.as_slice(),
+        ));
+        staged.push((
+            allocation_root,
+            ExtentKind::Allocation,
+            allocation_bytes.as_slice(),
+        ));
+        verify_staged_payloads(
             &self.device,
             &state,
             generation,
             next_segment_generation,
-            allocation_root,
-            ExtentKind::Allocation,
-            &allocation_bytes,
+            &staged,
             self.limits.recovery_memory_bytes,
         )
         .await?;

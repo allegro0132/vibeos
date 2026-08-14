@@ -2671,6 +2671,17 @@ async fn storage_object_bench(
         .0
         .lock()
         .lookup_lease::<crate::store::StoreService>(store_cap, Rights::NONE);
+    let (
+        authority_objects,
+        authority_records,
+        cas_payloads_verified,
+        allocated_segments,
+        free_segments,
+        cleaner_reserved_segments,
+    ) = storage
+        .benchmark_authority_shape()
+        .await
+        .unwrap_or((0, 0, false, 0, 0, 0));
     #[cfg(feature = "qemu-virt")]
     let io_started = crate::virtio_blk::telemetry();
     let put_started = crate::sbi::time();
@@ -2750,11 +2761,17 @@ async fn storage_object_bench(
         io.used_interrupts,
     );
     println!(
-        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"get_ticks\":{},\"put_block_requests\":{},\"put_block_read_requests\":{},\"put_block_write_requests\":{},\"put_block_flush_requests\":{},\"put_block_read_bytes\":{},\"put_block_write_bytes\":{},\"put_block_used_interrupts\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"authority_objects\":{},\"authority_records\":{},\"cas_payloads_verified\":{},\"allocated_segments\":{},\"free_segments\":{},\"cleaner_reserved_segments\":{},\"put_ticks\":{},\"get_ticks\":{},\"put_block_requests\":{},\"put_block_read_requests\":{},\"put_block_write_requests\":{},\"put_block_flush_requests\":{},\"put_block_read_bytes\":{},\"put_block_write_bytes\":{},\"put_block_used_interrupts\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
         backend,
         size,
         seed,
         exec::timebase_hz(),
+        authority_objects,
+        authority_records,
+        u8::from(cas_payloads_verified),
+        allocated_segments,
+        free_segments,
+        cleaner_reserved_segments,
         put_ticks,
         get_ticks,
         put_io.0,

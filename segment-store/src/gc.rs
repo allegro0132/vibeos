@@ -40,8 +40,8 @@ use crate::authority_snapshot::{
     encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
 };
 use crate::cas::{
-    build_record, flush, verify_manifest_blob, write_page, write_payload_record, CasObjectHandle,
-    CasStoreError, FinalRecord,
+    build_record, flush, verify_manifest_blob, write_page, write_payload_records_with_header,
+    CasObjectHandle, CasStoreError, FinalRecord,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -58,8 +58,8 @@ use crate::root_codec::{
     encode_persistent_root_set, PersistentRootEntry, PersistentRootSet, RootCodecError,
 };
 use crate::store::{
-    read_pointer_payload, write_checkpoint, MountedState, SegmentStore, StoreError, StoreLimits,
-    ROOT_PIN_SLOTS,
+    read_pointer_payload, read_pointer_payloads, write_checkpoint, MountedState, SegmentStore,
+    StoreError, StoreLimits, ROOT_PIN_SLOTS,
 };
 use crate::typed_manifest::{
     ReferenceCodecAdmission, TypedObjectReference, TYPED_REFERENCE_ENTRY_LEN, TYPED_REFS_HEADER_LEN,
@@ -1587,8 +1587,23 @@ pub(crate) struct SegmentBuilder {
     relative: u32,
     ordinal: u32,
     header_digest: Option<BodyDigest>,
+    header_body: Option<Box<Page>>,
+    header_seal: Option<Box<Page>>,
     summary: SegmentSummaryAccumulator,
     previous: Option<(u64, u64, [u8; 32])>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentPayload<'a> {
+    pub(crate) extent_kind: ExtentKind,
+    pub(crate) object_kind: u32,
+    pub(crate) extent_index: u32,
+    pub(crate) extent_count: u32,
+    pub(crate) content_byte_len: u64,
+    pub(crate) encoded_blob_len: u64,
+    pub(crate) encoded_offset: u64,
+    pub(crate) merkle_root: [u8; 32],
+    pub(crate) bytes: &'a [u8],
 }
 
 #[derive(Clone, Copy)]
@@ -1689,6 +1704,8 @@ impl SegmentBuilder {
             relative: DATA_FIRST_PAGE,
             ordinal: 1,
             header_digest: None,
+            header_body: None,
+            header_seal: None,
             summary: SegmentSummaryAccumulator::empty(
                 state.superblock.binding.store_uuid,
                 first,
@@ -1748,15 +1765,21 @@ impl SegmentBuilder {
             encode_segment_header_body(&header, &mut body).map_err(StoreError::Format)?;
         encode_record_seal(header_digest, &mut seal).map_err(StoreError::Format)?;
         self.header_digest = Some(header_digest);
-        write_page(device, base, &body).await?;
-        flush(device).await?;
-        write_page(device, base + 1, &seal).await?;
-        flush(device).await?;
+        self.header_body = Some(body);
+        self.header_seal = Some(seal);
         self.relative = DATA_FIRST_PAGE;
         self.ordinal = 1;
         self.summary =
             SegmentSummaryAccumulator::empty(self.store_uuid, segment_no, segment_generation);
         Ok(())
+    }
+
+    fn take_header_pages(&mut self) -> Result<Option<(Box<Page>, Box<Page>)>, GcError> {
+        match (self.header_body.take(), self.header_seal.take()) {
+            (Some(body), Some(seal)) => Ok(Some((body, seal))),
+            (None, None) => Ok(None),
+            _ => Err(GcError::Corrupt),
+        }
     }
 
     async fn finish_current<D: PageDevice>(
@@ -1843,7 +1866,11 @@ impl SegmentBuilder {
             hash,
         )
         .map_err(StoreError::Format)?;
-        write_payload_record(device, base, &record, bytes).await?;
+        let header_pages = self.take_header_pages()?;
+        let header = header_pages
+            .as_ref()
+            .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
+        write_payload_records_with_header(device, base, header, &[(&record, bytes)]).await?;
         self.relative = self
             .relative
             .checked_add(record.value.record_span_pages)
@@ -1855,6 +1882,113 @@ impl SegmentBuilder {
         let pointer = record.pointer();
         self.summary.push(&record)?;
         Ok(pointer)
+    }
+
+    pub(crate) async fn payload_batch<D: PageDevice>(
+        &mut self,
+        device: &D,
+        payloads: &[SegmentPayload<'_>],
+    ) -> Result<Vec<PhysicalPointer>, GcStoreError<D::Error>> {
+        if payloads.is_empty() {
+            return Err(GcError::InvalidSegmentSet.into());
+        }
+        let span = payloads.iter().try_fold(0_u32, |total, payload| {
+            metadata_pages(payload.bytes.len())?
+                .checked_add(2)
+                .and_then(|more| total.checked_add(more))
+                .ok_or(GcError::ArithmeticOverflow)
+        })?;
+        if self
+            .relative
+            .checked_add(span)
+            .is_none_or(|end| end > DATA_END_PAGE)
+        {
+            let mut pointers = Vec::new();
+            pointers
+                .try_reserve_exact(payloads.len())
+                .map_err(|_| GcError::MemoryLimit)?;
+            for payload in payloads {
+                pointers.push(
+                    self.payload(
+                        device,
+                        payload.extent_kind,
+                        payload.object_kind,
+                        payload.extent_index,
+                        payload.extent_count,
+                        payload.content_byte_len,
+                        payload.encoded_blob_len,
+                        payload.encoded_offset,
+                        payload.merkle_root,
+                        payload.bytes,
+                    )
+                    .await?,
+                );
+            }
+            return Ok(pointers);
+        }
+
+        let segment_no = self.segments[self.index];
+        let segment_generation = self.segment_generation()?;
+        let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
+        let mut relative = self.relative;
+        let mut ordinal = self.ordinal;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(payloads.len())
+            .map_err(|_| GcError::MemoryLimit)?;
+        for payload in payloads {
+            let hash = payload_sha256(payload.bytes);
+            let record = build_record(
+                self.store_uuid,
+                segment_no,
+                segment_generation,
+                self.checkpoint_generation,
+                ordinal,
+                relative,
+                payload.extent_kind,
+                payload.object_kind,
+                payload.extent_index,
+                payload.extent_count,
+                payload.content_byte_len,
+                payload.encoded_blob_len,
+                payload.encoded_offset,
+                payload.bytes.len() as u64,
+                payload.merkle_root,
+                hash,
+            )
+            .map_err(StoreError::Format)?;
+            relative = relative
+                .checked_add(record.value.record_span_pages)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            ordinal = ordinal.checked_add(1).ok_or(GcError::ArithmeticOverflow)?;
+            records.push(record);
+        }
+        let mut writes = Vec::new();
+        writes
+            .try_reserve_exact(records.len())
+            .map_err(|_| GcError::MemoryLimit)?;
+        writes.extend(
+            records
+                .iter()
+                .zip(payloads)
+                .map(|(record, payload)| (record, payload.bytes)),
+        );
+        let header_pages = self.take_header_pages()?;
+        let header = header_pages
+            .as_ref()
+            .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
+        write_payload_records_with_header(device, base, header, &writes).await?;
+        let mut pointers = Vec::new();
+        pointers
+            .try_reserve_exact(records.len())
+            .map_err(|_| GcError::MemoryLimit)?;
+        for record in &records {
+            pointers.push(record.pointer());
+            self.summary.push(record)?;
+        }
+        self.relative = relative;
+        self.ordinal = ordinal;
+        Ok(pointers)
     }
 
     pub(crate) async fn finish<D: PageDevice>(
@@ -1939,7 +2073,6 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
     flush(device).await?;
     write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
-    flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
     flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
@@ -2071,6 +2204,43 @@ pub(crate) async fn verify_staged_payload<D: PageDevice>(
     )
     .await?;
     if observed.bytes != expected {
+        return Err(GcError::Corrupt.into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn verify_staged_payloads<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    checkpoint_generation: u64,
+    next_segment_generation: u64,
+    expected: &[(PhysicalPointer, ExtentKind, &[u8])],
+    maximum_bytes: usize,
+) -> Result<(), GcStoreError<D::Error>> {
+    let mut requests = Vec::new();
+    requests
+        .try_reserve_exact(expected.len())
+        .map_err(|_| GcError::MemoryLimit)?;
+    requests.extend(
+        expected
+            .iter()
+            .map(|(pointer, kind, _)| (*pointer, *kind, maximum_bytes)),
+    );
+    let observed = read_pointer_payloads(
+        device,
+        state.superblock.binding.store_uuid,
+        state.admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        &requests,
+    )
+    .await?;
+    if observed.len() != expected.len()
+        || observed
+            .iter()
+            .zip(expected)
+            .any(|(actual, (_, _, bytes))| actual.bytes != *bytes)
+    {
         return Err(GcError::Corrupt.into());
     }
     Ok(())

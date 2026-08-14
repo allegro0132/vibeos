@@ -13,7 +13,7 @@ use vibeos_driver_virtio_core as virtio;
 use vibeos_driver_virtio_core::{
     AvailableRing, BlockDmaAddresses, BlockOperation, BlockRequestHeader, BlockStatus, Descriptor,
     ModernInit, NegotiatedFeatures, QueueError, ResetReason, SplitQueueModel, Submission,
-    UsedElement, UsedRing, BLOCK_HEADER_DESCRIPTOR, BLOCK_SECTOR_SIZE, SPLIT_QUEUE_SIZE,
+    UsedElement, UsedRing, BLOCK_HEADER_DESCRIPTOR, BLOCK_MAX_TRANSFER_SIZE, SPLIT_QUEUE_SIZE,
     STATUS_DEVICE_NEEDS_RESET, STATUS_DRIVER_OK,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
@@ -62,7 +62,7 @@ struct DmaSlab {
     available: AvailableRing,
     used: UsedRing,
     header: BlockRequestHeader,
-    data: [u8; BLOCK_SECTOR_SIZE as usize],
+    data: [u8; BLOCK_MAX_TRANSFER_SIZE as usize],
     status: u8,
 }
 
@@ -84,7 +84,7 @@ impl DmaSlab {
             reserved: 0,
             sector: 0,
         },
-        data: [0; BLOCK_SECTOR_SIZE as usize],
+        data: [0; BLOCK_MAX_TRANSFER_SIZE as usize],
         status: 0,
     };
 }
@@ -185,7 +185,7 @@ impl BlockEngine {
     pub fn submit(
         &mut self,
         operation: BlockOperation,
-        data: [u8; 512],
+        data: &[u8],
     ) -> Result<PendingSubmission, HardwareError> {
         self.submit_tracked(operation, data, || {})
     }
@@ -200,7 +200,7 @@ impl BlockEngine {
     pub fn submit_tracked(
         &mut self,
         operation: BlockOperation,
-        data: [u8; 512],
+        data: &[u8],
         on_request_published: impl FnOnce(),
     ) -> Result<PendingSubmission, HardwareError> {
         let previous_used_index = self.model.used_index();
@@ -235,17 +235,23 @@ impl BlockEngine {
         submission: PendingSubmission,
         observed_used_index: u16,
         used: UsedElement,
-    ) -> Result<[u8; 512], HardwareError> {
+        output: &mut [u8],
+    ) -> Result<(), HardwareError> {
         let status = unsafe { core::ptr::addr_of!((*DMA.0.get()).status).read_volatile() };
         let completion = self
             .model
             .complete(submission.protocol, observed_used_index, used, status)
             .map_err(|_| HardwareError::Protocol)?;
         match completion.block_status {
-            BlockStatus::Ok if matches!(submission.operation, BlockOperation::Read { .. }) => {
-                Ok(read_dma_data())
+            BlockStatus::Ok if submission.operation.is_read() => {
+                if output.len() != submission.operation.data_len() as usize {
+                    return Err(HardwareError::Protocol);
+                }
+                read_dma_data(output);
+                Ok(())
             }
-            BlockStatus::Ok => Ok([0; 512]),
+            BlockStatus::Ok if output.is_empty() => Ok(()),
+            BlockStatus::Ok => Err(HardwareError::Protocol),
             BlockStatus::IoError => Err(HardwareError::DeviceIo),
             BlockStatus::Unsupported => Err(HardwareError::Unsupported),
         }
@@ -365,11 +371,20 @@ pub fn dma_base() -> usize {
 
 fn publish_request(
     operation: BlockOperation,
-    data: [u8; 512],
+    data: &[u8],
     available_slot: u16,
     on_request_published: impl FnOnce(),
 ) -> Result<(), HardwareError> {
     if available_slot >= SPLIT_QUEUE_SIZE {
+        return Err(HardwareError::Protocol);
+    }
+    let expected_len = operation.data_len() as usize;
+    let valid_data = if operation.is_write() {
+        data.len() == expected_len
+    } else {
+        data.is_empty()
+    };
+    if !valid_data {
         return Err(HardwareError::Protocol);
     }
     let addresses = unsafe {
@@ -386,7 +401,7 @@ fn publish_request(
         let slab = DMA.0.get();
         core::ptr::addr_of_mut!((*slab).header).write_volatile(BlockRequestHeader::new(operation));
         core::ptr::addr_of_mut!((*slab).status).write_volatile(0xff);
-        if matches!(operation, BlockOperation::Write { .. }) {
+        if operation.is_write() {
             let destination = core::ptr::addr_of_mut!((*slab).data) as *mut u8;
             for (index, byte) in data.iter().copied().enumerate() {
                 destination.add(index).write_volatile(byte);
@@ -436,20 +451,19 @@ fn read_used_element(slot: usize) -> UsedElement {
     unsafe { core::ptr::addr_of!((*DMA.0.get()).used.ring[slot]).read_volatile() }
 }
 
-fn read_dma_data() -> [u8; 512] {
-    let mut data = [0; 512];
+fn read_dma_data(data: &mut [u8]) {
     unsafe {
         let source = core::ptr::addr_of!((*DMA.0.get()).data) as *const u8;
         for (index, byte) in data.iter_mut().enumerate() {
             *byte = source.add(index).read_volatile();
         }
     }
-    data
 }
 
 fn map_queue_error(error: QueueError) -> HardwareError {
     match error {
         QueueError::Busy => HardwareError::QueueFull,
+        QueueError::InvalidTransferLength => HardwareError::Protocol,
         QueueError::ReadOnly => HardwareError::ReadOnly,
         QueueError::FlushUnsupported => HardwareError::FlushUnsupported,
         _ => HardwareError::Protocol,
@@ -470,7 +484,10 @@ fn dma_fence() {
 mod tests {
     use super::*;
     use core::cell::Cell;
+    use std::sync::Mutex;
     use vibeos_driver_virtio_core::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_F_VERSION_1};
+
+    static DMA_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn dma_layout_is_stable_and_queue_aligned() {
@@ -522,10 +539,11 @@ mod tests {
 
     #[test]
     fn tracked_publication_marks_exactly_before_available_index() {
+        let _guard = DMA_TEST_LOCK.lock().unwrap();
         clear_dma();
         let publications = Cell::new(0);
         let slab = DMA.0.get();
-        publish_request(BlockOperation::Write { sector: 7 }, [0xa5; 512], 0, || {
+        publish_request(BlockOperation::Write { sector: 7 }, &[0xa5; 512], 0, || {
             // Safety: this test exclusively exercises the static slab;
             // the callback runs synchronously before publish_request
             // returns and no device is attached on the host.
@@ -548,12 +566,38 @@ mod tests {
         assert_eq!(
             publish_request(
                 BlockOperation::Read { sector: 0 },
-                [0; 512],
+                &[],
                 SPLIT_QUEUE_SIZE,
                 || rejected.set(rejected.get() + 1),
             ),
             Err(HardwareError::Protocol)
         );
         assert_eq!(rejected.get(), 0);
+    }
+
+    #[test]
+    fn page_request_is_one_descriptor_and_preserves_all_bytes() {
+        let _guard = DMA_TEST_LOCK.lock().unwrap();
+        clear_dma();
+        let operation = BlockOperation::WriteBlocks {
+            sector: 16,
+            block_count: 8,
+        };
+        let mut page = [0u8; 4096];
+        for (index, byte) in page.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(29).wrapping_add(7);
+        }
+        publish_request(operation, &page, 0, || {}).unwrap();
+        // Safety: the host test has exclusive use of the unattached slab.
+        unsafe {
+            let slab = &*DMA.0.get();
+            assert_eq!(
+                slab.descriptors[virtio::BLOCK_DATA_DESCRIPTOR as usize].length(),
+                4096
+            );
+            for (index, expected) in page.iter().copied().enumerate() {
+                assert_eq!(slab.data[index], expected);
+            }
+        }
     }
 }

@@ -18,6 +18,14 @@ fn addresses() -> BlockDmaAddresses {
     }
 }
 
+fn large_addresses() -> BlockDmaAddresses {
+    BlockDmaAddresses {
+        header: 0x1000,
+        data: 0x2000,
+        status: 0x30000,
+    }
+}
+
 fn complete_ok(queue: &mut SplitQueueModel, submission: Submission, status: u8) -> Completion {
     queue
         .complete(
@@ -52,7 +60,8 @@ fn modern_mmio_constants_match_virtio_1_2() {
     assert_eq!(MMIO_QUEUE_DEVICE_LOW_OFFSET, 0x0a0);
     assert_eq!(MMIO_CONFIG_GENERATION_OFFSET, 0x0fc);
     assert_eq!(MMIO_CONFIG_OFFSET, 0x100);
-    assert_eq!(SPLIT_QUEUE_SIZE, 8);
+    assert_eq!(SPLIT_QUEUE_SIZE, 128);
+    assert_eq!(NET_QUEUE_SIZE, 8);
 }
 
 #[test]
@@ -396,9 +405,12 @@ fn split_ring_wire_types_have_the_required_layout() {
     assert_eq!(size_of::<Descriptor>(), 16);
     assert_eq!(align_of::<Descriptor>(), 16);
     assert_eq!(size_of::<UsedElement>(), 8);
-    assert_eq!(size_of::<AvailableRing>(), 20);
+    assert_eq!(
+        size_of::<AvailableRing>(),
+        4 + 2 * SPLIT_QUEUE_SIZE as usize
+    );
     assert_eq!(align_of::<AvailableRing>(), 2);
-    assert_eq!(size_of::<UsedRing>(), 68);
+    assert_eq!(size_of::<UsedRing>(), 4 + 8 * SPLIT_QUEUE_SIZE as usize);
     assert_eq!(align_of::<UsedRing>(), 4);
     assert_eq!(size_of::<BlockRequestHeader>(), 16);
 }
@@ -455,6 +467,51 @@ fn write_chain_keeps_payload_device_readable() {
     assert!(!data.device_writable());
     assert_eq!(data.next(), BLOCK_STATUS_DESCRIPTOR);
     assert!(chain.descriptors[BLOCK_STATUS_DESCRIPTOR as usize].device_writable());
+}
+
+#[test]
+fn multi_block_chain_uses_one_contiguous_bounded_descriptor() {
+    let read = BlockOperation::ReadBlocks {
+        sector: 32,
+        block_count: 8,
+    };
+    let chain = build_block_chain(read, large_addresses()).unwrap();
+    assert_eq!(chain.descriptor_count(), 3);
+    let data = chain.descriptors[BLOCK_DATA_DESCRIPTOR as usize];
+    assert_eq!(data.length(), 4096);
+    assert!(data.device_writable());
+    assert_eq!(maximum_used_length(read), 4097);
+
+    let maximum = BlockOperation::WriteBlocks {
+        sector: 64,
+        block_count: BLOCK_MAX_TRANSFER_BLOCKS,
+    };
+    let chain = build_block_chain(maximum, large_addresses()).unwrap();
+    assert_eq!(
+        chain.descriptors[BLOCK_DATA_DESCRIPTOR as usize].length(),
+        BLOCK_MAX_TRANSFER_SIZE
+    );
+    assert!(!chain.descriptors[BLOCK_DATA_DESCRIPTOR as usize].device_writable());
+
+    for invalid in [
+        BlockOperation::ReadBlocks {
+            sector: 0,
+            block_count: 0,
+        },
+        BlockOperation::WriteBlocks {
+            sector: 0,
+            block_count: BLOCK_MAX_TRANSFER_BLOCKS + 1,
+        },
+    ] {
+        assert_eq!(
+            build_block_chain(invalid, large_addresses()),
+            Err(ChainError::InvalidTransferLength)
+        );
+        assert_eq!(
+            SplitQueueModel::new(read_write_features()).submit(invalid),
+            Err(QueueError::InvalidTransferLength)
+        );
+    }
 }
 
 #[test]
@@ -576,8 +633,9 @@ fn used_length_bounds_and_block_status_values_match_block_protocol() {
 fn ring_index_helpers_use_u16_wrapping_and_queue_modulo() {
     assert_eq!(ring_slot(0), 0);
     assert_eq!(ring_slot(7), 7);
-    assert_eq!(ring_slot(8), 0);
-    assert_eq!(ring_slot(u16::MAX), 7);
+    assert_eq!(ring_slot(127), 127);
+    assert_eq!(ring_slot(128), 0);
+    assert_eq!(ring_slot(u16::MAX), 127);
     assert_eq!(advance_ring_index(u16::MAX), 0);
     assert!(used_advanced_once(u16::MAX, 0));
     assert!(!used_advanced_once(u16::MAX, 1));
@@ -711,7 +769,9 @@ fn every_malformed_used_field_quarantines_dma_until_reset() {
                 )
                 .unwrap_err()
         },
-        QueueError::UsedIdOutOfRange { observed: 8 },
+        QueueError::UsedIdOutOfRange {
+            observed: SPLIT_QUEUE_SIZE as u32,
+        },
     );
     assert_malformed_completion(
         |queue, submission| {
@@ -892,7 +952,7 @@ fn queue_ring_indices_really_cross_the_u16_boundary() {
     }
     let last = last.unwrap();
     assert_eq!(last.available_index, 0);
-    assert_eq!(last.available_slot, 7);
+    assert_eq!(last.available_slot, SPLIT_QUEUE_SIZE - 1);
     assert_eq!(queue.available_index(), 0);
     assert_eq!(queue.used_index(), 0);
     assert_eq!(queue.state(), QueueState::Idle);

@@ -2807,18 +2807,24 @@ async fn write_extent<D: PageDevice>(
 ) -> Result<(), StoreError<D::Error>> {
     let relative = extent.value.binding.self_page - base;
     let mut copied = 0;
-    for page_index in 0..extent.value.payload_pages {
-        let mut page = [0; PAGE_SIZE];
-        let remaining = extent.payload.len() - copied;
-        let take = remaining.min(PAGE_SIZE);
-        page[..take].copy_from_slice(&extent.payload[copied..copied + take]);
-        write_page(
-            device,
-            base + u64::from(extent.value.payload_first_relative_page + page_index),
-            &page,
-        )
-        .await?;
-        copied += take;
+    let mut page_index = 0_u32;
+    while page_index < extent.value.payload_pages {
+        let batch_pages = (extent.value.payload_pages - page_index).min(32) as usize;
+        let mut pages = vec![[0; PAGE_SIZE]; batch_pages];
+        for page in &mut pages {
+            let remaining = extent.payload.len() - copied;
+            let take = remaining.min(PAGE_SIZE);
+            page[..take].copy_from_slice(&extent.payload[copied..copied + take]);
+            copied += take;
+        }
+        device
+            .write_pages(
+                base + u64::from(extent.value.payload_first_relative_page + page_index),
+                &pages,
+            )
+            .await
+            .map_err(StoreError::Mutation)?;
+        page_index += batch_pages as u32;
     }
     flush(device).await?;
     write_page(device, base + relative, &extent.body).await?;

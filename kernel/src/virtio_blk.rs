@@ -11,6 +11,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -21,7 +22,7 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, BlockOperation, UsedElement, SPLIT_QUEUE_SIZE};
+use crate::virtio::{self, BlockOperation, UsedElement, BLOCK_MAX_TRANSFER_SIZE, SPLIT_QUEUE_SIZE};
 use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;
@@ -82,6 +83,43 @@ pub struct BlockInfo {
     pub session_epoch: u64,
     pub irq: u32,
     pub used_interrupts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BlockTelemetry {
+    pub requests: u64,
+    pub read_requests: u64,
+    pub write_requests: u64,
+    pub flush_requests: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub used_interrupts: u64,
+}
+
+impl BlockTelemetry {
+    pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            requests: self.requests.saturating_sub(earlier.requests),
+            read_requests: self.read_requests.saturating_sub(earlier.read_requests),
+            write_requests: self.write_requests.saturating_sub(earlier.write_requests),
+            flush_requests: self.flush_requests.saturating_sub(earlier.flush_requests),
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
+            used_interrupts: self.used_interrupts.saturating_sub(earlier.used_interrupts),
+        }
+    }
+}
+
+pub(crate) fn telemetry() -> BlockTelemetry {
+    BlockTelemetry {
+        requests: REQUEST_COUNT.load(Ordering::Acquire),
+        read_requests: READ_REQUEST_COUNT.load(Ordering::Acquire),
+        write_requests: WRITE_REQUEST_COUNT.load(Ordering::Acquire),
+        flush_requests: FLUSH_REQUEST_COUNT.load(Ordering::Acquire),
+        read_bytes: READ_BYTE_COUNT.load(Ordering::Acquire),
+        write_bytes: WRITE_BYTE_COUNT.load(Ordering::Acquire),
+        used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
+    }
 }
 
 /// Capability naming exactly one discovered 4 KiB transport window.
@@ -194,7 +232,26 @@ pub(crate) fn raw_info() -> BlockInfo {
 }
 
 pub(crate) async fn raw_read_at(expected_epoch: u64, sector: u64) -> Result<[u8; 512], BlockError> {
-    request_at(expected_epoch, BlockOperation::Read { sector }, [0; 512])
+    let mut output = [0; 512];
+    raw_read_blocks_at(expected_epoch, sector, 1, &mut output).await?;
+    Ok(output)
+}
+
+pub(crate) async fn raw_read_blocks_at(
+    expected_epoch: u64,
+    sector: u64,
+    block_count: u32,
+    output: &mut [u8],
+) -> Result<(), BlockError> {
+    let operation = if block_count == 1 {
+        BlockOperation::Read { sector }
+    } else {
+        BlockOperation::ReadBlocks {
+            sector,
+            block_count,
+        }
+    };
+    request_at(expected_epoch, operation, &[], output)
         .await
         .map_err(|failure| failure.error)
 }
@@ -204,17 +261,32 @@ pub(crate) async fn raw_write_at(
     sector: u64,
     data: [u8; 512],
 ) -> MutationResult<(), BlockError> {
-    request_at(expected_epoch, BlockOperation::Write { sector }, data)
+    raw_write_blocks_at(expected_epoch, sector, 1, &data).await
+}
+
+pub(crate) async fn raw_write_blocks_at(
+    expected_epoch: u64,
+    sector: u64,
+    block_count: u32,
+    data: &[u8],
+) -> MutationResult<(), BlockError> {
+    let operation = if block_count == 1 {
+        BlockOperation::Write { sector }
+    } else {
+        BlockOperation::WriteBlocks {
+            sector,
+            block_count,
+        }
+    };
+    request_at(expected_epoch, operation, data, &mut [])
         .await
         .map_err(RequestFailure::into_mutation)
-        .map(|_| ())
 }
 
 pub(crate) async fn raw_flush_at(expected_epoch: u64) -> MutationResult<(), BlockError> {
-    request_at(expected_epoch, BlockOperation::Flush, [0; 512])
+    request_at(expected_epoch, BlockOperation::Flush, &[], &mut [])
         .await
         .map_err(RequestFailure::into_mutation)
-        .map(|_| ())
 }
 
 pub struct BlockResources {
@@ -241,7 +313,7 @@ struct PendingRequest {
     id: u64,
     expected_epoch: u64,
     operation: BlockOperation,
-    data: [u8; 512],
+    data_len: u32,
     abandoned: bool,
     submitted: bool,
     requester: AllocationDomain,
@@ -285,7 +357,15 @@ impl RequestFailure {
     }
 }
 
-type RequestResult = Result<[u8; 512], RequestFailure>;
+type RequestResult = Result<(), RequestFailure>;
+
+struct StableRequestData(UnsafeCell<[u8; BLOCK_MAX_TRANSFER_SIZE as usize]>);
+
+// Safety: REQUEST is the ownership state machine for this buffer. The client
+// writes it only while changing Empty -> Queued; the driver owns it while the
+// slot is Queued/InFlight, and a successful reader copies it before changing
+// Completed -> Empty. IRQ code never dereferences it.
+unsafe impl Sync for StableRequestData {}
 
 #[derive(Clone, Copy)]
 enum RequestSlot {
@@ -326,23 +406,63 @@ static CONTROL: SpinLock<DriverControl> = SpinLock::new_recoverable(DriverContro
 });
 static AUTHORITY: SpinLock<Option<DriverAuthority>> = SpinLock::new_recoverable(None);
 static REQUEST: SpinLock<RequestSlot> = SpinLock::new_recoverable(RequestSlot::Empty);
+static REQUEST_DATA: StableRequestData =
+    StableRequestData(UnsafeCell::new([0; BLOCK_MAX_TRANSFER_SIZE as usize]));
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static REQUEST_WAIT: WaitQueue = WaitQueue::new();
 static COMPLETION_WAIT: WaitQueue = WaitQueue::new();
 static IRQ_WAIT: WaitQueue = WaitQueue::new();
 static IRQ_CAUSES: AtomicU32 = AtomicU32::new(0);
 static USED_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static WRITE_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static FLUSH_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_BYTE_COUNT: AtomicU64 = AtomicU64::new(0);
+static WRITE_BYTE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DRIVER_OWNER: AtomicU64 = AtomicU64::new(OwnerId::SYSTEM.get());
 static DRIVER_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 static FAULT_AFTER_PUBLISH: AtomicBool = AtomicBool::new(false);
 static SUPPRESS_NEXT_NOTIFY: AtomicBool = AtomicBool::new(false);
 
+fn request_input(request: PendingRequest) -> &'static [u8] {
+    if !request.operation.is_write() {
+        return &[];
+    }
+    // Safety: only the driver can call this while REQUEST is InFlight. The
+    // client cannot regain access until a terminal completion is published.
+    unsafe { &(&*REQUEST_DATA.0.get())[..request.data_len as usize] }
+}
+
+fn request_output(request: PendingRequest) -> &'static mut [u8] {
+    if !request.operation.is_read() {
+        return &mut [];
+    }
+    // Safety: only the driver can call this while REQUEST is InFlight. It
+    // finishes the DMA-to-stable copy before publishing Completed.
+    unsafe { &mut (&mut *REQUEST_DATA.0.get())[..request.data_len as usize] }
+}
+
 async fn request_at(
     expected_epoch: u64,
     operation: BlockOperation,
-    data: [u8; 512],
+    input: &[u8],
+    output: &mut [u8],
 ) -> RequestResult {
     validate_operation(expected_epoch, operation).map_err(RequestFailure::not_submitted)?;
+    let data_len = operation.data_len() as usize;
+    let buffers_valid = match operation {
+        BlockOperation::Read { .. } | BlockOperation::ReadBlocks { .. } => {
+            input.is_empty() && output.len() == data_len
+        }
+        BlockOperation::Write { .. } | BlockOperation::WriteBlocks { .. } => {
+            input.len() == data_len && output.is_empty()
+        }
+        BlockOperation::Flush => input.is_empty() && output.is_empty(),
+    };
+    if !buffers_valid || data_len > BLOCK_MAX_TRANSFER_SIZE as usize {
+        return Err(RequestFailure::not_submitted(BlockError::Protocol));
+    }
 
     let id = NEXT_REQUEST_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -352,11 +472,16 @@ async fn request_at(
         if !matches!(*slot, RequestSlot::Empty) {
             return Err(RequestFailure::not_submitted(BlockError::QueueFull));
         }
+        if operation.is_write() {
+            // Safety: the Empty slot gives this client exclusive ownership,
+            // and publication to Queued occurs only after the copy completes.
+            unsafe { (&mut *REQUEST_DATA.0.get())[..data_len].copy_from_slice(input) };
+        }
         *slot = RequestSlot::Queued(PendingRequest {
             id,
             expected_epoch,
             operation,
-            data,
+            data_len: data_len as u32,
             abandoned: false,
             submitted: false,
             requester: crate::heap::current_domain(),
@@ -375,6 +500,13 @@ async fn request_at(
                     result,
                     ..
                 } if completed_id == id => {
+                    if result.is_ok() && operation.is_read() {
+                        // Safety: Completed retains driver publication of the
+                        // read bytes until this exact client empties the slot.
+                        unsafe {
+                            output.copy_from_slice(&(&*REQUEST_DATA.0.get())[..data_len]);
+                        }
+                    }
                     *slot = RequestSlot::Empty;
                     Some(result)
                 }
@@ -401,12 +533,17 @@ fn validate_operation(expected_epoch: u64, operation: BlockOperation) -> Result<
         return Err(BlockError::DriverRestarted);
     }
     match operation {
-        BlockOperation::Read { sector } | BlockOperation::Write { sector }
-            if sector >= info.capacity_sectors =>
+        BlockOperation::Read { sector }
+        | BlockOperation::Write { sector }
+        | BlockOperation::ReadBlocks { sector, .. }
+        | BlockOperation::WriteBlocks { sector, .. }
+            if sector
+                .checked_add(u64::from(operation.block_count()))
+                .is_none_or(|end| end > info.capacity_sectors) =>
         {
             return Err(BlockError::OutOfRange);
         }
-        BlockOperation::Write { .. } if info.read_only => return Err(BlockError::ReadOnly),
+        _ if operation.is_write() && info.read_only => return Err(BlockError::ReadOnly),
         BlockOperation::Flush if !info.supports_flush => return Err(BlockError::FlushUnsupported),
         _ => {}
     }
@@ -694,11 +831,21 @@ impl DriverSession {
         }
         let submission = self
             .engine_mut()
-            .submit_tracked(request.operation, request.data, || {
+            .submit_tracked(request.operation, request_input(request), || {
                 mark_submitted(request.id)
             })
             .map_err(map_hardware_error)
             .map_err(RequestFailure::not_submitted)?;
+        REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+        if request.operation.is_read() {
+            READ_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+            READ_BYTE_COUNT.fetch_add(u64::from(request.data_len), Ordering::Relaxed);
+        } else if request.operation.is_write() {
+            WRITE_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+            WRITE_BYTE_COUNT.fetch_add(u64::from(request.data_len), Ordering::Relaxed);
+        } else {
+            FLUSH_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         if !SUPPRESS_NEXT_NOTIFY.swap(false, Ordering::AcqRel) {
             self.engine().notify();
         }
@@ -736,8 +883,11 @@ impl DriverSession {
             return Err(RequestFailure::ambiguous(BlockError::DriverRestarted));
         }
 
-        match self.engine_mut().complete(submission, observed_used, used) {
-            Ok(data) => Ok(data),
+        match self
+            .engine_mut()
+            .complete(submission, observed_used, used, request_output(request))
+        {
+            Ok(()) => Ok(()),
             Err(HardwareError::Protocol) => {
                 self.reset_required_transport()
                     .map_err(RequestFailure::ambiguous)?;

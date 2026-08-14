@@ -1,9 +1,10 @@
 //! Capability-scoped kernel adapters for Storage V2.
 //!
-//! The admitted block backends expose one 512-byte logical block per request,
-//! while the on-media Storage V2 ABI is page based.  This module is the sole
-//! translation boundary: every 4 KiB page is issued as eight sequential
-//! capability-checked requests against one pinned device incarnation.
+//! The admitted block backends expose 512-byte logical blocks while the
+//! on-media Storage V2 ABI is page based. This module is the sole translation
+//! boundary: QEMU issues each 4 KiB page (and bounded consecutive page batch)
+//! as a contiguous capability-checked request against one pinned incarnation;
+//! Milk-V retains the compatible one-block PIO fallback.
 
 extern crate alloc;
 
@@ -355,6 +356,23 @@ impl CapabilityPageDevice {
             return Err(PageIoError::InvalidRange);
         }
         page.checked_mul(BLOCKS_PER_PAGE)
+            .ok_or(PageIoError::InvalidRange)
+    }
+
+    fn page_range_first_sector(
+        &self,
+        first_page: u64,
+        page_count: usize,
+    ) -> Result<u64, PageIoError> {
+        let page_count = u64::try_from(page_count).map_err(|_| PageIoError::InvalidRange)?;
+        let end = first_page
+            .checked_add(page_count)
+            .ok_or(PageIoError::InvalidRange)?;
+        if page_count == 0 || end > self.info.lock().page_count {
+            return Err(PageIoError::InvalidRange);
+        }
+        first_page
+            .checked_mul(BLOCKS_PER_PAGE)
             .ok_or(PageIoError::InvalidRange)
     }
 
@@ -2937,6 +2955,18 @@ impl PageDevice for &CapabilityPageDevice {
         (*self).write_page(page, input).await
     }
 
+    async fn read_pages(&self, first_page: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+        (*self).read_pages(first_page, output).await
+    }
+
+    async fn write_pages(
+        &self,
+        first_page: u64,
+        input: &[Page],
+    ) -> MutationResult<(), Self::Error> {
+        (*self).write_pages(first_page, input).await
+    }
+
     async fn flush(&self) -> MutationResult<(), Self::Error> {
         (*self).flush().await
     }
@@ -2956,6 +2986,19 @@ impl PageDevice for CapabilityPageDevice {
             .map_err(PageIoError::Block)?
             .session();
         self.require_session(session)?;
+        #[cfg(feature = "qemu-virt")]
+        {
+            block_device::read_blocks_with_session(
+                &lease,
+                session,
+                first,
+                BLOCKS_PER_PAGE as u32,
+                output,
+            )
+            .await
+            .map_err(PageIoError::Block)?;
+        }
+        #[cfg(feature = "milkv-duo")]
         for index in 0..BLOCKS_PER_PAGE {
             let offset = usize::try_from(index)
                 .ok()
@@ -2989,6 +3032,25 @@ impl PageDevice for CapabilityPageDevice {
             .map_err(MutationFailure::not_submitted)
             .map_err(|failure| self.compose_mutation_failure(failure))?;
 
+        #[cfg(feature = "qemu-virt")]
+        {
+            let result = block_device::write_blocks_with_session(
+                &lease,
+                session,
+                first,
+                BLOCKS_PER_PAGE as u32,
+                input,
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|failure| failure.map(PageIoError::Block));
+            match result {
+                Ok(()) => self.mark_mutation_submitted(),
+                Err(failure) => return Err(self.compose_mutation_failure(failure)),
+            }
+        }
+        #[cfg(feature = "milkv-duo")]
         for index in 0..BLOCKS_PER_PAGE {
             let offset = usize::try_from(index)
                 .ok()
@@ -3012,6 +3074,136 @@ impl PageDevice for CapabilityPageDevice {
             }
         }
         Ok(())
+    }
+
+    async fn read_pages(&self, first_page: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let first = self.page_range_first_sector(first_page, output.len())?;
+        #[cfg(feature = "qemu-virt")]
+        {
+            const MAX_PAGES_PER_REQUEST: usize =
+                crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
+            let lease = self.lease(Rights::READ)?;
+            let session = block_device::range_info_with(&lease)
+                .map_err(PageIoError::Block)?
+                .session();
+            self.require_session(session)?;
+            for (chunk_index, chunk) in output.chunks_mut(MAX_PAGES_PER_REQUEST).enumerate() {
+                let page_offset = chunk_index
+                    .checked_mul(MAX_PAGES_PER_REQUEST)
+                    .ok_or(PageIoError::InvalidRange)?;
+                let block_offset = (page_offset as u64)
+                    .checked_mul(BLOCKS_PER_PAGE)
+                    .ok_or(PageIoError::InvalidRange)?;
+                let block_count = u32::try_from(chunk.len())
+                    .ok()
+                    .and_then(|count| count.checked_mul(BLOCKS_PER_PAGE as u32))
+                    .ok_or(PageIoError::InvalidRange)?;
+                block_device::read_blocks_with_session(
+                    &lease,
+                    session,
+                    first
+                        .checked_add(block_offset)
+                        .ok_or(PageIoError::InvalidRange)?,
+                    block_count,
+                    chunk.as_flattened_mut(),
+                )
+                .await
+                .map_err(PageIoError::Block)?;
+            }
+            Ok(())
+        }
+        #[cfg(feature = "milkv-duo")]
+        {
+            for (offset, page) in output.iter_mut().enumerate() {
+                self.read_page(
+                    first_page
+                        .checked_add(offset as u64)
+                        .ok_or(PageIoError::InvalidRange)?,
+                    page,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    async fn write_pages(
+        &self,
+        first_page: u64,
+        input: &[Page],
+    ) -> MutationResult<(), Self::Error> {
+        if input.is_empty() {
+            return Ok(());
+        }
+        let first = self
+            .page_range_first_sector(first_page, input.len())
+            .map_err(MutationFailure::not_submitted)
+            .map_err(|failure| self.compose_mutation_failure(failure))?;
+        #[cfg(feature = "qemu-virt")]
+        {
+            const MAX_PAGES_PER_REQUEST: usize =
+                crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
+            let lease = self
+                .lease(Rights::WRITE)
+                .map_err(MutationFailure::not_submitted)
+                .map_err(|failure| self.compose_mutation_failure(failure))?;
+            let session = block_device::begin_mutation(&lease).map_err(|failure| {
+                self.compose_mutation_failure(failure.map(PageIoError::Block))
+            })?;
+            self.require_session(session.device_session())
+                .map_err(MutationFailure::not_submitted)
+                .map_err(|failure| self.compose_mutation_failure(failure))?;
+            for (chunk_index, chunk) in input.chunks(MAX_PAGES_PER_REQUEST).enumerate() {
+                let page_offset = chunk_index
+                    .checked_mul(MAX_PAGES_PER_REQUEST)
+                    .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))
+                    .map_err(|failure| self.compose_mutation_failure(failure))?;
+                let block_offset = (page_offset as u64)
+                    .checked_mul(BLOCKS_PER_PAGE)
+                    .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))
+                    .map_err(|failure| self.compose_mutation_failure(failure))?;
+                let block_count = u32::try_from(chunk.len())
+                    .ok()
+                    .and_then(|count| count.checked_mul(BLOCKS_PER_PAGE as u32))
+                    .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))
+                    .map_err(|failure| self.compose_mutation_failure(failure))?;
+                let result = block_device::write_blocks_with_session(
+                    &lease,
+                    session,
+                    first
+                        .checked_add(block_offset)
+                        .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))
+                        .map_err(|failure| self.compose_mutation_failure(failure))?,
+                    block_count,
+                    chunk.as_flattened(),
+                    false,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|failure| failure.map(PageIoError::Block));
+                match result {
+                    Ok(()) => self.mark_mutation_submitted(),
+                    Err(failure) => return Err(self.compose_mutation_failure(failure)),
+                }
+            }
+            Ok(())
+        }
+        #[cfg(feature = "milkv-duo")]
+        {
+            for (offset, page) in input.iter().enumerate() {
+                self.write_page(
+                    first_page
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))?,
+                    page,
+                )
+                .await?;
+            }
+            Ok(())
+        }
     }
 
     async fn flush(&self) -> MutationResult<(), Self::Error> {

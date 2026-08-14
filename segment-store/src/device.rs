@@ -22,6 +22,28 @@ pub trait PageDevice {
     fn info(&self) -> PageDeviceInfo;
     async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error>;
     async fn write_page(&self, page: u64, input: &Page) -> MutationResult<(), Self::Error>;
+    /// Read consecutive pages. Backends remain source-compatible through this
+    /// bounded, ordered fallback; block backends override it with one request.
+    async fn read_pages(&self, first_page: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+        for (offset, page) in output.iter_mut().enumerate() {
+            let page_number = first_page.checked_add(offset as u64).unwrap_or(u64::MAX);
+            self.read_page(page_number, page).await?;
+        }
+        Ok(())
+    }
+    /// Write consecutive pages without implying a flush. The caller retains
+    /// the same publication/barrier responsibility as for `write_page`.
+    async fn write_pages(
+        &self,
+        first_page: u64,
+        input: &[Page],
+    ) -> MutationResult<(), Self::Error> {
+        for (offset, page) in input.iter().enumerate() {
+            let page_number = first_page.checked_add(offset as u64).unwrap_or(u64::MAX);
+            self.write_page(page_number, page).await?;
+        }
+        Ok(())
+    }
     async fn flush(&self) -> MutationResult<(), Self::Error>;
 }
 
@@ -152,28 +174,44 @@ impl<I: BlockIo> BlockPageDevice<I> {
         Ok(blocks_per_page)
     }
 
+    fn request_pages(
+        &self,
+        operation: Operation,
+        first_page: u64,
+        page_count: usize,
+    ) -> Result<vibeos_storage_device::ValidatedRequest, BlockPageError<I::Error>> {
+        let page_count_u64 = u64::try_from(page_count)
+            .map_err(|_| BlockPageError::Contract(ContractError::ArithmeticOverflow))?;
+        let page_end = first_page
+            .checked_add(page_count_u64)
+            .ok_or(BlockPageError::Contract(ContractError::ArithmeticOverflow))?;
+        if page_count == 0 || page_end > self.info.page_count {
+            return Err(BlockPageError::Contract(ContractError::OutsideRange));
+        }
+        let info = self.io.info().map_err(BlockPageError::Backend)?;
+        let blocks_per_page = (PAGE_SIZE as u32) / info.geometry().logical_block_size();
+        let first = first_page
+            .checked_mul(u64::from(blocks_per_page))
+            .ok_or(BlockPageError::Contract(ContractError::ArithmeticOverflow))?;
+        let block_count = blocks_per_page
+            .checked_mul(
+                u32::try_from(page_count)
+                    .map_err(|_| BlockPageError::Contract(ContractError::ArithmeticOverflow))?,
+            )
+            .ok_or(BlockPageError::Contract(ContractError::ArithmeticOverflow))?;
+        let byte_len = PAGE_SIZE
+            .checked_mul(page_count)
+            .ok_or(BlockPageError::Contract(ContractError::ArithmeticOverflow))?;
+        validate_request(self.binding, info, operation, first, block_count, byte_len)
+            .map_err(BlockPageError::Contract)
+    }
+
     fn request(
         &self,
         operation: Operation,
         page: u64,
     ) -> Result<vibeos_storage_device::ValidatedRequest, BlockPageError<I::Error>> {
-        if page >= self.info.page_count {
-            return Err(BlockPageError::Contract(ContractError::OutsideRange));
-        }
-        let info = self.io.info().map_err(BlockPageError::Backend)?;
-        let blocks_per_page = (PAGE_SIZE as u32) / info.geometry().logical_block_size();
-        let first = page
-            .checked_mul(u64::from(blocks_per_page))
-            .ok_or(BlockPageError::Contract(ContractError::ArithmeticOverflow))?;
-        validate_request(
-            self.binding,
-            info,
-            operation,
-            first,
-            blocks_per_page,
-            PAGE_SIZE,
-        )
-        .map_err(BlockPageError::Contract)
+        self.request_pages(operation, page, 1)
     }
 }
 
@@ -198,6 +236,35 @@ impl<I: BlockIo> PageDevice for BlockPageDevice<I> {
             .map_err(MutationFailure::not_submitted)?;
         self.io
             .write(request, input)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.map(BlockPageError::Backend))
+    }
+
+    async fn read_pages(&self, first_page: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let request = self.request_pages(Operation::Read, first_page, output.len())?;
+        self.io
+            .read(request, output.as_flattened_mut())
+            .await
+            .map_err(BlockPageError::Backend)
+    }
+
+    async fn write_pages(
+        &self,
+        first_page: u64,
+        input: &[Page],
+    ) -> MutationResult<(), Self::Error> {
+        if input.is_empty() {
+            return Ok(());
+        }
+        let request = self
+            .request_pages(Operation::Write { fua: false }, first_page, input.len())
+            .map_err(MutationFailure::not_submitted)?;
+        self.io
+            .write(request, input.as_flattened())
             .await
             .map(|_| ())
             .map_err(|error| error.map(BlockPageError::Backend))
@@ -337,13 +404,35 @@ impl<I: BlockIo> GrowablePageDevice for BlockPageDevice<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::future::Future;
+    use core::pin::pin;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
     use std::future::{ready, Ready};
     use std::sync::{Arc, Mutex};
+    use std::task::Wake;
     use vibeos_storage_device::{
         BlockRangeProvisioner, DeviceId, DeviceSession, ValidatedFlush, ValidatedRequest,
         WriteCache, WriteDurability,
     };
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct MutableBlockIo {
@@ -448,5 +537,19 @@ mod tests {
             assert_eq!(device.info().logical_block_count, 2_048);
             assert_eq!(io.mutations(), 0);
         }
+    }
+
+    #[test]
+    fn block_page_batch_is_one_validated_backend_request() {
+        let current = session(1);
+        // SAFETY: this fixture owns the complete in-memory device authority.
+        let ranges = unsafe { BlockRangeProvisioner::new(current, 0, 4_096) }.unwrap();
+        let authority = ranges.derive(0, 4_096).unwrap();
+        let io = MutableBlockIo::new(info(current, false, geometry(256, true)));
+        let device = BlockPageDevice::new(io.clone(), authority).unwrap();
+        let pages = [[0x31; PAGE_SIZE], [0x72; PAGE_SIZE]];
+
+        block_on(device.write_pages(7, &pages)).unwrap();
+        assert_eq!(io.mutations(), 1, "two pages must remain one block request");
     }
 }

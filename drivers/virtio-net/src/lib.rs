@@ -13,7 +13,7 @@ use vibeos_driver_virtio_core as virtio;
 use vibeos_driver_virtio_core::{
     AvailableRing, Descriptor, ModernInit, NegotiatedFeatures, NetDeviceModel, NetDeviceState,
     NetOperation, NetQueue, NetResetReason, NetSubmission, UsedElement, UsedRing, VirtioNetHeader,
-    NET_HEADER_SIZE, NET_RECEIVE_QUEUE, NET_TRANSMIT_QUEUE, SPLIT_QUEUE_SIZE, VIRTIO_F_VERSION_1,
+    NET_HEADER_SIZE, NET_QUEUE_SIZE, NET_RECEIVE_QUEUE, NET_TRANSMIT_QUEUE, VIRTIO_F_VERSION_1,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
 use vibeos_hal::MAX_PACKET_LEN;
@@ -21,7 +21,7 @@ use vibeos_hal::MAX_PACKET_LEN;
 const _: () = assert!(MAX_PACKET_LEN as u32 == virtio::NET_MAX_FRAME_SIZE);
 
 pub const RESET_POLL_BUDGET: usize = 100_000;
-pub const QUEUE_SLOTS: usize = SPLIT_QUEUE_SIZE as usize;
+pub const QUEUE_SLOTS: usize = NET_QUEUE_SIZE as usize;
 const HEADER_BYTES: usize = NET_HEADER_SIZE as usize;
 const INTERRUPT_STATUS_OFFSET: usize = 0x060;
 const INTERRUPT_ACK_OFFSET: usize = 0x064;
@@ -91,12 +91,12 @@ impl QueueDma {
         available: AvailableRing {
             flags: 0,
             index: 0,
-            ring: [0; QUEUE_SLOTS],
+            ring: [0; vibeos_driver_virtio_core::SPLIT_QUEUE_SIZE as usize],
         },
         used: UsedRing {
             flags: 0,
             index: 0,
-            ring: [UsedElement::new(0, 0); QUEUE_SLOTS],
+            ring: [UsedElement::new(0, 0); vibeos_driver_virtio_core::SPLIT_QUEUE_SIZE as usize],
         },
     };
 }
@@ -318,7 +318,7 @@ impl Engine {
             HardwareError::Protocol
         })? as usize;
         let head = used.id();
-        let header = if head < u32::from(SPLIT_QUEUE_SIZE) {
+        let header = if head < u32::from(NET_QUEUE_SIZE) {
             VirtioNetHeader::from_bytes(read_receive_header(head as usize))
         } else {
             VirtioNetHeader::transmit()
@@ -518,11 +518,11 @@ fn initialize_transport(transport: MmioTransport) -> Result<NegotiatedFeatures, 
         .map_err(|_| HardwareError::Protocol)?;
     for queue in [NetQueue::Receive, NetQueue::Transmit] {
         transport.select_queue(queue.index());
-        if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
+        if transport.queue_ready() || transport.queue_num_max() < NET_QUEUE_SIZE {
             return Err(HardwareError::Protocol);
         }
         let (descriptors, available, used) = queue_dma_addresses(queue);
-        transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
+        transport.configure_queue(NET_QUEUE_SIZE, descriptors, available, used);
     }
     Ok(features)
 }

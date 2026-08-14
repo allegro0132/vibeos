@@ -131,8 +131,12 @@ pub const ENTROPY_DRIVER_REJECTED_FEATURES: u64 = VIRTIO_RING_F_INDIRECT_DESC
     | VIRTIO_F_ACCESS_PLATFORM
     | VIRTIO_F_RING_PACKED;
 
-pub const SPLIT_QUEUE_SIZE: u16 = 8;
-pub const NET_QUEUE_SIZE: u16 = SPLIT_QUEUE_SIZE;
+/// Block queue capacity negotiated with the comparison platform. The current
+/// client path remains single-in-flight while preserving the complete ring for
+/// the independently tested QD4/QD16 scheduler follow-up.
+pub const SPLIT_QUEUE_SIZE: u16 = 128;
+pub const NET_QUEUE_SIZE: u16 = 8;
+pub const ENTROPY_QUEUE_SIZE: u16 = 8;
 pub const NET_RECEIVE_QUEUE: u16 = 0;
 pub const NET_TRANSMIT_QUEUE: u16 = 1;
 pub const ENTROPY_QUEUE: u16 = 0;
@@ -142,6 +146,12 @@ pub const NET_HEADER_SIZE: u32 = 12;
 pub const NET_MAX_FRAME_SIZE: u32 = 1_514;
 pub const NET_RECEIVE_BUFFER_SIZE: u32 = NET_HEADER_SIZE + NET_MAX_FRAME_SIZE;
 pub const BLOCK_SECTOR_SIZE: u32 = 512;
+/// Largest contiguous request admitted by the supervised QEMU block path.
+/// The queue remains single-in-flight until the multi-token reset/cancellation
+/// model is proven, but a page or streaming window no longer needs one request
+/// per 512-byte logical block.
+pub const BLOCK_MAX_TRANSFER_SIZE: u32 = 128 * 1024;
+pub const BLOCK_MAX_TRANSFER_BLOCKS: u32 = BLOCK_MAX_TRANSFER_SIZE / BLOCK_SECTOR_SIZE;
 pub const BLOCK_HEADER_DESCRIPTOR: u16 = 0;
 pub const BLOCK_DATA_DESCRIPTOR: u16 = 1;
 pub const BLOCK_STATUS_DESCRIPTOR: u16 = 2;
@@ -672,20 +682,40 @@ impl UsedElement {
 
 /// Split available ring without the optional EVENT_IDX tail field.
 #[repr(C, align(2))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AvailableRing {
     pub flags: u16,
     pub index: u16,
     pub ring: [u16; SPLIT_QUEUE_SIZE as usize],
 }
 
+impl Default for AvailableRing {
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            index: 0,
+            ring: [0; SPLIT_QUEUE_SIZE as usize],
+        }
+    }
+}
+
 /// Split used ring without the optional EVENT_IDX tail field.
 #[repr(C, align(4))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsedRing {
     pub flags: u16,
     pub index: u16,
     pub ring: [UsedElement; SPLIT_QUEUE_SIZE as usize],
+}
+
+impl Default for UsedRing {
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            index: 0,
+            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
+        }
+    }
 }
 
 /// The 12-byte modern `virtio_net_hdr` used before every Ethernet frame.
@@ -929,23 +959,55 @@ impl BlockRequestHeader {
 pub enum BlockOperation {
     Read { sector: u64 },
     Write { sector: u64 },
+    ReadBlocks { sector: u64, block_count: u32 },
+    WriteBlocks { sector: u64, block_count: u32 },
     Flush,
 }
 
 impl BlockOperation {
     pub const fn request_type(self) -> u32 {
         match self {
-            Self::Read { .. } => BLOCK_REQUEST_IN,
-            Self::Write { .. } => BLOCK_REQUEST_OUT,
+            Self::Read { .. } | Self::ReadBlocks { .. } => BLOCK_REQUEST_IN,
+            Self::Write { .. } | Self::WriteBlocks { .. } => BLOCK_REQUEST_OUT,
             Self::Flush => BLOCK_REQUEST_FLUSH,
         }
     }
 
     pub const fn sector(self) -> u64 {
         match self {
-            Self::Read { sector } | Self::Write { sector } => sector,
+            Self::Read { sector }
+            | Self::Write { sector }
+            | Self::ReadBlocks { sector, .. }
+            | Self::WriteBlocks { sector, .. } => sector,
             Self::Flush => 0,
         }
+    }
+
+    pub const fn block_count(self) -> u32 {
+        match self {
+            Self::Read { .. } | Self::Write { .. } => 1,
+            Self::ReadBlocks { block_count, .. } | Self::WriteBlocks { block_count, .. } => {
+                block_count
+            }
+            Self::Flush => 0,
+        }
+    }
+
+    pub const fn data_len(self) -> u32 {
+        self.block_count().saturating_mul(BLOCK_SECTOR_SIZE)
+    }
+
+    pub const fn is_read(self) -> bool {
+        matches!(self, Self::Read { .. } | Self::ReadBlocks { .. })
+    }
+
+    pub const fn is_write(self) -> bool {
+        matches!(self, Self::Write { .. } | Self::WriteBlocks { .. })
+    }
+
+    pub const fn valid_transfer(self) -> bool {
+        matches!(self, Self::Flush)
+            || (self.block_count() > 0 && self.data_len() <= BLOCK_MAX_TRANSFER_SIZE)
     }
 }
 
@@ -961,6 +1023,7 @@ pub enum ChainError {
     ZeroAddress,
     AddressOverflow,
     OverlappingBuffers,
+    InvalidTransferLength,
     InvalidPacketLength { observed: u16 },
 }
 
@@ -982,6 +1045,9 @@ pub fn build_block_chain(
     operation: BlockOperation,
     addresses: BlockDmaAddresses,
 ) -> Result<BlockDescriptorChain, ChainError> {
+    if !operation.valid_transfer() {
+        return Err(ChainError::InvalidTransferLength);
+    }
     if addresses.header == 0 || addresses.status == 0 {
         return Err(ChainError::ZeroAddress);
     }
@@ -1000,8 +1066,12 @@ pub fn build_block_chain(
         Descriptor::new(addresses.status, 1, DESC_F_WRITE, 0);
 
     let descriptor_count = match operation {
-        BlockOperation::Read { .. } | BlockOperation::Write { .. } => {
-            let data_end = checked_end(addresses.data, BLOCK_SECTOR_SIZE)?;
+        BlockOperation::Read { .. }
+        | BlockOperation::Write { .. }
+        | BlockOperation::ReadBlocks { .. }
+        | BlockOperation::WriteBlocks { .. } => {
+            let data_len = operation.data_len();
+            let data_end = checked_end(addresses.data, data_len)?;
             if overlaps(addresses.header, header_end, addresses.data, data_end)
                 || overlaps(addresses.data, data_end, addresses.status, status_end)
             {
@@ -1014,13 +1084,15 @@ pub fn build_block_chain(
                 BLOCK_DATA_DESCRIPTOR,
             );
             let data_flags = match operation {
-                BlockOperation::Read { .. } => DESC_F_NEXT | DESC_F_WRITE,
-                BlockOperation::Write { .. } => DESC_F_NEXT,
+                BlockOperation::Read { .. } | BlockOperation::ReadBlocks { .. } => {
+                    DESC_F_NEXT | DESC_F_WRITE
+                }
+                BlockOperation::Write { .. } | BlockOperation::WriteBlocks { .. } => DESC_F_NEXT,
                 BlockOperation::Flush => unreachable!(),
             };
             descriptors[BLOCK_DATA_DESCRIPTOR as usize] = Descriptor::new(
                 addresses.data,
-                BLOCK_SECTOR_SIZE,
+                data_len,
                 data_flags,
                 BLOCK_STATUS_DESCRIPTOR,
             );
@@ -1059,8 +1131,10 @@ const fn overlaps(left_start: u64, left_end: u64, right_start: u64, right_end: u
 /// this driver requires the complete writable prefix before interpreting it.
 pub const fn maximum_used_length(operation: BlockOperation) -> u32 {
     match operation {
-        BlockOperation::Read { .. } => BLOCK_SECTOR_SIZE + 1,
-        BlockOperation::Write { .. } | BlockOperation::Flush => 1,
+        BlockOperation::Read { .. } | BlockOperation::ReadBlocks { .. } => operation.data_len() + 1,
+        BlockOperation::Write { .. }
+        | BlockOperation::WriteBlocks { .. }
+        | BlockOperation::Flush => 1,
     }
 }
 
@@ -1084,6 +1158,10 @@ impl BlockStatus {
 
 pub const fn ring_slot(index: u16) -> u16 {
     index % SPLIT_QUEUE_SIZE
+}
+
+pub const fn net_ring_slot(index: u16) -> u16 {
+    index % NET_QUEUE_SIZE
 }
 
 pub const fn advance_ring_index(index: u16) -> u16 {
@@ -1127,6 +1205,7 @@ pub enum QueueState {
 pub enum QueueError {
     Busy,
     ResetRequired,
+    InvalidTransferLength,
     ReadOnly,
     FlushUnsupported,
     StaleSession { expected: u64, observed: u64 },
@@ -1219,8 +1298,11 @@ impl SplitQueueModel {
             QueueState::ResetRequired { .. } => return Err(QueueError::ResetRequired),
         }
 
-        if matches!(operation, BlockOperation::Write { .. }) && self.features.read_only() {
+        if operation.is_write() && self.features.read_only() {
             return Err(QueueError::ReadOnly);
+        }
+        if !operation.valid_transfer() {
+            return Err(QueueError::InvalidTransferLength);
         }
         if matches!(operation, BlockOperation::Flush) && !self.features.supports_flush() {
             return Err(QueueError::FlushUnsupported);
@@ -1492,7 +1574,7 @@ pub enum NetQueueError {
 struct NetQueueBook {
     available_index: u16,
     used_index: u16,
-    active: [Option<NetSubmission>; SPLIT_QUEUE_SIZE as usize],
+    active: [Option<NetSubmission>; NET_QUEUE_SIZE as usize],
     active_count: u8,
 }
 
@@ -1501,7 +1583,7 @@ impl NetQueueBook {
         Self {
             available_index: 0,
             used_index: 0,
-            active: [None; SPLIT_QUEUE_SIZE as usize],
+            active: [None; NET_QUEUE_SIZE as usize],
             active_count: 0,
         }
     }
@@ -1576,7 +1658,7 @@ impl NetDeviceModel {
     }
 
     pub const fn queue_size(&self) -> u16 {
-        SPLIT_QUEUE_SIZE
+        NET_QUEUE_SIZE
     }
 
     pub const fn available_index(&self, queue: NetQueue) -> u16 {
@@ -1592,7 +1674,7 @@ impl NetDeviceModel {
     }
 
     pub const fn active_submission(&self, queue: NetQueue, head: u16) -> Option<NetSubmission> {
-        if head >= SPLIT_QUEUE_SIZE {
+        if head >= NET_QUEUE_SIZE {
             None
         } else {
             self.book(queue).active[head as usize]
@@ -1603,7 +1685,7 @@ impl NetDeviceModel {
     /// `ResetConfirmed` the old device no longer owns it, but publication is
     /// still forbidden until `reinitialize` returns the model to `Active`.
     pub const fn slot_reusable(&self, queue: NetQueue, head: u16) -> bool {
-        if head >= SPLIT_QUEUE_SIZE {
+        if head >= NET_QUEUE_SIZE {
             return false;
         }
         matches!(
@@ -1761,7 +1843,7 @@ impl NetDeviceModel {
                 head,
             },
             available_index: advance_ring_index(previous),
-            available_slot: ring_slot(previous),
+            available_slot: net_ring_slot(previous),
             operation,
         };
         book.available_index = submission.available_index;
@@ -1791,7 +1873,7 @@ impl NetDeviceModel {
             });
         }
         let used_id = used.id();
-        if used_id >= SPLIT_QUEUE_SIZE as u32 {
+        if used_id >= NET_QUEUE_SIZE as u32 {
             return self.malformed(NetQueueError::UsedIdOutOfRange {
                 queue,
                 observed: used_id,
@@ -1825,7 +1907,7 @@ impl NetDeviceModel {
             });
         }
         self.require_active()?;
-        if token.head >= SPLIT_QUEUE_SIZE
+        if token.head >= NET_QUEUE_SIZE
             || self.book(token.queue).active[token.head as usize]
                 .is_none_or(|submission| submission.token != token)
         {

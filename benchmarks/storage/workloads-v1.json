@@ -1,0 +1,127 @@
+{
+  "schema": "vibeos.storage-bench.manifest",
+  "version": 1,
+  "seed": 14476452505690153217,
+  "platform": {
+    "machine": "virt",
+    "isa": "rv64",
+    "data_disk_bytes": 1073741824,
+    "virtio_queue_size": 128,
+    "memory_mib": 512,
+    "qemu_cache": "none",
+    "qemu_aio": "threads",
+    "primary": { "smp": 1, "tcg_threads": "single" },
+    "scaling": { "smp": 4, "tcg_threads": "multi" }
+  },
+  "sampling": {
+    "latency_vms": 5,
+    "warmups_per_vm": 5,
+    "samples_per_vm": 20,
+    "throughput_vms": 5,
+    "coefficient_of_variation_limit": 0.10,
+    "schedule": "alternate-vibeos-linux"
+  },
+  "gates": {
+    "durable_latency_ratio_max": 2.0,
+    "sequential_throughput_ratio_min": 0.70,
+    "required_queue_depth": 1,
+    "scaling_queue_depths": [4, 16],
+    "v3_checkpoint_share_trigger": 0.30
+  },
+  "workloads": [
+    {
+      "id": "block-random-read",
+      "layer": "block",
+      "operation": "read",
+      "sizes": [4096],
+      "access": "random",
+      "queue_depths": [1, 4, 16]
+    },
+    {
+      "id": "block-random-write",
+      "layer": "block",
+      "operation": "write",
+      "sizes": [4096],
+      "access": "random",
+      "queue_depths": [1, 4, 16]
+    },
+    {
+      "id": "block-flush",
+      "layer": "block",
+      "operation": "flush",
+      "sizes": [0],
+      "queue_depths": [1]
+    },
+    {
+      "id": "block-sequential",
+      "layer": "block",
+      "operation": "read-write",
+      "sizes": [131072],
+      "stream_bytes": 67108864,
+      "access": "sequential",
+      "queue_depths": [1, 4, 16]
+    },
+    {
+      "id": "object-durable-put-get",
+      "layer": "object",
+      "operation": "durable-put-get",
+      "sizes": [0, 64, 4096, 131072, 368640],
+      "queue_depths": [1],
+      "backends": ["m4", "storage-v2", "linux-ext4"]
+    },
+    {
+      "id": "object-v2-large",
+      "layer": "object",
+      "operation": "durable-put-get",
+      "sizes": [1048576, 16777216, 67108864],
+      "queue_depths": [1],
+      "backends": ["storage-v2"]
+    },
+    {
+      "id": "object-range-revoke-recovery",
+      "layer": "object",
+      "operation": "range-get-revoke-cold-recovery",
+      "sizes": [4096, 131072, 368640],
+      "queue_depths": [1]
+    },
+    {
+      "id": "file-durable-mutations",
+      "layer": "file-tree",
+      "operation": "create-unlink-overwrite",
+      "sizes": [0, 4096, 1048576],
+      "queue_depths": [1]
+    },
+    {
+      "id": "file-batch-create",
+      "layer": "file-tree",
+      "operation": "batch-create",
+      "sizes": [4096],
+      "object_counts": [1000],
+      "queue_depths": [1]
+    },
+    {
+      "id": "file-sequential",
+      "layer": "file-tree",
+      "operation": "sequential-write-read",
+      "sizes": [67108864],
+      "queue_depths": [1]
+    },
+    {
+      "id": "file-directory",
+      "layer": "file-tree",
+      "operation": "lookup-list-cold-recovery",
+      "sizes": [4096],
+      "object_counts": [100, 1000, 4000],
+      "queue_depths": [1]
+    },
+    {
+      "id": "v2-dedup-gc",
+      "layer": "object",
+      "operation": "dedup-gc-steady-state",
+      "sizes": [4096, 131072],
+      "content_classes": ["unique", "half-duplicate", "all-duplicate"],
+      "queue_depths": [1],
+      "equivalence_gate": false
+    }
+  ]
+}

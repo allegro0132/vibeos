@@ -2465,6 +2465,7 @@ async fn storage_v2_command(args: &[&str]) {
                 Err(_) => println!("  Storage V2: boot fail-closed, migration control corrupt"),
             }
         }
+        "bench" => storage_object_bench(storage, &args[1..]).await,
         raw_action @ ("migrate" | "migrate-stage" | "rollback" | "close-rollback") => {
             let action = match raw_action {
                 "migrate" => StorageV2OperatorAction::Migrate,
@@ -2550,10 +2551,207 @@ async fn storage_v2_command(args: &[&str]) {
             }
         }
         other => println!(
-            "  usage: storage [status|migrate|migrate-stage|rollback|close-rollback] (got `{}`)",
+            "  usage: storage [status|bench BYTES|migrate|migrate-stage|rollback|close-rollback] (got `{}`)",
             other
         ),
     }
+}
+
+async fn storage_object_bench(
+    storage: &Arc<crate::segment_store_platform::StorageV2Devices>,
+    args: &[&str],
+) {
+    const MAX_BENCH_BYTES: usize = 1024 * 1024;
+    const OBJECT_KIND_RAW: u32 = 0x4245_4e43;
+    let Some(raw_size) = args.first() else {
+        println!("  usage: storage bench BYTES [SEED]");
+        return;
+    };
+    let Ok(size) = raw_size.parse::<usize>() else {
+        println!("  storage benchmark size must be an integer");
+        return;
+    };
+    let seed = match args.get(1) {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(seed) => seed,
+            Err(_) => {
+                println!("  storage benchmark seed must be an integer");
+                return;
+            }
+        },
+        None => 1,
+    };
+    let selection_deadline =
+        crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
+    let selection = loop {
+        match storage.selected_boot_store() {
+            Some(crate::segment_store_platform::BootStoreSelection::LegacyM4)
+            | Some(crate::segment_store_platform::BootStoreSelection::StorageV2)
+            | Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => {
+                break storage.selected_boot_store();
+            }
+            _ if crate::sbi::time() >= selection_deadline => break None,
+            _ => exec::yield_now().await,
+        }
+    };
+    let backend = match selection {
+        Some(crate::segment_store_platform::BootStoreSelection::LegacyM4) => "m4",
+        Some(crate::segment_store_platform::BootStoreSelection::StorageV2) => "storage-v2",
+        Some(crate::segment_store_platform::BootStoreSelection::Blank) => "blank",
+        Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => "fail-closed",
+        None => "pending",
+    };
+    if size > MAX_BENCH_BYTES {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\"}}",
+            backend,
+            size,
+            seed,
+            exec::timebase_hz(),
+        );
+        return;
+    }
+    let w = world();
+    let Some(store_cap) = w.store else {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\"}}",
+            backend,
+            size,
+            seed,
+            exec::timebase_hz(),
+        );
+        return;
+    };
+    let mut payload = Vec::new();
+    if payload.try_reserve_exact(size).is_err() {
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"status\":\"failed-closed\"}}",
+            backend,
+            size,
+            seed,
+            exec::timebase_hz(),
+        );
+        return;
+    }
+    payload.extend((0..size).map(|index| {
+        (index as u64)
+            .wrapping_mul(131)
+            .wrapping_add((index as u64) >> 7)
+            .wrapping_add(seed.wrapping_mul(17))
+            .wrapping_add(0x5a) as u8
+    }));
+    let init = w.spaces["init"].clone();
+    let ready_deadline = crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
+    loop {
+        let ready = init
+            .0
+            .lock()
+            .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ)
+            .ok()
+            .and_then(|lease| crate::store::info_with(&lease).ok())
+            .is_some_and(|info| info.ready && !info.busy);
+        #[cfg(feature = "qemu-virt")]
+        let quiet = if ready {
+            let before = crate::virtio_blk::telemetry();
+            exec::sleep_ms(250).await;
+            crate::virtio_blk::telemetry().requests == before.requests
+        } else {
+            false
+        };
+        #[cfg(feature = "milkv-duo")]
+        let quiet = ready;
+        if quiet || crate::sbi::time() >= ready_deadline {
+            break;
+        }
+        exec::sleep_ms(10).await;
+    }
+    let object_kind = crate::store::journal_object_kind(OBJECT_KIND_RAW)
+        .expect("storage benchmark kind is non-zero");
+    let put_lease = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store_cap, Rights::NONE);
+    #[cfg(feature = "qemu-virt")]
+    let io_started = crate::virtio_blk::telemetry();
+    let put_started = crate::sbi::time();
+    let publication = match put_lease {
+        Ok(lease) => crate::store::put_blob_with(lease, init.clone(), object_kind, &payload).await,
+        Err(_) => Err(crate::store::BlobStoreError::Store(
+            crate::store::StoreError::PermissionDenied,
+        )),
+    };
+    let put_ticks = crate::sbi::time().saturating_sub(put_started).max(1);
+    let Ok(publication) = publication else {
+        let status = if backend == "m4" && size > 360 * 1024 {
+            "unsupported"
+        } else {
+            "failed-closed"
+        };
+        println!(
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\"}}",
+            backend,
+            size,
+            seed,
+            exec::timebase_hz(),
+            put_ticks,
+            status,
+        );
+        return;
+    };
+    let service = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoreService>(store_cap, Rights::READ);
+    let object = init
+        .0
+        .lock()
+        .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+    let get_started = crate::sbi::time();
+    let read_back = match (service, object) {
+        (Ok(service), Ok(object)) => crate::store::get_blob_with(service, object).await,
+        _ => Err(crate::store::BlobStoreError::Store(
+            crate::store::StoreError::ObjectUnavailable,
+        )),
+    };
+    let get_ticks = crate::sbi::time().saturating_sub(get_started).max(1);
+    let status = if read_back.as_ref().is_ok_and(|verified| {
+        verified.bytes == payload && verified.descriptor == publication.descriptor
+    }) {
+        "ok"
+    } else {
+        "failed-closed"
+    };
+    #[cfg(feature = "qemu-virt")]
+    let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
+    #[cfg(feature = "milkv-duo")]
+    let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    #[cfg(feature = "qemu-virt")]
+    let io = (
+        io.requests,
+        io.read_requests,
+        io.write_requests,
+        io.flush_requests,
+        io.read_bytes,
+        io.write_bytes,
+        io.used_interrupts,
+    );
+    println!(
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"object-durable-put-get\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"get_ticks\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\"}}",
+        backend,
+        size,
+        seed,
+        exec::timebase_hz(),
+        put_ticks,
+        get_ticks,
+        io.0,
+        io.1,
+        io.2,
+        io.3,
+        io.4,
+        io.5,
+        io.6,
+        status,
+    );
 }
 
 async fn blob_command(args: &[&str]) {

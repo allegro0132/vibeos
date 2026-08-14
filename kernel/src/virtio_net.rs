@@ -23,14 +23,14 @@ use crate::net::{
 };
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, NegotiatedFeatures, NET_HEADER_SIZE, SPLIT_QUEUE_SIZE};
+use crate::virtio::{self, NegotiatedFeatures, NET_HEADER_SIZE, NET_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
 use vibeos_driver_virtio_net::{Engine, HardwareError, ResetReason};
 
 const TX_TIMEOUT_MS: u64 = 2_000;
 const IDLE_POLL_MS: u64 = 1;
-const QUEUE_SLOTS: usize = SPLIT_QUEUE_SIZE as usize;
+const QUEUE_SLOTS: usize = NET_QUEUE_SIZE as usize;
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -165,7 +165,7 @@ impl NetDevice {
         NetInfo {
             online: control.online,
             quarantined: control.quarantined,
-            queue_size: SPLIT_QUEUE_SIZE,
+            queue_size: NET_QUEUE_SIZE,
             header_size: NET_HEADER_SIZE,
             accepted_features: control.features.map_or(0, |features| features.accepted()),
             session_epoch: control.sessions.device_epoch(),
@@ -653,7 +653,7 @@ impl DriverSession {
     fn publish_transmits(&mut self) -> Result<bool, NetError> {
         let mut published = false;
         let mut control = CONTROL.lock();
-        while self.engine.info().tx_inflight < SPLIT_QUEUE_SIZE as u8 {
+        while self.engine.info().tx_inflight < NET_QUEUE_SIZE as u8 {
             let Some(packet) = take_admitted_outbound(&mut control)? else {
                 break;
             };

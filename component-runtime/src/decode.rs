@@ -12,21 +12,80 @@ use crate::{
         ExecutableExportPlan, HostImportPlan, ImportedFunctionDraft, LiftDraft, LiftOptionsDraft,
         LowerDraft,
     },
-    predecode::{predecode_component, PredecodeError},
+    predecode::{predecode_component_for_profile, PredecodeError},
     types::TypeBuilder,
     value::ValueType,
     world::{normalize_component_world_entities, NamedEntityShape, WorldContract, WorldError},
 };
 use alloc::{string::String, vec::Vec};
-use vibeos_component_format::{LimitKind, PROFILE_1_LIMITS};
+use vibeos_component_format::{LimitKind, ProfileIdentity, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::inspect_core;
 use wasmparser::{
-    component_types::ComponentEntityType, CanonicalFunction, CanonicalOption, ComponentAlias,
-    ComponentDefinedType as RawDefinedType, ComponentExternalKind, ComponentInstance,
-    ComponentType as RawComponentType, ComponentTypeRef, Encoding, ExternalKind, Instance,
-    InstanceTypeDeclaration, Parser, Payload, PrimitiveValType, TypeRef, ValType, Validator,
-    WasmFeatures,
+    component_types::{ComponentAnyTypeId, ComponentEntityType},
+    CanonicalFunction, CanonicalOption, ComponentAlias, ComponentDefinedType as RawDefinedType,
+    ComponentExternalKind, ComponentInstance, ComponentType as RawComponentType, ComponentTypeRef,
+    Encoding, ExternalKind, Instance, InstanceTypeDeclaration, Parser, Payload, PrimitiveValType,
+    TypeRef, ValType, Validator, WasmFeatures,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AsyncAbiSummary {
+    pub async_function_types: u32,
+    pub future_types: u32,
+    pub stream_types: u32,
+    pub async_lifts: u32,
+    pub async_lowers: u32,
+    pub task_builtins: u32,
+    pub context_builtins: u32,
+    pub subtask_builtins: u32,
+    pub cooperative_yields: u32,
+    pub stream_builtins: u32,
+    pub future_builtins: u32,
+    pub waitable_builtins: u32,
+    pub backpressure_builtins: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AsyncCanonicalOptions {
+    /// `None` is the Canonical ABI UTF-8 default.
+    pub string_encoding: Option<CanonicalStringEncoding>,
+    pub memory: Option<u32>,
+    pub realloc: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncLiftInfo {
+    pub canonical_index: u32,
+    pub core_function: u32,
+    pub function_type: u32,
+    pub callback_core_function: u32,
+    pub options: AsyncCanonicalOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncLowerInfo {
+    pub canonical_index: u32,
+    pub component_function: u32,
+    pub options: AsyncCanonicalOptions,
+}
+
+impl AsyncAbiSummary {
+    pub const fn is_empty(self) -> bool {
+        self.async_function_types == 0
+            && self.future_types == 0
+            && self.stream_types == 0
+            && self.async_lifts == 0
+            && self.async_lowers == 0
+            && self.task_builtins == 0
+            && self.context_builtins == 0
+            && self.subtask_builtins == 0
+            && self.cooperative_yields == 0
+            && self.stream_builtins == 0
+            && self.future_builtins == 0
+            && self.waitable_builtins == 0
+            && self.backpressure_builtins == 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ComponentSummary {
@@ -44,6 +103,7 @@ pub struct ComponentSummary {
     pub exports: u32,
     pub custom_sections: u32,
     pub custom_section_bytes: u64,
+    pub async_abi: AsyncAbiSummary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,15 +127,22 @@ impl DecodeError {
 }
 
 pub struct ComponentPlan<'a> {
+    profile: ProfileIdentity,
     pub summary: ComponentSummary,
     /// Exact borrowed byte ranges from the validated parent artifact.
     pub embedded_modules: Vec<&'a [u8]>,
     pub imports: Vec<NamedEntityShape>,
     pub exports: Vec<NamedEntityShape>,
+    async_lifts: Vec<AsyncLiftInfo>,
+    async_lowers: Vec<AsyncLowerInfo>,
     pub(crate) execution: ComponentExecutionPlan,
 }
 
 impl ComponentPlan<'_> {
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.profile
+    }
+
     pub const fn summary(&self) -> ComponentSummary {
         self.summary
     }
@@ -92,8 +159,24 @@ impl ComponentPlan<'_> {
         &self.exports
     }
 
+    pub fn async_lifts(&self) -> &[AsyncLiftInfo] {
+        &self.async_lifts
+    }
+
+    pub fn async_lowers(&self) -> &[AsyncLowerInfo] {
+        &self.async_lowers
+    }
+
     pub fn executable_exports(&self) -> impl Iterator<Item = &ExecutableExportInfo> {
         self.execution.exports.iter().map(|export| &export.info)
+    }
+
+    /// C5.1 validates and preserves async ABI structure, but C5.2 owns the
+    /// resumable runtime. The validation-only profile and every plan containing
+    /// an async construct are inert, including a sync-only payload mislabeled
+    /// with the C5.1 descriptor.
+    pub const fn runtime_ready(&self) -> bool {
+        self.profile.execution_enabled() && self.summary.async_abi.is_empty()
     }
 
     /// Number of Core runtime instances this Component would instantiate.
@@ -115,9 +198,10 @@ impl ComponentPlan<'_> {
     }
 }
 
-fn profile_features() -> WasmFeatures {
+fn profile_features(async_profile: bool) -> WasmFeatures {
     let mut features = WasmFeatures::empty();
     features.set(WasmFeatures::COMPONENT_MODEL, true);
+    features.set(WasmFeatures::CM_ASYNC, async_profile);
     features
 }
 
@@ -154,6 +238,12 @@ struct CoreModuleImportDraft {
     kind: CoreModuleImportKind,
 }
 
+#[derive(Clone, Copy)]
+enum CanonicalEffectCheck {
+    Lift { type_index: u32, async_: bool },
+    Lower { function_index: u32, async_: bool },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CoreModuleImportKind {
     Function,
@@ -172,10 +262,27 @@ fn record_name(target: &mut Vec<String>, name: &str) -> Result<(), DecodeError> 
 /// Performs a structural limit pass before invoking `Validator`, validates all
 /// embedded Core modules through C1, and returns an inert typed plan.
 pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError> {
+    inspect_component_for_profile(bytes, ProfileIdentity::PROFILE_1)
+}
+
+/// Inspect bytes under an exact trusted profile descriptor. This explicit
+/// entrypoint exists for migration/differential tests; admission accepts only
+/// the active identity and never derives it from component-controlled bytes.
+pub fn inspect_component_for_profile(
+    bytes: &[u8],
+    profile: ProfileIdentity,
+) -> Result<ComponentPlan<'_>, DecodeError> {
+    let async_profile = if profile == ProfileIdentity::PROFILE_1_ASYNC {
+        true
+    } else if profile == ProfileIdentity::PROFILE_1_SYNC {
+        false
+    } else {
+        return Err(DecodeError::Unsupported);
+    };
     if bytes.len() > PROFILE_1_LIMITS.max_component_bytes || bytes.len() > u32::MAX as usize {
         return Err(DecodeError::Limit);
     }
-    predecode_component(bytes).map_err(predecode_error)?;
+    predecode_component_for_profile(bytes, async_profile).map_err(predecode_error)?;
     let mut summary = ComponentSummary {
         bytes: bytes.len() as u32,
         ..ComponentSummary::default()
@@ -189,6 +296,10 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
     let mut component_instances: Vec<Option<ComponentInstanceDraft>> = Vec::new();
     let mut function_exports = Vec::new();
     let mut instance_exports = Vec::new();
+    let mut async_lifts = Vec::new();
+    let mut async_lowers = Vec::new();
+    let mut canonical_effect_checks = Vec::new();
+    let mut canonical_index = 0_u32;
     let mut import_names = Vec::new();
     let mut export_names = Vec::new();
     let mut saw_top = false;
@@ -360,7 +471,7 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                 )?;
                 for ty in reader {
                     let ty = ty.map_err(|_| DecodeError::Malformed)?;
-                    inspect_type(&ty, &mut summary, 1)?;
+                    inspect_type(&ty, &mut summary, async_profile, 1)?;
                 }
             }
             Payload::ComponentAliasSection(reader) => {
@@ -419,7 +530,9 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                 )?;
                 for function in reader {
                     let function = function.map_err(|_| DecodeError::Malformed)?;
-                    if inspect_canonical(function.clone())? {
+                    let inspection = inspect_canonical(&function, async_profile)?;
+                    record_canonical(&mut summary, inspection)?;
+                    if inspection.adapter {
                         add(
                             &mut summary.adapters,
                             1,
@@ -430,38 +543,84 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                     match function {
                         CanonicalFunction::Lift {
                             core_func_index,
+                            type_index,
                             options,
-                            ..
                         } => {
-                            let options = execution_options(&options)?;
+                            canonical_effect_checks
+                                .try_reserve(1)
+                                .map_err(|_| DecodeError::Allocation)?;
+                            canonical_effect_checks.push(CanonicalEffectCheck::Lift {
+                                type_index,
+                                async_: has_async_option(&options),
+                            });
                             component_functions
                                 .try_reserve(1)
                                 .map_err(|_| DecodeError::Allocation)?;
-                            component_functions.push(Some(ComponentFunctionDraft::Lift(
-                                LiftDraft {
+                            if has_async_option(&options) {
+                                let (options, callback) = async_plan_options(&options)?;
+                                async_lifts
+                                    .try_reserve(1)
+                                    .map_err(|_| DecodeError::Allocation)?;
+                                async_lifts.push(AsyncLiftInfo {
+                                    canonical_index,
                                     core_function: core_func_index,
-                                    string_encoding: options.string_encoding,
-                                    memory: options.memory,
-                                    realloc: options.realloc,
-                                    post_return: options.post_return,
-                                },
-                            )));
+                                    function_type: type_index,
+                                    callback_core_function: callback
+                                        .ok_or(DecodeError::InvalidWiring)?,
+                                    options,
+                                });
+                                component_functions.push(None);
+                            } else {
+                                let options = execution_options(&options)?;
+                                component_functions.push(Some(ComponentFunctionDraft::Lift(
+                                    LiftDraft {
+                                        core_function: core_func_index,
+                                        string_encoding: options.string_encoding,
+                                        memory: options.memory,
+                                        realloc: options.realloc,
+                                        post_return: options.post_return,
+                                    },
+                                )));
+                            }
                         }
                         CanonicalFunction::Lower {
                             func_index,
                             options,
                         } => {
-                            let options = execution_options(&options)?;
+                            canonical_effect_checks
+                                .try_reserve(1)
+                                .map_err(|_| DecodeError::Allocation)?;
+                            canonical_effect_checks.push(CanonicalEffectCheck::Lower {
+                                function_index: func_index,
+                                async_: has_async_option(&options),
+                            });
                             core_functions
                                 .try_reserve(1)
                                 .map_err(|_| DecodeError::Allocation)?;
-                            core_functions.push(Some(CoreFunctionDraft::Lower(LowerDraft {
-                                component_function: func_index,
-                                string_encoding: options.string_encoding,
-                                memory: options.memory,
-                                realloc: options.realloc,
-                                post_return: options.post_return,
-                            })));
+                            if has_async_option(&options) {
+                                let (options, callback) = async_plan_options(&options)?;
+                                if callback.is_some() {
+                                    return Err(DecodeError::Unsupported);
+                                }
+                                async_lowers
+                                    .try_reserve(1)
+                                    .map_err(|_| DecodeError::Allocation)?;
+                                async_lowers.push(AsyncLowerInfo {
+                                    canonical_index,
+                                    component_function: func_index,
+                                    options,
+                                });
+                                core_functions.push(None);
+                            } else {
+                                let options = execution_options(&options)?;
+                                core_functions.push(Some(CoreFunctionDraft::Lower(LowerDraft {
+                                    component_function: func_index,
+                                    string_encoding: options.string_encoding,
+                                    memory: options.memory,
+                                    realloc: options.realloc,
+                                    post_return: options.post_return,
+                                })));
+                            }
                         }
                         CanonicalFunction::ResourceNew { .. }
                         | CanonicalFunction::ResourceDrop { .. }
@@ -471,8 +630,57 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
                                 .map_err(|_| DecodeError::Allocation)?;
                             core_functions.push(None);
                         }
-                        _ => return Err(DecodeError::Unsupported),
+                        CanonicalFunction::TaskReturn { .. }
+                        | CanonicalFunction::TaskCancel
+                        | CanonicalFunction::ContextGet { .. }
+                        | CanonicalFunction::ContextSet { .. }
+                        | CanonicalFunction::ThreadYield { .. }
+                        | CanonicalFunction::SubtaskDrop
+                        | CanonicalFunction::SubtaskCancel { .. }
+                        | CanonicalFunction::StreamNew { .. }
+                        | CanonicalFunction::StreamRead { .. }
+                        | CanonicalFunction::StreamWrite { .. }
+                        | CanonicalFunction::StreamCancelRead { .. }
+                        | CanonicalFunction::StreamCancelWrite { .. }
+                        | CanonicalFunction::StreamDropReadable { .. }
+                        | CanonicalFunction::StreamDropWritable { .. }
+                        | CanonicalFunction::FutureNew { .. }
+                        | CanonicalFunction::FutureRead { .. }
+                        | CanonicalFunction::FutureWrite { .. }
+                        | CanonicalFunction::FutureCancelRead { .. }
+                        | CanonicalFunction::FutureCancelWrite { .. }
+                        | CanonicalFunction::FutureDropReadable { .. }
+                        | CanonicalFunction::FutureDropWritable { .. }
+                        | CanonicalFunction::WaitableSetNew
+                        | CanonicalFunction::WaitableSetWait { .. }
+                        | CanonicalFunction::WaitableSetPoll { .. }
+                        | CanonicalFunction::WaitableSetDrop
+                        | CanonicalFunction::WaitableJoin
+                        | CanonicalFunction::BackpressureInc
+                        | CanonicalFunction::BackpressureDec => {
+                            core_functions
+                                .try_reserve(1)
+                                .map_err(|_| DecodeError::Allocation)?;
+                            core_functions.push(None);
+                        }
+                        CanonicalFunction::ErrorContextNew { .. }
+                        | CanonicalFunction::ErrorContextDebugMessage { .. }
+                        | CanonicalFunction::ErrorContextDrop
+                        | CanonicalFunction::ThreadIndex
+                        | CanonicalFunction::ThreadNewIndirect { .. }
+                        | CanonicalFunction::ThreadResumeLater
+                        | CanonicalFunction::ThreadSuspend { .. }
+                        | CanonicalFunction::ThreadSuspendThenResume { .. }
+                        | CanonicalFunction::ThreadYieldThenResume { .. }
+                        | CanonicalFunction::ThreadSuspendThenPromote { .. }
+                        | CanonicalFunction::ThreadYieldThenPromote { .. }
+                        | CanonicalFunction::ThreadSpawnRef { .. }
+                        | CanonicalFunction::ThreadSpawnIndirect { .. }
+                        | CanonicalFunction::ThreadAvailableParallelism => {
+                            return Err(DecodeError::Unsupported)
+                        }
                     }
+                    canonical_index = canonical_index.checked_add(1).ok_or(DecodeError::Limit)?;
                 }
             }
             Payload::ComponentImportSection(reader) => {
@@ -560,36 +768,46 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
         inspect_core(module).map_err(|_| DecodeError::InvalidEmbeddedCore)?;
     }
 
-    let types = match Validator::new_with_features(profile_features()).validate_all(bytes) {
-        Ok(types) => types,
-        Err(_) => {
-            if Validator::new_with_features(WasmFeatures::all())
-                .validate_all(bytes)
-                .is_ok()
-            {
-                return Err(DecodeError::Unsupported);
+    let types =
+        match Validator::new_with_features(profile_features(async_profile)).validate_all(bytes) {
+            Ok(types) => types,
+            Err(_) => {
+                if Validator::new_with_features(WasmFeatures::all())
+                    .validate_all(bytes)
+                    .is_ok()
+                {
+                    return Err(DecodeError::Unsupported);
+                }
+                return Err(DecodeError::Malformed);
             }
-            return Err(DecodeError::Malformed);
-        }
-    };
+        };
+    check_canonical_effects(&types, &canonical_effect_checks)?;
     let (imports, exports) =
         normalize_component_world_entities(&types, &import_names, &export_names)
             .map_err(shape_error)?;
+    let build_runtime = profile.execution_enabled() && summary.async_abi.is_empty();
     let mut type_builder = TypeBuilder::default();
-    let (instances, component_to_runtime, host_imports) = build_execution_instances(
-        &modules,
-        &core_instances,
-        &core_functions,
-        &core_memories,
-        &component_functions,
-        &types,
-        &mut type_builder,
-    )?;
+    let (instances, component_to_runtime, host_imports) = if build_runtime {
+        build_execution_instances(
+            &modules,
+            &core_instances,
+            &core_functions,
+            &core_memories,
+            &component_functions,
+            &types,
+            &mut type_builder,
+        )?
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     let mut executable_exports = Vec::new();
     executable_exports
         .try_reserve_exact(function_exports.len())
         .map_err(|_| DecodeError::Allocation)?;
     for (name, function_index) in function_exports {
+        if !build_runtime {
+            continue;
+        }
         let item = types
             .component_item_for_export(&name)
             .ok_or(DecodeError::InvalidWiring)?;
@@ -610,6 +828,9 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
         )?;
     }
     for (interface_name, instance_index) in instance_exports {
+        if !build_runtime {
+            continue;
+        }
         let instance = component_instances
             .get(instance_index as usize)
             .and_then(Option::as_ref)
@@ -653,16 +874,54 @@ pub fn inspect_component(bytes: &[u8]) -> Result<ComponentPlan<'_>, DecodeError>
         }
     }
     Ok(ComponentPlan {
+        profile,
         summary,
         embedded_modules: modules,
         imports,
         exports,
+        async_lifts,
+        async_lowers,
         execution: ComponentExecutionPlan {
             instances,
             exports: executable_exports,
             host_imports,
         },
     })
+}
+
+fn check_canonical_effects(
+    types: &wasmparser::types::Types,
+    checks: &[CanonicalEffectCheck],
+) -> Result<(), DecodeError> {
+    for check in checks {
+        let (declared_async, canonical_async) = match *check {
+            CanonicalEffectCheck::Lift { type_index, async_ } => {
+                if type_index >= types.as_ref().component_type_count() {
+                    return Err(DecodeError::InvalidWiring);
+                }
+                let ComponentAnyTypeId::Func(function_type) =
+                    types.component_any_type_at(type_index)
+                else {
+                    return Err(DecodeError::InvalidWiring);
+                };
+                (types[function_type].async_, async_)
+            }
+            CanonicalEffectCheck::Lower {
+                function_index,
+                async_,
+            } => {
+                if function_index >= types.component_function_count() {
+                    return Err(DecodeError::InvalidWiring);
+                }
+                let function_type = types.component_function_at(function_index);
+                (types[function_type].async_, async_)
+            }
+        };
+        if declared_async != canonical_async {
+            return Err(DecodeError::Unsupported);
+        }
+    }
+    Ok(())
 }
 
 fn predecode_error(error: PredecodeError) -> DecodeError {
@@ -1297,18 +1556,26 @@ fn shape_error(error: WorldError) -> DecodeError {
 fn inspect_type(
     ty: &RawComponentType<'_>,
     summary: &mut ComponentSummary,
+    async_profile: bool,
     depth: u32,
 ) -> Result<(), DecodeError> {
     if depth > PROFILE_1_LIMITS.max_component_nesting {
         return Err(DecodeError::Limit);
     }
     match ty {
-        RawComponentType::Defined(defined) => inspect_defined_type(defined),
+        RawComponentType::Defined(defined) => inspect_defined_type(defined, summary, async_profile),
         RawComponentType::Func(function) => {
-            if function.async_
-                || function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize
-            {
-                return Err(DecodeError::Unsupported);
+            if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
+                return Err(DecodeError::Limit);
+            }
+            if function.async_ {
+                require_async(async_profile)?;
+                add(
+                    &mut summary.async_abi.async_function_types,
+                    1,
+                    PROFILE_1_LIMITS.max_async_functions,
+                    LimitKind::AsyncFunctions,
+                )?;
             }
             for (_, ty) in function.params.iter() {
                 inspect_primitive(raw_primitive(*ty))?;
@@ -1332,7 +1599,7 @@ fn inspect_type(
                             PROFILE_1_LIMITS.max_component_definitions,
                             LimitKind::ComponentDefinitions,
                         )?;
-                        inspect_type(nested, summary, depth + 1)?;
+                        inspect_type(nested, summary, async_profile, depth + 1)?;
                     }
                     InstanceTypeDeclaration::Alias(_) => add(
                         &mut summary.aliases,
@@ -1360,7 +1627,11 @@ fn inspect_type(
     }
 }
 
-fn inspect_defined_type(defined: &RawDefinedType<'_>) -> Result<(), DecodeError> {
+fn inspect_defined_type(
+    defined: &RawDefinedType<'_>,
+    summary: &mut ComponentSummary,
+    async_profile: bool,
+) -> Result<(), DecodeError> {
     match defined {
         RawDefinedType::Primitive(primitive) => inspect_primitive(Some(*primitive)),
         RawDefinedType::Record(fields) => {
@@ -1400,10 +1671,33 @@ fn inspect_defined_type(defined: &RawDefinedType<'_>) -> Result<(), DecodeError>
             Ok(())
         }
         RawDefinedType::Own(_) | RawDefinedType::Borrow(_) => Ok(()),
-        RawDefinedType::Map(_, _)
-        | RawDefinedType::FixedLengthList(_, _)
-        | RawDefinedType::Future(_)
-        | RawDefinedType::Stream(_) => Err(DecodeError::Unsupported),
+        RawDefinedType::Future(payload) => {
+            require_async(async_profile)?;
+            if let Some(payload) = payload {
+                inspect_primitive(raw_primitive(*payload))?;
+            }
+            add(
+                &mut summary.async_abi.future_types,
+                1,
+                PROFILE_1_LIMITS.max_future_types,
+                LimitKind::FutureTypes,
+            )
+        }
+        RawDefinedType::Stream(payload) => {
+            require_async(async_profile)?;
+            if let Some(payload) = payload {
+                inspect_primitive(raw_primitive(*payload))?;
+            }
+            add(
+                &mut summary.async_abi.stream_types,
+                1,
+                PROFILE_1_LIMITS.max_stream_types,
+                LimitKind::StreamTypes,
+            )
+        }
+        RawDefinedType::Map(_, _) | RawDefinedType::FixedLengthList(_, _) => {
+            Err(DecodeError::Unsupported)
+        }
     }
 }
 
@@ -1431,15 +1725,252 @@ fn raw_primitive(ty: wasmparser::ComponentValType) -> Option<PrimitiveValType> {
     }
 }
 
-fn inspect_canonical(function: CanonicalFunction) -> Result<bool, DecodeError> {
-    let (options, adapter) = match function {
-        CanonicalFunction::Lift { options, .. } => (options, false),
-        CanonicalFunction::Lower { options, .. } => (options, true),
+#[derive(Clone, Copy)]
+enum CanonicalClass {
+    Sync,
+    AsyncLift,
+    AsyncLower,
+    Task,
+    Context,
+    Subtask,
+    CooperativeYield,
+    Stream,
+    Future,
+    Waitable,
+    Backpressure,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalInspection {
+    class: CanonicalClass,
+    adapter: bool,
+}
+
+#[derive(Default)]
+struct InspectedOptions {
+    async_: bool,
+    callback: bool,
+}
+
+fn inspect_canonical(
+    function: &CanonicalFunction,
+    async_profile: bool,
+) -> Result<CanonicalInspection, DecodeError> {
+    let inspected = match function {
+        CanonicalFunction::Lift { options, .. } => {
+            let options = inspect_options(options, async_profile)?;
+            if options.async_ {
+                if !options.callback {
+                    // Callback-free lift is the disabled stackful ABI.
+                    return Err(DecodeError::Unsupported);
+                }
+                CanonicalInspection {
+                    class: CanonicalClass::AsyncLift,
+                    adapter: false,
+                }
+            } else {
+                if options.callback {
+                    return Err(DecodeError::Unsupported);
+                }
+                CanonicalInspection {
+                    class: CanonicalClass::Sync,
+                    adapter: false,
+                }
+            }
+        }
+        CanonicalFunction::Lower { options, .. } => {
+            let options = inspect_options(options, async_profile)?;
+            if options.callback {
+                return Err(DecodeError::Unsupported);
+            }
+            CanonicalInspection {
+                class: if options.async_ {
+                    CanonicalClass::AsyncLower
+                } else {
+                    CanonicalClass::Sync
+                },
+                adapter: true,
+            }
+        }
         CanonicalFunction::ResourceNew { .. }
         | CanonicalFunction::ResourceDrop { .. }
-        | CanonicalFunction::ResourceRep { .. } => return Ok(false),
-        _ => return Err(DecodeError::Unsupported),
+        | CanonicalFunction::ResourceRep { .. } => CanonicalInspection {
+            class: CanonicalClass::Sync,
+            adapter: false,
+        },
+        CanonicalFunction::TaskReturn { options, .. } => {
+            require_async(async_profile)?;
+            let options = inspect_options(options, async_profile)?;
+            if options.async_ || options.callback {
+                return Err(DecodeError::Unsupported);
+            }
+            CanonicalInspection {
+                class: CanonicalClass::Task,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::TaskCancel => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Task,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::ContextGet { ty, slot } | CanonicalFunction::ContextSet { ty, slot } => {
+            require_async(async_profile)?;
+            if *ty != ValType::I32 || *slot != 0 {
+                return Err(DecodeError::Unsupported);
+            }
+            CanonicalInspection {
+                class: CanonicalClass::Context,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::SubtaskDrop => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Subtask,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::SubtaskCancel { async_ } => {
+            require_async(async_profile)?;
+            if *async_ {
+                return Err(DecodeError::Unsupported);
+            }
+            CanonicalInspection {
+                class: CanonicalClass::Subtask,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::ThreadYield { .. } => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::CooperativeYield,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::StreamNew { .. }
+        | CanonicalFunction::StreamDropReadable { .. }
+        | CanonicalFunction::StreamDropWritable { .. } => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Stream,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::StreamRead { options, .. }
+        | CanonicalFunction::StreamWrite { options, .. } => {
+            require_async_transfer(options, async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Stream,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::StreamCancelRead { async_, .. }
+        | CanonicalFunction::StreamCancelWrite { async_, .. } => {
+            require_async(async_profile)?;
+            if *async_ {
+                return Err(DecodeError::Unsupported);
+            }
+            CanonicalInspection {
+                class: CanonicalClass::Stream,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::FutureNew { .. }
+        | CanonicalFunction::FutureDropReadable { .. }
+        | CanonicalFunction::FutureDropWritable { .. } => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Future,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::FutureRead { options, .. }
+        | CanonicalFunction::FutureWrite { options, .. } => {
+            require_async_transfer(options, async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Future,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::FutureCancelRead { async_, .. }
+        | CanonicalFunction::FutureCancelWrite { async_, .. } => {
+            require_async(async_profile)?;
+            if *async_ {
+                return Err(DecodeError::Unsupported);
+            }
+            CanonicalInspection {
+                class: CanonicalClass::Future,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::WaitableSetNew
+        | CanonicalFunction::WaitableSetWait { .. }
+        | CanonicalFunction::WaitableSetPoll { .. }
+        | CanonicalFunction::WaitableSetDrop
+        | CanonicalFunction::WaitableJoin => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Waitable,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::BackpressureInc | CanonicalFunction::BackpressureDec => {
+            require_async(async_profile)?;
+            CanonicalInspection {
+                class: CanonicalClass::Backpressure,
+                adapter: false,
+            }
+        }
+        CanonicalFunction::ErrorContextNew { .. }
+        | CanonicalFunction::ErrorContextDebugMessage { .. }
+        | CanonicalFunction::ErrorContextDrop
+        | CanonicalFunction::ThreadIndex
+        | CanonicalFunction::ThreadNewIndirect { .. }
+        | CanonicalFunction::ThreadResumeLater
+        | CanonicalFunction::ThreadSuspend { .. }
+        | CanonicalFunction::ThreadSuspendThenResume { .. }
+        | CanonicalFunction::ThreadYieldThenResume { .. }
+        | CanonicalFunction::ThreadSuspendThenPromote { .. }
+        | CanonicalFunction::ThreadYieldThenPromote { .. }
+        | CanonicalFunction::ThreadSpawnRef { .. }
+        | CanonicalFunction::ThreadSpawnIndirect { .. }
+        | CanonicalFunction::ThreadAvailableParallelism => return Err(DecodeError::Unsupported),
     };
+    Ok(inspected)
+}
+
+fn require_async(async_profile: bool) -> Result<(), DecodeError> {
+    if async_profile {
+        Ok(())
+    } else {
+        Err(DecodeError::Unsupported)
+    }
+}
+
+fn require_async_transfer(
+    options: &[CanonicalOption],
+    async_profile: bool,
+) -> Result<(), DecodeError> {
+    require_async(async_profile)?;
+    let options = inspect_options(options, async_profile)?;
+    if !options.async_ || options.callback {
+        Err(DecodeError::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+fn inspect_options(
+    options: &[CanonicalOption],
+    async_profile: bool,
+) -> Result<InspectedOptions, DecodeError> {
+    if options.len() > PROFILE_1_LIMITS.max_canonical_options_per_function as usize {
+        return Err(DecodeError::Limit);
+    }
+    let mut result = InspectedOptions::default();
     let mut utf8 = false;
     let mut memory = false;
     let mut realloc = false;
@@ -1450,10 +1981,16 @@ fn inspect_canonical(function: CanonicalFunction) -> Result<bool, DecodeError> {
             CanonicalOption::Memory(_) => core::mem::replace(&mut memory, true),
             CanonicalOption::Realloc(_) => core::mem::replace(&mut realloc, true),
             CanonicalOption::PostReturn(_) => core::mem::replace(&mut post_return, true),
+            CanonicalOption::Async => {
+                require_async(async_profile)?;
+                core::mem::replace(&mut result.async_, true)
+            }
+            CanonicalOption::Callback(_) => {
+                require_async(async_profile)?;
+                core::mem::replace(&mut result.callback, true)
+            }
             CanonicalOption::UTF16
             | CanonicalOption::CompactUTF16
-            | CanonicalOption::Async
-            | CanonicalOption::Callback(_)
             | CanonicalOption::CoreType(_)
             | CanonicalOption::Gc => return Err(DecodeError::Unsupported),
         };
@@ -1461,7 +1998,80 @@ fn inspect_canonical(function: CanonicalFunction) -> Result<bool, DecodeError> {
             return Err(DecodeError::Malformed);
         }
     }
-    Ok(adapter)
+    Ok(result)
+}
+
+fn has_async_option(options: &[CanonicalOption]) -> bool {
+    options
+        .iter()
+        .any(|option| matches!(option, CanonicalOption::Async))
+}
+
+fn record_canonical(
+    summary: &mut ComponentSummary,
+    inspection: CanonicalInspection,
+) -> Result<(), DecodeError> {
+    let counter = match inspection.class {
+        CanonicalClass::Sync => return Ok(()),
+        CanonicalClass::AsyncLift => &mut summary.async_abi.async_lifts,
+        CanonicalClass::AsyncLower => &mut summary.async_abi.async_lowers,
+        CanonicalClass::Task => &mut summary.async_abi.task_builtins,
+        CanonicalClass::Context => &mut summary.async_abi.context_builtins,
+        CanonicalClass::Subtask => &mut summary.async_abi.subtask_builtins,
+        CanonicalClass::CooperativeYield => &mut summary.async_abi.cooperative_yields,
+        CanonicalClass::Stream => &mut summary.async_abi.stream_builtins,
+        CanonicalClass::Future => &mut summary.async_abi.future_builtins,
+        CanonicalClass::Waitable => &mut summary.async_abi.waitable_builtins,
+        CanonicalClass::Backpressure => &mut summary.async_abi.backpressure_builtins,
+    };
+    add(
+        counter,
+        1,
+        PROFILE_1_LIMITS.max_canonical_functions,
+        LimitKind::CanonicalFunctions,
+    )
+}
+
+fn async_plan_options(
+    options: &[CanonicalOption],
+) -> Result<(AsyncCanonicalOptions, Option<u32>), DecodeError> {
+    let mut plan = AsyncCanonicalOptions::default();
+    let mut callback = None;
+    for option in options {
+        match option {
+            CanonicalOption::UTF8 => {
+                if plan
+                    .string_encoding
+                    .replace(CanonicalStringEncoding::Utf8)
+                    .is_some()
+                {
+                    return Err(DecodeError::Malformed);
+                }
+            }
+            CanonicalOption::Memory(index) => {
+                if plan.memory.replace(*index).is_some() {
+                    return Err(DecodeError::Malformed);
+                }
+            }
+            CanonicalOption::Realloc(index) => {
+                if plan.realloc.replace(*index).is_some() {
+                    return Err(DecodeError::Malformed);
+                }
+            }
+            CanonicalOption::Async => {}
+            CanonicalOption::Callback(index) => {
+                if callback.replace(*index).is_some() {
+                    return Err(DecodeError::Malformed);
+                }
+            }
+            CanonicalOption::UTF16
+            | CanonicalOption::CompactUTF16
+            | CanonicalOption::PostReturn(_)
+            | CanonicalOption::CoreType(_)
+            | CanonicalOption::Gc => return Err(DecodeError::Unsupported),
+        }
+    }
+    Ok((plan, callback))
 }
 
 fn execution_options(options: &[CanonicalOption]) -> Result<LiftOptionsDraft, DecodeError> {

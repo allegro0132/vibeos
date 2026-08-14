@@ -18,7 +18,8 @@ use vibeos_component_runtime::resource::ResourceTypeId;
 use vibeos_component_runtime::types::{FunctionType, NamedParameterType};
 use vibeos_component_runtime::value::{CanonicalValue, ResourceOwnership, ValueType};
 use vibeos_component_runtime::world::{
-    EntityShape, FunctionShape, NamedEntityShape, NamedValueShape, TypeShape, ValueShape,
+    EntityShape, FunctionEffect, FunctionShape, NamedEntityShape, NamedValueShape, TypeShape,
+    ValueShape,
 };
 
 pub const CLOCK_INTERFACE: &str = "vibe:clock/monotonic@1.0.0";
@@ -264,7 +265,11 @@ fn function(
     result: Option<Shape<'_>>,
 ) -> bool {
     entity.name == name
-        && matches!(&entity.entity, EntityShape::Function(FunctionShape { parameters: actual, result: actual_result })
+        && matches!(&entity.entity, EntityShape::Function(FunctionShape {
+            effect: FunctionEffect::Sync,
+            parameters: actual,
+            result: actual_result,
+        })
             if named_values_are(actual, parameters) && optional_shape_is(actual_result.as_ref(), result))
 }
 

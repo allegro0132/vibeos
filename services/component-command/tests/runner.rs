@@ -31,7 +31,7 @@ fn admitted(
         imports: plan.imports,
         exports: plan.exports,
     };
-    let artifact = ComponentArtifact::copy_from(&bytes).unwrap();
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
     let identity = artifact.identity();
     Arc::new(
         admit(
@@ -232,7 +232,7 @@ fn only_the_exact_import_free_byte_filter_signature_is_executable() {
         imports: plan.imports,
         exports: plan.exports,
     };
-    let artifact = ComponentArtifact::copy_from(&bytes).unwrap();
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
     let identity = artifact.identity();
     let invalid = Arc::new(
         admit(
@@ -282,7 +282,7 @@ fn aggregate_memory_limit_requires_exactly_one_runtime_instance() {
         imports: plan.imports,
         exports: plan.exports,
     };
-    let artifact = ComponentArtifact::copy_from(&bytes).unwrap();
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
     let identity = artifact.identity();
     let admitted = Arc::new(
         admit(

@@ -379,6 +379,9 @@ const fn build_error_terminal(error: RunnerBuildError) -> ComponentTerminal {
             ComponentTerminal::Denied
         }
         RunnerBuildError::Allocation => ComponentTerminal::BudgetExceeded,
+        RunnerBuildError::Admission(AdmissionError::RuntimeUnavailable) => {
+            ComponentTerminal::Unavailable
+        }
         RunnerBuildError::Admission(_)
         | RunnerBuildError::ManifestRejected
         | RunnerBuildError::ManifestMismatch
@@ -393,6 +396,7 @@ const fn sync_error_terminal(error: SyncError) -> ComponentTerminal {
         SyncError::Allocation | SyncError::CoreAdmission | SyncError::InvalidBudget => {
             ComponentTerminal::BudgetExceeded
         }
+        SyncError::AsyncUnavailable => ComponentTerminal::Unavailable,
         SyncError::CoreInstantiation
         | SyncError::MissingModule
         | SyncError::MissingExport

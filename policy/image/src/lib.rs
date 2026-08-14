@@ -3,6 +3,8 @@
 //! Compile-time logical resource and storage-layout policy selected by final
 //! firmware images. Physical hardware descriptions remain in the BSP/HAL.
 
+use vibeos_component_format::ProfileIdentity;
+
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
 compile_error!("image policies `qemu-default` and `milkv-duo-sd` are mutually exclusive");
 
@@ -62,7 +64,7 @@ pub struct ComponentCommandPin {
     artifact_bytes: &'static [u8],
     expected_sha256: [u8; 32],
     command_name: &'static str,
-    abi: u16,
+    profile: ProfileIdentity,
     wit_source: &'static str,
     world: &'static str,
     entrypoint: &'static str,
@@ -88,7 +90,11 @@ impl ComponentCommandPin {
     }
 
     pub const fn abi(self) -> u16 {
-        self.abi
+        self.profile.runtime_abi
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
     }
 
     pub const fn wit_source(self) -> &'static str {
@@ -134,7 +140,7 @@ impl core::fmt::Debug for ComponentCommandPin {
             .debug_struct("ComponentCommandPin")
             .field("artifact", &"<redacted>")
             .field("command_name", &self.command_name)
-            .field("abi", &self.abi)
+            .field("profile", &self.profile)
             .field("world", &self.world)
             .field("entrypoint", &self.entrypoint)
             .field("min_args", &self.min_args)
@@ -169,7 +175,7 @@ pub const SSH_EXEC_COMPONENT: ComponentCommandPin = ComponentCommandPin {
     artifact_bytes: C4_BYTE_FILTER_BYTES,
     expected_sha256: C4_BYTE_FILTER_SHA256,
     command_name: "case-filter",
-    abi: 1,
+    profile: ProfileIdentity::PROFILE_1,
     wit_source: C4_BYTE_FILTER_WIT,
     world: "vibe:filters/filter@1.0.0",
     entrypoint: "run",
@@ -226,7 +232,8 @@ mod tests {
             pin.expected_sha256()
         );
         assert_eq!(pin.command_name(), "case-filter");
-        assert_eq!(pin.abi(), 1);
+        assert_eq!(pin.profile(), ProfileIdentity::PROFILE_1);
+        assert_eq!(pin.abi(), ProfileIdentity::PROFILE_1.runtime_abi);
         assert_eq!(pin.world(), "vibe:filters/filter@1.0.0");
         assert_eq!(pin.entrypoint(), "run");
         assert_eq!((pin.min_args(), pin.max_args()), (0, 0));

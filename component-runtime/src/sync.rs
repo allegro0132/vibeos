@@ -45,6 +45,7 @@ pub enum SyncError {
     Value = 12,
     Resource = 13,
     Poisoned = 14,
+    AsyncUnavailable = 15,
 }
 
 impl SyncError {
@@ -144,6 +145,9 @@ impl SynchronousComponent {
         reservation_per_module: OwnerAllocationReservation,
         memory_bytes: usize,
     ) -> Result<Self, SyncError> {
+        if !plan.runtime_ready() {
+            return Err(SyncError::AsyncUnavailable);
+        }
         let execution = &plan.execution;
         if execution
             .host_imports()

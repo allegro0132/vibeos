@@ -50,7 +50,7 @@ use crate::HEAP;
 #[cfg(feature = "ssh-component-command")]
 use vibeos_component_admission::{
     admit, AdmissionPolicy, AdmittedComponent, ArtifactTrust, CallerAuthority, CommandStreamMode,
-    ComponentArtifact, InstanceLimits, ProfileIdentity,
+    ComponentArtifact, InstanceLimits,
 };
 #[cfg(feature = "ssh-component-command")]
 use vibeos_component_command::{
@@ -805,7 +805,7 @@ fn build_image_root() -> Result<ImageRoot, ComponentTerminal> {
     let pin = SSH_EXEC_COMPONENT;
     let world = WorldContract::parse(pin.wit_source(), pin.world())
         .map_err(|_| ComponentTerminal::BackendFault)?;
-    let artifact = ComponentArtifact::copy_from(pin.artifact_bytes())
+    let artifact = ComponentArtifact::copy_from(pin.artifact_bytes(), pin.profile())
         .map_err(|_| ComponentTerminal::BackendFault)?;
     let identity = artifact.identity();
     if identity.as_bytes() != &pin.expected_sha256() {
@@ -820,7 +820,7 @@ fn build_image_root() -> Result<ImageRoot, ComponentTerminal> {
             min_args: pin.min_args(),
             max_args: pin.max_args(),
             exact_world: &world,
-            profile: ProfileIdentity::PROFILE_1,
+            profile: pin.profile(),
             trust: ArtifactTrust::ImagePinned(identity),
             limits: InstanceLimits {
                 memory_bytes: limits.memory_bytes,
@@ -996,6 +996,9 @@ const fn build_error_terminal(error: RunnerBuildError) -> ComponentTerminal {
             ComponentTerminal::Denied
         }
         RunnerBuildError::Allocation => ComponentTerminal::BudgetExceeded,
+        RunnerBuildError::Admission(
+            vibeos_component_admission::AdmissionError::RuntimeUnavailable,
+        ) => ComponentTerminal::Unavailable,
         RunnerBuildError::Admission(_)
         | RunnerBuildError::ManifestRejected
         | RunnerBuildError::ManifestMismatch
@@ -1011,6 +1014,7 @@ const fn sync_error_terminal(error: SyncError) -> ComponentTerminal {
         SyncError::Allocation | SyncError::CoreAdmission | SyncError::InvalidBudget => {
             ComponentTerminal::BudgetExceeded
         }
+        SyncError::AsyncUnavailable => ComponentTerminal::Unavailable,
         SyncError::CoreInstantiation
         | SyncError::MissingModule
         | SyncError::MissingExport

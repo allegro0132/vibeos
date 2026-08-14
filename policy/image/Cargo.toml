@@ -3,6 +3,9 @@ name = "vibeos-image-policy"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+vibeos-component-format = { path = "../../component-format" }
+
 [features]
 default = ["qemu-default"]
 qemu-default = []

@@ -232,6 +232,14 @@ fn decisions_and_unthresholded_shapes_are_frozen() {
     assert_eq!(SELECTED_CORE_ENGINE, Candidate::Wasmi);
     assert!(FRONTEND_DECISION.no_std_alloc);
     assert!(FRONTEND_DECISION.policy_is_in_tree);
+    assert_eq!(
+        FRONTEND_DECISION.selected_async_component_revision,
+        vibeos_component_format::ASYNC_COMPONENT_MODEL_REVISION
+    );
+    assert_eq!(
+        FRONTEND_DECISION.selected_async_canonical_revision,
+        vibeos_component_format::ASYNC_CANONICAL_ABI_REVISION
+    );
     assert_eq!(format!("{FLOAT_DECISION:?}"), "IntegerOnly");
     assert!(ENGINE_EVIDENCE.iter().all(|candidate| {
         candidate.no_std_alloc

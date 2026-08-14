@@ -21,7 +21,10 @@ fn artifact_and_exact_world(source: &str) -> (ComponentArtifact, WorldContract) 
         imports: plan.imports,
         exports: plan.exports,
     };
-    (ComponentArtifact::copy_from(&bytes).unwrap(), world)
+    (
+        ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap(),
+        world,
+    )
 }
 
 fn clock_ceiling() -> InterfaceCeiling<'static> {
@@ -88,6 +91,7 @@ fn pure_inspection_and_admission_create_an_inert_sealed_template() {
     let manifest = admitted.command_manifest();
     assert_eq!(manifest.name(), "clock-filter");
     assert_eq!(manifest.abi(), ProfileIdentity::PROFILE_1.runtime_abi);
+    assert_eq!(manifest.profile(), ProfileIdentity::PROFILE_1);
     assert_eq!(manifest.artifact(), identity);
     assert_eq!(manifest.world(), "vibe:test/admitted@1.0.0");
     assert_eq!(manifest.entrypoint(), "run");
@@ -117,6 +121,127 @@ fn pure_inspection_and_admission_create_an_inert_sealed_template() {
 }
 
 #[test]
+fn artifact_revision_descriptor_mismatch_wins_before_trust_and_decode() {
+    let (_, world) = artifact_and_exact_world(PURE_COMPONENT);
+    let mut foreign = ProfileIdentity::PROFILE_1;
+    foreign.component_revision = "component-model-untrusted-adjacent";
+    let artifact = ComponentArtifact::copy_from(b"not even a component", foreign).unwrap();
+    let identity = artifact.identity();
+    assert_eq!(
+        admit(
+            artifact,
+            &policy(identity, &world, &[]),
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::BadProfile)
+    );
+
+    let mut mismatches = [ProfileIdentity::PROFILE_1; 6];
+    mismatches[0].component_revision = "component-model-adjacent";
+    mismatches[1].canonical_abi_revision = "canonical-abi-previous-rc";
+    mismatches[2].wasm_tools_revision = "wasm-tools-v1.254.0";
+    mismatches[3].wasi_revision = "wasi-v0.3.0-rc-2026-01-06";
+    mismatches[4].canonical_features ^= 1 << 16;
+    mismatches[5].runtime_abi = mismatches[5].runtime_abi.saturating_add(1);
+    for bad_profile in mismatches {
+        let (artifact, world) = artifact_and_exact_world(PURE_COMPONENT);
+        let identity = artifact.identity();
+        let mut bad_policy = policy(identity, &world, &[]);
+        bad_policy.entrypoint = "add";
+        bad_policy.profile = bad_profile;
+        assert_eq!(
+            admit(artifact, &bad_policy, &CallerAuthority { offers: &[] },).err(),
+            Some(AdmissionError::BadProfile),
+            "{bad_profile:?}"
+        );
+    }
+}
+
+#[test]
+fn selected_async_profile_is_inspectable_but_cannot_be_admitted_before_c52() {
+    assert_eq!(AdmissionError::RuntimeUnavailable.code(), 18);
+    let bytes = wat::parse_str(
+        r#"(component
+              (type $t (func async))
+              (import "source" (func $source (type $t)))
+              (export "run" (func $source)))"#,
+    )
+    .unwrap();
+    let world = WorldContract::parse(
+        r#"
+            package test:async-admission@1.0.0;
+            world api {
+                import source: async func();
+                export run: async func();
+            }
+        "#,
+        "test:async-admission/api@1.0.0",
+    )
+    .unwrap();
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1_ASYNC).unwrap();
+    let identity = artifact.identity();
+    let inspection = artifact.inspect().unwrap();
+    assert_eq!(inspection.profile(), ProfileIdentity::PROFILE_1_ASYNC);
+    assert!(!inspection.plan().runtime_ready());
+    drop(inspection);
+
+    let mut async_policy = policy(identity, &world, &[]);
+    async_policy.profile = ProfileIdentity::PROFILE_1_ASYNC;
+    assert_eq!(
+        admit(artifact, &async_policy, &CallerAuthority { offers: &[] },).err(),
+        Some(AdmissionError::RuntimeUnavailable)
+    );
+
+    let mut adjacent = ProfileIdentity::PROFILE_1_ASYNC;
+    adjacent.canonical_abi_revision = "canonical-abi-adjacent-rc";
+    let artifact = ComponentArtifact::copy_from(&bytes, adjacent).unwrap();
+    assert_eq!(artifact.inspect().err(), Some(AdmissionError::BadProfile));
+}
+
+#[test]
+fn component_controlled_revision_custom_section_never_grants_profile_identity() {
+    let mut bytes = wat::parse_str(
+        r#"(component
+              (type $t (func async))
+              (import "source" (func $source (type $t)))
+              (export "run" (func $source)))"#,
+    )
+    .unwrap();
+    let name = b"vibe:claimed-profile";
+    let claim = vibeos_component_format::ASYNC_CANONICAL_ABI_REVISION.as_bytes();
+    let mut custom = Vec::new();
+    push_leb(&mut custom, name.len() as u32);
+    custom.extend_from_slice(name);
+    custom.extend_from_slice(claim);
+    bytes.push(0);
+    push_leb(&mut bytes, custom.len() as u32);
+    bytes.extend_from_slice(&custom);
+
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1_SYNC).unwrap();
+    assert!(matches!(
+        artifact.inspect(),
+        Err(AdmissionError::Decode(
+            vibeos_component_runtime::decode::DecodeError::Unsupported
+        ))
+    ));
+}
+
+fn push_leb(target: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        target.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+#[test]
 fn import_free_component_requires_no_ambient_authority() {
     let (artifact, world) = artifact_and_exact_world(PURE_COMPONENT);
     let identity = artifact.identity();
@@ -140,9 +265,10 @@ fn exact_identity_profile_and_world_fail_closed() {
     let identity = artifact.identity();
     let ceilings = [clock_ceiling()];
     let offers = [clock_offer()];
-    let wrong_identity = ComponentArtifact::copy_from(b"different exact bytes")
-        .unwrap()
-        .identity();
+    let wrong_identity =
+        ComponentArtifact::copy_from(b"different exact bytes", ProfileIdentity::PROFILE_1)
+            .unwrap()
+            .identity();
     assert_eq!(
         admit(
             artifact,
@@ -255,7 +381,7 @@ fn image_ceiling_and_caller_authority_intersect_exactly() {
 fn artifact_and_instance_bounds_are_checked_before_runtime_work() {
     let oversized = vec![0_u8; vibeos_component_format::PROFILE_1_LIMITS.max_artifact_bytes + 1];
     assert_eq!(
-        ComponentArtifact::copy_from(&oversized).err(),
+        ComponentArtifact::copy_from(&oversized, ProfileIdentity::PROFILE_1).err(),
         Some(AdmissionError::ArtifactLimit),
     );
 

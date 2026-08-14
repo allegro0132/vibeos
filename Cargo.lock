@@ -919,6 +919,7 @@ dependencies = [
  "dlr-wasm-interpreter",
  "vibeos-component-format",
  "vibeos-wasm-runtime",
+ "wasm-encoder",
  "wasmparser 0.255.0",
  "wat",
  "wit-parser",
@@ -1036,6 +1037,7 @@ name = "vibeos-image-policy"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "vibeos-component-format",
  "wat",
 ]
 

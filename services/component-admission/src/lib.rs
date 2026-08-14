@@ -13,16 +13,13 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 use sha2::{Digest, Sha256};
-use vibeos_component_format::{
-    ProfileLimits, ARTIFACT_ABI_VERSION, CANONICAL_ABI_REVISION, COMPONENT_MODEL_REVISION,
-    COMPONENT_PROFILE_VERSION, CORE_PROFILE_VERSION, CORE_SPEC_REVISION, PROFILE_1_LIMITS,
-    RUNTIME_ABI_VERSION,
-};
+pub use vibeos_component_format::ProfileIdentity;
+use vibeos_component_format::{ProfileLimits, PROFILE_1_LIMITS};
 use vibeos_component_host::{
     HostManifestError, HostResourceKind, VibeHostManifest, VibeHostRequirement,
 };
 use vibeos_component_runtime::{
-    decode::{inspect_component, ComponentPlan, ComponentSummary, DecodeError},
+    decode::{inspect_component_for_profile, ComponentPlan, ComponentSummary, DecodeError},
     world::{NamedEntityShape, WorldContract, WorldError},
 };
 use vibeos_core::cap::Rights;
@@ -47,39 +44,19 @@ impl fmt::Debug for ComponentIdentity {
     }
 }
 
-/// Exact format and engine contract selected by an image policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProfileIdentity {
-    pub artifact_abi: u16,
-    pub component_profile: u16,
-    pub core_profile: u16,
-    pub runtime_abi: u16,
-    pub core_revision: &'static str,
-    pub component_revision: &'static str,
-    pub canonical_abi_revision: &'static str,
-}
-
-impl ProfileIdentity {
-    pub const PROFILE_1: Self = Self {
-        artifact_abi: ARTIFACT_ABI_VERSION,
-        component_profile: COMPONENT_PROFILE_VERSION,
-        core_profile: CORE_PROFILE_VERSION,
-        runtime_abi: RUNTIME_ABI_VERSION,
-        core_revision: CORE_SPEC_REVISION,
-        component_revision: COMPONENT_MODEL_REVISION,
-        canonical_abi_revision: CANONICAL_ABI_REVISION,
-    };
-}
-
 /// Owned immutable bytes. Construction charges the public artifact bound before
 /// performing a fallible copy.
 pub struct ComponentArtifact {
     bytes: Vec<u8>,
     identity: ComponentIdentity,
+    profile: ProfileIdentity,
 }
 
 impl ComponentArtifact {
-    pub fn copy_from(bytes: &[u8]) -> Result<Self, AdmissionError> {
+    /// Copy immutable payload bytes while binding the trusted descriptor that
+    /// supplied their revision identity. The descriptor is not parsed from a
+    /// component-controlled custom section.
+    pub fn copy_from(bytes: &[u8], profile: ProfileIdentity) -> Result<Self, AdmissionError> {
         if bytes.len() > PROFILE_1_LIMITS.max_artifact_bytes {
             return Err(AdmissionError::ArtifactLimit);
         }
@@ -91,6 +68,7 @@ impl ComponentArtifact {
         Ok(Self {
             identity: ComponentIdentity(Sha256::digest(bytes).into()),
             bytes: owned,
+            profile,
         })
     }
 
@@ -98,12 +76,22 @@ impl ComponentArtifact {
         self.identity
     }
 
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.profile
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
     pub fn inspect(&self) -> Result<InspectedComponent<'_>, AdmissionError> {
-        let plan = inspect_component(&self.bytes).map_err(AdmissionError::Decode)?;
+        if self.profile != ProfileIdentity::PROFILE_1
+            && self.profile != ProfileIdentity::PROFILE_1_ASYNC
+        {
+            return Err(AdmissionError::BadProfile);
+        }
+        let plan = inspect_component_for_profile(&self.bytes, self.profile)
+            .map_err(AdmissionError::Decode)?;
         let mut modules = Vec::new();
         modules
             .try_reserve_exact(plan.embedded_modules().len())
@@ -137,7 +125,7 @@ impl InspectedComponent<'_> {
     }
 
     pub const fn profile(&self) -> ProfileIdentity {
-        ProfileIdentity::PROFILE_1
+        self.artifact.profile
     }
 
     pub const fn limits(&self) -> ProfileLimits {
@@ -336,7 +324,7 @@ impl AuthorityGrant {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ComponentCommandManifest {
     name: String,
-    abi: u16,
+    profile: ProfileIdentity,
     artifact: ComponentIdentity,
     world: String,
     entrypoint: String,
@@ -355,7 +343,11 @@ impl ComponentCommandManifest {
     }
 
     pub const fn abi(&self) -> u16 {
-        self.abi
+        self.profile.runtime_abi
+    }
+
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.profile
     }
 
     pub const fn artifact(&self) -> ComponentIdentity {
@@ -469,8 +461,10 @@ impl AdmittedComponent {
         let identity = ComponentIdentity(Sha256::digest(&self.artifact.bytes).into());
         if identity != self.artifact.identity
             || identity != self.command.artifact
+            || self.artifact.profile != ProfileIdentity::PROFILE_1
+            || self.artifact.profile != self.command.profile
+            || self.artifact.profile != self.inspection.profile
             || self.inspection.profile != ProfileIdentity::PROFILE_1
-            || self.command.abi != RUNTIME_ABI_VERSION
             || self.command.world != self.inspection.world
             || !valid_manifest_text(&self.inspection.world, 256)
             || !valid_name(&self.command.name)
@@ -499,8 +493,11 @@ impl AdmittedComponent {
             }
         }
 
-        let plan = inspect_component(&self.artifact.bytes).map_err(AdmissionError::Decode)?;
+        let plan = inspect_component_for_profile(&self.artifact.bytes, self.artifact.profile)
+            .map_err(AdmissionError::Decode)?;
         if plan.summary() != self.inspection.component
+            || plan.profile() != self.artifact.profile
+            || !plan.runtime_ready()
             || plan.imports() != self.inspection.imports
             || plan.exports() != self.inspection.exports
             || plan.embedded_modules().len() != self.inspection.modules.len()
@@ -548,6 +545,7 @@ pub enum AdmissionError {
     RevalidationMismatch = 15,
     InvalidEntrypoint = 16,
     InvalidArgumentLimits = 17,
+    RuntimeUnavailable = 18,
 }
 
 impl AdmissionError {
@@ -570,6 +568,7 @@ impl AdmissionError {
             Self::RevalidationMismatch => 15,
             Self::InvalidEntrypoint => 16,
             Self::InvalidArgumentLimits => 17,
+            Self::RuntimeUnavailable => 18,
         }
     }
 }
@@ -596,6 +595,9 @@ impl fmt::Display for AdmissionError {
             Self::RevalidationMismatch => "component revalidation differs from admitted manifest",
             Self::InvalidEntrypoint => "component entrypoint is not an executable export",
             Self::InvalidArgumentLimits => "component command argument limits are invalid",
+            Self::RuntimeUnavailable => {
+                "component requires async execution that is unavailable before C5.2"
+            }
         })
     }
 }
@@ -607,7 +609,12 @@ pub fn admit(
     policy: &AdmissionPolicy<'_>,
     caller: &CallerAuthority<'_>,
 ) -> Result<AdmittedComponent, AdmissionError> {
-    if policy.profile != ProfileIdentity::PROFILE_1 {
+    if policy.profile != ProfileIdentity::PROFILE_1
+        && policy.profile != ProfileIdentity::PROFILE_1_ASYNC
+    {
+        return Err(AdmissionError::BadProfile);
+    }
+    if artifact.profile != policy.profile {
         return Err(AdmissionError::BadProfile);
     }
     if policy.trust != ArtifactTrust::ImagePinned(artifact.identity) {
@@ -637,6 +644,9 @@ pub fn admit(
         let InspectedComponent { plan, modules, .. } = artifact.inspect()?;
         plan.check_world(policy.exact_world)
             .map_err(AdmissionError::World)?;
+        if !policy.profile.execution_enabled() || !plan.runtime_ready() {
+            return Err(AdmissionError::RuntimeUnavailable);
+        }
         let entrypoints = plan
             .executable_exports()
             .filter(|export| export.name == policy.entrypoint)
@@ -701,7 +711,7 @@ pub fn admit(
     let entrypoint = copied(policy.entrypoint)?;
     let command = ComponentCommandManifest {
         name,
-        abi: RUNTIME_ABI_VERSION,
+        profile: policy.profile,
         artifact: artifact.identity,
         world,
         entrypoint,

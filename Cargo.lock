@@ -870,6 +870,17 @@ name = "vibeos-durable-format"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-file-store"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-durable-format",
+ "vibeos-segment-format",
+ "vibeos-segment-store",
+ "vibeos-storage-device",
+]
+
+[[package]]
 name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
@@ -920,6 +931,7 @@ dependencies = [
  "vibeos-driver-virtio-rng",
  "vibeos-driver-xhci",
  "vibeos-durable-format",
+ "vibeos-file-store",
  "vibeos-hal",
  "vibeos-image-policy",
  "vibeos-iperf3-server",
@@ -1075,6 +1087,7 @@ name = "vibeos-vsh"
 version = "0.1.0"
 dependencies = [
  "vibeos-core",
+ "vibeos-file-store",
 ]
 
 [[package]]

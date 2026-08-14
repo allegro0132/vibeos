@@ -2102,6 +2102,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                     object_kind: binding.object_kind,
                 })
                 .collect();
+            entries.extend_from_slice(decoded.external_roots());
             entries.sort_unstable_by_key(|entry| entry.object_id);
             let roots = PersistentRootSet::new(decoded.checkpoint_generation(), entries)
                 .map_err(|_| StoreError::Corrupt)?;

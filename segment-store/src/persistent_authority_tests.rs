@@ -18,7 +18,7 @@ use vibeos_storage_device::MutationFailure;
 
 use crate::{
     canonical_attributable_physical_bytes, root_policy_commitment, CasStoreError, FormatOptions,
-    PageDevice, PageDeviceInfo, PersistentAuthorityError, PersistentAuthorityImport,
+    FsTreeKind, PageDevice, PageDeviceInfo, PersistentAuthorityError, PersistentAuthorityImport,
     PersistentAuthorityView, PersistentObjectHandle, PersistentSingletonUpdate,
     PrincipalQuotaLimits, QuotaError, ScrubStatus, SegmentStore, StoreLimits, StoreRuntimeContext,
     LEGACY_SYSTEM_PRINCIPAL, REFERENCE_CODEC_TYPED_V1,
@@ -39,6 +39,213 @@ fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => std::thread::yield_now(),
         }
     }
+}
+
+const FAULT_FS_NAMESPACE: u128 = 0x4653_2d46_4155_4c54_2d4e_5301;
+
+fn governed_fs_runtime() -> (
+    StoreRuntimeContext,
+    crate::StorageQuotaProvisioner,
+    crate::StoreMaintenanceProvisioner,
+) {
+    StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+        &crate::fs_typed_reference_kinds(),
+    )
+    .unwrap()
+}
+
+fn cold_fs_generation(device: AuthorityFaultDevice, case: &str) -> u64 {
+    device.power_cycle();
+    let (runtime, _quota, provisioner) = governed_fs_runtime();
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(cold.mount()).unwrap_or_else(|error| panic!("{case}: cold mount: {error:?}"));
+    let root = block_on(cold.recover_fs_root(FAULT_FS_NAMESPACE))
+        .unwrap_or_else(|error| panic!("{case}: recover root: {error:?}"))
+        .unwrap_or_else(|| panic!("{case}: file-tree root disappeared"));
+    let generation = root.generation();
+    assert!(
+        matches!(generation, 1 | 2),
+        "{case}: torn generation {generation}"
+    );
+    let maintenance = cold.provision_maintenance_root(&provisioner).unwrap();
+    assert_eq!(
+        block_on(cold.scrub(&maintenance))
+            .unwrap_or_else(|error| panic!("{case}: scrub: {error:?}"))
+            .status,
+        ScrubStatus::Healthy,
+        "{case}"
+    );
+    generation
+}
+
+#[test]
+fn file_tree_authority_root_switch_is_power_cut_atomic_at_every_mutation() {
+    let seed_device = AuthorityFaultDevice::blank();
+    let (runtime, _quota, provisioner) = governed_fs_runtime();
+    let mut seed = SegmentStore::new_with_runtime_context(seed_device.clone(), limits(), runtime);
+    block_on(seed.format(authority_fault_options())).unwrap();
+    let maintenance = seed.provision_maintenance_root(&provisioner).unwrap();
+    block_on(seed.import_persistent_authority(&maintenance, import(&format_records(), &[])))
+        .unwrap();
+    let inode = block_on(seed.commit_fs_cow_tree_for_maintenance(
+        &maintenance,
+        None,
+        FsTreeKind::Inode,
+        1,
+        &[],
+    ))
+    .unwrap();
+    let dirent = block_on(seed.commit_fs_cow_tree_for_maintenance(
+        &maintenance,
+        None,
+        FsTreeKind::Dirent,
+        1,
+        &[],
+    ))
+    .unwrap();
+    let root = block_on(seed.commit_fs_root_for_maintenance(
+        &maintenance,
+        FAULT_FS_NAMESPACE,
+        1,
+        2,
+        1,
+        &inode,
+        &dirent,
+    ))
+    .unwrap();
+    assert_eq!(
+        block_on(seed.compare_exchange_fs_root_for_maintenance(
+            &maintenance,
+            FAULT_FS_NAMESPACE,
+            0,
+            &root,
+        ))
+        .unwrap(),
+        1
+    );
+    drop(seed);
+    seed_device.power_cycle();
+    let seeded = seed_device.durable_image();
+
+    let prepare_candidate = |device: &AuthorityFaultDevice| {
+        let (runtime, _quota, provisioner) = governed_fs_runtime();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+        block_on(store.mount()).unwrap();
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let previous = block_on(store.recover_fs_root(FAULT_FS_NAMESPACE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.generation(), 1);
+        let inode = block_on(store.commit_fs_cow_tree_for_maintenance(
+            &maintenance,
+            Some(&previous),
+            FsTreeKind::Inode,
+            2,
+            &[],
+        ))
+        .unwrap();
+        let dirent = block_on(store.commit_fs_cow_tree_for_maintenance(
+            &maintenance,
+            Some(&previous),
+            FsTreeKind::Dirent,
+            2,
+            &[],
+        ))
+        .unwrap();
+        let next = block_on(store.commit_fs_root_for_maintenance(
+            &maintenance,
+            FAULT_FS_NAMESPACE,
+            2,
+            2,
+            1,
+            &inode,
+            &dirent,
+        ))
+        .unwrap();
+        (store, maintenance, next)
+    };
+
+    let probe_device = AuthorityFaultDevice::from_durable(seeded.clone());
+    let (mut probe, probe_maintenance, probe_root) = prepare_candidate(&probe_device);
+    probe_device.reset_mutation_count();
+    assert_eq!(
+        block_on(probe.compare_exchange_fs_root_for_maintenance(
+            &probe_maintenance,
+            FAULT_FS_NAMESPACE,
+            1,
+            &probe_root,
+        ))
+        .unwrap(),
+        2
+    );
+    let mutation_count = probe_device.mutation_count();
+    assert!(mutation_count > 0);
+    drop(probe);
+
+    let failure_actions = [
+        AuthorityFaultAction::FailNotSubmitted,
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::None),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Visible),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Durable),
+    ];
+    let cancel_actions = [
+        AuthorityFaultAction::Pending(AuthorityEffect::None),
+        AuthorityFaultAction::Pending(AuthorityEffect::Visible),
+        AuthorityFaultAction::Pending(AuthorityEffect::Durable),
+    ];
+    let mut old = 0;
+    let mut new = 0;
+    for mutation in 0..mutation_count {
+        for action in failure_actions {
+            let case = alloc::format!("FS root mutation {mutation}/{mutation_count}, {action:?}");
+            let device = AuthorityFaultDevice::from_durable(seeded.clone());
+            let (mut store, maintenance, next) = prepare_candidate(&device);
+            device.arm(mutation, action);
+            assert!(
+                block_on(store.compare_exchange_fs_root_for_maintenance(
+                    &maintenance,
+                    FAULT_FS_NAMESPACE,
+                    1,
+                    &next,
+                ))
+                .is_err(),
+                "{case}: injected fault was not reached"
+            );
+            drop(store);
+            match cold_fs_generation(device, &case) {
+                1 => old += 1,
+                2 => new += 1,
+                _ => unreachable!(),
+            }
+        }
+        for action in cancel_actions {
+            let case = alloc::format!("FS root mutation {mutation}/{mutation_count}, {action:?}");
+            let device = AuthorityFaultDevice::from_durable(seeded.clone());
+            let (mut store, maintenance, next) = prepare_candidate(&device);
+            device.arm(mutation, action);
+            let mut operation = Box::pin(store.compare_exchange_fs_root_for_maintenance(
+                &maintenance,
+                FAULT_FS_NAMESPACE,
+                1,
+                &next,
+            ));
+            assert!(
+                matches!(poll_once(operation.as_mut()), Poll::Pending),
+                "{case}"
+            );
+            drop(operation);
+            drop(store);
+            match cold_fs_generation(device, &case) {
+                1 => old += 1,
+                2 => new += 1,
+                _ => unreachable!(),
+            }
+        }
+    }
+    assert!(
+        old > 0 && new > 0,
+        "fault matrix must recover both old and new roots"
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

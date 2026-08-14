@@ -24,6 +24,8 @@ pub const CAS_GC_CODEC_VERSION: u16 = 2;
 pub const REFERENCE_CODEC_RAW: u16 = 0;
 /// Canonical `VIBEREF1` child-reference payload.
 pub const REFERENCE_CODEC_TYPED_V1: u16 = 1;
+/// Dedicated canonical `FsRootV1`/`FsBtreeNodeV1` child extraction.
+pub const REFERENCE_CODEC_FS_V1: u16 = 2;
 pub const MAX_BLOB_CONTENT_LEN: u64 = 64 * 1024 * 1024;
 pub const MAX_BLOB_EXTENTS: usize = 66;
 pub const CANONICAL_CONTENT_EXTENT_LEN: u64 = MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64;
@@ -432,7 +434,7 @@ fn validate_object_mapping(
         || value.commit_generation > checkpoint_generation
         || !matches!(
             value.reference_codec,
-            REFERENCE_CODEC_RAW | REFERENCE_CODEC_TYPED_V1
+            REFERENCE_CODEC_RAW | REFERENCE_CODEC_TYPED_V1 | REFERENCE_CODEC_FS_V1
         )
     {
         return Err(CasCodecError::InvalidField);
@@ -1455,7 +1457,7 @@ mod tests {
             Err(CasCodecError::NonZeroReserved)
         );
         let mut unknown = snapshot;
-        unknown.objects[0].reference_codec = 2;
+        unknown.objects[0].reference_codec = 3;
         assert_eq!(
             encode_cas_snapshot(&unknown, context()),
             Err(CasCodecError::InvalidField)

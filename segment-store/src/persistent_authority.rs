@@ -466,7 +466,6 @@ impl<D: PageDevice> SegmentStore<D> {
         update: PersistentAuthorityImport,
         principal: &StoragePrincipal,
     ) -> Result<PersistentAuthorityAppendResult, PersistentAuthorityError<D::Error>> {
-        crate::bench_mark(0);
         let lease = self
             .acquire_maintenance(
                 &writer.maintenance,
@@ -529,7 +528,6 @@ impl<D: PageDevice> SegmentStore<D> {
             .copied()
             .filter(|object_id| !update.is_admitted(*object_id))
             .collect();
-        crate::bench_mark(1);
         let retry_update = update.clone();
         let retry_transient_ids = transient_ids.clone();
         let retry_new_object_ids = new_object_ids.clone();
@@ -911,7 +909,6 @@ impl<D: PageDevice> SegmentStore<D> {
             let root = self.cached_logical_root(recovered)?;
             logical_roots.insert(recovered.object_id.get(), root);
         }
-        crate::bench_mark(2);
         // A strict logical-stream successor cannot redefine an existing M4
         // ObjectId. Reuse its already authenticated V2 binding instead of
         // consuming a new CAS mapping/segment on every authority append.
@@ -1064,7 +1061,6 @@ impl<D: PageDevice> SegmentStore<D> {
             }
             fresh.push(recovered);
         }
-        crate::bench_mark(3);
         if fresh.len() == 1 {
             let recovered = fresh[0];
             let stable_id = recovered.object_id.get();
@@ -1128,9 +1124,7 @@ impl<D: PageDevice> SegmentStore<D> {
             for chunk in recovered.bytes.chunks(LEAF_SIZE) {
                 writer.write_chunk(chunk).await?;
             }
-            crate::bench_mark(4);
             let staged = Box::pin(writer.stage_commit()).await?;
-            crate::bench_mark(5);
             let mut bindings: Vec<PersistentObjectBinding> = reusable_bindings
                 .into_iter()
                 .filter(|binding| import.is_admitted(binding.stable_object_id))
@@ -1184,7 +1178,6 @@ impl<D: PageDevice> SegmentStore<D> {
             // Same ordering contract as publish_persistent_snapshot: the pure
             // quota installation precedes the first media mutation of the
             // fused publication.
-            crate::bench_mark(6);
             self.install_persistent_quota_snapshot(&snapshot)?;
             let object = self
                 .publish_staged_object_with_authority(
@@ -1216,7 +1209,6 @@ impl<D: PageDevice> SegmentStore<D> {
                     object: Arc::new(object),
                 });
             }
-            crate::bench_mark(11);
             self.committed_ids_cache = Some((generation, imported_committed_ids));
             // Admitted fused objects are durably named by the checkpoint's
             // authority snapshot and root set; their runtime handles may drop.
@@ -1224,7 +1216,6 @@ impl<D: PageDevice> SegmentStore<D> {
             let view = self
                 .build_persistent_view(self.require_current_generation()?, snapshot, false)
                 .await?;
-            crate::bench_mark(12);
             return Ok((view, transient_objects));
         }
         let mut committed = Vec::new();

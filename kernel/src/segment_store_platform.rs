@@ -2874,25 +2874,6 @@ fn cache_metadata_matches_boot_proof(
         && store_uuid == STORAGE_V2_UUID
 }
 
-#[cfg(feature = "storage-bench")]
-static BENCH_MARKS: [core::sync::atomic::AtomicU64; 16] = [
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
-];
-
-#[cfg(feature = "storage-bench")]
-fn bench_probe(stage: u8) {
-    if let Some(slot) = BENCH_MARKS.get(stage as usize) {
-        slot.store(crate::sbi::time(), core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 fn append_error_requires_cold_recovery(error: V2RuntimeError) -> bool {
     // GenerationMismatch is checked against the mounted authority before any
     // append mutation. Every other error is conservatively ambiguous at this
@@ -3115,16 +3096,6 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
             #[cfg(feature = "storage-bench")]
             let phase_started = crate::sbi::time();
-            #[cfg(feature = "storage-bench")]
-            {
-                for slot in BENCH_MARKS.iter() {
-                    slot.store(0, core::sync::atomic::Ordering::Relaxed);
-                }
-                vibeos_segment_store::BENCH_PROBE.store(
-                    bench_probe as usize,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
             let mut stream_records = Vec::new();
             stream_records
                 .try_reserve_exact(
@@ -3191,20 +3162,6 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             runtime.publish_authority(view);
             #[cfg(feature = "storage-bench")]
             {
-                let mut marks = alloc::string::String::new();
-                let mut previous = 0u64;
-                for (index, slot) in BENCH_MARKS.iter().enumerate() {
-                    let value = slot.load(core::sync::atomic::Ordering::Relaxed);
-                    if value != 0 {
-                        let delta = value.saturating_sub(previous);
-                        previous = value;
-                        let _ = core::fmt::Write::write_fmt(
-                            &mut marks,
-                            format_args!(" m{}={}", index, delta),
-                        );
-                    }
-                }
-                crate::println!("  bench-marks{}", marks);
                 let phase_publish = crate::sbi::time();
                 crate::println!(
                     "  bench-phase preflight={} import={} append={} publish={}",

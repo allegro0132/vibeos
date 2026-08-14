@@ -212,6 +212,7 @@ pub fn help(_args: &[String]) -> Result<String, Status> {
          \x20 mem             bounded-memory accounts\n\
          \x20 quiet           mute background component output\n\
          \x20 verbose         restore background component output\n\
+         \x20 reboot          cold reboot the machine\n\
          \x20 poweroff        power off\n",
     );
     #[cfg(feature = "pci-usb-help")]

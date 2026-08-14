@@ -15,6 +15,12 @@ const SBI_EXT_IPI_SEND: usize = 0;
 const SBI_EXT_HSM: usize = 0x48534D;
 const SBI_EXT_HSM_HART_START: usize = 0;
 const SBI_EXT_HSM_HART_STATUS: usize = 2;
+const SBI_EXT_SRST: usize = 0x5352_5354;
+const SBI_EXT_SRST_SYSTEM_RESET: usize = 0;
+const SBI_SRST_RESET_TYPE_SHUTDOWN: usize = 0;
+const SBI_SRST_RESET_TYPE_COLD_REBOOT: usize = 1;
+const SBI_SRST_RESET_REASON_NONE: usize = 0;
+const SBI_SRST_RESET_REASON_SYSTEM_FAILURE: usize = 1;
 pub const RFENCE_EXTENSION_ID: usize = 0x52464E43;
 const SBI_EXT_RFENCE_REMOTE_FENCE_I: usize = 0;
 const SBI_EXT_RFENCE_REMOTE_SFENCE_VMA: usize = 1;
@@ -278,7 +284,33 @@ pub fn legacy_putchar(c: u8) {
 
 /// SBI System Reset.
 pub fn shutdown(failure: bool) -> ! {
-    ecall(0x53525354, 0, 0, if failure { 1 } else { 0 }, 0, 0);
+    ecall(
+        SBI_EXT_SRST,
+        SBI_EXT_SRST_SYSTEM_RESET,
+        SBI_SRST_RESET_TYPE_SHUTDOWN,
+        if failure {
+            SBI_SRST_RESET_REASON_SYSTEM_FAILURE
+        } else {
+            SBI_SRST_RESET_REASON_NONE
+        },
+        0,
+        0,
+    );
+    loop {
+        wait_for_interrupt();
+    }
+}
+
+/// Ask the platform to perform a full cold reboot.
+pub fn reboot() -> ! {
+    ecall(
+        SBI_EXT_SRST,
+        SBI_EXT_SRST_SYSTEM_RESET,
+        SBI_SRST_RESET_TYPE_COLD_REBOOT,
+        SBI_SRST_RESET_REASON_NONE,
+        0,
+        0,
+    );
     loop {
         wait_for_interrupt();
     }

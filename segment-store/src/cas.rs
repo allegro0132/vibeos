@@ -9,8 +9,8 @@ use core::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
 use vibeos_blob_format::{
-    verify_proof, BlobDescriptor, BlobError, BlobGeometry, Hash, MerkleProof, MerkleTreeSink,
-    StreamingError, StreamingMerkle, HASH_SIZE, HEADER_SIZE, LEAF_SIZE,
+    verify_proof, BlobDescriptor, BlobError, BlobGeometry, BlobView, Hash, MerkleProof,
+    MerkleTreeSink, StreamingError, StreamingMerkle, HASH_SIZE, HEADER_SIZE, LEAF_SIZE,
     MAX_STREAMING_EMISSIONS_PER_STEP,
 };
 use vibeos_segment_format::{
@@ -49,15 +49,16 @@ use crate::quota::{
     QuotaReservation, StoragePrincipal, QUOTA_DEDUP_UNIQUE_OBJECT_BYTES,
 };
 use crate::store::{
-    read_pointer_payload, scan_segment, validate_cas_blob_descriptors, write_checkpoint,
-    CapacityClass, CasMountedState, MountedState, SegmentStore, StoreError, READER_PIN_SLOTS,
-    ROOT_PIN_SLOTS,
+    read_pointer_payload, read_pointer_payloads, scan_segment, validate_cas_blob_descriptors,
+    write_checkpoint, CapacityClass, CasMountedState, MountedState, SegmentStore, StoreError,
+    READER_PIN_SLOTS, ROOT_PIN_SLOTS,
 };
 
 const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
 const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const MAX_TREE_PAGES: usize = MAX_EXTENT_PAYLOAD_PAGES as usize;
+const SMALL_STAGED_BLOB_READBACK_LIMIT: u64 = 64 * 1024;
 
 /// Allocate page-sized I/O scratch directly in the heap-backed representation.
 /// Keeping `Page` arrays out of async generator variants is part of the kernel
@@ -1587,6 +1588,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             .last()
             .and_then(|segment| segment.segment_no.checked_add(1))
             .ok_or(StoreError::Capacity(CapacityClass::Payload))?;
+        let zero = heap_page();
         for segment_no in self
             .segments
             .iter()
@@ -1594,17 +1596,24 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             .chain(core::iter::once(extra_metadata_segment))
         {
             let base = segment_base_page(segment_no)?;
-            let zero = heap_page();
             self.store
                 .device
-                .write_page(base + u64::from(SEGMENT_SEAL_PAGE), &zero)
+                .write_page(base + u64::from(SEGMENT_SEAL_PAGE), zero.as_ref())
                 .await
                 .map_err(StoreError::Mutation)?;
-            self.store
-                .device
-                .flush()
-                .await
-                .map_err(StoreError::Mutation)?;
+        }
+        self.store
+            .device
+            .flush()
+            .await
+            .map_err(StoreError::Mutation)?;
+        for segment_no in self
+            .segments
+            .iter()
+            .map(|segment| segment.segment_no)
+            .chain(core::iter::once(extra_metadata_segment))
+        {
+            let base = segment_base_page(segment_no)?;
             let mut observed = heap_page();
             self.store
                 .device
@@ -2126,6 +2135,64 @@ async fn verify_staged_blob<D: PageDevice>(
     manifest: &BlobManifest,
     scratch_extents: &[ScratchExtent],
 ) -> Result<(), CasStoreError<D::Error>> {
+    if manifest.encoded_blob_len <= SMALL_STAGED_BLOB_READBACK_LIMIT {
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(manifest.extents.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        requests.extend(manifest.extents.iter().map(|extent| {
+            (
+                extent.pointer,
+                ExtentKind::Blob,
+                CANONICAL_CONTENT_EXTENT_LEN as usize,
+            )
+        }));
+        let resolved = read_pointer_payloads(
+            device,
+            store_uuid,
+            admitted_segments,
+            next_segment_generation,
+            checkpoint_generation,
+            &requests,
+        )
+        .await?;
+        let encoded_len =
+            usize::try_from(manifest.encoded_blob_len).map_err(|_| StoreError::MemoryLimit)?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(encoded_len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for (declared, observed) in manifest.extents.iter().zip(&resolved) {
+            let extent = observed.extent;
+            if encoded.len() as u64 != declared.encoded_offset
+                || extent.extent_kind != ExtentKind::Blob
+                || extent.object_kind != manifest.blob_key.object_kind()
+                || extent.extent_index != declared.extent_index
+                || extent.extent_count != declared.extent_count
+                || extent.content_byte_len != manifest.blob_key.exact_len()
+                || extent.encoded_blob_len != manifest.encoded_blob_len
+                || extent.encoded_offset != declared.encoded_offset
+                || extent.payload_byte_len != declared.payload_byte_len
+                || extent.merkle_root != manifest.blob_key.merkle_root()
+                || observed.bytes.len() as u64 != declared.payload_byte_len
+            {
+                return Err(StoreError::Corrupt.into());
+            }
+            encoded.extend_from_slice(&observed.bytes);
+        }
+        if encoded.len() != encoded_len {
+            return Err(StoreError::Corrupt.into());
+        }
+        let blob = BlobView::decode(&encoded)?;
+        if blob.descriptor().object_kind != manifest.blob_key.object_kind()
+            || blob.descriptor().byte_len != manifest.blob_key.exact_len()
+            || blob.descriptor().root != manifest.blob_key.merkle_root()
+        {
+            return Err(StoreError::Corrupt.into());
+        }
+        blob.verify_all()?;
+        return Ok(());
+    }
     validate_cas_blob_descriptors(
         device,
         store_uuid,
@@ -2829,7 +2896,7 @@ async fn commit_snapshot<D: PageDevice>(
     // that damaged a data segment, while avoiding a scan of unchanged history.
     // Authority remains withheld until mount_verified_successor also re-reads
     // and selects this exact checkpoint pair.
-    if is_new {
+    let expected_manifest = if is_new {
         verify_staged_blob(
             device,
             state.superblock.binding.store_uuid,
@@ -2840,48 +2907,53 @@ async fn commit_snapshot<D: PageDevice>(
             scratch_extents,
         )
         .await?;
-        let expected_manifest = encode_blob_manifest(&scratch_manifest, context)?;
-        let observed_manifest = read_pointer_payload(
-            device,
-            state.superblock.binding.store_uuid,
-            state.admitted_segments,
-            next_segment_generation,
-            checkpoint_generation,
+        Some(encode_blob_manifest(&scratch_manifest, context)?)
+    } else {
+        None
+    };
+    let mut requests = Vec::new();
+    let mut expected = Vec::new();
+    requests
+        .try_reserve_exact(3)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    expected
+        .try_reserve_exact(3)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    if let Some(bytes) = expected_manifest.as_ref() {
+        requests.push((
             new_blob_mapping.manifest,
             ExtentKind::Catalog,
             limits.recovery_memory_bytes,
-        )
-        .await?;
-        if observed_manifest.bytes != expected_manifest {
-            return Err(StoreError::Corrupt.into());
-        }
+        ));
+        expected.push(bytes.as_slice());
     }
-    let observed_snapshot = read_pointer_payload(
-        device,
-        state.superblock.binding.store_uuid,
-        state.admitted_segments,
-        next_segment_generation,
-        checkpoint_generation,
+    requests.push((
         catalog_root,
         ExtentKind::Catalog,
         limits.recovery_memory_bytes,
-    )
-    .await?;
-    if observed_snapshot.bytes != snapshot_bytes {
-        return Err(StoreError::Corrupt.into());
-    }
-    let observed_allocation = read_pointer_payload(
+    ));
+    expected.push(snapshot_bytes.as_slice());
+    requests.push((
+        allocation_root,
+        ExtentKind::Allocation,
+        limits.recovery_memory_bytes,
+    ));
+    expected.push(allocation_bytes.as_slice());
+    let observed = read_pointer_payloads(
         device,
         state.superblock.binding.store_uuid,
         state.admitted_segments,
         next_segment_generation,
         checkpoint_generation,
-        allocation_root,
-        ExtentKind::Allocation,
-        limits.recovery_memory_bytes,
+        &requests,
     )
     .await?;
-    if observed_allocation.bytes != allocation_bytes {
+    if observed.len() != expected.len()
+        || observed
+            .iter()
+            .zip(expected)
+            .any(|(actual, bytes)| actual.bytes != bytes)
+    {
         return Err(StoreError::Corrupt.into());
     }
     let next_physical_segment = (0..state.admitted_segments)
@@ -2961,24 +3033,17 @@ async fn commit_snapshot<D: PageDevice>(
     ))
 }
 
-pub(crate) async fn write_payload_record<D: PageDevice>(
-    device: &D,
-    base: u64,
-    record: &FinalRecord,
-    payload: &[u8],
-) -> Result<(), StoreError<D::Error>> {
-    write_payload_records_with_header(device, base, None, &[(record, payload)]).await
-}
-
-async fn write_payload_records_with_header<D: PageDevice>(
+pub(crate) async fn write_payload_records_with_header<D: PageDevice>(
     device: &D,
     base: u64,
     header: Option<(&Page, &Page)>,
     records: &[(&FinalRecord, &[u8])],
 ) -> Result<(), StoreError<D::Error>> {
-    // Payload, descriptor body, and descriptor seal are three dependency
-    // phases.  Records in the same segment transaction share each barrier.
-    // The single-record API above remains an exact adapter for existing users.
+    // Payload and descriptor bodies are two dependency phases. Records in the
+    // same segment transaction share each barrier. Descriptor seals are left
+    // pending for the immediately following segment-summary body barrier: no
+    // checkpoint can name the segment until its final seal is written, so a
+    // cut before that shared barrier still leaves the whole segment unreachable.
     for (record, payload) in records {
         let mut copied = 0_usize;
         let mut page_index = 0_u32;
@@ -3021,7 +3086,7 @@ async fn write_payload_records_with_header<D: PageDevice>(
         )
         .await?;
     }
-    flush(device).await
+    Ok(())
 }
 
 fn map_streaming_error<E>(error: StreamingError<EmissionError>) -> CasStoreError<E> {

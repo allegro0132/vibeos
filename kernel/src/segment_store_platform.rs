@@ -47,6 +47,7 @@ use crate::{exec, heap, sync::SpinLock};
 
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
+const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
 pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
     vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
@@ -377,9 +378,13 @@ impl CapabilityPageDevice {
     }
 
     fn expose_preprovisioned_range(&self) {
+        self.expose_block_count(self.provisioned_block_count);
+    }
+
+    fn expose_block_count(&self, block_count: u64) {
         let mut info = self.info.lock();
-        info.logical_block_count = self.provisioned_block_count;
-        info.page_count = self.provisioned_block_count / BLOCKS_PER_PAGE;
+        info.logical_block_count = block_count;
+        info.page_count = block_count / BLOCKS_PER_PAGE;
     }
 
     fn restrict_to_initial_range(&self) {
@@ -388,14 +393,16 @@ impl CapabilityPageDevice {
         info.page_count = self.initial_block_count / BLOCKS_PER_PAGE;
     }
 
-    fn growth_capability(
+    fn growth_capability_bounded(
         &self,
         durable_block_count: u64,
+        maximum_additional_blocks: u64,
     ) -> Result<Option<BlockRangeCapability>, PageIoError> {
         if durable_block_count > self.provisioned_block_count {
             return Err(PageIoError::InvalidRange);
         }
-        let additional = self.provisioned_block_count - durable_block_count;
+        let additional =
+            (self.provisioned_block_count - durable_block_count).min(maximum_additional_blocks);
         if additional == 0 {
             return Ok(None);
         }
@@ -1211,13 +1218,39 @@ impl StorageV2Runtime {
                         }
                         _ => V2RuntimeError::Corrupt,
                     })?;
-            *self.last_info.lock() = Some(info);
             self.install_maintenance_if_missing(&mut operation)?;
             let maintenance = self
                 .maintenance
                 .lock()
                 .clone()
                 .ok_or(V2RuntimeError::Corrupt)?;
+            let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
+                .ok()
+                .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
+                .ok_or(V2RuntimeError::Corrupt)?;
+            // Full preprovisioned addressability is needed only to discover a
+            // previously grown checkpoint. Once mount has fixed the durable
+            // boundary, narrow the live device view before deriving the exact
+            // adjacent suffix admitted by this growth transaction.
+            self.device.expose_block_count(durable_blocks);
+            let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
+                .saturating_sub(info.free_segments)
+                .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
+                .ok_or(V2RuntimeError::Corrupt)?;
+            let info = match self
+                .device
+                .growth_capability_bounded(durable_blocks, growth_blocks)
+                .map_err(|_| V2RuntimeError::Corrupt)?
+            {
+                Some(additional) => {
+                    match poll_as_system(operation.store().grow(&maintenance, additional)).await {
+                        Ok(info) => info,
+                        Err(_) => return Err(V2RuntimeError::Corrupt),
+                    }
+                }
+                None => info,
+            };
+            *self.last_info.lock() = Some(info);
             let view = poll_as_system(
                 operation
                     .store()
@@ -1307,9 +1340,13 @@ impl StorageV2Runtime {
             .ok()
             .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
             .ok_or(FileError::ServiceUnavailable)?;
+        let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
+            .saturating_sub(info.free_segments)
+            .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
+            .ok_or(FileError::ServiceUnavailable)?;
         let additional = self
             .device
-            .growth_capability(durable_blocks)
+            .growth_capability_bounded(durable_blocks, growth_blocks)
             .map_err(|_| FileError::ServiceUnavailable)?;
         if let Some(additional) = additional {
             let maintenance = self
@@ -1464,6 +1501,24 @@ impl StorageV2Devices {
 
     pub(crate) fn selected_boot_store(&self) -> Option<BootStoreSelection> {
         BootStoreSelection::decode(self.runtime.boot_selection.load(Ordering::Acquire))
+    }
+
+    pub(crate) async fn benchmark_authority_shape(
+        &self,
+    ) -> Option<(usize, usize, bool, u64, u64, u32)> {
+        let view = self.runtime.authority_view()?;
+        let info = self.runtime.last_info.lock().as_ref().copied()?;
+        let mut operation = self.runtime.begin().ok()?;
+        let verified = operation.store().current_cas_payloads_verified();
+        operation.finish();
+        Some((
+            view.objects().len(),
+            view.record_stream().len() / LOGICAL_BLOCK_SIZE,
+            verified,
+            info.allocated_segments,
+            info.free_segments,
+            info.cleaner_reserved_segments,
+        ))
     }
 
     #[cfg(feature = "file-tree")]
@@ -3232,8 +3287,9 @@ impl GrowablePageDevice for CapabilityPageDevice {
         durable_logical_block_count: u64,
         additional: BlockRangeCapability,
     ) -> Result<(), Self::Error> {
+        let additional_blocks = additional.range().block_count();
         let expected = self
-            .growth_capability(durable_logical_block_count)?
+            .growth_capability_bounded(durable_logical_block_count, additional_blocks)?
             .ok_or(PageIoError::InvalidRange)?;
         if expected != additional {
             return Err(PageIoError::InvalidRange);
@@ -3250,10 +3306,10 @@ impl GrowablePageDevice for CapabilityPageDevice {
         let enlarged = durable_logical_block_count
             .checked_add(additional.range().block_count())
             .ok_or(PageIoError::InvalidRange)?;
-        if enlarged != self.provisioned_block_count {
+        if enlarged > self.provisioned_block_count {
             return Err(PageIoError::InvalidRange);
         }
-        self.expose_preprovisioned_range();
+        self.expose_block_count(enlarged);
         Ok(self.info())
     }
 }

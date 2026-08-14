@@ -988,6 +988,12 @@ impl<D: PageDevice> SegmentStore<D> {
         self.verified_cas_generation.load(Ordering::Acquire) == generation
     }
 
+    pub fn current_cas_payloads_verified(&self) -> bool {
+        self.mounted
+            .as_ref()
+            .is_some_and(|state| self.cas_payloads_verified(state.generation))
+    }
+
     pub async fn put(
         &mut self,
         object_kind: u32,
@@ -1361,18 +1367,13 @@ async fn flush<D: PageDevice>(device: &D) -> Result<(), StoreError<D::Error>> {
 async fn read_pair<D: PageDevice>(
     device: &D,
     body_page: u64,
-) -> Result<(Box<Page>, Box<Page>), StoreError<D::Error>> {
-    let mut body = Box::new([0; PAGE_SIZE]);
-    let mut seal = Box::new([0; PAGE_SIZE]);
+) -> Result<Box<[Page; 2]>, StoreError<D::Error>> {
+    let mut pages = alloc::vec![[0; PAGE_SIZE]; 2].into_boxed_slice();
     device
-        .read_page(body_page, body.as_mut())
+        .read_pages(body_page, &mut pages)
         .await
         .map_err(StoreError::Device)?;
-    device
-        .read_page(body_page + 1, seal.as_mut())
-        .await
-        .map_err(StoreError::Device)?;
-    Ok((body, seal))
+    pages.try_into().map_err(|_| StoreError::Corrupt)
 }
 
 fn optional_verified<T>(status: DecodeStatus<VerifiedRecord<T>>) -> Option<VerifiedRecord<T>> {
@@ -1386,16 +1387,20 @@ pub(crate) async fn read_superblock<D: PageDevice>(
     device: &D,
     page: u64,
 ) -> Result<Option<VerifiedRecord<Superblock>>, StoreError<D::Error>> {
-    let (body, seal) = read_pair(device, page).await?;
-    Ok(optional_verified(decode_superblock_verified(&body, &seal)?))
+    let pages = read_pair(device, page).await?;
+    Ok(optional_verified(decode_superblock_verified(
+        &pages[0], &pages[1],
+    )?))
 }
 
 pub(crate) async fn read_checkpoint<D: PageDevice>(
     device: &D,
     page: u64,
 ) -> Result<Option<VerifiedRecord<Checkpoint>>, StoreError<D::Error>> {
-    let (body, seal) = read_pair(device, page).await?;
-    Ok(optional_verified(decode_checkpoint_verified(&body, &seal)?))
+    let pages = read_pair(device, page).await?;
+    Ok(optional_verified(decode_checkpoint_verified(
+        &pages[0], &pages[1],
+    )?))
 }
 
 pub(crate) async fn write_checkpoint<D: PageDevice>(
@@ -1428,8 +1433,8 @@ pub(crate) async fn write_checkpoint<D: PageDevice>(
     flush(device).await?;
     write_page(device, body_page + 1, &seal).await?;
     flush(device).await?;
-    let (observed_body, observed_seal) = read_pair(device, body_page).await?;
-    match decode_checkpoint_verified(&observed_body, &observed_seal)? {
+    let observed = read_pair(device, body_page).await?;
+    match decode_checkpoint_verified(&observed[0], &observed[1])? {
         DecodeStatus::Sealed(value) if value.value() == checkpoint => Ok(value),
         _ => Err(StoreError::Corrupt),
     }
@@ -1468,8 +1473,8 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
     let base = segment_base_page(pointer.segment_no)?;
-    let (header_body, header_seal) = read_pair(device, base).await?;
-    let header = match decode_segment_header_verified(&header_body, &header_seal)? {
+    let header_pages = read_pair(device, base).await?;
+    let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
@@ -1481,18 +1486,17 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
 
-    let (summary_body, summary_seal_page) =
-        read_pair(device, base + u64::from(SUMMARY_BODY_PAGE)).await?;
-    let summary = match decode_segment_summary_verified(&summary_body, &summary_seal_page)? {
+    let summary_pages = read_pair(device, base + u64::from(SUMMARY_BODY_PAGE)).await?;
+    let summary = match decode_segment_summary_verified(&summary_pages[0], &summary_pages[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
-    let (segment_seal_body, final_seal_page) =
-        read_pair(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE)).await?;
-    let segment_seal = match decode_segment_seal_verified(&segment_seal_body, &final_seal_page)? {
-        DecodeStatus::Sealed(value) => value,
-        _ => return Err(StoreError::Corrupt),
-    };
+    let segment_seal_pages = read_pair(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE)).await?;
+    let segment_seal =
+        match decode_segment_seal_verified(&segment_seal_pages[0], &segment_seal_pages[1])? {
+            DecodeStatus::Sealed(value) => value,
+            _ => return Err(StoreError::Corrupt),
+        };
 
     let mut relative = DATA_FIRST_PAGE;
     let mut descriptor_chain =
@@ -1507,8 +1511,8 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     let mut last_target = 0_u64;
     let mut matched = None;
     for ordinal in 1..=summary.value().record_count {
-        let (body, seal) = read_pair(device, base + u64::from(relative)).await?;
-        let extent = match decode_extent_verified(&body, &seal)? {
+        let descriptor_pages = read_pair(device, base + u64::from(relative)).await?;
+        let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };
@@ -1646,7 +1650,153 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     )
     .await?;
     let extent = scanned.matched.ok_or(StoreError::Corrupt)?;
-    if extent.extent_kind != pointer.extent_kind
+    read_pointer_payload_after_scan(
+        device,
+        pointer,
+        expected_kind,
+        checkpoint_generation,
+        extent,
+        &scanned,
+    )
+    .await
+}
+
+/// Resolve several pointers from one immutable sealed segment while paying
+/// for its descriptor-chain authentication only once. Every requested
+/// descriptor seal and payload is still read back and checked independently.
+pub(crate) async fn read_pointer_payloads<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    requests: &[(PhysicalPointer, ExtentKind, usize)],
+) -> Result<Vec<ResolvedPayload>, StoreError<D::Error>> {
+    let Some((PhysicalPointer::Value(first), _, _)) = requests.first().copied() else {
+        return if requests.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(StoreError::Corrupt)
+        };
+    };
+    if requests.len() == 1 {
+        let (pointer, kind, maximum_bytes) = requests[0];
+        return Ok(vec![
+            read_pointer_payload(
+                device,
+                store_uuid,
+                admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                pointer,
+                kind,
+                maximum_bytes,
+            )
+            .await?,
+        ]);
+    }
+    let one_segment = requests.iter().all(|(pointer, _, _)| {
+        matches!(
+            pointer,
+            PhysicalPointer::Value(value)
+                if value.store_uuid == first.store_uuid
+                    && value.segment_no == first.segment_no
+                    && value.segment_generation == first.segment_generation
+        )
+    });
+    if !one_segment {
+        let mut resolved = Vec::new();
+        resolved
+            .try_reserve_exact(requests.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for (pointer, kind, maximum_bytes) in requests.iter().copied() {
+            resolved.push(
+                read_pointer_payload(
+                    device,
+                    store_uuid,
+                    admitted_segments,
+                    next_segment_generation,
+                    checkpoint_generation,
+                    pointer,
+                    kind,
+                    maximum_bytes,
+                )
+                .await?,
+            );
+        }
+        return Ok(resolved);
+    }
+    let scanned = scan_segment(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        first,
+    )
+    .await?;
+    let base = segment_base_page(first.segment_no)?;
+    let mut resolved = Vec::new();
+    resolved
+        .try_reserve_exact(requests.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (physical, kind, maximum_bytes) in requests.iter().copied() {
+        let PhysicalPointer::Value(pointer) = physical else {
+            return Err(StoreError::Corrupt);
+        };
+        if pointer.store_uuid != first.store_uuid
+            || pointer.segment_no != first.segment_no
+            || pointer.segment_generation != first.segment_generation
+            || pointer.extent_kind != kind
+            || pointer.exact_byte_len > maximum_bytes as u64
+            || pointer.exact_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+            || pointer.ordinal == 0
+            || pointer.ordinal > scanned.record_count
+        {
+            return Err(StoreError::Corrupt);
+        }
+        let descriptor_pages =
+            read_pair(device, base + u64::from(pointer.descriptor_relative_page)).await?;
+        let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
+            DecodeStatus::Sealed(value) => *value.value(),
+            _ => return Err(StoreError::Corrupt),
+        };
+        resolved.push(
+            read_pointer_payload_after_scan(
+                device,
+                pointer,
+                kind,
+                checkpoint_generation,
+                extent,
+                &scanned,
+            )
+            .await?,
+        );
+    }
+    Ok(resolved)
+}
+
+async fn read_pointer_payload_after_scan<D: PageDevice>(
+    device: &D,
+    pointer: PointerValue,
+    expected_kind: ExtentKind,
+    checkpoint_generation: u64,
+    extent: ExtentRecord,
+    scanned: &ScannedSegment,
+) -> Result<ResolvedPayload, StoreError<D::Error>> {
+    let base = segment_base_page(pointer.segment_no)?;
+    if pointer.payload_relative_page
+        != pointer
+            .descriptor_relative_page
+            .checked_add(2)
+            .ok_or(StoreError::Corrupt)?
+        || extent.binding.store_uuid != pointer.store_uuid
+        || extent.binding.segment_no != pointer.segment_no
+        || extent.binding.generation != pointer.segment_generation
+        || extent.binding.ordinal != pointer.ordinal
+        || extent.binding.self_page != base + u64::from(pointer.descriptor_relative_page)
+        || extent.binding.target_checkpoint_generation > checkpoint_generation
+        || extent.extent_kind != pointer.extent_kind
         || extent.payload_first_relative_page != pointer.payload_relative_page
         || extent.payload_pages != pointer.payload_pages
         || extent.payload_byte_len != pointer.exact_byte_len
@@ -1663,7 +1813,6 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     }
     let exact_len = usize::try_from(pointer.exact_byte_len).map_err(|_| StoreError::Corrupt)?;
     let mut bytes = vec![0; exact_len];
-    let base = segment_base_page(pointer.segment_no)?;
     let mut copied = 0;
     for index in 0..pointer.payload_pages {
         let mut page = Box::new([0; PAGE_SIZE]);

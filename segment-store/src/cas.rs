@@ -59,6 +59,7 @@ const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const MAX_TREE_PAGES: usize = MAX_EXTENT_PAYLOAD_PAGES as usize;
 const SMALL_STAGED_BLOB_READBACK_LIMIT: u64 = 64 * 1024;
+const MAX_BATCHED_BLOB_READ_LIMIT: usize = 512 * 1024;
 
 /// Allocate page-sized I/O scratch directly in the heap-backed representation.
 /// Keeping `Page` arrays out of async generator variants is part of the kernel
@@ -1190,7 +1191,43 @@ impl<D: PageDevice> SegmentStore<D> {
         })
     }
 
+    /// Resolve authority and the manifest once, then return the complete
+    /// logical Blob while performing the same full Merkle verification as
+    /// `verify_blob`. This avoids re-resolving and re-scanning the manifest for
+    /// every leaf in callers which need the whole object.
+    pub(crate) async fn read_verified_blob(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
+        let read_pin = self.pin_blob_reader(object)?;
+        let (descriptor, manifest) = self.resolve_authorized_manifest_unverified(object).await?;
+        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
+        // The batched path retains resolved payloads, one contiguous encoded
+        // image, and the decoded output at the same time. Keep that working
+        // set below one recovery-memory budget even when a caller supplies a
+        // smaller-than-default limit.
+        let batched_limit = MAX_BATCHED_BLOB_READ_LIMIT.min(self.limits.recovery_memory_bytes / 4);
+        let bytes = if manifest.encoded_blob_len <= batched_limit as u64 {
+            read_small_verified_blob(&self.device, state, descriptor, &manifest).await?
+        } else {
+            validate_resolved_manifest(&self.device, state, descriptor, &manifest).await?;
+            read_and_verify_resolved_blob(&self.device, state, descriptor, &manifest).await?
+        };
+        drop(read_pin);
+        Ok(bytes)
+    }
+
     async fn resolve_authorized_manifest(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<(BlobDescriptor, BlobManifest), CasStoreError<D::Error>> {
+        let (descriptor, manifest) = self.resolve_authorized_manifest_unverified(object).await?;
+        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
+        validate_resolved_manifest(&self.device, state, descriptor, &manifest).await?;
+        Ok((descriptor, manifest))
+    }
+
+    async fn resolve_authorized_manifest_unverified(
         &self,
         object: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<(BlobDescriptor, BlobManifest), CasStoreError<D::Error>> {
@@ -1258,15 +1295,6 @@ impl<D: PageDevice> SegmentStore<D> {
         if manifest.blob_key != mapping.blob_key {
             return Err(StoreError::Corrupt.into());
         }
-        validate_cas_blob_descriptors(
-            &self.device,
-            state.superblock.binding.store_uuid,
-            state.admitted_segments,
-            state.next_segment_generation,
-            state.generation,
-            &manifest,
-        )
-        .await?;
         let descriptor = BlobDescriptor {
             object_kind: mapping.blob_key.object_kind(),
             byte_len: mapping.blob_key.exact_len(),
@@ -1274,14 +1302,6 @@ impl<D: PageDevice> SegmentStore<D> {
             tree_node_count: BlobGeometry::for_len(mapping.blob_key.exact_len())?.tree_node_count(),
             root: mapping.blob_key.merkle_root(),
         };
-        let header = read_manifest_range(&self.device, state, &manifest, 0, HEADER_SIZE).await?;
-        let header: &[u8; HEADER_SIZE] = header
-            .as_slice()
-            .try_into()
-            .map_err(|_| StoreError::Corrupt)?;
-        if BlobDescriptor::decode_header(header)? != descriptor {
-            return Err(StoreError::Corrupt.into());
-        }
         Ok((descriptor, manifest))
     }
 
@@ -1366,6 +1386,96 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
     verify_resolved_blob(device, state, descriptor, manifest).await
 }
 
+async fn validate_resolved_manifest<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    descriptor: BlobDescriptor,
+    manifest: &BlobManifest,
+) -> Result<(), CasStoreError<D::Error>> {
+    validate_cas_blob_descriptors(
+        device,
+        state.superblock.binding.store_uuid,
+        state.admitted_segments,
+        state.next_segment_generation,
+        state.generation,
+        manifest,
+    )
+    .await?;
+    let header = read_manifest_range(device, state, manifest, 0, HEADER_SIZE).await?;
+    let header: &[u8; HEADER_SIZE] = header
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Corrupt)?;
+    if BlobDescriptor::decode_header(header)? != descriptor {
+        return Err(StoreError::Corrupt.into());
+    }
+    Ok(())
+}
+
+async fn read_small_verified_blob<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    descriptor: BlobDescriptor,
+    manifest: &BlobManifest,
+) -> Result<Vec<u8>, CasStoreError<D::Error>> {
+    let mut requests = Vec::new();
+    requests
+        .try_reserve_exact(manifest.extents.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    requests.extend(manifest.extents.iter().map(|extent| {
+        (
+            extent.pointer,
+            ExtentKind::Blob,
+            CANONICAL_CONTENT_EXTENT_LEN as usize,
+        )
+    }));
+    let resolved = read_pointer_payloads(
+        device,
+        state.superblock.binding.store_uuid,
+        state.admitted_segments,
+        state.next_segment_generation,
+        state.generation,
+        &requests,
+    )
+    .await?;
+    if resolved.len() != manifest.extents.len() {
+        return Err(StoreError::Corrupt.into());
+    }
+    let encoded_len =
+        usize::try_from(manifest.encoded_blob_len).map_err(|_| StoreError::MemoryLimit)?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (declared, observed) in manifest.extents.iter().zip(&resolved) {
+        let extent = observed.extent;
+        if encoded.len() as u64 != declared.encoded_offset
+            || extent.extent_kind != ExtentKind::Blob
+            || extent.object_kind != descriptor.object_kind
+            || extent.extent_index != declared.extent_index
+            || extent.extent_count != declared.extent_count
+            || extent.content_byte_len != descriptor.byte_len
+            || extent.encoded_blob_len != manifest.encoded_blob_len
+            || extent.encoded_offset != declared.encoded_offset
+            || extent.payload_byte_len != declared.payload_byte_len
+            || extent.merkle_root != descriptor.root
+            || observed.bytes.len() as u64 != declared.payload_byte_len
+        {
+            return Err(StoreError::Corrupt.into());
+        }
+        encoded.extend_from_slice(&observed.bytes);
+    }
+    if encoded.len() != encoded_len {
+        return Err(StoreError::Corrupt.into());
+    }
+    let blob = BlobView::decode(&encoded)?;
+    if blob.descriptor() != descriptor {
+        return Err(StoreError::Corrupt.into());
+    }
+    blob.verify_all()?;
+    Ok(blob.data().to_vec())
+}
+
 async fn verify_resolved_blob<D: PageDevice>(
     device: &D,
     state: &MountedState,
@@ -1409,6 +1519,57 @@ async fn verify_resolved_blob<D: PageDevice>(
         return Err(StoreError::Corrupt.into());
     }
     Ok(())
+}
+
+async fn read_and_verify_resolved_blob<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    descriptor: BlobDescriptor,
+    manifest: &BlobManifest,
+) -> Result<Vec<u8>, CasStoreError<D::Error>> {
+    let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
+    let exact_len = usize::try_from(descriptor.byte_len).map_err(|_| StoreError::MemoryLimit)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(exact_len)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    let mut builder = StreamingMerkle::begin(
+        descriptor.object_kind,
+        descriptor.byte_len,
+        EmissionSink::new(),
+    )
+    .map_err(map_streaming_error)?;
+    for index in 0..geometry.leaf_count() {
+        if descriptor.byte_len == 0 {
+            break;
+        }
+        let chunk_len = descriptor
+            .byte_len
+            .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
+            .min(LEAF_SIZE as u64) as usize;
+        let bytes = read_manifest_range(
+            device,
+            state,
+            manifest,
+            HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
+            chunk_len,
+        )
+        .await?;
+        builder
+            .push_chunk(index, &bytes)
+            .map_err(map_streaming_error)?;
+        output.extend_from_slice(&bytes);
+        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+    }
+    while builder.padding_remaining().map_err(map_streaming_error)? != 0 {
+        builder.pad_next().map_err(map_streaming_error)?;
+        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+    }
+    let computed = builder.finalize().map_err(map_streaming_error)?;
+    if computed.descriptor != descriptor || output.len() != exact_len {
+        return Err(StoreError::Corrupt.into());
+    }
+    Ok(output)
 }
 
 impl<D: PageDevice> Drop for BlobWriter<'_, D> {

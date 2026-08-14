@@ -1450,6 +1450,7 @@ fn codec_error<E>(error: CodecError) -> StoreError<E> {
 
 pub(crate) struct ScannedSegment {
     pub(crate) matched: Option<ExtentRecord>,
+    additional_matches: Vec<ExtentRecord>,
     pub(crate) record_count: u32,
     pub(crate) total_payload_bytes: u64,
     pub(crate) segment_seal_body_sha256: [u8; 32],
@@ -1464,6 +1465,28 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     next_segment_generation: u64,
     checkpoint_generation: u64,
     pointer: PointerValue,
+) -> Result<ScannedSegment, StoreError<D::Error>> {
+    scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        &[],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_segment_with_matches<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PointerValue,
+    additional: &[PointerValue],
 ) -> Result<ScannedSegment, StoreError<D::Error>> {
     if pointer.store_uuid != store_uuid
         || pointer.segment_no >= admitted_segments
@@ -1510,6 +1533,10 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     let mut first_target = 0_u64;
     let mut last_target = 0_u64;
     let mut matched = None;
+    let mut additional_matches = Vec::new();
+    additional_matches
+        .try_reserve_exact(additional.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
     for ordinal in 1..=summary.value().record_count {
         let descriptor_pages = read_pair(device, base + u64::from(relative)).await?;
         let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
@@ -1566,6 +1593,11 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         if relative == pointer.descriptor_relative_page && ordinal == pointer.ordinal {
             matched = Some(value);
         }
+        for wanted in additional {
+            if relative == wanted.descriptor_relative_page && ordinal == wanted.ordinal {
+                additional_matches.push(value);
+            }
+        }
         relative = relative
             .checked_add(value.record_span_pages)
             .ok_or(StoreError::Corrupt)?;
@@ -1598,8 +1630,12 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     {
         return Err(StoreError::Corrupt);
     }
+    if additional_matches.len() != additional.len() {
+        return Err(StoreError::Corrupt);
+    }
     Ok(ScannedSegment {
         matched,
+        additional_matches,
         record_count: summary_value.record_count,
         total_payload_bytes: summary_value.total_payload_bytes,
         segment_seal_body_sha256: segment_seal.digest().body_sha256(),
@@ -1726,13 +1762,24 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
         }
         return Ok(resolved);
     }
-    let scanned = scan_segment(
+    let mut additional = Vec::new();
+    additional
+        .try_reserve_exact(requests.len().saturating_sub(1))
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (pointer, _, _) in &requests[1..] {
+        let PhysicalPointer::Value(pointer) = pointer else {
+            return Err(StoreError::Corrupt);
+        };
+        additional.push(*pointer);
+    }
+    let scanned = scan_segment_with_matches(
         device,
         store_uuid,
         admitted_segments,
         next_segment_generation,
         checkpoint_generation,
         first,
+        &additional,
     )
     .await?;
     let base = segment_base_page(first.segment_no)?;
@@ -1740,7 +1787,7 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
     resolved
         .try_reserve_exact(requests.len())
         .map_err(|_| StoreError::MemoryLimit)?;
-    for (physical, kind, maximum_bytes) in requests.iter().copied() {
+    for (request_index, (physical, kind, maximum_bytes)) in requests.iter().copied().enumerate() {
         let PhysicalPointer::Value(pointer) = physical else {
             return Err(StoreError::Corrupt);
         };
@@ -1755,11 +1802,19 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
         {
             return Err(StoreError::Corrupt);
         }
-        let descriptor_pages =
-            read_pair(device, base + u64::from(pointer.descriptor_relative_page)).await?;
-        let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
-            DecodeStatus::Sealed(value) => *value.value(),
-            _ => return Err(StoreError::Corrupt),
+        let extent = if request_index == 0 {
+            scanned.matched.ok_or(StoreError::Corrupt)?
+        } else {
+            scanned
+                .additional_matches
+                .iter()
+                .copied()
+                .find(|extent| {
+                    extent.binding.ordinal == pointer.ordinal
+                        && extent.binding.self_page
+                            == base + u64::from(pointer.descriptor_relative_page)
+                })
+                .ok_or(StoreError::Corrupt)?
         };
         resolved.push(
             read_pointer_payload_after_scan(

@@ -15,6 +15,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::future::Future;
+use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -1672,6 +1673,140 @@ pub trait ComponentCommandRunner: Send + Sync {
     fn run<'a>(&'a self, stage: PreparedComponentStage) -> ComponentCommandFuture<'a>;
 }
 
+/// Opaque, non-owning reference to one Component invocation managed by the
+/// trusted SYSTEM lifecycle service.
+///
+/// Copying this value neither extends the invocation's lifetime nor grants
+/// authority over its child task, arena, or CSpace. Safe code can observe and
+/// return a token supplied by [`ManagedComponentLifecycle`], but cannot forge
+/// one or extract the lifecycle-private lookup key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ManagedComponentToken(NonZeroU64);
+
+impl ManagedComponentToken {
+    /// Construct a token at the trusted lifecycle boundary.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must name a live entry in the implementing lifecycle service and
+    /// must never be reused while an older generation can still be observed.
+    pub const unsafe fn from_trusted_raw(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+
+    /// Recover the lifecycle-private lookup key.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the same trusted lifecycle implementation that
+    /// issued this token. The returned value must not be accepted as identity
+    /// without that service's full generation and object-identity checks.
+    pub const unsafe fn trusted_raw(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for ManagedComponentToken {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ManagedComponentToken(<opaque>)")
+    }
+}
+
+/// Copy-only state published by a trusted managed Component lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedComponentState {
+    /// The child remains live. VSH yields between bounded scalar reads; the
+    /// SSH supervisor must provide the enclosing timeout/cancellation bound.
+    Running,
+    /// Stable terminal scalar. Once returned for a token, every later exact
+    /// lookup must return the same value.
+    Complete(ComponentTerminal),
+    /// The token no longer resolves exactly. VSH fails closed and never asks
+    /// the lifecycle to reclaim an ambiguous instance.
+    Lost,
+}
+
+/// Result of a cooperative cancellation request for a managed invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedComponentCancel {
+    /// The lifecycle atomically published a cooperative cancel word and woke
+    /// the exact child. `state` may remain `Running` until a next/future child
+    /// poll observes the word and publishes terminal state; under the enclosing
+    /// SSH supervisor bound it must eventually leave `Running`, or return
+    /// `Lost` and apply the mismatch quarantine contract.
+    Requested,
+    /// The exact token already has a stable [`ManagedComponentState::Complete`]
+    /// value; cancellation did not change or republish terminal state.
+    AlreadyComplete,
+    /// The token did not resolve exactly. The lifecycle remains responsible
+    /// for quarantining or conservatively leaking the ambiguous instance.
+    Lost,
+}
+
+/// Trusted SYSTEM boundary for the narrow, scalar-only SSH Component path.
+///
+/// # Safety
+///
+/// Implementations must be globally stable for the lifetime of every token,
+/// and `manifest` must return one immutable, image-admitted pin for the entire
+/// lifetime of the service. Every `start` must execute exactly that manifest;
+/// it may not select bytes, entrypoints, or policy from caller-controlled
+/// state.
+///
+/// Before `start` returns a token, the implementation must have completed the
+/// full registry binding, SYSTEM control-record installation, and exclusive
+/// executor publication transaction. The registry owns the runtime payload,
+/// arena, and CSpace. The published Component child future may contain only
+/// the opaque core registry token; VSH's token is a separate non-owning lookup
+/// key. A failed or partially published `start` leaves no resource owned by
+/// VSH: the lifecycle must fail-stop, quarantine, or conservatively leak it.
+/// `start` may install a registry-owned lazy driver containing only static pin
+/// and copy fields; no trait method may construct, poll, or drop the runtime
+/// payload on the VSH caller, or re-enter/drive executor task polling.
+///
+/// Every method must be bounded and nonblocking. No method may poll WASM, call
+/// `TaskHandle::cancel`, allocate in caller-owned storage, or retain any caller
+/// reference, `Arc`, CSpace, `OutputSink`, or other VSH execution object. Any
+/// allocation must be charged to lifecycle-owned SYSTEM/reserved storage.
+/// `state` may only read a stable copy-only scalar; `Complete` is immutable.
+/// `request_cancel` may only atomically set a cooperative cancellation word
+/// and wake the exact child. No trait method may terminalize, drop, reclaim,
+/// unregister, retire, or reset child state; those operations belong only to
+/// the independent SYSTEM lifecycle/child path.
+///
+/// `state` and `request_cancel` must at least verify the lifecycle-token
+/// generation/control entry plus TaskId/status, owner/arena domain, and Space
+/// structural identity. Cancellation only writes the stable word and wakes;
+/// it must not hold a registry lock while waiting for CSpace access. The next
+/// child poll performs the complete CSpace identity/incarnation gate. Before
+/// any irreversible fault reclaim, payload Drop/tombstone, owner retirement,
+/// or reset, the lifecycle must simultaneously verify generation, TaskId and
+/// status, owner/arena, Space object identity, and CSpace object identity plus
+/// incarnation. Any mismatch must quarantine and conservatively leak or
+/// fail-stop; it must never reset or reclaim. A parent VSH fault does not
+/// authorize reclaim of its managed child. Terminal collection and CSpace
+/// reset remain entirely internal to a SYSTEM lifecycle task after the child
+/// has published terminal state.
+pub unsafe trait ManagedComponentLifecycle: Send + Sync + 'static {
+    /// Immutable manifest for the one image-admitted Component pinned to this
+    /// service. Installation snapshots and compares it with independent image
+    /// policy before the command becomes visible.
+    fn manifest(&self) -> &ComponentCommandManifest;
+
+    /// Allocate and start one zero-argument, closed-input invocation. This is
+    /// called only after every shell grammar, image-policy, session-policy,
+    /// and immutable-manifest gate has passed.
+    fn start(&self) -> Result<ManagedComponentToken, ComponentTerminal>;
+
+    /// Read copy-only lifecycle state for a token. This is a completion-table
+    /// lookup, not a future/WASM poll operation.
+    fn state(&self, token: ManagedComponentToken) -> ManagedComponentState;
+
+    /// Request cooperative cancellation. The lifecycle wakes its owned child;
+    /// VSH never cancels or retains that child's executor handle.
+    fn request_cancel(&self, token: ManagedComponentToken) -> ManagedComponentCancel;
+}
+
 #[derive(Clone)]
 enum Applet {
     Echo,
@@ -1692,6 +1827,10 @@ enum Applet {
     Component {
         manifest: Arc<ComponentCommandManifest>,
         runner: Arc<dyn ComponentCommandRunner>,
+    },
+    ManagedComponent {
+        manifest: Arc<ComponentCommandManifest>,
+        lifecycle: &'static dyn ManagedComponentLifecycle,
     },
 }
 
@@ -2033,12 +2172,14 @@ struct PreflightStage {
     command_source: Cap,
     manifest: CommandManifest,
     component: Option<Arc<ComponentCommandManifest>>,
+    managed_component: bool,
 }
 
 /// Synchronous, inert result of validating every stage in one pipeline.
 /// It owns the syntax and immutable manifest snapshots but no candidate task,
 /// stream, CSpace, or live object pointer that can perform an operation.
 pub struct PipelinePreflight {
+    owner_identity: Arc<SessionIdentity>,
     stages: Vec<PreflightStage>,
 }
 
@@ -2065,6 +2206,7 @@ struct PreparedStage {
     _stderr: LocalIo,
     component_authorities: Vec<PreparedComponentAuthority>,
     is_component: bool,
+    is_managed_component: bool,
     result: Arc<SpinLock<Option<StageExit>>>,
 }
 
@@ -2072,6 +2214,7 @@ struct PreparedStage {
 /// bounded value expansion, but no stage task or runner is started until
 /// [`PreparedPipeline::commit`].
 pub struct PreparedPipeline {
+    owner_identity: Arc<SessionIdentity>,
     owner: Arc<SpinLock<CSpace>>,
     id: u64,
     admission: CSpace,
@@ -2184,6 +2327,7 @@ impl BlockOutcome {
 }
 
 pub struct Session {
+    identity: Arc<SessionIdentity>,
     cspace: Arc<SpinLock<CSpace>>,
     commands: BTreeMap<String, Cap>,
     capabilities: BTreeMap<String, Cap>,
@@ -2202,6 +2346,11 @@ pub struct Session {
     ssh_exec_policy_commands: BTreeSet<String>,
     profile: SessionProfile,
 }
+
+/// Unforgeable in-process identity for one Session value. Prepared work is
+/// bound to this object as well as its CSpace so two SSH sessions sharing a
+/// supervisor-provided CSpace cannot reuse each other's installed policy.
+struct SessionIdentity;
 
 /// Commands and syntax made available when constructing a shell session.
 ///
@@ -2239,6 +2388,7 @@ impl Session {
         let mut capabilities = BTreeMap::new();
         capabilities.insert("console".to_string(), console_cap);
         let mut session = Self {
+            identity: Arc::new(SessionIdentity),
             cspace,
             commands: BTreeMap::new(),
             capabilities,
@@ -2369,6 +2519,69 @@ impl Session {
         Ok(())
     }
 
+    /// Install the narrow managed-Component path selected by explicit image
+    /// and SSH-session policy.
+    ///
+    /// Unlike [`Self::install_ssh_exec_component_command`], this accepts only
+    /// a globally stable trusted lifecycle service and installs the distinct
+    /// [`Applet::ManagedComponent`] variant. An ordinary runner can therefore
+    /// never masquerade as a registry-managed invocation. The current managed
+    /// ABI is deliberately scalar-only: zero arguments, closed stdin, and no
+    /// delegated authorities.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the trusted SSH platform installation hook. In the
+    /// same accepted-session transaction, immediately before this call, it
+    /// must have revalidated an exact `AuthorizedProfile`: profile id and
+    /// generation, nonzero policy incarnation, command name, and artifact
+    /// digest. It must also independently match the complete manifest against
+    /// the image-admitted pin. Interactive, onboarding, and default sessions
+    /// must never call this function, even if they can construct an `SshExec`
+    /// Session value. `lifecycle` must satisfy every invariant of the unsafe
+    /// [`ManagedComponentLifecycle`] contract.
+    pub unsafe fn install_ssh_exec_managed_component_command(
+        &mut self,
+        policy: &SshExecComponentPolicy,
+        lifecycle: &'static dyn ManagedComponentLifecycle,
+    ) -> Result<(), Diagnostic> {
+        if self.profile != SessionProfile::SshExec {
+            return Err(Diagnostic::new(
+                0,
+                0,
+                "managed SSH component policy requires an SSH exec session",
+            ));
+        }
+        let source_manifest = lifecycle.manifest();
+        if !policy.admits(source_manifest) {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "managed component lifecycle does not match SSH image policy",
+            ));
+        }
+        if source_manifest.min_args != 0
+            || source_manifest.max_args != 0
+            || source_manifest.stdin != StreamMode::Closed
+            || !source_manifest.requirements.is_empty()
+        {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "managed SSH component contract is not scalar-only",
+            ));
+        }
+
+        // Query the lifecycle manifest exactly once. Copy the same value that
+        // passed the independent policy comparison; execution will compare a
+        // fresh read before `start` and fail closed if trusted setup mutated.
+        let manifest = Self::snapshot_component_manifest(source_manifest)?;
+        let name = manifest.name.clone();
+        self.install_managed_component_command_inner(manifest, lifecycle)?;
+        self.ssh_exec_policy_commands.insert(name);
+        Ok(())
+    }
+
     fn snapshot_component_manifest(
         source_manifest: &ComponentCommandManifest,
     ) -> Result<ComponentCommandManifest, Diagnostic> {
@@ -2440,6 +2653,50 @@ impl Session {
         let command = Arc::new(Command {
             manifest: general,
             applet: Applet::Component { manifest, runner },
+        });
+        let cap = self.cspace.lock().mint(
+            command,
+            Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
+        );
+        self.commands.insert(name, cap);
+        Ok(())
+    }
+
+    fn install_managed_component_command_inner(
+        &mut self,
+        manifest: ComponentCommandManifest,
+        lifecycle: &'static dyn ManagedComponentLifecycle,
+    ) -> Result<(), Diagnostic> {
+        manifest.validate(Span {
+            start: 0,
+            end: manifest.name.len(),
+        })?;
+        if self.commands.contains_key(&manifest.name)
+            || self.functions.contains_key(&manifest.name)
+            || is_special_form(&manifest.name)
+        {
+            return Err(Diagnostic::new(
+                0,
+                manifest.name.len(),
+                "component command name is already registered",
+            ));
+        }
+        if self.commands.len() >= 128 {
+            return Err(Diagnostic::new(
+                0,
+                manifest.name.len(),
+                "visible command limit exceeded",
+            ));
+        }
+        let name = manifest.name.clone();
+        let general = manifest.command_manifest();
+        let manifest = Arc::new(manifest);
+        let command = Arc::new(Command {
+            manifest: general,
+            applet: Applet::ManagedComponent {
+                manifest,
+                lifecycle,
+            },
         });
         let cap = self.cspace.lock().mint(
             command,
@@ -3313,7 +3570,7 @@ impl Session {
                 self.preflight_redirect(redirect)?;
             }
 
-            let component = match &command.applet {
+            let (component, managed_component) = match &command.applet {
                 Applet::Component { manifest, runner } => {
                     manifest.validate(command_ast.span)?;
                     if runner.manifest() != manifest.as_ref() {
@@ -3327,9 +3584,63 @@ impl Session {
                         self.preflight_component_authority(requirement, command_ast.span)?;
                     }
                     component_preflights.push((command_ast.span, manifest.clone(), runner.clone()));
-                    Some(manifest.clone())
+                    (Some(manifest.clone()), false)
                 }
-                _ => None,
+                Applet::ManagedComponent {
+                    manifest,
+                    lifecycle,
+                } => {
+                    manifest.validate(command_ast.span)?;
+                    if ast.commands.len() != 1 {
+                        return Err(Diagnostic::new(
+                            ast.span.start,
+                            ast.span.end,
+                            "managed component must be the only pipeline stage",
+                        ));
+                    }
+                    if !command_ast.redirects.is_empty() {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component redirection is not allowed",
+                        ));
+                    }
+                    if literal_word(&command_ast.name) != Some(manifest.name())
+                        || command_ast.args.iter().any(|argument| match argument {
+                            Argument::Word(word) => !word
+                                .parts
+                                .iter()
+                                .all(|part| matches!(part, WordPart::Literal(_))),
+                            Argument::Capability { .. } => true,
+                        })
+                    {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component substitution is not allowed",
+                        ));
+                    }
+                    if lifecycle.manifest() != manifest.as_ref() {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component manifest changed after installation",
+                        ));
+                    }
+                    if manifest.min_args != 0
+                        || manifest.max_args != 0
+                        || manifest.stdin != StreamMode::Closed
+                        || !manifest.requirements.is_empty()
+                    {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed SSH component contract is not scalar-only",
+                        ));
+                    }
+                    (Some(manifest.clone()), true)
+                }
+                _ => (None, false),
             };
             stages.push(PreflightStage {
                 command: command_ast.clone(),
@@ -3337,6 +3648,7 @@ impl Session {
                 command_source,
                 manifest,
                 component,
+                managed_component,
             });
         }
 
@@ -3354,7 +3666,10 @@ impl Session {
                 .preflight(&manifest)
                 .map_err(|terminal| component_preflight_diagnostic(span, terminal))?;
         }
-        Ok(PipelinePreflight { stages })
+        Ok(PipelinePreflight {
+            owner_identity: self.identity.clone(),
+            stages,
+        })
     }
 
     fn preflight_command_name(&self, word: &Word) -> Result<String, Diagnostic> {
@@ -3522,7 +3837,10 @@ impl Session {
                     })?;
                 if matches!(
                     command_resource.applet,
-                    Applet::Host { .. } | Applet::AsyncHost { .. } | Applet::Component { .. }
+                    Applet::Host { .. }
+                        | Applet::AsyncHost { .. }
+                        | Applet::Component { .. }
+                        | Applet::ManagedComponent { .. }
                 ) {
                     return Err(Diagnostic::new(
                         outer_span.start,
@@ -3701,8 +4019,18 @@ impl Session {
         &mut self,
         preflight: PipelinePreflight,
     ) -> Result<PreparedPipeline, Diagnostic> {
+        let PipelinePreflight {
+            owner_identity,
+            stages: preflight_stages,
+        } = preflight;
+        if !Arc::ptr_eq(&owner_identity, &self.identity) {
+            return Err(Diagnostic::new(
+                0,
+                0,
+                "pipeline preflight belongs to another session",
+            ));
+        }
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
-        let preflight_stages = preflight.stages;
         let mut admission = CSpace::new("vsh-admission");
         let mut pipes = Vec::new();
         let mut roots = Vec::new();
@@ -3869,6 +4197,7 @@ impl Session {
                 _stderr: stderr,
                 component_authorities,
                 is_component: preflight_stage.component.is_some(),
+                is_managed_component: preflight_stage.managed_component,
                 result: Arc::new(SpinLock::new(None)),
             });
         }
@@ -3903,6 +4232,7 @@ impl Session {
             stage.args = args;
         }
         Ok(PreparedPipeline {
+            owner_identity: self.identity.clone(),
             owner: self.cspace.clone(),
             id,
             admission,
@@ -3931,13 +4261,15 @@ impl PreparedPipeline {
         background: bool,
     ) -> Result<JobReport, Diagnostic> {
         let Self {
+            owner_identity,
             owner,
             id,
             admission,
             pipes,
             stages,
         } = self;
-        if !Arc::ptr_eq(&owner, &session.cspace) {
+        if !Arc::ptr_eq(&owner_identity, &session.identity) || !Arc::ptr_eq(&owner, &session.cspace)
+        {
             return Err(Diagnostic::new(
                 0,
                 0,
@@ -3948,6 +4280,34 @@ impl PreparedPipeline {
             live: Arc::new(AtomicBool::new(true)),
             pipes: pipes.clone(),
         };
+        let managed_stages = stages
+            .iter()
+            .filter(|stage| stage.is_managed_component)
+            .count();
+        if managed_stages != 0 {
+            if session.profile != SessionProfile::SshExec {
+                return Err(Diagnostic::new(
+                    0,
+                    0,
+                    "managed component requires an SSH exec session",
+                ));
+            }
+            if managed_stages != 1 || stages.len() != 1 {
+                return Err(Diagnostic::new(
+                    0,
+                    0,
+                    "managed component must be the only pipeline stage",
+                ));
+            }
+            if background {
+                return Err(Diagnostic::new(
+                    0,
+                    0,
+                    "managed component must run in the foreground",
+                ));
+            }
+            return commit_managed_component(session, id, admission, stages, job).await;
+        }
         if heap::current_domain().arena.is_tracked() {
             // Existing kernel VSH/SSH supervisors run in audited raw-reclaim
             // arenas. Ordinary child commands inherit that exact domain and
@@ -4151,6 +4511,135 @@ impl PreparedPipeline {
             stage_reports,
         )
         .await)
+    }
+}
+
+/// Execute the managed SSH Component adapter in the calling VSH task. The
+/// lifecycle service owns and schedules the actual Component child; this
+/// adapter retains only its static service reference and opaque token while it
+/// waits for a copy-only completion scalar.
+async fn commit_managed_component(
+    session: &mut Session,
+    id: u64,
+    mut admission: CSpace,
+    mut stages: Vec<PreparedStage>,
+    job: JobControl,
+) -> Result<JobReport, Diagnostic> {
+    debug_assert_eq!(session.profile, SessionProfile::SshExec);
+    debug_assert_eq!(stages.len(), 1);
+    debug_assert!(stages[0].is_managed_component);
+    debug_assert!(job.pipes.is_empty());
+
+    if let Some(cap) = session.revoke_next_job.take() {
+        let _ = session.cspace.lock().revoke(cap);
+    }
+    if core::mem::take(&mut session.cancel_next_job) {
+        job.fail(Status::Cancelled);
+    }
+    let external_cancel = session.external_cancel.clone();
+    let stage = stages.pop().expect("managed stage gate required one stage");
+    let exit = run_managed_component_stage(&stage, &job, external_cancel.as_ref()).await;
+    *stage.result.lock() = Some(exit.clone());
+    close_stage_outputs(&stage, exit.status);
+    if severe(exit.status) {
+        job.fail(exit.status);
+    }
+    stage.cspace.lock().revoke_all();
+    admission.revoke_all();
+    job.live.store(false, Ordering::Release);
+
+    Ok(JobReport {
+        id,
+        status: exit.status,
+        stages: vec![StageReport {
+            stage: 0,
+            status: exit.status,
+            detail: exit.detail,
+        }],
+        output: session.console.take_string(),
+        peak_pipe_depth: 0,
+    })
+}
+
+async fn run_managed_component_stage(
+    stage: &PreparedStage,
+    job: &JobControl,
+    external_cancel: Option<&Arc<AtomicBool>>,
+) -> StageExit {
+    let command = match stage
+        .cspace
+        .lock()
+        .lookup_as::<Command>(stage.command, Rights::INVOKE)
+    {
+        Ok(command) => command,
+        Err(_) => return managed_component_exit(ComponentTerminal::Denied),
+    };
+    let lifecycle = match &command.applet {
+        Applet::ManagedComponent {
+            manifest,
+            lifecycle,
+        } if lifecycle.manifest() == manifest.as_ref() => *lifecycle,
+        _ => {
+            return managed_component_exit(ComponentTerminal::BackendFault);
+        }
+    };
+    // The async adapter retains only the static service reference across
+    // `start` and subsequent yields. In particular, it does not keep the
+    // stage-local Command Arc (and its manifest) live alongside the child.
+    drop(command);
+    if external_cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+        job.fail(Status::Cancelled);
+    }
+    if !job.live.load(Ordering::Acquire) {
+        return managed_component_exit(ComponentTerminal::Cancelled);
+    }
+
+    let token = match lifecycle.start() {
+        Ok(token) => token,
+        Err(
+            terminal @ (ComponentTerminal::Denied
+            | ComponentTerminal::Unavailable
+            | ComponentTerminal::BackendFault
+            | ComponentTerminal::BudgetExceeded
+            | ComponentTerminal::Cancelled
+            | ComponentTerminal::RunnerFault
+            | ComponentTerminal::Trapped(_)),
+        ) => return managed_component_exit(terminal),
+        Err(ComponentTerminal::Success | ComponentTerminal::Returned(_)) => {
+            return managed_component_exit(ComponentTerminal::BackendFault);
+        }
+    };
+    let mut cancel_requested = false;
+    loop {
+        if external_cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+            job.fail(Status::Cancelled);
+        }
+        if !job.live.load(Ordering::Acquire) && !cancel_requested {
+            match lifecycle.request_cancel(token) {
+                ManagedComponentCancel::Requested | ManagedComponentCancel::AlreadyComplete => {
+                    cancel_requested = true;
+                }
+                ManagedComponentCancel::Lost => {
+                    return managed_component_exit(ComponentTerminal::RunnerFault);
+                }
+            }
+        }
+        match lifecycle.state(token) {
+            ManagedComponentState::Running => exec::yield_now().await,
+            ManagedComponentState::Complete(terminal) => {
+                return managed_component_exit(terminal);
+            }
+            ManagedComponentState::Lost => {
+                return managed_component_exit(ComponentTerminal::RunnerFault);
+            }
+        }
+    }
+}
+
+const fn managed_component_exit(terminal: ComponentTerminal) -> StageExit {
+    StageExit {
+        status: terminal.status(),
+        detail: TerminalDetail::Component(terminal),
     }
 }
 
@@ -4650,7 +5139,7 @@ async fn run_stage(stage: &PreparedStage, job: &JobControl) -> StageExit {
     };
     if !job.live.load(Ordering::Acquire) {
         return match &command.applet {
-            Applet::Component { .. } => StageExit {
+            Applet::Component { .. } | Applet::ManagedComponent { .. } => StageExit {
                 status: Status::Cancelled,
                 detail: TerminalDetail::Component(ComponentTerminal::Cancelled),
             },
@@ -4728,6 +5217,11 @@ async fn run_stage(stage: &PreparedStage, job: &JobControl) -> StageExit {
         },
         Applet::Component { manifest, runner } => {
             return run_component_stage(stage, job, manifest.clone(), runner.clone()).await;
+        }
+        Applet::ManagedComponent { .. } => {
+            // Managed invocations must take the dedicated direct adapter path,
+            // which never owns or cancels the lifecycle's child task handle.
+            return managed_component_exit(ComponentTerminal::BackendFault);
         }
     };
     command_exit(status)

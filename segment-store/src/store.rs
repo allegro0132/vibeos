@@ -531,6 +531,18 @@ pub struct SegmentStore<D> {
     pub(crate) typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
     pub(crate) maintenance_domain: alloc::sync::Arc<MaintenanceDomain>,
     pub(crate) quota: Option<PrincipalQuotaTable>,
+    /// Runtime cache of CAS blob keys whose payloads were verified against
+    /// the logical record stream during a promotion readback. Entries are
+    /// content-addressed and refer to immutable sealed segments, so the cache
+    /// remains valid across in-process GC mounts and prevents the steady-state
+    /// append path from re-verifying every historical object on each commit.
+    pub(crate) promotion_verified: alloc::collections::BTreeSet<crate::cas_codec::BlobKey>,
+    /// Runtime cache of CAS blob keys whose existing on-media manifest was
+    /// fully compare-verified against freshly recomputed content hashes by a
+    /// deduplicating commit. Sealed segments are immutable and a mismatch is
+    /// already the fatal hash-collision path, so one verification per key per
+    /// process carries the same guarantee as re-scanning on every duplicate.
+    pub(crate) dedup_verified: alloc::collections::BTreeSet<crate::cas_codec::BlobKey>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -554,6 +566,8 @@ impl<D: PageDevice> SegmentStore<D> {
             typed_reference_kinds: runtime.typed_reference_kinds,
             maintenance_domain: runtime.maintenance_domain,
             quota: runtime.quota,
+            promotion_verified: alloc::collections::BTreeSet::new(),
+            dedup_verified: alloc::collections::BTreeSet::new(),
         }
     }
 

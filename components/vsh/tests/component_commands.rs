@@ -20,8 +20,7 @@ static TRACKED_COMPONENT_CLOSED: AtomicUsize = AtomicUsize::new(0);
 static TRACKED_COMPONENT_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn unexpected_tracked_test_reclaim(
-    _primary_task: exec::TaskId,
-    _domain: AllocationDomain,
+    _witness: exec::ReclaimableFaultWitness,
 ) -> exec::FaultReclaimOutcome {
     panic!("tracked VSH compatibility test unexpectedly faulted")
 }

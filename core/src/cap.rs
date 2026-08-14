@@ -2005,18 +2005,18 @@ impl CSpace {
         self.collect()
     }
 
-    /// Retire every capability in one exactly identified volatile CSpace
-    /// incarnation.
+    /// Validate every reset precondition for one exactly identified volatile
+    /// CSpace incarnation without mutating capabilities or generations.
     ///
     /// All preconditions are checked before any derivation is killed. A stale
-    /// lifecycle token therefore cannot reset a different CSpace or a newer
-    /// incarnation, and durable state cannot be crossed by this volatile
-    /// lifecycle operation.
-    pub fn reset_exact(
-        &mut self,
+    /// lifecycle token therefore cannot authorize a later irreversible arena
+    /// operation for a different CSpace or a newer incarnation, and durable
+    /// state cannot be crossed by this volatile lifecycle operation.
+    pub fn preflight_reset_exact(
+        &self,
         expected_identity: CSpaceIdentity,
         expected_incarnation: u64,
-    ) -> Result<usize, CSpaceResetError> {
+    ) -> Result<(), CSpaceResetError> {
         if self.identity != expected_identity {
             return Err(CSpaceResetError::IdentityMismatch);
         }
@@ -2032,6 +2032,22 @@ impl CSpace {
         }) {
             return Err(CSpaceResetError::PersistentLifecycleRequired);
         }
+        self.incarnation
+            .checked_add(1)
+            .ok_or(CSpaceResetError::IncarnationExhausted)?;
+        Ok(())
+    }
+
+    /// Commit a reset after rechecking every exact precondition.  Lifecycle
+    /// code which must perform another irreversible operation first can call
+    /// [`Self::preflight_reset_exact`] while it still has a fail-closed branch,
+    /// then retain exclusive access until this commit.
+    pub fn reset_exact(
+        &mut self,
+        expected_identity: CSpaceIdentity,
+        expected_incarnation: u64,
+    ) -> Result<usize, CSpaceResetError> {
+        self.preflight_reset_exact(expected_identity, expected_incarnation)?;
         let next_incarnation = self
             .incarnation
             .checked_add(1)

@@ -78,7 +78,7 @@ extern crate alloc;
 #[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, exec, heap, interrupt, ipi, sync};
+pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
 #[cfg(feature = "qemu-virt")]
 pub use vibeos_driver_virtio_core as virtio;
 pub use vibeos_durable_format as durable;
@@ -94,6 +94,7 @@ mod bench_platform;
 mod board_led;
 mod cap_table_pool;
 mod code_pool;
+mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
@@ -687,12 +688,23 @@ pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) ->
 }
 
 /// Executor callback after every task and external registration in a tracked
-/// incarnation has been detached. The sealed World templates prove that no
-/// arena-backed pointer escaped, so raw reclamation is sound and runs no Drop.
+/// incarnation has been detached. Managed WASM instances first pass the
+/// generational registry gate; legacy components retain the sealed-World
+/// escape proof below. Raw reclamation never runs `Drop`.
 unsafe fn reclaim_faulted_component(
-    _primary_task: exec::TaskId,
-    domain: heap::AllocationDomain,
+    witness: exec::ReclaimableFaultWitness,
 ) -> exec::FaultReclaimOutcome {
+    match unsafe { component_instances::reclaim_faulted(witness) } {
+        component_instances::FaultRoute::ManagedReclaimed => {
+            return exec::FaultReclaimOutcome::Reclaimed;
+        }
+        component_instances::FaultRoute::Quarantined => {
+            return exec::FaultReclaimOutcome::Quarantined;
+        }
+        component_instances::FaultRoute::Legacy => {}
+    }
+
+    let domain = witness.allocation_domain();
     unsafe {
         // Repair component-stable synchronization state while the exact
         // faulting incarnation is still identifiable and before Faulted is

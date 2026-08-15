@@ -205,7 +205,7 @@ impl PersistentAuthorityTransientObjects {
             .map(|index| &self.objects[index])
             .filter(|handle| {
                 handle.object_kind() == object.object_kind.get()
-                    && handle.exact_len() == object.bytes.len() as u64
+                    && handle.exact_len() == object.byte_len()
             })
     }
 }
@@ -266,7 +266,7 @@ impl PersistentAuthorityView {
             .map(|index| &self.objects[index])
             .filter(|handle| {
                 handle.object_kind() == object.object_kind.get()
-                    && handle.exact_len() == object.bytes.len() as u64
+                    && handle.exact_len() == object.byte_len()
             })
     }
 }
@@ -777,7 +777,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 .map(|index| &view.objects[index])
                 .filter(|object| {
                     object.object_kind() == recovered.object_kind.get()
-                        && object.exact_len() == recovered.bytes.len() as u64
+                        && object.exact_len() == recovered.byte_len()
                 })
                 .ok_or(PersistentAuthorityError::PolicyMismatch)?;
             if !self
@@ -800,9 +800,34 @@ impl<D: PageDevice> SegmentStore<D> {
         recovered: &vibeos_durable_format::RecoveredObject,
     ) -> Result<bool, PersistentAuthorityError<D::Error>> {
         if object.object_kind() != recovered.object_kind.get()
-            || object.exact_len() != recovered.bytes.len() as u64
+            || object.exact_len() != recovered.byte_len()
         {
             return Ok(false);
+        }
+        if let Some(declared) = recovered.external_root {
+            // External content is authenticated by the CAS Merkle machinery:
+            // the blob key commits to the content root, and the cold proof
+            // requires a healthy scrub of every CAS payload. The structural
+            // check here is that the bound mapping's key names exactly the
+            // declared identity.
+            let key = object
+                .backend_handle()
+                .authority_key()
+                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+            let state = self.require_current_generation()?;
+            let matches = state.cas.as_ref().is_some_and(|cas| {
+                cas.objects
+                    .binary_search_by_key(&key.object_id(), |mapping| mapping.object_id)
+                    .ok()
+                    .map(|index| cas.objects[index])
+                    .is_some_and(|mapping| {
+                        mapping.commit_generation == key.commit_generation()
+                            && mapping.blob_key.object_kind() == recovered.object_kind.get()
+                            && mapping.blob_key.exact_len() == recovered.byte_len()
+                            && mapping.blob_key.merkle_root() == declared
+                    })
+            });
+            return Ok(matches);
         }
         let expected = BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
             .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
@@ -901,7 +926,7 @@ impl<D: PageDevice> SegmentStore<D> {
 
     async fn install_persistent_import(
         &mut self,
-        import: PersistentAuthorityImport,
+        mut import: PersistentAuthorityImport,
         transient_ids: BTreeSet<u128>,
         charged_ids: BTreeSet<u128>,
         _lease: MaintenanceOperationLease,
@@ -911,6 +936,12 @@ impl<D: PageDevice> SegmentStore<D> {
         PersistentAuthorityError<D::Error>,
     > {
         validate_quota_totals(&import, None)?;
+        // Content for external objects committed by this exact append. A
+        // re-install (cold recovery, migration replace, compaction) carries
+        // no payloads: external objects then bind to their already-durable
+        // blobs through promotion, and a fresh external object without a
+        // payload or an existing blob fails closed below.
+        let external_payloads = core::mem::take(&mut import.external_payloads);
         // Captured for the successor's committed-set cache before the import
         // moves into the snapshot.
         let imported_committed_ids: BTreeSet<u128> = import
@@ -987,7 +1018,7 @@ impl<D: PageDevice> SegmentStore<D> {
                         !claimed_v2_object_ids.contains(&mapping.object_id)
                             && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                             && mapping.blob_key.object_kind() == recovered.object_kind.get()
-                            && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
+                            && mapping.blob_key.exact_len() == recovered.byte_len()
                             && mapping.blob_key.merkle_root() == root
                             && table.has_active_persistent_candidate(stable_id, mapping.object_id)
                     })
@@ -1006,7 +1037,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 .filter(|object| reservation_ids.contains(&object.object_id.get()))
             {
                 let reservation =
-                    self.reserve_blob_quota(principal, recovered.bytes.len() as u64)?;
+                    self.reserve_blob_quota(principal, recovered.byte_len())?;
                 quota_reservations.push((recovered.object_id.get(), reservation));
             }
             quota_reservations.sort_unstable_by_key(|(stable_id, _)| *stable_id);
@@ -1137,7 +1168,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 let (_, reservation) = quota_reservations.remove(index);
                 self.begin_blob_with_quota_reservation(
                     recovered.object_kind.get(),
-                    recovered.bytes.len() as u64,
+                    recovered.byte_len(),
                     reservation,
                 )?
             } else {
@@ -1145,15 +1176,30 @@ impl<D: PageDevice> SegmentStore<D> {
                     Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
                     None => self.begin_blob_for_persistent_import(
                         recovered.object_kind.get(),
-                        recovered.bytes.len() as u64,
+                        recovered.byte_len(),
                     )?,
                 }
             };
             writer.enable_staged_batching();
-            for chunk in recovered.bytes.chunks(LEAF_SIZE) {
+            let content: &[u8] = match recovered.external_root {
+                Some(_) => external_payloads
+                    .get(&stable_id)
+                    .map(|bytes| bytes.as_slice())
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?,
+                None => &recovered.bytes,
+            };
+            for chunk in content.chunks(LEAF_SIZE) {
                 writer.write_chunk(chunk).await?;
             }
             let staged = Box::pin(writer.stage_commit()).await?;
+            // The staged blob's content address must equal the identity the
+            // record stream declares, or the stream would durably reference
+            // content that never existed.
+            if let Some(declared) = recovered.external_root {
+                if staged.blob_key.merkle_root() != declared {
+                    return Err(PersistentAuthorityError::PolicyMismatch);
+                }
+            }
             let mut bindings: Vec<PersistentObjectBinding> = reusable_bindings
                 .into_iter()
                 .filter(|binding| import.is_admitted(binding.stable_object_id))
@@ -1283,7 +1329,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 let (_, reservation) = quota_reservations.remove(index);
                 self.begin_blob_with_quota_reservation(
                     recovered.object_kind.get(),
-                    recovered.bytes.len() as u64,
+                    recovered.byte_len(),
                     reservation,
                 )?
             } else {
@@ -1291,11 +1337,18 @@ impl<D: PageDevice> SegmentStore<D> {
                     Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
                     None => self.begin_blob_for_persistent_import(
                         recovered.object_kind.get(),
-                        recovered.bytes.len() as u64,
+                        recovered.byte_len(),
                     )?,
                 }
             };
-            for chunk in recovered.bytes.chunks(LEAF_SIZE) {
+            let content: &[u8] = match recovered.external_root {
+                Some(_) => external_payloads
+                    .get(&recovered.object_id.get())
+                    .map(|bytes| bytes.as_slice())
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?,
+                None => &recovered.bytes,
+            };
+            for chunk in content.chunks(LEAF_SIZE) {
                 writer.write_chunk(chunk).await?;
             }
             // `BlobWriter::commit` is already split into sub-16 KiB raw
@@ -1330,7 +1383,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     let (_, reservation) = quota_reservations.remove(index);
                     self.begin_blob_with_quota_reservation(
                         recovered.object_kind.get(),
-                        recovered.bytes.len() as u64,
+                        recovered.byte_len(),
                         reservation,
                     )?
                 } else {
@@ -1338,11 +1391,18 @@ impl<D: PageDevice> SegmentStore<D> {
                         Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
                         None => self.begin_blob_for_persistent_import(
                             recovered.object_kind.get(),
-                            recovered.bytes.len() as u64,
+                            recovered.byte_len(),
                         )?,
                     }
                 };
-                for chunk in recovered.bytes.chunks(LEAF_SIZE) {
+                let content: &[u8] = match recovered.external_root {
+                    Some(_) => external_payloads
+                        .get(&recovered.object_id.get())
+                        .map(|bytes| bytes.as_slice())
+                        .ok_or(PersistentAuthorityError::PolicyMismatch)?,
+                    None => &recovered.bytes,
+                };
+                for chunk in content.chunks(LEAF_SIZE) {
                     writer.write_chunk(chunk).await?;
                 }
                 let object = Box::pin(writer.commit()).await?;
@@ -1800,7 +1860,13 @@ impl<D: PageDevice> SegmentStore<D> {
     ) -> Result<vibeos_blob_format::Hash, PersistentAuthorityError<D::Error>> {
         let stable_id = recovered.object_id.get();
         let kind = recovered.object_kind.get();
-        let len = recovered.bytes.len() as u64;
+        let len = recovered.byte_len();
+        if let Some(root) = recovered.external_root {
+            // An external record declares its content address directly; the
+            // blob bound under it is proved against this root elsewhere.
+            self.logical_roots.insert(stable_id, (kind, len, root));
+            return Ok(root);
+        }
         if let Some((cached_kind, cached_len, root)) = self.logical_roots.get(&stable_id) {
             if *cached_kind == kind && *cached_len == len {
                 return Ok(*root);
@@ -1834,7 +1900,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                     && mapping.blob_key.object_kind() == binding.object_kind
                     && binding.object_kind == recovered.object_kind.get()
-                    && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
+                    && mapping.blob_key.exact_len() == recovered.byte_len()
                     && mapping.blob_key.merkle_root() == descriptor_root
             })
             .ok_or(PersistentAuthorityError::PolicyMismatch)?;
@@ -1865,7 +1931,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     }))
                 && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                 && mapping.blob_key.object_kind() == recovered.object_kind.get()
-                && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
+                && mapping.blob_key.exact_len() == recovered.byte_len()
                 && mapping.blob_key.merkle_root() == root
         }) {
             let mut object = recover_promotable_cas_object(
@@ -2019,14 +2085,12 @@ fn validate_quota_totals<E>(
 ) -> Result<(), PersistentAuthorityError<E>> {
     let logical = import
         .admitted_objects()
-        .try_fold(0_u64, |total, object| {
-            total.checked_add(object.bytes.len() as u64)
-        })
+        .try_fold(0_u64, |total, object| total.checked_add(object.byte_len()))
         .ok_or(PersistentAuthorityError::InvalidQuotaPolicy)?;
     let physical = import
         .admitted_objects()
         .try_fold(0_u64, |total, object| {
-            canonical_attributable_physical_bytes(object.bytes.len() as u64)
+            canonical_attributable_physical_bytes(object.byte_len())
                 .ok()
                 .and_then(|bytes| total.checked_add(bytes))
         })

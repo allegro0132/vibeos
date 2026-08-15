@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -87,6 +87,10 @@ pub struct PersistentAuthorityImport {
     pub(crate) recovered: RecoveredStore,
     admitted_object_ids: BTreeSet<u128>,
     pub(crate) principals: Vec<PersistentPrincipalPolicy>,
+    /// Content for external objects committed by this exact append, keyed by
+    /// stable object id. Never populated by recovery: a re-install binds
+    /// external objects to their already-durable blobs instead.
+    pub(crate) external_payloads: BTreeMap<u128, Vec<u8>>,
 }
 
 impl PersistentAuthorityImport {
@@ -228,6 +232,7 @@ impl PersistentAuthorityImport {
             principals
         };
         let mut result = Self {
+            external_payloads: BTreeMap::new(),
             root_policy_sha256: root_policy_commitment(canonical_external_root_policy),
             record_stream,
             recovered,
@@ -294,6 +299,28 @@ impl PersistentAuthorityImport {
 
     pub fn admitted_object_count(&self) -> usize {
         self.admitted_object_ids.len()
+    }
+
+    /// Attach the content bytes for one external object committed by this
+    /// exact append. The stream must have committed a matching external
+    /// identity (declared length; the content root is proved by the blob
+    /// writer at publication). Recovery re-installs never attach payloads.
+    pub fn attach_external_payload(
+        &mut self,
+        stable_object_id: u128,
+        bytes: Vec<u8>,
+    ) -> Result<(), AuthoritySnapshotError> {
+        let object = self
+            .recovered
+            .objects
+            .iter()
+            .find(|object| object.object_id.get() == stable_object_id)
+            .ok_or(AuthoritySnapshotError::InvalidAuthorityGraph)?;
+        if object.external_root.is_none() || object.byte_len() != bytes.len() as u64 {
+            return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
+        }
+        self.external_payloads.insert(stable_object_id, bytes);
+        Ok(())
     }
 
     pub fn principals(&self) -> &[PersistentPrincipalPolicy] {
@@ -925,10 +952,9 @@ fn system_policy_for_objects<'a>(
 ) -> Result<PersistentPrincipalPolicy, AuthoritySnapshotError> {
     let totals = objects.try_fold((0_u64, 0_u64), |(logical, physical), object| {
         Some((
-            logical.checked_add(object.bytes.len() as u64)?,
-            physical.checked_add(
-                canonical_attributable_physical_bytes(object.bytes.len() as u64).ok()?,
-            )?,
+            logical.checked_add(object.byte_len())?,
+            physical
+                .checked_add(canonical_attributable_physical_bytes(object.byte_len()).ok()?)?,
         ))
     });
     let (committed_logical_bytes, committed_physical_bytes) =

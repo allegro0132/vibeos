@@ -34,6 +34,11 @@ pub const CHUNK_DATA_SIZE: usize = 360;
 /// backend still enforces its physical sector capacity independently.
 pub const MAX_OBJECT_CHUNKS: u32 = 4096;
 pub const MAX_OBJECT_SIZE: usize = CHUNK_DATA_SIZE * MAX_OBJECT_CHUNKS as usize;
+/// Ceiling for external (content-by-reference) objects. Their bytes live in
+/// the Storage V2 content-addressed store; the stream carries only the
+/// declared identity, so this matches the CAS blob format's 64 MiB envelope
+/// rather than the inline chunk budget above.
+pub const MAX_EXTERNAL_OBJECT_SIZE: u64 = 64 * 1024 * 1024;
 
 const MAGIC: &[u8; 8] = b"VIBECAP\0";
 const SEAL: &[u8; 16] = b"VIBECAP-COMMIT!!";
@@ -229,6 +234,12 @@ pub enum RecordBody {
     ObjectPrepare(ObjectMetadata),
     ObjectChunk(ObjectChunk),
     ObjectCommit(ObjectCommit),
+    ObjectExternal {
+        object_id: ObjectId,
+        object_kind: ObjectKind,
+        byte_len: u64,
+        merkle_root: [u8; 32],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +281,7 @@ pub enum EncodeError {
     BadChunkLength,
     BadFirstChunkSequence,
     BadCheckpoint,
+    ZeroExternalRoot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,6 +314,7 @@ pub enum DecodeError {
     BadChunkCount,
     BadChunkLength,
     BadFirstChunkSequence,
+    ZeroExternalRoot,
 }
 
 #[repr(u16)]
@@ -315,6 +328,11 @@ enum RecordKind {
     ObjectPrepare = 6,
     ObjectChunk = 7,
     ObjectCommit = 8,
+    /// One-record commit of an object whose content lives in the V2
+    /// content-addressed store. The record declares the exact identity
+    /// (kind, byte length, CAS Merkle root); the storage layer must bind and
+    /// verify a blob with that identity before the object confers anything.
+    ObjectExternal = 9,
 }
 
 impl RecordKind {
@@ -328,6 +346,7 @@ impl RecordKind {
             6 => Some(Self::ObjectPrepare),
             7 => Some(Self::ObjectChunk),
             8 => Some(Self::ObjectCommit),
+            9 => Some(Self::ObjectExternal),
             _ => None,
         }
     }
@@ -342,6 +361,7 @@ impl RecordKind {
             Self::ObjectPrepare => 40,
             Self::ObjectChunk => PAYLOAD_CAPACITY as u16,
             Self::ObjectCommit => 48,
+            Self::ObjectExternal => 64,
         }
     }
 }
@@ -357,6 +377,7 @@ impl RecordBody {
             Self::ObjectPrepare(_) => RecordKind::ObjectPrepare,
             Self::ObjectChunk(_) => RecordKind::ObjectChunk,
             Self::ObjectCommit(_) => RecordKind::ObjectCommit,
+            Self::ObjectExternal { .. } => RecordKind::ObjectExternal,
         }
     }
 }
@@ -445,6 +466,17 @@ impl LogRecord {
                 put_u64(&mut out, PAYLOAD_OFFSET + 32, commit.first_chunk_sequence);
                 put_u32(&mut out, PAYLOAD_OFFSET + 40, commit.chunks_crc32c);
                 put_u32(&mut out, PAYLOAD_OFFSET + 44, commit.content_crc32c);
+            }
+            RecordBody::ObjectExternal {
+                object_id,
+                object_kind,
+                byte_len,
+                merkle_root,
+            } => {
+                put_u128(&mut out, PAYLOAD_OFFSET, object_id.get());
+                put_u32(&mut out, PAYLOAD_OFFSET + 16, object_kind.get());
+                put_u64(&mut out, PAYLOAD_OFFSET + 24, *byte_len);
+                out[PAYLOAD_OFFSET + 32..PAYLOAD_OFFSET + 64].copy_from_slice(merkle_root);
             }
         }
 
@@ -547,6 +579,7 @@ fn validate_envelope(record: &LogRecord) -> Result<(), EncodeError> {
             | RecordBody::ObjectPrepare(_)
             | RecordBody::ObjectChunk(_)
             | RecordBody::ObjectCommit(_)
+            | RecordBody::ObjectExternal { .. }
     );
     if needs_tx && record.transaction_id.is_none() {
         return Err(EncodeError::MissingTransaction);
@@ -590,6 +623,18 @@ fn validate_envelope(record: &LogRecord) -> Result<(), EncodeError> {
                 return Err(EncodeError::BadFirstChunkSequence);
             }
         }
+        RecordBody::ObjectExternal {
+            byte_len,
+            merkle_root,
+            ..
+        } => {
+            if *byte_len == 0 || *byte_len > MAX_EXTERNAL_OBJECT_SIZE {
+                return Err(EncodeError::ObjectTooLarge);
+            }
+            if *merkle_root == [0u8; 32] {
+                return Err(EncodeError::ZeroExternalRoot);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -607,6 +652,7 @@ fn validate_decoded_envelope(record: &LogRecord) -> Result<(), DecodeError> {
             | RecordBody::ObjectPrepare(_)
             | RecordBody::ObjectChunk(_)
             | RecordBody::ObjectCommit(_)
+            | RecordBody::ObjectExternal { .. }
     );
     if needs_tx && record.transaction_id.is_none() {
         return Err(DecodeError::MissingTransaction);
@@ -741,6 +787,27 @@ fn decode_body(bytes: &[u8; RECORD_SIZE], kind: RecordKind) -> Result<RecordBody
                 chunks_crc32c: get_u32(bytes, PAYLOAD_OFFSET + 40),
                 content_crc32c: get_u32(bytes, PAYLOAD_OFFSET + 44),
             })
+        }
+        RecordKind::ObjectExternal => {
+            if get_u32(bytes, PAYLOAD_OFFSET + 20) != 0 {
+                return Err(DecodeError::NonZeroReserved);
+            }
+            let byte_len = get_u64(bytes, PAYLOAD_OFFSET + 24);
+            if byte_len == 0 || byte_len > MAX_EXTERNAL_OBJECT_SIZE {
+                return Err(DecodeError::ObjectTooLarge);
+            }
+            let mut merkle_root = [0u8; 32];
+            merkle_root.copy_from_slice(&bytes[PAYLOAD_OFFSET + 32..PAYLOAD_OFFSET + 64]);
+            if merkle_root == [0u8; 32] {
+                return Err(DecodeError::ZeroExternalRoot);
+            }
+            RecordBody::ObjectExternal {
+                object_id: id::<ObjectId>(get_u128(bytes, PAYLOAD_OFFSET))?,
+                object_kind: ObjectKind::new(get_u32(bytes, PAYLOAD_OFFSET + 16))
+                    .ok_or(DecodeError::ZeroObjectKind)?,
+                byte_len,
+                merkle_root,
+            }
         }
     })
 }
@@ -953,6 +1020,35 @@ pub fn preview_revoke_transaction(
     ))
 }
 
+/// Preview one single-record external object commit without advancing `chain`.
+/// The caller must separately make a blob with exactly this (kind, length,
+/// Merkle root) durable in the same transaction that publishes these records.
+pub fn preview_external_object_transaction(
+    chain: &RecordChain,
+    transaction_id: TransactionId,
+    object_id: ObjectId,
+    object_kind: ObjectKind,
+    byte_len: u64,
+    merkle_root: [u8; 32],
+) -> Result<(EncodedAuthorityTransaction, RecordChain), EncodeError> {
+    let mut next = chain.clone();
+    let record = next.append(
+        Some(transaction_id),
+        RecordBody::ObjectExternal {
+            object_id,
+            object_kind,
+            byte_len,
+            merkle_root,
+        },
+    )?;
+    Ok((
+        EncodedAuthorityTransaction {
+            records: alloc::vec![record],
+        },
+        next,
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootPolicy {
     /// Root grants are trust anchors and must match this record exactly.
@@ -977,10 +1073,28 @@ pub struct RecoveredGrant {
 pub struct RecoveredObject {
     pub object_id: ObjectId,
     pub object_kind: ObjectKind,
+    /// Inline content. Empty for external objects, whose bytes live in the
+    /// content-addressed store under `external_root`.
     pub bytes: Vec<u8>,
+    /// Exact logical length: `bytes.len()` for inline objects, the declared
+    /// length for external objects.
+    pub byte_len: u64,
+    /// CAS Merkle root declared by an external commit record; `None` for
+    /// inline objects.
+    pub external_root: Option<[u8; 32]>,
     pub transaction_id: TransactionId,
     pub prepare_sequence: u64,
     pub commit_sequence: u64,
+}
+
+impl RecoveredObject {
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub const fn is_external(&self) -> bool {
+        self.external_root.is_some()
+    }
 }
 
 /// Complete historical state of one durable CSpace slot. `max_generation`
@@ -1314,18 +1428,36 @@ impl RecoveryPreflight {
         for (_, event) in &events {
             match event {
                 Event::Object(object) => {
-                    let transaction = encode_object_transaction(
-                        &mut chain,
-                        object.transaction_id,
-                        object.object_id,
-                        object.object_kind,
-                        &object.bytes,
-                    )
-                    .map_err(|_| RecoveryError::CompactionMismatch)?;
+                    let encoded = match object.external_root {
+                        Some(merkle_root) => {
+                            let (transaction, next) = preview_external_object_transaction(
+                                &chain,
+                                object.transaction_id,
+                                object.object_id,
+                                object.object_kind,
+                                object.byte_len,
+                                merkle_root,
+                            )
+                            .map_err(|_| RecoveryError::CompactionMismatch)?;
+                            chain = next;
+                            transaction.records
+                        }
+                        None => {
+                            encode_object_transaction(
+                                &mut chain,
+                                object.transaction_id,
+                                object.object_id,
+                                object.object_kind,
+                                &object.bytes,
+                            )
+                            .map_err(|_| RecoveryError::CompactionMismatch)?
+                            .records
+                        }
+                    };
                     records
-                        .try_reserve(transaction.records.len())
+                        .try_reserve(encoded.len())
                         .map_err(|_| RecoveryError::AllocationFailed)?;
-                    records.extend(transaction.records);
+                    records.extend(encoded);
                 }
                 Event::Grant(recovered) => {
                     let (transaction, next) = preview_grant_transaction(
@@ -1379,14 +1511,22 @@ impl RecoveryPreflight {
         if verify.slots != self.slots {
             return Err(RecoveryError::CompactionMismatch);
         }
-        let objects_by_id = |preflight: &RecoveryPreflight| -> BTreeMap<ObjectId, (ObjectKind, u32)> {
+        let objects_by_id = |preflight: &RecoveryPreflight| -> BTreeMap<
+            ObjectId,
+            (ObjectKind, u64, Option<[u8; 32]>, u32),
+        > {
             preflight
                 .objects
                 .iter()
                 .map(|object| {
                     (
                         object.object_id,
-                        (object.object_kind, crc32c(&object.bytes)),
+                        (
+                            object.object_kind,
+                            object.byte_len,
+                            object.external_root,
+                            crc32c(&object.bytes),
+                        ),
                     )
                 })
                 .collect()
@@ -1886,15 +2026,51 @@ pub fn preflight_recovery(
                 {
                     return Err(RecoveryError::ObjectContentCrcMismatch { sequence });
                 }
+                let byte_len = prepared.bytes.len() as u64;
                 committed_objects.push(RecoveredObject {
                     object_id: prepared.metadata.object_id,
                     object_kind: prepared.metadata.object_kind,
                     bytes: prepared.bytes,
+                    byte_len,
+                    external_root: None,
                     transaction_id: tx,
                     prepare_sequence: prepared.sequence,
                     commit_sequence: sequence,
                 });
                 transactions.insert(tx, TxState::Finished);
+            }
+            RecordBody::ObjectExternal {
+                object_id,
+                object_kind,
+                byte_len,
+                merkle_root,
+            } => {
+                let tx = decoded
+                    .record
+                    .transaction_id
+                    .expect("decoder requires transaction");
+                if !id_reserved(tx.get(), high_water) || !id_reserved(object_id.get(), high_water)
+                {
+                    return Err(RecoveryError::IdNotReserved { sequence });
+                }
+                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(&mut id_classes, object_id.get(), IdClass::Object, sequence)?;
+                if transactions.insert(tx, TxState::Finished).is_some() {
+                    return Err(RecoveryError::DuplicateTransaction { sequence });
+                }
+                if !seen_objects.insert(*object_id) {
+                    return Err(RecoveryError::DuplicateObject { sequence });
+                }
+                committed_objects.push(RecoveredObject {
+                    object_id: *object_id,
+                    object_kind: *object_kind,
+                    bytes: Vec::new(),
+                    byte_len: *byte_len,
+                    external_root: Some(*merkle_root),
+                    transaction_id: tx,
+                    prepare_sequence: sequence,
+                    commit_sequence: sequence,
+                });
             }
         }
     }

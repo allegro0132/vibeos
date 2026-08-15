@@ -2856,8 +2856,7 @@ async fn storage_object_bench(
         return;
     }
     if workload == "object-v2-large"
-        && crate::store::blob_encoded_len(size)
-            .map_or(true, |encoded| encoded > crate::store::MAX_OBJECT_SIZE)
+        && size as u64 > vibeos_object_store::MAX_EXTERNAL_OBJECT_SIZE
     {
         println!(
             "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"object content exceeds the v2 authority record-stream envelope\"}}",
@@ -3033,7 +3032,26 @@ async fn storage_object_bench(
     #[cfg(feature = "qemu-virt")]
     let io_started = crate::virtio_blk::telemetry();
     let put_started = crate::sbi::time();
+    // The Merkle-blob profile wraps content in its own verified envelope;
+    // when that envelope no longer fits the external-object ceiling, publish
+    // the raw content instead — the V2 content store's own Merkle machinery
+    // provides equivalent authentication, checked below by exact readback.
+    let raw_large_object = workload == "object-v2-large"
+        && crate::store::blob_profile_encoded_len(size)
+            .map_or(true, |len| len as u64 > vibeos_object_store::MAX_EXTERNAL_OBJECT_SIZE);
     let publication = match put_lease {
+        Ok(lease) if raw_large_object => {
+            match crate::store::BlobDescriptor::from_content(object_kind.get(), &payload) {
+                Ok(descriptor) => crate::store::put_with(lease, init.clone(), object_kind, &payload)
+                    .await
+                    .map(|capability| crate::store::BlobPublication {
+                        capability,
+                        descriptor,
+                    })
+                    .map_err(crate::store::BlobStoreError::Store),
+                Err(error) => Err(crate::store::BlobStoreError::Format(error)),
+            }
+        }
         Ok(lease) => crate::store::put_blob_with(lease, init.clone(), object_kind, &payload).await,
         Err(_) => Err(crate::store::BlobStoreError::Store(
             crate::store::StoreError::PermissionDenied,
@@ -3095,6 +3113,15 @@ async fn storage_object_bench(
                     bytes: chunk.bytes,
                 })
         }
+        (Ok(service), Ok(object)) if raw_large_object => crate::store::get_with(service, object)
+            .await
+            .map_err(crate::store::BlobStoreError::Store)
+            .and_then(|bytes| {
+                let descriptor =
+                    crate::store::BlobDescriptor::from_content(object_kind.get(), &bytes)
+                        .map_err(crate::store::BlobStoreError::Format)?;
+                Ok(crate::store::VerifiedBlob { descriptor, bytes })
+            }),
         (Ok(service), Ok(object)) => crate::store::get_blob_with(service, object).await,
         _ => Err(crate::store::BlobStoreError::Store(
             crate::store::StoreError::ObjectUnavailable,

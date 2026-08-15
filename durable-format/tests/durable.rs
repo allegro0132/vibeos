@@ -1059,3 +1059,92 @@ fn compaction_is_idempotent_and_preserves_root_selection() {
         "the live replacement root is the selected one",
     );
 }
+
+#[test]
+fn external_object_records_recover_compact_and_fail_closed() {
+    let mut log = TestLog::formatted();
+    let merkle_root = [0x5a; 32];
+    log.push(
+        Some(tx(700)),
+        RecordBody::ObjectExternal {
+            object_id: object(400),
+            object_kind: okind(50),
+            byte_len: 16 * 1024 * 1024,
+            merkle_root,
+        },
+    );
+    let preflight = preflight_recovery(&log.sectors, store()).unwrap();
+    let recovered = &preflight.committed_objects()[0];
+    assert_eq!(recovered.object_id, object(400));
+    assert_eq!(recovered.byte_len(), 16 * 1024 * 1024);
+    assert_eq!(recovered.external_root, Some(merkle_root));
+    assert!(recovered.bytes.is_empty());
+    assert!(recovered.is_external());
+
+    // The canonical record round-trips exactly.
+    let bytes = log.sectors.last().unwrap();
+    let DecodeStatus::Valid(decoded) = LogRecord::decode(bytes).unwrap() else {
+        panic!("external record must decode");
+    };
+    assert_eq!(decoded.record.encode().unwrap(), *bytes);
+
+    // A second commit reusing the stable object id is rejected.
+    let mut duplicate = log.sectors.clone();
+    duplicate.push(
+        RecordChain::from_checkpoint(store(), preflight.chain_checkpoint().unwrap())
+            .unwrap()
+            .append(
+                Some(tx(701)),
+                RecordBody::ObjectExternal {
+                    object_id: object(400),
+                    object_kind: okind(50),
+                    byte_len: 4096,
+                    merkle_root,
+                },
+            )
+            .unwrap(),
+    );
+    assert!(matches!(
+        preflight_recovery(&duplicate, store()),
+        Err(RecoveryError::DuplicateObject { .. })
+    ));
+
+    // Runtime compaction keeps the ungranted external object; boot
+    // compaction sheds it like any other runtime-transient object.
+    let kept = preflight.compact(false).unwrap();
+    let kept = preflight_recovery(&kept, store()).unwrap();
+    assert_eq!(kept.committed_objects().len(), 1);
+    assert_eq!(kept.committed_objects()[0].external_root, Some(merkle_root));
+    assert_eq!(kept.committed_objects()[0].byte_len(), 16 * 1024 * 1024);
+    let shed = preflight.compact(true).unwrap();
+    assert!(preflight_recovery(&shed, store())
+        .unwrap()
+        .committed_objects()
+        .is_empty());
+
+    // Declared identities outside the envelope fail to encode.
+    let mut chain = RecordChain::new(store());
+    let _ = chain.append(None, RecordBody::Format).unwrap();
+    assert!(chain
+        .append(
+            Some(tx(1)),
+            RecordBody::ObjectExternal {
+                object_id: object(2),
+                object_kind: okind(50),
+                byte_len: 64 * 1024 * 1024 + 1,
+                merkle_root,
+            },
+        )
+        .is_err());
+    assert!(chain
+        .append(
+            Some(tx(1)),
+            RecordBody::ObjectExternal {
+                object_id: object(2),
+                object_kind: okind(50),
+                byte_len: 4096,
+                merkle_root: [0; 32],
+            },
+        )
+        .is_err());
+}

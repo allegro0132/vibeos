@@ -1380,7 +1380,11 @@ impl StorageV2Runtime {
                 .await
                 .map_err(|error| match error {
                     PersistentAuthorityError::GenerationMismatch => V2RuntimeError::JournalChanged,
-                    _ => V2RuntimeError::Corrupt,
+                    _error => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail authority append error: {_error:?}");
+                        V2RuntimeError::Corrupt
+                    }
                 })
         })
         .await;
@@ -3261,6 +3265,11 @@ impl StorageV2ReadToken {
         recovered: &vibeos_durable_format::RecoveredObject,
         cache: &HotReadCache,
     ) {
+        if recovered.is_external() {
+            // External content never rides the record stream; caching the
+            // empty inline bytes would serve empty reads.
+            return;
+        }
         match self {
             Self::Persistent { handle, cached, .. }
                 if handle.object_kind() == recovered.object_kind.get()
@@ -3402,6 +3411,16 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
         records: &'a [[u8; LOGICAL_BLOCK_SIZE]],
     ) -> vibeos_object_store::StorageV2Future<'a, vibeos_object_store::StorageV2AuthoritySnapshot>
     {
+        self.append_authority_with_payload(expected, records, None)
+    }
+
+    fn append_authority_with_payload<'a>(
+        &'a self,
+        expected: vibeos_durable_format::ChainCheckpoint,
+        records: &'a [[u8; LOGICAL_BLOCK_SIZE]],
+        external_payload: Option<(u128, &'a [u8])>,
+    ) -> vibeos_object_store::StorageV2Future<'a, vibeos_object_store::StorageV2AuthoritySnapshot>
+    {
         Box::pin(async move {
             let runtime = INSTALLED_V2_RUNTIME
                 .lock()
@@ -3418,7 +3437,18 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             // it must complete before this append captures its generation
             // witness. Failure here is not fatal by itself; a true capacity
             // condition still fails the append closed below.
-            let _ = runtime.ensure_foreground_capacity().await;
+            let required_free = external_payload
+                .map(|(_, payload)| {
+                    // An external payload consumes roughly a segment per
+                    // 4 MiB plus metadata; the quota admission additionally
+                    // requires that much ordinary capacity to be free before
+                    // the reservation, so replenish to the whole appetite.
+                    (payload.len() as u64)
+                        .div_ceil(STORAGE_V2_GROWTH_GRANULE_BLOCKS * LOGICAL_BLOCK_SIZE as u64)
+                        .saturating_add(8)
+                })
+                .unwrap_or(STORAGE_V2_FOREGROUND_FREE_SEGMENTS);
+            let _ = runtime.ensure_foreground_capacity_for(required_free).await;
             let current = runtime
                 .authority_view()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
@@ -3462,8 +3492,37 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             stream_records.extend_from_slice(records);
             #[cfg(feature = "storage-bench")]
             let phase_preflight = crate::sbi::time();
-            let import = crate::durable_cspace::storage_v2_migration_import(&stream_records)
-                .map_err(|_| vibeos_object_store::StoreError::Corrupt)?;
+            let mut import = crate::durable_cspace::storage_v2_migration_import(&stream_records)
+                .map_err(|_error| {
+                    #[cfg(feature = "storage-bench")]
+                    crate::println!("  bench-detail migration import error: {_error:?}");
+                    vibeos_object_store::StoreError::Corrupt
+                })?;
+            if let Some((stable_object_id, payload)) = external_payload {
+                // The payload copy lives exactly as long as the installation
+                // and can reach 64 MiB; charge it to the system heap beside
+                // the store's own staging buffers, not the client budget.
+                let mut system = heap::enter_owner(OwnerId::SYSTEM);
+                let mut owned = Vec::new();
+                let reserved = owned.try_reserve_exact(payload.len());
+                if reserved.is_ok() {
+                    owned.extend_from_slice(payload);
+                }
+                system.restore();
+                if reserved.is_err() {
+                    #[cfg(feature = "storage-bench")]
+                    crate::println!("  bench-detail external payload copy oom");
+                    return Err(vibeos_object_store::StoreError::InsufficientMemory);
+                }
+                import
+                    .attach_external_payload(stable_object_id, owned)
+                    .map_err(|_error| {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail attach error: {_error:?}");
+                        vibeos_object_store::StoreError::Corrupt
+                    })?;
+            }
+            let import = import;
             #[cfg(feature = "storage-bench")]
             let phase_import = crate::sbi::time();
             // The import owns its own validated copy; release the raw stream

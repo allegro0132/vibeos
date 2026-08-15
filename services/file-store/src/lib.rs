@@ -32,6 +32,11 @@ pub type FileId = u64;
 pub const ROOT_FILE_ID: FileId = 1;
 pub const MAX_TRANSACTION_EDITS: usize = 4096;
 pub const DATA_CHUNK_SIZE: usize = 4096;
+/// Chunk stride for content staged straight to the persistent backend. Three
+/// 1 MiB content extents plus header and Merkle tree fill one 4 MiB scratch
+/// segment, so this is the largest stride that still commits whole segments.
+/// In-memory (volatile) files keep the 4 KiB stride.
+pub const PERSISTENT_STAGE_CHUNK_SIZE: usize = 3 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileError {
@@ -364,10 +369,10 @@ pub struct StagedFileContent {
 impl FsContentStager {
     pub async fn push(&mut self, mut bytes: &[u8]) -> Result<(), FileError> {
         while !bytes.is_empty() {
-            let take = core::cmp::min(DATA_CHUNK_SIZE - self.pending.len(), bytes.len());
+            let take = core::cmp::min(PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len(), bytes.len());
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
-            if self.pending.len() == DATA_CHUNK_SIZE {
+            if self.pending.len() == PERSISTENT_STAGE_CHUNK_SIZE {
                 let chunk = core::mem::take(&mut self.pending);
                 self.tail = Some(self.backend.stage_chunk(self.tail.clone(), chunk).await?);
             }

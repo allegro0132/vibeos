@@ -693,6 +693,66 @@ mod tests {
     }
 
     #[test]
+    fn stager_carries_multi_mib_content_in_segment_sized_chunks() {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d42_4947_4649_4c45_5f31;
+        let device = MemoryDevice::blank(96);
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-BIGFILE!").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: limits(),
+        }))
+        .unwrap();
+        let backend = Arc::new(TestBackend {
+            store: Mutex::new(store),
+            maximum_staged_chunk: AtomicUsize::new(0),
+        });
+        let mut root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        root.attach_backend(backend.clone()).unwrap();
+        let path = crate::RelPath::parse("large").unwrap();
+
+        // 20 MiB + a ragged tail: six full 3 MiB chunks plus a partial one.
+        let total = 20 * 1024 * 1024 + 12345_usize;
+        let mut stager = root.begin_content_stager(&path, false).unwrap();
+        let mut written = 0_usize;
+        let mut step = 0_u64;
+        while written < total {
+            let len = (total - written).min(1 << (14 + step % 8));
+            let bytes: Vec<u8> = (written..written + len)
+                .map(|offset| (offset % 251) as u8)
+                .collect();
+            block_on(stager.push(&bytes)).unwrap();
+            written += len;
+            step += 1;
+        }
+        let staged = block_on(stager.finish()).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction.write_staged(&path, staged).unwrap();
+        assert_eq!(block_on(transaction.commit_authoritative()).unwrap(), 1);
+        // The stager must have cut at the persistent stride, not at 4 KiB.
+        assert_eq!(
+            backend.maximum_staged_chunk.load(Ordering::Relaxed),
+            crate::PERSISTENT_STAGE_CHUNK_SIZE
+        );
+
+        let reader = root.reader(&path).unwrap();
+        assert_eq!(
+            reader.chunk_count(),
+            (total as u64).div_ceil(crate::PERSISTENT_STAGE_CHUNK_SIZE as u64)
+        );
+        let mut offset = 0_usize;
+        for index in 0..reader.chunk_count() {
+            let chunk = block_on(reader.read_chunk(index)).unwrap().unwrap();
+            assert!(chunk
+                .iter()
+                .enumerate()
+                .all(|(at, byte)| *byte == ((offset + at) % 251) as u8));
+            offset += chunk.len();
+        }
+        assert_eq!(offset, total);
+    }
+
+    #[test]
     fn backend_stager_bounds_unknown_input_and_publishes_only_on_commit() {
         const NAMESPACE: u128 = 0x5649_4245_4f53_2d53_5441_4745_5445_53;
         let device = MemoryDevice::blank(96);
@@ -731,7 +791,10 @@ mod tests {
         let mut transaction = root.begin().unwrap();
         transaction.write_staged(&path, staged).unwrap();
         assert_eq!(block_on(transaction.commit_authoritative()).unwrap(), 1);
-        assert!(backend.maximum_staged_chunk.load(Ordering::Relaxed) <= crate::DATA_CHUNK_SIZE);
+        assert!(
+            backend.maximum_staged_chunk.load(Ordering::Relaxed)
+                <= crate::PERSISTENT_STAGE_CHUNK_SIZE
+        );
 
         let reader = root.reader(&path).unwrap();
         let mut actual = Vec::new();

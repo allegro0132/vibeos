@@ -17,8 +17,9 @@ use crate::gc::GcStoreError;
 use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
 use crate::persistent_authority::PersistentAuthorityError;
 use crate::root_codec::PersistentRootEntry;
+use crate::fs_codec::{decode_fs_data_node_v1_prefix, FsDataNodeMeta};
 use crate::{
-    decode_fs_btree_node_v1, decode_fs_data_node_v1, encode_fs_btree_node_v1,
+    decode_fs_btree_node_v1, encode_fs_btree_node_v1,
     encode_fs_data_node_v1, encode_fs_root_v1, FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError,
     FsDataNodeV1, FsRootV1, FsTreeKind, SegmentStore, StoragePrincipal, StoreError,
     TypedObjectReference, FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT,
@@ -116,7 +117,10 @@ pub struct FsPersistentData {
 #[derive(Clone)]
 enum FsPersistentDataLayout {
     Raw,
-    Stream(FsDataNodeV1),
+    /// Skip-linked stream node held as structure-only metadata. Content bytes
+    /// stay on media and are read (and Merkle-verified) per leaf on demand, so
+    /// a resident handle to a multi-MiB chunk costs only its ancestor table.
+    Stream(FsDataNodeMeta),
 }
 
 impl FsPersistentData {
@@ -341,13 +345,74 @@ impl<D: PageDevice> SegmentStore<D> {
         let mapping = self.fs_mapping_for_reference(reference, FS_DATA_V1_KIND)?;
         let object = self.recover_fs_reference(reference, FS_DATA_V1_KIND)?;
         let layout = if mapping.reference_codec == REFERENCE_CODEC_FS_V1 {
-            FsPersistentDataLayout::Stream(decode_fs_data_node_v1(
-                &self.read_fs_object_bytes(&object).await?,
-            )?)
+            FsPersistentDataLayout::Stream(self.read_fs_data_node_meta(&object).await?)
         } else {
             FsPersistentDataLayout::Raw
         };
         Ok(FsPersistentData { object, layout })
+    }
+
+    /// Read and validate a data node's structural prefix from its first leaf.
+    /// The header and full ancestor table always fit one leaf, so a skip-list
+    /// hop costs one verified 4 KiB read regardless of the chunk's size.
+    async fn read_fs_data_node_meta(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<FsDataNodeMeta, FsRootPublishError<D::Error>> {
+        const _: () = assert!(
+            crate::fs_codec::FS_DATA_HEADER_LEN
+                + crate::fs_codec::FS_DATA_MAX_ANCESTORS * crate::fs_codec::FS_DATA_REFERENCE_LEN
+                <= vibeos_blob_format::LEAF_SIZE,
+            "a data node's structural prefix must fit the first Merkle leaf",
+        );
+        let first = self.get_blob_chunk(object, 0).await?;
+        let meta = decode_fs_data_node_v1_prefix(&first.bytes)?;
+        // Bind the prefix to the whole object: the recorded payload length
+        // must name exactly the committed blob's byte length.
+        if meta.encoded_len() as u64 != object.exact_len() {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        Ok(meta)
+    }
+
+    /// Read a data node's content bytes with per-leaf Merkle verification,
+    /// without materializing the encoded node twice.
+    async fn read_fs_data_node_content(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+        meta: &FsDataNodeMeta,
+    ) -> Result<Vec<u8>, FsRootPublishError<D::Error>> {
+        if meta.encoded_len() as u64 != object.exact_len() {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(meta.bytes_len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        if meta.bytes_len == 0 {
+            return Ok(bytes);
+        }
+        let leaf_size = vibeos_blob_format::LEAF_SIZE;
+        let start = meta.bytes_offset();
+        let end = meta.encoded_len();
+        let first_leaf = start / leaf_size;
+        let last_leaf = (end - 1) / leaf_size;
+        for leaf in first_leaf..=last_leaf {
+            let chunk = self
+                .get_blob_chunk(object, u32::try_from(leaf).map_err(|_| StoreError::Corrupt)?)
+                .await?;
+            let leaf_start = leaf * leaf_size;
+            let copy_from = start.saturating_sub(leaf_start);
+            let copy_to = (end - leaf_start).min(chunk.bytes.len());
+            if copy_from >= copy_to {
+                return Err(FsRootPublishError::InvalidRoot);
+            }
+            bytes.extend_from_slice(&chunk.bytes[copy_from..copy_to]);
+        }
+        if bytes.len() != meta.bytes_len {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        Ok(bytes)
     }
 
     fn fs_reference_for(
@@ -495,12 +560,14 @@ impl<D: PageDevice> SegmentStore<D> {
             bytes: bytes.to_vec(),
         };
         let payload = encode_fs_data_node_v1(&decoded)?;
+        let meta = FsDataNodeMeta::from_node(&decoded);
+        drop(decoded);
         Ok(FsPersistentData {
             object: Arc::new(
                 self.commit_fs_payload(FS_DATA_V1_KIND, &payload, principal, maintenance)
                     .await?,
             ),
-            layout: FsPersistentDataLayout::Stream(decoded),
+            layout: FsPersistentDataLayout::Stream(meta),
         })
     }
 
@@ -1178,17 +1245,19 @@ impl<D: PageDevice> SegmentStore<D> {
                         .ok_or(FsRootPublishError::InvalidRoot)?;
                     if next_node.chunk_index != expected_index
                         || next_node.total_len >= node.total_len
-                        || next_node.total_len + node.bytes.len() as u64 > node.total_len
+                        || next_node.total_len + node.bytes_len as u64 > node.total_len
                     {
                         return Err(FsRootPublishError::InvalidRoot);
                     }
                     current = next;
                     current_index = expected_index;
                 }
-                let FsPersistentDataLayout::Stream(node) = current.layout else {
+                let FsPersistentDataLayout::Stream(node) = &current.layout else {
                     return Err(FsRootPublishError::InvalidRoot);
                 };
-                Ok(Some(node.bytes))
+                Ok(Some(
+                    self.read_fs_data_node_content(&current.object, node).await?,
+                ))
             }
         }
     }
@@ -1482,6 +1551,55 @@ mod tests {
         assert_eq!(
             block_on(store.read_fs_data_chunk(&tail, tail.chunk_count())).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn multi_page_data_chunks_commit_and_cold_recover() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let pattern = |index: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|offset| (index * 31 + offset * 7) as u8)
+                .collect()
+        };
+        // Mixed chunk sizes in one stream: historical 4 KiB nodes, multi-MiB
+        // nodes, and a short tail all chain and read back.
+        let sizes = [4096_usize, 1024 * 1024, 2 * 1024 * 1024, 4096, 700];
+        let mut tail = None;
+        for (index, size) in sizes.iter().enumerate() {
+            let bytes = pattern(index, *size);
+            let next =
+                block_on(store.commit_fs_data_chunk(tail.as_ref(), &bytes)).unwrap();
+            assert_eq!(next.chunk_count(), index as u64 + 1);
+            tail = Some(next);
+        }
+        let tail = tail.unwrap();
+        let total: usize = sizes.iter().sum();
+        assert_eq!(tail.exact_len(), total as u64);
+        for (index, size) in sizes.iter().enumerate() {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index as u64)).unwrap(),
+                Some(pattern(index, *size)),
+                "chunk {index} readback",
+            );
+        }
+        drop(store);
+
+        // Cold mount must recover the same stream through prefix-only metadata
+        // reads. Rebuild the tail handle from a freshly recovered store by
+        // committing one more chunk against a re-recovered reference chain.
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let extended = block_on(cold.commit_fs_data_chunk(Some(&tail), &pattern(9, 4096))).unwrap();
+        assert_eq!(extended.chunk_count(), sizes.len() as u64 + 1);
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&extended, 2)).unwrap(),
+            Some(pattern(2, 2 * 1024 * 1024))
+        );
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&extended, sizes.len() as u64)).unwrap(),
+            Some(pattern(9, 4096))
         );
     }
 

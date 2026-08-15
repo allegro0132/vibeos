@@ -1292,17 +1292,34 @@ pub fn preflight_recovery(
     store_id: StoreId,
 ) -> Result<RecoveryPreflight, RecoveryError> {
     // Decode-only preflight rejects every sealed malformed sector without
-    // retaining ObjectChunk Vecs for the full journal. Decoded records are
-    // kept for the two validation passes below so each sector's CRC and
-    // parse cost is paid exactly once.
-    let mut decoded_records: Vec<Option<DecodedRecord>> = Vec::new();
-    decoded_records
+    // retaining ObjectChunk Vecs for the full journal: only a compact,
+    // fixed-size chain probe per sector survives this pass, keeping the
+    // recovery allocation peak bounded while the chain-validation pass below
+    // avoids a second full decode of every record.
+    #[derive(Clone, Copy)]
+    struct ChainProbe {
+        sequence: u64,
+        previous_sequence: u64,
+        previous_crc32c: u32,
+        crc32c: u32,
+        store_id: StoreId,
+        is_format: bool,
+    }
+    let mut probes: Vec<Option<ChainProbe>> = Vec::new();
+    probes
         .try_reserve_exact(sectors.len())
         .map_err(|_| RecoveryError::AllocationFailed)?;
     for (sector, bytes) in sectors.iter().enumerate() {
         match LogRecord::decode(bytes) {
-            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => decoded_records.push(None),
-            Ok(DecodeStatus::Valid(decoded)) => decoded_records.push(Some(decoded)),
+            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => probes.push(None),
+            Ok(DecodeStatus::Valid(decoded)) => probes.push(Some(ChainProbe {
+                sequence: decoded.record.sequence,
+                previous_sequence: decoded.record.previous_sequence,
+                previous_crc32c: decoded.record.previous_crc32c,
+                crc32c: decoded.crc32c,
+                store_id: decoded.record.store_id,
+                is_format: matches!(decoded.record.body, RecordBody::Format),
+            })),
             Err(source) => return Err(RecoveryError::SealedRecord { sector, source }),
         }
     }
@@ -1310,32 +1327,31 @@ pub fn preflight_recovery(
     let mut previous_sequence = 0u64;
     let mut previous_crc = 0u32;
     let mut valid_index = 0usize;
-    for (sector, entry) in decoded_records.iter().enumerate() {
-        let Some(decoded) = entry else { continue };
-        let record = &decoded.record;
-        if valid_index == 0 && (record.sequence != 1 || !matches!(record.body, RecordBody::Format))
-        {
+    for (sector, entry) in probes.iter().enumerate() {
+        let Some(probe) = entry else { continue };
+        if valid_index == 0 && (probe.sequence != 1 || !probe.is_format) {
             return Err(RecoveryError::FormatNotFirst);
         }
-        if record.store_id != store_id {
+        if probe.store_id != store_id {
             return Err(RecoveryError::WrongStore { sector });
         }
         let expected = previous_sequence
             .checked_add(1)
             .ok_or(RecoveryError::SequenceOverflow)?;
-        if record.sequence != expected
-            || record.previous_sequence != previous_sequence
-            || record.previous_crc32c != previous_crc
+        if probe.sequence != expected
+            || probe.previous_sequence != previous_sequence
+            || probe.previous_crc32c != previous_crc
         {
             return Err(RecoveryError::BrokenSequence { sector });
         }
-        if valid_index != 0 && matches!(record.body, RecordBody::Format) {
+        if valid_index != 0 && probe.is_format {
             return Err(RecoveryError::DuplicateFormat);
         }
-        previous_sequence = record.sequence;
-        previous_crc = decoded.crc32c;
+        previous_sequence = probe.sequence;
+        previous_crc = probe.crc32c;
         valid_index += 1;
     }
+    drop(probes);
     if valid_index == 0 {
         return Err(RecoveryError::MissingFormat);
     }
@@ -1349,9 +1365,14 @@ pub fn preflight_recovery(
     let mut committed_objects: Vec<RecoveredObject> = Vec::new();
     let mut tombstone_sequence: BTreeMap<DerivationId, u64> = BTreeMap::new();
 
-    // Validate one record at a time from the single decode pass above.
-    for entry in decoded_records {
-        let Some(decoded) = entry else { continue };
+    // Decode and validate one record at a time. At most one <=360-byte chunk
+    // Vec is transiently owned here; no per-record decoded catalog survives.
+    for bytes in sectors {
+        let decoded = match LogRecord::decode(bytes) {
+            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
+            Ok(DecodeStatus::Valid(decoded)) => decoded,
+            Err(_) => unreachable!("decode-only preflight accepted this sector"),
+        };
         let sequence = decoded.record.sequence;
         match &decoded.record.body {
             RecordBody::Format => {}

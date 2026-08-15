@@ -531,7 +531,18 @@ impl<D: PageDevice> SegmentStore<D> {
             .copied()
             .filter(|object_id| !update.is_admitted(*object_id))
             .collect();
-        let retry_update = update.clone();
+        // The foreground-cleaner retry needs its own copy of the import, but
+        // that copy costs a full record stream plus every object's bytes.
+        // Relief can only trigger near capacity, so skip the clone while free
+        // segments are comfortably above the reserve.
+        let relief_plausible = state
+            .allocation
+            .counts()
+            .ok()
+            .is_none_or(|counts| {
+                counts.free <= u64::from(state.cleaner_reserve_segments).saturating_add(6)
+            });
+        let retry_update = relief_plausible.then(|| update.clone());
         let retry_transient_ids = transient_ids.clone();
         let retry_new_object_ids = new_object_ids.clone();
         let (view, transient_objects) = match self
@@ -545,7 +556,8 @@ impl<D: PageDevice> SegmentStore<D> {
             .await
         {
             Ok(result) => result,
-            Err(error) if gc_can_relieve_persistent_import(&error) => {
+            Err(error) if gc_can_relieve_persistent_import(&error) && retry_update.is_some() => {
+                let retry_update = retry_update.expect("guarded by match arm");
                 // A logical authority append owns an explicit maintenance
                 // lease, so it may spend the cleaner reserve only through one
                 // bounded foreground collection. The failed import publishes

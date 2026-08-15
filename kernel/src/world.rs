@@ -49,7 +49,7 @@ const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // 512-byte record per 360-byte chunk), so the qualification image needs a
 // larger transient envelope than the production interactive client budget.
 #[cfg(feature = "storage-bench")]
-pub const SHELL_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+pub const SHELL_MEMORY_BUDGET: usize = 192 * 1024 * 1024;
 #[cfg(not(feature = "storage-bench"))]
 pub const SHELL_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 

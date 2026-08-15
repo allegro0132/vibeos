@@ -552,12 +552,15 @@ impl<D: PageDevice> SegmentStore<D> {
                 // no authority snapshot; any anonymous CAS objects from a
                 // partial attempt are deliberately unrooted and may be
                 // reclaimed before the retry.
-                let retry_lease = self
-                    .acquire_maintenance(
-                        &writer.maintenance,
-                        MaintenanceOperation::ExplicitMaintenance,
-                    )
-                    .ok_or(PersistentAuthorityError::Unauthorized)?;
+                // A relievable error must have left the store mounted; if it
+                // did not, surface the original failure rather than masking
+                // it as an authorization problem.
+                let Some(retry_lease) = self.acquire_maintenance(
+                    &writer.maintenance,
+                    MaintenanceOperation::ExplicitMaintenance,
+                ) else {
+                    return Err(error);
+                };
                 Box::pin(self.collect_garbage()).await?;
 
                 // GC advances the checkpoint generation while preserving the
@@ -1402,9 +1405,6 @@ impl<D: PageDevice> SegmentStore<D> {
             .counts()
             .map_err(GcError::from)
             .map_err(PersistentAuthorityError::Gc)?;
-        if counts.free <= u64::from(state.cleaner_reserve_segments) {
-            return Err(PersistentAuthorityError::Gc(GcError::Capacity));
-        }
         // Reserve every segment this payload batch can span BEFORE the
         // first mutation: a multi-extent authority chain may cross segment
         // boundaries and must never fail mid-write, which would poison the
@@ -1430,15 +1430,54 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?,
             1,
         )?;
-        let batch_span = empty_snapshot_span
-            .checked_add(span_of(authority_bytes.len(), authority_extent_count)?)
-            .and_then(|span| span.checked_add(allocation_span))
-            .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
-        let needed_segments = batch_span
-            .div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE))
-            .max(1);
-        let needed_segments = usize::try_from(needed_segments)
-            .map_err(|_| PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+        // Extents never cross a segment boundary, so segment demand must be
+        // computed by placing each span first-fit in order, exactly as the
+        // builder will; summing pages and dividing underestimates when chunk
+        // granularity wastes tail space in a segment.
+        let payload_area = u64::from(DATA_END_PAGE - DATA_FIRST_PAGE);
+        let mut needed_segments = 1usize;
+        let mut placed = 0u64;
+        let mut place = |span: u64| -> Result<(), PersistentAuthorityError<D::Error>> {
+            if span > payload_area {
+                return Err(PersistentAuthorityError::Gc(GcError::Capacity));
+            }
+            if placed
+                .checked_add(span)
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?
+                > payload_area
+            {
+                needed_segments = needed_segments
+                    .checked_add(1)
+                    .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+                placed = 0;
+            }
+            placed = placed
+                .checked_add(span)
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+            Ok(())
+        };
+        if empty_snapshot_span != 0 {
+            place(empty_snapshot_span)?;
+        }
+        let mut remaining_authority = authority_bytes.len();
+        for _ in 0..authority_extent_count {
+            let chunk = remaining_authority.min(authority_chunk_bytes);
+            place(span_of(chunk, 1)?)?;
+            remaining_authority -= chunk;
+        }
+        place(allocation_span)?;
+        // Ordinary publication must never consume the cleaner reserve: a
+        // transition that dips free below the reserve floor is a capacity
+        // condition the foreground-cleaner retry (or store growth) relieves,
+        // not a mid-write validation failure.
+        if counts.free
+            < u64::try_from(needed_segments)
+                .ok()
+                .and_then(|needed| needed.checked_add(u64::from(state.cleaner_reserve_segments)))
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?
+        {
+            return Err(PersistentAuthorityError::Gc(GcError::Capacity));
+        }
         let free = select_free_segments(&state.allocation, needed_segments)
             .map_err(PersistentAuthorityError::Gc)?;
         let next_segment_generation = state

@@ -44,6 +44,13 @@ const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
 // their transient buffers to the shell owner. Keep the documented store
 // working-set floor plus client/future headroom while retaining a hard quota.
+// Storage-bench images additionally drive object benchmarks whose logical
+// journal envelope scales with object size (payload + Merkle envelope + one
+// 512-byte record per 360-byte chunk), so the qualification image needs a
+// larger transient envelope than the production interactive client budget.
+#[cfg(feature = "storage-bench")]
+pub const SHELL_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+#[cfg(not(feature = "storage-bench"))]
 pub const SHELL_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]

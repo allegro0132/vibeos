@@ -75,6 +75,10 @@ const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const METADATA_KIND_ROOT_SET: u32 = 0xffff_0020;
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
+/// Upper bound on source segments relocated by one collection round. Bounds
+/// the foreground pause and the round's read/copy volume; remaining dead
+/// space is reclaimed by subsequent rounds.
+const GC_MAX_SOURCES_PER_ROUND: usize = 8;
 
 /// Allocate page I/O scratch directly in its final heap representation so the
 /// segment-builder futures remain safe for the kernel's bounded stack.
@@ -3499,9 +3503,21 @@ impl<D: PageDevice> SegmentStore<D> {
                 allocation_len,
             )?;
             let reservation = required.checked_add(1).ok_or(GcError::ArithmeticOverflow)?;
+            // Bound one collection round: relocating an unbounded number of
+            // sources makes the foreground pause proportional to total dead
+            // space. Net yield still decides between admissible prefixes.
+            if candidate.len() > GC_MAX_SOURCES_PER_ROUND {
+                break;
+            }
+            // The cleaner reserve guarantees worst-case progress, but when more
+            // segments are actually free the collector may use them: a large
+            // multi-extent authority can legitimately need more relocation
+            // targets than the reserve floor.
+            let target_budget = u64::from(state.cleaner_reserve_segments)
+                .max(state.allocation.counts().map_err(GcError::from)?.free);
             if candidate.len() > reservation
                 && u64::try_from(reservation).map_err(|_| GcError::ArithmeticOverflow)?
-                    <= u64::from(state.cleaner_reserve_segments)
+                    <= target_budget
             {
                 let net = candidate.len() - reservation;
                 // Prefer the best yielding strict partial prefix. The full-set

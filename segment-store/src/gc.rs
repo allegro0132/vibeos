@@ -1882,7 +1882,10 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &[(&record, bytes)], false, None)
+        // Every SegmentBuilder consumer publishes a checkpoint before its
+        // segments become referenced; that slot protocol's first flush is the
+        // shared durability barrier for all deferred phases below.
+        write_payload_records_with_header(device, base, header, &[(&record, bytes)], true, None)
             .await?;
         self.relative = self
             .relative
@@ -1991,7 +1994,7 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &writes, false, None).await?;
+        write_payload_records_with_header(device, base, header, &writes, true, None).await?;
         let mut pointers = Vec::new();
         pointers
             .try_reserve_exact(records.len())
@@ -2100,15 +2103,13 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     let seal_digest =
         encode_segment_seal_body(&seal, &mut seal_body).map_err(StoreError::Format)?;
     encode_record_seal(seal_digest, &mut final_seal).map_err(StoreError::Format)?;
+    // Deferred like the commit path: no checkpoint can name this segment
+    // until the caller's slot protocol flushes, which covers every phase.
     write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
-    flush(device).await?;
     write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
-    flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
-    if flush_final_seal {
-        flush(device).await?;
-    }
+    let _ = flush_final_seal;
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
 }
 

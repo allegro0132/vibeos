@@ -684,6 +684,21 @@ enum LegacySnapshot {
 
 const STORAGE_V2_UUID: [u8; 16] = *b"VIBEOS-STOR-V2!!";
 
+/// Runtime store limits for the Storage V2 device. The recovery budget must
+/// match the format-time policy: large objects ride the M4 record stream
+/// inside the authority snapshot, and mount/growth transition accounting
+/// holds predecessor and successor state simultaneously.
+fn storage_v2_store_limits() -> StoreLimits {
+    StoreLimits {
+        // Recovery and collection account two mounted states side by side;
+        // each carries the full logical record stream, so the budget bounds
+        // the cumulative object bytes a store instance can carry (~a quarter
+        // of this value) rather than a single object's size.
+        recovery_memory_bytes: 64 * 1024 * 1024,
+        ..StoreLimits::default()
+    }
+}
+
 fn storage_v2_format_options() -> FormatOptions {
     FormatOptions {
         store_uuid: StoreUuid::new(STORAGE_V2_UUID).expect("fixed Storage V2 UUID is non-zero"),
@@ -692,10 +707,7 @@ fn storage_v2_format_options() -> FormatOptions {
         // snapshot; the default 2 MiB recovery ceiling cannot remount a store
         // holding a ~1 MiB object. Raise the bounded accounting budget without
         // changing any on-media geometry.
-        limits: StoreLimits {
-            recovery_memory_bytes: 16 * 1024 * 1024,
-            ..StoreLimits::default()
-        },
+        limits: storage_v2_store_limits(),
     }
 }
 
@@ -938,7 +950,7 @@ impl StorageV2Runtime {
         let runtime = Arc::new(Self {
             store: StableSegmentStore(UnsafeCell::new(SegmentStore::new_with_runtime_context(
                 device.clone(),
-                StoreLimits::default(),
+                storage_v2_store_limits(),
                 context.clone(),
             ))),
             device,
@@ -999,7 +1011,7 @@ impl StorageV2Runtime {
             unsafe {
                 *self.store.0.get() = SegmentStore::new_with_runtime_context(
                     self.device.clone(),
-                    StoreLimits::default(),
+                    storage_v2_store_limits(),
                     self.context.clone(),
                 );
             }
@@ -1467,7 +1479,18 @@ impl StorageV2Runtime {
             // per-round source budget bounds this pause; waiting instead for
             // hard capacity inside an append can strand a store whose grown
             // authority payload no longer fits the remaining free set.
-            let _ = poll_as_system(operation.store().collect_garbage()).await;
+            if poll_as_system(operation.store().collect_garbage()).await.is_ok() {
+                // Collection preserves the logical stream but advances the
+                // checkpoint generation; refresh the published authority view
+                // so the next append's generation witness is current.
+                if let Ok(view) = poll_as_system(operation.store().recover_persistent_authority(
+                    crate::durable_cspace::storage_v2_external_policy_sha256(),
+                ))
+                .await
+                {
+                    self.publish_authority(view);
+                }
+            }
         }
         operation.finish();
         Ok(())
@@ -3109,6 +3132,16 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
                 .cloned()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            // Keep the cleaner off the commit path: while the device still has
+            // growth capability, capacity relief happens through bounded store
+            // growth instead of a blocking foreground collection inside the
+            // append; once growth is exhausted, a budgeted collection runs at
+            // the free-segment floor. Either transition advances the
+            // checkpoint generation while preserving the logical stream, so
+            // it must complete before this append captures its generation
+            // witness. Failure here is not fatal by itself; a true capacity
+            // condition still fails the append closed below.
+            let _ = runtime.ensure_foreground_capacity().await;
             let current = runtime
                 .authority_view()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
@@ -3156,18 +3189,15 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .map_err(|_| vibeos_object_store::StoreError::Corrupt)?;
             #[cfg(feature = "storage-bench")]
             let phase_import = crate::sbi::time();
+            // The import owns its own validated copy; release the raw stream
+            // buffer before the append's peak transient allocations.
+            drop(stream_records);
             let principal = current
                 .principals()
                 .first()
                 .filter(|_| current.principals().len() == 1)
                 .cloned()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
-            // Keep the cleaner off the commit path: while the device still has
-            // growth capability, capacity relief happens through bounded store
-            // growth here instead of a blocking foreground collection inside
-            // the append. Growth failure is not fatal by itself; a true
-            // capacity condition still fails the append closed below.
-            let _ = runtime.ensure_foreground_capacity().await;
             let appended = runtime
                 .append_persistent_authority(current.checkpoint_generation(), import, principal)
                 .await

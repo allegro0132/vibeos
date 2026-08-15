@@ -596,14 +596,30 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         // Reject an over-budget typed payload from the authenticated BlobKey
         // before reading its manifest or allocating any Blob-sized buffer.
         // The exact logical length is part of the Merkle identity, so this
-        // preflight cannot be bypassed by media contents.
-        let maximum_typed_len = TYPED_REFS_HEADER_LEN
-            .checked_add(
-                GC_CHILD_BUDGET
-                    .checked_mul(TYPED_REFERENCE_ENTRY_LEN)
-                    .ok_or(GcError::ArithmeticOverflow)?,
-            )
-            .ok_or(GcError::ArithmeticOverflow)?;
+        // preflight cannot be bypassed by media contents. A file data node is
+        // special: its references all sit in the bounded structural prefix,
+        // but the typed payload is the whole node including up to a chunk
+        // envelope of content bytes, so its admission bound is the format's
+        // data-node maximum. (Reading only the prefix leaf is a follow-up;
+        // the memory accounting below already bounds the whole-node read.)
+        let maximum_typed_len = if object.blob_key.object_kind() == crate::FS_DATA_V1_KIND {
+            crate::fs_codec::FS_DATA_HEADER_LEN
+                .checked_add(
+                    crate::fs_codec::FS_DATA_MAX_ANCESTORS
+                        .checked_mul(crate::fs_codec::FS_DATA_REFERENCE_LEN)
+                        .ok_or(GcError::ArithmeticOverflow)?,
+                )
+                .and_then(|prefix| prefix.checked_add(crate::fs_codec::FS_DATA_CHUNK_MAX_LEN))
+                .ok_or(GcError::ArithmeticOverflow)?
+        } else {
+            TYPED_REFS_HEADER_LEN
+                .checked_add(
+                    GC_CHILD_BUDGET
+                        .checked_mul(TYPED_REFERENCE_ENTRY_LEN)
+                        .ok_or(GcError::ArithmeticOverflow)?,
+                )
+                .ok_or(GcError::ArithmeticOverflow)?
+        };
         let typed_exact_len =
             usize::try_from(object.blob_key.exact_len()).map_err(|_| GcError::MemoryLimit)?;
         if typed_exact_len > maximum_typed_len {

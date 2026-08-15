@@ -856,12 +856,21 @@ fn oom(layout: core::alloc::Layout) -> ! {
             quota_bytes,
         }) if owner != heap::OwnerId::SYSTEM =>
         {
-            // Keep the panic text deterministic; the account snapshot carries
-            // exact live/peak/request evidence for diagnostics and tests.
+            // Keep the production panic text deterministic; the account
+            // snapshot carries exact live/peak/request evidence for
+            // diagnostics and tests. Benchmark images print the numbers,
+            // because oversized transient envelopes are exactly what their
+            // qualification workloads probe.
+            #[cfg(feature = "storage-bench")]
             panic!(
                 "component allocation quota exceeded: owner={} live={} requested={} quota={}",
                 owner, live_bytes, requested_bytes, quota_bytes
-            )
+            );
+            #[cfg(not(feature = "storage-bench"))]
+            {
+                let _ = (owner, requested_bytes, live_bytes, quota_bytes);
+                panic!("component allocation quota exceeded")
+            }
         }
         failure => {
             // A global allocator failure is kernel state, even if it happened

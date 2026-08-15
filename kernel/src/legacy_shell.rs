@@ -3206,7 +3206,7 @@ async fn storage_file_tree_bench(
         unsupported("requested file count exceeds the bounded transaction edit budget");
         return;
     }
-    if (workload == "file-sequential" && size > 64 * 1024 * 1024)
+    if (workload == "file-sequential" && size > 512 * 1024 * 1024)
         || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
         || (workload == "file-batch-create" && count > 100) {
         unsupported("staged persistence exceeds the bounded guest benchmark budget");

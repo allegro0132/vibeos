@@ -1441,38 +1441,37 @@ impl StorageV2Runtime {
         Ok(bytes)
     }
 
-    #[cfg(feature = "file-tree")]
     /// Grow the store toward the foreground free-segment floor while the
     /// device still has growth capability. Both the file-tree and the object
     /// append paths call this before mutating, which keeps capacity relief on
     /// the growth path instead of a blocking foreground collection.
-    async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), FileError> {
-        let mut operation = self.begin().map_err(map_file_runtime_error)?;
+    async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), V2RuntimeError> {
+        let mut operation = self.begin()?;
         let info = operation
             .store()
             .info()
-            .map_err(|_| FileError::ServiceUnavailable)?;
+            .map_err(|_| V2RuntimeError::Corrupt)?;
         let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
             .ok()
             .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
-            .ok_or(FileError::ServiceUnavailable)?;
+            .ok_or(V2RuntimeError::Corrupt)?;
         let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
             .saturating_sub(info.free_segments)
             .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
-            .ok_or(FileError::ServiceUnavailable)?;
+            .ok_or(V2RuntimeError::Corrupt)?;
         let additional = self
             .device
             .growth_capability_bounded(durable_blocks, growth_blocks)
-            .map_err(|_| FileError::ServiceUnavailable)?;
+            .map_err(|_| V2RuntimeError::Corrupt)?;
         if let Some(additional) = additional {
             let maintenance = self
                 .maintenance
                 .lock()
                 .clone()
-                .ok_or(FileError::ServiceUnavailable)?;
+                .ok_or(V2RuntimeError::Corrupt)?;
             poll_as_system(operation.store().grow(&maintenance, additional))
                 .await
-                .map_err(|_| FileError::ServiceUnavailable)?;
+                .map_err(|_| V2RuntimeError::Corrupt)?;
         } else if info.free_segments < STORAGE_V2_FOREGROUND_FREE_SEGMENTS {
             // Growth is exhausted: reclaim dead space now, while enough free
             // segments remain for the collector's relocation targets. The
@@ -1507,7 +1506,9 @@ impl StorageV2Runtime {
         {
             return Err(FileError::ServiceUnavailable);
         }
-        self.ensure_foreground_capacity().await?;
+        self.ensure_foreground_capacity()
+            .await
+            .map_err(|_| FileError::ServiceUnavailable)?;
         let mut operation = self.begin().map_err(map_file_runtime_error)?;
         let recovered = poll_as_system(FileTreeRoot::recover_persistent(
             operation.store(),

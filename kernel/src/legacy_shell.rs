@@ -3190,15 +3190,11 @@ async fn storage_file_tree_bench(
     let seed = args.get(1).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
     let workload = args.get(2).copied().unwrap_or("file-durable-mutations");
     let count = args.get(3).and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
-    // Reuse one namespace for mutation workloads so the catalog/root cache is
-    // warm across samples. Directory runs use a seed-scoped namespace because
-    // each sample intentionally creates a fresh directory population before
-    // measuring lookup/list and recovery.
-    let namespace = if workload == "file-directory" {
-        HOME_NAMESPACE ^ (seed as u128)
-    } else {
-        HOME_NAMESPACE ^ 0x5a5a_0000_0000_0000_0000_0000_0000_0001
-    };
+    // One namespace for every file workload: the persistent fs root is a
+    // store-wide `latest(kind)` singleton, so a second namespace can never
+    // publish while the first namespace's root is current. Directory runs
+    // create a fresh seed-scoped subdirectory per sample instead.
+    let namespace = HOME_NAMESPACE ^ 0x5a5a_0000_0000_0000_0000_0000_0000_0001;
     let backend = "storage-v2";
     let unsupported = |reason: &str| {
         println!(
@@ -3322,9 +3318,11 @@ async fn storage_file_tree_bench(
             Ok(())
         }
         "file-directory" => {
+            let directory = alloc::format!("dir-{seed:016x}");
+            let directory_path = RelPath::parse(&directory)?;
             let mut staged_files = Vec::with_capacity(count);
             for index in 0..count {
-                let name = alloc::format!("dir-{seed:016x}-{index:04}");
+                let name = alloc::format!("{directory}/file-{index:04}");
                 let path = RelPath::parse(&name)?;
                 let mut stager = root.begin_content_stager(&path, false)?;
                 stager.push(&payload).await?;
@@ -3332,11 +3330,12 @@ async fn storage_file_tree_bench(
                 staged_files.push((path, staged));
             }
             let mut tx = root.begin()?;
+            tx.mkdir(&directory_path, false)?;
             for (path, staged) in staged_files {
                 tx.write_staged(&path, staged)?;
             }
             tx.commit_durable().await?;
-            let listed = root.snapshot().list(&RelPath::root(), true)?;
+            let listed = root.snapshot().list(&directory_path, true)?;
             if listed.len() != count {
                 return Err(FileError::Conflict);
             }
@@ -3344,7 +3343,7 @@ async fn storage_file_tree_bench(
             drop(root);
             let recovered = storage.recover_file_tree_root(namespace).await?;
             recovery_ticks = crate::sbi::time().saturating_sub(recovery_started).max(1);
-            if recovered.snapshot().list(&RelPath::root(), true)?.len() != count {
+            if recovered.snapshot().list(&directory_path, true)?.len() != count {
                 return Err(FileError::Conflict);
             }
             operations = count as u64 + 2;

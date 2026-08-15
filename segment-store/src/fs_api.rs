@@ -375,8 +375,9 @@ impl<D: PageDevice> SegmentStore<D> {
         Ok(meta)
     }
 
-    /// Read a data node's content bytes with per-leaf Merkle verification,
-    /// without materializing the encoded node twice.
+    /// Read a data node's content bytes. The whole node is read and verified
+    /// as one batched blob pass — per-leaf proof walks would cost a dozen
+    /// small device reads for every 4 KiB of a multi-MiB chunk.
     async fn read_fs_data_node_content(
         &self,
         object: &AuthorizedObject<CasObjectHandle>,
@@ -385,30 +386,14 @@ impl<D: PageDevice> SegmentStore<D> {
         if meta.encoded_len() as u64 != object.exact_len() {
             return Err(FsRootPublishError::InvalidRoot);
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(meta.bytes_len)
-            .map_err(|_| StoreError::MemoryLimit)?;
         if meta.bytes_len == 0 {
-            return Ok(bytes);
+            return Ok(Vec::new());
         }
-        let leaf_size = vibeos_blob_format::LEAF_SIZE;
-        let start = meta.bytes_offset();
-        let end = meta.encoded_len();
-        let first_leaf = start / leaf_size;
-        let last_leaf = (end - 1) / leaf_size;
-        for leaf in first_leaf..=last_leaf {
-            let chunk = self
-                .get_blob_chunk(object, u32::try_from(leaf).map_err(|_| StoreError::Corrupt)?)
-                .await?;
-            let leaf_start = leaf * leaf_size;
-            let copy_from = start.saturating_sub(leaf_start);
-            let copy_to = (end - leaf_start).min(chunk.bytes.len());
-            if copy_from >= copy_to {
-                return Err(FsRootPublishError::InvalidRoot);
-            }
-            bytes.extend_from_slice(&chunk.bytes[copy_from..copy_to]);
+        let mut encoded = self.read_verified_blob(object).await?;
+        if encoded.len() != meta.encoded_len() {
+            return Err(FsRootPublishError::InvalidRoot);
         }
+        let bytes = encoded.split_off(meta.bytes_offset());
         if bytes.len() != meta.bytes_len {
             return Err(FsRootPublishError::InvalidRoot);
         }
@@ -594,6 +579,34 @@ impl<D: PageDevice> SegmentStore<D> {
             .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
             .ok_or(FsStructuralCommitError::InvalidChild)?;
         drop(lease);
+        // Decline the whole batch before staging anything when the free set
+        // cannot plausibly carry it: nothing is consumed, the store stays
+        // mounted, and the caller may reclaim or grow and retry. (A mid-batch
+        // shortfall — e.g. from fragmentation — still poisons like any
+        // interrupted staged publication.)
+        {
+            let state = self.require_current_generation()?;
+            // Each chunk's encoded blob packs about three 1 MiB extents per
+            // 4 MiB segment; one metadata segment publishes the batch.
+            let mut needed = 1_u64;
+            for bytes in chunks {
+                needed = needed
+                    .checked_add(1 + bytes.len() as u64 / (3 * 1024 * 1024))
+                    .ok_or(StoreError::Corrupt)?;
+            }
+            let floor = u64::from(state.cleaner_reserve_segments)
+                .saturating_add(u64::from(crate::store::ROOT_POLICY_HEADROOM_SEGMENTS));
+            let free = state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .free;
+            if free < needed.saturating_add(floor) {
+                return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                    StoreError::Capacity(crate::CapacityClass::Payload),
+                )));
+            }
+        }
         // Seed the stream frontier from the committed predecessor, if any.
         let mut tail: Option<(TypedObjectReference, FsDataNodeMeta)> = match previous {
             None => None,
@@ -1902,6 +1915,57 @@ mod tests {
         assert_eq!(after.generation, before.generation + 1);
         // Only the metadata segment was consumed.
         assert_eq!(after.allocated_segments, before.allocated_segments + 1);
+    }
+
+    #[test]
+    fn gc_after_batched_staging_preserves_the_id_high_water() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let maintenance = store.mint_maintenance_root().unwrap();
+        // Destructive collection needs a synchronized root policy; publish an
+        // empty namespace root first.
+        let root = empty_root(&mut store, 1, 2);
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+        // A batch binds several object ids under one checkpoint, pushing the
+        // id high-water past the generation floor.
+        let chunks: Vec<Vec<u8>> = (0..6_u8).map(|index| alloc::vec![index + 1; 40960]).collect();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            None,
+            &chunks,
+        ))
+        .unwrap();
+        let mut batch = store.begin_staged_batch().unwrap();
+        let (first_id, _) = batch.predicted_object(0).unwrap();
+        drop(batch);
+        block_on(store.mount()).unwrap();
+        assert!(
+            first_id > u128::from(store.info().unwrap().generation),
+            "fixture must exercise ids beyond the generation floor",
+        );
+
+        // Collection must proceed (not fail closed) and keep the media
+        // high-water durable across destructive rounds and a cold mount.
+        for _ in 0..3 {
+            block_on(store.collect_garbage()).unwrap();
+        }
+        drop(store);
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let mut batch = cold.begin_staged_batch().unwrap();
+        let (next_id, _) = batch.predicted_object(0).unwrap();
+        drop(batch);
+        block_on(cold.mount()).unwrap();
+        assert!(
+            next_id >= first_id,
+            "GC or remount reissued object ids ({next_id} < {first_id})",
+        );
+        // The staged stream still reads after collection: the pinned tail
+        // kept the whole ancestor chain live through destructive rounds.
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&tail, 4)).unwrap(),
+            Some(alloc::vec![5_u8; 40960])
+        );
     }
 
     #[test]

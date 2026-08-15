@@ -2028,8 +2028,11 @@ pub fn build() {
             const STORAGE_V2_BLOCKS: u64 = crate::segment_store_platform::STORAGE_V2_BLOCK_COUNT;
             const STORAGE_V2_GRANULE: u64 =
                 crate::segment_store_platform::STORAGE_V2_GROWTH_GRANULE_BLOCKS;
+            // The benchmark harness always provisions a 1 GiB data disk. Park
+            // the dedicated raw-block window near its tail so the Storage V2
+            // growth range keeps roughly 900 MiB for large-file workloads.
             #[cfg(feature = "storage-bench")]
-            const BENCHMARK_BLOCK_FIRST: u64 = 262_144;
+            const BENCHMARK_BLOCK_FIRST: u64 = 1_835_008;
             #[cfg(feature = "storage-bench")]
             const BENCHMARK_BLOCKS: u64 = 131_072;
 

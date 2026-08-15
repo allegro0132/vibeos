@@ -3206,10 +3206,10 @@ async fn storage_file_tree_bench(
         unsupported("requested file count exceeds the bounded transaction edit budget");
         return;
     }
-    if (workload == "file-sequential" && size > 1024 * 1024)
-        || (workload == "file-overwrite-1m" && size >= 1024 * 1024)
+    if (workload == "file-sequential" && size > 64 * 1024 * 1024)
+        || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
         || (workload == "file-batch-create" && count > 100) {
-        unsupported("4 KiB staged persistence path exceeds the bounded guest benchmark budget");
+        unsupported("staged persistence exceeds the bounded guest benchmark budget");
         return;
     }
     let root = match storage.recover_file_tree_root(namespace).await {
@@ -3222,13 +3222,17 @@ async fn storage_file_tree_bench(
             return;
         }
     };
-    let mut payload = Vec::with_capacity(size.min(1024 * 1024));
-    payload.extend((0..size).map(|index| {
-        (index as u64)
-            .wrapping_mul(131)
-            .wrapping_add(seed.wrapping_mul(17))
-            .wrapping_add(0x5a) as u8
-    }));
+    // file-sequential regenerates its content chunk by chunk, so a large run
+    // must not also materialize the whole payload here.
+    let mut payload = Vec::new();
+    if workload != "file-sequential" {
+        payload.extend((0..size).map(|index| {
+            (index as u64)
+                .wrapping_mul(131)
+                .wrapping_add(seed.wrapping_mul(17))
+                .wrapping_add(0x5a) as u8
+        }));
+    }
     let started = crate::sbi::time();
     let mut transferred = 0_u64;
     let mut operations = 0_u64;
@@ -3313,7 +3317,12 @@ async fn storage_file_tree_bench(
             for index in 0..reader.chunk_count() {
                 read = read.saturating_add(reader.read_chunk(index).await?.map(|chunk| chunk.len() as u64).unwrap_or(0));
             }
-            operations = 2;
+            // Remove the file so repeated samples measure a steady state
+            // instead of accumulating tens of megabytes of live data.
+            let mut tx = root.begin()?;
+            tx.remove(&path, false, false)?;
+            tx.commit_durable().await?;
+            operations = 3;
             transferred = (size as u64).saturating_add(read);
             Ok(())
         }

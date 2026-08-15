@@ -3250,13 +3250,14 @@ impl<D: PageDevice> SegmentStore<D> {
         memory.transient(two_states)?;
         let state = self.require_current_generation()?.clone();
         memory.retain(two_states)?;
-        // Generation is the frozen-format durable ObjectId high-water. A
-        // production store mounts with next_object_id == generation; a catalog
-        // imported with larger IDs remains readable/writable but cannot be
-        // destructively filtered until a future format carries its high-water.
-        if !generation_covers_object_id_high_water(state.generation, state.next_object_id) {
-            return Err(GcError::ObjectIdHighWaterUnavailable.into());
-        }
+        // Generation is the frozen-format durable ObjectId high-water floor.
+        // Batched staging binds several ids per checkpoint, so a production
+        // catalog's ids may legitimately exceed the floor; the top catalog
+        // entry then carries the media high-water (mount recomputes
+        // `max(top id + 1, generation)`) and is force-retained below so
+        // destructive filtering can never lower it.
+        let must_retain_top_entry =
+            !generation_covers_object_id_high_water(state.generation, state.next_object_id);
         // Relocation always needs at least one G+1 target and one distinct
         // G+2 barrier segment. Historical reserve-one images remain fully
         // mountable/readable, but cannot safely enter this protocol.
@@ -3388,6 +3389,17 @@ impl<D: PageDevice> SegmentStore<D> {
                 &mut mark,
             )
             .map_err(|_| GcError::CorruptAt("mark"))?;
+        if must_retain_top_entry {
+            let top = cas.objects.last().ok_or(GcError::ObjectIdHighWaterUnavailable)?;
+            let key = RootKey::new(
+                top.object_id,
+                top.commit_generation,
+                top.blob_key.object_kind(),
+            )
+            .map_err(|_| GcError::ObjectIdHighWaterUnavailable)?;
+            mark.retain_object(key, top.blob_key)
+                .map_err(|_| GcError::MemoryLimit)?;
+        }
         let planner_bytes = planner
             .allocated_bytes()
             .ok_or(GcError::ArithmeticOverflow)?;

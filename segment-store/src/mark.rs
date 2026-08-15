@@ -213,6 +213,30 @@ impl MarkPlan {
         self.live_objects.clear();
         self.live_blobs.clear();
     }
+
+    /// Force-retain one catalog entry (and its blob) in the live set.
+    ///
+    /// The mounted object-id high-water is `max(top catalog id + 1,
+    /// generation)`. Batched staging binds several ids per checkpoint, so ids
+    /// can legitimately outrun the generation floor; the highest catalog
+    /// entry is then the only durable carrier of the high-water and must
+    /// survive destructive filtering even when unreachable, or a future mount
+    /// could reissue live-range ids.
+    pub(crate) fn retain_object(&mut self, key: RootKey, blob: BlobKey) -> Result<(), MarkError> {
+        if let Err(at) = self.live_objects.binary_search(&key) {
+            if self.live_objects.len() >= self.object_capacity {
+                return Err(MarkError::AllocationFailed);
+            }
+            self.live_objects.insert(at, key);
+        }
+        if let Err(at) = self.live_blobs.binary_search(&blob) {
+            if self.live_blobs.len() >= self.blob_capacity {
+                return Err(MarkError::AllocationFailed);
+            }
+            self.live_blobs.insert(at, blob);
+        }
+        Ok(())
+    }
 }
 
 /// All temporary vectors are allocated to their fixed maxima at construction.

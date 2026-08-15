@@ -3054,23 +3054,27 @@ async fn storage_object_bench(
         put_io.write_bytes,
         put_io.used_interrupts,
     );
-    let Ok(publication) = publication else {
-        let status = if backend == "m4" && size > 360 * 1024 {
-            "unsupported"
-        } else {
-            "failed-closed"
-        };
-        println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\",\"reason\":\"publication failed\"}}",
-            backend,
-            workload,
-            size,
-            seed,
-            exec::timebase_hz(),
-            put_ticks,
-            status,
-        );
-        return;
+    let publication = match publication {
+        Ok(publication) => publication,
+        Err(error) => {
+            let status = if backend == "m4" && size > 360 * 1024 {
+                "unsupported"
+            } else {
+                "failed-closed"
+            };
+            println!(
+                "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\",\"reason\":\"publication failed: {:?}\"}}",
+                backend,
+                workload,
+                size,
+                seed,
+                exec::timebase_hz(),
+                put_ticks,
+                status,
+                error,
+            );
+            return;
+        }
     };
     let service = init
         .0

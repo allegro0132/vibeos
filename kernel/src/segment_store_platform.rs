@@ -1430,7 +1430,11 @@ impl StorageV2Runtime {
     }
 
     #[cfg(feature = "file-tree")]
-    async fn ensure_file_tree_capacity(self: &Arc<Self>) -> Result<(), FileError> {
+    /// Grow the store toward the foreground free-segment floor while the
+    /// device still has growth capability. Both the file-tree and the object
+    /// append paths call this before mutating, which keeps capacity relief on
+    /// the growth path instead of a blocking foreground collection.
+    async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), FileError> {
         let mut operation = self.begin().map_err(map_file_runtime_error)?;
         let info = operation
             .store()
@@ -1457,6 +1461,13 @@ impl StorageV2Runtime {
             poll_as_system(operation.store().grow(&maintenance, additional))
                 .await
                 .map_err(|_| FileError::ServiceUnavailable)?;
+        } else if info.free_segments < STORAGE_V2_FOREGROUND_FREE_SEGMENTS {
+            // Growth is exhausted: reclaim dead space now, while enough free
+            // segments remain for the collector's relocation targets. The
+            // per-round source budget bounds this pause; waiting instead for
+            // hard capacity inside an append can strand a store whose grown
+            // authority payload no longer fits the remaining free set.
+            let _ = poll_as_system(operation.store().collect_garbage()).await;
         }
         operation.finish();
         Ok(())
@@ -1473,7 +1484,7 @@ impl StorageV2Runtime {
         {
             return Err(FileError::ServiceUnavailable);
         }
-        self.ensure_file_tree_capacity().await?;
+        self.ensure_foreground_capacity().await?;
         let mut operation = self.begin().map_err(map_file_runtime_error)?;
         let recovered = poll_as_system(FileTreeRoot::recover_persistent(
             operation.store(),
@@ -3151,6 +3162,12 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .filter(|_| current.principals().len() == 1)
                 .cloned()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            // Keep the cleaner off the commit path: while the device still has
+            // growth capability, capacity relief happens through bounded store
+            // growth here instead of a blocking foreground collection inside
+            // the append. Growth failure is not fatal by itself; a true
+            // capacity condition still fails the append closed below.
+            let _ = runtime.ensure_foreground_capacity().await;
             let appended = runtime
                 .append_persistent_authority(current.checkpoint_generation(), import, principal)
                 .await

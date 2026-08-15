@@ -849,12 +849,19 @@ impl core::fmt::Write for SbiWriter {
 #[alloc_error_handler]
 fn oom(layout: core::alloc::Layout) -> ! {
     match HEAP.take_last_failure() {
-        Some(heap::AllocationFailure::QuotaExceeded { owner, .. })
-            if owner != heap::OwnerId::SYSTEM =>
+        Some(heap::AllocationFailure::QuotaExceeded {
+            owner,
+            requested_bytes,
+            live_bytes,
+            quota_bytes,
+        }) if owner != heap::OwnerId::SYSTEM =>
         {
             // Keep the panic text deterministic; the account snapshot carries
             // exact live/peak/request evidence for diagnostics and tests.
-            panic!("component allocation quota exceeded")
+            panic!(
+                "component allocation quota exceeded: owner={} live={} requested={} quota={}",
+                owner, live_bytes, requested_bytes, quota_bytes
+            )
         }
         failure => {
             // A global allocator failure is kernel state, even if it happened

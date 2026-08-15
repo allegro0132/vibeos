@@ -504,3 +504,57 @@ fn large_object_append_and_cold_recover() {
     assert_eq!(recovered.objects().len(), 3);
 }
 
+#[test]
+fn two_transient_large_appends() {
+    // Repeated ~1.5 MiB authority rewrites plus their relocation targets need
+    // more headroom than the small steady-state store; the kernel relies on
+    // online growth for the same reason.
+    let device = CountingDevice::blank(48);
+    let (runtime, _quota, provisioner) = runtime_ctx();
+    let large_limits = StoreLimits {
+        recovery_memory_bytes: 64 * 1024 * 1024,
+        ..StoreLimits::default()
+    };
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), large_limits, runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"PERF-2xLARGE-OBJ").unwrap(),
+        cleaner_reserve_segments: 2,
+        limits: large_limits,
+    }))
+    .unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let writer: PersistentAuthorityWriter =
+        store.derive_persistent_authority_writer(&maintenance).unwrap();
+    let mut records = format_records();
+    let first_view =
+        block_on(store.import_persistent_authority(&maintenance, import(&records))).unwrap();
+    records = first_view
+        .record_stream()
+        .chunks_exact(vibeos_durable_format::RECORD_SIZE)
+        .map(|chunk| chunk.try_into().unwrap())
+        .collect();
+    let principal = first_view.principals()[0].clone();
+    let mut generation = first_view.checkpoint_generation();
+    for round in 0..8u64 {
+        let payload: Vec<u8> = (0..1024 * 1024usize)
+            .map(|index| (index as u64).wrapping_mul(131).wrapping_add(round) as u8)
+            .collect();
+        let (next_records, _object_id) = append_records(&records, &payload);
+        let update = import(&next_records);
+        let result = block_on(store.append_persistent_authority(
+            &writer,
+            generation,
+            update,
+            &principal,
+        ))
+        .unwrap_or_else(|error| panic!("transient append round {} failed: {:?}", round, error));
+        let info = store.info().unwrap();
+        println!(
+            "round {} ok, gen {} free={} allocated={} admitted={}",
+            round, generation, info.free_segments, info.allocated_segments, info.admitted_segments
+        );
+        let (view, _transient) = result.into_parts();
+        generation = view.checkpoint_generation();
+        records = next_records;
+    }
+}

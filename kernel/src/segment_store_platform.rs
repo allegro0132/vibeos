@@ -48,6 +48,9 @@ use crate::{exec, heap, sync::SpinLock};
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
+/// Extra segments requested beyond the floor whenever foreground growth
+/// runs, so one growth transaction serves many subsequent commits.
+const STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS: u64 = 22;
 pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
     vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
@@ -1451,11 +1454,20 @@ impl StorageV2Runtime {
             .store()
             .info()
             .map_err(|_| V2RuntimeError::Corrupt)?;
+        if info.free_segments >= STORAGE_V2_FOREGROUND_FREE_SEGMENTS {
+            operation.finish();
+            return Ok(());
+        }
         let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
             .ok()
             .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
             .ok_or(V2RuntimeError::Corrupt)?;
+        // Grow with hysteresis: replenishing exactly to the floor makes the
+        // very next commit dip below it again, turning every append into a
+        // growth checkpoint. Overshooting amortizes one growth transaction
+        // across many commits.
         let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
+            .saturating_add(STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS)
             .saturating_sub(info.free_segments)
             .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
             .ok_or(V2RuntimeError::Corrupt)?;

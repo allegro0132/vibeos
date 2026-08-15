@@ -801,27 +801,64 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 .lock()
                 .clone()
                 .ok_or(FileError::ServiceUnavailable)?;
-            // Replenish free segments before the batch claims its scratch;
-            // one batch consumes several segments in a single transaction.
-            self.runtime
-                .ensure_foreground_capacity()
-                .await
-                .map_err(map_file_runtime_error)?;
-            let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
-            let result = poll_as_system(operation.store().stage_fs_data_chunks_for_maintenance(
-                &maintenance,
-                previous.as_ref(),
-                &chunks,
-            ))
-            .await
-            .map_err(|_| FileError::ServiceUnavailable);
-            if result.is_err() {
-                // A failed staged batch leaves the store poisoned; only a new
-                // cold proof may re-establish the durable checkpoint.
-                self.runtime.invalidate_recovery_cache();
+            // One batch consumes a segment per chunk plus its metadata
+            // segment inside a single transaction, and the following
+            // tree/root commit burns several more; replenish to that
+            // appetite, not to the per-append floor.
+            let needed = (chunks.len() as u64).saturating_add(12);
+            let mut attempt = 0;
+            loop {
+                self.runtime
+                    .ensure_foreground_capacity_for(needed)
+                    .await
+                    .map_err(map_file_runtime_error)?;
+                let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
+                let result =
+                    poll_as_system(operation.store().stage_fs_data_chunks_for_maintenance(
+                        &maintenance,
+                        previous.as_ref(),
+                        &chunks,
+                    ))
+                    .await;
+                let declined_clean =
+                    result.is_err() && !operation.store().needs_remount();
+                if result.is_err() && !declined_clean {
+                    // A failed staged batch leaves the store poisoned; only a
+                    // new cold proof may re-establish the durable checkpoint.
+                    self.runtime.invalidate_recovery_cache();
+                }
+                operation.finish();
+                match result {
+                    Ok(tail) => return Ok(tail),
+                    Err(error) => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!(
+                            "  bench-detail fs-stage error (clean={declined_clean}): {error:?}"
+                        );
+                        let _ = &error;
+                        if declined_clean && attempt == 0 {
+                            // The batch was declined before staging anything;
+                            // reclaim dead segments and retry once.
+                            if let Ok(mut operation) = self.runtime.begin() {
+                                let _ = poll_as_system(operation.store().collect_garbage()).await;
+                                if let Ok(view) = poll_as_system(
+                                    operation.store().recover_persistent_authority(
+                                        crate::durable_cspace::storage_v2_external_policy_sha256(),
+                                    ),
+                                )
+                                .await
+                                {
+                                    self.runtime.publish_authority(view);
+                                }
+                                operation.finish();
+                            }
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(FileError::ServiceUnavailable);
+                    }
+                }
             }
-            operation.finish();
-            result
         })
     }
 
@@ -854,6 +891,11 @@ impl FileTreeBackend for KernelFileTreeBackend {
             )
             .await
             .map_err(|error| match error {
+                #[cfg(feature = "storage-bench")]
+                ref detail if {
+                    crate::println!("  bench-detail fs-commit error: {detail:?}");
+                    false
+                } => unreachable!(),
                 vibeos_file_store::PersistentCommitError::File(error) => error,
                 vibeos_file_store::PersistentCommitError::Publish(
                     vibeos_segment_store::FsRootPublishError::Conflict,
@@ -1557,12 +1599,25 @@ impl StorageV2Runtime {
     /// append paths call this before mutating, which keeps capacity relief on
     /// the growth path instead of a blocking foreground collection.
     async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), V2RuntimeError> {
+        self.ensure_foreground_capacity_for(STORAGE_V2_FOREGROUND_FREE_SEGMENTS)
+            .await
+    }
+
+    /// Like [`StorageV2Runtime::ensure_foreground_capacity`], but replenishing
+    /// to at least `required_free` segments. Batched staging consumes several
+    /// segments inside one transaction, so its caller must raise the floor to
+    /// the batch's appetite instead of relying on the per-append default.
+    async fn ensure_foreground_capacity_for(
+        self: &Arc<Self>,
+        required_free: u64,
+    ) -> Result<(), V2RuntimeError> {
+        let floor = STORAGE_V2_FOREGROUND_FREE_SEGMENTS.max(required_free);
         let mut operation = self.begin()?;
         let info = operation
             .store()
             .info()
             .map_err(|_| V2RuntimeError::Corrupt)?;
-        if info.free_segments >= STORAGE_V2_FOREGROUND_FREE_SEGMENTS {
+        if info.free_segments >= floor {
             operation.finish();
             return Ok(());
         }
@@ -1583,6 +1638,14 @@ impl StorageV2Runtime {
             .device
             .growth_capability_bounded(durable_blocks, growth_blocks)
             .map_err(|_| V2RuntimeError::Corrupt)?;
+        #[cfg(feature = "storage-bench")]
+        crate::println!(
+            "  bench-detail capacity free={} floor={} growth_blocks={} additional={:?}",
+            info.free_segments,
+            floor,
+            growth_blocks,
+            additional.is_some()
+        );
         if let Some(additional) = additional {
             let maintenance = self
                 .maintenance
@@ -1592,13 +1655,46 @@ impl StorageV2Runtime {
             poll_as_system(operation.store().grow(&maintenance, additional))
                 .await
                 .map_err(|_| V2RuntimeError::Corrupt)?;
-        } else if info.free_segments < STORAGE_V2_FOREGROUND_FREE_SEGMENTS {
+        } else {
             // Growth is exhausted: reclaim dead space now, while enough free
-            // segments remain for the collector's relocation targets. The
-            // per-round source budget bounds this pause; waiting instead for
-            // hard capacity inside an append can strand a store whose grown
-            // authority payload no longer fits the remaining free set.
-            if poll_as_system(operation.store().collect_garbage()).await.is_ok() {
+            // segments remain for the collector's relocation targets. Each
+            // round's source budget bounds its pause, and a retired segment
+            // only rejoins the free set two checkpoint generations later, so
+            // one round cannot observe its own relief — iterate bounded
+            // rounds until the requested floor is met or reclaim stalls.
+            let mut collected = false;
+            let mut last_free = info.free_segments;
+            let mut stalled = 0_u32;
+            for _ in 0..8 {
+                if let Err(_error) = poll_as_system(operation.store().collect_garbage()).await {
+                    #[cfg(feature = "storage-bench")]
+                    crate::println!("  bench-detail gc error: {_error:?}");
+                    break;
+                }
+                collected = true;
+                let Ok(current) = operation.store().info() else {
+                    break;
+                };
+                #[cfg(feature = "storage-bench")]
+                crate::println!(
+                    "  bench-detail gc-round free={} floor={}",
+                    current.free_segments,
+                    floor
+                );
+                if current.free_segments >= floor {
+                    break;
+                }
+                if current.free_segments <= last_free {
+                    stalled += 1;
+                    if stalled >= 3 {
+                        break;
+                    }
+                } else {
+                    stalled = 0;
+                }
+                last_free = current.free_segments;
+            }
+            if collected {
                 // Collection preserves the logical stream but advances the
                 // checkpoint generation; refresh the published authority view
                 // so the next append's generation witness is current.

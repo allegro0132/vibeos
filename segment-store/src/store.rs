@@ -661,6 +661,14 @@ impl<D: PageDevice> SegmentStore<D> {
         self.device
     }
 
+    /// True when the store's continuable state is gone (a staged transaction
+    /// failed or is still in flight) and only a fresh mount can proceed.
+    /// Callers use this to distinguish a cleanly declined operation, which
+    /// leaves the store serviceable, from an interrupted one.
+    pub fn needs_remount(&self) -> bool {
+        self.poisoned || self.mounted.is_none()
+    }
+
     pub fn info(&self) -> Result<StoreInfo, StoreError<D::Error>> {
         let state = self.mounted.as_ref().ok_or(if self.poisoned {
             StoreError::RecoveryRequired

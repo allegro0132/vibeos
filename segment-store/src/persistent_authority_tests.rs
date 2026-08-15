@@ -1819,3 +1819,257 @@ fn compacted_replace_preserves_stale_handles_and_witnesses() {
     let fresh = replaced.object_for_recovered(&object_a_compacted).unwrap();
     assert_eq!(block_on(read_handle(&store, fresh)), bytes_a);
 }
+
+fn append_external_object_records(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    byte_len: u64,
+    merkle_root: [u8; 32],
+) -> (Vec<[u8; vibeos_durable_format::RECORD_SIZE]>, ObjectId) {
+    let preflight = vibeos_durable_format::preflight_recovery(records, store_id()).unwrap();
+    let mut chain =
+        RecordChain::from_checkpoint(store_id(), preflight.chain_checkpoint().unwrap()).unwrap();
+    let transaction = preflight.id_high_water().max(1);
+    let object = transaction.checked_add(1).unwrap();
+    let exclusive_end = object.checked_add(1).unwrap();
+    let object_id = ObjectId::new(object).unwrap();
+    let mut output = records.to_vec();
+    output.push(
+        chain
+            .append(None, RecordBody::IdHighWater { exclusive_end })
+            .unwrap(),
+    );
+    let (transaction, _) = vibeos_durable_format::preview_external_object_transaction(
+        &chain,
+        TransactionId::new(transaction).unwrap(),
+        object_id,
+        kind(),
+        byte_len,
+        merkle_root,
+    )
+    .unwrap();
+    output.extend(transaction.records);
+    (output, object_id)
+}
+
+#[test]
+fn external_object_appends_recover_and_verify_end_to_end() {
+    let device = MemoryDevice::blank();
+    let (runtime, _quota, maintenance_provisioner) =
+        StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+        cleaner_reserve_segments: 4,
+        limits: limits(),
+    }))
+    .unwrap();
+    let maintenance = store
+        .provision_maintenance_root(&maintenance_provisioner)
+        .unwrap();
+    let initial =
+        block_on(store.import_persistent_authority(&maintenance, import(&format_records(), &[])))
+            .unwrap();
+    let principal = initial.principals()[0].clone();
+    let writer = store
+        .derive_persistent_authority_writer(&maintenance)
+        .unwrap();
+
+    // Content larger than one page, with its content address computed
+    // exactly the way the blob writer will.
+    let content: Vec<u8> = (0..200_000_u32).map(|at| (at * 7 + 3) as u8).collect();
+    let declared = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND_RAW, &content)
+        .unwrap()
+        .root;
+    let (records, object_id) =
+        append_external_object_records(&format_records(), content.len() as u64, declared);
+    let recovered_external = vibeos_durable_format::preflight_recovery(&records, store_id())
+        .unwrap()
+        .committed_objects()
+        .iter()
+        .find(|object| object.object_id == object_id)
+        .unwrap()
+        .clone();
+    assert!(recovered_external.is_external());
+
+    // A fresh external object without its payload must fail closed. Run the
+    // starved attempt on its own store so its released reservations cannot
+    // interact with the happy path below.
+    {
+        let device = MemoryDevice::blank();
+        let (runtime, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut starved_store =
+            SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(starved_store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+            cleaner_reserve_segments: 4,
+            limits: limits(),
+        }))
+        .unwrap();
+        let maintenance = starved_store
+            .provision_maintenance_root(&provisioner)
+            .unwrap();
+        let initial = block_on(
+            starved_store
+                .import_persistent_authority(&maintenance, import(&format_records(), &[])),
+        )
+        .unwrap();
+        let principal = initial.principals()[0].clone();
+        let writer = starved_store
+            .derive_persistent_authority_writer(&maintenance)
+            .unwrap();
+        let starved = import(&records, &[]);
+        assert!(block_on(starved_store.append_persistent_authority(
+            &writer,
+            initial.checkpoint_generation(),
+            starved,
+            &principal,
+        ))
+        .is_err());
+    }
+
+    // With the payload attached, the append publishes object and record
+    // stream under one checkpoint, readable through the transient witness.
+    let mut with_payload = import(&records, &[]);
+    with_payload
+        .attach_external_payload(object_id.get(), content.clone())
+        .unwrap();
+    let appended = block_on(store.append_persistent_authority(
+        &writer,
+        initial.checkpoint_generation(),
+        with_payload,
+        &principal,
+    ))
+    .unwrap();
+    let usage = store.principal_quota_usage(&principal).unwrap();
+    assert_eq!(usage.committed_logical_bytes, content.len() as u64);
+    let (view, witness) = appended.into_parts();
+    assert_eq!(
+        block_on(store.read_transient_object(&witness, &recovered_external)).unwrap(),
+        content
+    );
+    let after_append = view.checkpoint_generation();
+    drop(view);
+
+    // A wrong declared root must never publish: rebuild the same records
+    // with a tampered root and a fresh store to prove the writer-side check.
+    {
+        let device = MemoryDevice::blank();
+        let (runtime, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut poisoned = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(poisoned.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+            cleaner_reserve_segments: 4,
+            limits: limits(),
+        }))
+        .unwrap();
+        let maintenance = poisoned.provision_maintenance_root(&provisioner).unwrap();
+        let initial = block_on(
+            poisoned.import_persistent_authority(&maintenance, import(&format_records(), &[])),
+        )
+        .unwrap();
+        let principal = initial.principals()[0].clone();
+        let writer = poisoned
+            .derive_persistent_authority_writer(&maintenance)
+            .unwrap();
+        let mut tampered_root = declared;
+        tampered_root[0] ^= 1;
+        let (records, object_id) = append_external_object_records(
+            &format_records(),
+            content.len() as u64,
+            tampered_root,
+        );
+        let mut tampered = import(&records, &[]);
+        tampered
+            .attach_external_payload(object_id.get(), content.clone())
+            .unwrap();
+        assert!(block_on(poisoned.append_persistent_authority(
+            &writer,
+            initial.checkpoint_generation(),
+            tampered,
+            &principal,
+        ))
+        .is_err());
+    }
+
+    // A later grant admits the external object into the durable view. Its
+    // content never re-enters the stream: the binding reuses the blob the
+    // fused append committed.
+    let (grant_records, grant) = append_root_grant_records(&records, object_id);
+    let rooted = block_on(store.append_persistent_authority(
+        &writer,
+        after_append,
+        import(&grant_records, &[RootPolicy {
+            grant: grant.clone(),
+        }]),
+        &principal,
+    ))
+    .unwrap();
+    let handle = rooted
+        .view()
+        .object_for_recovered(&recovered_external)
+        .unwrap();
+    assert_eq!(block_on(read_handle(&store, handle)), content);
+    let after_grant = rooted.view().checkpoint_generation();
+    drop(rooted);
+
+    // Cold boot: the granted external object resolves persistently through
+    // its already-durable blob and the full import verification accepts the
+    // stream without any payload.
+    drop(store);
+    let (cold_runtime, _cold_quota, _cold_provisioner) =
+        StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits(), cold_runtime);
+    block_on(cold.mount()).unwrap();
+    let recovered =
+        block_on(cold.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+    assert_eq!(recovered.checkpoint_generation(), after_grant);
+    let verify = import(&grant_records, &[RootPolicy { grant }]);
+    block_on(cold.verify_persistent_authority_import(&recovered, &verify)).unwrap();
+    let handle = recovered.object_for_recovered(&recovered_external).unwrap();
+    assert_eq!(block_on(read_handle(&cold, handle)), content);
+}
+
+#[test]
+fn control_inline_object_then_grant_same_flow() {
+    let device = MemoryDevice::blank();
+    let (runtime, _quota, maintenance_provisioner) =
+        StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+        cleaner_reserve_segments: 4,
+        limits: limits(),
+    }))
+    .unwrap();
+    let maintenance = store
+        .provision_maintenance_root(&maintenance_provisioner)
+        .unwrap();
+    let initial =
+        block_on(store.import_persistent_authority(&maintenance, import(&format_records(), &[])))
+            .unwrap();
+    let principal = initial.principals()[0].clone();
+    let writer = store
+        .derive_persistent_authority_writer(&maintenance)
+        .unwrap();
+    let content: Vec<u8> = (0..200_000_u32).map(|at| (at * 7 + 3) as u8).collect();
+    let (records, object_id) = append_next_object_records(&format_records(), &content);
+    let appended = block_on(store.append_persistent_authority(
+        &writer,
+        initial.checkpoint_generation(),
+        import(&records, &[]),
+        &principal,
+    ))
+    .unwrap();
+    let after_append = appended.view().checkpoint_generation();
+    let (_view, _witness) = appended.into_parts();
+    let (grant_records, grant) = append_root_grant_records(&records, object_id);
+    let _rooted = block_on(store.append_persistent_authority(
+        &writer,
+        after_append,
+        import(&grant_records, &[RootPolicy { grant }]),
+        &principal,
+    ))
+    .unwrap();
+}

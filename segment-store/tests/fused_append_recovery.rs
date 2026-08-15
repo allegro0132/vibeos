@@ -298,10 +298,77 @@ fn payload(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index * 197 + 0x11) as u8).collect()
 }
 
+/// Grant one external (content-by-reference) object: a single commit record
+/// declaring the content identity, plus a durable root grant for it. The
+/// content itself travels beside the import as an attached payload.
+fn granted_external_object_records(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    bytes: &[u8],
+) -> (Vec<[u8; vibeos_durable_format::RECORD_SIZE]>, GrantRecord, u128) {
+    let preflight = vibeos_durable_format::preflight_recovery(records, store_id()).unwrap();
+    let mut chain =
+        RecordChain::from_checkpoint(store_id(), preflight.chain_checkpoint().unwrap()).unwrap();
+    let transaction = preflight.id_high_water().max(1);
+    let object = transaction.checked_add(1).unwrap();
+    let grant_transaction = object.checked_add(1).unwrap();
+    let derivation = grant_transaction.checked_add(1).unwrap();
+    let space = derivation.checked_add(1).unwrap();
+    let exclusive_end = space.checked_add(1).unwrap();
+    let object_id = ObjectId::new(object).unwrap();
+    let declared = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND_RAW, bytes)
+        .unwrap()
+        .root;
+    let mut output = records.to_vec();
+    output.push(
+        chain
+            .append(None, RecordBody::IdHighWater { exclusive_end })
+            .unwrap(),
+    );
+    let (transaction_records, next) = vibeos_durable_format::preview_external_object_transaction(
+        &chain,
+        TransactionId::new(transaction).unwrap(),
+        object_id,
+        ObjectKind::new(OBJECT_KIND_RAW).unwrap(),
+        bytes.len() as u64,
+        declared,
+    )
+    .unwrap();
+    chain = next;
+    output.extend(transaction_records.records);
+    let grant = GrantRecord {
+        derivation_id: DerivationId::new(derivation).unwrap(),
+        parent_id: None,
+        object_id,
+        target: SlotIdentity {
+            space: SpaceId::new(space).unwrap(),
+            slot: 0,
+            generation: 0,
+        },
+        rights: DurableRights::READ,
+        resource_kind: ResourceKind::new(OBJECT_KIND_RAW).unwrap(),
+        flags: GrantFlags::ROOT,
+    };
+    output.extend(
+        preview_grant_transaction(
+            &chain,
+            TransactionId::new(grant_transaction).unwrap(),
+            grant.clone(),
+        )
+        .unwrap()
+        .0
+        .records,
+    );
+    (output, grant, object)
+}
+
 /// Drive one granted-object append over `device`. Returns Ready(Ok) when the
 /// append completed, Ready(Err) when it failed cleanly, Pending when the
 /// armed cut fired.
 fn drive_append(device: &FaultDevice, size: usize) -> Poll<Result<(), String>> {
+    drive_append_with(device, size, false)
+}
+
+fn drive_append_with(device: &FaultDevice, size: usize, external: bool) -> Poll<Result<(), String>> {
     let (runtime, _quota, provisioner) =
         StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
             .unwrap();
@@ -321,8 +388,18 @@ fn drive_append(device: &FaultDevice, size: usize) -> Poll<Result<(), String>> {
         .chunks_exact(vibeos_durable_format::RECORD_SIZE)
         .map(|chunk| chunk.try_into().unwrap())
         .collect();
-    let (next_records, grant) = granted_object_records(&records, &payload(size));
-    let update = granted_import(&next_records, &grant);
+    let update = if external {
+        let (next_records, grant, stable_id) =
+            granted_external_object_records(&records, &payload(size));
+        let mut update = granted_import(&next_records, &grant);
+        update
+            .attach_external_payload(stable_id, payload(size))
+            .unwrap();
+        update
+    } else {
+        let (next_records, grant) = granted_object_records(&records, &payload(size));
+        granted_import(&next_records, &grant)
+    };
     let generation = view.checkpoint_generation();
     let principal = view.principals()[0].clone();
     let mut future = Box::pin(store.append_persistent_authority(
@@ -358,11 +435,15 @@ fn recovered_objects(image: BTreeMap<u64, Page>, size: usize) -> usize {
 }
 
 fn sweep_cut_boundaries(size: usize, stride: usize) {
+    sweep_cut_boundaries_with(size, stride, false)
+}
+
+fn sweep_cut_boundaries_with(size: usize, stride: usize, external: bool) {
     let (initial_image, _records) = prepared_image();
 
     // Unfaulted baseline: count the mutation boundaries of one append.
     let device = FaultDevice::from_image(SEGMENTS, initial_image.clone());
-    match drive_append(&device, size) {
+    match drive_append_with(&device, size, external) {
         Poll::Ready(Ok(())) => {}
         other => panic!("baseline append did not complete: {:?}", other.is_pending()),
     }
@@ -373,7 +454,7 @@ fn sweep_cut_boundaries(size: usize, stride: usize) {
     for boundary in (0..boundaries).step_by(stride) {
         let device = FaultDevice::from_image(SEGMENTS, initial_image.clone());
         device.arm(boundary);
-        let outcome = drive_append(&device, size);
+        let outcome = drive_append_with(&device, size, external);
         assert!(
             outcome.is_pending(),
             "boundary {}: cut did not fire (mutations={})",
@@ -391,7 +472,7 @@ fn sweep_cut_boundaries(size: usize, stride: usize) {
         if objects == 0 {
             // The predecessor state must still accept the append.
             let retry = FaultDevice::from_image(SEGMENTS, device.durable_image());
-            match drive_append(&retry, size) {
+            match drive_append_with(&retry, size, external) {
                 Poll::Ready(Ok(())) => {}
                 other => panic!(
                     "boundary {}: resume append failed: pending={}",
@@ -421,4 +502,13 @@ fn large_fused_append_cut_boundaries_recover() {
 #[test]
 fn one_mib_append_cut_boundaries_recover() {
     sweep_cut_boundaries(1024 * 1024, 17);
+}
+
+/// A 2 MiB external object: its content never enters the record stream —
+/// the single external commit record and the content blob must land in one
+/// checkpoint or not at all, and the declared identity must verify on every
+/// recovered image.
+#[test]
+fn external_object_append_cut_boundaries_recover() {
+    sweep_cut_boundaries_with(2 * 1024 * 1024, 23, true);
 }

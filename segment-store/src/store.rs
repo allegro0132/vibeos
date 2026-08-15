@@ -58,7 +58,11 @@ use crate::root_codec::{
 const METADATA_KIND_CATALOG: u32 = 0xffff_0001;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 
-pub(crate) const ROOT_PIN_SLOTS: usize = 256;
+/// Every persistent file held open by a namespace pins its stream tail, so
+/// this bounds how many files an open file tree can carry, not merely how
+/// many reads are in flight. 1024 keeps a directory of several hundred files
+/// recoverable with headroom for transaction-scoped pins.
+pub(crate) const ROOT_PIN_SLOTS: usize = 1024;
 pub(crate) const READER_PIN_SLOTS: usize = 256;
 pub(crate) const RESERVED_ROOT_PIN_SLOTS: usize = 8;
 pub(crate) const RESERVED_READER_PIN_SLOTS: usize = 8;

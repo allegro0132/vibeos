@@ -1707,3 +1707,115 @@ fn delayed_grants_keep_duplicate_content_stable_objects_independent() {
     assert_eq!(recovered.checkpoint_generation(), final_generation);
     assert_eq!(recovered.objects().len(), 2);
 }
+
+#[test]
+fn compacted_replace_preserves_stale_handles_and_witnesses() {
+    let device = MemoryDevice::blank();
+    let (runtime, _quota, maintenance_provisioner) =
+        StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+        cleaner_reserve_segments: 4,
+        limits: limits(),
+    }))
+    .unwrap();
+    let maintenance = store
+        .provision_maintenance_root(&maintenance_provisioner)
+        .unwrap();
+    let initial =
+        block_on(store.import_persistent_authority(&maintenance, import(&format_records(), &[])))
+            .unwrap();
+    let principal = initial.principals()[0].clone();
+    let writer = store
+        .derive_persistent_authority_writer(&maintenance)
+        .unwrap();
+
+    // Granted object A, then ungranted object B.
+    let bytes_a = b"granted object a";
+    let bytes_b = b"boot-local object b";
+    let object_records = append_object_records(&format_records(), bytes_a);
+    let object_a = find_object(&object_records);
+    let appended = block_on(store.append_persistent_authority(
+        &writer,
+        initial.checkpoint_generation(),
+        import(&object_records, &[]),
+        &principal,
+    ))
+    .unwrap();
+    let after_object = appended.view().checkpoint_generation();
+    drop(appended);
+    let grant_records = append_grant_records(&object_records);
+    let grant = root_grant();
+    let rooted = block_on(store.append_persistent_authority(
+        &writer,
+        after_object,
+        import(&grant_records, &[RootPolicy {
+            grant: grant.clone(),
+        }]),
+        &principal,
+    ))
+    .unwrap();
+    let stale_persistent = rooted
+        .view()
+        .object_for_recovered(&object_a)
+        .unwrap()
+        .clone();
+    let after_grant = rooted.view().checkpoint_generation();
+    drop(rooted);
+    let (both_records, object_b_id) = append_next_object_records(&grant_records, bytes_b);
+    let object_b = vibeos_durable_format::preflight_recovery(&both_records, store_id())
+        .unwrap()
+        .committed_objects()
+        .iter()
+        .find(|object| object.object_id == object_b_id)
+        .unwrap()
+        .clone();
+    let appended_b = block_on(store.append_persistent_authority(
+        &writer,
+        after_grant,
+        import(&both_records, &[RootPolicy {
+            grant: grant.clone(),
+        }]),
+        &principal,
+    ))
+    .unwrap();
+    let (view_b, witness_b) = appended_b.into_parts();
+    let after_b = view_b.checkpoint_generation();
+    drop(view_b);
+
+    // Compact (runtime policy: keep the ungranted object) and replace.
+    let preflight =
+        vibeos_durable_format::preflight_recovery(&both_records, store_id()).unwrap();
+    let compacted = preflight.compact(false).unwrap();
+    assert!(
+        compacted.len() < both_records.len(),
+        "redundant high-water records must fold away ({} -> {})",
+        both_records.len(),
+        compacted.len(),
+    );
+    let replaced = block_on(store.replace_persistent_authority(
+        &writer,
+        after_b,
+        import(&compacted, &[RootPolicy { grant }]),
+    ))
+    .unwrap();
+
+    // Handles minted before the replacement must still read.
+    assert_eq!(block_on(read_handle(&store, &stale_persistent)), bytes_a);
+    assert_eq!(
+        block_on(store.read_transient_object(&witness_b, &object_b)).unwrap(),
+        bytes_b
+    );
+    // The replacement view resolves object A persistently under its new
+    // sequence numbers.
+    let object_a_compacted = vibeos_durable_format::preflight_recovery(&compacted, store_id())
+        .unwrap()
+        .committed_objects()
+        .iter()
+        .find(|object| object.object_id.get() == 2)
+        .unwrap()
+        .clone();
+    let fresh = replaced.object_for_recovered(&object_a_compacted).unwrap();
+    assert_eq!(block_on(read_handle(&store, fresh)), bytes_a);
+}

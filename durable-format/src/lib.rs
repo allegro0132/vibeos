@@ -29,7 +29,10 @@ pub const PAYLOAD_CAPACITY: usize = 384;
 pub const CRC_OFFSET: usize = 0x1d0;
 pub const SEAL_OFFSET: usize = 0x1f0;
 pub const CHUNK_DATA_SIZE: usize = 360;
-pub const MAX_OBJECT_CHUNKS: u32 = 1024;
+/// Storage V2 admits larger logical objects than the M4 journal's physical
+/// 512-sector log. The chunk count is the logical-stream envelope; the M4
+/// backend still enforces its physical sector capacity independently.
+pub const MAX_OBJECT_CHUNKS: u32 = 4096;
 pub const MAX_OBJECT_SIZE: usize = CHUNK_DATA_SIZE * MAX_OBJECT_CHUNKS as usize;
 
 const MAGIC: &[u8; 8] = b"VIBECAP\0";

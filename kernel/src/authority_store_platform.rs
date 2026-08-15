@@ -88,7 +88,12 @@ pub(crate) fn is_storage_v2_native_empty_view(
 fn validate_storage_v2_records(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
 ) -> Result<durable::RecoveryPreflight, DurableCSpaceError> {
-    if records.is_empty() || records.len() > vibeos_object_store::STORE_LOG_SECTORS {
+    // The V2 logical stream is not constrained by the M4 journal's physical
+    // 512-sector log; its envelope is the persistent authority snapshot
+    // payload, which admits multi-MiB large objects.
+    if records.is_empty()
+        || records.len() > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS
+    {
         return Err(DurableCSpaceError::RootPolicy);
     }
     let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
@@ -125,7 +130,7 @@ pub(crate) fn storage_v2_recovery_import(
         return Err(DurableCSpaceError::RootPolicy);
     }
     let record_count = record_stream.len() / vibeos_durable_format::RECORD_SIZE;
-    if record_count > vibeos_object_store::STORE_LOG_SECTORS {
+    if record_count > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS {
         return Err(DurableCSpaceError::RootPolicy);
     }
     let mut records = Vec::new();

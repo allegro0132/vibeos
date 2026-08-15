@@ -384,7 +384,9 @@ fn steady_state_replace_attribution() {
         };
         generation = view.checkpoint_generation();
         records = next_records;
-        let kind_label = if counters.read_bytes > 1024 * 1024 {
+        // A collection round is visible as extra checkpoint transactions;
+        // flush count is the stable signature now that GC reads are batched.
+        let kind_label = if counters.flushes > 4 {
             "gc"
         } else {
             "normal"
@@ -422,3 +424,83 @@ fn steady_state_replace_attribution() {
     // remains empty, exactly like the observed "2 live objects" matrix.
     assert_eq!(view.objects().len(), 0);
 }
+
+#[test]
+fn large_object_append_and_cold_recover() {
+    let device = CountingDevice::blank(SEGMENTS);
+    let (runtime, _quota, provisioner) = runtime_ctx();
+    let large_limits = StoreLimits {
+        recovery_memory_bytes: 64 * 1024 * 1024,
+        ..StoreLimits::default()
+    };
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), large_limits, runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"PERF-LARGE-OBJ!!").unwrap(),
+        cleaner_reserve_segments: 2,
+        limits: large_limits,
+    }))
+    .unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let writer: PersistentAuthorityWriter =
+        store.derive_persistent_authority_writer(&maintenance).unwrap();
+    let mut records = format_records();
+    let first_view = block_on(store.import_persistent_authority(&maintenance, import(&records))).unwrap();
+    records = first_view
+        .record_stream()
+        .chunks_exact(vibeos_durable_format::RECORD_SIZE)
+        .map(|chunk| chunk.try_into().unwrap())
+        .collect();
+    let principal = first_view.principals()[0].clone();
+    let mut generation = first_view.checkpoint_generation();
+    let mut expected_objects = 0usize;
+    let mut all_grants: Vec<RootPolicy> = Vec::new();
+    // Append three 1 MiB objects: the third one forces the authority extent
+    // chain past one segment's payload area, exercising the multi-segment
+    // write and the allocated-segment scan on cold recovery.
+    for round in 0..3 {
+        let object_payload: Vec<u8> = (0..1024 * 1024usize)
+            .map(|index| (index as u64)
+                .wrapping_mul(131)
+                .wrapping_add(round as u64)
+                .wrapping_add(0x5a) as u8)
+            .collect();
+        let (object_records, object_id) = append_records(&records, &object_payload);
+        let (next_records, grant) = append_grant_for(&object_records, object_id);
+        all_grants.push(RootPolicy { grant });
+        let update = PersistentAuthorityImport::from_m4(
+            &next_records,
+            store_id(),
+            &all_grants,
+            POLICY,
+            Vec::new(),
+        )
+        .unwrap()
+        .with_system_principal(LEGACY_SYSTEM_PRINCIPAL, 1 << 30, 1 << 30, false)
+        .unwrap();
+        let result = block_on(store.append_persistent_authority(
+            &writer,
+            generation,
+            update,
+            &principal,
+        ))
+        .unwrap_or_else(|error| panic!("append round {} failed: {:?}", round, error));
+        let (view, _) = result.into_parts();
+        generation = view.checkpoint_generation();
+        records = next_records;
+        expected_objects += 1;
+        assert_eq!(view.objects().len(), expected_objects);
+        assert_eq!(
+            block_on(store.read_persistent_object(view.objects().last().unwrap())).unwrap(),
+            object_payload
+        );
+    }
+    drop(store);
+    // Cold recovery must reassemble the multi-extent authority payload.
+    let (runtime, _quota, _provisioner) = runtime_ctx();
+    let mut cold = SegmentStore::new_with_runtime_context(device.clone(), large_limits, runtime);
+    block_on(cold.mount()).unwrap_or_else(|error| panic!("cold mount: {:?}", error));
+    let recovered =
+        block_on(cold.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+    assert_eq!(recovered.objects().len(), 3);
+}
+

@@ -10,7 +10,10 @@ use core::fmt;
 
 use sha2::{Digest, Sha256};
 use vibeos_blob_format::{BlobDescriptor, LEAF_SIZE};
-use vibeos_segment_format::{payload_sha256, ExtentKind, PhysicalPointer, ANCHOR_SEGMENT_NO};
+use vibeos_segment_format::{
+    payload_sha256, ExtentKind, PhysicalPointer, ANCHOR_SEGMENT_NO, DATA_END_PAGE,
+    DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE,
+};
 
 use crate::allocation_v2::{encode_allocation_v2, AllocationTransition, SegmentAllocation};
 use crate::authority::AuthorizedObject;
@@ -1061,7 +1064,18 @@ impl<D: PageDevice> SegmentStore<D> {
             }
             fresh.push(recovered);
         }
-        if fresh.len() == 1 {
+        // The fused single-checkpoint path writes the authority snapshot as
+        // one extent; route payloads that could exceed the 1 MiB extent
+        // ceiling through the general multi-extent publication instead. The
+        // slack covers the header, bindings, principals, and external roots.
+        let fused_authority_fits = import
+            .record_stream
+            .len()
+            .checked_add(128 * 1024)
+            .is_some_and(|estimate| {
+                estimate <= MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE
+            });
+        if fresh.len() == 1 && fused_authority_fits {
             let recovered = fresh[0];
             let stable_id = recovered.object_id.get();
             // Reusable bindings get the same validation as the general path.
@@ -1391,11 +1405,45 @@ impl<D: PageDevice> SegmentStore<D> {
         if counts.free <= u64::from(state.cleaner_reserve_segments) {
             return Err(PersistentAuthorityError::Gc(GcError::Capacity));
         }
-        let free =
-            select_free_segments(&state.allocation, 1).map_err(PersistentAuthorityError::Gc)?;
+        // Reserve every segment this payload batch can span BEFORE the
+        // first mutation: a multi-extent authority chain may cross segment
+        // boundaries and must never fail mid-write, which would poison the
+        // store and strand the foreground-cleaner retry. The payload set is
+        // exactly [optional empty CAS snapshot, authority extents,
+        // allocation], whose spans are known before any encoding.
+        let authority_chunk_bytes = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+        let authority_extent_count = authority_bytes.len().div_ceil(authority_chunk_bytes);
+        let span_of = |len: usize, extents: usize| -> Result<u64, PersistentAuthorityError<D::Error>> {
+            u64::try_from(len.div_ceil(PAGE_SIZE))
+                .ok()
+                .and_then(|pages| pages.checked_add((extents * 2) as u64))
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))
+        };
+        let empty_snapshot_span = if state.catalog_root == PhysicalPointer::Null {
+            span_of(crate::cas_codec::CAS_SNAPSHOT_HEADER_LEN, 1)?
+        } else {
+            0
+        };
+        let allocation_span = span_of(
+            crate::allocation_v2::ALLOCATION_V2_HEADER_LEN
+                .checked_add(state.allocation.packed_bitmap().len())
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?,
+            1,
+        )?;
+        let batch_span = empty_snapshot_span
+            .checked_add(span_of(authority_bytes.len(), authority_extent_count)?)
+            .and_then(|span| span.checked_add(allocation_span))
+            .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+        let needed_segments = batch_span
+            .div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE))
+            .max(1);
+        let needed_segments = usize::try_from(needed_segments)
+            .map_err(|_| PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+        let free = select_free_segments(&state.allocation, needed_segments)
+            .map_err(PersistentAuthorityError::Gc)?;
         let next_segment_generation = state
             .next_segment_generation
-            .checked_add(1)
+            .checked_add(needed_segments as u64)
             .ok_or(PersistentAuthorityError::Gc(GcError::InvalidGeneration))?;
         let allocation = state
             .allocation
@@ -1459,18 +1507,26 @@ impl<D: PageDevice> SegmentStore<D> {
                 bytes,
             });
         }
+        // Large-object record streams can exceed one extent's 1 MiB
+        // payload ceiling. Split the authority payload into consecutive
+        // extent records inside a single segment so extent 0 remains the
+        // exact checkpoint root and recovery can reassemble the chain.
+        let authority_extent_count = authority_extent_count as u32;
+        let authority_merkle_root = payload_sha256(&authority_bytes);
         let authority_index = payloads.len();
-        payloads.push(SegmentPayload {
-            extent_kind: ExtentKind::Authority,
-            object_kind: METADATA_KIND_PERSISTENT_AUTHORITY,
-            extent_index: 0,
-            extent_count: 1,
-            content_byte_len: authority_bytes.len() as u64,
-            encoded_blob_len: authority_bytes.len() as u64,
-            encoded_offset: 0,
-            merkle_root: payload_sha256(&authority_bytes),
-            bytes: &authority_bytes,
-        });
+        for (extent_index, chunk) in authority_bytes.chunks(authority_chunk_bytes).enumerate() {
+            payloads.push(SegmentPayload {
+                extent_kind: ExtentKind::Authority,
+                object_kind: METADATA_KIND_PERSISTENT_AUTHORITY,
+                extent_index: extent_index as u32,
+                extent_count: authority_extent_count,
+                content_byte_len: authority_bytes.len() as u64,
+                encoded_blob_len: authority_bytes.len() as u64,
+                encoded_offset: (extent_index * authority_chunk_bytes) as u64,
+                merkle_root: authority_merkle_root,
+                bytes: chunk,
+            });
+        }
         let allocation_index = payloads.len();
         payloads.push(SegmentPayload {
             extent_kind: ExtentKind::Allocation,
@@ -1483,7 +1539,42 @@ impl<D: PageDevice> SegmentStore<D> {
             merkle_root: payload_sha256(&allocation_bytes),
             bytes: &allocation_bytes,
         });
-        let pointers = builder.payload_batch(&self.device, &payloads).await?;
+        let pointers = match builder
+            .payload_batch_single_segment(&self.device, &payloads)
+            .await
+        {
+            Ok(pointers) => pointers,
+            Err(GcStoreError::Gc(GcError::Capacity)) => {
+                // The authority chain exceeds one segment's payload area;
+                // write every extent individually so the builder spans
+                // segments. Recovery reassembles the chain by scanning the
+                // allocated segment set.
+                let mut pointers = Vec::new();
+                pointers
+                    .try_reserve_exact(payloads.len())
+                    .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+                for payload in &payloads {
+                    pointers.push(
+                        builder
+                            .payload(
+                                &self.device,
+                                payload.extent_kind,
+                                payload.object_kind,
+                                payload.extent_index,
+                                payload.extent_count,
+                                payload.content_byte_len,
+                                payload.encoded_blob_len,
+                                payload.encoded_offset,
+                                payload.merkle_root,
+                                payload.bytes,
+                            )
+                            .await?,
+                    );
+                }
+                pointers
+            }
+            Err(error) => return Err(error.into()),
+        };
         let catalog_root = if empty_cas_snapshot.is_some() {
             pointers
                 .first()
@@ -1518,18 +1609,19 @@ impl<D: PageDevice> SegmentStore<D> {
         // predecessor witness and the exact checkpoint transition.
         let mut staged = Vec::new();
         staged
-            .try_reserve_exact(3)
+            .try_reserve_exact(3 + authority_extent_count as usize)
             .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
         if let (Some(bytes), PhysicalPointer::Value(_)) =
             (empty_cas_snapshot.as_ref(), catalog_root)
         {
             staged.push((catalog_root, ExtentKind::Catalog, bytes.as_slice()));
         }
-        staged.push((
-            authority_root,
-            ExtentKind::Authority,
-            authority_bytes.as_slice(),
-        ));
+        for (chunk, pointer) in authority_bytes
+            .chunks(authority_chunk_bytes)
+            .zip(&pointers[authority_index..authority_index + authority_extent_count as usize])
+        {
+            staged.push((*pointer, ExtentKind::Authority, chunk));
+        }
         staged.push((
             allocation_root,
             ExtentKind::Allocation,

@@ -59,7 +59,8 @@ pub use authority_snapshot::{
     decode_persistent_authority_snapshot, encode_persistent_authority_snapshot,
     root_policy_commitment, AuthoritySnapshotError, PersistentAuthorityImport,
     PersistentAuthoritySnapshot, PersistentPrincipalPolicy, StablePrincipalId,
-    LEGACY_SYSTEM_PRINCIPAL, MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN, MAX_STABLE_PRINCIPALS,
+    LEGACY_SYSTEM_PRINCIPAL, MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN,
+    MAX_PERSISTENT_AUTHORITY_RECORDS, MAX_STABLE_PRINCIPALS,
     PERSISTENT_AUTHORITY_HEADER_LEN, PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN,
     PERSISTENT_AUTHORITY_PRINCIPAL_LEN, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION,
 };

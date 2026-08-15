@@ -1182,9 +1182,6 @@ async fn put_to_space(
     if !lease.authorizes(Rights::WRITE) {
         return Err(StoreError::PermissionDenied);
     }
-    if bytes.len() > journal::MAX_OBJECT_SIZE {
-        return Err(StoreError::ObjectTooLarge);
-    }
 
     // Snapshot the destination before either backend can await. Publication
     // must never redirect a completed transaction into a restarted authority
@@ -1192,6 +1189,12 @@ async fn put_to_space(
     let target_incarnation = target.incarnation();
     let inner = lease.with(|service| service.inner.clone());
     if let Some(backend) = selected_v2_backend(&inner)? {
+        // The logical v2 record stream admits objects up to the full journal
+        // chunk envelope; the M4 backend additionally enforces its physical
+        // sector capacity below.
+        if bytes.len() > journal::MAX_OBJECT_SIZE {
+            return Err(StoreError::ObjectTooLarge);
+        }
         // The V2 backend has its own exclusive mutable-store epoch, but that
         // epoch begins only at append time.  Keep the facade claim across
         // recovery, preview, the audited pre-write fault point, append, and
@@ -1223,12 +1226,14 @@ async fn put_to_space(
             bytes,
         )
         .map_err(map_encode_error)?;
-        let mut records = Vec::new();
+        // Reuse the transaction's record buffer instead of duplicating the
+        // whole write set beside it: large objects carry thousands of
+        // 512-byte chunk records and the extra copy wasted client quota.
+        let mut records = transaction.records;
         records
-            .try_reserve_exact(1 + transaction.records.len())
+            .try_reserve_exact(1)
             .map_err(|_| StoreError::InsufficientMemory)?;
-        records.push(high_water);
-        records.extend(transaction.records);
+        records.insert(0, high_water);
 
         if let Some(target) = fault_target {
             assert_eq!(
@@ -1512,6 +1517,12 @@ pub async fn get_blob_chunk_with(
 
 pub const fn blob_leaf_size() -> usize {
     LEAF_SIZE
+}
+
+/// Encoded length of one canonical Merkle blob envelope for a content size.
+/// Used by callers which must admit an object before allocating its envelope.
+pub fn blob_encoded_len(content_len: usize) -> Result<usize, BlobError> {
+    vibeos_blob_format::encoded_len(content_len)
 }
 
 async fn read_committed_object(

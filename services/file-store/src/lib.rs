@@ -356,10 +356,16 @@ impl FsFileReader {
     }
 }
 
+/// How many full persistent chunks one backend staging call may carry. Four
+/// 3 MiB chunks bound the stager's buffered bytes at 12 MiB while letting a
+/// batching backend publish them under a single durable transaction.
+pub const STAGE_FLUSH_CHUNKS: usize = 4;
+
 pub struct FsContentStager {
     backend: Arc<dyn FileTreeBackend>,
     tail: Option<vibeos_segment_store::FsPersistentData>,
     pending: Vec<u8>,
+    staged: Vec<Vec<u8>>,
 }
 
 pub struct StagedFileContent {
@@ -373,20 +379,32 @@ impl FsContentStager {
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.pending.len() == PERSISTENT_STAGE_CHUNK_SIZE {
-                let chunk = core::mem::take(&mut self.pending);
-                self.tail = Some(self.backend.stage_chunk(self.tail.clone(), chunk).await?);
+                self.staged.push(core::mem::take(&mut self.pending));
+                if self.staged.len() == STAGE_FLUSH_CHUNKS {
+                    self.flush().await?;
+                }
             }
         }
         Ok(())
     }
 
+    async fn flush(&mut self) -> Result<(), FileError> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        let chunks = core::mem::take(&mut self.staged);
+        self.tail = Some(self.backend.stage_chunks(self.tail.clone(), chunks).await?);
+        Ok(())
+    }
+
     pub async fn finish(mut self) -> Result<StagedFileContent, FileError> {
-        if !self.pending.is_empty() || self.tail.is_none() {
-            self.tail = Some(
-                self.backend
-                    .stage_chunk(self.tail.clone(), core::mem::take(&mut self.pending))
-                    .await?,
-            );
+        if !self.pending.is_empty() {
+            self.staged.push(core::mem::take(&mut self.pending));
+        }
+        self.flush().await?;
+        if self.tail.is_none() {
+            // An empty file still needs its zero-length stream head.
+            self.tail = Some(self.backend.stage_chunk(None, Vec::new()).await?);
         }
         Ok(StagedFileContent {
             data: self.tail.ok_or(FileError::InvalidType)?,
@@ -419,6 +437,23 @@ pub trait FileTreeBackend: Send + Sync {
         previous: Option<vibeos_segment_store::FsPersistentData>,
         bytes: Vec<u8>,
     ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData>;
+
+    /// Stage several full chunks at once. Backends that can batch chunks
+    /// under one durable transaction override this; the default preserves
+    /// per-chunk semantics exactly.
+    fn stage_chunks<'a>(
+        &'a self,
+        previous: Option<vibeos_segment_store::FsPersistentData>,
+        chunks: Vec<Vec<u8>>,
+    ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+        Box::pin(async move {
+            let mut tail = previous;
+            for bytes in chunks {
+                tail = Some(self.stage_chunk(tail, bytes).await?);
+            }
+            tail.ok_or(FileError::InvalidType)
+        })
+    }
 
     fn read_chunk<'a>(
         &'a self,
@@ -528,7 +563,8 @@ impl FileTreeRoot {
         Ok(FsContentStager {
             backend,
             tail,
-            pending: Vec::with_capacity(DATA_CHUNK_SIZE),
+            pending: Vec::new(),
+            staged: Vec::new(),
         })
     }
     pub fn begin(&self) -> Result<FsTransaction, FileError> {

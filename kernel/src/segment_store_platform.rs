@@ -780,6 +780,51 @@ impl FileTreeBackend for KernelFileTreeBackend {
         })
     }
 
+    fn stage_chunks<'a>(
+        &'a self,
+        previous: Option<vibeos_segment_store::FsPersistentData>,
+        chunks: Vec<Vec<u8>>,
+    ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+        Box::pin(async move {
+            if chunks.is_empty() || chunks.iter().any(|bytes| bytes.is_empty()) {
+                // The batched path admits only whole non-empty chunks; the
+                // zero-length stream head keeps its dedicated commit.
+                let mut tail = previous;
+                for bytes in chunks {
+                    tail = Some(self.stage_chunk(tail, bytes).await?);
+                }
+                return tail.ok_or(FileError::ServiceUnavailable);
+            }
+            let maintenance = self
+                .runtime
+                .maintenance
+                .lock()
+                .clone()
+                .ok_or(FileError::ServiceUnavailable)?;
+            // Replenish free segments before the batch claims its scratch;
+            // one batch consumes several segments in a single transaction.
+            self.runtime
+                .ensure_foreground_capacity()
+                .await
+                .map_err(map_file_runtime_error)?;
+            let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
+            let result = poll_as_system(operation.store().stage_fs_data_chunks_for_maintenance(
+                &maintenance,
+                previous.as_ref(),
+                &chunks,
+            ))
+            .await
+            .map_err(|_| FileError::ServiceUnavailable);
+            if result.is_err() {
+                // A failed staged batch leaves the store poisoned; only a new
+                // cold proof may re-establish the durable checkpoint.
+                self.runtime.invalidate_recovery_cache();
+            }
+            operation.finish();
+            result
+        })
+    }
+
     fn read_chunk<'a>(
         &'a self,
         data: vibeos_segment_store::FsPersistentData,

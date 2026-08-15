@@ -571,6 +571,178 @@ impl<D: PageDevice> SegmentStore<D> {
         })
     }
 
+    /// Append many bounded data chunks to one immutable skip-linked stream
+    /// and publish them under a single metadata segment and checkpoint.
+    /// Chunk `k` in the batch references chunk `k-1` (and its skip ancestors)
+    /// through position-predicted object identities, so no chunk waits for an
+    /// intermediate checkpoint. Any failure poisons the store exactly like an
+    /// interrupted staged publication: nothing durable references the staged
+    /// scratch, and the next mount observes the predecessor checkpoint.
+    pub async fn stage_fs_data_chunks_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentData>,
+        chunks: &[Vec<u8>],
+    ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
+        if chunks.is_empty() || chunks.iter().any(|bytes| bytes.is_empty()) {
+            return Err(FsCodecError::OutOfBounds.into());
+        }
+        // The lease proves maintenance authority for this trusted-service
+        // write path; each staged blob is written outside quota domains just
+        // like `commit_fs_data_chunk_for_maintenance`.
+        let lease = self
+            .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
+            .ok_or(FsStructuralCommitError::InvalidChild)?;
+        drop(lease);
+        // Seed the stream frontier from the committed predecessor, if any.
+        let mut tail: Option<(TypedObjectReference, FsDataNodeMeta)> = match previous {
+            None => None,
+            Some(data) if data.exact_len() == 0 => None,
+            Some(data) => {
+                let FsPersistentDataLayout::Stream(meta) = &data.layout else {
+                    return Err(FsStructuralCommitError::InvalidChild);
+                };
+                Some((self.fs_reference_for(&data.object)?, meta.clone()))
+            }
+        };
+        let mut batch = self.begin_staged_batch()?;
+        // Structural metadata for every node staged in this batch, keyed by
+        // its predicted object id: ancestor recovery must not read objects
+        // that do not exist on media yet.
+        let mut staged_metas: alloc::collections::BTreeMap<u128, FsDataNodeMeta> =
+            alloc::collections::BTreeMap::new();
+        let mut result = Ok(());
+        for bytes in chunks {
+            match self
+                .stage_fs_data_chunk_inner(&mut batch, &mut staged_metas, tail.take(), bytes)
+                .await
+            {
+                Ok(next) => tail = Some(next),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        result?;
+        let tail_index = batch.staged_len() - 1;
+        let (tail_reference, tail_meta) = tail.ok_or(FsStructuralCommitError::InvalidChild)?;
+        let published = self.publish_staged_batch(batch).await?;
+        let object = published
+            .into_iter()
+            .nth(tail_index)
+            .ok_or(StoreError::Corrupt)?;
+        // The published identity must equal the prediction the staged nodes
+        // already encoded; a mismatch means the batch's position accounting
+        // broke and the stream would dangle.
+        let key = object
+            .backend_handle()
+            .authority_key()
+            .map_err(|_| StoreError::Corrupt)?;
+        if key.object_id() != tail_reference.object_id
+            || key.commit_generation() != tail_reference.commit_generation
+        {
+            return Err(StoreError::Corrupt.into());
+        }
+        Ok(FsPersistentData {
+            object: Arc::new(object),
+            layout: FsPersistentDataLayout::Stream(tail_meta),
+        })
+    }
+
+    /// Stage one chunk into `batch`, resolving skip ancestors from the batch's
+    /// own staged metadata first and from committed objects otherwise.
+    async fn stage_fs_data_chunk_inner(
+        &mut self,
+        batch: &mut crate::cas::StagedBlobBatch,
+        staged_metas: &mut alloc::collections::BTreeMap<u128, FsDataNodeMeta>,
+        previous: Option<(TypedObjectReference, FsDataNodeMeta)>,
+        bytes: &[u8],
+    ) -> Result<(TypedObjectReference, FsDataNodeMeta), FsStructuralCommitError<D::Error>> {
+        if bytes.is_empty() || bytes.len() > FS_DATA_CHUNK_MAX_LEN {
+            return Err(FsCodecError::OutOfBounds.into());
+        }
+        let (chunk_index, total_len, ancestors) = match previous {
+            None => (0, bytes.len() as u64, Vec::new()),
+            Some((tail_reference, tail_meta)) => {
+                let chunk_index = tail_meta
+                    .chunk_index
+                    .checked_add(1)
+                    .ok_or(FsCodecError::ArithmeticOverflow)?;
+                let total_len = tail_meta
+                    .total_len
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(FsCodecError::ArithmeticOverflow)?;
+                let required = (u64::BITS - chunk_index.leading_zeros()) as usize;
+                let mut ancestors = Vec::new();
+                ancestors
+                    .try_reserve_exact(required)
+                    .map_err(|_| FsCodecError::OutOfBounds)?;
+                ancestors.push(tail_reference);
+                let mut level_meta = tail_meta;
+                for level in 1..required {
+                    let reference = level_meta
+                        .ancestors
+                        .get(level - 1)
+                        .copied()
+                        .ok_or(FsStructuralCommitError::InvalidChild)?;
+                    ancestors.push(reference);
+                    if level + 1 < required {
+                        level_meta = self
+                            .batch_data_node_meta(batch, staged_metas, reference)
+                            .await?;
+                    }
+                }
+                (chunk_index, total_len, ancestors)
+            }
+        };
+        let decoded = FsDataNodeV1 {
+            chunk_index,
+            total_len,
+            ancestors,
+            bytes: bytes.to_vec(),
+        };
+        let payload = encode_fs_data_node_v1(&decoded)?;
+        let meta = FsDataNodeMeta::from_node(&decoded);
+        drop(decoded);
+        let (object_id, commit_generation) = self
+            .stage_blob_in_batch(batch, FS_DATA_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
+            .await?;
+        let reference = TypedObjectReference {
+            object_id,
+            commit_generation,
+            object_kind: FS_DATA_V1_KIND,
+        };
+        staged_metas.insert(object_id, meta.clone());
+        Ok((reference, meta))
+    }
+
+    /// Resolve a data node's structural metadata while a staged batch holds
+    /// the store's state: batch-staged nodes come from the in-memory table,
+    /// committed nodes from a prefix read under the batch's planning view.
+    async fn batch_data_node_meta(
+        &mut self,
+        batch: &mut crate::cas::StagedBlobBatch,
+        staged_metas: &alloc::collections::BTreeMap<u128, FsDataNodeMeta>,
+        reference: TypedObjectReference,
+    ) -> Result<FsDataNodeMeta, FsStructuralCommitError<D::Error>> {
+        if let Some(meta) = staged_metas.get(&reference.object_id) {
+            return Ok(meta.clone());
+        }
+        let restored = batch.install_planning_state(self);
+        let recovered = self.recover_fs_data_reference(reference).await;
+        crate::cas::StagedBlobBatch::withdraw_planning_state(self, restored);
+        let recovered = recovered.map_err(|error| match error {
+            FsRootPublishError::Store(error) => FsStructuralCommitError::Store(error),
+            FsRootPublishError::Codec(error) => FsStructuralCommitError::Codec(error),
+            _ => FsStructuralCommitError::InvalidChild,
+        })?;
+        let FsPersistentDataLayout::Stream(meta) = recovered.layout else {
+            return Err(FsStructuralCommitError::InvalidChild);
+        };
+        Ok(meta)
+    }
+
     pub async fn commit_fs_btree_node(
         &mut self,
         tree: FsTreeKind,
@@ -1314,7 +1486,7 @@ mod tests {
         media: StdArc<Mutex<TestMedia>>,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum FaultAction {
         NotSubmitted,
         AmbiguousNone,
@@ -1601,6 +1773,202 @@ mod tests {
             block_on(cold.read_fs_data_chunk(&extended, sizes.len() as u64)).unwrap(),
             Some(pattern(9, 4096))
         );
+    }
+
+    #[test]
+    fn staged_chunk_batch_publishes_one_checkpoint_per_batch() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let maintenance = store.mint_maintenance_root().unwrap();
+        let pattern = |index: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|offset| (index * 131 + offset * 3) as u8)
+                .collect()
+        };
+        let sizes = [4096_usize, 3 * 1024 * 1024, 1024 * 1024, 4096, 700];
+        let chunks: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| pattern(index, *size))
+            .collect();
+        let before = store.info().unwrap();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            None,
+            &chunks,
+        ))
+        .unwrap();
+        let after = store.info().unwrap();
+        // The whole batch rode exactly one checkpoint and bound one object
+        // per chunk.
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.object_count, before.object_count + sizes.len() as u32);
+        assert_eq!(tail.chunk_count(), sizes.len() as u64);
+        assert_eq!(tail.exact_len(), sizes.iter().sum::<usize>() as u64);
+        for (index, size) in sizes.iter().enumerate() {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index as u64)).unwrap(),
+                Some(pattern(index, *size)),
+                "chunk {index} readback",
+            );
+        }
+
+        // A second batch appends across the published boundary: its skip
+        // ancestors resolve committed nodes through prefix reads.
+        let more: Vec<Vec<u8>> = (5..9).map(|index| pattern(index, 4096)).collect();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            Some(&tail),
+            &more,
+        ))
+        .unwrap();
+        assert_eq!(store.info().unwrap().generation, before.generation + 2);
+        assert_eq!(tail.chunk_count(), 9);
+        for index in [0_u64, 1, 4, 5, 8] {
+            let expected = pattern(
+                index as usize,
+                *sizes.get(index as usize).unwrap_or(&4096),
+            );
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index)).unwrap(),
+                Some(expected),
+                "post-append chunk {index} readback",
+            );
+        }
+        drop(store);
+
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        // Continue the stream across a cold boot with one more batch; the
+        // fresh tail re-pins under the cold store, and reads reach both the
+        // pre-boot multi-MiB chunk and the newest appends.
+        let maintenance = cold.mint_maintenance_root().unwrap();
+        let tail = block_on(cold.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            Some(&tail),
+            &[pattern(9, 4096)],
+        ))
+        .unwrap();
+        assert_eq!(tail.chunk_count(), 10);
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&tail, 1)).unwrap(),
+            Some(pattern(1, 3 * 1024 * 1024))
+        );
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&tail, 9)).unwrap(),
+            Some(pattern(9, 4096))
+        );
+    }
+
+    #[test]
+    fn staged_batch_tolerates_duplicate_content() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device);
+        // Two identical payloads staged in one batch must publish without
+        // corrupting the blob table, and both objects must read back.
+        let payload = alloc::vec![0x5a_u8; 8192];
+        let mut batch = store.begin_staged_batch().unwrap();
+        for _ in 0..2 {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                &payload,
+            ))
+            .unwrap();
+        }
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        assert_eq!(published.len(), 2);
+        for object in &published {
+            assert_eq!(object.exact_len(), payload.len() as u64);
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..4096]);
+        }
+
+        // Content already committed deduplicates without new scratch.
+        let before = store.info().unwrap();
+        let mut batch = store.begin_staged_batch().unwrap();
+        block_on(store.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &payload,
+        ))
+        .unwrap();
+        assert_eq!(batch.staged_segment_count(), 0);
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        assert_eq!(published.len(), 1);
+        let after = store.info().unwrap();
+        assert_eq!(after.generation, before.generation + 1);
+        // Only the metadata segment was consumed.
+        assert_eq!(after.allocated_segments, before.allocated_segments + 1);
+    }
+
+    #[test]
+    fn every_batch_publication_mutation_recovers_all_or_nothing() {
+        let chunk_sizes = [4096_usize, 40960, 4096];
+        let chunks: Vec<Vec<u8>> = chunk_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| alloc::vec![index as u8 + 1; *size])
+            .collect();
+        let run = |device: &TestDevice| -> (SegmentStore<TestDevice>, StoreMaintenance) {
+            let store = format(device.clone());
+            let maintenance = store.mint_maintenance_root().unwrap();
+            (store, maintenance)
+        };
+
+        let probe_device = TestDevice::blank(64);
+        let (mut probe, probe_maintenance) = run(&probe_device);
+        let baseline = probe.info().unwrap();
+        probe_device.reset_mutations();
+        block_on(probe.stage_fs_data_chunks_for_maintenance(&probe_maintenance, None, &chunks))
+            .unwrap();
+        let complete = probe.info().unwrap();
+        let mutation_count = probe_device.mutation_count();
+        assert!(mutation_count > 0);
+
+        for boundary in 0..mutation_count {
+            for action in [
+                FaultAction::NotSubmitted,
+                FaultAction::AmbiguousNone,
+                FaultAction::AmbiguousDurable,
+            ] {
+                let device = TestDevice::blank(64);
+                let (mut store, maintenance) = run(&device);
+                device.arm(boundary, action);
+                assert!(block_on(
+                    store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)
+                )
+                .is_err());
+                device.power_cycle();
+
+                let mut cold =
+                    SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime());
+                block_on(cold.mount()).unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: cold mount failed: {error:?}")
+                });
+                let info = cold.info().unwrap();
+                // Atomicity: the batch is entirely present or entirely absent.
+                assert!(
+                    info.object_count == baseline.object_count
+                        || info.object_count == complete.object_count,
+                    "boundary {boundary} {action:?} recovered a partial batch",
+                );
+                // The recovered store must accept the same batch again.
+                let maintenance = cold.mint_maintenance_root().unwrap();
+                let tail = block_on(
+                    cold.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: re-stage failed: {error:?}")
+                });
+                assert_eq!(
+                    block_on(cold.read_fs_data_chunk(&tail, 1)).unwrap(),
+                    Some(chunks[1].clone())
+                );
+            }
+        }
     }
 
     fn root_switch_fixture() -> (

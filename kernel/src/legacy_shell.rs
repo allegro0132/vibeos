@@ -2855,9 +2855,12 @@ async fn storage_object_bench(
         );
         return;
     }
-    if workload == "object-v2-large" && size > 368_640 {
+    if workload == "object-v2-large"
+        && crate::store::blob_encoded_len(size)
+            .map_or(true, |encoded| encoded > crate::store::MAX_OBJECT_SIZE)
+    {
         println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"compatibility journal max object size is 368640 bytes\"}}",
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"object content exceeds the v2 authority record-stream envelope\"}}",
             backend,
             workload,
             size,

@@ -688,7 +688,14 @@ fn storage_v2_format_options() -> FormatOptions {
     FormatOptions {
         store_uuid: StoreUuid::new(STORAGE_V2_UUID).expect("fixed Storage V2 UUID is non-zero"),
         cleaner_reserve_segments: 2,
-        limits: StoreLimits::default(),
+        // Large objects ride the M4 record stream inside the authority
+        // snapshot; the default 2 MiB recovery ceiling cannot remount a store
+        // holding a ~1 MiB object. Raise the bounded accounting budget without
+        // changing any on-media geometry.
+        limits: StoreLimits {
+            recovery_memory_bytes: 16 * 1024 * 1024,
+            ..StoreLimits::default()
+        },
     }
 }
 

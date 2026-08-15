@@ -64,6 +64,9 @@ const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
 // recovery-memory budget while covering the 128 KiB qualification size.
 const SMALL_STAGED_BLOB_READBACK_LIMIT: u64 = 512 * 1024;
 const MAX_BATCHED_BLOB_READ_LIMIT: usize = 512 * 1024;
+/// Blobs up to this encoded size buffer their scratch writes in the staged
+/// page sink; the bound keeps the transient heap cost of one commit small.
+const SMALL_BLOB_SINK_LIMIT: u64 = 256 * 1024;
 
 /// Buffered writes of a deferred-barrier publication window. Pages are
 /// staged in memory and drained to the device as contiguous multi-page
@@ -1299,6 +1302,14 @@ impl<D: PageDevice> SegmentStore<D> {
             .try_reserve_exact(tree_page_count)
             .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
         tree_pages.resize(tree_page_count, None);
+        // Small blobs stage their scratch writes in memory and drain them as
+        // batched contiguous requests just before the commit checkpoint;
+        // larger blobs stream directly to keep the heap footprint bounded.
+        let staged_sink = if geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT {
+            Some(PageSink::new())
+        } else {
+            None
+        };
         Ok(BlobWriter {
             store: self,
             state: Some(state),
@@ -1317,7 +1328,7 @@ impl<D: PageDevice> SegmentStore<D> {
             mutated: false,
             failed: false,
             quota_reservation,
-            staged_sink: None,
+            staged_sink,
         })
     }
 
@@ -2045,7 +2056,9 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
     /// Route this writer's scratch writes through an in-memory sink so a
     /// fused publication can drain them as batched device requests.
     pub(crate) fn enable_staged_batching(&mut self) {
-        if self.staged_sink.is_none() {
+        if self.staged_sink.is_none()
+            && self.geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT
+        {
             self.staged_sink = Some(PageSink::new());
         }
     }
@@ -2098,7 +2111,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         // materialized on the kernel stack.
         let mut writer = Box::new(self);
         async move {
-            let root = writer.finish_blob_encoding(false).await?;
+            let root = writer.finish_blob_encoding(true).await?;
             let (pending, object_kind, exact_len, previous, checkpoint, successor) =
                 writer.commit_encoded_snapshot(root).await?;
             // The checkpoint is durable, but publication is still withheld. A
@@ -2354,6 +2367,12 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
     > {
         let (blob_key, scratch_manifest, payload_hashes, existing_mapping) =
             self.staged_manifest_and_dedup(root).await?;
+        if existing_mapping.is_some() && self.staged_sink.is_some() {
+            // Deduplicated content: the buffered scratch pages will never be
+            // referenced by any seal or checkpoint; skip writing them.
+            self.staged_sink = Some(PageSink::new());
+        }
+        let sink = self.staged_sink.take();
         let state = self.state.take().ok_or(CasStoreError::WriterFailed)?;
         let (pending, checkpoint, successor) = commit_snapshot(
             &self.store.device,
@@ -2369,7 +2388,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             self.reference_codec,
             None,
             None,
-            None,
+            sink,
         )
         .await?;
         Ok((
@@ -3250,10 +3269,10 @@ async fn commit_snapshot<D: PageDevice>(
         .generation
         .checked_add(1)
         .ok_or(StoreError::IdExhausted)?;
-    // In fused publication no checkpoint can name any page written below
-    // until the checkpoint slot protocol's first flush; that shared barrier
-    // replaces the per-phase segment flushes.
-    let defer_barriers = fused.is_some();
+    // No checkpoint can name any page written below until this transaction's
+    // own checkpoint slot protocol runs; its first flush is the shared
+    // durability barrier that replaces the per-phase segment flushes.
+    let defer_barriers = true;
     let is_new = existing.is_none();
     let data_segment_count = if is_new { scratch_segments.len() } else { 0 };
     let scratch_first_segment = scratch_segments
@@ -3295,7 +3314,7 @@ async fn commit_snapshot<D: PageDevice>(
                         payload_hashes,
                         previous,
                         defer_barriers,
-                        None,
+                        sink.as_mut(),
                     )
                     .await?,
                 );

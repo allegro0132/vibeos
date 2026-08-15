@@ -28,8 +28,9 @@ use vibeos_segment_format::{
     encode_segment_header_body, encode_segment_seal_body, encode_segment_summary_body,
     payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
     Checkpoint, ExtentKind, Page, PhysicalPointer, RecordBinding, SegmentHeader, SegmentSeal,
-    SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE,
-    SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
+    SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE,
+    MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE,
+    SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
 use crate::allocation_v2::{
@@ -58,8 +59,8 @@ use crate::root_codec::{
     encode_persistent_root_set, PersistentRootEntry, PersistentRootSet, RootCodecError,
 };
 use crate::store::{
-    read_pointer_payload, read_pointer_payloads, write_checkpoint, MountedState, SegmentStore,
-    StoreError, StoreLimits, ROOT_PIN_SLOTS,
+    read_pointer_payload, read_pointer_payloads, write_checkpoint, CasMountedState, MountedState,
+    SegmentStore, StoreError, StoreLimits, ROOT_PIN_SLOTS,
 };
 use crate::typed_manifest::{
     ReferenceCodecAdmission, TypedObjectReference, TYPED_REFERENCE_ENTRY_LEN, TYPED_REFS_HEADER_LEN,
@@ -1572,9 +1573,14 @@ fn required_gc_segments(
         }
         place(*manifest_len)?;
     }
-    for len in [snapshot_len, root_len, allocation_len] {
-        place(len)?;
+    place(snapshot_len)?;
+    let authority_chunk = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+    let mut remaining = root_len;
+    while remaining != 0 {
+        place(remaining.min(authority_chunk))?;
+        remaining = remaining.saturating_sub(authority_chunk);
     }
+    place(allocation_len)?;
     Ok(segments)
 }
 
@@ -1887,7 +1893,13 @@ impl SegmentBuilder {
         Ok(pointer)
     }
 
-    pub(crate) async fn payload_batch<D: PageDevice>(
+
+    /// Write a batch that must land in one segment. The builder seals the
+    /// current segment and opens the next one when the batch does not fit the
+    /// remaining space; a batch larger than one segment's payload area is
+    /// rejected rather than scattered, so consecutive extent records always
+    /// share one immutable segment.
+    pub(crate) async fn payload_batch_single_segment<D: PageDevice>(
         &mut self,
         device: &D,
         payloads: &[SegmentPayload<'_>],
@@ -1901,35 +1913,30 @@ impl SegmentBuilder {
                 .and_then(|more| total.checked_add(more))
                 .ok_or(GcError::ArithmeticOverflow)
         })?;
+        if span > DATA_END_PAGE.saturating_sub(DATA_FIRST_PAGE) {
+            return Err(GcError::Capacity.into());
+        }
         if self
             .relative
             .checked_add(span)
             .is_none_or(|end| end > DATA_END_PAGE)
         {
-            let mut pointers = Vec::new();
-            pointers
-                .try_reserve_exact(payloads.len())
-                .map_err(|_| GcError::MemoryLimit)?;
-            for payload in payloads {
-                pointers.push(
-                    self.payload(
-                        device,
-                        payload.extent_kind,
-                        payload.object_kind,
-                        payload.extent_index,
-                        payload.extent_count,
-                        payload.content_byte_len,
-                        payload.encoded_blob_len,
-                        payload.encoded_offset,
-                        payload.merkle_root,
-                        payload.bytes,
-                    )
-                    .await?,
-                );
-            }
-            return Ok(pointers);
+            self.finish_current(device, true).await?;
+            self.index = self
+                .index
+                .checked_add(1)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            let segment_no = *self.segments.get(self.index).ok_or(GcError::Capacity)?;
+            self.open(device, segment_no).await?;
         }
+        self.write_batch(device, payloads).await
+    }
 
+    async fn write_batch<D: PageDevice>(
+        &mut self,
+        device: &D,
+        payloads: &[SegmentPayload<'_>],
+    ) -> Result<Vec<PhysicalPointer>, GcStoreError<D::Error>> {
         let segment_no = self.segments[self.index];
         let segment_generation = self.segment_generation()?;
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
@@ -2330,6 +2337,16 @@ async fn verify_staged_copied_extent<D: PageDevice>(
 }
 
 #[allow(clippy::too_many_arguments)]
+struct GcRelocationOutput {
+    catalog_root: PhysicalPointer,
+    authority_root: PhysicalPointer,
+    allocation_root: PhysicalPointer,
+    last_segment: (u64, u64, [u8; 32]),
+    relocated_cas: CasSnapshot,
+    relocated_authority: Option<PersistentAuthoritySnapshot>,
+    telemetry: GcTelemetry,
+}
+
 async fn relocate_live_state<D: PageDevice>(
     device: &D,
     state: &MountedState,
@@ -2341,16 +2358,7 @@ async fn relocate_live_state<D: PageDevice>(
     manifests: &[BlobManifest],
     manifest_lens: &[usize],
     plan: &GcSegmentPlan,
-) -> Result<
-    (
-        PhysicalPointer,
-        PhysicalPointer,
-        PhysicalPointer,
-        [u8; 32],
-        GcTelemetry,
-    ),
-    GcStoreError<D::Error>,
-> {
+) -> Result<GcRelocationOutput, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
     let target_next_generation = plan.relocation_allocation.next_segment_generation;
     let context = CasCodecContext::new(
@@ -2359,14 +2367,13 @@ async fn relocate_live_state<D: PageDevice>(
         target_next_generation,
     )
     .map_err(|_| GcError::Corrupt)?;
-    let (root_bytes, root_kind) = match authority {
+    let relocated_authority = authority
+        .map(|snapshot| snapshot.relocated(plan.relocation_generation))
+        .transpose()
+        .map_err(GcError::from)?;
+    let (root_bytes, root_kind) = match relocated_authority.as_ref() {
         Some(snapshot) => (
-            encode_persistent_authority_snapshot(
-                &snapshot
-                    .relocated(plan.relocation_generation)
-                    .map_err(GcError::from)?,
-            )
-            .map_err(GcError::from)?,
+            encode_persistent_authority_snapshot(snapshot).map_err(GcError::from)?,
             METADATA_KIND_PERSISTENT_AUTHORITY,
         ),
         None => (
@@ -2500,20 +2507,65 @@ async fn relocate_live_state<D: PageDevice>(
             &snapshot_bytes,
         )
         .await?;
-    let authority_root = builder
-        .payload(
-            device,
-            ExtentKind::Authority,
-            root_kind,
-            0,
-            1,
-            root_bytes.len() as u64,
-            root_bytes.len() as u64,
-            0,
-            payload_sha256(&root_bytes),
-            &root_bytes,
-        )
-        .await?;
+    let authority_chunk_bytes = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+    let authority_extent_count = root_bytes.len().div_ceil(authority_chunk_bytes) as u32;
+    let authority_merkle_root = payload_sha256(&root_bytes);
+    let mut authority_payloads = Vec::new();
+    authority_payloads
+        .try_reserve_exact(authority_extent_count as usize)
+        .map_err(|_| GcError::MemoryLimit)?;
+    for (extent_index, chunk) in root_bytes.chunks(authority_chunk_bytes).enumerate() {
+        authority_payloads.push(SegmentPayload {
+            extent_kind: ExtentKind::Authority,
+            object_kind: root_kind,
+            extent_index: extent_index as u32,
+            extent_count: authority_extent_count,
+            content_byte_len: root_bytes.len() as u64,
+            encoded_blob_len: root_bytes.len() as u64,
+            encoded_offset: (extent_index * authority_chunk_bytes) as u64,
+            merkle_root: authority_merkle_root,
+            bytes: chunk,
+        });
+    }
+    let authority_pointers = match builder
+        .payload_batch_single_segment(device, &authority_payloads)
+        .await
+    {
+        Ok(pointers) => pointers,
+        Err(GcStoreError::Gc(GcError::Capacity)) => {
+            // The authority chain exceeds one segment; span segments with
+            // individual extents. Recovery reassembles via allocated-
+            // segment scans.
+            let mut pointers = Vec::new();
+            pointers
+                .try_reserve_exact(authority_payloads.len())
+                .map_err(|_| GcError::MemoryLimit)?;
+            for payload in &authority_payloads {
+                pointers.push(
+                    builder
+                        .payload(
+                            device,
+                            payload.extent_kind,
+                            payload.object_kind,
+                            payload.extent_index,
+                            payload.extent_count,
+                            payload.content_byte_len,
+                            payload.encoded_blob_len,
+                            payload.encoded_offset,
+                            payload.merkle_root,
+                            payload.bytes,
+                        )
+                        .await?,
+                );
+            }
+            pointers
+        }
+        Err(error) => return Err(error),
+    };
+    let authority_root = authority_pointers
+        .first()
+        .copied()
+        .ok_or(GcError::Corrupt)?;
     let allocation_root = builder
         .payload(
             device,
@@ -2534,36 +2586,30 @@ async fn relocate_live_state<D: PageDevice>(
     // root and stream-verify each copied Blob before G+1 can make the targets
     // authoritative. This catches acknowledged-but-corrupted device writes
     // while the old source segments are still the selected truth.
-    verify_staged_payload(
-        device,
-        state,
-        plan.relocation_generation,
-        target_next_generation,
-        catalog_root,
-        ExtentKind::Catalog,
-        &snapshot_bytes,
-        limits.recovery_memory_bytes,
-    )
-    .await?;
-    verify_staged_payload(
-        device,
-        state,
-        plan.relocation_generation,
-        target_next_generation,
-        authority_root,
-        ExtentKind::Authority,
-        &root_bytes,
-        limits.recovery_memory_bytes,
-    )
-    .await?;
-    verify_staged_payload(
-        device,
-        state,
-        plan.relocation_generation,
-        target_next_generation,
+    // All three staged roots live in the same target segment(s); one batch
+    // call pays a single descriptor-chain scan when they share a segment.
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(2 + authority_extent_count as usize)
+        .map_err(|_| GcError::MemoryLimit)?;
+    staged.push((catalog_root, ExtentKind::Catalog, snapshot_bytes.as_slice()));
+    for (chunk, pointer) in root_bytes
+        .chunks(authority_chunk_bytes)
+        .zip(authority_pointers.iter().copied())
+    {
+        staged.push((pointer, ExtentKind::Authority, chunk));
+    }
+    staged.push((
         allocation_root,
         ExtentKind::Allocation,
-        &allocation_bytes,
+        allocation_bytes.as_slice(),
+    ));
+    verify_staged_payloads(
+        device,
+        state,
+        plan.relocation_generation,
+        target_next_generation,
+        &staged,
         limits.recovery_memory_bytes,
     )
     .await?;
@@ -2636,13 +2682,70 @@ async fn relocate_live_state<D: PageDevice>(
         .unwrap_or(u32::MAX),
         ..GcTelemetry::default()
     };
-    Ok((
+    Ok(GcRelocationOutput {
         catalog_root,
         authority_root,
         allocation_root,
-        last.2,
+        last_segment: last,
+        relocated_cas: snapshot,
+        relocated_authority,
         telemetry,
-    ))
+    })
+}
+
+/// Build the G+1 mounted-state successor from an in-memory relocation so the
+/// post-GC mount can use the verified fast path instead of a full cold
+/// recovery: every root was just written and read back by this cycle, and
+/// the checkpoint pair re-read in mount_verified_successor re-authenticates
+/// the publication itself.
+fn build_relocation_successor<E>(
+    state: &MountedState,
+    plan: &GcSegmentPlan,
+    output: GcRelocationOutput,
+    relocated_roots: PersistentRootSet,
+) -> Result<MountedState, GcStoreError<E>> {
+    let mut successor = MountedState {
+        superblock: state.superblock,
+        generation: plan.relocation_generation,
+        admitted_segments: state.admitted_segments,
+        next_physical_segment: (0..state.admitted_segments)
+            .find(|segment_no| {
+                plan.relocation_allocation.segment_state(*segment_no)
+                    == Some(SegmentAllocation::Free)
+            })
+            .unwrap_or(state.admitted_segments),
+        next_segment_generation: plan.relocation_allocation.next_segment_generation,
+        next_object_id: state
+            .next_object_id
+            .max(u128::from(plan.relocation_generation)),
+        cleaner_reserve_segments: state.cleaner_reserve_segments,
+        replay_count: 0,
+        catalog_root: output.catalog_root,
+        replay_tail: PhysicalPointer::Null,
+        authority_root: output.authority_root,
+        allocation_root: output.allocation_root,
+        allocation: plan.relocation_allocation.clone(),
+        allocation_version: 2,
+        persistent_roots: Some(relocated_roots),
+        persistent_authority: output.relocated_authority,
+        catalog: Vec::new(),
+        cas: Some(CasMountedState {
+            objects: output.relocated_cas.objects,
+            blobs: output.relocated_cas.blobs,
+        }),
+        recovery_peak_bytes: 0,
+        last_segment: Some(output.last_segment),
+        last_segment_previous: Some(state.last_segment.unwrap_or((
+            ANCHOR_SEGMENT_NO,
+            0,
+            [0; 32],
+        ))),
+        last_segment_target_checkpoint_generation: plan.relocation_generation,
+    };
+    successor.recovery_peak_bytes = successor
+        .resident_heap_bytes()
+        .ok_or(StoreError::MemoryLimit)?;
+    Ok(successor)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3491,45 +3594,55 @@ impl<D: PageDevice> SegmentStore<D> {
         self.mounted = None;
         self.poisoned = true;
         memory.release(state_bytes)?;
-        let (catalog_root, authority_root, allocation_root, _last_hash, telemetry) =
-            relocate_live_state(
-                &self.device,
-                &state,
-                self.limits,
-                &mark,
-                roots.len(),
-                &relocated_roots,
-                state.persistent_authority.as_ref(),
-                &manifests,
-                &manifest_lens,
-                &plan,
-            )
-            .await
-            .map_err(|error| match error {
-                GcStoreError::Gc(GcError::Corrupt) => {
-                    GcStoreError::Gc(GcError::CorruptAt("relocate"))
-                }
-                other => other,
-            })?;
-        let mut protocol = GcProtocol::begin(plan, telemetry)?;
-        publish_checkpoint(
+        let relocation = relocate_live_state(
+            &self.device,
+            &state,
+            self.limits,
+            &mark,
+            roots.len(),
+            &relocated_roots,
+            state.persistent_authority.as_ref(),
+            &manifests,
+            &manifest_lens,
+            &plan,
+        )
+        .await
+        .map_err(|error| match error {
+            GcStoreError::Gc(GcError::Corrupt) => {
+                GcStoreError::Gc(GcError::CorruptAt("relocate"))
+            }
+            other => other,
+        })?;
+        let mut protocol = GcProtocol::begin(plan, relocation.telemetry)?;
+        let relocation_checkpoint = publish_checkpoint(
             &self.device,
             &state,
             self.limits,
             protocol.plan.relocation_generation,
             protocol.plan.relocation_allocation.next_segment_generation,
-            catalog_root,
-            authority_root,
-            allocation_root,
+            relocation.catalog_root,
+            relocation.authority_root,
+            relocation.allocation_root,
         )
         .await?;
-        self.mount().await?;
+        // Fast-path mount: the relocation already cold-read every staged
+        // root; mount_verified_successor re-reads the checkpoint pair and
+        // validates the transition without re-running full recovery.
+        let epoch_generation = state.generation;
+        let relocation_successor = build_relocation_successor::<D::Error>(
+            &state,
+            &protocol.plan,
+            relocation,
+            relocated_roots,
+        )?;
+        self.mount_verified_successor(state, relocation_checkpoint, relocation_successor, false)
+            .await?;
         protocol.relocation_published()?;
         protocol.observe_quiescence(self.pins.as_ref())?;
         let barrier_state = self.mounted.as_ref().ok_or(GcError::NotMounted)?.clone();
         self.mounted = None;
         self.poisoned = true;
-        let zero = clear_old_checkpoint_seal(&self.device, state.generation).await?;
+        let zero = clear_old_checkpoint_seal(&self.device, epoch_generation).await?;
         protocol.old_checkpoint_cleared(zero)?;
 
         // G+2 has its own sealed allocation record. Catalog and authority
@@ -3562,7 +3675,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 &allocation_bytes,
             )
             .await?;
-        barrier.finish(&self.device).await?;
+        let barrier_last = barrier.finish(&self.device).await?;
         verify_staged_payload(
             &self.device,
             &barrier_state,
@@ -3574,18 +3687,46 @@ impl<D: PageDevice> SegmentStore<D> {
             self.limits.recovery_memory_bytes,
         )
         .await?;
-        publish_checkpoint(
+        let reuse_checkpoint = publish_checkpoint(
             &self.device,
             &barrier_state,
             self.limits,
             protocol.plan.reuse_generation,
             protocol.plan.reuse_allocation.next_segment_generation,
-            catalog_root,
-            authority_root,
+            relocation_checkpoint.catalog_root,
+            relocation_checkpoint.authority_root,
             reuse_allocation_root,
         )
         .await?;
-        self.mount().await?;
+        let mut reuse_successor = barrier_state.clone();
+        reuse_successor.generation = protocol.plan.reuse_generation;
+        reuse_successor.next_segment_generation =
+            protocol.plan.reuse_allocation.next_segment_generation;
+        reuse_successor.next_object_id = reuse_successor
+            .next_object_id
+            .max(u128::from(protocol.plan.reuse_generation));
+        reuse_successor.allocation_root = reuse_allocation_root;
+        reuse_successor.allocation = protocol.plan.reuse_allocation.clone();
+        reuse_successor.next_physical_segment = (0..reuse_successor.admitted_segments)
+            .find(|segment_no| {
+                reuse_successor.allocation.segment_state(*segment_no)
+                    == Some(SegmentAllocation::Free)
+            })
+            .unwrap_or(reuse_successor.admitted_segments);
+        reuse_successor.last_segment = Some(barrier_last);
+        reuse_successor.last_segment_previous = barrier_state.last_segment;
+        reuse_successor.last_segment_target_checkpoint_generation =
+            protocol.plan.reuse_generation;
+        reuse_successor.recovery_peak_bytes = reuse_successor
+            .resident_heap_bytes()
+            .ok_or(StoreError::MemoryLimit)?;
+        self.mount_verified_successor(
+            barrier_state,
+            reuse_checkpoint,
+            reuse_successor,
+            false,
+        )
+        .await?;
         protocol.reuse_barrier_published()?;
         protocol.telemetry.memory_high_water_bytes = memory.peak;
         protocol.telemetry.foreground_cycles = 1;

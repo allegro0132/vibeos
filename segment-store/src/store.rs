@@ -31,8 +31,8 @@ use crate::authority_snapshot::{
     PERSISTENT_AUTHORITY_HEADER_LEN,
 };
 use crate::cas_codec::{
-    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping, CasCodecContext,
-    ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
+    decode_blob_manifest, decode_cas_snapshot, BlobKey, BlobManifest, BlobMapping,
+    CasCodecContext, ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
     CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, OBJECT_MAPPING_LEN,
 };
 use crate::codec::{
@@ -1487,6 +1487,7 @@ fn codec_error<E>(error: CodecError) -> StoreError<E> {
 pub(crate) struct ScannedSegment {
     pub(crate) matched: Option<ExtentRecord>,
     additional_matches: Vec<ExtentRecord>,
+    authority_siblings: Vec<ExtentRecord>,
     pub(crate) record_count: u32,
     pub(crate) total_payload_bytes: u64,
     pub(crate) segment_seal_body_sha256: [u8; 32],
@@ -1510,6 +1511,8 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         checkpoint_generation,
         pointer,
         &[],
+        false,
+        false,
     )
     .await
 }
@@ -1523,6 +1526,8 @@ async fn scan_segment_with_matches<D: PageDevice>(
     checkpoint_generation: u64,
     pointer: PointerValue,
     additional: &[PointerValue],
+    collect_authority_siblings: bool,
+    collect_authority_records: bool,
 ) -> Result<ScannedSegment, StoreError<D::Error>> {
     if pointer.store_uuid != store_uuid
         || pointer.segment_no >= admitted_segments
@@ -1573,6 +1578,7 @@ async fn scan_segment_with_matches<D: PageDevice>(
     additional_matches
         .try_reserve_exact(additional.len())
         .map_err(|_| StoreError::MemoryLimit)?;
+    let mut authority_siblings = Vec::new();
     for ordinal in 1..=summary.value().record_count {
         let descriptor_pages = read_pair(device, base + u64::from(relative)).await?;
         let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
@@ -1629,6 +1635,38 @@ async fn scan_segment_with_matches<D: PageDevice>(
         if relative == pointer.descriptor_relative_page && ordinal == pointer.ordinal {
             matched = Some(value);
         }
+        if collect_authority_records && value.extent_kind == ExtentKind::Authority {
+            authority_siblings.push(value);
+        }
+        if collect_authority_siblings && ordinal > pointer.ordinal {
+            let still_collecting = matched.as_ref().is_some_and(|first| {
+                authority_siblings.len() as u32 + 1 < first.extent_count
+            });
+            if still_collecting {
+                let first = matched.as_ref().expect("collecting implies matched");
+                let expected_index = authority_siblings.len() as u32 + 1;
+                if value.extent_kind != ExtentKind::Authority
+                    || value.binding.target_checkpoint_generation
+                        != first.binding.target_checkpoint_generation
+                    || value.extent_index != expected_index
+                    || value.extent_count != first.extent_count
+                    || value.object_kind != first.object_kind
+                    || value.content_byte_len != first.content_byte_len
+                    || value.encoded_blob_len != first.encoded_blob_len
+                    || value.encoded_offset
+                        != first
+                            .payload_byte_len
+                            .checked_mul(u64::from(expected_index))
+                            .ok_or(StoreError::Corrupt)?
+                    || value.merkle_root != first.merkle_root
+                    || value.payload_byte_len
+                        > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                authority_siblings.push(value);
+            }
+        }
         for wanted in additional {
             if relative == wanted.descriptor_relative_page && ordinal == wanted.ordinal {
                 additional_matches.push(value);
@@ -1669,9 +1707,22 @@ async fn scan_segment_with_matches<D: PageDevice>(
     if additional_matches.len() != additional.len() {
         return Err(StoreError::Corrupt);
     }
+    if collect_authority_siblings {
+        let first = matched.ok_or(StoreError::Corrupt)?;
+        if first.extent_kind != ExtentKind::Authority
+            || first.extent_index != 0
+            || first.extent_count == 0
+            || first.encoded_offset != 0
+            || first.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+            || authority_siblings.len() as u32 + 1 > first.extent_count
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
     Ok(ScannedSegment {
         matched,
         additional_matches,
+        authority_siblings,
         record_count: summary_value.record_count,
         total_payload_bytes: summary_value.total_payload_bytes,
         segment_seal_body_sha256: segment_seal.digest().body_sha256(),
@@ -1693,6 +1744,44 @@ pub(crate) struct ResolvedPayload {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Validate the semantic chain of one multi-extent authority payload.
+/// Extent 0 carries extent_count and the whole-payload merkle root; every
+/// sibling must continue the ascending index/offset sequence with identical
+/// logical shape. Binding shape is authenticated separately by the scan.
+fn validate_authority_extent_chain<E>(extents: &[ExtentRecord]) -> Result<(), StoreError<E>> {
+    let Some(first) = extents.first() else {
+        return Ok(());
+    };
+    if first.extent_index != 0
+        || first.extent_count == 0
+        || first.encoded_offset != 0
+        || first.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        || extents.len() as u32 != first.extent_count
+    {
+        return Err(StoreError::Corrupt);
+    }
+    for (index, extent) in extents.iter().enumerate().skip(1) {
+        let expected_offset = first
+            .payload_byte_len
+            .checked_mul(index as u64)
+            .ok_or(StoreError::Corrupt)?;
+        if extent.extent_index != index as u32
+            || extent.extent_count != first.extent_count
+            || extent.object_kind != first.object_kind
+            || extent.content_byte_len != first.content_byte_len
+            || extent.encoded_blob_len != first.encoded_blob_len
+            || extent.encoded_offset != expected_offset
+            || extent.merkle_root != first.merkle_root
+            || extent.binding.target_checkpoint_generation
+                != first.binding.target_checkpoint_generation
+            || extent.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn read_pointer_payload<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
@@ -1753,7 +1842,7 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
     };
     if requests.len() == 1 {
         let (pointer, kind, maximum_bytes) = requests[0];
-        return Ok(vec![
+        let resolved = vec![
             read_pointer_payload(
                 device,
                 store_uuid,
@@ -1765,7 +1854,9 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
                 maximum_bytes,
             )
             .await?,
-        ]);
+        ];
+        validate_resolved_authority_chains(&resolved)?;
+        return Ok(resolved);
     }
     let one_segment = requests.iter().all(|(pointer, _, _)| {
         matches!(
@@ -1816,6 +1907,8 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
         checkpoint_generation,
         first,
         &additional,
+        false,
+        false,
     )
     .await?;
     let base = segment_base_page(first.segment_no)?;
@@ -1864,7 +1957,22 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
             .await?,
         );
     }
+    validate_resolved_authority_chains(&resolved)?;
     Ok(resolved)
+}
+
+fn validate_resolved_authority_chains<E>(resolved: &[ResolvedPayload]) -> Result<(), StoreError<E>> {
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(resolved.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    extents.extend(
+        resolved
+            .iter()
+            .filter(|payload| payload.extent.extent_kind == ExtentKind::Authority)
+            .map(|payload| payload.extent),
+    );
+    validate_authority_extent_chain(&extents)
 }
 
 async fn read_pointer_payload_after_scan<D: PageDevice>(
@@ -1898,7 +2006,10 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
                 || extent.content_byte_len != pointer.exact_byte_len
                 || extent.encoded_blob_len != pointer.exact_byte_len
                 || extent.encoded_offset != 0
-                || extent.merkle_root != pointer.payload_sha256))
+                || extent.merkle_root != pointer.payload_sha256)
+            && expected_kind != ExtentKind::Authority)
+        || (expected_kind == ExtentKind::Authority
+            && (extent.extent_count == 0 || extent.extent_index >= extent.extent_count))
     {
         return Err(StoreError::Corrupt);
     }
@@ -2103,6 +2214,213 @@ async fn read_recovery_pointer_payload<D: PageDevice>(
         checkpoint_generation,
         pointer,
         expected_kind,
+        remaining,
+    )
+    .await
+}
+
+/// Scan one allocated segment and return every Authority extent record it
+/// contains, authenticated by the segment's full descriptor/summary/seal
+/// chain. Used to reassemble authority chains whose extents span segments.
+pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    segment_no: u64,
+    maximum: usize,
+) -> Result<Vec<ExtentRecord>, StoreError<D::Error>> {
+    let base = segment_base_page(segment_no)?;
+    let header_pages = read_pair(device, base).await?;
+    let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
+        DecodeStatus::Sealed(value) => value,
+        _ => return Err(StoreError::Corrupt),
+    };
+    let generation = header.value().binding.generation;
+    if header.value().binding.store_uuid != store_uuid
+        || header.value().binding.segment_no != segment_no
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let pointer = PointerValue {
+        store_uuid,
+        segment_no,
+        segment_generation: generation,
+        descriptor_relative_page: DATA_FIRST_PAGE,
+        payload_relative_page: DATA_FIRST_PAGE + 2,
+        payload_pages: 0,
+        ordinal: 0,
+        exact_byte_len: 0,
+        extent_kind: ExtentKind::Authority,
+        payload_sha256: [0; 32],
+    };
+    let scanned = scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        &[],
+        false,
+        true,
+    )
+    .await?;
+    if scanned.authority_siblings.len() > maximum {
+        return Err(StoreError::MemoryLimit);
+    }
+    Ok(scanned.authority_siblings)
+}
+
+/// Resolve a possibly multi-extent authority payload. Extent 0 is named by
+/// the checkpoint; sibling extents are collected from the extent 0 segment
+/// scan and, when the chain spans segments, from authenticated scans of
+/// every allocated segment. The returned bytes are the concatenated logical
+/// authority snapshot payload.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    allocated_segments: &[u64],
+    maximum_bytes: usize,
+) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
+    let PhysicalPointer::Value(pointer) = pointer else {
+        return Err(StoreError::Corrupt);
+    };
+    if pointer.extent_kind != ExtentKind::Authority
+        || pointer.exact_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let scanned = scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        &[],
+        true,
+        false,
+    )
+    .await?;
+    let first = scanned.matched.ok_or(StoreError::Corrupt)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(first.extent_count as usize)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    records.push(first);
+    records.extend(scanned.authority_siblings.iter().copied());
+    if records.len() as u32 != first.extent_count {
+        for segment_no in allocated_segments.iter().copied() {
+            if segment_no == pointer.segment_no {
+                continue;
+            }
+            let found = scan_segment_authority_records(
+                device,
+                store_uuid,
+                admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                segment_no,
+                first.extent_count as usize,
+            )
+            .await?;
+            records.extend(found);
+        }
+    }
+    // Older generations' authority chains remain allocated on media; only
+    // extents targeting this checkpoint's generation belong to the chain.
+    records.retain(|extent| {
+        extent.binding.target_checkpoint_generation == first.binding.target_checkpoint_generation
+    });
+    records.sort_unstable_by_key(|extent| extent.extent_index);
+    validate_authority_extent_chain(&records)?;
+    if records.len() as u32 != first.extent_count {
+        return Err(StoreError::Corrupt);
+    }
+    let total = records.iter().try_fold(0usize, |total, extent| {
+        usize::try_from(extent.payload_byte_len)
+            .map_err(|_| StoreError::Corrupt)
+            .and_then(|bytes| total.checked_add(bytes).ok_or(StoreError::Corrupt))
+    })?;
+    if total > maximum_bytes {
+        return Err(StoreError::MemoryLimit);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for extent in &records {
+        let exact_len =
+            usize::try_from(extent.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
+        let base = segment_base_page(extent.binding.segment_no)?;
+        let mut chunk = Vec::new();
+        chunk
+            .try_reserve_exact(exact_len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let mut copied = 0;
+        for index in 0..extent.payload_pages {
+            let mut page = Box::new([0; PAGE_SIZE]);
+            device
+                .read_page(
+                    base + u64::from(extent.payload_first_relative_page) + u64::from(index),
+                    page.as_mut(),
+                )
+                .await
+                .map_err(StoreError::Device)?;
+            let remaining = exact_len - copied;
+            let take = remaining.min(PAGE_SIZE);
+            chunk.extend_from_slice(&page[..take]);
+            copied += take;
+        }
+        if copied != exact_len || payload_sha256(&chunk) != extent.payload_sha256 {
+            return Err(StoreError::Corrupt);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != total || payload_sha256(&bytes) != records[0].merkle_root {
+        return Err(StoreError::Corrupt);
+    }
+    Ok((bytes, first))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_recovery_authority_payload<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    allocated_segments: &[u64],
+    memory_limit: usize,
+    resident_bytes: usize,
+) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
+    let remaining = recovery_remaining(memory_limit, resident_bytes)?;
+    if let PhysicalPointer::Value(pointer) = pointer {
+        if pointer.extent_kind != ExtentKind::Authority
+            || pointer.exact_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        {
+            return Err(StoreError::Corrupt);
+        }
+        if pointer.exact_byte_len > remaining as u64 {
+            return Err(StoreError::MemoryLimit);
+        }
+    }
+    read_pointer_authority_payload(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        allocated_segments,
         remaining,
     )
     .await
@@ -2425,14 +2743,23 @@ pub(crate) async fn recover_state<D: PageDevice>(
         let resident_before_roots =
             recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None, None)
                 .map_err(|_| StoreError::MemoryLimit)?;
-        let authority = read_recovery_pointer_payload(
+        let mut allocated_segments = Vec::new();
+        allocated_segments
+            .try_reserve_exact(usize::try_from(allocation.counts().map_err(|_| StoreError::Corrupt)?.allocated).unwrap_or(0))
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for segment_no in 0..checkpoint.admitted_segments {
+            if allocation.segment_state(segment_no) == Some(SegmentAllocation::Allocated) {
+                allocated_segments.push(segment_no);
+            }
+        }
+        let (authority_bytes, authority_extent) = read_recovery_authority_payload(
             device,
             superblock.binding.store_uuid,
             checkpoint.admitted_segments,
             checkpoint.next_segment_generation,
             checkpoint.binding.generation,
             checkpoint.authority_root,
-            ExtentKind::Authority,
+            &allocated_segments,
             limits.recovery_memory_bytes,
             resident_before_roots,
         )
@@ -2442,17 +2769,17 @@ pub(crate) async fn recover_state<D: PageDevice>(
         // bindings which would require CAS resolution yet.
         let cas_objects: &[ObjectMapping] =
             cas.as_ref().map_or(&[], |state| state.objects.as_slice());
-        let (decoded_roots, decoded_authority) = if authority.bytes.starts_with(b"VIBEAUT2") {
+        let (decoded_roots, decoded_authority) = if authority_bytes.starts_with(b"VIBEAUT2") {
             recovery_preflight_decode(
                 limits.recovery_memory_bytes,
                 resident_before_roots,
-                authority.bytes.capacity(),
-                persistent_authority_decode_capacity_upper_bound(&authority.bytes)?,
+                authority_bytes.capacity(),
+                persistent_authority_decode_capacity_upper_bound(&authority_bytes)?,
             )?;
-            let decoded = decode_persistent_authority_snapshot(&authority.bytes)
+            let decoded = decode_persistent_authority_snapshot(&authority_bytes)
                 .map_err(|_| StoreError::Corrupt)?;
             if decoded.checkpoint_generation()
-                != authority.extent.binding.target_checkpoint_generation
+                != authority_extent.binding.target_checkpoint_generation
             {
                 return Err(StoreError::Corrupt);
             }
@@ -2474,14 +2801,14 @@ pub(crate) async fn recover_state<D: PageDevice>(
             recovery_preflight_decode(
                 limits.recovery_memory_bytes,
                 resident_before_roots,
-                authority.bytes.capacity(),
-                persistent_roots_decode_capacity_upper_bound(&authority.bytes)?,
+                authority_bytes.capacity(),
+                persistent_roots_decode_capacity_upper_bound(&authority_bytes)?,
             )?;
             let decoded =
-                decode_persistent_root_set(&authority.bytes).map_err(|_| StoreError::Corrupt)?;
+                decode_persistent_root_set(&authority_bytes).map_err(|_| StoreError::Corrupt)?;
             if decoded.checkpoint_generation > checkpoint.binding.generation
                 || decoded.checkpoint_generation
-                    != authority.extent.binding.target_checkpoint_generation
+                    != authority_extent.binding.target_checkpoint_generation
             {
                 return Err(StoreError::Corrupt);
             }
@@ -2503,7 +2830,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
             &mut recovery_peak,
             limits.recovery_memory_bytes,
             resident_before_roots
-                .checked_add(authority.bytes.capacity())
+                .checked_add(authority_bytes.capacity())
                 .and_then(|bytes| bytes.checked_add(decoded_roots.allocated_bytes()?))
                 .and_then(|bytes| {
                     bytes.checked_add(

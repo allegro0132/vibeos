@@ -164,7 +164,11 @@ impl PageDevice for FaultDevice {
 }
 
 fn limits() -> StoreLimits {
-    StoreLimits::default()
+    StoreLimits {
+        // Large-object sweeps carry >2 MiB record streams through recovery.
+        recovery_memory_bytes: 64 * 1024 * 1024,
+        ..StoreLimits::default()
+    }
 }
 
 fn store_id() -> StoreId {
@@ -290,14 +294,14 @@ fn prepared_image() -> (BTreeMap<u64, Page>, Vec<[u8; vibeos_durable_format::REC
     (device.durable_image(), records)
 }
 
-fn payload() -> Vec<u8> {
-    (0..4096usize).map(|index| (index * 197 + 0x11) as u8).collect()
+fn payload(size: usize) -> Vec<u8> {
+    (0..size).map(|index| (index * 197 + 0x11) as u8).collect()
 }
 
 /// Drive one granted-object append over `device`. Returns Ready(Ok) when the
 /// append completed, Ready(Err) when it failed cleanly, Pending when the
 /// armed cut fired.
-fn drive_append(device: &FaultDevice) -> Poll<Result<(), String>> {
+fn drive_append(device: &FaultDevice, size: usize) -> Poll<Result<(), String>> {
     let (runtime, _quota, provisioner) =
         StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
             .unwrap();
@@ -317,7 +321,7 @@ fn drive_append(device: &FaultDevice) -> Poll<Result<(), String>> {
         .chunks_exact(vibeos_durable_format::RECORD_SIZE)
         .map(|chunk| chunk.try_into().unwrap())
         .collect();
-    let (next_records, grant) = granted_object_records(&records, &payload());
+    let (next_records, grant) = granted_object_records(&records, &payload(size));
     let update = granted_import(&next_records, &grant);
     let generation = view.checkpoint_generation();
     let principal = view.principals()[0].clone();
@@ -336,7 +340,7 @@ fn drive_append(device: &FaultDevice) -> Poll<Result<(), String>> {
 
 /// Mount the durable image cold and classify the recovered authority state.
 /// Returns the number of admitted objects after verifying any object content.
-fn recovered_objects(image: BTreeMap<u64, Page>) -> usize {
+fn recovered_objects(image: BTreeMap<u64, Page>, size: usize) -> usize {
     let device = FaultDevice::from_image(SEGMENTS, image);
     let (runtime, _quota, _provisioner) =
         StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
@@ -348,29 +352,28 @@ fn recovered_objects(image: BTreeMap<u64, Page>) -> usize {
     for handle in view.objects() {
         let bytes = block_on(store.read_persistent_object(handle))
             .unwrap_or_else(|error| panic!("cold read: {:?}", error));
-        assert_eq!(bytes, payload(), "recovered object content diverged");
+        assert_eq!(bytes, payload(size), "recovered object content diverged");
     }
     view.objects().len()
 }
 
-#[test]
-fn every_fused_append_cut_boundary_recovers_predecessor_or_successor() {
+fn sweep_cut_boundaries(size: usize, stride: usize) {
     let (initial_image, _records) = prepared_image();
 
-    // Unfaulted baseline: count the mutation boundaries of one fused append.
+    // Unfaulted baseline: count the mutation boundaries of one append.
     let device = FaultDevice::from_image(SEGMENTS, initial_image.clone());
-    match drive_append(&device) {
+    match drive_append(&device, size) {
         Poll::Ready(Ok(())) => {}
         other => panic!("baseline append did not complete: {:?}", other.is_pending()),
     }
     let boundaries = device.mutation_count();
     assert!(boundaries > 20, "implausibly few mutations: {}", boundaries);
-    assert_eq!(recovered_objects(device.durable_image()), 1);
+    assert_eq!(recovered_objects(device.durable_image(), size), 1);
 
-    for boundary in 0..boundaries {
+    for boundary in (0..boundaries).step_by(stride) {
         let device = FaultDevice::from_image(SEGMENTS, initial_image.clone());
         device.arm(boundary);
-        let outcome = drive_append(&device);
+        let outcome = drive_append(&device, size);
         assert!(
             outcome.is_pending(),
             "boundary {}: cut did not fire (mutations={})",
@@ -378,7 +381,7 @@ fn every_fused_append_cut_boundary_recovers_predecessor_or_successor() {
             device.mutation_count()
         );
         // Power cycle: everything volatile is lost; remount the durable image.
-        let objects = recovered_objects(device.durable_image());
+        let objects = recovered_objects(device.durable_image(), size);
         assert!(
             objects == 0 || objects == 1,
             "boundary {}: recovered {} objects",
@@ -388,7 +391,7 @@ fn every_fused_append_cut_boundary_recovers_predecessor_or_successor() {
         if objects == 0 {
             // The predecessor state must still accept the append.
             let retry = FaultDevice::from_image(SEGMENTS, device.durable_image());
-            match drive_append(&retry) {
+            match drive_append(&retry, size) {
                 Poll::Ready(Ok(())) => {}
                 other => panic!(
                     "boundary {}: resume append failed: pending={}",
@@ -396,7 +399,26 @@ fn every_fused_append_cut_boundary_recovers_predecessor_or_successor() {
                     other.is_pending()
                 ),
             }
-            assert_eq!(recovered_objects(retry.durable_image()), 1);
+            assert_eq!(recovered_objects(retry.durable_image(), size), 1);
         }
     }
+}
+
+#[test]
+fn every_fused_append_cut_boundary_recovers_predecessor_or_successor() {
+    sweep_cut_boundaries(4096, 1);
+}
+
+/// Above the former 368,640-byte compatibility envelope but still within one
+/// authority extent, so the fused single-checkpoint path carries it.
+#[test]
+fn large_fused_append_cut_boundaries_recover() {
+    sweep_cut_boundaries(372_000, 5);
+}
+
+/// A 1 MiB object's ~1.5 MiB record stream exceeds one authority extent and
+/// takes the general publication path with a multi-extent authority chain.
+#[test]
+fn one_mib_append_cut_boundaries_recover() {
+    sweep_cut_boundaries(1024 * 1024, 17);
 }

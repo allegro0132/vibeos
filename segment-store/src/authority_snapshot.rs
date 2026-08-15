@@ -28,7 +28,18 @@ const LEGACY_PERSISTENT_AUTHORITY_SNAPSHOT_VERSION: u16 = 1;
 pub const PERSISTENT_AUTHORITY_HEADER_LEN: usize = 0x80;
 pub const PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN: usize = 0x30;
 pub const PERSISTENT_AUTHORITY_PRINCIPAL_LEN: usize = 0x40;
-pub const MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN: usize = 256 * 4096;
+/// Upper bound on the encoded authority snapshot payload. Storage V2 large
+/// objects are carried as M4 record streams inside this payload (one 1 MiB
+/// object needs ~1.5 MiB of stream), and the authority extent chain may span
+/// allocated segments, so this bounds the cumulative encoded object bytes a
+/// store instance can admit. Mount memory limits bound the practical value.
+pub const MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN: usize = 16_384 * 4096;
+/// Upper bound on the number of logical M4 records an authority snapshot can
+/// carry. The kernel's Storage V2 record-stream admission check uses this
+/// instead of the M4 journal's physical sector count.
+pub const MAX_PERSISTENT_AUTHORITY_RECORDS: usize =
+    (MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN - PERSISTENT_AUTHORITY_HEADER_LEN)
+        / vibeos_durable_format::RECORD_SIZE;
 pub const MAX_STABLE_PRINCIPALS: usize = 256;
 pub const LEGACY_SYSTEM_PRINCIPAL: StablePrincipalId = StablePrincipalId(*b"VIBE-M4-SYSTEM!!");
 

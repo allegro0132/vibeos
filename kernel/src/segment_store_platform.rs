@@ -882,9 +882,16 @@ pub(crate) struct StorageV2Runtime {
     last_info: SpinLock<Option<vibeos_segment_store::StoreInfo>>,
     boot_selection: AtomicU8,
     needs_rebuild: AtomicBool,
+    /// Logical-record count at the last steady-state compaction attempt, so
+    /// the append path re-evaluates compaction only after meaningful growth.
+    compact_watermark: AtomicU64,
     maintenance_provisioner: StoreMaintenanceProvisioner,
     _quota_provisioner: StorageQuotaProvisioner,
 }
+
+/// Below this many logical records the authority stream is not worth
+/// rewriting: migration fixtures and small stores never trigger compaction.
+const STORAGE_V2_COMPACT_MIN_RECORDS: usize = 2048;
 
 const STORAGE_V2_HOT_READ_CACHE_BYTES: usize = 256 * 1024;
 // Object-store tokens retain the encoded Merkle envelope, so a 64 KiB user
@@ -1011,6 +1018,7 @@ impl StorageV2Runtime {
             last_info: SpinLock::new_recoverable(None),
             boot_selection: AtomicU8::new(0),
             needs_rebuild: AtomicBool::new(false),
+            compact_watermark: AtomicU64::new(0),
             maintenance_provisioner: maintenance,
             _quota_provisioner: quota,
         });
@@ -1435,6 +1443,61 @@ impl StorageV2Runtime {
             )
             .await
             .map_err(|_| V2RuntimeError::Corrupt)?;
+            // Boot-boundary compaction: no runtime capabilities exist yet, so
+            // ungranted boot-local objects — which cold recovery deliberately
+            // refuses to resolve — may be shed together with dead grant
+            // closures. A replacement is re-validated under the compiled
+            // policy and re-verified exactly like the recovered view; any
+            // failure past the replacement attempt fails the cold proof.
+            let view = {
+                let record_count = view.record_stream().len() / LOGICAL_BLOCK_SIZE;
+                let compacted = if record_count >= STORAGE_V2_COMPACT_MIN_RECORDS {
+                    decode_authority_records(view.record_stream())
+                        .ok()
+                        .and_then(|records| {
+                            crate::durable_cspace::storage_v2_compact_records(&records, true)
+                                .ok()
+                                .flatten()
+                        })
+                } else {
+                    None
+                };
+                match compacted {
+                    None => view,
+                    Some(compacted) => {
+                        let import =
+                            crate::durable_cspace::storage_v2_migration_import(&compacted)
+                                .map_err(|_| V2RuntimeError::Corrupt)?;
+                        let writer = operation
+                            .store()
+                            .derive_persistent_authority_writer(&maintenance)
+                            .map_err(|_| V2RuntimeError::Corrupt)?;
+                        let generation = view.checkpoint_generation();
+                        drop(view);
+                        let replaced = poll_as_system(
+                            operation.store().replace_persistent_authority(
+                                &writer,
+                                generation,
+                                import,
+                            ),
+                        )
+                        .await
+                        .map_err(|_| V2RuntimeError::Corrupt)?;
+                        let verify = crate::durable_cspace::storage_v2_recovery_import(
+                            replaced.record_stream(),
+                        )
+                        .map_err(|_| V2RuntimeError::Corrupt)?;
+                        poll_as_system(
+                            operation
+                                .store()
+                                .verify_persistent_authority_import(&replaced, &verify),
+                        )
+                        .await
+                        .map_err(|_| V2RuntimeError::Corrupt)?;
+                        replaced
+                    }
+                }
+            };
             let scrub = poll_as_system(operation.store().scrub(&maintenance))
                 .await
                 .map_err(|_| V2RuntimeError::Corrupt)?;
@@ -1550,6 +1613,66 @@ impl StorageV2Runtime {
         }
         operation.finish();
         Ok(())
+    }
+
+    /// Steady-state stream compaction. When the appended logical journal has
+    /// outgrown the threshold and a rewrite would shed at least a quarter of
+    /// its records, replace the persistent authority with the compacted
+    /// equivalent and return the published replacement view. Handles and
+    /// read tokens minted earlier this boot keep resolving: persistent and
+    /// transient resolution binds stable object ids, never stream sequences.
+    /// Ungranted (runtime-transient) objects are retained; only a boot
+    /// boundary may shed those.
+    async fn maybe_compact_authority(
+        self: &Arc<Self>,
+        view: &PersistentAuthorityView,
+    ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
+        let record_count = (view.record_stream().len() / LOGICAL_BLOCK_SIZE) as u64;
+        if (record_count as usize) < STORAGE_V2_COMPACT_MIN_RECORDS {
+            return Ok(None);
+        }
+        let watermark = self.compact_watermark.load(Ordering::Acquire);
+        if watermark != 0 && record_count < watermark.saturating_add(watermark / 4) {
+            return Ok(None);
+        }
+        self.compact_watermark.store(record_count, Ordering::Release);
+        // Evaluation failures (nothing worth compacting, policy re-validation
+        // declined) leave the appended state authoritative. Only an actual
+        // replacement attempt with an unknown durable outcome fails closed.
+        let Ok(records) = decode_authority_records(view.record_stream()) else {
+            return Ok(None);
+        };
+        let compacted = match crate::durable_cspace::storage_v2_compact_records(&records, false)
+        {
+            Ok(Some(compacted)) => compacted,
+            _ => return Ok(None),
+        };
+        let Ok(import) = crate::durable_cspace::storage_v2_migration_import(&compacted) else {
+            return Ok(None);
+        };
+        let mut expected = Vec::new();
+        if expected
+            .try_reserve_exact(compacted.len() * LOGICAL_BLOCK_SIZE)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        for record in &compacted {
+            expected.extend_from_slice(record);
+        }
+        match self.install_persistent_authority(import, &expected).await {
+            Ok(replacement) => {
+                self.compact_watermark
+                    .store(compacted.len() as u64, Ordering::Release);
+                Ok(Some(replacement))
+            }
+            Err(_) => {
+                // The replacement's durability is unknown; only a fresh cold
+                // proof may re-establish which checkpoint is live.
+                self.invalidate_recovery_cache();
+                Err(vibeos_object_store::StoreError::Corrupt)
+            }
+        }
     }
 
     #[cfg(feature = "file-tree")]
@@ -3264,14 +3387,28 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             let phase_append = crate::sbi::time();
             let (view, transient) = appended.into_parts();
             let transient = system_arc(transient);
-            let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    runtime.invalidate_recovery_cache();
-                    return Err(error);
-                }
+            // Steady-state compaction: an oversized logical journal is
+            // rewritten to its live equivalent and installed as a
+            // replacement checkpoint. Token resolution binds stable object
+            // ids, so the snapshot below stays valid either way; the
+            // just-appended (still ungranted) objects resolve through the
+            // transient witness.
+            let compacted_view = runtime.maybe_compact_authority(&view).await?;
+            let snapshot_view: &PersistentAuthorityView = match compacted_view.as_deref() {
+                Some(replacement) => replacement,
+                None => &view,
             };
-            runtime.publish_authority(view);
+            let snapshot =
+                match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        runtime.invalidate_recovery_cache();
+                        return Err(error);
+                    }
+                };
+            if compacted_view.is_none() {
+                runtime.publish_authority(view);
+            }
             #[cfg(feature = "storage-bench")]
             {
                 let phase_publish = crate::sbi::time();

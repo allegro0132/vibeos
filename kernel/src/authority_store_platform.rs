@@ -264,6 +264,35 @@ pub(crate) fn storage_v2_migration_import(
     .map_err(|_| DurableCSpaceError::RootPolicy)
 }
 
+/// Attempt to compact a validated V2 logical stream. Returns `None` when the
+/// rewrite would not repay an extra checkpoint (savings below one quarter of
+/// the records). `drop_ungranted_objects` may be true only at a boot
+/// boundary: ungranted objects are unreachable after reboot because no
+/// durable grant names them, but capabilities minted this boot still resolve
+/// them, so runtime compaction must keep them.
+pub(crate) fn storage_v2_compact_records(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    drop_ungranted_objects: bool,
+) -> Result<Option<Vec<[u8; vibeos_durable_format::RECORD_SIZE]>>, DurableCSpaceError> {
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let preflight = durable::preflight_recovery(records, store_id)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let compacted = preflight
+        .compact(drop_ungranted_objects)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    // The rewrite must be worth a replace checkpoint plus the risk budget of
+    // touching authority at all: require at least a 25% record reduction.
+    if compacted
+        .len()
+        .saturating_add(compacted.len() / 4)
+        .saturating_add(1)
+        >= records.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some(compacted))
+}
+
 #[derive(Default)]
 struct LiveGraph {
     root: Option<PersistentCapIdentity>,

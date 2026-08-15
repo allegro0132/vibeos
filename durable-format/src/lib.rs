@@ -1064,6 +1064,9 @@ pub struct RecoveryPreflight {
     committed: Vec<RecoveredGrant>,
     objects: Vec<RecoveredObject>,
     tombstone_sequence: BTreeMap<DerivationId, u64>,
+    /// The transaction that carried each tombstone, retained so a compacted
+    /// stream can re-emit the tombstone under its original stable identity.
+    tombstone_transactions: BTreeMap<DerivationId, TransactionId>,
     graph: BTreeMap<DerivationId, RecoveredGrant>,
     slots: Vec<RecoveredSlot>,
     last_sequence: u64,
@@ -1167,6 +1170,240 @@ impl RecoveryPreflight {
         Ok(selected)
     }
 
+    /// Rebuild a minimal record stream whose recovery is equivalent to this
+    /// one for every consumer-visible property: the id high-water mark, the
+    /// live derivation graph, per-slot generation history (so no retired slot
+    /// generation can ever be reissued), and every object still reachable
+    /// through a retained grant. Grants whose whole closure is tombstoned are
+    /// dropped together with objects referenced only by dropped grants — the
+    /// steady-state garbage a replace-style workload accumulates.
+    ///
+    /// Objects that never received any grant are runtime-transient: nothing
+    /// durable can name them after a reboot, but capabilities minted this
+    /// boot still resolve them. `drop_ungranted_objects` therefore must be
+    /// `false` for any compaction while such capabilities may exist, and may
+    /// be `true` only at a boot boundary.
+    ///
+    /// The compacted stream is fully re-validated here, and its recovered
+    /// state is compared against this preflight property by property; any
+    /// divergence fails closed with [`RecoveryError::CompactionMismatch`]
+    /// and the caller keeps the original stream. Sequence numbers and record
+    /// CRCs necessarily differ; no equivalence claim covers them.
+    ///
+    /// One check this rewrite deliberately relaxes: dropped derivation and
+    /// transaction ids are no longer remembered by the stream itself, so a
+    /// later writer could re-prepare one without the stream rejecting it.
+    /// The id allocator's high-water mark — which is preserved — remains the
+    /// authority that prevents such reuse.
+    pub fn compact(
+        &self,
+        drop_ungranted_objects: bool,
+    ) -> Result<Vec<[u8; RECORD_SIZE]>, RecoveryError> {
+        // 1. Retained derivations: every live grant, plus each slot's
+        // highest-generation holder (alive or dead), plus ancestor closure.
+        let mut retained: BTreeSet<DerivationId> = BTreeSet::new();
+        for recovered in &self.committed {
+            if !is_tombstoned(
+                recovered.grant.derivation_id,
+                &self.graph,
+                &self.tombstone_sequence,
+            ) {
+                retained.insert(recovered.grant.derivation_id);
+            }
+        }
+        for slot in &self.slots {
+            let holder = self
+                .committed
+                .iter()
+                .find(|recovered| {
+                    recovered.grant.target.space == slot.space
+                        && recovered.grant.target.slot == slot.slot
+                        && recovered.grant.target.generation == slot.max_generation
+                })
+                .ok_or(RecoveryError::CompactionMismatch)?;
+            retained.insert(holder.grant.derivation_id);
+        }
+        let mut closure: Vec<DerivationId> = retained.iter().copied().collect();
+        while let Some(derivation) = closure.pop() {
+            let Some(node) = self.graph.get(&derivation) else {
+                return Err(RecoveryError::CompactionMismatch);
+            };
+            if let Some(parent) = node.grant.parent_id {
+                if retained.insert(parent) {
+                    closure.push(parent);
+                }
+            }
+        }
+
+        // 2. Retained objects: referenced by a retained grant, or never
+        // granted at all (unless a boot boundary permits dropping those).
+        let mut granted_objects: BTreeSet<ObjectId> = BTreeSet::new();
+        let mut retained_objects: BTreeSet<ObjectId> = BTreeSet::new();
+        for recovered in &self.committed {
+            granted_objects.insert(recovered.grant.object_id);
+            if retained.contains(&recovered.grant.derivation_id) {
+                retained_objects.insert(recovered.grant.object_id);
+            }
+        }
+        if !drop_ungranted_objects {
+            for object in &self.objects {
+                if !granted_objects.contains(&object.object_id) {
+                    retained_objects.insert(object.object_id);
+                }
+            }
+        }
+
+        // 3. Merge retained events in original sequence order so every
+        // cross-record proof obligation (objects before the root grants that
+        // select them, tombstones before slot reuse) carries over.
+        enum Event<'a> {
+            Object(&'a RecoveredObject),
+            Grant(&'a RecoveredGrant),
+            Tombstone(DerivationId, TransactionId),
+        }
+        let mut events: Vec<(u64, Event<'_>)> = Vec::new();
+        events
+            .try_reserve_exact(
+                self.objects
+                    .len()
+                    .checked_add(self.committed.len())
+                    .and_then(|count| count.checked_add(self.tombstone_sequence.len()))
+                    .ok_or(RecoveryError::AllocationFailed)?,
+            )
+            .map_err(|_| RecoveryError::AllocationFailed)?;
+        for object in &self.objects {
+            if retained_objects.contains(&object.object_id) {
+                events.push((object.commit_sequence, Event::Object(object)));
+            }
+        }
+        for recovered in &self.committed {
+            if retained.contains(&recovered.grant.derivation_id) {
+                events.push((recovered.commit_sequence, Event::Grant(recovered)));
+            }
+        }
+        for (derivation, sequence) in &self.tombstone_sequence {
+            if retained.contains(derivation) {
+                let transaction = self
+                    .tombstone_transactions
+                    .get(derivation)
+                    .ok_or(RecoveryError::CompactionMismatch)?;
+                events.push((*sequence, Event::Tombstone(*derivation, *transaction)));
+            }
+        }
+        events.sort_by_key(|(sequence, _)| *sequence);
+
+        // 4. Re-encode under a fresh chain.
+        let mut chain = RecordChain::new(self.store_id);
+        let mut records: Vec<[u8; RECORD_SIZE]> = Vec::new();
+        records
+            .push(chain.append(None, RecordBody::Format).map_err(|_| {
+                RecoveryError::CompactionMismatch
+            })?);
+        if self.id_high_water != 0 {
+            records.push(
+                chain
+                    .append(
+                        None,
+                        RecordBody::IdHighWater {
+                            exclusive_end: self.id_high_water,
+                        },
+                    )
+                    .map_err(|_| RecoveryError::CompactionMismatch)?,
+            );
+        }
+        for (_, event) in &events {
+            match event {
+                Event::Object(object) => {
+                    let transaction = encode_object_transaction(
+                        &mut chain,
+                        object.transaction_id,
+                        object.object_id,
+                        object.object_kind,
+                        &object.bytes,
+                    )
+                    .map_err(|_| RecoveryError::CompactionMismatch)?;
+                    records
+                        .try_reserve(transaction.records.len())
+                        .map_err(|_| RecoveryError::AllocationFailed)?;
+                    records.extend(transaction.records);
+                }
+                Event::Grant(recovered) => {
+                    let (transaction, next) = preview_grant_transaction(
+                        &chain,
+                        recovered.transaction_id,
+                        recovered.grant.clone(),
+                    )
+                    .map_err(|_| RecoveryError::CompactionMismatch)?;
+                    chain = next;
+                    records
+                        .try_reserve(transaction.records.len())
+                        .map_err(|_| RecoveryError::AllocationFailed)?;
+                    records.extend(transaction.records);
+                }
+                Event::Tombstone(derivation, transaction_id) => {
+                    let (transaction, next) =
+                        preview_revoke_transaction(&chain, *transaction_id, *derivation)
+                            .map_err(|_| RecoveryError::CompactionMismatch)?;
+                    chain = next;
+                    records
+                        .try_reserve(transaction.records.len())
+                        .map_err(|_| RecoveryError::AllocationFailed)?;
+                    records.extend(transaction.records);
+                }
+            }
+        }
+
+        // 5. Fail closed unless the compacted stream provably recovers the
+        // equivalent state.
+        let verify = preflight_recovery(&records, self.store_id)?;
+        if verify.id_high_water != self.id_high_water {
+            return Err(RecoveryError::CompactionMismatch);
+        }
+        let live = |preflight: &RecoveryPreflight| -> BTreeMap<DerivationId, GrantRecord> {
+            preflight
+                .committed
+                .iter()
+                .filter(|recovered| {
+                    !is_tombstoned(
+                        recovered.grant.derivation_id,
+                        &preflight.graph,
+                        &preflight.tombstone_sequence,
+                    )
+                })
+                .map(|recovered| (recovered.grant.derivation_id, recovered.grant.clone()))
+                .collect()
+        };
+        if live(&verify) != live(self) {
+            return Err(RecoveryError::CompactionMismatch);
+        }
+        if verify.slots != self.slots {
+            return Err(RecoveryError::CompactionMismatch);
+        }
+        let objects_by_id = |preflight: &RecoveryPreflight| -> BTreeMap<ObjectId, (ObjectKind, u32)> {
+            preflight
+                .objects
+                .iter()
+                .map(|object| {
+                    (
+                        object.object_id,
+                        (object.object_kind, crc32c(&object.bytes)),
+                    )
+                })
+                .collect()
+        };
+        let recovered_objects = objects_by_id(&verify);
+        let original_objects = objects_by_id(self);
+        if recovered_objects.len() != retained_objects.len()
+            || recovered_objects.iter().any(|(object_id, identity)| {
+                !retained_objects.contains(object_id)
+                    || original_objects.get(object_id) != Some(identity)
+            })
+        {
+            return Err(RecoveryError::CompactionMismatch);
+        }
+        Ok(records)
+    }
+
     /// Apply exact external root policy and publish the unified object,
     /// authority, slot-history, and chain-checkpoint view.
     pub fn finish(self, roots: &[RootPolicy]) -> Result<RecoveredStore, RecoveryError> {
@@ -1250,6 +1487,9 @@ pub enum RecoveryError {
     MissingRootConstraint,
     AmbiguousRootConstraint,
     AllocationFailed,
+    /// A compacted rewrite failed its own equivalence proof; the original
+    /// stream stays authoritative.
+    CompactionMismatch,
 }
 
 struct PreparedGrant {
@@ -1367,6 +1607,7 @@ pub fn preflight_recovery(
     let mut committed: Vec<RecoveredGrant> = Vec::new();
     let mut committed_objects: Vec<RecoveredObject> = Vec::new();
     let mut tombstone_sequence: BTreeMap<DerivationId, u64> = BTreeMap::new();
+    let mut tombstone_transactions: BTreeMap<DerivationId, TransactionId> = BTreeMap::new();
 
     // Decode and validate one record at a time. At most one <=360-byte chunk
     // Vec is transiently owned here; no per-record decoded catalog survives.
@@ -1505,6 +1746,9 @@ pub fn preflight_recovery(
                 )?;
                 if transactions.insert(tx, TxState::Finished).is_some() {
                     return Err(RecoveryError::DuplicateTransaction { sequence });
+                }
+                if !tombstone_sequence.contains_key(derivation_id) {
+                    tombstone_transactions.insert(*derivation_id, tx);
                 }
                 tombstone_sequence
                     .entry(*derivation_id)
@@ -1751,6 +1995,7 @@ pub fn preflight_recovery(
         committed,
         objects: committed_objects,
         tombstone_sequence,
+        tombstone_transactions,
         graph,
         slots,
         last_sequence: previous_sequence,

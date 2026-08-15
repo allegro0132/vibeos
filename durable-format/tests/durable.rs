@@ -897,3 +897,165 @@ fn a_valid_but_broken_chain_and_wrong_store_are_rejected() {
         Err(RecoveryError::WrongStore { sector: 0 })
     );
 }
+
+fn root_grant_for_object(
+    id: u128,
+    object_id: u128,
+    space_id: u128,
+    slot: u32,
+    generation: u64,
+) -> GrantRecord {
+    GrantRecord {
+        derivation_id: deriv(id),
+        parent_id: None,
+        object_id: object(object_id),
+        target: SlotIdentity {
+            space: space(space_id),
+            slot,
+            generation,
+        },
+        rights: DurableRights::ALL,
+        resource_kind: kind(7),
+        flags: GrantFlags::ROOT,
+    }
+}
+
+fn okind(value: u32) -> ObjectKind {
+    ObjectKind::new(value).unwrap()
+}
+
+/// A replace-style history: object versions whose grants were tombstoned are
+/// the reclaimable garbage; live closures, slot generation history, and
+/// ungranted (runtime-transient) objects must survive compaction verbatim.
+fn replace_style_log() -> TestLog {
+    let mut log = TestLog::formatted();
+    // The long-lived root object and its live grant chain.
+    log.object(tx(501), object(100), okind(40), b"root-object");
+    log.grant(tx(502), root_grant_for_object(10, 100, 1, 1, 1));
+    log.tombstone(tx(503), deriv(10));
+    log.grant(tx(504), root_grant_for_object(11, 100, 1, 1, 2));
+    log.grant(tx(505), child_grant(12, 11, 2, 7));
+    // A dead derived branch under the live root.
+    log.grant(tx(506), child_grant(13, 11, 2, 8));
+    log.tombstone(tx(507), deriv(13));
+    // Replace pattern: version 1 fully dead, version 2 live.
+    log.object(tx(520), object(200), okind(41), b"replaced-v1");
+    log.grant(tx(521), root_grant_for_object(14, 200, 1, 5, 1));
+    log.tombstone(tx(522), deriv(14));
+    log.object(tx(523), object(201), okind(41), b"replaced-v2");
+    log.grant(tx(524), root_grant_for_object(15, 201, 1, 5, 2));
+    // A slot whose final holder is dead: its generation must stay burned.
+    log.object(tx(530), object(210), okind(42), b"dead-slot-object");
+    log.grant(tx(531), root_grant_for_object(16, 210, 1, 9, 1));
+    log.tombstone(tx(532), deriv(16));
+    // A never-granted (runtime-transient) object.
+    log.object(tx(533), object(300), okind(43), b"ungranted");
+    log
+}
+
+#[test]
+fn compaction_drops_dead_closures_and_keeps_equivalent_state() {
+    let log = replace_style_log();
+    let original = preflight_recovery(&log.sectors, store()).unwrap();
+    let compacted = original.compact(false).unwrap();
+    assert!(
+        compacted.len() < log.sectors.len(),
+        "compaction must shrink this history ({} -> {})",
+        log.sectors.len(),
+        compacted.len(),
+    );
+    let recovered = preflight_recovery(&compacted, store()).unwrap();
+    assert_eq!(recovered.id_high_water(), HIGH_WATER);
+    let object_ids: Vec<u128> = recovered
+        .committed_objects()
+        .iter()
+        .map(|object| object.object_id.get())
+        .collect();
+    // Replaced version 1 is gone; everything reachable or transient stays.
+    assert_eq!(object_ids, vec![100, 201, 210, 300]);
+    // The dead slot 9 keeps its burned generation: a fresh grant reusing
+    // generation 1 on that slot must still be rejected.
+    let mut reuse = RecordChain::from_checkpoint(
+        store(),
+        preflight_recovery(&compacted, store())
+            .unwrap()
+            .chain_checkpoint()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut sectors = compacted.clone();
+    let grant = root_grant_for_object(17, 210, 1, 9, 1);
+    let (prepare, commit);
+    {
+        let bytes = reuse
+            .append(Some(tx(560)), RecordBody::GrantPrepare(grant.clone()))
+            .unwrap();
+        let DecodeStatus::Valid(decoded) = LogRecord::decode(&bytes).unwrap() else {
+            panic!("prepare must decode");
+        };
+        prepare = (decoded.record.sequence, decoded.crc32c);
+        sectors.push(bytes);
+        commit = reuse
+            .append(
+                Some(tx(560)),
+                RecordBody::GrantCommit {
+                    prepare_sequence: prepare.0,
+                    prepare_crc32c: prepare.1,
+                    derivation_id: grant.derivation_id,
+                },
+            )
+            .unwrap();
+        sectors.push(commit);
+    }
+    assert!(matches!(
+        preflight_recovery(&sectors, store()),
+        Err(RecoveryError::SlotGeneration { .. })
+    ));
+}
+
+#[test]
+fn boot_compaction_may_drop_only_ungranted_objects() {
+    let log = replace_style_log();
+    let original = preflight_recovery(&log.sectors, store()).unwrap();
+    let compacted = original.compact(true).unwrap();
+    let recovered = preflight_recovery(&compacted, store()).unwrap();
+    let object_ids: Vec<u128> = recovered
+        .committed_objects()
+        .iter()
+        .map(|object| object.object_id.get())
+        .collect();
+    assert_eq!(object_ids, vec![100, 201, 210]);
+}
+
+#[test]
+fn compaction_is_idempotent_and_preserves_root_selection() {
+    let log = replace_style_log();
+    let original = preflight_recovery(&log.sectors, store()).unwrap();
+    let once = original.compact(false).unwrap();
+    let twice = preflight_recovery(&once, store())
+        .unwrap()
+        .compact(false)
+        .unwrap();
+    assert_eq!(once, twice, "a second compaction must change nothing");
+
+    // Root policy selection sees the same unique live roots before and after.
+    let constraint = RootConstraint {
+        space: space(1),
+        first_slot: 1,
+        last_slot_inclusive: 1,
+        rights: RootRightsConstraint::exact(DurableRights::ALL),
+        resource_kind: kind(7),
+        object_kind: okind(40),
+    };
+    let original_roots = original.select_roots(&[constraint]).unwrap();
+    let compacted_roots = preflight_recovery(&once, store())
+        .unwrap()
+        .select_roots(&[constraint])
+        .unwrap();
+    assert_eq!(original_roots, compacted_roots);
+    assert_eq!(
+        original_roots[0].grant.derivation_id,
+        deriv(11),
+        "the live replacement root is the selected one",
+    );
+}

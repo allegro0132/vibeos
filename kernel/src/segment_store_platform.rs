@@ -938,6 +938,10 @@ pub(crate) struct StorageV2Runtime {
     /// Logical-record count at the last steady-state compaction attempt, so
     /// the append path re-evaluates compaction only after meaningful growth.
     compact_watermark: AtomicU64,
+    /// Validated replay of the published logical stream (fix: appends
+    /// re-decoded the whole journal per put). Keyed by chain checkpoint and
+    /// record count; any mismatch falls back to a full replay.
+    preflight_cache: SpinLock<Option<crate::durable_cspace::StorageV2PreflightCache>>,
     maintenance_provisioner: StoreMaintenanceProvisioner,
     _quota_provisioner: StorageQuotaProvisioner,
 }
@@ -1055,12 +1059,19 @@ impl StorageV2Runtime {
                 typed_kinds,
             )
             .expect("fixed Storage V2 governed runtime policy is valid");
+        let mut store = SegmentStore::new_with_runtime_context(
+            device.clone(),
+            storage_v2_store_limits(),
+            context.clone(),
+        );
+        // Deferred commit read-back: every read path Merkle-verifies content
+        // and boot performs a full cold scrub, so a damaged device write is
+        // detected at first use instead of at the commit that produced it.
+        // This trades that detection window for not re-reading and re-hashing
+        // every just-written page on the foreground commit path.
+        store.set_deferred_commit_readback(true);
         let runtime = Arc::new(Self {
-            store: StableSegmentStore(UnsafeCell::new(SegmentStore::new_with_runtime_context(
-                device.clone(),
-                storage_v2_store_limits(),
-                context.clone(),
-            ))),
+            store: StableSegmentStore(UnsafeCell::new(store)),
             device,
             context,
             active: SpinLock::new_recoverable(None),
@@ -1072,6 +1083,7 @@ impl StorageV2Runtime {
             boot_selection: AtomicU8::new(0),
             needs_rebuild: AtomicBool::new(false),
             compact_watermark: AtomicU64::new(0),
+            preflight_cache: SpinLock::new_recoverable(None),
             maintenance_provisioner: maintenance,
             _quota_provisioner: quota,
         });
@@ -1221,6 +1233,7 @@ impl StorageV2Runtime {
     /// proof after that proof has failed.
     fn invalidate_recovery_cache(&self) {
         self.clear_recovery_cache();
+        *self.preflight_cache.lock() = None;
         self.needs_rebuild.store(true, Ordering::Release);
     }
 
@@ -3536,7 +3549,14 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             stream_records.extend_from_slice(records);
             #[cfg(feature = "storage-bench")]
             let phase_preflight = crate::sbi::time();
-            let mut import = crate::durable_cspace::storage_v2_migration_import(&stream_records)
+            let cached_preflight = self.preflight_cache.lock().take();
+            let (mut import, preflight_cache) =
+                crate::durable_cspace::storage_v2_migration_import_incremental(
+                    &stream_records,
+                    records.len(),
+                    expected,
+                    cached_preflight,
+                )
                 .map_err(|_error| {
                     #[cfg(feature = "storage-bench")]
                     crate::println!("  bench-detail migration import error: {_error:?}");
@@ -3593,6 +3613,13 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             // just-appended (still ungranted) objects resolve through the
             // transient witness.
             let compacted_view = runtime.maybe_compact_authority(&view).await?;
+            if compacted_view.is_none() {
+                // The appended stream is now the published stream; retain its
+                // validated replay for the next strict extension. A compacted
+                // replacement rewrites the chain, so its cache would never
+                // match and is not worth holding.
+                *runtime.preflight_cache.lock() = Some(preflight_cache);
+            }
             let snapshot_view: &PersistentAuthorityView = match compacted_view.as_deref() {
                 Some(replacement) => replacement,
                 None => &view,

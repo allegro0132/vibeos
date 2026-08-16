@@ -345,6 +345,16 @@ fn gc_can_relieve_persistent_import<E>(error: &PersistentAuthorityError<E>) -> b
     )
 }
 
+/// Promotion claims from the previous live authority append: for each
+/// still-unbound stable object, the anonymous V2 mapping it deterministically
+/// claims. Bound to the exact logical stream (length plus final record) the
+/// claims were computed against; any mismatch falls back to the full loop.
+pub(crate) struct PromotionClaims {
+    pub(crate) stream_len: usize,
+    pub(crate) last_record: [u8; vibeos_durable_format::RECORD_SIZE],
+    pub(crate) claims: alloc::collections::BTreeMap<u128, u128>,
+}
+
 impl<D: PageDevice> SegmentStore<D> {
     /// Atomically replace trusted-service roots while preserving the exact M4
     /// authority graph, object bindings, and persistent quota policy. The
@@ -1051,6 +1061,29 @@ impl<D: PageDevice> SegmentStore<D> {
         promoted
             .try_reserve_exact(import.recovered.objects.len())
             .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+        // Claims carried from the previous live append apply only when this
+        // import extends the exact stream they were computed against; the
+        // claims of a still-unbound, still-ungranted object are then already
+        // deterministic and need no promotion pass of their own.
+        let carried_claims = match (admission_principal.is_some(), self.promotion_claims_cache.take()) {
+            (true, Some(cache)) => {
+                let stream = self
+                    .require_current_generation()?
+                    .persistent_authority
+                    .as_ref()
+                    .map(|snapshot| snapshot.record_stream());
+                let matches = stream.is_some_and(|stream| {
+                    stream.len() == cache.stream_len
+                        && cache.stream_len >= vibeos_durable_format::RECORD_SIZE
+                        && stream[cache.stream_len - vibeos_durable_format::RECORD_SIZE..]
+                            == cache.last_record
+                });
+                matches.then_some(cache)
+            }
+            _ => None,
+        };
+        let mut next_claims: alloc::collections::BTreeMap<u128, u128> =
+            alloc::collections::BTreeMap::new();
         for recovered in &import.recovered.objects {
             if reusable_bindings
                 .binary_search_by_key(&recovered.object_id.get(), |binding| {
@@ -1059,6 +1092,17 @@ impl<D: PageDevice> SegmentStore<D> {
                 .is_ok()
             {
                 continue;
+            }
+            let stable_id = recovered.object_id.get();
+            if !import.is_admitted(stable_id) && !transient_ids.contains(&stable_id) {
+                if let Some(claim) = carried_claims
+                    .as_ref()
+                    .and_then(|cache| cache.claims.get(&stable_id).copied())
+                {
+                    claimed_v2_object_ids.insert(claim);
+                    next_claims.insert(stable_id, claim);
+                    continue;
+                }
             }
             let reservation_index = quota_reservations
                 .binary_search_by_key(&recovered.object_id.get(), |(stable_id, _)| *stable_id)
@@ -1080,13 +1124,31 @@ impl<D: PageDevice> SegmentStore<D> {
                 )
                 .await?
             {
-                claimed_v2_object_ids.insert(object.backend_handle().persistent_binding_parts().0);
+                let claim = object.backend_handle().persistent_binding_parts().0;
+                claimed_v2_object_ids.insert(claim);
+                next_claims.insert(recovered.object_id.get(), claim);
                 promoted.push((recovered.object_id.get(), object));
             }
             if let Some(reservation) = reservation {
                 quota_reservations.push((recovered.object_id.get(), reservation));
                 quota_reservations.sort_unstable_by_key(|(stable_id, _)| *stable_id);
             }
+        }
+        // Bind the refreshed claims to the stream this import publishes; a
+        // failed publication leaves them keyed to a stream that never became
+        // current, so the next append simply misses and re-derives them.
+        if admission_principal.is_some()
+            && import.record_stream.len() >= vibeos_durable_format::RECORD_SIZE
+        {
+            let mut last_record = [0u8; vibeos_durable_format::RECORD_SIZE];
+            last_record.copy_from_slice(
+                &import.record_stream[import.record_stream.len() - vibeos_durable_format::RECORD_SIZE..],
+            );
+            self.promotion_claims_cache = Some(PromotionClaims {
+                stream_len: import.record_stream.len(),
+                last_record,
+                claims: next_claims,
+            });
         }
         // Fused fast path: exactly one logical object needs a fresh CAS
         // commit — the shape of every ordinary durable append. Stage its blob
@@ -1285,6 +1347,12 @@ impl<D: PageDevice> SegmentStore<D> {
                 });
             }
             self.committed_ids_cache = Some((generation, imported_committed_ids));
+            if let Some(cache) = self.promotion_claims_cache.as_mut() {
+                // The freshly staged object now owns its published mapping;
+                // record the claim so the next strict extension skips its
+                // promotion pass as well.
+                let _ = cache.claims.insert(stable_id, staged_v2_object_id);
+            }
             // Admitted fused objects are durably named by the checkpoint's
             // authority snapshot and root set; their runtime handles may drop.
             drop(committed);

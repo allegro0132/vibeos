@@ -558,6 +558,17 @@ pub struct SegmentStore<D> {
     /// generation, captured at installation so a strict-successor append does
     /// not re-decode the whole predecessor stream to learn it.
     pub(crate) committed_ids_cache: Option<(u64, alloc::collections::BTreeSet<u128>)>,
+    /// Promotion claims computed by the last live authority append, keyed by
+    /// the exact logical stream they were computed against. A strict stream
+    /// extension reuses them for still-unbound objects instead of re-running
+    /// promotion over the whole committed set.
+    pub(crate) promotion_claims_cache: Option<crate::persistent_authority::PromotionClaims>,
+    /// Decoded successor trees of the last fused file transaction, keyed by
+    /// the exact root they belong to.
+    pub(crate) fs_tree_cache: Option<crate::fs_api::FsTreeCache>,
+    /// When set, commits skip the publication-time read-back verification of
+    /// the pages they just wrote. See [`SegmentStore::set_deferred_commit_readback`].
+    pub(crate) defer_commit_readback: bool,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -585,6 +596,9 @@ impl<D: PageDevice> SegmentStore<D> {
             dedup_verified: alloc::collections::BTreeSet::new(),
             logical_roots: alloc::collections::BTreeMap::new(),
             committed_ids_cache: None,
+            promotion_claims_cache: None,
+            fs_tree_cache: None,
+            defer_commit_readback: false,
         }
     }
 
@@ -671,6 +685,18 @@ impl<D: PageDevice> SegmentStore<D> {
     /// leaves the store serviceable, from an interrupted one.
     pub fn needs_remount(&self) -> bool {
         self.poisoned || self.mounted.is_none()
+    }
+
+    /// Select the commit-time verification profile. The default profile
+    /// re-reads and verifies every page a commit just wrote before the
+    /// successor mounts, failing the commit on any device write that was
+    /// acknowledged but damaged. The deferred profile skips that read-back:
+    /// every read path still fails closed on the content's Merkle identity
+    /// and cold recovery re-verifies checkpoint state, so damaged data is
+    /// never served as valid — it is simply detected at the first read or
+    /// scrub instead of at the commit that wrote it.
+    pub fn set_deferred_commit_readback(&mut self, deferred: bool) {
+        self.defer_commit_readback = deferred;
     }
 
     pub fn info(&self) -> Result<StoreInfo, StoreError<D::Error>> {
@@ -829,6 +855,8 @@ impl<D: PageDevice> SegmentStore<D> {
         self.dedup_verified.clear();
         self.logical_roots.clear();
         self.committed_ids_cache = None;
+        self.promotion_claims_cache = None;
+        self.fs_tree_cache = None;
         self.mounted = None;
         self.poisoned = false;
         validate_limits(self.limits)?;

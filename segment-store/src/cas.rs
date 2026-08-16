@@ -2400,6 +2400,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             None,
             None,
             sink,
+            self.store.defer_commit_readback,
         )
         .await?;
         Ok((
@@ -3240,6 +3241,7 @@ impl<D: PageDevice> SegmentStore<D> {
             Some(&fused),
             staged.last_scratch_seal,
             Some(staged.sink),
+            self.defer_commit_readback,
         )
         .await?;
         self.mount_verified_successor(state, checkpoint, successor, true)
@@ -3438,8 +3440,16 @@ impl<D: PageDevice> SegmentStore<D> {
             return Err(StoreError::Corrupt.into());
         }
         let (pending, checkpoint, successor) =
-            commit_batch_snapshot(&self.device, &base, &planning, self.limits, staged, &self.pins)
-                .await?;
+            commit_batch_snapshot(
+                &self.device,
+                &base,
+                &planning,
+                self.limits,
+                staged,
+                &self.pins,
+                self.defer_commit_readback,
+            )
+            .await?;
         self.mount_verified_successor(base, checkpoint, successor, true)
             .await?;
         let mut published = Vec::new();
@@ -3472,6 +3482,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
     limits: crate::store::StoreLimits,
     mut staged: Vec<StagedObjectCommit>,
     pins: &crate::store::SharedStorePinRegistry,
+    defer_readback: bool,
 ) -> Result<(Vec<PendingCasObjectHandle>, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -3773,93 +3784,98 @@ async fn commit_batch_snapshot<D: PageDevice>(
     // Re-read everything this transaction wrote from batched span snapshots
     // and verify each staged blob against its manifest, exactly as the
     // single-blob staged publication does.
-    let mut verify_ranges: Vec<(u64, u64)> = Vec::new();
-    verify_ranges
-        .try_reserve_exact(2 + 2 * scratch_segment_numbers.len())
-        .map_err(|_| StoreError::MemoryLimit)?;
-    verify_ranges.push((base, u64::from(relative)));
-    verify_ranges.push((base + u64::from(SUMMARY_BODY_PAGE), 4));
-    for entry in &staged {
-        if entry.existing.is_some() {
-            continue;
-        }
-        for segment in &entry.segments {
-            let segment_base = segment_base_page(segment.segment_no)?;
-            let mut end_relative = DATA_FIRST_PAGE;
-            for extent in &entry.extents[segment.first_extent..segment.extent_end] {
-                let pages = u32::try_from(extent.payload_byte_len.div_ceil(PAGE_SIZE as u64))
-                    .map_err(|_| StoreError::Corrupt)?;
-                end_relative = end_relative.max(
-                    extent
-                        .payload_relative_page
-                        .checked_add(pages)
-                        .ok_or(StoreError::Corrupt)?,
-                );
+    // Same detection-window trade as the single-object commit: with the
+    // read-back deferred, damage in these just-written pages is caught by
+    // the first verified read or scrub instead of failing this commit.
+    if !defer_readback {
+        let mut verify_ranges: Vec<(u64, u64)> = Vec::new();
+        verify_ranges
+            .try_reserve_exact(2 + 2 * scratch_segment_numbers.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        verify_ranges.push((base, u64::from(relative)));
+        verify_ranges.push((base + u64::from(SUMMARY_BODY_PAGE), 4));
+        for entry in &staged {
+            if entry.existing.is_some() {
+                continue;
             }
-            verify_ranges.push((segment_base, u64::from(end_relative)));
-            verify_ranges.push((segment_base + u64::from(SUMMARY_BODY_PAGE), 4));
+            for segment in &entry.segments {
+                let segment_base = segment_base_page(segment.segment_no)?;
+                let mut end_relative = DATA_FIRST_PAGE;
+                for extent in &entry.extents[segment.first_extent..segment.extent_end] {
+                    let pages = u32::try_from(extent.payload_byte_len.div_ceil(PAGE_SIZE as u64))
+                        .map_err(|_| StoreError::Corrupt)?;
+                    end_relative = end_relative.max(
+                        extent
+                            .payload_relative_page
+                            .checked_add(pages)
+                            .ok_or(StoreError::Corrupt)?,
+                    );
+                }
+                verify_ranges.push((segment_base, u64::from(end_relative)));
+                verify_ranges.push((segment_base + u64::from(SUMMARY_BODY_PAGE), 4));
+            }
         }
-    }
-    let verify_device = SpanSnapshotDevice::capture(device, &verify_ranges).await?;
-    for entry in &staged {
-        if entry.existing.is_some() {
-            continue;
+        let verify_device = SpanSnapshotDevice::capture(device, &verify_ranges).await?;
+        for entry in &staged {
+            if entry.existing.is_some() {
+                continue;
+            }
+            verify_staged_blob(
+                &verify_device,
+                state.superblock.binding.store_uuid,
+                state.admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                &entry.manifest,
+                &entry.extents,
+            )
+            .await?;
         }
-        verify_staged_blob(
+        let mut requests = Vec::new();
+        let mut expected: Vec<&[u8]> = Vec::new();
+        requests
+            .try_reserve_exact(manifest_payloads.len() + 2)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        expected
+            .try_reserve_exact(manifest_payloads.len() + 2)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for (index, bytes) in &manifest_payloads {
+            requests.push((
+                records[*index].pointer(),
+                ExtentKind::Catalog,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(bytes.as_slice());
+        }
+        requests.push((
+            catalog_root,
+            ExtentKind::Catalog,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(snapshot_bytes.as_slice());
+        requests.push((
+            allocation_root,
+            ExtentKind::Allocation,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(allocation_bytes.as_slice());
+        let observed = read_pointer_payloads(
             &verify_device,
             state.superblock.binding.store_uuid,
             state.admitted_segments,
             next_segment_generation,
             checkpoint_generation,
-            &entry.manifest,
-            &entry.extents,
+            &requests,
         )
         .await?;
-    }
-    let mut requests = Vec::new();
-    let mut expected: Vec<&[u8]> = Vec::new();
-    requests
-        .try_reserve_exact(manifest_payloads.len() + 2)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    expected
-        .try_reserve_exact(manifest_payloads.len() + 2)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    for (index, bytes) in &manifest_payloads {
-        requests.push((
-            records[*index].pointer(),
-            ExtentKind::Catalog,
-            limits.recovery_memory_bytes,
-        ));
-        expected.push(bytes.as_slice());
-    }
-    requests.push((
-        catalog_root,
-        ExtentKind::Catalog,
-        limits.recovery_memory_bytes,
-    ));
-    expected.push(snapshot_bytes.as_slice());
-    requests.push((
-        allocation_root,
-        ExtentKind::Allocation,
-        limits.recovery_memory_bytes,
-    ));
-    expected.push(allocation_bytes.as_slice());
-    let observed = read_pointer_payloads(
-        &verify_device,
-        state.superblock.binding.store_uuid,
-        state.admitted_segments,
-        next_segment_generation,
-        checkpoint_generation,
-        &requests,
-    )
-    .await?;
-    if observed.len() != expected.len()
-        || observed
-            .iter()
-            .zip(expected)
-            .any(|(actual, bytes)| actual.bytes != bytes)
-    {
-        return Err(StoreError::Corrupt.into());
+        if observed.len() != expected.len()
+            || observed
+                .iter()
+                .zip(expected)
+                .any(|(actual, bytes)| actual.bytes != bytes)
+        {
+            return Err(StoreError::Corrupt.into());
+        }
     }
 
     let next_physical_segment = (0..state.admitted_segments)
@@ -3954,6 +3970,7 @@ async fn commit_snapshot<D: PageDevice>(
     fused: Option<&FusedAuthorityPublication>,
     staged_scratch_seal: Option<(u64, u64, Hash)>,
     mut sink: Option<PageSink>,
+    defer_readback: bool,
 ) -> Result<(PendingCasObjectHandle, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -4305,98 +4322,105 @@ async fn commit_snapshot<D: PageDevice>(
     // segment plus, for a new blob, every scratch segment. This reads the
     // exact same media bytes as the former page-by-page verification while
     // paying a handful of large device requests instead of one per page.
-    let mut verify_ranges: Vec<(u64, u64)> = Vec::new();
-    verify_ranges
-        .try_reserve_exact(2 + 2 * scratch_segments.len())
-        .map_err(|_| StoreError::MemoryLimit)?;
-    verify_ranges.push((base, u64::from(relative)));
-    verify_ranges.push((base + u64::from(SUMMARY_BODY_PAGE), 4));
-    if is_new {
-        for segment in scratch_segments {
-            let segment_base = segment_base_page(segment.segment_no)?;
-            let mut end_relative = DATA_FIRST_PAGE;
-            for extent in &scratch_extents[segment.first_extent..segment.extent_end] {
-                let pages = u32::try_from(extent.payload_byte_len.div_ceil(PAGE_SIZE as u64))
-                    .map_err(|_| StoreError::Corrupt)?;
-                end_relative = end_relative.max(
-                    extent
-                        .payload_relative_page
-                        .checked_add(pages)
-                        .ok_or(StoreError::Corrupt)?,
-                );
+    // Deferring the read-back narrows corruption detection from this commit
+    // to the first read or scrub of the affected object: every read path
+    // still fails closed on the content's Merkle identity, and cold recovery
+    // re-verifies checkpoint state, so acknowledged-but-damaged device
+    // writes cannot be served as valid data either way.
+    if !defer_readback {
+        let mut verify_ranges: Vec<(u64, u64)> = Vec::new();
+        verify_ranges
+            .try_reserve_exact(2 + 2 * scratch_segments.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        verify_ranges.push((base, u64::from(relative)));
+        verify_ranges.push((base + u64::from(SUMMARY_BODY_PAGE), 4));
+        if is_new {
+            for segment in scratch_segments {
+                let segment_base = segment_base_page(segment.segment_no)?;
+                let mut end_relative = DATA_FIRST_PAGE;
+                for extent in &scratch_extents[segment.first_extent..segment.extent_end] {
+                    let pages = u32::try_from(extent.payload_byte_len.div_ceil(PAGE_SIZE as u64))
+                        .map_err(|_| StoreError::Corrupt)?;
+                    end_relative = end_relative.max(
+                        extent
+                            .payload_relative_page
+                            .checked_add(pages)
+                            .ok_or(StoreError::Corrupt)?,
+                    );
+                }
+                verify_ranges.push((segment_base, u64::from(end_relative)));
+                verify_ranges.push((segment_base + u64::from(SUMMARY_BODY_PAGE), 4));
             }
-            verify_ranges.push((segment_base, u64::from(end_relative)));
-            verify_ranges.push((segment_base + u64::from(SUMMARY_BODY_PAGE), 4));
         }
-    }
-    let verify_device = SpanSnapshotDevice::capture(device, &verify_ranges).await?;
-    let expected_manifest = if is_new {
-        verify_staged_blob(
+        let verify_device = SpanSnapshotDevice::capture(device, &verify_ranges).await?;
+        let expected_manifest = if is_new {
+            verify_staged_blob(
+                &verify_device,
+                state.superblock.binding.store_uuid,
+                state.admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                &scratch_manifest,
+                scratch_extents,
+            )
+            .await?;
+            Some(encode_blob_manifest(&scratch_manifest, context)?)
+        } else {
+            None
+        };
+        let mut requests = Vec::new();
+        let mut expected = Vec::new();
+        requests
+            .try_reserve_exact(4)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        expected
+            .try_reserve_exact(4)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        if let Some(bytes) = expected_manifest.as_ref() {
+            requests.push((
+                new_blob_mapping.manifest,
+                ExtentKind::Catalog,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(bytes.as_slice());
+        }
+        requests.push((
+            catalog_root,
+            ExtentKind::Catalog,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(snapshot_bytes.as_slice());
+        requests.push((
+            allocation_root,
+            ExtentKind::Allocation,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(allocation_bytes.as_slice());
+        if let Some(fused) = fused {
+            requests.push((
+                authority_root,
+                ExtentKind::Authority,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(fused.authority_bytes.as_slice());
+        }
+        let observed = read_pointer_payloads(
             &verify_device,
             state.superblock.binding.store_uuid,
             state.admitted_segments,
             next_segment_generation,
             checkpoint_generation,
-            &scratch_manifest,
-            scratch_extents,
+            &requests,
         )
         .await?;
-        Some(encode_blob_manifest(&scratch_manifest, context)?)
-    } else {
-        None
-    };
-    let mut requests = Vec::new();
-    let mut expected = Vec::new();
-    requests
-        .try_reserve_exact(4)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    expected
-        .try_reserve_exact(4)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    if let Some(bytes) = expected_manifest.as_ref() {
-        requests.push((
-            new_blob_mapping.manifest,
-            ExtentKind::Catalog,
-            limits.recovery_memory_bytes,
-        ));
-        expected.push(bytes.as_slice());
-    }
-    requests.push((
-        catalog_root,
-        ExtentKind::Catalog,
-        limits.recovery_memory_bytes,
-    ));
-    expected.push(snapshot_bytes.as_slice());
-    requests.push((
-        allocation_root,
-        ExtentKind::Allocation,
-        limits.recovery_memory_bytes,
-    ));
-    expected.push(allocation_bytes.as_slice());
-    if let Some(fused) = fused {
-        requests.push((
-            authority_root,
-            ExtentKind::Authority,
-            limits.recovery_memory_bytes,
-        ));
-        expected.push(fused.authority_bytes.as_slice());
-    }
-    let observed = read_pointer_payloads(
-        &verify_device,
-        state.superblock.binding.store_uuid,
-        state.admitted_segments,
-        next_segment_generation,
-        checkpoint_generation,
-        &requests,
-    )
-    .await?;
-    if observed.len() != expected.len()
-        || observed
-            .iter()
-            .zip(expected)
-            .any(|(actual, bytes)| actual.bytes != bytes)
-    {
-        return Err(StoreError::Corrupt.into());
+        if observed.len() != expected.len()
+            || observed
+                .iter()
+                .zip(expected)
+                .any(|(actual, bytes)| actual.bytes != bytes)
+        {
+            return Err(StoreError::Corrupt.into());
+        }
     }
     let next_physical_segment = (0..state.admitted_segments)
         .find(|segment_no| allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free))

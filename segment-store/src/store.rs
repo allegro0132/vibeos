@@ -31,7 +31,7 @@ use crate::authority_snapshot::{
     PERSISTENT_AUTHORITY_HEADER_LEN,
 };
 use crate::cas_codec::{
-    decode_blob_manifest, decode_cas_snapshot, BlobKey, BlobManifest, BlobMapping,
+    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping,
     CasCodecContext, ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
     CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, OBJECT_MAPPING_LEN,
 };

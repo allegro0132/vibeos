@@ -443,6 +443,35 @@ dhclient -r netN
 clears the local IPv4 configuration; smoltcp does not currently emit a DHCP
 RELEASE packet.
 
+### File-tree image
+
+The production image built above (`milkv-ssh` alone) does not link the
+capability-rooted file tree: `mkdir`, `ls`, `cat`, `write`, `rm`, `cp`, `mv`,
+`ln`, `readlink`, `stat`, and the RW `@home` capability binding all require the
+opt-in `file-tree` Cargo feature described in [FILE_TREE.md](FILE_TREE.md). A
+plain `milkv-ssh` image reports `unknown command` for `mkdir @home/...` because
+that feature, and the file commands it installs, were never compiled in.
+
+To get file-tree commands together with production SSH, build the combined
+`milkv-ssh,file-tree` feature set with `--file-tree`:
+
+```sh
+./scripts/build-milkv-duo.sh --file-tree
+```
+
+Then package it in the same SDK environment used above:
+
+```sh
+./scripts/package-milkv-duo-sdk.sh --file-tree /path/to/duo-buildroot-sdk
+```
+
+The flashable result is
+`target/milkv-duo-file-tree/vibeos-milkv-duo-file-tree-sd.img`. It boots the
+same DWMAC/DHCP/SSH production stack as the plain `milkv-ssh` image, plus a
+persistent, Storage-V2-backed `@home` namespace bound at VSH/SSH session start.
+See [FILE_TREE.md](FILE_TREE.md) for the `@NAME/path` capability syntax — there
+is no bare path, `/`, `~`, cwd, or globbing.
+
 ### Explicit SSH/VSH hardware acceptance image (insecure)
 
 The physical remote-login gate uses a deliberately separate

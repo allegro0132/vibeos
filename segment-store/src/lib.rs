@@ -99,7 +99,8 @@ pub use fs_codec::{
     FS_DATA_REFERENCE_LEN, FS_OBJECT_MAX_LEN, FS_ROOT_V1_LEN,
 };
 pub use fs_reference::{
-    decode_fs_typed_references, fs_typed_reference_kinds, FsReferenceError, FS_BTREE_NODE_V1_KIND,
+    decode_fs_data_typed_references_from_prefix, decode_fs_typed_references,
+    fs_typed_reference_kinds, FsReferenceError, FS_BTREE_NODE_V1_KIND,
     FS_DATA_V1_KIND, FS_ROOT_V1_KIND,
 };
 pub use gc::{GcError, GcStoreError, GcTelemetry, GcTimeSource};

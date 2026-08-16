@@ -22,7 +22,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use vibeos_blob_format::{BlobGeometry, BlobView, HASH_SIZE};
+use vibeos_blob_format::{
+    verify_proof, BlobDescriptor, BlobGeometry, BlobView, MerkleProof, HASH_SIZE, HEADER_SIZE,
+    LEAF_SIZE,
+};
 use vibeos_segment_format::{
     admitted_pages, descriptor_chain_initial, descriptor_chain_next, encode_record_seal,
     encode_segment_header_body, encode_segment_seal_body, encode_segment_summary_body,
@@ -41,8 +44,8 @@ use crate::authority_snapshot::{
     encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
 };
 use crate::cas::{
-    build_record, flush, verify_manifest_blob, write_page, write_payload_records_with_header,
-    CasObjectHandle, CasStoreError, FinalRecord,
+    build_record, flush, read_manifest_range, verify_manifest_blob, write_page,
+    write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -598,10 +601,9 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         // The exact logical length is part of the Merkle identity, so this
         // preflight cannot be bypassed by media contents. A file data node is
         // special: its references all sit in the bounded structural prefix,
-        // but the typed payload is the whole node including up to a chunk
-        // envelope of content bytes, so its admission bound is the format's
-        // data-node maximum. (Reading only the prefix leaf is a follow-up;
-        // the memory accounting below already bounds the whole-node read.)
+        // so only its first content leaf is read below, but the node's
+        // declared payload envelope is still admitted against the format's
+        // data-node maximum before any read is issued.
         let maximum_typed_len = if object.blob_key.object_kind() == crate::FS_DATA_V1_KIND {
             crate::fs_codec::FS_DATA_HEADER_LEN
                 .checked_add(
@@ -682,84 +684,173 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             core::mem::size_of::<ManifestExtent>(),
         )?;
         drop(payload);
-        let blob_memory = limits
-            .recovery_memory_bytes
-            .checked_sub(workspace)
-            .and_then(|bytes| bytes.checked_sub(manifest_resident))
-            .ok_or(GcError::MemoryLimit)?;
-        let encoded = read_authenticated_blob(device, state, blob_memory, &manifest).await?;
-        let blob_peak = workspace
-            .checked_add(manifest_resident)
-            .and_then(|bytes| bytes.checked_add(encoded.capacity()))
-            .and_then(|bytes| {
-                manifest
-                    .extents
-                    .iter()
-                    .try_fold(0_usize, |largest, extent| {
-                        usize::try_from(extent.payload_byte_len)
-                            .map(|value| largest.max(value))
-                            .map_err(|_| GcError::MemoryLimit)
-                    })
-                    .ok()
-                    .and_then(|largest| bytes.checked_add(largest))
-            })
-            .ok_or(GcError::ArithmeticOverflow)?;
-        peak_bytes = peak_bytes.max(blob_peak);
-        drop(manifest);
-        let geometry =
-            BlobGeometry::for_len(object.blob_key.exact_len()).map_err(|_| GcError::Corrupt)?;
-        let tree_verify_bytes = usize::try_from(geometry.tree_node_count())
-            .map_err(|_| GcError::MemoryLimit)?
-            .checked_mul(HASH_SIZE)
-            .ok_or(GcError::ArithmeticOverflow)?;
-        let verify_peak = workspace
-            .checked_add(encoded.capacity())
-            .and_then(|bytes| bytes.checked_add(tree_verify_bytes))
-            .ok_or(GcError::ArithmeticOverflow)?;
-        peak_bytes = peak_bytes.max(verify_peak);
-        if verify_peak > limits.recovery_memory_bytes {
-            return Err(GcError::MemoryLimit.into());
-        }
-        let view = BlobView::decode(&encoded).map_err(|_| GcError::Corrupt)?;
-        view.verify_all().map_err(|_| GcError::Corrupt)?;
-        if view.data().len() != typed_exact_len {
-            return Err(GcError::MemoryLimit.into());
-        }
-        let maximum_references = view
-            .data()
-            .len()
-            .saturating_sub(TYPED_REFS_HEADER_LEN)
-            .checked_div(TYPED_REFERENCE_ENTRY_LEN)
-            .ok_or(GcError::ArithmeticOverflow)?;
-        let decoded_reference_bytes = vector_bytes(
-            maximum_references,
-            core::mem::size_of::<TypedObjectReference>(),
-        )?;
-        let retained_child_bytes =
-            vector_bytes(maximum_references, core::mem::size_of::<ChildReference>())?;
-        let typed_decode_peak = workspace
-            .checked_add(encoded.capacity())
-            .and_then(|bytes| bytes.checked_add(decoded_reference_bytes))
-            .and_then(|bytes| bytes.checked_add(retained_child_bytes))
-            .ok_or(GcError::ArithmeticOverflow)?;
-        peak_bytes = peak_bytes.max(typed_decode_peak);
-        if typed_decode_peak > limits.recovery_memory_bytes {
-            return Err(GcError::MemoryLimit.into());
-        }
         let object_kind = object.blob_key.object_kind();
-        let decoded = if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
-            && matches!(
+        let (decoded, encoded_capacity) = if object.reference_codec
+            == crate::cas_codec::REFERENCE_CODEC_FS_V1
+            && object_kind == crate::FS_DATA_V1_KIND
+        {
+            // A file data node keeps every reference inside its bounded
+            // structural prefix, which always fits the first content leaf.
+            // Read and Merkle-authenticate that single leaf instead of the
+            // whole node, so one mark walk costs reads proportional to the
+            // node count rather than the store's total content bytes.
+            if manifest.blob_key != object.blob_key {
+                return Err(GcError::Corrupt.into());
+            }
+            let geometry = BlobGeometry::for_len(object.blob_key.exact_len())
+                .map_err(|_| GcError::Corrupt)?;
+            let prefix_peak = workspace
+                .checked_add(manifest_resident)
+                .and_then(|bytes| bytes.checked_add(LEAF_SIZE))
+                .and_then(|bytes| {
+                    (geometry.height() as usize)
+                        .checked_mul(HASH_SIZE)
+                        .and_then(|siblings| bytes.checked_add(siblings))
+                })
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(prefix_peak);
+            if prefix_peak > limits.recovery_memory_bytes {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let chunk_len = object.blob_key.exact_len().min(LEAF_SIZE as u64) as usize;
+            let bytes =
+                read_manifest_range(device, state, &manifest, HEADER_SIZE as u64, chunk_len)
+                    .await
+                    .map_err(map_prefix_read_error)?;
+            let mut siblings = Vec::new();
+            siblings
+                .try_reserve_exact(geometry.height() as usize)
+                .map_err(|_| GcError::MemoryLimit)?;
+            let mut position = 0_usize;
+            let mut level_width = geometry.padded_leaf_count() as usize;
+            let mut level_base = 0_usize;
+            while level_width > 1 {
+                let node_index = level_base
+                    .checked_add(position ^ 1)
+                    .ok_or(GcError::ArithmeticOverflow)?;
+                let node_offset = u64::try_from(geometry.tree_offset())
+                    .ok()
+                    .and_then(|offset| {
+                        node_index
+                            .checked_mul(HASH_SIZE)
+                            .and_then(|more| u64::try_from(more).ok())
+                            .and_then(|more| offset.checked_add(more))
+                    })
+                    .ok_or(GcError::ArithmeticOverflow)?;
+                let node = read_manifest_range(device, state, &manifest, node_offset, HASH_SIZE)
+                    .await
+                    .map_err(map_prefix_read_error)?;
+                siblings.push(node.as_slice().try_into().map_err(|_| GcError::Corrupt)?);
+                level_base = level_base
+                    .checked_add(level_width)
+                    .ok_or(GcError::ArithmeticOverflow)?;
+                position /= 2;
+                level_width /= 2;
+            }
+            drop(manifest);
+            let descriptor = BlobDescriptor {
                 object_kind,
-                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND | crate::FS_DATA_V1_KIND
-            ) {
-            crate::decode_fs_typed_references(object_kind, view.data(), object.commit_generation)
-                .map_err(|_| GcError::Corrupt)?
+                byte_len: object.blob_key.exact_len(),
+                leaf_count: geometry.leaf_count(),
+                tree_node_count: geometry.tree_node_count(),
+                root: object.blob_key.merkle_root(),
+            };
+            let proof = MerkleProof {
+                leaf_index: 0,
+                siblings,
+            };
+            verify_proof(descriptor, &bytes, &proof).map_err(|_| GcError::Corrupt)?;
+            let decoded = crate::decode_fs_data_typed_references_from_prefix(
+                &bytes,
+                object.blob_key.exact_len(),
+                object.commit_generation,
+            )
+            .map_err(|_| GcError::Corrupt)?;
+            (decoded, bytes.capacity())
         } else {
-            let admission =
-                ReferenceCodecAdmission::refs_v1(object_kind).map_err(|_| GcError::Corrupt)?;
-            admission
-                .decode(object_kind, view.data())
+            let blob_memory = limits
+                .recovery_memory_bytes
+                .checked_sub(workspace)
+                .and_then(|bytes| bytes.checked_sub(manifest_resident))
+                .ok_or(GcError::MemoryLimit)?;
+            let encoded = read_authenticated_blob(device, state, blob_memory, &manifest).await?;
+            let blob_peak = workspace
+                .checked_add(manifest_resident)
+                .and_then(|bytes| bytes.checked_add(encoded.capacity()))
+                .and_then(|bytes| {
+                    manifest
+                        .extents
+                        .iter()
+                        .try_fold(0_usize, |largest, extent| {
+                            usize::try_from(extent.payload_byte_len)
+                                .map(|value| largest.max(value))
+                                .map_err(|_| GcError::MemoryLimit)
+                        })
+                        .ok()
+                        .and_then(|largest| bytes.checked_add(largest))
+                })
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(blob_peak);
+            drop(manifest);
+            let geometry =
+                BlobGeometry::for_len(object.blob_key.exact_len()).map_err(|_| GcError::Corrupt)?;
+            let tree_verify_bytes = usize::try_from(geometry.tree_node_count())
+                .map_err(|_| GcError::MemoryLimit)?
+                .checked_mul(HASH_SIZE)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            let verify_peak = workspace
+                .checked_add(encoded.capacity())
+                .and_then(|bytes| bytes.checked_add(tree_verify_bytes))
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(verify_peak);
+            if verify_peak > limits.recovery_memory_bytes {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let view = BlobView::decode(&encoded).map_err(|_| GcError::Corrupt)?;
+            view.verify_all().map_err(|_| GcError::Corrupt)?;
+            if view.data().len() != typed_exact_len {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let maximum_references = view
+                .data()
+                .len()
+                .saturating_sub(TYPED_REFS_HEADER_LEN)
+                .checked_div(TYPED_REFERENCE_ENTRY_LEN)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            let decoded_reference_bytes = vector_bytes(
+                maximum_references,
+                core::mem::size_of::<TypedObjectReference>(),
+            )?;
+            let retained_child_bytes =
+                vector_bytes(maximum_references, core::mem::size_of::<ChildReference>())?;
+            let typed_decode_peak = workspace
+                .checked_add(encoded.capacity())
+                .and_then(|bytes| bytes.checked_add(decoded_reference_bytes))
+                .and_then(|bytes| bytes.checked_add(retained_child_bytes))
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(typed_decode_peak);
+            if typed_decode_peak > limits.recovery_memory_bytes {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let decoded = if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
+                && matches!(
+                    object_kind,
+                    crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND | crate::FS_DATA_V1_KIND
+                ) {
+                crate::decode_fs_typed_references(
+                    object_kind,
+                    view.data(),
+                    object.commit_generation,
+                )
                 .map_err(|_| GcError::Corrupt)?
+            } else {
+                let admission =
+                    ReferenceCodecAdmission::refs_v1(object_kind).map_err(|_| GcError::Corrupt)?;
+                admission
+                    .decode(object_kind, view.data())
+                    .map_err(|_| GcError::Corrupt)?
+            };
+            (decoded, encoded.capacity())
         };
         if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_TYPED_V1
             && decoded.manifest_commit_generation != object.commit_generation
@@ -774,7 +865,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             .try_reserve_exact(decoded.references().len())
             .map_err(|_| GcError::MemoryLimit)?;
         let actual_decode_peak = workspace
-            .checked_add(encoded.capacity())
+            .checked_add(encoded_capacity)
             .and_then(|bytes| {
                 bytes.checked_add(
                     vector_bytes(
@@ -831,6 +922,15 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         allocated_bytes,
         peak_bytes,
     })
+}
+
+/// Device faults surface as store errors; every structural surprise inside a
+/// data-node prefix read fails closed as a mark-walk corruption.
+fn map_prefix_read_error<E>(error: CasStoreError<E>) -> GcStoreError<E> {
+    match error {
+        CasStoreError::Store(error) => GcStoreError::Store(error),
+        _ => GcStoreError::Gc(GcError::CorruptAt("fs-data-prefix-read")),
+    }
 }
 
 async fn read_authenticated_blob<D: PageDevice>(
@@ -2655,8 +2755,10 @@ async fn relocate_live_state<D: PageDevice>(
             return Err(GcError::CorruptAt("relocate-manifest-key").into());
         }
         drop(manifest_payload);
+        let mut relocated = false;
         for extent in &manifest.extents {
             if source_contains(&plan.targets, extent.pointer) {
+                relocated = true;
                 verify_staged_copied_extent(
                     device,
                     state,
@@ -2667,12 +2769,19 @@ async fn relocate_live_state<D: PageDevice>(
                 .await?;
             }
         }
-        verify_manifest_blob(device, &staged_state, &manifest)
-            .await
-            .map_err(|error| match error {
-                CasStoreError::Store(error) => GcStoreError::Store(error),
-                _ => GcStoreError::Gc(GcError::CorruptAt("relocate-blob-readback")),
-            })?;
+        // Only a Blob whose extents this round copied gained new device
+        // bytes, so only it needs the end-to-end Merkle readback before G+1.
+        // Untouched Blobs were authenticated when their own commit published
+        // them, and re-verifying the complete live set every round makes one
+        // collection cost reads proportional to the store's total content.
+        if relocated {
+            verify_manifest_blob(device, &staged_state, &manifest)
+                .await
+                .map_err(|error| match error {
+                    CasStoreError::Store(error) => GcStoreError::Store(error),
+                    _ => GcStoreError::Gc(GcError::CorruptAt("relocate-blob-readback")),
+                })?;
+        }
     }
     let metadata_bytes = manifest_lens.iter().try_fold(
         snapshot_bytes

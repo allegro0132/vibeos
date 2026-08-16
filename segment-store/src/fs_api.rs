@@ -146,10 +146,27 @@ pub struct FsPersistentTreeEntry {
     pub content: Option<FsPersistentData>,
 }
 
+#[derive(Clone)]
 struct RecoverableFsNode {
     decoded: FsBtreeNodeV1,
     mapping: ObjectMapping,
 }
+
+/// Decoded B+tree state of one committed namespace root, retained across
+/// fused transactions so the next commit against that exact root skips
+/// re-reading both trees from media. Node content is immutable and
+/// id-addressed, so a key match makes the cached decode equal to a fresh
+/// recovery; any mismatch falls back to reading the trees.
+pub(crate) struct FsTreeCache {
+    root_object_id: u128,
+    root_commit_generation: u64,
+    inode_nodes: Vec<RecoverableFsNode>,
+    dirent_nodes: Vec<RecoverableFsNode>,
+}
+
+/// Trees larger than this stay uncached: the cache exists for the common
+/// small-namespace transaction, not to pin megabytes of decoded nodes.
+const FS_TREE_CACHE_MAX_NODES: usize = 512;
 
 struct CowBuiltNode {
     minimum_key: Vec<u8>,
@@ -957,19 +974,43 @@ impl<D: PageDevice> SegmentStore<D> {
             FsRootPublishError::Codec(error) => FsStructuralCommitError::Codec(error),
             _ => FsStructuralCommitError::InvalidChild,
         };
-        let old_inode_nodes = match previous {
-            Some(root) => self
-                .recover_fs_nodes(root, FsTreeKind::Inode)
-                .await
-                .map_err(map_recover)?,
-            None => Vec::new(),
+        let previous_identity = previous
+            .map(|root| {
+                root._object
+                    .backend_handle()
+                    .authority_key()
+                    .map(|key| (key.object_id(), key.commit_generation()))
+                    .map_err(|_| FsStructuralCommitError::InvalidChild)
+            })
+            .transpose()?;
+        let cached_trees = match (previous_identity, self.fs_tree_cache.take()) {
+            (Some((object_id, commit_generation)), Some(cache))
+                if cache.root_object_id == object_id
+                    && cache.root_commit_generation == commit_generation =>
+            {
+                Some(cache)
+            }
+            _ => None,
         };
-        let old_dirent_nodes = match previous {
-            Some(root) => self
-                .recover_fs_nodes(root, FsTreeKind::Dirent)
-                .await
-                .map_err(map_recover)?,
-            None => Vec::new(),
+        let (old_inode_nodes, old_dirent_nodes) = match cached_trees {
+            Some(cache) => (cache.inode_nodes, cache.dirent_nodes),
+            None => {
+                let inode = match previous {
+                    Some(root) => self
+                        .recover_fs_nodes(root, FsTreeKind::Inode)
+                        .await
+                        .map_err(map_recover)?,
+                    None => Vec::new(),
+                };
+                let dirent = match previous {
+                    Some(root) => self
+                        .recover_fs_nodes(root, FsTreeKind::Dirent)
+                        .await
+                        .map_err(map_recover)?,
+                    None => Vec::new(),
+                };
+                (inode, dirent)
+            }
         };
         let inode_leaves =
             self.resolve_fs_leaves(FsTreeKind::Inode, inode_entries, &old_inode_nodes)?;
@@ -1024,6 +1065,13 @@ impl<D: PageDevice> SegmentStore<D> {
             )));
         }
         resolved.resize(plan.len(), None);
+        let mut staged_decoded: Vec<Option<FsBtreeNodeV1>> = Vec::new();
+        if staged_decoded.try_reserve_exact(plan.len()).is_err() {
+            return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                StoreError::MemoryLimit,
+            )));
+        }
+        staged_decoded.resize(plan.len(), None);
         let mut staging: Result<(), FsStructuralCommitError<D::Error>> = Ok(());
         'stage: for (slot, node) in plan.iter().enumerate() {
             match node {
@@ -1060,18 +1108,20 @@ impl<D: PageDevice> SegmentStore<D> {
                             reference,
                         });
                     }
-                    let payload = match encode_fs_btree_node_v1(&FsBtreeNodeV1 {
+                    let decoded_node = FsBtreeNodeV1 {
                         tree: *tree,
                         level: *level,
                         commit_generation: namespace_generation,
                         entries: encoded_entries,
-                    }) {
+                    };
+                    let payload = match encode_fs_btree_node_v1(&decoded_node) {
                         Ok(payload) => payload,
                         Err(error) => {
                             staging = Err(error.into());
                             break 'stage;
                         }
                     };
+                    staged_decoded[slot] = Some(decoded_node);
                     match self
                         .stage_blob_in_batch(
                             &mut batch,
@@ -1133,6 +1183,92 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| StoreError::Corrupt)?;
         if key.object_id() != root_id || key.commit_generation() != root_generation {
             return Err(StoreError::Corrupt.into());
+        }
+        // Retain the successor trees so the next transaction against this
+        // root skips re-reading them. Best effort: any inconsistency simply
+        // leaves the cache empty and the next commit reads from media.
+        self.fs_tree_cache = None;
+        if plan.len() <= FS_TREE_CACHE_MAX_NODES {
+            let mut inode_nodes = Vec::new();
+            let mut dirent_nodes = Vec::new();
+            let mut complete = inode_nodes.try_reserve_exact(plan.len()).is_ok()
+                && dirent_nodes.try_reserve_exact(plan.len()).is_ok();
+            if complete {
+                if let Some(cas) = self
+                    .require_current_generation()
+                    .ok()
+                    .and_then(|state| state.cas.clone())
+                {
+                    'cache: for (slot, node) in plan.iter().enumerate() {
+                        let (tree, decoded, reference) = match node {
+                            PlannedFsNode::Reused(reference) => {
+                                match old_inode_nodes
+                                    .iter()
+                                    .chain(old_dirent_nodes.iter())
+                                    .find(|old| {
+                                        old.mapping.object_id == reference.object_id
+                                            && old.mapping.commit_generation
+                                                == reference.commit_generation
+                                    }) {
+                                    Some(old) => {
+                                        (old.decoded.tree, old.decoded.clone(), *reference)
+                                    }
+                                    None => {
+                                        complete = false;
+                                        break 'cache;
+                                    }
+                                }
+                            }
+                            PlannedFsNode::Staged { tree, .. } => {
+                                match (
+                                    staged_decoded.get(slot).cloned().flatten(),
+                                    resolved.get(slot).copied().flatten(),
+                                ) {
+                                    (Some(decoded), Some(reference)) => {
+                                        (*tree, decoded, reference)
+                                    }
+                                    _ => {
+                                        complete = false;
+                                        break 'cache;
+                                    }
+                                }
+                            }
+                        };
+                        let mapping = cas
+                            .objects
+                            .binary_search_by_key(&reference.object_id, |mapping| {
+                                mapping.object_id
+                            })
+                            .ok()
+                            .map(|index| cas.objects[index])
+                            .filter(|mapping| {
+                                mapping.commit_generation == reference.commit_generation
+                            });
+                        let Some(mapping) = mapping else {
+                            complete = false;
+                            break 'cache;
+                        };
+                        match tree {
+                            FsTreeKind::Inode => {
+                                inode_nodes.push(RecoverableFsNode { decoded, mapping })
+                            }
+                            FsTreeKind::Dirent => {
+                                dirent_nodes.push(RecoverableFsNode { decoded, mapping })
+                            }
+                        }
+                    }
+                } else {
+                    complete = false;
+                }
+            }
+            if complete {
+                self.fs_tree_cache = Some(FsTreeCache {
+                    root_object_id: key.object_id(),
+                    root_commit_generation: key.commit_generation(),
+                    inode_nodes,
+                    dirent_nodes,
+                });
+            }
         }
         Ok(object)
     }
@@ -2254,6 +2390,47 @@ mod tests {
         let recovered = block_on(store.recover_fs_root(NAMESPACE)).unwrap().unwrap();
         assert_eq!(recovered.generation(), 1);
         assert_eq!(recovered.next_file_id(), 2);
+    }
+
+    #[test]
+    fn deferred_readback_profile_commits_batches_and_cold_recovers_verified() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        store.set_deferred_commit_readback(true);
+        let maintenance = store.mint_maintenance_root().unwrap();
+        let pattern = |index: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|offset| (index * 89 + offset * 5) as u8)
+                .collect()
+        };
+        let chunks: Vec<Vec<u8>> = (0..3).map(|index| pattern(index, 4096)).collect();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            None,
+            &chunks,
+        ))
+        .unwrap();
+        // Reads still verify the content's Merkle identity end to end.
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index as u64))
+                    .unwrap()
+                    .unwrap(),
+                *chunk,
+            );
+        }
+        drop(store);
+        // A cold mount of a deferred-profile store recovers and reads the
+        // same verified stream.
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let extended =
+            block_on(cold.commit_fs_data_chunk(Some(&tail), &pattern(9, 4096))).unwrap();
+        assert_eq!(extended.chunk_count(), chunks.len() as u64 + 1);
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&extended, 1)).unwrap(),
+            Some(pattern(1, 4096))
+        );
     }
 
     #[test]

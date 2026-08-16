@@ -1148,3 +1148,52 @@ fn external_object_records_recover_compact_and_fail_closed() {
         )
         .is_err());
 }
+
+#[test]
+fn incremental_replay_equals_whole_stream_recovery_at_every_cut() {
+    use vibeos_durable_format::PreflightReplay;
+    let log = replace_style_log();
+    let whole = preflight_recovery(&log.sectors, store()).unwrap();
+    for cut in 0..=log.sectors.len() {
+        let mut replay = PreflightReplay::new(store());
+        replay.append(&log.sectors[..cut]).unwrap();
+        replay.append(&log.sectors[cut..]).unwrap();
+        assert_eq!(replay.record_count(), log.sectors.len() as u64, "cut {cut}");
+        let split = replay.finish().unwrap();
+        assert_eq!(split.id_high_water(), whole.id_high_water(), "cut {cut}");
+        assert_eq!(split.last_sequence(), whole.last_sequence(), "cut {cut}");
+        assert_eq!(split.last_crc32c(), whole.last_crc32c(), "cut {cut}");
+        assert_eq!(
+            split.chain_checkpoint().unwrap(),
+            whole.chain_checkpoint().unwrap(),
+            "cut {cut}"
+        );
+        let ids = |p: &vibeos_durable_format::RecoveryPreflight| -> Vec<(u128, u64)> {
+            p.committed_objects()
+                .iter()
+                .map(|object| (object.object_id.get(), object.commit_sequence))
+                .collect()
+        };
+        assert_eq!(ids(&split), ids(&whole), "cut {cut}");
+        assert_eq!(
+            split.committed_grants().len(),
+            whole.committed_grants().len(),
+            "cut {cut}"
+        );
+        assert_eq!(split.slots().len(), whole.slots().len(), "cut {cut}");
+    }
+    // A failed append poisons the builder fail-closed.
+    let mut poisoned = PreflightReplay::new(store());
+    poisoned.append(&log.sectors).unwrap();
+    let mut broken = log.sectors[3];
+    broken[0] ^= 0xff;
+    assert!(poisoned.append(&[broken]).is_err());
+    assert!(matches!(
+        poisoned.append(&log.sectors[..1]),
+        Err(vibeos_durable_format::RecoveryError::ReplayPoisoned)
+    ));
+    assert!(matches!(
+        poisoned.finish(),
+        Err(vibeos_durable_format::RecoveryError::ReplayPoisoned)
+    ));
+}

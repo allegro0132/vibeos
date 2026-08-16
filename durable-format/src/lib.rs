@@ -1630,14 +1630,19 @@ pub enum RecoveryError {
     /// A compacted rewrite failed its own equivalence proof; the original
     /// stream stays authoritative.
     CompactionMismatch,
+    /// A resumable replay builder observed an earlier failure; its retained
+    /// state is not a validated prefix of any stream.
+    ReplayPoisoned,
 }
 
+#[derive(Clone)]
 struct PreparedGrant {
     grant: GrantRecord,
     sequence: u64,
     crc32c: u32,
 }
 
+#[derive(Clone)]
 struct PreparedObject {
     metadata: ObjectMetadata,
     sequence: u64,
@@ -1650,6 +1655,7 @@ struct PreparedObject {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone)]
 enum TxState {
     GrantPrepared(PreparedGrant),
     ObjectPrepared(PreparedObject),
@@ -1670,88 +1676,165 @@ enum IdClass {
 /// chain break, invalid object transaction, or invalid derivation graph rejects
 /// the entire store. The result is inert until exact external root policy is
 /// supplied to [`RecoveryPreflight::finish`].
-pub fn preflight_recovery(
-    sectors: &[[u8; RECORD_SIZE]],
+/// Resumable single-owner replay of the unified journal. The stream's
+/// appender may retain this builder and validate only newly appended records
+/// instead of re-decoding the entire journal on every append. Both passes
+/// (chain probe, then semantic replay) run in the same order as
+/// [`preflight_recovery`], so `new` + one `append` of the whole stream +
+/// `finish` is behaviorally identical to a fresh recovery. Any error poisons
+/// the builder: a failed append leaves partially applied state, so every
+/// later call fails closed.
+#[derive(Clone)]
+pub struct PreflightReplay {
     store_id: StoreId,
-) -> Result<RecoveryPreflight, RecoveryError> {
-    // Decode-only preflight rejects every sealed malformed sector without
-    // retaining ObjectChunk Vecs for the full journal: only a compact,
-    // fixed-size chain probe per sector survives this pass, keeping the
-    // recovery allocation peak bounded while the chain-validation pass below
-    // avoids a second full decode of every record.
-    #[derive(Clone, Copy)]
-    struct ChainProbe {
-        sequence: u64,
-        previous_sequence: u64,
-        previous_crc32c: u32,
-        crc32c: u32,
-        store_id: StoreId,
-        is_format: bool,
-    }
-    let mut probes: Vec<Option<ChainProbe>> = Vec::new();
-    probes
-        .try_reserve_exact(sectors.len())
-        .map_err(|_| RecoveryError::AllocationFailed)?;
-    for (sector, bytes) in sectors.iter().enumerate() {
-        match LogRecord::decode(bytes) {
-            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => probes.push(None),
-            Ok(DecodeStatus::Valid(decoded)) => probes.push(Some(ChainProbe {
-                sequence: decoded.record.sequence,
-                previous_sequence: decoded.record.previous_sequence,
-                previous_crc32c: decoded.record.previous_crc32c,
-                crc32c: decoded.crc32c,
-                store_id: decoded.record.store_id,
-                is_format: matches!(decoded.record.body, RecordBody::Format),
-            })),
-            Err(source) => return Err(RecoveryError::SealedRecord { sector, source }),
+    poisoned: bool,
+    total_sectors: usize,
+    valid_records: u64,
+    previous_sequence: u64,
+    previous_crc: u32,
+    high_water: u128,
+    id_classes: BTreeMap<u128, IdClass>,
+    transactions: BTreeMap<TransactionId, TxState>,
+    seen_derivations: BTreeSet<DerivationId>,
+    seen_objects: BTreeSet<ObjectId>,
+    committed: Vec<RecoveredGrant>,
+    committed_objects: Vec<RecoveredObject>,
+    tombstone_sequence: BTreeMap<DerivationId, u64>,
+    tombstone_transactions: BTreeMap<DerivationId, TransactionId>,
+}
+
+impl PreflightReplay {
+    pub fn new(store_id: StoreId) -> Self {
+        Self {
+            store_id,
+            poisoned: false,
+            total_sectors: 0,
+            valid_records: 0,
+            previous_sequence: 0,
+            previous_crc: 0,
+            high_water: 0,
+            id_classes: BTreeMap::new(),
+            transactions: BTreeMap::new(),
+            seen_derivations: BTreeSet::new(),
+            seen_objects: BTreeSet::new(),
+            committed: Vec::new(),
+            committed_objects: Vec::new(),
+            tombstone_sequence: BTreeMap::new(),
+            tombstone_transactions: BTreeMap::new(),
         }
     }
 
-    let mut previous_sequence = 0u64;
-    let mut previous_crc = 0u32;
-    let mut valid_index = 0usize;
-    for (sector, entry) in probes.iter().enumerate() {
-        let Some(probe) = entry else { continue };
-        if valid_index == 0 && (probe.sequence != 1 || !probe.is_format) {
-            return Err(RecoveryError::FormatNotFirst);
-        }
-        if probe.store_id != store_id {
-            return Err(RecoveryError::WrongStore { sector });
-        }
-        let expected = previous_sequence
-            .checked_add(1)
-            .ok_or(RecoveryError::SequenceOverflow)?;
-        if probe.sequence != expected
-            || probe.previous_sequence != previous_sequence
-            || probe.previous_crc32c != previous_crc
-        {
-            return Err(RecoveryError::BrokenSequence { sector });
-        }
-        if valid_index != 0 && probe.is_format {
-            return Err(RecoveryError::DuplicateFormat);
-        }
-        previous_sequence = probe.sequence;
-        previous_crc = probe.crc32c;
-        valid_index += 1;
-    }
-    drop(probes);
-    if valid_index == 0 {
-        return Err(RecoveryError::MissingFormat);
+    pub const fn record_count(&self) -> u64 {
+        self.valid_records
     }
 
-    let mut high_water = 0u128;
-    let mut id_classes: BTreeMap<u128, IdClass> = BTreeMap::new();
-    let mut transactions: BTreeMap<TransactionId, TxState> = BTreeMap::new();
-    let mut seen_derivations = BTreeSet::new();
-    let mut seen_objects = BTreeSet::new();
-    let mut committed: Vec<RecoveredGrant> = Vec::new();
-    let mut committed_objects: Vec<RecoveredObject> = Vec::new();
-    let mut tombstone_sequence: BTreeMap<DerivationId, u64> = BTreeMap::new();
-    let mut tombstone_transactions: BTreeMap<DerivationId, TransactionId> = BTreeMap::new();
+    /// Chain checkpoint after every record appended so far. This is the value
+    /// an appender compares against a concurrently observed stream tail
+    /// before trusting this builder as that stream's validated prefix.
+    pub fn chain_checkpoint(&self) -> Result<ChainCheckpoint, RecoveryError> {
+        if self.poisoned || self.valid_records == 0 {
+            return Err(RecoveryError::ReplayPoisoned);
+        }
+        Ok(ChainCheckpoint {
+            next_sequence: self
+                .previous_sequence
+                .checked_add(1)
+                .ok_or(RecoveryError::SequenceOverflow)?,
+            previous_sequence: self.previous_sequence,
+            previous_crc32c: self.previous_crc,
+        })
+    }
 
-    // Decode and validate one record at a time. At most one <=360-byte chunk
-    // Vec is transiently owned here; no per-record decoded catalog survives.
-    for bytes in sectors {
+    pub fn append(&mut self, sectors: &[[u8; RECORD_SIZE]]) -> Result<(), RecoveryError> {
+        if self.poisoned {
+            return Err(RecoveryError::ReplayPoisoned);
+        }
+        let result = self.append_inner(sectors);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn append_inner(&mut self, sectors: &[[u8; RECORD_SIZE]]) -> Result<(), RecoveryError> {
+        // Decode-only chain probe over exactly the appended records, seeded
+        // from the retained chain state, mirroring the whole-stream probe.
+        #[derive(Clone, Copy)]
+        struct ChainProbe {
+            sequence: u64,
+            previous_sequence: u64,
+            previous_crc32c: u32,
+            crc32c: u32,
+            store_id: StoreId,
+            is_format: bool,
+        }
+        let mut probes: Vec<Option<ChainProbe>> = Vec::new();
+        probes
+            .try_reserve_exact(sectors.len())
+            .map_err(|_| RecoveryError::AllocationFailed)?;
+        for (sector, bytes) in sectors.iter().enumerate() {
+            match LogRecord::decode(bytes) {
+                Ok(DecodeStatus::Empty | DecodeStatus::Torn) => probes.push(None),
+                Ok(DecodeStatus::Valid(decoded)) => probes.push(Some(ChainProbe {
+                    sequence: decoded.record.sequence,
+                    previous_sequence: decoded.record.previous_sequence,
+                    previous_crc32c: decoded.record.previous_crc32c,
+                    crc32c: decoded.crc32c,
+                    store_id: decoded.record.store_id,
+                    is_format: matches!(decoded.record.body, RecordBody::Format),
+                })),
+                Err(source) => {
+                    return Err(RecoveryError::SealedRecord {
+                        sector: self.total_sectors + sector,
+                        source,
+                    })
+                }
+            }
+        }
+        let mut previous_sequence = self.previous_sequence;
+        let mut previous_crc = self.previous_crc;
+        let mut valid_index = self.valid_records;
+        for (sector, entry) in probes.iter().enumerate() {
+            let Some(probe) = entry else { continue };
+            if valid_index == 0 && (probe.sequence != 1 || !probe.is_format) {
+                return Err(RecoveryError::FormatNotFirst);
+            }
+            if probe.store_id != self.store_id {
+                return Err(RecoveryError::WrongStore {
+                    sector: self.total_sectors + sector,
+                });
+            }
+            let expected = previous_sequence
+                .checked_add(1)
+                .ok_or(RecoveryError::SequenceOverflow)?;
+            if probe.sequence != expected
+                || probe.previous_sequence != previous_sequence
+                || probe.previous_crc32c != previous_crc
+            {
+                return Err(RecoveryError::BrokenSequence {
+                    sector: self.total_sectors + sector,
+                });
+            }
+            if valid_index != 0 && probe.is_format {
+                return Err(RecoveryError::DuplicateFormat);
+            }
+            previous_sequence = probe.sequence;
+            previous_crc = probe.crc32c;
+            valid_index += 1;
+        }
+        drop(probes);
+
+        // Semantic replay of the appended records against retained state.
+        let high_water = &mut self.high_water;
+        let id_classes = &mut self.id_classes;
+        let transactions = &mut self.transactions;
+        let seen_derivations = &mut self.seen_derivations;
+        let seen_objects = &mut self.seen_objects;
+        let committed = &mut self.committed;
+        let committed_objects = &mut self.committed_objects;
+        let tombstone_sequence = &mut self.tombstone_sequence;
+        let tombstone_transactions = &mut self.tombstone_transactions;
+        for bytes in sectors {
         let decoded = match LogRecord::decode(bytes) {
             Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
             Ok(DecodeStatus::Valid(decoded)) => decoded,
@@ -1761,37 +1844,37 @@ pub fn preflight_recovery(
         match &decoded.record.body {
             RecordBody::Format => {}
             RecordBody::IdHighWater { exclusive_end } => {
-                if *exclusive_end <= high_water {
+                if *exclusive_end <= *high_water {
                     return Err(RecoveryError::NonMonotonicHighWater);
                 }
-                high_water = *exclusive_end;
+                *high_water = *exclusive_end;
             }
             RecordBody::GrantPrepare(grant) => {
                 let tx = decoded
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !ids_reserved_for_grant(grant, tx, high_water) {
+                if !ids_reserved_for_grant(grant, tx, *high_water) {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     grant.derivation_id.get(),
                     IdClass::Derivation,
                     sequence,
                 )?;
                 if let Some(parent) = grant.parent_id {
-                    claim_id_class(&mut id_classes, parent.get(), IdClass::Derivation, sequence)?;
+                    claim_id_class(id_classes, parent.get(), IdClass::Derivation, sequence)?;
                 }
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     grant.object_id.get(),
                     IdClass::Object,
                     sequence,
                 )?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     grant.target.space.get(),
                     IdClass::Space,
                     sequence,
@@ -1822,14 +1905,14 @@ pub fn preflight_recovery(
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), high_water)
-                    || !id_reserved(derivation_id.get(), high_water)
+                if !id_reserved(tx.get(), *high_water)
+                    || !id_reserved(derivation_id.get(), *high_water)
                 {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     derivation_id.get(),
                     IdClass::Derivation,
                     sequence,
@@ -1872,14 +1955,14 @@ pub fn preflight_recovery(
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), high_water)
-                    || !id_reserved(derivation_id.get(), high_water)
+                if !id_reserved(tx.get(), *high_water)
+                    || !id_reserved(derivation_id.get(), *high_water)
                 {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     derivation_id.get(),
                     IdClass::Derivation,
                     sequence,
@@ -1900,14 +1983,14 @@ pub fn preflight_recovery(
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), high_water)
-                    || !id_reserved(metadata.object_id.get(), high_water)
+                if !id_reserved(tx.get(), *high_water)
+                    || !id_reserved(metadata.object_id.get(), *high_water)
                 {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     metadata.object_id.get(),
                     IdClass::Object,
                     sequence,
@@ -1938,14 +2021,14 @@ pub fn preflight_recovery(
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), high_water)
-                    || !id_reserved(chunk.object_id.get(), high_water)
+                if !id_reserved(tx.get(), *high_water)
+                    || !id_reserved(chunk.object_id.get(), *high_water)
                 {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     chunk.object_id.get(),
                     IdClass::Object,
                     sequence,
@@ -1986,14 +2069,14 @@ pub fn preflight_recovery(
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), high_water)
-                    || !id_reserved(commit.object_id.get(), high_water)
+                if !id_reserved(tx.get(), *high_water)
+                    || !id_reserved(commit.object_id.get(), *high_water)
                 {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
                 claim_id_class(
-                    &mut id_classes,
+                    id_classes,
                     commit.object_id.get(),
                     IdClass::Object,
                     sequence,
@@ -2049,12 +2132,12 @@ pub fn preflight_recovery(
                     .record
                     .transaction_id
                     .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), high_water) || !id_reserved(object_id.get(), high_water)
+                if !id_reserved(tx.get(), *high_water) || !id_reserved(object_id.get(), *high_water)
                 {
                     return Err(RecoveryError::IdNotReserved { sequence });
                 }
-                claim_id_class(&mut id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(&mut id_classes, object_id.get(), IdClass::Object, sequence)?;
+                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                claim_id_class(id_classes, object_id.get(), IdClass::Object, sequence)?;
                 if transactions.insert(tx, TxState::Finished).is_some() {
                     return Err(RecoveryError::DuplicateTransaction { sequence });
                 }
@@ -2073,11 +2156,29 @@ pub fn preflight_recovery(
                 });
             }
         }
+        }
+        self.previous_sequence = previous_sequence;
+        self.previous_crc = previous_crc;
+        self.valid_records = valid_index;
+        self.total_sectors += sectors.len();
+        Ok(())
     }
 
+    /// Validate the cross-record graph and slot invariants over everything
+    /// appended so far, exactly like the tail of a whole-stream recovery.
+    /// Consumes the builder so a single-shot recovery never holds two copies
+    /// of the committed object bytes; a caller that keeps the builder for
+    /// the next strict extension finishes a clone instead.
+    pub fn finish(self) -> Result<RecoveryPreflight, RecoveryError> {
+        if self.poisoned {
+            return Err(RecoveryError::ReplayPoisoned);
+        }
+        if self.valid_records == 0 {
+            return Err(RecoveryError::MissingFormat);
+        }
     let mut graph: BTreeMap<DerivationId, RecoveredGrant> = BTreeMap::new();
     let mut object_kinds: BTreeMap<ObjectId, ResourceKind> = BTreeMap::new();
-    for recovered in &committed {
+    for recovered in &self.committed {
         let grant = &recovered.grant;
         if let Some(kind) = object_kinds.insert(grant.object_id, grant.resource_kind) {
             if kind != grant.resource_kind {
@@ -2125,7 +2226,7 @@ pub fn preflight_recovery(
     }
 
     let mut slots: BTreeMap<(SpaceId, u32), (u64, DerivationId)> = BTreeMap::new();
-    for recovered in &committed {
+    for recovered in &self.committed {
         let key = (recovered.grant.target.space, recovered.grant.target.slot);
         if let Some((old_generation, old_derivation)) = slots.get(&key).copied() {
             if old_generation == u64::MAX || recovered.grant.target.generation <= old_generation {
@@ -2137,7 +2238,7 @@ pub fn preflight_recovery(
                 old_derivation,
                 recovered.commit_sequence,
                 &graph,
-                &tombstone_sequence,
+                &self.tombstone_sequence,
             ) {
                 return Err(RecoveryError::SlotStillLive {
                     sequence: recovered.commit_sequence,
@@ -2160,25 +2261,34 @@ pub fn preflight_recovery(
                 space,
                 slot,
                 max_generation,
-                live_derivation: (!is_tombstoned(derivation, &graph, &tombstone_sequence))
+                live_derivation: (!is_tombstoned(derivation, &graph, &self.tombstone_sequence))
                     .then_some(derivation),
             },
         )
         .collect();
-    Ok(RecoveryPreflight {
-        store_id,
-        id_high_water: high_water,
-        committed,
-        objects: committed_objects,
-        tombstone_sequence,
-        tombstone_transactions,
-        graph,
-        slots,
-        last_sequence: previous_sequence,
-        last_crc32c: previous_crc,
-    })
+        Ok(RecoveryPreflight {
+            store_id: self.store_id,
+            id_high_water: self.high_water,
+            committed: self.committed,
+            objects: self.committed_objects,
+            tombstone_sequence: self.tombstone_sequence,
+            tombstone_transactions: self.tombstone_transactions,
+            graph,
+            slots,
+            last_sequence: self.previous_sequence,
+            last_crc32c: self.previous_crc,
+        })
+    }
 }
 
+pub fn preflight_recovery(
+    sectors: &[[u8; RECORD_SIZE]],
+    store_id: StoreId,
+) -> Result<RecoveryPreflight, RecoveryError> {
+    let mut replay = PreflightReplay::new(store_id);
+    replay.append(sectors)?;
+    replay.finish()
+}
 /// Compatibility wrapper for callers with an already-known exact root policy.
 /// It shares the same unified semantic pass as dynamic-root recovery.
 pub fn recover(

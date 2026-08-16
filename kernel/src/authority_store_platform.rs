@@ -243,6 +243,15 @@ pub(crate) fn storage_v2_migration_import(
     let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
     let preflight = validate_storage_v2_records(records)?;
     let roots = select_storage_v2_roots(&preflight)?;
+    storage_v2_import_from_parts(records, store_id, preflight, roots)
+}
+
+fn storage_v2_import_from_parts(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    store_id: StoreId,
+    preflight: durable::RecoveryPreflight,
+    roots: Vec<RootPolicy>,
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
     let ssh_kind = durable::ObjectKind::new(SSH_CONFIG_OBJECT_KIND_RAW)
         .expect("fixed SSH configuration kind is non-zero");
     let sealed_singletons = preflight
@@ -262,6 +271,82 @@ pub(crate) fn storage_v2_migration_import(
         preflight,
     )
     .map_err(|_| DurableCSpaceError::RootPolicy)
+}
+
+/// Retained validated replay of the exact published logical stream, so the
+/// next strict-extension append validates only its own records instead of
+/// re-decoding the whole journal. The chain checkpoint and record count bind
+/// the cache to one stream identity; any mismatch falls back to full replay.
+pub(crate) struct StorageV2PreflightCache {
+    pub(crate) checkpoint: vibeos_durable_format::ChainCheckpoint,
+    pub(crate) records: usize,
+    pub(crate) replay: durable::PreflightReplay,
+}
+
+/// Build the persistent-authority import for `full_records`, reusing a cached
+/// validated replay of the untouched prefix when its chain checkpoint matches
+/// the observed stream tail. The complete production authorization pass still
+/// runs over the resulting state on every append; only the per-record decode
+/// and semantic replay of the unchanged prefix is skipped.
+pub(crate) fn storage_v2_migration_import_incremental(
+    full_records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    appended: usize,
+    observed: vibeos_durable_format::ChainCheckpoint,
+    cache: Option<StorageV2PreflightCache>,
+) -> Result<
+    (
+        vibeos_segment_store::PersistentAuthorityImport,
+        StorageV2PreflightCache,
+    ),
+    DurableCSpaceError,
+> {
+    if full_records.is_empty()
+        || appended == 0
+        || appended > full_records.len()
+        || full_records.len() > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let prefix_len = full_records.len() - appended;
+    let mut replay = match cache {
+        Some(cache)
+            if cache.records == prefix_len
+                && cache.checkpoint == observed
+                && cache.replay.record_count() as usize == prefix_len =>
+        {
+            cache.replay
+        }
+        _ => {
+            let mut replay = durable::PreflightReplay::new(store_id);
+            replay
+                .append(&full_records[..prefix_len])
+                .map_err(|_| DurableCSpaceError::RootPolicy)?;
+            replay
+        }
+    };
+    replay
+        .append(&full_records[prefix_len..])
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let preflight = replay
+        .clone()
+        .finish()
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    // This is the complete production validator: exact external roots, fixed
+    // CSpace history, typed resource witnesses, and saved-program semantics.
+    let snapshot = AuthoritySnapshot::from_legacy_preflight(full_records.len(), preflight.clone())?;
+    let _validated = authorize_snapshot(snapshot)?;
+    let roots = select_storage_v2_roots(&preflight)?;
+    let import = storage_v2_import_from_parts(full_records, store_id, preflight, roots)?;
+    let checkpoint = replay
+        .chain_checkpoint()
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let cache = StorageV2PreflightCache {
+        checkpoint,
+        records: full_records.len(),
+        replay,
+    };
+    Ok((import, cache))
 }
 
 /// Attempt to compact a validated V2 logical stream. Returns `None` when the

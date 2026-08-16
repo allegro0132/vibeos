@@ -1191,7 +1191,13 @@ impl StorageV2Runtime {
                 )
         });
         if !current {
-            return Err(vibeos_object_store::StoreError::ObjectUnavailable);
+            // A stale cache entry proves nothing about the object itself: a
+            // later append or collection advanced the published generation
+            // without touching this content. Decline the cache and let the
+            // caller resolve through the durable path, which re-validates
+            // the object's stable identity against the current view and
+            // fails closed only if the object is genuinely unresolvable.
+            return Ok(None);
         }
         let output = bytes.as_ref().to_vec();
         drop(authority);
@@ -1471,23 +1477,13 @@ impl StorageV2Runtime {
             // boundary, narrow the live device view before deriving the exact
             // adjacent suffix admitted by this growth transaction.
             self.device.expose_block_count(durable_blocks);
-            let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
-                .saturating_sub(info.free_segments)
-                .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
-                .ok_or(V2RuntimeError::Corrupt)?;
-            let info = match self
-                .device
-                .growth_capability_bounded(durable_blocks, growth_blocks)
-                .map_err(|_| V2RuntimeError::Corrupt)?
-            {
-                Some(additional) => {
-                    match poll_as_system(operation.store().grow(&maintenance, additional)).await {
-                        Ok(info) => info,
-                        Err(_) => return Err(V2RuntimeError::Corrupt),
-                    }
-                }
-                None => info,
-            };
+            // No growth here: a cold proof must leave the checkpoint exactly
+            // where recovery found it. The migration contract binds a staged
+            // or native activation to the precise current checkpoint, and a
+            // boot-time growth transaction silently advanced past it,
+            // failing every powered-off selector verification. Foreground
+            // writers replenish capacity themselves (with hysteresis) on
+            // their first commit instead.
             *self.last_info.lock() = Some(info);
             let view = poll_as_system(
                 operation

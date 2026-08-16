@@ -2205,7 +2205,9 @@ def verify_image(
                 require(
                     current == floor
                     == v2_evidence["selected_checkpoint_generation"],
-                    "staged selector does not bind the exact current checkpoint",
+                    "staged selector does not bind the exact current checkpoint"
+                    f" (authority_generation={current} activation_floor={floor}"
+                    f" selected_checkpoint={v2_evidence['selected_checkpoint_generation']})",
                 )
             if current == floor:
                 require(

@@ -252,7 +252,8 @@ vibeos_kernel_start:
     addi t0, t0, 8
     j .Lbss
 .Ldone:
-    j kmain
+    // See the secondary path: `tail` avoids the +-1 MiB JAL range limit.
+    tail kmain
 
 .align 4
 .global _secondary_start
@@ -280,7 +281,10 @@ _secondary_start:
     li t1, 1
     slli t1, t1, 18
     add sp, sp, t1
-    j secondary_kmain
+    // A plain `j` limits the kernel to +-1 MiB between this boot stub and
+    // secondary_kmain; `tail` expands to auipc+jalr and never becomes a
+    // link-time range constraint on text layout.
+    tail secondary_kmain
 
 .Lsecondary_park:
     wfi
@@ -845,12 +849,28 @@ impl core::fmt::Write for SbiWriter {
 #[alloc_error_handler]
 fn oom(layout: core::alloc::Layout) -> ! {
     match HEAP.take_last_failure() {
-        Some(heap::AllocationFailure::QuotaExceeded { owner, .. })
-            if owner != heap::OwnerId::SYSTEM =>
+        Some(heap::AllocationFailure::QuotaExceeded {
+            owner,
+            requested_bytes,
+            live_bytes,
+            quota_bytes,
+        }) if owner != heap::OwnerId::SYSTEM =>
         {
-            // Keep the panic text deterministic; the account snapshot carries
-            // exact live/peak/request evidence for diagnostics and tests.
-            panic!("component allocation quota exceeded")
+            // Keep the production panic text deterministic; the account
+            // snapshot carries exact live/peak/request evidence for
+            // diagnostics and tests. Benchmark images print the numbers,
+            // because oversized transient envelopes are exactly what their
+            // qualification workloads probe.
+            #[cfg(feature = "storage-bench")]
+            panic!(
+                "component allocation quota exceeded: owner={} live={} requested={} quota={}",
+                owner, live_bytes, requested_bytes, quota_bytes
+            );
+            #[cfg(not(feature = "storage-bench"))]
+            {
+                let _ = (owner, requested_bytes, live_bytes, quota_bytes);
+                panic!("component allocation quota exceeded")
+            }
         }
         failure => {
             // A global allocator failure is kernel state, even if it happened

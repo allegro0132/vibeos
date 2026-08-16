@@ -17,8 +17,9 @@ use crate::gc::GcStoreError;
 use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
 use crate::persistent_authority::PersistentAuthorityError;
 use crate::root_codec::PersistentRootEntry;
+use crate::fs_codec::{decode_fs_data_node_v1_prefix, FsDataNodeMeta};
 use crate::{
-    decode_fs_btree_node_v1, decode_fs_data_node_v1, encode_fs_btree_node_v1,
+    decode_fs_btree_node_v1, encode_fs_btree_node_v1,
     encode_fs_data_node_v1, encode_fs_root_v1, FsBtreeEntryV1, FsBtreeNodeV1, FsCodecError,
     FsDataNodeV1, FsRootV1, FsTreeKind, SegmentStore, StoragePrincipal, StoreError,
     TypedObjectReference, FS_BTREE_ENTRY_HEADER_LEN, FS_BTREE_HEADER_LEN, FS_BTREE_MAX_HEIGHT,
@@ -116,7 +117,10 @@ pub struct FsPersistentData {
 #[derive(Clone)]
 enum FsPersistentDataLayout {
     Raw,
-    Stream(FsDataNodeV1),
+    /// Skip-linked stream node held as structure-only metadata. Content bytes
+    /// stay on media and are read (and Merkle-verified) per leaf on demand, so
+    /// a resident handle to a multi-MiB chunk costs only its ancestor table.
+    Stream(FsDataNodeMeta),
 }
 
 impl FsPersistentData {
@@ -142,14 +146,196 @@ pub struct FsPersistentTreeEntry {
     pub content: Option<FsPersistentData>,
 }
 
+#[derive(Clone)]
 struct RecoverableFsNode {
     decoded: FsBtreeNodeV1,
     mapping: ObjectMapping,
 }
 
+/// Decoded B+tree state of one committed namespace root, retained across
+/// fused transactions so the next commit against that exact root skips
+/// re-reading both trees from media. Node content is immutable and
+/// id-addressed, so a key match makes the cached decode equal to a fresh
+/// recovery; any mismatch falls back to reading the trees.
+pub(crate) struct FsTreeCache {
+    root_object_id: u128,
+    root_commit_generation: u64,
+    inode_nodes: Vec<RecoverableFsNode>,
+    dirent_nodes: Vec<RecoverableFsNode>,
+}
+
+/// Trees larger than this stay uncached: the cache exists for the common
+/// small-namespace transaction, not to pin megabytes of decoded nodes.
+const FS_TREE_CACHE_MAX_NODES: usize = 512;
+
 struct CowBuiltNode {
     minimum_key: Vec<u8>,
     object: Arc<AuthorizedObject<CasObjectHandle>>,
+}
+
+/// One child reference inside a planned-but-unstaged tree node: either a
+/// committed identity known before staging begins, or the plan slot of a
+/// node the same batch stages earlier (children always precede parents).
+enum PlannedFsRef {
+    Known(TypedObjectReference),
+    Node(usize),
+}
+
+struct PlannedFsEntry {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    reference: Option<PlannedFsRef>,
+}
+
+/// One node of a planned fused transaction. Reuse is decided during planning
+/// exactly like the sequential COW commit: a node whose (tree, level, entries)
+/// byte-match a previous node keeps that committed identity. Any node with a
+/// batch-staged child can never match — its child's commit generation is
+/// fresh — so reuse decisions never depend on the ids the batch will predict.
+enum PlannedFsNode {
+    Reused(TypedObjectReference),
+    Staged {
+        tree: FsTreeKind,
+        level: u8,
+        entries: Vec<PlannedFsEntry>,
+    },
+}
+
+fn find_reusable_fs_node(
+    old_nodes: &[RecoverableFsNode],
+    tree: FsTreeKind,
+    level: u8,
+    entries: &[FsBtreeEntryV1],
+) -> Option<TypedObjectReference> {
+    old_nodes
+        .iter()
+        .find(|old| {
+            old.decoded.tree == tree
+                && old.decoded.level == level
+                && old.decoded.entries.as_slice() == entries
+        })
+        .map(|old| TypedObjectReference {
+            object_id: old.mapping.object_id,
+            commit_generation: old.mapping.commit_generation,
+            object_kind: FS_BTREE_NODE_V1_KIND,
+        })
+}
+
+/// Plan one tree of a fused transaction bottom-up, appending its nodes to
+/// `plan` (children before parents) and returning the plan slot of the tree's
+/// root node. The partitioning and reuse rules are exactly the sequential
+/// COW commit's; only the commit itself is deferred to the staged batch.
+fn plan_fs_cow_tree(
+    tree: FsTreeKind,
+    leaves: Vec<FsBtreeEntryV1>,
+    old_nodes: &[RecoverableFsNode],
+    plan: &mut Vec<PlannedFsNode>,
+) -> Result<usize, FsCodecError> {
+    struct PlannedChild {
+        minimum_key: Vec<u8>,
+        slot: usize,
+        exact: Option<TypedObjectReference>,
+    }
+    let mut built: Vec<PlannedChild> = Vec::new();
+    for range in partition_fs_entries(&leaves)? {
+        let entries = &leaves[range.clone()];
+        let reused = find_reusable_fs_node(old_nodes, tree, 0, entries);
+        let slot = plan.len();
+        match reused {
+            Some(reference) => plan.push(PlannedFsNode::Reused(reference)),
+            None => plan.push(PlannedFsNode::Staged {
+                tree,
+                level: 0,
+                entries: entries
+                    .iter()
+                    .map(|entry| PlannedFsEntry {
+                        key: entry.key.clone(),
+                        value: entry.value.clone(),
+                        reference: entry.reference.map(PlannedFsRef::Known),
+                    })
+                    .collect(),
+            }),
+        }
+        built.push(PlannedChild {
+            minimum_key: leaves
+                .get(range.start)
+                .map(|entry| entry.key.clone())
+                .unwrap_or_default(),
+            slot,
+            exact: reused,
+        });
+    }
+    let mut level = 1u8;
+    while built.len() > 1 {
+        if level > FS_BTREE_MAX_HEIGHT {
+            return Err(FsCodecError::OutOfBounds);
+        }
+        // Entry geometry depends only on keys and values, so placeholder
+        // references give partitioning the exact node boundaries.
+        let mut sizing = Vec::new();
+        sizing
+            .try_reserve_exact(built.len())
+            .map_err(|_| FsCodecError::OutOfBounds)?;
+        for child in &built {
+            sizing.push(FsBtreeEntryV1 {
+                key: child.minimum_key.clone(),
+                value: Vec::new(),
+                reference: None,
+            });
+        }
+        let mut parents = Vec::new();
+        for range in partition_fs_entries(&sizing)? {
+            let children = &built[range.clone()];
+            // A parent is reusable only when every child kept its committed
+            // identity; then its exact entries are known before staging.
+            let exact_entries: Option<Vec<FsBtreeEntryV1>> = children
+                .iter()
+                .map(|child| {
+                    child.exact.map(|reference| FsBtreeEntryV1 {
+                        key: child.minimum_key.clone(),
+                        value: Vec::new(),
+                        reference: Some(reference),
+                    })
+                })
+                .collect();
+            let reused = exact_entries
+                .as_deref()
+                .and_then(|entries| find_reusable_fs_node(old_nodes, tree, level, entries));
+            let slot = plan.len();
+            match reused {
+                Some(reference) => plan.push(PlannedFsNode::Reused(reference)),
+                None => plan.push(PlannedFsNode::Staged {
+                    tree,
+                    level,
+                    entries: children
+                        .iter()
+                        .map(|child| PlannedFsEntry {
+                            key: child.minimum_key.clone(),
+                            value: Vec::new(),
+                            reference: Some(match child.exact {
+                                Some(reference) => PlannedFsRef::Known(reference),
+                                None => PlannedFsRef::Node(child.slot),
+                            }),
+                        })
+                        .collect(),
+                }),
+            }
+            parents.push(PlannedChild {
+                minimum_key: children
+                    .first()
+                    .map(|child| child.minimum_key.clone())
+                    .ok_or(FsCodecError::OutOfBounds)?,
+                slot,
+                exact: reused,
+            });
+        }
+        built = parents;
+        level += 1;
+    }
+    built
+        .pop()
+        .map(|node| node.slot)
+        .ok_or(FsCodecError::OutOfBounds)
 }
 
 fn partition_fs_entries(
@@ -341,13 +527,59 @@ impl<D: PageDevice> SegmentStore<D> {
         let mapping = self.fs_mapping_for_reference(reference, FS_DATA_V1_KIND)?;
         let object = self.recover_fs_reference(reference, FS_DATA_V1_KIND)?;
         let layout = if mapping.reference_codec == REFERENCE_CODEC_FS_V1 {
-            FsPersistentDataLayout::Stream(decode_fs_data_node_v1(
-                &self.read_fs_object_bytes(&object).await?,
-            )?)
+            FsPersistentDataLayout::Stream(self.read_fs_data_node_meta(&object).await?)
         } else {
             FsPersistentDataLayout::Raw
         };
         Ok(FsPersistentData { object, layout })
+    }
+
+    /// Read and validate a data node's structural prefix from its first leaf.
+    /// The header and full ancestor table always fit one leaf, so a skip-list
+    /// hop costs one verified 4 KiB read regardless of the chunk's size.
+    async fn read_fs_data_node_meta(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+    ) -> Result<FsDataNodeMeta, FsRootPublishError<D::Error>> {
+        const _: () = assert!(
+            crate::fs_codec::FS_DATA_HEADER_LEN
+                + crate::fs_codec::FS_DATA_MAX_ANCESTORS * crate::fs_codec::FS_DATA_REFERENCE_LEN
+                <= vibeos_blob_format::LEAF_SIZE,
+            "a data node's structural prefix must fit the first Merkle leaf",
+        );
+        let first = self.get_blob_chunk(object, 0).await?;
+        let meta = decode_fs_data_node_v1_prefix(&first.bytes)?;
+        // Bind the prefix to the whole object: the recorded payload length
+        // must name exactly the committed blob's byte length.
+        if meta.encoded_len() as u64 != object.exact_len() {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        Ok(meta)
+    }
+
+    /// Read a data node's content bytes. The whole node is read and verified
+    /// as one batched blob pass — per-leaf proof walks would cost a dozen
+    /// small device reads for every 4 KiB of a multi-MiB chunk.
+    async fn read_fs_data_node_content(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+        meta: &FsDataNodeMeta,
+    ) -> Result<Vec<u8>, FsRootPublishError<D::Error>> {
+        if meta.encoded_len() as u64 != object.exact_len() {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        if meta.bytes_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut encoded = self.read_verified_blob(object).await?;
+        if encoded.len() != meta.encoded_len() {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        let bytes = encoded.split_off(meta.bytes_offset());
+        if bytes.len() != meta.bytes_len {
+            return Err(FsRootPublishError::InvalidRoot);
+        }
+        Ok(bytes)
     }
 
     fn fs_reference_for(
@@ -495,13 +727,590 @@ impl<D: PageDevice> SegmentStore<D> {
             bytes: bytes.to_vec(),
         };
         let payload = encode_fs_data_node_v1(&decoded)?;
+        let meta = FsDataNodeMeta::from_node(&decoded);
+        drop(decoded);
         Ok(FsPersistentData {
             object: Arc::new(
                 self.commit_fs_payload(FS_DATA_V1_KIND, &payload, principal, maintenance)
                     .await?,
             ),
-            layout: FsPersistentDataLayout::Stream(decoded),
+            layout: FsPersistentDataLayout::Stream(meta),
         })
+    }
+
+    /// Append many bounded data chunks to one immutable skip-linked stream
+    /// and publish them under a single metadata segment and checkpoint.
+    /// Chunk `k` in the batch references chunk `k-1` (and its skip ancestors)
+    /// through position-predicted object identities, so no chunk waits for an
+    /// intermediate checkpoint. Any failure poisons the store exactly like an
+    /// interrupted staged publication: nothing durable references the staged
+    /// scratch, and the next mount observes the predecessor checkpoint.
+    pub async fn stage_fs_data_chunks_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentData>,
+        chunks: &[Vec<u8>],
+    ) -> Result<FsPersistentData, FsStructuralCommitError<D::Error>> {
+        if chunks.is_empty() || chunks.iter().any(|bytes| bytes.is_empty()) {
+            return Err(FsCodecError::OutOfBounds.into());
+        }
+        // The lease proves maintenance authority for this trusted-service
+        // write path; each staged blob is written outside quota domains just
+        // like `commit_fs_data_chunk_for_maintenance`.
+        let lease = self
+            .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
+            .ok_or(FsStructuralCommitError::InvalidChild)?;
+        drop(lease);
+        // Decline the whole batch before staging anything when the free set
+        // cannot plausibly carry it: nothing is consumed, the store stays
+        // mounted, and the caller may reclaim or grow and retry. (A mid-batch
+        // shortfall — e.g. from fragmentation — still poisons like any
+        // interrupted staged publication.)
+        {
+            let state = self.require_current_generation()?;
+            // Each chunk's encoded blob packs about three 1 MiB extents per
+            // 4 MiB segment; one metadata segment publishes the batch.
+            let mut needed = 1_u64;
+            for bytes in chunks {
+                needed = needed
+                    .checked_add(1 + bytes.len() as u64 / (3 * 1024 * 1024))
+                    .ok_or(StoreError::Corrupt)?;
+            }
+            let floor = u64::from(state.cleaner_reserve_segments)
+                .saturating_add(u64::from(crate::store::ROOT_POLICY_HEADROOM_SEGMENTS));
+            let free = state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .free;
+            if free < needed.saturating_add(floor) {
+                return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                    StoreError::Capacity(crate::CapacityClass::Payload),
+                )));
+            }
+        }
+        // Seed the stream frontier from the committed predecessor, if any.
+        let mut tail: Option<(TypedObjectReference, FsDataNodeMeta)> = match previous {
+            None => None,
+            Some(data) if data.exact_len() == 0 => None,
+            Some(data) => {
+                let FsPersistentDataLayout::Stream(meta) = &data.layout else {
+                    return Err(FsStructuralCommitError::InvalidChild);
+                };
+                Some((self.fs_reference_for(&data.object)?, meta.clone()))
+            }
+        };
+        let mut batch = self.begin_staged_batch()?;
+        // Structural metadata for every node staged in this batch, keyed by
+        // its predicted object id: ancestor recovery must not read objects
+        // that do not exist on media yet.
+        let mut staged_metas: alloc::collections::BTreeMap<u128, FsDataNodeMeta> =
+            alloc::collections::BTreeMap::new();
+        let mut result = Ok(());
+        for bytes in chunks {
+            match self
+                .stage_fs_data_chunk_inner(&mut batch, &mut staged_metas, tail.take(), bytes)
+                .await
+            {
+                Ok(next) => tail = Some(next),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        result?;
+        let tail_index = batch.staged_len() - 1;
+        let (tail_reference, tail_meta) = tail.ok_or(FsStructuralCommitError::InvalidChild)?;
+        let published = self.publish_staged_batch(batch).await?;
+        let object = published
+            .into_iter()
+            .nth(tail_index)
+            .ok_or(StoreError::Corrupt)?;
+        // The published identity must equal the prediction the staged nodes
+        // already encoded; a mismatch means the batch's position accounting
+        // broke and the stream would dangle.
+        let key = object
+            .backend_handle()
+            .authority_key()
+            .map_err(|_| StoreError::Corrupt)?;
+        if key.object_id() != tail_reference.object_id
+            || key.commit_generation() != tail_reference.commit_generation
+        {
+            return Err(StoreError::Corrupt.into());
+        }
+        Ok(FsPersistentData {
+            object: Arc::new(object),
+            layout: FsPersistentDataLayout::Stream(tail_meta),
+        })
+    }
+
+    /// Stage one chunk into `batch`, resolving skip ancestors from the batch's
+    /// own staged metadata first and from committed objects otherwise.
+    async fn stage_fs_data_chunk_inner(
+        &mut self,
+        batch: &mut crate::cas::StagedBlobBatch,
+        staged_metas: &mut alloc::collections::BTreeMap<u128, FsDataNodeMeta>,
+        previous: Option<(TypedObjectReference, FsDataNodeMeta)>,
+        bytes: &[u8],
+    ) -> Result<(TypedObjectReference, FsDataNodeMeta), FsStructuralCommitError<D::Error>> {
+        if bytes.is_empty() || bytes.len() > FS_DATA_CHUNK_MAX_LEN {
+            return Err(FsCodecError::OutOfBounds.into());
+        }
+        let (chunk_index, total_len, ancestors) = match previous {
+            None => (0, bytes.len() as u64, Vec::new()),
+            Some((tail_reference, tail_meta)) => {
+                let chunk_index = tail_meta
+                    .chunk_index
+                    .checked_add(1)
+                    .ok_or(FsCodecError::ArithmeticOverflow)?;
+                let total_len = tail_meta
+                    .total_len
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(FsCodecError::ArithmeticOverflow)?;
+                let required = (u64::BITS - chunk_index.leading_zeros()) as usize;
+                let mut ancestors = Vec::new();
+                ancestors
+                    .try_reserve_exact(required)
+                    .map_err(|_| FsCodecError::OutOfBounds)?;
+                ancestors.push(tail_reference);
+                let mut level_meta = tail_meta;
+                for level in 1..required {
+                    let reference = level_meta
+                        .ancestors
+                        .get(level - 1)
+                        .copied()
+                        .ok_or(FsStructuralCommitError::InvalidChild)?;
+                    ancestors.push(reference);
+                    if level + 1 < required {
+                        level_meta = self
+                            .batch_data_node_meta(batch, staged_metas, reference)
+                            .await?;
+                    }
+                }
+                (chunk_index, total_len, ancestors)
+            }
+        };
+        let decoded = FsDataNodeV1 {
+            chunk_index,
+            total_len,
+            ancestors,
+            bytes: bytes.to_vec(),
+        };
+        let payload = encode_fs_data_node_v1(&decoded)?;
+        let meta = FsDataNodeMeta::from_node(&decoded);
+        drop(decoded);
+        let (object_id, commit_generation) = self
+            .stage_blob_in_batch(batch, FS_DATA_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
+            .await?;
+        let reference = TypedObjectReference {
+            object_id,
+            commit_generation,
+            object_kind: FS_DATA_V1_KIND,
+        };
+        staged_metas.insert(object_id, meta.clone());
+        Ok((reference, meta))
+    }
+
+    /// Resolve a data node's structural metadata while a staged batch holds
+    /// the store's state: batch-staged nodes come from the in-memory table,
+    /// committed nodes from a prefix read under the batch's planning view.
+    async fn batch_data_node_meta(
+        &mut self,
+        batch: &mut crate::cas::StagedBlobBatch,
+        staged_metas: &alloc::collections::BTreeMap<u128, FsDataNodeMeta>,
+        reference: TypedObjectReference,
+    ) -> Result<FsDataNodeMeta, FsStructuralCommitError<D::Error>> {
+        if let Some(meta) = staged_metas.get(&reference.object_id) {
+            return Ok(meta.clone());
+        }
+        let restored = batch.install_planning_state(self);
+        let recovered = self.recover_fs_data_reference(reference).await;
+        crate::cas::StagedBlobBatch::withdraw_planning_state(self, restored);
+        let recovered = recovered.map_err(|error| match error {
+            FsRootPublishError::Store(error) => FsStructuralCommitError::Store(error),
+            FsRootPublishError::Codec(error) => FsStructuralCommitError::Codec(error),
+            _ => FsStructuralCommitError::InvalidChild,
+        })?;
+        let FsPersistentDataLayout::Stream(meta) = recovered.layout else {
+            return Err(FsStructuralCommitError::InvalidChild);
+        };
+        Ok(meta)
+    }
+
+    /// Fused transaction commit for the trusted maintenance path: stage every
+    /// new B+tree node of both trees plus the namespace root object into one
+    /// staged batch and publish them under a single metadata segment and
+    /// checkpoint. Parents reference batch-staged children through
+    /// position-predicted object identities, and unchanged nodes are reused
+    /// by their committed identity exactly like the sequential COW commit.
+    /// Any failure poisons the store like an interrupted staged publication:
+    /// nothing durable references the staged scratch, and the next mount
+    /// observes the predecessor checkpoint — strictly stronger atomicity than
+    /// the sequential path, which can leave committed-but-unreferenced nodes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_fs_transaction_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_entries: &[FsNodeEntryInput<'_>],
+        dirent_entries: &[FsNodeEntryInput<'_>],
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        // The lease proves maintenance authority for this trusted-service
+        // write path, exactly like the staged chunk batch.
+        let lease = self
+            .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
+            .ok_or(FsStructuralCommitError::InvalidChild)?;
+        drop(lease);
+        // Recover the previous trees and resolve every committed reference
+        // while the store is still mounted; staging poisons it until
+        // publication.
+        let map_recover = |error: FsRootPublishError<D::Error>| match error {
+            FsRootPublishError::Store(error) => FsStructuralCommitError::Store(error),
+            FsRootPublishError::Codec(error) => FsStructuralCommitError::Codec(error),
+            _ => FsStructuralCommitError::InvalidChild,
+        };
+        let previous_identity = previous
+            .map(|root| {
+                root._object
+                    .backend_handle()
+                    .authority_key()
+                    .map(|key| (key.object_id(), key.commit_generation()))
+                    .map_err(|_| FsStructuralCommitError::InvalidChild)
+            })
+            .transpose()?;
+        let cached_trees = match (previous_identity, self.fs_tree_cache.take()) {
+            (Some((object_id, commit_generation)), Some(cache))
+                if cache.root_object_id == object_id
+                    && cache.root_commit_generation == commit_generation =>
+            {
+                Some(cache)
+            }
+            _ => None,
+        };
+        let (old_inode_nodes, old_dirent_nodes) = match cached_trees {
+            Some(cache) => (cache.inode_nodes, cache.dirent_nodes),
+            None => {
+                let inode = match previous {
+                    Some(root) => self
+                        .recover_fs_nodes(root, FsTreeKind::Inode)
+                        .await
+                        .map_err(map_recover)?,
+                    None => Vec::new(),
+                };
+                let dirent = match previous {
+                    Some(root) => self
+                        .recover_fs_nodes(root, FsTreeKind::Dirent)
+                        .await
+                        .map_err(map_recover)?,
+                    None => Vec::new(),
+                };
+                (inode, dirent)
+            }
+        };
+        let inode_leaves =
+            self.resolve_fs_leaves(FsTreeKind::Inode, inode_entries, &old_inode_nodes)?;
+        let dirent_leaves =
+            self.resolve_fs_leaves(FsTreeKind::Dirent, dirent_entries, &old_dirent_nodes)?;
+        // Both trees plan into one node list; reuse decisions depend only on
+        // committed references, never on the ids the batch will predict, so
+        // the plan is exact before any staging begins.
+        let mut plan: Vec<PlannedFsNode> = Vec::new();
+        let inode_root_slot =
+            plan_fs_cow_tree(FsTreeKind::Inode, inode_leaves, &old_inode_nodes, &mut plan)?;
+        let dirent_root_slot =
+            plan_fs_cow_tree(FsTreeKind::Dirent, dirent_leaves, &old_dirent_nodes, &mut plan)?;
+        // Ensure capacity before staging anything: nothing is consumed while
+        // the store stays mounted, so a shortfall may collect garbage and
+        // re-check like the sequential maintenance commit did per node.
+        // Every node payload is bounded by `FS_OBJECT_MAX_LEN`, so each
+        // staged entry takes one scratch segment; the root and the batch's
+        // metadata segment complete the appetite.
+        let staged_nodes = plan
+            .iter()
+            .filter(|node| matches!(node, PlannedFsNode::Staged { .. }))
+            .count() as u64;
+        let needed = staged_nodes.checked_add(2).ok_or(StoreError::Corrupt)?;
+        let maximum_cycles = self.info()?.admitted_segments;
+        let mut cycles = 0_u64;
+        loop {
+            let state = self.require_current_generation()?;
+            let floor = u64::from(state.cleaner_reserve_segments)
+                .saturating_add(u64::from(crate::store::ROOT_POLICY_HEADROOM_SEGMENTS));
+            let free = state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .free;
+            if free >= needed.saturating_add(floor) {
+                break;
+            }
+            if cycles == maximum_cycles {
+                return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                    StoreError::Capacity(crate::CapacityClass::Payload),
+                )));
+            }
+            self.collect_garbage().await?;
+            cycles += 1;
+        }
+        let mut batch = self.begin_staged_batch()?;
+        let mut resolved: Vec<Option<TypedObjectReference>> = Vec::new();
+        if resolved.try_reserve_exact(plan.len()).is_err() {
+            return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                StoreError::MemoryLimit,
+            )));
+        }
+        resolved.resize(plan.len(), None);
+        let mut staged_decoded: Vec<Option<FsBtreeNodeV1>> = Vec::new();
+        if staged_decoded.try_reserve_exact(plan.len()).is_err() {
+            return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                StoreError::MemoryLimit,
+            )));
+        }
+        staged_decoded.resize(plan.len(), None);
+        let mut staging: Result<(), FsStructuralCommitError<D::Error>> = Ok(());
+        'stage: for (slot, node) in plan.iter().enumerate() {
+            match node {
+                PlannedFsNode::Reused(reference) => resolved[slot] = Some(*reference),
+                PlannedFsNode::Staged {
+                    tree,
+                    level,
+                    entries,
+                } => {
+                    let mut encoded_entries = Vec::new();
+                    if encoded_entries.try_reserve_exact(entries.len()).is_err() {
+                        staging = Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                            StoreError::MemoryLimit,
+                        )));
+                        break 'stage;
+                    }
+                    for entry in entries {
+                        let reference = match entry.reference {
+                            None => None,
+                            Some(PlannedFsRef::Known(reference)) => Some(reference),
+                            Some(PlannedFsRef::Node(child_slot)) => {
+                                match resolved.get(child_slot).copied().flatten() {
+                                    Some(reference) => Some(reference),
+                                    None => {
+                                        staging = Err(FsStructuralCommitError::InvalidChild);
+                                        break 'stage;
+                                    }
+                                }
+                            }
+                        };
+                        encoded_entries.push(FsBtreeEntryV1 {
+                            key: entry.key.clone(),
+                            value: entry.value.clone(),
+                            reference,
+                        });
+                    }
+                    let decoded_node = FsBtreeNodeV1 {
+                        tree: *tree,
+                        level: *level,
+                        commit_generation: namespace_generation,
+                        entries: encoded_entries,
+                    };
+                    let payload = match encode_fs_btree_node_v1(&decoded_node) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            staging = Err(error.into());
+                            break 'stage;
+                        }
+                    };
+                    staged_decoded[slot] = Some(decoded_node);
+                    match self
+                        .stage_blob_in_batch(
+                            &mut batch,
+                            FS_BTREE_NODE_V1_KIND,
+                            REFERENCE_CODEC_FS_V1,
+                            &payload,
+                        )
+                        .await
+                    {
+                        Ok((object_id, commit_generation)) => {
+                            resolved[slot] = Some(TypedObjectReference {
+                                object_id,
+                                commit_generation,
+                                object_kind: FS_BTREE_NODE_V1_KIND,
+                            });
+                        }
+                        Err(error) => {
+                            staging = Err(error.into());
+                            break 'stage;
+                        }
+                    }
+                }
+            }
+        }
+        staging?;
+        let inode_tree = resolved
+            .get(inode_root_slot)
+            .copied()
+            .flatten()
+            .ok_or(FsStructuralCommitError::InvalidChild)?;
+        let dirent_tree = resolved
+            .get(dirent_root_slot)
+            .copied()
+            .flatten()
+            .ok_or(FsStructuralCommitError::InvalidChild)?;
+        let payload = encode_fs_root_v1(&FsRootV1 {
+            namespace_uuid,
+            commit_generation: namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_tree,
+            dirent_tree,
+        })?;
+        let (root_id, root_generation) = self
+            .stage_blob_in_batch(&mut batch, FS_ROOT_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
+            .await?;
+        let root_index = batch.staged_len() - 1;
+        let published = self.publish_staged_batch(batch).await?;
+        let object = published
+            .into_iter()
+            .nth(root_index)
+            .ok_or(StoreError::Corrupt)?;
+        // The published identity must equal the prediction the staged root
+        // payload's readers will resolve; a mismatch means the batch's
+        // position accounting broke.
+        let key = object
+            .backend_handle()
+            .authority_key()
+            .map_err(|_| StoreError::Corrupt)?;
+        if key.object_id() != root_id || key.commit_generation() != root_generation {
+            return Err(StoreError::Corrupt.into());
+        }
+        // Retain the successor trees so the next transaction against this
+        // root skips re-reading them. Best effort: any inconsistency simply
+        // leaves the cache empty and the next commit reads from media.
+        self.fs_tree_cache = None;
+        if plan.len() <= FS_TREE_CACHE_MAX_NODES {
+            let mut inode_nodes = Vec::new();
+            let mut dirent_nodes = Vec::new();
+            let mut complete = inode_nodes.try_reserve_exact(plan.len()).is_ok()
+                && dirent_nodes.try_reserve_exact(plan.len()).is_ok();
+            if complete {
+                if let Some(cas) = self
+                    .require_current_generation()
+                    .ok()
+                    .and_then(|state| state.cas.clone())
+                {
+                    'cache: for (slot, node) in plan.iter().enumerate() {
+                        let (tree, decoded, reference) = match node {
+                            PlannedFsNode::Reused(reference) => {
+                                match old_inode_nodes
+                                    .iter()
+                                    .chain(old_dirent_nodes.iter())
+                                    .find(|old| {
+                                        old.mapping.object_id == reference.object_id
+                                            && old.mapping.commit_generation
+                                                == reference.commit_generation
+                                    }) {
+                                    Some(old) => {
+                                        (old.decoded.tree, old.decoded.clone(), *reference)
+                                    }
+                                    None => {
+                                        complete = false;
+                                        break 'cache;
+                                    }
+                                }
+                            }
+                            PlannedFsNode::Staged { tree, .. } => {
+                                match (
+                                    staged_decoded.get(slot).cloned().flatten(),
+                                    resolved.get(slot).copied().flatten(),
+                                ) {
+                                    (Some(decoded), Some(reference)) => {
+                                        (*tree, decoded, reference)
+                                    }
+                                    _ => {
+                                        complete = false;
+                                        break 'cache;
+                                    }
+                                }
+                            }
+                        };
+                        let mapping = cas
+                            .objects
+                            .binary_search_by_key(&reference.object_id, |mapping| {
+                                mapping.object_id
+                            })
+                            .ok()
+                            .map(|index| cas.objects[index])
+                            .filter(|mapping| {
+                                mapping.commit_generation == reference.commit_generation
+                            });
+                        let Some(mapping) = mapping else {
+                            complete = false;
+                            break 'cache;
+                        };
+                        match tree {
+                            FsTreeKind::Inode => {
+                                inode_nodes.push(RecoverableFsNode { decoded, mapping })
+                            }
+                            FsTreeKind::Dirent => {
+                                dirent_nodes.push(RecoverableFsNode { decoded, mapping })
+                            }
+                        }
+                    }
+                } else {
+                    complete = false;
+                }
+            }
+            if complete {
+                self.fs_tree_cache = Some(FsTreeCache {
+                    root_object_id: key.object_id(),
+                    root_commit_generation: key.commit_generation(),
+                    inode_nodes,
+                    dirent_nodes,
+                });
+            }
+        }
+        Ok(object)
+    }
+
+    /// Resolve one tree's leaf entries against committed children and, for
+    /// the inode tree, the previous root's unchanged data edges — the same
+    /// resolution the sequential COW commit applies.
+    fn resolve_fs_leaves(
+        &self,
+        tree: FsTreeKind,
+        entries: &[FsNodeEntryInput<'_>],
+        old_nodes: &[RecoverableFsNode],
+    ) -> Result<Vec<FsBtreeEntryV1>, FsStructuralCommitError<D::Error>> {
+        let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(entries.len())
+            .map_err(|_| FsCodecError::OutOfBounds)?;
+        for input in entries {
+            if input.child.is_some() && input.data.is_some() {
+                return Err(FsStructuralCommitError::InvalidChild);
+            }
+            let mut reference = match (input.child, input.data) {
+                (Some(child), None) => Some(self.fs_reference_for(child)?),
+                (None, Some(data)) => Some(self.fs_reference_for(&data.object)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!(),
+            };
+            if reference.is_none() && tree == FsTreeKind::Inode {
+                reference = old_nodes
+                    .iter()
+                    .filter(|node| node.decoded.level == 0)
+                    .flat_map(|node| &node.decoded.entries)
+                    .find(|entry| entry.key == input.key && entry.value == input.value)
+                    .and_then(|entry| entry.reference);
+            }
+            leaves.push(FsBtreeEntryV1 {
+                key: input.key.to_vec(),
+                value: input.value.to_vec(),
+                reference,
+            });
+        }
+        Ok(leaves)
     }
 
     pub async fn commit_fs_btree_node(
@@ -1178,17 +1987,19 @@ impl<D: PageDevice> SegmentStore<D> {
                         .ok_or(FsRootPublishError::InvalidRoot)?;
                     if next_node.chunk_index != expected_index
                         || next_node.total_len >= node.total_len
-                        || next_node.total_len + node.bytes.len() as u64 > node.total_len
+                        || next_node.total_len + node.bytes_len as u64 > node.total_len
                     {
                         return Err(FsRootPublishError::InvalidRoot);
                     }
                     current = next;
                     current_index = expected_index;
                 }
-                let FsPersistentDataLayout::Stream(node) = current.layout else {
+                let FsPersistentDataLayout::Stream(node) = &current.layout else {
                     return Err(FsRootPublishError::InvalidRoot);
                 };
-                Ok(Some(node.bytes))
+                Ok(Some(
+                    self.read_fs_data_node_content(&current.object, node).await?,
+                ))
             }
         }
     }
@@ -1245,7 +2056,7 @@ mod tests {
         media: StdArc<Mutex<TestMedia>>,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum FaultAction {
         NotSubmitted,
         AmbiguousNone,
@@ -1483,6 +2294,390 @@ mod tests {
             block_on(store.read_fs_data_chunk(&tail, tail.chunk_count())).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn multi_page_data_chunks_commit_and_cold_recover() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let pattern = |index: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|offset| (index * 31 + offset * 7) as u8)
+                .collect()
+        };
+        // Mixed chunk sizes in one stream: historical 4 KiB nodes, multi-MiB
+        // nodes, and a short tail all chain and read back.
+        let sizes = [4096_usize, 1024 * 1024, 2 * 1024 * 1024, 4096, 700];
+        let mut tail = None;
+        for (index, size) in sizes.iter().enumerate() {
+            let bytes = pattern(index, *size);
+            let next =
+                block_on(store.commit_fs_data_chunk(tail.as_ref(), &bytes)).unwrap();
+            assert_eq!(next.chunk_count(), index as u64 + 1);
+            tail = Some(next);
+        }
+        let tail = tail.unwrap();
+        let total: usize = sizes.iter().sum();
+        assert_eq!(tail.exact_len(), total as u64);
+        for (index, size) in sizes.iter().enumerate() {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index as u64)).unwrap(),
+                Some(pattern(index, *size)),
+                "chunk {index} readback",
+            );
+        }
+        drop(store);
+
+        // Cold mount must recover the same stream through prefix-only metadata
+        // reads. Rebuild the tail handle from a freshly recovered store by
+        // committing one more chunk against a re-recovered reference chain.
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let extended = block_on(cold.commit_fs_data_chunk(Some(&tail), &pattern(9, 4096))).unwrap();
+        assert_eq!(extended.chunk_count(), sizes.len() as u64 + 1);
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&extended, 2)).unwrap(),
+            Some(pattern(2, 2 * 1024 * 1024))
+        );
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&extended, sizes.len() as u64)).unwrap(),
+            Some(pattern(9, 4096))
+        );
+    }
+
+    #[test]
+    fn fused_transaction_publishes_both_trees_and_root_under_one_checkpoint() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let maintenance = store.mint_maintenance_root().unwrap();
+        const NAMESPACE: u128 = 0x4655_5345_442d_5458;
+        let inode_inputs = [FsNodeEntryInput {
+            key: b"inode-1",
+            value: b"meta-1",
+            child: None,
+            data: None,
+        }];
+        let dirent_inputs = [FsNodeEntryInput {
+            key: b"dirent-1",
+            value: b"target-1",
+            child: None,
+            data: None,
+        }];
+        let before = store.info().unwrap();
+        let root = block_on(store.commit_fs_transaction_for_maintenance(
+            &maintenance,
+            None,
+            NAMESPACE,
+            1,
+            2,
+            1,
+            &inode_inputs,
+            &dirent_inputs,
+        ))
+        .unwrap();
+        let after = store.info().unwrap();
+        assert_eq!(
+            after.generation,
+            before.generation + 1,
+            "two leaves and the namespace root must ride one checkpoint"
+        );
+        assert_eq!(after.object_count, before.object_count + 3);
+        assert_eq!(root.object_kind(), FS_ROOT_V1_KIND);
+        // The staged root must resolve both staged trees on the published
+        // successor exactly like sequentially committed objects.
+        let _ = &maintenance;
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+        let recovered = block_on(store.recover_fs_root(NAMESPACE)).unwrap().unwrap();
+        assert_eq!(recovered.generation(), 1);
+        assert_eq!(recovered.next_file_id(), 2);
+    }
+
+    #[test]
+    fn deferred_readback_profile_commits_batches_and_cold_recovers_verified() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        store.set_deferred_commit_readback(true);
+        let maintenance = store.mint_maintenance_root().unwrap();
+        let pattern = |index: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|offset| (index * 89 + offset * 5) as u8)
+                .collect()
+        };
+        let chunks: Vec<Vec<u8>> = (0..3).map(|index| pattern(index, 4096)).collect();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            None,
+            &chunks,
+        ))
+        .unwrap();
+        // Reads still verify the content's Merkle identity end to end.
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index as u64))
+                    .unwrap()
+                    .unwrap(),
+                *chunk,
+            );
+        }
+        drop(store);
+        // A cold mount of a deferred-profile store recovers and reads the
+        // same verified stream.
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let extended =
+            block_on(cold.commit_fs_data_chunk(Some(&tail), &pattern(9, 4096))).unwrap();
+        assert_eq!(extended.chunk_count(), chunks.len() as u64 + 1);
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&extended, 1)).unwrap(),
+            Some(pattern(1, 4096))
+        );
+    }
+
+    #[test]
+    fn staged_chunk_batch_publishes_one_checkpoint_per_batch() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let maintenance = store.mint_maintenance_root().unwrap();
+        let pattern = |index: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|offset| (index * 131 + offset * 3) as u8)
+                .collect()
+        };
+        let sizes = [4096_usize, 3 * 1024 * 1024, 1024 * 1024, 4096, 700];
+        let chunks: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| pattern(index, *size))
+            .collect();
+        let before = store.info().unwrap();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            None,
+            &chunks,
+        ))
+        .unwrap();
+        let after = store.info().unwrap();
+        // The whole batch rode exactly one checkpoint and bound one object
+        // per chunk.
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.object_count, before.object_count + sizes.len() as u32);
+        assert_eq!(tail.chunk_count(), sizes.len() as u64);
+        assert_eq!(tail.exact_len(), sizes.iter().sum::<usize>() as u64);
+        for (index, size) in sizes.iter().enumerate() {
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index as u64)).unwrap(),
+                Some(pattern(index, *size)),
+                "chunk {index} readback",
+            );
+        }
+
+        // A second batch appends across the published boundary: its skip
+        // ancestors resolve committed nodes through prefix reads.
+        let more: Vec<Vec<u8>> = (5..9).map(|index| pattern(index, 4096)).collect();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            Some(&tail),
+            &more,
+        ))
+        .unwrap();
+        assert_eq!(store.info().unwrap().generation, before.generation + 2);
+        assert_eq!(tail.chunk_count(), 9);
+        for index in [0_u64, 1, 4, 5, 8] {
+            let expected = pattern(
+                index as usize,
+                *sizes.get(index as usize).unwrap_or(&4096),
+            );
+            assert_eq!(
+                block_on(store.read_fs_data_chunk(&tail, index)).unwrap(),
+                Some(expected),
+                "post-append chunk {index} readback",
+            );
+        }
+        drop(store);
+
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        // Continue the stream across a cold boot with one more batch; the
+        // fresh tail re-pins under the cold store, and reads reach both the
+        // pre-boot multi-MiB chunk and the newest appends.
+        let maintenance = cold.mint_maintenance_root().unwrap();
+        let tail = block_on(cold.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            Some(&tail),
+            &[pattern(9, 4096)],
+        ))
+        .unwrap();
+        assert_eq!(tail.chunk_count(), 10);
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&tail, 1)).unwrap(),
+            Some(pattern(1, 3 * 1024 * 1024))
+        );
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&tail, 9)).unwrap(),
+            Some(pattern(9, 4096))
+        );
+    }
+
+    #[test]
+    fn staged_batch_tolerates_duplicate_content() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device);
+        // Two identical payloads staged in one batch must publish without
+        // corrupting the blob table, and both objects must read back.
+        let payload = alloc::vec![0x5a_u8; 8192];
+        let mut batch = store.begin_staged_batch().unwrap();
+        for _ in 0..2 {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                &payload,
+            ))
+            .unwrap();
+        }
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        assert_eq!(published.len(), 2);
+        for object in &published {
+            assert_eq!(object.exact_len(), payload.len() as u64);
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..4096]);
+        }
+
+        // Content already committed deduplicates without new scratch.
+        let before = store.info().unwrap();
+        let mut batch = store.begin_staged_batch().unwrap();
+        block_on(store.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &payload,
+        ))
+        .unwrap();
+        assert_eq!(batch.staged_segment_count(), 0);
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        assert_eq!(published.len(), 1);
+        let after = store.info().unwrap();
+        assert_eq!(after.generation, before.generation + 1);
+        // Only the metadata segment was consumed.
+        assert_eq!(after.allocated_segments, before.allocated_segments + 1);
+    }
+
+    #[test]
+    fn gc_after_batched_staging_preserves_the_id_high_water() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        let maintenance = store.mint_maintenance_root().unwrap();
+        // Destructive collection needs a synchronized root policy; publish an
+        // empty namespace root first.
+        let root = empty_root(&mut store, 1, 2);
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+        // A batch binds several object ids under one checkpoint, pushing the
+        // id high-water past the generation floor.
+        let chunks: Vec<Vec<u8>> = (0..6_u8).map(|index| alloc::vec![index + 1; 40960]).collect();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(
+            &maintenance,
+            None,
+            &chunks,
+        ))
+        .unwrap();
+        let mut batch = store.begin_staged_batch().unwrap();
+        let (first_id, _) = batch.predicted_object(0).unwrap();
+        drop(batch);
+        block_on(store.mount()).unwrap();
+        assert!(
+            first_id > u128::from(store.info().unwrap().generation),
+            "fixture must exercise ids beyond the generation floor",
+        );
+
+        // Collection must proceed (not fail closed) and keep the media
+        // high-water durable across destructive rounds and a cold mount.
+        for _ in 0..3 {
+            block_on(store.collect_garbage()).unwrap();
+        }
+        drop(store);
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let mut batch = cold.begin_staged_batch().unwrap();
+        let (next_id, _) = batch.predicted_object(0).unwrap();
+        drop(batch);
+        block_on(cold.mount()).unwrap();
+        assert!(
+            next_id >= first_id,
+            "GC or remount reissued object ids ({next_id} < {first_id})",
+        );
+        // The staged stream still reads after collection: the pinned tail
+        // kept the whole ancestor chain live through destructive rounds.
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&tail, 4)).unwrap(),
+            Some(alloc::vec![5_u8; 40960])
+        );
+    }
+
+    #[test]
+    fn every_batch_publication_mutation_recovers_all_or_nothing() {
+        let chunk_sizes = [4096_usize, 40960, 4096];
+        let chunks: Vec<Vec<u8>> = chunk_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| alloc::vec![index as u8 + 1; *size])
+            .collect();
+        let run = |device: &TestDevice| -> (SegmentStore<TestDevice>, StoreMaintenance) {
+            let store = format(device.clone());
+            let maintenance = store.mint_maintenance_root().unwrap();
+            (store, maintenance)
+        };
+
+        let probe_device = TestDevice::blank(64);
+        let (mut probe, probe_maintenance) = run(&probe_device);
+        let baseline = probe.info().unwrap();
+        probe_device.reset_mutations();
+        block_on(probe.stage_fs_data_chunks_for_maintenance(&probe_maintenance, None, &chunks))
+            .unwrap();
+        let complete = probe.info().unwrap();
+        let mutation_count = probe_device.mutation_count();
+        assert!(mutation_count > 0);
+
+        for boundary in 0..mutation_count {
+            for action in [
+                FaultAction::NotSubmitted,
+                FaultAction::AmbiguousNone,
+                FaultAction::AmbiguousDurable,
+            ] {
+                let device = TestDevice::blank(64);
+                let (mut store, maintenance) = run(&device);
+                device.arm(boundary, action);
+                assert!(block_on(
+                    store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)
+                )
+                .is_err());
+                device.power_cycle();
+
+                let mut cold =
+                    SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime());
+                block_on(cold.mount()).unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: cold mount failed: {error:?}")
+                });
+                let info = cold.info().unwrap();
+                // Atomicity: the batch is entirely present or entirely absent.
+                assert!(
+                    info.object_count == baseline.object_count
+                        || info.object_count == complete.object_count,
+                    "boundary {boundary} {action:?} recovered a partial batch",
+                );
+                // The recovered store must accept the same batch again.
+                let maintenance = cold.mint_maintenance_root().unwrap();
+                let tail = block_on(
+                    cold.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: re-stage failed: {error:?}")
+                });
+                assert_eq!(
+                    block_on(cold.read_fs_data_chunk(&tail, 1)).unwrap(),
+                    Some(chunks[1].clone())
+                );
+            }
+        }
     }
 
     fn root_switch_fixture() -> (

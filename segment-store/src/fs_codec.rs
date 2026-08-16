@@ -15,7 +15,10 @@ pub const FS_BTREE_ENTRY_HEADER_LEN: usize = 0x30;
 pub const FS_DATA_HEADER_LEN: usize = 0x40;
 pub const FS_DATA_REFERENCE_LEN: usize = 0x28;
 pub const FS_DATA_MAX_ANCESTORS: usize = 64;
-pub const FS_DATA_CHUNK_MAX_LEN: usize = 4096;
+/// Format envelope for one data node's content bytes. Large sequential file
+/// content stages multi-page chunks so one CAS commit carries megabytes, while
+/// the historical 4 KiB nodes remain valid: this is a ceiling, not a stride.
+pub const FS_DATA_CHUNK_MAX_LEN: usize = 4 * 1024 * 1024;
 const FS_ROOT_MAGIC: &[u8; 8] = b"VIBEFSR1";
 const FS_NODE_MAGIC: &[u8; 8] = b"VIBEFSN1";
 const FS_DATA_MAGIC: &[u8; 8] = b"VIBEFSD1";
@@ -85,6 +88,116 @@ pub struct FsDataNodeV1 {
     pub total_len: u64,
     pub ancestors: Vec<TypedObjectReference>,
     pub bytes: Vec<u8>,
+}
+
+/// The structural half of one data node: everything except the content bytes.
+/// Skip-list walks and stream-tail bookkeeping need only this, so holding or
+/// recovering a node's metadata must not require materializing a multi-MiB
+/// chunk in memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FsDataNodeMeta {
+    pub chunk_index: u64,
+    pub total_len: u64,
+    pub bytes_len: usize,
+    pub ancestors: Vec<TypedObjectReference>,
+}
+
+impl FsDataNodeMeta {
+    pub fn from_node(node: &FsDataNodeV1) -> Self {
+        Self {
+            chunk_index: node.chunk_index,
+            total_len: node.total_len,
+            bytes_len: node.bytes.len(),
+            ancestors: node.ancestors.clone(),
+        }
+    }
+
+    /// Encoded offset of the first content byte within the node payload.
+    pub fn bytes_offset(&self) -> usize {
+        FS_DATA_HEADER_LEN + self.ancestors.len() * FS_DATA_REFERENCE_LEN
+    }
+
+    /// Total encoded payload length of the node this metadata describes.
+    pub fn encoded_len(&self) -> usize {
+        self.bytes_offset() + self.bytes_len
+    }
+}
+
+fn validate_data_node_shape(
+    chunk_index: u64,
+    total_len: u64,
+    bytes_len: usize,
+    ancestors: &[TypedObjectReference],
+) -> Result<(), FsCodecError> {
+    let expected_ancestors = fs_data_ancestor_count(chunk_index);
+    if ancestors.len() != expected_ancestors
+        || ancestors.len() > FS_DATA_MAX_ANCESTORS
+        || bytes_len > FS_DATA_CHUNK_MAX_LEN
+        || (total_len == 0 && (chunk_index != 0 || !ancestors.is_empty() || bytes_len != 0))
+        || (total_len != 0 && bytes_len == 0)
+        || total_len < bytes_len as u64
+        || (chunk_index == 0 && total_len != bytes_len as u64)
+        || (chunk_index != 0 && total_len <= bytes_len as u64)
+    {
+        return Err(FsCodecError::InvalidField);
+    }
+    for reference in ancestors {
+        validate_reference(*reference, Some(FS_DATA_V1_KIND))?;
+    }
+    Ok(())
+}
+
+/// Decode a data node's header and ancestor table from an encoded prefix.
+/// `input` must cover at least the header and ancestor references; any content
+/// bytes present past that prefix are ignored. Every header field is validated
+/// with exactly the canonical-encoding rules, so a prefix accepted here names
+/// the same structure a full [`decode_fs_data_node_v1`] would produce.
+pub fn decode_fs_data_node_v1_prefix(input: &[u8]) -> Result<FsDataNodeMeta, FsCodecError> {
+    if input.len() < FS_DATA_HEADER_LEN {
+        return Err(FsCodecError::InvalidLength);
+    }
+    if &input[..8] != FS_DATA_MAGIC {
+        return Err(FsCodecError::InvalidMagic);
+    }
+    if get_u16(input, 0x08) != FS_CODEC_VERSION
+        || get_u16(input, 0x0a) as usize != FS_DATA_HEADER_LEN
+        || !zero(&input[0x26..FS_DATA_HEADER_LEN])
+    {
+        return Err(FsCodecError::InvalidField);
+    }
+    let chunk_index = get_u64(input, 0x10);
+    let total_len = get_u64(input, 0x18);
+    let bytes_len = get_u32(input, 0x20) as usize;
+    let ancestor_count = get_u16(input, 0x24) as usize;
+    let references_len = ancestor_count
+        .checked_mul(FS_DATA_REFERENCE_LEN)
+        .ok_or(FsCodecError::ArithmeticOverflow)?;
+    let bytes_offset = FS_DATA_HEADER_LEN
+        .checked_add(references_len)
+        .ok_or(FsCodecError::ArithmeticOverflow)?;
+    if get_u32(input, 0x0c) as usize != bytes_offset.checked_add(bytes_len).ok_or(FsCodecError::ArithmeticOverflow)? {
+        return Err(FsCodecError::InvalidLength);
+    }
+    if input.len() < bytes_offset {
+        return Err(FsCodecError::InvalidLength);
+    }
+    let mut ancestors = Vec::new();
+    ancestors
+        .try_reserve_exact(ancestor_count)
+        .map_err(|_| FsCodecError::OutOfBounds)?;
+    for index in 0..ancestor_count {
+        ancestors.push(decode_reference(
+            input,
+            FS_DATA_HEADER_LEN + index * FS_DATA_REFERENCE_LEN,
+        )?);
+    }
+    validate_data_node_shape(chunk_index, total_len, bytes_len, &ancestors)?;
+    Ok(FsDataNodeMeta {
+        chunk_index,
+        total_len,
+        bytes_len,
+        ancestors,
+    })
 }
 
 fn put_u16(out: &mut [u8], offset: usize, value: u16) {
@@ -214,22 +327,12 @@ fn fs_data_ancestor_count(chunk_index: u64) -> usize {
 }
 
 pub fn encode_fs_data_node_v1(node: &FsDataNodeV1) -> Result<Vec<u8>, FsCodecError> {
-    let expected_ancestors = fs_data_ancestor_count(node.chunk_index);
-    if node.ancestors.len() != expected_ancestors
-        || node.ancestors.len() > FS_DATA_MAX_ANCESTORS
-        || node.bytes.len() > FS_DATA_CHUNK_MAX_LEN
-        || (node.total_len == 0
-            && (node.chunk_index != 0 || !node.ancestors.is_empty() || !node.bytes.is_empty()))
-        || (node.total_len != 0 && node.bytes.is_empty())
-        || node.total_len < node.bytes.len() as u64
-        || (node.chunk_index == 0 && node.total_len != node.bytes.len() as u64)
-        || (node.chunk_index != 0 && node.total_len <= node.bytes.len() as u64)
-    {
-        return Err(FsCodecError::InvalidField);
-    }
-    for reference in &node.ancestors {
-        validate_reference(*reference, Some(FS_DATA_V1_KIND))?;
-    }
+    validate_data_node_shape(
+        node.chunk_index,
+        node.total_len,
+        node.bytes.len(),
+        &node.ancestors,
+    )?;
     let length = FS_DATA_HEADER_LEN
         .checked_add(
             node.ancestors
@@ -564,5 +667,74 @@ mod tests {
         let mut corrupt = encoded;
         corrupt[0x26] = 1;
         assert!(decode_fs_data_node_v1(&corrupt).is_err());
+    }
+
+    #[test]
+    fn data_node_prefix_decode_matches_full_decode() {
+        let node = FsDataNodeV1 {
+            chunk_index: 5,
+            total_len: 40,
+            ancestors: vec![
+                reference(20, FS_DATA_V1_KIND),
+                reference(18, FS_DATA_V1_KIND),
+                reference(14, FS_DATA_V1_KIND),
+            ],
+            bytes: vec![7; 8],
+        };
+        let encoded = encode_fs_data_node_v1(&node).unwrap();
+        let expected = FsDataNodeMeta::from_node(&node);
+        // Full payload, exact prefix, and prefix-plus-partial-data all agree.
+        assert_eq!(decode_fs_data_node_v1_prefix(&encoded).unwrap(), expected);
+        let prefix_len = expected.bytes_offset();
+        assert_eq!(
+            decode_fs_data_node_v1_prefix(&encoded[..prefix_len]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            decode_fs_data_node_v1_prefix(&encoded[..prefix_len + 3]).unwrap(),
+            expected
+        );
+        assert_eq!(expected.encoded_len(), encoded.len());
+
+        // A prefix short of the ancestor table fails closed.
+        assert!(decode_fs_data_node_v1_prefix(&encoded[..prefix_len - 1]).is_err());
+        // A tampered length field fails closed.
+        let mut bad_len = encoded.clone();
+        bad_len[0x0c] ^= 1;
+        assert!(decode_fs_data_node_v1_prefix(&bad_len).is_err());
+        // A tampered ancestor count fails closed.
+        let mut bad_count = encoded.clone();
+        bad_count[0x24] = 2;
+        assert!(decode_fs_data_node_v1_prefix(&bad_count).is_err());
+        // A wrong-kind ancestor reference fails closed.
+        let mut bad_kind = encoded;
+        put_u32(&mut bad_kind, FS_DATA_HEADER_LEN + 0x18, FS_BTREE_NODE_V1_KIND);
+        assert!(decode_fs_data_node_v1_prefix(&bad_kind).is_err());
+    }
+
+    #[test]
+    fn data_node_format_admits_multi_page_chunks() {
+        let node = FsDataNodeV1 {
+            chunk_index: 0,
+            total_len: (2 * 1024 * 1024) as u64,
+            ancestors: Vec::new(),
+            bytes: vec![0xa5; 2 * 1024 * 1024],
+        };
+        let encoded = encode_fs_data_node_v1(&node).unwrap();
+        assert_eq!(decode_fs_data_node_v1(&encoded).unwrap(), node);
+        assert_eq!(
+            decode_fs_data_node_v1_prefix(&encoded[..FS_DATA_HEADER_LEN]).unwrap(),
+            FsDataNodeMeta::from_node(&node)
+        );
+        let oversize = FsDataNodeV1 {
+            chunk_index: 0,
+            total_len: (FS_DATA_CHUNK_MAX_LEN + 1) as u64,
+            ancestors: Vec::new(),
+            bytes: vec![0; FS_DATA_CHUNK_MAX_LEN + 1],
+        };
+        assert_eq!(
+            encode_fs_data_node_v1(&oversize),
+            Err(FsCodecError::InvalidField)
+        );
     }
 }

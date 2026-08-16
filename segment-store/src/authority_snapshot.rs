@@ -179,6 +179,7 @@ impl PersistentAuthorityImport {
             return Err(AuthoritySnapshotError::OutOfBounds);
         }
         validate_principals(&principals)?;
+        let caller_preflighted = preflight.is_some();
         let recovered = match preflight {
             Some(preflight) => preflight.finish(exact_roots),
             None => preflight_recovery(sectors, store_id)
@@ -209,12 +210,24 @@ impl PersistentAuthorityImport {
         record_stream
             .try_reserve_exact(record_bytes)
             .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
-        for sector in sectors {
-            match LogRecord::decode(sector)
-                .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?
-            {
-                DecodeStatus::Valid(_) => record_stream.extend_from_slice(sector),
-                DecodeStatus::Empty | DecodeStatus::Torn => {}
+        let dense_stream = recovered.last_sequence == sectors.len() as u64;
+        if dense_stream {
+            // Valid sequences are strictly dense (1..=n), so a stream whose
+            // sector count equals its final sequence holds no empty or torn
+            // sectors: the recovery pass above already decoded every one of
+            // these exact records, and a second decode pass would only
+            // re-prove that.
+            for sector in sectors {
+                record_stream.extend_from_slice(sector);
+            }
+        } else {
+            for sector in sectors {
+                match LogRecord::decode(sector)
+                    .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?
+                {
+                    DecodeStatus::Valid(_) => record_stream.extend_from_slice(sector),
+                    DecodeStatus::Empty | DecodeStatus::Torn => {}
+                }
             }
         }
         let principals = if principals.is_empty() {
@@ -239,7 +252,10 @@ impl PersistentAuthorityImport {
             admitted_object_ids: selected_ids,
             principals,
         };
-        validate_import(&mut result)?;
+        // When the caller handed in the preflight of exactly these sectors
+        // and the stream bytes above are their verbatim copy, a second full
+        // chain recovery inside validation would only re-prove that pass.
+        validate_import(&mut result, !(caller_preflighted && dense_stream))?;
         Ok(result)
     }
 
@@ -971,23 +987,16 @@ fn system_policy_for_objects<'a>(
     Ok(policy)
 }
 
-fn validate_import(value: &mut PersistentAuthorityImport) -> Result<(), AuthoritySnapshotError> {
-    validate_record_chain(&value.record_stream)?;
+fn validate_import(
+    value: &mut PersistentAuthorityImport,
+    check_record_chain: bool,
+) -> Result<(), AuthoritySnapshotError> {
+    if check_record_chain {
+        validate_record_chain(&value.record_stream)?;
+    }
     validate_principals(&value.principals)?;
     if value.root_policy_sha256 == [0; 32] {
         return Err(AuthoritySnapshotError::InvalidField);
-    }
-    let grant_objects = admitted_object_ids(&value.recovered);
-    if !grant_objects.is_subset(&value.admitted_object_ids)
-        || !value.admitted_object_ids.iter().all(|id| {
-            value
-                .recovered
-                .objects
-                .iter()
-                .any(|object| object.object_id.get() == *id)
-        })
-    {
-        return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
     }
     value
         .recovered
@@ -1000,6 +1009,18 @@ fn validate_import(value: &mut PersistentAuthorityImport) -> Result<(), Authorit
         .any(|pair| pair[0].object_id >= pair[1].object_id)
     {
         return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
+    }
+    let grant_objects = admitted_object_ids(&value.recovered);
+    if !grant_objects.is_subset(&value.admitted_object_ids)
+        || !value.admitted_object_ids.iter().all(|id| {
+            value
+                .recovered
+                .objects
+                .binary_search_by_key(id, |object| object.object_id.get())
+                .is_ok()
+        })
+    {
+        return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
     }
     Ok(())
 }

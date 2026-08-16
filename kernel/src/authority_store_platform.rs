@@ -418,6 +418,14 @@ pub struct DurableCSpaceService {
 }
 
 static INSTALLED_DURABLE_CSPACE: SpinLock<Option<Arc<DurableCSpaceInner>>> = SpinLock::new(None);
+
+/// The saved-program artifact whose source-to-executable recompilation proof
+/// already succeeded this boot. The proof is a deterministic function of the
+/// stream-authenticated artifact bytes, so re-running the compiler on every
+/// authority append re-proves a settled fact; any identity change (a new
+/// program, or a compacted stream's fresh sequences) revalidates in full.
+static VALIDATED_PROGRAM_ARTIFACT: SpinLock<Option<program_model::ValidatedArtifact>> =
+    SpinLock::new(None);
 static NEXT_ACTIVE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl DurableCSpaceInner {
@@ -1529,6 +1537,9 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     }) {
         return Err(DurableCSpaceError::RootPolicy);
     }
+    // The shape validator reads only object identities, never content, so
+    // the space-partitioned view borrows the objects instead of duplicating
+    // every committed object's bytes on each append.
     let persistent = RecoveredStore {
         store_id: recovered.store_id,
         id_high_water: recovered.id_high_water,
@@ -1538,7 +1549,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
             .filter(|grant| grant.grant.target.space == persistent_space_id())
             .cloned()
             .collect(),
-        objects: recovered.objects.clone(),
+        objects: Vec::new(),
         slots: recovered
             .slots
             .iter()
@@ -1555,7 +1566,8 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     }) {
         return Err(DurableCSpaceError::RootPolicy);
     }
-    let shape = validate_fixed_graph_shape(&persistent_committed_grants, &persistent)?;
+    let shape =
+        validate_fixed_graph_shape(&persistent_committed_grants, &persistent, &recovered.objects)?;
     let persistent_root = roots
         .iter()
         .find(|root| root.grant.target.space == persistent_space_id());
@@ -1588,12 +1600,20 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
         last_sequence: recovered.last_sequence,
         last_crc32c: recovered.last_crc32c,
     };
-    let program = program_model::authorize_recovered_with(&program_recovered, |object| {
-        object_resolver
-            .stored_object(object)
-            .map_err(program_model::SavedProgramError::from)
-    })
+    let memo = *VALIDATED_PROGRAM_ARTIFACT.lock();
+    let (program, validated) = program_model::authorize_recovered_with_memo(
+        &program_recovered,
+        |object| {
+            object_resolver
+                .stored_object(object)
+                .map_err(program_model::SavedProgramError::from)
+        },
+        memo,
+    )
     .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    if validated.is_some() {
+        *VALIDATED_PROGRAM_ARTIFACT.lock() = validated;
+    }
     Ok(TrustedSnapshot {
         slots: persistent.slots,
         grants: persistent.grants,
@@ -1606,6 +1626,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
 fn validate_fixed_graph_shape(
     committed: &[RecoveredGrant],
     recovered: &durable::RecoveredStore,
+    objects: &[durable::RecoveredObject],
 ) -> Result<ValidatedGraphShape, DurableCSpaceError> {
     fn slot(
         slots: &[RecoveredSlot],
@@ -1695,7 +1716,7 @@ fn validate_fixed_graph_shape(
         .find(|recovered| recovered.grant.derivation_id == root.derivation_id)
         .map(|recovered| recovered.commit_sequence)
         .ok_or(DurableCSpaceError::UnexpectedGraph)?;
-    if !recovered.objects.iter().any(|object| {
+    if !objects.iter().any(|object| {
         object.object_id == root.object_id
             && object.object_kind == persistent_object_kind()
             && object.commit_sequence < root_commit_sequence

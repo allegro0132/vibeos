@@ -29,7 +29,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate as journal;
 use vibeos_durable_format as authority;
 
-use vibeos_blob_format::{BlobDescriptor, BlobError, BlobView, MerkleProof, LEAF_SIZE};
+pub use vibeos_blob_format::{encoded_len as blob_profile_encoded_len, BlobDescriptor};
+use vibeos_blob_format::{BlobError, BlobView, MerkleProof, LEAF_SIZE};
 use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::exec::{self, TaskId};
 use vibeos_core::heap::{self, AllocationDomain, OwnerId};
@@ -296,7 +297,7 @@ impl StorageV2RecoveredObject {
         Self {
             stable_object_id: object.object_id,
             object_kind: object.object_kind,
-            byte_len: object.bytes.len(),
+            byte_len: object.byte_len() as usize,
             commit_sequence: object.commit_sequence,
             token,
         }
@@ -305,7 +306,7 @@ impl StorageV2RecoveredObject {
     fn matches(&self, object: &authority::RecoveredObject) -> bool {
         self.stable_object_id == object.object_id
             && self.object_kind == object.object_kind
-            && self.byte_len == object.bytes.len()
+            && self.byte_len == object.byte_len() as usize
             && self.commit_sequence == object.commit_sequence
     }
 }
@@ -359,6 +360,21 @@ pub trait StorageV2Backend: Send + Sync {
         expected: ChainCheckpoint,
         records: &'a [[u8; journal::RECORD_SIZE]],
     ) -> StorageV2Future<'a, StorageV2AuthoritySnapshot>;
+    /// Append a successor whose new records include one external object;
+    /// `external_payload` carries that object's exact content bytes so the
+    /// backend can commit them in the same durable transaction. Backends
+    /// without external-object support refuse the payload form.
+    fn append_authority_with_payload<'a>(
+        &'a self,
+        expected: ChainCheckpoint,
+        records: &'a [[u8; journal::RECORD_SIZE]],
+        external_payload: Option<(u128, &'a [u8])>,
+    ) -> StorageV2Future<'a, StorageV2AuthoritySnapshot> {
+        match external_payload {
+            None => self.append_authority(expected, records),
+            Some(_) => Box::pin(async { Err(StoreError::ObjectTooLarge) }),
+        }
+    }
     fn read_object<'a>(&'a self, object: &'a StorageV2ObjectToken) -> StorageV2Future<'a, Vec<u8>>;
 }
 
@@ -1099,7 +1115,7 @@ impl StoredObject {
                 store_id: store_id(),
                 object_id: object.object_id,
                 object_kind: object.object_kind,
-                byte_len: object.bytes.len(),
+                byte_len: object.byte_len() as usize,
                 commit_sequence: object.commit_sequence,
                 v2_token: Some(token),
             })
@@ -1182,9 +1198,6 @@ async fn put_to_space(
     if !lease.authorizes(Rights::WRITE) {
         return Err(StoreError::PermissionDenied);
     }
-    if bytes.len() > journal::MAX_OBJECT_SIZE {
-        return Err(StoreError::ObjectTooLarge);
-    }
 
     // Snapshot the destination before either backend can await. Publication
     // must never redirect a completed transaction into a restarted authority
@@ -1192,6 +1205,14 @@ async fn put_to_space(
     let target_incarnation = target.incarnation();
     let inner = lease.with(|service| service.inner.clone());
     if let Some(backend) = selected_v2_backend(&inner)? {
+        // The logical v2 record stream admits inline objects up to the
+        // journal chunk envelope; larger objects commit by reference with
+        // their content in the V2 content-addressed store. The M4 backend
+        // additionally enforces its physical sector capacity below.
+        let external = bytes.len() > journal::MAX_OBJECT_SIZE;
+        if bytes.len() as u64 > journal::MAX_EXTERNAL_OBJECT_SIZE {
+            return Err(StoreError::ObjectTooLarge);
+        }
         // The V2 backend has its own exclusive mutable-store epoch, but that
         // epoch begins only at append time.  Keep the facade claim across
         // recovery, preview, the audited pre-write fault point, append, and
@@ -1215,20 +1236,52 @@ async fn put_to_space(
         let high_water = chain
             .append(None, journal::RecordBody::IdHighWater { exclusive_end })
             .map_err(map_encode_error)?;
-        let (transaction, _) = journal::preview_object_transaction(
-            &chain,
-            transaction_id,
-            object_id,
-            object_kind,
-            bytes,
-        )
-        .map_err(map_encode_error)?;
-        let mut records = Vec::new();
+        let declared_root = if external {
+            // The content address is computed here, declared in the record,
+            // and proved again by the backend's blob writer before anything
+            // durable references it.
+            Some(
+                vibeos_blob_format::BlobDescriptor::from_content(object_kind.get(), bytes)
+                    .map_err(|_| StoreError::ObjectTooLarge)?
+                    .root,
+            )
+        } else {
+            None
+        };
+        let mut records = match declared_root {
+            Some(root) => {
+                journal::preview_external_object_transaction(
+                    &chain,
+                    transaction_id,
+                    object_id,
+                    object_kind,
+                    bytes.len() as u64,
+                    root,
+                )
+                .map_err(map_encode_error)?
+                .0
+                .records
+            }
+            None => {
+                journal::preview_object_transaction(
+                    &chain,
+                    transaction_id,
+                    object_id,
+                    object_kind,
+                    bytes,
+                )
+                .map_err(map_encode_error)?
+                .0
+                .records
+            }
+        };
+        // Reuse the transaction's record buffer instead of duplicating the
+        // whole write set beside it: large objects carry thousands of
+        // 512-byte chunk records and the extra copy wasted client quota.
         records
-            .try_reserve_exact(1 + transaction.records.len())
+            .try_reserve_exact(1)
             .map_err(|_| StoreError::InsufficientMemory)?;
-        records.push(high_water);
-        records.extend(transaction.records);
+        records.insert(0, high_water);
 
         if let Some(target) = fault_target {
             assert_eq!(
@@ -1245,7 +1298,11 @@ async fn put_to_space(
         }
 
         let committed = backend
-            .append_authority(before.checkpoint, &records)
+            .append_authority_with_payload(
+                before.checkpoint,
+                &records,
+                declared_root.map(|_| (object_raw, bytes)),
+            )
             .await?;
         let object = committed
             .preflight
@@ -1254,7 +1311,13 @@ async fn put_to_space(
             .find(|candidate| {
                 candidate.object_id == object_id
                     && candidate.object_kind == object_kind
-                    && candidate.bytes.as_slice() == bytes
+                    && match declared_root {
+                        Some(root) => {
+                            candidate.external_root == Some(root)
+                                && candidate.byte_len() == bytes.len() as u64
+                        }
+                        None => candidate.bytes.as_slice() == bytes,
+                    }
             })
             .ok_or(StoreError::ObjectMismatch)?;
         let token = committed
@@ -1411,14 +1474,16 @@ pub async fn get_with(
 }
 
 /// Encode content into the canonical Merkle-blob profile after enforcing the
-/// current journal object's physical size limit. This preflight avoids a large
-/// doomed allocation when the durable v1 journal cannot hold the result.
+/// storage envelope. The encoded image may exceed the inline journal chunk
+/// budget: the V2 backend then commits it by reference through the external
+/// object path, while the M4 backend still enforces its physical sector
+/// capacity at publication.
 pub fn encode_blob_object(
     object_kind: journal::ObjectKind,
     bytes: &[u8],
 ) -> Result<Vec<u8>, BlobStoreError> {
     let encoded_len = vibeos_blob_format::encoded_len(bytes.len())?;
-    if encoded_len > journal::MAX_OBJECT_SIZE {
+    if encoded_len as u64 > journal::MAX_EXTERNAL_OBJECT_SIZE {
         return Err(BlobStoreError::Store(StoreError::ObjectTooLarge));
     }
     Ok(vibeos_blob_format::encode_blob(object_kind.get(), bytes)?)
@@ -1512,6 +1577,12 @@ pub async fn get_blob_chunk_with(
 
 pub const fn blob_leaf_size() -> usize {
     LEAF_SIZE
+}
+
+/// Encoded length of one canonical Merkle blob envelope for a content size.
+/// Used by callers which must admit an object before allocating its envelope.
+pub fn blob_encoded_len(content_len: usize) -> Result<usize, BlobError> {
+    vibeos_blob_format::encoded_len(content_len)
 }
 
 async fn read_committed_object(

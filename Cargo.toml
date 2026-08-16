@@ -12,3 +12,21 @@ panic = "abort"
 lto = true
 opt-level = "z"
 debug = true
+
+# The size-optimized kernel profile keeps the image small, but the storage
+# stack's software SHA-256 and codec loops are latency-critical on the
+# durable put/get path (and painfully slow under TCG emulation at -Oz).
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.digest]
+opt-level = 3
+[profile.release.package.block-buffer]
+opt-level = 3
+[profile.release.package.vibeos-segment-store]
+opt-level = 3
+[profile.release.package.vibeos-durable-format]
+opt-level = 3
+[profile.release.package.vibeos-segment-format]
+opt-level = 3
+[profile.release.package.vibeos-blob-format]
+opt-level = 3

@@ -88,7 +88,12 @@ pub(crate) fn is_storage_v2_native_empty_view(
 fn validate_storage_v2_records(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
 ) -> Result<durable::RecoveryPreflight, DurableCSpaceError> {
-    if records.is_empty() || records.len() > vibeos_object_store::STORE_LOG_SECTORS {
+    // The V2 logical stream is not constrained by the M4 journal's physical
+    // 512-sector log; its envelope is the persistent authority snapshot
+    // payload, which admits multi-MiB large objects.
+    if records.is_empty()
+        || records.len() > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS
+    {
         return Err(DurableCSpaceError::RootPolicy);
     }
     let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
@@ -125,7 +130,7 @@ pub(crate) fn storage_v2_recovery_import(
         return Err(DurableCSpaceError::RootPolicy);
     }
     let record_count = record_stream.len() / vibeos_durable_format::RECORD_SIZE;
-    if record_count > vibeos_object_store::STORE_LOG_SECTORS {
+    if record_count > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS {
         return Err(DurableCSpaceError::RootPolicy);
     }
     let mut records = Vec::new();
@@ -238,6 +243,15 @@ pub(crate) fn storage_v2_migration_import(
     let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
     let preflight = validate_storage_v2_records(records)?;
     let roots = select_storage_v2_roots(&preflight)?;
+    storage_v2_import_from_parts(records, store_id, preflight, roots)
+}
+
+fn storage_v2_import_from_parts(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    store_id: StoreId,
+    preflight: durable::RecoveryPreflight,
+    roots: Vec<RootPolicy>,
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
     let ssh_kind = durable::ObjectKind::new(SSH_CONFIG_OBJECT_KIND_RAW)
         .expect("fixed SSH configuration kind is non-zero");
     let sealed_singletons = preflight
@@ -245,15 +259,123 @@ pub(crate) fn storage_v2_migration_import(
         .iter()
         .any(|object| object.object_kind == ssh_kind)
         .then_some(ssh_kind);
-    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_sealed_singletons(
+    // The preflight above already validated this exact stream; hand it to
+    // the import so the stream is not decoded a second time.
+    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_sealed_singletons_preflighted(
         records,
         store_id,
         &roots,
         sealed_singletons.as_slice(),
         STORAGE_V2_EXTERNAL_POLICY,
         Vec::new(),
+        preflight,
     )
     .map_err(|_| DurableCSpaceError::RootPolicy)
+}
+
+/// Retained validated replay of the exact published logical stream, so the
+/// next strict-extension append validates only its own records instead of
+/// re-decoding the whole journal. The chain checkpoint and record count bind
+/// the cache to one stream identity; any mismatch falls back to full replay.
+pub(crate) struct StorageV2PreflightCache {
+    pub(crate) checkpoint: vibeos_durable_format::ChainCheckpoint,
+    pub(crate) records: usize,
+    pub(crate) replay: durable::PreflightReplay,
+}
+
+/// Build the persistent-authority import for `full_records`, reusing a cached
+/// validated replay of the untouched prefix when its chain checkpoint matches
+/// the observed stream tail. The complete production authorization pass still
+/// runs over the resulting state on every append; only the per-record decode
+/// and semantic replay of the unchanged prefix is skipped.
+pub(crate) fn storage_v2_migration_import_incremental(
+    full_records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    appended: usize,
+    observed: vibeos_durable_format::ChainCheckpoint,
+    cache: Option<StorageV2PreflightCache>,
+) -> Result<
+    (
+        vibeos_segment_store::PersistentAuthorityImport,
+        StorageV2PreflightCache,
+    ),
+    DurableCSpaceError,
+> {
+    if full_records.is_empty()
+        || appended == 0
+        || appended > full_records.len()
+        || full_records.len() > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let prefix_len = full_records.len() - appended;
+    let mut replay = match cache {
+        Some(cache)
+            if cache.records == prefix_len
+                && cache.checkpoint == observed
+                && cache.replay.record_count() as usize == prefix_len =>
+        {
+            cache.replay
+        }
+        _ => {
+            let mut replay = durable::PreflightReplay::new(store_id);
+            replay
+                .append(&full_records[..prefix_len])
+                .map_err(|_| DurableCSpaceError::RootPolicy)?;
+            replay
+        }
+    };
+    replay
+        .append(&full_records[prefix_len..])
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let preflight = replay
+        .clone()
+        .finish()
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    // This is the complete production validator: exact external roots, fixed
+    // CSpace history, typed resource witnesses, and saved-program semantics.
+    let snapshot = AuthoritySnapshot::from_legacy_preflight(full_records.len(), preflight.clone())?;
+    let _validated = authorize_snapshot(snapshot)?;
+    let roots = select_storage_v2_roots(&preflight)?;
+    let import = storage_v2_import_from_parts(full_records, store_id, preflight, roots)?;
+    let checkpoint = replay
+        .chain_checkpoint()
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let cache = StorageV2PreflightCache {
+        checkpoint,
+        records: full_records.len(),
+        replay,
+    };
+    Ok((import, cache))
+}
+
+/// Attempt to compact a validated V2 logical stream. Returns `None` when the
+/// rewrite would not repay an extra checkpoint (savings below one quarter of
+/// the records). `drop_ungranted_objects` may be true only at a boot
+/// boundary: ungranted objects are unreachable after reboot because no
+/// durable grant names them, but capabilities minted this boot still resolve
+/// them, so runtime compaction must keep them.
+pub(crate) fn storage_v2_compact_records(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    drop_ungranted_objects: bool,
+) -> Result<Option<Vec<[u8; vibeos_durable_format::RECORD_SIZE]>>, DurableCSpaceError> {
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let preflight = durable::preflight_recovery(records, store_id)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    let compacted = preflight
+        .compact(drop_ungranted_objects)
+        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    // The rewrite must be worth a replace checkpoint plus the risk budget of
+    // touching authority at all: require at least a 25% record reduction.
+    if compacted
+        .len()
+        .saturating_add(compacted.len() / 4)
+        .saturating_add(1)
+        >= records.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some(compacted))
 }
 
 #[derive(Default)]
@@ -296,6 +418,14 @@ pub struct DurableCSpaceService {
 }
 
 static INSTALLED_DURABLE_CSPACE: SpinLock<Option<Arc<DurableCSpaceInner>>> = SpinLock::new(None);
+
+/// The saved-program artifact whose source-to-executable recompilation proof
+/// already succeeded this boot. The proof is a deterministic function of the
+/// stream-authenticated artifact bytes, so re-running the compiler on every
+/// authority append re-proves a settled fact; any identity change (a new
+/// program, or a compacted stream's fresh sequences) revalidates in full.
+static VALIDATED_PROGRAM_ARTIFACT: SpinLock<Option<program_model::ValidatedArtifact>> =
+    SpinLock::new(None);
 static NEXT_ACTIVE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl DurableCSpaceInner {
@@ -1407,6 +1537,9 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     }) {
         return Err(DurableCSpaceError::RootPolicy);
     }
+    // The shape validator reads only object identities, never content, so
+    // the space-partitioned view borrows the objects instead of duplicating
+    // every committed object's bytes on each append.
     let persistent = RecoveredStore {
         store_id: recovered.store_id,
         id_high_water: recovered.id_high_water,
@@ -1416,7 +1549,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
             .filter(|grant| grant.grant.target.space == persistent_space_id())
             .cloned()
             .collect(),
-        objects: recovered.objects.clone(),
+        objects: Vec::new(),
         slots: recovered
             .slots
             .iter()
@@ -1433,7 +1566,8 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     }) {
         return Err(DurableCSpaceError::RootPolicy);
     }
-    let shape = validate_fixed_graph_shape(&persistent_committed_grants, &persistent)?;
+    let shape =
+        validate_fixed_graph_shape(&persistent_committed_grants, &persistent, &recovered.objects)?;
     let persistent_root = roots
         .iter()
         .find(|root| root.grant.target.space == persistent_space_id());
@@ -1466,12 +1600,20 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
         last_sequence: recovered.last_sequence,
         last_crc32c: recovered.last_crc32c,
     };
-    let program = program_model::authorize_recovered_with(&program_recovered, |object| {
-        object_resolver
-            .stored_object(object)
-            .map_err(program_model::SavedProgramError::from)
-    })
+    let memo = *VALIDATED_PROGRAM_ARTIFACT.lock();
+    let (program, validated) = program_model::authorize_recovered_with_memo(
+        &program_recovered,
+        |object| {
+            object_resolver
+                .stored_object(object)
+                .map_err(program_model::SavedProgramError::from)
+        },
+        memo,
+    )
     .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    if validated.is_some() {
+        *VALIDATED_PROGRAM_ARTIFACT.lock() = validated;
+    }
     Ok(TrustedSnapshot {
         slots: persistent.slots,
         grants: persistent.grants,
@@ -1484,6 +1626,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
 fn validate_fixed_graph_shape(
     committed: &[RecoveredGrant],
     recovered: &durable::RecoveredStore,
+    objects: &[durable::RecoveredObject],
 ) -> Result<ValidatedGraphShape, DurableCSpaceError> {
     fn slot(
         slots: &[RecoveredSlot],
@@ -1573,7 +1716,7 @@ fn validate_fixed_graph_shape(
         .find(|recovered| recovered.grant.derivation_id == root.derivation_id)
         .map(|recovered| recovered.commit_sequence)
         .ok_or(DurableCSpaceError::UnexpectedGraph)?;
-    if !recovered.objects.iter().any(|object| {
+    if !objects.iter().any(|object| {
         object.object_id == root.object_id
             && object.object_kind == persistent_object_kind()
             && object.commit_sequence < root_commit_sequence

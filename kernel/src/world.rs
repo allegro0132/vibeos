@@ -44,6 +44,13 @@ const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
 // their transient buffers to the shell owner. Keep the documented store
 // working-set floor plus client/future headroom while retaining a hard quota.
+// Storage-bench images additionally drive object benchmarks whose logical
+// journal envelope scales with object size (payload + Merkle envelope + one
+// 512-byte record per 360-byte chunk), so the qualification image needs a
+// larger transient envelope than the production interactive client budget.
+#[cfg(feature = "storage-bench")]
+pub const SHELL_MEMORY_BUDGET: usize = 192 * 1024 * 1024;
+#[cfg(not(feature = "storage-bench"))]
 pub const SHELL_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -2021,8 +2028,11 @@ pub fn build() {
             const STORAGE_V2_BLOCKS: u64 = crate::segment_store_platform::STORAGE_V2_BLOCK_COUNT;
             const STORAGE_V2_GRANULE: u64 =
                 crate::segment_store_platform::STORAGE_V2_GROWTH_GRANULE_BLOCKS;
+            // The benchmark harness always provisions a 1 GiB data disk. Park
+            // the dedicated raw-block window near its tail so the Storage V2
+            // growth range keeps roughly 900 MiB for large-file workloads.
             #[cfg(feature = "storage-bench")]
-            const BENCHMARK_BLOCK_FIRST: u64 = 262_144;
+            const BENCHMARK_BLOCK_FIRST: u64 = 1_835_008;
             #[cfg(feature = "storage-bench")]
             const BENCHMARK_BLOCKS: u64 = 131_072;
 

@@ -22,14 +22,18 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use vibeos_blob_format::{BlobGeometry, BlobView, HASH_SIZE};
+use vibeos_blob_format::{
+    verify_proof, BlobDescriptor, BlobGeometry, BlobView, MerkleProof, HASH_SIZE, HEADER_SIZE,
+    LEAF_SIZE,
+};
 use vibeos_segment_format::{
     admitted_pages, descriptor_chain_initial, descriptor_chain_next, encode_record_seal,
     encode_segment_header_body, encode_segment_seal_body, encode_segment_summary_body,
     payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
     Checkpoint, ExtentKind, Page, PhysicalPointer, RecordBinding, SegmentHeader, SegmentSeal,
-    SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE,
-    SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
+    SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO, DATA_END_PAGE, DATA_FIRST_PAGE,
+    MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE,
+    SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
 use crate::allocation_v2::{
@@ -40,8 +44,8 @@ use crate::authority_snapshot::{
     encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
 };
 use crate::cas::{
-    build_record, flush, verify_manifest_blob, write_page, write_payload_records_with_header,
-    CasObjectHandle, CasStoreError, FinalRecord,
+    build_record, flush, read_manifest_range, verify_manifest_blob, write_page,
+    write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -58,8 +62,8 @@ use crate::root_codec::{
     encode_persistent_root_set, PersistentRootEntry, PersistentRootSet, RootCodecError,
 };
 use crate::store::{
-    read_pointer_payload, read_pointer_payloads, write_checkpoint, MountedState, SegmentStore,
-    StoreError, StoreLimits, ROOT_PIN_SLOTS,
+    read_pointer_payload, read_pointer_payloads, write_checkpoint, CasMountedState, MountedState,
+    SegmentStore, StoreError, StoreLimits, ROOT_PIN_SLOTS,
 };
 use crate::typed_manifest::{
     ReferenceCodecAdmission, TypedObjectReference, TYPED_REFERENCE_ENTRY_LEN, TYPED_REFS_HEADER_LEN,
@@ -74,6 +78,10 @@ const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const METADATA_KIND_ROOT_SET: u32 = 0xffff_0020;
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
+/// Upper bound on source segments relocated by one collection round. Bounds
+/// the foreground pause and the round's read/copy volume; remaining dead
+/// space is reclaimed by subsequent rounds.
+const GC_MAX_SOURCES_PER_ROUND: usize = 8;
 
 /// Allocate page I/O scratch directly in its final heap representation so the
 /// segment-builder futures remain safe for the kernel's bounded stack.
@@ -591,14 +599,29 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         // Reject an over-budget typed payload from the authenticated BlobKey
         // before reading its manifest or allocating any Blob-sized buffer.
         // The exact logical length is part of the Merkle identity, so this
-        // preflight cannot be bypassed by media contents.
-        let maximum_typed_len = TYPED_REFS_HEADER_LEN
-            .checked_add(
-                GC_CHILD_BUDGET
-                    .checked_mul(TYPED_REFERENCE_ENTRY_LEN)
-                    .ok_or(GcError::ArithmeticOverflow)?,
-            )
-            .ok_or(GcError::ArithmeticOverflow)?;
+        // preflight cannot be bypassed by media contents. A file data node is
+        // special: its references all sit in the bounded structural prefix,
+        // so only its first content leaf is read below, but the node's
+        // declared payload envelope is still admitted against the format's
+        // data-node maximum before any read is issued.
+        let maximum_typed_len = if object.blob_key.object_kind() == crate::FS_DATA_V1_KIND {
+            crate::fs_codec::FS_DATA_HEADER_LEN
+                .checked_add(
+                    crate::fs_codec::FS_DATA_MAX_ANCESTORS
+                        .checked_mul(crate::fs_codec::FS_DATA_REFERENCE_LEN)
+                        .ok_or(GcError::ArithmeticOverflow)?,
+                )
+                .and_then(|prefix| prefix.checked_add(crate::fs_codec::FS_DATA_CHUNK_MAX_LEN))
+                .ok_or(GcError::ArithmeticOverflow)?
+        } else {
+            TYPED_REFS_HEADER_LEN
+                .checked_add(
+                    GC_CHILD_BUDGET
+                        .checked_mul(TYPED_REFERENCE_ENTRY_LEN)
+                        .ok_or(GcError::ArithmeticOverflow)?,
+                )
+                .ok_or(GcError::ArithmeticOverflow)?
+        };
         let typed_exact_len =
             usize::try_from(object.blob_key.exact_len()).map_err(|_| GcError::MemoryLimit)?;
         if typed_exact_len > maximum_typed_len {
@@ -661,84 +684,173 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             core::mem::size_of::<ManifestExtent>(),
         )?;
         drop(payload);
-        let blob_memory = limits
-            .recovery_memory_bytes
-            .checked_sub(workspace)
-            .and_then(|bytes| bytes.checked_sub(manifest_resident))
-            .ok_or(GcError::MemoryLimit)?;
-        let encoded = read_authenticated_blob(device, state, blob_memory, &manifest).await?;
-        let blob_peak = workspace
-            .checked_add(manifest_resident)
-            .and_then(|bytes| bytes.checked_add(encoded.capacity()))
-            .and_then(|bytes| {
-                manifest
-                    .extents
-                    .iter()
-                    .try_fold(0_usize, |largest, extent| {
-                        usize::try_from(extent.payload_byte_len)
-                            .map(|value| largest.max(value))
-                            .map_err(|_| GcError::MemoryLimit)
-                    })
-                    .ok()
-                    .and_then(|largest| bytes.checked_add(largest))
-            })
-            .ok_or(GcError::ArithmeticOverflow)?;
-        peak_bytes = peak_bytes.max(blob_peak);
-        drop(manifest);
-        let geometry =
-            BlobGeometry::for_len(object.blob_key.exact_len()).map_err(|_| GcError::Corrupt)?;
-        let tree_verify_bytes = usize::try_from(geometry.tree_node_count())
-            .map_err(|_| GcError::MemoryLimit)?
-            .checked_mul(HASH_SIZE)
-            .ok_or(GcError::ArithmeticOverflow)?;
-        let verify_peak = workspace
-            .checked_add(encoded.capacity())
-            .and_then(|bytes| bytes.checked_add(tree_verify_bytes))
-            .ok_or(GcError::ArithmeticOverflow)?;
-        peak_bytes = peak_bytes.max(verify_peak);
-        if verify_peak > limits.recovery_memory_bytes {
-            return Err(GcError::MemoryLimit.into());
-        }
-        let view = BlobView::decode(&encoded).map_err(|_| GcError::Corrupt)?;
-        view.verify_all().map_err(|_| GcError::Corrupt)?;
-        if view.data().len() != typed_exact_len {
-            return Err(GcError::MemoryLimit.into());
-        }
-        let maximum_references = view
-            .data()
-            .len()
-            .saturating_sub(TYPED_REFS_HEADER_LEN)
-            .checked_div(TYPED_REFERENCE_ENTRY_LEN)
-            .ok_or(GcError::ArithmeticOverflow)?;
-        let decoded_reference_bytes = vector_bytes(
-            maximum_references,
-            core::mem::size_of::<TypedObjectReference>(),
-        )?;
-        let retained_child_bytes =
-            vector_bytes(maximum_references, core::mem::size_of::<ChildReference>())?;
-        let typed_decode_peak = workspace
-            .checked_add(encoded.capacity())
-            .and_then(|bytes| bytes.checked_add(decoded_reference_bytes))
-            .and_then(|bytes| bytes.checked_add(retained_child_bytes))
-            .ok_or(GcError::ArithmeticOverflow)?;
-        peak_bytes = peak_bytes.max(typed_decode_peak);
-        if typed_decode_peak > limits.recovery_memory_bytes {
-            return Err(GcError::MemoryLimit.into());
-        }
         let object_kind = object.blob_key.object_kind();
-        let decoded = if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
-            && matches!(
+        let (decoded, encoded_capacity) = if object.reference_codec
+            == crate::cas_codec::REFERENCE_CODEC_FS_V1
+            && object_kind == crate::FS_DATA_V1_KIND
+        {
+            // A file data node keeps every reference inside its bounded
+            // structural prefix, which always fits the first content leaf.
+            // Read and Merkle-authenticate that single leaf instead of the
+            // whole node, so one mark walk costs reads proportional to the
+            // node count rather than the store's total content bytes.
+            if manifest.blob_key != object.blob_key {
+                return Err(GcError::Corrupt.into());
+            }
+            let geometry = BlobGeometry::for_len(object.blob_key.exact_len())
+                .map_err(|_| GcError::Corrupt)?;
+            let prefix_peak = workspace
+                .checked_add(manifest_resident)
+                .and_then(|bytes| bytes.checked_add(LEAF_SIZE))
+                .and_then(|bytes| {
+                    (geometry.height() as usize)
+                        .checked_mul(HASH_SIZE)
+                        .and_then(|siblings| bytes.checked_add(siblings))
+                })
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(prefix_peak);
+            if prefix_peak > limits.recovery_memory_bytes {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let chunk_len = object.blob_key.exact_len().min(LEAF_SIZE as u64) as usize;
+            let bytes =
+                read_manifest_range(device, state, &manifest, HEADER_SIZE as u64, chunk_len)
+                    .await
+                    .map_err(map_prefix_read_error)?;
+            let mut siblings = Vec::new();
+            siblings
+                .try_reserve_exact(geometry.height() as usize)
+                .map_err(|_| GcError::MemoryLimit)?;
+            let mut position = 0_usize;
+            let mut level_width = geometry.padded_leaf_count() as usize;
+            let mut level_base = 0_usize;
+            while level_width > 1 {
+                let node_index = level_base
+                    .checked_add(position ^ 1)
+                    .ok_or(GcError::ArithmeticOverflow)?;
+                let node_offset = u64::try_from(geometry.tree_offset())
+                    .ok()
+                    .and_then(|offset| {
+                        node_index
+                            .checked_mul(HASH_SIZE)
+                            .and_then(|more| u64::try_from(more).ok())
+                            .and_then(|more| offset.checked_add(more))
+                    })
+                    .ok_or(GcError::ArithmeticOverflow)?;
+                let node = read_manifest_range(device, state, &manifest, node_offset, HASH_SIZE)
+                    .await
+                    .map_err(map_prefix_read_error)?;
+                siblings.push(node.as_slice().try_into().map_err(|_| GcError::Corrupt)?);
+                level_base = level_base
+                    .checked_add(level_width)
+                    .ok_or(GcError::ArithmeticOverflow)?;
+                position /= 2;
+                level_width /= 2;
+            }
+            drop(manifest);
+            let descriptor = BlobDescriptor {
                 object_kind,
-                crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND | crate::FS_DATA_V1_KIND
-            ) {
-            crate::decode_fs_typed_references(object_kind, view.data(), object.commit_generation)
-                .map_err(|_| GcError::Corrupt)?
+                byte_len: object.blob_key.exact_len(),
+                leaf_count: geometry.leaf_count(),
+                tree_node_count: geometry.tree_node_count(),
+                root: object.blob_key.merkle_root(),
+            };
+            let proof = MerkleProof {
+                leaf_index: 0,
+                siblings,
+            };
+            verify_proof(descriptor, &bytes, &proof).map_err(|_| GcError::Corrupt)?;
+            let decoded = crate::decode_fs_data_typed_references_from_prefix(
+                &bytes,
+                object.blob_key.exact_len(),
+                object.commit_generation,
+            )
+            .map_err(|_| GcError::Corrupt)?;
+            (decoded, bytes.capacity())
         } else {
-            let admission =
-                ReferenceCodecAdmission::refs_v1(object_kind).map_err(|_| GcError::Corrupt)?;
-            admission
-                .decode(object_kind, view.data())
+            let blob_memory = limits
+                .recovery_memory_bytes
+                .checked_sub(workspace)
+                .and_then(|bytes| bytes.checked_sub(manifest_resident))
+                .ok_or(GcError::MemoryLimit)?;
+            let encoded = read_authenticated_blob(device, state, blob_memory, &manifest).await?;
+            let blob_peak = workspace
+                .checked_add(manifest_resident)
+                .and_then(|bytes| bytes.checked_add(encoded.capacity()))
+                .and_then(|bytes| {
+                    manifest
+                        .extents
+                        .iter()
+                        .try_fold(0_usize, |largest, extent| {
+                            usize::try_from(extent.payload_byte_len)
+                                .map(|value| largest.max(value))
+                                .map_err(|_| GcError::MemoryLimit)
+                        })
+                        .ok()
+                        .and_then(|largest| bytes.checked_add(largest))
+                })
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(blob_peak);
+            drop(manifest);
+            let geometry =
+                BlobGeometry::for_len(object.blob_key.exact_len()).map_err(|_| GcError::Corrupt)?;
+            let tree_verify_bytes = usize::try_from(geometry.tree_node_count())
+                .map_err(|_| GcError::MemoryLimit)?
+                .checked_mul(HASH_SIZE)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            let verify_peak = workspace
+                .checked_add(encoded.capacity())
+                .and_then(|bytes| bytes.checked_add(tree_verify_bytes))
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(verify_peak);
+            if verify_peak > limits.recovery_memory_bytes {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let view = BlobView::decode(&encoded).map_err(|_| GcError::Corrupt)?;
+            view.verify_all().map_err(|_| GcError::Corrupt)?;
+            if view.data().len() != typed_exact_len {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let maximum_references = view
+                .data()
+                .len()
+                .saturating_sub(TYPED_REFS_HEADER_LEN)
+                .checked_div(TYPED_REFERENCE_ENTRY_LEN)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            let decoded_reference_bytes = vector_bytes(
+                maximum_references,
+                core::mem::size_of::<TypedObjectReference>(),
+            )?;
+            let retained_child_bytes =
+                vector_bytes(maximum_references, core::mem::size_of::<ChildReference>())?;
+            let typed_decode_peak = workspace
+                .checked_add(encoded.capacity())
+                .and_then(|bytes| bytes.checked_add(decoded_reference_bytes))
+                .and_then(|bytes| bytes.checked_add(retained_child_bytes))
+                .ok_or(GcError::ArithmeticOverflow)?;
+            peak_bytes = peak_bytes.max(typed_decode_peak);
+            if typed_decode_peak > limits.recovery_memory_bytes {
+                return Err(GcError::MemoryLimit.into());
+            }
+            let decoded = if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_FS_V1
+                && matches!(
+                    object_kind,
+                    crate::FS_ROOT_V1_KIND | crate::FS_BTREE_NODE_V1_KIND | crate::FS_DATA_V1_KIND
+                ) {
+                crate::decode_fs_typed_references(
+                    object_kind,
+                    view.data(),
+                    object.commit_generation,
+                )
                 .map_err(|_| GcError::Corrupt)?
+            } else {
+                let admission =
+                    ReferenceCodecAdmission::refs_v1(object_kind).map_err(|_| GcError::Corrupt)?;
+                admission
+                    .decode(object_kind, view.data())
+                    .map_err(|_| GcError::Corrupt)?
+            };
+            (decoded, encoded.capacity())
         };
         if object.reference_codec == crate::cas_codec::REFERENCE_CODEC_TYPED_V1
             && decoded.manifest_commit_generation != object.commit_generation
@@ -753,7 +865,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             .try_reserve_exact(decoded.references().len())
             .map_err(|_| GcError::MemoryLimit)?;
         let actual_decode_peak = workspace
-            .checked_add(encoded.capacity())
+            .checked_add(encoded_capacity)
             .and_then(|bytes| {
                 bytes.checked_add(
                     vector_bytes(
@@ -810,6 +922,15 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
         allocated_bytes,
         peak_bytes,
     })
+}
+
+/// Device faults surface as store errors; every structural surprise inside a
+/// data-node prefix read fails closed as a mark-walk corruption.
+fn map_prefix_read_error<E>(error: CasStoreError<E>) -> GcStoreError<E> {
+    match error {
+        CasStoreError::Store(error) => GcStoreError::Store(error),
+        _ => GcStoreError::Gc(GcError::CorruptAt("fs-data-prefix-read")),
+    }
 }
 
 async fn read_authenticated_blob<D: PageDevice>(
@@ -1572,9 +1693,14 @@ fn required_gc_segments(
         }
         place(*manifest_len)?;
     }
-    for len in [snapshot_len, root_len, allocation_len] {
-        place(len)?;
+    place(snapshot_len)?;
+    let authority_chunk = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+    let mut remaining = root_len;
+    while remaining != 0 {
+        place(remaining.min(authority_chunk))?;
+        remaining = remaining.saturating_sub(authority_chunk);
     }
+    place(allocation_len)?;
     Ok(segments)
 }
 
@@ -1872,7 +1998,11 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &[(&record, bytes)]).await?;
+        // Every SegmentBuilder consumer publishes a checkpoint before its
+        // segments become referenced; that slot protocol's first flush is the
+        // shared durability barrier for all deferred phases below.
+        write_payload_records_with_header(device, base, header, &[(&record, bytes)], true, None)
+            .await?;
         self.relative = self
             .relative
             .checked_add(record.value.record_span_pages)
@@ -1886,7 +2016,13 @@ impl SegmentBuilder {
         Ok(pointer)
     }
 
-    pub(crate) async fn payload_batch<D: PageDevice>(
+
+    /// Write a batch that must land in one segment. The builder seals the
+    /// current segment and opens the next one when the batch does not fit the
+    /// remaining space; a batch larger than one segment's payload area is
+    /// rejected rather than scattered, so consecutive extent records always
+    /// share one immutable segment.
+    pub(crate) async fn payload_batch_single_segment<D: PageDevice>(
         &mut self,
         device: &D,
         payloads: &[SegmentPayload<'_>],
@@ -1900,35 +2036,30 @@ impl SegmentBuilder {
                 .and_then(|more| total.checked_add(more))
                 .ok_or(GcError::ArithmeticOverflow)
         })?;
+        if span > DATA_END_PAGE.saturating_sub(DATA_FIRST_PAGE) {
+            return Err(GcError::Capacity.into());
+        }
         if self
             .relative
             .checked_add(span)
             .is_none_or(|end| end > DATA_END_PAGE)
         {
-            let mut pointers = Vec::new();
-            pointers
-                .try_reserve_exact(payloads.len())
-                .map_err(|_| GcError::MemoryLimit)?;
-            for payload in payloads {
-                pointers.push(
-                    self.payload(
-                        device,
-                        payload.extent_kind,
-                        payload.object_kind,
-                        payload.extent_index,
-                        payload.extent_count,
-                        payload.content_byte_len,
-                        payload.encoded_blob_len,
-                        payload.encoded_offset,
-                        payload.merkle_root,
-                        payload.bytes,
-                    )
-                    .await?,
-                );
-            }
-            return Ok(pointers);
+            self.finish_current(device, true).await?;
+            self.index = self
+                .index
+                .checked_add(1)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            let segment_no = *self.segments.get(self.index).ok_or(GcError::Capacity)?;
+            self.open(device, segment_no).await?;
         }
+        self.write_batch(device, payloads).await
+    }
 
+    async fn write_batch<D: PageDevice>(
+        &mut self,
+        device: &D,
+        payloads: &[SegmentPayload<'_>],
+    ) -> Result<Vec<PhysicalPointer>, GcStoreError<D::Error>> {
         let segment_no = self.segments[self.index];
         let segment_generation = self.segment_generation()?;
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
@@ -1979,7 +2110,7 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &writes).await?;
+        write_payload_records_with_header(device, base, header, &writes, true, None).await?;
         let mut pointers = Vec::new();
         pointers
             .try_reserve_exact(records.len())
@@ -2088,15 +2219,13 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     let seal_digest =
         encode_segment_seal_body(&seal, &mut seal_body).map_err(StoreError::Format)?;
     encode_record_seal(seal_digest, &mut final_seal).map_err(StoreError::Format)?;
+    // Deferred like the commit path: no checkpoint can name this segment
+    // until the caller's slot protocol flushes, which covers every phase.
     write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
-    flush(device).await?;
     write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
-    flush(device).await?;
     write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
-    if flush_final_seal {
-        flush(device).await?;
-    }
+    let _ = flush_final_seal;
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
 }
 
@@ -2329,6 +2458,16 @@ async fn verify_staged_copied_extent<D: PageDevice>(
 }
 
 #[allow(clippy::too_many_arguments)]
+struct GcRelocationOutput {
+    catalog_root: PhysicalPointer,
+    authority_root: PhysicalPointer,
+    allocation_root: PhysicalPointer,
+    last_segment: (u64, u64, [u8; 32]),
+    relocated_cas: CasSnapshot,
+    relocated_authority: Option<PersistentAuthoritySnapshot>,
+    telemetry: GcTelemetry,
+}
+
 async fn relocate_live_state<D: PageDevice>(
     device: &D,
     state: &MountedState,
@@ -2340,16 +2479,7 @@ async fn relocate_live_state<D: PageDevice>(
     manifests: &[BlobManifest],
     manifest_lens: &[usize],
     plan: &GcSegmentPlan,
-) -> Result<
-    (
-        PhysicalPointer,
-        PhysicalPointer,
-        PhysicalPointer,
-        [u8; 32],
-        GcTelemetry,
-    ),
-    GcStoreError<D::Error>,
-> {
+) -> Result<GcRelocationOutput, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
     let target_next_generation = plan.relocation_allocation.next_segment_generation;
     let context = CasCodecContext::new(
@@ -2358,14 +2488,13 @@ async fn relocate_live_state<D: PageDevice>(
         target_next_generation,
     )
     .map_err(|_| GcError::Corrupt)?;
-    let (root_bytes, root_kind) = match authority {
+    let relocated_authority = authority
+        .map(|snapshot| snapshot.relocated(plan.relocation_generation))
+        .transpose()
+        .map_err(GcError::from)?;
+    let (root_bytes, root_kind) = match relocated_authority.as_ref() {
         Some(snapshot) => (
-            encode_persistent_authority_snapshot(
-                &snapshot
-                    .relocated(plan.relocation_generation)
-                    .map_err(GcError::from)?,
-            )
-            .map_err(GcError::from)?,
+            encode_persistent_authority_snapshot(snapshot).map_err(GcError::from)?,
             METADATA_KIND_PERSISTENT_AUTHORITY,
         ),
         None => (
@@ -2499,20 +2628,65 @@ async fn relocate_live_state<D: PageDevice>(
             &snapshot_bytes,
         )
         .await?;
-    let authority_root = builder
-        .payload(
-            device,
-            ExtentKind::Authority,
-            root_kind,
-            0,
-            1,
-            root_bytes.len() as u64,
-            root_bytes.len() as u64,
-            0,
-            payload_sha256(&root_bytes),
-            &root_bytes,
-        )
-        .await?;
+    let authority_chunk_bytes = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+    let authority_extent_count = root_bytes.len().div_ceil(authority_chunk_bytes) as u32;
+    let authority_merkle_root = payload_sha256(&root_bytes);
+    let mut authority_payloads = Vec::new();
+    authority_payloads
+        .try_reserve_exact(authority_extent_count as usize)
+        .map_err(|_| GcError::MemoryLimit)?;
+    for (extent_index, chunk) in root_bytes.chunks(authority_chunk_bytes).enumerate() {
+        authority_payloads.push(SegmentPayload {
+            extent_kind: ExtentKind::Authority,
+            object_kind: root_kind,
+            extent_index: extent_index as u32,
+            extent_count: authority_extent_count,
+            content_byte_len: root_bytes.len() as u64,
+            encoded_blob_len: root_bytes.len() as u64,
+            encoded_offset: (extent_index * authority_chunk_bytes) as u64,
+            merkle_root: authority_merkle_root,
+            bytes: chunk,
+        });
+    }
+    let authority_pointers = match builder
+        .payload_batch_single_segment(device, &authority_payloads)
+        .await
+    {
+        Ok(pointers) => pointers,
+        Err(GcStoreError::Gc(GcError::Capacity)) => {
+            // The authority chain exceeds one segment; span segments with
+            // individual extents. Recovery reassembles via allocated-
+            // segment scans.
+            let mut pointers = Vec::new();
+            pointers
+                .try_reserve_exact(authority_payloads.len())
+                .map_err(|_| GcError::MemoryLimit)?;
+            for payload in &authority_payloads {
+                pointers.push(
+                    builder
+                        .payload(
+                            device,
+                            payload.extent_kind,
+                            payload.object_kind,
+                            payload.extent_index,
+                            payload.extent_count,
+                            payload.content_byte_len,
+                            payload.encoded_blob_len,
+                            payload.encoded_offset,
+                            payload.merkle_root,
+                            payload.bytes,
+                        )
+                        .await?,
+                );
+            }
+            pointers
+        }
+        Err(error) => return Err(error),
+    };
+    let authority_root = authority_pointers
+        .first()
+        .copied()
+        .ok_or(GcError::Corrupt)?;
     let allocation_root = builder
         .payload(
             device,
@@ -2533,36 +2707,30 @@ async fn relocate_live_state<D: PageDevice>(
     // root and stream-verify each copied Blob before G+1 can make the targets
     // authoritative. This catches acknowledged-but-corrupted device writes
     // while the old source segments are still the selected truth.
-    verify_staged_payload(
-        device,
-        state,
-        plan.relocation_generation,
-        target_next_generation,
-        catalog_root,
-        ExtentKind::Catalog,
-        &snapshot_bytes,
-        limits.recovery_memory_bytes,
-    )
-    .await?;
-    verify_staged_payload(
-        device,
-        state,
-        plan.relocation_generation,
-        target_next_generation,
-        authority_root,
-        ExtentKind::Authority,
-        &root_bytes,
-        limits.recovery_memory_bytes,
-    )
-    .await?;
-    verify_staged_payload(
-        device,
-        state,
-        plan.relocation_generation,
-        target_next_generation,
+    // All three staged roots live in the same target segment(s); one batch
+    // call pays a single descriptor-chain scan when they share a segment.
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(2 + authority_extent_count as usize)
+        .map_err(|_| GcError::MemoryLimit)?;
+    staged.push((catalog_root, ExtentKind::Catalog, snapshot_bytes.as_slice()));
+    for (chunk, pointer) in root_bytes
+        .chunks(authority_chunk_bytes)
+        .zip(authority_pointers.iter().copied())
+    {
+        staged.push((pointer, ExtentKind::Authority, chunk));
+    }
+    staged.push((
         allocation_root,
         ExtentKind::Allocation,
-        &allocation_bytes,
+        allocation_bytes.as_slice(),
+    ));
+    verify_staged_payloads(
+        device,
+        state,
+        plan.relocation_generation,
+        target_next_generation,
+        &staged,
         limits.recovery_memory_bytes,
     )
     .await?;
@@ -2587,8 +2755,10 @@ async fn relocate_live_state<D: PageDevice>(
             return Err(GcError::CorruptAt("relocate-manifest-key").into());
         }
         drop(manifest_payload);
+        let mut relocated = false;
         for extent in &manifest.extents {
             if source_contains(&plan.targets, extent.pointer) {
+                relocated = true;
                 verify_staged_copied_extent(
                     device,
                     state,
@@ -2599,12 +2769,19 @@ async fn relocate_live_state<D: PageDevice>(
                 .await?;
             }
         }
-        verify_manifest_blob(device, &staged_state, &manifest)
-            .await
-            .map_err(|error| match error {
-                CasStoreError::Store(error) => GcStoreError::Store(error),
-                _ => GcStoreError::Gc(GcError::CorruptAt("relocate-blob-readback")),
-            })?;
+        // Only a Blob whose extents this round copied gained new device
+        // bytes, so only it needs the end-to-end Merkle readback before G+1.
+        // Untouched Blobs were authenticated when their own commit published
+        // them, and re-verifying the complete live set every round makes one
+        // collection cost reads proportional to the store's total content.
+        if relocated {
+            verify_manifest_blob(device, &staged_state, &manifest)
+                .await
+                .map_err(|error| match error {
+                    CasStoreError::Store(error) => GcStoreError::Store(error),
+                    _ => GcStoreError::Gc(GcError::CorruptAt("relocate-blob-readback")),
+                })?;
+        }
     }
     let metadata_bytes = manifest_lens.iter().try_fold(
         snapshot_bytes
@@ -2635,13 +2812,70 @@ async fn relocate_live_state<D: PageDevice>(
         .unwrap_or(u32::MAX),
         ..GcTelemetry::default()
     };
-    Ok((
+    Ok(GcRelocationOutput {
         catalog_root,
         authority_root,
         allocation_root,
-        last.2,
+        last_segment: last,
+        relocated_cas: snapshot,
+        relocated_authority,
         telemetry,
-    ))
+    })
+}
+
+/// Build the G+1 mounted-state successor from an in-memory relocation so the
+/// post-GC mount can use the verified fast path instead of a full cold
+/// recovery: every root was just written and read back by this cycle, and
+/// the checkpoint pair re-read in mount_verified_successor re-authenticates
+/// the publication itself.
+fn build_relocation_successor<E>(
+    state: &MountedState,
+    plan: &GcSegmentPlan,
+    output: GcRelocationOutput,
+    relocated_roots: PersistentRootSet,
+) -> Result<MountedState, GcStoreError<E>> {
+    let mut successor = MountedState {
+        superblock: state.superblock,
+        generation: plan.relocation_generation,
+        admitted_segments: state.admitted_segments,
+        next_physical_segment: (0..state.admitted_segments)
+            .find(|segment_no| {
+                plan.relocation_allocation.segment_state(*segment_no)
+                    == Some(SegmentAllocation::Free)
+            })
+            .unwrap_or(state.admitted_segments),
+        next_segment_generation: plan.relocation_allocation.next_segment_generation,
+        next_object_id: state
+            .next_object_id
+            .max(u128::from(plan.relocation_generation)),
+        cleaner_reserve_segments: state.cleaner_reserve_segments,
+        replay_count: 0,
+        catalog_root: output.catalog_root,
+        replay_tail: PhysicalPointer::Null,
+        authority_root: output.authority_root,
+        allocation_root: output.allocation_root,
+        allocation: plan.relocation_allocation.clone(),
+        allocation_version: 2,
+        persistent_roots: Some(relocated_roots),
+        persistent_authority: output.relocated_authority,
+        catalog: Vec::new(),
+        cas: Some(CasMountedState {
+            objects: output.relocated_cas.objects,
+            blobs: output.relocated_cas.blobs,
+        }),
+        recovery_peak_bytes: 0,
+        last_segment: Some(output.last_segment),
+        last_segment_previous: Some(state.last_segment.unwrap_or((
+            ANCHOR_SEGMENT_NO,
+            0,
+            [0; 32],
+        ))),
+        last_segment_target_checkpoint_generation: plan.relocation_generation,
+    };
+    successor.recovery_peak_bytes = successor
+        .resident_heap_bytes()
+        .ok_or(StoreError::MemoryLimit)?;
+    Ok(successor)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3141,13 +3375,14 @@ impl<D: PageDevice> SegmentStore<D> {
         memory.transient(two_states)?;
         let state = self.require_current_generation()?.clone();
         memory.retain(two_states)?;
-        // Generation is the frozen-format durable ObjectId high-water. A
-        // production store mounts with next_object_id == generation; a catalog
-        // imported with larger IDs remains readable/writable but cannot be
-        // destructively filtered until a future format carries its high-water.
-        if !generation_covers_object_id_high_water(state.generation, state.next_object_id) {
-            return Err(GcError::ObjectIdHighWaterUnavailable.into());
-        }
+        // Generation is the frozen-format durable ObjectId high-water floor.
+        // Batched staging binds several ids per checkpoint, so a production
+        // catalog's ids may legitimately exceed the floor; the top catalog
+        // entry then carries the media high-water (mount recomputes
+        // `max(top id + 1, generation)`) and is force-retained below so
+        // destructive filtering can never lower it.
+        let must_retain_top_entry =
+            !generation_covers_object_id_high_water(state.generation, state.next_object_id);
         // Relocation always needs at least one G+1 target and one distinct
         // G+2 barrier segment. Historical reserve-one images remain fully
         // mountable/readable, but cannot safely enter this protocol.
@@ -3279,6 +3514,17 @@ impl<D: PageDevice> SegmentStore<D> {
                 &mut mark,
             )
             .map_err(|_| GcError::CorruptAt("mark"))?;
+        if must_retain_top_entry {
+            let top = cas.objects.last().ok_or(GcError::ObjectIdHighWaterUnavailable)?;
+            let key = RootKey::new(
+                top.object_id,
+                top.commit_generation,
+                top.blob_key.object_kind(),
+            )
+            .map_err(|_| GcError::ObjectIdHighWaterUnavailable)?;
+            mark.retain_object(key, top.blob_key)
+                .map_err(|_| GcError::MemoryLimit)?;
+        }
         let planner_bytes = planner
             .allocated_bytes()
             .ok_or(GcError::ArithmeticOverflow)?;
@@ -3395,9 +3641,21 @@ impl<D: PageDevice> SegmentStore<D> {
                 allocation_len,
             )?;
             let reservation = required.checked_add(1).ok_or(GcError::ArithmeticOverflow)?;
+            // Bound one collection round: relocating an unbounded number of
+            // sources makes the foreground pause proportional to total dead
+            // space. Net yield still decides between admissible prefixes.
+            if candidate.len() > GC_MAX_SOURCES_PER_ROUND {
+                break;
+            }
+            // The cleaner reserve guarantees worst-case progress, but when more
+            // segments are actually free the collector may use them: a large
+            // multi-extent authority can legitimately need more relocation
+            // targets than the reserve floor.
+            let target_budget = u64::from(state.cleaner_reserve_segments)
+                .max(state.allocation.counts().map_err(GcError::from)?.free);
             if candidate.len() > reservation
                 && u64::try_from(reservation).map_err(|_| GcError::ArithmeticOverflow)?
-                    <= u64::from(state.cleaner_reserve_segments)
+                    <= target_budget
             {
                 let net = candidate.len() - reservation;
                 // Prefer the best yielding strict partial prefix. The full-set
@@ -3490,45 +3748,55 @@ impl<D: PageDevice> SegmentStore<D> {
         self.mounted = None;
         self.poisoned = true;
         memory.release(state_bytes)?;
-        let (catalog_root, authority_root, allocation_root, _last_hash, telemetry) =
-            relocate_live_state(
-                &self.device,
-                &state,
-                self.limits,
-                &mark,
-                roots.len(),
-                &relocated_roots,
-                state.persistent_authority.as_ref(),
-                &manifests,
-                &manifest_lens,
-                &plan,
-            )
-            .await
-            .map_err(|error| match error {
-                GcStoreError::Gc(GcError::Corrupt) => {
-                    GcStoreError::Gc(GcError::CorruptAt("relocate"))
-                }
-                other => other,
-            })?;
-        let mut protocol = GcProtocol::begin(plan, telemetry)?;
-        publish_checkpoint(
+        let relocation = relocate_live_state(
+            &self.device,
+            &state,
+            self.limits,
+            &mark,
+            roots.len(),
+            &relocated_roots,
+            state.persistent_authority.as_ref(),
+            &manifests,
+            &manifest_lens,
+            &plan,
+        )
+        .await
+        .map_err(|error| match error {
+            GcStoreError::Gc(GcError::Corrupt) => {
+                GcStoreError::Gc(GcError::CorruptAt("relocate"))
+            }
+            other => other,
+        })?;
+        let mut protocol = GcProtocol::begin(plan, relocation.telemetry)?;
+        let relocation_checkpoint = publish_checkpoint(
             &self.device,
             &state,
             self.limits,
             protocol.plan.relocation_generation,
             protocol.plan.relocation_allocation.next_segment_generation,
-            catalog_root,
-            authority_root,
-            allocation_root,
+            relocation.catalog_root,
+            relocation.authority_root,
+            relocation.allocation_root,
         )
         .await?;
-        self.mount().await?;
+        // Fast-path mount: the relocation already cold-read every staged
+        // root; mount_verified_successor re-reads the checkpoint pair and
+        // validates the transition without re-running full recovery.
+        let epoch_generation = state.generation;
+        let relocation_successor = build_relocation_successor::<D::Error>(
+            &state,
+            &protocol.plan,
+            relocation,
+            relocated_roots,
+        )?;
+        self.mount_verified_successor(state, relocation_checkpoint, relocation_successor, false)
+            .await?;
         protocol.relocation_published()?;
         protocol.observe_quiescence(self.pins.as_ref())?;
         let barrier_state = self.mounted.as_ref().ok_or(GcError::NotMounted)?.clone();
         self.mounted = None;
         self.poisoned = true;
-        let zero = clear_old_checkpoint_seal(&self.device, state.generation).await?;
+        let zero = clear_old_checkpoint_seal(&self.device, epoch_generation).await?;
         protocol.old_checkpoint_cleared(zero)?;
 
         // G+2 has its own sealed allocation record. Catalog and authority
@@ -3561,7 +3829,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 &allocation_bytes,
             )
             .await?;
-        barrier.finish(&self.device).await?;
+        let barrier_last = barrier.finish(&self.device).await?;
         verify_staged_payload(
             &self.device,
             &barrier_state,
@@ -3573,18 +3841,46 @@ impl<D: PageDevice> SegmentStore<D> {
             self.limits.recovery_memory_bytes,
         )
         .await?;
-        publish_checkpoint(
+        let reuse_checkpoint = publish_checkpoint(
             &self.device,
             &barrier_state,
             self.limits,
             protocol.plan.reuse_generation,
             protocol.plan.reuse_allocation.next_segment_generation,
-            catalog_root,
-            authority_root,
+            relocation_checkpoint.catalog_root,
+            relocation_checkpoint.authority_root,
             reuse_allocation_root,
         )
         .await?;
-        self.mount().await?;
+        let mut reuse_successor = barrier_state.clone();
+        reuse_successor.generation = protocol.plan.reuse_generation;
+        reuse_successor.next_segment_generation =
+            protocol.plan.reuse_allocation.next_segment_generation;
+        reuse_successor.next_object_id = reuse_successor
+            .next_object_id
+            .max(u128::from(protocol.plan.reuse_generation));
+        reuse_successor.allocation_root = reuse_allocation_root;
+        reuse_successor.allocation = protocol.plan.reuse_allocation.clone();
+        reuse_successor.next_physical_segment = (0..reuse_successor.admitted_segments)
+            .find(|segment_no| {
+                reuse_successor.allocation.segment_state(*segment_no)
+                    == Some(SegmentAllocation::Free)
+            })
+            .unwrap_or(reuse_successor.admitted_segments);
+        reuse_successor.last_segment = Some(barrier_last);
+        reuse_successor.last_segment_previous = barrier_state.last_segment;
+        reuse_successor.last_segment_target_checkpoint_generation =
+            protocol.plan.reuse_generation;
+        reuse_successor.recovery_peak_bytes = reuse_successor
+            .resident_heap_bytes()
+            .ok_or(StoreError::MemoryLimit)?;
+        self.mount_verified_successor(
+            barrier_state,
+            reuse_checkpoint,
+            reuse_successor,
+            false,
+        )
+        .await?;
         protocol.reuse_barrier_published()?;
         protocol.telemetry.memory_high_water_bytes = memory.peak;
         protocol.telemetry.foreground_cycles = 1;

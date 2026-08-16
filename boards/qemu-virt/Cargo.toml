@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 vibeos-hal = { path = "../../hal" }
+
+[features]
+storage-bench = []

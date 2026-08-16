@@ -2855,9 +2855,11 @@ async fn storage_object_bench(
         );
         return;
     }
-    if workload == "object-v2-large" && size > 368_640 {
+    if workload == "object-v2-large"
+        && size as u64 > vibeos_object_store::MAX_EXTERNAL_OBJECT_SIZE
+    {
         println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"compatibility journal max object size is 368640 bytes\"}}",
+            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"status\":\"unsupported\",\"reason\":\"object content exceeds the v2 authority record-stream envelope\"}}",
             backend,
             workload,
             size,
@@ -3030,7 +3032,26 @@ async fn storage_object_bench(
     #[cfg(feature = "qemu-virt")]
     let io_started = crate::virtio_blk::telemetry();
     let put_started = crate::sbi::time();
+    // The Merkle-blob profile wraps content in its own verified envelope;
+    // when that envelope no longer fits the external-object ceiling, publish
+    // the raw content instead — the V2 content store's own Merkle machinery
+    // provides equivalent authentication, checked below by exact readback.
+    let raw_large_object = workload == "object-v2-large"
+        && crate::store::blob_profile_encoded_len(size)
+            .map_or(true, |len| len as u64 > vibeos_object_store::MAX_EXTERNAL_OBJECT_SIZE);
     let publication = match put_lease {
+        Ok(lease) if raw_large_object => {
+            match crate::store::BlobDescriptor::from_content(object_kind.get(), &payload) {
+                Ok(descriptor) => crate::store::put_with(lease, init.clone(), object_kind, &payload)
+                    .await
+                    .map(|capability| crate::store::BlobPublication {
+                        capability,
+                        descriptor,
+                    })
+                    .map_err(crate::store::BlobStoreError::Store),
+                Err(error) => Err(crate::store::BlobStoreError::Format(error)),
+            }
+        }
         Ok(lease) => crate::store::put_blob_with(lease, init.clone(), object_kind, &payload).await,
         Err(_) => Err(crate::store::BlobStoreError::Store(
             crate::store::StoreError::PermissionDenied,
@@ -3051,23 +3072,27 @@ async fn storage_object_bench(
         put_io.write_bytes,
         put_io.used_interrupts,
     );
-    let Ok(publication) = publication else {
-        let status = if backend == "m4" && size > 360 * 1024 {
-            "unsupported"
-        } else {
-            "failed-closed"
-        };
-        println!(
-            "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\",\"reason\":\"publication failed\"}}",
-            backend,
-            workload,
-            size,
-            seed,
-            exec::timebase_hz(),
-            put_ticks,
-            status,
-        );
-        return;
+    let publication = match publication {
+        Ok(publication) => publication,
+        Err(error) => {
+            let status = if backend == "m4" && size > 360 * 1024 {
+                "unsupported"
+            } else {
+                "failed-closed"
+            };
+            println!(
+                "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"object\",\"workload\":\"{}\",\"durability\":\"flush-readback-publish\",\"object_bytes\":{},\"object_count\":1,\"seed\":{},\"timebase_hz\":{},\"put_ticks\":{},\"status\":\"{}\",\"reason\":\"publication failed: {:?}\"}}",
+                backend,
+                workload,
+                size,
+                seed,
+                exec::timebase_hz(),
+                put_ticks,
+                status,
+                error,
+            );
+            return;
+        }
     };
     let service = init
         .0
@@ -3088,6 +3113,15 @@ async fn storage_object_bench(
                     bytes: chunk.bytes,
                 })
         }
+        (Ok(service), Ok(object)) if raw_large_object => crate::store::get_with(service, object)
+            .await
+            .map_err(crate::store::BlobStoreError::Store)
+            .and_then(|bytes| {
+                let descriptor =
+                    crate::store::BlobDescriptor::from_content(object_kind.get(), &bytes)
+                        .map_err(crate::store::BlobStoreError::Format)?;
+                Ok(crate::store::VerifiedBlob { descriptor, bytes })
+            }),
         (Ok(service), Ok(object)) => crate::store::get_blob_with(service, object).await,
         _ => Err(crate::store::BlobStoreError::Store(
             crate::store::StoreError::ObjectUnavailable,
@@ -3183,15 +3217,11 @@ async fn storage_file_tree_bench(
     let seed = args.get(1).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
     let workload = args.get(2).copied().unwrap_or("file-durable-mutations");
     let count = args.get(3).and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
-    // Reuse one namespace for mutation workloads so the catalog/root cache is
-    // warm across samples. Directory runs use a seed-scoped namespace because
-    // each sample intentionally creates a fresh directory population before
-    // measuring lookup/list and recovery.
-    let namespace = if workload == "file-directory" {
-        HOME_NAMESPACE ^ (seed as u128)
-    } else {
-        HOME_NAMESPACE ^ 0x5a5a_0000_0000_0000_0000_0000_0000_0001
-    };
+    // One namespace for every file workload: the persistent fs root is a
+    // store-wide `latest(kind)` singleton, so a second namespace can never
+    // publish while the first namespace's root is current. Directory runs
+    // create a fresh seed-scoped subdirectory per sample instead.
+    let namespace = HOME_NAMESPACE ^ 0x5a5a_0000_0000_0000_0000_0000_0000_0001;
     let backend = "storage-v2";
     let unsupported = |reason: &str| {
         println!(
@@ -3203,10 +3233,10 @@ async fn storage_file_tree_bench(
         unsupported("requested file count exceeds the bounded transaction edit budget");
         return;
     }
-    if (workload == "file-sequential" && size > 1024 * 1024)
-        || (workload == "file-overwrite-1m" && size >= 1024 * 1024)
+    if (workload == "file-sequential" && size > 512 * 1024 * 1024)
+        || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
         || (workload == "file-batch-create" && count > 100) {
-        unsupported("4 KiB staged persistence path exceeds the bounded guest benchmark budget");
+        unsupported("staged persistence exceeds the bounded guest benchmark budget");
         return;
     }
     let root = match storage.recover_file_tree_root(namespace).await {
@@ -3219,13 +3249,17 @@ async fn storage_file_tree_bench(
             return;
         }
     };
-    let mut payload = Vec::with_capacity(size.min(1024 * 1024));
-    payload.extend((0..size).map(|index| {
-        (index as u64)
-            .wrapping_mul(131)
-            .wrapping_add(seed.wrapping_mul(17))
-            .wrapping_add(0x5a) as u8
-    }));
+    // file-sequential regenerates its content chunk by chunk, so a large run
+    // must not also materialize the whole payload here.
+    let mut payload = Vec::new();
+    if workload != "file-sequential" {
+        payload.extend((0..size).map(|index| {
+            (index as u64)
+                .wrapping_mul(131)
+                .wrapping_add(seed.wrapping_mul(17))
+                .wrapping_add(0x5a) as u8
+        }));
+    }
     let started = crate::sbi::time();
     let mut transferred = 0_u64;
     let mut operations = 0_u64;
@@ -3310,14 +3344,21 @@ async fn storage_file_tree_bench(
             for index in 0..reader.chunk_count() {
                 read = read.saturating_add(reader.read_chunk(index).await?.map(|chunk| chunk.len() as u64).unwrap_or(0));
             }
-            operations = 2;
+            // Remove the file so repeated samples measure a steady state
+            // instead of accumulating tens of megabytes of live data.
+            let mut tx = root.begin()?;
+            tx.remove(&path, false, false)?;
+            tx.commit_durable().await?;
+            operations = 3;
             transferred = (size as u64).saturating_add(read);
             Ok(())
         }
         "file-directory" => {
+            let directory = alloc::format!("dir-{seed:016x}");
+            let directory_path = RelPath::parse(&directory)?;
             let mut staged_files = Vec::with_capacity(count);
             for index in 0..count {
-                let name = alloc::format!("dir-{seed:016x}-{index:04}");
+                let name = alloc::format!("{directory}/file-{index:04}");
                 let path = RelPath::parse(&name)?;
                 let mut stager = root.begin_content_stager(&path, false)?;
                 stager.push(&payload).await?;
@@ -3325,11 +3366,12 @@ async fn storage_file_tree_bench(
                 staged_files.push((path, staged));
             }
             let mut tx = root.begin()?;
+            tx.mkdir(&directory_path, false)?;
             for (path, staged) in staged_files {
                 tx.write_staged(&path, staged)?;
             }
             tx.commit_durable().await?;
-            let listed = root.snapshot().list(&RelPath::root(), true)?;
+            let listed = root.snapshot().list(&directory_path, true)?;
             if listed.len() != count {
                 return Err(FileError::Conflict);
             }
@@ -3337,7 +3379,7 @@ async fn storage_file_tree_bench(
             drop(root);
             let recovered = storage.recover_file_tree_root(namespace).await?;
             recovery_ticks = crate::sbi::time().saturating_sub(recovery_started).max(1);
-            if recovered.snapshot().list(&RelPath::root(), true)?.len() != count {
+            if recovered.snapshot().list(&directory_path, true)?.len() != count {
                 return Err(FileError::Conflict);
             }
             operations = count as u64 + 2;

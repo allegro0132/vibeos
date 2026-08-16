@@ -10,7 +10,10 @@ use core::fmt;
 
 use sha2::{Digest, Sha256};
 use vibeos_blob_format::{BlobDescriptor, LEAF_SIZE};
-use vibeos_segment_format::{payload_sha256, ExtentKind, PhysicalPointer, ANCHOR_SEGMENT_NO};
+use vibeos_segment_format::{
+    payload_sha256, ExtentKind, PhysicalPointer, ANCHOR_SEGMENT_NO, DATA_END_PAGE,
+    DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE,
+};
 
 use crate::allocation_v2::{encode_allocation_v2, AllocationTransition, SegmentAllocation};
 use crate::authority::AuthorizedObject;
@@ -202,7 +205,7 @@ impl PersistentAuthorityTransientObjects {
             .map(|index| &self.objects[index])
             .filter(|handle| {
                 handle.object_kind() == object.object_kind.get()
-                    && handle.exact_len() == object.bytes.len() as u64
+                    && handle.exact_len() == object.byte_len()
             })
     }
 }
@@ -263,7 +266,7 @@ impl PersistentAuthorityView {
             .map(|index| &self.objects[index])
             .filter(|handle| {
                 handle.object_kind() == object.object_kind.get()
-                    && handle.exact_len() == object.bytes.len() as u64
+                    && handle.exact_len() == object.byte_len()
             })
     }
 }
@@ -340,6 +343,16 @@ fn gc_can_relieve_persistent_import<E>(error: &PersistentAuthorityError<E>) -> b
                 crate::quota::QuotaError::OrdinaryCapacityExceeded
             ))
     )
+}
+
+/// Promotion claims from the previous live authority append: for each
+/// still-unbound stable object, the anonymous V2 mapping it deterministically
+/// claims. Bound to the exact logical stream (length plus final record) the
+/// claims were computed against; any mismatch falls back to the full loop.
+pub(crate) struct PromotionClaims {
+    pub(crate) stream_len: usize,
+    pub(crate) last_record: [u8; vibeos_durable_format::RECORD_SIZE],
+    pub(crate) claims: alloc::collections::BTreeMap<u128, u128>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -420,6 +433,8 @@ impl<D: PageDevice> SegmentStore<D> {
         if self.require_current_generation()?.authority_root != PhysicalPointer::Null {
             return Err(PersistentAuthorityError::AlreadyInitialized);
         }
+        // The incoming stream is not a strict successor of any cached state.
+        self.logical_roots.clear();
         self.install_persistent_import(import, BTreeSet::new(), BTreeSet::new(), lease, None)
             .await
             .map(|(view, _)| view)
@@ -445,6 +460,8 @@ impl<D: PageDevice> SegmentStore<D> {
         if current.checkpoint_generation() != expected_generation {
             return Err(PersistentAuthorityError::GenerationMismatch);
         }
+        // A replacement may redefine logical content behind existing IDs.
+        self.logical_roots.clear();
         self.install_persistent_import(update, BTreeSet::new(), BTreeSet::new(), lease, None)
             .await
             .map(|(view, _)| view)
@@ -489,22 +506,29 @@ impl<D: PageDevice> SegmentStore<D> {
         {
             return Err(PersistentAuthorityError::GenerationMismatch);
         }
-        let old_sectors: Vec<[u8; vibeos_durable_format::RECORD_SIZE]> =
-            current.record_sectors().copied().collect();
-        let store_id = decoded_store_id(&old_sectors).ok_or(PersistentAuthorityError::Snapshot(
-            AuthoritySnapshotError::InvalidAuthorityGraph,
-        ))?;
-        let old_object_ids: BTreeSet<u128> =
-            vibeos_durable_format::preflight_recovery(&old_sectors, store_id)
-                .map_err(|_| {
-                    PersistentAuthorityError::Snapshot(
+        let old_object_ids: BTreeSet<u128> = match &self.committed_ids_cache {
+            // The predecessor stream's committed set was captured when that
+            // exact generation was installed; no re-decode is needed.
+            Some((generation, ids)) if *generation == expected_generation => ids.clone(),
+            _ => {
+                let old_sectors: Vec<[u8; vibeos_durable_format::RECORD_SIZE]> =
+                    current.record_sectors().copied().collect();
+                let store_id =
+                    decoded_store_id(&old_sectors).ok_or(PersistentAuthorityError::Snapshot(
                         AuthoritySnapshotError::InvalidAuthorityGraph,
-                    )
-                })?
-                .committed_objects()
-                .iter()
-                .map(|object| object.object_id.get())
-                .collect();
+                    ))?;
+                vibeos_durable_format::preflight_recovery(&old_sectors, store_id)
+                    .map_err(|_| {
+                        PersistentAuthorityError::Snapshot(
+                            AuthoritySnapshotError::InvalidAuthorityGraph,
+                        )
+                    })?
+                    .committed_objects()
+                    .iter()
+                    .map(|object| object.object_id.get())
+                    .collect()
+            }
+        };
         let new_object_ids: BTreeSet<u128> = update
             .recovered
             .objects
@@ -517,7 +541,18 @@ impl<D: PageDevice> SegmentStore<D> {
             .copied()
             .filter(|object_id| !update.is_admitted(*object_id))
             .collect();
-        let retry_update = update.clone();
+        // The foreground-cleaner retry needs its own copy of the import, but
+        // that copy costs a full record stream plus every object's bytes.
+        // Relief can only trigger near capacity, so skip the clone while free
+        // segments are comfortably above the reserve.
+        let relief_plausible = state
+            .allocation
+            .counts()
+            .ok()
+            .is_none_or(|counts| {
+                counts.free <= u64::from(state.cleaner_reserve_segments).saturating_add(6)
+            });
+        let retry_update = relief_plausible.then(|| update.clone());
         let retry_transient_ids = transient_ids.clone();
         let retry_new_object_ids = new_object_ids.clone();
         let (view, transient_objects) = match self
@@ -531,19 +566,23 @@ impl<D: PageDevice> SegmentStore<D> {
             .await
         {
             Ok(result) => result,
-            Err(error) if gc_can_relieve_persistent_import(&error) => {
+            Err(error) if gc_can_relieve_persistent_import(&error) && retry_update.is_some() => {
+                let retry_update = retry_update.expect("guarded by match arm");
                 // A logical authority append owns an explicit maintenance
                 // lease, so it may spend the cleaner reserve only through one
                 // bounded foreground collection. The failed import publishes
                 // no authority snapshot; any anonymous CAS objects from a
                 // partial attempt are deliberately unrooted and may be
                 // reclaimed before the retry.
-                let retry_lease = self
-                    .acquire_maintenance(
-                        &writer.maintenance,
-                        MaintenanceOperation::ExplicitMaintenance,
-                    )
-                    .ok_or(PersistentAuthorityError::Unauthorized)?;
+                // A relievable error must have left the store mounted; if it
+                // did not, surface the original failure rather than masking
+                // it as an authorization problem.
+                let Some(retry_lease) = self.acquire_maintenance(
+                    &writer.maintenance,
+                    MaintenanceOperation::ExplicitMaintenance,
+                ) else {
+                    return Err(error);
+                };
                 Box::pin(self.collect_garbage()).await?;
 
                 // GC advances the checkpoint generation while preserving the
@@ -748,7 +787,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 .map(|index| &view.objects[index])
                 .filter(|object| {
                     object.object_kind() == recovered.object_kind.get()
-                        && object.exact_len() == recovered.bytes.len() as u64
+                        && object.exact_len() == recovered.byte_len()
                 })
                 .ok_or(PersistentAuthorityError::PolicyMismatch)?;
             if !self
@@ -771,9 +810,34 @@ impl<D: PageDevice> SegmentStore<D> {
         recovered: &vibeos_durable_format::RecoveredObject,
     ) -> Result<bool, PersistentAuthorityError<D::Error>> {
         if object.object_kind() != recovered.object_kind.get()
-            || object.exact_len() != recovered.bytes.len() as u64
+            || object.exact_len() != recovered.byte_len()
         {
             return Ok(false);
+        }
+        if let Some(declared) = recovered.external_root {
+            // External content is authenticated by the CAS Merkle machinery:
+            // the blob key commits to the content root, and the cold proof
+            // requires a healthy scrub of every CAS payload. The structural
+            // check here is that the bound mapping's key names exactly the
+            // declared identity.
+            let key = object
+                .backend_handle()
+                .authority_key()
+                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+            let state = self.require_current_generation()?;
+            let matches = state.cas.as_ref().is_some_and(|cas| {
+                cas.objects
+                    .binary_search_by_key(&key.object_id(), |mapping| mapping.object_id)
+                    .ok()
+                    .map(|index| cas.objects[index])
+                    .is_some_and(|mapping| {
+                        mapping.commit_generation == key.commit_generation()
+                            && mapping.blob_key.object_kind() == recovered.object_kind.get()
+                            && mapping.blob_key.exact_len() == recovered.byte_len()
+                            && mapping.blob_key.merkle_root() == declared
+                    })
+            });
+            return Ok(matches);
         }
         let expected = BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
             .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
@@ -872,7 +936,7 @@ impl<D: PageDevice> SegmentStore<D> {
 
     async fn install_persistent_import(
         &mut self,
-        import: PersistentAuthorityImport,
+        mut import: PersistentAuthorityImport,
         transient_ids: BTreeSet<u128>,
         charged_ids: BTreeSet<u128>,
         _lease: MaintenanceOperationLease,
@@ -882,6 +946,28 @@ impl<D: PageDevice> SegmentStore<D> {
         PersistentAuthorityError<D::Error>,
     > {
         validate_quota_totals(&import, None)?;
+        // Content for external objects committed by this exact append. A
+        // re-install (cold recovery, migration replace, compaction) carries
+        // no payloads: external objects then bind to their already-durable
+        // blobs through promotion, and a fresh external object without a
+        // payload or an existing blob fails closed below.
+        let external_payloads = core::mem::take(&mut import.external_payloads);
+        // Captured for the successor's committed-set cache before the import
+        // moves into the snapshot.
+        let imported_committed_ids: BTreeSet<u128> = import
+            .recovered
+            .objects
+            .iter()
+            .map(|object| object.object_id.get())
+            .collect();
+        // Merkle roots for every logical object, from the cache where the
+        // stable ObjectId was already hashed by an earlier installation.
+        let mut logical_roots: alloc::collections::BTreeMap<u128, vibeos_blob_format::Hash> =
+            alloc::collections::BTreeMap::new();
+        for recovered in &import.recovered.objects {
+            let root = self.cached_logical_root(recovered)?;
+            logical_roots.insert(recovered.object_id.get(), root);
+        }
         // A strict logical-stream successor cannot redefine an existing M4
         // ObjectId. Reuse its already authenticated V2 binding instead of
         // consuming a new CAS mapping/segment on every authority append.
@@ -934,16 +1020,16 @@ impl<D: PageDevice> SegmentStore<D> {
                 {
                     continue;
                 }
-                let descriptor =
-                    BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
-                        .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+                let root = *logical_roots
+                    .get(&stable_id)
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?;
                 let has_active_exact_candidate = state.cas.as_ref().is_some_and(|cas| {
                     cas.objects.iter().any(|mapping| {
                         !claimed_v2_object_ids.contains(&mapping.object_id)
                             && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                             && mapping.blob_key.object_kind() == recovered.object_kind.get()
-                            && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
-                            && mapping.blob_key.merkle_root() == descriptor.root
+                            && mapping.blob_key.exact_len() == recovered.byte_len()
+                            && mapping.blob_key.merkle_root() == root
                             && table.has_active_persistent_candidate(stable_id, mapping.object_id)
                     })
                 });
@@ -961,7 +1047,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 .filter(|object| reservation_ids.contains(&object.object_id.get()))
             {
                 let reservation =
-                    self.reserve_blob_quota(principal, recovered.bytes.len() as u64)?;
+                    self.reserve_blob_quota(principal, recovered.byte_len())?;
                 quota_reservations.push((recovered.object_id.get(), reservation));
             }
             quota_reservations.sort_unstable_by_key(|(stable_id, _)| *stable_id);
@@ -975,6 +1061,29 @@ impl<D: PageDevice> SegmentStore<D> {
         promoted
             .try_reserve_exact(import.recovered.objects.len())
             .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+        // Claims carried from the previous live append apply only when this
+        // import extends the exact stream they were computed against; the
+        // claims of a still-unbound, still-ungranted object are then already
+        // deterministic and need no promotion pass of their own.
+        let carried_claims = match (admission_principal.is_some(), self.promotion_claims_cache.take()) {
+            (true, Some(cache)) => {
+                let stream = self
+                    .require_current_generation()?
+                    .persistent_authority
+                    .as_ref()
+                    .map(|snapshot| snapshot.record_stream());
+                let matches = stream.is_some_and(|stream| {
+                    stream.len() == cache.stream_len
+                        && cache.stream_len >= vibeos_durable_format::RECORD_SIZE
+                        && stream[cache.stream_len - vibeos_durable_format::RECORD_SIZE..]
+                            == cache.last_record
+                });
+                matches.then_some(cache)
+            }
+            _ => None,
+        };
+        let mut next_claims: alloc::collections::BTreeMap<u128, u128> =
+            alloc::collections::BTreeMap::new();
         for recovered in &import.recovered.objects {
             if reusable_bindings
                 .binary_search_by_key(&recovered.object_id.get(), |binding| {
@@ -984,6 +1093,17 @@ impl<D: PageDevice> SegmentStore<D> {
             {
                 continue;
             }
+            let stable_id = recovered.object_id.get();
+            if !import.is_admitted(stable_id) && !transient_ids.contains(&stable_id) {
+                if let Some(claim) = carried_claims
+                    .as_ref()
+                    .and_then(|cache| cache.claims.get(&stable_id).copied())
+                {
+                    claimed_v2_object_ids.insert(claim);
+                    next_claims.insert(stable_id, claim);
+                    continue;
+                }
+            }
             let reservation_index = quota_reservations
                 .binary_search_by_key(&recovered.object_id.get(), |(stable_id, _)| *stable_id)
                 .ok();
@@ -991,22 +1111,255 @@ impl<D: PageDevice> SegmentStore<D> {
             let require_active_candidate = admission_principal.is_some()
                 && import.is_admitted(recovered.object_id.get())
                 && reservation.is_none();
+            let root = *logical_roots
+                .get(&recovered.object_id.get())
+                .ok_or(PersistentAuthorityError::PolicyMismatch)?;
             if let Some(object) = self
                 .promote_existing_logical_object(
                     recovered,
                     &claimed_v2_object_ids,
                     require_active_candidate,
                     &mut reservation,
+                    root,
                 )
                 .await?
             {
-                claimed_v2_object_ids.insert(object.backend_handle().persistent_binding_parts().0);
+                let claim = object.backend_handle().persistent_binding_parts().0;
+                claimed_v2_object_ids.insert(claim);
+                next_claims.insert(recovered.object_id.get(), claim);
                 promoted.push((recovered.object_id.get(), object));
             }
             if let Some(reservation) = reservation {
                 quota_reservations.push((recovered.object_id.get(), reservation));
                 quota_reservations.sort_unstable_by_key(|(stable_id, _)| *stable_id);
             }
+        }
+        // Bind the refreshed claims to the stream this import publishes; a
+        // failed publication leaves them keyed to a stream that never became
+        // current, so the next append simply misses and re-derives them.
+        if admission_principal.is_some()
+            && import.record_stream.len() >= vibeos_durable_format::RECORD_SIZE
+        {
+            let mut last_record = [0u8; vibeos_durable_format::RECORD_SIZE];
+            last_record.copy_from_slice(
+                &import.record_stream[import.record_stream.len() - vibeos_durable_format::RECORD_SIZE..],
+            );
+            self.promotion_claims_cache = Some(PromotionClaims {
+                stream_len: import.record_stream.len(),
+                last_record,
+                claims: next_claims,
+            });
+        }
+        // Fused fast path: exactly one logical object needs a fresh CAS
+        // commit — the shape of every ordinary durable append. Stage its blob
+        // payload, then publish the object mapping and the authority snapshot
+        // under one metadata segment and one checkpoint instead of two
+        // independent durable segment transactions and checkpoint pairs.
+        let mut fresh = Vec::new();
+        for recovered in &import.recovered.objects {
+            let stable_id = recovered.object_id.get();
+            if !(import.is_admitted(stable_id) || transient_ids.contains(&stable_id)) {
+                continue;
+            }
+            if reusable_bindings
+                .binary_search_by_key(&stable_id, |binding| binding.stable_object_id)
+                .is_ok()
+                || promoted
+                    .binary_search_by_key(&stable_id, |(id, _)| *id)
+                    .is_ok()
+            {
+                continue;
+            }
+            fresh.push(recovered);
+        }
+        // The fused single-checkpoint path writes the authority snapshot as
+        // one extent; route payloads that could exceed the 1 MiB extent
+        // ceiling through the general multi-extent publication instead. The
+        // slack covers the header, bindings, principals, and external roots.
+        let fused_authority_fits = import
+            .record_stream
+            .len()
+            .checked_add(128 * 1024)
+            .is_some_and(|estimate| {
+                estimate <= MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE
+            });
+        if fresh.len() == 1 && fused_authority_fits {
+            let recovered = fresh[0];
+            let stable_id = recovered.object_id.get();
+            // Reusable bindings get the same validation as the general path.
+            for admitted in import.admitted_objects() {
+                if let Ok(index) = reusable_bindings.binary_search_by_key(
+                    &admitted.object_id.get(),
+                    |binding| binding.stable_object_id,
+                ) {
+                    let root = *logical_roots
+                        .get(&admitted.object_id.get())
+                        .ok_or(PersistentAuthorityError::PolicyMismatch)?;
+                    Self::validate_reusable_binding(
+                        self.require_current_generation()?,
+                        reusable_bindings[index],
+                        admitted,
+                        root,
+                    )?;
+                }
+            }
+            // Partition already-promoted objects into admitted bindings and
+            // transient handles; other promotions only reserved claim order.
+            let mut committed = Vec::new();
+            let mut transient_promoted = Vec::new();
+            for (stable, object) in promoted.drain(..) {
+                if import.is_admitted(stable) {
+                    committed.push((stable, object));
+                } else if transient_ids.contains(&stable) {
+                    transient_promoted.push((stable, object));
+                }
+            }
+            let (generation, staged_v2_object_id) = {
+                let current = self.require_current_generation()?;
+                (
+                    current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(PersistentAuthorityError::Gc(GcError::InvalidGeneration))?,
+                    current.next_object_id,
+                )
+            };
+            let mut writer = if let Ok(index) =
+                quota_reservations.binary_search_by_key(&stable_id, |(id, _)| *id)
+            {
+                let (_, reservation) = quota_reservations.remove(index);
+                self.begin_blob_with_quota_reservation(
+                    recovered.object_kind.get(),
+                    recovered.byte_len(),
+                    reservation,
+                )?
+            } else {
+                match admission_principal {
+                    Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
+                    None => self.begin_blob_for_persistent_import(
+                        recovered.object_kind.get(),
+                        recovered.byte_len(),
+                    )?,
+                }
+            };
+            writer.enable_staged_batching();
+            let content: &[u8] = match recovered.external_root {
+                Some(_) => external_payloads
+                    .get(&stable_id)
+                    .map(|bytes| bytes.as_slice())
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?,
+                None => &recovered.bytes,
+            };
+            for chunk in content.chunks(LEAF_SIZE) {
+                writer.write_chunk(chunk).await?;
+            }
+            let staged = Box::pin(writer.stage_commit()).await?;
+            // The staged blob's content address must equal the identity the
+            // record stream declares, or the stream would durably reference
+            // content that never existed.
+            if let Some(declared) = recovered.external_root {
+                if staged.blob_key.merkle_root() != declared {
+                    return Err(PersistentAuthorityError::PolicyMismatch);
+                }
+            }
+            let mut bindings: Vec<PersistentObjectBinding> = reusable_bindings
+                .into_iter()
+                .filter(|binding| import.is_admitted(binding.stable_object_id))
+                .collect();
+            bindings
+                .try_reserve_exact(committed.len() + 1)
+                .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+            for (stable, object) in &committed {
+                let (v2_object_id, commit_generation, object_kind) =
+                    object.backend_handle().persistent_binding_parts();
+                bindings.push(PersistentObjectBinding {
+                    stable_object_id: *stable,
+                    v2_object_id,
+                    commit_generation,
+                    object_kind,
+                });
+            }
+            if import.is_admitted(stable_id) {
+                bindings.push(PersistentObjectBinding {
+                    stable_object_id: stable_id,
+                    v2_object_id: staged_v2_object_id,
+                    commit_generation: generation,
+                    object_kind: staged.object_kind,
+                });
+            }
+            bindings.sort_unstable_by_key(|binding| binding.stable_object_id);
+            let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
+                generation,
+                import.root_policy_sha256,
+                import.record_stream,
+                bindings,
+                import.principals,
+                external_roots,
+            )
+            .map_err(PersistentAuthorityError::Snapshot)?;
+            let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
+                .map_err(PersistentAuthorityError::Snapshot)?;
+            let mut root_entries: Vec<PersistentRootEntry> = snapshot
+                .objects
+                .iter()
+                .map(|binding| PersistentRootEntry {
+                    object_id: binding.v2_object_id,
+                    commit_generation: binding.commit_generation,
+                    object_kind: binding.object_kind,
+                })
+                .collect();
+            root_entries.extend_from_slice(snapshot.external_roots());
+            root_entries.sort_unstable_by_key(|entry| entry.object_id);
+            let persistent_roots = PersistentRootSet::new(generation, root_entries)
+                .map_err(|_| PersistentAuthorityError::Store(StoreError::Corrupt))?;
+            // Same ordering contract as publish_persistent_snapshot: the pure
+            // quota installation precedes the first media mutation of the
+            // fused publication.
+            self.install_persistent_quota_snapshot(&snapshot)?;
+            let object = self
+                .publish_staged_object_with_authority(
+                    staged,
+                    crate::cas::FusedAuthorityPublication {
+                        authority_bytes,
+                        persistent_authority: snapshot.clone(),
+                        persistent_roots,
+                    },
+                )
+                .await?;
+            object
+                .backend_handle()
+                .bind_persistent_quota_candidate(stable_id)
+                .map_err(|_| PersistentAuthorityError::InvalidQuotaPolicy)?;
+            let mut transient_objects = Vec::new();
+            transient_objects
+                .try_reserve_exact(transient_promoted.len() + 1)
+                .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+            for (stable, object) in transient_promoted {
+                transient_objects.push(PersistentObjectHandle {
+                    stable_object_id: stable,
+                    object: Arc::new(object),
+                });
+            }
+            if transient_ids.contains(&stable_id) {
+                transient_objects.push(PersistentObjectHandle {
+                    stable_object_id: stable_id,
+                    object: Arc::new(object),
+                });
+            }
+            self.committed_ids_cache = Some((generation, imported_committed_ids));
+            if let Some(cache) = self.promotion_claims_cache.as_mut() {
+                // The freshly staged object now owns its published mapping;
+                // record the claim so the next strict extension skips its
+                // promotion pass as well.
+                let _ = cache.claims.insert(stable_id, staged_v2_object_id);
+            }
+            // Admitted fused objects are durably named by the checkpoint's
+            // authority snapshot and root set; their runtime handles may drop.
+            drop(committed);
+            let view = self
+                .build_persistent_view(self.require_current_generation()?, snapshot, false)
+                .await?;
+            return Ok((view, transient_objects));
         }
         let mut committed = Vec::new();
         committed
@@ -1020,10 +1373,14 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok()
                 .map(|index| reusable_bindings[index])
             {
+                let root = *logical_roots
+                    .get(&recovered.object_id.get())
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?;
                 Self::validate_reusable_binding(
                     self.require_current_generation()?,
                     binding,
                     recovered,
+                    root,
                 )?;
                 continue;
             }
@@ -1040,7 +1397,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 let (_, reservation) = quota_reservations.remove(index);
                 self.begin_blob_with_quota_reservation(
                     recovered.object_kind.get(),
-                    recovered.bytes.len() as u64,
+                    recovered.byte_len(),
                     reservation,
                 )?
             } else {
@@ -1048,11 +1405,18 @@ impl<D: PageDevice> SegmentStore<D> {
                     Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
                     None => self.begin_blob_for_persistent_import(
                         recovered.object_kind.get(),
-                        recovered.bytes.len() as u64,
+                        recovered.byte_len(),
                     )?,
                 }
             };
-            for chunk in recovered.bytes.chunks(LEAF_SIZE) {
+            let content: &[u8] = match recovered.external_root {
+                Some(_) => external_payloads
+                    .get(&recovered.object_id.get())
+                    .map(|bytes| bytes.as_slice())
+                    .ok_or(PersistentAuthorityError::PolicyMismatch)?,
+                None => &recovered.bytes,
+            };
+            for chunk in content.chunks(LEAF_SIZE) {
                 writer.write_chunk(chunk).await?;
             }
             // `BlobWriter::commit` is already split into sub-16 KiB raw
@@ -1087,7 +1451,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     let (_, reservation) = quota_reservations.remove(index);
                     self.begin_blob_with_quota_reservation(
                         recovered.object_kind.get(),
-                        recovered.bytes.len() as u64,
+                        recovered.byte_len(),
                         reservation,
                     )?
                 } else {
@@ -1095,11 +1459,18 @@ impl<D: PageDevice> SegmentStore<D> {
                         Some(_) => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
                         None => self.begin_blob_for_persistent_import(
                             recovered.object_kind.get(),
-                            recovered.bytes.len() as u64,
+                            recovered.byte_len(),
                         )?,
                     }
                 };
-                for chunk in recovered.bytes.chunks(LEAF_SIZE) {
+                let content: &[u8] = match recovered.external_root {
+                    Some(_) => external_payloads
+                        .get(&recovered.object_id.get())
+                        .map(|bytes| bytes.as_slice())
+                        .ok_or(PersistentAuthorityError::PolicyMismatch)?,
+                    None => &recovered.bytes,
+                };
+                for chunk in content.chunks(LEAF_SIZE) {
                     writer.write_chunk(chunk).await?;
                 }
                 let object = Box::pin(writer.commit()).await?;
@@ -1138,14 +1509,14 @@ impl<D: PageDevice> SegmentStore<D> {
             });
         }
         bindings.sort_unstable_by_key(|binding| binding.stable_object_id);
-        let snapshot = PersistentAuthoritySnapshot::new(
+        let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
             generation,
             import.root_policy_sha256,
             import.record_stream,
             bindings,
             import.principals,
+            external_roots,
         )
-        .and_then(|snapshot| snapshot.with_external_roots(external_roots))
         .map_err(PersistentAuthorityError::Snapshot)?;
         let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
             .map_err(PersistentAuthorityError::Snapshot)?;
@@ -1154,6 +1525,7 @@ impl<D: PageDevice> SegmentStore<D> {
         // partially imported authority graph.
         self.publish_persistent_snapshot(state, generation, authority_bytes, &snapshot)
             .await?;
+        self.committed_ids_cache = Some((generation, imported_committed_ids));
         drop(committed);
         let view = self
             .build_persistent_view(self.require_current_generation()?, snapshot, false)
@@ -1173,14 +1545,84 @@ impl<D: PageDevice> SegmentStore<D> {
             .counts()
             .map_err(GcError::from)
             .map_err(PersistentAuthorityError::Gc)?;
-        if counts.free <= u64::from(state.cleaner_reserve_segments) {
+        // Reserve every segment this payload batch can span BEFORE the
+        // first mutation: a multi-extent authority chain may cross segment
+        // boundaries and must never fail mid-write, which would poison the
+        // store and strand the foreground-cleaner retry. The payload set is
+        // exactly [optional empty CAS snapshot, authority extents,
+        // allocation], whose spans are known before any encoding.
+        let authority_chunk_bytes = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+        let authority_extent_count = authority_bytes.len().div_ceil(authority_chunk_bytes);
+        let span_of = |len: usize, extents: usize| -> Result<u64, PersistentAuthorityError<D::Error>> {
+            u64::try_from(len.div_ceil(PAGE_SIZE))
+                .ok()
+                .and_then(|pages| pages.checked_add((extents * 2) as u64))
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))
+        };
+        let empty_snapshot_span = if state.catalog_root == PhysicalPointer::Null {
+            span_of(crate::cas_codec::CAS_SNAPSHOT_HEADER_LEN, 1)?
+        } else {
+            0
+        };
+        let allocation_span = span_of(
+            crate::allocation_v2::ALLOCATION_V2_HEADER_LEN
+                .checked_add(state.allocation.packed_bitmap().len())
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?,
+            1,
+        )?;
+        // Extents never cross a segment boundary, so segment demand must be
+        // computed by placing each span first-fit in order, exactly as the
+        // builder will; summing pages and dividing underestimates when chunk
+        // granularity wastes tail space in a segment.
+        let payload_area = u64::from(DATA_END_PAGE - DATA_FIRST_PAGE);
+        let mut needed_segments = 1usize;
+        let mut placed = 0u64;
+        let mut place = |span: u64| -> Result<(), PersistentAuthorityError<D::Error>> {
+            if span > payload_area {
+                return Err(PersistentAuthorityError::Gc(GcError::Capacity));
+            }
+            if placed
+                .checked_add(span)
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?
+                > payload_area
+            {
+                needed_segments = needed_segments
+                    .checked_add(1)
+                    .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+                placed = 0;
+            }
+            placed = placed
+                .checked_add(span)
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?;
+            Ok(())
+        };
+        if empty_snapshot_span != 0 {
+            place(empty_snapshot_span)?;
+        }
+        let mut remaining_authority = authority_bytes.len();
+        for _ in 0..authority_extent_count {
+            let chunk = remaining_authority.min(authority_chunk_bytes);
+            place(span_of(chunk, 1)?)?;
+            remaining_authority -= chunk;
+        }
+        place(allocation_span)?;
+        // Ordinary publication must never consume the cleaner reserve: a
+        // transition that dips free below the reserve floor is a capacity
+        // condition the foreground-cleaner retry (or store growth) relieves,
+        // not a mid-write validation failure.
+        if counts.free
+            < u64::try_from(needed_segments)
+                .ok()
+                .and_then(|needed| needed.checked_add(u64::from(state.cleaner_reserve_segments)))
+                .ok_or(PersistentAuthorityError::Gc(GcError::ArithmeticOverflow))?
+        {
             return Err(PersistentAuthorityError::Gc(GcError::Capacity));
         }
-        let free =
-            select_free_segments(&state.allocation, 1).map_err(PersistentAuthorityError::Gc)?;
+        let free = select_free_segments(&state.allocation, needed_segments)
+            .map_err(PersistentAuthorityError::Gc)?;
         let next_segment_generation = state
             .next_segment_generation
-            .checked_add(1)
+            .checked_add(needed_segments as u64)
             .ok_or(PersistentAuthorityError::Gc(GcError::InvalidGeneration))?;
         let allocation = state
             .allocation
@@ -1244,18 +1686,26 @@ impl<D: PageDevice> SegmentStore<D> {
                 bytes,
             });
         }
+        // Large-object record streams can exceed one extent's 1 MiB
+        // payload ceiling. Split the authority payload into consecutive
+        // extent records inside a single segment so extent 0 remains the
+        // exact checkpoint root and recovery can reassemble the chain.
+        let authority_extent_count = authority_extent_count as u32;
+        let authority_merkle_root = payload_sha256(&authority_bytes);
         let authority_index = payloads.len();
-        payloads.push(SegmentPayload {
-            extent_kind: ExtentKind::Authority,
-            object_kind: METADATA_KIND_PERSISTENT_AUTHORITY,
-            extent_index: 0,
-            extent_count: 1,
-            content_byte_len: authority_bytes.len() as u64,
-            encoded_blob_len: authority_bytes.len() as u64,
-            encoded_offset: 0,
-            merkle_root: payload_sha256(&authority_bytes),
-            bytes: &authority_bytes,
-        });
+        for (extent_index, chunk) in authority_bytes.chunks(authority_chunk_bytes).enumerate() {
+            payloads.push(SegmentPayload {
+                extent_kind: ExtentKind::Authority,
+                object_kind: METADATA_KIND_PERSISTENT_AUTHORITY,
+                extent_index: extent_index as u32,
+                extent_count: authority_extent_count,
+                content_byte_len: authority_bytes.len() as u64,
+                encoded_blob_len: authority_bytes.len() as u64,
+                encoded_offset: (extent_index * authority_chunk_bytes) as u64,
+                merkle_root: authority_merkle_root,
+                bytes: chunk,
+            });
+        }
         let allocation_index = payloads.len();
         payloads.push(SegmentPayload {
             extent_kind: ExtentKind::Allocation,
@@ -1268,7 +1718,42 @@ impl<D: PageDevice> SegmentStore<D> {
             merkle_root: payload_sha256(&allocation_bytes),
             bytes: &allocation_bytes,
         });
-        let pointers = builder.payload_batch(&self.device, &payloads).await?;
+        let pointers = match builder
+            .payload_batch_single_segment(&self.device, &payloads)
+            .await
+        {
+            Ok(pointers) => pointers,
+            Err(GcStoreError::Gc(GcError::Capacity)) => {
+                // The authority chain exceeds one segment's payload area;
+                // write every extent individually so the builder spans
+                // segments. Recovery reassembles the chain by scanning the
+                // allocated segment set.
+                let mut pointers = Vec::new();
+                pointers
+                    .try_reserve_exact(payloads.len())
+                    .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+                for payload in &payloads {
+                    pointers.push(
+                        builder
+                            .payload(
+                                &self.device,
+                                payload.extent_kind,
+                                payload.object_kind,
+                                payload.extent_index,
+                                payload.extent_count,
+                                payload.content_byte_len,
+                                payload.encoded_blob_len,
+                                payload.encoded_offset,
+                                payload.merkle_root,
+                                payload.bytes,
+                            )
+                            .await?,
+                    );
+                }
+                pointers
+            }
+            Err(error) => return Err(error.into()),
+        };
         let catalog_root = if empty_cas_snapshot.is_some() {
             pointers
                 .first()
@@ -1303,18 +1788,19 @@ impl<D: PageDevice> SegmentStore<D> {
         // predecessor witness and the exact checkpoint transition.
         let mut staged = Vec::new();
         staged
-            .try_reserve_exact(3)
+            .try_reserve_exact(3 + authority_extent_count as usize)
             .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
         if let (Some(bytes), PhysicalPointer::Value(_)) =
             (empty_cas_snapshot.as_ref(), catalog_root)
         {
             staged.push((catalog_root, ExtentKind::Catalog, bytes.as_slice()));
         }
-        staged.push((
-            authority_root,
-            ExtentKind::Authority,
-            authority_bytes.as_slice(),
-        ));
+        for (chunk, pointer) in authority_bytes
+            .chunks(authority_chunk_bytes)
+            .zip(&pointers[authority_index..authority_index + authority_extent_count as usize])
+        {
+            staged.push((*pointer, ExtentKind::Authority, chunk));
+        }
         staged.push((
             allocation_root,
             ExtentKind::Allocation,
@@ -1432,14 +1918,42 @@ impl<D: PageDevice> SegmentStore<D> {
         }
     }
 
+    /// Return the Merkle root of one logical object, computing and caching it
+    /// on first sight. A valid record stream never redefines an ObjectId's
+    /// content, and non-successor installations clear the cache, so the hit
+    /// path is sound without re-hashing the object bytes.
+    fn cached_logical_root(
+        &mut self,
+        recovered: &vibeos_durable_format::RecoveredObject,
+    ) -> Result<vibeos_blob_format::Hash, PersistentAuthorityError<D::Error>> {
+        let stable_id = recovered.object_id.get();
+        let kind = recovered.object_kind.get();
+        let len = recovered.byte_len();
+        if let Some(root) = recovered.external_root {
+            // An external record declares its content address directly; the
+            // blob bound under it is proved against this root elsewhere.
+            self.logical_roots.insert(stable_id, (kind, len, root));
+            return Ok(root);
+        }
+        if let Some((cached_kind, cached_len, root)) = self.logical_roots.get(&stable_id) {
+            if *cached_kind == kind && *cached_len == len {
+                return Ok(*root);
+            }
+        }
+        let descriptor = BlobDescriptor::from_content(kind, &recovered.bytes)
+            .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+        self.logical_roots
+            .insert(stable_id, (kind, len, descriptor.root));
+        Ok(descriptor.root)
+    }
+
     fn validate_reusable_binding(
         state: &MountedState,
         binding: PersistentObjectBinding,
         recovered: &vibeos_durable_format::RecoveredObject,
+        root: vibeos_blob_format::Hash,
     ) -> Result<(), PersistentAuthorityError<D::Error>> {
-        let descriptor =
-            BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
-                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+        let descriptor_root = root;
         state
             .cas
             .as_ref()
@@ -1454,28 +1968,26 @@ impl<D: PageDevice> SegmentStore<D> {
                     && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                     && mapping.blob_key.object_kind() == binding.object_kind
                     && binding.object_kind == recovered.object_kind.get()
-                    && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
-                    && mapping.blob_key.merkle_root() == descriptor.root
+                    && mapping.blob_key.exact_len() == recovered.byte_len()
+                    && mapping.blob_key.merkle_root() == descriptor_root
             })
             .ok_or(PersistentAuthorityError::PolicyMismatch)?;
         Ok(())
     }
 
     async fn promote_existing_logical_object(
-        &self,
+        &mut self,
         recovered: &vibeos_durable_format::RecoveredObject,
         claimed_v2_object_ids: &BTreeSet<u128>,
         require_active_quota_candidate: bool,
         quota_reservation: &mut Option<QuotaReservation>,
+        root: vibeos_blob_format::Hash,
     ) -> Result<Option<AuthorizedObject<CasObjectHandle>>, PersistentAuthorityError<D::Error>> {
         let state = self.require_current_generation()?;
         let Some(cas) = state.cas.as_ref() else {
             return Ok(None);
         };
         let cas_payloads_verified = self.cas_payloads_verified(state.generation);
-        let descriptor =
-            BlobDescriptor::from_content(recovered.object_kind.get(), &recovered.bytes)
-                .map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
         for mapping in cas.objects.iter().copied().filter(|mapping| {
             !claimed_v2_object_ids.contains(&mapping.object_id)
                 && (!require_active_quota_candidate
@@ -1487,8 +1999,8 @@ impl<D: PageDevice> SegmentStore<D> {
                     }))
                 && mapping.reference_codec == crate::cas_codec::REFERENCE_CODEC_RAW
                 && mapping.blob_key.object_kind() == recovered.object_kind.get()
-                && mapping.blob_key.exact_len() == recovered.bytes.len() as u64
-                && mapping.blob_key.merkle_root() == descriptor.root
+                && mapping.blob_key.exact_len() == recovered.byte_len()
+                && mapping.blob_key.merkle_root() == root
         }) {
             let mut object = recover_promotable_cas_object(
                 state.superblock.binding.store_uuid,
@@ -1496,12 +2008,17 @@ impl<D: PageDevice> SegmentStore<D> {
                 &self.pins,
             )
             .map_err(|_| PersistentAuthorityError::Store(StoreError::ObjectUnavailable))?;
+            let previously_verified = self.promotion_verified.contains(&mapping.blob_key);
             if !cas_payloads_verified
+                && !previously_verified
                 && !self
                     .persistent_object_matches_recovered(&object, recovered)
                     .await?
             {
                 continue;
+            }
+            if !previously_verified {
+                self.promotion_verified.insert(mapping.blob_key);
             }
             if let Some(reservation) = quota_reservation.take() {
                 if !object.backend_handle_mut().can_attach_quota_charge() {
@@ -1636,14 +2153,12 @@ fn validate_quota_totals<E>(
 ) -> Result<(), PersistentAuthorityError<E>> {
     let logical = import
         .admitted_objects()
-        .try_fold(0_u64, |total, object| {
-            total.checked_add(object.bytes.len() as u64)
-        })
+        .try_fold(0_u64, |total, object| total.checked_add(object.byte_len()))
         .ok_or(PersistentAuthorityError::InvalidQuotaPolicy)?;
     let physical = import
         .admitted_objects()
         .try_fold(0_u64, |total, object| {
-            canonical_attributable_physical_bytes(object.bytes.len() as u64)
+            canonical_attributable_physical_bytes(object.byte_len())
                 .ok()
                 .and_then(|bytes| total.checked_add(bytes))
         })

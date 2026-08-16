@@ -48,6 +48,9 @@ use crate::{exec, heap, sync::SpinLock};
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
+/// Extra segments requested beyond the floor whenever foreground growth
+/// runs, so one growth transaction serves many subsequent commits.
+const STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS: u64 = 22;
 pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
     vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
@@ -684,11 +687,30 @@ enum LegacySnapshot {
 
 const STORAGE_V2_UUID: [u8; 16] = *b"VIBEOS-STOR-V2!!";
 
+/// Runtime store limits for the Storage V2 device. The recovery budget must
+/// match the format-time policy: large objects ride the M4 record stream
+/// inside the authority snapshot, and mount/growth transition accounting
+/// holds predecessor and successor state simultaneously.
+fn storage_v2_store_limits() -> StoreLimits {
+    StoreLimits {
+        // Recovery and collection account two mounted states side by side;
+        // each carries the full logical record stream, so the budget bounds
+        // the cumulative object bytes a store instance can carry (~a quarter
+        // of this value) rather than a single object's size.
+        recovery_memory_bytes: 64 * 1024 * 1024,
+        ..StoreLimits::default()
+    }
+}
+
 fn storage_v2_format_options() -> FormatOptions {
     FormatOptions {
         store_uuid: StoreUuid::new(STORAGE_V2_UUID).expect("fixed Storage V2 UUID is non-zero"),
         cleaner_reserve_segments: 2,
-        limits: StoreLimits::default(),
+        // Large objects ride the M4 record stream inside the authority
+        // snapshot; the default 2 MiB recovery ceiling cannot remount a store
+        // holding a ~1 MiB object. Raise the bounded accounting budget without
+        // changing any on-media geometry.
+        limits: storage_v2_store_limits(),
     }
 }
 
@@ -758,6 +780,88 @@ impl FileTreeBackend for KernelFileTreeBackend {
         })
     }
 
+    fn stage_chunks<'a>(
+        &'a self,
+        previous: Option<vibeos_segment_store::FsPersistentData>,
+        chunks: Vec<Vec<u8>>,
+    ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+        Box::pin(async move {
+            if chunks.is_empty() || chunks.iter().any(|bytes| bytes.is_empty()) {
+                // The batched path admits only whole non-empty chunks; the
+                // zero-length stream head keeps its dedicated commit.
+                let mut tail = previous;
+                for bytes in chunks {
+                    tail = Some(self.stage_chunk(tail, bytes).await?);
+                }
+                return tail.ok_or(FileError::ServiceUnavailable);
+            }
+            let maintenance = self
+                .runtime
+                .maintenance
+                .lock()
+                .clone()
+                .ok_or(FileError::ServiceUnavailable)?;
+            // One batch consumes a segment per chunk plus its metadata
+            // segment inside a single transaction, and the following
+            // tree/root commit burns several more; replenish to that
+            // appetite, not to the per-append floor.
+            let needed = (chunks.len() as u64).saturating_add(12);
+            let mut attempt = 0;
+            loop {
+                self.runtime
+                    .ensure_foreground_capacity_for(needed)
+                    .await
+                    .map_err(map_file_runtime_error)?;
+                let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
+                let result =
+                    poll_as_system(operation.store().stage_fs_data_chunks_for_maintenance(
+                        &maintenance,
+                        previous.as_ref(),
+                        &chunks,
+                    ))
+                    .await;
+                let declined_clean =
+                    result.is_err() && !operation.store().needs_remount();
+                if result.is_err() && !declined_clean {
+                    // A failed staged batch leaves the store poisoned; only a
+                    // new cold proof may re-establish the durable checkpoint.
+                    self.runtime.invalidate_recovery_cache();
+                }
+                operation.finish();
+                match result {
+                    Ok(tail) => return Ok(tail),
+                    Err(error) => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!(
+                            "  bench-detail fs-stage error (clean={declined_clean}): {error:?}"
+                        );
+                        let _ = &error;
+                        if declined_clean && attempt == 0 {
+                            // The batch was declined before staging anything;
+                            // reclaim dead segments and retry once.
+                            if let Ok(mut operation) = self.runtime.begin() {
+                                let _ = poll_as_system(operation.store().collect_garbage()).await;
+                                if let Ok(view) = poll_as_system(
+                                    operation.store().recover_persistent_authority(
+                                        crate::durable_cspace::storage_v2_external_policy_sha256(),
+                                    ),
+                                )
+                                .await
+                                {
+                                    self.runtime.publish_authority(view);
+                                }
+                                operation.finish();
+                            }
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(FileError::ServiceUnavailable);
+                    }
+                }
+            }
+        })
+    }
+
     fn read_chunk<'a>(
         &'a self,
         data: vibeos_segment_store::FsPersistentData,
@@ -781,12 +885,28 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 .lock()
                 .clone()
                 .ok_or(FileError::ServiceUnavailable)?;
+            // The fused transaction stages every new node in one batch;
+            // prefer growth to a foreground collection for its appetite.
+            self.runtime
+                .ensure_foreground_capacity_for(12)
+                .await
+                .map_err(map_file_runtime_error)?;
             let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
             let result = poll_as_system(
                 transaction.commit_persistent_for_maintenance(operation.store(), &maintenance),
             )
-            .await
-            .map_err(|error| match error {
+            .await;
+            if result.is_err() && operation.store().needs_remount() {
+                // A failed staged batch leaves the store poisoned; only a
+                // new cold proof may re-establish the durable checkpoint.
+                self.runtime.invalidate_recovery_cache();
+            }
+            let result = result.map_err(|error| match error {
+                #[cfg(feature = "storage-bench")]
+                ref detail if {
+                    crate::println!("  bench-detail fs-commit error: {detail:?}");
+                    false
+                } => unreachable!(),
                 vibeos_file_store::PersistentCommitError::File(error) => error,
                 vibeos_file_store::PersistentCommitError::Publish(
                     vibeos_segment_store::FsRootPublishError::Conflict,
@@ -815,9 +935,20 @@ pub(crate) struct StorageV2Runtime {
     last_info: SpinLock<Option<vibeos_segment_store::StoreInfo>>,
     boot_selection: AtomicU8,
     needs_rebuild: AtomicBool,
+    /// Logical-record count at the last steady-state compaction attempt, so
+    /// the append path re-evaluates compaction only after meaningful growth.
+    compact_watermark: AtomicU64,
+    /// Validated replay of the published logical stream (fix: appends
+    /// re-decoded the whole journal per put). Keyed by chain checkpoint and
+    /// record count; any mismatch falls back to a full replay.
+    preflight_cache: SpinLock<Option<crate::durable_cspace::StorageV2PreflightCache>>,
     maintenance_provisioner: StoreMaintenanceProvisioner,
     _quota_provisioner: StorageQuotaProvisioner,
 }
+
+/// Below this many logical records the authority stream is not worth
+/// rewriting: migration fixtures and small stores never trigger compaction.
+const STORAGE_V2_COMPACT_MIN_RECORDS: usize = 2048;
 
 const STORAGE_V2_HOT_READ_CACHE_BYTES: usize = 256 * 1024;
 // Object-store tokens retain the encoded Merkle envelope, so a 64 KiB user
@@ -928,12 +1059,19 @@ impl StorageV2Runtime {
                 typed_kinds,
             )
             .expect("fixed Storage V2 governed runtime policy is valid");
+        let mut store = SegmentStore::new_with_runtime_context(
+            device.clone(),
+            storage_v2_store_limits(),
+            context.clone(),
+        );
+        // Deferred commit read-back: every read path Merkle-verifies content
+        // and boot performs a full cold scrub, so a damaged device write is
+        // detected at first use instead of at the commit that produced it.
+        // This trades that detection window for not re-reading and re-hashing
+        // every just-written page on the foreground commit path.
+        store.set_deferred_commit_readback(true);
         let runtime = Arc::new(Self {
-            store: StableSegmentStore(UnsafeCell::new(SegmentStore::new_with_runtime_context(
-                device.clone(),
-                StoreLimits::default(),
-                context.clone(),
-            ))),
+            store: StableSegmentStore(UnsafeCell::new(store)),
             device,
             context,
             active: SpinLock::new_recoverable(None),
@@ -944,6 +1082,8 @@ impl StorageV2Runtime {
             last_info: SpinLock::new_recoverable(None),
             boot_selection: AtomicU8::new(0),
             needs_rebuild: AtomicBool::new(false),
+            compact_watermark: AtomicU64::new(0),
+            preflight_cache: SpinLock::new_recoverable(None),
             maintenance_provisioner: maintenance,
             _quota_provisioner: quota,
         });
@@ -992,7 +1132,7 @@ impl StorageV2Runtime {
             unsafe {
                 *self.store.0.get() = SegmentStore::new_with_runtime_context(
                     self.device.clone(),
-                    StoreLimits::default(),
+                    storage_v2_store_limits(),
                     self.context.clone(),
                 );
             }
@@ -1051,7 +1191,13 @@ impl StorageV2Runtime {
                 )
         });
         if !current {
-            return Err(vibeos_object_store::StoreError::ObjectUnavailable);
+            // A stale cache entry proves nothing about the object itself: a
+            // later append or collection advanced the published generation
+            // without touching this content. Decline the cache and let the
+            // caller resolve through the durable path, which re-validates
+            // the object's stable identity against the current view and
+            // fails closed only if the object is genuinely unresolvable.
+            return Ok(None);
         }
         let output = bytes.as_ref().to_vec();
         drop(authority);
@@ -1093,6 +1239,7 @@ impl StorageV2Runtime {
     /// proof after that proof has failed.
     fn invalidate_recovery_cache(&self) {
         self.clear_recovery_cache();
+        *self.preflight_cache.lock() = None;
         self.needs_rebuild.store(true, Ordering::Release);
     }
 
@@ -1263,7 +1410,11 @@ impl StorageV2Runtime {
                 .await
                 .map_err(|error| match error {
                     PersistentAuthorityError::GenerationMismatch => V2RuntimeError::JournalChanged,
-                    _ => V2RuntimeError::Corrupt,
+                    _error => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail authority append error: {_error:?}");
+                        V2RuntimeError::Corrupt
+                    }
                 })
         })
         .await;
@@ -1326,23 +1477,13 @@ impl StorageV2Runtime {
             // boundary, narrow the live device view before deriving the exact
             // adjacent suffix admitted by this growth transaction.
             self.device.expose_block_count(durable_blocks);
-            let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
-                .saturating_sub(info.free_segments)
-                .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
-                .ok_or(V2RuntimeError::Corrupt)?;
-            let info = match self
-                .device
-                .growth_capability_bounded(durable_blocks, growth_blocks)
-                .map_err(|_| V2RuntimeError::Corrupt)?
-            {
-                Some(additional) => {
-                    match poll_as_system(operation.store().grow(&maintenance, additional)).await {
-                        Ok(info) => info,
-                        Err(_) => return Err(V2RuntimeError::Corrupt),
-                    }
-                }
-                None => info,
-            };
+            // No growth here: a cold proof must leave the checkpoint exactly
+            // where recovery found it. The migration contract binds a staged
+            // or native activation to the precise current checkpoint, and a
+            // boot-time growth transaction silently advanced past it,
+            // failing every powered-off selector verification. Foreground
+            // writers replenish capacity themselves (with hysteresis) on
+            // their first commit instead.
             *self.last_info.lock() = Some(info);
             let view = poll_as_system(
                 operation
@@ -1368,6 +1509,61 @@ impl StorageV2Runtime {
             )
             .await
             .map_err(|_| V2RuntimeError::Corrupt)?;
+            // Boot-boundary compaction: no runtime capabilities exist yet, so
+            // ungranted boot-local objects — which cold recovery deliberately
+            // refuses to resolve — may be shed together with dead grant
+            // closures. A replacement is re-validated under the compiled
+            // policy and re-verified exactly like the recovered view; any
+            // failure past the replacement attempt fails the cold proof.
+            let view = {
+                let record_count = view.record_stream().len() / LOGICAL_BLOCK_SIZE;
+                let compacted = if record_count >= STORAGE_V2_COMPACT_MIN_RECORDS {
+                    decode_authority_records(view.record_stream())
+                        .ok()
+                        .and_then(|records| {
+                            crate::durable_cspace::storage_v2_compact_records(&records, true)
+                                .ok()
+                                .flatten()
+                        })
+                } else {
+                    None
+                };
+                match compacted {
+                    None => view,
+                    Some(compacted) => {
+                        let import =
+                            crate::durable_cspace::storage_v2_migration_import(&compacted)
+                                .map_err(|_| V2RuntimeError::Corrupt)?;
+                        let writer = operation
+                            .store()
+                            .derive_persistent_authority_writer(&maintenance)
+                            .map_err(|_| V2RuntimeError::Corrupt)?;
+                        let generation = view.checkpoint_generation();
+                        drop(view);
+                        let replaced = poll_as_system(
+                            operation.store().replace_persistent_authority(
+                                &writer,
+                                generation,
+                                import,
+                            ),
+                        )
+                        .await
+                        .map_err(|_| V2RuntimeError::Corrupt)?;
+                        let verify = crate::durable_cspace::storage_v2_recovery_import(
+                            replaced.record_stream(),
+                        )
+                        .map_err(|_| V2RuntimeError::Corrupt)?;
+                        poll_as_system(
+                            operation
+                                .store()
+                                .verify_persistent_authority_import(&replaced, &verify),
+                        )
+                        .await
+                        .map_err(|_| V2RuntimeError::Corrupt)?;
+                        replaced
+                    }
+                }
+            };
             let scrub = poll_as_system(operation.store().scrub(&maintenance))
                 .await
                 .map_err(|_| V2RuntimeError::Corrupt)?;
@@ -1422,37 +1618,214 @@ impl StorageV2Runtime {
         Ok(bytes)
     }
 
-    #[cfg(feature = "file-tree")]
-    async fn ensure_file_tree_capacity(self: &Arc<Self>) -> Result<(), FileError> {
-        let mut operation = self.begin().map_err(map_file_runtime_error)?;
+    /// Grow the store toward the foreground free-segment floor while the
+    /// device still has growth capability. Both the file-tree and the object
+    /// append paths call this before mutating, which keeps capacity relief on
+    /// the growth path instead of a blocking foreground collection.
+    async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), V2RuntimeError> {
+        self.ensure_foreground_capacity_for(STORAGE_V2_FOREGROUND_FREE_SEGMENTS)
+            .await
+    }
+
+    /// Like [`StorageV2Runtime::ensure_foreground_capacity`], but replenishing
+    /// to at least `required_free` segments. Batched staging consumes several
+    /// segments inside one transaction, so its caller must raise the floor to
+    /// the batch's appetite instead of relying on the per-append default.
+    async fn ensure_foreground_capacity_for(
+        self: &Arc<Self>,
+        required_free: u64,
+    ) -> Result<(), V2RuntimeError> {
+        let floor = STORAGE_V2_FOREGROUND_FREE_SEGMENTS.max(required_free);
+        let mut operation = self.begin()?;
         let info = operation
             .store()
             .info()
-            .map_err(|_| FileError::ServiceUnavailable)?;
+            .map_err(|_| V2RuntimeError::Corrupt)?;
+        if info.free_segments >= floor {
+            operation.finish();
+            return Ok(());
+        }
         let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
             .ok()
             .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
-            .ok_or(FileError::ServiceUnavailable)?;
+            .ok_or(V2RuntimeError::Corrupt)?;
+        // Grow with hysteresis: replenishing exactly to the floor makes the
+        // very next commit dip below it again, turning every append into a
+        // growth checkpoint. Overshooting amortizes one growth transaction
+        // across many commits.
         let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
+            .saturating_add(STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS)
             .saturating_sub(info.free_segments)
             .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
-            .ok_or(FileError::ServiceUnavailable)?;
+            .ok_or(V2RuntimeError::Corrupt)?;
         let additional = self
             .device
             .growth_capability_bounded(durable_blocks, growth_blocks)
-            .map_err(|_| FileError::ServiceUnavailable)?;
+            .map_err(|_| V2RuntimeError::Corrupt)?;
+        #[cfg(feature = "storage-bench")]
+        crate::println!(
+            "  bench-detail capacity free={} floor={} growth_blocks={} additional={:?}",
+            info.free_segments,
+            floor,
+            growth_blocks,
+            additional.is_some()
+        );
         if let Some(additional) = additional {
             let maintenance = self
                 .maintenance
                 .lock()
                 .clone()
-                .ok_or(FileError::ServiceUnavailable)?;
+                .ok_or(V2RuntimeError::Corrupt)?;
             poll_as_system(operation.store().grow(&maintenance, additional))
                 .await
-                .map_err(|_| FileError::ServiceUnavailable)?;
+                .map_err(|_| V2RuntimeError::Corrupt)?;
+        } else {
+            // Growth is exhausted: reclaim dead space now, while enough free
+            // segments remain for the collector's relocation targets. Each
+            // round's source budget bounds its pause, and a retired segment
+            // only rejoins the free set two checkpoint generations later, so
+            // one round cannot observe its own relief — iterate bounded
+            // rounds until the requested floor is met or reclaim stalls.
+            // Reclaim past the floor with the same hysteresis as growth:
+            // every mark walk costs one pass over the live object graph, so
+            // stopping at the floor makes the very next batch dip below it
+            // and charges a full walk per handful of freed segments.
+            // Overshooting amortizes one walk across many commits.
+            let reclaim_target = floor.saturating_add(STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS);
+            let mut collected = false;
+            let mut last_free = info.free_segments;
+            let mut stalled = 0_u32;
+            for _ in 0..8 {
+                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                let io_before = crate::virtio_blk::telemetry();
+                let _telemetry =
+                    match poll_as_system(operation.store().collect_garbage()).await {
+                        Ok(telemetry) => telemetry,
+                        Err(_error) => {
+                            #[cfg(feature = "storage-bench")]
+                            crate::println!("  bench-detail gc error: {_error:?}");
+                            break;
+                        }
+                    };
+                collected = true;
+                let Ok(current) = operation.store().info() else {
+                    break;
+                };
+                #[cfg(feature = "storage-bench")]
+                crate::println!(
+                    "  bench-detail gc-round free={} floor={}",
+                    current.free_segments,
+                    floor
+                );
+                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                {
+                    let io = crate::virtio_blk::telemetry().saturating_sub(io_before);
+                    crate::println!(
+                        "  bench-detail gc-io reads={} read_mib={} writes={} live_obj={} live_blob={} copied={} reclaimed_seg={} pause_ms={}",
+                        io.read_requests,
+                        io.read_bytes / (1024 * 1024),
+                        io.write_requests,
+                        _telemetry.live_object_count,
+                        _telemetry.live_blob_count,
+                        _telemetry.copied_bytes,
+                        _telemetry.reclaimed_segments,
+                        _telemetry.foreground_pause_ns / 1_000_000
+                    );
+                }
+                if current.free_segments >= reclaim_target {
+                    break;
+                }
+                // Past the floor the walk is pure amortization; a round that
+                // stops yielding must not stall the caller, which already has
+                // the capacity it asked for.
+                if current.free_segments >= floor && current.free_segments <= last_free {
+                    break;
+                }
+                if current.free_segments <= last_free {
+                    stalled += 1;
+                    if stalled >= 3 {
+                        break;
+                    }
+                } else {
+                    stalled = 0;
+                }
+                last_free = current.free_segments;
+            }
+            if collected {
+                // Collection preserves the logical stream but advances the
+                // checkpoint generation; refresh the published authority view
+                // so the next append's generation witness is current.
+                if let Ok(view) = poll_as_system(operation.store().recover_persistent_authority(
+                    crate::durable_cspace::storage_v2_external_policy_sha256(),
+                ))
+                .await
+                {
+                    self.publish_authority(view);
+                }
+            }
         }
         operation.finish();
         Ok(())
+    }
+
+    /// Steady-state stream compaction. When the appended logical journal has
+    /// outgrown the threshold and a rewrite would shed at least a quarter of
+    /// its records, replace the persistent authority with the compacted
+    /// equivalent and return the published replacement view. Handles and
+    /// read tokens minted earlier this boot keep resolving: persistent and
+    /// transient resolution binds stable object ids, never stream sequences.
+    /// Ungranted (runtime-transient) objects are retained; only a boot
+    /// boundary may shed those.
+    async fn maybe_compact_authority(
+        self: &Arc<Self>,
+        view: &PersistentAuthorityView,
+    ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
+        let record_count = (view.record_stream().len() / LOGICAL_BLOCK_SIZE) as u64;
+        if (record_count as usize) < STORAGE_V2_COMPACT_MIN_RECORDS {
+            return Ok(None);
+        }
+        let watermark = self.compact_watermark.load(Ordering::Acquire);
+        if watermark != 0 && record_count < watermark.saturating_add(watermark / 4) {
+            return Ok(None);
+        }
+        self.compact_watermark.store(record_count, Ordering::Release);
+        // Evaluation failures (nothing worth compacting, policy re-validation
+        // declined) leave the appended state authoritative. Only an actual
+        // replacement attempt with an unknown durable outcome fails closed.
+        let Ok(records) = decode_authority_records(view.record_stream()) else {
+            return Ok(None);
+        };
+        let compacted = match crate::durable_cspace::storage_v2_compact_records(&records, false)
+        {
+            Ok(Some(compacted)) => compacted,
+            _ => return Ok(None),
+        };
+        let Ok(import) = crate::durable_cspace::storage_v2_migration_import(&compacted) else {
+            return Ok(None);
+        };
+        let mut expected = Vec::new();
+        if expected
+            .try_reserve_exact(compacted.len() * LOGICAL_BLOCK_SIZE)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        for record in &compacted {
+            expected.extend_from_slice(record);
+        }
+        match self.install_persistent_authority(import, &expected).await {
+            Ok(replacement) => {
+                self.compact_watermark
+                    .store(compacted.len() as u64, Ordering::Release);
+                Ok(Some(replacement))
+            }
+            Err(_) => {
+                // The replacement's durability is unknown; only a fresh cold
+                // proof may re-establish which checkpoint is live.
+                self.invalidate_recovery_cache();
+                Err(vibeos_object_store::StoreError::Corrupt)
+            }
+        }
     }
 
     #[cfg(feature = "file-tree")]
@@ -1466,7 +1839,9 @@ impl StorageV2Runtime {
         {
             return Err(FileError::ServiceUnavailable);
         }
-        self.ensure_file_tree_capacity().await?;
+        self.ensure_foreground_capacity()
+            .await
+            .map_err(|_| FileError::ServiceUnavailable)?;
         let mut operation = self.begin().map_err(map_file_runtime_error)?;
         let recovered = poll_as_system(FileTreeRoot::recover_persistent(
             operation.store(),
@@ -2943,6 +3318,11 @@ impl StorageV2ReadToken {
         recovered: &vibeos_durable_format::RecoveredObject,
         cache: &HotReadCache,
     ) {
+        if recovered.is_external() {
+            // External content never rides the record stream; caching the
+            // empty inline bytes would serve empty reads.
+            return;
+        }
         match self {
             Self::Persistent { handle, cached, .. }
                 if handle.object_kind() == recovered.object_kind.get()
@@ -3084,6 +3464,16 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
         records: &'a [[u8; LOGICAL_BLOCK_SIZE]],
     ) -> vibeos_object_store::StorageV2Future<'a, vibeos_object_store::StorageV2AuthoritySnapshot>
     {
+        self.append_authority_with_payload(expected, records, None)
+    }
+
+    fn append_authority_with_payload<'a>(
+        &'a self,
+        expected: vibeos_durable_format::ChainCheckpoint,
+        records: &'a [[u8; LOGICAL_BLOCK_SIZE]],
+        external_payload: Option<(u128, &'a [u8])>,
+    ) -> vibeos_object_store::StorageV2Future<'a, vibeos_object_store::StorageV2AuthoritySnapshot>
+    {
         Box::pin(async move {
             let runtime = INSTALLED_V2_RUNTIME
                 .lock()
@@ -3091,9 +3481,32 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
                 .cloned()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            // Keep the cleaner off the commit path: while the device still has
+            // growth capability, capacity relief happens through bounded store
+            // growth instead of a blocking foreground collection inside the
+            // append; once growth is exhausted, a budgeted collection runs at
+            // the free-segment floor. Either transition advances the
+            // checkpoint generation while preserving the logical stream, so
+            // it must complete before this append captures its generation
+            // witness. Failure here is not fatal by itself; a true capacity
+            // condition still fails the append closed below.
+            let required_free = external_payload
+                .map(|(_, payload)| {
+                    // An external payload consumes roughly a segment per
+                    // 4 MiB plus metadata; the quota admission additionally
+                    // requires that much ordinary capacity to be free before
+                    // the reservation, so replenish to the whole appetite.
+                    (payload.len() as u64)
+                        .div_ceil(STORAGE_V2_GROWTH_GRANULE_BLOCKS * LOGICAL_BLOCK_SIZE as u64)
+                        .saturating_add(8)
+                })
+                .unwrap_or(STORAGE_V2_FOREGROUND_FREE_SEGMENTS);
+            let _ = runtime.ensure_foreground_capacity_for(required_free).await;
             let current = runtime
                 .authority_view()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            #[cfg(feature = "storage-bench")]
+            let phase_started = crate::sbi::time();
             let mut stream_records = Vec::new();
             stream_records
                 .try_reserve_exact(
@@ -3107,20 +3520,74 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                         .map_err(|_| vibeos_object_store::StoreError::Corrupt)?,
                 );
             }
-            let store_id = vibeos_durable_format::StoreId::new(M4_STORE_ID_RAW)
-                .expect("fixed M4 store ID is non-zero");
-            let before = vibeos_durable_format::preflight_recovery(&stream_records, store_id)
-                .map_err(|_| vibeos_object_store::StoreError::Corrupt)?;
-            if before
-                .chain_checkpoint()
-                .map_err(|_| vibeos_object_store::StoreError::Corrupt)?
-                != expected
-            {
+            // The published stream was fully validated when it was recovered or
+            // appended; the concurrency guard only needs the chain checkpoint,
+            // which one decode of the final record yields.
+            let last_record = stream_records
+                .last()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let decoded = match vibeos_durable_format::LogRecord::decode(last_record) {
+                Ok(vibeos_durable_format::DecodeStatus::Valid(decoded)) => decoded,
+                _ => return Err(vibeos_object_store::StoreError::Corrupt),
+            };
+            let observed = vibeos_durable_format::ChainCheckpoint {
+                next_sequence: decoded
+                    .record
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(vibeos_object_store::StoreError::Corrupt)?,
+                previous_sequence: decoded.record.sequence,
+                previous_crc32c: decoded.crc32c,
+            };
+            if observed != expected {
                 return Err(vibeos_object_store::StoreError::JournalChanged);
             }
             stream_records.extend_from_slice(records);
-            let import = crate::durable_cspace::storage_v2_migration_import(&stream_records)
-                .map_err(|_| vibeos_object_store::StoreError::Corrupt)?;
+            #[cfg(feature = "storage-bench")]
+            let phase_preflight = crate::sbi::time();
+            let cached_preflight = self.preflight_cache.lock().take();
+            let (mut import, preflight_cache) =
+                crate::durable_cspace::storage_v2_migration_import_incremental(
+                    &stream_records,
+                    records.len(),
+                    expected,
+                    cached_preflight,
+                )
+                .map_err(|_error| {
+                    #[cfg(feature = "storage-bench")]
+                    crate::println!("  bench-detail migration import error: {_error:?}");
+                    vibeos_object_store::StoreError::Corrupt
+                })?;
+            if let Some((stable_object_id, payload)) = external_payload {
+                // The payload copy lives exactly as long as the installation
+                // and can reach 64 MiB; charge it to the system heap beside
+                // the store's own staging buffers, not the client budget.
+                let mut system = heap::enter_owner(OwnerId::SYSTEM);
+                let mut owned = Vec::new();
+                let reserved = owned.try_reserve_exact(payload.len());
+                if reserved.is_ok() {
+                    owned.extend_from_slice(payload);
+                }
+                system.restore();
+                if reserved.is_err() {
+                    #[cfg(feature = "storage-bench")]
+                    crate::println!("  bench-detail external payload copy oom");
+                    return Err(vibeos_object_store::StoreError::InsufficientMemory);
+                }
+                import
+                    .attach_external_payload(stable_object_id, owned)
+                    .map_err(|_error| {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail attach error: {_error:?}");
+                        vibeos_object_store::StoreError::Corrupt
+                    })?;
+            }
+            let import = import;
+            #[cfg(feature = "storage-bench")]
+            let phase_import = crate::sbi::time();
+            // The import owns its own validated copy; release the raw stream
+            // buffer before the append's peak transient allocations.
+            drop(stream_records);
             let principal = current
                 .principals()
                 .first()
@@ -3131,16 +3598,50 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 .append_persistent_authority(current.checkpoint_generation(), import, principal)
                 .await
                 .map_err(map_facade_error)?;
+            #[cfg(feature = "storage-bench")]
+            let phase_append = crate::sbi::time();
             let (view, transient) = appended.into_parts();
             let transient = system_arc(transient);
-            let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    runtime.invalidate_recovery_cache();
-                    return Err(error);
-                }
+            // Steady-state compaction: an oversized logical journal is
+            // rewritten to its live equivalent and installed as a
+            // replacement checkpoint. Token resolution binds stable object
+            // ids, so the snapshot below stays valid either way; the
+            // just-appended (still ungranted) objects resolve through the
+            // transient witness.
+            let compacted_view = runtime.maybe_compact_authority(&view).await?;
+            if compacted_view.is_none() {
+                // The appended stream is now the published stream; retain its
+                // validated replay for the next strict extension. A compacted
+                // replacement rewrites the chain, so its cache would never
+                // match and is not worth holding.
+                *runtime.preflight_cache.lock() = Some(preflight_cache);
+            }
+            let snapshot_view: &PersistentAuthorityView = match compacted_view.as_deref() {
+                Some(replacement) => replacement,
+                None => &view,
             };
-            runtime.publish_authority(view);
+            let snapshot =
+                match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        runtime.invalidate_recovery_cache();
+                        return Err(error);
+                    }
+                };
+            if compacted_view.is_none() {
+                runtime.publish_authority(view);
+            }
+            #[cfg(feature = "storage-bench")]
+            {
+                let phase_publish = crate::sbi::time();
+                crate::println!(
+                    "  bench-phase preflight={} import={} append={} publish={}",
+                    phase_preflight.saturating_sub(phase_started),
+                    phase_import.saturating_sub(phase_preflight),
+                    phase_append.saturating_sub(phase_import),
+                    phase_publish.saturating_sub(phase_append),
+                );
+            }
             Ok(snapshot)
         })
     }

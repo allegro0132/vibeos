@@ -19,7 +19,7 @@ use vibeos_segment_format::{
     payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
     Checkpoint, ExtentKind, ExtentRecord, FormatError, Page, PhysicalPointer, PointerValue,
     RecordBinding, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO,
-    DATA_END_PAGE, DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_PAGES,
+    DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE, SEGMENT_PAGES,
     SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
@@ -37,7 +37,7 @@ use crate::cas_codec::{
     MAX_METADATA_PAYLOAD_LEN, OBJECT_MAPPING_LEN, REFERENCE_CODEC_RAW,
 };
 use crate::codec::{encode_allocation, AllocationState};
-use crate::device::PageDevice;
+use crate::device::{PageDevice, PageDeviceInfo};
 use crate::gc::{GcStoreError, GcTelemetry, GcTimeSource};
 use crate::maintenance::MaintenanceOperationLease;
 use crate::pins::{
@@ -57,9 +57,217 @@ use crate::store::{
 const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
 const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
-const MAX_TREE_PAGES: usize = MAX_EXTENT_PAYLOAD_PAGES as usize;
-const SMALL_STAGED_BLOB_READBACK_LIMIT: u64 = 64 * 1024;
+const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
+// The cheap readback path decodes and fully re-verifies the staged blob from
+// one batched read; the expensive path re-derives the tree through many
+// single-range reads. 512 KiB keeps the cheap path within the ordinary
+// recovery-memory budget while covering the 128 KiB qualification size.
+const SMALL_STAGED_BLOB_READBACK_LIMIT: u64 = 512 * 1024;
 const MAX_BATCHED_BLOB_READ_LIMIT: usize = 512 * 1024;
+/// Blobs up to this encoded size buffer their scratch writes in the staged
+/// page sink; the bound keeps the transient heap cost of one commit small.
+const SMALL_BLOB_SINK_LIMIT: u64 = 256 * 1024;
+
+/// Buffered writes of a deferred-barrier publication window. Pages are
+/// staged in memory and drained to the device as contiguous multi-page
+/// requests immediately before the checkpoint slot protocol, whose first
+/// flush is the shared durability barrier for the whole window.
+pub(crate) struct PageSink {
+    entries: Vec<(u64, Box<Page>)>,
+}
+
+impl PageSink {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn push<E>(&mut self, page: u64, bytes: &Page) -> Result<(), StoreError<E>> {
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let mut copy = heap_page();
+        copy.copy_from_slice(bytes);
+        self.entries.push((page, copy));
+        Ok(())
+    }
+
+    /// Move every page staged in `other` into this sink. Callers merge sinks
+    /// whose page sets are disjoint (they target different segments), so the
+    /// drain-time last-write-wins rule is never exercised across sources.
+    pub(crate) fn absorb<E>(&mut self, other: PageSink) -> Result<(), StoreError<E>> {
+        self.entries
+            .try_reserve(other.entries.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        self.entries.extend(other.entries);
+        Ok(())
+    }
+
+    /// Drain every staged page as contiguous ascending runs. Later writes to
+    /// the same page win, exactly like direct device ordering would.
+    pub(crate) async fn drain<D: PageDevice>(
+        mut self,
+        device: &D,
+    ) -> Result<(), StoreError<D::Error>> {
+        self.entries
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        // Deduplicate: keep the last write per page.
+        let mut deduped: Vec<(u64, Box<Page>)> = Vec::new();
+        deduped
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for entry in self.entries {
+            if deduped.last().is_some_and(|last| last.0 == entry.0) {
+                *deduped.last_mut().expect("non-empty") = entry;
+            } else {
+                deduped.push(entry);
+            }
+        }
+        let mut index = 0;
+        while index < deduped.len() {
+            let first_page = deduped[index].0;
+            let mut end = index + 1;
+            while end < deduped.len() && deduped[end].0 == first_page + (end - index) as u64 {
+                end += 1;
+            }
+            let mut run = Vec::new();
+            run.try_reserve_exact(end - index)
+                .map_err(|_| StoreError::MemoryLimit)?;
+            for entry in &deduped[index..end] {
+                run.push(*entry.1);
+            }
+            device
+                .write_pages(first_page, &run)
+                .await
+                .map_err(StoreError::Mutation)?;
+            index = end;
+        }
+        Ok(())
+    }
+}
+
+async fn sink_or_write_page<D: PageDevice>(
+    device: &D,
+    sink: Option<&mut PageSink>,
+    page: u64,
+    bytes: &Page,
+) -> Result<(), StoreError<D::Error>> {
+    match sink {
+        Some(sink) => sink.push(page, bytes),
+        None => write_page(device, page, bytes).await,
+    }
+}
+
+/// A read-only device view backed by span snapshots fetched with batched
+/// multi-page reads. Reads inside a span are served from the buffer; reads
+/// outside fall through to the inner device. Mutations pass through, though
+/// verification callers never issue any.
+pub(crate) struct SpanSnapshotDevice<'a, D> {
+    inner: &'a D,
+    spans: Vec<(u64, Vec<Page>)>,
+}
+
+impl<'a, D: PageDevice> SpanSnapshotDevice<'a, D> {
+    pub(crate) async fn capture(
+        inner: &'a D,
+        ranges: &[(u64, u64)],
+    ) -> Result<SpanSnapshotDevice<'a, D>, StoreError<D::Error>> {
+        let mut spans = Vec::new();
+        spans
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for (first, count) in ranges {
+            let count = usize::try_from(*count).map_err(|_| StoreError::MemoryLimit)?;
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(count)
+                .map_err(|_| StoreError::MemoryLimit)?;
+            pages.resize(count, [0; PAGE_SIZE]);
+            inner
+                .read_pages(*first, &mut pages)
+                .await
+                .map_err(StoreError::Device)?;
+            spans.push((*first, pages));
+        }
+        Ok(SpanSnapshotDevice { inner, spans })
+    }
+}
+
+impl<D: PageDevice> PageDevice for SpanSnapshotDevice<'_, D> {
+    type Error = D::Error;
+
+    fn info(&self) -> PageDeviceInfo {
+        self.inner.info()
+    }
+
+    async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
+        for (first, pages) in &self.spans {
+            if page >= *first && page < *first + pages.len() as u64 {
+                output.copy_from_slice(&pages[(page - first) as usize]);
+                return Ok(());
+            }
+        }
+        self.inner.read_page(page, output).await
+    }
+
+    async fn write_page(
+        &self,
+        page: u64,
+        input: &Page,
+    ) -> Result<(), vibeos_storage_device::MutationFailure<Self::Error>> {
+        self.inner.write_page(page, input).await
+    }
+
+    async fn flush(&self) -> Result<(), vibeos_storage_device::MutationFailure<Self::Error>> {
+        self.inner.flush().await
+    }
+}
+
+/// A device view that overlays a [`PageSink`]'s still-buffered writes over
+/// the inner device, so verification logic that runs before the sink drains
+/// observes exactly what the media will contain.
+pub(crate) struct SinkOverlayDevice<'a, D> {
+    inner: &'a D,
+    sink: Option<&'a PageSink>,
+}
+
+impl<'a, D> SinkOverlayDevice<'a, D> {
+    pub(crate) fn new(inner: &'a D, sink: Option<&'a PageSink>) -> Self {
+        Self { inner, sink }
+    }
+}
+
+impl<D: PageDevice> PageDevice for SinkOverlayDevice<'_, D> {
+    type Error = D::Error;
+
+    fn info(&self) -> PageDeviceInfo {
+        self.inner.info()
+    }
+
+    async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
+        if let Some(sink) = self.sink {
+            // Later writes win, so search from the end.
+            if let Some((_, bytes)) = sink.entries.iter().rev().find(|(sunk, _)| *sunk == page) {
+                output.copy_from_slice(bytes.as_ref());
+                return Ok(());
+            }
+        }
+        self.inner.read_page(page, output).await
+    }
+
+    async fn write_page(
+        &self,
+        page: u64,
+        input: &Page,
+    ) -> Result<(), vibeos_storage_device::MutationFailure<Self::Error>> {
+        self.inner.write_page(page, input).await
+    }
+
+    async fn flush(&self) -> Result<(), vibeos_storage_device::MutationFailure<Self::Error>> {
+        self.inner.flush().await
+    }
+}
 
 /// Allocate page-sized I/O scratch directly in the heap-backed representation.
 /// Keeping `Page` arrays out of async generator variants is part of the kernel
@@ -547,11 +755,20 @@ pub struct BlobWriter<'a, D: PageDevice> {
     merkle: Option<StreamingMerkle<EmissionSink>>,
     extents: Vec<ScratchExtent>,
     segments: Vec<ScratchSegment>,
-    tree_initialized: [bool; MAX_TREE_PAGES],
+    /// Sparse in-memory Merkle tree pages; written to media only at finish.
+    tree_pages: Vec<Option<Box<Page>>>,
+    /// Running per-content-extent payload hashers fed as chunks stream in.
+    content_hashers: Vec<Sha256>,
+    header_hash: Option<Hash>,
+    tree_hash: Option<Hash>,
     prepared: bool,
     mutated: bool,
     failed: bool,
     quota_reservation: Option<QuotaReservation>,
+    /// Present when this writer stages for a fused publication: scratch
+    /// payload/seal pages accumulate here and drain as batched requests
+    /// before the fused checkpoint.
+    staged_sink: Option<PageSink>,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -1078,6 +1295,32 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let state = self.mounted.take().ok_or(StoreError::NotMounted)?;
         self.poisoned = true;
+        let content_count = usize::try_from(geometry.exact_len())
+            .map_err(|_| StoreError::ObjectTooLarge)?
+            .div_ceil(CANONICAL_CONTENT_EXTENT_LEN as usize);
+        let mut content_hashers = Vec::new();
+        content_hashers
+            .try_reserve_exact(content_count)
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        for _ in 0..content_count {
+            content_hashers.push(Sha256::new());
+        }
+        let tree_page_count = usize::try_from(geometry.tree_len())
+            .map_err(|_| StoreError::ObjectTooLarge)?
+            .div_ceil(PAGE_SIZE);
+        let mut tree_pages = Vec::new();
+        tree_pages
+            .try_reserve_exact(tree_page_count)
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        tree_pages.resize(tree_page_count, None);
+        // Small blobs stage their scratch writes in memory and drain them as
+        // batched contiguous requests just before the commit checkpoint;
+        // larger blobs stream directly to keep the heap footprint bounded.
+        let staged_sink = if geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT {
+            Some(PageSink::new())
+        } else {
+            None
+        };
         Ok(BlobWriter {
             store: self,
             state: Some(state),
@@ -1088,11 +1331,15 @@ impl<D: PageDevice> SegmentStore<D> {
             merkle: Some(merkle),
             extents,
             segments,
-            tree_initialized: [false; MAX_TREE_PAGES],
+            tree_pages,
+            content_hashers,
+            header_hash: None,
+            tree_hash: None,
             prepared: false,
             mutated: false,
             failed: false,
             quota_reservation,
+            staged_sink,
         })
     }
 
@@ -1725,6 +1972,14 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             self.failed = true;
             return Err(error);
         }
+        let content_slot = usize::try_from(index)
+            .map_err(|_| StoreError::Corrupt)?
+            .checked_mul(LEAF_SIZE)
+            .ok_or(StoreError::Corrupt)?
+            / CANONICAL_CONTENT_EXTENT_LEN as usize;
+        if let Some(hasher) = self.content_hashers.get_mut(content_slot) {
+            hasher.update(bytes);
+        }
         let mut page = heap_page();
         page[..bytes.len()].copy_from_slice(bytes);
         if let Err(error) = self.write_exact_page(content_offset, &page).await {
@@ -1804,12 +2059,19 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             .checked_add(u64::from(extent.payload_relative_page))
             .and_then(|page| page.checked_add(within / PAGE_SIZE as u64))
             .ok_or(StoreError::Corrupt)?;
-        self.store
-            .device
-            .write_page(physical, page)
-            .await
-            .map_err(StoreError::Mutation)?;
+        sink_or_write_page(&self.store.device, self.staged_sink.as_mut(), physical, page)
+            .await?;
         Ok(())
+    }
+
+    /// Route this writer's scratch writes through an in-memory sink so a
+    /// fused publication can drain them as batched device requests.
+    pub(crate) fn enable_staged_batching(&mut self) {
+        if self.staged_sink.is_none()
+            && self.geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT
+        {
+            self.staged_sink = Some(PageSink::new());
+        }
     }
 
     async fn drain_emissions(&mut self) -> Result<(), CasStoreError<D::Error>> {
@@ -1827,34 +2089,25 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
                 .ok()
                 .and_then(|offset| offset.checked_add(tree_relative))
                 .ok_or(StoreError::Corrupt)?;
-            let (extent, within) =
+            let (_extent, within) =
                 find_scratch_extent(&self.extents, encoded_offset, HASH_SIZE as u64)?;
             let tree_page =
                 usize::try_from(within / PAGE_SIZE as u64).map_err(|_| StoreError::Corrupt)?;
-            if tree_page >= self.tree_initialized.len() {
-                return Err(StoreError::Corrupt.into());
-            }
-            let physical = segment_base_page(extent.segment_no)?
-                .checked_add(u64::from(extent.payload_relative_page))
-                .and_then(|page| page.checked_add(tree_page as u64))
-                .ok_or(StoreError::Corrupt)?;
-            let mut page = heap_page();
-            if self.tree_initialized[tree_page] {
-                self.store
-                    .device
-                    .read_page(physical, &mut page)
-                    .await
-                    .map_err(StoreError::Device)?;
-            }
             let in_page =
                 usize::try_from(within % PAGE_SIZE as u64).map_err(|_| StoreError::Corrupt)?;
+            // Patch the in-memory tree page instead of a media read-modify-
+            // write; all tree pages are written once at finish time.
+            let page = match self.tree_pages.get_mut(tree_page) {
+                Some(slot) => match slot {
+                    Some(page) => page,
+                    None => {
+                        *slot = Some(heap_page());
+                        slot.as_mut().expect("freshly inserted tree page")
+                    }
+                },
+                None => return Err(StoreError::Corrupt.into()),
+            };
             page[in_page..in_page + HASH_SIZE].copy_from_slice(&emission.hash);
-            self.store
-                .device
-                .write_page(physical, &page)
-                .await
-                .map_err(StoreError::Mutation)?;
-            self.tree_initialized[tree_page] = true;
         }
         Ok(())
     }
@@ -1869,7 +2122,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         // materialized on the kernel stack.
         let mut writer = Box::new(self);
         async move {
-            let root = writer.finish_blob_encoding().await?;
+            let root = writer.finish_blob_encoding(true).await?;
             let (pending, object_kind, exact_len, previous, checkpoint, successor) =
                 writer.commit_encoded_snapshot(root).await?;
             // The checkpoint is durable, but publication is still withheld. A
@@ -1914,7 +2167,10 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
     /// Complete the streaming Merkle state and persist the canonical header.
     /// This phase intentionally ends before catalog publication so its Merkle
     /// locals cannot overlap the snapshot or cold-mount child futures.
-    async fn finish_blob_encoding(&mut self) -> Result<Hash, CasStoreError<D::Error>> {
+    async fn finish_blob_encoding(
+        &mut self,
+        defer_barriers: bool,
+    ) -> Result<Hash, CasStoreError<D::Error>> {
         if self.failed {
             return Err(CasStoreError::WriterFailed);
         }
@@ -1958,17 +2214,149 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
 
         let mut header_page = heap_page();
         header_page[..HEADER_SIZE].copy_from_slice(&streaming.header);
+        self.header_hash = Some(Sha256::digest(&streaming.header).into());
         self.write_exact_page(0, &header_page).await?;
-        // Scratch content, tree emissions, and the canonical header are still
+        // Write every buffered tree page (canonical zeros where no emission
+        // landed), then hash the exact tree payload from memory.
+        let tree_extent = self
+            .extents
+            .last()
+            .cloned()
+            .ok_or(CasStoreError::WriterFailed)?;
+        let tree_len =
+            usize::try_from(self.geometry.tree_len()).map_err(|_| StoreError::Corrupt)?;
+        for slot in self.tree_pages.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(heap_page());
+            }
+        }
+        let tree_base = segment_base_page(tree_extent.segment_no)?;
+        for slot_index in 0..self.tree_pages.len() {
+            let physical = tree_base
+                .checked_add(u64::from(tree_extent.payload_relative_page))
+                .and_then(|page| page.checked_add(slot_index as u64))
+                .ok_or(StoreError::Corrupt)?;
+            let page = *self.tree_pages[slot_index]
+                .as_ref()
+                .expect("materialized tree page")
+                .clone();
+            sink_or_write_page(&self.store.device, self.staged_sink.as_mut(), physical, &page)
+                .await?;
+        }
+        let mut tree_hasher = Sha256::new();
+        let mut remaining = tree_len;
+        for page in &self.tree_pages {
+            let take = remaining.min(PAGE_SIZE);
+            tree_hasher.update(&page.as_ref().expect("materialized tree page")[..take]);
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(StoreError::Corrupt.into());
+        }
+        self.tree_hash = Some(tree_hasher.finalize().into());
+        // Scratch content, tree pages, and the canonical header are still
         // unreachable from every sealed extent and checkpoint. They may share
         // one data-dependency barrier before hashing and metadata publication;
         // cancellation or a power cut before this point can expose no object.
-        self.store
-            .device
-            .flush()
-            .await
-            .map_err(StoreError::Mutation)?;
+        // A deferring caller folds that barrier into the checkpoint slot
+        // protocol's first flush, which precedes the checkpoint body write.
+        if !defer_barriers {
+            self.store
+                .device
+                .flush()
+                .await
+                .map_err(StoreError::Mutation)?;
+        }
         Ok(streaming.descriptor.root)
+    }
+
+    /// Compute the staged manifest from the streaming in-memory state and
+    /// authenticate any dedup candidate. Shared by the immediate-commit and
+    /// staged (fused authority) commit paths.
+    async fn staged_manifest_and_dedup(
+        &mut self,
+        root: Hash,
+    ) -> Result<(BlobKey, BlobManifest, Vec<Hash>, Option<BlobMapping>), CasStoreError<D::Error>>
+    {
+        let state = self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
+        let blob_key = BlobKey::sha256(self.object_kind, self.geometry.exact_len(), root)?;
+
+        let mut payload_hashes = Vec::new();
+        payload_hashes
+            .try_reserve_exact(self.extents.len())
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        // Extent payload hashes come from the streaming in-memory state: the
+        // canonical header, the per-extent content hashers, and the buffered
+        // tree pages. No media re-read is needed for data just written.
+        payload_hashes.push(self.header_hash.take().ok_or(CasStoreError::WriterFailed)?);
+        for hasher in self.content_hashers.drain(..) {
+            payload_hashes.push(hasher.finalize().into());
+        }
+        payload_hashes.push(self.tree_hash.take().ok_or(CasStoreError::WriterFailed)?);
+        if payload_hashes.len() != self.extents.len() {
+            return Err(StoreError::Corrupt.into());
+        }
+        let scratch_manifest = make_manifest(
+            state.superblock.binding.store_uuid,
+            blob_key,
+            self.geometry.encoded_len() as u64,
+            &self.extents,
+            &payload_hashes,
+        );
+
+        let existing = state.cas.as_ref().and_then(|cas| {
+            cas.blobs
+                .binary_search_by_key(&blob_key, |mapping| mapping.blob_key)
+                .ok()
+                .map(|index| cas.blobs[index])
+        });
+        let existing_mapping = if let Some(mapping) = existing {
+            // A key's existing manifest needs one full compare-verification
+            // against freshly recomputed content hashes per process: sealed
+            // segments are immutable and any later divergence under the same
+            // key is already the fatal hash-collision path.
+            if !self.store.dedup_verified.contains(&blob_key) {
+                let context = CasCodecContext::new(
+                    state.superblock.binding.store_uuid,
+                    state.admitted_segments,
+                    state.next_segment_generation,
+                )?;
+                // Scratch content may still be buffered in the staged sink;
+                // give the comparison a view of the future media contents.
+                let overlay =
+                    SinkOverlayDevice::new(&self.store.device, self.staged_sink.as_ref());
+                let payload = read_pointer_payload(
+                    &overlay,
+                    state.superblock.binding.store_uuid,
+                    state.admitted_segments,
+                    state.next_segment_generation,
+                    state.generation,
+                    mapping.manifest,
+                    ExtentKind::Catalog,
+                    self.store.limits.recovery_memory_bytes,
+                )
+                .await?;
+                let manifest = decode_blob_manifest(&payload.bytes, context)?;
+                if manifest.blob_key != blob_key
+                    || !compare_manifests(
+                        &overlay,
+                        state,
+                        &scratch_manifest,
+                        &manifest,
+                        &self.extents,
+                        &payload_hashes,
+                    )
+                    .await?
+                {
+                    return Err(CasStoreError::HashCollision);
+                }
+                self.store.dedup_verified.insert(blob_key);
+            }
+            Some(mapping)
+        } else {
+            None
+        };
+        Ok((blob_key, scratch_manifest, payload_hashes, existing_mapping))
     }
 
     /// Authenticate any dedup candidate and publish the new CAS checkpoint.
@@ -1988,66 +2376,14 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         ),
         CasStoreError<D::Error>,
     > {
-        let state = self.state.as_ref().ok_or(CasStoreError::WriterFailed)?;
-        let blob_key = BlobKey::sha256(self.object_kind, self.geometry.exact_len(), root)?;
-
-        let mut payload_hashes = Vec::new();
-        payload_hashes
-            .try_reserve_exact(self.extents.len())
-            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
-        for extent in &self.extents {
-            payload_hashes.push(hash_scratch_extent(&self.store.device, extent).await?);
+        let (blob_key, scratch_manifest, payload_hashes, existing_mapping) =
+            self.staged_manifest_and_dedup(root).await?;
+        if existing_mapping.is_some() && self.staged_sink.is_some() {
+            // Deduplicated content: the buffered scratch pages will never be
+            // referenced by any seal or checkpoint; skip writing them.
+            self.staged_sink = Some(PageSink::new());
         }
-        let scratch_manifest = make_manifest(
-            state.superblock.binding.store_uuid,
-            blob_key,
-            self.geometry.encoded_len() as u64,
-            &self.extents,
-            &payload_hashes,
-        );
-
-        let existing = state.cas.as_ref().and_then(|cas| {
-            cas.blobs
-                .binary_search_by_key(&blob_key, |mapping| mapping.blob_key)
-                .ok()
-                .map(|index| cas.blobs[index])
-        });
-        let existing_manifest = if let Some(mapping) = existing {
-            let context = CasCodecContext::new(
-                state.superblock.binding.store_uuid,
-                state.admitted_segments,
-                state.next_segment_generation,
-            )?;
-            let payload = read_pointer_payload(
-                &self.store.device,
-                state.superblock.binding.store_uuid,
-                state.admitted_segments,
-                state.next_segment_generation,
-                state.generation,
-                mapping.manifest,
-                ExtentKind::Catalog,
-                self.store.limits.recovery_memory_bytes,
-            )
-            .await?;
-            let manifest = decode_blob_manifest(&payload.bytes, context)?;
-            if manifest.blob_key != blob_key
-                || !compare_manifests(
-                    &self.store.device,
-                    state,
-                    &scratch_manifest,
-                    &manifest,
-                    &self.extents,
-                    &payload_hashes,
-                )
-                .await?
-            {
-                return Err(CasStoreError::HashCollision);
-            }
-            Some((mapping, manifest))
-        } else {
-            None
-        };
-
+        let sink = self.staged_sink.take();
         let state = self.state.take().ok_or(CasStoreError::WriterFailed)?;
         let (pending, checkpoint, successor) = commit_snapshot(
             &self.store.device,
@@ -2055,12 +2391,16 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             self.store.limits,
             blob_key,
             scratch_manifest,
-            existing_manifest.map(|(mapping, _)| mapping),
+            existing_mapping,
             &self.extents,
             &self.segments,
             &payload_hashes,
             &self.store.pins,
             self.reference_codec,
+            None,
+            None,
+            sink,
+            self.store.defer_commit_readback,
         )
         .await?;
         Ok((
@@ -2071,6 +2411,91 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             checkpoint,
             successor,
         ))
+    }
+
+    /// Make the blob payload durable and authenticate any dedup candidate,
+    /// but write no metadata segment and no checkpoint. New-blob scratch
+    /// segments are sealed against the successor checkpoint generation; the
+    /// caller must complete publication through
+    /// [`SegmentStore::publish_staged_object_with_authority`], which commits
+    /// the object mapping and the authority snapshot under one checkpoint.
+    /// The store stays poisoned until that publication mounts the successor.
+    pub(crate) fn stage_commit(
+        self,
+    ) -> impl Future<Output = Result<StagedObjectCommit, CasStoreError<D::Error>>> + 'a {
+        let mut writer = Box::new(self);
+        async move {
+            let root = writer.finish_blob_encoding(true).await?;
+            let (blob_key, manifest, payload_hashes, existing) =
+                writer.staged_manifest_and_dedup(root).await?;
+            let state = writer.state.take().ok_or(CasStoreError::WriterFailed)?;
+            let checkpoint_generation = state
+                .generation
+                .checked_add(1)
+                .ok_or(StoreError::IdExhausted)?;
+            let mut last_scratch_seal = None;
+            if existing.is_none() {
+                let mut previous = state.last_segment;
+                if writer.staged_sink.is_none() {
+                    writer.staged_sink = Some(PageSink::new());
+                }
+                for segment in &writer.segments {
+                    previous = Some(
+                        seal_scratch_segment(
+                            &writer.store.device,
+                            &state,
+                            checkpoint_generation,
+                            blob_key,
+                            manifest.encoded_blob_len,
+                            *segment,
+                            &writer.extents,
+                            &payload_hashes,
+                            previous,
+                            true,
+                            writer.staged_sink.as_mut(),
+                        )
+                        .await?,
+                    );
+                }
+                last_scratch_seal = previous;
+            } else {
+                // Deduplicated content: the buffered scratch pages will never
+                // be referenced by any seal or checkpoint. Discard them so
+                // they are not even written to media.
+                writer.staged_sink = Some(PageSink::new());
+            }
+            let quota_charge = match writer.quota_reservation.take() {
+                Some(reservation) => {
+                    let table = writer
+                        .store
+                        .quota
+                        .clone()
+                        .ok_or(crate::quota::QuotaError::UnknownPrincipal)?;
+                    let charge = if existing.is_none() {
+                        reservation.commit()
+                    } else {
+                        reservation.commit_with_unique_physical(QUOTA_DEDUP_UNIQUE_OBJECT_BYTES)?
+                    };
+                    Some((table, charge))
+                }
+                None => None,
+            };
+            Ok(StagedObjectCommit {
+                predecessor: state,
+                blob_key,
+                manifest,
+                existing,
+                extents: core::mem::take(&mut writer.extents),
+                segments: core::mem::take(&mut writer.segments),
+                payload_hashes,
+                reference_codec: writer.reference_codec,
+                object_kind: writer.object_kind,
+                exact_len: writer.geometry.exact_len(),
+                quota_charge,
+                last_scratch_seal,
+                sink: writer.staged_sink.take().unwrap_or_else(PageSink::new),
+            })
+        }
     }
 
     pub async fn commit_to<T>(
@@ -2186,33 +2611,6 @@ pub(crate) async fn write_page<D: PageDevice>(
 
 pub(crate) async fn flush<D: PageDevice>(device: &D) -> Result<(), StoreError<D::Error>> {
     device.flush().await.map_err(StoreError::Mutation)
-}
-
-async fn hash_scratch_extent<D: PageDevice>(
-    device: &D,
-    extent: &ScratchExtent,
-) -> Result<Hash, StoreError<D::Error>> {
-    let base = segment_base_page(extent.segment_no)?;
-    let mut remaining =
-        usize::try_from(extent.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
-    let mut hasher = Sha256::new();
-    for page_index in 0..extent.payload_byte_len.div_ceil(PAGE_SIZE as u64) {
-        let mut page = heap_page();
-        device
-            .read_page(
-                base + u64::from(extent.payload_relative_page) + page_index,
-                &mut page,
-            )
-            .await
-            .map_err(StoreError::Device)?;
-        let take = remaining.min(PAGE_SIZE);
-        hasher.update(&page[..take]);
-        remaining -= take;
-    }
-    if remaining != 0 {
-        return Err(StoreError::Corrupt);
-    }
-    Ok(hasher.finalize().into())
 }
 
 async fn read_scratch_range<D: PageDevice>(
@@ -2560,6 +2958,8 @@ async fn seal_scratch_segment<D: PageDevice>(
     extents: &[ScratchExtent],
     payload_hashes: &[Hash],
     previous: Option<(u64, u64, Hash)>,
+    defer_barriers: bool,
+    mut sink: Option<&mut PageSink>,
 ) -> Result<(u64, u64, Hash), StoreError<D::Error>> {
     let base = segment_base_page(segment.segment_no)?;
     let (previous_segment_no, previous_segment_generation, previous_hash) =
@@ -2615,26 +3015,32 @@ async fn seal_scratch_segment<D: PageDevice>(
     // every descriptor body is durable, and the segment summary is not written
     // until every descriptor seal is durable.  A crash at either barrier leaves
     // an unsealed segment, exactly as the former per-record barriers did.
-    write_page(device, base, &header_body).await?;
+    sink_or_write_page(device, sink.as_deref_mut(), base, &header_body).await?;
     for record in &records {
-        write_page(
+        sink_or_write_page(
             device,
+            sink.as_deref_mut(),
             base + u64::from(record.value.payload_first_relative_page - 2),
             &record.body,
         )
         .await?;
     }
-    flush(device).await?;
-    write_page(device, base + 1, &header_seal).await?;
+    if !defer_barriers {
+        flush(device).await?;
+    }
+    sink_or_write_page(device, sink.as_deref_mut(), base + 1, &header_seal).await?;
     for record in &records {
-        write_page(
+        sink_or_write_page(
             device,
+            sink.as_deref_mut(),
             base + u64::from(record.value.payload_first_relative_page - 1),
             &record.seal,
         )
         .await?;
     }
-    flush(device).await?;
+    if !defer_barriers {
+        flush(device).await?;
+    }
     finalize_segment(
         device,
         state.superblock.binding.store_uuid,
@@ -2643,6 +3049,8 @@ async fn seal_scratch_segment<D: PageDevice>(
         segment.segment_generation,
         header_digest,
         &records,
+        defer_barriers,
+        sink,
     )
     .await
 }
@@ -2655,6 +3063,8 @@ pub(crate) async fn finalize_segment<D: PageDevice>(
     segment_generation: u64,
     header_digest: BodyDigest,
     records: &[FinalRecord],
+    defer_barriers: bool,
+    mut sink: Option<&mut PageSink>,
 ) -> Result<(u64, u64, Hash), StoreError<D::Error>> {
     let base = segment_base_page(segment_no)?;
     let mut descriptor_chain = descriptor_chain_initial(store_uuid, segment_no, segment_generation);
@@ -2744,16 +3154,804 @@ pub(crate) async fn finalize_segment<D: PageDevice>(
     let mut final_seal = heap_page();
     let seal_digest = encode_segment_seal_body(&seal, &mut seal_body)?;
     encode_record_seal(seal_digest, &mut final_seal)?;
-    write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
-    flush(device).await?;
-    write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
-    write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
-    flush(device).await?;
-    write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
+    sink_or_write_page(device, sink.as_deref_mut(), base + u64::from(SUMMARY_BODY_PAGE), &summary_body)
+        .await?;
+    if !defer_barriers {
+        flush(device).await?;
+    }
+    sink_or_write_page(device, sink.as_deref_mut(), base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal)
+        .await?;
+    sink_or_write_page(
+        device,
+        sink.as_deref_mut(),
+        base + u64::from(SEGMENT_SEAL_BODY_PAGE),
+        &seal_body,
+    )
+    .await?;
+    if !defer_barriers {
+        flush(device).await?;
+    }
+    sink_or_write_page(device, sink.as_deref_mut(), base + u64::from(SEGMENT_SEAL_PAGE), &final_seal)
+        .await?;
     // The caller immediately begins either the next segment's first durable
     // phase or checkpoint-slot clearing. That barrier also makes this final
     // seal durable, so a standalone flush here would add no ordering edge.
+    // With deferred barriers no checkpoint can name this segment until the
+    // slot protocol's first flush lands, which covers every phase above.
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
+}
+
+/// Authority state committed in the same metadata segment and checkpoint as
+/// a staged CAS object, so one durable transaction publishes both.
+pub(crate) struct FusedAuthorityPublication {
+    pub(crate) authority_bytes: Vec<u8>,
+    pub(crate) persistent_authority: crate::authority_snapshot::PersistentAuthoritySnapshot,
+    pub(crate) persistent_roots: crate::root_codec::PersistentRootSet,
+}
+
+/// A blob whose payload phase completed via [`BlobWriter::stage_commit`]:
+/// scratch data is durable (and sealed for a new blob) but no metadata
+/// segment or checkpoint exists yet. `predecessor` is the mounted state the
+/// writer consumed; the store stays poisoned until
+/// [`SegmentStore::publish_staged_object_with_authority`] mounts a successor.
+pub(crate) struct StagedObjectCommit {
+    pub(crate) predecessor: MountedState,
+    pub(crate) blob_key: BlobKey,
+    pub(crate) manifest: BlobManifest,
+    pub(crate) existing: Option<BlobMapping>,
+    pub(crate) extents: Vec<ScratchExtent>,
+    pub(crate) segments: Vec<ScratchSegment>,
+    pub(crate) payload_hashes: Vec<Hash>,
+    pub(crate) reference_codec: u16,
+    pub(crate) object_kind: u32,
+    pub(crate) exact_len: u64,
+    /// The staging reservation already committed into a charge, so the quota
+    /// table carries no outstanding reservation when the caller installs the
+    /// persistent quota snapshot ahead of the fused publication — the same
+    /// ordering the two-transaction path reaches through `commit()`.
+    pub(crate) quota_charge: Option<(PrincipalQuotaTable, CommittedQuotaCharge)>,
+    pub(crate) last_scratch_seal: Option<(u64, u64, Hash)>,
+    pub(crate) sink: PageSink,
+}
+
+impl<D: PageDevice> SegmentStore<D> {
+    /// Publish a staged object mapping together with a persistent-authority
+    /// snapshot in one metadata segment and one checkpoint, then mount the
+    /// verified successor. This is the durable-append fast path: it replaces
+    /// the former sequence of two independent segment transactions and two
+    /// checkpoint publications per logical object append.
+    pub(crate) async fn publish_staged_object_with_authority(
+        &mut self,
+        mut staged: StagedObjectCommit,
+        fused: FusedAuthorityPublication,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, CasStoreError<D::Error>> {
+        let state = staged.predecessor;
+        let (pending, checkpoint, successor) = commit_snapshot(
+            &self.device,
+            &state,
+            self.limits,
+            staged.blob_key,
+            staged.manifest,
+            staged.existing,
+            &staged.extents,
+            &staged.segments,
+            &staged.payload_hashes,
+            &self.pins,
+            staged.reference_codec,
+            Some(&fused),
+            staged.last_scratch_seal,
+            Some(staged.sink),
+            self.defer_commit_readback,
+        )
+        .await?;
+        self.mount_verified_successor(state, checkpoint, successor, true)
+            .await?;
+        let handle = pending.complete(staged.quota_charge.take());
+        let maximum_persistence = if handle.is_quota_charged() {
+            ObjectPublicationPersistence::RuntimeOnly
+        } else {
+            ObjectPublicationPersistence::Persistent
+        };
+        Ok(AuthorizedObject::from_committed(
+            handle,
+            staged.object_kind,
+            staged.exact_len,
+            maximum_persistence,
+        ))
+    }
+}
+
+/// Blobs staged strictly sequentially against a private planning state and
+/// awaiting one shared metadata segment and checkpoint. Each entry's scratch
+/// segments are planned against the union of the base allocation and every
+/// earlier entry, and each new entry's scratch seals chain from the previous
+/// entry's, so publication needs exactly one segment transaction. The store
+/// stays poisoned from the first stage until the batch publishes; an
+/// abandoned batch leaves only unreferenced writes to free segments.
+pub struct StagedBlobBatch {
+    base: MountedState,
+    planning: MountedState,
+    staged: Vec<StagedObjectCommit>,
+}
+
+impl StagedBlobBatch {
+    pub fn staged_len(&self) -> usize {
+        self.staged.len()
+    }
+
+    /// Scratch segments consumed so far; callers use this to bound one
+    /// batch's allocation appetite before staging more.
+    pub fn staged_segment_count(&self) -> usize {
+        self.staged
+            .iter()
+            .filter(|entry| entry.existing.is_none())
+            .map(|entry| entry.segments.len())
+            .sum()
+    }
+
+    /// Temporarily install the batch's planning view so ordinary read paths
+    /// can resolve committed objects mid-batch. The planning view names only
+    /// the published generation's catalog, so nothing staged becomes
+    /// readable. The caller must call [`StagedBlobBatch::withdraw_planning_state`]
+    /// before staging continues or the batch publishes.
+    pub(crate) fn install_planning_state<D: PageDevice>(&self, store: &mut SegmentStore<D>) {
+        store.mounted = Some(self.planning.clone());
+        store.poisoned = false;
+    }
+
+    /// Remove a planning view installed by
+    /// [`StagedBlobBatch::install_planning_state`], returning the store to
+    /// its poisoned mid-batch state.
+    pub(crate) fn withdraw_planning_state<D: PageDevice>(store: &mut SegmentStore<D>, _token: ()) {
+        store.mounted = None;
+        store.poisoned = true;
+    }
+
+    /// The stable object identity entry `index` binds at publication:
+    /// `(object_id, commit_generation)`. Identities are assigned by position,
+    /// so they are exact before publication and valid only if it succeeds.
+    pub fn predicted_object(&self, index: usize) -> Option<(u128, u64)> {
+        let object_id = self
+            .base
+            .next_object_id
+            .checked_add(index as u128)?;
+        Some((object_id, self.base.generation.checked_add(1)?))
+    }
+}
+
+impl<D: PageDevice> SegmentStore<D> {
+    /// Open a staged batch by taking the mounted state. The store is poisoned
+    /// until [`SegmentStore::publish_staged_batch`] mounts the successor or a
+    /// caller remounts after abandoning the batch.
+    pub(crate) fn begin_staged_batch(&mut self) -> Result<StagedBlobBatch, CasStoreError<D::Error>> {
+        let _ = self.require_current_generation()?;
+        let state = self.mounted.take().ok_or(StoreError::NotMounted)?;
+        self.poisoned = true;
+        Ok(StagedBlobBatch {
+            planning: state.clone(),
+            base: state,
+            staged: Vec::new(),
+        })
+    }
+
+    /// Stage one whole payload as the batch's next blob. Payload and seal
+    /// writes land now (buffered small writes ride the entry's sink); no
+    /// metadata segment or checkpoint exists until publication. Returns the
+    /// predicted `(object_id, commit_generation)` for the staged entry.
+    pub(crate) async fn stage_blob_in_batch(
+        &mut self,
+        batch: &mut StagedBlobBatch,
+        object_kind: u32,
+        reference_codec: u16,
+        payload: &[u8],
+    ) -> Result<(u128, u64), CasStoreError<D::Error>> {
+        let predicted = batch
+            .predicted_object(batch.staged.len())
+            .ok_or(StoreError::IdExhausted)?;
+        self.mounted = Some(batch.planning.clone());
+        self.poisoned = false;
+        let staged = match self.begin_blob_with_reference_codec_internal(
+            object_kind,
+            payload.len() as u64,
+            None,
+            reference_codec,
+            None,
+        ) {
+            Ok(mut writer) => {
+                let mut write_error = None;
+                for chunk in payload.chunks(PAGE_SIZE) {
+                    if let Err(error) = writer.write_chunk(chunk).await {
+                        write_error = Some(error);
+                        break;
+                    }
+                }
+                match write_error {
+                    Some(error) => Err(error),
+                    None => writer.stage_commit().await,
+                }
+            }
+            Err(error) => Err(error),
+        };
+        // Whatever happened, the batch owns the only continuable state; the
+        // store stays poisoned until publication or remount.
+        self.mounted = None;
+        self.poisoned = true;
+        let staged = staged?;
+        if staged.existing.is_none() {
+            let mut allocate = Vec::new();
+            allocate
+                .try_reserve_exact(staged.segments.len())
+                .map_err(|_| StoreError::MemoryLimit)?;
+            allocate.extend(staged.segments.iter().map(|segment| segment.segment_no));
+            let next_segment_generation = batch
+                .planning
+                .next_segment_generation
+                .checked_add(allocate.len() as u64)
+                .ok_or(StoreError::IdExhausted)?;
+            // Planning-only transition: it reserves the staged segments and
+            // advances the cursors the next stage plans against. The durable
+            // transition is computed once, from the base state, at publication.
+            batch.planning.allocation = batch
+                .planning
+                .allocation
+                .apply_transition(AllocationTransition {
+                    checkpoint_generation: batch
+                        .planning
+                        .allocation
+                        .checkpoint_generation
+                        .checked_add(1)
+                        .ok_or(StoreError::IdExhausted)?,
+                    next_segment_generation,
+                    allocate: &allocate,
+                    retire: &[],
+                    reclaim: &[],
+                })
+                .map_err(|_| StoreError::Corrupt)?;
+            batch.planning.next_segment_generation = next_segment_generation;
+            batch.planning.next_physical_segment = allocate
+                .last()
+                .copied()
+                .and_then(|segment| segment.checked_add(1))
+                .ok_or(StoreError::Corrupt)?;
+            if staged.last_scratch_seal.is_some() {
+                batch.planning.last_segment = staged.last_scratch_seal;
+            }
+        }
+        batch
+            .staged
+            .try_reserve(1)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        batch.staged.push(staged);
+        Ok(predicted)
+    }
+
+    /// Publish every staged entry under one metadata segment and checkpoint,
+    /// then mount the verified successor. Entry order fixes object identity.
+    pub(crate) async fn publish_staged_batch(
+        &mut self,
+        batch: StagedBlobBatch,
+    ) -> Result<Vec<AuthorizedObject<CasObjectHandle>>, CasStoreError<D::Error>> {
+        let StagedBlobBatch {
+            base,
+            planning,
+            staged,
+        } = batch;
+        if staged.is_empty() {
+            return Err(StoreError::Corrupt.into());
+        }
+        let (pending, checkpoint, successor) =
+            commit_batch_snapshot(
+                &self.device,
+                &base,
+                &planning,
+                self.limits,
+                staged,
+                &self.pins,
+                self.defer_commit_readback,
+            )
+            .await?;
+        self.mount_verified_successor(base, checkpoint, successor, true)
+            .await?;
+        let mut published = Vec::new();
+        published
+            .try_reserve_exact(pending.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for handle in pending {
+            let object_kind = handle.object_kind;
+            let exact_len = handle.exact_len;
+            published.push(AuthorizedObject::from_committed(
+                handle.complete(None),
+                object_kind,
+                exact_len,
+                ObjectPublicationPersistence::Persistent,
+            ));
+        }
+        Ok(published)
+    }
+}
+
+/// One-transaction publication for a staged batch: a single metadata segment
+/// carries every first-occurrence manifest, the catalog snapshot, and the
+/// allocation transition, and one checkpoint makes all of it durable. Blob
+/// keys already committed (or staged earlier in the same batch) deduplicate
+/// to the existing mapping; their objects still bind by position.
+async fn commit_batch_snapshot<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    planning: &MountedState,
+    limits: crate::store::StoreLimits,
+    mut staged: Vec<StagedObjectCommit>,
+    pins: &crate::store::SharedStorePinRegistry,
+    defer_readback: bool,
+) -> Result<(Vec<PendingCasObjectHandle>, Checkpoint, MountedState), CasStoreError<D::Error>> {
+    let checkpoint_generation = state
+        .generation
+        .checked_add(1)
+        .ok_or(StoreError::IdExhausted)?;
+    let defer_barriers = true;
+
+    // Merge every entry's buffered writes into one sink so the whole batch
+    // drains as few large contiguous requests. Entry page sets are disjoint:
+    // each targets its own scratch segments.
+    let mut sink = PageSink::new();
+    let mut scratch_segment_numbers: Vec<u64> = Vec::new();
+    let mut last_new_seal = None;
+    for entry in &mut staged {
+        sink.absorb::<D::Error>(core::mem::replace(&mut entry.sink, PageSink::new()))?;
+        if entry.existing.is_none() {
+            scratch_segment_numbers
+                .try_reserve(entry.segments.len())
+                .map_err(|_| StoreError::MemoryLimit)?;
+            scratch_segment_numbers.extend(entry.segments.iter().map(|segment| segment.segment_no));
+            last_new_seal = entry.last_scratch_seal.or(last_new_seal);
+        }
+    }
+    let total_scratch = scratch_segment_numbers.len() as u64;
+
+    // The metadata segment comes from planning-aware placement so it can never
+    // collide with a staged scratch segment or dip into the cleaner reserve.
+    let metadata_segment_no = planning
+        .find_free_run(1, false)
+        .ok_or(StoreError::Capacity(CapacityClass::CleanerReserve))?;
+    let metadata_generation = state
+        .next_segment_generation
+        .checked_add(total_scratch)
+        .ok_or(StoreError::IdExhausted)?;
+    let next_segment_generation = metadata_generation
+        .checked_add(1)
+        .ok_or(StoreError::IdExhausted)?;
+
+    let base = segment_base_page(metadata_segment_no)?;
+    let (previous_segment_no, previous_segment_generation, previous_hash) = last_new_seal
+        .or(state.last_segment)
+        .unwrap_or((ANCHOR_SEGMENT_NO, 0, [0; 32]));
+    let header = SegmentHeader {
+        binding: RecordBinding {
+            store_uuid: state.superblock.binding.store_uuid,
+            generation: metadata_generation,
+            segment_no: metadata_segment_no,
+            ordinal: 0,
+            self_page: base,
+            target_checkpoint_generation: checkpoint_generation,
+        },
+        base_page: base,
+        previous_segment_no,
+        previous_segment_generation,
+        previous_segment_seal_body_sha256: previous_hash,
+    };
+    let mut header_body = heap_page();
+    let mut header_seal = heap_page();
+    let header_digest = encode_segment_header_body(&header, &mut header_body)?;
+    encode_record_seal(header_digest, &mut header_seal)?;
+
+    let context = CasCodecContext::new(
+        state.superblock.binding.store_uuid,
+        state.admitted_segments,
+        next_segment_generation,
+    )?;
+    let mut relative = DATA_FIRST_PAGE;
+    let mut ordinal = 1_u32;
+    let mut records: Vec<FinalRecord> = Vec::new();
+    let mut manifest_payloads: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut objects = state
+        .cas
+        .as_ref()
+        .map_or_else(Vec::new, |cas| cas.objects.clone());
+    let mut blobs = state
+        .cas
+        .as_ref()
+        .map_or_else(Vec::new, |cas| cas.blobs.clone());
+    objects
+        .try_reserve_exact(staged.len())
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+    let mut first_new_manifest: alloc::collections::BTreeMap<BlobKey, usize> =
+        alloc::collections::BTreeMap::new();
+    let mut pending_infos: Vec<(u128, u32, u64, bool)> = Vec::new();
+    pending_infos
+        .try_reserve_exact(staged.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (index, entry) in staged.iter().enumerate() {
+        let object_id = state
+            .next_object_id
+            .checked_add(index as u128)
+            .ok_or(StoreError::IdExhausted)?;
+        let mut is_new = false;
+        if entry.existing.is_none() && !first_new_manifest.contains_key(&entry.blob_key) {
+            // First occurrence of a genuinely new blob: it owns a manifest
+            // record and a blob-table entry. A later in-batch entry with the
+            // same key deduplicates onto this mapping; its sealed scratch is
+            // still allocated below and simply becomes dead space.
+            let manifest_bytes = encode_blob_manifest(&entry.manifest, context)?;
+            let record = build_record(
+                state.superblock.binding.store_uuid,
+                metadata_segment_no,
+                metadata_generation,
+                checkpoint_generation,
+                ordinal,
+                relative,
+                ExtentKind::Catalog,
+                METADATA_KIND_MANIFEST,
+                0,
+                1,
+                manifest_bytes.len() as u64,
+                manifest_bytes.len() as u64,
+                0,
+                manifest_bytes.len() as u64,
+                payload_sha256(&manifest_bytes),
+                payload_sha256(&manifest_bytes),
+            )?;
+            relative += record.value.record_span_pages;
+            ordinal += 1;
+            blobs
+                .try_reserve(1)
+                .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+            let insert = blobs
+                .binary_search_by_key(&entry.blob_key, |mapping| mapping.blob_key)
+                .err()
+                .ok_or(StoreError::Corrupt)?;
+            blobs.insert(
+                insert,
+                BlobMapping {
+                    blob_key: entry.blob_key,
+                    manifest: record.pointer(),
+                },
+            );
+            first_new_manifest.insert(entry.blob_key, records.len());
+            manifest_payloads.push((records.len(), manifest_bytes));
+            records.push(record);
+            is_new = true;
+        }
+        objects.push(ObjectMapping {
+            object_id,
+            blob_key: entry.blob_key,
+            commit_generation: checkpoint_generation,
+            reference_codec: entry.reference_codec,
+        });
+        pending_infos.push((object_id, entry.object_kind, entry.exact_len, is_new));
+    }
+    if objects.len() > limits.max_catalog_entries as usize
+        || blobs.len() > limits.max_catalog_entries as usize
+    {
+        return Err(StoreError::Capacity(CapacityClass::Metadata).into());
+    }
+    let snapshot = CasSnapshot {
+        checkpoint_generation,
+        objects,
+        blobs,
+    };
+    let snapshot_bytes = encode_cas_snapshot(&snapshot, context)?;
+    let snapshot_record = build_record(
+        state.superblock.binding.store_uuid,
+        metadata_segment_no,
+        metadata_generation,
+        checkpoint_generation,
+        ordinal,
+        relative,
+        ExtentKind::Catalog,
+        METADATA_KIND_CAS_SNAPSHOT,
+        0,
+        1,
+        snapshot_bytes.len() as u64,
+        snapshot_bytes.len() as u64,
+        0,
+        snapshot_bytes.len() as u64,
+        payload_sha256(&snapshot_bytes),
+        payload_sha256(&snapshot_bytes),
+    )?;
+    relative += snapshot_record.value.record_span_pages;
+    ordinal += 1;
+    let catalog_root = snapshot_record.pointer();
+    let snapshot_index = records.len();
+    records.push(snapshot_record);
+
+    scratch_segment_numbers.sort_unstable();
+    scratch_segment_numbers
+        .try_reserve_exact(1)
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+    let (allocation, allocation_version, allocation_bytes) = if state.allocation_version == 2 {
+        let mut allocated_segments = scratch_segment_numbers.clone();
+        allocated_segments.push(metadata_segment_no);
+        allocated_segments.sort_unstable();
+        let allocation = state
+            .allocation
+            .apply_transition(AllocationTransition {
+                checkpoint_generation,
+                next_segment_generation,
+                allocate: &allocated_segments,
+                retire: &[],
+                reclaim: &[],
+            })
+            .map_err(|_| StoreError::Corrupt)?;
+        let bytes = encode_allocation_v2(&allocation).map_err(|_| StoreError::Corrupt)?;
+        (allocation, 2, bytes)
+    } else {
+        let allocated_prefix_segments = metadata_segment_no + 1;
+        let legacy = AllocationState {
+            checkpoint_generation,
+            admitted_segments: state.admitted_segments,
+            allocated_prefix_segments,
+            next_segment_generation,
+            cleaner_reserve_segments: state.cleaner_reserve_segments,
+        };
+        let allocation = AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?;
+        let bytes = encode_allocation(legacy)
+            .map_err(|_| StoreError::Corrupt)?
+            .to_vec();
+        (allocation, 1, bytes)
+    };
+    let allocation_record = build_record(
+        state.superblock.binding.store_uuid,
+        metadata_segment_no,
+        metadata_generation,
+        checkpoint_generation,
+        ordinal,
+        relative,
+        ExtentKind::Allocation,
+        METADATA_KIND_ALLOCATION,
+        0,
+        1,
+        allocation_bytes.len() as u64,
+        allocation_bytes.len() as u64,
+        0,
+        allocation_bytes.len() as u64,
+        payload_sha256(&allocation_bytes),
+        payload_sha256(&allocation_bytes),
+    )?;
+    relative += allocation_record.value.record_span_pages;
+    let allocation_root = allocation_record.pointer();
+    let allocation_index = records.len();
+    records.push(allocation_record);
+    if relative > DATA_END_PAGE {
+        return Err(StoreError::Capacity(CapacityClass::Metadata).into());
+    }
+    let mut payload_records = Vec::new();
+    payload_records
+        .try_reserve_exact(records.len())
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+    for (index, bytes) in &manifest_payloads {
+        payload_records.push((&records[*index], bytes.as_slice()));
+    }
+    payload_records.push((&records[snapshot_index], snapshot_bytes.as_slice()));
+    payload_records.push((&records[allocation_index], allocation_bytes.as_slice()));
+    write_payload_records_with_header(
+        device,
+        base,
+        Some((&header_body, &header_seal)),
+        &payload_records,
+        defer_barriers,
+        Some(&mut sink),
+    )
+    .await?;
+    let (_, _, metadata_seal_hash) = finalize_segment(
+        device,
+        state.superblock.binding.store_uuid,
+        checkpoint_generation,
+        metadata_segment_no,
+        metadata_generation,
+        header_digest,
+        &records,
+        defer_barriers,
+        Some(&mut sink),
+    )
+    .await?;
+    sink.drain(device).await?;
+
+    let slot = ((checkpoint_generation - 1) & 1) as u8;
+    let checkpoint = Checkpoint {
+        binding: RecordBinding {
+            store_uuid: state.superblock.binding.store_uuid,
+            generation: checkpoint_generation,
+            segment_no: ANCHOR_SEGMENT_NO,
+            ordinal: u32::from(slot),
+            self_page: 4 + u64::from(slot) * 2,
+            target_checkpoint_generation: checkpoint_generation,
+        },
+        slot,
+        previous_generation: state.generation,
+        admitted_range_pages: vibeos_segment_format::admitted_pages(state.admitted_segments)?,
+        admitted_segments: state.admitted_segments,
+        next_segment_generation,
+        replay_count: 0,
+        max_replay_records: limits.max_replay_records,
+        cleaner_reserve_segments: state.cleaner_reserve_segments,
+        catalog_root,
+        authority_root: state.authority_root,
+        allocation_root,
+        replay_tail: PhysicalPointer::Null,
+    };
+    write_checkpoint(device, &checkpoint, true).await?;
+
+    // Re-read everything this transaction wrote from batched span snapshots
+    // and verify each staged blob against its manifest, exactly as the
+    // single-blob staged publication does.
+    // Same detection-window trade as the single-object commit: with the
+    // read-back deferred, damage in these just-written pages is caught by
+    // the first verified read or scrub instead of failing this commit.
+    if !defer_readback {
+        let mut verify_ranges: Vec<(u64, u64)> = Vec::new();
+        verify_ranges
+            .try_reserve_exact(2 + 2 * scratch_segment_numbers.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        verify_ranges.push((base, u64::from(relative)));
+        verify_ranges.push((base + u64::from(SUMMARY_BODY_PAGE), 4));
+        for entry in &staged {
+            if entry.existing.is_some() {
+                continue;
+            }
+            for segment in &entry.segments {
+                let segment_base = segment_base_page(segment.segment_no)?;
+                let mut end_relative = DATA_FIRST_PAGE;
+                for extent in &entry.extents[segment.first_extent..segment.extent_end] {
+                    let pages = u32::try_from(extent.payload_byte_len.div_ceil(PAGE_SIZE as u64))
+                        .map_err(|_| StoreError::Corrupt)?;
+                    end_relative = end_relative.max(
+                        extent
+                            .payload_relative_page
+                            .checked_add(pages)
+                            .ok_or(StoreError::Corrupt)?,
+                    );
+                }
+                verify_ranges.push((segment_base, u64::from(end_relative)));
+                verify_ranges.push((segment_base + u64::from(SUMMARY_BODY_PAGE), 4));
+            }
+        }
+        let verify_device = SpanSnapshotDevice::capture(device, &verify_ranges).await?;
+        for entry in &staged {
+            if entry.existing.is_some() {
+                continue;
+            }
+            verify_staged_blob(
+                &verify_device,
+                state.superblock.binding.store_uuid,
+                state.admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                &entry.manifest,
+                &entry.extents,
+            )
+            .await?;
+        }
+        let mut requests = Vec::new();
+        let mut expected: Vec<&[u8]> = Vec::new();
+        requests
+            .try_reserve_exact(manifest_payloads.len() + 2)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        expected
+            .try_reserve_exact(manifest_payloads.len() + 2)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for (index, bytes) in &manifest_payloads {
+            requests.push((
+                records[*index].pointer(),
+                ExtentKind::Catalog,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(bytes.as_slice());
+        }
+        requests.push((
+            catalog_root,
+            ExtentKind::Catalog,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(snapshot_bytes.as_slice());
+        requests.push((
+            allocation_root,
+            ExtentKind::Allocation,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(allocation_bytes.as_slice());
+        let observed = read_pointer_payloads(
+            &verify_device,
+            state.superblock.binding.store_uuid,
+            state.admitted_segments,
+            next_segment_generation,
+            checkpoint_generation,
+            &requests,
+        )
+        .await?;
+        if observed.len() != expected.len()
+            || observed
+                .iter()
+                .zip(expected)
+                .any(|(actual, bytes)| actual.bytes != bytes)
+        {
+            return Err(StoreError::Corrupt.into());
+        }
+    }
+
+    let next_physical_segment = (0..state.admitted_segments)
+        .find(|segment_no| allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free))
+        .unwrap_or(state.admitted_segments);
+    let next_object_id = state
+        .next_object_id
+        .checked_add(staged.len() as u128)
+        .ok_or(StoreError::IdExhausted)?
+        .max(u128::from(checkpoint_generation));
+    let mut successor = MountedState {
+        superblock: state.superblock,
+        generation: checkpoint_generation,
+        admitted_segments: state.admitted_segments,
+        next_physical_segment,
+        next_segment_generation,
+        next_object_id,
+        cleaner_reserve_segments: state.cleaner_reserve_segments,
+        replay_count: 0,
+        catalog_root,
+        replay_tail: PhysicalPointer::Null,
+        authority_root: state.authority_root,
+        allocation_root,
+        allocation,
+        allocation_version,
+        persistent_roots: state.persistent_roots.clone(),
+        persistent_authority: state.persistent_authority.clone(),
+        catalog: state.catalog.clone(),
+        cas: Some(CasMountedState {
+            objects: snapshot.objects,
+            blobs: snapshot.blobs,
+        }),
+        recovery_peak_bytes: 0,
+        last_segment: Some((metadata_segment_no, metadata_generation, metadata_seal_hash)),
+        last_segment_previous: Some((
+            previous_segment_no,
+            previous_segment_generation,
+            previous_hash,
+        )),
+        last_segment_target_checkpoint_generation: checkpoint_generation,
+    };
+    successor.recovery_peak_bytes = successor
+        .resident_heap_bytes()
+        .ok_or(StoreError::MemoryLimit)?;
+    if successor.recovery_peak_bytes > limits.recovery_memory_bytes {
+        return Err(StoreError::MemoryLimit.into());
+    }
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(pending_infos.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (object_id, object_kind, exact_len, is_new) in pending_infos {
+        let root_key = RootKey::new(object_id, checkpoint_generation, object_kind)
+            .map_err(|_| StoreError::Corrupt)?;
+        let owner = pins
+            .allocate_owner()
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        let root_pin = PinRegistry::pin_root_owned(
+            pins,
+            root_key,
+            RuntimeRootClass::ObjectResource,
+            owner,
+            PinAdmission::CompletionCritical,
+        )
+        .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        pending.push(PendingCasObjectHandle {
+            store_uuid: state.superblock.binding.store_uuid,
+            object_id,
+            object_kind,
+            exact_len,
+            commit_generation: checkpoint_generation,
+            root_pin,
+            is_new_blob: is_new,
+        });
+    }
+    Ok((pending, checkpoint, successor))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2769,11 +3967,19 @@ async fn commit_snapshot<D: PageDevice>(
     payload_hashes: &[Hash],
     pins: &crate::store::SharedStorePinRegistry,
     reference_codec: u16,
+    fused: Option<&FusedAuthorityPublication>,
+    staged_scratch_seal: Option<(u64, u64, Hash)>,
+    mut sink: Option<PageSink>,
+    defer_readback: bool,
 ) -> Result<(PendingCasObjectHandle, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
         .checked_add(1)
         .ok_or(StoreError::IdExhausted)?;
+    // No checkpoint can name any page written below until this transaction's
+    // own checkpoint slot protocol runs; its first flush is the shared
+    // durability barrier that replaces the per-phase segment flushes.
+    let defer_barriers = true;
     let is_new = existing.is_none();
     let data_segment_count = if is_new { scratch_segments.len() } else { 0 };
     let scratch_first_segment = scratch_segments
@@ -2797,21 +4003,29 @@ async fn commit_snapshot<D: PageDevice>(
         .ok_or(StoreError::IdExhausted)?;
     let mut previous = state.last_segment;
     if is_new {
-        for segment in scratch_segments {
-            previous = Some(
-                seal_scratch_segment(
-                    device,
-                    state,
-                    checkpoint_generation,
-                    blob_key,
-                    scratch_manifest.encoded_blob_len,
-                    *segment,
-                    scratch_extents,
-                    payload_hashes,
-                    previous,
-                )
-                .await?,
-            );
+        if let Some(seal) = staged_scratch_seal {
+            // stage_commit() already sealed the scratch segments against this
+            // exact checkpoint generation; chain from its final seal.
+            previous = Some(seal);
+        } else {
+            for segment in scratch_segments {
+                previous = Some(
+                    seal_scratch_segment(
+                        device,
+                        state,
+                        checkpoint_generation,
+                        blob_key,
+                        scratch_manifest.encoded_blob_len,
+                        *segment,
+                        scratch_extents,
+                        payload_hashes,
+                        previous,
+                        defer_barriers,
+                        sink.as_mut(),
+                    )
+                    .await?,
+                );
+            }
         }
     }
 
@@ -2941,7 +4155,39 @@ async fn commit_snapshot<D: PageDevice>(
     relative += snapshot_record.value.record_span_pages;
     ordinal += 1;
     let catalog_root = snapshot_record.pointer();
+    let snapshot_index = records.len();
     records.push(snapshot_record);
+
+    let authority_index = if let Some(fused) = fused {
+        let record = build_record(
+            state.superblock.binding.store_uuid,
+            metadata_segment_no,
+            metadata_generation,
+            checkpoint_generation,
+            ordinal,
+            relative,
+            ExtentKind::Authority,
+            METADATA_KIND_PERSISTENT_AUTHORITY,
+            0,
+            1,
+            fused.authority_bytes.len() as u64,
+            fused.authority_bytes.len() as u64,
+            0,
+            fused.authority_bytes.len() as u64,
+            payload_sha256(&fused.authority_bytes),
+            payload_sha256(&fused.authority_bytes),
+        )?;
+        relative += record.value.record_span_pages;
+        ordinal += 1;
+        let index = records.len();
+        records.push(record);
+        Some(index)
+    } else {
+        None
+    };
+    let authority_root = authority_index
+        .map(|index| records[index].pointer())
+        .unwrap_or(state.authority_root);
 
     let (allocation, allocation_version, allocation_bytes) = if state.allocation_version == 2 {
         let mut allocated_segments = Vec::new();
@@ -2999,6 +4245,7 @@ async fn commit_snapshot<D: PageDevice>(
     )?;
     relative += allocation_record.value.record_span_pages;
     let allocation_root = allocation_record.pointer();
+    let allocation_index = records.len();
     records.push(allocation_record);
     if relative > DATA_END_PAGE {
         return Err(StoreError::Capacity(CapacityClass::Metadata).into());
@@ -3010,13 +4257,18 @@ async fn commit_snapshot<D: PageDevice>(
     if let Some((record, bytes)) = &manifest_record_and_bytes {
         payload_records.push((record, bytes.as_slice()));
     }
-    payload_records.push((&records[records.len() - 2], snapshot_bytes.as_slice()));
-    payload_records.push((&records[records.len() - 1], allocation_bytes.as_slice()));
+    payload_records.push((&records[snapshot_index], snapshot_bytes.as_slice()));
+    if let (Some(index), Some(fused)) = (authority_index, fused) {
+        payload_records.push((&records[index], fused.authority_bytes.as_slice()));
+    }
+    payload_records.push((&records[allocation_index], allocation_bytes.as_slice()));
     write_payload_records_with_header(
         device,
         base,
         Some((&header_body, &header_seal)),
         &payload_records,
+        defer_barriers,
+        sink.as_mut(),
     )
     .await?;
     let (_, _, metadata_seal_hash) = finalize_segment(
@@ -3027,8 +4279,15 @@ async fn commit_snapshot<D: PageDevice>(
         metadata_generation,
         header_digest,
         &records,
+        defer_barriers,
+        sink.as_mut(),
     )
     .await?;
+    // Batched publication: everything staged above lands as a few large
+    // contiguous requests before the checkpoint slot protocol's barrier.
+    if let Some(sink) = sink.take() {
+        sink.drain(device).await?;
+    }
 
     let slot = ((checkpoint_generation - 1) & 1) as u8;
     let checkpoint = Checkpoint {
@@ -3049,7 +4308,7 @@ async fn commit_snapshot<D: PageDevice>(
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
         catalog_root,
-        authority_root: state.authority_root,
+        authority_root,
         allocation_root,
         replay_tail: PhysicalPointer::Null,
     };
@@ -3059,65 +4318,109 @@ async fn commit_snapshot<D: PageDevice>(
     // that damaged a data segment, while avoiding a scan of unchanged history.
     // Authority remains withheld until mount_verified_successor also re-reads
     // and selects this exact checkpoint pair.
-    let expected_manifest = if is_new {
-        verify_staged_blob(
-            device,
+    // Serve the whole read-back from batched span snapshots: the metadata
+    // segment plus, for a new blob, every scratch segment. This reads the
+    // exact same media bytes as the former page-by-page verification while
+    // paying a handful of large device requests instead of one per page.
+    // Deferring the read-back narrows corruption detection from this commit
+    // to the first read or scrub of the affected object: every read path
+    // still fails closed on the content's Merkle identity, and cold recovery
+    // re-verifies checkpoint state, so acknowledged-but-damaged device
+    // writes cannot be served as valid data either way.
+    if !defer_readback {
+        let mut verify_ranges: Vec<(u64, u64)> = Vec::new();
+        verify_ranges
+            .try_reserve_exact(2 + 2 * scratch_segments.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        verify_ranges.push((base, u64::from(relative)));
+        verify_ranges.push((base + u64::from(SUMMARY_BODY_PAGE), 4));
+        if is_new {
+            for segment in scratch_segments {
+                let segment_base = segment_base_page(segment.segment_no)?;
+                let mut end_relative = DATA_FIRST_PAGE;
+                for extent in &scratch_extents[segment.first_extent..segment.extent_end] {
+                    let pages = u32::try_from(extent.payload_byte_len.div_ceil(PAGE_SIZE as u64))
+                        .map_err(|_| StoreError::Corrupt)?;
+                    end_relative = end_relative.max(
+                        extent
+                            .payload_relative_page
+                            .checked_add(pages)
+                            .ok_or(StoreError::Corrupt)?,
+                    );
+                }
+                verify_ranges.push((segment_base, u64::from(end_relative)));
+                verify_ranges.push((segment_base + u64::from(SUMMARY_BODY_PAGE), 4));
+            }
+        }
+        let verify_device = SpanSnapshotDevice::capture(device, &verify_ranges).await?;
+        let expected_manifest = if is_new {
+            verify_staged_blob(
+                &verify_device,
+                state.superblock.binding.store_uuid,
+                state.admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                &scratch_manifest,
+                scratch_extents,
+            )
+            .await?;
+            Some(encode_blob_manifest(&scratch_manifest, context)?)
+        } else {
+            None
+        };
+        let mut requests = Vec::new();
+        let mut expected = Vec::new();
+        requests
+            .try_reserve_exact(4)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        expected
+            .try_reserve_exact(4)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        if let Some(bytes) = expected_manifest.as_ref() {
+            requests.push((
+                new_blob_mapping.manifest,
+                ExtentKind::Catalog,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(bytes.as_slice());
+        }
+        requests.push((
+            catalog_root,
+            ExtentKind::Catalog,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(snapshot_bytes.as_slice());
+        requests.push((
+            allocation_root,
+            ExtentKind::Allocation,
+            limits.recovery_memory_bytes,
+        ));
+        expected.push(allocation_bytes.as_slice());
+        if let Some(fused) = fused {
+            requests.push((
+                authority_root,
+                ExtentKind::Authority,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(fused.authority_bytes.as_slice());
+        }
+        let observed = read_pointer_payloads(
+            &verify_device,
             state.superblock.binding.store_uuid,
             state.admitted_segments,
             next_segment_generation,
             checkpoint_generation,
-            &scratch_manifest,
-            scratch_extents,
+            &requests,
         )
         .await?;
-        Some(encode_blob_manifest(&scratch_manifest, context)?)
-    } else {
-        None
-    };
-    let mut requests = Vec::new();
-    let mut expected = Vec::new();
-    requests
-        .try_reserve_exact(3)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    expected
-        .try_reserve_exact(3)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    if let Some(bytes) = expected_manifest.as_ref() {
-        requests.push((
-            new_blob_mapping.manifest,
-            ExtentKind::Catalog,
-            limits.recovery_memory_bytes,
-        ));
-        expected.push(bytes.as_slice());
-    }
-    requests.push((
-        catalog_root,
-        ExtentKind::Catalog,
-        limits.recovery_memory_bytes,
-    ));
-    expected.push(snapshot_bytes.as_slice());
-    requests.push((
-        allocation_root,
-        ExtentKind::Allocation,
-        limits.recovery_memory_bytes,
-    ));
-    expected.push(allocation_bytes.as_slice());
-    let observed = read_pointer_payloads(
-        device,
-        state.superblock.binding.store_uuid,
-        state.admitted_segments,
-        next_segment_generation,
-        checkpoint_generation,
-        &requests,
-    )
-    .await?;
-    if observed.len() != expected.len()
-        || observed
-            .iter()
-            .zip(expected)
-            .any(|(actual, bytes)| actual.bytes != bytes)
-    {
-        return Err(StoreError::Corrupt.into());
+        if observed.len() != expected.len()
+            || observed
+                .iter()
+                .zip(expected)
+                .any(|(actual, bytes)| actual.bytes != bytes)
+        {
+            return Err(StoreError::Corrupt.into());
+        }
     }
     let next_physical_segment = (0..state.admitted_segments)
         .find(|segment_no| allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free))
@@ -3138,12 +4441,18 @@ async fn commit_snapshot<D: PageDevice>(
         replay_count: 0,
         catalog_root,
         replay_tail: PhysicalPointer::Null,
-        authority_root: state.authority_root,
+        authority_root,
         allocation_root,
         allocation,
         allocation_version,
-        persistent_roots: state.persistent_roots.clone(),
-        persistent_authority: state.persistent_authority.clone(),
+        persistent_roots: match fused {
+            Some(fused) => Some(fused.persistent_roots.clone()),
+            None => state.persistent_roots.clone(),
+        },
+        persistent_authority: match fused {
+            Some(fused) => Some(fused.persistent_authority.clone()),
+            None => state.persistent_authority.clone(),
+        },
         catalog: state.catalog.clone(),
         cas: Some(CasMountedState {
             objects: snapshot.objects,
@@ -3201,6 +4510,8 @@ pub(crate) async fn write_payload_records_with_header<D: PageDevice>(
     base: u64,
     header: Option<(&Page, &Page)>,
     records: &[(&FinalRecord, &[u8])],
+    defer_barriers: bool,
+    mut sink: Option<&mut PageSink>,
 ) -> Result<(), StoreError<D::Error>> {
     // Payload and descriptor bodies are two dependency phases. Records in the
     // same segment transaction share each barrier. Descriptor seals are left
@@ -3218,32 +4529,58 @@ pub(crate) async fn write_payload_records_with_header<D: PageDevice>(
                 page[..take].copy_from_slice(&payload[copied..copied + take]);
                 copied += take;
             }
-            device
-                .write_pages(
-                    base + u64::from(record.value.payload_first_relative_page + page_index),
-                    &pages,
-                )
-                .await
-                .map_err(StoreError::Mutation)?;
+            match sink.as_deref_mut() {
+                Some(sink) => {
+                    for (offset, page) in pages.iter().enumerate() {
+                        sink.push(
+                            base + u64::from(record.value.payload_first_relative_page + page_index)
+                                + offset as u64,
+                            page,
+                        )?;
+                    }
+                }
+                None => {
+                    device
+                        .write_pages(
+                            base + u64::from(
+                                record.value.payload_first_relative_page + page_index,
+                            ),
+                            &pages,
+                        )
+                        .await
+                        .map_err(StoreError::Mutation)?;
+                }
+            }
             page_index += batch_pages as u32;
         }
     }
     if let Some((body, _)) = header {
-        write_page(device, base, body).await?;
+        sink_or_write_page(device, sink.as_deref_mut(), base, body).await?;
     }
-    flush(device).await?;
+    if !defer_barriers {
+        flush(device).await?;
+    }
     if let Some((_, seal)) = header {
-        write_page(device, base + 1, seal).await?;
+        sink_or_write_page(device, sink.as_deref_mut(), base + 1, seal).await?;
     }
     for (record, _) in records {
         let descriptor_relative = record.value.payload_first_relative_page - 2;
-        write_page(device, base + u64::from(descriptor_relative), &record.body).await?;
-    }
-    flush(device).await?;
-    for (record, _) in records {
-        let descriptor_relative = record.value.payload_first_relative_page - 2;
-        write_page(
+        sink_or_write_page(
             device,
+            sink.as_deref_mut(),
+            base + u64::from(descriptor_relative),
+            &record.body,
+        )
+        .await?;
+    }
+    if !defer_barriers {
+        flush(device).await?;
+    }
+    for (record, _) in records {
+        let descriptor_relative = record.value.payload_first_relative_page - 2;
+        sink_or_write_page(
+            device,
+            sink.as_deref_mut(),
             base + u64::from(descriptor_relative + 1),
             &record.seal,
         )

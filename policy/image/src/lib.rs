@@ -38,7 +38,11 @@ pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queu
 #[cfg(all(feature = "qemu-default", feature = "storage-bench"))]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 0,
-    sector_count: 393_216,
+    // The benchmark harness always provisions a 1 GiB data disk; admit all of
+    // it so large-file workloads exercise real growth instead of an
+    // artificially small window. The raw-block benchmark range parks in the
+    // final 64 MiB.
+    sector_count: 2_097_152,
 });
 
 #[cfg(all(
@@ -87,7 +91,7 @@ mod tests {
         assert_eq!(
             BLOCK_DATA_SLICE.unwrap().end_sector(),
             Some(if cfg!(feature = "storage-bench") {
-                393_216
+                2_097_152
             } else if cfg!(feature = "file-tree") {
                 262_144
             } else {

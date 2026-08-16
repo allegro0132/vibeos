@@ -53,12 +53,17 @@ fn full_read_rejects_content_corruption_even_when_header_still_parses() {
 }
 
 #[test]
-fn current_journal_limit_is_checked_before_encoding() {
-    let content = vec![0u8; vibeos_object_store::MAX_OBJECT_SIZE];
+fn storage_envelope_is_checked_before_encoding() {
+    // Content whose encoded image would exceed the external-object ceiling
+    // is rejected before any doomed allocation; content past the former
+    // inline chunk envelope now encodes and rides the by-reference path.
+    let content = vec![0u8; vibeos_object_store::MAX_EXTERNAL_OBJECT_SIZE as usize];
     assert_eq!(
         encode_blob_object(kind(11), &content),
         Err(BlobStoreError::Store(StoreError::ObjectTooLarge))
     );
+    let inline_limit = vec![0u8; vibeos_object_store::MAX_OBJECT_SIZE];
+    assert!(encode_blob_object(kind(11), &inline_limit).is_ok());
 }
 
 #[test]

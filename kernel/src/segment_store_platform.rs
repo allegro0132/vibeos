@@ -885,12 +885,23 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 .lock()
                 .clone()
                 .ok_or(FileError::ServiceUnavailable)?;
+            // The fused transaction stages every new node in one batch;
+            // prefer growth to a foreground collection for its appetite.
+            self.runtime
+                .ensure_foreground_capacity_for(12)
+                .await
+                .map_err(map_file_runtime_error)?;
             let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
             let result = poll_as_system(
                 transaction.commit_persistent_for_maintenance(operation.store(), &maintenance),
             )
-            .await
-            .map_err(|error| match error {
+            .await;
+            if result.is_err() && operation.store().needs_remount() {
+                // A failed staged batch leaves the store poisoned; only a
+                // new cold proof may re-establish the durable checkpoint.
+                self.runtime.invalidate_recovery_cache();
+            }
+            let result = result.map_err(|error| match error {
                 #[cfg(feature = "storage-bench")]
                 ref detail if {
                     crate::println!("  bench-detail fs-commit error: {detail:?}");
@@ -1666,15 +1677,27 @@ impl StorageV2Runtime {
             // only rejoins the free set two checkpoint generations later, so
             // one round cannot observe its own relief — iterate bounded
             // rounds until the requested floor is met or reclaim stalls.
+            // Reclaim past the floor with the same hysteresis as growth:
+            // every mark walk costs one pass over the live object graph, so
+            // stopping at the floor makes the very next batch dip below it
+            // and charges a full walk per handful of freed segments.
+            // Overshooting amortizes one walk across many commits.
+            let reclaim_target = floor.saturating_add(STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS);
             let mut collected = false;
             let mut last_free = info.free_segments;
             let mut stalled = 0_u32;
             for _ in 0..8 {
-                if let Err(_error) = poll_as_system(operation.store().collect_garbage()).await {
-                    #[cfg(feature = "storage-bench")]
-                    crate::println!("  bench-detail gc error: {_error:?}");
-                    break;
-                }
+                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                let io_before = crate::virtio_blk::telemetry();
+                let _telemetry =
+                    match poll_as_system(operation.store().collect_garbage()).await {
+                        Ok(telemetry) => telemetry,
+                        Err(_error) => {
+                            #[cfg(feature = "storage-bench")]
+                            crate::println!("  bench-detail gc error: {_error:?}");
+                            break;
+                        }
+                    };
                 collected = true;
                 let Ok(current) = operation.store().info() else {
                     break;
@@ -1685,7 +1708,28 @@ impl StorageV2Runtime {
                     current.free_segments,
                     floor
                 );
-                if current.free_segments >= floor {
+                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                {
+                    let io = crate::virtio_blk::telemetry().saturating_sub(io_before);
+                    crate::println!(
+                        "  bench-detail gc-io reads={} read_mib={} writes={} live_obj={} live_blob={} copied={} reclaimed_seg={} pause_ms={}",
+                        io.read_requests,
+                        io.read_bytes / (1024 * 1024),
+                        io.write_requests,
+                        _telemetry.live_object_count,
+                        _telemetry.live_blob_count,
+                        _telemetry.copied_bytes,
+                        _telemetry.reclaimed_segments,
+                        _telemetry.foreground_pause_ns / 1_000_000
+                    );
+                }
+                if current.free_segments >= reclaim_target {
+                    break;
+                }
+                // Past the floor the walk is pure amortization; a round that
+                // stops yielding must not stall the caller, which already has
+                // the capacity it asked for.
+                if current.free_segments >= floor && current.free_segments <= last_free {
                     break;
                 }
                 if current.free_segments <= last_free {

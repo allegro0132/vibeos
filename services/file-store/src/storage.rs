@@ -305,68 +305,35 @@ impl FsTransaction {
             }
         }
         let (inode_entries, dirent_entries) = encode_namespace(&self.working)?;
-        let inode_root = commit_tree(
-            store,
-            self.previous_root.as_ref(),
-            FsTreeKind::Inode,
-            generation,
-            &inode_entries,
-            Some(&content),
-            principal,
-            maintenance,
-        )
-        .await?;
-        let dirent_root = commit_tree(
-            store,
-            self.previous_root.as_ref(),
-            FsTreeKind::Dirent,
-            generation,
-            &dirent_entries,
-            None,
-            principal,
-            maintenance,
-        )
-        .await?;
-        let new_root = match (principal, maintenance) {
-            (Some(principal), None) => {
-                store
-                    .commit_fs_root_for_principal(
-                        principal,
-                        self.working.namespace,
-                        generation,
-                        self.working.next_file_id,
-                        crate::ROOT_FILE_ID,
-                        &inode_root,
-                        &dirent_root,
-                    )
-                    .await?
-            }
-            (None, Some(maintenance)) => {
-                store
-                    .commit_fs_root_for_maintenance(
-                        maintenance,
-                        self.working.namespace,
-                        generation,
-                        self.working.next_file_id,
-                        crate::ROOT_FILE_ID,
-                        &inode_root,
-                        &dirent_root,
-                    )
-                    .await?
-            }
-            (None, None) => {
-                store
-                    .commit_fs_root(
-                        self.working.namespace,
-                        generation,
-                        self.working.next_file_id,
-                        crate::ROOT_FILE_ID,
-                        &inode_root,
-                        &dirent_root,
-                    )
-                    .await?
-            }
-            (Some(_), Some(_)) => return Err(FileError::InvalidType.into()),
+        let new_root = if let (None, Some(maintenance)) = (principal, maintenance) {
+            // Fused trusted-service path: both trees and the namespace root
+            // publish under one staged-batch checkpoint instead of one
+            // checkpoint per new node plus one for the root.
+            let inode_inputs = build_node_inputs(&inode_entries, Some(&content))?;
+            let dirent_inputs = build_node_inputs(&dirent_entries, None)?;
+            store
+                .commit_fs_transaction_for_maintenance(
+                    maintenance,
+                    self.previous_root.as_ref(),
+                    self.working.namespace,
+                    generation,
+                    self.working.next_file_id,
+                    crate::ROOT_FILE_ID,
+                    &inode_inputs,
+                    &dirent_inputs,
+                )
+                .await?
+        } else {
+            self.commit_persistent_trees_and_root(
+                store,
+                generation,
+                &inode_entries,
+                &dirent_entries,
+                &content,
+                principal,
+                maintenance,
+            )
+            .await?
         };
         match maintenance {
             Some(maintenance) => {
@@ -400,6 +367,105 @@ impl FsTransaction {
         assert!(self.root.release_writer_claim(self.claim));
         Ok(generation)
     }
+
+    /// Sequential commit sequence for callers without maintenance authority:
+    /// one COW commit per tree followed by the namespace-root commit.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_persistent_trees_and_root<D: PageDevice>(
+        &self,
+        store: &mut SegmentStore<D>,
+        generation: u64,
+        inode_entries: &[(Vec<u8>, Vec<u8>)],
+        dirent_entries: &[(Vec<u8>, Vec<u8>)],
+        content: &BTreeMap<FileId, FsPersistentData>,
+        principal: Option<&StoragePrincipal>,
+        maintenance: Option<&StoreMaintenance>,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, PersistentCommitError<D::Error>> {
+        let inode_root = commit_tree(
+            store,
+            self.previous_root.as_ref(),
+            FsTreeKind::Inode,
+            generation,
+            inode_entries,
+            Some(content),
+            principal,
+            maintenance,
+        )
+        .await?;
+        let dirent_root = commit_tree(
+            store,
+            self.previous_root.as_ref(),
+            FsTreeKind::Dirent,
+            generation,
+            dirent_entries,
+            None,
+            principal,
+            maintenance,
+        )
+        .await?;
+        match (principal, maintenance) {
+            (Some(principal), None) => store
+                .commit_fs_root_for_principal(
+                    principal,
+                    self.working.namespace,
+                    generation,
+                    self.working.next_file_id,
+                    crate::ROOT_FILE_ID,
+                    &inode_root,
+                    &dirent_root,
+                )
+                .await
+                .map_err(Into::into),
+            (None, Some(maintenance)) => store
+                .commit_fs_root_for_maintenance(
+                    maintenance,
+                    self.working.namespace,
+                    generation,
+                    self.working.next_file_id,
+                    crate::ROOT_FILE_ID,
+                    &inode_root,
+                    &dirent_root,
+                )
+                .await
+                .map_err(Into::into),
+            (None, None) => store
+                .commit_fs_root(
+                    self.working.namespace,
+                    generation,
+                    self.working.next_file_id,
+                    crate::ROOT_FILE_ID,
+                    &inode_root,
+                    &dirent_root,
+                )
+                .await
+                .map_err(Into::into),
+            (Some(_), Some(_)) => Err(FileError::InvalidType.into()),
+        }
+    }
+}
+
+/// Build the leaf inputs one tree commit consumes from encoded namespace
+/// entries, attaching each non-directory inode's content edge.
+fn build_node_inputs<'a>(
+    entries: &'a [(Vec<u8>, Vec<u8>)],
+    content: Option<&'a BTreeMap<FileId, FsPersistentData>>,
+) -> Result<Vec<FsNodeEntryInput<'a>>, FileError> {
+    let mut inputs = Vec::new();
+    for (key, value) in entries {
+        let data = if let Some(content) = content {
+            let file_id = crate::decode_inode_key(key).map_err(|_| FileError::InvalidType)?;
+            content.get(&file_id)
+        } else {
+            None
+        };
+        inputs.push(FsNodeEntryInput {
+            key,
+            value,
+            child: None,
+            data,
+        });
+    }
+    Ok(inputs)
 }
 
 impl FileTreeRoot {
@@ -935,6 +1001,115 @@ mod tests {
                 .unwrap(),
             b"authority-preserved"
         );
+    }
+
+    #[test]
+    fn fused_maintenance_commit_batches_trees_and_root_and_cold_recovers() {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d46_5553_4544_5458_4e;
+        const POLICY: &[u8] = b"fused transaction commit policy v1";
+        // Enough segments that the first transaction's forty sequential
+        // content commits never force capacity-relief collections into the
+        // second transaction's checkpoint budget.
+        let device = MemoryDevice::blank(256);
+        let (context, _quota, maintenance_provisioner) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), context);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-FUSED-TX").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: limits(),
+        }))
+        .unwrap();
+        let maintenance = store
+            .provision_maintenance_root(&maintenance_provisioner)
+            .unwrap();
+        let import = vibeos_segment_store::PersistentAuthorityImport::empty(
+            vibeos_durable_format::StoreId::new(92).unwrap(),
+            POLICY,
+            Vec::new(),
+        )
+        .unwrap();
+        block_on(store.import_persistent_authority(&maintenance, import)).unwrap();
+
+        // Enough files that both trees split into several leaves plus an
+        // internal level, so the fused plan stages parents whose children are
+        // batch-predicted identities.
+        let root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .mkdir(&crate::RelPath::parse("d").unwrap(), false)
+            .unwrap();
+        for index in 0..40_u32 {
+            let path = alloc::format!("d/file-{index:02}");
+            transaction
+                .write_chunks(
+                    &crate::RelPath::parse(&path).unwrap(),
+                    [alloc::format!("payload-{index:02}").into_bytes()],
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            block_on(transaction.commit_persistent_for_maintenance(&mut store, &maintenance))
+                .unwrap(),
+            1
+        );
+
+        // A follow-up single-file change reuses unchanged nodes and rides at
+        // most three checkpoints: the content batch, the fused tree/root
+        // batch, and the persistent root swap.
+        let generation_before = store.info().unwrap().generation;
+        let mut transaction = root.begin().unwrap();
+        transaction
+            .write_chunks(
+                &crate::RelPath::parse("d/file-00").unwrap(),
+                [b"rewritten".to_vec()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            block_on(transaction.commit_persistent_for_maintenance(&mut store, &maintenance))
+                .unwrap(),
+            2
+        );
+        let generation_delta = store.info().unwrap().generation - generation_before;
+        assert!(
+            generation_delta <= 3,
+            "fused transaction must not spend one checkpoint per tree node (delta={generation_delta})"
+        );
+        drop(store);
+
+        let (cold_context, _cold_quota, _cold_maintenance) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), cold_context);
+        block_on(cold.mount()).unwrap();
+        let recovered = block_on(crate::FileTreeRoot::recover_persistent(
+            &cold, NAMESPACE, 256,
+        ))
+        .unwrap()
+        .unwrap();
+        let snapshot = recovered.snapshot();
+        for index in 0..40_u32 {
+            let path = alloc::format!("d/file-{index:02}");
+            let data = snapshot
+                .persistent_data(&crate::RelPath::parse(&path).unwrap())
+                .unwrap();
+            let expected = if index == 0 {
+                b"rewritten".to_vec()
+            } else {
+                alloc::format!("payload-{index:02}").into_bytes()
+            };
+            assert_eq!(
+                block_on(cold.read_fs_data_chunk(&data, 0)).unwrap().unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -46,6 +46,9 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
   API, unified on-disk journal, publication boundary, and raw-media acceptance.
+- **[docs/FILE_TREE.md](docs/FILE_TREE.md)** — the opt-in `file-tree` VSH
+  profile: `@NAME/path` capability syntax, namespace/transaction semantics,
+  and powered-off verification.
 - **[docs/PERSISTENT_CSPACE.md](docs/PERSISTENT_CSPACE.md)** — the fixed
   `persistent-test` CSpace, external root policy, atomic recovery install, and
   three-boot acceptance boundary.

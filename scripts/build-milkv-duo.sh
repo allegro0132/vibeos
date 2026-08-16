@@ -10,6 +10,7 @@ ssh_acceptance=false
 jitterentropy_probe=false
 jitterentropy_ssh_probe=false
 iperf3_server=false
+file_tree=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -18,10 +19,11 @@ for arg in "$@"; do
     --jitterentropy-probe) jitterentropy_probe=true ;;
     --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
     --iperf3-server) iperf3_server=true ;;
-    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
+    --file-tree) file_tree=true ;;
+    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
     *)
       if [ -n "$sdk_arg" ]; then
-        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server] [duo-buildroot-sdk-root]" >&2
+        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree] [duo-buildroot-sdk-root]" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -35,6 +37,7 @@ mode_count=0
 [ "$jitterentropy_probe" = true ] && mode_count=$((mode_count + 1))
 [ "$jitterentropy_ssh_probe" = true ] && mode_count=$((mode_count + 1))
 [ "$iperf3_server" = true ] && mode_count=$((mode_count + 1))
+[ "$file_tree" = true ] && mode_count=$((mode_count + 1))
 if [ "$mode_count" -gt 1 ]; then
   echo "build-milkv-duo.sh: image mode options are mutually exclusive" >&2
   exit 2
@@ -111,6 +114,10 @@ elif [ "$iperf3_server" = true ]; then
   features=milkv-iperf3-server
   output_dir="$repo_root/target/milkv-duo-iperf3-server"
   output_elf="$output_dir/vibeos-milkv-duo-iperf3-server.elf"
+elif [ "$file_tree" = true ]; then
+  features=milkv-ssh,file-tree
+  output_dir="$repo_root/target/milkv-duo-file-tree"
+  output_elf="$output_dir/vibeos-milkv-duo-file-tree.elf"
 fi
 
 (

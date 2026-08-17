@@ -157,6 +157,8 @@ fn install_shared_commands(session: &mut Session) {
     #[cfg(feature = "qemu-virt")]
     vibeos_vsh::install_commands(session, QEMU_COMMANDS);
     #[cfg(feature = "milkv-duo")]
+    vibeos_vsh::install_commands(session, MILKV_STORAGE_COMMANDS);
+    #[cfg(feature = "milkv-duo")]
     vibeos_vsh::install_commands(session, MILKV_USB_COMMANDS);
     #[cfg(any(
         feature = "tcp-echo",
@@ -303,6 +305,22 @@ const QEMU_COMMANDS: &[CommandSpec] = &[
         min_args: 0,
         max_args: 2,
         handler: vsh_usb,
+    },
+];
+
+#[cfg(feature = "milkv-duo")]
+const MILKV_STORAGE_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "readback",
+        min_args: 0,
+        max_args: 1,
+        handler: vsh_readback,
+    },
+    CommandSpec {
+        name: "iostat",
+        min_args: 0,
+        max_args: 1,
+        handler: vsh_iostat,
     },
 ];
 
@@ -827,6 +845,58 @@ fn vsh_quiet(_args: &[String]) -> Result<String, Status> {
 fn vsh_verbose(_args: &[String]) -> Result<String, Status> {
     crate::tty::set_quiet(false);
     Ok(String::from("background component output restored\n"))
+}
+
+/// Toggle SDHCI large-burst write read-back verification.
+///
+/// - `readback` / `readback status` — show the current state.
+/// - `readback off` — trust large write bursts without reading them back
+///   (faster writes, drops the silent-corruption guard).
+/// - `readback on` — restore read-back verification (default).
+/// Report or reset the SDHCI I/O counters, to attribute an operation's cost.
+///
+/// - `iostat` — print ops / blocks-read / blocks-written / busy-ms.
+/// - `iostat reset` — zero the counters before measuring one operation.
+#[cfg(feature = "milkv-duo")]
+fn vsh_iostat(args: &[String]) -> Result<String, Status> {
+    match args.first().map(String::as_str) {
+        Some("reset") => {
+            crate::sdhci_blk::reset_io_counters();
+            Ok(String::from("iostat: counters reset\n"))
+        }
+        None => {
+            let (ops, read, written, busy_ms) = crate::sdhci_blk::io_counters();
+            Ok(format!(
+                "iostat: {ops} ops, {read} blk rd ({} KiB), {written} blk wr ({} KiB), {busy_ms} ms busy\n",
+                read / 2,
+                written / 2,
+            ))
+        }
+        _ => Err(Status::Usage),
+    }
+}
+
+#[cfg(feature = "milkv-duo")]
+fn vsh_readback(args: &[String]) -> Result<String, Status> {
+    match args.first().map(String::as_str) {
+        None | Some("status") => Ok(format!(
+            "write read-back: {}\n",
+            if crate::sdhci_blk::write_readback_enabled() {
+                "on"
+            } else {
+                "off"
+            }
+        )),
+        Some("on") => {
+            crate::sdhci_blk::set_write_readback(true);
+            Ok(String::from("write read-back: on\n"))
+        }
+        Some("off") => {
+            crate::sdhci_blk::set_write_readback(false);
+            Ok(String::from("write read-back: off\n"))
+        }
+        _ => Err(Status::Usage),
+    }
 }
 
 fn vsh_reboot(_args: &[String]) -> Result<String, Status> {

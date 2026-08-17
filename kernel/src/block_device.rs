@@ -377,7 +377,7 @@ fn current_device_info() -> Result<DeviceInfo, BlockError> {
     #[cfg(feature = "qemu-virt")]
     let max_transfer_blocks = vibeos_driver_virtio_core::BLOCK_MAX_TRANSFER_BLOCKS;
     #[cfg(feature = "milkv-duo")]
-    let max_transfer_blocks = 1;
+    let max_transfer_blocks = backend::MAX_TRANSFER_BLOCKS;
     let geometry = DeviceGeometry::new(
         512,
         None,

@@ -472,6 +472,72 @@ persistent, Storage-V2-backed `@home` namespace bound at VSH/SSH session start.
 See [FILE_TREE.md](FILE_TREE.md) for the `@NAME/path` capability syntax — there
 is no bare path, `/`, `~`, cwd, or globbing.
 
+#### Storage I/O performance status (2026-08-17: batched path landed on hardware)
+
+Multi-block I/O is now wired into the production milkv-duo path and validated
+on a physical board across many flash/boot cycles. Interactive `mkdir`/`ls`
+under `@home` measure ~0.1 s sustained (previously 15–30 s). The load-bearing
+findings, all reproduced with UART evidence:
+
+- **The earlier "bricks" were misdiagnosed.** A plain `reboot` (SBI reset)
+  hangs this board with total UART silence *on the unmodified known-good
+  image too* — reproduced with zero multi-block code involved. The two
+  historical failures attributed to multi-block wiring were this warm-reboot
+  hang; "revert + power cycle" recovered because reverting implied reflashing.
+  Always power-cycle instead of `reboot` until the warm-reset hang is fixed.
+- **Batched reads (CMD18, up to 256 blocks) work as-is** through the
+  production capability/session path.
+- **The CV1800B SDHCI integration never raises the initial buffer-write-ready
+  for PIO writes** (neither the interrupt nor PRESENT_STATE bit 10), so every
+  standard CMD25 shape stalls before its data phase: Auto CMD12, manual
+  CMD12, open-ended, and CMD23-prefixed all fail identically, on 1-bit and
+  4-bit widths, while the card correctly sits in `rcv` state (R1 decode). The
+  signal *does* fire on full-to-space transitions once the FIFO has been
+  saturated. No vendor software hits this: Linux writes via DMA, U-Boot and
+  the FSBL barely write.
+- **Production writes therefore use a "blind PIO" CMD25 feed**: the first
+  8 blocks (hardware-verified FIFO-safe) are pushed without the ready signal,
+  and later blocks strictly wait for the now-live signal. The kernel probes
+  the protocol ladder once per session, locks the working mode, read-back
+  verifies each newly used burst size before trusting it, retries transient
+  failures, and falls back to proven single-sector CMD24 only after repeated
+  failures. Failed transfers are aborted (CMD12 abort + CMD/DAT line reset)
+  so the card is never left wedged in a data state.
+- **Driver waits are wall-clock deadlines (10 s via the timebase), not spin
+  budgets**: cards legitimately stall >1 s during internal garbage
+  collection, and the old ~0.7 s spin budgets converted that into spurious
+  TimedOut failures under sustained load.
+- **A 2 MiB write-through LRU page cache in `CapabilityPageDevice`** now
+  serves ~99.9% of storage-stack page reads. Measured before the cache: tens
+  of megabytes of *repeat* reads of the same hot B+tree/manifest pages per
+  small mutation (invisible on a RAM-backed QEMU disk, fatal at 25 MHz PIO).
+  Writes update or drop affected entries; an ambiguous write failure drops
+  them.
+
+Remaining, well-characterized issues:
+
+- **Sustained `mkdir`/`write` on a populated store still cost 20–60 s and
+  grow roughly linearly with the number of live files** (measured with a
+  dropped-input-immune sync-marker protocol; a fresh, near-empty tree is
+  sub-second). The per-commit cost is thousands of two-page node-prefix
+  reads across segment clusters — now ~99.9% served by the page cache, so
+  the residual is CPU-bound traversal/verification in the segment-store or
+  file-tree commit path that scales with live-object count, not device I/O.
+  It reproduces identically on QEMU (count `CapabilityPageDevice` reads per
+  operation), where fast storage and CPU hide it; the fix belongs in the
+  segment-store commit/GC/manifest path and is independent of this board
+  port. The foreground free-segment floor and growth hysteresis now scale to
+  the device size (a fixed 10+22-segment policy was unreachable on this
+  16-segment slice and forced GC walks per commit), which is necessary but
+  was not sufficient.
+- One spontaneous board reset was observed under sustained write load
+  (possible supply dip; worth checking the Duo's power source). Data written
+  minutes before the reset survived except one subtree, consistent with the
+  card's own volatile write cache on abrupt power loss — SD gives no
+  power-loss durability guarantee for recently programmed data.
+- `blk multiblock-probe` on the `--diagnostic` image remains available for
+  bare CMD18 bring-up experiments.
+
 ### Explicit SSH/VSH hardware acceptance image (insecure)
 
 The physical remote-login gate uses a deliberately separate

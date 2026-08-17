@@ -830,7 +830,14 @@ fn vsh_verbose(_args: &[String]) -> Result<String, Status> {
 }
 
 fn vsh_reboot(_args: &[String]) -> Result<String, Status> {
-    crate::sbi::reboot()
+    // Ask firmware to reset first (QEMU's OpenSBI honors this and never
+    // returns), then fall back to the board's own hardware reset for firmware
+    // whose SRST is a no-op, such as the CV1800B's OpenSBI.
+    crate::sbi::request_system_reset(
+        crate::sbi::RESET_TYPE_COLD_REBOOT,
+        crate::sbi::RESET_REASON_NONE,
+    );
+    crate::platform::cold_reset()
 }
 
 fn vsh_poweroff(_args: &[String]) -> Result<String, Status> {

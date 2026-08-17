@@ -69,11 +69,14 @@ pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
 });
 
 /// The packaged Duo image places raw service data immediately after its
-/// 128 MiB FAT boot partition.
+/// 128 MiB FAT boot partition. The slice is 512 MiB: Storage V2's segment
+/// granule is 4 MiB and its foreground free-segment policy needs dozens of
+/// segments of headroom, so the previous 64 MiB (sixteen segments) forced a
+/// full garbage-collection walk on nearly every commit.
 #[cfg(feature = "milkv-duo-sd")]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 262_145,
-    sector_count: 131_072,
+    sector_count: 1_048_576,
 });
 
 #[cfg(test)]

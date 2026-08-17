@@ -522,6 +522,7 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
             allocation_root,
             ExtentKind::Allocation,
             self.limits.recovery_memory_bytes,
+            None,
         )
         .await?;
         if staged.bytes != allocation_bytes {

@@ -51,7 +51,7 @@ use crate::quota::{
 use crate::store::{
     read_pointer_payload, read_pointer_payloads, scan_segment, validate_cas_blob_descriptors,
     write_checkpoint, CapacityClass, CasMountedState, MountedState, SegmentStore, StoreError,
-    READER_PIN_SLOTS, ROOT_PIN_SLOTS,
+    VerifiedSegmentScans, READER_PIN_SLOTS, ROOT_PIN_SLOTS,
 };
 
 const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
@@ -1455,9 +1455,9 @@ impl<D: PageDevice> SegmentStore<D> {
         // smaller-than-default limit.
         let batched_limit = MAX_BATCHED_BLOB_READ_LIMIT.min(self.limits.recovery_memory_bytes / 4);
         let bytes = if manifest.encoded_blob_len <= batched_limit as u64 {
-            read_small_verified_blob(&self.device, state, descriptor, &manifest).await?
+            read_small_verified_blob(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?
         } else {
-            validate_resolved_manifest(&self.device, state, descriptor, &manifest).await?;
+            validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?;
             read_and_verify_resolved_blob(&self.device, state, descriptor, &manifest).await?
         };
         drop(read_pin);
@@ -1470,7 +1470,7 @@ impl<D: PageDevice> SegmentStore<D> {
     ) -> Result<(BlobDescriptor, BlobManifest), CasStoreError<D::Error>> {
         let (descriptor, manifest) = self.resolve_authorized_manifest_unverified(object).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
-        validate_resolved_manifest(&self.device, state, descriptor, &manifest).await?;
+        validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?;
         Ok((descriptor, manifest))
     }
 
@@ -1531,6 +1531,7 @@ impl<D: PageDevice> SegmentStore<D> {
             blob.manifest,
             ExtentKind::Catalog,
             self.limits.recovery_memory_bytes,
+            None,
         )
         .await?;
         let context = CasCodecContext::new(
@@ -1604,6 +1605,7 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
     device: &D,
     state: &MountedState,
     manifest: &BlobManifest,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), CasStoreError<D::Error>> {
     let geometry = BlobGeometry::for_len(manifest.blob_key.exact_len())?;
     let descriptor = BlobDescriptor {
@@ -1620,6 +1622,7 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
         state.next_segment_generation,
         state.generation,
         manifest,
+        memo,
     )
     .await?;
     let header = read_manifest_range(device, state, manifest, 0, HEADER_SIZE).await?;
@@ -1638,6 +1641,7 @@ async fn validate_resolved_manifest<D: PageDevice>(
     state: &MountedState,
     descriptor: BlobDescriptor,
     manifest: &BlobManifest,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), CasStoreError<D::Error>> {
     validate_cas_blob_descriptors(
         device,
@@ -1646,6 +1650,7 @@ async fn validate_resolved_manifest<D: PageDevice>(
         state.next_segment_generation,
         state.generation,
         manifest,
+        memo,
     )
     .await?;
     let header = read_manifest_range(device, state, manifest, 0, HEADER_SIZE).await?;
@@ -1664,6 +1669,7 @@ async fn read_small_verified_blob<D: PageDevice>(
     state: &MountedState,
     descriptor: BlobDescriptor,
     manifest: &BlobManifest,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
     let mut requests = Vec::new();
     requests
@@ -1683,6 +1689,7 @@ async fn read_small_verified_blob<D: PageDevice>(
         state.next_segment_generation,
         state.generation,
         &requests,
+        memo,
     )
     .await?;
     if resolved.len() != manifest.extents.len() {
@@ -2334,6 +2341,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
                     mapping.manifest,
                     ExtentKind::Catalog,
                     self.store.limits.recovery_memory_bytes,
+                    None,
                 )
                 .await?;
                 let manifest = decode_blob_manifest(&payload.bytes, context)?;
@@ -2401,6 +2409,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             None,
             sink,
             self.store.defer_commit_readback,
+            Some(&self.store.verified_scans),
         )
         .await?;
         Ok((
@@ -2713,6 +2722,7 @@ async fn verify_staged_blob<D: PageDevice>(
             next_segment_generation,
             checkpoint_generation,
             &requests,
+            None,
         )
         .await?;
         let encoded_len =
@@ -2759,6 +2769,7 @@ async fn verify_staged_blob<D: PageDevice>(
         next_segment_generation,
         checkpoint_generation,
         manifest,
+        None,
     )
     .await?;
     // This pass verifies every exact extent payload hash and, through
@@ -2774,6 +2785,7 @@ async fn verify_staged_blob<D: PageDevice>(
             declared.pointer,
             ExtentKind::Blob,
             CANONICAL_CONTENT_EXTENT_LEN as usize,
+            None,
         )
         .await?;
         if resolved.bytes.len() as u64 != declared.payload_byte_len {
@@ -2900,6 +2912,7 @@ async fn compare_manifests<D: PageDevice>(
             state.next_segment_generation,
             state.generation,
             existing_pointer,
+            None,
         )
         .await?;
         let Some(extent) = scanned.matched else {
@@ -3242,6 +3255,7 @@ impl<D: PageDevice> SegmentStore<D> {
             staged.last_scratch_seal,
             Some(staged.sink),
             self.defer_commit_readback,
+            Some(&self.verified_scans),
         )
         .await?;
         self.mount_verified_successor(state, checkpoint, successor, true)
@@ -3448,6 +3462,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 staged,
                 &self.pins,
                 self.defer_commit_readback,
+                Some(&self.verified_scans),
             )
             .await?;
         self.mount_verified_successor(base, checkpoint, successor, true)
@@ -3483,6 +3498,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
     mut staged: Vec<StagedObjectCommit>,
     pins: &crate::store::SharedStorePinRegistry,
     defer_readback: bool,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(Vec<PendingCasObjectHandle>, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -3866,6 +3882,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
             next_segment_generation,
             checkpoint_generation,
             &requests,
+            memo,
         )
         .await?;
         if observed.len() != expected.len()
@@ -3971,6 +3988,7 @@ async fn commit_snapshot<D: PageDevice>(
     staged_scratch_seal: Option<(u64, u64, Hash)>,
     mut sink: Option<PageSink>,
     defer_readback: bool,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(PendingCasObjectHandle, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -4411,6 +4429,7 @@ async fn commit_snapshot<D: PageDevice>(
             next_segment_generation,
             checkpoint_generation,
             &requests,
+            memo,
         )
         .await?;
         if observed.len() != expected.len()

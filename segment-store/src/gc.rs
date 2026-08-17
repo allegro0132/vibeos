@@ -63,7 +63,7 @@ use crate::root_codec::{
 };
 use crate::store::{
     read_pointer_payload, read_pointer_payloads, write_checkpoint, CasMountedState, MountedState,
-    SegmentStore, StoreError, StoreLimits, ROOT_PIN_SLOTS,
+    SegmentStore, StoreError, StoreLimits, ROOT_PIN_SLOTS, VerifiedSegmentScans,
 };
 use crate::typed_manifest::{
     ReferenceCodecAdmission, TypedObjectReference, TYPED_REFERENCE_ENTRY_LEN, TYPED_REFS_HEADER_LEN,
@@ -508,6 +508,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
     limits: StoreLimits,
     roots: &[MarkRoot],
     typed_reference_kinds: &[u32],
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<DecodedTypedChildren, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
     let object_budget =
@@ -656,6 +657,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             blob.manifest,
             ExtentKind::Catalog,
             limits.recovery_memory_bytes - workspace,
+            memo,
         )
         .await?;
         let maximum_manifest_extents = payload
@@ -773,7 +775,7 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
                 .checked_sub(workspace)
                 .and_then(|bytes| bytes.checked_sub(manifest_resident))
                 .ok_or(GcError::MemoryLimit)?;
-            let encoded = read_authenticated_blob(device, state, blob_memory, &manifest).await?;
+            let encoded = read_authenticated_blob(device, state, blob_memory, &manifest, memo).await?;
             let blob_peak = workspace
                 .checked_add(manifest_resident)
                 .and_then(|bytes| bytes.checked_add(encoded.capacity()))
@@ -938,6 +940,7 @@ async fn read_authenticated_blob<D: PageDevice>(
     state: &MountedState,
     memory_limit: usize,
     manifest: &BlobManifest,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<Vec<u8>, GcStoreError<D::Error>> {
     let encoded_len =
         usize::try_from(manifest.encoded_blob_len).map_err(|_| GcError::MemoryLimit)?;
@@ -981,6 +984,7 @@ async fn read_authenticated_blob<D: PageDevice>(
             memory_limit
                 .checked_sub(encoded.capacity())
                 .ok_or(GcError::MemoryLimit)?,
+            memo,
         )
         .await?;
         if encoded
@@ -2235,6 +2239,7 @@ async fn load_live_manifests<D: PageDevice>(
     limits: StoreLimits,
     mark: &MarkPlan,
     retained_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<Vec<BlobManifest>, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
     let context = CasCodecContext::new(
@@ -2288,6 +2293,7 @@ async fn load_live_manifests<D: PageDevice>(
                 .and_then(|bytes| bytes.checked_sub(table_bytes))
                 .and_then(|bytes| bytes.checked_sub(existing_extents))
                 .ok_or(GcError::MemoryLimit)?,
+            memo,
         )
         .await?;
         let maximum_new_extents = payload
@@ -2340,6 +2346,7 @@ pub(crate) async fn verify_staged_payload<D: PageDevice>(
     kind: ExtentKind,
     expected: &[u8],
     maximum_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), GcStoreError<D::Error>> {
     let observed = read_pointer_payload(
         device,
@@ -2350,6 +2357,7 @@ pub(crate) async fn verify_staged_payload<D: PageDevice>(
         pointer,
         kind,
         maximum_bytes,
+        memo,
     )
     .await?;
     if observed.bytes != expected {
@@ -2365,6 +2373,7 @@ pub(crate) async fn verify_staged_payloads<D: PageDevice>(
     next_segment_generation: u64,
     expected: &[(PhysicalPointer, ExtentKind, &[u8])],
     maximum_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), GcStoreError<D::Error>> {
     let mut requests = Vec::new();
     requests
@@ -2382,6 +2391,7 @@ pub(crate) async fn verify_staged_payloads<D: PageDevice>(
         next_segment_generation,
         checkpoint_generation,
         &requests,
+        memo,
     )
     .await?;
     if observed.len() != expected.len()
@@ -2406,6 +2416,7 @@ async fn verify_staged_copied_extent<D: PageDevice>(
     checkpoint_generation: u64,
     next_segment_generation: u64,
     declared: &ManifestExtent,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), GcStoreError<D::Error>> {
     let maximum_bytes =
         usize::try_from(declared.payload_byte_len).map_err(|_| GcError::MemoryLimit)?;
@@ -2418,6 +2429,7 @@ async fn verify_staged_copied_extent<D: PageDevice>(
         declared.pointer,
         ExtentKind::Blob,
         maximum_bytes,
+        memo,
     )
     .await
     .map_err(|error| match error {
@@ -2479,6 +2491,7 @@ async fn relocate_live_state<D: PageDevice>(
     manifests: &[BlobManifest],
     manifest_lens: &[usize],
     plan: &GcSegmentPlan,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<GcRelocationOutput, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
     let target_next_generation = plan.relocation_allocation.next_segment_generation;
@@ -2550,6 +2563,7 @@ async fn relocate_live_state<D: PageDevice>(
                 declared.pointer,
                 ExtentKind::Blob,
                 usize::try_from(declared.payload_byte_len).map_err(|_| GcError::MemoryLimit)?,
+                memo,
             )
             .await?;
             let bytes = payload.bytes;
@@ -2732,6 +2746,7 @@ async fn relocate_live_state<D: PageDevice>(
         target_next_generation,
         &staged,
         limits.recovery_memory_bytes,
+        memo,
     )
     .await?;
     let mut staged_state = state.clone();
@@ -2747,6 +2762,7 @@ async fn relocate_live_state<D: PageDevice>(
             mapping.manifest,
             ExtentKind::Catalog,
             limits.recovery_memory_bytes,
+            memo,
         )
         .await?;
         let manifest = decode_blob_manifest(&manifest_payload.bytes, context)
@@ -2765,6 +2781,7 @@ async fn relocate_live_state<D: PageDevice>(
                     plan.relocation_generation,
                     target_next_generation,
                     extent,
+                    memo,
                 )
                 .await?;
             }
@@ -2775,7 +2792,7 @@ async fn relocate_live_state<D: PageDevice>(
         // them, and re-verifying the complete live set every round makes one
         // collection cost reads proportional to the store's total content.
         if relocated {
-            verify_manifest_blob(device, &staged_state, &manifest)
+            verify_manifest_blob(device, &staged_state, &manifest, memo)
                 .await
                 .map_err(|error| match error {
                     CasStoreError::Store(error) => GcStoreError::Store(error),
@@ -3052,6 +3069,7 @@ impl<D: PageDevice> SegmentStore<D> {
             ExtentKind::Allocation,
             &allocation_bytes,
             self.limits.recovery_memory_bytes,
+            Some(&self.verified_scans),
         )
         .await?;
         publish_checkpoint(
@@ -3280,6 +3298,7 @@ impl<D: PageDevice> SegmentStore<D> {
             ExtentKind::Authority,
             &root_bytes,
             self.limits.recovery_memory_bytes,
+            Some(&self.verified_scans),
         )
         .await?;
         verify_staged_payload(
@@ -3291,6 +3310,7 @@ impl<D: PageDevice> SegmentStore<D> {
             ExtentKind::Allocation,
             &allocation_bytes,
             self.limits.recovery_memory_bytes,
+            Some(&self.verified_scans),
         )
         .await?;
         publish_checkpoint(
@@ -3363,6 +3383,23 @@ impl<D: PageDevice> SegmentStore<D> {
     }
 
     async fn collect_garbage_with_policy(
+        &mut self,
+        initial_roots: Option<&[&AuthorizedObject<CasObjectHandle>]>,
+    ) -> Result<GcTelemetry, GcStoreError<D::Error>> {
+        let result = self.collect_garbage_with_policy_inner(initial_roots).await;
+        // A collection round is the only path that retires and eventually
+        // reuses segment numbers. Proofs for segments the successor state
+        // still holds Allocated stay valid (sealed segments are immutable);
+        // everything else is purged so a later rewrite can never be shadowed
+        // by a stale proof. Without a provable successor, drop everything.
+        match self.mounted.as_ref() {
+            Some(state) => self.verified_scans.retain_allocated(&state.allocation),
+            None => self.verified_scans.clear(),
+        }
+        result
+    }
+
+    async fn collect_garbage_with_policy_inner(
         &mut self,
         initial_roots: Option<&[&AuthorizedObject<CasObjectHandle>]>,
     ) -> Result<GcTelemetry, GcStoreError<D::Error>> {
@@ -3474,6 +3511,7 @@ impl<D: PageDevice> SegmentStore<D> {
             },
             &roots,
             &self.typed_reference_kinds,
+            Some(&self.verified_scans),
         )
         .await?;
         memory.transient(typed.peak_bytes)?;
@@ -3533,7 +3571,7 @@ impl<D: PageDevice> SegmentStore<D> {
         memory.release(typed.allocated_bytes)?;
         drop(typed);
         let manifests =
-            load_live_manifests(&self.device, &state, self.limits, &mark, memory.current)
+            load_live_manifests(&self.device, &state, self.limits, &mark, memory.current, Some(&self.verified_scans))
                 .await
                 .map_err(|error| match error {
                     GcStoreError::Gc(GcError::Corrupt) => {
@@ -3759,6 +3797,7 @@ impl<D: PageDevice> SegmentStore<D> {
             &manifests,
             &manifest_lens,
             &plan,
+            Some(&self.verified_scans),
         )
         .await
         .map_err(|error| match error {
@@ -3839,6 +3878,7 @@ impl<D: PageDevice> SegmentStore<D> {
             ExtentKind::Allocation,
             &allocation_bytes,
             self.limits.recovery_memory_bytes,
+            Some(&self.verified_scans),
         )
         .await?;
         let reuse_checkpoint = publish_checkpoint(

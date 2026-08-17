@@ -725,6 +725,7 @@ async fn verify_durable_authority_closure<D: PageDevice>(
         },
         &roots,
         typed_reference_kinds,
+        None,
     )
     .await
     .map_err(map_gc_step_error)?;
@@ -807,6 +808,7 @@ async fn verify_segment_set<D: PageDevice>(
             state.next_segment_generation,
             state.generation,
             probe,
+            None,
         )
         .await
         .map_err(StepError::from_store)?;
@@ -899,6 +901,7 @@ async fn verify_state_contents<D: PageDevice>(
                 blob.manifest,
                 ExtentKind::Catalog,
                 manifest_len,
+                None,
             )
             .await
             .map_err(StepError::from_store)?;
@@ -916,7 +919,7 @@ async fn verify_state_contents<D: PageDevice>(
             for extent in &manifest.extents {
                 verify_pointer_payload_and_padding(device, state, extent.pointer).await?;
             }
-            verify_manifest_blob(device, state, &manifest)
+            verify_manifest_blob(device, state, &manifest, None)
                 .await
                 .map_err(|error| match error {
                     crate::cas::CasStoreError::Store(error) => StepError::from_store(error),
@@ -950,6 +953,7 @@ async fn verify_state_contents<D: PageDevice>(
                     entry.blob,
                     ExtentKind::Blob,
                     self_legacy_limit(state, total_memory_limit, resident)?,
+                    None,
                 )
                 .await
                 .map_err(StepError::from_store)?;

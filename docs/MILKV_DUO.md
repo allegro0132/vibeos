@@ -514,22 +514,34 @@ findings, all reproduced with UART evidence:
   Writes update or drop affected entries; an ambiguous write failure drops
   them.
 
-Remaining, well-characterized issues:
+The sustained-commit slowdown (20–60 s per `mkdir`/`write` on a populated
+store, growing with live file count) was traced to three storage-engine
+causes and fixed (QEMU-validated; `mkdir` p50 dropped to ~35 ms against a
+130–220 ms baseline, and `write` from 26–70 s to ~0.1–0.3 s at the same
+operation counts, with a 200-operation sustained run completing with zero
+failures):
 
-- **Sustained `mkdir`/`write` on a populated store still cost 20–60 s and
-  grow roughly linearly with the number of live files** (measured with a
-  dropped-input-immune sync-marker protocol; a fresh, near-empty tree is
-  sub-second). The per-commit cost is thousands of two-page node-prefix
-  reads across segment clusters — now ~99.9% served by the page cache, so
-  the residual is CPU-bound traversal/verification in the segment-store or
-  file-tree commit path that scales with live-object count, not device I/O.
-  It reproduces identically on QEMU (count `CapabilityPageDevice` reads per
-  operation), where fast storage and CPU hide it; the fix belongs in the
-  segment-store commit/GC/manifest path and is independent of this board
-  port. The foreground free-segment floor and growth hysteresis now scale to
-  the device size (a fixed 10+22-segment policy was unreachable on this
-  16-segment slice and forced GC walks per commit), which is necessary but
-  was not sufficient.
+- every pointer dereference re-authenticated the complete descriptor chain
+  of its immutable sealed segment — now memoized per session
+  (`VerifiedSegmentScans`, cleared around every collection round);
+- the foreground free-segment policy was tuned for large devices and
+  structurally unreachable on a small slice, forcing a full GC mark walk on
+  nearly every commit — floors and hysteresis now scale with the device,
+  and the data slice grew from 64 MiB (16 segments) to 512 MiB;
+- the fused commit's capacity loop checked only the free-segment *count*
+  while blob admission needs a *contiguous* run, so fragmentation caused an
+  instant `Capacity(CleanerReserve)` failure — and a failed staged batch
+  poisoned the store into returning Unavailable for the rest of the session.
+  The loop is now run-aware, and the file-tree entry points re-establish the
+  cold boot proof after an invalidation instead of failing forever.
+
+Remaining, well-characterized issue: each GC round's mark walk is still
+O(live objects); with the fixes it runs every ~15–30 commits instead of
+every commit, so it appears as an occasional sub-second (QEMU) pause that
+grows slowly with tree size. Fully flattening it requires packing multiple
+small objects per 4 MiB segment at staging time (the on-media format
+already supports multi-extent segments; one-object-per-segment is writer
+placement behavior).
 - One spontaneous board reset was observed under sustained write load
   (possible supply dip; worth checking the Duo's power source). Data written
   minutes before the reset survived except one subtree, consistent with the
@@ -683,7 +695,7 @@ fixed peer source and guest destination checked by VibeOS. The QEMU socket peer
 and its unicast frame contract are unchanged.
 
 The image contains a bootable, type `0x0c`, 128 MiB FAT partition followed by a
-64 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
+512 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
 rootfs. The native block backend translates the data partition's first LBA to
 logical sector zero, so shell block tests and the persistent journal cannot
 overwrite FAT, `fip.bin`, or `boot.sd`. You can use read-only mounts to validate
@@ -822,7 +834,7 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
 - [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
       native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
       generates `target/milkv-duo/boot.sd`, with no FIT validation errors.
-- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 64 MiB raw
+- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 512 MiB raw
       VibeOS data partition. Its `fip.bin` and `boot.sd` are byte-for-byte
       identical to this build, and no Linux/rootfs partition exists.
 - [x] The serial console displays the FSBL, OpenSBI, U-Boot, and VibeOS banners.

@@ -152,7 +152,7 @@ path = sys.argv[1]
 sector_size = 512
 seed = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
 with open(path, "wb") as data:
-    data.truncate(64 * 1024 * 1024)
+    data.truncate(512 * 1024 * 1024)
 with open(path, "r+b") as data:
     data.seek(7 * sector_size)
     data.write(seed)

@@ -1046,7 +1046,14 @@ impl<D: PageDevice> SegmentStore<D> {
                 .counts()
                 .map_err(|_| StoreError::Corrupt)?
                 .free;
-            if free >= needed.saturating_add(floor) {
+            // Fragmentation starves staging even when the count is ample:
+            // the batch consumes a contiguous scratch run entry by entry and
+            // every entry's blob admission needs one segment of contiguous
+            // headroom beyond its own, so a store whose free segments are
+            // scattered singles admits nothing. Collect until the count and
+            // a run covering the whole batch appetite both hold.
+            let run_available = state.find_free_run(needed, false).is_some();
+            if free >= needed.saturating_add(floor) && run_available {
                 break;
             }
             if cycles == maximum_cycles {

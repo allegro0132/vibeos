@@ -1813,6 +1813,7 @@ impl<D: PageDevice> SegmentStore<D> {
             next_segment_generation,
             &staged,
             self.limits.recovery_memory_bytes,
+            None,
         )
         .await?;
         let mut root_entries: Vec<PersistentRootEntry> = snapshot

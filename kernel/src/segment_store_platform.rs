@@ -898,6 +898,7 @@ impl FileTreeBackend for KernelFileTreeBackend {
         bytes: Vec<u8>,
     ) -> FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
         Box::pin(async move {
+            self.runtime.ensure_boot_proof().await?;
             let maintenance = self
                 .runtime
                 .maintenance
@@ -1016,6 +1017,7 @@ impl FileTreeBackend for KernelFileTreeBackend {
 
     fn commit<'a>(&'a self, transaction: FsTransaction) -> FileTreeFuture<'a, u64> {
         Box::pin(async move {
+            self.runtime.ensure_boot_proof().await?;
             let maintenance = self
                 .runtime
                 .maintenance
@@ -1023,9 +1025,12 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 .clone()
                 .ok_or(FileError::ServiceUnavailable)?;
             // The fused transaction stages every new node in one batch;
-            // prefer growth to a foreground collection for its appetite.
+            // prefer growth to a foreground collection for its appetite. The
+            // appetite is capped by the device-scaled policy: on a small
+            // store a fixed 12-segment demand is structurally unreachable
+            // and turns every commit into a full foreground collection.
             self.runtime
-                .ensure_foreground_capacity_for(12)
+                .ensure_foreground_capacity_for_scaled(12)
                 .await
                 .map_err(map_file_runtime_error)?;
             let mut operation = self.runtime.begin().map_err(map_file_runtime_error)?;
@@ -1039,9 +1044,8 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 self.runtime.invalidate_recovery_cache();
             }
             let result = result.map_err(|error| match error {
-                #[cfg(feature = "storage-bench")]
                 ref detail if {
-                    crate::println!("  bench-detail fs-commit error: {detail:?}");
+                    crate::uart::_print(format_args!("  fs-commit error: {detail:?}\n"));
                     false
                 } => unreachable!(),
                 vibeos_file_store::PersistentCommitError::File(error) => error,
@@ -1597,7 +1601,12 @@ impl StorageV2Runtime {
                         vibeos_segment_store::StoreError::Unformatted => {
                             V2RuntimeError::Unformatted
                         }
-                        _ => V2RuntimeError::Corrupt,
+                        other => {
+                            crate::uart::_print(format_args!(
+                                "  cold mount failed: {other:?}\n"
+                            ));
+                            V2RuntimeError::Corrupt
+                        }
                     })?;
             self.install_maintenance_if_missing(&mut operation)?;
             let maintenance = self
@@ -1630,7 +1639,12 @@ impl StorageV2Runtime {
             .await
             .map_err(|error| match error {
                 PersistentAuthorityError::NotInitialized => V2RuntimeError::AuthorityMissing,
-                _ => V2RuntimeError::Corrupt,
+                other => {
+                    crate::uart::_print(format_args!(
+                        "  cold authority recovery failed: {other:?}\n"
+                    ));
+                    V2RuntimeError::Corrupt
+                }
             })?;
             // The stored digest commits to policy bytes but does not prove
             // either that this stream satisfies the policy or that its private
@@ -1763,6 +1777,23 @@ impl StorageV2Runtime {
         // Zero lets the device-scaled floor decide; batched callers pass
         // their real per-transaction appetite instead.
         self.ensure_foreground_capacity_for(0).await
+    }
+
+    /// Like [`StorageV2Runtime::ensure_foreground_capacity_for`], but the
+    /// requested appetite is clamped to what the device's scaled policy can
+    /// actually sustain, so a demand tuned on large devices cannot force a
+    /// collection on every commit of a small store.
+    async fn ensure_foreground_capacity_for_scaled(
+        self: &Arc<Self>,
+        required_free: u64,
+    ) -> Result<(), V2RuntimeError> {
+        let total_segments = (self.device.provisioned_page_count()
+            / vibeos_segment_format::SEGMENT_PAGES)
+            .max(1);
+        let sustainable = scaled_free_floor(total_segments)
+            .saturating_add(scaled_growth_hysteresis(total_segments));
+        self.ensure_foreground_capacity_for(required_free.min(sustainable))
+            .await
     }
 
     /// Like [`StorageV2Runtime::ensure_foreground_capacity`], but replenishing
@@ -1971,17 +2002,41 @@ impl StorageV2Runtime {
         }
     }
 
+    /// Re-establish the boot proof after an invalidation (for example a
+    /// failed staged batch that poisoned the mounted store). The file tree
+    /// stays fail-closed until a complete cold proof succeeds; without this
+    /// re-proof, one recoverable capacity failure would leave every later
+    /// file-tree operation returning Unavailable for the rest of the session.
+    #[cfg(feature = "file-tree")]
+    async fn ensure_boot_proof(self: &Arc<Self>) -> Result<(), FileError> {
+        if BootStoreSelection::decode(self.boot_selection.load(Ordering::Acquire))
+            != Some(BootStoreSelection::StorageV2)
+        {
+            return Err(FileError::ServiceUnavailable);
+        }
+        if self.boot_proved_authority().is_some() {
+            return Ok(());
+        }
+        crate::uart::_print(format_args!(
+            "  storage v2: re-proving the store after an invalidated boot proof
+"
+        ));
+        self.cold_recover_and_scrub(crate::durable_cspace::storage_v2_external_policy_sha256())
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                crate::uart::_print(format_args!("  storage v2: re-proof failed: {error:?}
+"));
+                FileError::ServiceUnavailable
+            })
+    }
+
     #[cfg(feature = "file-tree")]
     async fn recover_file_tree(
         self: &Arc<Self>,
         namespace: u128,
     ) -> Result<FileTreeRoot, FileError> {
-        if self.boot_proved_authority().is_none()
-            || BootStoreSelection::decode(self.boot_selection.load(Ordering::Acquire))
-                != Some(BootStoreSelection::StorageV2)
-        {
-            return Err(FileError::ServiceUnavailable);
-        }
+        self.ensure_boot_proof().await?;
         self.ensure_foreground_capacity()
             .await
             .map_err(|_| FileError::ServiceUnavailable)?;

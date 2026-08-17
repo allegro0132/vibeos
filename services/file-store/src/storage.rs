@@ -641,6 +641,8 @@ mod tests {
     struct MemoryDevice {
         page_count: u64,
         pages: Arc<Mutex<BTreeMap<u64, Page>>>,
+        reads: Arc<AtomicUsize>,
+        panic_at: Arc<AtomicUsize>,
     }
 
     impl MemoryDevice {
@@ -648,7 +650,13 @@ mod tests {
             Self {
                 page_count: admitted_pages(segments).unwrap(),
                 pages: Arc::new(Mutex::new(BTreeMap::new())),
+                reads: Arc::new(AtomicUsize::new(0)),
+                panic_at: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
         }
     }
 
@@ -668,6 +676,11 @@ mod tests {
         async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
             if page >= self.page_count {
                 return Err(DeviceError::OutsideRange);
+            }
+            let count = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+            let trigger = self.panic_at.load(Ordering::Relaxed);
+            if trigger != 0 && count == trigger {
+                panic!("read sample at device read #{count}");
             }
             *output = self
                 .pages
@@ -1215,5 +1228,75 @@ mod tests {
             .unwrap();
         assert_eq!(config.file_id, hard.file_id);
         assert_eq!(config.link_count, 2);
+    }
+
+    /// Diagnostic benchmark for the sustained-commit cost on a small device
+    /// (the Milk-V Duo data slice is sixteen 4 MiB segments). Prints device
+    /// reads per fused maintenance commit as the tree grows.
+    #[test]
+    fn small_device_commit_read_volume_diagnostic() {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d53_4d41_4c4c_4445_5631;
+        const POLICY: &[u8] = b"small-device diagnostic policy v1";
+        // Mirrors the QEMU file-tree image: 128 MiB, 32 four-MiB segments.
+        let device = MemoryDevice::blank(32);
+        let (context, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut store =
+            SegmentStore::new_with_runtime_context(device.clone(), limits(), context);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-SMALLDEV").unwrap(),
+            cleaner_reserve_segments: 2,
+            limits: limits(),
+        }))
+        .unwrap();
+        store.set_deferred_commit_readback(true);
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let import = vibeos_segment_store::PersistentAuthorityImport::empty(
+            vibeos_durable_format::StoreId::new(91).unwrap(),
+            POLICY,
+            Vec::new(),
+        )
+        .unwrap();
+        block_on(store.import_persistent_authority(&maintenance, import)).unwrap();
+        let mut root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        for index in 0..120_u32 {
+            let mut transaction = root.begin().unwrap();
+            transaction
+                .mkdir(
+                    &crate::RelPath::parse(&std::format!("d{index}")).unwrap(),
+                    false,
+                )
+                .unwrap();
+            transaction
+                .write_chunks(
+                    &crate::RelPath::parse(&std::format!("d{index}/f.txt")).unwrap(),
+                    [std::format!("payload-{index}").as_bytes()],
+                    false,
+                )
+                .unwrap();
+            let info = store.info().unwrap();
+            std::println!(
+                "  pre-op {index}: free={} admitted={} objects={} generation={}",
+                info.free_segments, info.admitted_segments, info.object_count, info.generation
+            );
+            let before = device.reads();
+            if index == 20 {
+                if let Ok(offset) = std::env::var("READ_SAMPLE_OFFSET") {
+                    let offset: usize = offset.parse().unwrap();
+                    device.panic_at.store(before + offset, Ordering::Relaxed);
+                }
+            }
+            match block_on(transaction.commit_persistent_for_maintenance(&mut store, &maintenance)) {
+                Ok(_) => {}
+                Err(error) => {
+                    std::println!("COMMIT FAILED at op {index}: {error:?}");
+                    return;
+                }
+            }
+            std::println!("mkdir {index}: {} device page reads", device.reads() - before);
+        }
     }
 }

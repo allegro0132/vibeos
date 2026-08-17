@@ -6,12 +6,47 @@
 
 extern crate alloc;
 
-use alloc::{format, string::String, sync::Arc};
+use alloc::{format, string::String, sync::Arc, vec};
 use core::any::Any;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use vibeos_driver_sdhci_blk::{Card as HardwareCard, Error as HardwareError};
+use vibeos_driver_sdhci_blk::{
+    Card as HardwareCard, Error as HardwareError, MultiBlockWriteMode, SAFE_BLIND_WRITE_BLOCKS,
+};
+
+/// Issue one logical batched write as one or more hardware transfers: the
+/// blind PIO mode is split into [`SAFE_BLIND_WRITE_BLOCKS`]-sized CMD25
+/// bursts (the always-safe, FIFO-verified size used while probing). The
+/// publication hook still fires exactly once, before the first published
+/// transfer.
+fn write_batch_in_mode<H: FnOnce()>(
+    hardware: &mut HardwareCard,
+    physical_first: u64,
+    data: &[u8],
+    mode: MultiBlockWriteMode,
+    hook: &mut Option<H>,
+) -> Result<(), HardwareError> {
+    let chunk_bytes = if mode == MultiBlockWriteMode::BlindPio {
+        SAFE_BLIND_WRITE_BLOCKS as usize * 512
+    } else {
+        data.len()
+    };
+    let mut sector = physical_first;
+    for chunk in data.chunks(chunk_bytes) {
+        hardware.write_blocks_tracked_with_mode(sector, chunk, mode, || {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        })?;
+        sector += (chunk.len() / 512) as u64;
+    }
+    Ok(())
+}
+
+/// Largest logical-block run one raw batched request may carry, re-exported
+/// so the shared block facade can advertise the same bound in its geometry.
+pub(crate) use vibeos_driver_sdhci_blk::MAX_TRANSFER_BLOCKS;
 use vibeos_storage_device::{MutationFailure, MutationResult};
 
 use crate::cap::{Cap, Resource, Rights};
@@ -170,6 +205,7 @@ pub(crate) fn raw_info() -> BlockInfo {
 }
 
 pub(crate) async fn raw_read_at(expected_epoch: u64, sector: u64) -> Result<[u8; 512], BlockError> {
+    IO_BLOCKS_READ.fetch_add(1, Ordering::Relaxed);
     with_card_at(expected_epoch, |card| card.read_sector(sector))
 }
 
@@ -179,11 +215,14 @@ pub(crate) async fn raw_read_blocks_at(
     block_count: u32,
     output: &mut [u8],
 ) -> Result<(), BlockError> {
-    if block_count != 1 || output.len() != 512 {
+    if block_count == 0 || block_count > MAX_TRANSFER_BLOCKS {
         return Err(BlockError::Unsupported);
     }
-    output.copy_from_slice(&raw_read_at(expected_epoch, sector).await?);
-    Ok(())
+    if output.len() != block_count as usize * 512 {
+        return Err(BlockError::Protocol);
+    }
+    IO_BLOCKS_READ.fetch_add(u64::from(block_count), Ordering::Relaxed);
+    with_card_at(expected_epoch, |card| card.read_blocks(sector, output))
 }
 
 pub(crate) async fn raw_write_at(
@@ -192,6 +231,7 @@ pub(crate) async fn raw_write_at(
     data: [u8; 512],
 ) -> MutationResult<(), BlockError> {
     let submitted = Cell::new(false);
+    IO_BLOCKS_WRITTEN.fetch_add(1, Ordering::Relaxed);
     with_card_at(expected_epoch, |card| {
         card.write_sector_tracked(sector, &data, || submitted.set(true))
     })
@@ -204,12 +244,18 @@ pub(crate) async fn raw_write_blocks_at(
     block_count: u32,
     data: &[u8],
 ) -> MutationResult<(), BlockError> {
-    if block_count != 1 || data.len() != 512 {
+    if block_count == 0 || block_count > MAX_TRANSFER_BLOCKS {
         return Err(MutationFailure::not_submitted(BlockError::Unsupported));
     }
-    let mut block = [0; 512];
-    block.copy_from_slice(data);
-    raw_write_at(expected_epoch, sector, block).await
+    if data.len() != block_count as usize * 512 {
+        return Err(MutationFailure::not_submitted(BlockError::Protocol));
+    }
+    let submitted = Cell::new(false);
+    IO_BLOCKS_WRITTEN.fetch_add(u64::from(block_count), Ordering::Relaxed);
+    with_card_at(expected_epoch, |card| {
+        card.write_blocks_tracked(sector, data, || submitted.set(true))
+    })
+    .map_err(|error| mutation_failure(error, submitted.get()))
 }
 
 pub(crate) async fn raw_flush_at(expected_epoch: u64) -> MutationResult<(), BlockError> {
@@ -227,6 +273,15 @@ fn mutation_failure(error: BlockError, submitted: bool) -> MutationFailure<Block
         MutationFailure::not_submitted(error)
     }
 }
+
+/// Coarse I/O accounting for hardware bring-up: request count, block volume
+/// by direction, and cumulative wall time spent inside the exclusive card
+/// claim. A stats line prints every 512 requests so sustained workloads can
+/// be attributed to either real device time or time spent elsewhere.
+pub(crate) static IO_OPS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static IO_BLOCKS_READ: AtomicU64 = AtomicU64::new(0);
+pub(crate) static IO_BLOCKS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static IO_BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
 
 fn with_card_at<T>(
     expected_epoch: u64,
@@ -265,10 +320,33 @@ fn with_card_at<T>(
             }
         }
     };
+    let busy_start = crate::sbi::time();
     let result = operation(&mut card);
+    let busy_ticks = crate::sbi::time().wrapping_sub(busy_start);
+    IO_BUSY_TICKS.fetch_add(busy_ticks, Ordering::Relaxed);
+    let ops = IO_OPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if ops % 16384 == 0 {
+        let busy_ms = IO_BUSY_TICKS.load(Ordering::Relaxed) / (crate::platform::TIMEBASE_HZ / 1000);
+        crate::uart::_print(format_args!(
+            "  sdhci stats: {ops} ops, {} blk rd, {} blk wr, {busy_ms} ms busy\n",
+            IO_BLOCKS_READ.load(Ordering::Relaxed),
+            IO_BLOCKS_WRITTEN.load(Ordering::Relaxed),
+        ));
+    }
     let last_command = card.hardware.last_command();
     let interrupt_status = card.hardware.last_interrupt_status();
     let present_state = card.hardware.present_state();
+    if let Err(error) = &result {
+        // Bounded first-failure diagnostics: hardware bring-up on this board
+        // has twice been set back by silent I/O failures, so the first few
+        // errors of a session log the exact command coordinates on UART.
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::uart::_print(format_args!(
+                "  sdhci io error: {error:?} after CMD{last_command}, int {interrupt_status:#010x}, present {present_state:#010x}\n"
+            ));
+        }
+    }
     let mut state = HOST.lock();
     state.last_command = last_command;
     state.interrupt_status = interrupt_status;
@@ -284,7 +362,48 @@ fn with_card_at<T>(
 struct Card {
     hardware: HardwareCard,
     capacity_sectors: u64,
+    /// Set after the first CMD18 failure of this incarnation: the rest of the
+    /// session decomposes batched reads into the single-sector command this
+    /// exact board has already proven, instead of paying a full poll-budget
+    /// timeout on every subsequent batch.
+    multiblock_reads_disabled: bool,
+    write_batching: WriteBatching,
+    /// Consecutive locked-mode batched-write failures; the lock survives
+    /// transient card stalls and is only abandoned after several in a row.
+    locked_write_failures: u8,
+    /// Blind CMD25 burst size currently attempted. SD cards handle one long
+    /// sequential burst far better than the same bytes as 4 KiB commands, so
+    /// this starts at the full transfer bound and shrinks on evidence.
+    blind_chunk_blocks: u32,
+    /// Largest blind burst size proven by read-back this session. A burst
+    /// larger than this is verified after it completes before the size is
+    /// trusted, because a FIFO overflow would corrupt data silently.
+    qualified_blind_blocks: u32,
 }
+
+/// Session-sticky CMD25 protocol probe state. The CV1800B integration has
+/// rejected the standard Auto CMD12 shape on real hardware, so the first
+/// batched write walks a ladder of protocol variants, locks onto the first
+/// one the controller completes, and otherwise decomposes every later batch
+/// into proven single-sector CMD24 writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteBatching {
+    Unprobed,
+    Locked(MultiBlockWriteMode),
+    Disabled,
+}
+
+/// (apply write-stall workarounds first, protocol shape) probe ladder: one
+/// baseline attempt reproduces the known stall, then the host workarounds are
+/// applied once and every protocol shape is retried under them.
+const WRITE_MODE_LADDER: [(bool, MultiBlockWriteMode); 6] = [
+    (false, MultiBlockWriteMode::AutoCmd12),
+    (true, MultiBlockWriteMode::AutoCmd12),
+    (true, MultiBlockWriteMode::ManualCmd12),
+    (true, MultiBlockWriteMode::OpenEnded),
+    (true, MultiBlockWriteMode::SetBlockCount),
+    (true, MultiBlockWriteMode::BlindPio),
+];
 
 struct HostState {
     card: Option<Card>,
@@ -428,6 +547,11 @@ impl Card {
         Ok(Self {
             hardware,
             capacity_sectors: DATA_SLICE.sector_count,
+            multiblock_reads_disabled: false,
+            write_batching: WriteBatching::Unprobed,
+            locked_write_failures: 0,
+            blind_chunk_blocks: MAX_TRANSFER_BLOCKS,
+            qualified_blind_blocks: SAFE_BLIND_WRITE_BLOCKS,
         })
     }
 
@@ -442,6 +566,299 @@ impl Card {
             return Err(BlockError::OutOfRange);
         }
         Ok(physical_sector)
+    }
+
+    /// Translate a logical multi-block run into the physical first sector the
+    /// hardware driver may be given, validating both endpoints against the
+    /// data-slice and card capacities.
+    ///
+    /// The final lower-bound check is the boot-media invariant this board's
+    /// history demands: the FSBL/FIP and the VibeOS FIT live in the physical
+    /// sectors below `DATA_SLICE.first_sector`, and a batched write published
+    /// with an untranslated (logical) first sector destroys them while every
+    /// host and QEMU test stays green. The check is structurally unreachable
+    /// today; it exists so no future refactor of this translation can ever
+    /// hand the driver a boot-area sector.
+    fn physical_block_range(&self, logical_first: u64, byte_len: usize) -> Result<u64, BlockError> {
+        if byte_len == 0 || byte_len % 512 != 0 {
+            return Err(BlockError::Protocol);
+        }
+        let block_count = (byte_len / 512) as u64;
+        let logical_last = logical_first
+            .checked_add(block_count - 1)
+            .ok_or(BlockError::OutOfRange)?;
+        let physical_first = self.physical_sector(logical_first)?;
+        self.physical_sector(logical_last)?;
+        if physical_first < DATA_SLICE.first_sector {
+            return Err(BlockError::OutOfRange);
+        }
+        Ok(physical_first)
+    }
+
+    fn read_blocks(&mut self, logical_first: u64, output: &mut [u8]) -> Result<(), BlockError> {
+        let physical_first = self.physical_block_range(logical_first, output.len())?;
+        let block_count = (output.len() / 512) as u64;
+        if block_count > 1 && !self.multiblock_reads_disabled {
+            match self.hardware.read_blocks(physical_first, output) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // The failed transfer was aborted by the driver; retry the
+                    // request with the single-sector command this board has
+                    // already proven before reporting anything upward.
+                    self.multiblock_reads_disabled = true;
+                    crate::uart::_print(format_args!(
+                        "  sdhci: CMD18 x{block_count} failed ({error:?}); single-sector reads for this session\n"
+                    ));
+                }
+            }
+        }
+        for (index, sector) in output.chunks_exact_mut(512).enumerate() {
+            sector.copy_from_slice(
+                &self
+                    .hardware
+                    .read_sector(physical_first + index as u64)
+                    .map_err(map_hardware_error)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn write_blocks_tracked(
+        &mut self,
+        logical_first: u64,
+        data: &[u8],
+        on_command_published: impl FnOnce(),
+    ) -> Result<(), BlockError> {
+        let physical_first = self.physical_block_range(logical_first, data.len())?;
+        let block_count = (data.len() / 512) as u64;
+        // The publication hook must fire exactly once even when a batched
+        // attempt already published CMD25 before failing: the mutation was
+        // submitted to the card either way.
+        let mut hook = Some(on_command_published);
+        if let WriteBatching::Locked(mode) = self.write_batching {
+            if block_count > 1 {
+                // A transient failure (for example a long card-internal
+                // garbage-collection stall) must not permanently give up the
+                // locked mode: retry once, fall back to single-sector for
+                // just this request, and disable only on repeated failures.
+                for attempt in 1..=2u32 {
+                    let result = if mode == MultiBlockWriteMode::BlindPio {
+                        self.write_blind(logical_first, physical_first, data, &mut hook)
+                    } else {
+                        write_batch_in_mode(&mut self.hardware, physical_first, data, mode, &mut hook)
+                    };
+                    match result {
+                        Ok(()) => {
+                            self.locked_write_failures = 0;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            crate::uart::_print(format_args!(
+                                "  sdhci: locked CMD25 x{block_count} via {mode:?} failed ({error:?}), attempt {attempt}\n"
+                            ));
+                        }
+                    }
+                }
+                self.locked_write_failures = self.locked_write_failures.saturating_add(1);
+                if self.locked_write_failures >= 3 {
+                    self.write_batching = WriteBatching::Disabled;
+                    crate::uart::_print(format_args!(
+                        "  sdhci: repeated locked-mode failures; single-sector writes for this session\n"
+                    ));
+                }
+            }
+        } else if block_count > 1 && self.write_batching == WriteBatching::Unprobed {
+            let probing = true;
+            {
+                let state = self.hardware.diagnostic_host_state();
+                crate::uart::_print(format_args!(
+                    "  sdhci host state: hc1 {:#04x}, blkgap {:#04x}, hc2 {:#06x}, mshc {:#010x}, txrx {:#010x}, phycfg {:#010x}\n",
+                    state[0], state[1], state[2], state[3], state[4], state[5]
+                ));
+            }
+            let mut workarounds_applied = false;
+            for &(needs_workarounds, mode) in &WRITE_MODE_LADDER {
+                if needs_workarounds && !workarounds_applied {
+                    workarounds_applied = true;
+                    self.hardware.apply_write_stall_workarounds();
+                    crate::uart::_print(format_args!(
+                        "  sdhci: applied write-stall workarounds (block-gap clear, clock-gate disable)\n"
+                    ));
+                }
+                let attempt =
+                    write_batch_in_mode(&mut self.hardware, physical_first, data, mode, &mut hook);
+                match attempt {
+                    Ok(()) => {
+                        if probing && !self.verify_written(logical_first, data) {
+                            crate::uart::_print(format_args!(
+                                "  sdhci: CMD25 x{block_count} via {mode:?} completed but read-back mismatched; rejecting the mode\n"
+                            ));
+                            continue;
+                        }
+                        if self.write_batching != WriteBatching::Locked(mode) {
+                            self.write_batching = WriteBatching::Locked(mode);
+                            crate::uart::_print(format_args!(
+                                "  sdhci: CMD25 x{block_count} ok via {mode:?}; batched writes locked to it\n"
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let interrupt_status = self.hardware.last_interrupt_status();
+                        let response = self.hardware.response_word();
+                        let present = self.hardware.present_state();
+                        crate::uart::_print(format_args!(
+                            "  sdhci: CMD25 x{block_count} via {mode:?} failed ({error:?}, int {interrupt_status:#010x}, r1 {response:#010x}, present {present:#010x})\n"
+                        ));
+                    }
+                }
+            }
+            // Last probe stage: the 1-bit bus is a corner no vendor software
+            // exercises for CMD25; try the standard 4-bit width once.
+            if probing {
+                match self.hardware.enable_four_bit_bus() {
+                    Ok(()) => {
+                        crate::uart::_print(format_args!(
+                            "  sdhci: switched to 4-bit bus; retrying CMD25\n"
+                        ));
+                        for mode in [
+                            MultiBlockWriteMode::AutoCmd12,
+                            MultiBlockWriteMode::OpenEnded,
+                            MultiBlockWriteMode::BlindPio,
+                        ] {
+                            let attempt = write_batch_in_mode(
+                                &mut self.hardware,
+                                physical_first,
+                                data,
+                                mode,
+                                &mut hook,
+                            );
+                            match attempt {
+                                Ok(()) => {
+                                    if !self.verify_written(logical_first, data) {
+                                        crate::uart::_print(format_args!(
+                                            "  sdhci: 4-bit CMD25 x{block_count} via {mode:?} completed but read-back mismatched; rejecting the mode\n"
+                                        ));
+                                        continue;
+                                    }
+                                    self.write_batching = WriteBatching::Locked(mode);
+                                    crate::uart::_print(format_args!(
+                                        "  sdhci: CMD25 x{block_count} ok via {mode:?} on the 4-bit bus; batched writes locked to it\n"
+                                    ));
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    let response = self.hardware.response_word();
+                                    let present = self.hardware.present_state();
+                                    crate::uart::_print(format_args!(
+                                        "  sdhci: 4-bit CMD25 x{block_count} via {mode:?} failed ({error:?}, r1 {response:#010x}, present {present:#010x})\n"
+                                    ));
+                                }
+                            }
+                        }
+                        self.hardware.disable_four_bit_bus();
+                        crate::uart::_print(format_args!(
+                            "  sdhci: returned to the 1-bit bus\n"
+                        ));
+                    }
+                    Err(error) => {
+                        crate::uart::_print(format_args!(
+                            "  sdhci: 4-bit bus switch failed ({error:?}); staying on 1-bit\n"
+                        ));
+                    }
+                }
+            }
+            if self.write_batching != WriteBatching::Disabled {
+                self.write_batching = WriteBatching::Disabled;
+                crate::uart::_print(format_args!(
+                    "  sdhci: single-sector writes for this session\n"
+                ));
+            }
+        }
+        for (index, sector) in data.chunks_exact(512).enumerate() {
+            let mut block = [0u8; 512];
+            block.copy_from_slice(sector);
+            self.hardware
+                .write_sector_tracked(physical_first + index as u64, &block, || {
+                    if let Some(hook) = hook.take() {
+                        hook();
+                    }
+                })
+                .map_err(map_hardware_error)?;
+        }
+        Ok(())
+    }
+
+    /// Batched write through blind CMD25 bursts with adaptive sizing: bursts
+    /// larger than the qualified size are read back and compared before the
+    /// size is trusted, any mismatch or hardware error shrinks the burst
+    /// (floor [`SAFE_BLIND_WRITE_BLOCKS`], which is always safe) and rewrites
+    /// the same chunk, so no corruption can persist and no failure at the
+    /// floor size is masked.
+    fn write_blind(
+        &mut self,
+        logical_first: u64,
+        physical_first: u64,
+        data: &[u8],
+        hook: &mut Option<impl FnOnce()>,
+    ) -> Result<(), HardwareError> {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let chunk_bytes = (self.blind_chunk_blocks as usize * 512).min(data.len() - offset);
+            let chunk = &data[offset..offset + chunk_bytes];
+            let attempt = self.hardware.write_blocks_tracked_with_mode(
+                physical_first + (offset / 512) as u64,
+                chunk,
+                MultiBlockWriteMode::BlindPio,
+                || {
+                    if let Some(hook) = hook.take() {
+                        hook();
+                    }
+                },
+            );
+            match attempt {
+                Ok(()) => {
+                    let blocks = (chunk.len() / 512) as u32;
+                    if blocks > self.qualified_blind_blocks {
+                        if self.verify_written(logical_first + (offset / 512) as u64, chunk) {
+                            self.qualified_blind_blocks = blocks;
+                            crate::uart::_print(format_args!(
+                                "  sdhci: blind CMD25 burst x{blocks} qualified by read-back\n"
+                            ));
+                        } else {
+                            let reduced = (blocks / 2).max(SAFE_BLIND_WRITE_BLOCKS);
+                            crate::uart::_print(format_args!(
+                                "  sdhci: blind CMD25 burst x{blocks} read-back mismatched; shrinking to x{reduced}\n"
+                            ));
+                            self.blind_chunk_blocks = reduced;
+                            continue;
+                        }
+                    }
+                    offset += chunk.len();
+                }
+                Err(error) if self.blind_chunk_blocks > SAFE_BLIND_WRITE_BLOCKS => {
+                    let reduced = (self.blind_chunk_blocks / 2).max(SAFE_BLIND_WRITE_BLOCKS);
+                    crate::uart::_print(format_args!(
+                        "  sdhci: blind CMD25 burst x{} failed ({error:?}); shrinking to x{reduced}\n",
+                        self.blind_chunk_blocks
+                    ));
+                    self.blind_chunk_blocks = reduced;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the just-written range back through the proven read path and
+    /// compare, before a freshly probed write mode is allowed to carry real
+    /// storage traffic.
+    fn verify_written(&mut self, logical_first: u64, data: &[u8]) -> bool {
+        let mut readback = vec![0u8; data.len()];
+        match self.read_blocks(logical_first, &mut readback) {
+            Ok(()) => readback == data,
+            Err(_) => false,
+        }
     }
 
     fn read_sector(&mut self, logical_sector: u64) -> Result<[u8; 512], BlockError> {
@@ -505,4 +922,46 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
 #[allow(dead_code)]
 pub fn debug_waiter_counts() -> (usize, usize, usize) {
     (0, 0, 0)
+}
+
+pub struct DiagnosticMultiblockReport {
+    pub blocks_requested: usize,
+    pub blocks_completed: usize,
+    pub result: Result<(), BlockError>,
+    pub last_command: u8,
+    pub interrupt_status: u32,
+    pub present_state: u32,
+}
+
+/// Diagnostic-only probe for the untested CMD18 multi-block PIO path. Reads
+/// raw physical sectors directly, never touching the managed `DATA_SLICE`
+/// logical namespace, the `block_device` capability layer, or any automatic
+/// boot or I/O path — only an explicit diagnostic vsh command invokes this,
+/// once, interactively. Deliberately does not share code with (or get called
+/// by) the production read/write path: see docs/MILKV_DUO.md for why that
+/// separation matters here.
+pub async fn diagnostic_probe_multiblock_read(
+    poll_budget: usize,
+    block_count: usize,
+    physical_sector: u64,
+) -> Result<DiagnosticMultiblockReport, BlockError> {
+    let block_count = block_count.clamp(1, 256);
+    let expected_epoch = raw_info().session_epoch;
+    let mut output = vec![0u8; block_count * 512];
+    let (blocks_completed, hardware_result) = with_card_at(expected_epoch, |card| {
+        Ok(card.hardware.diagnostic_probe_multiblock_read(
+            physical_sector,
+            &mut output,
+            poll_budget,
+        ))
+    })?;
+    let info = raw_info();
+    Ok(DiagnosticMultiblockReport {
+        blocks_requested: output.len() / 512,
+        blocks_completed,
+        result: hardware_result.map_err(map_hardware_error),
+        last_command: info.last_command,
+        interrupt_status: info.interrupt_status,
+        present_state: info.present_state,
+    })
 }

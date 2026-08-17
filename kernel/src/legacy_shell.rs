@@ -107,6 +107,10 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("  bench           emit the versioned machine-readable benchmark suite");
             println!("  durable         recover a sealed capability log and tombstone");
             println!("  blk info|scope|test   inspect or exercise the scoped block device");
+            #[cfg(feature = "milkv-duo")]
+            println!(
+                "  blk multiblock-probe [poll-budget] [block-count] [physical-sector]  bounded CMD18 hardware bring-up probe"
+            );
             println!("  net info|test|fault  inspect, handshake, or recover virtio-net");
             println!("  store info|test|fault  exercise capability-addressed persistence");
             println!("  storage status|migrate  inspect or explicitly cut over Storage V2");
@@ -2272,8 +2276,51 @@ async fn block_command(args: &[&str]) {
                 println!("  authority revocation: explicit restart failed");
             }
         }
+        #[cfg(feature = "milkv-duo")]
+        "multiblock-probe" => {
+            let poll_budget: usize = args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(500_000);
+            let block_count: usize = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2);
+            let physical_sector: u64 = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            println!(
+                "  multiblock probe: issuing CMD18 for {} blocks at physical sector {}, poll budget {}",
+                block_count, physical_sector, poll_budget
+            );
+            match crate::sdhci_blk::diagnostic_probe_multiblock_read(
+                poll_budget,
+                block_count,
+                physical_sector,
+            )
+            .await
+            {
+                Ok(report) => {
+                    println!(
+                        "  multiblock probe: {}/{} blocks completed, result {:?}",
+                        report.blocks_completed, report.blocks_requested, report.result
+                    );
+                    println!(
+                        "  SDHCI status: last CMD{}, interrupt {:#010x}, present {:#010x}",
+                        report.last_command, report.interrupt_status, report.present_state
+                    );
+                }
+                Err(error) => println!("  multiblock probe: request failed ({})", error),
+            }
+        }
         other => println!(
-            "  usage: blk [info|scope|test|fault|recover|timeout|cancel|revoke] (got `{}`)",
+            "  usage: blk [info|scope|test|fault|recover|timeout|cancel|revoke{}] (got `{}`)",
+            if cfg!(feature = "milkv-duo") {
+                "|multiblock-probe"
+            } else {
+                ""
+            },
             other
         ),
     }

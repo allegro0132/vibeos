@@ -47,10 +47,35 @@ use crate::{exec, heap, sync::SpinLock};
 
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
+
+/// Largest page run one block-device request may carry, derived from the
+/// selected board backend's maximum transfer size.
+#[cfg(feature = "qemu-virt")]
+const MAX_PAGES_PER_REQUEST: usize =
+    crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
+#[cfg(feature = "milkv-duo")]
+const MAX_PAGES_PER_REQUEST: usize =
+    crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize * LOGICAL_BLOCK_SIZE
+        / vibeos_segment_format::PAGE_SIZE;
 const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
 /// Extra segments requested beyond the floor whenever foreground growth
 /// runs, so one growth transaction serves many subsequent commits.
 const STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS: u64 = 22;
+
+/// Scale the fixed foreground floor and hysteresis to the device: they were
+/// tuned on large bench devices, and on a small store (the Milk-V 64 MiB
+/// slice is sixteen 4 MiB segments) a 10-segment floor is structurally
+/// unreachable once a handful of segments hold live data — growth exhausts
+/// immediately and every subsequent commit pays up to eight full GC mark
+/// walks of the live object graph. An eighth of the device (clamped to the
+/// tuned values) keeps foreground collection an emergency, not a tax.
+fn scaled_free_floor(total_segments: u64) -> u64 {
+    (total_segments / 8).clamp(2, STORAGE_V2_FOREGROUND_FREE_SEGMENTS)
+}
+
+fn scaled_growth_hysteresis(total_segments: u64) -> u64 {
+    (total_segments / 4).clamp(2, STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS)
+}
 pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
     vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
@@ -126,6 +151,109 @@ pub(crate) struct CapabilityPageDevice {
     initial_block_count: u64,
     provisioned_block_count: u64,
     active: Arc<SpinLock<Option<ActivePageSession>>>,
+    page_cache: Arc<PageCache>,
+}
+
+/// Bounded write-through LRU cache over this device's pages, shared by every
+/// clone of the device handle. The storage stack re-reads its hot B+tree and
+/// manifest pages on every traversal — measured at tens of megabytes of
+/// repeat reads per small mutation — which a RAM-backed QEMU disk absorbs
+/// but a 25 MHz PIO microSD cannot. All runtime I/O flows through this one
+/// device, so hits are coherent: writes update or drop the affected entries,
+/// and an ambiguous write failure drops them as well.
+const PAGE_CACHE_CAPACITY: usize = 512;
+
+struct PageCacheEntry {
+    data: alloc::boxed::Box<Page>,
+    tick: u64,
+}
+
+struct PageCache {
+    state: SpinLock<PageCacheState>,
+}
+
+struct PageCacheState {
+    entries: alloc::collections::BTreeMap<u64, PageCacheEntry>,
+    tick: u64,
+}
+
+/// Bounded page-cache effectiveness telemetry: a one-line hit-rate report
+/// every 8192 page reads.
+fn page_cache_account(pages: u64, hits: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static PAGES: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static LAST_REPORT: AtomicU64 = AtomicU64::new(0);
+    HITS.fetch_add(hits, Ordering::Relaxed);
+    let total = PAGES.fetch_add(pages, Ordering::Relaxed) + pages;
+    let last = LAST_REPORT.load(Ordering::Relaxed);
+    if total.saturating_sub(last) >= 8192
+        && LAST_REPORT
+            .compare_exchange(last, total, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        crate::uart::_print(format_args!(
+            "  pgcache: {} of {} page reads served from cache\n",
+            HITS.load(Ordering::Relaxed),
+            total,
+        ));
+    }
+}
+
+impl PageCache {
+    fn new() -> Self {
+        Self {
+            state: SpinLock::new_recoverable(PageCacheState {
+                entries: alloc::collections::BTreeMap::new(),
+                tick: 0,
+            }),
+        }
+    }
+
+    /// Copy a cached page into `output`, refreshing its recency.
+    fn get(&self, page: u64, output: &mut Page) -> bool {
+        let mut state = self.state.lock();
+        state.tick += 1;
+        let tick = state.tick;
+        match state.entries.get_mut(&page) {
+            Some(entry) => {
+                entry.tick = tick;
+                output.copy_from_slice(&entry.data[..]);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&self, page: u64, data: &Page) {
+        let boxed = alloc::boxed::Box::new(*data);
+        let mut state = self.state.lock();
+        state.tick += 1;
+        let tick = state.tick;
+        if let Some(entry) = state.entries.get_mut(&page) {
+            entry.data.copy_from_slice(data);
+            entry.tick = tick;
+            return;
+        }
+        if state.entries.len() >= PAGE_CACHE_CAPACITY {
+            if let Some(oldest) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.tick)
+                .map(|(page, _)| *page)
+            {
+                state.entries.remove(&oldest);
+            }
+        }
+        state.entries.insert(page, PageCacheEntry { data: boxed, tick });
+    }
+
+    fn invalidate(&self, first_page: u64, page_count: usize) {
+        let mut state = self.state.lock();
+        for page in first_page..first_page.saturating_add(page_count as u64) {
+            state.entries.remove(&page);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -159,6 +287,13 @@ impl Drop for PageDeviceOperation {
 }
 
 impl CapabilityPageDevice {
+    /// Full provisioned capacity of this device in pages, independent of how
+    /// much has been admitted so far — the denominator for scaling the
+    /// foreground free-segment policy to the actual media size.
+    pub(crate) fn provisioned_page_count(&self) -> u64 {
+        self.provisioned_block_count / BLOCKS_PER_PAGE
+    }
+
     pub(crate) fn new(
         backend: Arc<Space>,
         block: Cap,
@@ -192,6 +327,7 @@ impl CapabilityPageDevice {
             initial_block_count: range.block_count(),
             provisioned_block_count: range.block_count(),
             active: system_arc(SpinLock::new_recoverable(None)),
+            page_cache: system_arc(PageCache::new()),
         })
     }
 
@@ -229,6 +365,7 @@ impl CapabilityPageDevice {
             initial_block_count,
             provisioned_block_count: range.block_count(),
             active: system_arc(SpinLock::new_recoverable(None)),
+            page_cache: system_arc(PageCache::new()),
         })
     }
 
@@ -1623,8 +1760,9 @@ impl StorageV2Runtime {
     /// append paths call this before mutating, which keeps capacity relief on
     /// the growth path instead of a blocking foreground collection.
     async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), V2RuntimeError> {
-        self.ensure_foreground_capacity_for(STORAGE_V2_FOREGROUND_FREE_SEGMENTS)
-            .await
+        // Zero lets the device-scaled floor decide; batched callers pass
+        // their real per-transaction appetite instead.
+        self.ensure_foreground_capacity_for(0).await
     }
 
     /// Like [`StorageV2Runtime::ensure_foreground_capacity`], but replenishing
@@ -1635,7 +1773,12 @@ impl StorageV2Runtime {
         self: &Arc<Self>,
         required_free: u64,
     ) -> Result<(), V2RuntimeError> {
-        let floor = STORAGE_V2_FOREGROUND_FREE_SEGMENTS.max(required_free);
+        let total_segments = (self.device.provisioned_page_count()
+            / vibeos_segment_format::SEGMENT_PAGES)
+            .max(1);
+        let scaled_floor = scaled_free_floor(total_segments);
+        let hysteresis = scaled_growth_hysteresis(total_segments);
+        let floor = scaled_floor.max(required_free);
         let mut operation = self.begin()?;
         let info = operation
             .store()
@@ -1653,8 +1796,8 @@ impl StorageV2Runtime {
         // very next commit dip below it again, turning every append into a
         // growth checkpoint. Overshooting amortizes one growth transaction
         // across many commits.
-        let growth_blocks = STORAGE_V2_FOREGROUND_FREE_SEGMENTS
-            .saturating_add(STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS)
+        let growth_blocks = floor
+            .saturating_add(hysteresis)
             .saturating_sub(info.free_segments)
             .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
             .ok_or(V2RuntimeError::Corrupt)?;
@@ -1691,7 +1834,7 @@ impl StorageV2Runtime {
             // stopping at the floor makes the very next batch dip below it
             // and charges a full walk per handful of freed segments.
             // Overshooting amortizes one walk across many commits.
-            let reclaim_target = floor.saturating_add(STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS);
+            let reclaim_target = floor.saturating_add(hysteresis);
             let mut collected = false;
             let mut last_free = info.free_segments;
             let mut stalled = 0_u32;
@@ -2333,25 +2476,48 @@ impl StorageV2Devices {
                 self.runtime
                     .ensure_native_initial_format()
                     .await
-                    .map_err(|_| BootProbeError::StorageV2)?;
+                    .map_err(|error| {
+                        crate::uart::_print(format_args!(
+                            "  storage v2 native format failed: {error:?}\n"
+                        ));
+                        BootProbeError::StorageV2
+                    })?;
                 self.runtime
                     .install_native_empty_authority()
                     .await
-                    .map_err(|_| BootProbeError::StorageV2)?;
+                    .map_err(|error| {
+                        crate::uart::_print(format_args!(
+                            "  storage v2 empty-authority install failed: {error:?}\n"
+                        ));
+                        BootProbeError::StorageV2
+                    })?;
                 self.runtime
                     .cold_recover_and_scrub(
                         crate::durable_cspace::storage_v2_external_policy_sha256(),
                     )
                     .await
-                    .map_err(|_| BootProbeError::StorageV2)?
+                    .map_err(|error| {
+                        crate::uart::_print(format_args!(
+                            "  storage v2 post-format recovery failed: {error:?}\n"
+                        ));
+                        BootProbeError::StorageV2
+                    })?
             }
-            Err(_) => return Err(BootProbeError::StorageV2),
+            Err(error) => {
+                crate::uart::_print(format_args!(
+                    "  storage v2 native init rejected cold recovery: {error:?}\n"
+                ));
+                return Err(BootProbeError::StorageV2);
+            }
         };
         let (expected_native, _) =
             prepare_native_empty_authority().map_err(|_| BootProbeError::StorageV2)?;
         if !crate::durable_cspace::is_storage_v2_native_empty_view(&view, &expected_native)
             || evidence.store_uuid.as_bytes() != &STORAGE_V2_UUID
         {
+            crate::uart::_print(format_args!(
+                "  storage v2 native init: empty-view/uuid proof mismatch\n"
+            ));
             return Err(BootProbeError::StorageV2);
         }
         let maintenance = self
@@ -3752,44 +3918,28 @@ impl PageDevice for CapabilityPageDevice {
     }
 
     async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
+        if self.page_cache.get(page, output) {
+            page_cache_account(1, 1);
+            return Ok(());
+        }
+        page_cache_account(1, 0);
         let first = self.first_sector(page)?;
         let lease = self.lease(Rights::READ)?;
         let session = block_device::range_info_with(&lease)
             .map_err(PageIoError::Block)?
             .session();
         self.require_session(session)?;
-        #[cfg(feature = "qemu-virt")]
-        {
-            block_device::read_blocks_with_session(
-                &lease,
-                session,
-                first,
-                BLOCKS_PER_PAGE as u32,
-                output,
-            )
+        block_device::read_blocks_with_session(&lease, session, first, BLOCKS_PER_PAGE as u32, output)
             .await
             .map_err(PageIoError::Block)?;
-        }
-        #[cfg(feature = "milkv-duo")]
-        for index in 0..BLOCKS_PER_PAGE {
-            let offset = usize::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_mul(LOGICAL_BLOCK_SIZE))
-                .ok_or(PageIoError::InvalidRange)?;
-            block_device::read_blocks_with_session(
-                &lease,
-                session,
-                first + index,
-                1,
-                &mut output[offset..offset + LOGICAL_BLOCK_SIZE],
-            )
-            .await
-            .map_err(PageIoError::Block)?;
-        }
+        self.page_cache.insert(page, output);
         Ok(())
     }
 
     async fn write_page(&self, page: u64, input: &Page) -> MutationResult<(), Self::Error> {
+        // Drop the stale entry before the mutation may reach media; the fresh
+        // content is re-inserted only after an unambiguous success.
+        self.page_cache.invalidate(page, 1);
         let first = self
             .first_sector(page)
             .map_err(MutationFailure::not_submitted)
@@ -3804,47 +3954,22 @@ impl PageDevice for CapabilityPageDevice {
             .map_err(MutationFailure::not_submitted)
             .map_err(|failure| self.compose_mutation_failure(failure))?;
 
-        #[cfg(feature = "qemu-virt")]
-        {
-            let result = block_device::write_blocks_with_session(
-                &lease,
-                session,
-                first,
-                BLOCKS_PER_PAGE as u32,
-                input,
-                false,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|failure| failure.map(PageIoError::Block));
-            match result {
-                Ok(()) => self.mark_mutation_submitted(),
-                Err(failure) => return Err(self.compose_mutation_failure(failure)),
-            }
+        let result = block_device::write_blocks_with_session(
+            &lease,
+            session,
+            first,
+            BLOCKS_PER_PAGE as u32,
+            input,
+            false,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failure| failure.map(PageIoError::Block));
+        match result {
+            Ok(()) => self.mark_mutation_submitted(),
+            Err(failure) => return Err(self.compose_mutation_failure(failure)),
         }
-        #[cfg(feature = "milkv-duo")]
-        for index in 0..BLOCKS_PER_PAGE {
-            let offset = usize::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_mul(LOGICAL_BLOCK_SIZE))
-                .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))
-                .map_err(|failure| self.compose_mutation_failure(failure))?;
-            let result = block_device::write_blocks_with_session(
-                &lease,
-                session,
-                first + index,
-                1,
-                &input[offset..offset + LOGICAL_BLOCK_SIZE],
-                false,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|failure| failure.map(PageIoError::Block));
-            match result {
-                Ok(()) => self.mark_mutation_submitted(),
-                Err(failure) => return Err(self.compose_mutation_failure(failure)),
-            }
-        }
+        self.page_cache.insert(page, input);
         Ok(())
     }
 
@@ -3852,54 +3977,46 @@ impl PageDevice for CapabilityPageDevice {
         if output.is_empty() {
             return Ok(());
         }
+        let all_cached = output.iter_mut().enumerate().all(|(index, page)| {
+            self.page_cache.get(first_page + index as u64, page)
+        });
+        page_cache_account(output.len() as u64, if all_cached { output.len() as u64 } else { 0 });
+        if all_cached {
+            return Ok(());
+        }
         let first = self.page_range_first_sector(first_page, output.len())?;
-        #[cfg(feature = "qemu-virt")]
-        {
-            const MAX_PAGES_PER_REQUEST: usize =
-                crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
-            let lease = self.lease(Rights::READ)?;
-            let session = block_device::range_info_with(&lease)
-                .map_err(PageIoError::Block)?
-                .session();
-            self.require_session(session)?;
-            for (chunk_index, chunk) in output.chunks_mut(MAX_PAGES_PER_REQUEST).enumerate() {
-                let page_offset = chunk_index
-                    .checked_mul(MAX_PAGES_PER_REQUEST)
-                    .ok_or(PageIoError::InvalidRange)?;
-                let block_offset = (page_offset as u64)
-                    .checked_mul(BLOCKS_PER_PAGE)
-                    .ok_or(PageIoError::InvalidRange)?;
-                let block_count = u32::try_from(chunk.len())
-                    .ok()
-                    .and_then(|count| count.checked_mul(BLOCKS_PER_PAGE as u32))
-                    .ok_or(PageIoError::InvalidRange)?;
-                block_device::read_blocks_with_session(
-                    &lease,
-                    session,
-                    first
-                        .checked_add(block_offset)
-                        .ok_or(PageIoError::InvalidRange)?,
-                    block_count,
-                    chunk.as_flattened_mut(),
-                )
-                .await
-                .map_err(PageIoError::Block)?;
-            }
-            Ok(())
+        let lease = self.lease(Rights::READ)?;
+        let session = block_device::range_info_with(&lease)
+            .map_err(PageIoError::Block)?
+            .session();
+        self.require_session(session)?;
+        for (chunk_index, chunk) in output.chunks_mut(MAX_PAGES_PER_REQUEST).enumerate() {
+            let page_offset = chunk_index
+                .checked_mul(MAX_PAGES_PER_REQUEST)
+                .ok_or(PageIoError::InvalidRange)?;
+            let block_offset = (page_offset as u64)
+                .checked_mul(BLOCKS_PER_PAGE)
+                .ok_or(PageIoError::InvalidRange)?;
+            let block_count = u32::try_from(chunk.len())
+                .ok()
+                .and_then(|count| count.checked_mul(BLOCKS_PER_PAGE as u32))
+                .ok_or(PageIoError::InvalidRange)?;
+            block_device::read_blocks_with_session(
+                &lease,
+                session,
+                first
+                    .checked_add(block_offset)
+                    .ok_or(PageIoError::InvalidRange)?,
+                block_count,
+                chunk.as_flattened_mut(),
+            )
+            .await
+            .map_err(PageIoError::Block)?;
         }
-        #[cfg(feature = "milkv-duo")]
-        {
-            for (offset, page) in output.iter_mut().enumerate() {
-                self.read_page(
-                    first_page
-                        .checked_add(offset as u64)
-                        .ok_or(PageIoError::InvalidRange)?,
-                    page,
-                )
-                .await?;
-            }
-            Ok(())
+        for (index, page) in output.iter().enumerate() {
+            self.page_cache.insert(first_page + index as u64, page);
         }
+        Ok(())
     }
 
     async fn write_pages(
@@ -3910,14 +4027,14 @@ impl PageDevice for CapabilityPageDevice {
         if input.is_empty() {
             return Ok(());
         }
+        // Drop stale entries before any chunk may reach media; fresh content
+        // is re-inserted only after the whole run succeeds unambiguously.
+        self.page_cache.invalidate(first_page, input.len());
         let first = self
             .page_range_first_sector(first_page, input.len())
             .map_err(MutationFailure::not_submitted)
             .map_err(|failure| self.compose_mutation_failure(failure))?;
-        #[cfg(feature = "qemu-virt")]
         {
-            const MAX_PAGES_PER_REQUEST: usize =
-                crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
             let lease = self
                 .lease(Rights::WRITE)
                 .map_err(MutationFailure::not_submitted)
@@ -3961,18 +4078,8 @@ impl PageDevice for CapabilityPageDevice {
                     Err(failure) => return Err(self.compose_mutation_failure(failure)),
                 }
             }
-            Ok(())
-        }
-        #[cfg(feature = "milkv-duo")]
-        {
-            for (offset, page) in input.iter().enumerate() {
-                self.write_page(
-                    first_page
-                        .checked_add(offset as u64)
-                        .ok_or_else(|| MutationFailure::not_submitted(PageIoError::InvalidRange))?,
-                    page,
-                )
-                .await?;
+            for (index, page) in input.iter().enumerate() {
+                self.page_cache.insert(first_page + index as u64, page);
             }
             Ok(())
         }

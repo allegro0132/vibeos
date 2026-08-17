@@ -393,16 +393,21 @@ enum WriteBatching {
     Disabled,
 }
 
-/// (apply write-stall workarounds first, protocol shape) probe ladder: one
-/// baseline attempt reproduces the known stall, then the host workarounds are
-/// applied once and every protocol shape is retried under them.
-const WRITE_MODE_LADDER: [(bool, MultiBlockWriteMode); 6] = [
-    (false, MultiBlockWriteMode::AutoCmd12),
+/// (apply write-stall workarounds first, protocol shape) probe ladder.
+///
+/// `BlindPio` under the host write-stall workarounds is the only shape the
+/// CV1800B has ever completed on real hardware, so it leads the ladder: the
+/// workarounds are applied up front and the proven mode is tried first, which
+/// keeps a healthy session from spending four full data-transfer timeouts
+/// rediscovering it on every first batched write. The remaining standard
+/// shapes stay as ordered fallbacks in case a different card or a firmware
+/// revision ever accepts one of them.
+const WRITE_MODE_LADDER: [(bool, MultiBlockWriteMode); 5] = [
+    (true, MultiBlockWriteMode::BlindPio),
     (true, MultiBlockWriteMode::AutoCmd12),
     (true, MultiBlockWriteMode::ManualCmd12),
     (true, MultiBlockWriteMode::OpenEnded),
     (true, MultiBlockWriteMode::SetBlockCount),
-    (true, MultiBlockWriteMode::BlindPio),
 ];
 
 struct HostState {

@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use vibeos_segment_format::PAGE_SIZE;
+use vibeos_segment_format::{DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE};
 
 use crate::authority::AuthorizedObject;
 use crate::cas::{
@@ -768,14 +768,26 @@ impl<D: PageDevice> SegmentStore<D> {
         // interrupted staged publication.)
         {
             let state = self.require_current_generation()?;
-            // Each chunk's encoded blob packs about three 1 MiB extents per
-            // 4 MiB segment; one metadata segment publishes the batch.
-            let mut needed = 1_u64;
+            // Small chunks pack many record spans per shared scratch
+            // segment; larger chunks stream about three 1 MiB extents per
+            // 4 MiB segment. Two extra segments cover per-entry admission
+            // headroom and a dedicated metadata segment when needed.
+            let mut needed = 2_u64;
+            let mut pooled_pages = 0_u64;
             for bytes in chunks {
-                needed = needed
-                    .checked_add(1 + bytes.len() as u64 / (3 * 1024 * 1024))
-                    .ok_or(StoreError::Corrupt)?;
+                if bytes.len() <= 192 * 1024 {
+                    pooled_pages = pooled_pages
+                        .checked_add((bytes.len() as u64).div_ceil(PAGE_SIZE as u64) + 8)
+                        .ok_or(StoreError::Corrupt)?;
+                } else {
+                    needed = needed
+                        .checked_add(1 + bytes.len() as u64 / (3 * 1024 * 1024))
+                        .ok_or(StoreError::Corrupt)?;
+                }
             }
+            needed = needed
+                .checked_add(pooled_pages.div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE)))
+                .ok_or(StoreError::Corrupt)?;
             let floor = u64::from(state.cleaner_reserve_segments)
                 .saturating_add(u64::from(crate::store::ROOT_POLICY_HEADROOM_SEGMENTS));
             let free = state
@@ -1027,14 +1039,22 @@ impl<D: PageDevice> SegmentStore<D> {
         // Ensure capacity before staging anything: nothing is consumed while
         // the store stays mounted, so a shortfall may collect garbage and
         // re-check like the sequential maintenance commit did per node.
-        // Every node payload is bounded by `FS_OBJECT_MAX_LEN`, so each
-        // staged entry takes one scratch segment; the root and the batch's
-        // metadata segment complete the appetite.
+        // Every node payload is bounded by `FS_OBJECT_MAX_LEN` (one page),
+        // so each staged entry — the root included — packs a nine-page
+        // record span into the batch's shared scratch segments. Two extra
+        // segments cover the per-entry admission headroom and a metadata
+        // segment when the records do not fit the shared one.
         let staged_nodes = plan
             .iter()
             .filter(|node| matches!(node, PlannedFsNode::Staged { .. }))
             .count() as u64;
-        let needed = staged_nodes.checked_add(2).ok_or(StoreError::Corrupt)?;
+        let entry_span_pages = (FS_OBJECT_MAX_LEN as u64).div_ceil(PAGE_SIZE as u64) + 8;
+        let shared_segments = staged_nodes
+            .checked_add(1)
+            .and_then(|entries| entries.checked_mul(entry_span_pages))
+            .map(|pages| pages.div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE)))
+            .ok_or(StoreError::Corrupt)?;
+        let needed = shared_segments.checked_add(2).ok_or(StoreError::Corrupt)?;
         let maximum_cycles = self.info()?.admitted_segments;
         let mut cycles = 0_u64;
         loop {
@@ -2569,6 +2589,184 @@ mod tests {
         assert_eq!(after.allocated_segments, before.allocated_segments + 1);
     }
 
+    /// Format, publish an empty namespace root, and run one collection round
+    /// so the store carries the V2 allocation map — the state any production
+    /// store reaches after its first growth or collection.
+    fn format_v2(device: TestDevice) -> SegmentStore<TestDevice> {
+        let mut store = format(device);
+        let root = empty_root(&mut store, 1, 2);
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+        // Dead weight so a yielding compaction exists.
+        for index in 0..3_u8 {
+            drop(
+                block_on(store.commit_fs_data_chunk(None, &alloc::vec![index + 0x60; 8192]))
+                    .unwrap(),
+            );
+        }
+        block_on(store.collect_garbage()).unwrap();
+        store
+    }
+
+    #[test]
+    fn staged_batch_packs_small_blobs_and_metadata_into_one_segment() {
+        let device = TestDevice::blank(64);
+        let mut store = format_v2(device.clone());
+        let before = store.info().unwrap();
+        let payloads: Vec<Vec<u8>> = (0..6_u8)
+            .map(|index| alloc::vec![index + 1; 8192 + usize::from(index)])
+            .collect();
+        let mut batch = store.begin_staged_batch().unwrap();
+        for payload in &payloads {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                payload,
+            ))
+            .unwrap();
+        }
+        // All staged entries pack into the first entry's scratch segment.
+        assert_eq!(batch.staged_segment_count(), 1);
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        let after = store.info().unwrap();
+        // The manifests, snapshot, and allocation records join the shared
+        // segment, so six small objects consume exactly one segment.
+        assert_eq!(after.allocated_segments, before.allocated_segments + 1);
+        assert_eq!(after.generation, before.generation + 1);
+        for (object, payload) in published.iter().zip(&payloads) {
+            assert_eq!(object.exact_len(), payload.len() as u64);
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..4096]);
+        }
+        drop(store);
+
+        // The packed segment cold-recovers: every object resolves and reads
+        // through a fresh mount of the same media.
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        assert_eq!(cold.info().unwrap().object_count, after.object_count);
+        let mut batch = cold.begin_staged_batch().unwrap();
+        block_on(cold.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &alloc::vec![0x7e_u8; 512],
+        ))
+        .unwrap();
+        let published = block_on(cold.publish_staged_batch(batch)).unwrap();
+        let chunk = block_on(cold.get_blob_chunk(&published[0], 0)).unwrap();
+        assert_eq!(chunk.bytes, alloc::vec![0x7e_u8; 512]);
+    }
+
+    #[test]
+    fn staged_batch_mixes_large_and_packed_blobs_with_dedup() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        // Commit one blob first so a batch entry deduplicates against it.
+        let committed = alloc::vec![0x11_u8; 8192];
+        let mut batch = store.begin_staged_batch().unwrap();
+        block_on(store.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &committed,
+        ))
+        .unwrap();
+        block_on(store.publish_staged_batch(batch)).unwrap();
+
+        // One batch mixes: packed small, streaming large (over the sink
+        // limit, so it claims whole segments), a dedup of committed content,
+        // and another packed small after the large one.
+        let small_a = alloc::vec![0x22_u8; 4096];
+        let large = (0..1024 * 1024_usize + 700)
+            .map(|index| (index * 13) as u8)
+            .collect::<Vec<u8>>();
+        let small_b = alloc::vec![0x33_u8; 2048];
+        let payloads = [&small_a, &large, &committed, &small_b];
+        let mut batch = store.begin_staged_batch().unwrap();
+        for payload in payloads {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                payload,
+            ))
+            .unwrap();
+        }
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        assert_eq!(published.len(), 4);
+        for (object, payload) in published.iter().zip(payloads) {
+            assert_eq!(object.exact_len(), payload.len() as u64);
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..payload.len().min(4096)]);
+        }
+        drop(store);
+
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let mut batch = cold.begin_staged_batch().unwrap();
+        block_on(cold.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &large,
+        ))
+        .unwrap();
+        // Identical large content deduplicates against the cold-recovered
+        // mapping, proving the packed store's manifests authenticate.
+        assert_eq!(batch.staged_segment_count(), 0);
+        let published = block_on(cold.publish_staged_batch(batch)).unwrap();
+        let chunk = block_on(cold.get_blob_chunk(&published[0], 1)).unwrap();
+        assert_eq!(chunk.bytes, large[4096..8192]);
+    }
+
+    #[test]
+    fn staged_batch_metadata_overflow_claims_a_dedicated_segment() {
+        let device = TestDevice::blank(64);
+        let mut store = format_v2(device.clone());
+        let before = store.info().unwrap();
+        // Fill two shared segments almost exactly: each ~250 KiB blob packs
+        // to a 71-page record span, fourteen per 1018-page segment. After 28
+        // entries the second shared segment keeps only a couple dozen free
+        // pages, so the batch's metadata records cannot join it and must
+        // claim a dedicated metadata segment exactly like the unpacked path.
+        let payloads: Vec<Vec<u8>> = (0..28_u8)
+            .map(|index| alloc::vec![index + 1; 250 * 1024])
+            .collect();
+        let mut batch = store.begin_staged_batch().unwrap();
+        for payload in &payloads {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                payload,
+            ))
+            .unwrap();
+        }
+        let shared_segments = batch.staged_segment_count() as u64;
+        assert!(
+            (2..=3).contains(&shared_segments),
+            "expected ~2 shared segments, got {shared_segments}",
+        );
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        let after = store.info().unwrap();
+        // The shared segments plus one dedicated metadata segment — far
+        // below the unpacked one-segment-per-blob-plus-metadata appetite.
+        assert_eq!(
+            after.allocated_segments,
+            before.allocated_segments + shared_segments + 1
+        );
+        for (object, payload) in published.iter().zip(&payloads) {
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..4096]);
+        }
+        drop(store);
+
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        assert_eq!(cold.info().unwrap().object_count, after.object_count);
+    }
+
     #[test]
     fn gc_after_batched_staging_preserves_the_id_high_water() {
         let device = TestDevice::blank(64);
@@ -2598,7 +2796,14 @@ mod tests {
 
         // Collection must proceed (not fail closed) and keep the media
         // high-water durable across destructive rounds and a cold mount.
-        for _ in 0..3 {
+        // Staging now packs small blobs into shared segments, so a freshly
+        // staged store is already compact; feed every destructive round
+        // enough dropped (dead) objects that a yielding compaction exists.
+        for round in 0..3_u8 {
+            for extra in 0..3_u8 {
+                let payload = alloc::vec![0x40 + round * 3 + extra; 8192];
+                drop(block_on(store.commit_fs_data_chunk(None, &payload)).unwrap());
+            }
             block_on(store.collect_garbage()).unwrap();
         }
         drop(store);

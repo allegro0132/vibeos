@@ -1880,7 +1880,7 @@ impl<D: PageDevice> SegmentStore<D> {
         Ok(())
     }
 
-    fn preflight_persistent_quota(
+    pub(crate) fn preflight_persistent_quota(
         &self,
         policies: &[PersistentPrincipalPolicy],
         bindings: &[PersistentObjectBinding],
@@ -1897,7 +1897,7 @@ impl<D: PageDevice> SegmentStore<D> {
         }
     }
 
-    fn install_persistent_quota_snapshot(
+    pub(crate) fn install_persistent_quota_snapshot(
         &self,
         snapshot: &PersistentAuthoritySnapshot,
     ) -> Result<(), PersistentAuthorityError<D::Error>> {

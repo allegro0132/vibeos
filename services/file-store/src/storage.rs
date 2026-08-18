@@ -305,14 +305,15 @@ impl FsTransaction {
             }
         }
         let (inode_entries, dirent_entries) = encode_namespace(&self.working)?;
-        let new_root = if let (None, Some(maintenance)) = (principal, maintenance) {
-            // Fused trusted-service path: both trees and the namespace root
-            // publish under one staged-batch checkpoint instead of one
-            // checkpoint per new node plus one for the root.
+        if let (None, Some(maintenance)) = (principal, maintenance) {
+            // Fused trusted-service path: both trees, the namespace root,
+            // and the persistent root switch publish under one staged-batch
+            // checkpoint instead of one checkpoint for the batch plus one
+            // for the root-policy switch.
             let inode_inputs = build_node_inputs(&inode_entries, Some(&content))?;
             let dirent_inputs = build_node_inputs(&dirent_entries, None)?;
             store
-                .commit_fs_transaction_for_maintenance(
+                .commit_fs_transaction_with_root_switch_for_maintenance(
                     maintenance,
                     self.previous_root.as_ref(),
                     self.working.namespace,
@@ -321,39 +322,41 @@ impl FsTransaction {
                     crate::ROOT_FILE_ID,
                     &inode_inputs,
                     &dirent_inputs,
+                    self.base_generation,
                 )
-                .await?
+                .await?;
         } else {
-            self.commit_persistent_trees_and_root(
-                store,
-                generation,
-                &inode_entries,
-                &dirent_entries,
-                &content,
-                principal,
-                maintenance,
-            )
-            .await?
-        };
-        match maintenance {
-            Some(maintenance) => {
-                store
-                    .compare_exchange_fs_root_for_maintenance(
-                        maintenance,
-                        self.working.namespace,
-                        self.base_generation,
-                        &new_root,
-                    )
-                    .await?;
-            }
-            None => {
-                store
-                    .compare_exchange_fs_root(
-                        self.working.namespace,
-                        self.base_generation,
-                        &new_root,
-                    )
-                    .await?;
+            let new_root = self
+                .commit_persistent_trees_and_root(
+                    store,
+                    generation,
+                    &inode_entries,
+                    &dirent_entries,
+                    &content,
+                    principal,
+                    maintenance,
+                )
+                .await?;
+            match maintenance {
+                Some(maintenance) => {
+                    store
+                        .compare_exchange_fs_root_for_maintenance(
+                            maintenance,
+                            self.working.namespace,
+                            self.base_generation,
+                            &new_root,
+                        )
+                        .await?;
+                }
+                None => {
+                    store
+                        .compare_exchange_fs_root(
+                            self.working.namespace,
+                            self.base_generation,
+                            &new_root,
+                        )
+                        .await?;
+                }
             }
         }
         let persisted = store

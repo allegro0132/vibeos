@@ -8,15 +8,19 @@ use alloc::vec::Vec;
 use vibeos_segment_format::{DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE};
 
 use crate::authority::AuthorizedObject;
+use crate::authority_snapshot::{
+    encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
+};
 use crate::cas::{
     recover_persistent_cas_object, recover_promotable_cas_object, CasObjectHandle, CasStoreError,
+    FusedAuthorityPublication,
 };
 use crate::cas_codec::{ObjectMapping, REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW};
 use crate::device::PageDevice;
 use crate::gc::GcStoreError;
 use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
 use crate::persistent_authority::PersistentAuthorityError;
-use crate::root_codec::PersistentRootEntry;
+use crate::root_codec::{PersistentRootEntry, PersistentRootSet};
 use crate::fs_codec::{decode_fs_data_node_v1_prefix, FsDataNodeMeta};
 use crate::{
     decode_fs_btree_node_v1, encode_fs_btree_node_v1,
@@ -32,6 +36,62 @@ pub struct FsNodeEntryInput<'a> {
     pub value: &'a [u8],
     pub child: Option<&'a AuthorizedObject<CasObjectHandle>>,
     pub data: Option<&'a FsPersistentData>,
+}
+
+fn structural_to_root_publish<E>(error: FsStructuralCommitError<E>) -> FsRootPublishError<E> {
+    match error {
+        FsStructuralCommitError::Store(error) => FsRootPublishError::Store(error),
+        FsStructuralCommitError::Gc(error) => FsRootPublishError::Gc(error),
+        FsStructuralCommitError::Codec(error) => FsRootPublishError::Codec(error),
+        FsStructuralCommitError::InvalidChild => FsRootPublishError::InvalidRoot,
+    }
+}
+
+/// Build the fused successor policy for one namespace-root switch: the
+/// current authority snapshot relocated to the publishing checkpoint with its
+/// namespace-root external entry replaced by the batch's position-predicted
+/// root, plus the derived persistent root set — computed exactly as cold
+/// recovery derives it from the authority snapshot (object bindings plus
+/// external roots, sorted by object id).
+fn build_fs_root_switch_authority(
+    current: &PersistentAuthoritySnapshot,
+    root_id: u128,
+    root_generation: u64,
+) -> Result<FusedAuthorityPublication, AuthoritySnapshotError> {
+    let mut external_roots: Vec<PersistentRootEntry> = current
+        .external_roots()
+        .iter()
+        .copied()
+        .filter(|root| root.object_kind != FS_ROOT_V1_KIND)
+        .collect();
+    external_roots.push(PersistentRootEntry {
+        object_id: root_id,
+        commit_generation: root_generation,
+        object_kind: FS_ROOT_V1_KIND,
+    });
+    external_roots.sort_unstable_by_key(|root| root.object_id);
+    let snapshot = current
+        .relocated(root_generation)?
+        .with_external_roots(external_roots)?;
+    let authority_bytes = encode_persistent_authority_snapshot(&snapshot)?;
+    let mut root_entries: Vec<PersistentRootEntry> = snapshot
+        .objects
+        .iter()
+        .map(|binding| PersistentRootEntry {
+            object_id: binding.v2_object_id,
+            commit_generation: binding.commit_generation,
+            object_kind: binding.object_kind,
+        })
+        .collect();
+    root_entries.extend_from_slice(snapshot.external_roots());
+    root_entries.sort_unstable_by_key(|entry| entry.object_id);
+    let persistent_roots = PersistentRootSet::new(root_generation, root_entries)
+        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    Ok(FusedAuthorityPublication {
+        authority_bytes,
+        persistent_authority: snapshot,
+        persistent_roots,
+    })
 }
 
 #[derive(Debug)]
@@ -972,6 +1032,154 @@ impl<D: PageDevice> SegmentStore<D> {
         inode_entries: &[FsNodeEntryInput<'_>],
         dirent_entries: &[FsNodeEntryInput<'_>],
     ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_transaction_for_maintenance_inner(
+            maintenance,
+            previous,
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_entries,
+            dirent_entries,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::commit_fs_transaction_for_maintenance`] plus the persistent
+    /// root switch of [`Self::compare_exchange_fs_root_for_maintenance`], as
+    /// one segment transaction and one checkpoint: the successor authority
+    /// snapshot naming the freshly staged namespace root publishes in the
+    /// same fused batch. Every declinable precondition — root expectation,
+    /// initialized authority, snapshot size, quota admission — is checked
+    /// while the store is still cleanly mounted; when the successor snapshot
+    /// cannot ride a single authority extent the method transparently falls
+    /// back to the two-checkpoint sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_fs_transaction_with_root_switch_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_entries: &[FsNodeEntryInput<'_>],
+        dirent_entries: &[FsNodeEntryInput<'_>],
+        expected_generation: u64,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsRootPublishError<D::Error>> {
+        // The new root's declared generation must be the strict successor of
+        // the expectation, exactly as compare-exchange enforces after decode.
+        if Some(namespace_generation) != expected_generation.checked_add(1) {
+            return Err(FsRootPublishError::Conflict);
+        }
+        self.expect_current_fs_root(namespace_uuid, expected_generation)
+            .await?;
+        let state = self.require_current_generation()?;
+        let current_authority = state
+            .persistent_authority
+            .as_ref()
+            .ok_or(FsRootPublishError::InvalidRoot)?;
+        // The fused publication carries the successor snapshot as one
+        // Authority extent. Adding or replacing the namespace-root entry
+        // changes the encoded length by at most one root-entry record.
+        let fused_fits = encode_persistent_authority_snapshot(current_authority)
+            .map_err(|_| FsRootPublishError::InvalidRoot)?
+            .len()
+            .checked_add(64)
+            .is_some_and(|len| {
+                len <= vibeos_segment_format::MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE
+            });
+        // Quota admission is unchanged by an external-root replacement, but
+        // run the same pure preflight as the two-checkpoint path so a
+        // divergent quota table declines before any staging.
+        self.preflight_persistent_quota(
+            current_authority.principals(),
+            &current_authority.objects,
+        )
+        .map_err(FsRootPublishError::Authority)?;
+        if !fused_fits {
+            let root = self
+                .commit_fs_transaction_for_maintenance_inner(
+                    maintenance,
+                    previous,
+                    namespace_uuid,
+                    namespace_generation,
+                    next_file_id,
+                    root_file_id,
+                    inode_entries,
+                    dirent_entries,
+                    false,
+                )
+                .await
+                .map_err(structural_to_root_publish)?;
+            self.compare_exchange_fs_root_for_maintenance(
+                maintenance,
+                namespace_uuid,
+                expected_generation,
+                &root,
+            )
+            .await?;
+            return Ok(root);
+        }
+        self.commit_fs_transaction_for_maintenance_inner(
+            maintenance,
+            previous,
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_entries,
+            dirent_entries,
+            true,
+        )
+        .await
+        .map_err(structural_to_root_publish)
+    }
+
+    /// Validate that the currently committed namespace root matches the
+    /// compare-exchange expectation, without mutating anything.
+    async fn expect_current_fs_root(
+        &self,
+        namespace_uuid: u128,
+        expected_generation: u64,
+    ) -> Result<(), FsRootPublishError<D::Error>> {
+        match self.current_fs_root_mapping()? {
+            None if expected_generation == 0 => Ok(()),
+            Some(mapping) => {
+                let current = recover_persistent_cas_object(
+                    self.require_current_generation()?
+                        .superblock
+                        .binding
+                        .store_uuid,
+                    mapping,
+                );
+                let decoded =
+                    crate::decode_fs_root_v1(&self.read_fs_object_bytes(&current).await?)?;
+                if decoded.namespace_uuid != namespace_uuid
+                    || decoded.commit_generation != expected_generation
+                {
+                    return Err(FsRootPublishError::Conflict);
+                }
+                Ok(())
+            }
+            None => Err(FsRootPublishError::Conflict),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_fs_transaction_for_maintenance_inner(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_entries: &[FsNodeEntryInput<'_>],
+        dirent_entries: &[FsNodeEntryInput<'_>],
+        fused_root_switch: bool,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
         // The lease proves maintenance authority for this trusted-service
         // write path, exactly like the staged chunk batch.
         let lease = self
@@ -1196,7 +1404,29 @@ impl<D: PageDevice> SegmentStore<D> {
             .stage_blob_in_batch(&mut batch, FS_ROOT_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
             .await?;
         let root_index = batch.staged_len() - 1;
-        let published = self.publish_staged_batch(batch).await?;
+        let published = if fused_root_switch {
+            // Every declinable admission ran in the public wrapper while the
+            // store was cleanly mounted; a failure here is indistinguishable
+            // from any other mid-batch fault and poisons the store the same
+            // way. The successor snapshot replaces the namespace-root
+            // external entry with the batch's position-predicted root, whose
+            // catalog mapping publishes in this same checkpoint.
+            let fused = build_fs_root_switch_authority(
+                batch
+                    .base_persistent_authority()
+                    .ok_or(FsStructuralCommitError::InvalidChild)?,
+                root_id,
+                root_generation,
+            )
+            .map_err(|_| FsStructuralCommitError::Store(CasStoreError::WriterFailed))?;
+            // Same ordering contract as every fused authority publication:
+            // the pure quota installation precedes the publication mutation.
+            self.install_persistent_quota_snapshot(&fused.persistent_authority)
+                .map_err(|_| FsStructuralCommitError::Store(CasStoreError::WriterFailed))?;
+            self.publish_staged_batch_with_authority(batch, fused).await?
+        } else {
+            self.publish_staged_batch(batch).await?
+        };
         let object = published
             .into_iter()
             .nth(root_index)
@@ -1210,6 +1440,33 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| StoreError::Corrupt)?;
         if key.object_id() != root_id || key.commit_generation() != root_generation {
             return Err(StoreError::Corrupt.into());
+        }
+        if fused_root_switch {
+            // The mounted successor must expose the switched root through the
+            // same policy surface compare-exchange re-reads: the authority's
+            // external roots and the catalog mapping selected by them.
+            let state = self.require_current_generation()?;
+            let switched = state
+                .persistent_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority.external_roots().iter().any(|root| {
+                        root.object_id == root_id
+                            && root.commit_generation == root_generation
+                            && root.object_kind == FS_ROOT_V1_KIND
+                    })
+                });
+            if !switched
+                || self
+                    .current_fs_root_mapping()
+                    .map_err(|_| StoreError::Corrupt)?
+                    .is_none_or(|mapping| {
+                        mapping.object_id != root_id
+                            || mapping.commit_generation != root_generation
+                    })
+            {
+                return Err(StoreError::Corrupt.into());
+            }
         }
         // Retain the successor trees so the next transaction against this
         // root skips re-reading them. Best effort: any inconsistency simply

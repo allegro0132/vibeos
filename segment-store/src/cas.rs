@@ -19,7 +19,7 @@ use vibeos_segment_format::{
     payload_chain_initial, payload_chain_next, payload_sha256, segment_base_page, BodyDigest,
     Checkpoint, ExtentKind, ExtentRecord, FormatError, Page, PhysicalPointer, PointerValue,
     RecordBinding, SegmentHeader, SegmentSeal, SegmentSummary, StoreUuid, ANCHOR_SEGMENT_NO,
-    DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE, SEGMENT_PAGES,
+    DATA_END_PAGE, DATA_FIRST_PAGE, MAX_EXTENT_PAYLOAD_PAGES, PAGE_SIZE, SEGMENT_PAGES,
     SEGMENT_SEAL_BODY_PAGE, SEGMENT_SEAL_PAGE, SUMMARY_BODY_PAGE, SUMMARY_SEAL_PAGE,
 };
 
@@ -3579,6 +3579,14 @@ impl StagedBlobBatch {
         store.poisoned = true;
     }
 
+    /// The persistent-authority snapshot of the mounted state this batch was
+    /// opened against; a fused publication builds its successor from it.
+    pub(crate) fn base_persistent_authority(
+        &self,
+    ) -> Option<&crate::authority_snapshot::PersistentAuthoritySnapshot> {
+        self.base.persistent_authority.as_ref()
+    }
+
     /// The stable object identity entry `index` binds at publication:
     /// `(object_id, commit_generation)`. Identities are assigned by position,
     /// so they are exact before publication and valid only if it succeeds.
@@ -3746,6 +3754,28 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         batch: StagedBlobBatch,
     ) -> Result<Vec<AuthorizedObject<CasObjectHandle>>, CasStoreError<D::Error>> {
+        self.publish_staged_batch_inner(batch, None).await
+    }
+
+    /// Publish a staged batch together with a persistent-authority snapshot
+    /// under one segment transaction and one checkpoint, exactly like
+    /// [`SegmentStore::publish_staged_object_with_authority`] does for a
+    /// single staged object. The snapshot may name batch objects (by their
+    /// position-predicted identities) as external roots; cold recovery
+    /// resolves them against the same checkpoint's catalog.
+    pub(crate) async fn publish_staged_batch_with_authority(
+        &mut self,
+        batch: StagedBlobBatch,
+        fused: FusedAuthorityPublication,
+    ) -> Result<Vec<AuthorizedObject<CasObjectHandle>>, CasStoreError<D::Error>> {
+        self.publish_staged_batch_inner(batch, Some(fused)).await
+    }
+
+    async fn publish_staged_batch_inner(
+        &mut self,
+        batch: StagedBlobBatch,
+        fused: Option<FusedAuthorityPublication>,
+    ) -> Result<Vec<AuthorizedObject<CasObjectHandle>>, CasStoreError<D::Error>> {
         let StagedBlobBatch {
             base,
             planning,
@@ -3763,6 +3793,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 self.limits,
                 staged,
                 seal,
+                fused.as_ref(),
                 &self.pins,
                 self.defer_commit_readback,
                 Some(&self.verified_scans),
@@ -3804,6 +3835,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
     limits: crate::store::StoreLimits,
     mut staged: Vec<StagedObjectCommit>,
     mut seal: BatchSealState,
+    fused: Option<&FusedAuthorityPublication>,
     pins: &crate::store::SharedStorePinRegistry,
     defer_readback: bool,
     memo: Option<&VerifiedSegmentScans>,
@@ -3903,6 +3935,16 @@ async fn commit_batch_snapshot<D: PageDevice>(
         .checked_add(span_pages(snapshot_len)?)
         .and_then(|spans| spans.checked_add(span_pages(allocation_len).ok()?))
         .ok_or(StoreError::Corrupt)?;
+    if let Some(fused) = fused {
+        // A fused authority snapshot rides this same segment transaction as
+        // one Authority extent; callers pre-check its encoded size.
+        if fused.authority_bytes.len() > MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE {
+            return Err(StoreError::Capacity(CapacityClass::Metadata).into());
+        }
+        metadata_spans = metadata_spans
+            .checked_add(span_pages(fused.authority_bytes.len())?)
+            .ok_or(StoreError::Corrupt)?;
+    }
     drop(seen_new_keys);
     let use_open = state.allocation_version == 2
         && seal.open.as_ref().is_some_and(|open| {
@@ -4063,6 +4105,37 @@ async fn commit_batch_snapshot<D: PageDevice>(
     let snapshot_index = records.len();
     records.push(snapshot_record);
 
+    let authority_index = if let Some(fused) = fused {
+        let record = build_record(
+            state.superblock.binding.store_uuid,
+            metadata_segment_no,
+            metadata_generation,
+            checkpoint_generation,
+            ordinal,
+            relative,
+            ExtentKind::Authority,
+            METADATA_KIND_PERSISTENT_AUTHORITY,
+            0,
+            1,
+            fused.authority_bytes.len() as u64,
+            fused.authority_bytes.len() as u64,
+            0,
+            fused.authority_bytes.len() as u64,
+            payload_sha256(&fused.authority_bytes),
+            payload_sha256(&fused.authority_bytes),
+        )?;
+        relative += record.value.record_span_pages;
+        ordinal += 1;
+        let index = records.len();
+        records.push(record);
+        Some(index)
+    } else {
+        None
+    };
+    let authority_root = authority_index
+        .map(|index| records[index].pointer())
+        .unwrap_or(state.authority_root);
+
     scratch_segment_numbers.sort_unstable();
     scratch_segment_numbers
         .try_reserve_exact(1)
@@ -4133,6 +4206,9 @@ async fn commit_batch_snapshot<D: PageDevice>(
         payload_records.push((&records[*index], bytes.as_slice()));
     }
     payload_records.push((&records[snapshot_index], snapshot_bytes.as_slice()));
+    if let (Some(index), Some(fused)) = (authority_index, fused) {
+        payload_records.push((&records[index], fused.authority_bytes.as_slice()));
+    }
     payload_records.push((&records[allocation_index], allocation_bytes.as_slice()));
     let mut manifest_pointers = Vec::new();
     manifest_pointers
@@ -4257,7 +4333,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
         catalog_root,
-        authority_root: state.authority_root,
+        authority_root,
         allocation_root,
         replay_tail: PhysicalPointer::Null,
     };
@@ -4345,6 +4421,14 @@ async fn commit_batch_snapshot<D: PageDevice>(
             limits.recovery_memory_bytes,
         ));
         expected.push(allocation_bytes.as_slice());
+        if let (Some(_), Some(fused)) = (authority_index, fused) {
+            requests.push((
+                authority_root,
+                ExtentKind::Authority,
+                limits.recovery_memory_bytes,
+            ));
+            expected.push(fused.authority_bytes.as_slice());
+        }
         let observed = read_pointer_payloads(
             &verify_device,
             state.superblock.binding.store_uuid,
@@ -4384,12 +4468,18 @@ async fn commit_batch_snapshot<D: PageDevice>(
         replay_count: 0,
         catalog_root,
         replay_tail: PhysicalPointer::Null,
-        authority_root: state.authority_root,
+        authority_root,
         allocation_root,
         allocation,
         allocation_version,
-        persistent_roots: state.persistent_roots.clone(),
-        persistent_authority: state.persistent_authority.clone(),
+        persistent_roots: match fused {
+            Some(fused) => Some(fused.persistent_roots.clone()),
+            None => state.persistent_roots.clone(),
+        },
+        persistent_authority: match fused {
+            Some(fused) => Some(fused.persistent_authority.clone()),
+            None => state.persistent_authority.clone(),
+        },
         catalog: state.catalog.clone(),
         cas: Some(CasMountedState {
             objects: snapshot.objects,

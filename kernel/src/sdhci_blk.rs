@@ -283,6 +283,50 @@ pub(crate) static IO_BLOCKS_READ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static IO_BLOCKS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static IO_BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a blind CMD25 write burst larger than the session-qualified size is
+/// read back and compared before that size is trusted.
+///
+/// On by default: the read-back is this integration's guard against a silent
+/// FIFO-overflow that would corrupt data without any error. Each re-qualified
+/// burst therefore costs a full read of the just-written range. Turning it off
+/// removes that read (roughly halving write I/O for workloads whose burst size
+/// keeps changing) at the cost of the guard, so it is an operator opt-in for
+/// throughput on media already proven stable this session. The one-time write
+/// *mode* probe is unaffected and always verifies.
+static WRITE_READBACK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable read-back qualification of large blind write bursts.
+pub fn set_write_readback(enabled: bool) {
+    WRITE_READBACK_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether large-burst write read-back is currently enabled.
+pub fn write_readback_enabled() -> bool {
+    WRITE_READBACK_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Snapshot of the SDHCI I/O counters: (ops, blocks read, blocks written,
+/// busy milliseconds). Lets an operator attribute a single high-level
+/// operation's cost to reads, writes, or per-command busy time.
+pub fn io_counters() -> (u64, u64, u64, u64) {
+    let busy_ms = IO_BUSY_TICKS.load(Ordering::Relaxed) / (crate::platform::TIMEBASE_HZ / 1000);
+    (
+        IO_OPS.load(Ordering::Relaxed),
+        IO_BLOCKS_READ.load(Ordering::Relaxed),
+        IO_BLOCKS_WRITTEN.load(Ordering::Relaxed),
+        busy_ms,
+    )
+}
+
+/// Zero the I/O counters so the next high-level operation can be measured in
+/// isolation.
+pub fn reset_io_counters() {
+    IO_OPS.store(0, Ordering::Relaxed);
+    IO_BLOCKS_READ.store(0, Ordering::Relaxed);
+    IO_BLOCKS_WRITTEN.store(0, Ordering::Relaxed);
+    IO_BUSY_TICKS.store(0, Ordering::Relaxed);
+}
+
 fn with_card_at<T>(
     expected_epoch: u64,
     operation: impl FnOnce(&mut Card) -> Result<T, BlockError>,
@@ -393,16 +437,21 @@ enum WriteBatching {
     Disabled,
 }
 
-/// (apply write-stall workarounds first, protocol shape) probe ladder: one
-/// baseline attempt reproduces the known stall, then the host workarounds are
-/// applied once and every protocol shape is retried under them.
-const WRITE_MODE_LADDER: [(bool, MultiBlockWriteMode); 6] = [
-    (false, MultiBlockWriteMode::AutoCmd12),
+/// (apply write-stall workarounds first, protocol shape) probe ladder.
+///
+/// `BlindPio` under the host write-stall workarounds is the only shape the
+/// CV1800B has ever completed on real hardware, so it leads the ladder: the
+/// workarounds are applied up front and the proven mode is tried first, which
+/// keeps a healthy session from spending four full data-transfer timeouts
+/// rediscovering it on every first batched write. The remaining standard
+/// shapes stay as ordered fallbacks in case a different card or a firmware
+/// revision ever accepts one of them.
+const WRITE_MODE_LADDER: [(bool, MultiBlockWriteMode); 5] = [
+    (true, MultiBlockWriteMode::BlindPio),
     (true, MultiBlockWriteMode::AutoCmd12),
     (true, MultiBlockWriteMode::ManualCmd12),
     (true, MultiBlockWriteMode::OpenEnded),
     (true, MultiBlockWriteMode::SetBlockCount),
-    (true, MultiBlockWriteMode::BlindPio),
 ];
 
 struct HostState {
@@ -820,7 +869,13 @@ impl Card {
                 Ok(()) => {
                     let blocks = (chunk.len() / 512) as u32;
                     if blocks > self.qualified_blind_blocks {
-                        if self.verify_written(logical_first + (offset / 512) as u64, chunk) {
+                        if !write_readback_enabled() {
+                            // Read-back disabled by the operator: trust the
+                            // burst at this size without reading it back. Trades
+                            // the silent-corruption guard for roughly half the
+                            // write I/O.
+                            self.qualified_blind_blocks = blocks;
+                        } else if self.verify_written(logical_first + (offset / 512) as u64, chunk) {
                             self.qualified_blind_blocks = blocks;
                             crate::uart::_print(format_args!(
                                 "  sdhci: blind CMD25 burst x{blocks} qualified by read-back\n"

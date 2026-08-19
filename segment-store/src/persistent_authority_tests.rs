@@ -2073,3 +2073,225 @@ fn control_inline_object_then_grant_same_flow() {
     ))
     .unwrap();
 }
+
+/// Seed one committed and switched generation-1 namespace root on a fresh
+/// authority-initialized store, exactly like the compare-exchange matrix.
+fn seed_fs_root_switch_fixture() -> (AuthorityFaultDevice, BTreeMap<u64, Page>) {
+    let seed_device = AuthorityFaultDevice::blank();
+    let (runtime, _quota, provisioner) = governed_fs_runtime();
+    let mut seed = SegmentStore::new_with_runtime_context(seed_device.clone(), limits(), runtime);
+    block_on(seed.format(authority_fault_options())).unwrap();
+    let maintenance = seed.provision_maintenance_root(&provisioner).unwrap();
+    block_on(seed.import_persistent_authority(&maintenance, import(&format_records(), &[])))
+        .unwrap();
+    block_on(seed.commit_fs_transaction_with_root_switch_for_maintenance(
+        &maintenance,
+        None,
+        FAULT_FS_NAMESPACE,
+        1,
+        2,
+        1,
+        &[],
+        &[],
+        0,
+    ))
+    .unwrap();
+    drop(seed);
+    seed_device.power_cycle();
+    let seeded = seed_device.durable_image();
+    (seed_device, seeded)
+}
+
+#[test]
+fn fused_fs_root_switch_publishes_one_checkpoint_and_cold_recovers() {
+    let (device, _seeded) = seed_fs_root_switch_fixture();
+    let (runtime, _quota, provisioner) = governed_fs_runtime();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(store.mount()).unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let previous = block_on(store.recover_fs_root(FAULT_FS_NAMESPACE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(previous.generation(), 1);
+
+    // A stale expectation declines cleanly before any staging: the store
+    // stays mounted and the durable root is untouched.
+    assert!(matches!(
+        block_on(store.commit_fs_transaction_with_root_switch_for_maintenance(
+            &maintenance,
+            Some(&previous),
+            FAULT_FS_NAMESPACE,
+            8,
+            2,
+            1,
+            &[],
+            &[],
+            7,
+        )),
+        Err(crate::FsRootPublishError::Conflict)
+    ));
+    assert!(!store.needs_remount());
+
+    // The complete mkdir-equivalent — tree nodes, namespace root, and the
+    // persistent root switch — advances exactly one checkpoint generation.
+    let before = store.info().unwrap();
+    let dirent_inputs = [crate::FsNodeEntryInput {
+        key: b"dirent-fused",
+        value: b"target-fused",
+        child: None,
+        data: None,
+    }];
+    let root = block_on(store.commit_fs_transaction_with_root_switch_for_maintenance(
+        &maintenance,
+        Some(&previous),
+        FAULT_FS_NAMESPACE,
+        2,
+        2,
+        1,
+        &[],
+        &dirent_inputs,
+        1,
+    ))
+    .unwrap();
+    let after = store.info().unwrap();
+    assert_eq!(
+        after.generation,
+        before.generation + 1,
+        "tree batch and root switch must ride one checkpoint"
+    );
+    assert_eq!(root.object_kind(), crate::FS_ROOT_V1_KIND);
+    let switched = block_on(store.recover_fs_root(FAULT_FS_NAMESPACE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(switched.generation(), 2);
+    drop(store);
+
+    // Cold recovery selects the switched root through the fused authority
+    // snapshot and resolves its trees.
+    device.power_cycle();
+    let (runtime, _quota, provisioner) = governed_fs_runtime();
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(cold.mount()).unwrap();
+    let recovered = block_on(cold.recover_fs_root(FAULT_FS_NAMESPACE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.generation(), 2);
+    let cold_maintenance = cold.provision_maintenance_root(&provisioner).unwrap();
+    let entries = block_on(cold.read_fs_tree(&recovered, FsTreeKind::Dirent, 64)).unwrap();
+    assert!(entries.iter().any(|entry| entry.key == b"dirent-fused"));
+    // The switched store accepts the next fused transaction.
+    block_on(cold.commit_fs_transaction_with_root_switch_for_maintenance(
+        &cold_maintenance,
+        Some(&recovered),
+        FAULT_FS_NAMESPACE,
+        3,
+        2,
+        1,
+        &[],
+        &dirent_inputs,
+        2,
+    ))
+    .unwrap();
+}
+
+#[test]
+fn fused_fs_root_switch_is_power_cut_atomic_at_every_mutation() {
+    let (_seed_device, seeded) = seed_fs_root_switch_fixture();
+
+    let dirent_inputs = [crate::FsNodeEntryInput {
+        key: b"dirent-atomic",
+        value: b"target-atomic",
+        child: None,
+        data: None,
+    }];
+    macro_rules! run_switch {
+        ($store:expr, $maintenance:expr, $previous:expr) => {
+            Box::pin($store.commit_fs_transaction_with_root_switch_for_maintenance(
+                $maintenance,
+                Some($previous),
+                FAULT_FS_NAMESPACE,
+                2,
+                2,
+                1,
+                &[],
+                &dirent_inputs,
+                1,
+            ))
+        };
+    }
+    let prepare = |device: &AuthorityFaultDevice| {
+        let (runtime, _quota, provisioner) = governed_fs_runtime();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+        block_on(store.mount()).unwrap();
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let previous = block_on(store.recover_fs_root(FAULT_FS_NAMESPACE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.generation(), 1);
+        (store, maintenance, previous)
+    };
+
+    let probe_device = AuthorityFaultDevice::from_durable(seeded.clone());
+    let (mut probe, probe_maintenance, probe_previous) = prepare(&probe_device);
+    probe_device.reset_mutation_count();
+    block_on(run_switch!(&mut probe, &probe_maintenance, &probe_previous)).unwrap();
+    let mutation_count = probe_device.mutation_count();
+    assert!(mutation_count > 0);
+    drop(probe);
+
+    let failure_actions = [
+        AuthorityFaultAction::FailNotSubmitted,
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::None),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Visible),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Durable),
+    ];
+    let cancel_actions = [
+        AuthorityFaultAction::Pending(AuthorityEffect::None),
+        AuthorityFaultAction::Pending(AuthorityEffect::Visible),
+        AuthorityFaultAction::Pending(AuthorityEffect::Durable),
+    ];
+    let mut old = 0;
+    let mut new = 0;
+    for mutation in 0..mutation_count {
+        for action in failure_actions {
+            let case =
+                alloc::format!("fused root switch mutation {mutation}/{mutation_count}, {action:?}");
+            let device = AuthorityFaultDevice::from_durable(seeded.clone());
+            let (mut store, maintenance, previous) = prepare(&device);
+            device.arm(mutation, action);
+            assert!(
+                block_on(run_switch!(&mut store, &maintenance, &previous)).is_err(),
+                "{case}: injected fault was not reached"
+            );
+            drop(store);
+            match cold_fs_generation(device, &case) {
+                1 => old += 1,
+                2 => new += 1,
+                _ => unreachable!(),
+            }
+        }
+        for action in cancel_actions {
+            let case =
+                alloc::format!("fused root switch mutation {mutation}/{mutation_count}, {action:?}");
+            let device = AuthorityFaultDevice::from_durable(seeded.clone());
+            let (mut store, maintenance, previous) = prepare(&device);
+            device.arm(mutation, action);
+            let mut operation = run_switch!(&mut store, &maintenance, &previous);
+            assert!(
+                matches!(poll_once(operation.as_mut()), Poll::Pending),
+                "{case}"
+            );
+            drop(operation);
+            drop(store);
+            match cold_fs_generation(device, &case) {
+                1 => old += 1,
+                2 => new += 1,
+                _ => unreachable!(),
+            }
+        }
+    }
+    assert!(
+        old > 0 && new > 0,
+        "fault matrix must recover both old and new roots"
+    );
+}

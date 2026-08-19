@@ -135,7 +135,7 @@ def run_selftest():
         try:
             verify_region(image_file, 0, 4 * 1024 * 1024 // SECTOR_SIZE)
         except Violation as error:
-            if "expected 1048576" not in str(error):
+            if f"expected {EXPECTED_DATA_SECTORS}" not in str(error):
                 raise RuntimeError(
                     f"selftest 'old-4MiB-layout' failed for the wrong reason: {error}"
                 ) from error
@@ -169,7 +169,7 @@ def run_selftest():
             image_file,
             partition_bytes - 1,
             b"\x01",
-            "logical sector 131071",
+            f"logical sector {EXPECTED_DATA_SECTORS - 1}",
         )
 
         image_file.truncate(partition_bytes - 1)

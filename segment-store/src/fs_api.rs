@@ -5,18 +5,22 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use vibeos_segment_format::PAGE_SIZE;
+use vibeos_segment_format::{DATA_END_PAGE, DATA_FIRST_PAGE, PAGE_SIZE};
 
 use crate::authority::AuthorizedObject;
+use crate::authority_snapshot::{
+    encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
+};
 use crate::cas::{
     recover_persistent_cas_object, recover_promotable_cas_object, CasObjectHandle, CasStoreError,
+    FusedAuthorityPublication,
 };
 use crate::cas_codec::{ObjectMapping, REFERENCE_CODEC_FS_V1, REFERENCE_CODEC_RAW};
 use crate::device::PageDevice;
 use crate::gc::GcStoreError;
 use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
 use crate::persistent_authority::PersistentAuthorityError;
-use crate::root_codec::PersistentRootEntry;
+use crate::root_codec::{PersistentRootEntry, PersistentRootSet};
 use crate::fs_codec::{decode_fs_data_node_v1_prefix, FsDataNodeMeta};
 use crate::{
     decode_fs_btree_node_v1, encode_fs_btree_node_v1,
@@ -32,6 +36,62 @@ pub struct FsNodeEntryInput<'a> {
     pub value: &'a [u8],
     pub child: Option<&'a AuthorizedObject<CasObjectHandle>>,
     pub data: Option<&'a FsPersistentData>,
+}
+
+fn structural_to_root_publish<E>(error: FsStructuralCommitError<E>) -> FsRootPublishError<E> {
+    match error {
+        FsStructuralCommitError::Store(error) => FsRootPublishError::Store(error),
+        FsStructuralCommitError::Gc(error) => FsRootPublishError::Gc(error),
+        FsStructuralCommitError::Codec(error) => FsRootPublishError::Codec(error),
+        FsStructuralCommitError::InvalidChild => FsRootPublishError::InvalidRoot,
+    }
+}
+
+/// Build the fused successor policy for one namespace-root switch: the
+/// current authority snapshot relocated to the publishing checkpoint with its
+/// namespace-root external entry replaced by the batch's position-predicted
+/// root, plus the derived persistent root set — computed exactly as cold
+/// recovery derives it from the authority snapshot (object bindings plus
+/// external roots, sorted by object id).
+fn build_fs_root_switch_authority(
+    current: &PersistentAuthoritySnapshot,
+    root_id: u128,
+    root_generation: u64,
+) -> Result<FusedAuthorityPublication, AuthoritySnapshotError> {
+    let mut external_roots: Vec<PersistentRootEntry> = current
+        .external_roots()
+        .iter()
+        .copied()
+        .filter(|root| root.object_kind != FS_ROOT_V1_KIND)
+        .collect();
+    external_roots.push(PersistentRootEntry {
+        object_id: root_id,
+        commit_generation: root_generation,
+        object_kind: FS_ROOT_V1_KIND,
+    });
+    external_roots.sort_unstable_by_key(|root| root.object_id);
+    let snapshot = current
+        .relocated(root_generation)?
+        .with_external_roots(external_roots)?;
+    let authority_bytes = encode_persistent_authority_snapshot(&snapshot)?;
+    let mut root_entries: Vec<PersistentRootEntry> = snapshot
+        .objects
+        .iter()
+        .map(|binding| PersistentRootEntry {
+            object_id: binding.v2_object_id,
+            commit_generation: binding.commit_generation,
+            object_kind: binding.object_kind,
+        })
+        .collect();
+    root_entries.extend_from_slice(snapshot.external_roots());
+    root_entries.sort_unstable_by_key(|entry| entry.object_id);
+    let persistent_roots = PersistentRootSet::new(root_generation, root_entries)
+        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    Ok(FusedAuthorityPublication {
+        authority_bytes,
+        persistent_authority: snapshot,
+        persistent_roots,
+    })
 }
 
 #[derive(Debug)]
@@ -768,14 +828,26 @@ impl<D: PageDevice> SegmentStore<D> {
         // interrupted staged publication.)
         {
             let state = self.require_current_generation()?;
-            // Each chunk's encoded blob packs about three 1 MiB extents per
-            // 4 MiB segment; one metadata segment publishes the batch.
-            let mut needed = 1_u64;
+            // Small chunks pack many record spans per shared scratch
+            // segment; larger chunks stream about three 1 MiB extents per
+            // 4 MiB segment. Two extra segments cover per-entry admission
+            // headroom and a dedicated metadata segment when needed.
+            let mut needed = 2_u64;
+            let mut pooled_pages = 0_u64;
             for bytes in chunks {
-                needed = needed
-                    .checked_add(1 + bytes.len() as u64 / (3 * 1024 * 1024))
-                    .ok_or(StoreError::Corrupt)?;
+                if bytes.len() <= 192 * 1024 {
+                    pooled_pages = pooled_pages
+                        .checked_add((bytes.len() as u64).div_ceil(PAGE_SIZE as u64) + 8)
+                        .ok_or(StoreError::Corrupt)?;
+                } else {
+                    needed = needed
+                        .checked_add(1 + bytes.len() as u64 / (3 * 1024 * 1024))
+                        .ok_or(StoreError::Corrupt)?;
+                }
             }
+            needed = needed
+                .checked_add(pooled_pages.div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE)))
+                .ok_or(StoreError::Corrupt)?;
             let floor = u64::from(state.cleaner_reserve_segments)
                 .saturating_add(u64::from(crate::store::ROOT_POLICY_HEADROOM_SEGMENTS));
             let free = state
@@ -960,6 +1032,154 @@ impl<D: PageDevice> SegmentStore<D> {
         inode_entries: &[FsNodeEntryInput<'_>],
         dirent_entries: &[FsNodeEntryInput<'_>],
     ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+        self.commit_fs_transaction_for_maintenance_inner(
+            maintenance,
+            previous,
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_entries,
+            dirent_entries,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::commit_fs_transaction_for_maintenance`] plus the persistent
+    /// root switch of [`Self::compare_exchange_fs_root_for_maintenance`], as
+    /// one segment transaction and one checkpoint: the successor authority
+    /// snapshot naming the freshly staged namespace root publishes in the
+    /// same fused batch. Every declinable precondition — root expectation,
+    /// initialized authority, snapshot size, quota admission — is checked
+    /// while the store is still cleanly mounted; when the successor snapshot
+    /// cannot ride a single authority extent the method transparently falls
+    /// back to the two-checkpoint sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_fs_transaction_with_root_switch_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_entries: &[FsNodeEntryInput<'_>],
+        dirent_entries: &[FsNodeEntryInput<'_>],
+        expected_generation: u64,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsRootPublishError<D::Error>> {
+        // The new root's declared generation must be the strict successor of
+        // the expectation, exactly as compare-exchange enforces after decode.
+        if Some(namespace_generation) != expected_generation.checked_add(1) {
+            return Err(FsRootPublishError::Conflict);
+        }
+        self.expect_current_fs_root(namespace_uuid, expected_generation)
+            .await?;
+        let state = self.require_current_generation()?;
+        let current_authority = state
+            .persistent_authority
+            .as_ref()
+            .ok_or(FsRootPublishError::InvalidRoot)?;
+        // The fused publication carries the successor snapshot as one
+        // Authority extent. Adding or replacing the namespace-root entry
+        // changes the encoded length by at most one root-entry record.
+        let fused_fits = encode_persistent_authority_snapshot(current_authority)
+            .map_err(|_| FsRootPublishError::InvalidRoot)?
+            .len()
+            .checked_add(64)
+            .is_some_and(|len| {
+                len <= vibeos_segment_format::MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE
+            });
+        // Quota admission is unchanged by an external-root replacement, but
+        // run the same pure preflight as the two-checkpoint path so a
+        // divergent quota table declines before any staging.
+        self.preflight_persistent_quota(
+            current_authority.principals(),
+            &current_authority.objects,
+        )
+        .map_err(FsRootPublishError::Authority)?;
+        if !fused_fits {
+            let root = self
+                .commit_fs_transaction_for_maintenance_inner(
+                    maintenance,
+                    previous,
+                    namespace_uuid,
+                    namespace_generation,
+                    next_file_id,
+                    root_file_id,
+                    inode_entries,
+                    dirent_entries,
+                    false,
+                )
+                .await
+                .map_err(structural_to_root_publish)?;
+            self.compare_exchange_fs_root_for_maintenance(
+                maintenance,
+                namespace_uuid,
+                expected_generation,
+                &root,
+            )
+            .await?;
+            return Ok(root);
+        }
+        self.commit_fs_transaction_for_maintenance_inner(
+            maintenance,
+            previous,
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_entries,
+            dirent_entries,
+            true,
+        )
+        .await
+        .map_err(structural_to_root_publish)
+    }
+
+    /// Validate that the currently committed namespace root matches the
+    /// compare-exchange expectation, without mutating anything.
+    async fn expect_current_fs_root(
+        &self,
+        namespace_uuid: u128,
+        expected_generation: u64,
+    ) -> Result<(), FsRootPublishError<D::Error>> {
+        match self.current_fs_root_mapping()? {
+            None if expected_generation == 0 => Ok(()),
+            Some(mapping) => {
+                let current = recover_persistent_cas_object(
+                    self.require_current_generation()?
+                        .superblock
+                        .binding
+                        .store_uuid,
+                    mapping,
+                );
+                let decoded =
+                    crate::decode_fs_root_v1(&self.read_fs_object_bytes(&current).await?)?;
+                if decoded.namespace_uuid != namespace_uuid
+                    || decoded.commit_generation != expected_generation
+                {
+                    return Err(FsRootPublishError::Conflict);
+                }
+                Ok(())
+            }
+            None => Err(FsRootPublishError::Conflict),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_fs_transaction_for_maintenance_inner(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_entries: &[FsNodeEntryInput<'_>],
+        dirent_entries: &[FsNodeEntryInput<'_>],
+        fused_root_switch: bool,
+    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
         // The lease proves maintenance authority for this trusted-service
         // write path, exactly like the staged chunk batch.
         let lease = self
@@ -1027,14 +1247,22 @@ impl<D: PageDevice> SegmentStore<D> {
         // Ensure capacity before staging anything: nothing is consumed while
         // the store stays mounted, so a shortfall may collect garbage and
         // re-check like the sequential maintenance commit did per node.
-        // Every node payload is bounded by `FS_OBJECT_MAX_LEN`, so each
-        // staged entry takes one scratch segment; the root and the batch's
-        // metadata segment complete the appetite.
+        // Every node payload is bounded by `FS_OBJECT_MAX_LEN` (one page),
+        // so each staged entry — the root included — packs a nine-page
+        // record span into the batch's shared scratch segments. Two extra
+        // segments cover the per-entry admission headroom and a metadata
+        // segment when the records do not fit the shared one.
         let staged_nodes = plan
             .iter()
             .filter(|node| matches!(node, PlannedFsNode::Staged { .. }))
             .count() as u64;
-        let needed = staged_nodes.checked_add(2).ok_or(StoreError::Corrupt)?;
+        let entry_span_pages = (FS_OBJECT_MAX_LEN as u64).div_ceil(PAGE_SIZE as u64) + 8;
+        let shared_segments = staged_nodes
+            .checked_add(1)
+            .and_then(|entries| entries.checked_mul(entry_span_pages))
+            .map(|pages| pages.div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE)))
+            .ok_or(StoreError::Corrupt)?;
+        let needed = shared_segments.checked_add(2).ok_or(StoreError::Corrupt)?;
         let maximum_cycles = self.info()?.admitted_segments;
         let mut cycles = 0_u64;
         loop {
@@ -1176,7 +1404,29 @@ impl<D: PageDevice> SegmentStore<D> {
             .stage_blob_in_batch(&mut batch, FS_ROOT_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
             .await?;
         let root_index = batch.staged_len() - 1;
-        let published = self.publish_staged_batch(batch).await?;
+        let published = if fused_root_switch {
+            // Every declinable admission ran in the public wrapper while the
+            // store was cleanly mounted; a failure here is indistinguishable
+            // from any other mid-batch fault and poisons the store the same
+            // way. The successor snapshot replaces the namespace-root
+            // external entry with the batch's position-predicted root, whose
+            // catalog mapping publishes in this same checkpoint.
+            let fused = build_fs_root_switch_authority(
+                batch
+                    .base_persistent_authority()
+                    .ok_or(FsStructuralCommitError::InvalidChild)?,
+                root_id,
+                root_generation,
+            )
+            .map_err(|_| FsStructuralCommitError::Store(CasStoreError::WriterFailed))?;
+            // Same ordering contract as every fused authority publication:
+            // the pure quota installation precedes the publication mutation.
+            self.install_persistent_quota_snapshot(&fused.persistent_authority)
+                .map_err(|_| FsStructuralCommitError::Store(CasStoreError::WriterFailed))?;
+            self.publish_staged_batch_with_authority(batch, fused).await?
+        } else {
+            self.publish_staged_batch(batch).await?
+        };
         let object = published
             .into_iter()
             .nth(root_index)
@@ -1190,6 +1440,33 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| StoreError::Corrupt)?;
         if key.object_id() != root_id || key.commit_generation() != root_generation {
             return Err(StoreError::Corrupt.into());
+        }
+        if fused_root_switch {
+            // The mounted successor must expose the switched root through the
+            // same policy surface compare-exchange re-reads: the authority's
+            // external roots and the catalog mapping selected by them.
+            let state = self.require_current_generation()?;
+            let switched = state
+                .persistent_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority.external_roots().iter().any(|root| {
+                        root.object_id == root_id
+                            && root.commit_generation == root_generation
+                            && root.object_kind == FS_ROOT_V1_KIND
+                    })
+                });
+            if !switched
+                || self
+                    .current_fs_root_mapping()
+                    .map_err(|_| StoreError::Corrupt)?
+                    .is_none_or(|mapping| {
+                        mapping.object_id != root_id
+                            || mapping.commit_generation != root_generation
+                    })
+            {
+                return Err(StoreError::Corrupt.into());
+            }
         }
         // Retain the successor trees so the next transaction against this
         // root skips re-reading them. Best effort: any inconsistency simply
@@ -2569,6 +2846,184 @@ mod tests {
         assert_eq!(after.allocated_segments, before.allocated_segments + 1);
     }
 
+    /// Format, publish an empty namespace root, and run one collection round
+    /// so the store carries the V2 allocation map — the state any production
+    /// store reaches after its first growth or collection.
+    fn format_v2(device: TestDevice) -> SegmentStore<TestDevice> {
+        let mut store = format(device);
+        let root = empty_root(&mut store, 1, 2);
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+        // Dead weight so a yielding compaction exists.
+        for index in 0..3_u8 {
+            drop(
+                block_on(store.commit_fs_data_chunk(None, &alloc::vec![index + 0x60; 8192]))
+                    .unwrap(),
+            );
+        }
+        block_on(store.collect_garbage()).unwrap();
+        store
+    }
+
+    #[test]
+    fn staged_batch_packs_small_blobs_and_metadata_into_one_segment() {
+        let device = TestDevice::blank(64);
+        let mut store = format_v2(device.clone());
+        let before = store.info().unwrap();
+        let payloads: Vec<Vec<u8>> = (0..6_u8)
+            .map(|index| alloc::vec![index + 1; 8192 + usize::from(index)])
+            .collect();
+        let mut batch = store.begin_staged_batch().unwrap();
+        for payload in &payloads {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                payload,
+            ))
+            .unwrap();
+        }
+        // All staged entries pack into the first entry's scratch segment.
+        assert_eq!(batch.staged_segment_count(), 1);
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        let after = store.info().unwrap();
+        // The manifests, snapshot, and allocation records join the shared
+        // segment, so six small objects consume exactly one segment.
+        assert_eq!(after.allocated_segments, before.allocated_segments + 1);
+        assert_eq!(after.generation, before.generation + 1);
+        for (object, payload) in published.iter().zip(&payloads) {
+            assert_eq!(object.exact_len(), payload.len() as u64);
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..4096]);
+        }
+        drop(store);
+
+        // The packed segment cold-recovers: every object resolves and reads
+        // through a fresh mount of the same media.
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        assert_eq!(cold.info().unwrap().object_count, after.object_count);
+        let mut batch = cold.begin_staged_batch().unwrap();
+        block_on(cold.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &alloc::vec![0x7e_u8; 512],
+        ))
+        .unwrap();
+        let published = block_on(cold.publish_staged_batch(batch)).unwrap();
+        let chunk = block_on(cold.get_blob_chunk(&published[0], 0)).unwrap();
+        assert_eq!(chunk.bytes, alloc::vec![0x7e_u8; 512]);
+    }
+
+    #[test]
+    fn staged_batch_mixes_large_and_packed_blobs_with_dedup() {
+        let device = TestDevice::blank(64);
+        let mut store = format(device.clone());
+        // Commit one blob first so a batch entry deduplicates against it.
+        let committed = alloc::vec![0x11_u8; 8192];
+        let mut batch = store.begin_staged_batch().unwrap();
+        block_on(store.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &committed,
+        ))
+        .unwrap();
+        block_on(store.publish_staged_batch(batch)).unwrap();
+
+        // One batch mixes: packed small, streaming large (over the sink
+        // limit, so it claims whole segments), a dedup of committed content,
+        // and another packed small after the large one.
+        let small_a = alloc::vec![0x22_u8; 4096];
+        let large = (0..1024 * 1024_usize + 700)
+            .map(|index| (index * 13) as u8)
+            .collect::<Vec<u8>>();
+        let small_b = alloc::vec![0x33_u8; 2048];
+        let payloads = [&small_a, &large, &committed, &small_b];
+        let mut batch = store.begin_staged_batch().unwrap();
+        for payload in payloads {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                payload,
+            ))
+            .unwrap();
+        }
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        assert_eq!(published.len(), 4);
+        for (object, payload) in published.iter().zip(payloads) {
+            assert_eq!(object.exact_len(), payload.len() as u64);
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..payload.len().min(4096)]);
+        }
+        drop(store);
+
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        let mut batch = cold.begin_staged_batch().unwrap();
+        block_on(cold.stage_blob_in_batch(
+            &mut batch,
+            FS_DATA_V1_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW,
+            &large,
+        ))
+        .unwrap();
+        // Identical large content deduplicates against the cold-recovered
+        // mapping, proving the packed store's manifests authenticate.
+        assert_eq!(batch.staged_segment_count(), 0);
+        let published = block_on(cold.publish_staged_batch(batch)).unwrap();
+        let chunk = block_on(cold.get_blob_chunk(&published[0], 1)).unwrap();
+        assert_eq!(chunk.bytes, large[4096..8192]);
+    }
+
+    #[test]
+    fn staged_batch_metadata_overflow_claims_a_dedicated_segment() {
+        let device = TestDevice::blank(64);
+        let mut store = format_v2(device.clone());
+        let before = store.info().unwrap();
+        // Fill two shared segments almost exactly: each ~250 KiB blob packs
+        // to a 71-page record span, fourteen per 1018-page segment. After 28
+        // entries the second shared segment keeps only a couple dozen free
+        // pages, so the batch's metadata records cannot join it and must
+        // claim a dedicated metadata segment exactly like the unpacked path.
+        let payloads: Vec<Vec<u8>> = (0..28_u8)
+            .map(|index| alloc::vec![index + 1; 250 * 1024])
+            .collect();
+        let mut batch = store.begin_staged_batch().unwrap();
+        for payload in &payloads {
+            block_on(store.stage_blob_in_batch(
+                &mut batch,
+                FS_DATA_V1_KIND,
+                crate::cas_codec::REFERENCE_CODEC_RAW,
+                payload,
+            ))
+            .unwrap();
+        }
+        let shared_segments = batch.staged_segment_count() as u64;
+        assert!(
+            (2..=3).contains(&shared_segments),
+            "expected ~2 shared segments, got {shared_segments}",
+        );
+        let published = block_on(store.publish_staged_batch(batch)).unwrap();
+        let after = store.info().unwrap();
+        // The shared segments plus one dedicated metadata segment — far
+        // below the unpacked one-segment-per-blob-plus-metadata appetite.
+        assert_eq!(
+            after.allocated_segments,
+            before.allocated_segments + shared_segments + 1
+        );
+        for (object, payload) in published.iter().zip(&payloads) {
+            let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
+            assert_eq!(chunk.bytes, payload[..4096]);
+        }
+        drop(store);
+
+        let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+        block_on(cold.mount()).unwrap();
+        assert_eq!(cold.info().unwrap().object_count, after.object_count);
+    }
+
     #[test]
     fn gc_after_batched_staging_preserves_the_id_high_water() {
         let device = TestDevice::blank(64);
@@ -2598,7 +3053,14 @@ mod tests {
 
         // Collection must proceed (not fail closed) and keep the media
         // high-water durable across destructive rounds and a cold mount.
-        for _ in 0..3 {
+        // Staging now packs small blobs into shared segments, so a freshly
+        // staged store is already compact; feed every destructive round
+        // enough dropped (dead) objects that a yielding compaction exists.
+        for round in 0..3_u8 {
+            for extra in 0..3_u8 {
+                let payload = alloc::vec![0x40 + round * 3 + extra; 8192];
+                drop(block_on(store.commit_fs_data_chunk(None, &payload)).unwrap());
+            }
             block_on(store.collect_garbage()).unwrap();
         }
         drop(store);

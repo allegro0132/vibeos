@@ -81,6 +81,17 @@ pub const MMU: MmuDescription = MmuDescription {
     device_level0_tables: 4,
 };
 
+/// Board hardware-reset fallback. QEMU's OpenSBI performs a real SBI SRST
+/// reset, so the SBI reboot ecall never returns here and this is unreachable in
+/// practice; it exists to satisfy the same `platform::cold_reset()` contract
+/// the CV1800B board uses for its no-op-SRST firmware. If it is ever reached,
+/// spin rather than pretend to reset.
+pub fn cold_reset() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 pub struct Board;
 
 impl BoardContract for Board {

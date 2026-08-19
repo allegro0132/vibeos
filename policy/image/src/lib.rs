@@ -106,6 +106,6 @@ mod tests {
     #[cfg(feature = "milkv-duo-sd")]
     #[test]
     fn duo_data_slice_does_not_overflow() {
-        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(393_217));
+        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(1_310_721));
     }
 }

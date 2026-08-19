@@ -535,13 +535,23 @@ failures):
   The loop is now run-aware, and the file-tree entry points re-establish the
   cold boot proof after an invalidation instead of failing forever.
 
-Remaining, well-characterized issue: each GC round's mark walk is still
-O(live objects); with the fixes it runs every ~15–30 commits instead of
-every commit, so it appears as an occasional sub-second (QEMU) pause that
-grows slowly with tree size. Fully flattening it requires packing multiple
-small objects per 4 MiB segment at staging time (the on-media format
-already supports multi-extent segments; one-object-per-segment is writer
-placement behavior).
+The former remaining issue — one small object per 4 MiB segment at staging
+time forcing a full O(live-objects) GC mark walk every ~15–30 commits — is
+fixed: staged batches now pack every small (≤256 KiB encoded) blob into a
+shared scratch segment whose header/descriptors/summary/seal are deferred
+until the segment closes, and the publication's metadata records (manifests,
+CAS snapshot, allocation map) join that same segment when they fit. A small
+fused file transaction (`mkdir`, small `write`) therefore consumes one
+segment instead of one per staged node plus a metadata segment, so the
+free-segment floor that triggers a mark walk is reached an order of
+magnitude less often. The mark walk itself is still O(live objects) per
+round; only its frequency changed. Large blobs keep whole-segment
+placement, deduplicated entries roll the shared cursor back, and the
+segment-seal chain's strictly-increasing-generation invariant is preserved
+by closing the shared segment before any younger segment seals. The packed
+layout is byte-compatible with what the GC compactor already writes, and is
+exercised by the staged-batch crash matrix, the packing unit tests, and the
+file-tree QEMU case's powered-off verifier.
 - One spontaneous board reset was observed under sustained write load
   (possible supply dip; worth checking the Duo's power source). Data written
   minutes before the reset survived except one subtree, consistent with the

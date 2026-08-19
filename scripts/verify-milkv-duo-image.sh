@@ -16,7 +16,9 @@ import sys
 import tempfile
 
 SECTOR_SIZE = 512
-EXPECTED_DATA_SECTORS = 64 * 1024 * 1024 // SECTOR_SIZE
+# 512 MiB, matching policy/image BLOCK_DATA_SLICE for milkv-duo-sd
+# (first_sector 262_145, sector_count 1_048_576).
+EXPECTED_DATA_SECTORS = 512 * 1024 * 1024 // SECTOR_SIZE
 SEED_SECTOR = 7
 SEED = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
 EXPECTED_SEED_SECTOR = SEED + bytes(SECTOR_SIZE - len(SEED))
@@ -133,7 +135,7 @@ def run_selftest():
         try:
             verify_region(image_file, 0, 4 * 1024 * 1024 // SECTOR_SIZE)
         except Violation as error:
-            if "expected 131072" not in str(error):
+            if f"expected {EXPECTED_DATA_SECTORS}" not in str(error):
                 raise RuntimeError(
                     f"selftest 'old-4MiB-layout' failed for the wrong reason: {error}"
                 ) from error
@@ -167,7 +169,7 @@ def run_selftest():
             image_file,
             partition_bytes - 1,
             b"\x01",
-            "logical sector 131071",
+            f"logical sector {EXPECTED_DATA_SECTORS - 1}",
         )
 
         image_file.truncate(partition_bytes - 1)
@@ -365,7 +367,7 @@ if p2_start != p1_start + p1_size:
 expected_data_start = 262_145
 if p2_start != expected_data_start:
     fail(f"data partition starts at {p2_start}, policy requires {expected_data_start}")
-expected_data_sectors = 64 * 1024 * 1024 // sector_size
+expected_data_sectors = 512 * 1024 * 1024 // sector_size
 if p2_size != expected_data_sectors:
     fail(f"data partition has {p2_size} sectors, expected {expected_data_sectors}")
 

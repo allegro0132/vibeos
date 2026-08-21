@@ -12,6 +12,7 @@ pub mod decode;
 mod execution;
 pub mod host;
 pub mod memory;
+mod native_async;
 mod predecode;
 pub mod resource;
 pub mod sync;

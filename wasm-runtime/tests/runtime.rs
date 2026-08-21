@@ -792,6 +792,134 @@ fn component_group_links_exact_prior_functions_and_shared_memory() {
 }
 
 #[test]
+fn component_group_memory_authority_tracks_aliases_growth_and_owner() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (memory (export "memory") 1 3))"#,
+    );
+    let alias = compile_in(
+        &engine,
+        r#"(module
+              (import "env" "memory" (memory 1 3))
+              (export "alias" (memory 0)))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 3).unwrap();
+    assert_eq!(group.add_instance(&provider, &[]).unwrap(), 0);
+    assert_eq!(group.add_instance(&provider, &[]).unwrap(), 1);
+    assert_eq!(
+        group
+            .add_instance(
+                &alias,
+                &[CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+                    module: "env",
+                    name: "memory",
+                    instance: 0,
+                    export: "memory",
+                },)],
+            )
+            .unwrap(),
+        2
+    );
+    group.seal().unwrap();
+
+    let provider_authority = group.memory_authority(0, "memory").unwrap();
+    let distinct_authority = group.memory_authority(1, "memory").unwrap();
+    let alias_authority = group.memory_authority(2, "alias").unwrap();
+    assert_eq!(
+        format!("{provider_authority:?}"),
+        "CoreMemoryAuthority(<opaque>)"
+    );
+    assert!(matches!(
+        group.memory_authority(2, "missing"),
+        Err(TrapCode::Validation)
+    ));
+
+    group
+        .write_authorized_memory(&provider_authority, 8, &[1, 2, 3, 4])
+        .unwrap();
+    let mut bytes = [0_u8; 4];
+    group
+        .read_authorized_memory(&alias_authority, 8, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [1, 2, 3, 4]);
+
+    group
+        .write_authorized_memory(&alias_authority, 12, &[5, 6, 7, 8])
+        .unwrap();
+    group
+        .read_authorized_memory(&provider_authority, 12, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [5, 6, 7, 8]);
+
+    group
+        .read_authorized_memory(&distinct_authority, 8, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [0; 4]);
+    group
+        .write_authorized_memory(&distinct_authority, 8, &[9, 10, 11, 12])
+        .unwrap();
+    group
+        .read_authorized_memory(&provider_authority, 8, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [1, 2, 3, 4]);
+
+    assert_eq!(
+        group.authorized_memory_size(&provider_authority),
+        Ok(65_536)
+    );
+    assert_eq!(group.authorized_memory_size(&alias_authority), Ok(65_536));
+    group
+        .grow_authorized_memory_to(&alias_authority, 65_537)
+        .unwrap();
+    assert_eq!(
+        group.authorized_memory_size(&provider_authority),
+        Ok(2 * 65_536)
+    );
+    assert_eq!(
+        group.authorized_memory_size(&alias_authority),
+        Ok(2 * 65_536)
+    );
+    assert_eq!(
+        group.authorized_memory_size(&distinct_authority),
+        Ok(65_536)
+    );
+
+    group
+        .write_authorized_memory(&provider_authority, 65_536, &[13, 14, 15, 16])
+        .unwrap();
+    group
+        .read_authorized_memory(&alias_authority, 65_536, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [13, 14, 15, 16]);
+    assert_eq!(
+        group.read_authorized_memory(&provider_authority, 2 * 65_536, &mut bytes[..1]),
+        Err(TrapCode::MemoryOutOfBounds)
+    );
+
+    let mut foreign_group = CoreComponentGroup::new(&engine, 1).unwrap();
+    foreign_group.add_instance(&provider, &[]).unwrap();
+    foreign_group.seal().unwrap();
+    assert_eq!(
+        foreign_group.authorized_memory_size(&provider_authority),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        foreign_group.read_authorized_memory(&provider_authority, 0, &mut bytes),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        foreign_group.write_authorized_memory(&provider_authority, 0, &bytes),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        foreign_group.grow_authorized_memory_to(&provider_authority, 2 * 65_536),
+        Err(TrapCode::Validation)
+    );
+}
+
+#[test]
 fn component_group_polls_provider_while_guest_host_call_is_suspended() {
     let engine = ProfileEngine::new();
     let provider = compile_in(

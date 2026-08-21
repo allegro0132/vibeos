@@ -10,12 +10,14 @@
 use crate::{
     async_abi::{
         pack_endpoint_pair, unpack_callback_result, CallbackCode, EndpointPair as AbiEndpointPair,
+        EventCode,
     },
     async_state::{
-        AsyncState, AsyncStateError, AsyncStateLimits, EndpointKind, Event, EventLease,
-        EventLeaseState, TaskCancelState, TaskHandle, TaskResultState, WaitBegin, WaitResume,
-        WaitTicket,
+        AsyncState, AsyncStateError, AsyncStateLimits, CommitError, CopyBegin, EndpointKind, Event,
+        EventLease, EventLeaseState, EventToken, ReclaimError, TaskCancelState, TaskHandle,
+        TaskResultState, WaitBegin, WaitResume, WaitTicket,
     },
+    buffer_registry::{BufferPlanId, BufferRegistry, BufferRole},
     decode::ComponentPlan,
     execution::{
         AsyncCoreValueType, NativeAsyncCanonicalFunctionPlan, NativeAsyncCoreImportPlan,
@@ -29,8 +31,8 @@ use alloc::{string::String, vec::Vec};
 use vibeos_component_format::{ProfileIdentity, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
     CoreCallSlot, CoreCallSlotState, CoreComponentGroup, CoreHostImport, CoreInstanceExportImport,
-    CoreModuleImport, CoreSlotPollResult, CoreValue, CoreValueType, OwnerAllocationReservation,
-    PollResult, ProfileEngine, ValidatedCore,
+    CoreMemoryAuthority, CoreModuleImport, CoreSlotPollResult, CoreValue, CoreValueType,
+    OwnerAllocationReservation, PollResult, ProfileEngine, ValidatedCore,
 };
 
 /// Versioned Vibe fuel charged for resolving one empty native async result.
@@ -45,6 +47,12 @@ const TASK_RETURN_WORK: u64 = 1;
 /// handle action enabled by this executor slice.
 const HANDLE_STATE_SCAN_FACTOR: u64 = 8;
 const HANDLE_STATE_WORK: u64 = 1 + HANDLE_STATE_SCAN_FACTOR * PROFILE_1_LIMITS.max_resources as u64;
+/// Versioned work for finding and sealing one component-owned buffer slot.
+const BUFFER_STATE_WORK: u64 = 1 + PROFILE_1_LIMITS.max_resources as u64;
+/// A stream begin/cancel validates both the canonical handle and buffer arena.
+const BUFFER_BRIDGE_WORK: u64 = HANDLE_STATE_WORK + BUFFER_STATE_WORK;
+/// Fixed work for committing one local byte-stream transfer.
+const BUFFER_COPY_BASE_WORK: u64 = 1;
 /// Versioned Vibe fuel charged for one actual callback wait selection.
 ///
 /// Beginning or explicitly resuming a wait may scan the same bounded handle
@@ -133,6 +141,8 @@ pub(crate) struct NativeAsyncComponent {
     /// the matching slot between Idle and Active.
     callback_slots: Vec<CoreCallSlot>,
     bridges: Vec<RuntimeBridge>,
+    /// Component-lifetime authorities for every live guest copy buffer.
+    buffers: BufferRegistry,
     /// Canonical handles belong to the Component instance, not one invocation.
     state: AsyncState,
     poisoned: bool,
@@ -159,12 +169,28 @@ enum BridgeAction {
     WaitableSetNew,
     WaitableSetDrop,
     WaitableJoin,
+    StreamCopy {
+        plan: BufferPlanId,
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+    },
+    StreamCancel {
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+    },
     Unsupported,
 }
 
 struct RuntimeBridge {
     origin_instance: usize,
     action: BridgeAction,
+    memory_binding: Option<RuntimeMemoryBinding>,
+    memory: Option<CoreMemoryAuthority>,
+}
+
+struct RuntimeMemoryBinding {
+    core_instance: usize,
+    export: String,
 }
 
 enum OwnedCoreImport {
@@ -260,8 +286,12 @@ impl NativeAsyncComponent {
         // Classify every canonical bridge and reject unsupported exported
         // lifts before a Core module is instantiated. Core start functions
         // are guest execution; linked-but-disabled builtins remain fail-closed.
-        let bridges = runtime_bridges(execution)?;
+        let mut bridges = runtime_bridges(execution)?;
         let exports = runtime_exports(execution)?;
+        // Reserve all registry slots and the fixed byte-stream copy scratch
+        // before any Core start function can execute during instantiation.
+        let buffers = BufferRegistry::new(PROFILE_1_LIMITS.max_resources, memory_bytes)
+            .map_err(|_| NativeAsyncError::Allocation)?;
         let mut modules = CoreComponentGroup::new_with_memory_limit(
             engine,
             execution.instances().len(),
@@ -294,6 +324,19 @@ impl NativeAsyncComponent {
         modules
             .seal()
             .map_err(|_| NativeAsyncError::CoreInstantiation)?;
+        // Resolve validator-derived memory bindings once into opaque
+        // underlying-memory authorities. Re-export aliases consequently share
+        // the same capability and remain valid across memory.grow.
+        for bridge in &mut bridges {
+            bridge.memory = match &bridge.memory_binding {
+                Some(binding) => Some(
+                    modules
+                        .memory_authority(binding.core_instance, &binding.export)
+                        .map_err(|_| NativeAsyncError::InvalidWiring)?,
+                ),
+                None => None,
+            };
+        }
         let mut callback_slots = Vec::new();
         callback_slots
             .try_reserve_exact(exports.len())
@@ -319,6 +362,7 @@ impl NativeAsyncComponent {
             exports,
             callback_slots,
             bridges,
+            buffers,
             state,
             poisoned: false,
         })
@@ -489,72 +533,177 @@ fn runtime_bridges(
             .canonical_plans()
             .get(bridge.canonical as usize)
             .ok_or(NativeAsyncError::InvalidWiring)?;
-        let action = match &canonical.function {
+        let (action, memory_binding) = match &canonical.function {
             NativeAsyncCanonicalFunctionPlan::TaskReturn { result, options }
                 if result.is_none()
                     && !options.async_
                     && options.memory.is_none()
                     && options.realloc.is_none() =>
             {
-                BridgeAction::TaskReturn
+                (BridgeAction::TaskReturn, None)
             }
             NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::New {
                 value_type,
                 ..
-            }) => BridgeAction::StreamNew(stream_value_type_id(value_type)?),
+            }) => (
+                BridgeAction::StreamNew(stream_value_type_id(value_type)?),
+                None,
+            ),
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::Read {
+                value_type,
+                options,
+                ..
+            }) if stream_u8_value_type_id(value_type).is_some()
+                && options.async_
+                && options.realloc.is_none() =>
+            {
+                let value_type =
+                    stream_u8_value_type_id(value_type).ok_or(NativeAsyncError::InvalidWiring)?;
+                (
+                    BridgeAction::StreamCopy {
+                        plan: BufferPlanId::new(value_type.get())
+                            .ok_or(NativeAsyncError::InvalidWiring)?,
+                        direction: EndpointDirection::Read,
+                        value_type,
+                    },
+                    Some(runtime_memory_binding(options)?),
+                )
+            }
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::Write {
+                value_type,
+                options,
+                ..
+            }) if stream_u8_value_type_id(value_type).is_some()
+                && options.async_
+                && options.realloc.is_none() =>
+            {
+                let value_type =
+                    stream_u8_value_type_id(value_type).ok_or(NativeAsyncError::InvalidWiring)?;
+                (
+                    BridgeAction::StreamCopy {
+                        plan: BufferPlanId::new(value_type.get())
+                            .ok_or(NativeAsyncError::InvalidWiring)?,
+                        direction: EndpointDirection::Write,
+                        value_type,
+                    },
+                    Some(runtime_memory_binding(options)?),
+                )
+            }
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::CancelRead {
+                value_type,
+                ..
+            }) if stream_u8_value_type_id(value_type).is_some() => (
+                BridgeAction::StreamCancel {
+                    direction: EndpointDirection::Read,
+                    value_type: stream_u8_value_type_id(value_type)
+                        .ok_or(NativeAsyncError::InvalidWiring)?,
+                },
+                None,
+            ),
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::CancelWrite {
+                value_type,
+                ..
+            }) if stream_u8_value_type_id(value_type).is_some() => (
+                BridgeAction::StreamCancel {
+                    direction: EndpointDirection::Write,
+                    value_type: stream_u8_value_type_id(value_type)
+                        .ok_or(NativeAsyncError::InvalidWiring)?,
+                },
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::DropReadable {
                 value_type,
                 ..
-            }) => BridgeAction::DropEndpoint {
-                kind: EndpointKind::Stream,
-                direction: EndpointDirection::Read,
-                value_type: stream_value_type_id(value_type)?,
-            },
+            }) => (
+                BridgeAction::DropEndpoint {
+                    kind: EndpointKind::Stream,
+                    direction: EndpointDirection::Read,
+                    value_type: stream_value_type_id(value_type)?,
+                },
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::DropWritable {
                 value_type,
                 ..
-            }) => BridgeAction::DropEndpoint {
-                kind: EndpointKind::Stream,
-                direction: EndpointDirection::Write,
-                value_type: stream_value_type_id(value_type)?,
-            },
+            }) => (
+                BridgeAction::DropEndpoint {
+                    kind: EndpointKind::Stream,
+                    direction: EndpointDirection::Write,
+                    value_type: stream_value_type_id(value_type)?,
+                },
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::New {
                 value_type,
                 ..
-            }) => BridgeAction::FutureNew(future_value_type_id(value_type)?),
+            }) => (
+                BridgeAction::FutureNew(future_value_type_id(value_type)?),
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::DropReadable {
                 value_type,
                 ..
-            }) => BridgeAction::DropEndpoint {
-                kind: EndpointKind::Future,
-                direction: EndpointDirection::Read,
-                value_type: future_value_type_id(value_type)?,
-            },
+            }) => (
+                BridgeAction::DropEndpoint {
+                    kind: EndpointKind::Future,
+                    direction: EndpointDirection::Read,
+                    value_type: future_value_type_id(value_type)?,
+                },
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::DropWritable {
                 value_type,
                 ..
-            }) => BridgeAction::DropEndpoint {
-                kind: EndpointKind::Future,
-                direction: EndpointDirection::Write,
-                value_type: future_value_type_id(value_type)?,
-            },
+            }) => (
+                BridgeAction::DropEndpoint {
+                    kind: EndpointKind::Future,
+                    direction: EndpointDirection::Write,
+                    value_type: future_value_type_id(value_type)?,
+                },
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::SetNew) => {
-                BridgeAction::WaitableSetNew
+                (BridgeAction::WaitableSetNew, None)
             }
             NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::SetDrop) => {
-                BridgeAction::WaitableSetDrop
+                (BridgeAction::WaitableSetDrop, None)
             }
             NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::Join) => {
-                BridgeAction::WaitableJoin
+                (BridgeAction::WaitableJoin, None)
             }
-            _ => BridgeAction::Unsupported,
+            _ => (BridgeAction::Unsupported, None),
         };
         bridges.push(RuntimeBridge {
             origin_instance: bridge.core_instance,
             action,
+            memory_binding,
+            memory: None,
         });
     }
     Ok(bridges)
+}
+
+fn runtime_memory_binding(
+    options: &crate::execution::NativeAsyncCanonicalOptionsPlan,
+) -> Result<RuntimeMemoryBinding, NativeAsyncError> {
+    let memory = options
+        .memory
+        .as_ref()
+        .ok_or(NativeAsyncError::InvalidWiring)?;
+    Ok(RuntimeMemoryBinding {
+        core_instance: memory.core_instance,
+        export: copied(&memory.export)?,
+    })
+}
+
+fn stream_u8_value_type_id(value: &ValueType) -> Option<AsyncValueTypeId> {
+    match value {
+        ValueType::Stream {
+            type_id,
+            element: Some(element),
+        } if matches!(element.as_ref(), ValueType::U8) => Some(*type_id),
+        _ => None,
+    }
 }
 
 fn stream_value_type_id(value: &ValueType) -> Result<AsyncValueTypeId, NativeAsyncError> {
@@ -627,6 +776,34 @@ fn copied(value: &str) -> Result<String, NativeAsyncError> {
     Ok(copy)
 }
 
+const fn buffer_role(direction: EndpointDirection) -> BufferRole {
+    match direction {
+        EndpointDirection::Read => BufferRole::TargetRead,
+        EndpointDirection::Write => BufferRole::SourceWrite,
+    }
+}
+
+const fn stream_event_code(direction: EndpointDirection) -> EventCode {
+    match direction {
+        EndpointDirection::Read => EventCode::StreamRead,
+        EndpointDirection::Write => EventCode::StreamWrite,
+    }
+}
+
+fn buffer_copy_work(progress: u32, scratch_bytes: usize) -> Option<u64> {
+    let bytes = u64::from(progress);
+    let scratch = u64::try_from(scratch_bytes)
+        .ok()
+        .filter(|scratch| *scratch != 0)?;
+    let chunks = bytes
+        .checked_add(scratch.checked_sub(1)?)?
+        .checked_div(scratch)?;
+    BUFFER_COPY_BASE_WORK
+        .checked_add(u64::from(progress))?
+        .checked_add(bytes.checked_mul(2)?)?
+        .checked_add(chunks)
+}
+
 const fn map_state_error(error: AsyncStateError) -> NativeAsyncError {
     match error {
         AsyncStateError::AllocationFailed => NativeAsyncError::Allocation,
@@ -695,6 +872,22 @@ const fn map_runtime_state_error(error: AsyncStateError) -> TrapCode {
 const fn map_sealed_state_error(error: AsyncStateError) -> TrapCode {
     match error {
         AsyncStateError::InvalidHandle | AsyncStateError::StaleHandle => TrapCode::Validation,
+        _ => map_runtime_state_error(error),
+    }
+}
+
+/// Maps a failure after an endpoint's raw handle, kind, direction, and value
+/// type were all sealed by one read-only preflight. Losing any of that exact
+/// identity is an executor invariant; legal state misuse remains Canonical ABI.
+const fn map_exact_endpoint_state_error(error: AsyncStateError) -> TrapCode {
+    match error {
+        AsyncStateError::InvalidHandle
+        | AsyncStateError::StaleHandle
+        | AsyncStateError::WrongState
+        | AsyncStateError::WrongHandleKind
+        | AsyncStateError::WrongEndpointKind
+        | AsyncStateError::WrongDirection
+        | AsyncStateError::WrongType => TrapCode::Validation,
         _ => map_runtime_state_error(error),
     }
 }
@@ -980,6 +1173,7 @@ impl NativeAsyncInvocation<'_> {
             return self.finish_trap(TrapCode::Validation);
         }
         let action = bridge.action;
+        let memory = bridge.memory;
         match (action, call.arguments.as_slice()) {
             (BridgeAction::TaskReturn, []) => {
                 if let Err(trap) = self.debit_active_work(authority, TASK_RETURN_WORK) {
@@ -1033,6 +1227,36 @@ impl NativeAsyncInvocation<'_> {
                 }
                 NativeAsyncPoll::Pending(self.metrics())
             }
+            (
+                BridgeAction::StreamCopy {
+                    plan,
+                    direction,
+                    value_type,
+                },
+                [CoreValue::I32(raw), CoreValue::I32(pointer), CoreValue::I32(elements)],
+            ) => {
+                let Some(memory) = memory else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                self.handle_stream_copy(
+                    authority,
+                    call.id,
+                    plan,
+                    memory,
+                    direction,
+                    value_type,
+                    *raw as u32,
+                    *pointer as u32,
+                    *elements as u32,
+                )
+            }
+            (
+                BridgeAction::StreamCancel {
+                    direction,
+                    value_type,
+                },
+                [CoreValue::I32(raw)],
+            ) => self.handle_stream_cancel(authority, call.id, direction, value_type, *raw as u32),
             (
                 BridgeAction::DropEndpoint {
                     kind,
@@ -1120,6 +1344,203 @@ impl NativeAsyncInvocation<'_> {
             (BridgeAction::Unsupported, _) => self.finish_trap(TrapCode::CanonicalAbi),
             _ => self.finish_trap(TrapCode::Validation),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_stream_copy(
+        &mut self,
+        authority: CallAuthority,
+        host_id: u32,
+        plan: BufferPlanId,
+        memory: CoreMemoryAuthority,
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+        raw: u32,
+        pointer: u32,
+        elements: u32,
+    ) -> NativeAsyncPoll {
+        // Guest-controlled handles, ranges, and arena availability are all
+        // checked before either fuel or state changes.
+        let handle = match self.component.state.resolve_guest_endpoint(
+            raw,
+            EndpointKind::Stream,
+            direction,
+            value_type,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+        };
+        if let Err(error) = self.component.state.preflight_begin_copy(
+            handle,
+            EndpointKind::Stream,
+            direction,
+            value_type,
+            elements,
+        ) {
+            return self.finish_trap(map_exact_endpoint_state_error(error));
+        }
+        let role = buffer_role(direction);
+        let prepared = match self.component.buffers.preflight(
+            &self.component.modules,
+            plan,
+            memory,
+            role,
+            pointer,
+            elements,
+            value_type,
+        ) {
+            Ok(prepared) => prepared,
+            Err(trap) => return self.finish_trap(trap),
+        };
+        if let Err(trap) = self.debit_active_work_with_reserve(authority, BUFFER_BRIDGE_WORK) {
+            return self.finish_trap(trap);
+        }
+        let lease = match self.component.buffers.issue(prepared) {
+            Ok(lease) => lease,
+            Err(_) => return self.finish_trap(TrapCode::Validation),
+        };
+        let begun = match self.component.state.begin_copy(
+            handle,
+            EndpointKind::Stream,
+            direction,
+            value_type,
+            lease,
+        ) {
+            Ok(begun) => begun,
+            Err(failure) => {
+                let (error, lease) = failure.into_parts();
+                if self.component.buffers.discard_owned(lease).is_err() {
+                    return self.finish_trap(TrapCode::Validation);
+                }
+                return self.finish_trap(map_exact_endpoint_state_error(error));
+            }
+        };
+
+        let event = match begun {
+            CopyBegin::Blocked { abi, .. } => {
+                let results = [CoreValue::I32(abi as i32)];
+                if let Err(trap) = self.resume_active_host_call(authority, host_id, &results) {
+                    return self.finish_trap(trap);
+                }
+                return NativeAsyncPoll::Pending(self.metrics());
+            }
+            CopyBegin::Ready(event) => event,
+            CopyBegin::Local(mut ticket) => {
+                let progress = match self.component.state.local_copy_progress(&ticket) {
+                    Ok(progress) => progress,
+                    Err(_) => return self.finish_trap(TrapCode::Validation),
+                };
+                let Some(work) = buffer_copy_work(progress, self.component.buffers.scratch_bytes())
+                else {
+                    return self.finish_trap(TrapCode::FuelExhausted);
+                };
+                if let Err(trap) = self.debit_active_work_with_reserve(authority, work) {
+                    return self.finish_trap(trap);
+                }
+                let copied = {
+                    let (state, buffers, modules) = (
+                        &mut self.component.state,
+                        &mut self.component.buffers,
+                        &mut self.component.modules,
+                    );
+                    state.commit_local_copy(&mut ticket, progress, |source, target, progress| {
+                        buffers.copy_local(modules, source, target, progress)
+                    })
+                };
+                match copied {
+                    Ok(event) => event,
+                    Err(CommitError::State(_)) | Err(CommitError::Operation(_)) => {
+                        return self.finish_trap(TrapCode::Validation);
+                    }
+                }
+            }
+        };
+        self.finish_stream_event(authority, host_id, event, direction, raw)
+    }
+
+    fn handle_stream_cancel(
+        &mut self,
+        authority: CallAuthority,
+        host_id: u32,
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+        raw: u32,
+    ) -> NativeAsyncPoll {
+        let handle = match self.component.state.resolve_guest_endpoint(
+            raw,
+            EndpointKind::Stream,
+            direction,
+            value_type,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+        };
+        if let Err(error) = self.component.state.preflight_cancel_copy(
+            handle,
+            EndpointKind::Stream,
+            direction,
+            value_type,
+        ) {
+            return self.finish_trap(map_exact_endpoint_state_error(error));
+        }
+        if let Err(trap) = self.debit_active_work_with_reserve(authority, BUFFER_BRIDGE_WORK) {
+            return self.finish_trap(trap);
+        }
+        let event = match self.component.state.cancel_copy(
+            handle,
+            EndpointKind::Stream,
+            direction,
+            value_type,
+        ) {
+            Ok(event) => event,
+            Err(error) => return self.finish_trap(map_exact_endpoint_state_error(error)),
+        };
+        self.finish_stream_event(authority, host_id, event, direction, raw)
+    }
+
+    fn finish_stream_event(
+        &mut self,
+        authority: CallAuthority,
+        host_id: u32,
+        event: EventToken,
+        direction: EndpointDirection,
+        raw: u32,
+    ) -> NativeAsyncPoll {
+        let (event, mut reclaim) = match self.component.state.deliver_event(&event) {
+            Ok(delivered) => delivered,
+            Err(_) => return self.finish_trap(TrapCode::Validation),
+        };
+        if event.code != stream_event_code(direction) || event.p1 != raw {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        let reclaimed = {
+            let (state, buffers) = (&mut self.component.state, &mut self.component.buffers);
+            state.reclaim_event(&mut reclaim, |lease| {
+                buffers.release(lease, buffer_role(direction))
+            })
+        };
+        match reclaimed {
+            Ok(()) => {}
+            Err(ReclaimError::State(_)) | Err(ReclaimError::Operation(_)) => {
+                return self.finish_trap(TrapCode::Validation);
+            }
+        }
+        let results = [CoreValue::I32(event.p2 as i32)];
+        if let Err(trap) = self.resume_active_host_call(authority, host_id, &results) {
+            return self.finish_trap(trap);
+        }
+        NativeAsyncPoll::Pending(self.metrics())
+    }
+
+    fn debit_active_work_with_reserve(
+        &mut self,
+        authority: CallAuthority,
+        amount: u64,
+    ) -> Result<(), TrapCode> {
+        if self.remaining_work <= amount {
+            return Err(TrapCode::FuelExhausted);
+        }
+        self.debit_active_work(authority, amount)
     }
 
     fn debit_active_work(&mut self, authority: CallAuthority, amount: u64) -> Result<(), TrapCode> {
@@ -1276,12 +1697,22 @@ impl NativeAsyncInvocation<'_> {
                 };
                 self.start_callback_event(event)
             }
-            // Copy bridges and the component-owned buffer registry are still
-            // sealed. Do not deliver or reclaim the selected endpoint event:
-            // leaving it Pending preserves its future teardown authority.
-            EventLeaseState::EndpointPending
-            | EventLeaseState::EndpointDelivered
-            | EventLeaseState::Consumed => self.finish_trap(TrapCode::Validation),
+            EventLeaseState::EndpointPending => {
+                if lease.prepare_endpoint(&mut self.component.state).is_err() {
+                    return self.finish_trap(TrapCode::Validation);
+                }
+                let finished = {
+                    let (state, buffers) = (&mut self.component.state, &mut self.component.buffers);
+                    lease.finish_endpoint(state, |buffer| buffers.release_owned(buffer))
+                };
+                match finished {
+                    Ok(event) => self.start_callback_event(event),
+                    Err(_) => self.finish_trap(TrapCode::Validation),
+                }
+            }
+            EventLeaseState::EndpointDelivered | EventLeaseState::Consumed => {
+                self.finish_trap(TrapCode::Validation)
+            }
         }
     }
 
@@ -1399,6 +1830,16 @@ impl NativeAsyncInvocation<'_> {
         };
         if wait_cancelled {
             self.wait_ticket = None;
+        }
+        // Move every linear lease out of AsyncState before invalidating the
+        // registry. Exact discard failures are already fail-stop; `poison`
+        // then rotates every slot as the bounded invariant-recovery fallback.
+        {
+            let (state, buffers) = (&mut self.component.state, &mut self.component.buffers);
+            state.abort_all_copies(|lease| {
+                let _ = buffers.discard_owned(lease);
+            });
+            buffers.poison();
         }
         self.wait_token = None;
         self.callback_pending = false;
@@ -1628,6 +2069,18 @@ mod tests {
         )
     }
 
+    fn byte_stream_component(run: &str, callback: &str) -> String {
+        replace_once(
+            &replace_once(
+                SMOKE,
+                "    (func (export \"run\") (result i32)\n      call $task-return\n      i32.const 1)",
+                run,
+            ),
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            callback,
+        )
+    }
+
     fn trap_call(component: &mut NativeAsyncComponent) -> TrapCode {
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         loop {
@@ -1664,6 +2117,10 @@ mod tests {
                         | BridgeAction::WaitableJoin => {
                             handle_transitions += 1;
                             HANDLE_STATE_WORK
+                        }
+                        BridgeAction::StreamCopy { .. } | BridgeAction::StreamCancel { .. } => {
+                            handle_transitions += 1;
+                            BUFFER_BRIDGE_WORK
                         }
                         BridgeAction::Unsupported => {
                             panic!("fixture reached an unsupported bridge")
@@ -2397,7 +2854,7 @@ mod tests {
     }
 
     #[test]
-    fn read_write_cancel_and_task_cancel_bridges_remain_unsupported() {
+    fn byte_stream_bridges_activate_while_future_copy_and_task_cancel_stay_sealed() {
         let smoke = instantiate(SMOKE);
         assert_eq!(
             smoke
@@ -2405,12 +2862,632 @@ mod tests {
                 .iter()
                 .filter(|bridge| bridge.action == BridgeAction::Unsupported)
                 .count(),
-            8
+            4
         );
+        assert_eq!(
+            smoke
+                .bridges
+                .iter()
+                .filter(|bridge| matches!(bridge.action, BridgeAction::StreamCopy { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            smoke
+                .bridges
+                .iter()
+                .filter(|bridge| matches!(bridge.action, BridgeAction::StreamCancel { .. }))
+                .count(),
+            2
+        );
+        assert!(smoke
+            .bridges
+            .iter()
+            .filter(|bridge| matches!(bridge.action, BridgeAction::StreamCopy { .. }))
+            .all(|bridge| bridge.memory.is_some()));
 
         let mut task_cancel = instantiate(&handle_component("call $task-cancel"));
         assert_eq!(trap_call(&mut task_cancel), TrapCode::CanonicalAbi);
         assert!(task_cancel.is_poisoned());
+    }
+
+    #[test]
+    fn byte_stream_local_copy_uses_min_progress_and_reclaims_both_sides() {
+        let run = r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      i32.const 16
+      i32.const 67305985
+      i32.store
+      i32.const 24
+      i32.const -1431655766
+      i32.store
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      i32.const 4
+      call $stream-write
+      i32.const -1
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i32.wrap_i64
+      i32.const 24
+      i32.const 2
+      call $stream-read
+      i32.const 32
+      i32.ne
+      if unreachable end
+      i32.const 24
+      i32.load16_u
+      i32.const 513
+      i32.ne
+      if unreachable end
+      i32.const 26
+      i32.load16_u
+      i32.const 43690
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $stream-cancel-write
+      i32.const 32
+      i32.ne
+      if unreachable end
+      call $task-return
+      i32.const 1)"#;
+        let source = byte_stream_component(
+            run,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let mut component = instantiate(&source);
+        let metrics = {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            loop {
+                match call.poll() {
+                    NativeAsyncPoll::Complete(metrics) => break metrics,
+                    NativeAsyncPoll::Pending(_)
+                    | NativeAsyncPoll::Resolved(_)
+                    | NativeAsyncPoll::Yielded(_) => {}
+                    NativeAsyncPoll::WaitPending { .. } => {
+                        panic!("local byte-stream fixture unexpectedly waited")
+                    }
+                    NativeAsyncPoll::Trapped(trap) => {
+                        panic!("local byte-stream fixture trapped: {trap:?}")
+                    }
+                }
+            }
+        };
+        assert!(metrics.consumed_work >= 3 * BUFFER_BRIDGE_WORK);
+        assert_eq!(component.buffers.live(), 0);
+        assert!(!component.buffers.is_poisoned());
+        let mut copied = [0_u8; 4];
+        component
+            .modules
+            .read_memory(0, "memory", 24, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [1, 2, 0xaa, 0xaa]);
+    }
+
+    #[test]
+    fn endpoint_wait_reclaims_before_callback_can_reuse_the_same_stream_end() {
+        let run = r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      (local $set i32)
+      call $stream-new
+      local.set $pair
+      i32.const 8
+      local.get $pair
+      i32.wrap_i64
+      i32.store
+      i32.const 4
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.store
+      call $waitable-set-new
+      local.set $set
+      i32.const 0
+      local.get $set
+      i32.store
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      local.get $set
+      call $waitable-join
+      i32.const 16
+      i32.const 67305985
+      i32.store
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      i32.const 4
+      call $stream-write
+      i32.const -1
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i32.wrap_i64
+      i32.const 24
+      i32.const 4
+      call $stream-read
+      i32.const 64
+      i32.ne
+      if unreachable end
+      i32.const 1)"#;
+        let callback = r#"    (func (export "callback")
+      (param $event i32) (param $p1 i32) (param $p2 i32) (result i32)
+      local.get $event
+      i32.eqz
+      if (result i32)
+        i32.const 0
+        i32.load
+        i32.const 4
+        i32.shl
+        i32.const 2
+        i32.or
+      else
+        i32.const 12
+        i32.const 1
+        i32.store
+        local.get $event
+        i32.const 3
+        i32.ne
+        if unreachable end
+        local.get $p1
+        i32.const 4
+        i32.load
+        i32.ne
+        if unreachable end
+        local.get $p2
+        i32.const 64
+        i32.ne
+        if unreachable end
+        i32.const 4
+        i32.load
+        i32.const 0
+        call $waitable-join
+        i32.const 4
+        i32.load
+        i32.const -1
+        i32.const 0
+        call $stream-write
+        i32.const -1
+        i32.ne
+        if unreachable end
+        i32.const 4
+        i32.load
+        call $stream-cancel-write
+        i32.const 2
+        i32.ne
+        if unreachable end
+        i32.const 8
+        i32.load
+        call $stream-drop-readable
+        i32.const 4
+        i32.load
+        call $stream-drop-writable
+        i32.const 0
+        i32.load
+        call $waitable-set-drop
+        call $task-return
+        i32.const 0
+      end)"#;
+        let source = byte_stream_component(run, callback);
+        let mut component = instantiate(&source);
+        let mut observed_reclaim_boundary = false;
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            loop {
+                let before_live = call.component.buffers.live();
+                let progress = call.poll();
+                let after_live = call.component.buffers.live();
+                if !observed_reclaim_boundary && before_live == 1 && after_live == 0 {
+                    assert!(matches!(progress, NativeAsyncPoll::Pending(_)));
+                    assert!(matches!(call.stage, InvocationStage::Callback));
+                    assert_eq!(
+                        call.component.callback_slots[call.export].state(),
+                        CoreCallSlotState::Active
+                    );
+                    let mut marker = [0_u8; 4];
+                    call.component
+                        .modules
+                        .read_memory(0, "memory", 12, &mut marker)
+                        .unwrap();
+                    assert_eq!(marker, [0; 4]);
+                    observed_reclaim_boundary = true;
+                }
+                match progress {
+                    NativeAsyncPoll::Complete(_) => break,
+                    NativeAsyncPoll::Pending(_)
+                    | NativeAsyncPoll::Resolved(_)
+                    | NativeAsyncPoll::Yielded(_) => {}
+                    NativeAsyncPoll::WaitPending { .. } => {
+                        panic!("ready endpoint wait must start its callback immediately")
+                    }
+                    NativeAsyncPoll::Trapped(trap) => {
+                        panic!("endpoint wait fixture trapped: {trap:?}")
+                    }
+                }
+            }
+        }
+        assert!(observed_reclaim_boundary);
+        assert_eq!(component.buffers.live(), 0);
+        assert!(!component.buffers.is_poisoned());
+        let mut copied = [0_u8; 4];
+        component
+            .modules
+            .read_memory(0, "memory", 24, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [1, 2, 3, 4]);
+        let mut marker = [0_u8; 4];
+        component
+            .modules
+            .read_memory(0, "memory", 12, &mut marker)
+            .unwrap();
+        assert_eq!(marker, 1_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn byte_stream_zero_count_and_hostile_ranges_have_pinned_traps() {
+        let zero = byte_stream_component(
+            r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const -1
+      i32.const 0
+      call $stream-write
+      i32.const -1
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $stream-cancel-write
+      i32.const 2
+      i32.ne
+      if unreachable end
+      call $task-return
+      i32.const 1)"#,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let mut component = instantiate(&zero);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            loop {
+                match call.poll() {
+                    NativeAsyncPoll::Complete(_) => break,
+                    NativeAsyncPoll::Pending(_)
+                    | NativeAsyncPoll::Resolved(_)
+                    | NativeAsyncPoll::Yielded(_) => {}
+                    NativeAsyncPoll::WaitPending { .. } => panic!("zero copy unexpectedly waited"),
+                    NativeAsyncPoll::Trapped(trap) => panic!("zero copy trapped: {trap:?}"),
+                }
+            }
+        }
+        assert_eq!(component.buffers.live(), 0);
+
+        for (pointer, elements, expected) in [
+            (65_536, 1, TrapCode::MemoryOutOfBounds),
+            (0, 1_u32 << 28, TrapCode::LimitExceeded),
+        ] {
+            let run = format!(
+                r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const {pointer}
+      i32.const {elements}
+      call $stream-write
+      drop
+      i32.const 1)"#
+            );
+            let source = byte_stream_component(
+                &run,
+                r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+            );
+            let mut component = instantiate(&source);
+            assert_eq!(trap_call(&mut component), expected);
+            assert_eq!(component.buffers.live(), 0);
+            assert!(component.buffers.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn busy_stream_copy_state_precedes_hostile_range_and_bridge_fuel() {
+        for (pointer, elements) in [(65_536, 1), (0, 1_u32 << 28)] {
+            let run = format!(
+                r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      i32.const 1
+      call $stream-write
+      drop
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const {pointer}
+      i32.const {elements}
+      call $stream-write
+      drop
+      i32.const 1)"#
+            );
+            let source = byte_stream_component(
+                &run,
+                r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+            );
+            let mut component = instantiate(&source);
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let active = call.binding().core_instance;
+            let authority = CallAuthority::Run(active);
+            let mut writes = 0;
+
+            loop {
+                let result = call.component.modules.poll_call(active);
+                assert!(call.settle_metrics(authority));
+                match result {
+                    PollResult::Pending { .. } => {}
+                    PollResult::HostCall(host) => {
+                        let action = call.component.bridges[host.id as usize].action;
+                        if matches!(
+                            action,
+                            BridgeAction::StreamCopy {
+                                direction: EndpointDirection::Write,
+                                ..
+                            }
+                        ) {
+                            writes += 1;
+                            if writes == 2 {
+                                assert_eq!(call.component.buffers.live(), 1);
+                                let before = call.metrics();
+                                assert_eq!(
+                                    call.handle_host_call(authority, host),
+                                    NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                                );
+                                assert_eq!(call.metrics(), before);
+                                break;
+                            }
+                        }
+                        assert!(matches!(
+                            call.handle_host_call(authority, host),
+                            NativeAsyncPoll::Pending(_)
+                        ));
+                    }
+                    PollResult::Ready(_) => panic!("busy copy fixture unexpectedly returned"),
+                    PollResult::Trapped(trap) => {
+                        panic!("busy copy fixture trapped before the second write: {trap:?}")
+                    }
+                }
+            }
+
+            assert_eq!(writes, 2);
+            assert!(call.component.is_poisoned());
+            assert!(call.component.buffers.is_poisoned());
+            assert_eq!(call.component.buffers.live(), 0);
+        }
+    }
+
+    #[test]
+    fn invalid_stream_cancel_state_precedes_bridge_fuel() {
+        let fixtures = [
+            (
+                r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $stream-cancel-write
+      drop
+      i32.const 1)"#,
+                0,
+            ),
+            (
+                r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      (local $set i32)
+      call $stream-new
+      local.set $pair
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const -1
+      i32.const 0
+      call $stream-write
+      drop
+      call $waitable-set-new
+      local.set $set
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      local.get $set
+      call $waitable-join
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $stream-cancel-write
+      drop
+      i32.const 1)"#,
+                1,
+            ),
+        ];
+
+        for (run, live_before_cancel) in fixtures {
+            let source = byte_stream_component(
+                run,
+                r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+            );
+            let mut component = instantiate(&source);
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let active = call.binding().core_instance;
+            let authority = CallAuthority::Run(active);
+
+            loop {
+                let result = call.component.modules.poll_call(active);
+                assert!(call.settle_metrics(authority));
+                match result {
+                    PollResult::Pending { .. } => {}
+                    PollResult::HostCall(host) => {
+                        let action = call.component.bridges[host.id as usize].action;
+                        if matches!(action, BridgeAction::StreamCancel { .. }) {
+                            assert_eq!(call.component.buffers.live(), live_before_cancel);
+                            let excess = call
+                                .metrics()
+                                .remaining_work
+                                .checked_sub(BUFFER_BRIDGE_WORK)
+                                .unwrap();
+                            call.debit_active_work(authority, excess).unwrap();
+                            let before = call.metrics();
+                            assert_eq!(before.remaining_work, BUFFER_BRIDGE_WORK);
+                            assert_eq!(
+                                call.handle_host_call(authority, host),
+                                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                            );
+                            assert_eq!(call.metrics(), before);
+                            break;
+                        }
+                        assert!(matches!(
+                            call.handle_host_call(authority, host),
+                            NativeAsyncPoll::Pending(_)
+                                | NativeAsyncPoll::Resolved(_)
+                                | NativeAsyncPoll::Yielded(_)
+                        ));
+                    }
+                    PollResult::Ready(_) => panic!("invalid cancel fixture unexpectedly returned"),
+                    PollResult::Trapped(trap) => {
+                        panic!("invalid cancel fixture trapped before cancel: {trap:?}")
+                    }
+                }
+            }
+
+            assert!(call.component.is_poisoned());
+            assert!(call.component.buffers.is_poisoned());
+            assert_eq!(call.component.buffers.live(), 0);
+        }
+    }
+
+    #[test]
+    fn byte_stream_transfer_fuel_is_reserved_before_the_first_memory_write() {
+        let source = byte_stream_component(
+            r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      i32.const 16
+      i32.const 67305985
+      i32.store
+      i32.const 24
+      i32.const -1431655766
+      i32.store
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      i32.const 4
+      call $stream-write
+      drop
+      local.get $pair
+      i32.wrap_i64
+      i32.const 24
+      i32.const 4
+      call $stream-read
+      drop
+      i32.const 1)"#,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        let authority = CallAuthority::Run(active);
+        loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(authority));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => {
+                    let action = call.component.bridges[host.id as usize].action;
+                    if matches!(
+                        action,
+                        BridgeAction::StreamCopy {
+                            direction: EndpointDirection::Read,
+                            ..
+                        }
+                    ) {
+                        assert_eq!(call.component.buffers.live(), 1);
+                        let transfer =
+                            buffer_copy_work(4, call.component.buffers.scratch_bytes()).unwrap();
+                        let tight = BUFFER_BRIDGE_WORK + transfer;
+                        let excess = call.metrics().remaining_work.checked_sub(tight).unwrap();
+                        call.debit_active_work(authority, excess).unwrap();
+                        let before = call.metrics();
+                        assert_eq!(
+                            call.handle_host_call(authority, host),
+                            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
+                        );
+                        let after = call.metrics();
+                        assert_eq!(
+                            before.remaining_work - after.remaining_work,
+                            BUFFER_BRIDGE_WORK
+                        );
+                        break;
+                    }
+                    assert!(matches!(
+                        call.handle_host_call(authority, host),
+                        NativeAsyncPoll::Pending(_)
+                    ));
+                }
+                PollResult::Ready(_) => panic!("copy fuel fixture unexpectedly returned"),
+                PollResult::Trapped(trap) => panic!("copy fuel fixture trapped early: {trap:?}"),
+            }
+        }
+        assert!(call.component.is_poisoned());
+        assert!(call.component.buffers.is_poisoned());
+        assert_eq!(call.component.buffers.live(), 0);
+        assert!(!call.component.modules.any_active_call());
+        let mut target = [0_u8; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 24, &mut target)
+            .unwrap();
+        assert_eq!(target, [0xaa; 4]);
     }
 
     #[test]
@@ -2448,6 +3525,28 @@ mod tests {
             map_sealed_state_error(AsyncStateError::StaleHandle),
             TrapCode::Validation
         );
+        for error in [
+            AsyncStateError::InvalidHandle,
+            AsyncStateError::StaleHandle,
+            AsyncStateError::WrongState,
+            AsyncStateError::WrongHandleKind,
+            AsyncStateError::WrongEndpointKind,
+            AsyncStateError::WrongDirection,
+            AsyncStateError::WrongType,
+        ] {
+            assert_eq!(map_exact_endpoint_state_error(error), TrapCode::Validation);
+        }
+        for error in [
+            AsyncStateError::EndpointBusy,
+            AsyncStateError::EndpointDone,
+            AsyncStateError::OperationNotCopying,
+            AsyncStateError::CancelWhileJoined,
+        ] {
+            assert_eq!(
+                map_exact_endpoint_state_error(error),
+                TrapCode::CanonicalAbi
+            );
+        }
         assert_eq!(
             map_callback_yield_error(AsyncStateError::TaskAlreadyExited),
             TrapCode::Validation
@@ -3099,7 +4198,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_wait_lease_fails_validation_without_delivery_or_reclaim() {
+    fn endpoint_wait_reclaim_failure_drains_copy_state_before_poison() {
         let source = wait_component(false, cancellation_exit_callback());
         let mut component = instantiate(&source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
@@ -3140,8 +4239,11 @@ mod tests {
             WAIT_STATE_WORK
         );
         let endpoint = call.component.state.endpoint_info(pair.readable).unwrap();
-        assert!(endpoint.has_pending_event);
+        assert!(!endpoint.has_pending_event);
         assert!(!endpoint.event_delivered);
+        assert_eq!(endpoint.copy_state, crate::async_state::CopyState::Done);
+        assert_eq!(call.component.buffers.live(), 0);
+        assert!(call.component.buffers.is_poisoned());
         assert_eq!(
             call.component.state.task_info(call.task).err(),
             Some(AsyncStateError::StaleHandle)

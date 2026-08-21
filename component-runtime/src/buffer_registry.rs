@@ -174,7 +174,6 @@ impl BufferRegistry {
         Self::new_with_scratch_limit(maximum, max_copy_bytes, scratch_bytes)
     }
 
-    #[cfg(test)]
     pub(crate) const fn live(&self) -> u32 {
         self.live
     }

@@ -1,5 +1,15 @@
 //! Bounded Component Model validation and Canonical ABI runtime primitives.
 
+#![cfg_attr(
+    not(feature = "native-async-acceptance"),
+    doc = r#"
+The native async acceptance façade is structurally absent by default:
+
+```compile_fail
+use vibeos_component_runtime::native_async_acceptance;
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;
@@ -22,3 +32,21 @@ pub mod value;
 pub mod world;
 
 pub use execution::{HostCoreExportInfo, HostImportInfo};
+
+/// Acceptance-only façade for the sealed native async validation candidate.
+///
+/// Enabling this feature does not change either the advertised profile or its
+/// `runtime_ready` bit. Production execution remains inert; an acceptance
+/// harness must opt into both the Cargo feature and the explicitly named
+/// validation-candidate constructor.
+#[cfg(feature = "native-async-acceptance")]
+pub mod native_async_acceptance {
+    pub use crate::native_async::{
+        NativeAsyncCancelOutcome as CancelOutcome, NativeAsyncComponent as Component,
+        NativeAsyncControlError as ControlError, NativeAsyncError as Error,
+        NativeAsyncFinalizeError as FinalizeError, NativeAsyncHostError as HostError,
+        NativeAsyncHostRequest as HostRequest, NativeAsyncHostToken as HostToken,
+        NativeAsyncInvocation as Invocation, NativeAsyncMetrics as Metrics,
+        NativeAsyncPoll as Poll, NativeAsyncWaitToken as WaitToken,
+    };
+}

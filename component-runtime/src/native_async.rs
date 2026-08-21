@@ -14,9 +14,10 @@ use crate::{
     },
     async_state::{
         AsyncState, AsyncStateError, AsyncStateLimits, CommitError, CopyBegin, EndpointKind, Event,
-        EventLease, EventLeaseState, EventToken, HostCopyTicket, HostReadableBindingsPair,
-        ReadableTransferRequest, ReclaimError, TaskCancelState, TaskHandle, TaskResultState,
-        TransferredReadableEndpoint, WaitBegin, WaitResume, WaitTicket,
+        EventLease, EventLeaseState, EventToken, HostCopyTicket, HostPeerDropReceipt,
+        HostReadableBindingsPair, NativeFilterFinalizeError, ReadableTransferRequest, ReclaimError,
+        TaskCancelState, TaskHandle, TaskResultState, TransferredReadableEndpoint, WaitBegin,
+        WaitResume, WaitTicket,
     },
     buffer_registry::{BufferPlanId, BufferRegistry, BufferRole},
     decode::ComponentPlan,
@@ -72,7 +73,7 @@ use crate::async_state::TaskInfo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
-pub(crate) enum NativeAsyncError {
+pub enum NativeAsyncError {
     Allocation = 1,
     CoreAdmission = 2,
     CoreInstantiation = 3,
@@ -84,16 +85,17 @@ pub(crate) enum NativeAsyncError {
     Poisoned = 9,
     AsyncUnavailable = 10,
     UnsupportedFeature = 11,
+    NotValidationCandidate = 12,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NativeAsyncMetrics {
+pub struct NativeAsyncMetrics {
     pub consumed_work: u64,
     pub remaining_work: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeAsyncPoll {
+pub enum NativeAsyncPoll {
     Pending(NativeAsyncMetrics),
     Resolved(NativeAsyncMetrics),
     Yielded(NativeAsyncMetrics),
@@ -116,7 +118,7 @@ pub(crate) enum NativeAsyncPoll {
 /// rotates at every two-phase driver transition. Private fields make tokens
 /// unforgeable outside this executor module.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeAsyncHostToken {
+pub struct NativeAsyncHostToken {
     task: TaskHandle,
     generation: NonZeroU64,
 }
@@ -128,7 +130,7 @@ impl core::fmt::Debug for NativeAsyncHostToken {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeAsyncHostRequest {
+pub enum NativeAsyncHostRequest {
     InputStream { maximum: u32 },
     InputClosed,
     OutputStream { maximum: u32 },
@@ -136,7 +138,7 @@ pub(crate) enum NativeAsyncHostRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeAsyncHostError {
+pub enum NativeAsyncHostError {
     InvalidToken,
     NotPending,
     WrongRequest,
@@ -150,7 +152,7 @@ pub(crate) enum NativeAsyncHostError {
 /// the monotonically increasing generation prevents reuse across successive
 /// waits by the same task. Fields remain private so callers cannot forge it.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeAsyncWaitToken {
+pub struct NativeAsyncWaitToken {
     task: TaskHandle,
     generation: u64,
 }
@@ -162,20 +164,29 @@ impl core::fmt::Debug for NativeAsyncWaitToken {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeAsyncCancelOutcome {
+pub enum NativeAsyncCancelOutcome {
     Requested,
     TooLate,
     AlreadyTerminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeAsyncControlError {
+pub enum NativeAsyncControlError {
     Invariant,
     InvalidWaitToken,
     NotWaiting,
 }
 
-pub(crate) struct NativeAsyncComponent {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeAsyncFinalizeError {
+    NotReady,
+    AlreadyFinalized,
+    WrongContract,
+    Poisoned,
+    Invariant,
+}
+
+pub struct NativeAsyncComponent {
     modules: CoreComponentGroup,
     exports: Vec<RuntimeExport>,
     /// One allocation-backed callback call shell per exact runtime export.
@@ -321,6 +332,25 @@ impl NativeAsyncComponent {
             reservation_per_module,
             PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
         )
+    }
+
+    /// Instantiates only the still-inert native async validation candidate.
+    ///
+    /// This constructor is deliberately available only to the acceptance
+    /// façade. It neither consults nor changes a production activation bit;
+    /// instead it rejects a plan that claims to be runtime-ready and applies
+    /// the manifest-selected memory ceiling directly to every Core store.
+    #[cfg(feature = "native-async-acceptance")]
+    pub fn instantiate_validation_candidate_with_memory_limit(
+        plan: &ComponentPlan<'_>,
+        engine: &ProfileEngine,
+        reservation_per_module: OwnerAllocationReservation,
+        manifest_memory_bytes: usize,
+    ) -> Result<Self, NativeAsyncError> {
+        if plan.native_async_runtime_ready() {
+            return Err(NativeAsyncError::NotValidationCandidate);
+        }
+        Self::instantiate_sealed(plan, engine, reservation_per_module, manifest_memory_bytes)
     }
 
     #[cfg(test)]
@@ -514,17 +544,20 @@ impl NativeAsyncComponent {
             host_next: None,
             host_token: None,
             next_host_generation: 1,
+            terminal_drops: NativeFilterTerminalDropLedger::default(),
+            transport_finalized: false,
             terminal: false,
         })
     }
 
     /// Starts the exact resource-free C5.3 byte-stream filter contract.
     ///
-    /// This entry point remains crate-private while the profile identity is
-    /// validation-only. Both input endpoints are installed atomically before
-    /// Core entry, and no raw handle or host endpoint authority crosses this
-    /// executor boundary.
-    pub(crate) fn start_filter<'a>(
+    /// This entry point is reachable publicly only through the feature-gated
+    /// acceptance façade; the executor module remains private and the profile
+    /// identity remains validation-only. Both input endpoints are installed
+    /// atomically before Core entry, and no raw handle or host endpoint
+    /// authority crosses this executor boundary.
+    pub fn start_filter<'a>(
         &'a mut self,
         export: &str,
         total_work: u64,
@@ -638,6 +671,8 @@ impl NativeAsyncComponent {
             host_next: None,
             host_token: None,
             next_host_generation: 1,
+            terminal_drops: NativeFilterTerminalDropLedger::default(),
+            transport_finalized: false,
             terminal: false,
         })
     }
@@ -1344,7 +1379,14 @@ struct PendingHostCopy {
     charged: bool,
 }
 
-pub(crate) struct NativeAsyncInvocation<'a> {
+#[derive(Default)]
+struct NativeFilterTerminalDropLedger {
+    input_stream: Option<HostPeerDropReceipt>,
+    output_stream: Option<HostPeerDropReceipt>,
+    output_closed: Option<HostPeerDropReceipt>,
+}
+
+pub struct NativeAsyncInvocation<'a> {
     component: &'a mut NativeAsyncComponent,
     export: usize,
     task: TaskHandle,
@@ -1368,11 +1410,13 @@ pub(crate) struct NativeAsyncInvocation<'a> {
     host_next: Option<PendingHostCopy>,
     host_token: Option<NativeAsyncHostToken>,
     next_host_generation: u64,
+    terminal_drops: NativeFilterTerminalDropLedger,
+    transport_finalized: bool,
     terminal: bool,
 }
 
 impl NativeAsyncInvocation<'_> {
-    pub(crate) fn poll(&mut self) -> NativeAsyncPoll {
+    pub fn poll(&mut self) -> NativeAsyncPoll {
         if self.terminal {
             return NativeAsyncPoll::Trapped(TrapCode::Cancelled);
         }
@@ -1389,7 +1433,7 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    pub(crate) const fn metrics(&self) -> NativeAsyncMetrics {
+    pub const fn metrics(&self) -> NativeAsyncMetrics {
         NativeAsyncMetrics {
             consumed_work: self.total_work - self.remaining_work,
             remaining_work: self.remaining_work,
@@ -1398,9 +1442,7 @@ impl NativeAsyncInvocation<'_> {
 
     /// Requests owner-side task cancellation without cancelling or otherwise
     /// disturbing the currently active Core continuation.
-    pub(crate) fn request_cancel(
-        &mut self,
-    ) -> Result<NativeAsyncCancelOutcome, NativeAsyncControlError> {
+    pub fn request_cancel(&mut self) -> Result<NativeAsyncCancelOutcome, NativeAsyncControlError> {
         if self.terminal || self.component.poisoned {
             return Ok(NativeAsyncCancelOutcome::AlreadyTerminal);
         }
@@ -1429,7 +1471,7 @@ impl NativeAsyncInvocation<'_> {
 
     /// Reserves byte work and validates the exact guest input target before a
     /// backend is allowed to linearize an input receive.
-    pub(crate) fn prepare_host_input_stream(
+    pub fn prepare_host_input_stream(
         &mut self,
         token: NativeAsyncHostToken,
         progress: u32,
@@ -1457,7 +1499,7 @@ impl NativeAsyncInvocation<'_> {
         Ok(self.finish_host_prepare(progress, None))
     }
 
-    pub(crate) fn prepare_host_input_closed(
+    pub fn prepare_host_input_closed(
         &mut self,
         token: NativeAsyncHostToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
@@ -1482,7 +1524,7 @@ impl NativeAsyncInvocation<'_> {
 
     /// Copies the exact frozen guest source once into caller-owned fixed
     /// storage. The caller may linearize its backend send before committing.
-    pub(crate) fn prepare_host_output_stream(
+    pub fn prepare_host_output_stream(
         &mut self,
         token: NativeAsyncHostToken,
         output: &mut [u8],
@@ -1526,7 +1568,7 @@ impl NativeAsyncInvocation<'_> {
 
     /// Lifts the exact frozen close discriminant once. The value is retained
     /// in the stable HostPending request until backend linearization commits.
-    pub(crate) fn prepare_host_output_closed(
+    pub fn prepare_host_output_closed(
         &mut self,
         token: NativeAsyncHostToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
@@ -1559,7 +1601,7 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    pub(crate) fn commit_host_input_stream(
+    pub fn commit_host_input_stream(
         &mut self,
         token: NativeAsyncHostToken,
         input: &[u8],
@@ -1589,7 +1631,7 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    pub(crate) fn commit_host_input_closed(
+    pub fn commit_host_input_closed(
         &mut self,
         token: NativeAsyncHostToken,
         value: u8,
@@ -1620,7 +1662,7 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    pub(crate) fn commit_host_output(
+    pub fn commit_host_output(
         &mut self,
         token: NativeAsyncHostToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
@@ -1638,7 +1680,7 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    pub(crate) fn cancel_host_copy(
+    pub fn cancel_host_copy(
         &mut self,
         token: NativeAsyncHostToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
@@ -1654,7 +1696,7 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    pub(crate) fn drop_host_copy_peer(
+    pub fn drop_host_copy_peer(
         &mut self,
         token: NativeAsyncHostToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
@@ -1665,15 +1707,141 @@ impl NativeAsyncInvocation<'_> {
         ) {
             return Err(NativeAsyncHostError::WrongRequest);
         }
+        let request = self.host_current.as_ref().unwrap().request;
         self.host_token = None;
         let dropped = {
             let host = self.host_current.as_mut().unwrap();
-            self.component.state.drop_host_copy_peer(&mut host.ticket)
+            self.component
+                .state
+                .drop_host_copy_peer_with_receipt(&mut host.ticket)
         };
         match dropped {
-            Ok(_event) => Ok(self.finish_host_commit()),
+            Ok((_event, receipt)) => {
+                let slot = match request {
+                    NativeAsyncHostRequest::InputStream { .. } => {
+                        &mut self.terminal_drops.input_stream
+                    }
+                    NativeAsyncHostRequest::OutputStream { .. } => {
+                        &mut self.terminal_drops.output_stream
+                    }
+                    NativeAsyncHostRequest::OutputClosed { .. } => {
+                        &mut self.terminal_drops.output_closed
+                    }
+                    NativeAsyncHostRequest::InputClosed => {
+                        return Ok(self.finish_trap(TrapCode::Validation))
+                    }
+                };
+                if slot.is_some() {
+                    return Ok(self.finish_trap(TrapCode::Validation));
+                }
+                *slot = Some(receipt);
+                Ok(self.finish_host_commit())
+            }
             Err(error) => Ok(self.finish_trap(map_runtime_state_error(error))),
         }
+    }
+
+    /// Consumes the retained filter transport after clean guest termination.
+    ///
+    /// Caller-visible early attempts are read-only. The guest must first
+    /// reclaim every copy event, drop all four peer endpoints, exit its
+    /// callback, and leave no Core, wait, host-copy, or buffer continuation.
+    /// A rejection of an opaque seal at that exact boundary is an executor
+    /// invariant and therefore poisons the Component fail-stop.
+    pub fn finalize_transport(&mut self) -> Result<(), NativeAsyncFinalizeError> {
+        if self.component.poisoned {
+            return Err(NativeAsyncFinalizeError::Poisoned);
+        }
+        if self.transport_finalized {
+            return Err(NativeAsyncFinalizeError::AlreadyFinalized);
+        }
+        let RuntimeExportContract::ByteStream(contract) = self.binding().contract else {
+            return Err(NativeAsyncFinalizeError::WrongContract);
+        };
+        if !self.terminal || self.stage != InvocationStage::Terminal {
+            return Err(NativeAsyncFinalizeError::NotReady);
+        }
+        if self.component.modules.any_active_call()
+            || self
+                .component
+                .callback_slots
+                .iter()
+                .any(|slot| slot.state() != CoreCallSlotState::Idle)
+            || self.callback_pending
+            || self.wait_ticket.is_some()
+            || self.wait_token.is_some()
+            || self.host_current.is_some()
+            || self.host_next.is_some()
+            || self.host_token.is_some()
+        {
+            self.poison_finalize_invariant();
+            return Err(NativeAsyncFinalizeError::Invariant);
+        }
+        if !matches!(
+            self.component.state.task_info(self.task),
+            Err(AsyncStateError::StaleHandle)
+        ) {
+            self.poison_finalize_invariant();
+            return Err(NativeAsyncFinalizeError::Invariant);
+        }
+        if self.component.buffers.live() != 0 {
+            self.poison_finalize_invariant();
+            return Err(NativeAsyncFinalizeError::Invariant);
+        }
+
+        let finalized = match (
+            self.input.as_mut(),
+            self.output_stream.as_ref(),
+            self.output_closed.as_ref(),
+        ) {
+            (Some(input), Some(output_stream), Some(output_closed)) => {
+                if input.first.host.kind() != EndpointKind::Stream
+                    || input.first.host.direction() != EndpointDirection::Write
+                    || input.first.host.value_type() != contract.stream
+                    || input.second.host.kind() != EndpointKind::Future
+                    || input.second.host.direction() != EndpointDirection::Write
+                    || input.second.host.value_type() != contract.closed
+                    || output_stream.value_type() != contract.stream
+                    || output_closed.value_type() != contract.closed
+                {
+                    self.poison_finalize_invariant();
+                    return Err(NativeAsyncFinalizeError::Invariant);
+                }
+                self.component.state.finalize_native_filter_transport(
+                    input,
+                    output_stream,
+                    output_closed,
+                    self.terminal_drops.input_stream.as_ref(),
+                    self.terminal_drops.output_stream.as_ref(),
+                    self.terminal_drops.output_closed.as_ref(),
+                )
+            }
+            _ => {
+                self.poison_finalize_invariant();
+                return Err(NativeAsyncFinalizeError::Invariant);
+            }
+        };
+        match finalized {
+            Ok(()) => {
+                self.input = None;
+                self.output_stream = None;
+                self.output_closed = None;
+                self.terminal_drops = NativeFilterTerminalDropLedger::default();
+                self.transport_finalized = true;
+                Ok(())
+            }
+            Err(NativeFilterFinalizeError::Invariant(_)) => {
+                self.poison_finalize_invariant();
+                Err(NativeAsyncFinalizeError::Invariant)
+            }
+        }
+    }
+
+    fn poison_finalize_invariant(&mut self) {
+        self.host_token = None;
+        self.stage = InvocationStage::Terminal;
+        self.terminal = true;
+        self.poison_and_discard();
     }
 
     /// Uses one exact owner token to perform one real blocked-wait scan.
@@ -1681,7 +1849,7 @@ impl NativeAsyncInvocation<'_> {
     /// Ordinary [`Self::poll`] calls never scan a blocked wait. A pending
     /// explicit resume spends one bounded state-transition charge and rotates
     /// the token, making retries and spurious wakes observable and linear.
-    pub(crate) fn resume_wait(
+    pub fn resume_wait(
         &mut self,
         token: NativeAsyncWaitToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncControlError> {
@@ -3170,13 +3338,12 @@ impl NativeAsyncInvocation<'_> {
 impl Drop for NativeAsyncInvocation<'_> {
     fn drop(&mut self) {
         // A unit invocation owns no transport authority after a clean exit and
-        // can leave its Component reusable. The filter transport is not yet
-        // externally drivable while this profile remains validation-only, so
-        // silently dropping any retained input or result authority would lose
-        // its exact Host holder while leaving the pair arena live. Fail-stop
-        // until the host-pending slice has explicitly consumed every one of
-        // those authorities; a partially wired caller must never turn a clean
-        // callback exit into bounded per-invocation leakage.
+        // can leave its Component reusable. A filter invocation must also pass
+        // the exact terminal finalizer, which atomically consumes all retained
+        // Host holders and clears these fields. Silently dropping any
+        // remaining input or result authority would lose its exact holder
+        // while leaving the pair arena live, so incomplete acceptance drivers
+        // remain fail-stop.
         let retained_transport =
             self.input.is_some() || self.output_stream.is_some() || self.output_closed.is_some();
         if !self.terminal || (!self.component.poisoned && retained_transport) {
@@ -3306,6 +3473,8 @@ mod tests {
                 (canon stream.write $bytes async (memory $memory)))
               (core func $stream-drop-readable
                 (canon stream.drop-readable $bytes))
+              (core func $stream-drop-writable
+                (canon stream.drop-writable $bytes))
               (core func $future-new (canon future.new $closed))
               (core func $future-read
                 (canon future.read $closed async (memory $memory)))
@@ -3313,16 +3482,26 @@ mod tests {
                 (canon future.write $closed async (memory $memory)))
               (core func $future-drop-readable
                 (canon future.drop-readable $closed))
+              (core func $future-drop-writable
+                (canon future.drop-writable $closed))
+              (core func $waitable-set-new (canon waitable-set.new))
+              (core func $waitable-set-drop (canon waitable-set.drop))
+              (core func $waitable-join (canon waitable.join))
               (core instance $builtins
                 (export "task-return" (func $task-return))
                 (export "stream-new" (func $stream-new))
                 (export "stream-read" (func $stream-read))
                 (export "stream-write" (func $stream-write))
                 (export "stream-drop-readable" (func $stream-drop-readable))
+                (export "stream-drop-writable" (func $stream-drop-writable))
                 (export "future-new" (func $future-new))
                 (export "future-read" (func $future-read))
                 (export "future-write" (func $future-write))
-                (export "future-drop-readable" (func $future-drop-readable)))
+                (export "future-drop-readable" (func $future-drop-readable))
+                (export "future-drop-writable" (func $future-drop-writable))
+                (export "waitable-set-new" (func $waitable-set-new))
+                (export "waitable-set-drop" (func $waitable-set-drop))
+                (export "waitable-join" (func $waitable-join)))
 
               (core module $guest
                 (import "env" "memory" (memory 1 1))
@@ -3336,6 +3515,8 @@ mod tests {
                   (func $stream-write (param i32 i32 i32) (result i32)))
                 (import "vibe:async" "stream-drop-readable"
                   (func $stream-drop-readable (param i32)))
+                (import "vibe:async" "stream-drop-writable"
+                  (func $stream-drop-writable (param i32)))
                 (import "vibe:async" "future-new"
                   (func $future-new (result i64)))
                 (import "vibe:async" "future-read"
@@ -3344,10 +3525,19 @@ mod tests {
                   (func $future-write (param i32 i32) (result i32)))
                 (import "vibe:async" "future-drop-readable"
                   (func $future-drop-readable (param i32)))
+                (import "vibe:async" "future-drop-writable"
+                  (func $future-drop-writable (param i32)))
+                (import "vibe:async" "waitable-set-new"
+                  (func $waitable-set-new (result i32)))
+                (import "vibe:async" "waitable-set-drop"
+                  (func $waitable-set-drop (param i32)))
+                (import "vibe:async" "waitable-join"
+                  (func $waitable-join (param i32 i32)))
                 (func (export "run")
                   (param $input-bytes i32) (param $input-closed i32) (result i32)
                   (local $stream-pair i64)
                   (local $closed-pair i64)
+                  (local $set i32)
                   {run})
                 (func (export "callback")
                   (param $event i32) (param $p1 i32) (param $p2 i32) (result i32)
@@ -3501,6 +3691,324 @@ mod tests {
               i32.const 1"#
         );
         filter_transport_component(&run, "i32.const 0")
+    }
+
+    fn clean_finalize_component(leak_local_pair: bool) -> String {
+        clean_finalize_component_with_peer_drops(false, false, false, leak_local_pair)
+    }
+
+    fn clean_finalize_component_with_peer_drops(
+        drop_input_stream: bool,
+        drop_output_stream: bool,
+        drop_output_closed: bool,
+        leak_local_pair: bool,
+    ) -> String {
+        let leak = if leak_local_pair {
+            // This pair is deliberately unrelated to the four retained
+            // filter pairs. A callback Exit with it still live is a sealed
+            // terminal-state invariant, never work for finalization to guess.
+            "call $stream-new\n              drop"
+        } else {
+            ""
+        };
+        let input_stream = if drop_input_stream {
+            r#"local.get $input-bytes
+              local.get $set
+              call $waitable-join
+              local.get $input-bytes
+              i32.const 16
+              i32.const 4
+              call $stream-read
+              i32.const -1
+              i32.ne
+              if unreachable end"#
+        } else {
+            r#"local.get $input-bytes
+              call $stream-drop-readable"#
+        };
+        let output_stream = if drop_output_stream {
+            r#"i32.const 64
+              i32.const 67305985
+              i32.store
+              local.get $stream-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              local.get $set
+              call $waitable-join
+              local.get $stream-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.const 64
+              i32.const 4
+              call $stream-write
+              i32.const -1
+              i32.ne
+              if unreachable end"#
+        } else {
+            r#"local.get $stream-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              call $stream-drop-writable"#
+        };
+        let output_closed_result = u32::from(drop_output_closed);
+        let run = format!(
+            r#"i32.const 80
+              i32.const 0
+              i32.store
+              call $waitable-set-new
+              local.set $set
+              i32.const 84
+              local.get $set
+              i32.store
+              {input_stream}
+              local.get $input-closed
+              local.get $set
+              call $waitable-join
+              local.get $input-closed
+              i32.const 32
+              call $future-read
+              i32.const -1
+              i32.ne
+              if unreachable end
+              call $stream-new
+              local.set $stream-pair
+              {output_stream}
+              call $future-new
+              local.set $closed-pair
+              local.get $closed-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              local.get $set
+              call $waitable-join
+              i32.const 72
+              i32.const 6
+              i32.store8
+              local.get $closed-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.const 72
+              call $future-write
+              i32.const -1
+              i32.ne
+              if unreachable end
+              {leak}
+              local.get $stream-pair
+              i32.wrap_i64
+              local.get $closed-pair
+              i32.wrap_i64
+              call $task-return
+              local.get $set
+              i32.const 4
+              i32.shl
+              i32.const 2
+              i32.or"#
+        );
+        let expected_events = 2 + u32::from(drop_input_stream) + u32::from(drop_output_stream);
+        let callback = format!(
+            r#"local.get $event
+                  i32.const 2
+                  i32.eq
+                  if
+                    local.get $p2
+                    i32.const 1
+                    i32.ne
+                    if unreachable end
+                    local.get $p1
+                    call $stream-drop-readable
+                  else
+                    local.get $event
+                    i32.const 3
+                    i32.eq
+                    if
+                      local.get $p2
+                      i32.const 1
+                      i32.ne
+                      if unreachable end
+                      local.get $p1
+                      call $stream-drop-writable
+                    else
+                      local.get $event
+                      i32.const 4
+                      i32.eq
+                      if
+                        local.get $p2
+                        if unreachable end
+                        local.get $p1
+                        call $future-drop-readable
+                      else
+                        local.get $event
+                        i32.const 5
+                        i32.ne
+                        if unreachable end
+                        local.get $p2
+                        i32.const {output_closed_result}
+                        i32.ne
+                        if unreachable end
+                        local.get $p1
+                        call $future-drop-writable
+                      end
+                    end
+                  end
+                  i32.const 80
+                  i32.const 80
+                  i32.load
+                  i32.const 1
+                  i32.add
+                  i32.store
+                  i32.const 80
+                  i32.load
+                  i32.const {expected_events}
+                  i32.eq
+                  if (result i32)
+                    i32.const 84
+                    i32.load
+                    call $waitable-set-drop
+                    i32.const 0
+                  else
+                    i32.const 84
+                    i32.load
+                    i32.const 4
+                    i32.shl
+                    i32.const 2
+                    i32.or
+                  end"#
+        );
+        filter_transport_component(&run, &callback)
+    }
+
+    fn drive_clean_filter_to_complete(
+        call: &mut NativeAsyncInvocation<'_>,
+        drop_input_stream: bool,
+        drop_output_stream: bool,
+        drop_output_closed: bool,
+    ) {
+        let mut saw_input_stream = false;
+        let mut saw_input_closed = false;
+        let mut saw_output_stream = false;
+        let mut saw_output_closed = false;
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request: NativeAsyncHostRequest::InputStream { maximum: 4 },
+                    ..
+                } => {
+                    assert!(drop_input_stream);
+                    assert!(!saw_input_stream);
+                    saw_input_stream = true;
+                    assert!(matches!(
+                        call.drop_host_copy_peer(token),
+                        Ok(NativeAsyncPoll::Pending(_))
+                    ));
+                }
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request: NativeAsyncHostRequest::InputClosed,
+                    ..
+                } => {
+                    assert!(!saw_input_closed);
+                    saw_input_closed = true;
+                    let token = match call.prepare_host_input_closed(token).unwrap() {
+                        NativeAsyncPoll::HostPending {
+                            token,
+                            request: NativeAsyncHostRequest::InputClosed,
+                            ..
+                        } => token,
+                        other => panic!("input future prepare failed: {other:?}"),
+                    };
+                    assert!(matches!(
+                        call.commit_host_input_closed(token, 0),
+                        Ok(NativeAsyncPoll::Pending(_))
+                    ));
+                }
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request: NativeAsyncHostRequest::OutputStream { maximum: 4 },
+                    ..
+                } => {
+                    assert!(drop_output_stream);
+                    assert!(!saw_output_stream);
+                    saw_output_stream = true;
+                    assert!(matches!(
+                        call.drop_host_copy_peer(token),
+                        Ok(NativeAsyncPoll::HostPending { .. } | NativeAsyncPoll::Pending(_))
+                    ));
+                }
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request: NativeAsyncHostRequest::OutputClosed { value: None },
+                    ..
+                } => {
+                    assert!(!saw_output_closed);
+                    saw_output_closed = true;
+                    if drop_output_stream {
+                        assert!(call.terminal_drops.output_stream.is_some());
+                    }
+                    if drop_output_closed {
+                        assert!(matches!(
+                            call.drop_host_copy_peer(token),
+                            Ok(NativeAsyncPoll::Pending(_))
+                        ));
+                    } else {
+                        let token = match call.prepare_host_output_closed(token).unwrap() {
+                            NativeAsyncPoll::HostPending {
+                                token,
+                                request: NativeAsyncHostRequest::OutputClosed { value: Some(6) },
+                                ..
+                            } => token,
+                            other => panic!("output future prepare failed: {other:?}"),
+                        };
+                        assert!(matches!(
+                            call.commit_host_output(token),
+                            Ok(NativeAsyncPoll::Pending(_))
+                        ));
+                    }
+                }
+                NativeAsyncPoll::HostPending { request, .. } => {
+                    panic!("clean zero-byte filter requested {request:?}")
+                }
+                NativeAsyncPoll::WaitPending { .. } => {
+                    let mut count = [0_u8; 4];
+                    call.component
+                        .modules
+                        .read_memory(0, "memory", 80, &mut count)
+                        .unwrap();
+                    panic!(
+                        "clean-filter completion event is not ready after callback count {}",
+                        u32::from_le_bytes(count)
+                    )
+                }
+                NativeAsyncPoll::Complete(_) => break,
+                NativeAsyncPoll::Trapped(trap) => {
+                    panic!("clean filter trapped before finalization: {trap:?}")
+                }
+            }
+        }
+        assert_eq!(saw_input_stream, drop_input_stream);
+        assert!(saw_input_closed);
+        assert_eq!(saw_output_stream, drop_output_stream);
+        assert!(saw_output_closed);
+        assert_eq!(
+            call.terminal_drops.input_stream.is_some(),
+            drop_input_stream
+        );
+        assert_eq!(
+            call.terminal_drops.output_stream.is_some(),
+            drop_output_stream
+        );
+        assert_eq!(
+            call.terminal_drops.output_closed.is_some(),
+            drop_output_closed
+        );
+        assert_eq!(call.component.buffers.live(), 0);
     }
 
     fn filter_core_without_inputs(function_type: &str) -> String {
@@ -3887,6 +4395,271 @@ mod tests {
             .err(),
             Some(NativeAsyncError::AsyncUnavailable)
         );
+    }
+
+    #[cfg(feature = "native-async-acceptance")]
+    #[test]
+    fn acceptance_facade_requires_an_explicit_candidate_and_manifest_memory_limit() {
+        let source = clean_finalize_component(false);
+        let bytes = wat::parse_str(&source).unwrap();
+        let plan = inspect_component_for_profile(
+            &bytes,
+            ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+        )
+        .unwrap();
+        assert!(!plan.native_async_runtime_ready());
+        assert_eq!(
+            NativeAsyncComponent::instantiate(
+                &plan,
+                &ProfileEngine::new(),
+                OwnerAllocationReservation::profile_default(),
+            )
+            .err(),
+            Some(NativeAsyncError::AsyncUnavailable)
+        );
+        assert_eq!(
+            NativeAsyncComponent::instantiate_validation_candidate_with_memory_limit(
+                &plan,
+                &ProfileEngine::new(),
+                OwnerAllocationReservation::profile_default(),
+                65_535,
+            )
+            .err(),
+            Some(NativeAsyncError::CoreInstantiation)
+        );
+        let component: crate::native_async_acceptance::Component =
+            NativeAsyncComponent::instantiate_validation_candidate_with_memory_limit(
+                &plan,
+                &ProfileEngine::new(),
+                OwnerAllocationReservation::profile_default(),
+                65_536,
+            )
+            .unwrap();
+        assert!(!component.is_poisoned());
+    }
+
+    #[test]
+    fn finalize_is_read_only_before_complete_and_clean_completion_is_reusable() {
+        let source = clean_finalize_component(false);
+        let mut component = instantiate(&source);
+        for invocation in 0..2 {
+            {
+                let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+                let before_metrics = call.metrics();
+                let before_stream = call.input.as_ref().unwrap().first.guest;
+                let before_closed = call.input.as_ref().unwrap().second.guest;
+                assert_eq!(
+                    call.finalize_transport(),
+                    Err(NativeAsyncFinalizeError::NotReady)
+                );
+                assert_eq!(call.metrics(), before_metrics);
+                assert_eq!(call.input.as_ref().unwrap().first.guest, before_stream);
+                assert_eq!(call.input.as_ref().unwrap().second.guest, before_closed);
+                assert!(!call.component.is_poisoned());
+
+                drive_clean_filter_to_complete(&mut call, false, false, false);
+                assert_eq!(call.finalize_transport(), Ok(()));
+                assert!(call.input.is_none());
+                assert!(call.output_stream.is_none());
+                assert!(call.output_closed.is_none());
+                assert_eq!(
+                    call.finalize_transport(),
+                    Err(NativeAsyncFinalizeError::AlreadyFinalized)
+                );
+            }
+            assert!(
+                !component.is_poisoned(),
+                "clean finalized invocation {invocation} poisoned its component"
+            );
+        }
+    }
+
+    #[test]
+    fn consumed_host_peers_finalize_exactly_and_input_eof_is_reusable() {
+        // Real input EOF consumes the input stream's Host writer. Its receipt
+        // remains bound to the old pair generation until the guest reclaims
+        // the Dropped event and drops its readable endpoint.
+        let source = clean_finalize_component_with_peer_drops(true, false, false, false);
+        let mut component = instantiate(&source);
+        for invocation in 0..2 {
+            {
+                let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+                drive_clean_filter_to_complete(&mut call, true, false, false);
+                assert!(call.terminal_drops.input_stream.is_some());
+                assert_eq!(call.finalize_transport(), Ok(()));
+                assert!(call.terminal_drops.input_stream.is_none());
+            }
+            assert!(
+                !component.is_poisoned(),
+                "input EOF invocation {invocation} did not remain reusable"
+            );
+        }
+
+        // The first queued output copy is dropped before the close future is
+        // activated. This proves the stream receipt is archived before the
+        // fixed second request advances; dropping that future archives the
+        // third and final legal receipt slot as well.
+        let source = clean_finalize_component_with_peer_drops(false, true, true, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        drive_clean_filter_to_complete(&mut call, false, true, true);
+        assert!(call.terminal_drops.input_stream.is_none());
+        assert!(call.terminal_drops.output_stream.is_some());
+        assert!(call.terminal_drops.output_closed.is_some());
+        assert_eq!(call.finalize_transport(), Ok(()));
+        drop(call);
+        assert!(!component.is_poisoned());
+
+        // Mixed retained/consumed state exercises an allocation-free commit
+        // of only the two pairs whose Host holders remain live.
+        let source = clean_finalize_component_with_peer_drops(true, true, false, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        drive_clean_filter_to_complete(&mut call, true, true, false);
+        assert_eq!(call.finalize_transport(), Ok(()));
+        drop(call);
+        assert!(!component.is_poisoned());
+
+        // All three droppable peers consumed leaves only InputClosed retained,
+        // exercising the one-pair terminal commit.
+        let source = clean_finalize_component_with_peer_drops(true, true, true, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        drive_clean_filter_to_complete(&mut call, true, true, true);
+        assert_eq!(call.finalize_transport(), Ok(()));
+        drop(call);
+        assert!(!component.is_poisoned());
+    }
+
+    #[test]
+    fn finalize_wrong_contract_is_read_only() {
+        let mut component = instantiate(SMOKE);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let before_metrics = call.metrics();
+            let before_task = call.task_info();
+            assert_eq!(
+                call.finalize_transport(),
+                Err(NativeAsyncFinalizeError::WrongContract)
+            );
+            assert_eq!(call.metrics(), before_metrics);
+            assert_eq!(call.task_info(), before_task);
+            assert!(!call.component.is_poisoned());
+            loop {
+                match call.poll() {
+                    NativeAsyncPoll::Pending(_)
+                    | NativeAsyncPoll::Resolved(_)
+                    | NativeAsyncPoll::Yielded(_) => {}
+                    NativeAsyncPoll::Complete(_) => break,
+                    other => panic!("unit call changed by wrong finalize: {other:?}"),
+                }
+            }
+        }
+        assert!(!component.is_poisoned());
+    }
+
+    #[test]
+    fn terminal_transport_invariants_poison_without_partial_finalization() {
+        // A guest callback which exits without dropping every retained peer
+        // has no remaining execution path that could make progress. This is
+        // terminal malformed cleanup, not a retryable early finalize.
+        let source = output_transport_component(false, false, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Complete(_) => break,
+                other => panic!("unclean terminal fixture failed early: {other:?}"),
+            }
+        }
+        assert_eq!(call.component.buffers.live(), 0);
+        assert_eq!(
+            call.finalize_transport(),
+            Err(NativeAsyncFinalizeError::Invariant)
+        );
+        assert!(!call.transport_finalized);
+        assert!(call.component.is_poisoned());
+
+        // Even with the expected four pairs otherwise clean, an unrelated
+        // live guest pair at callback Exit violates the exact global baseline.
+        let source = clean_finalize_component(true);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        drive_clean_filter_to_complete(&mut call, false, false, false);
+        assert_eq!(
+            call.finalize_transport(),
+            Err(NativeAsyncFinalizeError::Invariant)
+        );
+        assert!(!call.transport_finalized);
+        assert!(call.component.is_poisoned());
+
+        // A consumed input stream receipt remains bound to its old generation.
+        // Reusing the raw handle/pair slots with a new live aggregate must not
+        // let the stale receipt substitute for that replacement.
+        let source = clean_finalize_component_with_peer_drops(true, false, false, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let old_input = call.input.as_ref().unwrap().first.guest;
+        drive_clean_filter_to_complete(&mut call, true, false, false);
+        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
+            panic!("replacement fixture lost its filter contract")
+        };
+        let replacement = call
+            .component
+            .state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, contract.stream),
+                (EndpointKind::Future, contract.closed),
+            )
+            .unwrap();
+        assert_eq!(replacement.first.guest.raw(), old_input.raw());
+        assert_ne!(replacement.first.guest, old_input);
+        assert_eq!(
+            call.finalize_transport(),
+            Err(NativeAsyncFinalizeError::Invariant)
+        );
+        assert!(!call.transport_finalized);
+        assert!(call.component.is_poisoned());
+        drop(replacement);
+    }
+
+    #[test]
+    fn live_buffer_at_terminal_finalize_is_a_fail_stop_invariant() {
+        let source = clean_finalize_component(false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        drive_clean_filter_to_complete(&mut call, false, false, false);
+        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
+            panic!("clean filter lost its byte-stream contract")
+        };
+        let prepared = call
+            .component
+            .buffers
+            .preflight(
+                &call.component.modules,
+                BufferPlanId::new(contract.stream.get()).unwrap(),
+                call.component
+                    .modules
+                    .memory_authority(0, "memory")
+                    .unwrap(),
+                BufferRole::TargetRead,
+                0,
+                0,
+                contract.stream,
+            )
+            .unwrap();
+        let _orphaned_for_invariant_test = call.component.buffers.issue(prepared).unwrap();
+        assert_eq!(call.component.buffers.live(), 1);
+        assert_eq!(
+            call.finalize_transport(),
+            Err(NativeAsyncFinalizeError::Invariant)
+        );
+        assert!(!call.transport_finalized);
+        assert!(call.component.is_poisoned());
+        assert_eq!(call.component.buffers.live(), 0);
     }
 
     #[test]

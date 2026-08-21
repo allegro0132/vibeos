@@ -10,10 +10,16 @@
 #[path = "component_instances_acceptance.rs"]
 mod acceptance;
 
-#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
 #[path = "component_instances_native_async.rs"]
 mod native_async_acceptance;
-#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
 #[path = "native_pending_shadow_model.rs"]
 mod native_pending_shadow_model;
 
@@ -285,7 +291,9 @@ struct InstalledComponentIo {
 
 #[cfg(feature = "ssh-component-command")]
 enum ComponentStartInput {
-    Managed(ManagedComponentStartLease),
+    ManagedSync(ManagedComponentStartLease),
+    #[cfg(feature = "ssh-native-async-command")]
+    ManagedNativeAsync(ManagedComponentStartLease),
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     Acceptance(Option<InstalledComponentIo>),
     #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
@@ -296,7 +304,9 @@ enum ComponentStartInput {
 impl ComponentStartInput {
     fn kind(&self) -> ControlStartKind {
         match self {
-            Self::Managed(_) => ControlStartKind::Managed,
+            Self::ManagedSync(_) => ControlStartKind::ManagedSync,
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync(_) => ControlStartKind::ManagedNativeAsync,
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => ControlStartKind::Acceptance,
             #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
@@ -306,7 +316,9 @@ impl ComponentStartInput {
 
     fn cleanup(&self) -> Option<ManagedComponentStartLease> {
         match self {
-            Self::Managed(cleanup) => Some(*cleanup),
+            Self::ManagedSync(cleanup) => Some(*cleanup),
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync(cleanup) => Some(*cleanup),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => None,
             #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
@@ -316,10 +328,17 @@ impl ComponentStartInput {
 
     fn abort_unpublished(&self, terminal: ComponentTerminal) -> ComponentTerminal {
         match self {
-            Self::Managed(cleanup) => match cleanup.abort_before_child_publication(terminal) {
+            Self::ManagedSync(cleanup) => match cleanup.abort_before_child_publication(terminal) {
                 ManagedComponentStartAbort::CleanAborted => terminal,
                 ManagedComponentStartAbort::Quarantined => ComponentTerminal::RunnerFault,
             },
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync(cleanup) => {
+                match cleanup.abort_before_child_publication(terminal) {
+                    ManagedComponentStartAbort::CleanAborted => terminal,
+                    ManagedComponentStartAbort::Quarantined => ComponentTerminal::RunnerFault,
+                }
+            }
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(Some(io)) => finalize_unpublished_start_error(io, terminal),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -333,7 +352,9 @@ impl ComponentStartInput {
 
     fn bind(&self, token: ManagedComponentToken) -> bool {
         match self {
-            Self::Managed(cleanup) => cleanup.bind_before_child_publication(token),
+            Self::ManagedSync(cleanup) => cleanup.bind_before_child_publication(token),
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync(cleanup) => cleanup.bind_before_child_publication(token),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => true,
             #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
@@ -343,7 +364,11 @@ impl ComponentStartInput {
 
     fn take_bound_io(&mut self, token: ManagedComponentToken) -> Option<InstalledComponentIo> {
         match self {
-            Self::Managed(cleanup) => cleanup
+            Self::ManagedSync(cleanup) => cleanup
+                .claim_bound_io(token)
+                .map(InstalledComponentIo::from),
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync(cleanup) => cleanup
                 .claim_bound_io(token)
                 .map(InstalledComponentIo::from),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -355,7 +380,9 @@ impl ComponentStartInput {
 
     fn quarantine_partial(&self) {
         match self {
-            Self::Managed(cleanup) => cleanup.quarantine_partial_start(),
+            Self::ManagedSync(cleanup) => cleanup.quarantine_partial_start(),
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync(cleanup) => cleanup.quarantine_partial_start(),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => {}
             #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
@@ -413,10 +440,16 @@ fn quarantine_committed_start(
     token: InstanceToken,
     streams: RegistryStreamBindings,
 ) {
-    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    #[cfg(not(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    )))]
     let _ = streams;
-    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-    if input.kind() == ControlStartKind::NativeAsyncAcceptance {
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    if input.kind().is_native_async() {
         native_async_acceptance::quarantine_fault_shadow(key, token, streams);
     }
     CONTROL.child_shadow[key.slot as usize].quarantine(key);
@@ -453,11 +486,26 @@ enum TerminalCandidateSource {
 #[cfg(feature = "ssh-component-command")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlStartKind {
-    Managed,
+    ManagedSync,
+    #[cfg(feature = "ssh-native-async-command")]
+    ManagedNativeAsync,
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     Acceptance,
     #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
     NativeAsyncAcceptance,
+}
+
+#[cfg(feature = "ssh-component-command")]
+impl ControlStartKind {
+    const fn is_native_async(self) -> bool {
+        match self {
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::ManagedNativeAsync => true,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance => true,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -778,7 +826,11 @@ impl ControlTable {
         };
         let candidate_exact = terminal_candidate.is_some() == candidate_source.is_some();
         let cleanup_exact = match (start_kind, cleanup) {
-            (ControlStartKind::Managed, Some(cleanup)) => key
+            (ControlStartKind::ManagedSync, Some(cleanup)) => key
+                .managed_token()
+                .is_some_and(|token| !require_cleanup_active || cleanup.is_active_for(token)),
+            #[cfg(feature = "ssh-native-async-command")]
+            (ControlStartKind::ManagedNativeAsync, Some(cleanup)) => key
                 .managed_token()
                 .is_some_and(|token| !require_cleanup_active || cleanup.is_active_for(token)),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -1994,7 +2046,9 @@ struct ImageComponentLifecycle;
 #[cfg(feature = "ssh-component-command")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PayloadMode {
-    Command,
+    CommandSync,
+    #[cfg(feature = "ssh-native-async-command")]
+    NativeAsyncCommand,
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     AcceptanceFault {
         round: u8,
@@ -2012,6 +2066,92 @@ enum PayloadMode {
     },
     #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
     NativeAsyncAcceptance,
+}
+
+#[cfg(feature = "ssh-component-command")]
+impl PayloadMode {
+    const fn is_native_async(self) -> bool {
+        match self {
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::NativeAsyncCommand => true,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "ssh-component-command")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPolicyGate {
+    Sync,
+    #[cfg(feature = "ssh-native-async-command")]
+    NativeAsync,
+    #[cfg(any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance"
+    ))]
+    None,
+}
+
+#[cfg(feature = "ssh-component-command")]
+impl StartPolicyGate {
+    fn permits(self) -> bool {
+        match self {
+            Self::Sync => SSH_POLICY_GATE.load(Ordering::Acquire) == POLICY_PASSED,
+            #[cfg(feature = "ssh-native-async-command")]
+            Self::NativeAsync => native_async_acceptance::policy_gate_passed(),
+            #[cfg(any(
+                feature = "wasm-c48-qemu-acceptance",
+                feature = "wasm-c53-native-async-qemu-acceptance"
+            ))]
+            Self::None => true,
+        }
+    }
+}
+
+#[cfg(feature = "ssh-component-command")]
+fn start_route_exact(
+    gate: StartPolicyGate,
+    mode: PayloadMode,
+    input: &ComponentStartInput,
+) -> bool {
+    // In the sync-only feature matrix each input enum has only its sync variant, so the
+    // fail-closed wildcard is statically unreachable. Other supported matrices need it.
+    #[allow(unreachable_patterns)]
+    match (gate, mode, input.kind()) {
+        (StartPolicyGate::Sync, PayloadMode::CommandSync, ControlStartKind::ManagedSync) => true,
+        #[cfg(feature = "ssh-native-async-command")]
+        (
+            StartPolicyGate::NativeAsync,
+            PayloadMode::NativeAsyncCommand,
+            ControlStartKind::ManagedNativeAsync,
+        ) => true,
+        #[cfg(feature = "wasm-c48-qemu-acceptance")]
+        (StartPolicyGate::None, PayloadMode::CommandSync, ControlStartKind::Acceptance)
+        | (
+            StartPolicyGate::None,
+            PayloadMode::AcceptanceFault { .. },
+            ControlStartKind::Acceptance,
+        )
+        | (
+            StartPolicyGate::None,
+            PayloadMode::AcceptanceStream { .. },
+            ControlStartKind::Acceptance,
+        )
+        | (
+            StartPolicyGate::None,
+            PayloadMode::AcceptanceTerminalRace { .. },
+            ControlStartKind::Acceptance,
+        ) => true,
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        (
+            StartPolicyGate::None,
+            PayloadMode::NativeAsyncAcceptance,
+            ControlStartKind::NativeAsyncAcceptance,
+        ) => true,
+        _ => false,
+    }
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -2094,7 +2234,11 @@ fn child_start_gate(
     // projection check closes the check/use window around this copy-only
     // lifecycle query.
     let active = match projection {
-        (Some(ControlStartKind::Managed), Some(cleanup)) => key
+        (Some(ControlStartKind::ManagedSync), Some(cleanup)) => key
+            .managed_token()
+            .is_some_and(|managed| cleanup.is_active_for(managed)),
+        #[cfg(feature = "ssh-native-async-command")]
+        (Some(ControlStartKind::ManagedNativeAsync), Some(cleanup)) => key
             .managed_token()
             .is_some_and(|managed| cleanup.is_active_for(managed)),
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -2224,12 +2368,16 @@ impl LazyComponentPayload {
 
 #[cfg(any(
     feature = "wasm-c48-qemu-acceptance",
-    feature = "wasm-c53-native-async-qemu-acceptance"
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
 ))]
 impl Drop for LazyComponentPayload {
     fn drop(&mut self) {
-        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-        if matches!(self.mode, PayloadMode::NativeAsyncAcceptance) {
+        #[cfg(any(
+            feature = "wasm-c53-native-async-qemu-acceptance",
+            feature = "ssh-native-async-command"
+        ))]
+        if self.mode.is_native_async() {
             native_async_acceptance::payload_drop(self.control, self.token, self.streams);
         }
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -2391,6 +2539,15 @@ pub(crate) fn init() {
         }
     }
     system.restore();
+    #[cfg(feature = "ssh-native-async-command")]
+    {
+        let sync_gate = SSH_POLICY_GATE.load(Ordering::Acquire);
+        native_async_acceptance::init();
+        if SSH_POLICY_GATE.load(Ordering::Acquire) != sync_gate {
+            lifecycle_fail_stop();
+            panic!("native async command projection modified the synchronous policy gate");
+        }
+    }
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -3552,10 +3709,16 @@ async fn run_image_component(
     streams: RegistryStreamBindings,
     mode: PayloadMode,
 ) -> u64 {
-    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    #[cfg(not(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    )))]
     let _ = key;
-    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-    if matches!(mode, PayloadMode::NativeAsyncAcceptance) {
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    if mode.is_native_async() {
         return native_async_acceptance::run(key, token, streams).await;
     }
     let Some(root) = root else {
@@ -3885,7 +4048,11 @@ fn publish_payload_terminal(
                 && witness.matches_handle(handle)
         })
         && match (record.start_kind, record.cleanup) {
-            (Some(ControlStartKind::Managed), Some(cleanup)) => key
+            (Some(ControlStartKind::ManagedSync), Some(cleanup)) => key
+                .managed_token()
+                .is_some_and(|managed| cleanup.is_active_for(managed)),
+            #[cfg(feature = "ssh-native-async-command")]
+            (Some(ControlStartKind::ManagedNativeAsync), Some(cleanup)) => key
                 .managed_token()
                 .is_some_and(|managed| cleanup.is_active_for(managed)),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -3947,17 +4114,25 @@ fn start_instance(
     cleanup: ManagedComponentStartLease,
 ) -> Result<ManagedComponentToken, ComponentTerminal> {
     start_image_instance_with_input(
-        true,
-        PayloadMode::Command,
-        ComponentStartInput::Managed(cleanup),
+        StartPolicyGate::Sync,
+        PayloadMode::CommandSync,
+        ComponentStartInput::ManagedSync(cleanup),
+    )
+}
+
+#[cfg(feature = "ssh-native-async-command")]
+fn start_native_async_instance(
+    cleanup: ManagedComponentStartLease,
+) -> Result<ManagedComponentToken, ComponentTerminal> {
+    start_image_instance_with_input(
+        StartPolicyGate::NativeAsync,
+        PayloadMode::NativeAsyncCommand,
+        ComponentStartInput::ManagedNativeAsync(cleanup),
     )
 }
 
 #[cfg(feature = "wasm-c48-qemu-acceptance")]
-fn start_image_instance(
-    require_session_gate: bool,
-    mode: PayloadMode,
-) -> Result<ManagedComponentToken, ComponentTerminal> {
+fn start_image_instance(mode: PayloadMode) -> Result<ManagedComponentToken, ComponentTerminal> {
     let stdin = ByteStream::new();
     let stdout = ByteStream::new();
     let stdin_writer = stdin.writer();
@@ -3969,7 +4144,7 @@ fn start_image_instance(
         return Err(ComponentTerminal::RunnerFault);
     }
     start_image_instance_with_input(
-        require_session_gate,
+        StartPolicyGate::None,
         mode,
         ComponentStartInput::Acceptance(Some(InstalledComponentIo {
             stdin: stdin.reader(),
@@ -3982,12 +4157,11 @@ fn start_image_instance(
 
 #[cfg(feature = "wasm-c48-qemu-acceptance")]
 fn start_image_instance_with_io(
-    require_session_gate: bool,
     mode: PayloadMode,
     io: InstalledComponentIo,
 ) -> Result<ManagedComponentToken, ComponentTerminal> {
     start_image_instance_with_input(
-        require_session_gate,
+        StartPolicyGate::None,
         mode,
         ComponentStartInput::Acceptance(Some(io)),
     )
@@ -3995,23 +4169,34 @@ fn start_image_instance_with_io(
 
 #[cfg(feature = "ssh-component-command")]
 fn start_image_instance_with_input(
-    require_session_gate: bool,
+    gate: StartPolicyGate,
     mode: PayloadMode,
     mut input: ComponentStartInput,
 ) -> Result<ManagedComponentToken, ComponentTerminal> {
-    if !lifecycle_is_healthy()
-        || (require_session_gate && SSH_POLICY_GATE.load(Ordering::Acquire) != POLICY_PASSED)
-    {
+    if !start_route_exact(gate, mode, &input) {
+        lifecycle_fail_stop();
+        return Err(input.abort_unpublished(ComponentTerminal::RunnerFault));
+    }
+    if !lifecycle_is_healthy() || !gate.permits() {
         return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
     }
-    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-    let native_mode = matches!(mode, PayloadMode::NativeAsyncAcceptance);
-    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    let native_mode = mode.is_native_async();
+    #[cfg(not(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    )))]
     let native_mode = false;
     let root = if native_mode {
-        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        #[cfg(any(
+            feature = "wasm-c53-native-async-qemu-acceptance",
+            feature = "ssh-native-async-command"
+        ))]
         if !native_async_acceptance::root_ready() {
-            lifecycle_fail_stop();
+            native_async_acceptance::lifecycle_fail_stop();
             return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
         }
         None
@@ -4023,11 +4208,17 @@ fn start_image_instance_with_input(
         Some(root)
     };
     let command_name = if native_mode {
-        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        #[cfg(any(
+            feature = "wasm-c53-native-async-qemu-acceptance",
+            feature = "ssh-native-async-command"
+        ))]
         {
             native_async_acceptance::command_name()
         }
-        #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+        #[cfg(not(any(
+            feature = "wasm-c53-native-async-qemu-acceptance",
+            feature = "ssh-native-async-command"
+        )))]
         unreachable!()
     } else {
         SSH_EXEC_COMPONENT.command_name()
@@ -4043,20 +4234,24 @@ fn start_image_instance_with_input(
         }
     };
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
-    if !lifecycle_is_healthy()
-        || (require_session_gate && SSH_POLICY_GATE.load(Ordering::Acquire) != POLICY_PASSED)
-    {
+    if !lifecycle_is_healthy() || !gate.permits() || !start_route_exact(gate, mode, &input) {
         system.restore();
         drop(control);
         return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
     }
     if root.is_some_and(|root| !revalidate_image_root(root))
         || (native_mode && {
-            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            #[cfg(any(
+                feature = "wasm-c53-native-async-qemu-acceptance",
+                feature = "ssh-native-async-command"
+            ))]
             {
                 !native_async_acceptance::root_ready()
             }
-            #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+            #[cfg(not(any(
+                feature = "wasm-c53-native-async-qemu-acceptance",
+                feature = "ssh-native-async-command"
+            )))]
             {
                 true
             }
@@ -4363,10 +4558,16 @@ fn start_image_instance_with_input(
     // completion, pre-first-poll cancellation, or pre-first-poll fault all
     // resolve the exact generation as snapshot(None), while no CONTROL ->
     // shadow lock edge is introduced.
-    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-    let pending_shadow_bound = start_kind != ControlStartKind::NativeAsyncAcceptance
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    let pending_shadow_bound = !start_kind.is_native_async()
         || native_async_acceptance::bind_pending_shadow(key, core_token, streams);
-    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    #[cfg(not(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    )))]
     let pending_shadow_bound = true;
     if !pending_shadow_bound {
         if let Ok(mut control) = suspended.resume() {
@@ -4732,7 +4933,11 @@ fn prove_terminal_outside_control(
     state: TaskState,
 ) -> TerminalProof {
     let cleanup_active = match (tuple.start_kind, tuple.cleanup) {
-        (ControlStartKind::Managed, Some(cleanup)) => key
+        (ControlStartKind::ManagedSync, Some(cleanup)) => key
+            .managed_token()
+            .is_some_and(|token| cleanup.is_active_for(token)),
+        #[cfg(feature = "ssh-native-async-command")]
+        (ControlStartKind::ManagedNativeAsync, Some(cleanup)) => key
             .managed_token()
             .is_some_and(|token| cleanup.is_active_for(token)),
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -4905,7 +5110,10 @@ fn finalize_stream_state(
     published
 }
 
-#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
 fn finalize_native_stream_state(
     space: &InstanceSpace,
     key: ControlKey,
@@ -4929,7 +5137,10 @@ unsafe fn finalize_registry_terminal(
     terminal: ComponentTerminal,
     completion: Option<u64>,
 ) -> Result<FinalizeOutcome, RegistryError> {
-    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    #[cfg(not(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    )))]
     let _ = key;
     unsafe {
         registry().finalize_with_space_expect_completion(
@@ -4937,8 +5148,11 @@ unsafe fn finalize_registry_terminal(
             &tuple.handle,
             completion,
             |space, _| {
-                #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-                let published = if tuple.start_kind == ControlStartKind::NativeAsyncAcceptance {
+                #[cfg(any(
+                    feature = "wasm-c53-native-async-qemu-acceptance",
+                    feature = "ssh-native-async-command"
+                ))]
+                let published = if tuple.start_kind.is_native_async() {
                     finalize_native_stream_state(
                         space,
                         key,
@@ -4949,7 +5163,10 @@ unsafe fn finalize_registry_terminal(
                 } else {
                     finalize_stream_state(space, tuple.streams, terminal)
                 };
-                #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+                #[cfg(not(any(
+                    feature = "wasm-c53-native-async-qemu-acceptance",
+                    feature = "ssh-native-async-command"
+                )))]
                 let published = finalize_stream_state(space, tuple.streams, terminal);
                 #[cfg(feature = "wasm-c48-qemu-acceptance")]
                 if published {
@@ -5143,7 +5360,20 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
     }
 
     let managed = match (tuple.start_kind, cleanup, key.managed_token()) {
-        (ControlStartKind::Managed, Some(cleanup), Some(token)) => {
+        (ControlStartKind::ManagedSync, Some(cleanup), Some(token)) => {
+            if !CONTROL.mark_cleanup_completing(key, cleanup, token, terminal) {
+                control
+                    .exact_mut(key)
+                    .expect("validated terminal control slot exists")
+                    .quarantine();
+                lifecycle_fail_stop();
+                system.restore();
+                return FinalizeControl::Lost;
+            }
+            Some((cleanup, token))
+        }
+        #[cfg(feature = "ssh-native-async-command")]
+        (ControlStartKind::ManagedNativeAsync, Some(cleanup), Some(token)) => {
             if !CONTROL.mark_cleanup_completing(key, cleanup, token, terminal) {
                 control
                     .exact_mut(key)
@@ -5227,7 +5457,7 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
                     && record
                         .cleanup
                         .is_some_and(|stored| stored.matches_exact(cleanup))
-                    && record.start_kind == Some(ControlStartKind::Managed)
+                    && record.start_kind == Some(tuple.start_kind)
             });
         if wake.is_none()
             || !complete_projection
@@ -5728,7 +5958,11 @@ fn acknowledge_instance(token: ManagedComponentToken) -> ManagedComponentAcknowl
                 == Some(TASK_SHADOW_COMPLETE)
         })
         && match (record.start_kind, record.cleanup) {
-            (Some(ControlStartKind::Managed), Some(cleanup)) => {
+            (Some(ControlStartKind::ManagedSync), Some(cleanup)) => {
+                CONTROL.cleanup_shadow_is_complete(key, cleanup, token, terminal)
+            }
+            #[cfg(feature = "ssh-native-async-command")]
+            (Some(ControlStartKind::ManagedNativeAsync), Some(cleanup)) => {
                 CONTROL.cleanup_shadow_is_complete(key, cleanup, token, terminal)
             }
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -5863,11 +6097,55 @@ pub(crate) fn ssh_exec_policy(profile: AuthorizedProfile) -> Option<SshExecCompo
 }
 
 #[cfg(feature = "ssh-component-command")]
+pub(crate) fn select_ssh_exec_component_policy(
+    profile: AuthorizedProfile,
+    source: &str,
+) -> Option<SshExecComponentSessionPolicy> {
+    let sync_selected = vibeos_vsh::validate_ssh_exec_with_component_name(
+        source,
+        SSH_EXEC_COMPONENT.command_name(),
+    ) == Ok(true);
+    #[cfg(feature = "ssh-native-async-command")]
+    let native_selected = vibeos_vsh::validate_ssh_exec_with_component_name(
+        source,
+        native_async_acceptance::command_name(),
+    ) == Ok(true);
+    #[cfg(not(feature = "ssh-native-async-command"))]
+    let native_selected = false;
+
+    match (sync_selected, native_selected) {
+        (true, false) => ssh_exec_policy(profile),
+        (false, true) => {
+            #[cfg(feature = "ssh-native-async-command")]
+            {
+                return native_async_acceptance::ssh_exec_policy(profile);
+            }
+            #[cfg(not(feature = "ssh-native-async-command"))]
+            {
+                lifecycle_fail_stop();
+                None
+            }
+        }
+        (false, false) => None,
+        (true, true) => {
+            lifecycle_fail_stop();
+            #[cfg(feature = "ssh-native-async-command")]
+            native_async_acceptance::lifecycle_fail_stop();
+            None
+        }
+    }
+}
+
+#[cfg(feature = "ssh-component-command")]
 pub(crate) fn install_ssh_exec_component(
     session: &mut Session,
     accepted: SshExecComponentSessionPolicy,
     io: SshExecComponentIoInstall,
 ) -> Result<(), vibeos_vsh::Diagnostic> {
+    #[cfg(feature = "ssh-native-async-command")]
+    if native_async_acceptance::ssh_exec_policy(accepted.profile()) == Some(accepted) {
+        return native_async_acceptance::install_ssh_exec_component(session, accepted, io);
+    }
     if ssh_exec_policy(accepted.profile()) != Some(accepted) {
         return Err(vibeos_vsh::ssh_exec_component_policy_rejected(
             accepted.command_name(),
@@ -5977,7 +6255,11 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
                 && tuple.domain == witness.allocation_domain()
                 && witness.matches_handle(&tuple.handle)
                 && match (tuple.start_kind, tuple.cleanup, key.managed_token()) {
-                    (ControlStartKind::Managed, Some(cleanup), Some(_)) => {
+                    (ControlStartKind::ManagedSync, Some(cleanup), Some(_)) => {
+                        CONTROL.cleanup_shadow_is_active(key, cleanup)
+                    }
+                    #[cfg(feature = "ssh-native-async-command")]
+                    (ControlStartKind::ManagedNativeAsync, Some(cleanup), Some(_)) => {
                         CONTROL.cleanup_shadow_is_active(key, cleanup)
                     }
                     #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -5997,15 +6279,21 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
             return FaultRoute::Quarantined;
         }
     };
-    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    #[cfg(not(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    )))]
     let _ = &tuple;
     if !lifecycle_is_healthy() {
         return FaultRoute::Quarantined;
     }
 
     let task = witness.task_id();
-    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
-    if tuple.start_kind == ControlStartKind::NativeAsyncAcceptance {
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    if tuple.start_kind.is_native_async() {
         // Snapshot and release SYSTEM shadow authority only after the complete
         // CONTROL tuple is proven. The core callback runs after it has restored
         // the exact Space and released its registry lock; CONTROL is released
@@ -6029,6 +6317,7 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
         let outcome = unsafe {
             registry().fault_reclaim_with_space(witness, |domain, space| {
                 if !lifecycle_is_healthy()
+                    || !native_async_acceptance::lifecycle_is_healthy()
                     || !native_async_acceptance::cancel_fault_snapshot(
                         space,
                         key,

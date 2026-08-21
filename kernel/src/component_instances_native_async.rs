@@ -1,10 +1,11 @@
-//! Isolated C5.3 native-async acceptance driver.
+//! C5.3 native-async driver shared by two sealed image roots.
 //!
-//! The validation-only profile remains inert. This module is linked only by
-//! the explicit QEMU acceptance feature and owns a separate image root,
-//! payload mode, and SYSTEM pending-operation shadow. It never publishes the
-//! synchronous SSH policy gate or converts its sealed admission candidate into
-//! an ordinary command manifest.
+//! The direct QEMU fixture retains its acceptance-only pin and cleanup-free
+//! start envelope. The formal command feature instead retains the opaque
+//! projection produced by `component-image-adapter` and can start only through
+//! a VSH-managed cleanup lease. Both use the same exact driver and SYSTEM
+//! pending-operation shadow while the validation-only profile and runtime
+//! readiness bits remain inert.
 
 use super::native_pending_shadow_model::{
     InputSpill, OutputStaging, PendingIdentity, PendingKind, PendingShadow, PendingShadowError,
@@ -12,46 +13,182 @@ use super::native_pending_shadow_model::{
 };
 use super::*;
 
-use vibeos_component_admission::{
-    admit_native_async_acceptance_candidate, AdmittedNativeAsyncAcceptanceCandidate,
-};
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    not(feature = "ssh-native-async-command")
+))]
+use vibeos_component_admission::admit_native_async_acceptance_candidate;
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+use vibeos_component_admission::AdmittedNativeAsyncAcceptanceCandidate;
+#[cfg(not(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+)))]
 use vibeos_component_format::{ProfileIdentity, ProfileStage};
-use vibeos_component_host::{StreamCloseObservation, StreamTerminalDispatch, STREAM_BUFFER_CHUNKS};
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+use vibeos_component_host::STREAM_BUFFER_CHUNKS;
+use vibeos_component_host::{StreamCloseObservation, StreamTerminalDispatch};
+#[cfg(all(
+    feature = "ssh-native-async-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
+use vibeos_component_image_adapter::project_native_async_command;
+#[cfg(feature = "ssh-native-async-command")]
+use vibeos_component_image_adapter::NativeAsyncCommandProjection;
+use vibeos_component_runtime::decode::ComponentPlan;
 use vibeos_component_runtime::native_async_acceptance::{
     Component as NativeComponent, Error as NativeError, HostRequest as NativeHostRequest,
     HostToken as NativeHostToken, Invocation as NativeInvocation, Poll as NativePoll,
 };
+#[cfg(feature = "ssh-native-async-command")]
+use vibeos_image_policy::C53_NATIVE_ASYNC_COMMAND;
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 use vibeos_image_policy::C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 const NATIVE_LIFECYCLE_HEALTHY: u8 = 0;
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 const NATIVE_LIFECYCLE_FAILED: u8 = 1;
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 static NATIVE_LIFECYCLE_HEALTH: AtomicU8 = AtomicU8::new(NATIVE_LIFECYCLE_HEALTHY);
+static NATIVE_POLICY_GATE: AtomicU8 = AtomicU8::new(POLICY_CLOSED);
 static IMAGE_ROOT: AtomicPtr<NativeImageRoot> = AtomicPtr::new(ptr::null_mut());
+#[cfg(feature = "ssh-native-async-command")]
+static LIFECYCLE: NativeImageComponentLifecycle = NativeImageComponentLifecycle;
 
 struct NativeImageRoot {
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
     admitted: AdmittedNativeAsyncAcceptanceCandidate,
+    #[cfg(feature = "ssh-native-async-command")]
+    projection: NativeAsyncCommandProjection,
+    #[cfg(feature = "ssh-native-async-command")]
+    ssh_policy: SshExecComponentPolicy,
     incarnation: NonZeroU64,
 }
 
+impl NativeImageRoot {
+    fn validated_plan(&self) -> Result<ComponentPlan<'_>, ()> {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            return self.admitted.validated_plan().map_err(|_| ());
+        }
+        #[cfg(all(
+            feature = "ssh-native-async-command",
+            not(feature = "wasm-c53-native-async-qemu-acceptance")
+        ))]
+        {
+            self.projection.validated_plan().map_err(|_| ())
+        }
+    }
+
+    fn entrypoint(&self) -> &str {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            return self.admitted.entrypoint();
+        }
+        #[cfg(all(
+            feature = "ssh-native-async-command",
+            not(feature = "wasm-c53-native-async-qemu-acceptance")
+        ))]
+        {
+            self.projection.manifest().entrypoint()
+        }
+    }
+
+    fn memory_bytes(&self) -> usize {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            return self.admitted.limits().memory_bytes;
+        }
+        #[cfg(all(
+            feature = "ssh-native-async-command",
+            not(feature = "wasm-c53-native-async-qemu-acceptance")
+        ))]
+        {
+            self.projection.manifest().memory_bytes()
+        }
+    }
+
+    fn total_fuel(&self) -> u64 {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            return self.admitted.limits().total_fuel;
+        }
+        #[cfg(all(
+            feature = "ssh-native-async-command",
+            not(feature = "wasm-c53-native-async-qemu-acceptance")
+        ))]
+        {
+            self.projection.manifest().total_fuel()
+        }
+    }
+
+    fn poll_quantum(&self) -> u64 {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            return self.admitted.limits().poll_quantum;
+        }
+        #[cfg(all(
+            feature = "ssh-native-async-command",
+            not(feature = "wasm-c53-native-async-qemu-acceptance")
+        ))]
+        {
+            self.projection.manifest().poll_quantum()
+        }
+    }
+}
+
 pub(super) fn lifecycle_is_healthy() -> bool {
-    NATIVE_LIFECYCLE_HEALTH.load(Ordering::Acquire) == NATIVE_LIFECYCLE_HEALTHY
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    {
+        return NATIVE_LIFECYCLE_HEALTH.load(Ordering::Acquire) == NATIVE_LIFECYCLE_HEALTHY;
+    }
+    #[cfg(all(
+        feature = "ssh-native-async-command",
+        not(feature = "wasm-c53-native-async-qemu-acceptance")
+    ))]
+    {
+        super::lifecycle_is_healthy()
+    }
 }
 
 pub(super) fn lifecycle_poll_permit() -> (&'static AtomicU8, u8) {
-    (&NATIVE_LIFECYCLE_HEALTH, NATIVE_LIFECYCLE_HEALTHY)
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    {
+        return (&NATIVE_LIFECYCLE_HEALTH, NATIVE_LIFECYCLE_HEALTHY);
+    }
+    #[cfg(all(
+        feature = "ssh-native-async-command",
+        not(feature = "wasm-c53-native-async-qemu-acceptance")
+    ))]
+    {
+        super::lifecycle_poll_permit()
+    }
 }
 
 pub(super) fn lifecycle_fail_stop() {
     CONTROL.reject_prepared_publications();
+    NATIVE_POLICY_GATE.store(POLICY_FAILED, Ordering::Release);
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
     NATIVE_LIFECYCLE_HEALTH.store(NATIVE_LIFECYCLE_FAILED, Ordering::Release);
+    #[cfg(all(
+        feature = "ssh-native-async-command",
+        not(feature = "wasm-c53-native-async-qemu-acceptance")
+    ))]
+    super::lifecycle_fail_stop();
     CONTROL.request_fail_stop_wake();
+}
+
+#[cfg(feature = "ssh-native-async-command")]
+pub(super) fn policy_gate_passed() -> bool {
+    lifecycle_is_healthy() && NATIVE_POLICY_GATE.load(Ordering::Acquire) == POLICY_PASSED
 }
 
 pub(super) fn init() {
     if !IMAGE_ROOT.load(Ordering::Acquire).is_null() {
         lifecycle_fail_stop();
-        panic!("native async acceptance image root initialized twice");
+        panic!("native async image root initialized twice");
     }
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
     let root = match build_image_root() {
@@ -59,7 +196,7 @@ pub(super) fn init() {
         Err(()) => {
             lifecycle_fail_stop();
             system.restore();
-            panic!("native async acceptance image admission failed");
+            panic!("native async image admission failed");
         }
     };
     let pointer = Box::into_raw(root);
@@ -75,13 +212,27 @@ pub(super) fn init() {
         unsafe { drop(Box::from_raw(pointer)) };
         lifecycle_fail_stop();
         system.restore();
-        panic!("native async acceptance image root publication raced");
+        panic!("native async image root publication raced");
     }
     let root = unsafe { &*pointer };
     if !revalidate_image_root(root) {
         lifecycle_fail_stop();
         system.restore();
-        panic!("native async acceptance image root failed publication revalidation");
+        panic!("native async image root failed publication revalidation");
+    }
+    #[cfg(feature = "ssh-native-async-command")]
+    if NATIVE_POLICY_GATE
+        .compare_exchange(
+            POLICY_CLOSED,
+            POLICY_PASSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        lifecycle_fail_stop();
+        system.restore();
+        panic!("native async command policy publication raced");
     }
     system.restore();
 }
@@ -95,17 +246,29 @@ pub(super) fn root_ready() -> bool {
 }
 
 pub(super) fn command_name() -> &'static str {
-    C53_NATIVE_ASYNC_QEMU_ACCEPTANCE.command_name()
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    {
+        return C53_NATIVE_ASYNC_QEMU_ACCEPTANCE.command_name();
+    }
+    #[cfg(all(
+        feature = "ssh-native-async-command",
+        not(feature = "wasm-c53-native-async-qemu-acceptance")
+    ))]
+    {
+        C53_NATIVE_ASYNC_COMMAND.command_name()
+    }
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 fn start_with_io(io: InstalledComponentIo) -> Result<ManagedComponentToken, ComponentTerminal> {
     start_image_instance_with_input(
-        false,
+        StartPolicyGate::None,
         PayloadMode::NativeAsyncAcceptance,
         ComponentStartInput::NativeAsyncAcceptance(Some(io)),
     )
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 fn admission_mode(mode: ComponentStreamMode) -> CommandStreamMode {
     match mode {
         ComponentStreamMode::Required => CommandStreamMode::Required,
@@ -114,6 +277,10 @@ fn admission_mode(mode: ComponentStreamMode) -> CommandStreamMode {
     }
 }
 
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    not(feature = "ssh-native-async-command")
+))]
 fn build_image_root() -> Result<NativeImageRoot, ()> {
     let pin = C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
     let world = WorldContract::parse(pin.wit_source(), pin.world()).map_err(|_| ())?;
@@ -159,6 +326,10 @@ fn build_image_root() -> Result<NativeImageRoot, ()> {
     }
 }
 
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    not(feature = "ssh-native-async-command")
+))]
 fn revalidate_image_root(root: &NativeImageRoot) -> bool {
     let pin = C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
     if root.incarnation.get() != 1
@@ -181,12 +352,100 @@ fn revalidate_image_root(root: &NativeImageRoot) -> bool {
     {
         return false;
     }
-    root.admitted.validated_plan().is_ok_and(|plan| {
+    root.validated_plan().is_ok_and(|plan| {
         plan.profile() == ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
             && !plan.runtime_ready()
             && !plan.native_async_runtime_ready()
             && plan.native_async_execution_plan().is_some()
     })
+}
+
+#[cfg(all(
+    feature = "ssh-native-async-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
+fn build_image_root() -> Result<NativeImageRoot, ()> {
+    let pin = C53_NATIVE_ASYNC_COMMAND;
+    let projection = project_native_async_command(pin).map_err(|_| ())?;
+    let limits = pin.limits();
+    let ssh_policy = SshExecComponentPolicy::from_image_pin(
+        pin.command_name(),
+        pin.abi(),
+        ComponentArtifactIdentity::new(pin.expected_sha256()),
+        pin.world(),
+        pin.entrypoint(),
+        pin.min_args(),
+        pin.max_args(),
+        vsh_stream(pin.stdin()),
+        vsh_stream(pin.stdout()),
+        vsh_stream(pin.stderr()),
+        limits.memory_bytes,
+        limits.total_fuel,
+        limits.poll_quantum,
+        limits.resources,
+        Vec::new(),
+    )
+    .map_err(|_| ())?;
+    let root = NativeImageRoot {
+        projection,
+        ssh_policy,
+        incarnation: NonZeroU64::new(1).expect("one is nonzero"),
+    };
+    if revalidate_image_root(&root) {
+        Ok(root)
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(all(
+    feature = "ssh-native-async-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
+fn revalidate_image_root(root: &NativeImageRoot) -> bool {
+    let pin = C53_NATIVE_ASYNC_COMMAND;
+    let manifest = root.projection.manifest();
+    root.incarnation.get() == 1
+        && manifest.name() == pin.command_name()
+        && manifest.abi() == pin.abi()
+        && manifest.artifact().as_bytes() == &pin.expected_sha256()
+        && manifest.world() == pin.world()
+        && manifest.entrypoint() == pin.entrypoint()
+        && manifest.min_args() == pin.min_args()
+        && manifest.max_args() == pin.max_args()
+        && manifest.stdin() == vsh_stream(pin.stdin())
+        && manifest.stdout() == vsh_stream(pin.stdout())
+        && manifest.stderr() == vsh_stream(pin.stderr())
+        && manifest.memory_bytes() == pin.limits().memory_bytes
+        && manifest.total_fuel() == pin.limits().total_fuel
+        && manifest.poll_quantum() == pin.limits().poll_quantum
+        && manifest.resource_limit() == pin.limits().resources
+        && manifest.requirements().is_empty()
+        && root.ssh_policy.admits_manifest(manifest)
+        && root.validated_plan().is_ok_and(|plan| {
+            plan.profile() == ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+                && plan.profile().stage == ProfileStage::ValidationOnly
+                && !plan.profile().execution_enabled()
+                && !plan.runtime_ready()
+                && !plan.native_async_runtime_ready()
+                && plan.native_async_execution_plan().is_some()
+        })
+}
+
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
+fn build_image_root() -> Result<NativeImageRoot, ()> {
+    Err(())
+}
+
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
+fn revalidate_image_root(_root: &NativeImageRoot) -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1264,32 +1523,28 @@ async fn run_driver(
         quarantine_shadow(identity);
         return terminal_word(ComponentTerminal::BackendFault);
     }
-    let plan = match root.admitted.validated_plan() {
+    let plan = match root.validated_plan() {
         Ok(plan) => plan,
         Err(_) => {
             quarantine_shadow(identity);
             return terminal_word(ComponentTerminal::BackendFault);
         }
     };
-    let limits = root.admitted.limits();
     let engine = ProfileEngine::new();
     let mut component = match NativeComponent::instantiate_validation_candidate_with_memory_limit(
         &plan,
         &engine,
-        OwnerAllocationReservation::new(limits.memory_bytes),
-        limits.memory_bytes,
+        OwnerAllocationReservation::new(root.memory_bytes()),
+        root.memory_bytes(),
     ) {
         Ok(component) => component,
         Err(error) => return terminal_word(native_error_terminal(error)),
     };
-    let mut invocation = match component.start_filter(
-        root.admitted.entrypoint(),
-        limits.total_fuel,
-        limits.poll_quantum,
-    ) {
-        Ok(invocation) => invocation,
-        Err(error) => return terminal_word(native_error_terminal(error)),
-    };
+    let mut invocation =
+        match component.start_filter(root.entrypoint(), root.total_fuel(), root.poll_quantum()) {
+            Ok(invocation) => invocation,
+            Err(error) => return terminal_word(native_error_terminal(error)),
+        };
     let mut spill = InputSpill::new();
     let mut staging = OutputStaging::new();
     let mut next = None;
@@ -1372,13 +1627,117 @@ pub(super) async fn run(
     run_driver(root, key, token, streams).await
 }
 
+#[cfg(feature = "ssh-native-async-command")]
+struct NativeImageComponentLifecycle;
+
+// SAFETY: the boot-static projection is immutable and every invocation enters
+// the same exact registry/control transaction as the synchronous lifecycle.
+// The distinct start input forces a managed cleanup lease and the native
+// pending shadow before child publication.
+#[cfg(feature = "ssh-native-async-command")]
+unsafe impl ManagedComponentLifecycle for NativeImageComponentLifecycle {
+    fn manifest(&self) -> &ComponentCommandManifest {
+        image_root()
+            .expect("native managed lifecycle used before boot projection")
+            .projection
+            .manifest()
+    }
+
+    fn start(
+        &self,
+        cleanup: ManagedComponentStartLease,
+    ) -> Result<ManagedComponentToken, ComponentTerminal> {
+        start_native_async_instance(cleanup)
+    }
+
+    fn state(&self, token: ManagedComponentToken) -> ManagedComponentState {
+        observe_instance(token)
+    }
+
+    fn wait_state<'a>(&'a self, token: ManagedComponentToken) -> ManagedComponentStateFuture<'a> {
+        let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+        let future = Box::pin(wait_instance(token));
+        system.restore();
+        future
+    }
+
+    fn request_cancel(
+        &self,
+        token: ManagedComponentToken,
+        terminal: ComponentTerminal,
+    ) -> ManagedComponentCancel {
+        cancel_instance_with_terminal(token, terminal)
+    }
+
+    fn acknowledge_complete(&self, token: ManagedComponentToken) -> ManagedComponentAcknowledge {
+        acknowledge_instance(token)
+    }
+}
+
+#[cfg(feature = "ssh-native-async-command")]
+pub(super) fn ssh_exec_policy(profile: AuthorizedProfile) -> Option<SshExecComponentSessionPolicy> {
+    if !policy_gate_passed() {
+        return None;
+    }
+    let root = image_root()?;
+    let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+    let matches = revalidate_image_root(root);
+    system.restore();
+    if !matches || !policy_gate_passed() {
+        lifecycle_fail_stop();
+        return None;
+    }
+    Some(SshExecComponentSessionPolicy::new(
+        profile,
+        root.incarnation,
+        C53_NATIVE_ASYNC_COMMAND.command_name(),
+        C53_NATIVE_ASYNC_COMMAND.expected_sha256(),
+    ))
+}
+
+#[cfg(feature = "ssh-native-async-command")]
+pub(super) fn install_ssh_exec_component(
+    session: &mut Session,
+    accepted: SshExecComponentSessionPolicy,
+    io: SshExecComponentIoInstall,
+) -> Result<(), vibeos_vsh::Diagnostic> {
+    if ssh_exec_policy(accepted.profile()) != Some(accepted) {
+        return Err(vibeos_vsh::ssh_exec_component_policy_rejected(
+            accepted.command_name(),
+        ));
+    }
+    let Some(root) = image_root() else {
+        return Err(vibeos_vsh::ssh_exec_component_policy_rejected(
+            accepted.command_name(),
+        ));
+    };
+    let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+    let matches = revalidate_image_root(root)
+        && accepted.command_name() == C53_NATIVE_ASYNC_COMMAND.command_name()
+        && accepted.artifact_sha256() == C53_NATIVE_ASYNC_COMMAND.expected_sha256()
+        && accepted.incarnation() == root.incarnation;
+    system.restore();
+    if !matches || !policy_gate_passed() {
+        lifecycle_fail_stop();
+        return Err(vibeos_vsh::ssh_exec_component_policy_rejected(
+            accepted.command_name(),
+        ));
+    }
+    unsafe {
+        session.install_ssh_exec_managed_native_async_component_io(&root.ssh_policy, &LIFECYCLE, io)
+    }
+}
+
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 const ACCEPTANCE_WAIT_SECONDS: u64 = 10;
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 fn acceptance_deadline_expired(started: u64) -> bool {
     crate::sbi::time().wrapping_sub(started)
         >= crate::exec::timebase_hz().saturating_mul(ACCEPTANCE_WAIT_SECONDS)
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 fn acceptance_driver_identity(token: ManagedComponentToken) -> Result<Option<DriverIdentity>, ()> {
     let Some(key) = managed_token_key(token) else {
         return Err(());
@@ -1404,6 +1763,7 @@ fn acceptance_driver_identity(token: ManagedComponentToken) -> Result<Option<Dri
     }
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 async fn acceptance_wait_for_shadow(token: ManagedComponentToken, expected: PendingKind) -> bool {
     let started = crate::sbi::time();
     loop {
@@ -1429,6 +1789,7 @@ async fn acceptance_wait_for_shadow(token: ManagedComponentToken, expected: Pend
     }
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 async fn acceptance_receive_exact(reader: &ByteStreamReader, output: &mut [u8]) -> bool {
     let started = crate::sbi::time();
     let mut dispatch = match reader.start() {
@@ -1461,6 +1822,7 @@ async fn acceptance_receive_exact(reader: &ByteStreamReader, output: &mut [u8]) 
     }
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 async fn acceptance_wait_for_success(token: ManagedComponentToken) -> bool {
     let started = crate::sbi::time();
     loop {
@@ -1476,6 +1838,7 @@ async fn acceptance_wait_for_success(token: ManagedComponentToken) -> bool {
     }
 }
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 async fn acceptance_acknowledge(token: ManagedComponentToken) -> bool {
     let started = crate::sbi::time();
     loop {
@@ -1496,6 +1859,7 @@ async fn acceptance_acknowledge(token: ManagedComponentToken) -> bool {
 /// ReadWaiting -> ReadPrepared and WriteWaiting SYSTEM shadows. The sealed
 /// two-module/two-instance candidate then transforms one exact 1024-byte chunk
 /// before the fixture verifies Normal EOF/close and terminal retirement.
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 pub(super) async fn run_acceptance() -> bool {
     let Some((module_count, instance_count)) = image_root().and_then(|root| {
         root.admitted
@@ -1572,6 +1936,7 @@ pub(super) async fn run_acceptance() -> bool {
         || stdout.depth() != 0
         || !acceptance_acknowledge(token).await
         || SSH_POLICY_GATE.load(Ordering::Acquire) != POLICY_CLOSED
+        || NATIVE_POLICY_GATE.load(Ordering::Acquire) != POLICY_CLOSED
         || !lifecycle_is_healthy()
     {
         return false;

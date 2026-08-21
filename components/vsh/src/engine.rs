@@ -57,6 +57,7 @@ pub const MAX_SCRIPT_CALL_DEPTH: usize = 8;
 pub const SSH_EXEC_MAX_INPUT_BYTES: usize = 1024;
 /// Exact managed command world authorized for the C5.3 SSH stream path.
 pub const VIBE_STREAM_FILTER_WORLD: &str = "vibe:stream/filter@1.0.0";
+pub const VIBE_NATIVE_STREAM_FILTER_WORLD: &str = "vibe:stream/native-filter@1.0.0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -4268,7 +4269,30 @@ enum Applet {
         manifest: Arc<ComponentCommandManifest>,
         lifecycle: &'static dyn ManagedComponentLifecycle,
         io: ManagedComponentIoSource,
+        contract: ManagedComponentContract,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedComponentContract {
+    SyncStream,
+    NativeAsyncStream,
+}
+
+impl ManagedComponentContract {
+    fn matches(self, manifest: &ComponentCommandManifest) -> bool {
+        manifest.min_args == 0
+            && manifest.max_args == 0
+            && manifest.world
+                == match self {
+                    Self::SyncStream => VIBE_STREAM_FILTER_WORLD,
+                    Self::NativeAsyncStream => VIBE_NATIVE_STREAM_FILTER_WORLD,
+                }
+            && manifest.stdin == StreamMode::Required
+            && manifest.stdout == StreamMode::Required
+            && manifest.stderr != StreamMode::Required
+            && manifest.requirements.is_empty()
+    }
 }
 
 pub struct Command {
@@ -5199,7 +5223,9 @@ impl Session {
                 "SSH component policy requires an SSH exec session",
             ));
         }
-        if source_manifest.world == VIBE_STREAM_FILTER_WORLD {
+        if source_manifest.world == VIBE_STREAM_FILTER_WORLD
+            || source_manifest.world == VIBE_NATIVE_STREAM_FILTER_WORLD
+        {
             return Err(Diagnostic::new(
                 0,
                 source_manifest.name.len(),
@@ -5269,14 +5295,7 @@ impl Session {
                 "managed component lifecycle does not match SSH image policy",
             ));
         }
-        if source_manifest.min_args != 0
-            || source_manifest.max_args != 0
-            || source_manifest.world != VIBE_STREAM_FILTER_WORLD
-            || source_manifest.stdin != StreamMode::Required
-            || source_manifest.stdout != StreamMode::Required
-            || source_manifest.stderr == StreamMode::Required
-            || !source_manifest.requirements.is_empty()
-        {
+        if !ManagedComponentContract::SyncStream.matches(source_manifest) {
             return Err(Diagnostic::new(
                 0,
                 source_manifest.name.len(),
@@ -5289,7 +5308,61 @@ impl Session {
         // fresh read before `start` and fail closed if trusted setup mutated.
         let manifest = Self::snapshot_component_manifest(source_manifest)?;
         let name = manifest.name.clone();
-        self.install_managed_component_command_inner(manifest, lifecycle, io.component)?;
+        self.install_managed_component_command_inner(
+            manifest,
+            lifecycle,
+            io.component,
+            ManagedComponentContract::SyncStream,
+        )?;
+        self.ssh_exec_policy_commands.insert(name);
+        Ok(())
+    }
+
+    /// Install the distinct native-async managed stream command selected by
+    /// an exact image/session policy. This never widens the synchronous stream
+    /// installer and cannot be reached through an ordinary component runner.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same trusted SSH setup and lifecycle
+    /// invariants as [`Self::install_ssh_exec_managed_component_io`], but for
+    /// the exact [`VIBE_NATIVE_STREAM_FILTER_WORLD`] contract.
+    pub unsafe fn install_ssh_exec_managed_native_async_component_io(
+        &mut self,
+        policy: &SshExecComponentPolicy,
+        lifecycle: &'static dyn ManagedComponentLifecycle,
+        io: SshExecComponentIoInstall,
+    ) -> Result<(), Diagnostic> {
+        if self.profile != SessionProfile::SshExec {
+            return Err(Diagnostic::new(
+                0,
+                0,
+                "managed native SSH component policy requires an SSH exec session",
+            ));
+        }
+        let source_manifest = lifecycle.manifest();
+        if !policy.admits_manifest(source_manifest) {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "managed native lifecycle does not match SSH image policy",
+            ));
+        }
+        if !ManagedComponentContract::NativeAsyncStream.matches(source_manifest) {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "managed native SSH component contract is not the exact async stream world",
+            ));
+        }
+        let manifest = Self::snapshot_component_manifest(source_manifest)?;
+        let name = manifest.name.clone();
+        self.install_managed_component_command_inner(
+            manifest,
+            lifecycle,
+            io.component,
+            ManagedComponentContract::NativeAsyncStream,
+        )?;
         self.ssh_exec_policy_commands.insert(name);
         Ok(())
     }
@@ -5379,6 +5452,7 @@ impl Session {
         manifest: ComponentCommandManifest,
         lifecycle: &'static dyn ManagedComponentLifecycle,
         io: ManagedComponentIo,
+        contract: ManagedComponentContract,
     ) -> Result<(), Diagnostic> {
         manifest.validate(Span {
             start: 0,
@@ -5450,6 +5524,7 @@ impl Session {
                 manifest,
                 lifecycle,
                 io,
+                contract,
             },
         });
         let cap = self.cspace.lock().mint(
@@ -6398,6 +6473,7 @@ impl Session {
                     manifest,
                     lifecycle,
                     io,
+                    contract,
                 } => {
                     manifest.validate(command_ast.span)?;
                     if ast.commands.len() != 1 {
@@ -6436,14 +6512,7 @@ impl Session {
                             "managed component manifest changed after installation",
                         ));
                     }
-                    if manifest.min_args != 0
-                        || manifest.max_args != 0
-                        || manifest.world != VIBE_STREAM_FILTER_WORLD
-                        || manifest.stdin != StreamMode::Required
-                        || manifest.stdout != StreamMode::Required
-                        || manifest.stderr == StreamMode::Required
-                        || !manifest.requirements.is_empty()
-                    {
+                    if !contract.matches(manifest) {
                         return Err(Diagnostic::new(
                             command_ast.span.start,
                             command_ast.span.end,
@@ -7577,8 +7646,11 @@ fn prepare_managed_component_start(
             Applet::ManagedComponent {
                 manifest,
                 lifecycle,
+                contract,
                 ..
-            } if lifecycle.manifest() == manifest.as_ref() => *lifecycle,
+            } if lifecycle.manifest() == manifest.as_ref() && contract.matches(manifest) => {
+                *lifecycle
+            }
             _ => return Err(ComponentTerminal::BackendFault),
         };
         let (

@@ -19,7 +19,8 @@ use vibeos_vsh::{
     ManagedComponentCancel, ManagedComponentLifecycle, ManagedComponentStartLease,
     ManagedComponentState, ManagedComponentStateFuture, ManagedComponentToken,
     PreparedComponentStage, Session, SessionProfile, SshExecComponentIoPump,
-    SshExecComponentPolicy, Status, StreamMode, TerminalDetail, VIBE_STREAM_FILTER_WORLD,
+    SshExecComponentPolicy, Status, StreamMode, TerminalDetail, VIBE_NATIVE_STREAM_FILTER_WORLD,
+    VIBE_STREAM_FILTER_WORLD,
 };
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -729,6 +730,20 @@ fn install_managed(
     Ok(pump)
 }
 
+fn install_native_managed(
+    session: &mut Session,
+    policy: &SshExecComponentPolicy,
+    lifecycle: &'static dyn ManagedComponentLifecycle,
+) -> Result<SshExecComponentIoPump, vibeos_vsh::Diagnostic> {
+    let (install, pump) = vibeos_vsh::new_ssh_exec_component_io();
+    // SAFETY: this is the native-world counterpart of `install_managed`; the
+    // static fake lifecycle and freshly split opaque IO model the trusted hook.
+    unsafe {
+        session.install_ssh_exec_managed_native_async_component_io(policy, lifecycle, install)
+    }?;
+    Ok(pump)
+}
+
 #[test]
 fn ssh_component_io_pump_exposes_only_data_directions() {
     let (_install, pump) = vibeos_vsh::new_ssh_exec_component_io();
@@ -1425,25 +1440,84 @@ fn managed_installer_requires_exact_image_and_session_policy() {
 }
 
 #[test]
-fn stream_world_cannot_enter_the_legacy_ssh_runner_path() {
+fn both_managed_stream_worlds_cannot_enter_the_legacy_ssh_runner_path() {
     let _serial = SERIAL.lock().unwrap();
-    let runner = ProbeRunner::new(
-        managed_manifest("managed-only"),
-        Behavior::Terminal(ComponentTerminal::Success),
+    for (name, world) in [
+        ("managed-sync-only", VIBE_STREAM_FILTER_WORLD),
+        ("managed-native-only", VIBE_NATIVE_STREAM_FILTER_WORLD),
+    ] {
+        let (manifest, policy) = managed_contract(
+            name,
+            world,
+            0,
+            0,
+            StreamMode::Required,
+            StreamMode::Required,
+            StreamMode::Optional,
+            Vec::new(),
+        );
+        let runner = ProbeRunner::new(manifest, Behavior::Terminal(ComponentTerminal::Success));
+        let mut session = Session::with_profile(SessionProfile::SshExec);
+        assert_eq!(
+            session
+                .install_ssh_exec_component_command(&policy, runner)
+                .unwrap_err()
+                .message,
+            "stream components require the managed SSH lifecycle"
+        );
+        assert_eq!(
+            execute(session, name).1.unwrap_err().message,
+            "command is outside the SSH exec profile"
+        );
+    }
+}
+
+#[test]
+fn sync_and_native_managed_installers_are_exact_and_do_not_cross() {
+    let _serial = SERIAL.lock().unwrap();
+    let sync = ManagedProbe::leaked(
+        managed_manifest("managed-sync"),
+        ManagedBehavior::Complete(ComponentTerminal::Success),
     );
-    let policy = managed_policy("managed-only");
-    let mut session = Session::with_profile(SessionProfile::SshExec);
+    let sync_policy = managed_policy("managed-sync");
+    let (native_manifest, native_policy) = managed_contract(
+        "managed-native",
+        VIBE_NATIVE_STREAM_FILTER_WORLD,
+        0,
+        0,
+        StreamMode::Required,
+        StreamMode::Required,
+        StreamMode::Optional,
+        Vec::new(),
+    );
+    let native = ManagedProbe::leaked(
+        native_manifest,
+        ManagedBehavior::Complete(ComponentTerminal::Success),
+    );
+
+    let mut sync_rejects_native = Session::with_profile(SessionProfile::SshExec);
     assert_eq!(
-        session
-            .install_ssh_exec_component_command(&policy, runner)
+        install_managed(&mut sync_rejects_native, &native_policy, native)
             .unwrap_err()
             .message,
-        "stream components require the managed SSH lifecycle"
+        "managed SSH component contract is not the exact stream world"
     );
+    let mut native_rejects_sync = Session::with_profile(SessionProfile::SshExec);
     assert_eq!(
-        execute(session, "managed-only").1.unwrap_err().message,
-        "command is outside the SSH exec profile"
+        install_native_managed(&mut native_rejects_sync, &sync_policy, sync)
+            .unwrap_err()
+            .message,
+        "managed native SSH component contract is not the exact async stream world"
     );
+    assert_eq!(sync.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(native.starts.load(Ordering::SeqCst), 0);
+
+    let mut native_session = Session::with_profile(SessionProfile::SshExec);
+    install_native_managed(&mut native_session, &native_policy, native).unwrap();
+    let (_, reports) = execute(native_session, "managed-native");
+    assert_eq!(reports.unwrap()[0].status, Status::Success);
+    assert_eq!(native.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(native.acknowledgements.load(Ordering::SeqCst), 1);
 }
 
 #[test]

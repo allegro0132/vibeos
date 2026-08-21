@@ -118,6 +118,30 @@ pub enum StreamCloseOutcome {
     Conflict,
 }
 
+/// One close publication and the effective lifecycle reason observed in the
+/// same stream-lock critical section.
+///
+/// `effective_reason` is `None` only when the stream had already fail-stopped
+/// before any lifecycle reason could be published.  In particular, an
+/// endpoint-side provisional `Normal` is reported as `Some(Normal)`, while a
+/// late endpoint-side `Normal` observes the immutable non-normal reason that
+/// won instead of requiring a racy follow-up query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamCloseObservation {
+    outcome: StreamCloseOutcome,
+    effective_reason: Option<StreamCloseReason>,
+}
+
+impl StreamCloseObservation {
+    pub const fn outcome(self) -> StreamCloseOutcome {
+        self.outcome
+    }
+
+    pub const fn effective_reason(self) -> Option<StreamCloseReason> {
+        self.effective_reason
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Chunk {
     length: u16,
@@ -591,7 +615,12 @@ impl ByteStreamReader {
     /// SYSTEM supervisor publishes the immutable terminal reason. Buffered
     /// input is discarded so a blocked producer cannot be stranded.
     pub fn close(&self, reason: StreamCloseReason) -> StreamCloseOutcome {
-        publish_close(&self.stream, reason, false, true)
+        self.close_observed(reason).outcome()
+    }
+
+    /// Publishes consumer-done and atomically observes the effective reason.
+    pub fn close_observed(&self, reason: StreamCloseReason) -> StreamCloseObservation {
+        publish_close_observed(&self.stream, reason, false, true)
     }
 }
 
@@ -739,7 +768,12 @@ impl ByteStreamWriter {
     /// Producer-done publication.  Normal is provisional until supervisor
     /// finalization; a non-normal reason is immediately immutable final.
     pub fn close(&self, reason: StreamCloseReason) -> StreamCloseOutcome {
-        publish_close(&self.stream, reason, false, false)
+        self.close_observed(reason).outcome()
+    }
+
+    /// Publishes producer-done and atomically observes the effective reason.
+    pub fn close_observed(&self, reason: StreamCloseReason) -> StreamCloseObservation {
+        publish_close_observed(&self.stream, reason, false, false)
     }
 }
 
@@ -890,7 +924,13 @@ impl ByteStreamSupervisor {
     /// Publish the one immutable terminal reason.  Finalizing `Normal` is the
     /// only transition which makes drained EOF observable to the reader.
     pub fn finalize(&self, reason: StreamCloseReason) -> StreamCloseOutcome {
-        publish_close(&self.stream, reason, true, false)
+        self.finalize_observed(reason).outcome()
+    }
+
+    /// Publishes the terminal reason and atomically observes the effective
+    /// immutable reason.
+    pub fn finalize_observed(&self, reason: StreamCloseReason) -> StreamCloseObservation {
+        publish_close_observed(&self.stream, reason, true, false)
     }
 
     pub fn final_reason(&self) -> Option<StreamCloseReason> {
@@ -912,15 +952,15 @@ impl ByteStreamSupervisor {
     }
 }
 
-fn publish_close(
+fn publish_close_observed(
     stream: &ByteStream,
     reason: StreamCloseReason,
     supervisor: bool,
     discard_buffer: bool,
-) -> StreamCloseOutcome {
+) -> StreamCloseObservation {
     let mut state = stream.state.lock();
     if state.fail_stopped {
-        return StreamCloseOutcome::Conflict;
+        return close_observation(StreamCloseOutcome::Conflict, state.lifecycle);
     }
     if discard_buffer {
         state.consumer_stopped = true;
@@ -941,10 +981,11 @@ fn publish_close(
             StreamCloseOutcome::AlreadyPublished
         }
         Lifecycle::Final(_) => {
+            let observation = close_observation(StreamCloseOutcome::Conflict, state.lifecycle);
             let wakes = state.fail_stop();
             drop(state);
             wake_all(wakes);
-            return StreamCloseOutcome::Conflict;
+            return observation;
         }
         Lifecycle::Open | Lifecycle::NormalProvisional if reason.is_normal() && !supervisor => {
             let was_provisional = matches!(state.lifecycle, Lifecycle::NormalProvisional);
@@ -969,9 +1010,25 @@ fn publish_close(
     let sender = state.take_ready_sender_wake();
     let receiver = state.take_ready_receiver_wake();
     let terminal = state.take_ready_terminal_wake();
+    let observation = close_observation(outcome, state.lifecycle);
     drop(state);
     wake_all([sender, receiver, terminal]);
-    outcome
+    observation
+}
+
+const fn close_observation(
+    outcome: StreamCloseOutcome,
+    lifecycle: Lifecycle,
+) -> StreamCloseObservation {
+    let effective_reason = match lifecycle {
+        Lifecycle::Open => None,
+        Lifecycle::NormalProvisional => Some(StreamCloseReason::Normal),
+        Lifecycle::Final(reason) => Some(reason),
+    };
+    StreamCloseObservation {
+        outcome,
+        effective_reason,
+    }
 }
 
 fn producer_closed(lifecycle: Lifecycle) -> Option<StreamCloseReason> {
@@ -1120,5 +1177,17 @@ mod tests {
             supervisor.resume_terminal(operation),
             Err(StreamError::FailStopped)
         );
+    }
+
+    #[test]
+    fn close_observation_has_no_reason_when_fail_stop_precedes_publication() {
+        let stream = ByteStream::new();
+        let supervisor = stream.supervisor();
+        let wakes = stream.state.lock().fail_stop();
+        wake_all(wakes);
+
+        let observed = supervisor.finalize_observed(StreamCloseReason::Failure);
+        assert_eq!(observed.outcome(), StreamCloseOutcome::Conflict);
+        assert_eq!(observed.effective_reason(), None);
     }
 }

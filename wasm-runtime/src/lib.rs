@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::{
     cmp::min,
     fmt,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use vibeos_component_format::{LimitKind, ProfileLimits, TrapCode, PROFILE_1_LIMITS};
 use wasmi::{
@@ -894,6 +894,52 @@ pub enum CoreValue {
     I64(i64),
 }
 
+/// Maximum number of integer results surfaced by one admitted Core function.
+pub const MAX_CORE_RESULTS: usize = PROFILE_1_LIMITS.max_results_per_function as usize;
+
+/// Allocation-free terminal results returned by a reusable Core call slot.
+///
+/// Only the prefix exposed by [`Self::as_slice`] is initialized with guest
+/// results. The fixed backing array keeps the slot's allocation-backed result
+/// scratch inside the runtime for the next invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreResults {
+    values: [CoreValue; MAX_CORE_RESULTS],
+    len: usize,
+}
+
+impl CoreResults {
+    fn from_slice(values: &[CoreValue]) -> Option<Self> {
+        if values.len() > MAX_CORE_RESULTS {
+            return None;
+        }
+        let mut result = Self {
+            values: [CoreValue::I32(0); MAX_CORE_RESULTS],
+            len: values.len(),
+        };
+        result.values[..values.len()].copy_from_slice(values);
+        Some(result)
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[CoreValue] {
+        &self.values[..self.len()]
+    }
+}
+
+impl AsRef<[CoreValue]> for CoreResults {
+    fn as_ref(&self) -> &[CoreValue] {
+        self.as_slice()
+    }
+}
+
 impl CoreValue {
     fn into_wasmi(self) -> Val {
         match self {
@@ -995,6 +1041,7 @@ impl CoreInstance {
             external_debit: 0,
             started: false,
             cancelled: false,
+            slot_tag: None,
         });
         Ok(())
     }
@@ -1008,14 +1055,32 @@ impl CoreInstance {
             return PollResult::Trapped(TrapCode::Validation);
         };
         let result = call.poll(&mut self.store);
-        if !matches!(result, PollResult::Pending { .. } | PollResult::HostCall(_)) {
-            let call = self
-                .active_call
-                .take()
-                .expect("the active call was present before polling");
-            self.last_call = Some(call.metrics());
+        match result {
+            ActivePollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            } => PollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            },
+            ActivePollResult::HostCall(call) => PollResult::HostCall(call),
+            ActivePollResult::Ready => {
+                let mut call = self
+                    .active_call
+                    .take()
+                    .expect("the active call was present before terminal polling");
+                self.last_call = Some(call.metrics());
+                PollResult::Ready(core::mem::take(&mut call.result_values))
+            }
+            ActivePollResult::Trapped(trap) => {
+                let call = self
+                    .active_call
+                    .take()
+                    .expect("the active call was present before terminal polling");
+                self.last_call = Some(call.metrics());
+                PollResult::Trapped(trap)
+            }
         }
-        result
     }
 
     /// Supplies the exact results for the currently suspended host import.
@@ -1179,6 +1244,7 @@ struct GroupInstance {
     instance: Instance,
     active_call: Option<ActiveCall>,
     last_call: Option<CallMetrics>,
+    last_call_slot_tag: Option<CoreCallSlotTag>,
 }
 
 /// Allocation-backed storage for one exact group call.
@@ -1194,6 +1260,53 @@ pub struct CoreCallReservation {
     inputs: Vec<Val>,
     outputs: Vec<Val>,
     result_values: Vec<CoreValue>,
+}
+
+/// Lifecycle of one reusable, allocation-backed Core call slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreCallSlotState {
+    Idle,
+    Active,
+    Poisoned,
+}
+
+/// Allocation-backed storage reusable for repeated calls to one exact export.
+///
+/// A slot is bound to the group, instance, export, and an unforgeable
+/// generation assigned at reservation. While active, its call scratch is
+/// owned by the matching runtime call; terminal slot polling returns that
+/// storage exactly once.
+pub struct CoreCallSlot {
+    owner: u32,
+    instance: usize,
+    export: Vec<u8>,
+    generation: u64,
+    state: CoreCallSlotState,
+    storage: Option<CoreCallStorage>,
+}
+
+struct CoreCallStorage {
+    function: Func,
+    inputs: Vec<Val>,
+    outputs: Vec<Val>,
+    result_values: Vec<CoreValue>,
+}
+
+impl CoreCallSlot {
+    pub const fn state(&self) -> CoreCallSlotState {
+        self.state
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoreCallSlotTag {
+    owner: u32,
+    instance: usize,
+    generation: u64,
 }
 
 impl CoreComponentGroup {
@@ -1341,6 +1454,7 @@ impl CoreComponentGroup {
             instance,
             active_call: None,
             last_call: None,
+            last_call_slot_tag: None,
         });
         for import in imports {
             if let CoreModuleImport::Host(host) = import {
@@ -1518,6 +1632,32 @@ impl CoreComponentGroup {
         })
     }
 
+    /// Preallocates one reusable call slot bound to an exact group export.
+    ///
+    /// Unlike [`Self::reserve_call`], terminal polling returns the allocation-
+    /// backed storage to this linear slot instead of consuming it.
+    pub fn reserve_call_slot(
+        &self,
+        instance: usize,
+        export: &str,
+    ) -> Result<CoreCallSlot, TrapCode> {
+        let reservation = self.reserve_call(instance, export)?;
+        let generation = next_core_call_slot_generation()?;
+        Ok(CoreCallSlot {
+            owner: reservation.owner,
+            instance: reservation.instance,
+            export: reservation.export,
+            generation,
+            state: CoreCallSlotState::Idle,
+            storage: Some(CoreCallStorage {
+                function: reservation.function,
+                inputs: reservation.inputs,
+                outputs: reservation.outputs,
+                result_values: reservation.result_values,
+            }),
+        })
+    }
+
     /// Starts a call using storage allocated by [`Self::reserve_call`].
     ///
     /// Every validation completes before group or per-instance state changes,
@@ -1592,17 +1732,235 @@ impl CoreComponentGroup {
             external_debit: 0,
             started: false,
             cancelled: false,
+            slot_tag: None,
         };
         let state = self
             .instances
             .get_mut(instance)
             .expect("the validated group instance remains present");
         state.last_call = None;
+        state.last_call_slot_tag = None;
         state.active_call = Some(call);
         self.state = ComponentGroupState::Sealed;
         Ok(())
     }
 
+    /// Starts one invocation using an idle reusable slot.
+    ///
+    /// Every caller-controlled value and all slot provenance are validated
+    /// before the slot or group changes. Successful start moves only the call
+    /// scratch into the active call and marks the slot active.
+    pub fn start_call_slot(
+        &mut self,
+        slot: &mut CoreCallSlot,
+        instance: usize,
+        export: &str,
+        inputs: &[CoreValue],
+        total_fuel: u64,
+        poll_quantum: u64,
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            self.discard_all_calls();
+            if slot.owner == self.reservation_owner {
+                slot.state = CoreCallSlotState::Poisoned;
+                slot.storage = None;
+            }
+            return Err(TrapCode::Validation);
+        }
+        if slot.owner != self.reservation_owner
+            || slot.instance != instance
+            || slot.export.as_slice() != export.as_bytes()
+            || slot.generation == 0
+            || slot.state != CoreCallSlotState::Idle
+        {
+            return Err(TrapCode::Validation);
+        }
+        let storage = slot.storage.as_ref().ok_or(TrapCode::Validation)?;
+        let state = self.instances.get(instance).ok_or(TrapCode::Validation)?;
+        if state.active_call.is_some()
+            || storage.inputs.len() != inputs.len()
+            || storage
+                .inputs
+                .iter()
+                .zip(inputs)
+                .any(|(reserved, input)| reserved.ty() != input.value_type().into_wasmi())
+        {
+            return Err(TrapCode::Validation);
+        }
+        let current = state
+            .instance
+            .get_func(&self.store, export)
+            .ok_or(TrapCode::Validation)?;
+        let current_type = current.ty(&self.store);
+        if current_type.params().len() != storage.inputs.len()
+            || current_type.results().len() != storage.outputs.len()
+            || current_type
+                .params()
+                .iter()
+                .zip(&storage.inputs)
+                .any(|(expected, reserved)| *expected != reserved.ty())
+            || current_type
+                .results()
+                .iter()
+                .zip(&storage.outputs)
+                .any(|(expected, reserved)| *expected != reserved.ty())
+        {
+            return Err(TrapCode::Validation);
+        }
+        if total_fuel == 0
+            || total_fuel > PROFILE_1_LIMITS.total_fuel
+            || poll_quantum == 0
+            || poll_quantum > PROFILE_1_LIMITS.poll_quantum
+            || poll_quantum > total_fuel
+        {
+            return Err(TrapCode::LimitExceeded);
+        }
+
+        let storage = slot
+            .storage
+            .as_mut()
+            .expect("the validated idle slot retains its call storage");
+        for (reserved, input) in storage.inputs.iter_mut().zip(inputs.iter().copied()) {
+            *reserved = input.into_wasmi();
+        }
+        let storage = slot
+            .storage
+            .take()
+            .expect("the validated idle slot retains its call storage");
+        let tag = CoreCallSlotTag {
+            owner: slot.owner,
+            instance: slot.instance,
+            generation: slot.generation,
+        };
+        let call = ActiveCall {
+            function: storage.function,
+            inputs: storage.inputs,
+            outputs: storage.outputs,
+            result_values: storage.result_values,
+            continuation: None,
+            remaining_fuel: total_fuel,
+            poll_quantum,
+            consumed_fuel: 0,
+            external_debit: 0,
+            started: false,
+            cancelled: false,
+            slot_tag: Some(tag),
+        };
+        let state = self
+            .instances
+            .get_mut(instance)
+            .expect("the validated group instance remains present");
+        state.last_call = None;
+        state.last_call_slot_tag = None;
+        state.active_call = Some(call);
+        slot.state = CoreCallSlotState::Active;
+        self.state = ComponentGroupState::Sealed;
+        Ok(())
+    }
+
+    /// Polls the exact active invocation owned by `slot` for one quantum.
+    ///
+    /// Ready and trapped terminals both return every allocation-backed call
+    /// scratch buffer to the slot before this method returns.
+    pub fn poll_call_slot(&mut self, slot: &mut CoreCallSlot) -> CoreSlotPollResult {
+        if slot.owner != self.reservation_owner {
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        }
+        if self.state == ComponentGroupState::Poisoned {
+            self.discard_all_calls();
+            slot.state = CoreCallSlotState::Poisoned;
+            slot.storage = None;
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        }
+        if slot.state != CoreCallSlotState::Active {
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        }
+        if slot.storage.is_some() {
+            slot.state = CoreCallSlotState::Poisoned;
+            self.state = ComponentGroupState::Poisoned;
+            self.discard_all_calls();
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        }
+        let expected = CoreCallSlotTag {
+            owner: slot.owner,
+            instance: slot.instance,
+            generation: slot.generation,
+        };
+        let Some(state) = self.instances.get_mut(slot.instance) else {
+            slot.state = CoreCallSlotState::Poisoned;
+            self.state = ComponentGroupState::Poisoned;
+            self.discard_all_calls();
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        };
+        let Some(call) = state.active_call.as_mut() else {
+            slot.state = CoreCallSlotState::Poisoned;
+            self.state = ComponentGroupState::Poisoned;
+            self.discard_all_calls();
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        };
+        if call.slot_tag != Some(expected) {
+            self.state = ComponentGroupState::Poisoned;
+            self.discard_all_calls();
+            slot.state = CoreCallSlotState::Poisoned;
+            return CoreSlotPollResult::Trapped(TrapCode::Validation);
+        }
+        let result = call.poll(&mut self.store);
+        match result {
+            ActivePollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            } => CoreSlotPollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            },
+            ActivePollResult::HostCall(call) => CoreSlotPollResult::HostCall(call),
+            ActivePollResult::Ready => {
+                let call = state
+                    .active_call
+                    .take()
+                    .expect("the exact slot call remained active until terminal return");
+                state.last_call = Some(call.metrics());
+                state.last_call_slot_tag = Some(expected);
+                let results = CoreResults::from_slice(&call.result_values);
+                if !restore_core_call_slot(slot, call) {
+                    self.state = ComponentGroupState::Poisoned;
+                    self.discard_all_calls();
+                    return CoreSlotPollResult::Trapped(TrapCode::Validation);
+                }
+                match results {
+                    Some(results) => CoreSlotPollResult::Ready(results),
+                    None => {
+                        slot.state = CoreCallSlotState::Poisoned;
+                        slot.storage = None;
+                        self.state = ComponentGroupState::Poisoned;
+                        self.discard_all_calls();
+                        CoreSlotPollResult::Trapped(TrapCode::Validation)
+                    }
+                }
+            }
+            ActivePollResult::Trapped(trap) => {
+                let call = state
+                    .active_call
+                    .take()
+                    .expect("the exact slot call remained active until terminal return");
+                state.last_call = Some(call.metrics());
+                state.last_call_slot_tag = Some(expected);
+                if restore_core_call_slot(slot, call) {
+                    CoreSlotPollResult::Trapped(trap)
+                } else {
+                    self.state = ComponentGroupState::Poisoned;
+                    self.discard_all_calls();
+                    CoreSlotPollResult::Trapped(TrapCode::Validation)
+                }
+            }
+        }
+    }
+
+    /// Polls an ordinary group call.
+    ///
+    /// Supplying this API for a slot-owned call destroys that call and
+    /// permanently poisons the group: without the linear slot argument its
+    /// scratch cannot be returned without creating a false reusable state.
     pub fn poll_call(&mut self, instance: usize) -> PollResult {
         if self.state == ComponentGroupState::Poisoned {
             return PollResult::Trapped(TrapCode::Validation);
@@ -1613,107 +1971,110 @@ impl CoreComponentGroup {
         let Some(call) = state.active_call.as_mut() else {
             return PollResult::Trapped(TrapCode::Validation);
         };
-        let result = call.poll(&mut self.store);
-        if !matches!(result, PollResult::Pending { .. } | PollResult::HostCall(_)) {
-            let call = state
-                .active_call
-                .take()
-                .expect("the active group call was present before polling");
-            state.last_call = Some(call.metrics());
+        if call.slot_tag.is_some() {
+            self.discard_all_calls();
+            return PollResult::Trapped(TrapCode::Validation);
         }
-        result
+        let result = call.poll(&mut self.store);
+        match result {
+            ActivePollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            } => PollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            },
+            ActivePollResult::HostCall(call) => PollResult::HostCall(call),
+            ActivePollResult::Ready => {
+                let mut call = state
+                    .active_call
+                    .take()
+                    .expect("the active group call was present before terminal polling");
+                state.last_call = Some(call.metrics());
+                state.last_call_slot_tag = None;
+                PollResult::Ready(core::mem::take(&mut call.result_values))
+            }
+            ActivePollResult::Trapped(trap) => {
+                let call = state
+                    .active_call
+                    .take()
+                    .expect("the active group call was present before terminal polling");
+                state.last_call = Some(call.metrics());
+                state.last_call_slot_tag = None;
+                PollResult::Trapped(trap)
+            }
+        }
     }
 
+    /// Supplies host results to an ordinary active call.
+    ///
+    /// Slot-owned calls require [`Self::resume_host_call_slot`].
     pub fn resume_host_call(
         &mut self,
         instance: usize,
         id: u32,
         results: &[CoreValue],
     ) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned || self.store.data().pending_host.is_some() {
-            return Err(TrapCode::Validation);
-        }
-        self.instances
-            .get_mut(instance)
-            .ok_or(TrapCode::Validation)?
-            .active_call
-            .as_mut()
-            .ok_or(TrapCode::Validation)?
-            .resume_host_call(&self.store, id, results)
+        self.resume_host_call_tagged(instance, None, id, results)
+    }
+
+    /// Supplies host results to the exact active call owned by `slot`.
+    pub fn resume_host_call_slot(
+        &mut self,
+        slot: &CoreCallSlot,
+        id: u32,
+        results: &[CoreValue],
+    ) -> Result<(), TrapCode> {
+        let tag = self.active_slot_tag(slot)?;
+        self.resume_host_call_tagged(slot.instance, Some(tag), id, results)
     }
 
     /// Removes reserved fuel from an active continuation without executing
     /// guest instructions. Component runtimes use this when host/canonical
     /// work shares the same top-level ledger as the suspended Core call.
+    /// Slot-owned calls require [`Self::debit_call_fuel_slot`].
     pub fn debit_call_fuel(&mut self, instance: usize, amount: u64) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        let call = self
-            .instances
-            .get_mut(instance)
-            .and_then(|state| state.active_call.as_mut())
-            .ok_or(TrapCode::Validation)?;
-        let remaining_fuel = call
-            .remaining_fuel
-            .checked_sub(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let consumed_fuel = call
-            .consumed_fuel
-            .checked_add(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let external_debit = call
-            .external_debit
-            .checked_add(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        call.remaining_fuel = remaining_fuel;
-        call.consumed_fuel = consumed_fuel;
-        call.external_debit = external_debit;
-        Ok(())
+        self.debit_call_fuel_tagged(instance, None, amount)
+    }
+
+    /// Debits shared host/canonical work from the exact active slot call.
+    pub fn debit_call_fuel_slot(
+        &mut self,
+        slot: &CoreCallSlot,
+        amount: u64,
+    ) -> Result<(), TrapCode> {
+        let tag = self.active_slot_tag(slot)?;
+        self.debit_call_fuel_tagged(slot.instance, Some(tag), amount)
     }
 
     /// Atomically releases unused fuel previously charged by
     /// [`Self::debit_call_fuel`]. Guest-executed fuel cannot be credited.
+    /// Slot-owned calls require [`Self::credit_call_fuel_slot`].
     pub fn credit_call_fuel(&mut self, instance: usize, amount: u64) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        let call = self
-            .instances
-            .get_mut(instance)
-            .and_then(|state| state.active_call.as_mut())
-            .ok_or(TrapCode::Validation)?;
-        let remaining_fuel = call
-            .remaining_fuel
-            .checked_add(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let consumed_fuel = call
-            .consumed_fuel
-            .checked_sub(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let external_debit = call
-            .external_debit
-            .checked_sub(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        call.remaining_fuel = remaining_fuel;
-        call.consumed_fuel = consumed_fuel;
-        call.external_debit = external_debit;
-        Ok(())
+        self.credit_call_fuel_tagged(instance, None, amount)
     }
 
+    /// Credits unused shared work to the exact active slot call.
+    pub fn credit_call_fuel_slot(
+        &mut self,
+        slot: &CoreCallSlot,
+        amount: u64,
+    ) -> Result<(), TrapCode> {
+        let tag = self.active_slot_tag(slot)?;
+        self.credit_call_fuel_tagged(slot.instance, Some(tag), amount)
+    }
+
+    /// Requests cancellation of an ordinary active call.
+    ///
+    /// Slot-owned calls require [`Self::cancel_call_slot`].
     pub fn cancel_call(&mut self, instance: usize) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        let call = self
-            .instances
-            .get_mut(instance)
-            .ok_or(TrapCode::Validation)?
-            .active_call
-            .as_mut()
-            .ok_or(TrapCode::Validation)?;
-        call.cancelled = true;
-        Ok(())
+        self.cancel_call_tagged(instance, None)
+    }
+
+    /// Requests cancellation of the exact active call owned by `slot`.
+    pub fn cancel_call_slot(&mut self, slot: &CoreCallSlot) -> Result<(), TrapCode> {
+        let tag = self.active_slot_tag(slot)?;
+        self.cancel_call_tagged(slot.instance, Some(tag))
     }
 
     pub fn discard_call(&mut self, instance: usize) -> Result<(), TrapCode> {
@@ -1724,19 +2085,87 @@ impl CoreComponentGroup {
             .instances
             .get_mut(instance)
             .ok_or(TrapCode::Validation)?;
+        if state
+            .active_call
+            .as_ref()
+            .is_some_and(|call| call.slot_tag.is_some())
+        {
+            return Err(TrapCode::Validation);
+        }
         let call = state.active_call.take().ok_or(TrapCode::Validation)?;
         state.last_call = Some(call.metrics());
+        state.last_call_slot_tag = None;
         Ok(())
+    }
+
+    /// Abandons the exact active slot call and returns its scratch to the slot.
+    ///
+    /// This does not execute more guest code. The restored slot is idle and
+    /// may be started again. Generic [`Self::discard_call`] deliberately
+    /// rejects slot-owned calls because it cannot return storage without the
+    /// linear slot authority.
+    pub fn discard_call_slot(&mut self, slot: &mut CoreCallSlot) -> Result<(), TrapCode> {
+        if slot.owner != self.reservation_owner {
+            return Err(TrapCode::Validation);
+        }
+        if self.state == ComponentGroupState::Poisoned {
+            self.discard_all_calls();
+            slot.state = CoreCallSlotState::Poisoned;
+            slot.storage = None;
+            return Err(TrapCode::Validation);
+        }
+        if slot.state != CoreCallSlotState::Active || slot.storage.is_some() {
+            return Err(TrapCode::Validation);
+        }
+        let expected = CoreCallSlotTag {
+            owner: slot.owner,
+            instance: slot.instance,
+            generation: slot.generation,
+        };
+        let state = self
+            .instances
+            .get_mut(slot.instance)
+            .ok_or(TrapCode::Validation)?;
+        if state.active_call.as_ref().and_then(|call| call.slot_tag) != Some(expected) {
+            slot.state = CoreCallSlotState::Poisoned;
+            self.state = ComponentGroupState::Poisoned;
+            self.discard_all_calls();
+            return Err(TrapCode::Validation);
+        }
+        let call = state
+            .active_call
+            .take()
+            .expect("the exact slot call was validated as active");
+        state.last_call = Some(call.metrics());
+        state.last_call_slot_tag = Some(expected);
+        self.store.data_mut().pending_host = None;
+        if restore_core_call_slot(slot, call) {
+            Ok(())
+        } else {
+            self.state = ComponentGroupState::Poisoned;
+            self.discard_all_calls();
+            Err(TrapCode::Validation)
+        }
     }
 
     /// Discards every suspended continuation in the principal without
     /// executing further guest instructions.
+    ///
+    /// If this destroys a slot-owned call without its linear slot authority,
+    /// the group is permanently poisoned. A later operation with that slot
+    /// synchronizes its externally visible state to [`CoreCallSlotState::Poisoned`].
     pub fn discard_all_calls(&mut self) {
         self.store.data_mut().pending_host = None;
+        let mut discarded_slot = false;
         for state in &mut self.instances {
             if let Some(call) = state.active_call.take() {
+                discarded_slot |= call.slot_tag.is_some();
                 state.last_call = Some(call.metrics());
+                state.last_call_slot_tag = call.slot_tag;
             }
+        }
+        if discarded_slot {
+            self.state = ComponentGroupState::Poisoned;
         }
     }
 
@@ -1750,16 +2179,175 @@ impl CoreComponentGroup {
         }
     }
 
+    /// Returns metrics for an ordinary active or most recently terminal call.
+    /// Slot-tagged metrics require [`Self::call_metrics_slot`].
     pub fn call_metrics(&self, instance: usize) -> Option<CallMetrics> {
         if self.state == ComponentGroupState::Poisoned {
             return None;
         }
         let state = self.instances.get(instance)?;
-        state
-            .active_call
-            .as_ref()
-            .map(ActiveCall::metrics)
-            .or(state.last_call)
+        if let Some(call) = state.active_call.as_ref() {
+            return (call.slot_tag.is_none()).then(|| call.metrics());
+        }
+        (state.last_call_slot_tag.is_none())
+            .then_some(state.last_call)
+            .flatten()
+    }
+
+    /// Returns metrics for the exact active or most recently terminal call
+    /// owned by `slot`. Metrics from another slot generation are never
+    /// surfaced through this authority.
+    pub fn call_metrics_slot(&self, slot: &CoreCallSlot) -> Option<CallMetrics> {
+        if self.state == ComponentGroupState::Poisoned
+            || slot.owner != self.reservation_owner
+            || slot.generation == 0
+        {
+            return None;
+        }
+        let tag = CoreCallSlotTag {
+            owner: slot.owner,
+            instance: slot.instance,
+            generation: slot.generation,
+        };
+        let state = self.instances.get(slot.instance)?;
+        match slot.state {
+            CoreCallSlotState::Active if slot.storage.is_none() => {
+                let call = state.active_call.as_ref()?;
+                (call.slot_tag == Some(tag)).then(|| call.metrics())
+            }
+            CoreCallSlotState::Idle if slot.storage.is_some() && state.active_call.is_none() => {
+                (state.last_call_slot_tag == Some(tag))
+                    .then_some(state.last_call)
+                    .flatten()
+            }
+            CoreCallSlotState::Idle | CoreCallSlotState::Active | CoreCallSlotState::Poisoned => {
+                None
+            }
+        }
+    }
+
+    fn active_slot_tag(&self, slot: &CoreCallSlot) -> Result<CoreCallSlotTag, TrapCode> {
+        if self.state == ComponentGroupState::Poisoned
+            || slot.owner != self.reservation_owner
+            || slot.generation == 0
+            || slot.state != CoreCallSlotState::Active
+            || slot.storage.is_some()
+        {
+            return Err(TrapCode::Validation);
+        }
+        let tag = CoreCallSlotTag {
+            owner: slot.owner,
+            instance: slot.instance,
+            generation: slot.generation,
+        };
+        let call = self
+            .instances
+            .get(slot.instance)
+            .and_then(|state| state.active_call.as_ref())
+            .ok_or(TrapCode::Validation)?;
+        if call.slot_tag != Some(tag) {
+            return Err(TrapCode::Validation);
+        }
+        Ok(tag)
+    }
+
+    fn active_call_mut_tagged(
+        &mut self,
+        instance: usize,
+        tag: Option<CoreCallSlotTag>,
+    ) -> Result<&mut ActiveCall, TrapCode> {
+        if self.state == ComponentGroupState::Poisoned {
+            return Err(TrapCode::Validation);
+        }
+        let call = self
+            .instances
+            .get_mut(instance)
+            .and_then(|state| state.active_call.as_mut())
+            .ok_or(TrapCode::Validation)?;
+        if call.slot_tag != tag {
+            return Err(TrapCode::Validation);
+        }
+        Ok(call)
+    }
+
+    fn resume_host_call_tagged(
+        &mut self,
+        instance: usize,
+        tag: Option<CoreCallSlotTag>,
+        id: u32,
+        results: &[CoreValue],
+    ) -> Result<(), TrapCode> {
+        if self.state == ComponentGroupState::Poisoned || self.store.data().pending_host.is_some() {
+            return Err(TrapCode::Validation);
+        }
+        let call = self
+            .instances
+            .get_mut(instance)
+            .and_then(|state| state.active_call.as_mut())
+            .ok_or(TrapCode::Validation)?;
+        if call.slot_tag != tag {
+            return Err(TrapCode::Validation);
+        }
+        call.resume_host_call(&self.store, id, results)
+    }
+
+    fn debit_call_fuel_tagged(
+        &mut self,
+        instance: usize,
+        tag: Option<CoreCallSlotTag>,
+        amount: u64,
+    ) -> Result<(), TrapCode> {
+        let call = self.active_call_mut_tagged(instance, tag)?;
+        let remaining_fuel = call
+            .remaining_fuel
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let consumed_fuel = call
+            .consumed_fuel
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let external_debit = call
+            .external_debit
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        call.remaining_fuel = remaining_fuel;
+        call.consumed_fuel = consumed_fuel;
+        call.external_debit = external_debit;
+        Ok(())
+    }
+
+    fn credit_call_fuel_tagged(
+        &mut self,
+        instance: usize,
+        tag: Option<CoreCallSlotTag>,
+        amount: u64,
+    ) -> Result<(), TrapCode> {
+        let call = self.active_call_mut_tagged(instance, tag)?;
+        let remaining_fuel = call
+            .remaining_fuel
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let consumed_fuel = call
+            .consumed_fuel
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let external_debit = call
+            .external_debit
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        call.remaining_fuel = remaining_fuel;
+        call.consumed_fuel = consumed_fuel;
+        call.external_debit = external_debit;
+        Ok(())
+    }
+
+    fn cancel_call_tagged(
+        &mut self,
+        instance: usize,
+        tag: Option<CoreCallSlotTag>,
+    ) -> Result<(), TrapCode> {
+        self.active_call_mut_tagged(instance, tag)?.cancelled = true;
+        Ok(())
     }
 
     pub fn read_memory(
@@ -1855,6 +2443,7 @@ fn allocation_error() -> AdmissionError {
 }
 
 static NEXT_GROUP_RESERVATION_OWNER: AtomicU32 = AtomicU32::new(1);
+static NEXT_CORE_CALL_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_group_reservation_owner() -> Result<u32, AdmissionError> {
     NEXT_GROUP_RESERVATION_OWNER
@@ -1862,6 +2451,45 @@ fn next_group_reservation_owner() -> Result<u32, AdmissionError> {
             current.checked_add(1)
         })
         .map_err(|_| allocation_error())
+}
+
+fn next_core_call_slot_generation() -> Result<u64, TrapCode> {
+    NEXT_CORE_CALL_SLOT_GENERATION
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| TrapCode::LimitExceeded)
+}
+
+fn restore_core_call_slot(slot: &mut CoreCallSlot, call: ActiveCall) -> bool {
+    let expected = CoreCallSlotTag {
+        owner: slot.owner,
+        instance: slot.instance,
+        generation: slot.generation,
+    };
+    if slot.state != CoreCallSlotState::Active
+        || slot.storage.is_some()
+        || call.slot_tag != Some(expected)
+    {
+        slot.state = CoreCallSlotState::Poisoned;
+        slot.storage = None;
+        return false;
+    }
+    let ActiveCall {
+        function,
+        inputs,
+        outputs,
+        result_values,
+        ..
+    } = call;
+    slot.storage = Some(CoreCallStorage {
+        function,
+        inputs,
+        outputs,
+        result_values,
+    });
+    slot.state = CoreCallSlotState::Idle;
+    true
 }
 
 struct ActiveCall {
@@ -1880,6 +2508,7 @@ struct ActiveCall {
     external_debit: u64,
     started: bool,
     cancelled: bool,
+    slot_tag: Option<CoreCallSlotTag>,
 }
 
 enum ActiveContinuation {
@@ -1890,6 +2519,16 @@ enum ActiveContinuation {
         response: Vec<Val>,
         response_ready: bool,
     },
+}
+
+enum ActivePollResult {
+    Pending {
+        consumed_fuel: u64,
+        remaining_fuel: u64,
+    },
+    HostCall(CoreHostCall),
+    Ready,
+    Trapped(TrapCode),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1948,31 +2587,31 @@ impl ActiveCall {
         Ok(())
     }
 
-    fn poll(&mut self, store: &mut Store<HostState>) -> PollResult {
+    fn poll(&mut self, store: &mut Store<HostState>) -> ActivePollResult {
         if self.cancelled {
             self.continuation = None;
             store.data_mut().pending_host = None;
-            return PollResult::Trapped(TrapCode::Cancelled);
+            return ActivePollResult::Trapped(TrapCode::Cancelled);
         }
         if store.data().pending_host.is_some() {
             self.continuation = None;
             store.data_mut().pending_host = None;
-            return PollResult::Trapped(TrapCode::Validation);
+            return ActivePollResult::Trapped(TrapCode::Validation);
         }
         if self.remaining_fuel == 0 {
             self.continuation = None;
-            return PollResult::Trapped(TrapCode::FuelExhausted);
+            return ActivePollResult::Trapped(TrapCode::FuelExhausted);
         }
 
         let grant = min(self.remaining_fuel, self.poll_quantum);
         if store.set_fuel(grant).is_err() {
-            return PollResult::Trapped(TrapCode::FuelExhausted);
+            return ActivePollResult::Trapped(TrapCode::FuelExhausted);
         }
         let call = if let Some(continuation) = self.continuation.take() {
             match continuation {
                 ActiveContinuation::OutOfFuel(continuation) => {
                     if continuation.required_fuel() > grant {
-                        return PollResult::Trapped(
+                        return ActivePollResult::Trapped(
                             if continuation.required_fuel() > self.remaining_fuel {
                                 TrapCode::FuelExhausted
                             } else {
@@ -1990,10 +2629,10 @@ impl ActiveCall {
                 } => {
                     let marker = invocation.host_error().downcast_ref::<HostBridgeError>();
                     if marker != Some(&HostBridgeError::Yield { id }) {
-                        return PollResult::Trapped(TrapCode::Validation);
+                        return ActivePollResult::Trapped(TrapCode::Validation);
                     }
                     if !response_ready {
-                        return PollResult::Trapped(TrapCode::Validation);
+                        return ActivePollResult::Trapped(TrapCode::Validation);
                     }
                     invocation.resume(&mut *store, &response, &mut self.outputs)
                 }
@@ -2003,7 +2642,7 @@ impl ActiveCall {
             self.function
                 .call_resumable(&mut *store, &self.inputs, &mut self.outputs)
         } else {
-            return PollResult::Trapped(TrapCode::Validation);
+            return ActivePollResult::Trapped(TrapCode::Validation);
         };
 
         let left = store.get_fuel().unwrap_or(0).min(grant);
@@ -2015,21 +2654,21 @@ impl ActiveCall {
                 self.result_values.clear();
                 for value in &self.outputs {
                     let Some(value) = CoreValue::from_wasmi(value) else {
-                        return PollResult::Trapped(TrapCode::Validation);
+                        return ActivePollResult::Trapped(TrapCode::Validation);
                     };
                     debug_assert!(self.result_values.len() < self.result_values.capacity());
                     self.result_values.push(value);
                 }
-                PollResult::Ready(core::mem::take(&mut self.result_values))
+                ActivePollResult::Ready
             }
             Ok(ResumableCall::OutOfFuel(continuation)) => {
                 if self.remaining_fuel == 0 {
-                    PollResult::Trapped(TrapCode::FuelExhausted)
+                    ActivePollResult::Trapped(TrapCode::FuelExhausted)
                 } else if continuation.required_fuel() > self.poll_quantum {
-                    PollResult::Trapped(TrapCode::LimitExceeded)
+                    ActivePollResult::Trapped(TrapCode::LimitExceeded)
                 } else {
                     self.continuation = Some(ActiveContinuation::OutOfFuel(continuation));
-                    PollResult::Pending {
+                    ActivePollResult::Pending {
                         consumed_fuel: self.consumed_fuel,
                         remaining_fuel: self.remaining_fuel,
                     }
@@ -2038,7 +2677,7 @@ impl ActiveCall {
             Ok(ResumableCall::HostTrap(invocation)) => self.suspend_host(store, invocation),
             Err(error) => {
                 store.data_mut().pending_host = None;
-                PollResult::Trapped(map_wasmi_error(&error))
+                ActivePollResult::Trapped(map_wasmi_error(&error))
             }
         }
     }
@@ -2047,16 +2686,16 @@ impl ActiveCall {
         &mut self,
         store: &mut Store<HostState>,
         invocation: ResumableCallHostTrap,
-    ) -> PollResult {
+    ) -> ActivePollResult {
         let marker_id = match invocation.host_error().downcast_ref::<HostBridgeError>() {
             Some(HostBridgeError::Yield { id }) => *id,
             _ => {
                 store.data_mut().pending_host = None;
-                return PollResult::Trapped(TrapCode::Validation);
+                return ActivePollResult::Trapped(TrapCode::Validation);
             }
         };
         let Some(mailbox) = store.data_mut().pending_host.take() else {
-            return PollResult::Trapped(TrapCode::Validation);
+            return ActivePollResult::Trapped(TrapCode::Validation);
         };
         let host_type = invocation.host_func().ty(&*store);
         if marker_id != mailbox.id
@@ -2067,7 +2706,7 @@ impl ActiveCall {
                 .any(|ty| !matches!(ty, ValType::I32 | ValType::I64))
             || self.remaining_fuel == 0
         {
-            return PollResult::Trapped(if self.remaining_fuel == 0 {
+            return ActivePollResult::Trapped(if self.remaining_fuel == 0 {
                 TrapCode::FuelExhausted
             } else {
                 TrapCode::Validation
@@ -2078,7 +2717,7 @@ impl ActiveCall {
             .try_reserve_exact(host_type.results().len())
             .is_err()
         {
-            return PollResult::Trapped(TrapCode::LimitExceeded);
+            return ActivePollResult::Trapped(TrapCode::LimitExceeded);
         }
         response.extend(host_type.results().iter().copied().map(Val::default));
         self.continuation = Some(ActiveContinuation::Host {
@@ -2087,7 +2726,7 @@ impl ActiveCall {
             response,
             response_ready: false,
         });
-        PollResult::HostCall(CoreHostCall {
+        ActivePollResult::HostCall(CoreHostCall {
             origin_instance: mailbox.origin_instance,
             id: marker_id,
             arguments: mailbox.arguments,
@@ -2118,6 +2757,22 @@ pub enum PollResult {
     },
     HostCall(CoreHostCall),
     Ready(Vec<CoreValue>),
+    Trapped(TrapCode),
+}
+
+/// Result of polling one exact reusable [`CoreCallSlot`].
+///
+/// The large inline ready variant is deliberate: boxing it would reintroduce
+/// a fallible allocation at the terminal callback boundary.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoreSlotPollResult {
+    Pending {
+        consumed_fuel: u64,
+        remaining_fuel: u64,
+    },
+    HostCall(CoreHostCall),
+    Ready(CoreResults),
     Trapped(TrapCode),
 }
 

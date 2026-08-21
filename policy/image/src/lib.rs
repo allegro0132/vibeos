@@ -4,7 +4,10 @@
 //! firmware images. Physical hardware descriptions remain in the BSP/HAL.
 
 use vibeos_component_format::ProfileIdentity;
-#[cfg(feature = "c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "c53-native-async-qemu-acceptance",
+    feature = "c53-native-async-command-projection"
+))]
 use vibeos_component_format::PROFILE_1_LIMITS;
 
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
@@ -265,6 +268,117 @@ impl core::fmt::Debug for NativeAsyncAcceptancePin {
     }
 }
 
+/// Image-policy authority for projecting the pinned native async artifact into
+/// an inert VSH command manifest.
+///
+/// This is a separate policy upgrade from `NativeAsyncAcceptancePin`. There
+/// is deliberately no `From`/`Into` implementation between the two roots, even
+/// though both may bind the same immutable artifact and validation-only
+/// profile. The command projection adapter accepts only this type.
+///
+/// ```compile_fail
+/// # use vibeos_image_policy::{
+/// #     NativeAsyncAcceptancePin, C53_NATIVE_ASYNC_COMMAND,
+/// # };
+/// let _: NativeAsyncAcceptancePin = C53_NATIVE_ASYNC_COMMAND.into();
+/// ```
+#[cfg(feature = "c53-native-async-command-projection")]
+#[derive(Clone, Copy)]
+pub struct NativeAsyncCommandPin {
+    artifact_bytes: &'static [u8],
+    expected_sha256: [u8; 32],
+    command_name: &'static str,
+    profile: ProfileIdentity,
+    wit_source: &'static str,
+    world: &'static str,
+    entrypoint: &'static str,
+    min_args: usize,
+    max_args: usize,
+    stdin: ComponentStreamMode,
+    stdout: ComponentStreamMode,
+    stderr: ComponentStreamMode,
+    limits: ComponentInstanceLimits,
+}
+
+#[cfg(feature = "c53-native-async-command-projection")]
+impl NativeAsyncCommandPin {
+    pub const fn artifact_bytes(self) -> &'static [u8] {
+        self.artifact_bytes
+    }
+
+    pub const fn expected_sha256(self) -> [u8; 32] {
+        self.expected_sha256
+    }
+
+    pub const fn command_name(self) -> &'static str {
+        self.command_name
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn abi(self) -> u16 {
+        self.profile.runtime_abi
+    }
+
+    pub const fn wit_source(self) -> &'static str {
+        self.wit_source
+    }
+
+    pub const fn world(self) -> &'static str {
+        self.world
+    }
+
+    pub const fn entrypoint(self) -> &'static str {
+        self.entrypoint
+    }
+
+    pub const fn min_args(self) -> usize {
+        self.min_args
+    }
+
+    pub const fn max_args(self) -> usize {
+        self.max_args
+    }
+
+    pub const fn stdin(self) -> ComponentStreamMode {
+        self.stdin
+    }
+
+    pub const fn stdout(self) -> ComponentStreamMode {
+        self.stdout
+    }
+
+    pub const fn stderr(self) -> ComponentStreamMode {
+        self.stderr
+    }
+
+    pub const fn limits(self) -> ComponentInstanceLimits {
+        self.limits
+    }
+}
+
+#[cfg(feature = "c53-native-async-command-projection")]
+impl core::fmt::Debug for NativeAsyncCommandPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativeAsyncCommandPin")
+            .field("artifact", &"<redacted>")
+            .field("command_name", &self.command_name)
+            .field("profile", &self.profile)
+            .field("world", &self.world)
+            .field("entrypoint", &self.entrypoint)
+            .field("min_args", &self.min_args)
+            .field("max_args", &self.max_args)
+            .field("stdin", &self.stdin)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
 const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/c53-stream-filter.component.wasm"
@@ -273,13 +387,19 @@ const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
 const C53_STREAM_FILTER_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c53-stream-filter.sha256.rs"));
 
-#[cfg(feature = "c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "c53-native-async-qemu-acceptance",
+    feature = "c53-native-async-command-projection"
+))]
 const C53_NATIVE_ASYNC_FILTER_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/c53-native-async-filter.component.wasm"
 ));
 
-#[cfg(feature = "c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "c53-native-async-qemu-acceptance",
+    feature = "c53-native-async-command-projection"
+))]
 const C53_NATIVE_ASYNC_FILTER_SHA256: [u8; 32] = include!(concat!(
     env!("OUT_DIR"),
     "/c53-native-async-filter.sha256.rs"
@@ -316,7 +436,10 @@ world filter {
 }
 "#;
 
-#[cfg(feature = "c53-native-async-qemu-acceptance")]
+#[cfg(any(
+    feature = "c53-native-async-qemu-acceptance",
+    feature = "c53-native-async-command-projection"
+))]
 const C53_NATIVE_ASYNC_FILTER_WIT: &str = r#"
 package vibe:%stream@1.0.0;
 
@@ -397,6 +520,34 @@ pub const C53_NATIVE_ASYNC_QEMU_ACCEPTANCE: NativeAsyncAcceptancePin = NativeAsy
         // The native runtime currently enforces the Profile-1-wide table
         // capacity. A smaller value here would be documentation, not a
         // real ceiling.
+        resources: PROFILE_1_LIMITS.max_resources as u16,
+    },
+};
+
+/// Explicit image-policy upgrade that lets the sealed adapter derive the
+/// trusted native async projection, which carries an inert VSH manifest.
+///
+/// This does not activate the profile, install a VSH command, select an SSH
+/// route, or authorize the native runtime. Those remain later trusted
+/// lifecycle boundaries.
+#[cfg(feature = "c53-native-async-command-projection")]
+pub const C53_NATIVE_ASYNC_COMMAND: NativeAsyncCommandPin = NativeAsyncCommandPin {
+    artifact_bytes: C53_NATIVE_ASYNC_FILTER_BYTES,
+    expected_sha256: C53_NATIVE_ASYNC_FILTER_SHA256,
+    command_name: "native-case-filter",
+    profile: ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    wit_source: C53_NATIVE_ASYNC_FILTER_WIT,
+    world: "vibe:stream/native-filter@1.0.0",
+    entrypoint: "run",
+    min_args: 0,
+    max_args: 0,
+    stdin: ComponentStreamMode::Required,
+    stdout: ComponentStreamMode::Required,
+    stderr: ComponentStreamMode::Optional,
+    limits: ComponentInstanceLimits {
+        memory_bytes: 64 * 1024,
+        total_fuel: 500_000,
+        poll_quantum: 100,
         resources: PROFILE_1_LIMITS.max_resources as u16,
     },
 };
@@ -493,6 +644,53 @@ mod tests {
         assert!(pin
             .wit_source()
             .contains("export run: async func(input: byte-stream) -> byte-stream;"));
+    }
+
+    #[cfg(feature = "c53-native-async-command-projection")]
+    #[test]
+    fn native_async_command_projection_requires_its_own_exact_pin() {
+        let pin = C53_NATIVE_ASYNC_COMMAND;
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.artifact_bytes())),
+            pin.expected_sha256()
+        );
+        assert_eq!(pin.command_name(), "native-case-filter");
+        assert_eq!(
+            pin.profile(),
+            ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+        );
+        assert!(!pin.profile().execution_enabled());
+        assert_eq!(pin.abi(), 3);
+        assert_eq!(pin.world(), "vibe:stream/native-filter@1.0.0");
+        assert_eq!(pin.entrypoint(), "run");
+        assert_eq!((pin.min_args(), pin.max_args()), (0, 0));
+        assert_eq!(pin.stdin(), ComponentStreamMode::Required);
+        assert_eq!(pin.stdout(), ComponentStreamMode::Required);
+        assert_eq!(pin.stderr(), ComponentStreamMode::Optional);
+        assert_eq!(
+            usize::from(pin.limits().resources),
+            PROFILE_1_LIMITS.max_resources as usize
+        );
+    }
+
+    #[cfg(all(
+        feature = "c53-native-async-qemu-acceptance",
+        feature = "c53-native-async-command-projection"
+    ))]
+    #[test]
+    fn native_async_policy_roots_are_distinct_types_over_the_same_artifact() {
+        assert_ne!(
+            core::any::type_name::<NativeAsyncAcceptancePin>(),
+            core::any::type_name::<NativeAsyncCommandPin>()
+        );
+        assert_eq!(
+            C53_NATIVE_ASYNC_QEMU_ACCEPTANCE.expected_sha256(),
+            C53_NATIVE_ASYNC_COMMAND.expected_sha256()
+        );
+        assert_eq!(
+            C53_NATIVE_ASYNC_QEMU_ACCEPTANCE.artifact_bytes(),
+            C53_NATIVE_ASYNC_COMMAND.artifact_bytes()
+        );
     }
 
     #[cfg(feature = "qemu-default")]

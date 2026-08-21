@@ -1,0 +1,26 @@
+[package]
+name = "vibeos-component-image-adapter"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+qemu-default = ["dep:vibeos-image-policy", "vibeos-image-policy/qemu-default"]
+milkv-duo-sd = ["dep:vibeos-image-policy", "vibeos-image-policy/milkv-duo-sd"]
+native-async-command-projection = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-image-policy",
+    "dep:vibeos-vsh",
+    "vibeos-component-admission/native-async-acceptance",
+    "vibeos-component-runtime/native-async-acceptance",
+    "vibeos-image-policy/c53-native-async-command-projection",
+]
+
+[dependencies]
+vibeos-component-admission = { path = "../component-admission", optional = true }
+vibeos-component-format = { path = "../../component-format", optional = true }
+vibeos-component-runtime = { path = "../../component-runtime", optional = true }
+vibeos-image-policy = { path = "../../policy/image", default-features = false, optional = true }
+vibeos-vsh = { path = "../../components/vsh", default-features = false, optional = true }

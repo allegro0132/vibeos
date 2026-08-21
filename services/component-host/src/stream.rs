@@ -933,6 +933,40 @@ impl ByteStreamSupervisor {
         publish_close_observed(&self.stream, reason, true, false)
     }
 
+    /// Publishes `reason` only while the lifecycle is still open or
+    /// provisional, otherwise atomically observes the immutable first winner.
+    ///
+    /// Unlike [`Self::finalize_observed`], a different reason which already
+    /// won is not a conflicting second publication. This is reserved for a
+    /// trusted lifecycle finalizer which must close an unclaimed stream but
+    /// preserve any endpoint or fault terminal that linearized first.
+    pub fn finalize_preserving_first_observed(
+        &self,
+        reason: StreamCloseReason,
+    ) -> StreamCloseObservation {
+        let mut state = self.stream.state.lock();
+        if state.fail_stopped {
+            return close_observation(StreamCloseOutcome::Conflict, state.lifecycle);
+        }
+        let outcome = match state.lifecycle {
+            Lifecycle::Final(_) => StreamCloseOutcome::AlreadyPublished,
+            Lifecycle::Open | Lifecycle::NormalProvisional => {
+                state.lifecycle = Lifecycle::Final(reason);
+                if !reason.is_normal() {
+                    state.ring.clear();
+                }
+                StreamCloseOutcome::Published
+            }
+        };
+        let sender = state.take_ready_sender_wake();
+        let receiver = state.take_ready_receiver_wake();
+        let terminal = state.take_ready_terminal_wake();
+        let observation = close_observation(outcome, state.lifecycle);
+        drop(state);
+        wake_all([sender, receiver, terminal]);
+        observation
+    }
+
     /// Atomically promotes a drained endpoint-side `Normal` publication to the
     /// immutable terminal reason.
     ///
@@ -1227,5 +1261,21 @@ mod tests {
         let observed = supervisor.finalize_observed(StreamCloseReason::Failure);
         assert_eq!(observed.outcome(), StreamCloseOutcome::Conflict);
         assert_eq!(observed.effective_reason(), None);
+    }
+
+    #[test]
+    fn lifecycle_finalizer_observes_a_different_first_winner_without_conflict() {
+        let stream = ByteStream::new();
+        let supervisor = stream.supervisor();
+
+        let first = supervisor.finalize_preserving_first_observed(StreamCloseReason::Failure);
+        assert_eq!(first.outcome(), StreamCloseOutcome::Published);
+        assert_eq!(first.effective_reason(), Some(StreamCloseReason::Failure));
+
+        let late = supervisor.finalize_preserving_first_observed(StreamCloseReason::Cancelled);
+        assert_eq!(late.outcome(), StreamCloseOutcome::AlreadyPublished);
+        assert_eq!(late.effective_reason(), Some(StreamCloseReason::Failure));
+        assert_eq!(stream.final_reason(), Some(StreamCloseReason::Failure));
+        assert!(!stream.is_fail_stopped());
     }
 }

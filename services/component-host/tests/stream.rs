@@ -885,6 +885,48 @@ fn observed_conflict_preserves_the_established_reason_and_fail_stops() {
 }
 
 #[test]
+fn lifecycle_finalizer_failure_cancelled_race_preserves_exactly_one_winner() {
+    for _ in 0..128 {
+        let stream = ByteStream::new();
+        let failure_supervisor = stream.supervisor();
+        let cancelled_supervisor = failure_supervisor.clone();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let failure_barrier = barrier.clone();
+        let failure = thread::spawn(move || {
+            failure_barrier.wait();
+            failure_supervisor.finalize_preserving_first_observed(StreamCloseReason::Failure)
+        });
+        let cancelled_barrier = barrier.clone();
+        let cancelled = thread::spawn(move || {
+            cancelled_barrier.wait();
+            cancelled_supervisor.finalize_preserving_first_observed(StreamCloseReason::Cancelled)
+        });
+
+        barrier.wait();
+        let failure = failure.join().unwrap();
+        let cancelled = cancelled.join().unwrap();
+        let published = usize::from(failure.outcome() == StreamCloseOutcome::Published)
+            + usize::from(cancelled.outcome() == StreamCloseOutcome::Published);
+        assert_eq!(published, 1);
+        assert_eq!(
+            [failure.outcome(), cancelled.outcome()]
+                .into_iter()
+                .filter(|outcome| *outcome == StreamCloseOutcome::AlreadyPublished)
+                .count(),
+            1
+        );
+        assert_eq!(failure.effective_reason(), cancelled.effective_reason());
+        assert!(matches!(
+            stream.final_reason(),
+            Some(StreamCloseReason::Failure | StreamCloseReason::Cancelled)
+        ));
+        assert_eq!(failure.effective_reason(), stream.final_reason());
+        assert!(!stream.is_fail_stopped());
+    }
+}
+
+#[test]
 fn observed_close_wakes_after_unlock_and_allows_reentrant_state_queries() {
     let stream = ByteStream::new();
     let reader = stream.reader();

@@ -161,12 +161,13 @@ impl core::fmt::Debug for ComponentCommandPin {
     }
 }
 
-/// Isolated image-policy root for the C5.3 native async validation candidate.
+/// Isolated image-policy root for C5.3 native async runtime acceptance.
 ///
 /// This type is intentionally not [`ComponentCommandPin`]. It cannot enter the
 /// synchronous command runner or the existing SSH C4.8 policy gate. Enabling
-/// its feature merely makes immutable validation inputs available to a later,
-/// separately reviewed native acceptance driver.
+/// its feature makes one immutable executable guest available only to the
+/// feature-gated runtime acceptance driver. Kernel installation, SSH routing,
+/// and QEMU execution remain separately reviewed boundaries.
 #[cfg(feature = "c53-native-async-qemu-acceptance")]
 #[derive(Clone, Copy)]
 pub struct NativeAsyncAcceptancePin {
@@ -369,12 +370,12 @@ pub const SSH_EXEC_COMPONENT: ComponentCommandPin = ComponentCommandPin {
     },
 };
 
-/// Immutable validation candidate for the future C5.3 native async QEMU gate.
+/// Immutable executable guest for C5.3 native async runtime acceptance.
 ///
-/// The checked-in fixture proves exact Profile-ABI-3 parsing, WIT binding, and
-/// native executor-plan topology. It deliberately does **not** claim real
-/// stream transport behavior; the kernel driver, SYSTEM pending shadow, and
-/// backpressure/terminal QEMU evidence remain separate later nodes.
+/// The checked-in artifact performs real bounded byte-stream reads and writes,
+/// XORs each byte by `0x20`, and propagates all eight terminal reasons through
+/// the close futures. This remains a validation-only runtime acceptance input,
+/// not a production, kernel, SSH, or QEMU end-to-end activation claim.
 #[cfg(feature = "c53-native-async-qemu-acceptance")]
 pub const C53_NATIVE_ASYNC_QEMU_ACCEPTANCE: NativeAsyncAcceptancePin = NativeAsyncAcceptancePin {
     artifact_bytes: C53_NATIVE_ASYNC_FILTER_BYTES,

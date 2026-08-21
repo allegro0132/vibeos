@@ -1,7 +1,11 @@
 use vibeos_component_format::{ProfileIdentity, PROFILE_1_LIMITS};
 use vibeos_component_runtime::{
-    decode::{inspect_component_for_profile, ComponentSummary, DecodeError},
+    decode::{
+        inspect_component_for_profile, AsyncCanonicalFunctionPlan, AsyncComponentFunctionSource,
+        AsyncCoreFunctionSource, AsyncStreamPlan, ComponentSummary, DecodeError,
+    },
     sync::{SyncError, SynchronousComponent},
+    value::ValueType,
     world::{EntityShape, FunctionEffect, ValueShape, WorldContract, WorldError},
 };
 use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
@@ -77,19 +81,26 @@ fn async_lower_component() -> Vec<u8> {
 }
 
 fn callback_lift_component() -> Vec<u8> {
-    wat::parse_str(
+    callback_lift_component_with(
+        r#"(func (export "callback") (param i32 i32 i32) (result i32)
+                  i32.const 0)"#,
+    )
+}
+
+fn callback_lift_component_with(callback: &str) -> Vec<u8> {
+    wat::parse_str(format!(
         r#"(component
               (core module $m
                 (func (export "run") (result i32) i32.const 0)
-                (func (export "callback") (param i32 i32 i32)))
+                {callback})
               (core instance $i (instantiate $m))
               (alias core export $i "run" (core func $run))
               (alias core export $i "callback" (core func $callback))
               (type $t (func async))
               (func $lifted (type $t)
                 (canon lift (core func $run) async (callback (core func $callback))))
-              (export "run" (func $lifted)))"#,
-    )
+              (export "run" (func $lifted)))"#
+    ))
     .unwrap()
 }
 
@@ -232,6 +243,21 @@ fn selected_base_async_intrinsics_are_validated_and_classified() {
     assert_eq!(summary.future_builtins, 7);
     assert_eq!(summary.waitable_builtins, 3);
     assert_eq!(summary.backpressure_builtins, 2);
+    assert_eq!(plan.async_canonical_plans().len(), 26);
+    let stream_read = &plan.async_canonical_plans()[8];
+    let AsyncCanonicalFunctionPlan::Stream(AsyncStreamPlan::Read {
+        value_type,
+        options,
+        ..
+    }) = &stream_read.function
+    else {
+        panic!("canonical entry 8 must be stream.read")
+    };
+    assert!(matches!(
+        value_type,
+        ValueType::Stream { element: None, .. }
+    ));
+    assert!(options.async_);
     assert!(!plan.runtime_ready());
 }
 
@@ -260,6 +286,23 @@ fn async_lower_is_selected_but_never_enters_the_sync_execution_plan() {
     assert_eq!(plan.async_lowers().len(), 1);
     assert_eq!(plan.async_lowers()[0].canonical_index, 0);
     assert_eq!(plan.async_lowers()[0].component_function, 0);
+    let [typed] = plan.async_canonical_plans() else {
+        panic!("async lower must have exactly one typed plan entry")
+    };
+    let AsyncCanonicalFunctionPlan::Lower {
+        component_function,
+        function_type,
+        options,
+    } = &typed.function
+    else {
+        panic!("typed plan must retain async lower")
+    };
+    assert_eq!(function_type.effect, FunctionEffect::Async);
+    assert!(options.async_);
+    assert!(matches!(
+        component_function.source,
+        AsyncComponentFunctionSource::Import { .. }
+    ));
     assert!(!plan.runtime_ready());
     assert_eq!(plan.runtime_instance_count(), 0);
     assert_eq!(plan.host_imports().count(), 0);
@@ -278,8 +321,56 @@ fn callback_async_lift_is_selected_and_stackless() {
     assert_eq!(plan.async_lifts()[0].core_function, 0);
     assert_eq!(plan.async_lifts()[0].function_type, 0);
     assert_eq!(plan.async_lifts()[0].callback_core_function, 1);
+    let [typed] = plan.async_canonical_plans() else {
+        panic!("async lift must have exactly one typed plan entry")
+    };
+    let AsyncCanonicalFunctionPlan::Lift {
+        core_function,
+        function_type,
+        callback,
+        options,
+    } = &typed.function
+    else {
+        panic!("typed plan must retain async lift")
+    };
+    assert_eq!(function_type.effect, FunctionEffect::Async);
+    assert!(options.async_);
+    let AsyncCoreFunctionSource::Export(core_export) = &core_function.source else {
+        panic!("lifted core function must retain its export source")
+    };
+    assert_eq!(
+        (core_export.core_instance, core_export.export.as_str()),
+        (0, "run")
+    );
+    let AsyncCoreFunctionSource::Export(callback_export) = &callback.source else {
+        panic!("callback must retain its export source")
+    };
+    assert_eq!(
+        (
+            callback_export.core_instance,
+            callback_export.export.as_str()
+        ),
+        (0, "callback")
+    );
     assert!(!plan.runtime_ready());
     assert_eq!(plan.executable_exports().count(), 0);
+}
+
+#[test]
+fn vibe_callback_signature_is_exact() {
+    for callback in [
+        r#"(func (export "callback") (param i32) (result i32) i32.const 0)"#,
+        r#"(func (export "callback") (param i32 i32 i32))"#,
+    ] {
+        assert_eq!(
+            inspect_component_for_profile(
+                &callback_lift_component_with(callback),
+                ProfileIdentity::PROFILE_1_ASYNC,
+            )
+            .err(),
+            Some(DecodeError::InvalidCallbackSignature)
+        );
+    }
 }
 
 #[test]

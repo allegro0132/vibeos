@@ -1,11 +1,17 @@
 //! Allocation-bounded decoding for Vibe Component Profile 1.
 
 pub use crate::execution::{
-    CanonicalStringEncoding, ExecutableExportInfo, HostCoreExportInfo, HostImportInfo,
+    AsyncCanonicalFunctionPlan, AsyncCanonicalOptionsPlan, AsyncCanonicalPlan,
+    AsyncComponentFunctionRef, AsyncComponentFunctionSource, AsyncCoreExportRef,
+    AsyncCoreFunctionRef, AsyncCoreFunctionSource, AsyncCoreMemoryRef, AsyncCoreValueType,
+    AsyncFuturePlan, AsyncStreamPlan, AsyncWaitablePlan, CanonicalStringEncoding,
+    ExecutableExportInfo, HostCoreExportInfo, HostImportInfo,
 };
 use crate::{
     abi_value::{flat_signature, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS},
     execution::{
+        AsyncCanonicalDraft, AsyncCanonicalFunctionDraft, AsyncComponentValueTypeRef,
+        AsyncFutureDraft, AsyncOptionsDraft, AsyncStreamDraft, AsyncWaitableDraft,
         ComponentExecutionPlan, ComponentFunctionDraft, ComponentInstanceDraft, CoreExportRef,
         CoreFunctionDraft, CoreImportPlan, CoreInstanceDraft, CoreInstanceExportDraft,
         CoreInstanceExportItemDraft, CoreInstancePlan, CoreInstantiationArgDraft,
@@ -49,6 +55,7 @@ pub struct AsyncAbiSummary {
 pub struct AsyncCanonicalOptions {
     /// `None` is the Canonical ABI UTF-8 default.
     pub string_encoding: Option<CanonicalStringEncoding>,
+    pub async_: bool,
     pub memory: Option<u32>,
     pub realloc: Option<u32>,
 }
@@ -118,6 +125,7 @@ pub enum DecodeError {
     DuplicateName = 7,
     TypeGraph = 8,
     InvalidWiring = 9,
+    InvalidCallbackSignature = 10,
 }
 
 impl DecodeError {
@@ -135,6 +143,7 @@ pub struct ComponentPlan<'a> {
     pub exports: Vec<NamedEntityShape>,
     async_lifts: Vec<AsyncLiftInfo>,
     async_lowers: Vec<AsyncLowerInfo>,
+    async_canonical: Vec<AsyncCanonicalPlan>,
     pub(crate) execution: ComponentExecutionPlan,
 }
 
@@ -167,14 +176,21 @@ impl ComponentPlan<'_> {
         &self.async_lowers
     }
 
+    /// Validated, typed async Canonical ABI entries. They remain inert in the
+    /// current validation-only profile; a separately versioned executor plan
+    /// must complete and revalidate its executable wiring.
+    pub fn async_canonical_plans(&self) -> &[AsyncCanonicalPlan] {
+        &self.async_canonical
+    }
+
     pub fn executable_exports(&self) -> impl Iterator<Item = &ExecutableExportInfo> {
         self.execution.exports.iter().map(|export| &export.info)
     }
 
-    /// C5.1 validates and preserves async ABI structure, but C5.2 owns the
-    /// resumable runtime. The validation-only profile and every plan containing
-    /// an async construct are inert, including a sync-only payload mislabeled
-    /// with the C5.1 descriptor.
+    /// The pinned async identity is permanently validation-only. Native async
+    /// execution requires a separately versioned executable identity, while
+    /// every plan containing an async construct remains inert here. This also
+    /// rejects a sync-only payload mislabeled with the async descriptor.
     pub const fn runtime_ready(&self) -> bool {
         self.profile.execution_enabled() && self.summary.async_abi.is_empty()
     }
@@ -298,6 +314,7 @@ pub fn inspect_component_for_profile(
     let mut instance_exports = Vec::new();
     let mut async_lifts = Vec::new();
     let mut async_lowers = Vec::new();
+    let mut async_canonical_drafts = Vec::new();
     let mut canonical_effect_checks = Vec::new();
     let mut canonical_index = 0_u32;
     let mut import_names = Vec::new();
@@ -415,7 +432,7 @@ pub fn inspect_component_for_profile(
                                     | ExternalKind::Global
                                     | ExternalKind::Tag
                                     | ExternalKind::FuncExact => {
-                                        return Err(DecodeError::InvalidWiring)
+                                        return Err(DecodeError::InvalidWiring);
                                     }
                                 };
                                 items.push(CoreInstanceExportDraft {
@@ -558,6 +575,7 @@ pub fn inspect_component_for_profile(
                                 .map_err(|_| DecodeError::Allocation)?;
                             if has_async_option(&options) {
                                 let (options, callback) = async_plan_options(&options)?;
+                                let callback = callback.ok_or(DecodeError::InvalidWiring)?;
                                 async_lifts
                                     .try_reserve(1)
                                     .map_err(|_| DecodeError::Allocation)?;
@@ -565,15 +583,29 @@ pub fn inspect_component_for_profile(
                                     canonical_index,
                                     core_function: core_func_index,
                                     function_type: type_index,
-                                    callback_core_function: callback
-                                        .ok_or(DecodeError::InvalidWiring)?,
+                                    callback_core_function: callback,
                                     options,
                                 });
-                                component_functions.push(None);
+                                async_canonical_drafts
+                                    .try_reserve(1)
+                                    .map_err(|_| DecodeError::Allocation)?;
+                                async_canonical_drafts.push(AsyncCanonicalDraft {
+                                    canonical_index,
+                                    function: AsyncCanonicalFunctionDraft::Lift {
+                                        core_function: core_func_index,
+                                        function_type: type_index,
+                                        callback,
+                                        options: async_options_draft(options),
+                                    },
+                                });
+                                component_functions.push(Some(ComponentFunctionDraft::AsyncLift {
+                                    canonical_index,
+                                }));
                             } else {
                                 let options = execution_options(&options)?;
                                 component_functions.push(Some(ComponentFunctionDraft::Lift(
                                     LiftDraft {
+                                        canonical_index,
                                         core_function: core_func_index,
                                         string_encoding: options.string_encoding,
                                         memory: options.memory,
@@ -610,10 +642,19 @@ pub fn inspect_component_for_profile(
                                     component_function: func_index,
                                     options,
                                 });
-                                core_functions.push(None);
+                                push_async_core_draft(
+                                    &mut core_functions,
+                                    &mut async_canonical_drafts,
+                                    canonical_index,
+                                    AsyncCanonicalFunctionDraft::Lower {
+                                        component_function: func_index,
+                                        options: async_options_draft(options),
+                                    },
+                                )?;
                             } else {
                                 let options = execution_options(&options)?;
                                 core_functions.push(Some(CoreFunctionDraft::Lower(LowerDraft {
+                                    canonical_index,
                                     component_function: func_index,
                                     string_encoding: options.string_encoding,
                                     memory: options.memory,
@@ -628,41 +669,266 @@ pub fn inspect_component_for_profile(
                             core_functions
                                 .try_reserve(1)
                                 .map_err(|_| DecodeError::Allocation)?;
-                            core_functions.push(None);
-                        }
-                        CanonicalFunction::TaskReturn { .. }
-                        | CanonicalFunction::TaskCancel
-                        | CanonicalFunction::ContextGet { .. }
-                        | CanonicalFunction::ContextSet { .. }
-                        | CanonicalFunction::ThreadYield { .. }
-                        | CanonicalFunction::SubtaskDrop
-                        | CanonicalFunction::SubtaskCancel { .. }
-                        | CanonicalFunction::StreamNew { .. }
-                        | CanonicalFunction::StreamRead { .. }
-                        | CanonicalFunction::StreamWrite { .. }
-                        | CanonicalFunction::StreamCancelRead { .. }
-                        | CanonicalFunction::StreamCancelWrite { .. }
-                        | CanonicalFunction::StreamDropReadable { .. }
-                        | CanonicalFunction::StreamDropWritable { .. }
-                        | CanonicalFunction::FutureNew { .. }
-                        | CanonicalFunction::FutureRead { .. }
-                        | CanonicalFunction::FutureWrite { .. }
-                        | CanonicalFunction::FutureCancelRead { .. }
-                        | CanonicalFunction::FutureCancelWrite { .. }
-                        | CanonicalFunction::FutureDropReadable { .. }
-                        | CanonicalFunction::FutureDropWritable { .. }
-                        | CanonicalFunction::WaitableSetNew
-                        | CanonicalFunction::WaitableSetWait { .. }
-                        | CanonicalFunction::WaitableSetPoll { .. }
-                        | CanonicalFunction::WaitableSetDrop
-                        | CanonicalFunction::WaitableJoin
-                        | CanonicalFunction::BackpressureInc
-                        | CanonicalFunction::BackpressureDec => {
                             core_functions
-                                .try_reserve(1)
-                                .map_err(|_| DecodeError::Allocation)?;
-                            core_functions.push(None);
+                                .push(Some(CoreFunctionDraft::SyncCanonical { canonical_index }));
                         }
+                        CanonicalFunction::TaskReturn { result, options } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::TaskReturn {
+                                result: result.map(async_value_type_ref).transpose()?,
+                                options: async_options_draft(async_plan_options(&options)?.0),
+                            },
+                        )?,
+                        CanonicalFunction::TaskCancel => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::TaskCancel,
+                        )?,
+                        CanonicalFunction::ContextGet { ty, slot } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::ContextGet {
+                                value_type: async_core_value_type(ty)?,
+                                slot,
+                            },
+                        )?,
+                        CanonicalFunction::ContextSet { ty, slot } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::ContextSet {
+                                value_type: async_core_value_type(ty)?,
+                                slot,
+                            },
+                        )?,
+                        CanonicalFunction::ThreadYield { cancellable } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::ThreadYield { cancellable },
+                        )?,
+                        CanonicalFunction::SubtaskDrop => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::SubtaskDrop,
+                        )?,
+                        CanonicalFunction::SubtaskCancel { async_ } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::SubtaskCancel { async_ },
+                        )?,
+                        CanonicalFunction::StreamNew { ty } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Stream(AsyncStreamDraft::New {
+                                type_index: ty,
+                            }),
+                        )?,
+                        CanonicalFunction::StreamRead { ty, options } => {
+                            let options = async_plan_options(&options)?.0;
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Stream(AsyncStreamDraft::Read {
+                                    type_index: ty,
+                                    options: async_options_draft(options),
+                                }),
+                            )?;
+                        }
+                        CanonicalFunction::StreamWrite { ty, options } => {
+                            let options = async_plan_options(&options)?.0;
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Stream(AsyncStreamDraft::Write {
+                                    type_index: ty,
+                                    options: async_options_draft(options),
+                                }),
+                            )?;
+                        }
+                        CanonicalFunction::StreamCancelRead { ty, async_ } => {
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Stream(AsyncStreamDraft::CancelRead {
+                                    type_index: ty,
+                                    async_,
+                                }),
+                            )?
+                        }
+                        CanonicalFunction::StreamCancelWrite { ty, async_ } => {
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Stream(
+                                    AsyncStreamDraft::CancelWrite {
+                                        type_index: ty,
+                                        async_,
+                                    },
+                                ),
+                            )?
+                        }
+                        CanonicalFunction::StreamDropReadable { ty } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Stream(AsyncStreamDraft::DropReadable {
+                                type_index: ty,
+                            }),
+                        )?,
+                        CanonicalFunction::StreamDropWritable { ty } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Stream(AsyncStreamDraft::DropWritable {
+                                type_index: ty,
+                            }),
+                        )?,
+                        CanonicalFunction::FutureNew { ty } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Future(AsyncFutureDraft::New {
+                                type_index: ty,
+                            }),
+                        )?,
+                        CanonicalFunction::FutureRead { ty, options } => {
+                            let options = async_plan_options(&options)?.0;
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Future(AsyncFutureDraft::Read {
+                                    type_index: ty,
+                                    options: async_options_draft(options),
+                                }),
+                            )?;
+                        }
+                        CanonicalFunction::FutureWrite { ty, options } => {
+                            let options = async_plan_options(&options)?.0;
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Future(AsyncFutureDraft::Write {
+                                    type_index: ty,
+                                    options: async_options_draft(options),
+                                }),
+                            )?;
+                        }
+                        CanonicalFunction::FutureCancelRead { ty, async_ } => {
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Future(AsyncFutureDraft::CancelRead {
+                                    type_index: ty,
+                                    async_,
+                                }),
+                            )?
+                        }
+                        CanonicalFunction::FutureCancelWrite { ty, async_ } => {
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Future(
+                                    AsyncFutureDraft::CancelWrite {
+                                        type_index: ty,
+                                        async_,
+                                    },
+                                ),
+                            )?
+                        }
+                        CanonicalFunction::FutureDropReadable { ty } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Future(AsyncFutureDraft::DropReadable {
+                                type_index: ty,
+                            }),
+                        )?,
+                        CanonicalFunction::FutureDropWritable { ty } => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Future(AsyncFutureDraft::DropWritable {
+                                type_index: ty,
+                            }),
+                        )?,
+                        CanonicalFunction::WaitableSetNew => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Waitable(AsyncWaitableDraft::SetNew),
+                        )?,
+                        CanonicalFunction::WaitableSetWait {
+                            cancellable,
+                            memory,
+                        } => {
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Waitable(
+                                    AsyncWaitableDraft::SetWait {
+                                        cancellable,
+                                        memory,
+                                    },
+                                ),
+                            )?;
+                        }
+                        CanonicalFunction::WaitableSetPoll {
+                            cancellable,
+                            memory,
+                        } => {
+                            push_async_core_draft(
+                                &mut core_functions,
+                                &mut async_canonical_drafts,
+                                canonical_index,
+                                AsyncCanonicalFunctionDraft::Waitable(
+                                    AsyncWaitableDraft::SetPoll {
+                                        cancellable,
+                                        memory,
+                                    },
+                                ),
+                            )?;
+                        }
+                        CanonicalFunction::WaitableSetDrop => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Waitable(AsyncWaitableDraft::SetDrop),
+                        )?,
+                        CanonicalFunction::WaitableJoin => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::Waitable(AsyncWaitableDraft::Join),
+                        )?,
+                        CanonicalFunction::BackpressureInc => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::BackpressureInc,
+                        )?,
+                        CanonicalFunction::BackpressureDec => push_async_core_draft(
+                            &mut core_functions,
+                            &mut async_canonical_drafts,
+                            canonical_index,
+                            AsyncCanonicalFunctionDraft::BackpressureDec,
+                        )?,
                         CanonicalFunction::ErrorContextNew { .. }
                         | CanonicalFunction::ErrorContextDebugMessage { .. }
                         | CanonicalFunction::ErrorContextDrop
@@ -677,7 +943,7 @@ pub fn inspect_component_for_profile(
                         | CanonicalFunction::ThreadSpawnRef { .. }
                         | CanonicalFunction::ThreadSpawnIndirect { .. }
                         | CanonicalFunction::ThreadAvailableParallelism => {
-                            return Err(DecodeError::Unsupported)
+                            return Err(DecodeError::Unsupported);
                         }
                     }
                     canonical_index = canonical_index.checked_add(1).ok_or(DecodeError::Limit)?;
@@ -714,9 +980,17 @@ pub fn inspect_component_for_profile(
                                 name: copied(import.name.name)?,
                             }));
                         }
-                        ComponentTypeRef::Value(_)
-                        | ComponentTypeRef::Type(_)
-                        | ComponentTypeRef::Component(_) => return Err(DecodeError::Unsupported),
+                        ComponentTypeRef::Type(_) => {
+                            // World-level named value types are inert imports:
+                            // they establish the nominal identities used by an
+                            // exported async function but bind no runtime host
+                            // authority. The final validator and normalized
+                            // world graph retain and check their exact shape.
+                            require_async(async_profile)?;
+                        }
+                        ComponentTypeRef::Value(_) | ComponentTypeRef::Component(_) => {
+                            return Err(DecodeError::Unsupported)
+                        }
                     }
                 }
             }
@@ -782,11 +1056,20 @@ pub fn inspect_component_for_profile(
             }
         };
     check_canonical_effects(&types, &canonical_effect_checks)?;
+    check_async_callback_signatures(&types, &async_canonical_drafts)?;
+    let mut type_builder = TypeBuilder::default();
+    let async_canonical = build_async_canonical_plans(
+        &async_canonical_drafts,
+        &component_functions,
+        &core_functions,
+        &core_memories,
+        &types,
+        &mut type_builder,
+    )?;
     let (imports, exports) =
         normalize_component_world_entities(&types, &import_names, &export_names)
             .map_err(shape_error)?;
     let build_runtime = profile.execution_enabled() && summary.async_abi.is_empty();
-    let mut type_builder = TypeBuilder::default();
     let (instances, component_to_runtime, host_imports) = if build_runtime {
         build_execution_instances(
             &modules,
@@ -881,6 +1164,7 @@ pub fn inspect_component_for_profile(
         exports,
         async_lifts,
         async_lowers,
+        async_canonical,
         execution: ComponentExecutionPlan {
             instances,
             exports: executable_exports,
@@ -922,6 +1206,496 @@ fn check_canonical_effects(
         }
     }
     Ok(())
+}
+
+fn push_async_core_draft(
+    core_functions: &mut Vec<Option<CoreFunctionDraft>>,
+    drafts: &mut Vec<AsyncCanonicalDraft>,
+    canonical_index: u32,
+    function: AsyncCanonicalFunctionDraft,
+) -> Result<(), DecodeError> {
+    core_functions
+        .try_reserve(1)
+        .map_err(|_| DecodeError::Allocation)?;
+    drafts.try_reserve(1).map_err(|_| DecodeError::Allocation)?;
+    core_functions.push(Some(CoreFunctionDraft::AsyncCanonical { canonical_index }));
+    drafts.push(AsyncCanonicalDraft {
+        canonical_index,
+        function,
+    });
+    Ok(())
+}
+
+fn check_async_callback_signatures(
+    types: &wasmparser::types::Types,
+    drafts: &[AsyncCanonicalDraft],
+) -> Result<(), DecodeError> {
+    for draft in drafts {
+        let AsyncCanonicalFunctionDraft::Lift { callback, .. } = draft.function else {
+            continue;
+        };
+        if callback >= types.as_ref().function_count() {
+            return Err(DecodeError::InvalidWiring);
+        }
+        let ty = types[types.as_ref().core_function_at(callback)].unwrap_func();
+        if ty.params() != [ValType::I32; 3] || ty.results() != [ValType::I32] {
+            return Err(DecodeError::InvalidCallbackSignature);
+        }
+    }
+    Ok(())
+}
+
+fn async_options_draft(options: AsyncCanonicalOptions) -> AsyncOptionsDraft {
+    AsyncOptionsDraft {
+        string_encoding: options.string_encoding,
+        async_: options.async_,
+        memory: options.memory,
+        realloc: options.realloc,
+    }
+}
+
+fn async_core_value_type(ty: ValType) -> Result<AsyncCoreValueType, DecodeError> {
+    match ty {
+        ValType::I32 => Ok(AsyncCoreValueType::I32),
+        ValType::I64 => Ok(AsyncCoreValueType::I64),
+        _ => Err(DecodeError::Unsupported),
+    }
+}
+
+fn async_value_type_ref(
+    ty: wasmparser::ComponentValType,
+) -> Result<AsyncComponentValueTypeRef, DecodeError> {
+    Ok(match ty {
+        wasmparser::ComponentValType::Primitive(ty) => match ty {
+            PrimitiveValType::Bool => AsyncComponentValueTypeRef::Bool,
+            PrimitiveValType::U8 => AsyncComponentValueTypeRef::U8,
+            PrimitiveValType::U16 => AsyncComponentValueTypeRef::U16,
+            PrimitiveValType::U32 => AsyncComponentValueTypeRef::U32,
+            PrimitiveValType::U64 => AsyncComponentValueTypeRef::U64,
+            PrimitiveValType::S8 => AsyncComponentValueTypeRef::S8,
+            PrimitiveValType::S16 => AsyncComponentValueTypeRef::S16,
+            PrimitiveValType::S32 => AsyncComponentValueTypeRef::S32,
+            PrimitiveValType::S64 => AsyncComponentValueTypeRef::S64,
+            PrimitiveValType::Char => AsyncComponentValueTypeRef::Char,
+            PrimitiveValType::String => AsyncComponentValueTypeRef::String,
+            PrimitiveValType::F32 | PrimitiveValType::F64 | PrimitiveValType::ErrorContext => {
+                return Err(DecodeError::Unsupported);
+            }
+        },
+        wasmparser::ComponentValType::Type(index) => AsyncComponentValueTypeRef::Defined(index),
+    })
+}
+
+fn build_async_canonical_plans(
+    drafts: &[AsyncCanonicalDraft],
+    component_functions: &[Option<ComponentFunctionDraft>],
+    core_functions: &[Option<CoreFunctionDraft>],
+    core_memories: &[Option<CoreExportRef>],
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+) -> Result<Vec<AsyncCanonicalPlan>, DecodeError> {
+    let mut plans = Vec::new();
+    plans
+        .try_reserve_exact(drafts.len())
+        .map_err(|_| DecodeError::Allocation)?;
+    for draft in drafts {
+        let function = match &draft.function {
+            AsyncCanonicalFunctionDraft::Lift {
+                core_function,
+                function_type,
+                callback,
+                options,
+            } => AsyncCanonicalFunctionPlan::Lift {
+                core_function: async_core_function_ref(core_functions, *core_function)?,
+                function_type: normalize_function_type(types, type_builder, *function_type)?,
+                callback: async_core_function_ref(core_functions, *callback)?,
+                options: build_async_options(options, core_functions, core_memories)?,
+            },
+            AsyncCanonicalFunctionDraft::Lower {
+                component_function,
+                options,
+            } => AsyncCanonicalFunctionPlan::Lower {
+                component_function: async_component_function_ref(
+                    component_functions,
+                    *component_function,
+                )?,
+                function_type: normalize_component_function(
+                    types,
+                    type_builder,
+                    *component_function,
+                )?,
+                options: build_async_options(options, core_functions, core_memories)?,
+            },
+            AsyncCanonicalFunctionDraft::TaskReturn { result, options } => {
+                AsyncCanonicalFunctionPlan::TaskReturn {
+                    result: result
+                        .map(|value| async_value_type(types, value))
+                        .map(|value| {
+                            type_builder
+                                .component_value(types, value)
+                                .map_err(type_error)
+                        })
+                        .transpose()?,
+                    options: build_async_options(options, core_functions, core_memories)?,
+                }
+            }
+            AsyncCanonicalFunctionDraft::TaskCancel => AsyncCanonicalFunctionPlan::TaskCancel,
+            AsyncCanonicalFunctionDraft::ContextGet { value_type, slot } => {
+                AsyncCanonicalFunctionPlan::ContextGet {
+                    value_type: *value_type,
+                    slot: *slot,
+                }
+            }
+            AsyncCanonicalFunctionDraft::ContextSet { value_type, slot } => {
+                AsyncCanonicalFunctionPlan::ContextSet {
+                    value_type: *value_type,
+                    slot: *slot,
+                }
+            }
+            AsyncCanonicalFunctionDraft::SubtaskDrop => AsyncCanonicalFunctionPlan::SubtaskDrop,
+            AsyncCanonicalFunctionDraft::SubtaskCancel { async_ } => {
+                AsyncCanonicalFunctionPlan::SubtaskCancel { async_: *async_ }
+            }
+            AsyncCanonicalFunctionDraft::ThreadYield { cancellable } => {
+                AsyncCanonicalFunctionPlan::ThreadYield {
+                    cancellable: *cancellable,
+                }
+            }
+            AsyncCanonicalFunctionDraft::Stream(stream) => {
+                AsyncCanonicalFunctionPlan::Stream(build_async_stream_plan(
+                    stream,
+                    core_functions,
+                    core_memories,
+                    types,
+                    type_builder,
+                )?)
+            }
+            AsyncCanonicalFunctionDraft::Future(future) => {
+                AsyncCanonicalFunctionPlan::Future(build_async_future_plan(
+                    future,
+                    core_functions,
+                    core_memories,
+                    types,
+                    type_builder,
+                )?)
+            }
+            AsyncCanonicalFunctionDraft::Waitable(waitable) => {
+                AsyncCanonicalFunctionPlan::Waitable(build_async_waitable_plan(
+                    waitable,
+                    core_memories,
+                )?)
+            }
+            AsyncCanonicalFunctionDraft::BackpressureInc => {
+                AsyncCanonicalFunctionPlan::BackpressureInc
+            }
+            AsyncCanonicalFunctionDraft::BackpressureDec => {
+                AsyncCanonicalFunctionPlan::BackpressureDec
+            }
+        };
+        plans.push(AsyncCanonicalPlan {
+            canonical_index: draft.canonical_index,
+            function,
+        });
+    }
+    Ok(plans)
+}
+
+fn type_error(error: crate::types::TypeError) -> DecodeError {
+    match error {
+        crate::types::TypeError::Unsupported => DecodeError::Unsupported,
+        crate::types::TypeError::NestingLimit | crate::types::TypeError::DefinitionLimit => {
+            DecodeError::Limit
+        }
+        crate::types::TypeError::Allocation => DecodeError::Allocation,
+        crate::types::TypeError::InvalidFunction => DecodeError::InvalidWiring,
+    }
+}
+
+fn normalize_function_type(
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+    type_index: u32,
+) -> Result<crate::types::FunctionType, DecodeError> {
+    if type_index >= types.as_ref().component_type_count() {
+        return Err(DecodeError::InvalidWiring);
+    }
+    let ComponentAnyTypeId::Func(function) = types.component_any_type_at(type_index) else {
+        return Err(DecodeError::InvalidWiring);
+    };
+    type_builder.function(types, function).map_err(type_error)
+}
+
+fn normalize_component_function(
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+    function_index: u32,
+) -> Result<crate::types::FunctionType, DecodeError> {
+    if function_index >= types.component_function_count() {
+        return Err(DecodeError::InvalidWiring);
+    }
+    type_builder
+        .function(types, types.component_function_at(function_index))
+        .map_err(type_error)
+}
+
+fn async_value_type(
+    types: &wasmparser::types::Types,
+    value: AsyncComponentValueTypeRef,
+) -> wasmparser::component_types::ComponentValType {
+    use wasmparser::component_types::ComponentValType;
+    ComponentValType::Primitive(match value {
+        AsyncComponentValueTypeRef::Bool => PrimitiveValType::Bool,
+        AsyncComponentValueTypeRef::U8 => PrimitiveValType::U8,
+        AsyncComponentValueTypeRef::U16 => PrimitiveValType::U16,
+        AsyncComponentValueTypeRef::U32 => PrimitiveValType::U32,
+        AsyncComponentValueTypeRef::U64 => PrimitiveValType::U64,
+        AsyncComponentValueTypeRef::S8 => PrimitiveValType::S8,
+        AsyncComponentValueTypeRef::S16 => PrimitiveValType::S16,
+        AsyncComponentValueTypeRef::S32 => PrimitiveValType::S32,
+        AsyncComponentValueTypeRef::S64 => PrimitiveValType::S64,
+        AsyncComponentValueTypeRef::Char => PrimitiveValType::Char,
+        AsyncComponentValueTypeRef::String => PrimitiveValType::String,
+        AsyncComponentValueTypeRef::Defined(index) => {
+            return ComponentValType::Type(types.component_defined_type_at(index));
+        }
+    })
+}
+
+fn normalize_async_defined_type(
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+    type_index: u32,
+    stream: bool,
+) -> Result<ValueType, DecodeError> {
+    if type_index >= types.as_ref().component_type_count() {
+        return Err(DecodeError::InvalidWiring);
+    }
+    let value = type_builder
+        .defined_value(types, types.component_defined_type_at(type_index))
+        .map_err(type_error)?;
+    if matches!(
+        (&value, stream),
+        (ValueType::Stream { .. }, true) | (ValueType::Future { .. }, false)
+    ) {
+        Ok(value)
+    } else {
+        Err(DecodeError::InvalidWiring)
+    }
+}
+
+fn async_component_function_ref(
+    functions: &[Option<ComponentFunctionDraft>],
+    index: u32,
+) -> Result<AsyncComponentFunctionRef, DecodeError> {
+    let source = match functions.get(index as usize).and_then(Option::as_ref) {
+        Some(ComponentFunctionDraft::Import(import)) => AsyncComponentFunctionSource::Import {
+            interface: import.interface.as_deref().map(copied).transpose()?,
+            function: copied(&import.function)?,
+        },
+        Some(ComponentFunctionDraft::Lift(lift)) => AsyncComponentFunctionSource::Lift {
+            canonical_index: lift.canonical_index,
+            core_function: lift.core_function,
+        },
+        Some(ComponentFunctionDraft::AsyncLift { canonical_index }) => {
+            AsyncComponentFunctionSource::AsyncLift {
+                canonical_index: *canonical_index,
+            }
+        }
+        None => return Err(DecodeError::InvalidWiring),
+    };
+    Ok(AsyncComponentFunctionRef {
+        component_function: index,
+        source,
+    })
+}
+
+fn async_core_function_ref(
+    functions: &[Option<CoreFunctionDraft>],
+    index: u32,
+) -> Result<AsyncCoreFunctionRef, DecodeError> {
+    let source = match functions.get(index as usize).and_then(Option::as_ref) {
+        Some(CoreFunctionDraft::Export(reference)) => {
+            AsyncCoreFunctionSource::Export(async_core_export_ref(reference)?)
+        }
+        Some(CoreFunctionDraft::Lower(lower)) => AsyncCoreFunctionSource::Lower {
+            canonical_index: lower.canonical_index,
+            component_function: lower.component_function,
+        },
+        Some(CoreFunctionDraft::SyncCanonical { canonical_index }) => {
+            AsyncCoreFunctionSource::SyncCanonical {
+                canonical_index: *canonical_index,
+            }
+        }
+        Some(CoreFunctionDraft::AsyncCanonical { canonical_index }) => {
+            AsyncCoreFunctionSource::AsyncCanonical {
+                canonical_index: *canonical_index,
+            }
+        }
+        None => return Err(DecodeError::InvalidWiring),
+    };
+    Ok(AsyncCoreFunctionRef {
+        core_function: index,
+        source,
+    })
+}
+
+fn async_core_export_ref(reference: &CoreExportRef) -> Result<AsyncCoreExportRef, DecodeError> {
+    Ok(AsyncCoreExportRef {
+        core_instance: u32::try_from(reference.instance).map_err(|_| DecodeError::Limit)?,
+        export: copied(&reference.name)?,
+    })
+}
+
+fn async_core_memory_ref(
+    memories: &[Option<CoreExportRef>],
+    index: u32,
+) -> Result<AsyncCoreMemoryRef, DecodeError> {
+    Ok(AsyncCoreMemoryRef {
+        core_memory: index,
+        source: async_core_export_ref(resolve_core_ref(memories, index)?)?,
+    })
+}
+
+fn build_async_options(
+    options: &AsyncOptionsDraft,
+    core_functions: &[Option<CoreFunctionDraft>],
+    core_memories: &[Option<CoreExportRef>],
+) -> Result<AsyncCanonicalOptionsPlan, DecodeError> {
+    Ok(AsyncCanonicalOptionsPlan {
+        string_encoding: options.string_encoding,
+        async_: options.async_,
+        memory: options
+            .memory
+            .map(|index| async_core_memory_ref(core_memories, index))
+            .transpose()?,
+        realloc: options
+            .realloc
+            .map(|index| async_core_function_ref(core_functions, index))
+            .transpose()?,
+    })
+}
+
+fn build_async_stream_plan(
+    draft: &AsyncStreamDraft,
+    core_functions: &[Option<CoreFunctionDraft>],
+    core_memories: &[Option<CoreExportRef>],
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+) -> Result<AsyncStreamPlan, DecodeError> {
+    Ok(match draft {
+        AsyncStreamDraft::New { type_index } => AsyncStreamPlan::New {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+        },
+        AsyncStreamDraft::Read {
+            type_index,
+            options,
+        } => AsyncStreamPlan::Read {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+            options: build_async_options(options, core_functions, core_memories)?,
+        },
+        AsyncStreamDraft::Write {
+            type_index,
+            options,
+        } => AsyncStreamPlan::Write {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+            options: build_async_options(options, core_functions, core_memories)?,
+        },
+        AsyncStreamDraft::CancelRead { type_index, async_ } => AsyncStreamPlan::CancelRead {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+            async_: *async_,
+        },
+        AsyncStreamDraft::CancelWrite { type_index, async_ } => AsyncStreamPlan::CancelWrite {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+            async_: *async_,
+        },
+        AsyncStreamDraft::DropReadable { type_index } => AsyncStreamPlan::DropReadable {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+        },
+        AsyncStreamDraft::DropWritable { type_index } => AsyncStreamPlan::DropWritable {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, true)?,
+        },
+    })
+}
+
+fn build_async_future_plan(
+    draft: &AsyncFutureDraft,
+    core_functions: &[Option<CoreFunctionDraft>],
+    core_memories: &[Option<CoreExportRef>],
+    types: &wasmparser::types::Types,
+    type_builder: &mut TypeBuilder,
+) -> Result<AsyncFuturePlan, DecodeError> {
+    Ok(match draft {
+        AsyncFutureDraft::New { type_index } => AsyncFuturePlan::New {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+        },
+        AsyncFutureDraft::Read {
+            type_index,
+            options,
+        } => AsyncFuturePlan::Read {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+            options: build_async_options(options, core_functions, core_memories)?,
+        },
+        AsyncFutureDraft::Write {
+            type_index,
+            options,
+        } => AsyncFuturePlan::Write {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+            options: build_async_options(options, core_functions, core_memories)?,
+        },
+        AsyncFutureDraft::CancelRead { type_index, async_ } => AsyncFuturePlan::CancelRead {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+            async_: *async_,
+        },
+        AsyncFutureDraft::CancelWrite { type_index, async_ } => AsyncFuturePlan::CancelWrite {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+            async_: *async_,
+        },
+        AsyncFutureDraft::DropReadable { type_index } => AsyncFuturePlan::DropReadable {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+        },
+        AsyncFutureDraft::DropWritable { type_index } => AsyncFuturePlan::DropWritable {
+            type_index: *type_index,
+            value_type: normalize_async_defined_type(types, type_builder, *type_index, false)?,
+        },
+    })
+}
+
+fn build_async_waitable_plan(
+    draft: &AsyncWaitableDraft,
+    core_memories: &[Option<CoreExportRef>],
+) -> Result<AsyncWaitablePlan, DecodeError> {
+    Ok(match draft {
+        AsyncWaitableDraft::SetNew => AsyncWaitablePlan::SetNew,
+        AsyncWaitableDraft::SetWait {
+            cancellable,
+            memory,
+        } => AsyncWaitablePlan::SetWait {
+            cancellable: *cancellable,
+            memory: async_core_memory_ref(core_memories, *memory)?,
+        },
+        AsyncWaitableDraft::SetPoll {
+            cancellable,
+            memory,
+        } => AsyncWaitablePlan::SetPoll {
+            cancellable: *cancellable,
+            memory: async_core_memory_ref(core_memories, *memory)?,
+        },
+        AsyncWaitableDraft::SetDrop => AsyncWaitablePlan::SetDrop,
+        AsyncWaitableDraft::Join => AsyncWaitablePlan::Join,
+    })
 }
 
 fn predecode_error(error: PredecodeError) -> DecodeError {
@@ -1158,6 +1932,10 @@ fn build_execution_instances(
                                         field: module_import.field,
                                         host_import,
                                     }
+                                }
+                                CoreFunctionDraft::SyncCanonical { .. }
+                                | CoreFunctionDraft::AsyncCanonical { .. } => {
+                                    return Err(DecodeError::InvalidWiring);
                                 }
                             }
                         }
@@ -2058,7 +2836,7 @@ fn async_plan_options(
                     return Err(DecodeError::Malformed);
                 }
             }
-            CanonicalOption::Async => {}
+            CanonicalOption::Async => plan.async_ = true,
             CanonicalOption::Callback(index) => {
                 if callback.replace(*index).is_some() {
                     return Err(DecodeError::Malformed);

@@ -10,9 +10,11 @@
 use crate::{
     async_abi::{
         pack_endpoint_pair, unpack_callback_result, CallbackCode, EndpointPair as AbiEndpointPair,
-        EventCode,
     },
-    async_state::{AsyncState, AsyncStateError, AsyncStateLimits, EndpointKind, TaskHandle},
+    async_state::{
+        AsyncState, AsyncStateError, AsyncStateLimits, EndpointKind, TaskCancelState, TaskHandle,
+        TaskResultState,
+    },
     decode::ComponentPlan,
     execution::{
         AsyncCoreValueType, NativeAsyncCanonicalFunctionPlan, NativeAsyncCoreImportPlan,
@@ -25,9 +27,9 @@ use crate::{
 use alloc::{string::String, vec::Vec};
 use vibeos_component_format::{ProfileIdentity, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
-    CoreCallReservation, CoreComponentGroup, CoreHostImport, CoreInstanceExportImport,
-    CoreModuleImport, CoreValue, CoreValueType, OwnerAllocationReservation, PollResult,
-    ProfileEngine, ValidatedCore,
+    CoreCallSlot, CoreCallSlotState, CoreComponentGroup, CoreHostImport, CoreInstanceExportImport,
+    CoreModuleImport, CoreSlotPollResult, CoreValue, CoreValueType, OwnerAllocationReservation,
+    PollResult, ProfileEngine, ValidatedCore,
 };
 
 /// Versioned Vibe fuel charged for resolving one empty native async result.
@@ -79,9 +81,27 @@ pub(crate) enum NativeAsyncPoll {
     Trapped(TrapCode),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeAsyncCancelOutcome {
+    Requested,
+    TooLate,
+    AlreadyTerminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeAsyncControlError {
+    Invariant,
+}
+
 pub(crate) struct NativeAsyncComponent {
     modules: CoreComponentGroup,
     exports: Vec<RuntimeExport>,
+    /// One allocation-backed callback call shell per exact runtime export.
+    ///
+    /// These are reserved during Component instantiation and retain their
+    /// generations for the full Component lifetime. An invocation only moves
+    /// the matching slot between Idle and Active.
+    callback_slots: Vec<CoreCallSlot>,
     bridges: Vec<RuntimeBridge>,
     /// Canonical handles belong to the Component instance, not one invocation.
     state: AsyncState,
@@ -244,6 +264,19 @@ impl NativeAsyncComponent {
         modules
             .seal()
             .map_err(|_| NativeAsyncError::CoreInstantiation)?;
+        let mut callback_slots = Vec::new();
+        callback_slots
+            .try_reserve_exact(exports.len())
+            .map_err(|_| NativeAsyncError::Allocation)?;
+        for binding in &exports {
+            let slot = modules
+                .reserve_call_slot(binding.callback_instance, &binding.callback)
+                .map_err(|trap| match trap {
+                    TrapCode::LimitExceeded => NativeAsyncError::Allocation,
+                    _ => NativeAsyncError::InvalidWiring,
+                })?;
+            callback_slots.push(slot);
+        }
         let state = AsyncState::new(AsyncStateLimits {
             handles: PROFILE_1_LIMITS.max_resources,
             pairs: PROFILE_1_LIMITS.max_resources,
@@ -254,6 +287,7 @@ impl NativeAsyncComponent {
         Ok(Self {
             modules,
             exports,
+            callback_slots,
             bridges,
             state,
             poisoned: false,
@@ -292,10 +326,14 @@ impl NativeAsyncComponent {
             .exports
             .get(export_index)
             .ok_or(NativeAsyncError::InvalidWiring)?;
-        let callback_reservation = self
-            .modules
-            .reserve_call(binding.callback_instance, &binding.callback)
-            .map_err(|_| NativeAsyncError::InvalidWiring)?;
+        let callback_slot = self
+            .callback_slots
+            .get(export_index)
+            .ok_or(NativeAsyncError::InvalidWiring)?;
+        if callback_slot.state() != CoreCallSlotState::Idle {
+            self.poisoned = true;
+            return Err(NativeAsyncError::Poisoned);
+        }
         self.modules
             .start_call(
                 binding.core_instance,
@@ -322,7 +360,7 @@ impl NativeAsyncComponent {
             remaining_work: total_work,
             active_call_budget: total_work,
             poll_quantum,
-            callback_reservation: Some(callback_reservation),
+            callback_pending: false,
             terminal: false,
         })
     }
@@ -628,12 +666,31 @@ const fn map_sealed_state_error(error: AsyncStateError) -> TrapCode {
     }
 }
 
+/// A yielded callback owns one exact running task and cannot already be
+/// exited or waiting. Failure of that executor-controlled precondition is an
+/// invariant violation, not a guest canonical-ABI error.
+const fn map_callback_yield_error(error: AsyncStateError) -> TrapCode {
+    match error {
+        AsyncStateError::InvalidHandle
+        | AsyncStateError::StaleHandle
+        | AsyncStateError::TaskAlreadyExited
+        | AsyncStateError::AlreadyWaiting => TrapCode::Validation,
+        _ => map_runtime_state_error(error),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InvocationStage {
     Run,
     StartCallback,
     Callback,
     Terminal,
+}
+
+#[derive(Clone, Copy)]
+enum CallAuthority {
+    Run(usize),
+    Callback,
 }
 
 pub(crate) struct NativeAsyncInvocation<'a> {
@@ -645,7 +702,7 @@ pub(crate) struct NativeAsyncInvocation<'a> {
     remaining_work: u64,
     active_call_budget: u64,
     poll_quantum: u64,
-    callback_reservation: Option<CoreCallReservation>,
+    callback_pending: bool,
     terminal: bool,
 }
 
@@ -657,13 +714,10 @@ impl NativeAsyncInvocation<'_> {
         match self.stage {
             InvocationStage::Run => {
                 let active = self.binding().core_instance;
-                self.poll_core(active)
+                self.poll_run(active)
             }
             InvocationStage::StartCallback => self.start_callback(),
-            InvocationStage::Callback => {
-                let active = self.binding().callback_instance;
-                self.poll_core(active)
-            }
+            InvocationStage::Callback => self.poll_callback(),
             InvocationStage::Terminal => NativeAsyncPoll::Trapped(TrapCode::Cancelled),
         }
     }
@@ -675,25 +729,84 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
+    /// Requests owner-side task cancellation without cancelling or otherwise
+    /// disturbing the currently active Core continuation.
+    pub(crate) fn request_cancel(
+        &mut self,
+    ) -> Result<NativeAsyncCancelOutcome, NativeAsyncControlError> {
+        if self.terminal || self.component.poisoned {
+            return Ok(NativeAsyncCancelOutcome::AlreadyTerminal);
+        }
+        let info = self
+            .component
+            .state
+            .task_info(self.task)
+            .map_err(|_| NativeAsyncControlError::Invariant)?;
+        if info.result == TaskResultState::Resolved {
+            return Ok(NativeAsyncCancelOutcome::TooLate);
+        }
+        match info.cancel {
+            TaskCancelState::None => {
+                self.component
+                    .state
+                    .request_task_cancel(self.task)
+                    .map_err(|_| NativeAsyncControlError::Invariant)?;
+                Ok(NativeAsyncCancelOutcome::Requested)
+            }
+            TaskCancelState::Requested => Ok(NativeAsyncCancelOutcome::Requested),
+            TaskCancelState::Delivered | TaskCancelState::Acknowledged => {
+                Ok(NativeAsyncCancelOutcome::TooLate)
+            }
+        }
+    }
+
     fn binding(&self) -> &RuntimeExport {
         &self.component.exports[self.export]
     }
 
-    fn poll_core(&mut self, active_instance: usize) -> NativeAsyncPoll {
+    fn poll_run(&mut self, active_instance: usize) -> NativeAsyncPoll {
         let result = self.component.modules.poll_call(active_instance);
-        if !self.settle_metrics(active_instance) {
+        let authority = CallAuthority::Run(active_instance);
+        if !self.settle_metrics(authority) {
             return self.finish_trap(TrapCode::Validation);
         }
         match result {
             PollResult::Pending { .. } => NativeAsyncPoll::Pending(self.metrics()),
-            PollResult::HostCall(call) => self.handle_host_call(active_instance, call),
-            PollResult::Ready(values) => self.handle_callback_result(values),
+            PollResult::HostCall(call) => self.handle_host_call(authority, call),
+            PollResult::Ready(values) => self.handle_callback_result(values.as_slice()),
             PollResult::Trapped(trap) => self.finish_trap(trap),
         }
     }
 
-    fn settle_metrics(&mut self, active_instance: usize) -> bool {
-        let Some(metrics) = self.component.modules.call_metrics(active_instance) else {
+    fn poll_callback(&mut self) -> NativeAsyncPoll {
+        let result = self
+            .component
+            .modules
+            .poll_call_slot(&mut self.component.callback_slots[self.export]);
+        if !self.settle_metrics(CallAuthority::Callback) {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        match result {
+            CoreSlotPollResult::Pending { .. } => NativeAsyncPoll::Pending(self.metrics()),
+            CoreSlotPollResult::HostCall(call) => {
+                self.handle_host_call(CallAuthority::Callback, call)
+            }
+            CoreSlotPollResult::Ready(values) => self.handle_callback_result(values.as_slice()),
+            CoreSlotPollResult::Trapped(trap) => self.finish_trap(trap),
+        }
+    }
+
+    fn settle_metrics(&mut self, authority: CallAuthority) -> bool {
+        let metrics = match authority {
+            CallAuthority::Run(active_instance) => {
+                self.component.modules.call_metrics(active_instance)
+            }
+            CallAuthority::Callback => self
+                .component
+                .modules
+                .call_metrics_slot(&self.component.callback_slots[self.export]),
+        };
+        let Some(metrics) = metrics else {
             return false;
         };
         metrics.remaining_fuel <= self.remaining_work
@@ -707,7 +820,7 @@ impl NativeAsyncInvocation<'_> {
 
     fn handle_host_call(
         &mut self,
-        active_instance: usize,
+        authority: CallAuthority,
         call: vibeos_wasm_runtime::CoreHostCall,
     ) -> NativeAsyncPoll {
         let Ok(bridge_index) = usize::try_from(call.id) else {
@@ -722,23 +835,19 @@ impl NativeAsyncInvocation<'_> {
         let action = bridge.action;
         match (action, call.arguments.as_slice()) {
             (BridgeAction::TaskReturn, []) => {
-                if let Err(trap) = self.debit_active_work(active_instance, TASK_RETURN_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, TASK_RETURN_WORK) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self.component.state.resolve_task_result(self.task) {
                     return self.finish_trap(map_sealed_state_error(error));
                 }
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &[])
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &[]) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Resolved(self.metrics())
             }
             (BridgeAction::StreamNew(value_type), []) => {
-                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
                     return self.finish_trap(trap);
                 }
                 let pair = match self.component.state.create_stream_pair(value_type) {
@@ -752,17 +861,13 @@ impl NativeAsyncInvocation<'_> {
                     return self.finish_trap(TrapCode::Validation);
                 };
                 let results = [CoreValue::I64(packed as i64)];
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &results)
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &results) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Pending(self.metrics())
             }
             (BridgeAction::FutureNew(value_type), []) => {
-                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
                     return self.finish_trap(trap);
                 }
                 let pair = match self.component.state.create_future_pair(value_type) {
@@ -776,11 +881,7 @@ impl NativeAsyncInvocation<'_> {
                     return self.finish_trap(TrapCode::Validation);
                 };
                 let results = [CoreValue::I64(packed as i64)];
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &results)
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &results) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Pending(self.metrics())
@@ -797,7 +898,7 @@ impl NativeAsyncInvocation<'_> {
                     Ok(handle) => handle,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
-                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self
@@ -807,17 +908,13 @@ impl NativeAsyncInvocation<'_> {
                 {
                     return self.finish_trap(map_sealed_state_error(error));
                 }
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &[])
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &[]) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Pending(self.metrics())
             }
             (BridgeAction::WaitableSetNew, []) => {
-                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
                     return self.finish_trap(trap);
                 }
                 let set = match self.component.state.create_waitable_set() {
@@ -825,11 +922,7 @@ impl NativeAsyncInvocation<'_> {
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
                 let results = [CoreValue::I32(set.raw() as i32)];
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &results)
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &results) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Pending(self.metrics())
@@ -839,17 +932,13 @@ impl NativeAsyncInvocation<'_> {
                     Ok(set) => set,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
-                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self.component.state.drop_waitable_set(set) {
                     return self.finish_trap(map_sealed_state_error(error));
                 }
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &[])
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &[]) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Pending(self.metrics())
@@ -866,7 +955,7 @@ impl NativeAsyncInvocation<'_> {
                     Ok(waitable) => waitable,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
-                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self
@@ -876,11 +965,7 @@ impl NativeAsyncInvocation<'_> {
                 {
                     return self.finish_trap(map_runtime_state_error(error));
                 }
-                if let Err(trap) =
-                    self.component
-                        .modules
-                        .resume_host_call(active_instance, call.id, &[])
-                {
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &[]) {
                     return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Pending(self.metrics())
@@ -890,20 +975,47 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    fn debit_active_work(&mut self, active_instance: usize, amount: u64) -> Result<(), TrapCode> {
+    fn debit_active_work(&mut self, authority: CallAuthority, amount: u64) -> Result<(), TrapCode> {
         debug_assert!(amount > 0);
-        self.component
-            .modules
-            .debit_call_fuel(active_instance, amount)?;
-        if self.settle_metrics(active_instance) {
+        match authority {
+            CallAuthority::Run(active_instance) => self
+                .component
+                .modules
+                .debit_call_fuel(active_instance, amount)?,
+            CallAuthority::Callback => self
+                .component
+                .modules
+                .debit_call_fuel_slot(&self.component.callback_slots[self.export], amount)?,
+        }
+        if self.settle_metrics(authority) {
             Ok(())
         } else {
             Err(TrapCode::Validation)
         }
     }
 
-    fn handle_callback_result(&mut self, values: Vec<CoreValue>) -> NativeAsyncPoll {
-        let [CoreValue::I32(raw)] = values.as_slice() else {
+    fn resume_active_host_call(
+        &mut self,
+        authority: CallAuthority,
+        id: u32,
+        results: &[CoreValue],
+    ) -> Result<(), TrapCode> {
+        match authority {
+            CallAuthority::Run(active_instance) => {
+                self.component
+                    .modules
+                    .resume_host_call(active_instance, id, results)
+            }
+            CallAuthority::Callback => self.component.modules.resume_host_call_slot(
+                &self.component.callback_slots[self.export],
+                id,
+                results,
+            ),
+        }
+    }
+
+    fn handle_callback_result(&mut self, values: &[CoreValue]) -> NativeAsyncPoll {
+        let [CoreValue::I32(raw)] = values else {
             return self.finish_trap(TrapCode::Validation);
         };
         let Ok(result) = unpack_callback_result(*raw as u32) else {
@@ -914,6 +1026,9 @@ impl NativeAsyncInvocation<'_> {
         }
         match result.code {
             CallbackCode::Exit => {
+                if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle {
+                    return self.finish_trap(TrapCode::Validation);
+                }
                 if let Err(error) = self.component.state.callback_exit(self.task) {
                     return self.finish_trap(map_sealed_state_error(error));
                 }
@@ -925,9 +1040,12 @@ impl NativeAsyncInvocation<'_> {
                 NativeAsyncPoll::Complete(self.metrics())
             }
             CallbackCode::Yield => {
-                if matches!(self.stage, InvocationStage::Callback) {
-                    return self.finish_trap(TrapCode::CanonicalAbi);
+                if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+                    || self.callback_pending
+                {
+                    return self.finish_trap(TrapCode::Validation);
                 }
+                self.callback_pending = true;
                 self.stage = InvocationStage::StartCallback;
                 NativeAsyncPoll::Yielded(self.metrics())
             }
@@ -939,20 +1057,36 @@ impl NativeAsyncInvocation<'_> {
         if self.remaining_work == 0 {
             return self.finish_trap(TrapCode::FuelExhausted);
         }
+        if !self.callback_pending {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        // Select at the owner-visible Yielded -> poll boundary, then start the
+        // exact callback immediately. This makes cancellation requested while
+        // yielded visible to the next callback without caching a replayable
+        // event across another executor boundary.
+        let event = match self.component.state.callback_yield(self.task) {
+            Ok(event) => event,
+            Err(error) => return self.finish_trap(map_callback_yield_error(error)),
+        };
         let inputs = [
-            CoreValue::I32(EventCode::None as i32),
-            CoreValue::I32(0),
-            CoreValue::I32(0),
+            CoreValue::I32(event.code as i32),
+            CoreValue::I32(event.p1 as i32),
+            CoreValue::I32(event.p2 as i32),
         ];
         let quantum = self.poll_quantum.min(self.remaining_work);
-        let (modules, exports) = (&mut self.component.modules, &self.component.exports);
+        let (modules, exports, callback_slots) = (
+            &mut self.component.modules,
+            &self.component.exports,
+            &mut self.component.callback_slots,
+        );
         let binding = &exports[self.export];
-        let Some(reservation) = self.callback_reservation.take() else {
-            return self.finish_trap(TrapCode::Validation);
-        };
+        let slot = &mut callback_slots[self.export];
         if modules
-            .start_call_reserved(
-                reservation,
+            .start_call_slot(
+                slot,
                 binding.callback_instance,
                 &binding.callback,
                 &inputs,
@@ -963,6 +1097,7 @@ impl NativeAsyncInvocation<'_> {
         {
             return self.finish_trap(TrapCode::Validation);
         }
+        self.callback_pending = false;
         self.active_call_budget = self.remaining_work;
         self.stage = InvocationStage::Callback;
         NativeAsyncPoll::Pending(self.metrics())
@@ -977,11 +1112,28 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn finish_trap(&mut self, trap: TrapCode) -> NativeAsyncPoll {
-        self.component.modules.discard_all_calls();
-        self.component.poisoned = true;
+        self.poison_and_discard();
         self.stage = InvocationStage::Terminal;
         self.terminal = true;
         NativeAsyncPoll::Trapped(trap)
+    }
+
+    fn poison_and_discard(&mut self) {
+        // A reusable call's storage can only be recovered with its exact slot
+        // authority. Recover every active slot before the principal-wide
+        // fallback so no slot can be left looking reusable after its storage
+        // was destroyed.
+        let (modules, callback_slots) = (
+            &mut self.component.modules,
+            &mut self.component.callback_slots,
+        );
+        for slot in callback_slots {
+            if slot.state() == CoreCallSlotState::Active {
+                let _ = modules.discard_call_slot(slot);
+            }
+        }
+        modules.discard_all_calls();
+        self.component.poisoned = true;
     }
 
     #[cfg(test)]
@@ -993,8 +1145,7 @@ impl NativeAsyncInvocation<'_> {
 impl Drop for NativeAsyncInvocation<'_> {
     fn drop(&mut self) {
         if !self.terminal {
-            self.component.modules.discard_all_calls();
-            self.component.poisoned = true;
+            self.poison_and_discard();
             self.stage = InvocationStage::Terminal;
             self.terminal = true;
         }
@@ -1004,10 +1155,7 @@ impl Drop for NativeAsyncInvocation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        async_state::{TaskCallbackState, TaskResultState},
-        decode::inspect_component_for_profile,
-    };
+    use crate::{async_state::TaskCallbackState, decode::inspect_component_for_profile};
     use alloc::format;
     use vibeos_wasm_runtime::CoreHostCall;
 
@@ -1142,7 +1290,7 @@ mod tests {
         let mut handle_transitions = 0;
         loop {
             let result = call.component.modules.poll_call(active);
-            assert!(call.settle_metrics(active));
+            assert!(call.settle_metrics(CallAuthority::Run(active)));
             match result {
                 PollResult::Pending { .. } => {}
                 PollResult::HostCall(host) => {
@@ -1163,7 +1311,7 @@ mod tests {
                         }
                     };
                     let before = call.metrics();
-                    let progress = call.handle_host_call(active, host);
+                    let progress = call.handle_host_call(CallAuthority::Run(active), host);
                     if action == BridgeAction::TaskReturn {
                         assert!(matches!(progress, NativeAsyncPoll::Resolved(_)));
                     } else {
@@ -1176,7 +1324,7 @@ mod tests {
                 PollResult::Ready(values) => {
                     let before = call.metrics();
                     assert!(matches!(
-                        call.handle_callback_result(values),
+                        call.handle_callback_result(values.as_slice()),
                         NativeAsyncPoll::Yielded(_)
                     ));
                     let after = call.metrics();
@@ -1216,13 +1364,13 @@ mod tests {
         assert!(!task.waiting);
         let run_instance = call.binding().core_instance;
         let run = call.component.modules.poll_call(run_instance);
-        assert!(call.settle_metrics(run_instance));
+        assert!(call.settle_metrics(CallAuthority::Run(run_instance)));
         let before_yield = call.metrics();
         let PollResult::Ready(values) = run else {
             panic!("the resumed smoke run must return YIELD")
         };
         assert!(matches!(
-            call.handle_callback_result(values),
+            call.handle_callback_result(values.as_slice()),
             NativeAsyncPoll::Yielded(_)
         ));
         let after_yield = call.metrics();
@@ -1337,6 +1485,8 @@ mod tests {
     #[test]
     fn smoke_resolves_before_callback_exit_and_clean_exit_is_reusable() {
         let mut component = instantiate(SMOKE);
+        assert_eq!(component.callback_slots.len(), component.exports.len());
+        assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
         let first = assert_smoke_sequence(&mut component);
         assert!(first.consumed_work > 0);
         assert!(!component.is_poisoned());
@@ -1346,18 +1496,276 @@ mod tests {
     }
 
     #[test]
+    fn callback_slot_generation_survives_invocations_and_three_yield_rounds() {
+        let source = replace_once(
+            &replace_once(
+                SMOKE,
+                "      call $task-return\n      i32.const 1",
+                "      i32.const 0\n      i32.const 0\n      i32.store\n      call $task-return\n      i32.const 1",
+            ),
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0
+      i32.const 0
+      i32.load
+      i32.const 1
+      i32.add
+      i32.store
+      i32.const 0
+      i32.load
+      i32.const 4
+      i32.lt_u)"#,
+        );
+        let mut component = instantiate(&source);
+        let generation = component.callback_slots[0].generation();
+
+        for _ in 0..2 {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            let run_instance = call.binding().core_instance;
+            let run_values = loop {
+                let result = call.component.modules.poll_call(run_instance);
+                assert!(call.settle_metrics(CallAuthority::Run(run_instance)));
+                match result {
+                    PollResult::Pending { .. } => {}
+                    PollResult::Ready(values) => break values,
+                    other => panic!("expected repeated fixture run result, got {other:?}"),
+                }
+            };
+            let before = call.metrics();
+            assert!(matches!(
+                call.handle_callback_result(run_values.as_slice()),
+                NativeAsyncPoll::Yielded(_)
+            ));
+            let after = call.metrics();
+            assert_eq!(
+                before.remaining_work - after.remaining_work,
+                CALLBACK_RESULT_WORK
+            );
+            assert_eq!(
+                after.consumed_work - before.consumed_work,
+                CALLBACK_RESULT_WORK
+            );
+            let mut callback_results = 0;
+            let mut callback_yields = 0;
+            loop {
+                assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+                assert_eq!(
+                    call.component.callback_slots[call.export].state(),
+                    CoreCallSlotState::Active
+                );
+                let values = loop {
+                    let result = call
+                        .component
+                        .modules
+                        .poll_call_slot(&mut call.component.callback_slots[call.export]);
+                    assert!(call.settle_metrics(CallAuthority::Callback));
+                    match result {
+                        CoreSlotPollResult::Pending { .. } => {}
+                        CoreSlotPollResult::Ready(values) => break values,
+                        other => {
+                            panic!("expected repeated fixture callback result, got {other:?}")
+                        }
+                    }
+                };
+                let before = call.metrics();
+                let progress = call.handle_callback_result(values.as_slice());
+                let after = call.metrics();
+                assert_eq!(
+                    before.remaining_work - after.remaining_work,
+                    CALLBACK_RESULT_WORK
+                );
+                assert_eq!(
+                    after.consumed_work - before.consumed_work,
+                    CALLBACK_RESULT_WORK
+                );
+                callback_results += 1;
+                assert_eq!(
+                    call.component.callback_slots[call.export].state(),
+                    CoreCallSlotState::Idle
+                );
+                assert_eq!(
+                    call.component.callback_slots[call.export].generation(),
+                    generation
+                );
+                match progress {
+                    NativeAsyncPoll::Yielded(_) => callback_yields += 1,
+                    NativeAsyncPoll::Complete(_) => break,
+                    other => {
+                        panic!("unexpected repeated callback progress: {other:?}")
+                    }
+                }
+            }
+            assert_eq!(callback_yields, 3);
+            assert_eq!(callback_results, 4, "three YIELDs plus one EXIT");
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Idle
+            );
+        }
+
+        assert_eq!(component.callback_slots[0].generation(), generation);
+        assert!(!component.is_poisoned());
+    }
+
+    #[test]
+    fn yielded_owner_cancel_is_delivered_once_and_late_requests_are_stable() {
+        let source = replace_once(
+            &replace_once(
+                SMOKE,
+                "      call $task-return\n      i32.const 1",
+                "      i32.const 4\n      i32.const 0\n      i32.store\n      i32.const 1",
+            ),
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            r#"    (func (export "callback") (param $event i32) (param $p1 i32) (param $p2 i32) (result i32)
+      i32.const 4
+      i32.load
+      if (result i32)
+        local.get $event
+        i32.eqz
+        local.get $p1
+        i32.eqz
+        i32.and
+        local.get $p2
+        i32.eqz
+        i32.and
+        if (result i32)
+          i32.const 0
+        else
+          i32.const 3
+        end
+      else
+        local.get $event
+        i32.const 6
+        i32.eq
+        local.get $p1
+        i32.eqz
+        i32.and
+        local.get $p2
+        i32.eqz
+        i32.and
+        if (result i32)
+          call $task-return
+          i32.const 4
+          i32.const 1
+          i32.store
+          i32.const 1
+        else
+          i32.const 3
+        end
+      end)"#,
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+
+        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        assert_eq!(call.task_info().cancel, TaskCancelState::None);
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        assert!(!call.component.is_poisoned());
+
+        // The selector runs on this exact Yielded -> poll boundary and the
+        // selected event is passed immediately to the reusable callback.
+        assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+        assert_eq!(call.task_info().cancel, TaskCancelState::Delivered);
+        assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
+        assert_eq!(call.task_info().cancel, TaskCancelState::Delivered);
+        assert!(!call.component.is_poisoned());
+
+        let mut saw_resolved = false;
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Resolved(_) => {
+                    saw_resolved = true;
+                    assert_eq!(call.task_info().result, TaskResultState::Resolved);
+                    assert_eq!(call.task_info().cancel, TaskCancelState::None);
+                    assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
+                    assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
+                    assert!(!call.component.is_poisoned());
+                }
+                NativeAsyncPoll::Complete(_) => break,
+                NativeAsyncPoll::Trapped(trap) => {
+                    panic!("cancel delivery callback trapped: {trap:?}")
+                }
+            }
+        }
+        assert!(saw_resolved);
+        assert!(!call.component.is_poisoned());
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::AlreadyTerminal)
+        );
+    }
+
+    #[test]
+    fn exhausted_yield_does_not_run_or_mutate_the_callback_selector() {
+        let source = replace_once(
+            SMOKE,
+            "      call $task-return\n      i32.const 1",
+            "      i32.const 1",
+        );
+        let exact_yield_work = {
+            let mut component = instantiate(&source);
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let NativeAsyncPoll::Yielded(metrics) = call.poll() else {
+                panic!("unresolved run must yield")
+            };
+            metrics.consumed_work
+        };
+        assert!(exact_yield_work > CALLBACK_RESULT_WORK);
+
+        let mut component = instantiate(&source);
+        let mut call = component
+            .start("run", exact_yield_work, exact_yield_work)
+            .unwrap();
+        assert_eq!(
+            call.poll(),
+            NativeAsyncPoll::Yielded(NativeAsyncMetrics {
+                consumed_work: exact_yield_work,
+                remaining_work: 0,
+            })
+        );
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
+        assert_eq!(
+            call.poll(),
+            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
+        );
+        assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::AlreadyTerminal)
+        );
+    }
+
+    #[test]
     fn canonical_transitions_debit_the_shared_ledger_exactly_once() {
         let mut component = instantiate(SMOKE);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         let run_instance = call.binding().core_instance;
         let host = call.component.modules.poll_call(run_instance);
-        assert!(call.settle_metrics(run_instance));
+        assert!(call.settle_metrics(CallAuthority::Run(run_instance)));
         let before_return = call.metrics();
         let PollResult::HostCall(host) = host else {
             panic!("the smoke run must stop at task.return")
         };
         assert!(matches!(
-            call.handle_host_call(run_instance, host),
+            call.handle_host_call(CallAuthority::Run(run_instance), host),
             NativeAsyncPoll::Resolved(_)
         ));
         let after_return = call.metrics();
@@ -1372,15 +1780,17 @@ mod tests {
 
         assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
         assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
-        let callback_instance = call.binding().callback_instance;
-        let callback = call.component.modules.poll_call(callback_instance);
-        assert!(call.settle_metrics(callback_instance));
+        let callback = call
+            .component
+            .modules
+            .poll_call_slot(&mut call.component.callback_slots[call.export]);
+        assert!(call.settle_metrics(CallAuthority::Callback));
         let before_callback_result = call.metrics();
-        let PollResult::Ready(values) = callback else {
+        let CoreSlotPollResult::Ready(values) = callback else {
             panic!("the smoke callback must finish with EXIT")
         };
         assert!(matches!(
-            call.handle_callback_result(values),
+            call.handle_callback_result(values.as_slice()),
             NativeAsyncPoll::Complete(_)
         ));
         let after_callback_result = call.metrics();
@@ -1391,6 +1801,128 @@ mod tests {
         assert_eq!(
             after_callback_result.consumed_work - before_callback_result.consumed_work,
             CALLBACK_RESULT_WORK
+        );
+    }
+
+    #[test]
+    fn callback_host_calls_use_only_exact_slot_authority_and_shared_fuel() {
+        let source = r#"(component
+          (type $run-type (func async))
+          (core func $task-return (canon task.return))
+          (core instance $builtins
+            (export "task-return" (func $task-return)))
+          (core module $provider
+            (import "vibe:async" "task-return" (func $task-return))
+            (func (export "resolve") call $task-return))
+          (core instance $provider-instance
+            (instantiate $provider
+              (with "vibe:async" (instance $builtins))))
+          (core module $guest
+            (import "provider" "resolve" (func $resolve))
+            (func (export "run") (result i32)
+              i32.const 1)
+            (func (export "callback") (param i32 i32 i32) (result i32)
+              call $resolve
+              i32.const 0))
+          (core instance $guest-instance
+            (instantiate $guest
+              (with "provider" (instance $provider-instance))))
+          (alias core export $guest-instance "run" (core func $run))
+          (alias core export $guest-instance "callback" (core func $callback))
+          (func $lifted (type $run-type)
+            (canon lift (core func $run) async
+              (callback (core func $callback))))
+          (export "run" (func $lifted)))"#;
+        let mut component = instantiate(source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+
+        let callback_instance = call.binding().callback_instance;
+        let host = loop {
+            let result = call
+                .component
+                .modules
+                .poll_call_slot(&mut call.component.callback_slots[call.export]);
+            assert!(call.settle_metrics(CallAuthority::Callback));
+            match result {
+                CoreSlotPollResult::Pending { .. } => {}
+                CoreSlotPollResult::HostCall(host) => break host,
+                other => panic!("expected transitive callback task.return, got {other:?}"),
+            }
+        };
+        assert!(matches!(
+            call.component.bridges[host.id as usize].action,
+            BridgeAction::TaskReturn
+        ));
+        assert_ne!(host.origin_instance, callback_instance);
+        let exact_before = call
+            .component
+            .modules
+            .call_metrics_slot(&call.component.callback_slots[call.export])
+            .unwrap();
+
+        // Every ordinary authority rejects the slot-owned continuation and
+        // leaves the exact slot metrics and pending host call untouched.
+        assert_eq!(call.component.modules.call_metrics(callback_instance), None);
+        assert_eq!(
+            call.component.modules.debit_call_fuel(callback_instance, 1),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(
+            call.component
+                .modules
+                .credit_call_fuel(callback_instance, 1),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(
+            call.component
+                .modules
+                .resume_host_call(callback_instance, host.id, &[]),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(
+            call.component.modules.cancel_call(callback_instance),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(
+            call.component.modules.discard_call(callback_instance),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(
+            call.component
+                .modules
+                .call_metrics_slot(&call.component.callback_slots[call.export]),
+            Some(exact_before)
+        );
+
+        let before = call.metrics();
+        assert!(matches!(
+            call.handle_host_call(CallAuthority::Callback, host),
+            NativeAsyncPoll::Resolved(_)
+        ));
+        let after = call.metrics();
+        assert_eq!(
+            before.remaining_work - after.remaining_work,
+            TASK_RETURN_WORK
+        );
+        assert_eq!(after.consumed_work - before.consumed_work, TASK_RETURN_WORK);
+
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::Complete(_) => break,
+                NativeAsyncPoll::Resolved(_) | NativeAsyncPoll::Yielded(_) => {
+                    panic!("callback host-call fixture surfaced unexpected progress")
+                }
+                NativeAsyncPoll::Trapped(trap) => {
+                    panic!("callback host-call fixture trapped: {trap:?}")
+                }
+            }
+        }
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
         );
     }
 
@@ -1544,6 +2076,14 @@ mod tests {
             map_sealed_state_error(AsyncStateError::StaleHandle),
             TrapCode::Validation
         );
+        assert_eq!(
+            map_callback_yield_error(AsyncStateError::TaskAlreadyExited),
+            TrapCode::Validation
+        );
+        assert_eq!(
+            map_callback_yield_error(AsyncStateError::AlreadyWaiting),
+            TrapCode::Validation
+        );
     }
 
     #[test]
@@ -1568,7 +2108,7 @@ mod tests {
             let active = call.binding().core_instance;
             let host = loop {
                 let result = call.component.modules.poll_call(active);
-                assert!(call.settle_metrics(active));
+                assert!(call.settle_metrics(CallAuthority::Run(active)));
                 match result {
                     PollResult::Pending { .. } => {}
                     PollResult::HostCall(host) => break host,
@@ -1577,7 +2117,7 @@ mod tests {
             };
             let before = call.metrics();
             assert_eq!(
-                call.handle_host_call(active, host),
+                call.handle_host_call(CallAuthority::Run(active), host),
                 NativeAsyncPoll::Trapped(TrapCode::LimitExceeded)
             );
             let after = call.metrics();
@@ -1658,7 +2198,7 @@ mod tests {
         let active = call.binding().core_instance;
         let mut host = loop {
             let result = call.component.modules.poll_call(active);
-            assert!(call.settle_metrics(active));
+            assert!(call.settle_metrics(CallAuthority::Run(active)));
             match result {
                 PollResult::Pending { .. } => {}
                 PollResult::HostCall(host) => break host,
@@ -1668,7 +2208,7 @@ mod tests {
         host.arguments.push(CoreValue::I32(0));
         let before = call.metrics();
         assert_eq!(
-            call.handle_host_call(active, host),
+            call.handle_host_call(CallAuthority::Run(active), host),
             NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
         assert_eq!(call.metrics(), before);
@@ -1683,7 +2223,7 @@ mod tests {
         let active = call.binding().core_instance;
         let host = loop {
             let result = call.component.modules.poll_call(active);
-            assert!(call.settle_metrics(active));
+            assert!(call.settle_metrics(CallAuthority::Run(active)));
             match result {
                 PollResult::Pending { .. } => {}
                 PollResult::HostCall(host) => break host,
@@ -1700,7 +2240,7 @@ mod tests {
             .unwrap();
         let before = call.metrics();
         assert_eq!(
-            call.handle_host_call(active, host),
+            call.handle_host_call(CallAuthority::Run(active), host),
             NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
         let after = call.metrics();
@@ -1876,6 +2416,152 @@ mod tests {
     }
 
     #[test]
+    fn callback_wait_remains_unsupported_and_restores_slot_before_poison() {
+        let source = replace_once(
+            SMOKE,
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 2)",
+        );
+        let mut component = instantiate(&source);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            assert_eq!(
+                call.poll(),
+                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+            );
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Idle
+            );
+        }
+        assert!(component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+    }
+
+    #[test]
+    fn callback_trap_and_drop_clean_up_the_exact_active_slot() {
+        let trapping = replace_once(
+            SMOKE,
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      unreachable)",
+        );
+        let mut component = instantiate(&trapping);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Trapped(_)));
+            let task = call.task_info();
+            assert_eq!(
+                call.request_cancel(),
+                Ok(NativeAsyncCancelOutcome::AlreadyTerminal)
+            );
+            assert_eq!(call.task_info(), task);
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Idle
+            );
+        }
+        assert!(component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+
+        let mut component = instantiate(SMOKE);
+        let generation = component.callback_slots[0].generation();
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Active
+            );
+            // Drop invokes exact discard_call_slot before the principal-wide
+            // fallback; no slot-owned active call is orphaned.
+        }
+        assert!(component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+        assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
+        assert_eq!(component.callback_slots[0].generation(), generation);
+
+        let host_calling = replace_once(
+            SMOKE,
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      call $waitable-set-new\n      drop\n      i32.const 0)",
+        );
+        let mut component = instantiate(&host_calling);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            loop {
+                let result = call
+                    .component
+                    .modules
+                    .poll_call_slot(&mut call.component.callback_slots[call.export]);
+                assert!(call.settle_metrics(CallAuthority::Callback));
+                match result {
+                    CoreSlotPollResult::Pending { .. } => {}
+                    CoreSlotPollResult::HostCall(_) => break,
+                    other => panic!("expected suspended callback host call, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Active
+            );
+        }
+        assert!(component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+        assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
+
+        let mut component = instantiate(SMOKE);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Idle
+            );
+        }
+        assert!(component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+        assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
+    }
+
+    #[test]
+    fn generic_poll_of_callback_slot_fails_closed_without_reusable_storage() {
+        let mut component = instantiate(SMOKE);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            let callback_instance = call.binding().callback_instance;
+            assert_eq!(
+                call.component.modules.poll_call(callback_instance),
+                PollResult::Trapped(TrapCode::Validation)
+            );
+            assert_eq!(
+                call.finish_trap(TrapCode::Validation),
+                NativeAsyncPoll::Trapped(TrapCode::Validation)
+            );
+            assert_eq!(
+                call.component.callback_slots[call.export].state(),
+                CoreCallSlotState::Poisoned
+            );
+        }
+        assert!(component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+    }
+
+    #[test]
     fn host_id_uses_bridge_then_canonical_not_an_identity_mapping() {
         let source = replace_once(
             SMOKE,
@@ -1968,7 +2654,7 @@ mod tests {
                 };
                 assert_eq!(
                     call.handle_host_call(
-                        active,
+                        CallAuthority::Run(active),
                         CoreHostCall {
                             origin_instance,
                             id,

@@ -7,6 +7,9 @@ edition = "2021"
 default = ["pci-usb-help"]
 pci-usb-help = []
 network = []
+# Target-only aggregate visibility for the standard managed-component QEMU
+# acceptance gate. Normal VSH and physical images expose no reaper snapshot.
+managed-component-target-acceptance = []
 
 [dependencies]
 vibeos-core = { path = "../../core" }

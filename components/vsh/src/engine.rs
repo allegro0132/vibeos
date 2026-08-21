@@ -2455,6 +2455,53 @@ impl ManagedReaperSlot {
 static MANAGED_REAPERS: [ManagedReaperSlot; MANAGED_REAPER_SLOTS] =
     [const { ManagedReaperSlot::new() }; MANAGED_REAPER_SLOTS];
 
+/// Allocation-free aggregate used only by the explicit managed-component
+/// target acceptance image after its SSH session has fully shut down.
+#[cfg(feature = "managed-component-target-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedComponentTargetSnapshot {
+    pub reaper_slots: usize,
+    pub reaper_waiters: usize,
+}
+
+/// Report residue without exposing a reaper key, task, token, or lifecycle.
+/// A clean vacant slot may retain its monotonic generation watermark; every
+/// owning field and all four one-shot waiter queues must nevertheless be empty.
+#[cfg(feature = "managed-component-target-acceptance")]
+pub fn managed_component_target_snapshot() -> ManagedComponentTargetSnapshot {
+    let mut reaper_slots = 0usize;
+    let mut reaper_waiters = 0usize;
+    for slot in &MANAGED_REAPERS {
+        let record = slot.record.lock();
+        let has_residue = record.phase != ManagedReaperPhase::Vacant
+            || record.lifecycle.is_some()
+            || record.parent_task.is_some()
+            || record.parent_domain.is_some()
+            || record.parent_wake.is_some()
+            || record.component.is_some()
+            || record.terminal.is_some()
+            || record.prestart_io.is_some()
+            || record.prestart_terminal.is_some()
+            || record.prestart_finalized
+            || record.cancel_terminal.is_some()
+            || record.detached
+            || record.foreground_disarmed
+            || record.reaper_finished
+            || record.reaper_task.is_some();
+        drop(record);
+        reaper_slots += usize::from(has_residue);
+        reaper_waiters = reaper_waiters
+            .saturating_add(slot.activation.waiter_count())
+            .saturating_add(slot.control.waiter_count())
+            .saturating_add(slot.lifecycle.waiter_count())
+            .saturating_add(slot.completion.waiter_count());
+    }
+    ManagedComponentTargetSnapshot {
+        reaper_slots,
+        reaper_waiters,
+    }
+}
+
 fn managed_reaper_slot(key: ManagedReaperKey) -> Option<&'static ManagedReaperSlot> {
     MANAGED_REAPERS.get(key.slot as usize)
 }

@@ -310,6 +310,11 @@ pub trait Platform: Sync {
                 == Ok(true)
         })
     }
+    /// Observe one exact policy-selected Component only after VSH shutdown and
+    /// the SSH exit-status/EOF/CLOSE exchange have fully drained. Production
+    /// platforms need no completion observer; target gates can correlate this
+    /// descriptor and status with private lifecycle evidence.
+    fn ssh_exec_component_completed(&self, _policy: SshExecComponentSessionPolicy, _status: u32) {}
     #[cfg(feature = "qualification-stream")]
     fn accepts_streaming_exec(&self, _command: &str) -> bool {
         false
@@ -2020,7 +2025,12 @@ async fn serve_connection(
             )
             .await
             {
-                Ok(()) => ConnectionEnd::ExecComplete(status),
+                Ok(()) => {
+                    if let Some(component) = accepted_component {
+                        space.ssh_exec_component_completed(component, status);
+                    }
+                    ConnectionEnd::ExecComplete(status)
+                }
                 Err(ConnectionEnd::Reset(reason)) => reset_connection(stack, reason),
                 Err(other) => other,
             }

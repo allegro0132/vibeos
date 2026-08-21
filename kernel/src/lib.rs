@@ -53,6 +53,15 @@ compile_error!(
 compile_error!(
     "the direct native-async acceptance image and formal managed command are distinct roots"
 );
+#[cfg(all(
+    feature = "ssh-native-async-qemu-acceptance",
+    not(all(
+        feature = "qemu-virt",
+        feature = "ssh-test",
+        feature = "wasm-c48-qemu-acceptance"
+    ))
+))]
+compile_error!("feature `ssh-native-async-qemu-acceptance` requires the QEMU ssh-test/C4.8 image");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
@@ -831,9 +840,23 @@ impl core::fmt::Write for SbiWriter {
 #[alloc_error_handler]
 fn oom(layout: core::alloc::Layout) -> ! {
     match HEAP.take_last_failure() {
-        Some(heap::AllocationFailure::QuotaExceeded { owner, .. })
-            if owner != heap::OwnerId::SYSTEM =>
-        {
+        Some(heap::AllocationFailure::QuotaExceeded {
+            owner,
+            requested_bytes,
+            live_bytes,
+            quota_bytes,
+        }) if owner != heap::OwnerId::SYSTEM => {
+            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            {
+                let mut w = SbiWriter;
+                let _ = core::fmt::write(
+                    &mut w,
+                    format_args!(
+                        "\nWASM_C53_NATIVE_SSH_ALLOCATION_DIAG live_bytes={} requested_bytes={} quota_bytes={}\n",
+                        live_bytes, requested_bytes, quota_bytes,
+                    ),
+                );
+            }
             // Keep the panic text deterministic; the account snapshot carries
             // exact live/peak/request evidence for diagnostics and tests.
             panic!("component allocation quota exceeded")

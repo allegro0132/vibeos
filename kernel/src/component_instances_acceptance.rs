@@ -2148,35 +2148,36 @@ async fn start_c53_instance(
         }
         crate::exec::yield_now().await;
     }
-    loop {
-        let ready = match CONTROL.try_lock() {
-            Ok(control) => {
-                drop(control);
-                true
+    let control = loop {
+        match CONTROL.try_lock() {
+            Ok(control) => break control,
+            Err(ControlGateError::Busy) => {
+                // The match temporary is consumed before this await, so the
+                // non-Send guard can never cross scheduler suspension.
             }
-            Err(ControlGateError::Busy) => false,
             Err(ControlGateError::Poisoned | ControlGateError::Unattributed) => {
                 C53_START_INTENT.store(false, Ordering::Release);
                 return None;
             }
-        };
-        if ready {
-            break;
         }
         if deadline_expired(started) {
             C53_START_INTENT.store(false, Ordering::Release);
             return None;
         }
         crate::exec::yield_now().await;
-    }
+    };
     let io = InstalledComponentIo {
         stdin: stdin.reader(),
         stdout: stdout.writer(),
         stdin_supervisor: stdin.supervisor(),
         stdout_supervisor: stdout.supervisor(),
     };
-    let result =
-        start_image_instance_with_io(PayloadMode::AcceptanceStream { round, hart }, io).ok();
+    let result = start_image_instance_with_io_under_control(
+        control,
+        PayloadMode::AcceptanceStream { round, hart },
+        io,
+    )
+    .ok();
     C53_START_INTENT.store(false, Ordering::Release);
     result
 }

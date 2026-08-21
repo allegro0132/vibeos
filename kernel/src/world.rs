@@ -33,9 +33,21 @@ const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
     any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
-    not(feature = "milkv-jitterentropy-ssh-probe")
+    not(feature = "milkv-jitterentropy-ssh-probe"),
+    not(feature = "ssh-native-async-qemu-acceptance")
 ))]
 const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
+// The target-only same-image gate sends a distinct 13,385-byte native command
+// through the QEMU OpenSSH session before retaining the existing sync probe.
+// Its measured transport/session owner reached 262,016/262,144 live bytes and
+// then requested another 1 KiB before the native instance driver was entered.
+// Keep the production, Milk-V, and ordinary ssh-test ceiling unchanged.
+#[cfg(all(
+    feature = "ssh-test",
+    feature = "ssh-native-async-qemu-acceptance",
+    not(feature = "milkv-jitterentropy-ssh-probe")
+))]
+const SSH_TEST_MEMORY_BUDGET: usize = 512 * 1024;
 #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
 const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge

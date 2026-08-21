@@ -913,6 +913,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-component-image-adapter"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-admission",
+ "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-image-policy",
+ "vibeos-vsh",
+]
+
+[[package]]
 name = "vibeos-component-runtime"
 version = "0.1.0"
 dependencies = [

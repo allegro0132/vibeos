@@ -39,7 +39,9 @@ fn main() {
     )
     .expect("write checked Component identity constant");
 
-    if env::var_os("CARGO_FEATURE_C53_NATIVE_ASYNC_QEMU_ACCEPTANCE").is_some() {
+    if env::var_os("CARGO_FEATURE_C53_NATIVE_ASYNC_QEMU_ACCEPTANCE").is_some()
+        || env::var_os("CARGO_FEATURE_C53_NATIVE_ASYNC_COMMAND_PROJECTION").is_some()
+    {
         let bytes = wat::parse_str(NATIVE_ASYNC_SOURCE)
             .expect("pinned native async Component WAT must parse");
         let observed: [u8; 32] = Sha256::digest(&bytes).into();

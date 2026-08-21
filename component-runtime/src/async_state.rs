@@ -92,6 +92,11 @@ impl AsyncStateError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeFilterFinalizeError {
+    Invariant(AsyncStateError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointKind {
     Stream,
     Future,
@@ -729,6 +734,62 @@ impl<T> Table<T> {
         Ok((first_value, second_value))
     }
 
+    /// Discards zero through four distinct, already-live entries as one
+    /// bounded commit.
+    ///
+    /// Every seal, generation, value, duplicate, and live-count check finishes
+    /// before the first value moves. The temporary fixed array permits exact
+    /// rollback if an internal table invariant nevertheless disappears while
+    /// taking the remaining values; no allocation is performed.
+    fn discard_up_to_four(&mut self, seals: [Option<Seal>; 4]) -> Result<(), AsyncStateError> {
+        let count = seals.iter().filter(|seal| seal.is_some()).count();
+        let count_u32 = u32::try_from(count).map_err(|_| AsyncStateError::PairInvariant)?;
+        if self.live < count_u32 {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        let mut indices = [None; 4];
+        for (position, seal) in seals.iter().copied().enumerate() {
+            let Some(seal) = seal else {
+                continue;
+            };
+            if seals[..position].contains(&Some(seal)) {
+                return Err(AsyncStateError::PairInvariant);
+            }
+            let _ = self.get(seal)?;
+            indices[position] = Some(
+                usize::try_from(
+                    seal.index
+                        .checked_sub(1)
+                        .ok_or(AsyncStateError::InvalidHandle)?,
+                )
+                .map_err(|_| AsyncStateError::InvalidHandle)?,
+            );
+        }
+
+        let mut removed: [Option<T>; 4] = core::array::from_fn(|_| None);
+        for position in 0..4 {
+            let Some(index) = indices[position] else {
+                continue;
+            };
+            match self.slots[index].value.take() {
+                Some(value) => removed[position] = Some(value),
+                None => {
+                    for rollback in 0..position {
+                        if let Some(index) = indices[rollback] {
+                            self.slots[index].value = removed[rollback].take();
+                        }
+                    }
+                    return Err(AsyncStateError::PairInvariant);
+                }
+            }
+        }
+        for index in indices.into_iter().flatten() {
+            retire_removed_slot(&mut self.slots[index]);
+        }
+        self.live -= count_u32;
+        Ok(())
+    }
+
     fn get_two_slots_mut(
         &mut self,
         first: Seal,
@@ -877,6 +938,27 @@ pub struct HostCopyTicket {
 impl fmt::Debug for HostCopyTicket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("HostCopyTicket(<opaque>)")
+    }
+}
+
+/// Exact proof that one host peer was consumed by a successful reactive-copy
+/// drop commit.
+///
+/// The receipt is intentionally neither `Clone` nor `Copy`: only AsyncState
+/// can sign it, and the native invocation must retain that single authority
+/// until terminal transport finalization verifies the original pair seal has
+/// become stale.
+pub(crate) struct HostPeerDropReceipt {
+    state_id: NonZeroU64,
+    pair: Seal,
+    kind: EndpointKind,
+    direction: EndpointDirection,
+    value_type: AsyncValueTypeId,
+}
+
+impl fmt::Debug for HostPeerDropReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostPeerDropReceipt(<opaque>)")
     }
 }
 
@@ -1352,6 +1434,317 @@ impl AsyncState {
         bindings.first.host.active = false;
         bindings.second.host.active = false;
         Ok(())
+    }
+
+    /// Atomically settles the four transport identities retained by one
+    /// completed native byte-stream filter invocation.
+    ///
+    /// This is intentionally narrower than general endpoint drop. Every guest
+    /// peer must already have completed its own event cleanup and dropped its
+    /// handle, so finalization cannot manufacture a guest callback event. All
+    /// four pair seals, generations, holders, types, and terminal states are
+    /// checked before the first pair moves.
+    pub(crate) fn finalize_native_filter_transport(
+        &mut self,
+        bindings: &mut HostReadableBindingsPair,
+        output_stream: &ReadableStreamEndpointToken,
+        output_closed: &ReadableFutureEndpointToken,
+        input_stream_drop: Option<&HostPeerDropReceipt>,
+        output_stream_drop: Option<&HostPeerDropReceipt>,
+        output_closed_drop: Option<&HostPeerDropReceipt>,
+    ) -> Result<(), NativeFilterFinalizeError> {
+        let input_stream = self.prepare_terminal_input_binding(
+            &bindings.first,
+            bindings.first_pair,
+            EndpointKind::Stream,
+            input_stream_drop,
+        )?;
+        let input_closed = self.prepare_terminal_input_binding(
+            &bindings.second,
+            bindings.second_pair,
+            EndpointKind::Future,
+            None,
+        )?;
+        if bindings.first.host.value_type != output_stream.value_type()
+            || bindings.second.host.value_type != output_closed.value_type()
+        {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::WrongType,
+            ));
+        }
+        let output_stream = self.prepare_terminal_output_stream(
+            output_stream,
+            output_stream_drop,
+            output_stream.value_type(),
+        )?;
+        let output_closed = self.prepare_terminal_output_future(
+            output_closed,
+            output_closed_drop,
+            output_closed.value_type(),
+        )?;
+
+        let identities = [
+            input_stream.0,
+            input_closed.0,
+            output_stream.0,
+            output_closed.0,
+        ];
+        for (position, pair) in identities.iter().enumerate() {
+            if identities[..position].contains(pair) {
+                return Err(NativeFilterFinalizeError::Invariant(
+                    AsyncStateError::PairInvariant,
+                ));
+            }
+        }
+        let retained = [
+            input_stream.1,
+            input_closed.1,
+            output_stream.1,
+            output_closed.1,
+        ];
+        let retained_count = retained.iter().filter(|pair| pair.is_some()).count();
+        let retained_count = u32::try_from(retained_count)
+            .map_err(|_| NativeFilterFinalizeError::Invariant(AsyncStateError::PairInvariant))?;
+
+        // Once the four expected guest peers have demonstrably completed and
+        // dropped, any remaining task/handle or any pair beyond the exact
+        // retained subset is an opaque sealed-state leak. A consumed pair's
+        // signed old seal was separately required to be stale above, so a
+        // replacement at the same raw slot cannot balance this count.
+        if self.handles.live != 0 || self.tasks.live != 0 || self.pairs.live != retained_count {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        self.pairs
+            .discard_up_to_four(retained)
+            .map_err(NativeFilterFinalizeError::Invariant)?;
+        bindings.first.host.active = false;
+        bindings.second.host.active = false;
+        Ok(())
+    }
+
+    fn prepare_terminal_input_binding(
+        &self,
+        binding: &HostReadableBinding,
+        expected_pair: Seal,
+        expected_kind: EndpointKind,
+        dropped: Option<&HostPeerDropReceipt>,
+    ) -> Result<(Seal, Option<Seal>), NativeFilterFinalizeError> {
+        let authority = &binding.host;
+        if authority.state_id != self.id
+            || binding.guest.state_id != self.id
+            || !authority.active
+            || authority.pair != expected_pair
+            || authority.kind != expected_kind
+            || authority.direction != EndpointDirection::Write
+        {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if let Some(receipt) = dropped {
+            self.prepare_terminal_drop_receipt(
+                receipt,
+                expected_pair,
+                expected_kind,
+                EndpointDirection::Write,
+                authority.value_type,
+            )?;
+            match self.handle_seal(binding.guest) {
+                Err(AsyncStateError::StaleHandle) => {}
+                Ok(_) => {
+                    return Err(NativeFilterFinalizeError::Invariant(
+                        AsyncStateError::PairInvariant,
+                    ))
+                }
+                Err(error) => return Err(NativeFilterFinalizeError::Invariant(error)),
+            }
+            return Ok((expected_pair, None));
+        }
+        let shared = self
+            .pairs
+            .get(expected_pair)
+            .map_err(NativeFilterFinalizeError::Invariant)?;
+        if shared.kind != expected_kind
+            || shared.value_type != authority.value_type
+            || shared.writable != Holder::Host
+        {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if shared.phase != PairPhase::Idle || shared.readable != Holder::Dropped {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if !shared.peer_dropped
+            || (expected_kind == EndpointKind::Stream && shared.host_writable_done)
+        {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if expected_kind == EndpointKind::Future && !shared.host_writable_done {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if self.pair_has_live_handle(expected_pair) {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        match self.handle_seal(binding.guest) {
+            Err(AsyncStateError::StaleHandle) => Ok((expected_pair, Some(expected_pair))),
+            Ok(_) => Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            )),
+            Err(error) => Err(NativeFilterFinalizeError::Invariant(error)),
+        }
+    }
+
+    fn prepare_terminal_output_stream(
+        &self,
+        token: &ReadableStreamEndpointToken,
+        dropped: Option<&HostPeerDropReceipt>,
+        expected_type: AsyncValueTypeId,
+    ) -> Result<(Seal, Option<Seal>), NativeFilterFinalizeError> {
+        if let Some(receipt) = dropped {
+            if validate_readable_stream_endpoint(
+                token,
+                self.id.get(),
+                receipt.pair.index,
+                receipt.pair.generation,
+                expected_type,
+                EndpointOwner::Host,
+            )
+            .is_err()
+            {
+                return Err(NativeFilterFinalizeError::Invariant(
+                    AsyncStateError::PairInvariant,
+                ));
+            }
+            self.prepare_terminal_drop_receipt(
+                receipt,
+                receipt.pair,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                expected_type,
+            )?;
+            return Ok((receipt.pair, None));
+        }
+        let pair = self
+            .find_stream_token(token)
+            .map_err(NativeFilterFinalizeError::Invariant)?;
+        self.prepare_terminal_output_pair(pair, EndpointKind::Stream, expected_type)?;
+        Ok((pair, Some(pair)))
+    }
+
+    fn prepare_terminal_output_future(
+        &self,
+        token: &ReadableFutureEndpointToken,
+        dropped: Option<&HostPeerDropReceipt>,
+        expected_type: AsyncValueTypeId,
+    ) -> Result<(Seal, Option<Seal>), NativeFilterFinalizeError> {
+        if let Some(receipt) = dropped {
+            if validate_readable_future_endpoint(
+                token,
+                self.id.get(),
+                receipt.pair.index,
+                receipt.pair.generation,
+                expected_type,
+                EndpointOwner::Host,
+            )
+            .is_err()
+            {
+                return Err(NativeFilterFinalizeError::Invariant(
+                    AsyncStateError::PairInvariant,
+                ));
+            }
+            self.prepare_terminal_drop_receipt(
+                receipt,
+                receipt.pair,
+                EndpointKind::Future,
+                EndpointDirection::Read,
+                expected_type,
+            )?;
+            return Ok((receipt.pair, None));
+        }
+        let pair = self
+            .find_future_token(token)
+            .map_err(NativeFilterFinalizeError::Invariant)?;
+        self.prepare_terminal_output_pair(pair, EndpointKind::Future, expected_type)?;
+        Ok((pair, Some(pair)))
+    }
+
+    fn prepare_terminal_output_pair(
+        &self,
+        pair: Seal,
+        expected_kind: EndpointKind,
+        expected_type: AsyncValueTypeId,
+    ) -> Result<(), NativeFilterFinalizeError> {
+        let shared = self
+            .pairs
+            .get(pair)
+            .map_err(NativeFilterFinalizeError::Invariant)?;
+        if shared.kind != expected_kind
+            || shared.value_type != expected_type
+            || shared.readable != Holder::Host
+            || shared.host_writable_done
+        {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if shared.phase != PairPhase::Idle || shared.writable != Holder::Dropped {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        if !shared.peer_dropped || self.pair_has_live_handle(pair) {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_terminal_drop_receipt(
+        &self,
+        receipt: &HostPeerDropReceipt,
+        expected_pair: Seal,
+        expected_kind: EndpointKind,
+        expected_direction: EndpointDirection,
+        expected_type: AsyncValueTypeId,
+    ) -> Result<(), NativeFilterFinalizeError> {
+        if receipt.state_id != self.id
+            || receipt.pair != expected_pair
+            || receipt.kind != expected_kind
+            || receipt.direction != expected_direction
+            || receipt.value_type != expected_type
+        {
+            return Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            ));
+        }
+        match self.pairs.get(receipt.pair) {
+            Err(AsyncStateError::StaleHandle) => Ok(()),
+            Ok(_) => Err(NativeFilterFinalizeError::Invariant(
+                AsyncStateError::PairInvariant,
+            )),
+            Err(error) => Err(NativeFilterFinalizeError::Invariant(error)),
+        }
+    }
+
+    fn pair_has_live_handle(&self, pair: Seal) -> bool {
+        self.handles.slots.iter().any(|slot| {
+            matches!(
+                slot.value.as_ref(),
+                Some(HandleEntry::Endpoint(endpoint)) if endpoint.pair == pair
+            )
+        })
     }
 
     fn prepare_host_readable_discard(
@@ -2282,8 +2675,27 @@ impl AsyncState {
         &mut self,
         ticket: &mut HostCopyTicket,
     ) -> Result<EventToken, AsyncStateError> {
+        self.drop_host_copy_peer_with_receipt(ticket)
+            .map(|(event, _receipt)| event)
+    }
+
+    /// Drops the host peer and signs the exact consumed pair identity in the
+    /// same checked commit. Native terminal finalization retains this receipt
+    /// until the guest has reclaimed its callback event and dropped the peer.
+    pub(crate) fn drop_host_copy_peer_with_receipt(
+        &mut self,
+        ticket: &mut HostCopyTicket,
+    ) -> Result<(EventToken, HostPeerDropReceipt), AsyncStateError> {
         let prepared = self.prepare_host_settle(ticket, CopyResult::Dropped, 0, None)?;
-        self.commit_preflighted_host_settle(ticket, prepared)
+        let receipt = HostPeerDropReceipt {
+            state_id: self.id,
+            pair: prepared.pair,
+            kind: prepared.kind,
+            direction: prepared.authority_direction,
+            value_type: prepared.value_type,
+        };
+        let event = self.commit_preflighted_host_settle(ticket, prepared)?;
+        Ok((event, receipt))
     }
 
     fn prepare_host_settle(
@@ -2333,6 +2745,7 @@ impl AsyncState {
             operation: ticket.operation,
             authority_direction: ticket.authority_direction,
             kind: endpoint.kind,
+            value_type: endpoint.value_type,
             result,
             event_progress,
             generation,
@@ -2374,6 +2787,7 @@ impl AsyncState {
             || shared.kind != prepared.kind
             || endpoint.pair != prepared.pair
             || endpoint.kind != shared.kind
+            || endpoint.value_type != prepared.value_type
             || endpoint.value_type != shared.value_type
             || endpoint.direction == prepared.authority_direction
             || endpoint.copy_state != CopyState::Copying
@@ -7587,6 +8001,7 @@ struct PreparedHostSettle {
     operation: OpRef,
     authority_direction: EndpointDirection,
     kind: EndpointKind,
+    value_type: AsyncValueTypeId,
     result: CopyResult,
     event_progress: u32,
     generation: NonZeroU64,

@@ -3,6 +3,12 @@ name = "vibeos-component-runtime"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Narrow acceptance-only access to the validation-candidate native async
+# executor. This does not activate the profile identity or runtime-ready bit.
+native-async-acceptance = []
+
 [dependencies]
 vibeos-component-format = { path = "../component-format" }
 vibeos-wasm-runtime = { path = "../wasm-runtime" }

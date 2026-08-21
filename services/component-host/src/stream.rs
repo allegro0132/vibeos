@@ -597,18 +597,7 @@ impl ByteStreamReader {
     }
 
     pub fn cancel(&self, operation: HostOperationToken) -> Result<(), StreamError> {
-        let mut state = self.stream.state.lock();
-        state.check_live()?;
-        let matches = match state.receive {
-            Some(ReceiveOperation::Waiting(waiting)) => waiting.token == operation,
-            Some(ReceiveOperation::Prepared(prepared)) => prepared.operation == operation,
-            None => false,
-        };
-        if !matches {
-            return Err(StreamError::TokenMismatch);
-        }
-        state.receive = None;
-        Ok(())
+        cancel_reader_operation_exact(&self.stream, operation)
     }
 
     /// Consumer-done publication. Normal remains provisional until the
@@ -756,13 +745,7 @@ impl ByteStreamWriter {
     }
 
     pub fn cancel(&self, operation: HostOperationToken) -> Result<(), StreamError> {
-        let mut state = self.stream.state.lock();
-        state.check_live()?;
-        if state.send.map(|pending| pending.token) != Some(operation) {
-            return Err(StreamError::TokenMismatch);
-        }
-        state.send = None;
-        Ok(())
+        cancel_writer_operation_exact(&self.stream, operation)
     }
 
     /// Producer-done publication.  Normal is provisional until supervisor
@@ -819,6 +802,35 @@ impl ByteStreamSupervisor {
     /// identity or object address is exposed to the caller.
     pub fn same_stream_as_writer(&self, writer: &ByteStreamWriter) -> bool {
         Arc::ptr_eq(&self.stream, &writer.stream)
+    }
+
+    /// Revokes the exact current reader operation after the reader capability
+    /// itself may already have been removed from its CSpace.
+    ///
+    /// This supervisor retains the stream object's unforgeable incarnation;
+    /// `operation` is the independent operation-generation seal. Both must
+    /// identify the current reader slot. A stale, foreign, or pre-restart token
+    /// is inert. Successful cancellation drops any registered wake authority
+    /// without invoking it and does not consume buffered bytes or alter the
+    /// immutable close winner.
+    pub fn cancel_reader_operation_exact(
+        &self,
+        operation: HostOperationToken,
+    ) -> Result<(), StreamError> {
+        cancel_reader_operation_exact(&self.stream, operation)
+    }
+
+    /// Revokes the exact current writer operation after the writer capability
+    /// itself may already have been removed from its CSpace.
+    ///
+    /// The supervisor-bound stream incarnation and `operation` generation must
+    /// both match the current writer slot. Cancellation is otherwise inert;
+    /// success drops, but never invokes, the slot's registered wake authority.
+    pub fn cancel_writer_operation_exact(
+        &self,
+        operation: HostOperationToken,
+    ) -> Result<(), StreamError> {
+        cancel_writer_operation_exact(&self.stream, operation)
     }
 
     /// Starts an observation of the one immutable terminal reason.
@@ -1016,6 +1028,41 @@ impl ByteStreamSupervisor {
     pub fn is_fail_stopped(&self) -> bool {
         self.stream.is_fail_stopped()
     }
+}
+
+fn cancel_reader_operation_exact(
+    stream: &ByteStream,
+    operation: HostOperationToken,
+) -> Result<(), StreamError> {
+    let mut state = stream.state.lock();
+    state.check_live()?;
+    let matches = match state.receive {
+        Some(ReceiveOperation::Waiting(waiting)) => waiting.token == operation,
+        Some(ReceiveOperation::Prepared(prepared)) => prepared.operation == operation,
+        None => false,
+    };
+    if !matches {
+        return Err(StreamError::TokenMismatch);
+    }
+    // Dropping the slot revokes its wake authority. Cancellation never wakes:
+    // a callback already taken by a readiness winner is necessarily late and
+    // still carries only the stale operation generation.
+    state.receive = None;
+    Ok(())
+}
+
+fn cancel_writer_operation_exact(
+    stream: &ByteStream,
+    operation: HostOperationToken,
+) -> Result<(), StreamError> {
+    let mut state = stream.state.lock();
+    state.check_live()?;
+    if state.send.map(|pending| pending.token) != Some(operation) {
+        return Err(StreamError::TokenMismatch);
+    }
+    // As for readers, dropping a registered wake is revocation, not a wakeup.
+    state.send = None;
+    Ok(())
 }
 
 fn publish_close_observed(

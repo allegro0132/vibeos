@@ -19,6 +19,12 @@ struct ReentrantWakeProbe {
     count: AtomicUsize,
 }
 
+struct DelayedWakeProbe {
+    entered: Barrier,
+    release: Barrier,
+    count: AtomicUsize,
+}
+
 fn count_wake(words: [usize; 4]) {
     // The test keeps the Arc containing this allocation alive until every
     // registered operation is either woken or cancelled.
@@ -40,6 +46,21 @@ fn reentrant_wake(words: [usize; 4]) {
 
 fn reentrant_wake_token(probe: &Arc<ReentrantWakeProbe>) -> HostWakeToken {
     HostWakeToken::new([Arc::as_ptr(probe) as usize, 0, 0, 0], reentrant_wake)
+}
+
+fn delayed_wake(words: [usize; 4]) {
+    // The producer has already released the stream lock and detached this
+    // callback from the old operation slot. Hold it outside the lock so the
+    // test can cancel that slot and publish a replacement before this late
+    // wake returns.
+    let probe = unsafe { &*(words[0] as *const DelayedWakeProbe) };
+    probe.count.fetch_add(1, Ordering::SeqCst);
+    probe.entered.wait();
+    probe.release.wait();
+}
+
+fn delayed_wake_token(probe: &Arc<DelayedWakeProbe>) -> HostWakeToken {
+    HostWakeToken::new([Arc::as_ptr(probe) as usize, 0, 0, 0], delayed_wake)
 }
 
 fn receive_one(reader: &vibeos_component_host::ByteStreamReader) -> Vec<u8> {
@@ -180,6 +201,150 @@ fn waiting_to_prepared_uses_fresh_token_and_stale_or_cross_tokens_are_inert() {
 }
 
 #[test]
+fn supervisor_reader_cancel_is_exact_across_incarnation_token_and_restart() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let foreign_stream = ByteStream::new();
+    let foreign_reader = foreign_stream.reader();
+    let foreign_supervisor = foreign_stream.supervisor();
+    let probe = Arc::new(WakeProbe {
+        count: AtomicUsize::new(0),
+    });
+
+    let first = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected reader wait, got {other:?}"),
+    };
+    let foreign = match foreign_reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected foreign reader wait, got {other:?}"),
+    };
+    reader.register_wake(first, wake_token(&probe)).unwrap();
+
+    // The operation token alone is not authority: the wrong supervisor names
+    // a different stream incarnation and cannot revoke this slot.
+    assert_eq!(
+        foreign_supervisor.cancel_reader_operation_exact(first),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(reader.start(), Err(StreamError::Busy));
+    assert_eq!(foreign_reader.start(), Err(StreamError::Busy));
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+
+    supervisor.cancel_reader_operation_exact(first).unwrap();
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    assert_eq!(reader.resume(first), Err(StreamError::TokenMismatch));
+
+    let restarted = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected restarted reader wait, got {other:?}"),
+    };
+    assert_ne!(first, restarted);
+    reader.register_wake(restarted, wake_token(&probe)).unwrap();
+    assert_eq!(
+        supervisor.cancel_reader_operation_exact(first),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(writer.start(&[7, 8, 9]), Ok(StreamSendDispatch::Sent));
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+
+    let prepared = match reader.resume(restarted).unwrap() {
+        StreamReceiveDispatch::Prepared(prepared) => prepared,
+        other => panic!("expected prepared restart, got {other:?}"),
+    };
+    assert_ne!(restarted, prepared.operation());
+    supervisor
+        .cancel_reader_operation_exact(prepared.operation())
+        .unwrap();
+    assert_eq!(stream.depth(), 1);
+
+    let replacement = match reader.start().unwrap() {
+        StreamReceiveDispatch::Prepared(prepared) => prepared,
+        other => panic!("cancelled preparation must restart, got {other:?}"),
+    };
+    let mut bytes = [0_u8; 3];
+    assert_eq!(
+        reader.commit(replacement.operation(), &mut bytes),
+        Ok(StreamReceiveCommit::Received(3))
+    );
+    assert_eq!(bytes, [7, 8, 9]);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    foreign_supervisor
+        .cancel_reader_operation_exact(foreign)
+        .unwrap();
+}
+
+#[test]
+fn supervisor_writer_cancel_is_exact_and_never_wakes_the_revoked_slot() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let foreign_stream = ByteStream::new();
+    let foreign_writer = foreign_stream.writer();
+    let foreign_supervisor = foreign_stream.supervisor();
+    let probe = Arc::new(WakeProbe {
+        count: AtomicUsize::new(0),
+    });
+
+    for value in 0..STREAM_BUFFER_CHUNKS {
+        assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+    }
+    let first = match writer.start(&[99]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("expected writer backpressure, got {other:?}"),
+    };
+    for value in 0..STREAM_BUFFER_CHUNKS {
+        assert_eq!(
+            foreign_writer.start(&[value as u8]),
+            Ok(StreamSendDispatch::Sent)
+        );
+    }
+    let foreign = match foreign_writer.start(&[101]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("expected foreign writer wait, got {other:?}"),
+    };
+    writer.register_wake(first, wake_token(&probe)).unwrap();
+    assert_eq!(
+        foreign_supervisor.cancel_writer_operation_exact(first),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(
+        supervisor.cancel_reader_operation_exact(first),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(writer.start(&[100]), Err(StreamError::Busy));
+    assert_eq!(foreign_writer.start(&[102]), Err(StreamError::Busy));
+
+    supervisor.cancel_writer_operation_exact(first).unwrap();
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    assert_eq!(writer.resume(first, &[99]), Err(StreamError::TokenMismatch));
+
+    let restarted = match writer.start(&[100]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("expected restarted writer wait, got {other:?}"),
+    };
+    assert_ne!(first, restarted);
+    writer.register_wake(restarted, wake_token(&probe)).unwrap();
+    assert_eq!(
+        supervisor.cancel_writer_operation_exact(first),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(receive_one(&reader), [0]);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        writer.resume(restarted, &[100]),
+        Ok(StreamSendDispatch::Sent)
+    );
+    assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+    foreign_supervisor
+        .cancel_writer_operation_exact(foreign)
+        .unwrap();
+}
+
+#[test]
 fn late_listener_recheck_never_loses_readable_or_writable_wake() {
     let stream = ByteStream::new();
     let reader = stream.reader();
@@ -224,6 +389,102 @@ fn late_listener_recheck_never_loses_readable_or_writable_wake() {
 }
 
 #[test]
+fn detached_late_reader_wake_cannot_touch_the_restarted_operation() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(DelayedWakeProbe {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+        count: AtomicUsize::new(0),
+    });
+
+    let stale = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected reader wait, got {other:?}"),
+    };
+    reader
+        .register_wake(stale, delayed_wake_token(&probe))
+        .unwrap();
+
+    let producer = thread::spawn(move || writer.start(&[0xa5]));
+    probe.entered.wait();
+    // Readiness has detached the old callback and released the lock, but the
+    // old operation remains current until this exact supervisor revokes it.
+    supervisor.cancel_reader_operation_exact(stale).unwrap();
+    let restarted = match reader.start().unwrap() {
+        StreamReceiveDispatch::Prepared(prepared) => prepared,
+        other => panic!("queued byte must prepare after restart, got {other:?}"),
+    };
+    assert_ne!(stale, restarted.operation());
+    assert_eq!(
+        supervisor.cancel_reader_operation_exact(stale),
+        Err(StreamError::TokenMismatch)
+    );
+
+    probe.release.wait();
+    assert_eq!(producer.join().unwrap(), Ok(StreamSendDispatch::Sent));
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(reader.resume(stale), Err(StreamError::TokenMismatch));
+
+    let mut byte = [0_u8];
+    assert_eq!(
+        reader.commit(restarted.operation(), &mut byte),
+        Ok(StreamReceiveCommit::Received(1))
+    );
+    assert_eq!(byte, [0xa5]);
+}
+
+#[test]
+fn detached_late_writer_wake_cannot_touch_the_restarted_operation() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(DelayedWakeProbe {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+        count: AtomicUsize::new(0),
+    });
+
+    for value in 0..STREAM_BUFFER_CHUNKS {
+        assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+    }
+    let stale = match writer.start(&[0xb4]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("expected writer wait, got {other:?}"),
+    };
+    writer
+        .register_wake(stale, delayed_wake_token(&probe))
+        .unwrap();
+
+    let consumer = thread::spawn(move || receive_one(&reader));
+    probe.entered.wait();
+    supervisor.cancel_writer_operation_exact(stale).unwrap();
+    assert_eq!(writer.start(&[0xb5]), Ok(StreamSendDispatch::Sent));
+    let restarted = match writer.start(&[0xb6]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("refilled ring must restart writer wait, got {other:?}"),
+    };
+    assert_ne!(stale, restarted);
+    assert_eq!(
+        supervisor.cancel_writer_operation_exact(stale),
+        Err(StreamError::TokenMismatch)
+    );
+
+    probe.release.wait();
+    assert_eq!(consumer.join().unwrap(), [0]);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        writer.resume(stale, &[0xb4]),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(writer.start(&[0xb7]), Err(StreamError::Busy));
+    supervisor.cancel_writer_operation_exact(restarted).unwrap();
+}
+
+#[test]
 fn endpoint_identity_check_is_redacted_and_exact() {
     let first = ByteStream::new();
     let first_reader = first.reader();
@@ -259,6 +520,53 @@ fn supervisor_is_a_distinct_invoke_only_cspace_resource() {
     assert!(space
         .lookup_as::<vibeos_component_host::ByteStreamSupervisor>(cap, Rights::RECV)
         .is_err());
+}
+
+#[test]
+fn supervisor_exact_cancel_survives_endpoint_cap_revocation() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let supervisor = stream.supervisor();
+    let waiting = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected reader wait, got {other:?}"),
+    };
+    let mut space = CSpace::new("reader-revoke-before-cancel");
+    let endpoint_cap = space.mint(reader.clone(), Rights::RECV.union(Rights::REVOKE));
+    let supervisor_cap = space.mint(supervisor, Rights::INVOKE);
+    let supervisor = space
+        .lookup_as::<vibeos_component_host::ByteStreamSupervisor>(supervisor_cap, Rights::INVOKE)
+        .unwrap();
+    assert_eq!(space.revoke(endpoint_cap), Ok(1));
+    drop(reader);
+    assert_eq!(supervisor.cancel_reader_operation_exact(waiting), Ok(()));
+    assert!(matches!(
+        stream.reader().start(),
+        Ok(StreamReceiveDispatch::Waiting(operation)) if operation != waiting
+    ));
+
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    for value in 0..STREAM_BUFFER_CHUNKS {
+        assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+    }
+    let blocked = match writer.start(&[0xc1]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("expected writer wait, got {other:?}"),
+    };
+    let mut space = CSpace::new("writer-revoke-before-cancel");
+    let endpoint_cap = space.mint(writer.clone(), Rights::SEND.union(Rights::REVOKE));
+    let supervisor_cap = space.mint(supervisor, Rights::INVOKE);
+    let supervisor = space
+        .lookup_as::<vibeos_component_host::ByteStreamSupervisor>(supervisor_cap, Rights::INVOKE)
+        .unwrap();
+    assert_eq!(space.revoke(endpoint_cap), Ok(1));
+    drop(writer);
+    assert_eq!(supervisor.cancel_writer_operation_exact(blocked), Ok(()));
+    assert_eq!(receive_one(&reader), [0]);
+    assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1);
 }
 
 #[test]
@@ -885,6 +1193,118 @@ fn observed_conflict_preserves_the_established_reason_and_fail_stops() {
 }
 
 #[test]
+fn exact_cancel_preserves_fault_close_first_winner_and_restart_incarnation() {
+    for reason in [
+        StreamCloseReason::Failure,
+        StreamCloseReason::Cancelled,
+        StreamCloseReason::BackendFault,
+    ] {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        let probe = Arc::new(WakeProbe {
+            count: AtomicUsize::new(0),
+        });
+        let waiting = match reader.start().unwrap() {
+            StreamReceiveDispatch::Waiting(operation) => operation,
+            other => panic!("expected reader wait, got {other:?}"),
+        };
+        reader.register_wake(waiting, wake_token(&probe)).unwrap();
+        let first = supervisor.finalize_preserving_first_observed(reason);
+        assert_eq!(first.outcome(), StreamCloseOutcome::Published);
+        assert_eq!(first.effective_reason(), Some(reason));
+        assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+
+        // Finalization detaches the wake but deliberately leaves the endpoint
+        // operation for exact lifecycle cleanup after its cap is revoked.
+        supervisor.cancel_reader_operation_exact(waiting).unwrap();
+        assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+        let late_normal = writer.close_observed(StreamCloseReason::Normal);
+        assert_eq!(late_normal.outcome(), StreamCloseOutcome::AlreadyPublished);
+        assert_eq!(late_normal.effective_reason(), Some(reason));
+        assert_eq!(supervisor.final_reason(), Some(reason));
+        assert!(!supervisor.is_fail_stopped());
+        assert_eq!(reader.start(), Ok(StreamReceiveDispatch::Closed(reason)));
+
+        // A restarted stream is a different supervisor-bound incarnation.
+        // Neither side accepts the other's otherwise well-formed token.
+        let restarted_stream = ByteStream::new();
+        let restarted_reader = restarted_stream.reader();
+        let restarted_supervisor = restarted_stream.supervisor();
+        let restarted = match restarted_reader.start().unwrap() {
+            StreamReceiveDispatch::Waiting(operation) => operation,
+            other => panic!("expected restarted stream wait, got {other:?}"),
+        };
+        assert_eq!(
+            supervisor.cancel_reader_operation_exact(restarted),
+            Err(StreamError::TokenMismatch)
+        );
+        assert_eq!(
+            restarted_supervisor.cancel_reader_operation_exact(waiting),
+            Err(StreamError::TokenMismatch)
+        );
+        assert_eq!(restarted_reader.start(), Err(StreamError::Busy));
+        restarted_supervisor
+            .cancel_reader_operation_exact(restarted)
+            .unwrap();
+
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        let probe = Arc::new(WakeProbe {
+            count: AtomicUsize::new(0),
+        });
+        for value in 0..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let blocked = match writer.start(&[0x91]).unwrap() {
+            StreamSendDispatch::Waiting(operation) => operation,
+            other => panic!("expected writer wait, got {other:?}"),
+        };
+        writer.register_wake(blocked, wake_token(&probe)).unwrap();
+        assert_eq!(
+            supervisor
+                .finalize_preserving_first_observed(reason)
+                .outcome(),
+            StreamCloseOutcome::Published
+        );
+        assert_eq!(stream.depth(), 0);
+        assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+        supervisor.cancel_writer_operation_exact(blocked).unwrap();
+        assert_eq!(
+            writer.resume(blocked, &[0x91]),
+            Err(StreamError::TokenMismatch)
+        );
+        assert_eq!(supervisor.final_reason(), Some(reason));
+        assert!(!stream.is_fail_stopped());
+        assert_eq!(reader.start(), Ok(StreamReceiveDispatch::Closed(reason)));
+    }
+
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let supervisor = stream.supervisor();
+    let waiting = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected reader wait, got {other:?}"),
+    };
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Failure),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Cancelled),
+        StreamCloseOutcome::Conflict
+    );
+    assert_eq!(
+        supervisor.cancel_reader_operation_exact(waiting),
+        Err(StreamError::FailStopped)
+    );
+    assert_eq!(supervisor.final_reason(), Some(StreamCloseReason::Failure));
+}
+
+#[test]
 fn lifecycle_finalizer_failure_cancelled_race_preserves_exactly_one_winner() {
     for _ in 0..128 {
         let stream = ByteStream::new();
@@ -1154,6 +1574,160 @@ fn observed_producer_done_and_failure_are_linearizable_across_harts() {
             Some(StreamCloseReason::Failure)
         );
         assert_eq!(stream.final_reason(), Some(StreamCloseReason::Failure));
+        assert!(!stream.is_fail_stopped());
+    }
+}
+
+#[test]
+fn exact_cancel_model_exhausts_both_linearization_orders_for_both_directions() {
+    for cancel_first in [true, false] {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        assert_eq!(writer.start(&[0x51]), Ok(StreamSendDispatch::Sent));
+        let prepared = match reader.start().unwrap() {
+            StreamReceiveDispatch::Prepared(prepared) => prepared,
+            other => panic!("expected prepared reader operation, got {other:?}"),
+        };
+        let mut byte = [0_u8];
+
+        if cancel_first {
+            assert_eq!(
+                supervisor.cancel_reader_operation_exact(prepared.operation()),
+                Ok(())
+            );
+            assert_eq!(
+                reader.commit(prepared.operation(), &mut byte),
+                Err(StreamError::TokenMismatch)
+            );
+            assert_eq!(stream.depth(), 1);
+            assert_eq!(receive_one(&reader), [0x51]);
+        } else {
+            assert_eq!(
+                reader.commit(prepared.operation(), &mut byte),
+                Ok(StreamReceiveCommit::Received(1))
+            );
+            assert_eq!(byte, [0x51]);
+            assert_eq!(
+                supervisor.cancel_reader_operation_exact(prepared.operation()),
+                Err(StreamError::TokenMismatch)
+            );
+            assert_eq!(stream.depth(), 0);
+        }
+
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        for value in 0..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let blocked = match writer.start(&[0x61]).unwrap() {
+            StreamSendDispatch::Waiting(operation) => operation,
+            other => panic!("expected blocked writer operation, got {other:?}"),
+        };
+        assert_eq!(receive_one(&reader), [0]);
+
+        if cancel_first {
+            assert_eq!(supervisor.cancel_writer_operation_exact(blocked), Ok(()));
+            assert_eq!(
+                writer.resume(blocked, &[0x61]),
+                Err(StreamError::TokenMismatch)
+            );
+            assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1);
+        } else {
+            assert_eq!(
+                writer.resume(blocked, &[0x61]),
+                Ok(StreamSendDispatch::Sent)
+            );
+            assert_eq!(
+                supervisor.cancel_writer_operation_exact(blocked),
+                Err(StreamError::TokenMismatch)
+            );
+            assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+        }
+        assert!(!stream.is_fail_stopped());
+    }
+}
+
+#[test]
+fn exact_cancel_and_backend_linearization_are_atomic_across_harts() {
+    for _ in 0..128 {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        assert_eq!(writer.start(&[0x71]), Ok(StreamSendDispatch::Sent));
+        let prepared = match reader.start().unwrap() {
+            StreamReceiveDispatch::Prepared(prepared) => prepared,
+            other => panic!("expected prepared reader operation, got {other:?}"),
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let cancel_barrier = barrier.clone();
+        let cancel = thread::spawn(move || {
+            cancel_barrier.wait();
+            supervisor.cancel_reader_operation_exact(prepared.operation())
+        });
+        let commit_barrier = barrier.clone();
+        let commit = thread::spawn(move || {
+            let mut byte = [0_u8];
+            commit_barrier.wait();
+            (reader.commit(prepared.operation(), &mut byte), byte)
+        });
+        barrier.wait();
+        let cancel = cancel.join().unwrap();
+        let (commit, byte) = commit.join().unwrap();
+        match (cancel, commit) {
+            (Ok(()), Err(StreamError::TokenMismatch)) => {
+                assert_eq!(byte, [0]);
+                assert_eq!(stream.depth(), 1);
+                let replacement = stream.reader();
+                assert_eq!(receive_one(&replacement), [0x71]);
+            }
+            (Err(StreamError::TokenMismatch), Ok(StreamReceiveCommit::Received(1))) => {
+                assert_eq!(byte, [0x71]);
+                assert_eq!(stream.depth(), 0);
+            }
+            other => panic!("non-linearizable reader cancellation outcome: {other:?}"),
+        }
+        assert!(!stream.is_fail_stopped());
+
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        for value in 0..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let blocked = match writer.start(&[0x72]).unwrap() {
+            StreamSendDispatch::Waiting(operation) => operation,
+            other => panic!("expected blocked writer operation, got {other:?}"),
+        };
+        assert_eq!(receive_one(&reader), [0]);
+        let barrier = Arc::new(Barrier::new(3));
+        let cancel_barrier = barrier.clone();
+        let cancel = thread::spawn(move || {
+            cancel_barrier.wait();
+            supervisor.cancel_writer_operation_exact(blocked)
+        });
+        let resume_barrier = barrier.clone();
+        let resume = thread::spawn(move || {
+            resume_barrier.wait();
+            writer.resume(blocked, &[0x72])
+        });
+        barrier.wait();
+        let cancel = cancel.join().unwrap();
+        let resume = resume.join().unwrap();
+        match (cancel, resume) {
+            (Ok(()), Err(StreamError::TokenMismatch)) => {
+                assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1)
+            }
+            (Err(StreamError::TokenMismatch), Ok(StreamSendDispatch::Sent)) => {
+                assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS)
+            }
+            other => panic!("non-linearizable writer cancellation outcome: {other:?}"),
+        }
         assert!(!stream.is_fail_stopped());
     }
 }

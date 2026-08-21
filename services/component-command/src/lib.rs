@@ -18,15 +18,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use vibeos_component_admission::{
     AdmissionError, AdmittedComponent, CommandStreamMode,
-    ComponentCommandManifest as AdmissionManifest,
+    ComponentCommandManifest as AdmissionManifest, STREAM_FILTER_WORLD,
 };
 use vibeos_component_format::{TrapCode, PROFILE_1_LIMITS};
-use vibeos_component_host::HostResourceKind;
+use vibeos_component_host::{HostResourceKind, VibeHostManifest};
 use vibeos_component_runtime::decode::ComponentPlan;
 use vibeos_component_runtime::host::HostError;
-use vibeos_component_runtime::resource::ResourceTable;
+use vibeos_component_runtime::resource::{ResourceTable, ResourceTypeId};
 use vibeos_component_runtime::sync::{SyncError, SynchronousComponent, TypedPoll};
-use vibeos_component_runtime::value::{CanonicalValue, ValueType};
+use vibeos_component_runtime::value::{CanonicalValue, ResourceOwnership, ValueType};
 use vibeos_vsh::{
     ComponentArtifactIdentity, ComponentAuthorityRequirement, ComponentCommandFuture,
     ComponentCommandManifest, ComponentCommandResult, ComponentCommandRunner, ComponentTerminal,
@@ -36,6 +36,9 @@ use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
 
 /// Exact parameter name in the reviewed Profile-1 VSH byte-filter ABI.
 pub const BYTE_FILTER_PARAMETER: &str = "input";
+pub const STREAM_READER_PARAMETER: &str = "input";
+pub const STREAM_WRITER_PARAMETER: &str = "output";
+const STREAM_FILTER_RUNTIME_INSTANCES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerBuildError {
@@ -209,6 +212,12 @@ impl SynchronousCommandRunner {
             }
             match call.poll() {
                 TypedPoll::Pending(_) => vibeos_core::exec::yield_now().await,
+                // This legacy runner has no lifecycle-owned stream dispatcher
+                // or exact wake registration. A pending host operation must
+                // fail closed instead of being polled as a busy loop.
+                TypedPoll::HostPending(_) => {
+                    return terminal_result(ComponentTerminal::BackendFault);
+                }
                 TypedPoll::Ready(value) => break value,
                 TypedPoll::HostFailed(error) => {
                     return terminal_result(host_error_terminal(error));
@@ -279,6 +288,93 @@ pub fn validate_admitted_filter(
         return Err(RunnerBuildError::ManifestMismatch);
     }
     Ok(())
+}
+
+/// Revalidate the exact C5.3 stream-filter contract without constructing a
+/// runtime instance or accepting transport resources as ambient authority.
+///
+/// The trusted lifecycle calls this before reserving a registry entry. The
+/// two resource parameters are injected from the command's stdin/stdout
+/// binding; they are not shell value arguments and never appear in the sealed
+/// ambient requirement/grant vectors.
+pub fn validate_admitted_stream_filter(
+    admitted: &AdmittedComponent,
+    manifest: &ComponentCommandManifest,
+) -> Result<(), RunnerBuildError> {
+    let source = admitted.command_manifest();
+    let plan = admitted
+        .validated_plan()
+        .map_err(RunnerBuildError::Admission)?;
+    if !source.uses_stream_transport()
+        || source.world() != STREAM_FILTER_WORLD
+        || source.min_args() != 0
+        || source.max_args() != 0
+        || source.stdin() != CommandStreamMode::Required
+        || source.stdout() != CommandStreamMode::Required
+        || source.stderr() == CommandStreamMode::Required
+    {
+        return Err(RunnerBuildError::UnsupportedStreams);
+    }
+    if !source.requirements().is_empty() || !admitted.grants().is_empty() {
+        return Err(RunnerBuildError::UnsupportedImports);
+    }
+    // A list-bearing canonical lower needs one memory-provider instance plus
+    // the guest instance: it cannot borrow the guest's own memory before that
+    // guest has been instantiated. Keep this topology exact for the pinned
+    // C5.3 artifact; the legacy no-import runner remains one-instance-only.
+    if plan.runtime_instance_count() != STREAM_FILTER_RUNTIME_INSTANCES {
+        return Err(RunnerBuildError::UnsupportedRuntimeInstances);
+    }
+    let (reader, writer) = VibeHostManifest::from_plan(&plan)
+        .map_err(|_| RunnerBuildError::UnsupportedImports)?
+        .stream_resource_types()
+        .ok_or(RunnerBuildError::UnsupportedImports)?;
+    if !plan_stream_signature_matches(&plan, source, reader, writer) {
+        return Err(RunnerBuildError::UnsupportedSignature);
+    }
+    let regenerated = try_manifest_from_admitted(admitted)?;
+    if &regenerated != manifest {
+        return Err(RunnerBuildError::ManifestMismatch);
+    }
+    Ok(())
+}
+
+fn plan_stream_signature_matches(
+    plan: &ComponentPlan<'_>,
+    manifest: &AdmissionManifest,
+    reader: ResourceTypeId,
+    writer: ResourceTypeId,
+) -> bool {
+    let mut exports = plan
+        .executable_exports()
+        .filter(|export| export.name == manifest.entrypoint());
+    let Some(export) = exports.next() else {
+        return false;
+    };
+    exports.next().is_none() && stream_function_is_filter(&export.function, reader, writer)
+}
+
+fn stream_function_is_filter(
+    function: &vibeos_component_runtime::types::FunctionType,
+    reader: ResourceTypeId,
+    writer: ResourceTypeId,
+) -> bool {
+    let [input, output] = function.parameters.as_slice() else {
+        return false;
+    };
+    input.name == STREAM_READER_PARAMETER
+        && output.name == STREAM_WRITER_PARAMETER
+        && borrowed_resource(&input.value, reader)
+        && borrowed_resource(&output.value, writer)
+        && function.result.is_none()
+}
+
+fn borrowed_resource(value: &ValueType, expected: ResourceTypeId) -> bool {
+    *value
+        == ValueType::Resource {
+            resource_type: expected,
+            ownership: ResourceOwnership::Borrow,
+        }
 }
 
 fn plan_signature_matches(plan: &ComponentPlan<'_>, manifest: &AdmissionManifest) -> bool {
@@ -370,6 +466,8 @@ const fn vsh_resource_kind(kind: HostResourceKind) -> &'static str {
         HostResourceKind::Random => "component-random",
         HostResourceKind::Blob => "component-blob",
         HostResourceKind::StructuredLog => "component-structured-log",
+        HostResourceKind::ByteStreamReader => "component-byte-stream-reader",
+        HostResourceKind::ByteStreamWriter => "component-byte-stream-writer",
     }
 }
 
@@ -416,6 +514,9 @@ const fn host_error_terminal(error: HostError) -> ComponentTerminal {
         HostError::Denied => ComponentTerminal::Denied,
         HostError::Unavailable => ComponentTerminal::Unavailable,
         HostError::Exhausted | HostError::BudgetExceeded => ComponentTerminal::BudgetExceeded,
+        HostError::Failed => ComponentTerminal::Returned(1),
+        HostError::Cancelled => ComponentTerminal::Cancelled,
+        HostError::InvalidState => ComponentTerminal::Usage,
         HostError::InvalidArgument | HostError::BackendFault => ComponentTerminal::BackendFault,
     }
 }

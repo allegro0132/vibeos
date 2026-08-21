@@ -31,6 +31,11 @@ pub const BLOB_LEN_FUNCTION: &str = "len";
 pub const BLOB_READ_FUNCTION: &str = "read";
 pub const LOG_INTERFACE: &str = "vibe:log/structured@1.0.0";
 pub const LOG_WRITE_FUNCTION: &str = "write";
+pub const STREAM_INTERFACE: &str = "vibe:stream/streams@1.0.0";
+pub const STREAM_READ_FUNCTION: &str = "read";
+pub const STREAM_WRITE_FUNCTION: &str = "write";
+pub const STREAM_CLOSE_READER_FUNCTION: &str = "close-reader";
+pub const STREAM_CLOSE_WRITER_FUNCTION: &str = "close-writer";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostManifestError {
@@ -51,6 +56,8 @@ pub struct VibeHostManifest {
     random: Option<ResourceTypeId>,
     blob: Option<ResourceTypeId>,
     log: Option<ResourceTypeId>,
+    stream_reader: Option<ResourceTypeId>,
+    stream_writer: Option<ResourceTypeId>,
 }
 
 /// One capability requirement derived from an exact, validator-produced host
@@ -93,12 +100,18 @@ impl VibeHostManifest {
             random: None,
             blob: None,
             log: None,
+            stream_reader: None,
+            stream_writer: None,
         };
         let mut clock_seen = false;
         let mut random_seen = false;
         let mut blob_len_seen = false;
         let mut blob_read_seen = false;
         let mut log_seen = false;
+        let mut stream_read_seen = false;
+        let mut stream_write_seen = false;
+        let mut stream_close_reader_seen = false;
+        let mut stream_close_writer_seen = false;
         let mut count = 0_usize;
 
         for import in plan.host_imports() {
@@ -146,6 +159,34 @@ impl VibeHostManifest {
                     }
                     set_resource_type(&mut manifest.log, resource_type)?;
                 }
+                (STREAM_INTERFACE, STREAM_READ_FUNCTION) => {
+                    mark_once(&mut stream_read_seen)?;
+                    if !stream_read_shape(&import.function_type, resource_type) {
+                        return Err(HostManifestError::InvalidShape);
+                    }
+                    set_resource_type(&mut manifest.stream_reader, resource_type)?;
+                }
+                (STREAM_INTERFACE, STREAM_WRITE_FUNCTION) => {
+                    mark_once(&mut stream_write_seen)?;
+                    if !stream_write_shape(&import.function_type, resource_type) {
+                        return Err(HostManifestError::InvalidShape);
+                    }
+                    set_resource_type(&mut manifest.stream_writer, resource_type)?;
+                }
+                (STREAM_INTERFACE, STREAM_CLOSE_READER_FUNCTION) => {
+                    mark_once(&mut stream_close_reader_seen)?;
+                    if !stream_close_shape(&import.function_type, resource_type, true) {
+                        return Err(HostManifestError::InvalidShape);
+                    }
+                    set_resource_type(&mut manifest.stream_reader, resource_type)?;
+                }
+                (STREAM_INTERFACE, STREAM_CLOSE_WRITER_FUNCTION) => {
+                    mark_once(&mut stream_close_writer_seen)?;
+                    if !stream_close_shape(&import.function_type, resource_type, false) {
+                        return Err(HostManifestError::InvalidShape);
+                    }
+                    set_resource_type(&mut manifest.stream_writer, resource_type)?;
+                }
                 _ => return Err(HostManifestError::UnexpectedImport),
             }
         }
@@ -153,7 +194,21 @@ impl VibeHostManifest {
             return Err(HostManifestError::Empty);
         }
 
-        let ids = [manifest.clock, manifest.random, manifest.blob, manifest.log];
+        validate_stream_import_set(
+            &manifest,
+            stream_read_seen,
+            stream_write_seen,
+            stream_close_reader_seen,
+            stream_close_writer_seen,
+        )?;
+        let ids = [
+            manifest.clock,
+            manifest.random,
+            manifest.blob,
+            manifest.log,
+            manifest.stream_reader,
+            manifest.stream_writer,
+        ];
         for (index, id) in ids.iter().enumerate() {
             if id.is_some() && ids[..index].contains(id) {
                 return Err(HostManifestError::DuplicateResourceType);
@@ -194,10 +249,50 @@ impl VibeHostManifest {
                 kind: crate::HostResourceKind::StructuredLog,
                 rights: vibeos_core::cap::Rights::WRITE,
             }),
+            self.stream_reader.map(|_| VibeHostRequirement {
+                interface: STREAM_INTERFACE,
+                resource: "reader",
+                kind: crate::HostResourceKind::ByteStreamReader,
+                rights: vibeos_core::cap::Rights::RECV,
+            }),
+            self.stream_writer.map(|_| VibeHostRequirement {
+                interface: STREAM_INTERFACE,
+                resource: "writer",
+                kind: crate::HostResourceKind::ByteStreamWriter,
+                rights: vibeos_core::cap::Rights::SEND,
+            }),
         ]
         .into_iter()
         .flatten()
     }
+
+    /// Exact nominal stream resource IDs for this one validated decode.
+    pub const fn stream_resource_types(self) -> Option<(ResourceTypeId, ResourceTypeId)> {
+        match (self.stream_reader, self.stream_writer) {
+            (Some(reader), Some(writer)) => Some((reader, writer)),
+            _ => None,
+        }
+    }
+}
+
+fn validate_stream_import_set(
+    manifest: &VibeHostManifest,
+    read: bool,
+    write: bool,
+    close_reader: bool,
+    close_writer: bool,
+) -> Result<(), HostManifestError> {
+    if (manifest.stream_reader.is_some() || manifest.stream_writer.is_some())
+        && (manifest.stream_reader.is_none()
+            || manifest.stream_writer.is_none()
+            || !read
+            || !write
+            || !close_reader
+            || !close_writer)
+    {
+        return Err(HostManifestError::InvalidShape);
+    }
+    Ok(())
 }
 
 fn validate_normalized_imports(imports: &[NamedEntityShape]) -> Result<(), HostManifestError> {
@@ -208,6 +303,7 @@ fn validate_normalized_imports(imports: &[NamedEntityShape]) -> Result<(), HostM
     let mut random = false;
     let mut blob = false;
     let mut log = false;
+    let mut stream = false;
     for import in imports {
         let valid = match import.name.as_str() {
             CLOCK_INTERFACE => {
@@ -225,6 +321,10 @@ fn validate_normalized_imports(imports: &[NamedEntityShape]) -> Result<(), HostM
             LOG_INTERFACE => {
                 mark_once(&mut log)?;
                 log_interface(import)
+            }
+            STREAM_INTERFACE => {
+                mark_once(&mut stream)?;
+                stream_interface(import)
             }
             _ => return Err(HostManifestError::UnexpectedImport),
         };
@@ -418,6 +518,63 @@ fn log_interface(import: &NamedEntityShape) -> bool {
             &[("log", Shape::Borrow("structured-log")), ("event", EVENT)],
             Some(RESULT),
         ))
+}
+
+const STREAM_CLOSE_CASES: &[&str] = &[
+    "normal",
+    "failure",
+    "cancelled",
+    "denied",
+    "unavailable",
+    "exhausted",
+    "invalid",
+    "backend-fault",
+];
+
+fn stream_interface(import: &NamedEntityShape) -> bool {
+    const BYTE: Shape<'_> = Shape::U8;
+    const BYTES: Shape<'_> = Shape::List(&BYTE);
+    const REASON: Shape<'_> = Shape::Enum(STREAM_CLOSE_CASES);
+    matches!(interface_members(import), Some([reader, writer, reason, read, write, close_reader, close_writer])
+        if resource(reader, "reader")
+            && resource(writer, "writer")
+            && enum_type(reason, "close-reason", STREAM_CLOSE_CASES)
+            && function(read, STREAM_READ_FUNCTION,
+                &[("input", Shape::Borrow("reader"))], Some(BYTES))
+            && function(write, STREAM_WRITE_FUNCTION,
+                &[("output", Shape::Borrow("writer")), ("bytes", BYTES)], None)
+            && function(close_reader, STREAM_CLOSE_READER_FUNCTION,
+                &[("input", Shape::Borrow("reader")), ("reason", REASON)], None)
+            && function(close_writer, STREAM_CLOSE_WRITER_FUNCTION,
+                &[("output", Shape::Borrow("writer")), ("reason", REASON)], None))
+}
+
+fn stream_read_shape(function: &FunctionType, reader: ResourceTypeId) -> bool {
+    matches!(function.parameters.as_slice(), [NamedParameterType { name, value: ValueType::Resource { resource_type, ownership: ResourceOwnership::Borrow } }]
+        if name == "input" && *resource_type == reader)
+        && matches!(function.result.as_ref(), Some(ValueType::List(item)) if matches!(item.as_ref(), ValueType::U8))
+}
+
+fn stream_write_shape(function: &FunctionType, writer: ResourceTypeId) -> bool {
+    matches!(function.parameters.as_slice(), [
+        NamedParameterType { name: output, value: ValueType::Resource { resource_type, ownership: ResourceOwnership::Borrow } },
+        NamedParameterType { name: bytes, value: ValueType::List(item) },
+    ] if output == "output" && *resource_type == writer && bytes == "bytes" && matches!(item.as_ref(), ValueType::U8))
+        && function.result.is_none()
+}
+
+fn stream_close_shape(
+    function: &FunctionType,
+    resource_type: ResourceTypeId,
+    reader: bool,
+) -> bool {
+    let resource_name = if reader { "input" } else { "output" };
+    matches!(function.parameters.as_slice(), [
+        NamedParameterType { name, value: ValueType::Resource { resource_type: actual, ownership: ResourceOwnership::Borrow } },
+        NamedParameterType { name: reason, value: ValueType::Enum(cases) },
+    ] if name == resource_name && *actual == resource_type && reason == "reason"
+        && usize::try_from(*cases).ok() == Some(STREAM_CLOSE_CASES.len()))
+        && function.result.is_none()
 }
 
 fn mark_once(seen: &mut bool) -> Result<(), HostManifestError> {
@@ -1050,5 +1207,50 @@ fn map_log_error(error: ComponentCallError<StructuredLogError>) -> u32 {
         ComponentCallError::Resource(StructuredLogError::Allocation)
         | ComponentCallError::Resource(StructuredLogError::BackendFault) => FAILED_CASE,
         ComponentCallError::Resource(_) => INVALID_CASE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_manifest() -> VibeHostManifest {
+        VibeHostManifest {
+            clock: None,
+            random: None,
+            blob: None,
+            log: None,
+            stream_reader: None,
+            stream_writer: None,
+        }
+    }
+
+    #[test]
+    fn partial_stream_import_sets_are_rejected_independently_of_normalized_shape() {
+        let mut writer_only = empty_manifest();
+        writer_only.stream_writer = Some(ResourceTypeId(7));
+        assert_eq!(
+            validate_stream_import_set(&writer_only, false, true, false, true),
+            Err(HostManifestError::InvalidShape)
+        );
+
+        let mut reader_only = empty_manifest();
+        reader_only.stream_reader = Some(ResourceTypeId(8));
+        assert_eq!(
+            validate_stream_import_set(&reader_only, true, false, true, false),
+            Err(HostManifestError::InvalidShape)
+        );
+
+        let mut missing_close = empty_manifest();
+        missing_close.stream_reader = Some(ResourceTypeId(9));
+        missing_close.stream_writer = Some(ResourceTypeId(10));
+        assert_eq!(
+            validate_stream_import_set(&missing_close, true, true, true, false),
+            Err(HostManifestError::InvalidShape)
+        );
+        assert_eq!(
+            validate_stream_import_set(&missing_close, true, true, true, true),
+            Ok(())
+        );
     }
 }

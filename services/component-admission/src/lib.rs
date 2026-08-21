@@ -25,6 +25,10 @@ use vibeos_component_runtime::{
 use vibeos_core::cap::Rights;
 use vibeos_wasm_runtime::{inspect_core, AdmissionError as CoreAdmissionError, CoreSummary};
 
+/// Exact Profile-1 command world that binds shell byte streams to the nominal
+/// `reader` and `writer` resources in `vibe:stream/streams@1.0.0`.
+pub const STREAM_FILTER_WORLD: &str = "vibe:stream/filter@1.0.0";
+
 /// Stable SHA-256 identity of the exact immutable Component bytes.
 ///
 /// Formatting is deliberately redacted so diagnostics cannot accidentally
@@ -333,6 +337,7 @@ pub struct ComponentCommandManifest {
     stdin: CommandStreamMode,
     stdout: CommandStreamMode,
     stderr: CommandStreamMode,
+    stream_transport: bool,
     limits: InstanceLimits,
     requirements: Vec<AuthorityRequirement>,
 }
@@ -380,6 +385,13 @@ impl ComponentCommandManifest {
 
     pub const fn stderr(&self) -> CommandStreamMode {
         self.stderr
+    }
+
+    /// Whether stdin/stdout use the exact `vibe:stream/streams@1.0.0`
+    /// transport. Transport resources are installed atomically by the trusted
+    /// lifecycle and never appear in ambient requirements or grants.
+    pub const fn uses_stream_transport(&self) -> bool {
+        self.stream_transport
     }
 
     pub const fn limits(&self) -> InstanceLimits {
@@ -471,6 +483,15 @@ impl AdmittedComponent {
             || !valid_entrypoint(&self.command.entrypoint)
             || !valid_argument_limits(self.command.min_args, self.command.max_args)
             || self.command.limits.validate().is_err()
+            || (self.command.stream_transport
+                && (self.command.world != STREAM_FILTER_WORLD
+                    || self.command.min_args != 0
+                    || self.command.max_args != 0
+                    || self.command.stdin != CommandStreamMode::Required
+                    || self.command.stdout != CommandStreamMode::Required
+                    || self.command.stderr == CommandStreamMode::Required
+                    || !self.command.requirements.is_empty()
+                    || !self.grants.is_empty()))
             || self.grants.len() != self.command.requirements.len()
         {
             return Err(AdmissionError::RevalidationMismatch);
@@ -518,7 +539,11 @@ impl AdmittedComponent {
             return Err(AdmissionError::RevalidationMismatch);
         }
 
-        if !host_manifest_matches(&plan, &self.command.requirements)? {
+        if !host_manifest_matches(
+            &plan,
+            &self.command.requirements,
+            self.command.stream_transport,
+        )? {
             return Err(AdmissionError::RevalidationMismatch);
         }
         Ok(plan)
@@ -640,7 +665,7 @@ pub fn admit(
     }
     validate_policy_tables(policy.interfaces, caller.offers)?;
 
-    let (component, modules, imports, exports, host_requirements) = {
+    let (component, modules, imports, exports, host_requirements, stream_transport) = {
         let InspectedComponent { plan, modules, .. } = artifact.inspect()?;
         plan.check_world(policy.exact_world)
             .map_err(AdmissionError::World)?;
@@ -655,15 +680,45 @@ pub fn admit(
             return Err(AdmissionError::InvalidEntrypoint);
         }
         let mut requirements = Vec::new();
+        let mut stream_reader = false;
+        let mut stream_writer = false;
         if !plan.imports().is_empty() || plan.host_imports().next().is_some() {
             let host = VibeHostManifest::from_plan(&plan).map_err(AdmissionError::HostManifest)?;
             requirements
                 .try_reserve_exact(host.requirements().count())
                 .map_err(|_| AdmissionError::Allocation)?;
-            requirements.extend(host.requirements());
+            for requirement in host.requirements() {
+                match requirement.kind() {
+                    HostResourceKind::ByteStreamReader => stream_reader = true,
+                    HostResourceKind::ByteStreamWriter => stream_writer = true,
+                    _ => requirements.push(requirement),
+                }
+            }
+        }
+        if stream_reader != stream_writer {
+            return Err(AdmissionError::InvalidPolicy);
+        }
+        let stream_transport = stream_reader && stream_writer;
+        if stream_transport
+            && (policy.exact_world.identity != STREAM_FILTER_WORLD
+                || policy.min_args != 0
+                || policy.max_args != 0
+                || policy.stdin != CommandStreamMode::Required
+                || policy.stdout != CommandStreamMode::Required
+                || policy.stderr == CommandStreamMode::Required
+                || !requirements.is_empty())
+        {
+            return Err(AdmissionError::InvalidPolicy);
         }
         let component = plan.summary();
-        (component, modules, plan.imports, plan.exports, requirements)
+        (
+            component,
+            modules,
+            plan.imports,
+            plan.exports,
+            requirements,
+            stream_transport,
+        )
     };
 
     let mut requirements = Vec::new();
@@ -720,6 +775,7 @@ pub fn admit(
         stdin: policy.stdin,
         stdout: policy.stdout,
         stderr: policy.stderr,
+        stream_transport,
         limits: policy.limits,
         requirements,
     };
@@ -742,25 +798,40 @@ pub fn admit(
 fn host_manifest_matches(
     plan: &ComponentPlan<'_>,
     expected: &[AuthorityRequirement],
+    expected_stream_transport: bool,
 ) -> Result<bool, AdmissionError> {
     if plan.imports().is_empty() && plan.host_imports().next().is_none() {
-        return Ok(expected.is_empty());
+        return Ok(expected.is_empty() && !expected_stream_transport);
     }
     let manifest = VibeHostManifest::from_plan(plan).map_err(AdmissionError::HostManifest)?;
-    let mut actual = manifest.requirements();
-    for expected in expected {
-        let Some(observed) = actual.next() else {
-            return Ok(false);
-        };
-        if observed.interface() != expected.interface
-            || observed.resource() != expected.resource
-            || observed.kind() != expected.kind
-            || observed.rights() != expected.rights
-        {
-            return Ok(false);
+    let mut stream_reader = false;
+    let mut stream_writer = false;
+    let mut ambient_index = 0_usize;
+    for observed in manifest.requirements() {
+        match observed.kind() {
+            HostResourceKind::ByteStreamReader => stream_reader = true,
+            HostResourceKind::ByteStreamWriter => stream_writer = true,
+            _ => {
+                let Some(expected) = expected.get(ambient_index) else {
+                    return Ok(false);
+                };
+                if observed.interface() != expected.interface
+                    || observed.resource() != expected.resource
+                    || observed.kind() != expected.kind
+                    || observed.rights() != expected.rights
+                {
+                    return Ok(false);
+                }
+                ambient_index += 1;
+            }
         }
     }
-    Ok(actual.next().is_none())
+    if stream_reader != stream_writer
+        || (stream_reader && stream_writer) != expected_stream_transport
+    {
+        return Ok(false);
+    }
+    Ok(ambient_index == expected.len())
 }
 
 fn unique_ceiling<'a>(
@@ -801,7 +872,8 @@ fn validate_policy_tables(
     offers: &[AuthorityOffer<'_>],
 ) -> Result<(), AdmissionError> {
     for (index, ceiling) in ceilings.iter().enumerate() {
-        if !valid_label(ceiling.label)
+        if stream_transport_kind(ceiling.kind)
+            || !valid_label(ceiling.label)
             || ceiling.interface.is_empty()
             || ceiling.interface.len() > 256
             || !operation_rights(ceiling.kind).contains(ceiling.rights)
@@ -813,7 +885,8 @@ fn validate_policy_tables(
         }
     }
     for (index, offer) in offers.iter().enumerate() {
-        if !valid_label(offer.label)
+        if stream_transport_kind(offer.kind)
+            || !valid_label(offer.label)
             || !operation_rights(offer.kind).contains(offer.grantable)
             || offers[..index]
                 .iter()
@@ -829,7 +902,16 @@ const fn operation_rights(kind: HostResourceKind) -> Rights {
     match kind {
         HostResourceKind::Clock | HostResourceKind::Random | HostResourceKind::Blob => Rights::READ,
         HostResourceKind::StructuredLog => Rights::WRITE,
+        HostResourceKind::ByteStreamReader => Rights::RECV,
+        HostResourceKind::ByteStreamWriter => Rights::SEND,
     }
+}
+
+const fn stream_transport_kind(kind: HostResourceKind) -> bool {
+    matches!(
+        kind,
+        HostResourceKind::ByteStreamReader | HostResourceKind::ByteStreamWriter
+    )
 }
 
 fn copied(value: &str) -> Result<String, AdmissionError> {

@@ -1,11 +1,12 @@
-//! QEMU-only C4.8 target evidence for the managed component lifecycle.
+//! QEMU-only C4.8/C5.2/C5.3 target evidence for the managed component lifecycle.
 //!
 //! Positive cycles use the production CONTROL/INSTANCES path.  Deliberate
 //! identity corruptions use a separate SYSTEM-owned registry and control gate,
 //! so proving sticky quarantine never requires a forbidden Failed -> Healthy
 //! transition before the real SSH image/session gate is opened.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use core::any::Any;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::MaybeUninit;
@@ -51,6 +52,11 @@ const NEG_DONE: u8 = 3;
 const NEG_OUTCOME_NONE: u8 = 0;
 const NEG_OUTCOME_QUARANTINED: u8 = 1;
 const NEG_OUTCOME_RECLAIMED: u8 = 2;
+const NEGATIVE_STREAM_CAPABILITIES: usize = 4;
+const NEGATIVE_SENTINEL_CAPABILITIES: usize = 1;
+const NEGATIVE_CAPABILITIES: usize = NEGATIVE_STREAM_CAPABILITIES + NEGATIVE_SENTINEL_CAPABILITIES;
+
+const _: () = assert!(NEGATIVE_CAPABILITIES == 5);
 
 const ERROR_POSITIVE_ARM: u64 = 1 << 0;
 const ERROR_POSITIVE_RUNTIME: u64 = 1 << 1;
@@ -67,6 +73,16 @@ const ERROR_ABA: u64 = 1 << 11;
 const ERROR_NORMAL_PROBE: u64 = 1 << 12;
 const ERROR_POLICY_GATE: u64 = 1 << 13;
 const ERROR_CONTINUATION_FAULT: u64 = 1 << 14;
+const ERROR_C53_PREPARE: u64 = 1 << 15;
+const ERROR_C53_ARM: u64 = 1 << 16;
+const ERROR_C53_BACKPRESSURE: u64 = 1 << 17;
+const ERROR_C53_HOST_PENDING: u64 = 1 << 18;
+const ERROR_C53_WAKE: u64 = 1 << 19;
+const ERROR_C53_RESUME: u64 = 1 << 20;
+const ERROR_C53_STREAM: u64 = 1 << 21;
+const ERROR_C53_TERMINAL: u64 = 1 << 22;
+const ERROR_C53_BASELINE: u64 = 1 << 23;
+const ERROR_C53_TERMINAL_RACE: u64 = 1 << 24;
 
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 static POSITIVE_RAW_RECLAIMS: AtomicUsize = AtomicUsize::new(0);
@@ -77,11 +93,153 @@ static C52_RESUMES: AtomicUsize = AtomicUsize::new(0);
 static C52_CROSS_HART_SIGNALS: AtomicUsize = AtomicUsize::new(0);
 static C52_STALE_REJECTS: AtomicUsize = AtomicUsize::new(0);
 static C52_LIVE_FAULTS: AtomicUsize = AtomicUsize::new(0);
+static C53_PAIRS: AtomicUsize = AtomicUsize::new(0);
+static C53_INPUT_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static C53_OUTPUT_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static C53_XOR_BYTES: AtomicUsize = AtomicUsize::new(0);
+static C53_BACKEND_PENDING: AtomicUsize = AtomicUsize::new(0);
+static C53_BACKEND_WAKES: AtomicUsize = AtomicUsize::new(0);
+static C53_HOST_PENDING: AtomicUsize = AtomicUsize::new(0);
+static C53_EXACT_WAKES: AtomicUsize = AtomicUsize::new(0);
+static C53_EXACT_RESUMES: AtomicUsize = AtomicUsize::new(0);
+static C53_LATE_WAKE_REJECTS: AtomicUsize = AtomicUsize::new(0);
+static C53_EOF: AtomicUsize = AtomicUsize::new(0);
+static C53_NORMAL_CLOSES: AtomicUsize = AtomicUsize::new(0);
+static C53_TERMINAL_MATCHES: AtomicUsize = AtomicUsize::new(0);
+static C53_TERMINAL_ORDERS: AtomicUsize = AtomicUsize::new(0);
+static C53_CLOSE_RACES: AtomicUsize = AtomicUsize::new(0);
+static C53_TERMINAL_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
+static C53_START_ERROR_TERMINALS: AtomicUsize = AtomicUsize::new(0);
+static C53_TERMINAL_RACES: AtomicUsize = AtomicUsize::new(0);
+static C53_CANCEL_BUSY_RETRIES: AtomicUsize = AtomicUsize::new(0);
+static C53_COMPLETION_BUSY_RETRIES: AtomicUsize = AtomicUsize::new(0);
+static C53_MISMATCH_REJECTS: AtomicUsize = AtomicUsize::new(0);
+static C53_DUPLICATE_FAULT_REJECTS: AtomicUsize = AtomicUsize::new(0);
+static C53_ABA_REJECTS: AtomicUsize = AtomicUsize::new(0);
 static FAULT_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
 static HART_FAULTS: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
+static C53_HART_PAIRS: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 static READY_MASKS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
 static PARKED_MASKS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
 static ROUND_DONE: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
+static C53_ROUND_DONE: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
+static C53_PENDING_MASKS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
+static C53_INPUT_TURNS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
+static C53_DRAIN_TURNS: [AtomicU8; ROUNDS] = [const { AtomicU8::new(0) }; ROUNDS];
+static C53_INPUT_WAKE_GATE: AtomicUsize = AtomicUsize::new(0);
+static C53_WAKE_GATE: AtomicUsize = AtomicUsize::new(0);
+static C53_START_INTENT: AtomicBool = AtomicBool::new(false);
+
+const TERMINAL_RACE_SUCCESS_FIRST: u8 = 1;
+const TERMINAL_RACE_RETURNED_FIRST: u8 = 2;
+const TERMINAL_RACE_CANCEL_FIRST: u8 = 3;
+const TERMINAL_RACE_IDLE: u8 = 0;
+const TERMINAL_RACE_ARMED: u8 = 1;
+const TERMINAL_RACE_PAYLOAD_BLOCKED: u8 = 2;
+const TERMINAL_RACE_PAYLOAD_RELEASED: u8 = 3;
+const TERMINAL_RACE_PAYLOAD_FOLDED: u8 = 4;
+const TERMINAL_RACE_HOLD_REQUESTED: u8 = 1;
+const TERMINAL_RACE_CONTROL_HELD: u8 = 2;
+const TERMINAL_RACE_BUSY_OBSERVED: u8 = 3;
+const TERMINAL_RACE_CONTROL_RELEASED: u8 = 4;
+const TERMINAL_RACE_COMPLETION_ARMED: u8 = 1;
+const TERMINAL_RACE_COMPLETION_EDGE: u8 = 2;
+const TERMINAL_RACE_COMPLETION_HELD: u8 = 3;
+const TERMINAL_RACE_COMPLETION_BUSY: u8 = 4;
+const TERMINAL_RACE_COMPLETION_RELEASED: u8 = 5;
+
+static TERMINAL_RACE_CASE: AtomicU8 = AtomicU8::new(TERMINAL_RACE_IDLE);
+static TERMINAL_RACE_EXPECTED: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_RACE_KEY_SLOT: AtomicU8 = AtomicU8::new(u8::MAX);
+static TERMINAL_RACE_KEY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_RACE_TASK: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_RACE_OWNER: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_RACE_ARENA: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_RACE_PAYLOAD: AtomicU8 = AtomicU8::new(TERMINAL_RACE_IDLE);
+static TERMINAL_RACE_LISTENER_ARMED: AtomicBool = AtomicBool::new(false);
+static TERMINAL_RACE_CANCEL_HOLD: AtomicU8 = AtomicU8::new(TERMINAL_RACE_IDLE);
+static TERMINAL_RACE_COMPLETION: AtomicU8 = AtomicU8::new(TERMINAL_RACE_IDLE);
+static TERMINAL_RACE_CANCEL_VALID: AtomicBool = AtomicBool::new(false);
+static TERMINAL_RACE_OBSERVED_TERMINAL: AtomicU64 = AtomicU64::new(0);
+
+const C53_FREE: u8 = 0;
+const C53_PUMP_READY: u8 = 1;
+const C53_ARMED: u8 = 2;
+const C53_TERMINAL_VISIBLE: u8 = 3;
+const C53_STREAM_TERMINAL_PUBLISHED: u8 = 4;
+const C53_OWNER_RETIRED: u8 = 5;
+const C53_CSPACE_RESET: u8 = 6;
+const C53_COMPLETE: u8 = 7;
+const C53_DONE: u8 = 8;
+
+struct C53Slot {
+    stage: AtomicU8,
+    task: AtomicU64,
+    owner: AtomicU64,
+    arena: AtomicU64,
+    round: AtomicU8,
+    hart: AtomicU8,
+    input_woken: AtomicBool,
+    host_pending: AtomicBool,
+    exact_wake: AtomicBool,
+    exact_resume: AtomicBool,
+    eof: AtomicBool,
+    close_mask: AtomicU8,
+    token: UnsafeCell<MaybeUninit<InstanceToken>>,
+    handle: UnsafeCell<MaybeUninit<TaskHandle>>,
+    before: UnsafeCell<MaybeUninit<AcceptanceInstanceProbe>>,
+    pending_operation: UnsafeCell<MaybeUninit<HostOperationToken>>,
+}
+
+unsafe impl Sync for C53Slot {}
+
+impl C53Slot {
+    const fn new() -> Self {
+        Self {
+            stage: AtomicU8::new(C53_FREE),
+            task: AtomicU64::new(0),
+            owner: AtomicU64::new(0),
+            arena: AtomicU64::new(0),
+            round: AtomicU8::new(0),
+            hart: AtomicU8::new(0),
+            input_woken: AtomicBool::new(false),
+            host_pending: AtomicBool::new(false),
+            exact_wake: AtomicBool::new(false),
+            exact_resume: AtomicBool::new(false),
+            eof: AtomicBool::new(false),
+            close_mask: AtomicU8::new(0),
+            token: UnsafeCell::new(MaybeUninit::uninit()),
+            handle: UnsafeCell::new(MaybeUninit::uninit()),
+            before: UnsafeCell::new(MaybeUninit::uninit()),
+            pending_operation: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn matches(&self, task: TaskId, domain: AllocationDomain) -> bool {
+        self.stage.load(Ordering::Acquire) >= C53_ARMED
+            && self.task.load(Ordering::Relaxed) == task.0
+            && self.owner.load(Ordering::Relaxed) == domain.owner.get()
+            && self.arena.load(Ordering::Relaxed) == domain.arena.get()
+    }
+
+    fn token(&self) -> InstanceToken {
+        unsafe { (*self.token.get()).assume_init() }
+    }
+
+    unsafe fn release_handle(&self) {
+        unsafe { (*self.handle.get()).assume_init_drop() };
+    }
+
+    fn before(&self) -> AcceptanceInstanceProbe {
+        unsafe { (*self.before.get()).assume_init() }
+    }
+
+    fn pending_operation(&self) -> HostOperationToken {
+        unsafe { (*self.pending_operation.get()).assume_init() }
+    }
+}
+
+static C53: [C53Slot; POSITIVE_CYCLES] = [const { C53Slot::new() }; POSITIVE_CYCLES];
 
 struct PositiveSlot {
     stage: AtomicU8,
@@ -195,10 +353,409 @@ fn deadline_expired(started: u64) -> bool {
         >= crate::exec::timebase_hz().saturating_mul(WAIT_SECONDS)
 }
 
+fn terminal_race_key_matches(key: ControlKey) -> bool {
+    TERMINAL_RACE_CASE.load(Ordering::Acquire) != TERMINAL_RACE_IDLE
+        && TERMINAL_RACE_KEY_SLOT.load(Ordering::Relaxed) == key.slot
+        && TERMINAL_RACE_KEY_GENERATION.load(Ordering::Relaxed) == key.generation
+}
+
+fn terminal_race_arm(case: u8, terminal: ComponentTerminal) -> bool {
+    if !matches!(
+        case,
+        TERMINAL_RACE_SUCCESS_FIRST | TERMINAL_RACE_RETURNED_FIRST | TERMINAL_RACE_CANCEL_FIRST
+    ) || TERMINAL_RACE_CASE
+        .compare_exchange(
+            TERMINAL_RACE_IDLE,
+            case,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    TERMINAL_RACE_EXPECTED.store(terminal_word(terminal), Ordering::Release);
+    TERMINAL_RACE_KEY_SLOT.store(u8::MAX, Ordering::Relaxed);
+    TERMINAL_RACE_KEY_GENERATION.store(0, Ordering::Relaxed);
+    TERMINAL_RACE_TASK.store(0, Ordering::Relaxed);
+    TERMINAL_RACE_OWNER.store(0, Ordering::Relaxed);
+    TERMINAL_RACE_ARENA.store(0, Ordering::Relaxed);
+    TERMINAL_RACE_PAYLOAD.store(TERMINAL_RACE_ARMED, Ordering::Release);
+    TERMINAL_RACE_LISTENER_ARMED.store(false, Ordering::Release);
+    TERMINAL_RACE_CANCEL_HOLD.store(TERMINAL_RACE_HOLD_REQUESTED, Ordering::Release);
+    TERMINAL_RACE_COMPLETION.store(TERMINAL_RACE_COMPLETION_ARMED, Ordering::Release);
+    TERMINAL_RACE_CANCEL_VALID.store(false, Ordering::Release);
+    TERMINAL_RACE_OBSERVED_TERMINAL.store(0, Ordering::Release);
+    true
+}
+
+fn terminal_race_bind(key: ControlKey, handle: &TaskHandle, domain: AllocationDomain) -> bool {
+    if TERMINAL_RACE_CASE.load(Ordering::Acquire) == TERMINAL_RACE_IDLE
+        || TERMINAL_RACE_KEY_SLOT.load(Ordering::Acquire) != u8::MAX
+        || handle.allocation_domain() != domain
+    {
+        return false;
+    }
+    TERMINAL_RACE_KEY_SLOT.store(key.slot, Ordering::Relaxed);
+    TERMINAL_RACE_KEY_GENERATION.store(key.generation, Ordering::Relaxed);
+    TERMINAL_RACE_TASK.store(handle.id().0, Ordering::Relaxed);
+    TERMINAL_RACE_OWNER.store(domain.owner.get(), Ordering::Relaxed);
+    TERMINAL_RACE_ARENA.store(domain.arena.get(), Ordering::Release);
+    true
+}
+
+fn terminal_race_bound_identity_matches(key: ControlKey, handle: &TaskHandle) -> bool {
+    terminal_race_key_matches(key)
+        && handle.id().0 == TERMINAL_RACE_TASK.load(Ordering::Relaxed)
+        && handle.allocation_domain().owner.get() == TERMINAL_RACE_OWNER.load(Ordering::Relaxed)
+        && handle.allocation_domain().arena.get() == TERMINAL_RACE_ARENA.load(Ordering::Relaxed)
+}
+
+fn terminal_race_spin_until(state: &AtomicU8, expected: u8) -> bool {
+    let started = crate::sbi::time();
+    while state.load(Ordering::Acquire) != expected {
+        if deadline_expired(started) {
+            fail(ERROR_C53_TERMINAL_RACE);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+pub(super) fn terminal_race_before_publish(case: u8, terminal: ComponentTerminal) {
+    if case != TERMINAL_RACE_CANCEL_FIRST {
+        return;
+    }
+    if TERMINAL_RACE_CASE.load(Ordering::Acquire) != case
+        || TERMINAL_RACE_EXPECTED.load(Ordering::Acquire) != terminal_word(terminal)
+        || TERMINAL_RACE_PAYLOAD
+            .compare_exchange(
+                TERMINAL_RACE_ARMED,
+                TERMINAL_RACE_PAYLOAD_BLOCKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        fail(ERROR_C53_TERMINAL_RACE);
+        return;
+    }
+    let _ = terminal_race_spin_until(&TERMINAL_RACE_PAYLOAD, TERMINAL_RACE_PAYLOAD_RELEASED);
+}
+
+pub(super) fn terminal_race_after_publish(
+    case: u8,
+    original: ComponentTerminal,
+    effective: ComponentTerminal,
+) {
+    if TERMINAL_RACE_CASE.load(Ordering::Acquire) != case
+        || TERMINAL_RACE_EXPECTED.load(Ordering::Acquire) != terminal_word(original)
+    {
+        fail(ERROR_C53_TERMINAL_RACE);
+        return;
+    }
+    if case == TERMINAL_RACE_CANCEL_FIRST {
+        if effective != ComponentTerminal::Cancelled
+            || TERMINAL_RACE_PAYLOAD
+                .compare_exchange(
+                    TERMINAL_RACE_PAYLOAD_RELEASED,
+                    TERMINAL_RACE_PAYLOAD_FOLDED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            fail(ERROR_C53_TERMINAL_RACE);
+        }
+        return;
+    }
+    if effective != original
+        || TERMINAL_RACE_PAYLOAD
+            .compare_exchange(
+                TERMINAL_RACE_ARMED,
+                TERMINAL_RACE_PAYLOAD_BLOCKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        fail(ERROR_C53_TERMINAL_RACE);
+        return;
+    }
+    let _ = terminal_race_spin_until(&TERMINAL_RACE_PAYLOAD, TERMINAL_RACE_PAYLOAD_RELEASED);
+}
+
+pub(super) fn terminal_race_listener_armed(key: ControlKey) {
+    if terminal_race_key_matches(key) {
+        TERMINAL_RACE_LISTENER_ARMED.store(true, Ordering::Release);
+    }
+}
+
+pub(super) fn terminal_race_completion_edge(key: ControlKey) {
+    if !terminal_race_key_matches(key) {
+        return;
+    }
+    if TERMINAL_RACE_COMPLETION
+        .compare_exchange(
+            TERMINAL_RACE_COMPLETION_ARMED,
+            TERMINAL_RACE_COMPLETION_EDGE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        fail(ERROR_C53_TERMINAL_RACE);
+        return;
+    }
+}
+
+pub(super) async fn terminal_race_listener_returned(key: ControlKey) {
+    if !terminal_race_key_matches(key) {
+        return;
+    }
+    let started = crate::sbi::time();
+    while TERMINAL_RACE_COMPLETION.load(Ordering::Acquire) != TERMINAL_RACE_COMPLETION_HELD {
+        if deadline_expired(started) {
+            fail(ERROR_C53_TERMINAL_RACE);
+            return;
+        }
+        crate::exec::yield_now().await;
+    }
+}
+
+pub(super) fn terminal_race_observed_control_busy() {
+    if TERMINAL_RACE_COMPLETION
+        .compare_exchange(
+            TERMINAL_RACE_COMPLETION_HELD,
+            TERMINAL_RACE_COMPLETION_BUSY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        C53_COMPLETION_BUSY_RETRIES.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub(super) fn component_start_intent() -> bool {
+    C53_START_INTENT.load(Ordering::Acquire)
+}
+
 fn positive_index(round: u8, hart: u8) -> Option<usize> {
     let round = usize::from(round);
     let hart = usize::from(hart);
     (round < ROUNDS && hart < HARTS).then_some(round * HARTS + hart)
+}
+
+fn c53_for_token(token: InstanceToken) -> Option<&'static C53Slot> {
+    C53.iter()
+        .find(|slot| slot.stage.load(Ordering::Acquire) >= C53_ARMED && slot.token() == token)
+}
+
+fn c53_for(task: TaskId, domain: AllocationDomain) -> Option<&'static C53Slot> {
+    C53.iter().find(|slot| slot.matches(task, domain))
+}
+
+fn prepare_c53_slot(round: u8, hart: u8) -> Option<(usize, &'static C53Slot)> {
+    let index = positive_index(round, hart)?;
+    let slot = &C53[index];
+    if slot
+        .stage
+        .compare_exchange(
+            C53_FREE,
+            C53_PUMP_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    slot.round.store(round, Ordering::Relaxed);
+    slot.hart.store(hart, Ordering::Relaxed);
+    Some((index, slot))
+}
+
+fn c53_input_wake(_words: [usize; 4]) {
+    let encoded = C53_INPUT_WAKE_GATE.swap(0, Ordering::AcqRel);
+    let Some(slot) = encoded.checked_sub(1).and_then(|index| C53.get(index)) else {
+        fail(ERROR_C53_WAKE);
+        return;
+    };
+    if slot.stage.load(Ordering::Acquire) < C53_PUMP_READY
+        || slot.input_woken.swap(true, Ordering::AcqRel)
+    {
+        fail(ERROR_C53_BACKPRESSURE);
+        return;
+    }
+    C53_BACKEND_WAKES.fetch_add(1, Ordering::AcqRel);
+}
+
+pub(super) fn arm_stream(
+    _key: ControlKey,
+    token: InstanceToken,
+    handle: &TaskHandle,
+    domain: AllocationDomain,
+    round: u8,
+    hart: u8,
+) -> bool {
+    let Some(index) = positive_index(round, hart) else {
+        fail(ERROR_C53_ARM);
+        return false;
+    };
+    let slot = &C53[index];
+    let snapshot = registry().snapshot(token);
+    let probe = registry().acceptance_probe(token);
+    let valid = slot.stage.load(Ordering::Acquire) == C53_PUMP_READY
+        && handle.allocation_domain() == domain
+        && snapshot.as_ref().is_ok_and(|snapshot| {
+            snapshot.phase == InstancePhase::Active
+                && snapshot.domain == domain
+                && snapshot.task == Some(handle.id())
+                && snapshot
+                    .home_hart
+                    .is_some_and(|home| home.index() == usize::from(hart))
+        })
+        && probe.is_some_and(|probe| {
+            probe.is_exact()
+                && probe.exact_phase() == Some(InstancePhase::Active)
+                && probe.seal_matches_space()
+                && probe.seal_matches_cspace()
+                && probe.capability_table_len() == 4
+                && probe.installed_capability_count() == 4
+        });
+    if !valid {
+        fail(ERROR_C53_ARM);
+        return false;
+    }
+    unsafe {
+        (*slot.token.get()).write(token);
+        (*slot.handle.get()).write(handle.clone());
+        (*slot.before.get()).write(probe.expect("validated C5.3 acceptance probe exists"));
+    }
+    slot.task.store(handle.id().0, Ordering::Relaxed);
+    slot.owner.store(domain.owner.get(), Ordering::Relaxed);
+    slot.arena.store(domain.arena.get(), Ordering::Relaxed);
+    if slot
+        .stage
+        .compare_exchange(
+            C53_PUMP_READY,
+            C53_ARMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        fail(ERROR_C53_ARM);
+        return false;
+    }
+    C53_PAIRS.fetch_add(1, Ordering::AcqRel);
+    C53_HART_PAIRS[usize::from(hart)].fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+/// Record the single output-ring backpressure edge only after the component
+/// runtime installed the exact wake token for that host operation.
+pub(super) fn record_stream_host_pending(token: InstanceToken, operation: HostOperationToken) {
+    let Some(slot) = c53_for_token(token) else {
+        return;
+    };
+    let exact = slot.stage.load(Ordering::Acquire) == C53_ARMED
+        && registry().acceptance_probe(token).is_some_and(|probe| {
+            probe.is_exact()
+                && probe.exact_phase() == Some(InstancePhase::Active)
+                && probe.seal_matches_space()
+                && probe.seal_matches_cspace()
+                && probe.capability_table_len() == 4
+                && probe.installed_capability_count() == 4
+        })
+        && !slot.host_pending.load(Ordering::Acquire);
+    if !exact {
+        fail(ERROR_C53_HOST_PENDING);
+        return;
+    }
+    unsafe { (*slot.pending_operation.get()).write(operation) };
+    if slot.host_pending.swap(true, Ordering::Release) {
+        fail(ERROR_C53_HOST_PENDING);
+        return;
+    }
+    C53_HOST_PENDING.fetch_add(1, Ordering::AcqRel);
+    C53_PENDING_MASKS[usize::from(slot.round.load(Ordering::Relaxed))]
+        .fetch_or(1 << slot.hart.load(Ordering::Relaxed), Ordering::AcqRel);
+}
+
+/// Observe one signal only while the acceptance pump has opened the bounded
+/// output-drain window. No callback word is retained, decoded, or correlated.
+pub(super) fn record_stream_wake(outcome: InstanceContinuationSignal) {
+    let encoded = C53_WAKE_GATE.swap(0, Ordering::AcqRel);
+    if encoded == 0 {
+        // Ordinary production and input-side wakeups share this callback.
+        return;
+    }
+    let Some(slot) = encoded.checked_sub(1).and_then(|index| C53.get(index)) else {
+        fail(ERROR_C53_WAKE);
+        return;
+    };
+    if outcome != InstanceContinuationSignal::Signalled
+        || slot.exact_wake.swap(true, Ordering::AcqRel)
+    {
+        fail(ERROR_C53_WAKE);
+        return;
+    }
+    C53_EXACT_WAKES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Record the matching writer-host resume. Opaque late-token rejection remains
+/// exercised by the core C5.2 continuation matrix; this layer never retains
+/// or decodes the host callback representation.
+pub(super) fn record_stream_resume(token: InstanceToken, operation: HostOperationToken) {
+    let Some(slot) = c53_for_token(token) else {
+        return;
+    };
+    let exact = slot.stage.load(Ordering::Acquire) == C53_ARMED
+        && slot.host_pending.load(Ordering::Acquire)
+        && slot.exact_wake.load(Ordering::Acquire)
+        && slot.pending_operation() == operation
+        && !slot.exact_resume.swap(true, Ordering::AcqRel);
+    if !exact
+        || !registry().acceptance_probe(token).is_some_and(|probe| {
+            probe.is_exact()
+                && probe.exact_phase() == Some(InstancePhase::Active)
+                && probe.seal_matches_space()
+                && probe.seal_matches_cspace()
+                && probe.capability_table_len() == 4
+                && probe.installed_capability_count() == 4
+        })
+    {
+        fail(ERROR_C53_RESUME);
+        return;
+    }
+    C53_EXACT_RESUMES.fetch_add(1, Ordering::AcqRel);
+}
+
+pub(super) fn record_stream_eof(token: InstanceToken) {
+    let Some(slot) = c53_for_token(token) else {
+        return;
+    };
+    if !slot.exact_resume.load(Ordering::Acquire) || slot.eof.swap(true, Ordering::AcqRel) {
+        fail(ERROR_C53_STREAM);
+        return;
+    }
+    C53_EOF.fetch_add(1, Ordering::AcqRel);
+}
+
+pub(super) fn record_stream_normal_close(token: InstanceToken, reader: bool) {
+    let Some(slot) = c53_for_token(token) else {
+        return;
+    };
+    let bit = if reader { 1 } else { 2 };
+    let previous = slot.close_mask.fetch_or(bit, Ordering::AcqRel);
+    if !slot.eof.load(Ordering::Acquire) || previous & bit != 0 {
+        fail(ERROR_C53_STREAM);
+        return;
+    }
+    C53_NORMAL_CLOSES.fetch_add(1, Ordering::AcqRel);
 }
 
 fn positive_for(task: TaskId, domain: AllocationDomain) -> Option<&'static PositiveSlot> {
@@ -236,7 +793,8 @@ pub(super) fn arm_positive(
             && probe.exact_phase() == Some(InstancePhase::Active)
             && probe.seal_matches_space()
             && probe.seal_matches_cspace()
-            && probe.capability_table_len() == 0
+            && probe.capability_table_len() == 4
+            && probe.installed_capability_count() == 4
     });
     if !valid {
         fail(ERROR_POSITIVE_ARM);
@@ -330,6 +888,10 @@ impl Future for ResumableContinuation {
                     || handle.allocation_domain().owner.get() != slot.owner.load(Ordering::Relaxed)
                     || handle.allocation_domain().arena.get() != slot.arena.load(Ordering::Relaxed)
                 {
+                    println!(
+                        "WASM_C52_DIAG round={} hart={} first-park-identity",
+                        self.round, self.hart
+                    );
                     fail(ERROR_CONTINUATION_FAULT);
                     return Poll::Ready(Err(()));
                 }
@@ -346,6 +908,12 @@ impl Future for ResumableContinuation {
                     )
                     .is_err()
                 {
+                    println!(
+                        "WASM_C52_DIAG round={} hart={} first-park-stage={}",
+                        self.round,
+                        self.hart,
+                        slot.stage.load(Ordering::Acquire),
+                    );
                     fail(ERROR_CONTINUATION_FAULT);
                     return Poll::Ready(Err(()));
                 }
@@ -357,6 +925,10 @@ impl Future for ResumableContinuation {
             Poll::Pending => {
                 // An External continuation has no self-wake. Any second poll
                 // before its one exact signal is observable spin.
+                println!(
+                    "WASM_C52_DIAG round={} hart={} first-resume-spurious-pending",
+                    self.round, self.hart
+                );
                 fail(ERROR_CONTINUATION_FAULT);
                 Poll::Ready(Err(()))
             }
@@ -372,7 +944,7 @@ impl Future for ResumableContinuation {
                 }) && slot.signal_hart.load(Ordering::Acquire) != self.hart
                     && usize::from(slot.signal_hart.load(Ordering::Relaxed))
                         == (usize::from(self.hart) + HARTS - 1) % HARTS
-                    && slot.park_polls.load(Ordering::Relaxed).checked_add(1) == Some(resume_polls);
+                    && slot.park_polls.load(Ordering::Relaxed) < resume_polls;
                 if !exact
                     || slot
                         .stage
@@ -384,6 +956,15 @@ impl Future for ResumableContinuation {
                         )
                         .is_err()
                 {
+                    println!(
+                        "WASM_C52_DIAG round={} hart={} first-resume-identity stage={} polls={}/{} signal_hart={}",
+                        self.round,
+                        self.hart,
+                        slot.stage.load(Ordering::Acquire),
+                        slot.park_polls.load(Ordering::Acquire),
+                        resume_polls,
+                        slot.signal_hart.load(Ordering::Acquire),
+                    );
                     fail(ERROR_CONTINUATION_FAULT);
                     return Poll::Ready(Err(()));
                 }
@@ -391,6 +972,10 @@ impl Future for ResumableContinuation {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                println!(
+                    "WASM_C52_DIAG round={} hart={} first-resume-terminal-shape",
+                    self.round, self.hart
+                );
                 fail(ERROR_CONTINUATION_FAULT);
                 Poll::Ready(Err(()))
             }
@@ -426,11 +1011,12 @@ impl Future for PendingContinuationFault {
                 });
                 let registrations = slot.handle().acceptance_registration_stats();
                 if !exact
-                    || registrations.total != 1
+                    || registrations.total != 2
                     || registrations.waits != 1
                     || registrations.timers != 0
                     || registrations.joins != 0
                     || registrations.irq_poll_probes != 0
+                    || registrations.task_detaches != 1
                     || slot
                         .stage
                         .compare_exchange(
@@ -441,6 +1027,19 @@ impl Future for PendingContinuationFault {
                         )
                         .is_err()
                 {
+                    println!(
+                        "WASM_C52_DIAG round={} hart={} pending-precondition exact={} stage={} regs={}/{}/{}/{}/{}/{}",
+                        self.round,
+                        self.hart,
+                        exact,
+                        slot.stage.load(Ordering::Acquire),
+                        registrations.total,
+                        registrations.waits,
+                        registrations.timers,
+                        registrations.joins,
+                        registrations.irq_poll_probes,
+                        registrations.task_detaches,
+                    );
                     fail(ERROR_CONTINUATION_FAULT);
                     return Poll::Ready(());
                 }
@@ -464,14 +1063,22 @@ pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round:
     let operation =
         match registry().arm_continuation_current(token, InstanceContinuationKind::External) {
             Ok(operation) => operation,
-            Err(_) => {
+            Err(error) => {
+                println!(
+                    "WASM_C52_DIAG round={} hart={} first-arm={error:?}",
+                    round, hart
+                );
                 fail(ERROR_CONTINUATION_FAULT);
                 return;
             }
         };
     let continuation = match registry().wait_continuation(operation) {
         Ok(continuation) => continuation,
-        Err(_) => {
+        Err(error) => {
+            println!(
+                "WASM_C52_DIAG round={} hart={} first-wait={error:?}",
+                round, hart
+            );
             fail(ERROR_CONTINUATION_FAULT);
             return;
         }
@@ -487,6 +1094,10 @@ pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round:
     .await
     .is_err()
     {
+        println!(
+            "WASM_C52_DIAG round={} hart={} first-resume-failed",
+            round, hart
+        );
         fail(ERROR_CONTINUATION_FAULT);
         return;
     }
@@ -519,22 +1130,43 @@ pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round:
             )
             .is_err()
     {
+        println!(
+            "WASM_C52_DIAG round={} hart={} stale-check-failed signal={stale:?}",
+            round, hart
+        );
         fail(ERROR_CONTINUATION_FAULT);
         return;
     }
     C52_STALE_REJECTS.fetch_add(1, Ordering::AcqRel);
+    C53_LATE_WAKE_REJECTS.fetch_add(1, Ordering::AcqRel);
 
     let fault_operation =
         match registry().arm_continuation_current(token, InstanceContinuationKind::External) {
             Ok(fault_operation) if fault_operation != operation => fault_operation,
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                println!(
+                    "WASM_C52_DIAG round={} hart={} second-arm-reused-token",
+                    round, hart
+                );
+                fail(ERROR_CONTINUATION_FAULT);
+                return;
+            }
+            Err(error) => {
+                println!(
+                    "WASM_C52_DIAG round={} hart={} second-arm={error:?}",
+                    round, hart
+                );
                 fail(ERROR_CONTINUATION_FAULT);
                 return;
             }
         };
     let continuation = match registry().wait_continuation(fault_operation) {
         Ok(continuation) => continuation,
-        Err(_) => {
+        Err(error) => {
+            println!(
+                "WASM_C52_DIAG round={} hart={} second-wait={error:?}",
+                round, hart
+            );
             fail(ERROR_CONTINUATION_FAULT);
             return;
         }
@@ -546,6 +1178,10 @@ pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round:
         hart,
     }
     .await;
+    println!(
+        "WASM_C52_DIAG round={} hart={} pending-fault-returned",
+        round, hart
+    );
     fail(ERROR_CONTINUATION_FAULT);
 }
 
@@ -583,6 +1219,35 @@ pub(super) fn record_terminal_visible(
     domain: AllocationDomain,
     state: TaskState,
 ) {
+    if let Some(slot) = c53_for(handle.id(), domain) {
+        let registrations = handle.acceptance_registration_stats();
+        if state != TaskState::Exited
+            || registrations.total != 0
+            || registrations.waits != 0
+            || registrations.timers != 0
+            || registrations.joins != 0
+            || registrations.irq_poll_probes != 0
+            || !slot.host_pending.load(Ordering::Acquire)
+            || !slot.exact_wake.load(Ordering::Acquire)
+            || !slot.exact_resume.load(Ordering::Acquire)
+            || !slot.eof.load(Ordering::Acquire)
+            || slot.close_mask.load(Ordering::Acquire) != 3
+            || slot
+                .stage
+                .compare_exchange(
+                    C53_ARMED,
+                    C53_TERMINAL_VISIBLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            fail(ERROR_C53_TERMINAL);
+        } else {
+            unsafe { slot.release_handle() };
+        }
+        return;
+    }
     let Some(slot) = positive_for(handle.id(), domain) else {
         return;
     };
@@ -613,12 +1278,56 @@ pub(super) fn record_terminal_visible(
     }
 }
 
+pub(super) fn record_stream_terminal_published(
+    task: TaskId,
+    domain: AllocationDomain,
+    terminal: ComponentTerminal,
+    reason: StreamCloseReason,
+) {
+    let Some(slot) = c53_for(task, domain) else {
+        return;
+    };
+    if terminal != ComponentTerminal::Success
+        || reason != StreamCloseReason::Normal
+        || slot
+            .stage
+            .compare_exchange(
+                C53_TERMINAL_VISIBLE,
+                C53_STREAM_TERMINAL_PUBLISHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        fail(ERROR_C53_TERMINAL);
+    }
+}
+
 pub(super) fn record_owner_retired(
     task: TaskId,
     domain: AllocationDomain,
     kind: TerminalRetireKind,
     retired: bool,
 ) {
+    if let Some(slot) = c53_for(task, domain) {
+        if kind != TerminalRetireKind::Normal
+            || !retired
+            || HEAP.arena_stats(domain.arena).is_some()
+            || HEAP.account_stats(domain.owner).is_some()
+            || slot
+                .stage
+                .compare_exchange(
+                    C53_STREAM_TERMINAL_PUBLISHED,
+                    C53_OWNER_RETIRED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            fail(ERROR_C53_TERMINAL);
+        }
+        return;
+    }
     let Some(slot) = positive_for(task, domain) else {
         return;
     };
@@ -641,6 +1350,26 @@ pub(super) fn record_owner_retired(
 }
 
 pub(super) fn record_cspace_reset(task: TaskId, domain: AllocationDomain, next_incarnation: u64) {
+    if let Some(slot) = c53_for(task, domain) {
+        let expected = slot
+            .before()
+            .cspace_incarnation()
+            .and_then(|value| value.checked_add(1));
+        if expected != Some(next_incarnation)
+            || slot
+                .stage
+                .compare_exchange(
+                    C53_OWNER_RETIRED,
+                    C53_CSPACE_RESET,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            fail(ERROR_C53_TERMINAL);
+        }
+        return;
+    }
     let Some(slot) = positive_for(task, domain) else {
         return;
     };
@@ -670,6 +1399,25 @@ pub(super) fn record_outer_complete(
     domain: AllocationDomain,
     terminal: ComponentTerminal,
 ) {
+    if let Some(slot) = c53_for(task, domain) {
+        if terminal != ComponentTerminal::Success
+            || slot
+                .stage
+                .compare_exchange(
+                    C53_CSPACE_RESET,
+                    C53_COMPLETE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            fail(ERROR_C53_TERMINAL);
+        } else {
+            C53_TERMINAL_MATCHES.fetch_add(1, Ordering::AcqRel);
+            C53_TERMINAL_ORDERS.fetch_add(1, Ordering::AcqRel);
+        }
+        return;
+    }
     let Some(slot) = positive_for(task, domain) else {
         return;
     };
@@ -702,9 +1450,10 @@ enum NegativeCase {
     Arena = 5,
     CurrentHart = 6,
     SpaceObject = 7,
-    CSpaceIncarnation = 8,
-    Duplicate = 9,
-    AbaSeed = 10,
+    CSpaceObject = 8,
+    CSpaceIncarnation = 9,
+    Duplicate = 10,
+    AbaSeed = 11,
 }
 
 impl NegativeCase {
@@ -717,9 +1466,10 @@ impl NegativeCase {
             5 => Some(Self::Arena),
             6 => Some(Self::CurrentHart),
             7 => Some(Self::SpaceObject),
-            8 => Some(Self::CSpaceIncarnation),
-            9 => Some(Self::Duplicate),
-            10 => Some(Self::AbaSeed),
+            8 => Some(Self::CSpaceObject),
+            9 => Some(Self::CSpaceIncarnation),
+            10 => Some(Self::Duplicate),
+            11 => Some(Self::AbaSeed),
             _ => None,
         }
     }
@@ -732,20 +1482,25 @@ impl NegativeCase {
             Self::Owner => Some(AcceptanceWitnessMismatch::Owner),
             Self::Arena => Some(AcceptanceWitnessMismatch::Arena),
             Self::CurrentHart => Some(AcceptanceWitnessMismatch::CurrentHart),
-            Self::SpaceObject | Self::CSpaceIncarnation | Self::Duplicate | Self::AbaSeed => None,
+            Self::SpaceObject
+            | Self::CSpaceObject
+            | Self::CSpaceIncarnation
+            | Self::Duplicate
+            | Self::AbaSeed => None,
         }
     }
 
     fn seal_mismatch(self) -> Option<AcceptanceSealMismatch> {
         match self {
             Self::SpaceObject => Some(AcceptanceSealMismatch::SpaceObject),
+            Self::CSpaceObject => Some(AcceptanceSealMismatch::CSpaceObject),
             Self::CSpaceIncarnation => Some(AcceptanceSealMismatch::CSpaceIncarnation),
             _ => None,
         }
     }
 }
 
-const MISMATCH_CASES: [NegativeCase; 8] = [
+const MISMATCH_CASES: [NegativeCase; 9] = [
     NegativeCase::Generation,
     NegativeCase::Task,
     NegativeCase::Status,
@@ -753,6 +1508,7 @@ const MISMATCH_CASES: [NegativeCase; 8] = [
     NegativeCase::Arena,
     NegativeCase::CurrentHart,
     NegativeCase::SpaceObject,
+    NegativeCase::CSpaceObject,
     NegativeCase::CSpaceIncarnation,
 ];
 
@@ -763,6 +1519,18 @@ static NEG_RAW_RECLAIMS: AtomicUsize = AtomicUsize::new(0);
 static NEG_REPLAY_AUTHORIZATIONS: AtomicUsize = AtomicUsize::new(0);
 static ABA_STALE_AUTHORIZATIONS: AtomicUsize = AtomicUsize::new(0);
 
+struct NegativeSentinel;
+
+impl Resource for NegativeSentinel {
+    fn kind(&self) -> &'static str {
+        "wasm-c53-negative-cspace-sentinel"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 struct NegativeRouteSlot {
     state: AtomicU8,
     kind: AtomicU8,
@@ -772,6 +1540,7 @@ struct NegativeRouteSlot {
     arena: AtomicU64,
     token: UnsafeCell<MaybeUninit<InstanceToken>>,
     key: UnsafeCell<MaybeUninit<ControlKey>>,
+    streams: UnsafeCell<MaybeUninit<RegistryStreamBindings>>,
     before: UnsafeCell<MaybeUninit<AcceptanceInstanceProbe>>,
     exact_witness: UnsafeCell<MaybeUninit<ReclaimableFaultWitness>>,
 }
@@ -789,6 +1558,7 @@ impl NegativeRouteSlot {
             arena: AtomicU64::new(0),
             token: UnsafeCell::new(MaybeUninit::uninit()),
             key: UnsafeCell::new(MaybeUninit::uninit()),
+            streams: UnsafeCell::new(MaybeUninit::uninit()),
             before: UnsafeCell::new(MaybeUninit::uninit()),
             exact_witness: UnsafeCell::new(MaybeUninit::uninit()),
         }
@@ -799,6 +1569,7 @@ impl NegativeRouteSlot {
         kind: NegativeCase,
         token: InstanceToken,
         key: ControlKey,
+        streams: RegistryStreamBindings,
         handle: &TaskHandle,
         domain: AllocationDomain,
         before: AcceptanceInstanceProbe,
@@ -809,6 +1580,7 @@ impl NegativeRouteSlot {
         unsafe {
             (*self.token.get()).write(token);
             (*self.key.get()).write(key);
+            (*self.streams.get()).write(streams);
             (*self.before.get()).write(before);
         }
         self.kind.store(kind as u8, Ordering::Relaxed);
@@ -838,6 +1610,10 @@ impl NegativeRouteSlot {
 
     fn key(&self) -> ControlKey {
         unsafe { (*self.key.get()).assume_init() }
+    }
+
+    fn streams(&self) -> RegistryStreamBindings {
+        unsafe { (*self.streams.get()).assume_init() }
     }
 
     fn before(&self) -> AcceptanceInstanceProbe {
@@ -903,6 +1679,7 @@ const _: () = {
 struct NegativeInstance {
     token: InstanceToken,
     key: ControlKey,
+    streams: RegistryStreamBindings,
     handle: TaskHandle,
     domain: AllocationDomain,
     before: AcceptanceInstanceProbe,
@@ -910,6 +1687,20 @@ struct NegativeInstance {
 
 fn same_control_key(left: ControlKey, right: ControlKey) -> bool {
     left.slot == right.slot && left.generation == right.generation
+}
+
+fn negative_stream_projection_is_well_formed(streams: RegistryStreamBindings) -> bool {
+    let caps: [Cap; NEGATIVE_STREAM_CAPABILITIES] = [
+        streams.stdin,
+        streams.stdout,
+        streams.stdin_supervisor,
+        streams.stdout_supervisor,
+    ];
+    streams.cspace_incarnation != 0
+        && caps
+            .iter()
+            .enumerate()
+            .all(|(index, cap)| caps.iter().skip(index + 1).all(|other| cap != other))
 }
 
 fn start_negative(kind: NegativeCase, pending: bool) -> Result<NegativeInstance, ()> {
@@ -925,10 +1716,91 @@ fn start_negative(kind: NegativeCase, pending: bool) -> Result<NegativeInstance,
     let token = NEG_REGISTRY
         .reserve_named(domain, "wasm-c48-negative")
         .map_err(|_| ())?;
+
+    let stdin_stream = ByteStream::new();
+    let stdout_stream = ByteStream::new();
+    let io = InstalledComponentIo {
+        stdin: stdin_stream.reader(),
+        stdout: stdout_stream.writer(),
+        stdin_supervisor: stdin_stream.supervisor(),
+        stdout_supervisor: stdout_stream.supervisor(),
+    };
+    if io.stdin.same_stream_as(&io.stdout)
+        || Arc::ptr_eq(&io.stdin_supervisor, &io.stdout_supervisor)
+        || !io.stdin_supervisor.same_stream_as_reader(&io.stdin)
+        || io.stdin_supervisor.same_stream_as_writer(&io.stdout)
+        || !io.stdout_supervisor.same_stream_as_writer(&io.stdout)
+        || io.stdout_supervisor.same_stream_as_reader(&io.stdin)
+    {
+        let _ = NEG_REGISTRY.quarantine(token);
+        control.exact_mut(key).ok_or(())?.quarantine();
+        system.restore();
+        return Err(());
+    }
+    // The stable CSpace receives the only endpoint/supervisor Arcs. These
+    // construction roots are not retained by the future or control table.
+    drop(stdin_stream);
+    drop(stdout_stream);
+    let (streams, configured_exactly) = match unsafe {
+        NEG_REGISTRY.configure_reserved_space(token, move |cspace| {
+            let cspace_identity = cspace.identity();
+            let cspace_incarnation = cspace.incarnation();
+            let stdin = cspace.mint(io.stdin, Rights::RECV);
+            let stdout = cspace.mint(io.stdout, Rights::SEND);
+            let stdin_supervisor = cspace.mint(io.stdin_supervisor, Rights::INVOKE);
+            let stdout_supervisor = cspace.mint(io.stdout_supervisor, Rights::INVOKE);
+            let sentinel = cspace.mint(Arc::new(NegativeSentinel), Rights::INVOKE);
+            let streams = RegistryStreamBindings {
+                cspace_identity,
+                cspace_incarnation,
+                stdin,
+                stdout,
+                stdin_supervisor,
+                stdout_supervisor,
+            };
+            let configured_exactly = negative_stream_projection_is_well_formed(streams)
+                && validate_stream_space(cspace, streams).is_ok()
+                && exact_lease::<ByteStreamReader>(cspace, stdin, Rights::RECV).is_ok()
+                && exact_lease::<ByteStreamWriter>(cspace, stdout, Rights::SEND).is_ok()
+                && exact_lease::<ByteStreamSupervisor>(cspace, stdin_supervisor, Rights::INVOKE)
+                    .is_ok()
+                && exact_lease::<ByteStreamSupervisor>(cspace, stdout_supervisor, Rights::INVOKE)
+                    .is_ok()
+                && exact_lease::<NegativeSentinel>(cspace, sentinel, Rights::INVOKE).is_ok();
+            (streams, configured_exactly)
+        })
+    } {
+        Ok(configured) => configured,
+        Err(_) => {
+            let _ = NEG_REGISTRY.quarantine(token);
+            control.exact_mut(key).ok_or(())?.quarantine();
+            system.restore();
+            return Err(());
+        }
+    };
+    if !configured_exactly {
+        let _ = NEG_REGISTRY.quarantine(token);
+        control.exact_mut(key).ok_or(())?.quarantine();
+        system.restore();
+        return Err(());
+    }
     {
         let record = control.exact_mut(key).ok_or(())?;
+        if record.phase != ControlPhase::Starting
+            || record.core_token.is_some()
+            || record.handle.is_some()
+            || record.domain.is_some()
+            || record.streams.is_some()
+            || record.terminal_candidate.is_some()
+        {
+            let _ = NEG_REGISTRY.quarantine(token);
+            record.quarantine();
+            system.restore();
+            return Err(());
+        }
         record.core_token = Some(token);
         record.domain = Some(domain);
+        record.streams = Some(streams);
     }
 
     let mut batch = PreparedTaskBatch::new();
@@ -978,7 +1850,16 @@ fn start_negative(kind: NegativeCase, pending: bool) -> Result<NegativeInstance,
         || before.exact_phase() != Some(InstancePhase::Active)
         || !before.seal_matches_space()
         || !before.seal_matches_cspace()
-        || before.capability_table_len() != 0
+        || before.cspace_incarnation() != Some(streams.cspace_incarnation)
+        || before.capability_table_len() != NEGATIVE_CAPABILITIES
+        || before.installed_capability_count() != NEGATIVE_CAPABILITIES
+        || control.exact(key).is_none_or(|record| {
+            record.phase != ControlPhase::Running
+                || record.core_token != Some(token)
+                || record.domain != Some(domain)
+                || record.streams != Some(streams)
+                || record.terminal_candidate.is_some()
+        })
     {
         let _ = NEG_REGISTRY.quarantine(token);
         control.exact_mut(key).ok_or(())?.quarantine();
@@ -993,7 +1874,7 @@ fn start_negative(kind: NegativeCase, pending: bool) -> Result<NegativeInstance,
             return Err(());
         }
     }
-    if !pending && !NEG_ROUTE.arm(kind, token, key, &published, domain, before) {
+    if !pending && !NEG_ROUTE.arm(kind, token, key, streams, &published, domain, before) {
         let _ = NEG_REGISTRY.quarantine(token);
         control.exact_mut(key).ok_or(())?.quarantine();
         system.restore();
@@ -1004,6 +1885,7 @@ fn start_negative(kind: NegativeCase, pending: bool) -> Result<NegativeInstance,
     Ok(NegativeInstance {
         token,
         key,
+        streams,
         handle: published,
         domain,
         before,
@@ -1063,6 +1945,28 @@ pub(super) unsafe fn route_fault(witness: ReclaimableFaultWitness) -> Option<Fau
             return Some(FaultRoute::Quarantined);
         }
     };
+    let expected_streams = NEG_ROUTE.streams();
+    let route_projection_is_exact = control.exact(key).is_some_and(|record| {
+        record.phase == ControlPhase::Running
+            && record.core_token == Some(exact_token)
+            && record.handle.as_ref().is_some_and(|handle| {
+                witness.matches_handle(handle)
+                    && handle.allocation_domain() == witness.allocation_domain()
+            })
+            && record.domain == Some(witness.allocation_domain())
+            && record.streams == Some(expected_streams)
+            && record.terminal_candidate.is_none()
+            && negative_stream_projection_is_well_formed(expected_streams)
+    });
+    if !route_projection_is_exact {
+        fail(ERROR_NEGATIVE_ROUTE);
+        let _ = NEG_REGISTRY.quarantine(exact_token);
+        if let Some(record) = control.exact_mut(key) {
+            record.quarantine();
+        }
+        NEG_ROUTE.finish(NEG_OUTCOME_QUARANTINED);
+        return Some(FaultRoute::Quarantined);
+    }
     let routed_key = match control.fault_tuple(routed) {
         Ok(routed_key) => routed_key,
         Err(()) => {
@@ -1135,13 +2039,597 @@ async fn wait_for_terminal(token: ManagedComponentToken, expected: ComponentTerm
         match observe_instance(token) {
             ManagedComponentState::Complete(terminal) => return terminal == expected,
             ManagedComponentState::Lost => return false,
-            ManagedComponentState::Running => {}
+            ManagedComponentState::Busy | ManagedComponentState::Running => {}
         }
         if deadline_expired(started) {
             return false;
         }
         crate::exec::yield_now().await;
     }
+}
+
+fn c53_fill_chunk(round: usize, hart: usize, chunk: usize, output: &mut [u8; 1024]) {
+    for (offset, byte) in output.iter_mut().enumerate() {
+        *byte = (round as u8)
+            .wrapping_mul(41)
+            .wrapping_add((hart as u8).wrapping_mul(67))
+            .wrapping_add((chunk as u8).wrapping_mul(17))
+            .wrapping_add(offset as u8);
+    }
+}
+
+fn c53_receive_and_check(
+    reader: &ByteStreamReader,
+    round: usize,
+    hart: usize,
+    chunk: usize,
+) -> bool {
+    let prepared = match reader.start() {
+        Ok(StreamReceiveDispatch::Prepared(prepared)) if prepared.length() == 1024 => prepared,
+        _ => return false,
+    };
+    let mut actual = [0_u8; 1024];
+    if reader.commit(prepared.operation(), &mut actual)
+        != Ok(StreamReceiveCommit::Received(actual.len()))
+    {
+        return false;
+    }
+    let mut input = [0_u8; 1024];
+    c53_fill_chunk(round, hart, chunk, &mut input);
+    if !actual
+        .iter()
+        .zip(input.iter())
+        .all(|(actual, input)| *actual == *input ^ 0x20)
+    {
+        return false;
+    }
+    C53_OUTPUT_CHUNKS.fetch_add(1, Ordering::AcqRel);
+    C53_XOR_BYTES.fetch_add(actual.len(), Ordering::AcqRel);
+    true
+}
+
+async fn wait_c53_flag(flag: &AtomicBool) -> bool {
+    let started = crate::sbi::time();
+    while !flag.load(Ordering::Acquire) {
+        if deadline_expired(started) {
+            return false;
+        }
+        crate::exec::yield_now().await;
+    }
+    true
+}
+
+async fn wait_c53_pending_round(round: usize) -> bool {
+    let started = crate::sbi::time();
+    while C53_PENDING_MASKS[round].load(Ordering::Acquire) != 0x0f {
+        if deadline_expired(started) {
+            return false;
+        }
+        crate::exec::yield_now().await;
+    }
+    true
+}
+
+async fn wait_c53_input_turn(round: usize, hart: usize) -> bool {
+    let started = crate::sbi::time();
+    while usize::from(C53_INPUT_TURNS[round].load(Ordering::Acquire)) != hart {
+        if deadline_expired(started) {
+            return false;
+        }
+        crate::exec::yield_now().await;
+    }
+    true
+}
+
+async fn wait_c53_drain_turn(round: usize, hart: usize) -> bool {
+    let started = crate::sbi::time();
+    while usize::from(C53_DRAIN_TURNS[round].load(Ordering::Acquire)) != hart {
+        if deadline_expired(started) {
+            return false;
+        }
+        crate::exec::yield_now().await;
+    }
+    true
+}
+
+async fn start_c53_instance(
+    stdin: &Arc<ByteStream>,
+    stdout: &Arc<ByteStream>,
+    round: u8,
+    hart: u8,
+) -> Option<ManagedComponentToken> {
+    let started = crate::sbi::time();
+    while C53_START_INTENT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        if deadline_expired(started) {
+            return None;
+        }
+        crate::exec::yield_now().await;
+    }
+    loop {
+        let ready = match CONTROL.try_lock() {
+            Ok(control) => {
+                drop(control);
+                true
+            }
+            Err(ControlGateError::Busy) => false,
+            Err(ControlGateError::Poisoned | ControlGateError::Unattributed) => {
+                C53_START_INTENT.store(false, Ordering::Release);
+                return None;
+            }
+        };
+        if ready {
+            break;
+        }
+        if deadline_expired(started) {
+            C53_START_INTENT.store(false, Ordering::Release);
+            return None;
+        }
+        crate::exec::yield_now().await;
+    }
+    let io = InstalledComponentIo {
+        stdin: stdin.reader(),
+        stdout: stdout.writer(),
+        stdin_supervisor: stdin.supervisor(),
+        stdout_supervisor: stdout.supervisor(),
+    };
+    let result =
+        start_image_instance_with_io(false, PayloadMode::AcceptanceStream { round, hart }, io).ok();
+    C53_START_INTENT.store(false, Ordering::Release);
+    result
+}
+
+fn c53_postconditions(index: usize) -> bool {
+    let slot = &C53[index];
+    if slot.stage.load(Ordering::Acquire) != C53_COMPLETE {
+        return false;
+    }
+    let before = slot.before();
+    let Some(after) = registry().acceptance_probe(slot.token()) else {
+        return false;
+    };
+    !after.is_exact()
+        && after.current_phase() == InstancePhase::Vacant
+        && before.current_generation().checked_add(1) == Some(after.current_generation())
+        && before.same_space_object(after)
+        && before.same_cspace_lock(after)
+        && before.same_cspace_identity(after)
+        && after.capability_table_len() == before.capability_table_len()
+        && before
+            .cspace_incarnation()
+            .and_then(|value| value.checked_add(1))
+            == after.cspace_incarnation()
+        && after.installed_capability_count() == 0
+        && HEAP
+            .arena_stats(ArenaId::new(slot.arena.load(Ordering::Relaxed)))
+            .is_none()
+        && HEAP
+            .account_stats(OwnerId::new(slot.owner.load(Ordering::Relaxed)))
+            .is_none()
+}
+
+async fn run_c53_cycle(round: usize, hart: usize) -> bool {
+    let Some((index, slot)) = prepare_c53_slot(round as u8, hart as u8) else {
+        fail(ERROR_C53_PREPARE);
+        return false;
+    };
+    let stdin = ByteStream::new();
+    let stdout = ByteStream::new();
+    let input = stdin.writer();
+    let output = stdout.reader();
+
+    let mut bytes = [0_u8; 1024];
+    for chunk in 0..8 {
+        c53_fill_chunk(round, hart, chunk, &mut bytes);
+        if input.start(&bytes) != Ok(StreamSendDispatch::Sent) {
+            fail(ERROR_C53_PREPARE);
+            return false;
+        }
+        C53_INPUT_CHUNKS.fetch_add(1, Ordering::AcqRel);
+    }
+    c53_fill_chunk(round, hart, 8, &mut bytes);
+    let blocked_input = match input.start(&bytes) {
+        Ok(StreamSendDispatch::Waiting(operation)) => operation,
+        _ => {
+            fail(ERROR_C53_BACKPRESSURE);
+            return false;
+        }
+    };
+    if stdin.depth() != 8 || stdin.peak_depth() != 8 {
+        fail(ERROR_C53_BACKPRESSURE);
+        return false;
+    }
+    C53_BACKEND_PENDING.fetch_add(1, Ordering::AcqRel);
+    if !wait_c53_input_turn(round, hart).await {
+        fail(ERROR_C53_BACKPRESSURE);
+        return false;
+    }
+    let backend_wakes_before = C53_BACKEND_WAKES.load(Ordering::Acquire);
+    if C53_INPUT_WAKE_GATE
+        .compare_exchange(0, index + 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        fail(ERROR_C53_BACKPRESSURE);
+        return false;
+    }
+    let wake = HostWakeToken::new([0; 4], c53_input_wake);
+    if input.register_wake(blocked_input, wake).is_err() {
+        fail(ERROR_C53_BACKPRESSURE);
+        return false;
+    }
+
+    let Some(token) = start_c53_instance(&stdin, &stdout, round as u8, hart as u8).await else {
+        let _ = input.cancel(blocked_input);
+        fail(ERROR_C53_ARM);
+        return false;
+    };
+    if !wait_c53_flag(&slot.input_woken).await
+        || C53_INPUT_WAKE_GATE.load(Ordering::Acquire) != 0
+        || C53_BACKEND_WAKES.load(Ordering::Acquire) != backend_wakes_before + 1
+    {
+        let _ = input.close(StreamCloseReason::BackendFault);
+        let _ = output.close(StreamCloseReason::BackendFault);
+        fail(ERROR_C53_BACKPRESSURE);
+        return false;
+    }
+    c53_fill_chunk(round, hart, 8, &mut bytes);
+    if input.resume(blocked_input, &bytes) != Ok(StreamSendDispatch::Sent) {
+        fail(ERROR_C53_BACKPRESSURE);
+        return false;
+    }
+    C53_INPUT_CHUNKS.fetch_add(1, Ordering::AcqRel);
+    if input.close(StreamCloseReason::Normal) != StreamCloseOutcome::Published {
+        fail(ERROR_C53_STREAM);
+        return false;
+    }
+    C53_INPUT_TURNS[round].store((hart + 1) as u8, Ordering::Release);
+
+    if !wait_c53_flag(&slot.host_pending).await {
+        let _ = output.close(StreamCloseReason::BackendFault);
+        fail(ERROR_C53_HOST_PENDING);
+        return false;
+    }
+    if !wait_c53_pending_round(round).await || !wait_c53_drain_turn(round, hart).await {
+        fail(ERROR_C53_HOST_PENDING);
+        return false;
+    }
+    if stdout.depth() != 8 || stdout.peak_depth() != 8 || slot.exact_wake.load(Ordering::Acquire) {
+        fail(ERROR_C53_HOST_PENDING);
+        return false;
+    }
+    let wakes_before = C53_EXACT_WAKES.load(Ordering::Acquire);
+    if C53_WAKE_GATE
+        .compare_exchange(0, index + 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        fail(ERROR_C53_WAKE);
+        return false;
+    }
+    if !c53_receive_and_check(&output, round, hart, 0)
+        || C53_WAKE_GATE.load(Ordering::Acquire) != 0
+        || C53_EXACT_WAKES.load(Ordering::Acquire) != wakes_before + 1
+        || !slot.exact_wake.load(Ordering::Acquire)
+        || !wait_c53_flag(&slot.exact_resume).await
+    {
+        fail(ERROR_C53_WAKE | ERROR_C53_RESUME);
+        return false;
+    }
+    C53_DRAIN_TURNS[round].store((hart + 1) as u8, Ordering::Release);
+    if stdout.depth() != 8 {
+        fail(ERROR_C53_RESUME);
+        return false;
+    }
+    for chunk in 1..9 {
+        if !c53_receive_and_check(&output, round, hart, chunk) {
+            fail(ERROR_C53_STREAM);
+            return false;
+        }
+    }
+    if stdout.depth() != 0 || !wait_for_terminal(token, ComponentTerminal::Success).await {
+        fail(ERROR_C53_TERMINAL);
+        return false;
+    }
+    if stdin.final_reason() != Some(StreamCloseReason::Normal)
+        || stdout.final_reason() != Some(StreamCloseReason::Normal)
+        || stdin.is_fail_stopped()
+        || stdout.is_fail_stopped()
+        || output.start() != Ok(StreamReceiveDispatch::Closed(StreamCloseReason::Normal))
+        || !c53_postconditions(index)
+        || !acknowledge_until_stable(token).await
+    {
+        fail(ERROR_C53_TERMINAL);
+        return false;
+    }
+    if slot
+        .stage
+        .compare_exchange(C53_COMPLETE, C53_DONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        fail(ERROR_C53_TERMINAL);
+        return false;
+    }
+    true
+}
+
+async fn finish_c53_round(round: usize) {
+    let previous = C53_ROUND_DONE[round].fetch_add(1, Ordering::AcqRel);
+    if previous >= HARTS as u8 {
+        fail(ERROR_C53_BASELINE);
+        return;
+    }
+    let started = crate::sbi::time();
+    while C53_ROUND_DONE[round].load(Ordering::Acquire) != HARTS as u8 {
+        if deadline_expired(started) {
+            fail(ERROR_C53_BASELINE);
+            return;
+        }
+        crate::exec::yield_now().await;
+    }
+}
+
+async fn c53_worker(hart: usize) {
+    for round in 0..ROUNDS {
+        if !run_c53_cycle(round, hart).await {
+            fail(ERROR_C53_STREAM);
+        }
+        finish_c53_round(round).await;
+    }
+}
+
+fn c53_reuse_is_exact() -> bool {
+    for round in 1..ROUNDS {
+        for hart in 0..HARTS {
+            let current = &C53[round * HARTS + hart];
+            let mut matching_previous = None;
+            let mut matches = 0;
+            for previous in &C53[(round - 1) * HARTS..round * HARTS] {
+                if current.token().shares_stable_slot(previous.token()) {
+                    matching_previous = Some(previous);
+                    matches += 1;
+                }
+            }
+            let Some(previous) = matching_previous else {
+                return false;
+            };
+            let current_probe = current.before();
+            let previous_probe = previous.before();
+            if matches != 1
+                || !current_probe.is_exact()
+                || current_probe.exact_phase() != Some(InstancePhase::Active)
+                || current_probe.capability_table_len() != 4
+                || current_probe.installed_capability_count() != 4
+                || !current_probe.same_space_object(previous_probe)
+                || !current_probe.same_cspace_lock(previous_probe)
+                || !current_probe.same_cspace_identity(previous_probe)
+                || current_probe.current_generation()
+                    != previous_probe.current_generation().saturating_add(1)
+                || current_probe.cspace_incarnation()
+                    != previous_probe
+                        .cspace_incarnation()
+                        .and_then(|value| value.checked_add(1))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn run_c53_matrix() {
+    if crate::online_hart_count() < HARTS || crate::online_hart_mask() & 0x0f != 0x0f {
+        fail(ERROR_C53_BASELINE);
+        return;
+    }
+    let mut workers = Vec::new();
+    if workers.try_reserve_exact(HARTS).is_err() {
+        fail(ERROR_C53_BASELINE);
+        return;
+    }
+    for hart in 0..HARTS {
+        let Some(hart_id) = crate::exec::HartId::new(hart) else {
+            fail(ERROR_C53_BASELINE);
+            return;
+        };
+        let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+        let worker =
+            crate::exec::spawn_pinned_on(hart_id, "wasm-c53-stream-worker", c53_worker(hart));
+        system.restore();
+        workers.push(worker);
+    }
+    for worker in workers {
+        if worker.join().await.state() != TaskState::Exited {
+            fail(ERROR_C53_BASELINE);
+        }
+    }
+    let stats = registry().occupancy_stats();
+    if C53_PAIRS.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_INPUT_CHUNKS.load(Ordering::Acquire) != POSITIVE_CYCLES * 9
+        || C53_OUTPUT_CHUNKS.load(Ordering::Acquire) != POSITIVE_CYCLES * 9
+        || C53_XOR_BYTES.load(Ordering::Acquire) != POSITIVE_CYCLES * 9 * 1024
+        || C53_BACKEND_PENDING.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_BACKEND_WAKES.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_HOST_PENDING.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_EXACT_WAKES.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_EXACT_RESUMES.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_EOF.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_NORMAL_CLOSES.load(Ordering::Acquire) != POSITIVE_CYCLES * 2
+        || C53_TERMINAL_MATCHES.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_TERMINAL_ORDERS.load(Ordering::Acquire) != POSITIVE_CYCLES
+        || C53_HART_PAIRS
+            .iter()
+            .any(|pairs| pairs.load(Ordering::Acquire) != ROUNDS)
+        || C53_ROUND_DONE
+            .iter()
+            .any(|done| done.load(Ordering::Acquire) != HARTS as u8)
+        || C53_PENDING_MASKS
+            .iter()
+            .any(|mask| mask.load(Ordering::Acquire) != 0x0f)
+        || C53_INPUT_TURNS
+            .iter()
+            .any(|turn| turn.load(Ordering::Acquire) != HARTS as u8)
+        || C53_DRAIN_TURNS
+            .iter()
+            .any(|turn| turn.load(Ordering::Acquire) != HARTS as u8)
+        || C53_INPUT_WAKE_GATE.load(Ordering::Acquire) != 0
+        || C53_WAKE_GATE.load(Ordering::Acquire) != 0
+        || C53
+            .iter()
+            .any(|slot| slot.stage.load(Ordering::Acquire) != C53_DONE)
+        || stats.occupied != 0
+        || stats.header_mismatches != 0
+        || !c53_reuse_is_exact()
+    {
+        fail(ERROR_C53_BASELINE);
+    }
+}
+
+fn run_c53_close_races() -> bool {
+    let production_before = registry().occupancy_stats();
+    let negative_before = NEG_REGISTRY.occupancy_stats();
+    let mappings = [
+        (
+            HostError::Failed,
+            ComponentTerminal::Returned(1),
+            StreamCloseReason::Failure,
+        ),
+        (
+            HostError::Cancelled,
+            ComponentTerminal::Cancelled,
+            StreamCloseReason::Cancelled,
+        ),
+        (
+            HostError::InvalidState,
+            ComponentTerminal::Usage,
+            StreamCloseReason::Invalid,
+        ),
+    ];
+    for (error, terminal, reason) in mappings {
+        if host_error_terminal(error) != terminal || terminal.stream_close_reason() != reason {
+            return false;
+        }
+
+        // Target-side regression for the prepared receive race: terminal
+        // publication may clear the FIFO, but it must leave the exact
+        // reservation attached until the runtime performs one cancellation.
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        if writer.start(&[1, 2, 3]) != Ok(StreamSendDispatch::Sent) {
+            return false;
+        }
+        let prepared = match reader.start() {
+            Ok(StreamReceiveDispatch::Prepared(prepared)) => prepared,
+            _ => return false,
+        };
+        if supervisor.finalize(reason) != StreamCloseOutcome::Published || stream.depth() != 0 {
+            return false;
+        }
+        let mut output = [0_u8; 3];
+        if reader.commit(prepared.operation(), &mut output)
+            != Ok(StreamReceiveCommit::Closed(reason))
+            || output != [0, 0, 0]
+            || reader.cancel(prepared.operation()) != Ok(())
+            || reader.cancel(prepared.operation()) != Err(StreamError::TokenMismatch)
+            || stream.is_fail_stopped()
+        {
+            return false;
+        }
+        C53_TERMINAL_MAPPINGS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    // Before publication there is no child finalizer. Every recoverable start
+    // error must therefore use the original paired supervisors to make the
+    // exact terminal visible to the SSH pump before returning Err.
+    for (terminal, reason) in [
+        (
+            ComponentTerminal::Unavailable,
+            StreamCloseReason::Unavailable,
+        ),
+        (
+            ComponentTerminal::BudgetExceeded,
+            StreamCloseReason::Exhausted,
+        ),
+    ] {
+        let stdin = ByteStream::new();
+        let stdout = ByteStream::new();
+        let input = stdin.writer();
+        let output = stdout.reader();
+        let io = InstalledComponentIo {
+            stdin: stdin.reader(),
+            stdout: stdout.writer(),
+            stdin_supervisor: stdin.supervisor(),
+            stdout_supervisor: stdout.supervisor(),
+        };
+        if finalize_unpublished_start_error(&io, terminal) != terminal
+            || stdin.final_reason() != Some(reason)
+            || stdout.final_reason() != Some(reason)
+            || input.start(&[1]) != Ok(StreamSendDispatch::Closed(reason))
+            || output.start() != Ok(StreamReceiveDispatch::Closed(reason))
+            || stdin.is_fail_stopped()
+            || stdout.is_fail_stopped()
+        {
+            return false;
+        }
+        C53_START_ERROR_TERMINALS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    // Transport Failure wins before the cooperative lifecycle publishes the
+    // matching terminal. The lifecycle must confirm, not conflict or reset.
+    let failure = ByteStream::new();
+    let failure_writer = failure.writer();
+    let failure_supervisor = failure.supervisor();
+    if failure_writer.close(StreamCloseReason::Failure) != StreamCloseOutcome::Published
+        || failure_supervisor.finalize(StreamCloseReason::Failure)
+            != StreamCloseOutcome::AlreadyPublished
+        || failure.final_reason() != Some(StreamCloseReason::Failure)
+        || failure.is_fail_stopped()
+    {
+        return false;
+    }
+    C53_CLOSE_RACES.fetch_add(1, Ordering::AcqRel);
+
+    // Cooperative cancellation wins first; a later matching transport close
+    // is idempotent and cannot quarantine or generically reset any registry.
+    let cancelled = ByteStream::new();
+    let cancelled_writer = cancelled.writer();
+    let cancelled_supervisor = cancelled.supervisor();
+    if cancelled_supervisor.finalize(StreamCloseReason::Cancelled) != StreamCloseOutcome::Published
+        || cancelled_writer.close(StreamCloseReason::Cancelled)
+            != StreamCloseOutcome::AlreadyPublished
+        || cancelled.final_reason() != Some(StreamCloseReason::Cancelled)
+        || cancelled.is_fail_stopped()
+    {
+        return false;
+    }
+    C53_CLOSE_RACES.fetch_add(1, Ordering::AcqRel);
+
+    // Normal endpoint completion is provisional. Usage/Invalid may still win
+    // immutable lifecycle publication and must then be idempotent at transport.
+    let invalid = ByteStream::new();
+    let invalid_writer = invalid.writer();
+    let invalid_supervisor = invalid.supervisor();
+    if invalid_writer.close(StreamCloseReason::Normal) != StreamCloseOutcome::Published
+        || invalid.final_reason().is_some()
+        || invalid_supervisor.finalize(StreamCloseReason::Invalid) != StreamCloseOutcome::Published
+        || invalid_writer.close(StreamCloseReason::Invalid) != StreamCloseOutcome::AlreadyPublished
+        || invalid.final_reason() != Some(StreamCloseReason::Invalid)
+        || invalid.is_fail_stopped()
+    {
+        return false;
+    }
+    C53_CLOSE_RACES.fetch_add(1, Ordering::AcqRel);
+
+    let production_after = registry().occupancy_stats();
+    let negative_after = NEG_REGISTRY.occupancy_stats();
+    production_after.occupied == production_before.occupied
+        && production_after.header_mismatches == production_before.header_mismatches
+        && negative_after.occupied == negative_before.occupied
+        && negative_after.header_mismatches == negative_before.header_mismatches
+        && lifecycle_is_healthy()
+        && SSH_POLICY_GATE.load(Ordering::Acquire) == POLICY_CLOSED
 }
 
 fn token_is_acknowledged(token: ManagedComponentToken) -> Result<bool, ControlGateError> {
@@ -1210,9 +2698,9 @@ fn positive_postconditions(index: usize) -> bool {
         && before.same_space_object(after)
         && before.same_cspace_lock(after)
         && before.same_cspace_identity(after)
-        && before.same_capability_table(after)
+        && after.capability_table_len() == before.capability_table_len()
         && expected_incarnation == after.cspace_incarnation()
-        && after.capability_table_len() == 0
+        && after.installed_capability_count() == 0
         && HEAP
             .arena_stats(ArenaId::new(slot.arena.load(Ordering::Relaxed)))
             .is_none()
@@ -1377,7 +2865,6 @@ fn positive_reuse_is_exact() -> bool {
                 || !current_probe.same_space_object(previous_probe)
                 || !current_probe.same_cspace_lock(previous_probe)
                 || !current_probe.same_cspace_identity(previous_probe)
-                || !current_probe.same_capability_table(previous_probe)
                 || current_probe.current_generation()
                     != previous_probe.current_generation().saturating_add(1)
                 || current_probe.cspace_incarnation()
@@ -1490,7 +2977,8 @@ fn unchanged_quarantined_probe(
         && before.same_cspace_identity(after)
         && before.same_cspace_incarnation(after)
         && before.same_capability_table(after)
-        && after.capability_table_len() == 0
+        && after.capability_table_len() == NEGATIVE_CAPABILITIES
+        && after.installed_capability_count() == NEGATIVE_CAPABILITIES
 }
 
 fn negative_control_matches(
@@ -1506,13 +2994,19 @@ fn negative_control_matches(
             && if retain_tuple {
                 record.core_token == Some(instance.token)
                     && record.domain == Some(instance.domain)
+                    && record.streams == Some(instance.streams)
+                    && record.terminal_candidate.is_none()
                     && record.handle.as_ref().is_some_and(|handle| {
                         handle.id() == instance.handle.id()
                             && handle.allocation_domain() == instance.domain
                             && handle.shares_status_with(&instance.handle)
                     })
             } else {
-                record.core_token.is_none() && record.domain.is_none() && record.handle.is_none()
+                record.core_token.is_none()
+                    && record.domain.is_none()
+                    && record.handle.is_none()
+                    && record.streams.is_none()
+                    && record.terminal_candidate.is_none()
             }
     })
 }
@@ -1542,6 +3036,8 @@ async fn run_mismatch_case(kind: NegativeCase) {
         && SSH_POLICY_GATE.load(Ordering::Acquire) == POLICY_CLOSED;
     if !valid {
         fail(ERROR_NEGATIVE_RESULT);
+    } else {
+        C53_MISMATCH_REJECTS.fetch_add(1, Ordering::AcqRel);
     }
     NEG_ROUTE.clear();
 }
@@ -1570,6 +3066,8 @@ async fn run_duplicate_case() {
         && SSH_POLICY_GATE.load(Ordering::Acquire) == POLICY_CLOSED;
     if !valid {
         fail(ERROR_NEGATIVE_RESULT);
+    } else {
+        C53_DUPLICATE_FAULT_REJECTS.fetch_add(1, Ordering::AcqRel);
     }
     NEG_ROUTE.clear();
 }
@@ -1577,28 +3075,88 @@ async fn run_duplicate_case() {
 fn finalize_negative_seed(instance: &NegativeInstance) -> Option<u64> {
     let mut control = NEG_CONTROL.try_lock().ok()?;
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
-    let tuple = control.running_tuple(instance.key).ok()??;
-    if tuple.core_token != instance.token
-        || tuple.handle.id() != instance.handle.id()
-        || !tuple.handle.shares_status_with(&instance.handle)
-        || tuple.domain != instance.domain
-        || tuple.handle.try_exit()?.state() != TaskState::Faulted
+    // The isolated negative table deliberately stores only the child/core,
+    // domain, and stream projection. It must not borrow production's full
+    // supervisor/reaper tuple gate merely to retire the already-authorized
+    // ABA seed.
+    let (core_token, handle, domain, streams) = {
+        let record = control.exact(instance.key)?;
+        if record.phase != ControlPhase::Running
+            || record.core_token != Some(instance.token)
+            || record.domain != Some(instance.domain)
+            || record.streams != Some(instance.streams)
+            || record.terminal_candidate.is_some()
+            || record.candidate_source.is_some()
+        {
+            system.restore();
+            return None;
+        }
+        (
+            record.core_token?,
+            record.handle.as_ref()?.clone(),
+            record.domain?,
+            record.streams?,
+        )
+    };
+    if core_token != instance.token
+        || handle.id() != instance.handle.id()
+        || !handle.shares_status_with(&instance.handle)
+        || domain != instance.domain
+        || streams != instance.streams
+        || handle.try_exit()?.state() != TaskState::Faulted
     {
         system.restore();
         return None;
     }
+    let lifecycle_stage = core::cell::Cell::new(0_u8);
     let outcome = unsafe {
-        NEG_REGISTRY.finalize(instance.token, &tuple.handle, |domain, kind| {
-            kind == TerminalRetireKind::FaultReclaimed
-                && domain == instance.domain
-                && HEAP.unregister_owner(domain.owner).is_ok()
-        })
+        NEG_REGISTRY.finalize_with_space_expect_completion(
+            instance.token,
+            &handle,
+            None,
+            |space, kind| {
+                if lifecycle_stage.get() != 0 || kind != TerminalRetireKind::FaultReclaimed {
+                    return false;
+                }
+                let published =
+                    finalize_stream_state(space, streams, ComponentTerminal::RunnerFault);
+                if published {
+                    lifecycle_stage.set(1);
+                }
+                published
+            },
+            |domain, kind| {
+                if lifecycle_stage.get() != 1
+                    || kind != TerminalRetireKind::FaultReclaimed
+                    || domain != instance.domain
+                {
+                    return false;
+                }
+                let retired = HEAP.unregister_owner(domain.owner).is_ok();
+                if retired {
+                    lifecycle_stage.set(2);
+                }
+                retired
+            },
+        )
     }
     .ok()?;
+    // Returning from finalize_with_space after stage 2 proves that terminal
+    // publication preceded owner retirement and the exact CSpace reset.
+    if lifecycle_stage.get() != 2
+        || outcome.revoked_capabilities != NEGATIVE_CAPABILITIES
+        || outcome.detached_completion.is_some()
+    {
+        system.restore();
+        return None;
+    }
     let record = control.exact_mut(instance.key)?;
     if record.phase != ControlPhase::Running
         || record.core_token != Some(instance.token)
         || record.domain != Some(instance.domain)
+        || record.streams != Some(instance.streams)
+        || record.terminal_candidate.is_some()
+        || record.candidate_source.is_some()
         || record.handle.as_ref().is_none_or(|handle| {
             handle.id() != instance.handle.id() || !handle.shares_status_with(&instance.handle)
         })
@@ -1614,6 +3172,8 @@ fn finalize_negative_seed(instance: &NegativeInstance) -> Option<u64> {
     record.core_token = None;
     record.handle = None;
     record.domain = None;
+    record.streams = None;
+    record.terminal_candidate = None;
     system.restore();
     Some(outcome.next_cspace_incarnation)
 }
@@ -1660,14 +3220,14 @@ async fn run_aba_case() {
             && seed.before.same_space_object(after)
             && seed.before.same_cspace_lock(after)
             && seed.before.same_cspace_identity(after)
-            && seed.before.same_capability_table(after)
+            && after.capability_table_len() == seed.before.capability_table_len()
             && after.cspace_incarnation() == Some(next_incarnation)
             && seed
                 .before
                 .cspace_incarnation()
                 .and_then(|value| value.checked_add(1))
                 == Some(next_incarnation)
-            && after.capability_table_len() == 0
+            && after.installed_capability_count() == 0
     });
     if !seed_finalized
         || HEAP.arena_stats(seed.domain.arena).is_some()
@@ -1693,7 +3253,6 @@ async fn run_aba_case() {
         || !seed.before.same_space_object(replacement.before)
         || !seed.before.same_cspace_lock(replacement.before)
         || !seed.before.same_cspace_identity(replacement.before)
-        || !seed.before.same_capability_table(replacement.before)
         || replacement.before.cspace_incarnation() != Some(next_incarnation)
         || !wait_until_polled(&replacement.handle).await
     {
@@ -1746,6 +3305,379 @@ async fn run_aba_case() {
         && SSH_POLICY_GATE.load(Ordering::Acquire) == POLICY_CLOSED;
     if !aba_valid {
         fail(ERROR_ABA);
+    } else {
+        C53_ABA_REJECTS.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct TerminalRaceEvidence {
+    key: ControlKey,
+    core_token: InstanceToken,
+    handle: TaskHandle,
+    domain: AllocationDomain,
+    home_hart: crate::exec::HartId,
+    before: AcceptanceInstanceProbe,
+}
+
+fn capture_terminal_race(token: ManagedComponentToken) -> Option<TerminalRaceEvidence> {
+    let key = managed_token_key(token)?;
+    let mut control = CONTROL.try_lock().ok()?;
+    let tuple = control.running_tuple(key).ok()??;
+    if tuple.terminal_candidate.is_some()
+        || !control_record_matches_tuple(control.exact(key)?, &tuple)
+    {
+        return None;
+    }
+    let snapshot = registry()
+        .observe_structural(tuple.core_token, &tuple.handle)
+        .ok()?;
+    let home_hart = snapshot.home_hart?;
+    let before = registry().acceptance_probe(tuple.core_token)?;
+    if !before.is_exact()
+        || before.exact_phase() != Some(InstancePhase::Active)
+        || !before.seal_matches_space()
+        || !before.seal_matches_cspace()
+        || before.capability_table_len() != 4
+        || before.installed_capability_count() != 4
+        || !terminal_race_bind(key, &tuple.handle, tuple.domain)
+    {
+        return None;
+    }
+    Some(TerminalRaceEvidence {
+        key,
+        core_token: tuple.core_token,
+        handle: tuple.handle,
+        domain: tuple.domain,
+        home_hart,
+        before,
+    })
+}
+
+async fn wait_terminal_race_ready_for_hold() -> bool {
+    let started = crate::sbi::time();
+    while TERMINAL_RACE_PAYLOAD.load(Ordering::Acquire) != TERMINAL_RACE_PAYLOAD_BLOCKED
+        || !TERMINAL_RACE_LISTENER_ARMED.load(Ordering::Acquire)
+    {
+        if deadline_expired(started) {
+            return false;
+        }
+        crate::exec::yield_now().await;
+    }
+    true
+}
+
+async fn hold_terminal_race_control() {
+    if !wait_terminal_race_ready_for_hold().await {
+        fail(ERROR_C53_TERMINAL_RACE);
+        TERMINAL_RACE_CANCEL_HOLD.store(TERMINAL_RACE_CONTROL_RELEASED, Ordering::Release);
+        return;
+    }
+    let started = crate::sbi::time();
+    let control = loop {
+        let retry = match CONTROL.try_lock() {
+            Ok(control) => break control,
+            Err(ControlGateError::Busy) if !deadline_expired(started) => true,
+            Err(_) => {
+                fail(ERROR_C53_TERMINAL_RACE);
+                TERMINAL_RACE_CANCEL_HOLD.store(TERMINAL_RACE_CONTROL_RELEASED, Ordering::Release);
+                return;
+            }
+        };
+        if retry {
+            crate::exec::yield_now().await;
+        }
+    };
+    if TERMINAL_RACE_CANCEL_HOLD
+        .compare_exchange(
+            TERMINAL_RACE_HOLD_REQUESTED,
+            TERMINAL_RACE_CONTROL_HELD,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+        || TERMINAL_RACE_CASE.load(Ordering::Acquire) == TERMINAL_RACE_IDLE
+    {
+        fail(ERROR_C53_TERMINAL_RACE);
+        drop(control);
+        TERMINAL_RACE_CANCEL_HOLD.store(TERMINAL_RACE_CONTROL_RELEASED, Ordering::Release);
+        return;
+    }
+    let _ = terminal_race_spin_until(&TERMINAL_RACE_CANCEL_HOLD, TERMINAL_RACE_BUSY_OBSERVED);
+    drop(control);
+    TERMINAL_RACE_CANCEL_HOLD.store(TERMINAL_RACE_CONTROL_RELEASED, Ordering::Release);
+
+    let started = crate::sbi::time();
+    while TERMINAL_RACE_COMPLETION.load(Ordering::Acquire) != TERMINAL_RACE_COMPLETION_EDGE {
+        if deadline_expired(started) {
+            fail(ERROR_C53_TERMINAL_RACE);
+            return;
+        }
+        crate::exec::yield_now().await;
+    }
+    let started = crate::sbi::time();
+    let completion_control = loop {
+        let retry = match CONTROL.try_lock() {
+            Ok(control) => break control,
+            Err(ControlGateError::Busy) if !deadline_expired(started) => true,
+            Err(_) => {
+                fail(ERROR_C53_TERMINAL_RACE);
+                return;
+            }
+        };
+        if retry {
+            crate::exec::yield_now().await;
+        }
+    };
+    if TERMINAL_RACE_COMPLETION
+        .compare_exchange(
+            TERMINAL_RACE_COMPLETION_EDGE,
+            TERMINAL_RACE_COMPLETION_HELD,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        fail(ERROR_C53_TERMINAL_RACE);
+        return;
+    }
+    let observed =
+        terminal_race_spin_until(&TERMINAL_RACE_COMPLETION, TERMINAL_RACE_COMPLETION_BUSY);
+    drop(completion_control);
+    if observed {
+        TERMINAL_RACE_COMPLETION.store(TERMINAL_RACE_COMPLETION_RELEASED, Ordering::Release);
+    }
+}
+
+async fn terminal_race_cancel_worker(
+    token: ManagedComponentToken,
+    evidence: TerminalRaceEvidence,
+    case: u8,
+    original: ComponentTerminal,
+) {
+    let started = crate::sbi::time();
+    while TERMINAL_RACE_CANCEL_HOLD.load(Ordering::Acquire) != TERMINAL_RACE_CONTROL_HELD {
+        if deadline_expired(started) {
+            fail(ERROR_C53_TERMINAL_RACE);
+            TERMINAL_RACE_PAYLOAD.store(TERMINAL_RACE_PAYLOAD_RELEASED, Ordering::Release);
+            return;
+        }
+        crate::exec::yield_now().await;
+    }
+    if cancel_instance(token) != ManagedComponentCancel::Busy {
+        fail(ERROR_C53_TERMINAL_RACE);
+    } else {
+        C53_CANCEL_BUSY_RETRIES.fetch_add(1, Ordering::AcqRel);
+    }
+    TERMINAL_RACE_CANCEL_HOLD.store(TERMINAL_RACE_BUSY_OBSERVED, Ordering::Release);
+    let started = crate::sbi::time();
+    while TERMINAL_RACE_CANCEL_HOLD.load(Ordering::Acquire) != TERMINAL_RACE_CONTROL_RELEASED {
+        if deadline_expired(started) {
+            fail(ERROR_C53_TERMINAL_RACE);
+            TERMINAL_RACE_PAYLOAD.store(TERMINAL_RACE_PAYLOAD_RELEASED, Ordering::Release);
+            return;
+        }
+        crate::exec::yield_now().await;
+    }
+
+    let expected_cancel = if case == TERMINAL_RACE_CANCEL_FIRST {
+        ManagedComponentCancel::Requested
+    } else {
+        ManagedComponentCancel::AlreadyCompleting
+    };
+    let started = crate::sbi::time();
+    let outcome = loop {
+        let outcome = cancel_instance(token);
+        if outcome != ManagedComponentCancel::Busy {
+            break outcome;
+        }
+        if deadline_expired(started) {
+            break ManagedComponentCancel::Lost;
+        }
+        crate::exec::yield_now().await;
+    };
+    let expected_candidate = if case == TERMINAL_RACE_CANCEL_FIRST {
+        ComponentTerminal::Cancelled
+    } else {
+        original
+    };
+    let projection_exact = if let Ok(control) = CONTROL.try_lock() {
+        control.exact(evidence.key).is_some_and(|record| {
+            record.phase == ControlPhase::Running
+                && record.core_token == Some(evidence.core_token)
+                && record.domain == Some(evidence.domain)
+                && record.terminal_candidate == Some(expected_candidate)
+                && record.handle.as_ref().is_some_and(|handle| {
+                    terminal_race_bound_identity_matches(evidence.key, handle)
+                        && handle.shares_status_with(&evidence.handle)
+                })
+        })
+    } else {
+        false
+    };
+    let core_exact = registry()
+        .acceptance_probe(evidence.core_token)
+        .is_some_and(|probe| {
+            probe.is_exact()
+                && probe.exact_phase() == Some(InstancePhase::Active)
+                && probe.seal_matches_space()
+                && probe.seal_matches_cspace()
+                && probe.capability_table_len() == 4
+                && probe.installed_capability_count() == 4
+        });
+    if outcome == expected_cancel && projection_exact && core_exact {
+        TERMINAL_RACE_CANCEL_VALID.store(true, Ordering::Release);
+    } else {
+        fail(ERROR_C53_TERMINAL_RACE);
+    }
+    TERMINAL_RACE_PAYLOAD.store(TERMINAL_RACE_PAYLOAD_RELEASED, Ordering::Release);
+}
+
+async fn terminal_race_observer(token: ManagedComponentToken) {
+    let terminal = match wait_instance(token).await {
+        ManagedComponentState::Complete(terminal) => terminal_word(terminal),
+        ManagedComponentState::Busy
+        | ManagedComponentState::Running
+        | ManagedComponentState::Lost => u64::MAX,
+    };
+    TERMINAL_RACE_OBSERVED_TERMINAL.store(terminal, Ordering::Release);
+}
+
+fn terminal_race_postconditions(evidence: &TerminalRaceEvidence) -> bool {
+    let Some(after) = registry().acceptance_probe(evidence.core_token) else {
+        return false;
+    };
+    !after.is_exact()
+        && after.current_phase() == InstancePhase::Vacant
+        && evidence.before.current_generation().checked_add(1) == Some(after.current_generation())
+        && evidence.before.same_space_object(after)
+        && evidence.before.same_cspace_lock(after)
+        && evidence.before.same_cspace_identity(after)
+        && after.capability_table_len() == evidence.before.capability_table_len()
+        && evidence
+            .before
+            .cspace_incarnation()
+            .and_then(|incarnation| incarnation.checked_add(1))
+            == after.cspace_incarnation()
+        && after.installed_capability_count() == 0
+        && HEAP.arena_stats(evidence.domain.arena).is_none()
+        && HEAP.account_stats(evidence.domain.owner).is_none()
+}
+
+async fn start_terminal_race(
+    case: u8,
+    terminal: ComponentTerminal,
+) -> Option<ManagedComponentToken> {
+    let started = crate::sbi::time();
+    loop {
+        match start_image_instance(
+            false,
+            PayloadMode::AcceptanceTerminalRace { case, terminal },
+        ) {
+            Ok(token) => return Some(token),
+            Err(ComponentTerminal::Unavailable) if !deadline_expired(started) => {
+                crate::exec::yield_now().await;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+async fn run_terminal_race_case(case: u8, original: ComponentTerminal) -> bool {
+    if !terminal_race_arm(case, original) {
+        return false;
+    }
+    let Some(token) = start_terminal_race(case, original).await else {
+        fail(ERROR_C53_TERMINAL_RACE);
+        TERMINAL_RACE_CASE.store(TERMINAL_RACE_IDLE, Ordering::Release);
+        return false;
+    };
+    let Some(evidence) = capture_terminal_race(token) else {
+        fail(ERROR_C53_TERMINAL_RACE);
+        TERMINAL_RACE_PAYLOAD.store(TERMINAL_RACE_PAYLOAD_RELEASED, Ordering::Release);
+        return false;
+    };
+    let home = evidence.home_hart.index();
+    let Some(cancel_hart) = crate::exec::HartId::new((home + 1) % HARTS) else {
+        return false;
+    };
+    let Some(observer_hart) = crate::exec::HartId::new((home + 2) % HARTS) else {
+        return false;
+    };
+    let Some(holder_hart) = crate::exec::HartId::new((home + 3) % HARTS) else {
+        return false;
+    };
+    let (observer, holder, canceller) = {
+        let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+        let observer = crate::exec::spawn_pinned_on(
+            observer_hart,
+            "wasm-c53-terminal-observer",
+            terminal_race_observer(token),
+        );
+        let holder = crate::exec::spawn_pinned_on(
+            holder_hart,
+            "wasm-c53-control-holder",
+            hold_terminal_race_control(),
+        );
+        let cancel_evidence = TerminalRaceEvidence {
+            key: evidence.key,
+            core_token: evidence.core_token,
+            handle: evidence.handle.clone(),
+            domain: evidence.domain,
+            home_hart: evidence.home_hart,
+            before: evidence.before,
+        };
+        let canceller = crate::exec::spawn_pinned_on(
+            cancel_hart,
+            "wasm-c53-terminal-canceller",
+            terminal_race_cancel_worker(token, cancel_evidence, case, original),
+        );
+        system.restore();
+        (observer, holder, canceller)
+    };
+
+    let cancel_exit = canceller.join().await.state();
+    let holder_exit = holder.join().await.state();
+    let observer_exit = observer.join().await.state();
+    let expected_terminal = if case == TERMINAL_RACE_CANCEL_FIRST {
+        ComponentTerminal::Cancelled
+    } else {
+        original
+    };
+    let expected_payload_phase = if case == TERMINAL_RACE_CANCEL_FIRST {
+        TERMINAL_RACE_PAYLOAD_FOLDED
+    } else {
+        TERMINAL_RACE_PAYLOAD_RELEASED
+    };
+    let valid = cancel_exit == TaskState::Exited
+        && holder_exit == TaskState::Exited
+        && observer_exit == TaskState::Exited
+        && TERMINAL_RACE_CANCEL_VALID.load(Ordering::Acquire)
+        && TERMINAL_RACE_OBSERVED_TERMINAL.load(Ordering::Acquire)
+            == terminal_word(expected_terminal)
+        && TERMINAL_RACE_PAYLOAD.load(Ordering::Acquire) == expected_payload_phase
+        && TERMINAL_RACE_COMPLETION.load(Ordering::Acquire) == TERMINAL_RACE_COMPLETION_RELEASED
+        && terminal_race_postconditions(&evidence)
+        && acknowledge_until_stable(token).await
+        && wait_for_supervisors_to_retire().await;
+    if valid {
+        C53_TERMINAL_RACES.fetch_add(1, Ordering::AcqRel);
+    } else {
+        fail(ERROR_C53_TERMINAL_RACE);
+    }
+    TERMINAL_RACE_CASE.store(TERMINAL_RACE_IDLE, Ordering::Release);
+    valid
+}
+
+async fn run_terminal_race_matrix() {
+    for (case, terminal) in [
+        (TERMINAL_RACE_SUCCESS_FIRST, ComponentTerminal::Success),
+        (TERMINAL_RACE_RETURNED_FIRST, ComponentTerminal::Returned(7)),
+        (TERMINAL_RACE_CANCEL_FIRST, ComponentTerminal::Returned(9)),
+    ] {
+        if !run_terminal_race_case(case, terminal).await {
+            fail(ERROR_C53_TERMINAL_RACE);
+            return;
+        }
     }
 }
 
@@ -1784,20 +3716,33 @@ async fn start_positive_command() -> Option<ManagedComponentToken> {
 }
 
 fn production_control_is_terminal_and_acknowledged(control: &ControlTable) -> bool {
-    control.slots.iter().all(|record| match record.phase {
-        ControlPhase::Vacant => {
-            record.core_token.is_none() && record.handle.is_none() && record.domain.is_none()
-        }
-        ControlPhase::Complete {
-            acknowledged: true, ..
-        } => record.core_token.is_none() && record.handle.is_none() && record.domain.is_none(),
-        ControlPhase::Starting
-        | ControlPhase::Running
-        | ControlPhase::Complete {
-            acknowledged: false,
-            ..
-        }
-        | ControlPhase::Quarantined => false,
+    control.slots.iter().enumerate().all(|(index, record)| {
+        CONTROL.completion[index].waiter_count() == 0
+            && match record.phase {
+                ControlPhase::Vacant => {
+                    record.core_token.is_none()
+                        && record.handle.is_none()
+                        && record.domain.is_none()
+                        && record.streams.is_none()
+                        && record.terminal_candidate.is_none()
+                }
+                ControlPhase::Complete {
+                    acknowledged: true, ..
+                } => {
+                    record.core_token.is_none()
+                        && record.handle.is_none()
+                        && record.domain.is_none()
+                        && record.streams.is_none()
+                        && record.terminal_candidate.is_none()
+                }
+                ControlPhase::Starting
+                | ControlPhase::Running
+                | ControlPhase::Complete {
+                    acknowledged: false,
+                    ..
+                }
+                | ControlPhase::Quarantined => false,
+            }
     })
 }
 
@@ -1856,6 +3801,19 @@ fn initial_state_is_closed_and_clean() -> bool {
         && negative.header_mismatches == 0
         && ERRORS.load(Ordering::Acquire) == 0
         && NEG_ROUTE.state.load(Ordering::Acquire) == NEG_FREE
+        && C53
+            .iter()
+            .all(|slot| slot.stage.load(Ordering::Acquire) == C53_FREE)
+        && C53_PAIRS.load(Ordering::Acquire) == 0
+        && C53_HOST_PENDING.load(Ordering::Acquire) == 0
+        && C53_EXACT_WAKES.load(Ordering::Acquire) == 0
+        && C53_EXACT_RESUMES.load(Ordering::Acquire) == 0
+        && C53_START_ERROR_TERMINALS.load(Ordering::Acquire) == 0
+        && C53_TERMINAL_RACES.load(Ordering::Acquire) == 0
+        && C53_CANCEL_BUSY_RETRIES.load(Ordering::Acquire) == 0
+        && C53_COMPLETION_BUSY_RETRIES.load(Ordering::Acquire) == 0
+        && !C53_START_INTENT.load(Ordering::Acquire)
+        && TERMINAL_RACE_CASE.load(Ordering::Acquire) == TERMINAL_RACE_IDLE
 }
 
 static RUN_STATE: AtomicU8 = AtomicU8::new(0);
@@ -1870,22 +3828,42 @@ pub(super) async fn run() -> bool {
     if !initial_state_is_closed_and_clean() {
         fail(ERROR_POLICY_GATE);
     } else {
+        if !run_c53_close_races() {
+            fail(ERROR_C53_STREAM);
+        }
+        run_c53_matrix().await;
         run_positive_matrix().await;
         for kind in MISMATCH_CASES {
             run_mismatch_case(kind).await;
         }
         run_duplicate_case().await;
         run_aba_case().await;
+        run_terminal_race_matrix().await;
         run_normal_production_probe().await;
 
         let negative = NEG_REGISTRY.occupancy_stats();
-        if negative.occupied != 10
+        let control_reusable = CONTROL
+            .try_lock()
+            .is_ok_and(|control| production_control_is_terminal_and_acknowledged(&control));
+        if negative.occupied != 11
             || negative.header_mismatches != 0
-            || negative.phase_count(InstancePhase::Quarantined) != 10
+            || negative.phase_count(InstancePhase::Quarantined) != 11
             || NEG_RAW_AUTHORIZATIONS.load(Ordering::Acquire) != 2
             || NEG_RAW_RECLAIMS.load(Ordering::Acquire) != 2
             || NEG_REPLAY_AUTHORIZATIONS.load(Ordering::Acquire) != 0
             || ABA_STALE_AUTHORIZATIONS.load(Ordering::Acquire) != 0
+            || C53_MISMATCH_REJECTS.load(Ordering::Acquire) != MISMATCH_CASES.len()
+            || C53_DUPLICATE_FAULT_REJECTS.load(Ordering::Acquire) != 1
+            || C53_ABA_REJECTS.load(Ordering::Acquire) != 1
+            || C53_LATE_WAKE_REJECTS.load(Ordering::Acquire) != POSITIVE_CYCLES
+            || C53_CLOSE_RACES.load(Ordering::Acquire) != 3
+            || C53_TERMINAL_MAPPINGS.load(Ordering::Acquire) != 3
+            || C53_START_ERROR_TERMINALS.load(Ordering::Acquire) != 2
+            || C53_TERMINAL_RACES.load(Ordering::Acquire) != 3
+            || C53_CANCEL_BUSY_RETRIES.load(Ordering::Acquire) != 3
+            || C53_COMPLETION_BUSY_RETRIES.load(Ordering::Acquire) != 3
+            || C53_START_INTENT.load(Ordering::Acquire)
+            || !control_reusable
         {
             fail(ERROR_NEGATIVE_RESULT);
         }
@@ -1893,6 +3871,33 @@ pub(super) async fn run() -> bool {
 
     if ERRORS.load(Ordering::Acquire) == 0 && open_production_policy_gate().await {
         RUN_STATE.store(2, Ordering::Release);
+        println!(
+            "WASM_C53_ACCEPTANCE PASS pairs={} input_chunks={} output_chunks={} xor_bytes={} backend_pending={} backend_wakes={} host_pending={} exact_wakes={} exact_resumes={} late_wake_rejects={} eof={} normal_closes={} terminal_matches={} terminal_orders={} close_races={} terminal_mappings={} start_error_terminals={} terminal_races={} cancel_busy_retries={} completion_busy_retries={} mismatches={} duplicate_fault_rejects={} aba_rejects={} harts={}",
+            C53_PAIRS.load(Ordering::Acquire),
+            C53_INPUT_CHUNKS.load(Ordering::Acquire),
+            C53_OUTPUT_CHUNKS.load(Ordering::Acquire),
+            C53_XOR_BYTES.load(Ordering::Acquire),
+            C53_BACKEND_PENDING.load(Ordering::Acquire),
+            C53_BACKEND_WAKES.load(Ordering::Acquire),
+            C53_HOST_PENDING.load(Ordering::Acquire),
+            C53_EXACT_WAKES.load(Ordering::Acquire),
+            C53_EXACT_RESUMES.load(Ordering::Acquire),
+            C53_LATE_WAKE_REJECTS.load(Ordering::Acquire),
+            C53_EOF.load(Ordering::Acquire),
+            C53_NORMAL_CLOSES.load(Ordering::Acquire),
+            C53_TERMINAL_MATCHES.load(Ordering::Acquire),
+            C53_TERMINAL_ORDERS.load(Ordering::Acquire),
+            C53_CLOSE_RACES.load(Ordering::Acquire),
+            C53_TERMINAL_MAPPINGS.load(Ordering::Acquire),
+            C53_START_ERROR_TERMINALS.load(Ordering::Acquire),
+            C53_TERMINAL_RACES.load(Ordering::Acquire),
+            C53_CANCEL_BUSY_RETRIES.load(Ordering::Acquire),
+            C53_COMPLETION_BUSY_RETRIES.load(Ordering::Acquire),
+            C53_MISMATCH_REJECTS.load(Ordering::Acquire),
+            C53_DUPLICATE_FAULT_REJECTS.load(Ordering::Acquire),
+            C53_ABA_REJECTS.load(Ordering::Acquire),
+            HARTS,
+        );
         println!(
             "WASM_C52_ACCEPTANCE PASS parks={} resumes={} cross_hart_signals={} stale_rejects={} live_faults={}",
             C52_PARKS.load(Ordering::Acquire),
@@ -1911,6 +3916,27 @@ pub(super) async fn run() -> bool {
         fail(ERROR_POLICY_GATE);
         lifecycle_fail_stop();
         RUN_STATE.store(3, Ordering::Release);
+        for (index, slot) in C53.iter().enumerate() {
+            let stage = slot.stage.load(Ordering::Acquire);
+            if stage != C53_FREE {
+                println!(
+                    "WASM_C53_ACCEPTANCE slot={} stage={} task={} owner={} arena={} round={} hart={} input_woken={} host_pending={} exact_wake={} exact_resume={} eof={} close_mask={:#x}",
+                    index,
+                    stage,
+                    slot.task.load(Ordering::Acquire),
+                    slot.owner.load(Ordering::Acquire),
+                    slot.arena.load(Ordering::Acquire),
+                    slot.round.load(Ordering::Acquire),
+                    slot.hart.load(Ordering::Acquire),
+                    slot.input_woken.load(Ordering::Acquire),
+                    slot.host_pending.load(Ordering::Acquire),
+                    slot.exact_wake.load(Ordering::Acquire),
+                    slot.exact_resume.load(Ordering::Acquire),
+                    slot.eof.load(Ordering::Acquire),
+                    slot.close_mask.load(Ordering::Acquire),
+                );
+            }
+        }
         for (round, evidence) in ROUND_EVIDENCE.iter().enumerate() {
             if let Some(snapshot) = evidence.get() {
                 println!(
@@ -1928,6 +3954,33 @@ pub(super) async fn run() -> bool {
                 );
             }
         }
+        println!(
+            "WASM_C53_ACCEPTANCE FAIL errors={:#x} pairs={} input_chunks={} output_chunks={} xor_bytes={} backend_pending={} backend_wakes={} host_pending={} exact_wakes={} exact_resumes={} late_wake_rejects={} eof={} normal_closes={} terminal_matches={} terminal_orders={} close_races={} terminal_mappings={} start_error_terminals={} terminal_races={} cancel_busy_retries={} completion_busy_retries={} mismatches={} duplicate_fault_rejects={} aba_rejects={}",
+            ERRORS.load(Ordering::Acquire),
+            C53_PAIRS.load(Ordering::Acquire),
+            C53_INPUT_CHUNKS.load(Ordering::Acquire),
+            C53_OUTPUT_CHUNKS.load(Ordering::Acquire),
+            C53_XOR_BYTES.load(Ordering::Acquire),
+            C53_BACKEND_PENDING.load(Ordering::Acquire),
+            C53_BACKEND_WAKES.load(Ordering::Acquire),
+            C53_HOST_PENDING.load(Ordering::Acquire),
+            C53_EXACT_WAKES.load(Ordering::Acquire),
+            C53_EXACT_RESUMES.load(Ordering::Acquire),
+            C53_LATE_WAKE_REJECTS.load(Ordering::Acquire),
+            C53_EOF.load(Ordering::Acquire),
+            C53_NORMAL_CLOSES.load(Ordering::Acquire),
+            C53_TERMINAL_MATCHES.load(Ordering::Acquire),
+            C53_TERMINAL_ORDERS.load(Ordering::Acquire),
+            C53_CLOSE_RACES.load(Ordering::Acquire),
+            C53_TERMINAL_MAPPINGS.load(Ordering::Acquire),
+            C53_START_ERROR_TERMINALS.load(Ordering::Acquire),
+            C53_TERMINAL_RACES.load(Ordering::Acquire),
+            C53_CANCEL_BUSY_RETRIES.load(Ordering::Acquire),
+            C53_COMPLETION_BUSY_RETRIES.load(Ordering::Acquire),
+            C53_MISMATCH_REJECTS.load(Ordering::Acquire),
+            C53_DUPLICATE_FAULT_REJECTS.load(Ordering::Acquire),
+            C53_ABA_REJECTS.load(Ordering::Acquire),
+        );
         println!(
             "WASM_C52_ACCEPTANCE FAIL errors={:#x} parks={} resumes={} cross_hart_signals={} stale_rejects={} live_faults={}",
             ERRORS.load(Ordering::Acquire),

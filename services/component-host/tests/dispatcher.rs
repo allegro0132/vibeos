@@ -76,6 +76,7 @@ fn invoke(
     for _ in 0..100_000 {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(_) => panic!("synchronous dispatcher unexpectedly suspended"),
             TypedPoll::Ready(value) => return Ok(value),
             TypedPoll::HostFailed(error) => return Err(InvokeFailure::Host(error)),
             TypedPoll::Trapped(trap) => return Err(InvokeFailure::Trap(trap)),
@@ -104,6 +105,7 @@ fn invoke_with_monotonic_metrics(
                 previous = metrics;
                 None
             }
+            TypedPoll::HostPending(_) => panic!("synchronous dispatcher unexpectedly suspended"),
             TypedPoll::Ready(value) => Some(Ok(value)),
             TypedPoll::HostFailed(error) => Some(Err(InvokeFailure::Host(error))),
             TypedPoll::Trapped(trap) => Some(Err(InvokeFailure::Trap(trap))),

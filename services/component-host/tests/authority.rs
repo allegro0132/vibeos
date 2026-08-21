@@ -131,6 +131,55 @@ fn operation_checks_kind_ceiling_and_revocation_again() {
 }
 
 #[test]
+fn ownerless_ephemeral_binding_seals_exact_space_incarnation_and_revocation() {
+    let first = SpinLock::new(CSpace::new("ownerless-first"));
+    let second = SpinLock::new(CSpace::new("ownerless-second"));
+    let first_cap = first.lock().mint(Arc::new(Probe(71)), Rights::READ);
+    let second_cap = second.lock().mint(Arc::new(Probe(72)), Rights::READ);
+    assert_eq!(
+        first_cap, second_cap,
+        "opaque numeric caps intentionally collide"
+    );
+
+    let authority =
+        ComponentAuthority::bind_ephemeral_in::<Probe>(&first, first_cap, Rights::READ).unwrap();
+    assert_eq!(
+        authority.with_resource::<Probe, _, _>(&first, Rights::READ, |probe| probe.0),
+        Ok(71)
+    );
+    assert_eq!(
+        authority
+            .with_resource::<Probe, _, _>(&second, Rights::READ, |probe| probe.0)
+            .unwrap_err(),
+        AuthorityError::WrongSpace
+    );
+
+    assert_eq!(first.lock().reset(), 1);
+    assert_eq!(
+        authority
+            .with_resource::<Probe, _, _>(&first, Rights::READ, |probe| probe.0)
+            .unwrap_err(),
+        AuthorityError::IncarnationMismatch
+    );
+
+    let replacement = first.lock().mint(Arc::new(Probe(73)), Rights::READ);
+    let replacement_authority =
+        ComponentAuthority::bind_ephemeral_in::<Probe>(&first, replacement, Rights::READ).unwrap();
+    assert_eq!(first.lock().revoke_slot(replacement.slot()), 1);
+    assert_eq!(
+        replacement_authority
+            .with_resource::<Probe, _, _>(&first, Rights::READ, |probe| probe.0)
+            .unwrap_err(),
+        AuthorityError::InvalidOrRevoked
+    );
+    assert_eq!(
+        ComponentAuthority::bind_ephemeral_in::<Probe>(&first, replacement, Rights::READ)
+            .unwrap_err(),
+        AuthorityError::InvalidOrRevoked
+    );
+}
+
+#[test]
 fn intrinsic_identity_rejects_same_numeric_cap_in_same_incarnation() {
     let (first, first_binding) = ordinary("first");
     let (second, second_binding) = ordinary("second");

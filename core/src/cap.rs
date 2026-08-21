@@ -1078,6 +1078,17 @@ impl CSpace {
         self.slots.range()
     }
 
+    /// Allocation-free count of installed entries for target lifecycle
+    /// acceptance. Vacant slot generations deliberately survive reset even
+    /// when COW republishes the table, so slot count is not a liveness metric.
+    #[cfg(feature = "wasm-c48-target-acceptance")]
+    pub(crate) fn acceptance_installed_capability_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.entry.is_some())
+            .count()
+    }
+
     /// Reserve the exact slot generation that a durable `GrantRecord` will
     /// name. The reservation survives ordinary allocation and space-reset
     /// attempts until it is installed or explicitly cancelled.

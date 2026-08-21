@@ -29,6 +29,7 @@ use vibeos_core::sync::SpinLock;
 mod resources;
 mod runtime_dispatch;
 mod service;
+mod stream;
 mod transfer;
 
 pub use resources::{
@@ -43,8 +44,15 @@ pub use runtime_dispatch::{
     ComponentHostDispatcher, HostManifestError, VibeHostManifest, VibeHostRequirement,
     BLOB_INTERFACE, BLOB_LEN_FUNCTION, BLOB_READ_FUNCTION, CLOCK_INTERFACE, CLOCK_NOW_FUNCTION,
     LOG_INTERFACE, LOG_WRITE_FUNCTION, RANDOM_FILL_FUNCTION, RANDOM_INTERFACE,
+    STREAM_CLOSE_READER_FUNCTION, STREAM_CLOSE_WRITER_FUNCTION, STREAM_INTERFACE,
+    STREAM_READ_FUNCTION, STREAM_WRITE_FUNCTION,
 };
 pub use service::{ComponentCallError, ComponentHostServices};
+pub use stream::{
+    ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseOutcome,
+    StreamCloseReason, StreamError, StreamPreparedReceive, StreamReceiveCommit,
+    StreamReceiveDispatch, StreamSendDispatch, MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
+};
 pub use transfer::{transfer_owned, OwnedTransferError};
 
 /// Shared ownership used by the trusted host to serialize one CSpace.
@@ -57,6 +65,8 @@ pub enum HostResourceKind {
     Random,
     Blob,
     StructuredLog,
+    ByteStreamReader,
+    ByteStreamWriter,
 }
 
 /// Ties a concrete Rust type to exactly one component-facing resource kind.
@@ -186,26 +196,7 @@ impl ComponentAuthoritySpace {
     ) -> Result<ComponentAuthority, AuthorityError> {
         let guard = self.inner.cspace.lock();
         self.check_incarnation(&guard)?;
-        let held = guard.rights_of(cap).map_err(map_cap_error)?;
-
-        // Resolve by the concrete caller-supplied T. `Resource::kind()` is not
-        // trusted for this check because safe external implementations control it.
-        drop(
-            guard
-                .lookup_revocable::<T>(cap, Rights::NONE)
-                .map_err(map_cap_error)?,
-        );
-        match guard.persistent_witness::<T>(cap, Rights::NONE) {
-            Ok(_) => return Err(AuthorityError::RawPersistentAuthority),
-            Err(CapError::NotPersistent) => {}
-            Err(error) => return Err(map_cap_error(error)),
-        }
-        if !rights_ceiling.contains(held)
-            || !T::OPERATION_RIGHTS.contains(held)
-            || !T::OPERATION_RIGHTS.contains(rights_ceiling)
-        {
-            return Err(AuthorityError::RightsExceedCeiling);
-        }
+        validate_ephemeral_cap::<T>(&guard, cap, rights_ceiling)?;
         drop(guard);
 
         Ok(self.authority(cap, T::HOST_KIND, rights_ceiling, AuthorityClass::Ephemeral))
@@ -412,6 +403,29 @@ impl fmt::Debug for ComponentAuthority {
 }
 
 impl ComponentAuthority {
+    /// Bind directly inside an already stable CSpace without retaining an Arc,
+    /// lock owner, or resource pointer. The returned authority contains only
+    /// the exact space identity/incarnation seal, opaque Cap, semantic kind,
+    /// and non-amplifying rights ceiling.
+    pub fn bind_ephemeral_in<T: ComponentHostResource>(
+        cspace: &SpinLock<CSpace>,
+        cap: Cap,
+        rights_ceiling: Rights,
+    ) -> Result<Self, AuthorityError> {
+        let guard = cspace.lock();
+        validate_ephemeral_cap::<T>(&guard, cap, rights_ceiling)?;
+        let authority = Self {
+            cspace_identity: guard.identity(),
+            cspace_incarnation: guard.incarnation(),
+            cap,
+            kind: T::HOST_KIND,
+            rights_ceiling,
+            class: AuthorityClass::Ephemeral,
+        };
+        drop(guard);
+        Ok(authority)
+    }
+
     pub const fn kind(&self) -> HostResourceKind {
         self.kind
     }
@@ -513,6 +527,34 @@ impl ComponentAuthority {
         drop(guard);
         token.try_with(operation).map_err(map_cap_error)
     }
+}
+
+fn validate_ephemeral_cap<T: ComponentHostResource>(
+    cspace: &CSpace,
+    cap: Cap,
+    rights_ceiling: Rights,
+) -> Result<(), AuthorityError> {
+    let held = cspace.rights_of(cap).map_err(map_cap_error)?;
+
+    // Resolve by the concrete caller-supplied T. `Resource::kind()` is not
+    // trusted for this check because safe external implementations control it.
+    drop(
+        cspace
+            .lookup_revocable::<T>(cap, Rights::NONE)
+            .map_err(map_cap_error)?,
+    );
+    match cspace.persistent_witness::<T>(cap, Rights::NONE) {
+        Ok(_) => return Err(AuthorityError::RawPersistentAuthority),
+        Err(CapError::NotPersistent) => {}
+        Err(error) => return Err(map_cap_error(error)),
+    }
+    if !rights_ceiling.contains(held)
+        || !T::OPERATION_RIGHTS.contains(held)
+        || !T::OPERATION_RIGHTS.contains(rights_ceiling)
+    {
+        return Err(AuthorityError::RightsExceedCeiling);
+    }
+    Ok(())
 }
 
 /// A boot-local, attenuated view of a durable resource.

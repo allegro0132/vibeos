@@ -2,7 +2,7 @@ use vibeos_component_runtime::{
     decode::{inspect_component, CanonicalStringEncoding, DecodeError},
     resource::ResourceTypeId,
     value::{ResourceOwnership, ValueType},
-    world::{WorldContract, WorldError},
+    world::{EntityShape, ValueShape, WorldContract, WorldError},
 };
 
 const COMPONENT: &str =
@@ -573,6 +573,78 @@ fn missing_and_unexpected_world_items_are_distinct() {
         plan.check_world(&contract),
         Err(WorldError::UnexpectedExport)
     );
+}
+
+#[test]
+fn escaped_keyword_package_selects_only_the_exact_normalized_world() {
+    let source = r#"
+        package vibe:%stream@1.0.0;
+        world decoy {}
+        world filter {}
+    "#;
+    let contract =
+        WorldContract::parse(source, "vibe:stream/filter@1.0.0").expect("exact stream world");
+    assert_eq!(contract.identity, "vibe:stream/filter@1.0.0");
+    assert_eq!(
+        WorldContract::parse(source, "vibe:stream/missing@1.0.0"),
+        Err(WorldError::MissingWorld)
+    );
+    assert_eq!(
+        WorldContract::parse(source, "vibe:stream/filter@2.0.0"),
+        Err(WorldError::VersionMismatch)
+    );
+    assert_eq!(
+        WorldContract::parse(source, "other:stream/filter@1.0.0"),
+        Err(WorldError::VersionMismatch)
+    );
+}
+
+#[test]
+fn world_level_resource_aliases_normalize_borrowed_export_parameters() {
+    let source = r#"
+        package vibe:%stream@1.0.0;
+        interface streams {
+            resource reader;
+            resource writer;
+        }
+        world filter {
+            import streams;
+            use streams.{reader, writer};
+            export run: func(input: borrow<reader>, output: borrow<writer>);
+        }
+    "#;
+    let contract = WorldContract::parse(source, "vibe:stream/filter@1.0.0").unwrap();
+    assert_eq!(contract.imports.len(), 1);
+    assert_eq!(contract.imports[0].name, "vibe:stream/streams@1.0.0");
+    assert_eq!(contract.exports.len(), 1);
+    let run = contract
+        .exports
+        .iter()
+        .find(|entity| entity.name == "run")
+        .expect("run export");
+    let EntityShape::Function(function) = &run.entity else {
+        panic!("run must remain a function");
+    };
+    assert_eq!(function.parameters.len(), 2);
+    assert_eq!(function.parameters[0].name, "input");
+    assert_eq!(
+        function.parameters[0].value,
+        ValueShape::Borrow("reader".into())
+    );
+    assert_eq!(function.parameters[1].name, "output");
+    assert_eq!(
+        function.parameters[1].value,
+        ValueShape::Borrow("writer".into())
+    );
+
+    let executable = wat::parse_str(include_str!("fixtures/host-stream.component.wat")).unwrap();
+    let plan = inspect_component(&executable).unwrap();
+    let full_contract = WorldContract::parse(
+        include_str!("../../component-format/tests/corpus/wit/stream.wit"),
+        "vibe:stream/filter@1.0.0",
+    )
+    .unwrap();
+    plan.check_world(&full_contract).unwrap();
 }
 
 #[test]

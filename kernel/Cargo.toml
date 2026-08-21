@@ -71,6 +71,7 @@ ssh-component-command = [
     "dep:vibeos-component-admission",
     "dep:vibeos-component-command",
     "dep:vibeos-component-format",
+    "dep:vibeos-component-host",
     "dep:vibeos-component-runtime",
     "dep:vibeos-sshd",
     "dep:vibeos-wasm-runtime",
@@ -111,6 +112,7 @@ vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-component-admission = { path = "../services/component-admission", optional = true }
 vibeos-component-command = { path = "../services/component-command", optional = true }
 vibeos-component-format = { path = "../component-format", optional = true }
+vibeos-component-host = { path = "../services/component-host", optional = true }
 vibeos-component-runtime = { path = "../component-runtime", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }

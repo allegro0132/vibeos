@@ -1,0 +1,28 @@
+package vibe:%stream@1.0.0;
+
+interface streams {
+    resource reader;
+    resource writer;
+
+    enum close-reason {
+        normal,
+        failure,
+        cancelled,
+        denied,
+        unavailable,
+        exhausted,
+        invalid,
+        backend-fault,
+    }
+
+    read: func(input: borrow<reader>) -> list<u8>;
+    write: func(output: borrow<writer>, bytes: list<u8>);
+    close-reader: func(input: borrow<reader>, reason: close-reason);
+    close-writer: func(output: borrow<writer>, reason: close-reason);
+}
+
+world filter {
+    use streams.{reader, writer};
+    import streams;
+    export run: func(input: borrow<reader>, output: borrow<writer>);
+}

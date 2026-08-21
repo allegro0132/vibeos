@@ -160,6 +160,7 @@ fn invoke(
     let terminal = (0..100_000)
         .find_map(|_| match call.poll() {
             TypedPoll::Pending(_) => None,
+            TypedPoll::HostPending(_) => panic!("synchronous model dispatcher suspended"),
             TypedPoll::Ready(value) => Some(Ok(value)),
             TypedPoll::HostFailed(error) => panic!("joint-model host failed: {error:?}"),
             TypedPoll::Trapped(trap) => Some(Err(trap)),

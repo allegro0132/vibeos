@@ -38,6 +38,33 @@ pub struct AsyncStateLimits {
     pub waitables_per_set: u32,
 }
 
+/// Current and historical use of one fixed-capacity async arena.
+///
+/// These counters are logical entries, not allocator bytes. They let the
+/// embedding prove that a Component stayed within its selected ceilings
+/// without exposing any handle, generation, or object identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncArenaUsage {
+    pub current: u32,
+    pub peak: u32,
+    pub limit: u32,
+}
+
+/// Redacted per-Component accounting for all allocation-backed async state.
+///
+/// Waitable membership has one canonical representation on the endpoint;
+/// sets retain only a bounded count. Consequently `joined_waitables` cannot
+/// hide allocator capacity accumulated by moving the same endpoint through
+/// multiple live sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncStateMetrics {
+    pub handles: AsyncArenaUsage,
+    pub pairs: AsyncArenaUsage,
+    pub tasks: AsyncArenaUsage,
+    pub joined_waitables: AsyncArenaUsage,
+    pub wait_registrations: AsyncArenaUsage,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum AsyncStateError {
@@ -423,10 +450,12 @@ struct Endpoint {
     active: Option<ActiveCopy>,
     event: Option<PendingEvent>,
     joined_set: Option<Seal>,
+    join_sequence: Option<NonZeroU64>,
 }
 
 struct WaitableSet {
-    members: Vec<Seal>,
+    member_count: u32,
+    next_join: u64,
     waiter: Option<WaitRegistration>,
     next_wait: u64,
 }
@@ -588,6 +617,7 @@ struct Slot<T> {
 struct Table<T> {
     slots: Vec<Slot<T>>,
     live: u32,
+    peak: u32,
     maximum: u32,
     full_error: AsyncStateError,
 }
@@ -600,6 +630,7 @@ impl<T> Table<T> {
         Ok(Self {
             slots: Vec::new(),
             live: 0,
+            peak: 0,
             maximum,
             full_error,
         })
@@ -656,6 +687,7 @@ impl<T> Table<T> {
         let seal = Seal::new(index, self.slots[slot].generation)?;
         self.slots[slot].value = Some(value);
         self.live = self.live.checked_add(1).ok_or(self.full_error)?;
+        self.peak = self.peak.max(self.live);
         Ok(seal)
     }
 
@@ -1083,6 +1115,10 @@ pub struct AsyncState {
     pairs: Table<SharedPair>,
     tasks: Table<Task>,
     waitables_per_set: u32,
+    joined_waitables: u32,
+    peak_joined_waitables: u32,
+    wait_registrations: u32,
+    peak_wait_registrations: u32,
 }
 
 impl AsyncState {
@@ -1112,7 +1148,42 @@ impl AsyncState {
             pairs: Table::new(limits.pairs, AsyncStateError::PairTableFull)?,
             tasks: Table::new(limits.tasks, AsyncStateError::TaskTableFull)?,
             waitables_per_set: limits.waitables_per_set,
+            joined_waitables: 0,
+            peak_joined_waitables: 0,
+            wait_registrations: 0,
+            peak_wait_registrations: 0,
         })
+    }
+
+    /// Return identity-free current, peak, and configured async-state counts.
+    pub const fn metrics(&self) -> AsyncStateMetrics {
+        AsyncStateMetrics {
+            handles: AsyncArenaUsage {
+                current: self.handles.live,
+                peak: self.handles.peak,
+                limit: self.handles.maximum,
+            },
+            pairs: AsyncArenaUsage {
+                current: self.pairs.live,
+                peak: self.pairs.peak,
+                limit: self.pairs.maximum,
+            },
+            tasks: AsyncArenaUsage {
+                current: self.tasks.live,
+                peak: self.tasks.peak,
+                limit: self.tasks.maximum,
+            },
+            joined_waitables: AsyncArenaUsage {
+                current: self.joined_waitables,
+                peak: self.peak_joined_waitables,
+                limit: self.handles.maximum,
+            },
+            wait_registrations: AsyncArenaUsage {
+                current: self.wait_registrations,
+                peak: self.peak_wait_registrations,
+                limit: self.tasks.maximum,
+            },
+        }
     }
 
     pub fn resolve_guest_handle(&self, raw: u32) -> Result<AsyncHandle, AsyncStateError> {
@@ -1166,7 +1237,8 @@ impl AsyncState {
         let set = self
             .handles
             .insert_prepared(HandleEntry::WaitableSet(WaitableSet {
-                members: Vec::new(),
+                member_count: 0,
+                next_join: 1,
                 waiter: None,
                 next_wait: 1,
             }))?;
@@ -1181,7 +1253,11 @@ impl AsyncState {
         set_raw: u32,
     ) -> Result<(), AsyncStateError> {
         let endpoint_seal = self.handle_seal(waitable)?;
-        let old_set = self.endpoint_by_seal(endpoint_seal)?.joined_set;
+        let endpoint = self.endpoint_by_seal(endpoint_seal)?;
+        let (old_set, old_sequence) = (endpoint.joined_set, endpoint.join_sequence);
+        if old_set.is_some() != old_sequence.is_some() {
+            return Err(AsyncStateError::PairInvariant);
+        }
         let new_set = if set_raw == 0 {
             None
         } else {
@@ -1192,52 +1268,77 @@ impl AsyncState {
         if old_set == new_set {
             return Ok(());
         }
-        let old_position = if let Some(old) = old_set {
-            Some(
-                self.waitable_set_by_seal(old)?
-                    .members
-                    .iter()
-                    .position(|member| *member == endpoint_seal)
-                    .ok_or(AsyncStateError::WaitableNotJoined)?,
-            )
-        } else {
-            None
-        };
-        if let Some(new) = new_set {
-            let maximum = usize::try_from(self.waitables_per_set)
-                .map_err(|_| AsyncStateError::WaitableSetFull)?;
-            let target = self.waitable_set_by_seal(new)?;
-            if target.members.len() >= maximum {
-                return Err(AsyncStateError::WaitableSetFull);
-            }
-            if target.members.contains(&endpoint_seal) {
+        if let Some(old) = old_set {
+            if self.waitable_set_by_seal(old)?.member_count == 0 || self.joined_waitables == 0 {
                 return Err(AsyncStateError::PairInvariant);
             }
-            self.waitable_set_by_seal_mut(new)?
-                .members
-                .try_reserve(1)
-                .map_err(|_| AsyncStateError::AllocationFailed)?;
-        }
-        if let (Some(old), Some(position)) = (old_set, old_position) {
-            self.waitable_set_by_seal_mut(old)?.members.remove(position);
         }
         if let Some(new) = new_set {
-            self.waitable_set_by_seal_mut(new)?
-                .members
-                .push(endpoint_seal);
+            let target = self.waitable_set_by_seal(new)?;
+            if target.member_count >= self.waitables_per_set {
+                return Err(AsyncStateError::WaitableSetFull);
+            }
         }
-        self.endpoint_by_seal_mut(endpoint_seal)?.joined_set = new_set;
+        let new_sequence = match new_set {
+            Some(new) => {
+                let next = self.waitable_set_by_seal(new)?.next_join;
+                if next == 0 || next == u64::MAX {
+                    return Err(AsyncStateError::GenerationExhausted);
+                }
+                Some(NonZeroU64::new(next).ok_or(AsyncStateError::GenerationExhausted)?)
+            }
+            None => None,
+        };
+        let next_joined = match (old_set, new_set) {
+            (None, Some(_)) => self
+                .joined_waitables
+                .checked_add(1)
+                .filter(|joined| *joined <= self.handles.maximum)
+                .ok_or(AsyncStateError::PairInvariant)?,
+            (Some(_), None) => self
+                .joined_waitables
+                .checked_sub(1)
+                .ok_or(AsyncStateError::PairInvariant)?,
+            (Some(_), Some(_)) => self.joined_waitables,
+            (None, None) => return Err(AsyncStateError::PairInvariant),
+        };
+        if let Some(old) = old_set {
+            let set = self.waitable_set_by_seal_mut(old)?;
+            set.member_count = set
+                .member_count
+                .checked_sub(1)
+                .ok_or(AsyncStateError::PairInvariant)?;
+        }
+        if let Some(new) = new_set {
+            let set = self.waitable_set_by_seal_mut(new)?;
+            set.member_count = set
+                .member_count
+                .checked_add(1)
+                .ok_or(AsyncStateError::PairInvariant)?;
+            set.next_join = set
+                .next_join
+                .checked_add(1)
+                .ok_or(AsyncStateError::GenerationExhausted)?;
+        }
+        let endpoint = self.endpoint_by_seal_mut(endpoint_seal)?;
+        endpoint.joined_set = new_set;
+        endpoint.join_sequence = new_sequence;
+        self.joined_waitables = next_joined;
+        self.peak_joined_waitables = self.peak_joined_waitables.max(next_joined);
         Ok(())
     }
 
     pub fn drop_waitable_set(&mut self, set: AsyncHandle) -> Result<(), AsyncStateError> {
         let seal = self.handle_seal(set)?;
         let set = self.waitable_set_by_seal(seal)?;
-        if !set.members.is_empty() {
+        if set.member_count != 0 {
             return Err(AsyncStateError::WaitableSetNotEmpty);
         }
         if set.waiter.is_some() {
             return Err(AsyncStateError::WaitableSetWaiting);
+        }
+        if self.observed_waitable_members(seal)? != 0 {
+            return Err(AsyncStateError::PairInvariant);
         }
         match self.handles.remove(seal)? {
             HandleEntry::WaitableSet(_) => Ok(()),
@@ -1903,6 +2004,7 @@ impl AsyncState {
                 active: None,
                 event: None,
                 joined_set: None,
+                join_sequence: None,
             }
             .into(),
         )
@@ -3631,7 +3733,7 @@ impl AsyncState {
         value_type: AsyncValueTypeId,
     ) -> Result<(), AsyncStateError> {
         let seal = self.handle_seal(handle)?;
-        let (pair, copy_state, joined_set) = {
+        let (pair, copy_state, joined_set, join_sequence) = {
             let endpoint = self.endpoint_by_seal(seal)?;
             validate_endpoint(endpoint, kind, direction, value_type)?;
             if endpoint.active.is_some() || endpoint.event.is_some() {
@@ -3649,9 +3751,17 @@ impl AsyncState {
             {
                 return Err(AsyncStateError::FutureWritableNotDone);
             }
-            (endpoint.pair, endpoint.copy_state, endpoint.joined_set)
+            (
+                endpoint.pair,
+                endpoint.copy_state,
+                endpoint.joined_set,
+                endpoint.join_sequence,
+            )
         };
         let _ = copy_state;
+        if joined_set.is_some() != join_sequence.is_some() {
+            return Err(AsyncStateError::PairInvariant);
+        }
         let (holder, pending) = {
             let shared = self.pairs.get(pair)?;
             let holder = match direction {
@@ -3668,6 +3778,11 @@ impl AsyncState {
         if holder != Holder::Guest(seal) {
             return Err(AsyncStateError::PairInvariant);
         }
+        if let Some(set) = joined_set {
+            if self.waitable_set_by_seal(set)?.member_count == 0 || self.joined_waitables == 0 {
+                return Err(AsyncStateError::PairInvariant);
+            }
+        }
         if let Some(operation) = pending {
             if operation.endpoint == seal {
                 return Err(AsyncStateError::PairInvariant);
@@ -3675,17 +3790,6 @@ impl AsyncState {
             self.prepare_event(operation, CopyResult::Dropped, 0)?;
             self.queue_event(operation, CopyResult::Dropped, 0)?;
         }
-        let joined_position = if let Some(set) = joined_set {
-            Some(
-                self.waitable_set_by_seal(set)?
-                    .members
-                    .iter()
-                    .position(|member| *member == seal)
-                    .ok_or(AsyncStateError::WaitableNotJoined)?,
-            )
-        } else {
-            None
-        };
         {
             let shared = self.pairs.get_mut(pair)?;
             shared.peer_dropped = true;
@@ -3695,8 +3799,16 @@ impl AsyncState {
                 EndpointDirection::Write => shared.writable = Holder::Dropped,
             }
         }
-        if let (Some(set), Some(position)) = (joined_set, joined_position) {
-            self.waitable_set_by_seal_mut(set)?.members.remove(position);
+        if let Some(set) = joined_set {
+            let waitable_set = self.waitable_set_by_seal_mut(set)?;
+            waitable_set.member_count = waitable_set
+                .member_count
+                .checked_sub(1)
+                .ok_or(AsyncStateError::PairInvariant)?;
+            self.joined_waitables = self
+                .joined_waitables
+                .checked_sub(1)
+                .ok_or(AsyncStateError::PairInvariant)?;
         }
         self.handles.remove(seal)?;
         self.maybe_remove_pair(pair)
@@ -4054,6 +4166,11 @@ impl AsyncState {
             }
             NonZeroU64::new(set.next_wait).ok_or(AsyncStateError::GenerationExhausted)?
         };
+        let registrations = self
+            .wait_registrations
+            .checked_add(1)
+            .filter(|registrations| *registrations <= self.tasks.maximum)
+            .ok_or(AsyncStateError::PairInvariant)?;
         {
             let set = self.waitable_set_by_seal_mut(set_seal)?;
             set.next_wait = set
@@ -4066,6 +4183,8 @@ impl AsyncState {
             });
         }
         self.tasks.get_mut(task_seal)?.waiting = Some((set_seal, epoch));
+        self.wait_registrations = registrations;
+        self.peak_wait_registrations = self.peak_wait_registrations.max(registrations);
         Ok(WaitBegin::Blocked {
             ticket: WaitTicket {
                 state_id: self.id,
@@ -4123,28 +4242,91 @@ impl AsyncState {
 
     fn clear_wait_registration(&mut self, ticket: &WaitTicket) -> Result<(), AsyncStateError> {
         self.validate_wait_ticket(ticket)?;
+        let registrations = self
+            .wait_registrations
+            .checked_sub(1)
+            .ok_or(AsyncStateError::PairInvariant)?;
         self.waitable_set_by_seal_mut(ticket.set)?.waiter = None;
         self.tasks.get_mut(ticket.task)?.waiting = None;
+        self.wait_registrations = registrations;
         Ok(())
     }
 
     fn pending_event_in_set(&self, set: Seal) -> Result<Option<EventToken>, AsyncStateError> {
-        for member in &self.waitable_set_by_seal(set)?.members {
-            let endpoint = self.endpoint_by_seal(*member)?;
-            if let Some(event) = endpoint
+        let expected = self.waitable_set_by_seal(set)?.member_count;
+        let mut observed = 0_u32;
+        let mut ready: Option<(NonZeroU64, EventToken)> = None;
+        for (index, slot) in self.handles.slots.iter().enumerate() {
+            let Some(HandleEntry::Endpoint(endpoint)) = slot.value.as_ref() else {
+                continue;
+            };
+            if endpoint.joined_set.is_some() != endpoint.join_sequence.is_some() {
+                return Err(AsyncStateError::PairInvariant);
+            }
+            if endpoint.joined_set != Some(set) {
+                continue;
+            }
+            if slot.retired {
+                return Err(AsyncStateError::PairInvariant);
+            }
+            observed = observed
+                .checked_add(1)
+                .ok_or(AsyncStateError::PairInvariant)?;
+            let Some(sequence) = endpoint.join_sequence else {
+                return Err(AsyncStateError::PairInvariant);
+            };
+            let Some(event) = endpoint
                 .event
                 .as_ref()
                 .filter(|event| event.phase == EventPhase::Pending)
+            else {
+                continue;
+            };
+            let member = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or(AsyncStateError::PairInvariant)?;
+            let member = Seal::new(member, slot.generation)?;
+            let token = EventToken {
+                state_id: self.id,
+                endpoint: member,
+                operation: event.operation,
+                generation: event.generation,
+            };
+            if ready
+                .as_ref()
+                .is_none_or(|(current, _)| sequence < *current)
             {
-                return Ok(Some(EventToken {
-                    state_id: self.id,
-                    endpoint: *member,
-                    operation: event.operation,
-                    generation: event.generation,
-                }));
+                ready = Some((sequence, token));
             }
         }
-        Ok(None)
+        if observed != expected || observed > self.waitables_per_set {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        Ok(ready.map(|(_, token)| token))
+    }
+
+    fn observed_waitable_members(&self, set: Seal) -> Result<u32, AsyncStateError> {
+        let mut observed = 0_u32;
+        for slot in &self.handles.slots {
+            let Some(HandleEntry::Endpoint(endpoint)) = slot.value.as_ref() else {
+                continue;
+            };
+            if endpoint.joined_set.is_some() != endpoint.join_sequence.is_some() {
+                return Err(AsyncStateError::PairInvariant);
+            }
+            if endpoint.joined_set != Some(set) {
+                continue;
+            }
+            if slot.retired {
+                return Err(AsyncStateError::PairInvariant);
+            }
+            observed = observed
+                .checked_add(1)
+                .filter(|members| *members <= self.waitables_per_set)
+                .ok_or(AsyncStateError::PairInvariant)?;
+        }
+        Ok(observed)
     }
 
     fn task_seal(&self, task: TaskHandle) -> Result<Seal, AsyncStateError> {
@@ -4393,6 +4575,305 @@ mod tests {
             state.resolve_guest_waitable_set(set.raw()),
             Err(AsyncStateError::StaleHandle)
         );
+    }
+
+    #[test]
+    fn waitable_membership_is_single_copy_and_accounted_across_set_churn() {
+        let mut state = AsyncState::new(AsyncStateLimits {
+            handles: 32,
+            pairs: 8,
+            tasks: 2,
+            waitables_per_set: 4,
+        })
+        .unwrap();
+        let mut pairs = Vec::new();
+        for _ in 0..4 {
+            pairs.push(state.create_stream_pair(ty(2)).unwrap());
+        }
+        let mut sets = Vec::new();
+        for _ in 0..8 {
+            sets.push(state.create_waitable_set().unwrap());
+        }
+
+        for _ in 0..3 {
+            for set in &sets {
+                for pair in &pairs {
+                    state.join_waitable(pair.readable, set.raw()).unwrap();
+                }
+                let members = sets
+                    .iter()
+                    .map(|candidate| {
+                        let seal = state.handle_seal(*candidate).unwrap();
+                        state.waitable_set_by_seal(seal).unwrap().member_count
+                    })
+                    .sum::<u32>();
+                assert_eq!(members, 4);
+                assert_eq!(
+                    state
+                        .waitable_set_by_seal(state.handle_seal(*set).unwrap())
+                        .unwrap()
+                        .member_count,
+                    4
+                );
+                assert_eq!(state.metrics().joined_waitables.current, 4);
+                assert_eq!(state.metrics().joined_waitables.peak, 4);
+            }
+        }
+
+        for pair in &pairs {
+            state.join_waitable(pair.readable, 0).unwrap();
+        }
+        assert_eq!(state.metrics().joined_waitables.current, 0);
+        assert_eq!(state.metrics().joined_waitables.peak, 4);
+        for set in sets {
+            state.drop_waitable_set(set).unwrap();
+        }
+        for pair in pairs {
+            state
+                .drop_endpoint(
+                    pair.readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(2),
+                )
+                .unwrap();
+            state
+                .drop_endpoint(
+                    pair.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(2),
+                )
+                .unwrap();
+        }
+        let metrics = state.metrics();
+        assert_eq!(
+            metrics.handles,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 16,
+                limit: 32,
+            }
+        );
+        assert_eq!(
+            metrics.pairs,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 4,
+                limit: 8,
+            }
+        );
+        assert_eq!(
+            metrics.joined_waitables,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 4,
+                limit: 32,
+            }
+        );
+        assert_eq!(
+            metrics.wait_registrations,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 0,
+                limit: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn waitable_member_limit_plus_one_is_atomic_and_move_retains_one_account() {
+        let mut state = AsyncState::new(AsyncStateLimits {
+            handles: 8,
+            pairs: 2,
+            tasks: 1,
+            waitables_per_set: 1,
+        })
+        .unwrap();
+        let first = state.create_stream_pair(ty(3)).unwrap();
+        let second = state.create_stream_pair(ty(3)).unwrap();
+        let old = state.create_waitable_set().unwrap();
+        let new = state.create_waitable_set().unwrap();
+        state.join_waitable(first.readable, old.raw()).unwrap();
+
+        let before = state.metrics();
+        let second_before = state.endpoint_info(second.readable).unwrap();
+        assert_eq!(
+            state.join_waitable(second.readable, old.raw()),
+            Err(AsyncStateError::WaitableSetFull)
+        );
+        assert_eq!(state.metrics(), before);
+        assert_eq!(state.endpoint_info(second.readable), Ok(second_before));
+
+        state.join_waitable(first.readable, new.raw()).unwrap();
+        assert_eq!(state.metrics(), before);
+        assert_eq!(
+            state
+                .waitable_set_by_seal(state.handle_seal(old).unwrap())
+                .unwrap()
+                .member_count,
+            0
+        );
+        assert_eq!(
+            state
+                .waitable_set_by_seal(state.handle_seal(new).unwrap())
+                .unwrap()
+                .member_count,
+            1
+        );
+        assert_eq!(
+            state.join_waitable(second.readable, new.raw()),
+            Err(AsyncStateError::WaitableSetFull)
+        );
+        assert_eq!(state.metrics(), before);
+    }
+
+    #[test]
+    fn dropping_a_joined_endpoint_releases_both_membership_accounts() {
+        let mut state = AsyncState::new(AsyncStateLimits {
+            handles: 4,
+            pairs: 1,
+            tasks: 1,
+            waitables_per_set: 1,
+        })
+        .unwrap();
+        let pair = state.create_stream_pair(ty(5)).unwrap();
+        let set = state.create_waitable_set().unwrap();
+        state.join_waitable(pair.readable, set.raw()).unwrap();
+
+        state
+            .drop_endpoint(
+                pair.readable,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                ty(5),
+            )
+            .unwrap();
+        assert_eq!(state.metrics().joined_waitables.current, 0);
+        assert_eq!(state.metrics().joined_waitables.peak, 1);
+        assert_eq!(
+            state
+                .waitable_set_by_seal(state.handle_seal(set).unwrap())
+                .unwrap()
+                .member_count,
+            0
+        );
+        state.drop_waitable_set(set).unwrap();
+        state
+            .drop_endpoint(
+                pair.writable,
+                EndpointKind::Stream,
+                EndpointDirection::Write,
+                ty(5),
+            )
+            .unwrap();
+        assert_eq!(state.metrics().handles.current, 0);
+        assert_eq!(state.metrics().pairs.current, 0);
+    }
+
+    #[test]
+    fn exhausted_join_sequence_rejects_a_cross_set_move_atomically() {
+        let mut state = AsyncState::new(AsyncStateLimits {
+            handles: 4,
+            pairs: 1,
+            tasks: 1,
+            waitables_per_set: 1,
+        })
+        .unwrap();
+        let pair = state.create_stream_pair(ty(6)).unwrap();
+        let old = state.create_waitable_set().unwrap();
+        let new = state.create_waitable_set().unwrap();
+        state.join_waitable(pair.readable, old.raw()).unwrap();
+        state
+            .waitable_set_by_seal_mut(state.handle_seal(new).unwrap())
+            .unwrap()
+            .next_join = u64::MAX;
+
+        let before = state.metrics();
+        let endpoint_before = state.endpoint_info(pair.readable).unwrap();
+        assert_eq!(
+            state.join_waitable(pair.readable, new.raw()),
+            Err(AsyncStateError::GenerationExhausted)
+        );
+        assert_eq!(state.metrics(), before);
+        assert_eq!(state.endpoint_info(pair.readable), Ok(endpoint_before));
+        assert_eq!(
+            state
+                .waitable_set_by_seal(state.handle_seal(old).unwrap())
+                .unwrap()
+                .member_count,
+            1
+        );
+        assert_eq!(
+            state
+                .waitable_set_by_seal(state.handle_seal(new).unwrap())
+                .unwrap()
+                .member_count,
+            0
+        );
+    }
+
+    #[test]
+    fn waitable_ready_selection_preserves_join_order_without_set_owned_storage() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let lower_slot = state.create_stream_pair(ty(4)).unwrap();
+        let first_joined = state.create_stream_pair(ty(4)).unwrap();
+        let set = state.create_waitable_set().unwrap();
+        state
+            .join_waitable(first_joined.readable, set.raw())
+            .unwrap();
+        state.join_waitable(lower_slot.readable, set.raw()).unwrap();
+
+        for (offset, pair) in [lower_slot, first_joined].into_iter().enumerate() {
+            let _ = blocked(
+                state
+                    .begin_copy(
+                        pair.readable,
+                        EndpointKind::Stream,
+                        EndpointDirection::Read,
+                        ty(4),
+                        lease(30 + offset as u32 * 2, 1),
+                    )
+                    .unwrap(),
+            );
+            let mut matched = local(
+                state
+                    .begin_copy(
+                        pair.writable,
+                        EndpointKind::Stream,
+                        EndpointDirection::Write,
+                        ty(4),
+                        lease(31 + offset as u32 * 2, 1),
+                    )
+                    .unwrap(),
+            );
+            let writer = state
+                .commit_local_copy(&mut matched, 1, |_, _, _| Ok::<_, ()>(()))
+                .unwrap();
+            reclaim_ok(&mut state, &writer);
+        }
+
+        let task = state.create_task().unwrap();
+        state.resolve_task_result(task).unwrap();
+        let mut first = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Ready(event) => event,
+            WaitBegin::Blocked { .. } => panic!("two ready members did not select an event"),
+        };
+        assert_eq!(
+            finish_endpoint_lease(&mut state, &mut first).p1,
+            first_joined.readable.raw()
+        );
+        let mut second = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Ready(event) => event,
+            WaitBegin::Blocked { .. } => panic!("second ready member was lost"),
+        };
+        assert_eq!(
+            finish_endpoint_lease(&mut state, &mut second).p1,
+            lower_slot.readable.raw()
+        );
+        assert_eq!(state.metrics().wait_registrations.current, 0);
+        state.callback_exit(task).unwrap();
+        state.drop_task(task).unwrap();
     }
 
     #[test]
@@ -6294,6 +6775,14 @@ mod tests {
             WaitBegin::Blocked { ticket } => ticket,
             WaitBegin::Ready(_) => panic!("empty set became ready"),
         };
+        assert_eq!(
+            state.metrics().wait_registrations,
+            AsyncArenaUsage {
+                current: 1,
+                peak: 1,
+                limit: 8,
+            }
+        );
         assert!(matches!(
             state.resume_callback_wait(&mut wait),
             Ok(WaitResume::Pending)
@@ -6329,6 +6818,14 @@ mod tests {
             WaitResume::Ready(event) => event,
             _ => panic!("joined endpoint event not delivered"),
         };
+        assert_eq!(
+            state.metrics().wait_registrations,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 1,
+                limit: 8,
+            }
+        );
         assert_eq!(read_event.state(), EventLeaseState::EndpointPending);
         assert_eq!(
             state.cancel_callback_wait(&mut wait),
@@ -6712,6 +7209,8 @@ mod tests {
             WaitBegin::Blocked { ticket } => ticket,
             _ => panic!("unexpected ready"),
         };
+        assert_eq!(state.metrics().wait_registrations.current, 2);
+        assert_eq!(state.metrics().wait_registrations.peak, 2);
         state.request_task_cancel(task_a).unwrap();
         let mut cancellation = match state.resume_callback_wait(&mut wait_a).unwrap() {
             WaitResume::Ready(event) => event,
@@ -6735,11 +7234,14 @@ mod tests {
             state.resume_callback_wait(&mut wait_a).err(),
             Some(AsyncStateError::StaleWait)
         );
+        assert_eq!(state.metrics().wait_registrations.current, 1);
         state.acknowledge_task_cancel(task_a).unwrap();
         state.callback_exit(task_a).unwrap();
         state.drop_task(task_a).unwrap();
 
         state.cancel_callback_wait(&mut wait_b).unwrap();
+        assert_eq!(state.metrics().wait_registrations.current, 0);
+        assert_eq!(state.metrics().wait_registrations.peak, 2);
         state.resolve_task_result(task_b).unwrap();
         state.callback_exit(task_b).unwrap();
         state.drop_task(task_b).unwrap();

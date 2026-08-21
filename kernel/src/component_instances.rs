@@ -10,6 +10,13 @@
 #[path = "component_instances_acceptance.rs"]
 mod acceptance;
 
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+#[path = "component_instances_native_async.rs"]
+mod native_async_acceptance;
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+#[path = "native_pending_shadow_model.rs"]
+mod native_pending_shadow_model;
+
 #[cfg(feature = "ssh-component-command")]
 extern crate alloc;
 
@@ -68,7 +75,10 @@ use vibeos_component_command::{
 };
 #[cfg(feature = "ssh-component-command")]
 use vibeos_component_format::TrapCode;
-#[cfg(feature = "wasm-c48-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-qemu-acceptance",
+    feature = "wasm-c53-native-async-qemu-acceptance"
+))]
 use vibeos_component_host::ByteStream;
 #[cfg(feature = "ssh-component-command")]
 use vibeos_component_host::{
@@ -142,9 +152,15 @@ const POLICY_PASSED: u8 = 1;
 #[cfg(feature = "ssh-component-command")]
 const POLICY_FAILED: u8 = 2;
 
-#[cfg(feature = "ssh-component-command")]
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
 const LIFECYCLE_HEALTHY: u8 = 0;
-#[cfg(feature = "ssh-component-command")]
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
 const LIFECYCLE_FAILED: u8 = 1;
 
 #[cfg(feature = "ssh-component-command")]
@@ -182,24 +198,56 @@ const STREAM_CLOSE_WORK: u64 = 1;
 static IMAGE_ROOT: AtomicPtr<ImageRoot> = AtomicPtr::new(ptr::null_mut());
 #[cfg(feature = "ssh-component-command")]
 static SSH_POLICY_GATE: AtomicU8 = AtomicU8::new(POLICY_CLOSED);
-#[cfg(feature = "ssh-component-command")]
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
 static LIFECYCLE_HEALTH: AtomicU8 = AtomicU8::new(LIFECYCLE_HEALTHY);
 #[cfg(feature = "ssh-component-command")]
 static CONTROL: ControlGate = ControlGate::new();
 #[cfg(feature = "ssh-component-command")]
 static LIFECYCLE: ImageComponentLifecycle = ImageComponentLifecycle;
 
-#[cfg(feature = "ssh-component-command")]
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
 fn lifecycle_is_healthy() -> bool {
     LIFECYCLE_HEALTH.load(Ordering::Acquire) == LIFECYCLE_HEALTHY
 }
 
-#[cfg(feature = "ssh-component-command")]
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
 fn lifecycle_fail_stop() {
     CONTROL.reject_prepared_publications();
     LIFECYCLE_HEALTH.store(LIFECYCLE_FAILED, Ordering::Release);
     SSH_POLICY_GATE.store(POLICY_FAILED, Ordering::Release);
     CONTROL.request_fail_stop_wake();
+}
+
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
+fn lifecycle_poll_permit() -> (&'static AtomicU8, u8) {
+    (&LIFECYCLE_HEALTH, LIFECYCLE_HEALTHY)
+}
+
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+fn lifecycle_is_healthy() -> bool {
+    native_async_acceptance::lifecycle_is_healthy()
+}
+
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+fn lifecycle_fail_stop() {
+    native_async_acceptance::lifecycle_fail_stop();
+}
+
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+fn lifecycle_poll_permit() -> (&'static AtomicU8, u8) {
+    native_async_acceptance::lifecycle_poll_permit()
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -240,6 +288,8 @@ enum ComponentStartInput {
     Managed(ManagedComponentStartLease),
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     Acceptance(Option<InstalledComponentIo>),
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    NativeAsyncAcceptance(Option<InstalledComponentIo>),
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -249,6 +299,8 @@ impl ComponentStartInput {
             Self::Managed(_) => ControlStartKind::Managed,
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => ControlStartKind::Acceptance,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(_) => ControlStartKind::NativeAsyncAcceptance,
         }
     }
 
@@ -257,6 +309,8 @@ impl ComponentStartInput {
             Self::Managed(cleanup) => Some(*cleanup),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => None,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(_) => None,
         }
     }
 
@@ -270,6 +324,10 @@ impl ComponentStartInput {
             Self::Acceptance(Some(io)) => finalize_unpublished_start_error(io, terminal),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(None) => ComponentTerminal::RunnerFault,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(Some(io)) => finalize_unpublished_start_error(io, terminal),
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(None) => ComponentTerminal::RunnerFault,
         }
     }
 
@@ -278,6 +336,8 @@ impl ComponentStartInput {
             Self::Managed(cleanup) => cleanup.bind_before_child_publication(token),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => true,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(_) => true,
         }
     }
 
@@ -288,6 +348,8 @@ impl ComponentStartInput {
                 .map(InstalledComponentIo::from),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(io) => io.take(),
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(io) => io.take(),
         }
     }
 
@@ -296,6 +358,8 @@ impl ComponentStartInput {
             Self::Managed(cleanup) => cleanup.quarantine_partial_start(),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             Self::Acceptance(_) => {}
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            Self::NativeAsyncAcceptance(_) => {}
         }
     }
 }
@@ -343,7 +407,18 @@ fn finalize_unpublished_start_error(
 }
 
 #[cfg(feature = "ssh-component-command")]
-fn quarantine_committed_start(input: &ComponentStartInput, key: ControlKey, token: InstanceToken) {
+fn quarantine_committed_start(
+    input: &ComponentStartInput,
+    key: ControlKey,
+    token: InstanceToken,
+    streams: RegistryStreamBindings,
+) {
+    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    let _ = streams;
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    if input.kind() == ControlStartKind::NativeAsyncAcceptance {
+        native_async_acceptance::quarantine_fault_shadow(key, token, streams);
+    }
     CONTROL.child_shadow[key.slot as usize].quarantine(key);
     CONTROL.supervisor_shadow[key.slot as usize].quarantine(key);
     // Quarantine is sticky and never takes/drops the arena-owned payload or
@@ -381,6 +456,8 @@ enum ControlStartKind {
     Managed,
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     Acceptance,
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    NativeAsyncAcceptance,
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -706,6 +783,8 @@ impl ControlTable {
                 .is_some_and(|token| !require_cleanup_active || cleanup.is_active_for(token)),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             (ControlStartKind::Acceptance, None) => true,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            (ControlStartKind::NativeAsyncAcceptance, None) => true,
             _ => false,
         };
         if handle.allocation_domain() != domain
@@ -1931,11 +2010,13 @@ enum PayloadMode {
         case: u8,
         terminal: ComponentTerminal,
     },
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    NativeAsyncAcceptance,
 }
 
 #[cfg(feature = "ssh-component-command")]
 struct LazyComponentPayload {
-    root: &'static ImageRoot,
+    root: Option<&'static ImageRoot>,
     control: ControlKey,
     token: InstanceToken,
     resource_generation: u64,
@@ -2018,6 +2099,8 @@ fn child_start_gate(
             .is_some_and(|managed| cleanup.is_active_for(managed)),
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
         (Some(ControlStartKind::Acceptance), None) => true,
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        (Some(ControlStartKind::NativeAsyncAcceptance), None) => true,
         _ => false,
     };
     if !active {
@@ -2090,9 +2173,8 @@ impl Future for ManagedChildFuture {
                 return Poll::Ready(());
             }
         }
-        match unsafe {
-            registry().poll_payload_if(witness, context, &LIFECYCLE_HEALTH, LIFECYCLE_HEALTHY)
-        } {
+        let (permit, expected) = lifecycle_poll_permit();
+        match unsafe { registry().poll_payload_if(witness, context, permit, expected) } {
             Ok(Poll::Ready(_)) => Poll::Ready(()),
             Ok(Poll::Pending) => match child_start_gate(self.control, self.token, witness) {
                 ChildStartGate::Active | ChildStartGate::AwaitStart => Poll::Pending,
@@ -2120,7 +2202,7 @@ impl Future for ManagedChildFuture {
 #[cfg(feature = "ssh-component-command")]
 impl LazyComponentPayload {
     const fn new(
-        root: &'static ImageRoot,
+        root: Option<&'static ImageRoot>,
         control: ControlKey,
         token: InstanceToken,
         resource_generation: u64,
@@ -2140,9 +2222,17 @@ impl LazyComponentPayload {
     }
 }
 
-#[cfg(feature = "wasm-c48-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-qemu-acceptance",
+    feature = "wasm-c53-native-async-qemu-acceptance"
+))]
 impl Drop for LazyComponentPayload {
     fn drop(&mut self) {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        if matches!(self.mode, PayloadMode::NativeAsyncAcceptance) {
+            native_async_acceptance::payload_drop(self.control, self.token, self.streams);
+        }
+        #[cfg(feature = "wasm-c48-qemu-acceptance")]
         if matches!(self.mode, PayloadMode::AcceptanceFault { .. }) {
             acceptance::record_fault_payload_drop();
         }
@@ -2170,6 +2260,7 @@ unsafe impl InstancePayload for LazyComponentPayload {
         if self.driver.is_none() {
             self.driver = Some(Box::pin(run_image_component(
                 self.root,
+                self.control,
                 self.token,
                 self.resource_generation,
                 self.streams,
@@ -2218,7 +2309,33 @@ unsafe impl InstancePayload for LazyComponentPayload {
     }
 }
 
-#[cfg(feature = "ssh-component-command")]
+#[cfg(all(
+    feature = "ssh-component-command",
+    feature = "wasm-c53-native-async-qemu-acceptance"
+))]
+pub(crate) fn init() {
+    // This feature is a sealed validation-candidate image, not an SSH command
+    // image. Do not even construct/publish the synchronous SSH_EXEC_COMPONENT
+    // root, and prove that its production/session gate remains untouched.
+    if !IMAGE_ROOT.load(Ordering::Acquire).is_null()
+        || SSH_POLICY_GATE.load(Ordering::Acquire) != POLICY_CLOSED
+    {
+        lifecycle_fail_stop();
+        panic!("native async acceptance started with a published synchronous root or gate");
+    }
+    native_async_acceptance::init();
+    if !IMAGE_ROOT.load(Ordering::Acquire).is_null()
+        || SSH_POLICY_GATE.load(Ordering::Acquire) != POLICY_CLOSED
+    {
+        lifecycle_fail_stop();
+        panic!("native async acceptance modified the synchronous SSH image path");
+    }
+}
+
+#[cfg(all(
+    feature = "ssh-component-command",
+    not(feature = "wasm-c53-native-async-qemu-acceptance")
+))]
 pub(crate) fn init() {
     if !IMAGE_ROOT.load(Ordering::Acquire).is_null() {
         lifecycle_fail_stop();
@@ -2976,25 +3093,21 @@ fn with_cleanup_writer<R>(
 
 #[cfg(feature = "ssh-component-command")]
 fn promote_provisional_eof(supervisor: &ByteStreamSupervisor) -> Result<(), HostError> {
-    if supervisor.is_fail_stopped() {
-        lifecycle_fail_stop();
-        return Err(HostError::BackendFault);
-    }
-    if supervisor.final_reason().is_none()
-        && supervisor.is_normal_provisional()
-        && supervisor.depth() == 0
-    {
-        match supervisor.finalize(StreamCloseReason::Normal) {
-            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
-                if supervisor.final_reason() == Some(StreamCloseReason::Normal)
-                    && !supervisor.is_fail_stopped() => {}
-            StreamCloseOutcome::Published
-            | StreamCloseOutcome::AlreadyPublished
-            | StreamCloseOutcome::Conflict => {
-                lifecycle_fail_stop();
-                return Err(HostError::BackendFault);
-            }
+    match supervisor.promote_normal_if_drained_observed() {
+        None => {}
+        Some(observation)
+            if observation.outcome() == StreamCloseOutcome::Conflict
+                || observation.effective_reason().is_none()
+                || (observation.outcome() == StreamCloseOutcome::Published
+                    && observation.effective_reason() != Some(StreamCloseReason::Normal)) =>
+        {
+            lifecycle_fail_stop();
+            return Err(HostError::BackendFault);
         }
+        // AlreadyPublished preserves the old behavior: an immutable terminal,
+        // including a non-normal first winner, is observed without attempting
+        // a conflicting Normal publication.
+        Some(_) => {}
     }
     Ok(())
 }
@@ -3432,12 +3545,23 @@ impl RegistryStreamDispatcher {
 
 #[cfg(feature = "ssh-component-command")]
 async fn run_image_component(
-    root: &'static ImageRoot,
+    root: Option<&'static ImageRoot>,
+    key: ControlKey,
     token: InstanceToken,
     generation: u64,
     streams: RegistryStreamBindings,
     mode: PayloadMode,
 ) -> u64 {
+    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    let _ = key;
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    if matches!(mode, PayloadMode::NativeAsyncAcceptance) {
+        return native_async_acceptance::run(key, token, streams).await;
+    }
+    let Some(root) = root else {
+        lifecycle_fail_stop();
+        return terminal_word(ComponentTerminal::BackendFault);
+    };
     if !revalidate_image_root(root) {
         lifecycle_fail_stop();
         return terminal_word(ComponentTerminal::BackendFault);
@@ -3766,6 +3890,8 @@ fn publish_payload_terminal(
                 .is_some_and(|managed| cleanup.is_active_for(managed)),
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             (Some(ControlStartKind::Acceptance), None) => true,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            (Some(ControlStartKind::NativeAsyncAcceptance), None) => true,
             _ => false,
         };
     if !exact {
@@ -3878,9 +4004,33 @@ fn start_image_instance_with_input(
     {
         return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
     }
-    let Some(root) = image_root() else {
-        lifecycle_fail_stop();
-        return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    let native_mode = matches!(mode, PayloadMode::NativeAsyncAcceptance);
+    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    let native_mode = false;
+    let root = if native_mode {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        if !native_async_acceptance::root_ready() {
+            lifecycle_fail_stop();
+            return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
+        }
+        None
+    } else {
+        let Some(root) = image_root() else {
+            lifecycle_fail_stop();
+            return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
+        };
+        Some(root)
+    };
+    let command_name = if native_mode {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            native_async_acceptance::command_name()
+        }
+        #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+        unreachable!()
+    } else {
+        SSH_EXEC_COMPONENT.command_name()
     };
     let mut control = match CONTROL.try_lock() {
         Ok(control) => control,
@@ -3900,7 +4050,18 @@ fn start_image_instance_with_input(
         drop(control);
         return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
     }
-    if !revalidate_image_root(root) {
+    if root.is_some_and(|root| !revalidate_image_root(root))
+        || (native_mode && {
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            {
+                !native_async_acceptance::root_ready()
+            }
+            #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+            {
+                true
+            }
+        })
+    {
         lifecycle_fail_stop();
         system.restore();
         drop(control);
@@ -3953,7 +4114,7 @@ fn start_image_instance_with_input(
         }
     };
     let domain = AllocationDomain::new(owner, arena);
-    let core_token = match registry().reserve_named(domain, SSH_EXEC_COMPONENT.command_name()) {
+    let core_token = match registry().reserve_named(domain, command_name) {
         Ok(token) => token,
         Err(error) => {
             let record = control
@@ -3982,12 +4143,7 @@ fn start_image_instance_with_input(
     };
     let mut batch = PreparedTaskBatch::new();
     unsafe {
-        batch.prepare_managed_instance_owned(
-            core_token,
-            domain,
-            SSH_EXEC_COMPONENT.command_name(),
-            child,
-        );
+        batch.prepare_managed_instance_owned(core_token, domain, command_name, child);
     }
     batch.prepare("wasm-instance-supervisor", supervise_instance(key));
     if !batch.try_reserve_prepared_task_registrations(0, 2)
@@ -4202,6 +4358,28 @@ fn start_image_instance_with_input(
             return Err(ComponentTerminal::RunnerFault);
         }
     };
+    // Bind the SYSTEM pending shadow while CONTROL is released and before the
+    // prepared child can become scheduler-visible. Thus a zero-operation
+    // completion, pre-first-poll cancellation, or pre-first-poll fault all
+    // resolve the exact generation as snapshot(None), while no CONTROL ->
+    // shadow lock edge is introduced.
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    let pending_shadow_bound = start_kind != ControlStartKind::NativeAsyncAcceptance
+        || native_async_acceptance::bind_pending_shadow(key, core_token, streams);
+    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    let pending_shadow_bound = true;
+    if !pending_shadow_bound {
+        if let Ok(mut control) = suspended.resume() {
+            let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+            if let Some(record) = control.exact_mut(key) {
+                record.quarantine();
+            }
+            system.restore();
+            drop(control);
+        }
+        quarantine_committed_start(&input, key, core_token, streams);
+        return Err(ComponentTerminal::RunnerFault);
+    }
     // SCHED may invoke only the fixed registry activation transaction.
     let staged = unsafe {
         batch.stage_exclusive_reclaimable_with(|bindings| registry().activate_batch(bindings))
@@ -4209,7 +4387,7 @@ fn start_image_instance_with_input(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4222,7 +4400,7 @@ fn start_image_instance_with_input(
             }
             system.restore();
             drop(control);
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4244,7 +4422,7 @@ fn start_image_instance_with_input(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token);
+        quarantine_committed_start(&input, key, core_token, streams);
         drop(stage);
         return Err(ComponentTerminal::RunnerFault);
     }
@@ -4255,7 +4433,7 @@ fn start_image_instance_with_input(
     let suspended = match control.suspend_for_scheduler(key, cleanup) {
         Ok(suspended) => suspended,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4264,7 +4442,7 @@ fn start_image_instance_with_input(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4289,7 +4467,7 @@ fn start_image_instance_with_input(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token);
+        quarantine_committed_start(&input, key, core_token, streams);
         drop(stage);
         return Err(ComponentTerminal::RunnerFault);
     }
@@ -4305,7 +4483,7 @@ fn start_image_instance_with_input(
     let suspended = match control.suspend_for_scheduler(key, cleanup) {
         Ok(suspended) => suspended,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4314,7 +4492,7 @@ fn start_image_instance_with_input(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4327,7 +4505,7 @@ fn start_image_instance_with_input(
             }
             system.restore();
             drop(control);
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4358,7 +4536,7 @@ fn start_image_instance_with_input(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token);
+        quarantine_committed_start(&input, key, core_token, streams);
         return Err(ComponentTerminal::RunnerFault);
     }
 
@@ -4370,7 +4548,7 @@ fn start_image_instance_with_input(
     let suspended = match control.suspend_for_scheduler(key, cleanup) {
         Ok(suspended) => suspended,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4396,7 +4574,7 @@ fn start_image_instance_with_input(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token);
+            quarantine_committed_start(&input, key, core_token, streams);
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4424,7 +4602,7 @@ fn start_image_instance_with_input(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token);
+        quarantine_committed_start(&input, key, core_token, streams);
         return Err(ComponentTerminal::RunnerFault);
     }
     control
@@ -4559,6 +4737,8 @@ fn prove_terminal_outside_control(
             .is_some_and(|token| cleanup.is_active_for(token)),
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
         (ControlStartKind::Acceptance, None) => true,
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        (ControlStartKind::NativeAsyncAcceptance, None) => true,
         _ => false,
     };
     if !cleanup_active || !lifecycle_is_healthy() {
@@ -4689,57 +4869,87 @@ fn finalize_stream_state(
     let _ = stdin.with(|_| ());
     let _ = stdout.with(|_| ());
     let reason = terminal.stream_close_reason();
-    stdout_supervisor.with(|supervisor| {
+    let published = stdout_supervisor.with(|supervisor| {
         if supervisor.is_fail_stopped() {
             return false;
         }
-        // A guest-side non-normal close is already an immutable transport
-        // terminal and may legitimately precede the async invocation result.
-        // Preserve that first winner instead of asking the supervisor to
-        // publish a conflicting reason, which would turn one component's
-        // output decision into a global stream fail-stop.
-        if supervisor.final_reason().is_none() {
-            if !matches!(
-                supervisor.finalize(reason),
-                StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
-            ) || supervisor.is_fail_stopped()
-                || supervisor.final_reason() != Some(reason)
-            {
-                return false;
-            }
+        // A guest-side close may legitimately precede the async invocation
+        // result. Publish only if still open; otherwise atomically preserve
+        // and observe the immutable first winner without a TOCTOU conflict.
+        let stdout_observed = supervisor.finalize_preserving_first_observed(reason);
+        if !matches!(
+            stdout_observed.outcome(),
+            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
+        ) || stdout_observed.effective_reason().is_none()
+            || supervisor.is_fail_stopped()
+        {
+            return false;
         }
 
-        stdin_supervisor.with(|stdin| {
+        let stdin_published = stdin_supervisor.with(|stdin| {
             if stdin.is_fail_stopped() {
                 return false;
             }
-            // Input is source-owned. Preserve an already immutable EOF/failure;
-            // otherwise close the still-open/provisional source with the exact
-            // component terminal reason.
-            if stdin.final_reason().is_some() {
-                return true;
-            }
+            // Input is source-owned. The same atomic operation preserves an
+            // established EOF/failure or closes the still-open/provisional
+            // source with the component terminal reason.
+            let stdin_observed = stdin.finalize_preserving_first_observed(reason);
             matches!(
-                stdin.finalize(reason),
+                stdin_observed.outcome(),
                 StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
             ) && !stdin.is_fail_stopped()
-                && stdin.final_reason() == Some(reason)
-        })
-    })
+                && stdin_observed.effective_reason().is_some()
+        });
+        stdin_published && !supervisor.is_fail_stopped()
+    });
+    published
+}
+
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+fn finalize_native_stream_state(
+    space: &InstanceSpace,
+    key: ControlKey,
+    token: InstanceToken,
+    streams: RegistryStreamBindings,
+    terminal: ComponentTerminal,
+) -> bool {
+    if !native_async_acceptance::prepare_terminal_shadow(space, key, token, streams, terminal) {
+        return false;
+    }
+    if !finalize_stream_state(space, streams, terminal) {
+        return false;
+    }
+    native_async_acceptance::retire_terminal_shadow(key, token, streams)
 }
 
 #[cfg(feature = "ssh-component-command")]
 unsafe fn finalize_registry_terminal(
+    key: ControlKey,
     tuple: &ControlTuple,
     terminal: ComponentTerminal,
     completion: Option<u64>,
 ) -> Result<FinalizeOutcome, RegistryError> {
+    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    let _ = key;
     unsafe {
         registry().finalize_with_space_expect_completion(
             tuple.core_token,
             &tuple.handle,
             completion,
             |space, _| {
+                #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+                let published = if tuple.start_kind == ControlStartKind::NativeAsyncAcceptance {
+                    finalize_native_stream_state(
+                        space,
+                        key,
+                        tuple.core_token,
+                        tuple.streams,
+                        terminal,
+                    )
+                } else {
+                    finalize_stream_state(space, tuple.streams, terminal)
+                };
+                #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
                 let published = finalize_stream_state(space, tuple.streams, terminal);
                 #[cfg(feature = "wasm-c48-qemu-acceptance")]
                 if published {
@@ -4876,7 +5086,8 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
     }
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     acceptance::record_terminal_visible(&tuple.handle, tuple.domain, state);
-    let finalized = unsafe { finalize_registry_terminal(&tuple, terminal, expected_completion) };
+    let finalized =
+        unsafe { finalize_registry_terminal(key, &tuple, terminal, expected_completion) };
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
@@ -4946,6 +5157,8 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
         }
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
         (ControlStartKind::Acceptance, None, _) => None,
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        (ControlStartKind::NativeAsyncAcceptance, None, _) => None,
         _ => {
             control
                 .exact_mut(key)
@@ -5520,6 +5733,8 @@ fn acknowledge_instance(token: ManagedComponentToken) -> ManagedComponentAcknowl
             }
             #[cfg(feature = "wasm-c48-qemu-acceptance")]
             (Some(ControlStartKind::Acceptance), None) => true,
+            #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+            (Some(ControlStartKind::NativeAsyncAcceptance), None) => true,
             _ => false,
         };
     if !projection_exact {
@@ -5753,11 +5968,12 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
             return FaultRoute::Quarantined;
         }
     };
-    let complete_projection = control.running_tuple_structural(key);
-    if !matches!(
-        complete_projection,
-        Ok(Some(ref tuple))
-            if tuple.core_token == witness.instance_token().expect("managed witness has a token")
+    let tuple = match control.running_tuple_structural(key) {
+        Ok(Some(tuple))
+            if tuple.core_token
+                == witness
+                    .instance_token()
+                    .expect("managed witness has a token")
                 && tuple.domain == witness.allocation_domain()
                 && witness.matches_handle(&tuple.handle)
                 && match (tuple.start_kind, tuple.cleanup, key.managed_token()) {
@@ -5766,20 +5982,78 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
                     }
                     #[cfg(feature = "wasm-c48-qemu-acceptance")]
                     (ControlStartKind::Acceptance, None, _) => true,
+                    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+                    (ControlStartKind::NativeAsyncAcceptance, None, _) => true,
                     _ => false,
-                }
-    ) {
-        if let Some(record) = control.exact_mut(key) {
-            record.quarantine();
+                } =>
+        {
+            tuple
         }
-        lifecycle_fail_stop();
-        return FaultRoute::Quarantined;
-    }
+        _ => {
+            if let Some(record) = control.exact_mut(key) {
+                record.quarantine();
+            }
+            lifecycle_fail_stop();
+            return FaultRoute::Quarantined;
+        }
+    };
+    #[cfg(not(feature = "wasm-c53-native-async-qemu-acceptance"))]
+    let _ = &tuple;
     if !lifecycle_is_healthy() {
         return FaultRoute::Quarantined;
     }
 
     let task = witness.task_id();
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    if tuple.start_kind == ControlStartKind::NativeAsyncAcceptance {
+        // Snapshot and release SYSTEM shadow authority only after the complete
+        // CONTROL tuple is proven. The core callback runs after it has restored
+        // the exact Space and released its registry lock; CONTROL is released
+        // here as well. cancel_fault_snapshot itself releases the CSpace lease
+        // before touching the stream, then clears the shadow only after exact
+        // backend cancellation. A false result quarantines in core before raw
+        // arena reclaim or any CSpace reset can occur.
+        drop(control);
+        let snapshot =
+            match native_async_acceptance::fault_snapshot(key, tuple.core_token, tuple.streams) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    native_async_acceptance::quarantine_fault_shadow(
+                        key,
+                        tuple.core_token,
+                        tuple.streams,
+                    );
+                    return FaultRoute::Quarantined;
+                }
+            };
+        let outcome = unsafe {
+            registry().fault_reclaim_with_space(witness, |domain, space| {
+                if !lifecycle_is_healthy()
+                    || !native_async_acceptance::cancel_fault_snapshot(
+                        space,
+                        key,
+                        tuple.core_token,
+                        tuple.streams,
+                        snapshot,
+                    )
+                {
+                    return false;
+                }
+                reclaim_authorized_domain(task, domain, true)
+            })
+        };
+        return match outcome {
+            FaultGateOutcome::ManagedReclaimed => FaultRoute::ManagedReclaimed,
+            FaultGateOutcome::NotManaged | FaultGateOutcome::Quarantined => {
+                native_async_acceptance::quarantine_fault_shadow(
+                    key,
+                    tuple.core_token,
+                    tuple.streams,
+                );
+                FaultRoute::Quarantined
+            }
+        };
+    }
     // Keep CONTROL from the outer generation/task/status/domain proof through
     // the core Space/CSpace proof and raw arena reclaim. Detached faults use a
     // separate bounded acquisition budget so independent harts serialize here
@@ -5848,4 +6122,9 @@ pub(crate) unsafe fn reclaim_faulted(witness: ReclaimableFaultWitness) -> FaultR
 #[cfg(feature = "wasm-c48-qemu-acceptance")]
 pub(crate) async fn run_qemu_acceptance() -> bool {
     acceptance::run().await
+}
+
+#[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+pub(crate) async fn run_native_async_qemu_acceptance() -> bool {
+    native_async_acceptance::run_acceptance().await
 }

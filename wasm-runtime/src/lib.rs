@@ -1233,6 +1233,24 @@ pub struct CoreComponentGroup {
     state: ComponentGroupState,
 }
 
+/// An opaque capability for one Core memory in a [`CoreComponentGroup`].
+///
+/// Authorities are issued only after resolving an instance export to its
+/// underlying Wasmi memory handle. Imported and re-exported aliases therefore
+/// authorize the same memory, and the handle remains valid across memory
+/// growth. Every operation verifies the issuing group before using the handle.
+#[derive(Clone, Copy)]
+pub struct CoreMemoryAuthority {
+    owner: u32,
+    memory: Memory,
+}
+
+impl fmt::Debug for CoreMemoryAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CoreMemoryAuthority(<opaque>)")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComponentGroupState {
     Building,
@@ -2357,12 +2375,8 @@ impl CoreComponentGroup {
         offset: usize,
         output: &mut [u8],
     ) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        self.memory(instance, export)?
-            .read(&self.store, offset, output)
-            .map_err(|_| TrapCode::MemoryOutOfBounds)
+        let authority = self.memory_authority(instance, export)?;
+        self.read_authorized_memory(&authority, offset, output)
     }
 
     pub fn write_memory(
@@ -2372,19 +2386,13 @@ impl CoreComponentGroup {
         offset: usize,
         input: &[u8],
     ) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        self.memory(instance, export)?
-            .write(&mut self.store, offset, input)
-            .map_err(|_| TrapCode::MemoryOutOfBounds)
+        let authority = self.memory_authority(instance, export)?;
+        self.write_authorized_memory(&authority, offset, input)
     }
 
     pub fn memory_size(&self, instance: usize, export: &str) -> Result<usize, TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        Ok(self.memory(instance, export)?.data_size(&self.store))
+        let authority = self.memory_authority(instance, export)?;
+        self.authorized_memory_size(&authority)
     }
 
     pub fn grow_memory_to(
@@ -2393,10 +2401,61 @@ impl CoreComponentGroup {
         export: &str,
         minimum_bytes: usize,
     ) -> Result<(), TrapCode> {
-        if self.state == ComponentGroupState::Poisoned {
-            return Err(TrapCode::Validation);
-        }
-        let memory = self.memory(instance, export)?;
+        let authority = self.memory_authority(instance, export)?;
+        self.grow_authorized_memory_to(&authority, minimum_bytes)
+    }
+
+    /// Resolves a Core memory export and issues an authority bound to this group.
+    pub fn memory_authority(
+        &self,
+        instance: usize,
+        export: &str,
+    ) -> Result<CoreMemoryAuthority, TrapCode> {
+        Ok(CoreMemoryAuthority {
+            owner: self.reservation_owner,
+            memory: self.memory(instance, export)?,
+        })
+    }
+
+    /// Reads from the memory named by an authority issued by this group.
+    pub fn read_authorized_memory(
+        &self,
+        authority: &CoreMemoryAuthority,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), TrapCode> {
+        self.authorized_memory(authority)?
+            .read(&self.store, offset, output)
+            .map_err(|_| TrapCode::MemoryOutOfBounds)
+    }
+
+    /// Writes to the memory named by an authority issued by this group.
+    pub fn write_authorized_memory(
+        &mut self,
+        authority: &CoreMemoryAuthority,
+        offset: usize,
+        input: &[u8],
+    ) -> Result<(), TrapCode> {
+        self.authorized_memory(authority)?
+            .write(&mut self.store, offset, input)
+            .map_err(|_| TrapCode::MemoryOutOfBounds)
+    }
+
+    /// Returns the current byte length of an authorized memory.
+    pub fn authorized_memory_size(
+        &self,
+        authority: &CoreMemoryAuthority,
+    ) -> Result<usize, TrapCode> {
+        Ok(self.authorized_memory(authority)?.data_size(&self.store))
+    }
+
+    /// Grows an authorized memory to contain at least `minimum_bytes` bytes.
+    pub fn grow_authorized_memory_to(
+        &mut self,
+        authority: &CoreMemoryAuthority,
+        minimum_bytes: usize,
+    ) -> Result<(), TrapCode> {
+        let memory = self.authorized_memory(authority)?;
         let current = memory.data_size(&self.store);
         if minimum_bytes <= current {
             return Ok(());
@@ -2410,6 +2469,14 @@ impl CoreComponentGroup {
             .grow(&mut self.store, additional_pages as u64)
             .map_err(|_| TrapCode::MemoryOutOfBounds)?;
         Ok(())
+    }
+
+    fn authorized_memory(&self, authority: &CoreMemoryAuthority) -> Result<Memory, TrapCode> {
+        if self.state == ComponentGroupState::Poisoned || authority.owner != self.reservation_owner
+        {
+            return Err(TrapCode::Validation);
+        }
+        Ok(authority.memory)
     }
 
     fn memory(&self, instance: usize, export: &str) -> Result<Memory, TrapCode> {

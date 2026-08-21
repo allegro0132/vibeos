@@ -14,6 +14,7 @@ use vibeos_component_format::{TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{CoreComponentGroup, CoreMemoryAuthority};
 
 const COPY_COUNT_LIMIT: u32 = 1_u32 << 28;
+const ENUM8_CASES: u8 = 8;
 static NEXT_BUFFER_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The endpoint role whose memory is retained by one registration.
@@ -406,6 +407,78 @@ impl BufferRegistry {
         Ok(())
     }
 
+    /// Copies one authorized write-buffer prefix into host-owned storage.
+    ///
+    /// The host slice length is the copy progress. Registry seals, endpoint
+    /// role, the opaque memory authority, the complete registered range, and
+    /// the requested prefix are all revalidated before the host slice is
+    /// touched. An empty prefix still validates the authority and registration.
+    pub(crate) fn copy_to_host(
+        &self,
+        modules: &CoreComponentGroup,
+        source: &BufferLease,
+        output: &mut [u8],
+    ) -> Result<(), TrapCode> {
+        let source =
+            self.resolve_host_copy(modules, source, BufferRole::SourceWrite, output.len())?;
+        if output.is_empty() {
+            return Ok(());
+        }
+        let source_pointer = usize::try_from(source.pointer).map_err(|_| TrapCode::Validation)?;
+        modules.read_authorized_memory(&source.memory, source_pointer, output)
+    }
+
+    /// Copies one host-owned byte slice into an authorized read-buffer prefix.
+    ///
+    /// The input slice length is the copy progress. All registry and memory
+    /// checks complete before guest memory is touched, so rejected host copies
+    /// cannot partially publish bytes into the guest.
+    #[allow(dead_code)] // Wired into the native host transport in the next activation slice.
+    pub(crate) fn copy_from_host(
+        &self,
+        modules: &mut CoreComponentGroup,
+        target: &BufferLease,
+        input: &[u8],
+    ) -> Result<(), TrapCode> {
+        let target =
+            self.resolve_host_copy(modules, target, BufferRole::TargetRead, input.len())?;
+        if input.is_empty() {
+            return Ok(());
+        }
+        let target_pointer = usize::try_from(target.pointer).map_err(|_| TrapCode::Validation)?;
+        modules.write_authorized_memory(&target.memory, target_pointer, input)
+    }
+
+    /// Lifts a one-byte eight-case enum without publishing an invalid
+    /// discriminant to host code. Admission assigns semantic case names.
+    pub(crate) fn lift_enum8(
+        &self,
+        modules: &CoreComponentGroup,
+        source: &BufferLease,
+    ) -> Result<u8, TrapCode> {
+        let mut discriminant = [0_u8];
+        self.copy_to_host(modules, source, &mut discriminant)?;
+        if discriminant[0] >= ENUM8_CASES {
+            return Err(TrapCode::CanonicalAbi);
+        }
+        Ok(discriminant[0])
+    }
+
+    /// Lowers one host-supplied eight-case enum only after validating its
+    /// domain, so a rejected value leaves the guest target untouched.
+    #[allow(dead_code)] // Wired into the native host input future in the next activation slice.
+    pub(crate) fn lower_enum8(
+        &self,
+        modules: &mut CoreComponentGroup,
+        target: &BufferLease,
+        discriminant: u8,
+    ) -> Result<(), TrapCode> {
+        if discriminant >= ENUM8_CASES {
+            return Err(TrapCode::CanonicalAbi);
+        }
+        self.copy_from_host(modules, target, &[discriminant])
+    }
+
     /// Clears every slot and rotates all reusable generations.
     ///
     /// Rotating free slots as well as live slots invalidates read-only
@@ -429,6 +502,32 @@ impl BufferRegistry {
         if registered.elements != lease.elements() {
             return Err(TrapCode::Validation);
         }
+        Ok(registered)
+    }
+
+    #[allow(dead_code)] // Shared by the staged host-copy entry points above.
+    fn resolve_host_copy(
+        &self,
+        modules: &CoreComponentGroup,
+        lease: &BufferLease,
+        expected_role: BufferRole,
+        progress: usize,
+    ) -> Result<RegisteredBuffer, TrapCode> {
+        let registered = self.resolve(lease)?;
+        if registered.role != expected_role {
+            return Err(TrapCode::Validation);
+        }
+        let progress = u32::try_from(progress).map_err(|_| TrapCode::Validation)?;
+        if progress >= COPY_COUNT_LIMIT
+            || progress > registered.elements
+            || usize::try_from(progress).map_err(|_| TrapCode::Validation)? > self.max_copy_bytes
+        {
+            return Err(TrapCode::Validation);
+        }
+
+        let memory_len = modules.authorized_memory_size(&registered.memory)?;
+        validate_range(registered.pointer, registered.elements, memory_len)?;
+        validate_range(registered.pointer, progress, memory_len)?;
         Ok(registered)
     }
 
@@ -905,6 +1004,347 @@ mod tests {
             ),
             Err(TrapCode::Validation)
         ));
+    }
+
+    #[test]
+    fn host_copy_transfers_only_the_requested_stream_prefix() {
+        let (mut modules, memory) = memory_group();
+        let mut registry = BufferRegistry::new(2, 8).unwrap();
+        modules
+            .write_authorized_memory(&memory, 32, &[1, 2, 3, 4, 5, 6])
+            .unwrap();
+        modules
+            .write_authorized_memory(&memory, 64, &[9, 9, 9, 9, 9, 9])
+            .unwrap();
+        let source = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::SourceWrite,
+            32,
+            6,
+            ty(1),
+        );
+        let target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::TargetRead,
+            64,
+            6,
+            ty(1),
+        );
+
+        let mut output = [0xaa; 3];
+        registry
+            .copy_to_host(&modules, &source, &mut output)
+            .unwrap();
+        assert_eq!(output, [1, 2, 3]);
+
+        registry
+            .copy_from_host(&mut modules, &target, &[7, 8, 10])
+            .unwrap();
+        let mut target_bytes = [0_u8; 6];
+        modules
+            .read_authorized_memory(&memory, 64, &mut target_bytes)
+            .unwrap();
+        assert_eq!(target_bytes, [7, 8, 10, 9, 9, 9]);
+    }
+
+    #[test]
+    fn host_copy_supports_single_byte_future_payloads() {
+        let (mut modules, memory) = memory_group();
+        let mut registry = BufferRegistry::new(2, 1).unwrap();
+        modules.write_authorized_memory(&memory, 80, &[6]).unwrap();
+        let source = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(2),
+            BufferRole::SourceWrite,
+            80,
+            1,
+            ty(2),
+        );
+        let target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(2),
+            BufferRole::TargetRead,
+            81,
+            1,
+            ty(2),
+        );
+
+        let mut close_reason = [0xff];
+        registry
+            .copy_to_host(&modules, &source, &mut close_reason)
+            .unwrap();
+        assert_eq!(close_reason, [6]);
+        registry
+            .copy_from_host(&mut modules, &target, &[3])
+            .unwrap();
+        let mut written = [0_u8];
+        modules
+            .read_authorized_memory(&memory, 81, &mut written)
+            .unwrap();
+        assert_eq!(written, [3]);
+    }
+
+    #[test]
+    fn enum8_host_codec_rejects_invalid_discriminants_before_publication() {
+        let (mut modules, memory) = memory_group();
+        let mut registry = BufferRegistry::new(2, 1).unwrap();
+        modules.write_authorized_memory(&memory, 80, &[8]).unwrap();
+        modules
+            .write_authorized_memory(&memory, 81, &[0xaa])
+            .unwrap();
+        let source = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(2),
+            BufferRole::SourceWrite,
+            80,
+            1,
+            ty(2),
+        );
+        let target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(2),
+            BufferRole::TargetRead,
+            81,
+            1,
+            ty(2),
+        );
+
+        assert_eq!(
+            registry.lift_enum8(&modules, &source),
+            Err(TrapCode::CanonicalAbi)
+        );
+        assert_eq!(
+            registry.lower_enum8(&mut modules, &target, 8),
+            Err(TrapCode::CanonicalAbi)
+        );
+        let mut target_byte = [0_u8];
+        modules
+            .read_authorized_memory(&memory, 81, &mut target_byte)
+            .unwrap();
+        assert_eq!(target_byte, [0xaa]);
+
+        modules.write_authorized_memory(&memory, 80, &[7]).unwrap();
+        assert_eq!(registry.lift_enum8(&modules, &source), Ok(7));
+        registry.lower_enum8(&mut modules, &target, 6).unwrap();
+        modules
+            .read_authorized_memory(&memory, 81, &mut target_byte)
+            .unwrap();
+        assert_eq!(target_byte, [6]);
+    }
+
+    #[test]
+    fn host_copy_rejects_wrong_roles_and_oversize_without_mutation() {
+        let (mut modules, memory) = memory_group();
+        let mut registry = BufferRegistry::new(2, 4).unwrap();
+        modules
+            .write_authorized_memory(&memory, 0, &[1, 2, 3, 4])
+            .unwrap();
+        modules
+            .write_authorized_memory(&memory, 8, &[9, 9, 9, 9])
+            .unwrap();
+        let source = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::SourceWrite,
+            0,
+            4,
+            ty(1),
+        );
+        let target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::TargetRead,
+            8,
+            4,
+            ty(1),
+        );
+
+        let mut wrong_role_output = [0xaa; 4];
+        assert_eq!(
+            registry.copy_to_host(&modules, &target, &mut wrong_role_output),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(wrong_role_output, [0xaa; 4]);
+        assert_eq!(
+            registry.copy_from_host(&mut modules, &source, &[5, 5, 5, 5]),
+            Err(TrapCode::Validation)
+        );
+
+        let mut oversize_output = [0xbb; 5];
+        assert_eq!(
+            registry.copy_to_host(&modules, &source, &mut oversize_output),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(oversize_output, [0xbb; 5]);
+        assert_eq!(
+            registry.copy_from_host(&mut modules, &target, &[6, 6, 6, 6, 6]),
+            Err(TrapCode::Validation)
+        );
+
+        let mut source_bytes = [0_u8; 4];
+        let mut target_bytes = [0_u8; 4];
+        modules
+            .read_authorized_memory(&memory, 0, &mut source_bytes)
+            .unwrap();
+        modules
+            .read_authorized_memory(&memory, 8, &mut target_bytes)
+            .unwrap();
+        assert_eq!(source_bytes, [1, 2, 3, 4]);
+        assert_eq!(target_bytes, [9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn host_copy_rejects_foreign_stale_and_poisoned_seals_without_mutation() {
+        let (mut modules, memory) = memory_group();
+        let (mut foreign_modules, _) = memory_group();
+        let mut registry = BufferRegistry::new(2, 4).unwrap();
+        let foreign_registry = BufferRegistry::new(1, 4).unwrap();
+        modules
+            .write_authorized_memory(&memory, 0, &[1, 2, 3, 4])
+            .unwrap();
+        modules
+            .write_authorized_memory(&memory, 8, &[9, 9, 9, 9])
+            .unwrap();
+        let source = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::SourceWrite,
+            0,
+            4,
+            ty(1),
+        );
+        let target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::TargetRead,
+            8,
+            4,
+            ty(1),
+        );
+
+        let mut output = [0xcc; 4];
+        assert_eq!(
+            foreign_registry.copy_to_host(&modules, &source, &mut output),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(output, [0xcc; 4]);
+        assert_eq!(
+            foreign_registry.copy_from_host(&mut modules, &target, &[5, 6, 7, 8]),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(
+            registry.copy_to_host(&foreign_modules, &source, &mut output),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(output, [0xcc; 4]);
+        assert_eq!(
+            registry.copy_from_host(&mut foreign_modules, &target, &[5, 6, 7, 8]),
+            Err(TrapCode::Validation)
+        );
+
+        registry.release(&source, BufferRole::SourceWrite).unwrap();
+        let replacement = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::SourceWrite,
+            0,
+            4,
+            ty(1),
+        );
+        assert_ne!(source.generation(), replacement.generation());
+        assert_eq!(
+            registry.copy_to_host(&modules, &source, &mut output),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(output, [0xcc; 4]);
+        registry.release(&target, BufferRole::TargetRead).unwrap();
+        let replacement_target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::TargetRead,
+            8,
+            4,
+            ty(1),
+        );
+        assert_ne!(target.generation(), replacement_target.generation());
+        assert_eq!(
+            registry.copy_from_host(&mut modules, &target, &[5, 6, 7, 8]),
+            Err(TrapCode::Validation)
+        );
+
+        registry.poison();
+        assert_eq!(
+            registry.copy_to_host(&modules, &replacement, &mut output),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(output, [0xcc; 4]);
+        assert_eq!(
+            registry.copy_from_host(&mut modules, &replacement_target, &[5, 6, 7, 8]),
+            Err(TrapCode::Validation)
+        );
+        let mut target_bytes = [0_u8; 4];
+        modules
+            .read_authorized_memory(&memory, 8, &mut target_bytes)
+            .unwrap();
+        assert_eq!(target_bytes, [9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn host_copy_accepts_empty_slices_after_revalidating_authority() {
+        let (mut modules, memory) = memory_group();
+        let mut registry = BufferRegistry::new(2, 1).unwrap();
+        let source = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::SourceWrite,
+            u32::MAX,
+            0,
+            ty(1),
+        );
+        let target = issue(
+            &mut registry,
+            &modules,
+            memory,
+            plan(1),
+            BufferRole::TargetRead,
+            u32::MAX,
+            0,
+            ty(1),
+        );
+
+        let mut output = [];
+        registry
+            .copy_to_host(&modules, &source, &mut output)
+            .unwrap();
+        registry.copy_from_host(&mut modules, &target, &[]).unwrap();
     }
 
     #[test]

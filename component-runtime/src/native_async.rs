@@ -178,6 +178,15 @@ enum BridgeAction {
         direction: EndpointDirection,
         value_type: AsyncValueTypeId,
     },
+    FutureCopy {
+        plan: BufferPlanId,
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+    },
+    FutureCancel {
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+    },
     Unsupported,
 }
 
@@ -640,6 +649,68 @@ fn runtime_bridges(
                 BridgeAction::FutureNew(future_value_type_id(value_type)?),
                 None,
             ),
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::Read {
+                value_type,
+                options,
+                ..
+            }) if future_enum8_value_type_id(value_type).is_some()
+                && options.async_
+                && options.realloc.is_none() =>
+            {
+                let value_type = future_enum8_value_type_id(value_type)
+                    .ok_or(NativeAsyncError::InvalidWiring)?;
+                (
+                    BridgeAction::FutureCopy {
+                        plan: BufferPlanId::new(value_type.get())
+                            .ok_or(NativeAsyncError::InvalidWiring)?,
+                        direction: EndpointDirection::Read,
+                        value_type,
+                    },
+                    Some(runtime_memory_binding(options)?),
+                )
+            }
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::Write {
+                value_type,
+                options,
+                ..
+            }) if future_enum8_value_type_id(value_type).is_some()
+                && options.async_
+                && options.realloc.is_none() =>
+            {
+                let value_type = future_enum8_value_type_id(value_type)
+                    .ok_or(NativeAsyncError::InvalidWiring)?;
+                (
+                    BridgeAction::FutureCopy {
+                        plan: BufferPlanId::new(value_type.get())
+                            .ok_or(NativeAsyncError::InvalidWiring)?,
+                        direction: EndpointDirection::Write,
+                        value_type,
+                    },
+                    Some(runtime_memory_binding(options)?),
+                )
+            }
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::CancelRead {
+                value_type,
+                ..
+            }) if future_enum8_value_type_id(value_type).is_some() => (
+                BridgeAction::FutureCancel {
+                    direction: EndpointDirection::Read,
+                    value_type: future_enum8_value_type_id(value_type)
+                        .ok_or(NativeAsyncError::InvalidWiring)?,
+                },
+                None,
+            ),
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::CancelWrite {
+                value_type,
+                ..
+            }) if future_enum8_value_type_id(value_type).is_some() => (
+                BridgeAction::FutureCancel {
+                    direction: EndpointDirection::Write,
+                    value_type: future_enum8_value_type_id(value_type)
+                        .ok_or(NativeAsyncError::InvalidWiring)?,
+                },
+                None,
+            ),
             NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::DropReadable {
                 value_type,
                 ..
@@ -720,6 +791,19 @@ fn future_value_type_id(value: &ValueType) -> Result<AsyncValueTypeId, NativeAsy
     }
 }
 
+/// Selects the one-byte enum shape supported by this executor slice. Canonical
+/// execution depends only on shape; admission separately binds the exact C5.3
+/// close-reason case names before any host transport is installed.
+fn future_enum8_value_type_id(value: &ValueType) -> Option<AsyncValueTypeId> {
+    match value {
+        ValueType::Future {
+            type_id,
+            payload: Some(payload),
+        } if matches!(payload.as_ref(), ValueType::Enum(8)) => Some(*type_id),
+        _ => None,
+    }
+}
+
 fn runtime_exports(
     execution: &NativeAsyncExecutionPlan,
 ) -> Result<Vec<RuntimeExport>, NativeAsyncError> {
@@ -783,10 +867,12 @@ const fn buffer_role(direction: EndpointDirection) -> BufferRole {
     }
 }
 
-const fn stream_event_code(direction: EndpointDirection) -> EventCode {
-    match direction {
-        EndpointDirection::Read => EventCode::StreamRead,
-        EndpointDirection::Write => EventCode::StreamWrite,
+const fn copy_event_code(kind: EndpointKind, direction: EndpointDirection) -> EventCode {
+    match (kind, direction) {
+        (EndpointKind::Stream, EndpointDirection::Read) => EventCode::StreamRead,
+        (EndpointKind::Stream, EndpointDirection::Write) => EventCode::StreamWrite,
+        (EndpointKind::Future, EndpointDirection::Read) => EventCode::FutureRead,
+        (EndpointKind::Future, EndpointDirection::Write) => EventCode::FutureWrite,
     }
 }
 
@@ -1238,11 +1324,12 @@ impl NativeAsyncInvocation<'_> {
                 let Some(memory) = memory else {
                     return self.finish_trap(TrapCode::Validation);
                 };
-                self.handle_stream_copy(
+                self.handle_copy(
                     authority,
                     call.id,
                     plan,
                     memory,
+                    EndpointKind::Stream,
                     direction,
                     value_type,
                     *raw as u32,
@@ -1251,12 +1338,57 @@ impl NativeAsyncInvocation<'_> {
                 )
             }
             (
+                BridgeAction::FutureCopy {
+                    plan,
+                    direction,
+                    value_type,
+                },
+                [CoreValue::I32(raw), CoreValue::I32(pointer)],
+            ) => {
+                let Some(memory) = memory else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                self.handle_copy(
+                    authority,
+                    call.id,
+                    plan,
+                    memory,
+                    EndpointKind::Future,
+                    direction,
+                    value_type,
+                    *raw as u32,
+                    *pointer as u32,
+                    1,
+                )
+            }
+            (
                 BridgeAction::StreamCancel {
                     direction,
                     value_type,
                 },
                 [CoreValue::I32(raw)],
-            ) => self.handle_stream_cancel(authority, call.id, direction, value_type, *raw as u32),
+            ) => self.handle_copy_cancel(
+                authority,
+                call.id,
+                EndpointKind::Stream,
+                direction,
+                value_type,
+                *raw as u32,
+            ),
+            (
+                BridgeAction::FutureCancel {
+                    direction,
+                    value_type,
+                },
+                [CoreValue::I32(raw)],
+            ) => self.handle_copy_cancel(
+                authority,
+                call.id,
+                EndpointKind::Future,
+                direction,
+                value_type,
+                *raw as u32,
+            ),
             (
                 BridgeAction::DropEndpoint {
                     kind,
@@ -1347,12 +1479,13 @@ impl NativeAsyncInvocation<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_stream_copy(
+    fn handle_copy(
         &mut self,
         authority: CallAuthority,
         host_id: u32,
         plan: BufferPlanId,
         memory: CoreMemoryAuthority,
+        kind: EndpointKind,
         direction: EndpointDirection,
         value_type: AsyncValueTypeId,
         raw: u32,
@@ -1361,22 +1494,19 @@ impl NativeAsyncInvocation<'_> {
     ) -> NativeAsyncPoll {
         // Guest-controlled handles, ranges, and arena availability are all
         // checked before either fuel or state changes.
-        let handle = match self.component.state.resolve_guest_endpoint(
-            raw,
-            EndpointKind::Stream,
-            direction,
-            value_type,
-        ) {
+        let handle = match self
+            .component
+            .state
+            .resolve_guest_endpoint(raw, kind, direction, value_type)
+        {
             Ok(handle) => handle,
             Err(error) => return self.finish_trap(map_runtime_state_error(error)),
         };
-        if let Err(error) = self.component.state.preflight_begin_copy(
-            handle,
-            EndpointKind::Stream,
-            direction,
-            value_type,
-            elements,
-        ) {
+        if let Err(error) = self
+            .component
+            .state
+            .preflight_begin_copy(handle, kind, direction, value_type, elements)
+        {
             return self.finish_trap(map_exact_endpoint_state_error(error));
         }
         let role = buffer_role(direction);
@@ -1399,13 +1529,11 @@ impl NativeAsyncInvocation<'_> {
             Ok(lease) => lease,
             Err(_) => return self.finish_trap(TrapCode::Validation),
         };
-        let begun = match self.component.state.begin_copy(
-            handle,
-            EndpointKind::Stream,
-            direction,
-            value_type,
-            lease,
-        ) {
+        let begun = match self
+            .component
+            .state
+            .begin_copy(handle, kind, direction, value_type, lease)
+        {
             Ok(begun) => begun,
             Err(failure) => {
                 let (error, lease) = failure.into_parts();
@@ -1444,65 +1572,78 @@ impl NativeAsyncInvocation<'_> {
                         &mut self.component.modules,
                     );
                     state.commit_local_copy(&mut ticket, progress, |source, target, progress| {
+                        // The supported future has a one-byte enum layout, but a
+                        // guest write buffer is still untrusted Core memory.
+                        // Validate its discriminant immediately before the
+                        // target publication; the source may have changed
+                        // after an earlier BLOCKED return.
+                        if kind == EndpointKind::Future {
+                            let _ = buffers.lift_enum8(modules, source)?;
+                        }
                         buffers.copy_local(modules, source, target, progress)
                     })
                 };
                 match copied {
                     Ok(event) => event,
-                    Err(CommitError::State(_)) | Err(CommitError::Operation(_)) => {
+                    Err(CommitError::State(_)) => {
+                        return self.finish_trap(TrapCode::Validation);
+                    }
+                    Err(CommitError::Operation(TrapCode::CanonicalAbi)) => {
+                        return self.finish_trap(TrapCode::CanonicalAbi);
+                    }
+                    Err(CommitError::Operation(_)) => {
                         return self.finish_trap(TrapCode::Validation);
                     }
                 }
             }
         };
-        self.finish_stream_event(authority, host_id, event, direction, raw)
+        self.finish_copy_event(authority, host_id, event, kind, direction, raw)
     }
 
-    fn handle_stream_cancel(
+    fn handle_copy_cancel(
         &mut self,
         authority: CallAuthority,
         host_id: u32,
+        kind: EndpointKind,
         direction: EndpointDirection,
         value_type: AsyncValueTypeId,
         raw: u32,
     ) -> NativeAsyncPoll {
-        let handle = match self.component.state.resolve_guest_endpoint(
-            raw,
-            EndpointKind::Stream,
-            direction,
-            value_type,
-        ) {
+        let handle = match self
+            .component
+            .state
+            .resolve_guest_endpoint(raw, kind, direction, value_type)
+        {
             Ok(handle) => handle,
             Err(error) => return self.finish_trap(map_runtime_state_error(error)),
         };
-        if let Err(error) = self.component.state.preflight_cancel_copy(
-            handle,
-            EndpointKind::Stream,
-            direction,
-            value_type,
-        ) {
+        if let Err(error) = self
+            .component
+            .state
+            .preflight_cancel_copy(handle, kind, direction, value_type)
+        {
             return self.finish_trap(map_exact_endpoint_state_error(error));
         }
         if let Err(trap) = self.debit_active_work_with_reserve(authority, BUFFER_BRIDGE_WORK) {
             return self.finish_trap(trap);
         }
-        let event = match self.component.state.cancel_copy(
-            handle,
-            EndpointKind::Stream,
-            direction,
-            value_type,
-        ) {
+        let event = match self
+            .component
+            .state
+            .cancel_copy(handle, kind, direction, value_type)
+        {
             Ok(event) => event,
             Err(error) => return self.finish_trap(map_exact_endpoint_state_error(error)),
         };
-        self.finish_stream_event(authority, host_id, event, direction, raw)
+        self.finish_copy_event(authority, host_id, event, kind, direction, raw)
     }
 
-    fn finish_stream_event(
+    fn finish_copy_event(
         &mut self,
         authority: CallAuthority,
         host_id: u32,
         event: EventToken,
+        kind: EndpointKind,
         direction: EndpointDirection,
         raw: u32,
     ) -> NativeAsyncPoll {
@@ -1510,7 +1651,7 @@ impl NativeAsyncInvocation<'_> {
             Ok(delivered) => delivered,
             Err(_) => return self.finish_trap(TrapCode::Validation),
         };
-        if event.code != stream_event_code(direction) || event.p1 != raw {
+        if event.code != copy_event_code(kind, direction) || event.p1 != raw {
             return self.finish_trap(TrapCode::Validation);
         }
         let reclaimed = {
@@ -2081,6 +2222,17 @@ mod tests {
         )
     }
 
+    fn close_future_component(run: &str, callback: &str) -> String {
+        replace_once(
+            &byte_stream_component(run, callback),
+            "  (type $closed (future u32))",
+            r#"  (type $close-reason
+    (enum "normal" "failure" "cancelled" "denied" "unavailable"
+      "exhausted" "invalid" "backend-fault"))
+  (type $closed (future $close-reason))"#,
+        )
+    }
+
     fn trap_call(component: &mut NativeAsyncComponent) -> TrapCode {
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         loop {
@@ -2118,7 +2270,10 @@ mod tests {
                             handle_transitions += 1;
                             HANDLE_STATE_WORK
                         }
-                        BridgeAction::StreamCopy { .. } | BridgeAction::StreamCancel { .. } => {
+                        BridgeAction::StreamCopy { .. }
+                        | BridgeAction::StreamCancel { .. }
+                        | BridgeAction::FutureCopy { .. }
+                        | BridgeAction::FutureCancel { .. } => {
                             handle_transitions += 1;
                             BUFFER_BRIDGE_WORK
                         }
@@ -2889,6 +3044,209 @@ mod tests {
         let mut task_cancel = instantiate(&handle_component("call $task-cancel"));
         assert_eq!(trap_call(&mut task_cancel), TrapCode::CanonicalAbi);
         assert!(task_cancel.is_poisoned());
+    }
+
+    #[test]
+    fn future_copy_classification_is_exactly_the_generic_enum8_abi_shape() {
+        let base = close_future_component(
+            r#"    (func (export "run") (result i32)
+      call $task-return
+      i32.const 1)"#,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let pinned = r#"(enum "normal" "failure" "cancelled" "denied" "unavailable"
+      "exhausted" "invalid" "backend-fault")"#;
+        let adjacent = replace_once(&base, pinned, r#"(enum "a" "b" "c" "d" "e" "f" "g" "h")"#);
+        for source in [&base, &adjacent] {
+            let component = instantiate(source);
+            assert_eq!(
+                component
+                    .bridges
+                    .iter()
+                    .filter(|bridge| matches!(bridge.action, BridgeAction::FutureCopy { .. }))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                component
+                    .bridges
+                    .iter()
+                    .filter(|bridge| matches!(bridge.action, BridgeAction::FutureCancel { .. }))
+                    .count(),
+                2
+            );
+        }
+
+        for rejected in [
+            r#"(enum "a" "b" "c" "d" "e" "f" "g")"#,
+            r#"(enum "a" "b" "c" "d" "e" "f" "g" "h" "i")"#,
+        ] {
+            let component = instantiate(&replace_once(&base, pinned, rejected));
+            assert_eq!(
+                component
+                    .bridges
+                    .iter()
+                    .filter(|bridge| matches!(bridge.action, BridgeAction::FutureCopy { .. }))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                component
+                    .bridges
+                    .iter()
+                    .filter(|bridge| matches!(bridge.action, BridgeAction::FutureCancel { .. }))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                component
+                    .bridges
+                    .iter()
+                    .filter(|bridge| bridge.action == BridgeAction::Unsupported)
+                    .count(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn close_reason_future_copies_one_byte_and_reclaims_both_sides() {
+        let run = r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $future-new
+      local.set $pair
+      i32.const 16
+      i32.const 6
+      i32.store8
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      call $future-write
+      i32.const -1
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i32.wrap_i64
+      i32.const 24
+      call $future-read
+      if unreachable end
+      i32.const 24
+      i32.load8_u
+      i32.const 6
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $future-cancel-write
+      if unreachable end
+      local.get $pair
+      i32.wrap_i64
+      call $future-drop-readable
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $future-drop-writable
+      call $task-return
+      i32.const 1)"#;
+        let source = close_future_component(
+            run,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let mut component = instantiate(&source);
+        assert_eq!(
+            component
+                .bridges
+                .iter()
+                .filter(|bridge| matches!(bridge.action, BridgeAction::FutureCopy { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            component
+                .bridges
+                .iter()
+                .filter(|bridge| matches!(bridge.action, BridgeAction::FutureCancel { .. }))
+                .count(),
+            2
+        );
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            loop {
+                match call.poll() {
+                    NativeAsyncPoll::Pending(_)
+                    | NativeAsyncPoll::Resolved(_)
+                    | NativeAsyncPoll::Yielded(_) => {}
+                    NativeAsyncPoll::Complete(_) => break,
+                    NativeAsyncPoll::WaitPending { .. } => {
+                        panic!("local close future unexpectedly waited")
+                    }
+                    NativeAsyncPoll::Trapped(trap) => {
+                        panic!("local close future trapped: {trap:?}")
+                    }
+                }
+            }
+        }
+        assert_eq!(component.buffers.live(), 0);
+        let mut close_reason = [0xff];
+        component
+            .modules
+            .read_memory(0, "memory", 24, &mut close_reason)
+            .unwrap();
+        assert_eq!(close_reason, [6]);
+    }
+
+    #[test]
+    fn close_reason_future_rejects_a_discriminant_changed_after_blocking() {
+        let run = r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $future-new
+      local.set $pair
+      i32.const 24
+      i32.const 170
+      i32.store8
+      i32.const 16
+      i32.const 6
+      i32.store8
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      call $future-write
+      i32.const -1
+      i32.ne
+      if unreachable end
+      i32.const 16
+      i32.const 255
+      i32.store8
+      local.get $pair
+      i32.wrap_i64
+      i32.const 24
+      call $future-read
+      drop
+      unreachable)"#;
+        let source = close_future_component(
+            run,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      unreachable)"#,
+        );
+        let mut component = instantiate(&source);
+        assert_eq!(trap_call(&mut component), TrapCode::CanonicalAbi);
+        assert!(component.is_poisoned());
+        assert_eq!(component.buffers.live(), 0);
+        let mut target = [0_u8];
+        component
+            .modules
+            .read_memory(0, "memory", 24, &mut target)
+            .unwrap();
+        assert_eq!(target, [0xaa]);
     }
 
     #[test]

@@ -159,6 +159,18 @@ pub struct EndpointPair {
     pub writable: AsyncHandle,
 }
 
+/// One guest-readable endpoint and the exact host authority for its writer.
+pub struct HostReadableBinding {
+    pub guest: AsyncHandle,
+    pub host: HostEndpointAuthority,
+}
+
+/// Fixed aggregate used to install a byte stream and close future atomically.
+pub struct HostReadableBindingsPair {
+    pub first: HostReadableBinding,
+    pub second: HostReadableBinding,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadableTransferRequest {
     pub handle: AsyncHandle,
@@ -1162,6 +1174,49 @@ impl AsyncState {
     ) -> Result<(AsyncHandle, HostEndpointAuthority), AsyncStateError> {
         self.pairs.prepare_insert(1)?;
         self.handles.prepare_insert(1)?;
+        self.insert_host_readable_prepared(kind, value_type)
+    }
+
+    /// Atomically creates two guest-readable ends backed by reactive host
+    /// writers.
+    ///
+    /// This is the bounded input-side constructor used for a byte stream and
+    /// its close-reason future. Both pair and handle tables reserve their full
+    /// capacity before the first entry becomes live. A commit-time invariant
+    /// failure while creating the second end precisely removes the first, so a
+    /// caller never observes or loses logical capacity to a partial aggregate.
+    pub fn insert_host_readables_pair(
+        &mut self,
+        first: (EndpointKind, AsyncValueTypeId),
+        second: (EndpointKind, AsyncValueTypeId),
+    ) -> Result<HostReadableBindingsPair, AsyncStateError> {
+        self.pairs.prepare_insert(2)?;
+        self.handles.prepare_insert(2)?;
+
+        let first = self.insert_host_readable_prepared(first.0, first.1)?;
+        match self.insert_host_readable_prepared(second.0, second.1) {
+            Ok(second) => Ok(HostReadableBindingsPair {
+                first: HostReadableBinding {
+                    guest: first.0,
+                    host: first.1,
+                },
+                second: HostReadableBinding {
+                    guest: second.0,
+                    host: second.1,
+                },
+            }),
+            Err(error) => {
+                self.rollback_host_readable(first.0, &first.1)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn insert_host_readable_prepared(
+        &mut self,
+        kind: EndpointKind,
+        value_type: AsyncValueTypeId,
+    ) -> Result<(AsyncHandle, HostEndpointAuthority), AsyncStateError> {
         let pair = self.pairs.insert_prepared(SharedPair {
             kind,
             value_type,
@@ -1175,11 +1230,26 @@ impl AsyncState {
         let readable = match self.insert_endpoint(pair, kind, EndpointDirection::Read, value_type) {
             Ok(readable) => readable,
             Err(error) => {
-                let _ = self.pairs.remove(pair);
-                return Err(error);
+                return match self.pairs.remove(pair) {
+                    Ok(_) => Err(error),
+                    Err(_) => Err(AsyncStateError::PairInvariant),
+                };
             }
         };
-        self.pairs.get_mut(pair)?.readable = Holder::Guest(readable);
+        if let Err(error) = self
+            .pairs
+            .get_mut(pair)
+            .map(|shared| shared.readable = Holder::Guest(readable))
+        {
+            let handle_removed =
+                matches!(self.handles.remove(readable), Ok(HandleEntry::Endpoint(_)));
+            let pair_removed = self.pairs.remove(pair).is_ok();
+            return if handle_removed && pair_removed {
+                Err(error)
+            } else {
+                Err(AsyncStateError::PairInvariant)
+            };
+        }
         Ok((
             self.public_handle(readable),
             HostEndpointAuthority {
@@ -1191,6 +1261,40 @@ impl AsyncState {
                 active: true,
             },
         ))
+    }
+
+    fn rollback_host_readable(
+        &mut self,
+        readable: AsyncHandle,
+        authority: &HostEndpointAuthority,
+    ) -> Result<(), AsyncStateError> {
+        if readable.state_id != self.id
+            || authority.state_id != self.id
+            || authority.direction != EndpointDirection::Write
+            || !authority.active
+        {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        let endpoint = self.endpoint_by_seal(readable.seal)?;
+        let shared = self.pairs.get(authority.pair)?;
+        if endpoint.pair != authority.pair
+            || endpoint.kind != authority.kind
+            || endpoint.kind != shared.kind
+            || endpoint.direction != EndpointDirection::Read
+            || endpoint.value_type != authority.value_type
+            || endpoint.value_type != shared.value_type
+            || shared.readable != Holder::Guest(readable.seal)
+            || shared.writable != Holder::Host
+            || shared.phase != PairPhase::Idle
+        {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        match self.handles.remove(readable.seal)? {
+            HandleEntry::Endpoint(_) => {}
+            HandleEntry::WaitableSet(_) => return Err(AsyncStateError::PairInvariant),
+        }
+        self.pairs.remove(authority.pair)?;
+        Ok(())
     }
 
     fn insert_endpoint(
@@ -1862,6 +1966,19 @@ impl AsyncState {
             authority_direction: authority.direction,
             committed: false,
         })
+    }
+
+    /// Returns the exact active buffer's maximum host completion progress.
+    ///
+    /// The ticket is fully revalidated on every call. Only the scalar element
+    /// count crosses this boundary; the linear buffer lease and its registry
+    /// identity remain owned by the async state.
+    pub fn host_copy_progress_limit(
+        &self,
+        ticket: &HostCopyTicket,
+    ) -> Result<u32, AsyncStateError> {
+        self.validate_host_ticket(ticket)?;
+        Ok(self.active_for(ticket.operation)?.lease.elements())
     }
 
     pub fn commit_host_copy<E>(
@@ -4248,6 +4365,195 @@ mod tests {
                 ty(2),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn host_readables_pair_is_atomic_and_preserves_exact_shapes() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let bindings = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(30)),
+                (EndpointKind::Future, ty(31)),
+            )
+            .unwrap();
+        let HostReadableBindingsPair {
+            first:
+                HostReadableBinding {
+                    guest: stream,
+                    host: stream_host,
+                },
+            second:
+                HostReadableBinding {
+                    guest: future,
+                    host: future_host,
+                },
+        } = bindings;
+
+        assert_eq!(state.pairs.live, 2);
+        assert_eq!(state.handles.live, 2);
+        assert_eq!(
+            state.endpoint_info(stream).unwrap(),
+            EndpointInfo {
+                kind: EndpointKind::Stream,
+                direction: EndpointDirection::Read,
+                value_type: ty(30),
+                copy_state: CopyState::Idle,
+                has_pending_event: false,
+                event_delivered: false,
+                joined_set: None,
+            }
+        );
+        assert_eq!(stream_host.kind(), EndpointKind::Stream);
+        assert_eq!(stream_host.direction(), EndpointDirection::Write);
+        assert_eq!(stream_host.value_type(), ty(30));
+        assert_eq!(
+            state.endpoint_info(future).unwrap(),
+            EndpointInfo {
+                kind: EndpointKind::Future,
+                direction: EndpointDirection::Read,
+                value_type: ty(31),
+                copy_state: CopyState::Idle,
+                has_pending_event: false,
+                event_delivered: false,
+                joined_set: None,
+            }
+        );
+        assert_eq!(future_host.kind(), EndpointKind::Future);
+        assert_eq!(future_host.direction(), EndpointDirection::Write);
+        assert_eq!(future_host.value_type(), ty(31));
+    }
+
+    #[test]
+    fn host_readables_pair_rolls_back_a_second_commit_failure() {
+        let mut state = AsyncState::new(limits()).unwrap();
+
+        // Pre-reserve the exact storage that the batch will use, then corrupt
+        // only its second free slot's generation. The first insert commits;
+        // the second must fail while constructing its seal.
+        state.handles.prepare_insert(2).unwrap();
+        state.handles.slots.push(Slot {
+            generation: 1,
+            value: None,
+            retired: false,
+        });
+        state.handles.slots.push(Slot {
+            generation: 0,
+            value: None,
+            retired: false,
+        });
+
+        assert!(matches!(
+            state.insert_host_readables_pair(
+                (EndpointKind::Stream, ty(32)),
+                (EndpointKind::Future, ty(33)),
+            ),
+            Err(AsyncStateError::GenerationExhausted)
+        ));
+        assert_eq!(state.pairs.live, 0);
+        assert_eq!(state.handles.live, 0);
+        assert!(state.pairs.slots.iter().all(|slot| slot.value.is_none()));
+        assert!(state.handles.slots.iter().all(|slot| slot.value.is_none()));
+
+        // Repair only the deliberately malformed, pre-existing slot. The
+        // failed aggregate retained all of its logical table capacity.
+        state.handles.slots[1].generation = 1;
+        state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(32)),
+                (EndpointKind::Future, ty(33)),
+            )
+            .unwrap();
+        assert_eq!(state.pairs.live, 2);
+        assert_eq!(state.handles.live, 2);
+    }
+
+    #[test]
+    fn host_readables_pair_preflight_failure_consumes_no_capacity() {
+        let mut state = AsyncState::new(AsyncStateLimits {
+            handles: 2,
+            pairs: 1,
+            tasks: 1,
+            waitables_per_set: 1,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            state.insert_host_readables_pair(
+                (EndpointKind::Stream, ty(34)),
+                (EndpointKind::Future, ty(35)),
+            ),
+            Err(AsyncStateError::PairTableFull)
+        ));
+        assert_eq!(state.pairs.live, 0);
+        assert_eq!(state.handles.live, 0);
+
+        state
+            .insert_host_readable(EndpointKind::Stream, ty(34))
+            .unwrap();
+        assert_eq!(state.pairs.live, 1);
+        assert_eq!(state.handles.live, 1);
+    }
+
+    #[test]
+    fn host_copy_progress_limit_revalidates_stale_and_committed_tickets() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let (readable, authority) = state
+            .insert_host_readable(EndpointKind::Stream, ty(36))
+            .unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(36),
+                    lease(1, 7),
+                )
+                .unwrap(),
+        );
+        let mut ticket = state.prepare_host_copy(&authority, &operation).unwrap();
+        assert_eq!(state.host_copy_progress_limit(&ticket), Ok(7));
+        let event = state
+            .commit_host_copy(&mut ticket, CopyResult::Completed, 4, |_, progress| {
+                assert_eq!(progress, 4);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(
+            state.host_copy_progress_limit(&ticket),
+            Err(AsyncStateError::StaleOperation)
+        );
+        reclaim_ok(&mut state, &event);
+
+        let (readable, authority) = state
+            .insert_host_readable(EndpointKind::Stream, ty(37))
+            .unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(37),
+                    lease(2, 5),
+                )
+                .unwrap(),
+        );
+        let ticket = state.prepare_host_copy(&authority, &operation).unwrap();
+        assert_eq!(state.host_copy_progress_limit(&ticket), Ok(5));
+        let cancelled = state
+            .cancel_copy(
+                readable,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                ty(37),
+            )
+            .unwrap();
+        assert_eq!(
+            state.host_copy_progress_limit(&ticket),
+            Err(AsyncStateError::StaleOperation)
+        );
+        reclaim_ok(&mut state, &cancelled);
     }
 
     #[test]

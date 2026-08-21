@@ -2,7 +2,9 @@ use vibeos_component_format::{ProfileIdentity, PROFILE_1_LIMITS};
 use vibeos_component_runtime::{
     decode::{
         inspect_component_for_profile, AsyncCanonicalFunctionPlan, AsyncComponentFunctionSource,
-        AsyncCoreFunctionSource, AsyncStreamPlan, ComponentSummary, DecodeError,
+        AsyncCoreFunctionSource, AsyncCoreValueType, AsyncStreamPlan, ComponentSummary,
+        DecodeError, NativeAsyncCanonicalFunctionPlan, NativeAsyncCoreImportPlan,
+        NativeAsyncFuturePlan, NativeAsyncStreamPlan, NativeAsyncWaitablePlan,
     },
     sync::{SyncError, SynchronousComponent},
     value::ValueType,
@@ -18,6 +20,12 @@ const ASYNC_COMPONENT_WAT: &str =
     include_str!("../../component-format/tests/corpus/component/async-0.255.0.component.wat");
 const ASYNC_WORLD_WIT: &str =
     include_str!("../../component-format/tests/corpus/wit/async-world.wit");
+const NATIVE_STREAM_WAT: &str = include_str!(
+    "../../component-format/tests/corpus/component/native-async-stream-0.255.0.component.wat"
+);
+const NATIVE_SMOKE_WAT: &str = include_str!(
+    "../../component-format/tests/corpus/component/native-async-smoke-0.255.0.component.wat"
+);
 
 fn async_world_component() -> Vec<u8> {
     wat::parse_str(ASYNC_COMPONENT_WAT).unwrap()
@@ -60,6 +68,131 @@ fn async_intrinsics_component() -> Vec<u8> {
     component.section(&types);
     component.section(&canon);
     component.finish()
+}
+
+fn native_resource_free_intrinsics_component() -> Vec<u8> {
+    let mut types = ComponentTypeSection::new();
+    types.defined_type().future(None);
+    types.defined_type().stream(None);
+
+    let mut canon = CanonicalFunctionSection::new();
+    canon.task_return(None, []);
+    canon.task_cancel();
+    canon.stream_new(1);
+    canon.stream_read(1, [CanonicalOption::Async]);
+    canon.stream_write(1, [CanonicalOption::Async]);
+    canon.stream_cancel_read(1, false);
+    canon.stream_cancel_write(1, false);
+    canon.stream_drop_readable(1);
+    canon.stream_drop_writable(1);
+    canon.future_new(0);
+    canon.future_read(0, [CanonicalOption::Async]);
+    canon.future_write(0, [CanonicalOption::Async]);
+    canon.future_cancel_read(0, false);
+    canon.future_cancel_write(0, false);
+    canon.future_drop_readable(0);
+    canon.future_drop_writable(0);
+    canon.waitable_set_new();
+    canon.waitable_set_drop();
+    canon.waitable_join();
+
+    let mut component = Component::new();
+    component.section(&types);
+    component.section(&canon);
+    component.finish()
+}
+
+fn native_task_return_bridge_component() -> Vec<u8> {
+    wat::parse_str(
+        r#"(component
+              (core module $m
+                (import "canon" "task-return" (func $task-return))
+                (func (export "run") (result i32)
+                  call $task-return
+                  i32.const 0)
+                (func (export "callback") (param i32 i32 i32) (result i32)
+                  i32.const 0))
+              (core func $task-return (canon task.return))
+              (core instance $canon
+                (export "task-return" (func $task-return)))
+              (core instance $i
+                (instantiate $m (with "canon" (instance $canon))))
+              (alias core export $i "run" (core func $run))
+              (alias core export $i "callback" (core func $callback))
+              (type $t (func async))
+              (func $lifted (type $t)
+                (canon lift (core func $run) async
+                  (callback (core func $callback))))
+              (export "run" (func $lifted)))"#,
+    )
+    .unwrap()
+}
+
+fn resource_type_component() -> Vec<u8> {
+    let mut types = ComponentTypeSection::new();
+    types.resource(wasm_encoder::ValType::I32, None);
+    let mut component = Component::new();
+    component.section(&types);
+    component.finish()
+}
+
+fn aggregate_native_bridge_component(bindings: usize, runtime_instances: usize) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut source = String::from("(component (core module $guest");
+    for index in 0..bindings {
+        write!(
+            source,
+            " (import \"canon\" \"b{index}\" (func $import{index}))"
+        )
+        .unwrap();
+    }
+    source.push(')');
+    for index in 0..bindings {
+        write!(source, " (core func $builtin{index} (canon task.return))").unwrap();
+    }
+    source.push_str(" (core instance $builtins");
+    for index in 0..bindings {
+        write!(source, " (export \"b{index}\" (func $builtin{index}))").unwrap();
+    }
+    source.push(')');
+    for index in 0..runtime_instances {
+        write!(
+            source,
+            " (core instance $guest{index} (instantiate $guest (with \"canon\" (instance $builtins))))"
+        )
+        .unwrap();
+    }
+    source.push(')');
+    wat::parse_str(source).unwrap()
+}
+
+fn synthetic_function_forward_component() -> Vec<u8> {
+    wat::parse_str(
+        r#"(component
+              (core module $provider (func (export "ordinary")))
+              (core module $guest (import "bundle" "ordinary" (func)))
+              (core instance $provider-instance (instantiate $provider))
+              (alias core export $provider-instance "ordinary" (core func $ordinary))
+              (core instance $bundle (export "ordinary" (func $ordinary)))
+              (core instance $guest-instance
+                (instantiate $guest (with "bundle" (instance $bundle)))))"#,
+    )
+    .unwrap()
+}
+
+fn synthetic_memory_forward_component() -> Vec<u8> {
+    wat::parse_str(
+        r#"(component
+              (core module $provider (memory (export "memory") 1 1))
+              (core module $guest (import "bundle" "memory" (memory 1 1)))
+              (core instance $provider-instance (instantiate $provider))
+              (alias core export $provider-instance "memory" (core memory $memory))
+              (core instance $bundle (export "memory" (memory $memory)))
+              (core instance $guest-instance
+                (instantiate $guest (with "bundle" (instance $bundle)))))"#,
+    )
+    .unwrap()
 }
 
 fn async_lower_component() -> Vec<u8> {
@@ -154,6 +287,7 @@ fn exact_async_types_and_world_are_preserved_but_inert() {
     let plan = inspect_component_for_profile(&bytes, ProfileIdentity::PROFILE_1_ASYNC).unwrap();
     assert_eq!(plan.profile(), ProfileIdentity::PROFILE_1_ASYNC);
     assert!(!plan.runtime_ready());
+    assert!(plan.native_async_execution_plan().is_none());
     assert_eq!(plan.executable_exports().count(), 0);
     assert_eq!(plan.summary().async_abi.async_function_types, 1);
     assert_eq!(plan.summary().async_abi.future_types, 1);
@@ -259,6 +393,347 @@ fn selected_base_async_intrinsics_are_validated_and_classified() {
     ));
     assert!(options.async_);
     assert!(!plan.runtime_ready());
+}
+
+#[test]
+fn native_resource_free_plan_is_total_owned_and_inert() {
+    let bytes = wat::parse_str(NATIVE_STREAM_WAT).unwrap();
+    let plan = inspect_component_for_profile(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.profile(),
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+    );
+    assert!(!plan.runtime_ready());
+    assert!(!plan.native_async_runtime_ready());
+    assert_eq!(plan.runtime_instance_count(), 1);
+    assert_eq!(plan.executable_exports().count(), 0);
+
+    let native = plan.native_async_execution_plan().unwrap();
+    assert_eq!(native.instances().len(), 1);
+    assert_eq!(native.canonical_plans().len(), 1);
+    assert_eq!(
+        native.canonical_plans().len(),
+        plan.summary().canonical_functions as usize
+    );
+    assert!(native.canonical_import_bridges().is_empty());
+    assert_eq!(native.exports().len(), 1);
+    assert_eq!(native.exports()[0].name, "run");
+    assert_eq!(native.exports()[0].canonical, 0);
+    let NativeAsyncCanonicalFunctionPlan::Lift {
+        core_function,
+        callback,
+        options,
+        ..
+    } = &native.canonical_plans()[0].function
+    else {
+        panic!("native export must resolve to a callback lift")
+    };
+    assert_eq!(
+        (core_function.core_instance, core_function.export.as_str()),
+        (0, "run")
+    );
+    assert_eq!(
+        (callback.core_instance, callback.export.as_str()),
+        (0, "callback")
+    );
+    assert!(options.async_);
+}
+
+#[test]
+fn native_resource_free_builtin_subset_is_exact_and_total() {
+    let bytes = native_resource_free_intrinsics_component();
+    let plan = inspect_component_for_profile(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    assert_eq!(plan.runtime_instance_count(), 0);
+    let native = plan.native_async_execution_plan().unwrap();
+    assert_eq!(plan.summary().canonical_functions, 19);
+    assert_eq!(native.canonical_plans().len(), 19);
+    assert!(native.instances().is_empty());
+    assert!(native.canonical_import_bridges().is_empty());
+    assert!(native.exports().is_empty());
+    assert!(matches!(
+        native.canonical_plans()[16].function,
+        NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::SetNew)
+    ));
+    assert!(matches!(
+        native.canonical_plans()[17].function,
+        NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::SetDrop)
+    ));
+    assert!(matches!(
+        native.canonical_plans()[18].function,
+        NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::Join)
+    ));
+}
+
+#[test]
+fn native_canonical_import_bridge_retains_exact_core_signature_and_origin() {
+    let bytes = native_task_return_bridge_component();
+    let plan = inspect_component_for_profile(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    assert_eq!(plan.runtime_instance_count(), 1);
+    let native = plan.native_async_execution_plan().unwrap();
+    assert_eq!(native.instances().len(), 1);
+    assert_eq!(native.canonical_plans().len(), 2);
+    assert_eq!(native.canonical_import_bridges().len(), 1);
+    let bridge = &native.canonical_import_bridges()[0];
+    assert_eq!(bridge.core_instance, 0);
+    assert_eq!(bridge.core_module, "canon");
+    assert_eq!(bridge.core_field, "task-return");
+    assert_eq!(bridge.canonical, 0);
+    assert_eq!(bridge.signature.parameters, []);
+    assert_eq!(bridge.signature.results, []);
+    assert!(matches!(
+        native.instances()[0].imports.as_slice(),
+        [NativeAsyncCoreImportPlan::Canonical { bridge: 0 }]
+    ));
+    assert!(matches!(
+        native.canonical_plans()[0].function,
+        NativeAsyncCanonicalFunctionPlan::TaskReturn { .. }
+    ));
+    assert!(matches!(
+        native.canonical_plans()[1].function,
+        NativeAsyncCanonicalFunctionPlan::Lift { .. }
+    ));
+    assert_eq!(native.exports()[0].canonical, 1);
+}
+
+#[test]
+fn native_smoke_plan_resolves_every_bridge_signature_and_memory_origin() {
+    use AsyncCoreValueType::{I32, I64};
+
+    let bytes = wat::parse_str(NATIVE_SMOKE_WAT).unwrap();
+    let plan = inspect_component_for_profile(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    assert_eq!(plan.runtime_instance_count(), 2);
+    let native = plan.native_async_execution_plan().unwrap();
+    assert_eq!(native.instances().len(), 2);
+    assert_eq!(native.canonical_plans().len(), 19);
+    assert_eq!(
+        native.canonical_plans().len(),
+        plan.summary().canonical_functions as usize
+    );
+    assert_eq!(native.canonical_import_bridges().len(), 18);
+    assert!(native.instances()[0].imports.is_empty());
+    assert_eq!(native.instances()[1].imports.len(), 19);
+    assert!(matches!(
+        &native.instances()[1].imports[0],
+        NativeAsyncCoreImportPlan::InstanceExport {
+            module,
+            field,
+            core_instance: 0,
+            export,
+        } if module == "env" && field == "memory" && export == "memory"
+    ));
+    for (position, import) in native.instances()[1].imports[1..].iter().enumerate() {
+        assert!(matches!(
+            import,
+            NativeAsyncCoreImportPlan::Canonical { bridge }
+                if *bridge == u32::try_from(position).unwrap()
+        ));
+    }
+
+    let expected = [
+        (vec![], vec![]),
+        (vec![], vec![I64]),
+        (vec![I32, I32, I32], vec![I32]),
+        (vec![I32, I32, I32], vec![I32]),
+        (vec![I32], vec![I32]),
+        (vec![I32], vec![I32]),
+        (vec![I32], vec![]),
+        (vec![I32], vec![]),
+        (vec![], vec![I64]),
+        (vec![I32, I32], vec![I32]),
+        (vec![I32, I32], vec![I32]),
+        (vec![I32], vec![I32]),
+        (vec![I32], vec![I32]),
+        (vec![I32], vec![]),
+        (vec![I32], vec![]),
+        (vec![], vec![I32]),
+        (vec![I32], vec![]),
+        (vec![I32, I32], vec![]),
+    ];
+    for (position, (bridge, (parameters, results))) in native
+        .canonical_import_bridges()
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+    {
+        assert_eq!(bridge.core_instance, 1);
+        assert_eq!(bridge.core_module, "vibe:async");
+        assert_eq!(bridge.canonical, u32::try_from(position).unwrap());
+        assert_eq!(&bridge.signature.parameters, parameters);
+        assert_eq!(&bridge.signature.results, results);
+    }
+
+    for canonical in [2_usize, 3, 9, 10] {
+        let options = match &native.canonical_plans()[canonical].function {
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::Read {
+                options,
+                ..
+            })
+            | NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::Write {
+                options,
+                ..
+            })
+            | NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::Read {
+                options,
+                ..
+            })
+            | NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::Write {
+                options,
+                ..
+            }) => options,
+            _ => panic!("canonical {canonical} must be a memory-bearing transfer"),
+        };
+        let memory = options.memory.as_ref().unwrap();
+        assert_eq!(
+            (memory.core_instance, memory.export.as_str()),
+            (0, "memory")
+        );
+    }
+    let NativeAsyncCanonicalFunctionPlan::Lift {
+        core_function,
+        callback,
+        ..
+    } = &native.canonical_plans()[18].function
+    else {
+        panic!("last canonical must be the exported lift")
+    };
+    assert_eq!(core_function.core_instance, 1);
+    assert_eq!(callback.core_instance, 1);
+    assert_eq!(native.exports()[0].canonical, 18);
+}
+
+#[test]
+fn native_canonical_bridge_limit_is_aggregate_across_runtime_instances() {
+    let profile = ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE;
+    let at_limit = aggregate_native_bridge_component(128, 2);
+    let plan = inspect_component_for_profile(&at_limit, profile).unwrap();
+    assert_eq!(plan.runtime_instance_count(), 2);
+    assert_eq!(
+        plan.native_async_execution_plan()
+            .unwrap()
+            .canonical_import_bridges()
+            .len(),
+        PROFILE_1_LIMITS.max_imports as usize
+    );
+
+    let over_limit = aggregate_native_bridge_component(129, 2);
+    assert_eq!(
+        inspect_component_for_profile(&over_limit, profile).err(),
+        Some(DecodeError::Limit)
+    );
+}
+
+#[test]
+fn native_synthetic_instances_are_canonical_builtin_bundles_only() {
+    let profile = ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE;
+    for bytes in [
+        synthetic_function_forward_component(),
+        synthetic_memory_forward_component(),
+    ] {
+        // Both are valid Component grammar and remain acceptable to the broad
+        // validation-only identity. The native grammar rejects their live
+        // forwarding authority before creating executor wiring.
+        assert!(inspect_component_for_profile(&bytes, ProfileIdentity::PROFILE_1_ASYNC).is_ok());
+        assert_eq!(
+            inspect_component_for_profile(&bytes, profile).err(),
+            Some(DecodeError::Unsupported)
+        );
+    }
+}
+
+#[test]
+fn native_resource_free_profile_rejects_authority_and_async_supersets() {
+    let profile = ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE;
+    for bytes in [
+        wat::parse_str(include_str!(
+            "../../component-format/tests/corpus/component/typed.component.wat"
+        ))
+        .unwrap(),
+        resource_type_component(),
+        async_lower_component(),
+        async_intrinsics_component(),
+        async_memory_intrinsics_component(),
+        wat::parse_str(
+            r#"(component
+                  (type $t (func async))
+                  (import "run" (func (type $t))))"#,
+        )
+        .unwrap(),
+        wat::parse_str(
+            r#"(component
+                  (type $api (instance))
+                  (import "api" (instance (type $api))))"#,
+        )
+        .unwrap(),
+        wat::parse_str(r#"(component (import "authority" (type (sub resource))))"#).unwrap(),
+        wat::parse_str(
+            r#"(component
+                  (type $api
+                    (instance
+                      (export "authority" (type (sub resource))))))"#,
+        )
+        .unwrap(),
+        wat::parse_str(
+            r#"(component
+                  (type $api
+                    (instance
+                      (export "authority" (type (sub resource)))
+                      (type $borrowed (borrow 0)))))"#,
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(
+            inspect_component_for_profile(&bytes, profile).err(),
+            Some(DecodeError::Unsupported)
+        );
+    }
+
+    let mut more_async = CanonicalFunctionSection::new();
+    more_async.stream_cancel_read(0, true);
+    let mut component = Component::new();
+    component.section(&more_async);
+    assert_eq!(
+        inspect_component_for_profile(&component.finish(), profile).err(),
+        Some(DecodeError::Unsupported)
+    );
+}
+
+#[test]
+fn native_identity_cannot_enter_the_synchronous_runtime_even_with_no_async_entries() {
+    let bytes = Component::new().finish();
+    let plan = inspect_component_for_profile(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    assert!(plan.summary().async_abi.is_empty());
+    assert!(!plan.runtime_ready());
+    assert!(!plan.native_async_runtime_ready());
+    assert!(plan.native_async_execution_plan().is_some());
+    assert_eq!(
+        SynchronousComponent::instantiate(
+            &plan,
+            &ProfileEngine::new(),
+            OwnerAllocationReservation::new(1_000_000),
+        )
+        .err(),
+        Some(SyncError::AsyncUnavailable)
+    );
 }
 
 #[test]
@@ -406,6 +881,7 @@ fn validation_only_identity_cannot_smuggle_a_sync_payload_into_execution() {
     let executable =
         inspect_component_for_profile(&bytes, ProfileIdentity::PROFILE_1_SYNC).unwrap();
     assert!(executable.runtime_ready());
+    assert!(executable.native_async_execution_plan().is_none());
     assert_eq!(executable.executable_exports().count(), 1);
 
     let validation_only =

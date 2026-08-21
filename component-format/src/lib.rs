@@ -34,6 +34,16 @@ pub const ASYNC_COMPONENT_MODEL_REVISION: &str =
     "component-model-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc";
 pub const ASYNC_CANONICAL_ABI_REVISION: &str =
     "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1";
+
+/// Resource-free native async execution contract selected by C5.3. This is a
+/// distinct artifact/runtime ABI even though it consumes the same pinned
+/// upstream Component Model and wasm-tools revisions as the C5.1 validator.
+pub const NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION: u16 = 3;
+pub const NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION: u16 = 3;
+pub const NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION: &str =
+    "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1-resource-free-exec-1";
+pub const NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION: &str =
+    "wasi-not-selected-native-async-resource-free";
 pub const SYNC_WASM_TOOLS_REVISION: &str =
     "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380";
 pub const ASYNC_WASM_TOOLS_REVISION: &str =
@@ -85,6 +95,10 @@ impl CanonicalAbiFeature {
     pub const fn enabled_in_async_profile(self) -> bool {
         ASYNC_CANONICAL_FEATURES & self.bit() != 0
     }
+
+    pub const fn enabled_in_native_async_resource_free_profile(self) -> bool {
+        NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_FEATURES & self.bit() != 0
+    }
 }
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
@@ -101,6 +115,17 @@ pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::CooperativeYield.bit()
     | CanonicalAbiFeature::WaitableSets.bit()
     | CanonicalAbiFeature::Backpressure.bit();
+
+/// Closed feature set for C5.3's resource-free native async executor. In
+/// particular, this excludes synchronous lifting/lowering, resources, async
+/// lowering, context, subtasks, cooperative yield, and backpressure.
+pub const NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
+    | CanonicalAbiFeature::AsyncFunctions.bit()
+    | CanonicalAbiFeature::CallbackLift.bit()
+    | CanonicalAbiFeature::Futures.bit()
+    | CanonicalAbiFeature::Streams.bit()
+    | CanonicalAbiFeature::TaskBuiltins.bit()
+    | CanonicalAbiFeature::WaitableSets.bit();
 
 /// Exact format, frontend and runtime contract carried by trusted artifact and
 /// image-policy metadata. Raw Component bytes do not encode these revisions;
@@ -159,6 +184,24 @@ impl ProfileIdentity {
         wasm_tools_revision: ASYNC_WASM_TOOLS_REVISION,
         wasi_revision: WASI_API_REVISION,
         canonical_features: ASYNC_CANONICAL_FEATURES,
+        stage: ProfileStage::ValidationOnly,
+    };
+
+    /// Pinned C5.3 resource-free native async identity. It remains
+    /// validation-only until the matching executor and admission path are
+    /// sealed; the older validation identity and active sync alias remain
+    /// unchanged.
+    pub const PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE: Self = Self {
+        artifact_abi: NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION,
+        component_profile: COMPONENT_PROFILE_VERSION,
+        core_profile: CORE_PROFILE_VERSION,
+        runtime_abi: NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION,
+        core_revision: CORE_SPEC_REVISION,
+        component_revision: ASYNC_COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: ASYNC_WASM_TOOLS_REVISION,
+        wasi_revision: NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION,
+        canonical_features: NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_FEATURES,
         stage: ProfileStage::ValidationOnly,
     };
 

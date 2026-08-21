@@ -28,6 +28,24 @@ compile_error!("feature `ssh-test` is the QEMU-only N4 acceptance image");
     not(all(feature = "qemu-virt", feature = "ssh-test"))
 ))]
 compile_error!("feature `wasm-c48-qemu-acceptance` requires the QEMU-only `ssh-test` image");
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c53-native-async-qemu-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    )
+))]
+compile_error!(
+    "feature `wasm-c53-native-async-qemu-acceptance` is isolated from every SSH/older WASM image"
+);
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
@@ -508,6 +526,13 @@ pub extern "C" fn kmain() -> ! {
     if xhci::info().is_some() {
         exec::spawn("usb-host", xhci::service_task());
     }
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    exec::spawn("wasm-c53-native-async-acceptance", async {
+        if !component_instances::run_native_async_qemu_acceptance().await {
+            crate::println!("WASM_C53_NATIVE_ASYNC_FAIL");
+            sbi::shutdown(true);
+        }
+    });
     #[cfg(feature = "milkv-duo")]
     if dwc2_host::info().is_some() {
         exec::spawn("usb-hid", dwc2_host::service_task());

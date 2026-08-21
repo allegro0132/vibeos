@@ -83,6 +83,16 @@ wasm-c48-qemu-acceptance = [
     "ssh-component-command",
     "vibeos-core/wasm-c48-target-acceptance",
 ]
+# QEMU-only C5.3 native-async validation driver. This reuses the stable
+# managed-instance/CSpace machinery but has its own image pin, admission type,
+# payload mode, pending shadow, and acceptance entry point. It does not open or
+# modify the synchronous SSH/C4.8 acceptance gate.
+wasm-c53-native-async-qemu-acceptance = [
+    "ssh-component-command",
+    "vibeos-component-admission/native-async-acceptance",
+    "vibeos-component-runtime/native-async-acceptance",
+    "vibeos-image-policy/c53-native-async-qemu-acceptance",
+]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.

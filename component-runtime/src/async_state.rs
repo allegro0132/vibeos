@@ -169,6 +169,8 @@ pub struct HostReadableBinding {
 pub struct HostReadableBindingsPair {
     pub first: HostReadableBinding,
     pub second: HostReadableBinding,
+    first_pair: Seal,
+    second_pair: Seal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -652,6 +654,71 @@ impl<T> Table<T> {
         first: Seal,
         second: Seal,
     ) -> Result<(&mut T, &mut T), AsyncStateError> {
+        let (first_slot, second_slot) = self.get_two_slots_mut(first, second)?;
+        let first = first_slot
+            .value
+            .as_mut()
+            .ok_or(AsyncStateError::StaleHandle)?;
+        let second = second_slot
+            .value
+            .as_mut()
+            .ok_or(AsyncStateError::StaleHandle)?;
+        Ok((first, second))
+    }
+
+    fn seal_for_raw(&self, raw: u32) -> Result<Seal, AsyncStateError> {
+        if raw == 0 {
+            return Err(AsyncStateError::InvalidHandle);
+        }
+        let slot = usize::try_from(raw - 1).map_err(|_| AsyncStateError::InvalidHandle)?;
+        let slot = self.slots.get(slot).ok_or(AsyncStateError::InvalidHandle)?;
+        if slot.value.is_none() {
+            return Err(AsyncStateError::StaleHandle);
+        }
+        Seal::new(raw, slot.generation)
+    }
+
+    fn remove(&mut self, seal: Seal) -> Result<T, AsyncStateError> {
+        let slot = self.slot_mut(seal)?;
+        let value = slot.value.take().ok_or(AsyncStateError::StaleHandle)?;
+        retire_removed_slot(slot);
+        self.live = self
+            .live
+            .checked_sub(1)
+            .ok_or(AsyncStateError::PairInvariant)?;
+        Ok(value)
+    }
+
+    /// Removes two distinct, already-live entries without exposing a partial
+    /// commit. Both slots and the live count are checked before either value
+    /// moves; the second `take` has an exact rollback for a corrupted table.
+    fn remove_two(&mut self, first: Seal, second: Seal) -> Result<(T, T), AsyncStateError> {
+        if self.live < 2 {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        let (first_slot, second_slot) = self.get_two_slots_mut(first, second)?;
+        let first_value = first_slot
+            .value
+            .take()
+            .ok_or(AsyncStateError::StaleHandle)?;
+        let second_value = match second_slot.value.take() {
+            Some(value) => value,
+            None => {
+                first_slot.value = Some(first_value);
+                return Err(AsyncStateError::StaleHandle);
+            }
+        };
+        retire_removed_slot(first_slot);
+        retire_removed_slot(second_slot);
+        self.live -= 2;
+        Ok((first_value, second_value))
+    }
+
+    fn get_two_slots_mut(
+        &mut self,
+        first: Seal,
+        second: Seal,
+    ) -> Result<(&mut Slot<T>, &mut Slot<T>), AsyncStateError> {
         let first_index = usize::try_from(
             first
                 .index
@@ -670,59 +737,26 @@ impl<T> Table<T> {
             return Err(AsyncStateError::PairInvariant);
         }
 
-        if first_index < second_index {
+        let (first_slot, second_slot) = if first_index < second_index {
             let (lower, upper) = self.slots.split_at_mut(second_index);
-            let first = slot_value_mut(
+            (
                 lower
                     .get_mut(first_index)
                     .ok_or(AsyncStateError::InvalidHandle)?,
-                first,
-            )?;
-            let second = slot_value_mut(
                 upper.first_mut().ok_or(AsyncStateError::InvalidHandle)?,
-                second,
-            )?;
-            Ok((first, second))
+            )
         } else {
             let (lower, upper) = self.slots.split_at_mut(first_index);
-            let second = slot_value_mut(
+            (
+                upper.first_mut().ok_or(AsyncStateError::InvalidHandle)?,
                 lower
                     .get_mut(second_index)
                     .ok_or(AsyncStateError::InvalidHandle)?,
-                second,
-            )?;
-            let first = slot_value_mut(
-                upper.first_mut().ok_or(AsyncStateError::InvalidHandle)?,
-                first,
-            )?;
-            Ok((first, second))
-        }
-    }
-
-    fn seal_for_raw(&self, raw: u32) -> Result<Seal, AsyncStateError> {
-        if raw == 0 {
-            return Err(AsyncStateError::InvalidHandle);
-        }
-        let slot = usize::try_from(raw - 1).map_err(|_| AsyncStateError::InvalidHandle)?;
-        let slot = self.slots.get(slot).ok_or(AsyncStateError::InvalidHandle)?;
-        if slot.value.is_none() {
-            return Err(AsyncStateError::StaleHandle);
-        }
-        Seal::new(raw, slot.generation)
-    }
-
-    fn remove(&mut self, seal: Seal) -> Result<T, AsyncStateError> {
-        let slot = self.slot_mut(seal)?;
-        let value = slot.value.take().ok_or(AsyncStateError::StaleHandle)?;
-        match slot.generation.checked_add(1) {
-            Some(next) if next != 0 => slot.generation = next,
-            _ => slot.retired = true,
-        }
-        self.live = self
-            .live
-            .checked_sub(1)
-            .ok_or(AsyncStateError::PairInvariant)?;
-        Ok(value)
+            )
+        };
+        validate_live_slot(first_slot, first)?;
+        validate_live_slot(second_slot, second)?;
+        Ok((first_slot, second_slot))
     }
 
     fn slot(&self, seal: Seal) -> Result<&Slot<T>, AsyncStateError> {
@@ -748,11 +782,18 @@ impl<T> Table<T> {
     }
 }
 
-fn slot_value_mut<T>(slot: &mut Slot<T>, seal: Seal) -> Result<&mut T, AsyncStateError> {
-    if slot.generation != seal.generation.get() || slot.retired {
+fn validate_live_slot<T>(slot: &Slot<T>, seal: Seal) -> Result<(), AsyncStateError> {
+    if slot.generation != seal.generation.get() || slot.retired || slot.value.is_none() {
         return Err(AsyncStateError::StaleHandle);
     }
-    slot.value.as_mut().ok_or(AsyncStateError::StaleHandle)
+    Ok(())
+}
+
+fn retire_removed_slot<T>(slot: &mut Slot<T>) {
+    match slot.generation.checked_add(1) {
+        Some(next) if next != 0 => slot.generation = next,
+        _ => slot.retired = true,
+    }
 }
 
 /// Persistent embedding authority for the host side of one exact pair.
@@ -1195,21 +1236,159 @@ impl AsyncState {
 
         let first = self.insert_host_readable_prepared(first.0, first.1)?;
         match self.insert_host_readable_prepared(second.0, second.1) {
-            Ok(second) => Ok(HostReadableBindingsPair {
-                first: HostReadableBinding {
-                    guest: first.0,
-                    host: first.1,
-                },
-                second: HostReadableBinding {
-                    guest: second.0,
-                    host: second.1,
-                },
-            }),
+            Ok(second) => {
+                let first_pair = first.1.pair;
+                let second_pair = second.1.pair;
+                Ok(HostReadableBindingsPair {
+                    first: HostReadableBinding {
+                        guest: first.0,
+                        host: first.1,
+                    },
+                    second: HostReadableBinding {
+                        guest: second.0,
+                        host: second.1,
+                    },
+                    first_pair,
+                    second_pair,
+                })
+            }
             Err(error) => {
                 self.rollback_host_readable(first.0, &first.1)?;
                 Err(error)
             }
         }
+    }
+
+    /// Discards an exact, still-unused pair returned by
+    /// [`Self::insert_host_readables_pair`].
+    ///
+    /// Native instantiation uses this only when Core startup fails before the
+    /// aggregate becomes guest-observable. Both origin seals, guest ends, host
+    /// authorities, and idle pair states are validated before any table entry
+    /// moves. Success consumes both host authorities and removes both pairs;
+    /// every rejection leaves the complete aggregate unchanged.
+    pub(crate) fn discard_host_readables_pair(
+        &mut self,
+        bindings: &mut HostReadableBindingsPair,
+    ) -> Result<(), AsyncStateError> {
+        let (first_handle, first_pair) =
+            self.prepare_host_readable_discard(&bindings.first, bindings.first_pair)?;
+        let (second_handle, second_pair) =
+            self.prepare_host_readable_discard(&bindings.second, bindings.second_pair)?;
+        if first_handle == second_handle || first_pair == second_pair {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        if self.handles.live < 2 || self.pairs.live < 2 {
+            return Err(AsyncStateError::PairInvariant);
+        }
+
+        let ((first_entry, second_entry), (first_shared, second_shared)) = {
+            let (first_handle_slot, second_handle_slot) = self
+                .handles
+                .get_two_slots_mut(first_handle, second_handle)?;
+            let (first_pair_slot, second_pair_slot) =
+                self.pairs.get_two_slots_mut(first_pair, second_pair)?;
+
+            let first_entry = first_handle_slot
+                .value
+                .take()
+                .ok_or(AsyncStateError::PairInvariant)?;
+            let second_entry = match second_handle_slot.value.take() {
+                Some(entry) => entry,
+                None => {
+                    first_handle_slot.value = Some(first_entry);
+                    return Err(AsyncStateError::PairInvariant);
+                }
+            };
+            let first_shared = match first_pair_slot.value.take() {
+                Some(shared) => shared,
+                None => {
+                    first_handle_slot.value = Some(first_entry);
+                    second_handle_slot.value = Some(second_entry);
+                    return Err(AsyncStateError::PairInvariant);
+                }
+            };
+            let second_shared = match second_pair_slot.value.take() {
+                Some(shared) => shared,
+                None => {
+                    first_pair_slot.value = Some(first_shared);
+                    first_handle_slot.value = Some(first_entry);
+                    second_handle_slot.value = Some(second_entry);
+                    return Err(AsyncStateError::PairInvariant);
+                }
+            };
+
+            // All four values are now owned by this transaction. Advancing
+            // generations and live counts is infallible because both tables'
+            // exact slots and minimum live counts were prevalidated.
+            retire_removed_slot(first_handle_slot);
+            retire_removed_slot(second_handle_slot);
+            retire_removed_slot(first_pair_slot);
+            retire_removed_slot(second_pair_slot);
+            ((first_entry, second_entry), (first_shared, second_shared))
+        };
+        self.handles.live -= 2;
+        self.pairs.live -= 2;
+
+        debug_assert!(matches!(first_entry, HandleEntry::Endpoint(_)));
+        debug_assert!(matches!(second_entry, HandleEntry::Endpoint(_)));
+        debug_assert!(first_shared.readable == Holder::Guest(first_handle));
+        debug_assert!(second_shared.readable == Holder::Guest(second_handle));
+        bindings.first.host.active = false;
+        bindings.second.host.active = false;
+        Ok(())
+    }
+
+    fn prepare_host_readable_discard(
+        &self,
+        binding: &HostReadableBinding,
+        expected_pair: Seal,
+    ) -> Result<(Seal, Seal), AsyncStateError> {
+        let authority = &binding.host;
+        if authority.state_id != self.id {
+            return Err(AsyncStateError::WrongState);
+        }
+        if !authority.active {
+            return Err(AsyncStateError::AuthorityConsumed);
+        }
+        if authority.pair != expected_pair || authority.direction != EndpointDirection::Write {
+            return Err(AsyncStateError::PairInvariant);
+        }
+
+        let handle = self.handle_seal(binding.guest)?;
+        let endpoint = self.endpoint_by_seal(handle)?;
+        validate_endpoint(
+            endpoint,
+            authority.kind,
+            EndpointDirection::Read,
+            authority.value_type,
+        )?;
+        if endpoint.pair != expected_pair {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        if endpoint.copy_state != CopyState::Idle
+            || endpoint.active.is_some()
+            || endpoint.event.is_some()
+        {
+            return Err(AsyncStateError::EndpointBusy);
+        }
+        if endpoint.joined_set.is_some() {
+            return Err(AsyncStateError::TransferWhileJoined);
+        }
+
+        let shared = self.pairs.get(expected_pair)?;
+        if shared.kind != authority.kind
+            || shared.value_type != authority.value_type
+            || shared.readable != Holder::Guest(handle)
+            || shared.writable != Holder::Host
+            || shared.peer_dropped
+        {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        if shared.phase != PairPhase::Idle || shared.host_writable_done {
+            return Err(AsyncStateError::EndpointBusy);
+        }
+        Ok((handle, expected_pair))
     }
 
     fn insert_host_readable_prepared(
@@ -2421,6 +2600,48 @@ impl AsyncState {
         })
     }
 
+    /// Atomically lifts the two readable endpoints in the native filter's
+    /// `(stream<u8>, future<close-reason>)` result aggregate.
+    ///
+    /// Unlike [`Self::detach_readables_batch`], this fixed-shape path does not
+    /// allocate. Both requests, their pair holders, and both output tokens are
+    /// completely validated before the first handle moves.
+    pub fn detach_readables_pair(
+        &mut self,
+        first: ReadableTransferRequest,
+        second: ReadableTransferRequest,
+    ) -> Result<(TransferredReadableEndpoint, TransferredReadableEndpoint), AsyncStateError> {
+        let (first_seal, first_pair, first_token) = self.prepare_readable_transfer(first)?;
+        if first.handle == second.handle {
+            return Err(AsyncStateError::DuplicateHandle);
+        }
+        let (second_seal, second_pair, second_token) = self.prepare_readable_transfer(second)?;
+
+        // These mutable resolutions are the last fallible pair-side step. The
+        // holders are rechecked before either guest handle is removed.
+        let (first_shared, second_shared) = self.pairs.get_two_mut(first_pair, second_pair)?;
+        if first_shared.readable != Holder::Guest(first_seal)
+            || first_shared.kind != first.kind
+            || first_shared.value_type != first.value_type
+            || second_shared.readable != Holder::Guest(second_seal)
+            || second_shared.kind != second.kind
+            || second_shared.value_type != second.value_type
+        {
+            return Err(AsyncStateError::PairInvariant);
+        }
+
+        // `remove_two` validates both exact slots before taking either one and
+        // rolls the first value back if a corrupted second slot disappears.
+        // Once it succeeds, changing these already-borrowed holders cannot
+        // fail, so the aggregate cannot be left half transferred.
+        let (first_entry, second_entry) = self.handles.remove_two(first_seal, second_seal)?;
+        debug_assert!(matches!(first_entry, HandleEntry::Endpoint(_)));
+        debug_assert!(matches!(second_entry, HandleEntry::Endpoint(_)));
+        first_shared.readable = Holder::Host;
+        second_shared.readable = Holder::Host;
+        Ok((first_token, second_token))
+    }
+
     /// Atomically lifts every readable endpoint in one aggregate.
     /// Allocation and validation finish before the first guest handle moves.
     pub fn detach_readables_batch(
@@ -2503,6 +2724,60 @@ impl AsyncState {
             output.push(token);
         }
         Ok(output)
+    }
+
+    fn prepare_readable_transfer(
+        &self,
+        request: ReadableTransferRequest,
+    ) -> Result<(Seal, Seal, TransferredReadableEndpoint), AsyncStateError> {
+        let seal = self.handle_seal(request.handle)?;
+        let endpoint = self.endpoint_by_seal(seal)?;
+        validate_endpoint(
+            endpoint,
+            request.kind,
+            EndpointDirection::Read,
+            request.value_type,
+        )?;
+        if endpoint.copy_state != CopyState::Idle
+            || endpoint.active.is_some()
+            || endpoint.event.is_some()
+        {
+            return Err(AsyncStateError::EndpointBusy);
+        }
+        if endpoint.joined_set.is_some() {
+            return Err(AsyncStateError::TransferWhileJoined);
+        }
+        let pair = endpoint.pair;
+        let shared = self.pairs.get(pair)?;
+        if shared.readable != Holder::Guest(seal)
+            || shared.kind != request.kind
+            || shared.value_type != request.value_type
+        {
+            return Err(AsyncStateError::PairInvariant);
+        }
+        let token = match request.kind {
+            EndpointKind::Stream => TransferredReadableEndpoint::Stream(
+                ReadableStreamEndpointToken::issue(
+                    self.id.get(),
+                    pair.index,
+                    pair.generation,
+                    request.value_type,
+                    EndpointOwner::Host,
+                )
+                .map_err(|_| AsyncStateError::PairInvariant)?,
+            ),
+            EndpointKind::Future => TransferredReadableEndpoint::Future(
+                ReadableFutureEndpointToken::issue(
+                    self.id.get(),
+                    pair.index,
+                    pair.generation,
+                    request.value_type,
+                    EndpointOwner::Host,
+                )
+                .map_err(|_| AsyncStateError::PairInvariant)?,
+            ),
+        };
+        Ok((seal, pair, token))
     }
 
     pub fn prepare_stream_host_copy(
@@ -4387,6 +4662,7 @@ mod tests {
                     guest: future,
                     host: future_host,
                 },
+            ..
         } = bindings;
 
         assert_eq!(state.pairs.live, 2);
@@ -4492,6 +4768,287 @@ mod tests {
             .unwrap();
         assert_eq!(state.pairs.live, 1);
         assert_eq!(state.handles.live, 1);
+    }
+
+    #[test]
+    fn discard_host_readables_pair_consumes_the_exact_idle_aggregate() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut bindings = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(40)),
+                (EndpointKind::Future, ty(41)),
+            )
+            .unwrap();
+        let first = bindings.first.guest;
+        let second = bindings.second.guest;
+
+        state.discard_host_readables_pair(&mut bindings).unwrap();
+
+        assert_eq!(state.handles.live, 0);
+        assert_eq!(state.pairs.live, 0);
+        assert_eq!(
+            state.endpoint_info(first),
+            Err(AsyncStateError::StaleHandle)
+        );
+        assert_eq!(
+            state.endpoint_info(second),
+            Err(AsyncStateError::StaleHandle)
+        );
+        assert!(!bindings.first.host.active);
+        assert!(!bindings.second.host.active);
+        assert_eq!(
+            state.discard_host_readables_pair(&mut bindings),
+            Err(AsyncStateError::AuthorityConsumed)
+        );
+    }
+
+    #[test]
+    fn discard_host_readables_pair_rejects_reordering_and_mixed_aggregates() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut first = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(42)),
+                (EndpointKind::Future, ty(43)),
+            )
+            .unwrap();
+        let mut second = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(44)),
+                (EndpointKind::Future, ty(45)),
+            )
+            .unwrap();
+        let handles = [
+            first.first.guest,
+            first.second.guest,
+            second.first.guest,
+            second.second.guest,
+        ];
+        let snapshots = handles.map(|handle| endpoint_snapshot(&state, handle));
+
+        core::mem::swap(&mut first.first, &mut first.second);
+        assert_eq!(
+            state.discard_host_readables_pair(&mut first),
+            Err(AsyncStateError::PairInvariant)
+        );
+        core::mem::swap(&mut first.first, &mut first.second);
+
+        core::mem::swap(&mut first.second, &mut second.second);
+        assert_eq!(
+            state.discard_host_readables_pair(&mut first),
+            Err(AsyncStateError::PairInvariant)
+        );
+        assert_eq!(
+            state.discard_host_readables_pair(&mut second),
+            Err(AsyncStateError::PairInvariant)
+        );
+        assert_eq!(state.handles.live, 4);
+        assert_eq!(state.pairs.live, 4);
+        for (handle, snapshot) in handles.into_iter().zip(snapshots) {
+            assert_eq!(endpoint_snapshot(&state, handle), snapshot);
+        }
+        assert!(first.first.host.active);
+        assert!(first.second.host.active);
+        assert!(second.first.host.active);
+        assert!(second.second.host.active);
+
+        core::mem::swap(&mut first.second, &mut second.second);
+        state.discard_host_readables_pair(&mut first).unwrap();
+        state.discard_host_readables_pair(&mut second).unwrap();
+    }
+
+    #[test]
+    fn discard_host_readables_pair_busy_or_joined_second_is_zero_mutation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut bindings = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(46)),
+                (EndpointKind::Future, ty(47)),
+            )
+            .unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    bindings.first.guest,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(46),
+                    lease(1, 4),
+                )
+                .unwrap(),
+        );
+        let busy_first = endpoint_snapshot(&state, bindings.first.guest);
+        let idle_second = endpoint_snapshot(&state, bindings.second.guest);
+        assert_eq!(
+            state.discard_host_readables_pair(&mut bindings),
+            Err(AsyncStateError::EndpointBusy)
+        );
+        assert_eq!(endpoint_snapshot(&state, bindings.first.guest), busy_first);
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.second.guest),
+            idle_second
+        );
+        assert!(bindings.first.host.active);
+        assert!(bindings.second.host.active);
+
+        let cancelled = state
+            .cancel_copy(
+                bindings.first.guest,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                ty(46),
+            )
+            .unwrap();
+        reclaim_ok(&mut state, &cancelled);
+        assert!(operation.operation.get() > 0);
+
+        let set = state.create_waitable_set().unwrap();
+        state
+            .join_waitable(bindings.second.guest, set.raw())
+            .unwrap();
+        let unjoined_first = endpoint_snapshot(&state, bindings.first.guest);
+        let joined_second = endpoint_snapshot(&state, bindings.second.guest);
+        assert_eq!(
+            state.discard_host_readables_pair(&mut bindings),
+            Err(AsyncStateError::TransferWhileJoined)
+        );
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.first.guest),
+            unjoined_first
+        );
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.second.guest),
+            joined_second
+        );
+        assert!(bindings.first.host.active);
+        assert!(bindings.second.host.active);
+
+        state.join_waitable(bindings.second.guest, 0).unwrap();
+        state.discard_host_readables_pair(&mut bindings).unwrap();
+        state.drop_waitable_set(set).unwrap();
+    }
+
+    #[test]
+    fn discard_host_readables_pair_rejects_stale_aba_without_touching_replacement() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut bindings = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(48)),
+                (EndpointKind::Future, ty(49)),
+            )
+            .unwrap();
+        let stale = bindings.first.guest;
+        state
+            .drop_endpoint(stale, EndpointKind::Stream, EndpointDirection::Read, ty(48))
+            .unwrap();
+        let replacement = state.create_stream_pair(ty(50)).unwrap();
+        assert_eq!(replacement.readable.raw(), stale.raw());
+        assert_ne!(replacement.readable.generation(), stale.generation());
+        let replacement_snapshot = endpoint_snapshot(&state, replacement.readable);
+        let second_snapshot = endpoint_snapshot(&state, bindings.second.guest);
+        let handles_live = state.handles.live;
+        let pairs_live = state.pairs.live;
+
+        assert_eq!(
+            state.discard_host_readables_pair(&mut bindings),
+            Err(AsyncStateError::StaleHandle)
+        );
+        assert_eq!(state.handles.live, handles_live);
+        assert_eq!(state.pairs.live, pairs_live);
+        assert_eq!(
+            endpoint_snapshot(&state, replacement.readable),
+            replacement_snapshot
+        );
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.second.guest),
+            second_snapshot
+        );
+        assert!(bindings.first.host.active);
+        assert!(bindings.second.host.active);
+    }
+
+    #[test]
+    fn discard_host_readables_pair_second_validation_failure_preserves_first() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut bindings = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(51)),
+                (EndpointKind::Future, ty(52)),
+            )
+            .unwrap();
+        let impostor = state.create_future_pair(ty(52)).unwrap();
+        let original_second = bindings.second.guest;
+        bindings.second.guest = impostor.readable;
+        let first_snapshot = endpoint_snapshot(&state, bindings.first.guest);
+        let second_snapshot = endpoint_snapshot(&state, original_second);
+        let impostor_snapshot = endpoint_snapshot(&state, impostor.readable);
+
+        assert_eq!(
+            state.discard_host_readables_pair(&mut bindings),
+            Err(AsyncStateError::PairInvariant)
+        );
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.first.guest),
+            first_snapshot
+        );
+        assert_eq!(endpoint_snapshot(&state, original_second), second_snapshot);
+        assert_eq!(
+            endpoint_snapshot(&state, impostor.readable),
+            impostor_snapshot
+        );
+        assert!(bindings.first.host.active);
+        assert!(bindings.second.host.active);
+
+        bindings.second.guest = original_second;
+        state.discard_host_readables_pair(&mut bindings).unwrap();
+    }
+
+    #[test]
+    fn discard_host_readables_pair_rejects_a_completed_future() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut bindings = state
+            .insert_host_readables_pair(
+                (EndpointKind::Stream, ty(53)),
+                (EndpointKind::Future, ty(54)),
+            )
+            .unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    bindings.second.guest,
+                    EndpointKind::Future,
+                    EndpointDirection::Read,
+                    ty(54),
+                    lease(1, 1),
+                )
+                .unwrap(),
+        );
+        let mut ticket = state
+            .prepare_host_copy(&bindings.second.host, &operation)
+            .unwrap();
+        let event = state
+            .commit_host_copy(&mut ticket, CopyResult::Completed, 1, |_, progress| {
+                assert_eq!(progress, 1);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        reclaim_ok(&mut state, &event);
+        let first_snapshot = endpoint_snapshot(&state, bindings.first.guest);
+        let future_snapshot = endpoint_snapshot(&state, bindings.second.guest);
+
+        assert_eq!(
+            state.discard_host_readables_pair(&mut bindings),
+            Err(AsyncStateError::EndpointBusy)
+        );
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.first.guest),
+            first_snapshot
+        );
+        assert_eq!(
+            endpoint_snapshot(&state, bindings.second.guest),
+            future_snapshot
+        );
+        assert!(bindings.first.host.active);
+        assert!(bindings.second.host.active);
     }
 
     #[test]
@@ -5486,6 +6043,245 @@ mod tests {
         state.callback_exit(delivered).unwrap();
         state.drop_task(delivered).unwrap();
         state.drop_waitable_set(delivered_set).unwrap();
+    }
+
+    #[test]
+    fn pair_detach_is_atomic_and_preserves_result_order() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(60)).unwrap();
+        let future = state.create_future_pair(ty(61)).unwrap();
+        let handles_live = state.handles.live;
+
+        let (first, second) = state
+            .detach_readables_pair(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(60),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(61),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            (first.kind(), first.value_type()),
+            (EndpointKind::Stream, ty(60))
+        );
+        assert_eq!(
+            (second.kind(), second.value_type()),
+            (EndpointKind::Future, ty(61))
+        );
+        assert_eq!(state.handles.live, handles_live - 2);
+        assert_eq!(
+            state.endpoint_info(stream.readable),
+            Err(AsyncStateError::StaleHandle)
+        );
+        assert_eq!(
+            state.endpoint_info(future.readable),
+            Err(AsyncStateError::StaleHandle)
+        );
+        assert!(state.endpoint_info(stream.writable).is_ok());
+        assert!(state.endpoint_info(future.writable).is_ok());
+    }
+
+    #[test]
+    fn pair_detach_duplicate_kind_and_type_failures_are_zero_mutation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(62)).unwrap();
+        let future = state.create_future_pair(ty(63)).unwrap();
+        let stream_request = ReadableTransferRequest {
+            handle: stream.readable,
+            kind: EndpointKind::Stream,
+            value_type: ty(62),
+        };
+        let future_request = ReadableTransferRequest {
+            handle: future.readable,
+            kind: EndpointKind::Future,
+            value_type: ty(63),
+        };
+        let stream_snapshot = endpoint_snapshot(&state, stream.readable);
+        let future_snapshot = endpoint_snapshot(&state, future.readable);
+
+        assert_eq!(
+            state.detach_readables_pair(stream_request, stream_request),
+            Err(AsyncStateError::DuplicateHandle)
+        );
+        assert_eq!(
+            state.detach_readables_pair(
+                stream_request,
+                ReadableTransferRequest {
+                    kind: EndpointKind::Stream,
+                    ..future_request
+                },
+            ),
+            Err(AsyncStateError::WrongEndpointKind)
+        );
+        assert_eq!(
+            state.detach_readables_pair(
+                stream_request,
+                ReadableTransferRequest {
+                    value_type: ty(64),
+                    ..future_request
+                },
+            ),
+            Err(AsyncStateError::WrongType)
+        );
+        assert_eq!(endpoint_snapshot(&state, stream.readable), stream_snapshot);
+        assert_eq!(endpoint_snapshot(&state, future.readable), future_snapshot);
+        assert_eq!(state.handles.live, 4);
+    }
+
+    #[test]
+    fn pair_detach_foreign_second_handle_preserves_both_states() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut foreign = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(65)).unwrap();
+        let future = foreign.create_future_pair(ty(66)).unwrap();
+        let stream_snapshot = endpoint_snapshot(&state, stream.readable);
+        let future_snapshot = endpoint_snapshot(&foreign, future.readable);
+
+        assert_eq!(
+            state.detach_readables_pair(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(65),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(66),
+                },
+            ),
+            Err(AsyncStateError::WrongState)
+        );
+        assert_eq!(endpoint_snapshot(&state, stream.readable), stream_snapshot);
+        assert_eq!(
+            endpoint_snapshot(&foreign, future.readable),
+            future_snapshot
+        );
+    }
+
+    #[test]
+    fn pair_detach_busy_or_joined_second_is_zero_mutation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(67)).unwrap();
+        let future = state.create_future_pair(ty(68)).unwrap();
+        let requests = (
+            ReadableTransferRequest {
+                handle: stream.readable,
+                kind: EndpointKind::Stream,
+                value_type: ty(67),
+            },
+            ReadableTransferRequest {
+                handle: future.readable,
+                kind: EndpointKind::Future,
+                value_type: ty(68),
+            },
+        );
+        let operation = blocked(
+            state
+                .begin_copy(
+                    future.readable,
+                    EndpointKind::Future,
+                    EndpointDirection::Read,
+                    ty(68),
+                    lease(1, 1),
+                )
+                .unwrap(),
+        );
+        let idle_first = endpoint_snapshot(&state, stream.readable);
+        let busy_second = endpoint_snapshot(&state, future.readable);
+        assert_eq!(
+            state.detach_readables_pair(requests.0, requests.1),
+            Err(AsyncStateError::EndpointBusy)
+        );
+        assert_eq!(endpoint_snapshot(&state, stream.readable), idle_first);
+        assert_eq!(endpoint_snapshot(&state, future.readable), busy_second);
+        let cancelled = state
+            .cancel_copy(
+                future.readable,
+                EndpointKind::Future,
+                EndpointDirection::Read,
+                ty(68),
+            )
+            .unwrap();
+        reclaim_ok(&mut state, &cancelled);
+        assert!(operation.operation.get() > 0);
+
+        let set = state.create_waitable_set().unwrap();
+        state.join_waitable(future.readable, set.raw()).unwrap();
+        let idle_first = endpoint_snapshot(&state, stream.readable);
+        let joined_second = endpoint_snapshot(&state, future.readable);
+        assert_eq!(
+            state.detach_readables_pair(requests.0, requests.1),
+            Err(AsyncStateError::TransferWhileJoined)
+        );
+        assert_eq!(endpoint_snapshot(&state, stream.readable), idle_first);
+        assert_eq!(endpoint_snapshot(&state, future.readable), joined_second);
+    }
+
+    #[test]
+    fn pair_detach_rejects_stale_aba_handle_without_touching_replacement() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let first = state.create_future_pair(ty(69)).unwrap();
+        let obsolete = state.create_stream_pair(ty(70)).unwrap();
+        state
+            .drop_endpoint(
+                obsolete.readable,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                ty(70),
+            )
+            .unwrap();
+        let replacement = state.create_stream_pair(ty(70)).unwrap();
+        assert_eq!(obsolete.readable.raw(), replacement.readable.raw());
+        assert_ne!(
+            obsolete.readable.generation(),
+            replacement.readable.generation()
+        );
+        let first_snapshot = endpoint_snapshot(&state, first.readable);
+        let replacement_snapshot = endpoint_snapshot(&state, replacement.readable);
+
+        assert_eq!(
+            state.detach_readables_pair(
+                ReadableTransferRequest {
+                    handle: first.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(69),
+                },
+                ReadableTransferRequest {
+                    handle: obsolete.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(70),
+                },
+            ),
+            Err(AsyncStateError::StaleHandle)
+        );
+        assert_eq!(endpoint_snapshot(&state, first.readable), first_snapshot);
+        assert_eq!(
+            endpoint_snapshot(&state, replacement.readable),
+            replacement_snapshot
+        );
+
+        state
+            .detach_readables_pair(
+                ReadableTransferRequest {
+                    handle: first.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(69),
+                },
+                ReadableTransferRequest {
+                    handle: replacement.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(70),
+                },
+            )
+            .unwrap();
     }
 
     #[test]

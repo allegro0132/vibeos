@@ -10,6 +10,8 @@ const UNSUPPORTED_CORE: &str = include_str!("corpus/core/unsupported-float.wat")
 const VALID_COMPONENT: &str = include_str!("corpus/component/typed.component.wat");
 const ASYNC_COMPONENT: &str = include_str!("corpus/component/async-0.255.0.component.wat");
 const ASYNC_WORLD: &str = include_str!("corpus/wit/async-world.wit");
+const NATIVE_ASYNC_STREAM_COMPONENT: &str =
+    include_str!("corpus/component/native-async-stream-0.255.0.component.wat");
 const MALFORMED_COMPONENT: &str = include_str!("corpus/component/malformed.hex");
 const RUST_GUEST: &str = include_str!("corpus/guests/typed_guest.rs");
 const C_GUEST: &str = include_str!("corpus/guests/typed_guest.c");
@@ -61,6 +63,12 @@ fn corpus_covers_the_profile_contract() {
         "close-reader: func(input: borrow<reader>, reason: close-reason)",
         "close-writer: func(output: borrow<writer>, reason: close-reason)",
         "export run: func(input: borrow<reader>, output: borrow<writer>)",
+        "record byte-stream",
+        "type bytes = stream<u8>",
+        "type closed = future<close-reason>",
+        "bytes: bytes",
+        "closed: closed",
+        "export run: async func(input: byte-stream) -> byte-stream",
     ] {
         assert!(STREAM.contains(marker), "{marker}");
     }
@@ -86,6 +94,18 @@ fn corpus_covers_the_profile_contract() {
     }
     for marker in ["async func", "future<u32>", "stream<u8>"] {
         assert!(ASYNC_WORLD.contains(marker), "{marker}");
+    }
+    for marker in [
+        "type $byte-stream-private",
+        "(stream u8)",
+        "(future $close-reason)",
+        "(func async",
+        "(param \"input\" $byte-stream)",
+        "(result $byte-stream)",
+        "(param i32 i32 i32) (result i32)",
+        "(callback (core func $callback))",
+    ] {
+        assert!(NATIVE_ASYNC_STREAM_COMPONENT.contains(marker), "{marker}");
     }
     assert!(MALFORMED_COMPONENT.contains("truncated-section"));
     assert!(RUST_GUEST.contains("extern \"C\""));

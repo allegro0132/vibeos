@@ -44,6 +44,7 @@ pub enum CodecError {
     Overflow = 18,
     ResourceBinding = 19,
     FlatLimit = 20,
+    Unsupported = 21,
 }
 
 impl CodecError {
@@ -65,6 +66,7 @@ impl From<ValueError> for CodecError {
             ValueError::Allocation => Self::Allocation,
             ValueError::BorrowEscape => Self::BorrowEscape,
             ValueError::Resource => Self::ResourceBinding,
+            ValueError::Endpoint | ValueError::Ownership => Self::Unsupported,
         }
     }
 }
@@ -318,11 +320,12 @@ pub fn lower_value<M: GuestMemory, A: PayloadAllocator<M>>(
     pointer: u32,
     position: ValuePosition,
 ) -> Result<CodecUsage, CodecError> {
-    validate_type(ty)?;
+    let layout = validate_type(ty)?.layout;
+    ensure_codec_supported(ty)?;
     validate_value(ty, value)?;
     validate_position(ty, position)?;
     let mut budget = Budget::default();
-    budget.protect(pointer, validate_type(ty)?.layout.size)?;
+    budget.protect(pointer, layout.size)?;
     lower_at(memory, allocator, ty, value, pointer, 1, true, &mut budget)?;
     Ok(budget.usage)
 }
@@ -336,6 +339,7 @@ pub fn lift_value<M: GuestMemory, B: ResourceBinder>(
     position: ValuePosition,
 ) -> Result<(CanonicalValue, CodecUsage), CodecError> {
     validate_type(ty)?;
+    ensure_codec_supported(ty)?;
     validate_position(ty, position)?;
     let mut budget = Budget::default();
     let value = lift_at(memory, binder, ty, pointer, position, 1, true, &mut budget)?;
@@ -660,6 +664,7 @@ fn lift_at<M: GuestMemory, B: ResourceBinder>(
                 position,
             )
             .map(CanonicalValue::Resource),
+        ValueType::Stream { .. } | ValueType::Future { .. } => Err(CodecError::Unsupported),
     }
 }
 
@@ -853,6 +858,35 @@ fn validate_position(ty: &ValueType, position: ValuePosition) -> Result<(), Code
     }
 }
 
+fn ensure_codec_supported(ty: &ValueType) -> Result<(), CodecError> {
+    match ty {
+        ValueType::Stream { .. } | ValueType::Future { .. } => Err(CodecError::Unsupported),
+        ValueType::List(item) | ValueType::Option(item) => ensure_codec_supported(item),
+        ValueType::Tuple(types) | ValueType::Record(types) => {
+            for ty in types {
+                ensure_codec_supported(ty)?;
+            }
+            Ok(())
+        }
+        ValueType::Result { ok, error } => {
+            if let Some(ok) = ok {
+                ensure_codec_supported(ok)?;
+            }
+            if let Some(error) = error {
+                ensure_codec_supported(error)?;
+            }
+            Ok(())
+        }
+        ValueType::Variant(cases) => {
+            for case in cases.iter().flatten() {
+                ensure_codec_supported(case)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlatKind {
     I32,
@@ -863,6 +897,8 @@ pub enum FlatKind {
 pub fn flat_signature(types: &[ValueType]) -> Result<Vec<FlatKind>, CodecError> {
     let mut result = Vec::new();
     for ty in types {
+        validate_type(ty)?;
+        ensure_codec_supported(ty)?;
         append_flat_types(ty, &mut result)?;
     }
     Ok(result)
@@ -1014,6 +1050,7 @@ pub fn lift_flat_values<M: GuestMemory, B: ResourceBinder>(
 fn validate_type_sequence(types: &[ValueType], position: ValuePosition) -> Result<(), CodecError> {
     for ty in types {
         validate_type(ty)?;
+        ensure_codec_supported(ty)?;
         validate_position(ty, position)?;
     }
     Ok(())
@@ -1280,6 +1317,7 @@ fn lift_flat_value<M: GuestMemory, B: ResourceBinder>(
                 position,
             )
             .map(CanonicalValue::Resource),
+        ValueType::Stream { .. } | ValueType::Future { .. } => Err(CodecError::Unsupported),
     }
 }
 
@@ -1737,6 +1775,7 @@ fn validate_sequence(
 ) -> Result<(), CodecError> {
     for (ty, value) in types.iter().zip(values) {
         validate_type(ty)?;
+        ensure_codec_supported(ty)?;
         validate_value(ty, value)?;
         validate_position(ty, position)?;
     }
@@ -2272,5 +2311,39 @@ fn try_box<T>(value: T) -> Result<Box<T>, CodecError> {
     unsafe {
         pointer.as_ptr().write(value);
         Ok(Box::from_raw(pointer.as_ptr()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::AsyncValueTypeId;
+    use alloc::vec;
+
+    #[test]
+    fn endpoint_types_are_rejected_before_flat_i32_codec_selection() {
+        let endpoint = ValueType::Record(vec![ValueType::Stream {
+            type_id: AsyncValueTypeId::new(1).unwrap(),
+            element: Some(Box::new(ValueType::U8)),
+        }]);
+        assert_eq!(flat_signature(&[endpoint]), Err(CodecError::Unsupported));
+
+        let future = ValueType::Future {
+            type_id: AsyncValueTypeId::new(2).unwrap(),
+            payload: None,
+        };
+        assert_eq!(flat_signature(&[future]), Err(CodecError::Unsupported));
+    }
+
+    #[test]
+    fn nesting_limit_precedes_the_recursive_endpoint_codec_scan() {
+        let mut value = ValueType::Stream {
+            type_id: AsyncValueTypeId::new(1).unwrap(),
+            element: Some(Box::new(ValueType::U8)),
+        };
+        for _ in 0..PROFILE_1_LIMITS.max_canonical_nesting {
+            value = ValueType::Option(Box::new(value));
+        }
+        assert_eq!(flat_signature(&[value]), Err(CodecError::NestingLimit));
     }
 }

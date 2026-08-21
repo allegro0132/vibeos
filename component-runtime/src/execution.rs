@@ -1,6 +1,6 @@
-//! Inert, validator-derived wiring for the synchronous Profile-1 executor.
+//! Inert, validator-derived wiring for synchronous and native async executors.
 
-use crate::types::FunctionType;
+use crate::{types::FunctionType, value::ValueType};
 use alloc::{string::String, vec::Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +52,230 @@ pub struct HostImportInfo {
     pub string_encoding: Option<CanonicalStringEncoding>,
     pub memory: Option<HostCoreExportInfo>,
     pub realloc: Option<HostCoreExportInfo>,
+}
+
+/// A validated Core export referenced by an async Canonical ABI plan.
+///
+/// Async plans are inspection-only today. This identity is retained so a
+/// future executor does not need to reinterpret attacker-controlled indices.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AsyncCoreExportRef {
+    pub core_instance: u32,
+    pub export: String,
+}
+
+/// The validated source of a Core function used by an async canonical entry.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncCoreFunctionSource {
+    Export(AsyncCoreExportRef),
+    Lower {
+        canonical_index: u32,
+        component_function: u32,
+    },
+    SyncCanonical {
+        canonical_index: u32,
+    },
+    AsyncCanonical {
+        canonical_index: u32,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AsyncCoreFunctionRef {
+    pub core_function: u32,
+    pub source: AsyncCoreFunctionSource,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AsyncCoreMemoryRef {
+    pub core_memory: u32,
+    pub source: AsyncCoreExportRef,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncComponentFunctionSource {
+    Import {
+        interface: Option<String>,
+        function: String,
+    },
+    Lift {
+        canonical_index: u32,
+        core_function: u32,
+    },
+    AsyncLift {
+        canonical_index: u32,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AsyncComponentFunctionRef {
+    pub component_function: u32,
+    pub source: AsyncComponentFunctionSource,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AsyncCanonicalOptionsPlan {
+    /// `None` is the Canonical ABI UTF-8 default.
+    pub string_encoding: Option<CanonicalStringEncoding>,
+    pub async_: bool,
+    pub memory: Option<AsyncCoreMemoryRef>,
+    pub realloc: Option<AsyncCoreFunctionRef>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AsyncComponentValueTypeRef {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    S8,
+    S16,
+    S32,
+    S64,
+    Char,
+    String,
+    Defined(u32),
+}
+
+/// One validated, typed, but not yet executable async Canonical ABI entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AsyncCanonicalPlan {
+    pub canonical_index: u32,
+    pub function: AsyncCanonicalFunctionPlan,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncCanonicalFunctionPlan {
+    Lift {
+        core_function: AsyncCoreFunctionRef,
+        function_type: FunctionType,
+        callback: AsyncCoreFunctionRef,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    Lower {
+        component_function: AsyncComponentFunctionRef,
+        function_type: FunctionType,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    TaskReturn {
+        result: Option<ValueType>,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    TaskCancel,
+    ContextGet {
+        value_type: AsyncCoreValueType,
+        slot: u32,
+    },
+    ContextSet {
+        value_type: AsyncCoreValueType,
+        slot: u32,
+    },
+    SubtaskDrop,
+    SubtaskCancel {
+        async_: bool,
+    },
+    ThreadYield {
+        cancellable: bool,
+    },
+    Stream(AsyncStreamPlan),
+    Future(AsyncFuturePlan),
+    Waitable(AsyncWaitablePlan),
+    BackpressureInc,
+    BackpressureDec,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncStreamPlan {
+    New {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    Read {
+        type_index: u32,
+        value_type: ValueType,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    Write {
+        type_index: u32,
+        value_type: ValueType,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    CancelRead {
+        type_index: u32,
+        value_type: ValueType,
+        async_: bool,
+    },
+    CancelWrite {
+        type_index: u32,
+        value_type: ValueType,
+        async_: bool,
+    },
+    DropReadable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    DropWritable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncFuturePlan {
+    New {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    Read {
+        type_index: u32,
+        value_type: ValueType,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    Write {
+        type_index: u32,
+        value_type: ValueType,
+        options: AsyncCanonicalOptionsPlan,
+    },
+    CancelRead {
+        type_index: u32,
+        value_type: ValueType,
+        async_: bool,
+    },
+    CancelWrite {
+        type_index: u32,
+        value_type: ValueType,
+        async_: bool,
+    },
+    DropReadable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    DropWritable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncWaitablePlan {
+    SetNew,
+    SetWait {
+        cancellable: bool,
+        memory: AsyncCoreMemoryRef,
+    },
+    SetPoll {
+        cancellable: bool,
+        memory: AsyncCoreMemoryRef,
+    },
+    SetDrop,
+    Join,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsyncCoreValueType {
+    I32,
+    I64,
 }
 
 pub(crate) struct ComponentExecutionPlan {
@@ -124,6 +348,7 @@ pub(crate) struct CoreExportRef {
 
 #[derive(Clone, Copy)]
 pub(crate) struct LiftDraft {
+    pub(crate) canonical_index: u32,
     pub(crate) core_function: u32,
     pub(crate) string_encoding: Option<CanonicalStringEncoding>,
     pub(crate) memory: Option<u32>,
@@ -151,6 +376,7 @@ pub(crate) struct ImportedFunctionDraft {
 #[derive(Clone)]
 pub(crate) enum ComponentFunctionDraft {
     Lift(LiftDraft),
+    AsyncLift { canonical_index: u32 },
     Import(ImportedFunctionDraft),
 }
 
@@ -162,15 +388,133 @@ pub(crate) enum ComponentInstanceDraft {
 pub(crate) enum CoreFunctionDraft {
     Export(CoreExportRef),
     Lower(LowerDraft),
+    SyncCanonical { canonical_index: u32 },
+    AsyncCanonical { canonical_index: u32 },
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct LowerDraft {
+    pub(crate) canonical_index: u32,
     pub(crate) component_function: u32,
     pub(crate) string_encoding: Option<CanonicalStringEncoding>,
     pub(crate) memory: Option<u32>,
     pub(crate) realloc: Option<u32>,
     pub(crate) post_return: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AsyncOptionsDraft {
+    pub(crate) string_encoding: Option<CanonicalStringEncoding>,
+    pub(crate) async_: bool,
+    pub(crate) memory: Option<u32>,
+    pub(crate) realloc: Option<u32>,
+}
+
+pub(crate) struct AsyncCanonicalDraft {
+    pub(crate) canonical_index: u32,
+    pub(crate) function: AsyncCanonicalFunctionDraft,
+}
+
+pub(crate) enum AsyncCanonicalFunctionDraft {
+    Lift {
+        core_function: u32,
+        function_type: u32,
+        callback: u32,
+        options: AsyncOptionsDraft,
+    },
+    Lower {
+        component_function: u32,
+        options: AsyncOptionsDraft,
+    },
+    TaskReturn {
+        result: Option<AsyncComponentValueTypeRef>,
+        options: AsyncOptionsDraft,
+    },
+    TaskCancel,
+    ContextGet {
+        value_type: AsyncCoreValueType,
+        slot: u32,
+    },
+    ContextSet {
+        value_type: AsyncCoreValueType,
+        slot: u32,
+    },
+    SubtaskDrop,
+    SubtaskCancel {
+        async_: bool,
+    },
+    ThreadYield {
+        cancellable: bool,
+    },
+    Stream(AsyncStreamDraft),
+    Future(AsyncFutureDraft),
+    Waitable(AsyncWaitableDraft),
+    BackpressureInc,
+    BackpressureDec,
+}
+
+pub(crate) enum AsyncStreamDraft {
+    New {
+        type_index: u32,
+    },
+    Read {
+        type_index: u32,
+        options: AsyncOptionsDraft,
+    },
+    Write {
+        type_index: u32,
+        options: AsyncOptionsDraft,
+    },
+    CancelRead {
+        type_index: u32,
+        async_: bool,
+    },
+    CancelWrite {
+        type_index: u32,
+        async_: bool,
+    },
+    DropReadable {
+        type_index: u32,
+    },
+    DropWritable {
+        type_index: u32,
+    },
+}
+
+pub(crate) enum AsyncFutureDraft {
+    New {
+        type_index: u32,
+    },
+    Read {
+        type_index: u32,
+        options: AsyncOptionsDraft,
+    },
+    Write {
+        type_index: u32,
+        options: AsyncOptionsDraft,
+    },
+    CancelRead {
+        type_index: u32,
+        async_: bool,
+    },
+    CancelWrite {
+        type_index: u32,
+        async_: bool,
+    },
+    DropReadable {
+        type_index: u32,
+    },
+    DropWritable {
+        type_index: u32,
+    },
+}
+
+pub(crate) enum AsyncWaitableDraft {
+    SetNew,
+    SetWait { cancellable: bool, memory: u32 },
+    SetPoll { cancellable: bool, memory: u32 },
+    SetDrop,
+    Join,
 }
 
 pub(crate) struct CoreInstantiationArgDraft {

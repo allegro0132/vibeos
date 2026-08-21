@@ -1,10 +1,11 @@
-//! Bounded synchronous Component Model and Canonical ABI runtime.
+//! Bounded Component Model validation and Canonical ABI runtime primitives.
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod abi_value;
+pub mod async_abi;
 pub mod canonical;
 pub mod decode;
 mod execution;

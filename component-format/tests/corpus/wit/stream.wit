@@ -26,3 +26,29 @@ world filter {
     import streams;
     export run: func(input: borrow<reader>, output: borrow<writer>);
 }
+
+// C5.3 native Component Model transport. This remains a validation-only
+// contract until the native async executor is admitted; the `filter` world
+// above continues to pin the executable synchronous surrogate.
+world native-filter {
+    enum close-reason {
+        normal,
+        failure,
+        cancelled,
+        denied,
+        unavailable,
+        exhausted,
+        invalid,
+        backend-fault,
+    }
+
+    type bytes = stream<u8>;
+    type closed = future<close-reason>;
+
+    record byte-stream {
+        bytes: bytes,
+        closed: closed,
+    }
+
+    export run: async func(input: byte-stream) -> byte-stream;
+}

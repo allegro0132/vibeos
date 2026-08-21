@@ -444,6 +444,11 @@ impl SshdPlatform for SshPlatform {
         crate::component_instances::select_ssh_exec_component_policy(profile, source)
     }
 
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    fn ssh_exec_component_completed(&self, policy: SshExecComponentSessionPolicy, status: u32) {
+        crate::component_instances::ssh_exec_component_completed(policy, status);
+    }
+
     #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
     fn accepts_streaming_exec(&self, command: &str) -> bool {
         crate::jitterentropy_probe::accepts_ssh_stream(command)

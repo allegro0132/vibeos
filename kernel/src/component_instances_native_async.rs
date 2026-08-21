@@ -465,6 +465,462 @@ impl DriverIdentity {
     }
 }
 
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_AUDIT_IDLE: u8 = 0;
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_AUDIT_STARTED: u8 = 1;
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_AUDIT_SHADOW_RETIRED: u8 = 2;
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_AUDIT_TERMINAL: u8 = 3;
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_AUDIT_REAPER_NOTIFIED: u8 = 4;
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_AUDIT_ACKNOWLEDGED: u8 = 5;
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+const TARGET_NATIVE_FIXTURE_BYTES: u64 = (13 * 1024 + 73) as u64;
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TargetManagedIdentity {
+    driver: DriverIdentity,
+    managed: ManagedComponentToken,
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+struct TargetManagedAudit {
+    watermark: u64,
+    stage: u8,
+    identity: Option<TargetManagedIdentity>,
+    terminal: Option<ComponentTerminal>,
+    input_bytes: u64,
+    output_bytes: u64,
+    normal_eof: u64,
+    normal_close: u64,
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+impl TargetManagedAudit {
+    const fn new() -> Self {
+        Self {
+            watermark: 0,
+            stage: TARGET_AUDIT_IDLE,
+            identity: None,
+            terminal: None,
+            input_bytes: 0,
+            output_bytes: 0,
+            normal_eof: 0,
+            normal_close: 0,
+        }
+    }
+
+    fn clear_active(&mut self) {
+        self.stage = TARGET_AUDIT_IDLE;
+        self.identity = None;
+        self.terminal = None;
+        self.input_bytes = 0;
+        self.output_bytes = 0;
+        self.normal_eof = 0;
+        self.normal_close = 0;
+    }
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub(super) struct TargetManagedReport {
+    passed: bool,
+    starts: u64,
+    shadow_retires: u64,
+    terminals: u64,
+    cspace_resets: u64,
+    reaper_notifies: u64,
+    acknowledgements: u64,
+    input_bytes: u64,
+    output_bytes: u64,
+    normal_eof: u64,
+    normal_close: u64,
+    pending_shadows: usize,
+    registry_occupied: usize,
+    registry_header_mismatches: usize,
+    control_live: usize,
+    stream_bindings: usize,
+    cleanup_shadows: usize,
+    reaper_slots: usize,
+    reaper_waiters: usize,
+    route_exact: bool,
+    gates_open: bool,
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_AUDIT: [SpinLock<TargetManagedAudit>; CONTROL_SLOTS] =
+    [const { SpinLock::new(TargetManagedAudit::new()) }; CONTROL_SLOTS];
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_STARTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_SHADOW_RETIRES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_TERMINALS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_CSPACE_RESETS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_REAPER_NOTIFIES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_ACKNOWLEDGEMENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+static TARGET_MANAGED_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_managed_slot(key: ControlKey) -> Option<&'static SpinLock<TargetManagedAudit>> {
+    TARGET_MANAGED_AUDIT.get(key.slot as usize)
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn target_record_managed_start(
+    key: ControlKey,
+    instance: InstanceToken,
+    streams: RegistryStreamBindings,
+    managed: ManagedComponentToken,
+) -> bool {
+    let Some(slot) = target_managed_slot(key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_IDLE
+        || audit.identity.is_some()
+        || key.generation <= audit.watermark
+    {
+        return false;
+    }
+    audit.watermark = key.generation;
+    audit.stage = TARGET_AUDIT_STARTED;
+    audit.identity = Some(TargetManagedIdentity {
+        driver: DriverIdentity {
+            key,
+            instance,
+            streams,
+        },
+        managed,
+    });
+    TARGET_MANAGED_STARTS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_record_input_bytes(identity: DriverIdentity, bytes: usize) -> bool {
+    let Some(slot) = target_managed_slot(identity.key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_STARTED
+        || audit.identity.map(|stored| stored.driver) != Some(identity)
+    {
+        return false;
+    }
+    let Some(total) = audit.input_bytes.checked_add(bytes as u64) else {
+        return false;
+    };
+    audit.input_bytes = total;
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_record_output_bytes(identity: DriverIdentity, bytes: usize) -> bool {
+    let Some(slot) = target_managed_slot(identity.key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_STARTED
+        || audit.identity.map(|stored| stored.driver) != Some(identity)
+    {
+        return false;
+    }
+    let Some(total) = audit.output_bytes.checked_add(bytes as u64) else {
+        return false;
+    };
+    audit.output_bytes = total;
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_record_normal_eof(identity: DriverIdentity) -> bool {
+    let Some(slot) = target_managed_slot(identity.key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_STARTED
+        || audit.identity.map(|stored| stored.driver) != Some(identity)
+        || audit.normal_eof != 0
+    {
+        return false;
+    }
+    audit.normal_eof = 1;
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_record_normal_close(identity: DriverIdentity) -> bool {
+    let Some(slot) = target_managed_slot(identity.key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_STARTED
+        || audit.identity.map(|stored| stored.driver) != Some(identity)
+        || audit.normal_close != 0
+    {
+        return false;
+    }
+    audit.normal_close = 1;
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_record_shadow_retired(identity: DriverIdentity) -> bool {
+    let Some(slot) = target_managed_slot(identity.key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_STARTED
+        || audit.identity.map(|stored| stored.driver) != Some(identity)
+    {
+        return false;
+    }
+    audit.stage = TARGET_AUDIT_SHADOW_RETIRED;
+    TARGET_MANAGED_SHADOW_RETIRES.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn target_record_managed_terminal(
+    key: ControlKey,
+    instance: InstanceToken,
+    streams: RegistryStreamBindings,
+    terminal: ComponentTerminal,
+) -> bool {
+    let identity = DriverIdentity {
+        key,
+        instance,
+        streams,
+    };
+    let Some(slot) = target_managed_slot(key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_SHADOW_RETIRED
+        || audit.identity.map(|stored| stored.driver) != Some(identity)
+        || audit.terminal.is_some()
+    {
+        return false;
+    }
+    audit.stage = TARGET_AUDIT_TERMINAL;
+    audit.terminal = Some(terminal);
+    TARGET_MANAGED_TERMINALS.fetch_add(1, Ordering::AcqRel);
+    // The parent invokes this hook only after `finalize_with_space` returned
+    // its exact next CSpace incarnation, which is the reset linearization.
+    TARGET_MANAGED_CSPACE_RESETS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn target_record_reaper_notified(
+    key: ControlKey,
+    instance: InstanceToken,
+    streams: RegistryStreamBindings,
+    managed: ManagedComponentToken,
+    terminal: ComponentTerminal,
+) -> bool {
+    let expected = TargetManagedIdentity {
+        driver: DriverIdentity {
+            key,
+            instance,
+            streams,
+        },
+        managed,
+    };
+    let Some(slot) = target_managed_slot(key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_TERMINAL
+        || audit.identity != Some(expected)
+        || audit.terminal != Some(terminal)
+    {
+        return false;
+    }
+    audit.stage = TARGET_AUDIT_REAPER_NOTIFIED;
+    TARGET_MANAGED_REAPER_NOTIFIES.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn target_record_managed_acknowledgement(
+    key: ControlKey,
+    managed: ManagedComponentToken,
+    terminal: ComponentTerminal,
+) -> bool {
+    let Some(slot) = target_managed_slot(key) else {
+        return false;
+    };
+    let mut audit = slot.lock();
+    if audit.stage != TARGET_AUDIT_REAPER_NOTIFIED
+        || audit
+            .identity
+            .is_none_or(|stored| stored.managed != managed)
+        || audit.terminal != Some(terminal)
+    {
+        return false;
+    }
+    audit.stage = TARGET_AUDIT_ACKNOWLEDGED;
+    TARGET_MANAGED_ACKNOWLEDGEMENTS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn target_pending_shadow_residue() -> usize {
+    PENDING_SHADOWS
+        .iter()
+        .filter(|shadow| !shadow.lock().is_retired())
+        .count()
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn target_completion_report(
+    status: u32,
+    route_exact: bool,
+    gates_open: bool,
+    pending_shadows: usize,
+    registry_occupied: usize,
+    registry_header_mismatches: usize,
+    control_live: usize,
+    stream_bindings: usize,
+    cleanup_shadows: usize,
+    reaper_slots: usize,
+    reaper_waiters: usize,
+) -> TargetManagedReport {
+    let starts = TARGET_MANAGED_STARTS.load(Ordering::Acquire);
+    let shadow_retires = TARGET_MANAGED_SHADOW_RETIRES.load(Ordering::Acquire);
+    let terminals = TARGET_MANAGED_TERMINALS.load(Ordering::Acquire);
+    let cspace_resets = TARGET_MANAGED_CSPACE_RESETS.load(Ordering::Acquire);
+    let reaper_notifies = TARGET_MANAGED_REAPER_NOTIFIES.load(Ordering::Acquire);
+    let acknowledgements = TARGET_MANAGED_ACKNOWLEDGEMENTS.load(Ordering::Acquire);
+    let completions = TARGET_MANAGED_COMPLETIONS.load(Ordering::Acquire);
+    let mut active = 0usize;
+    let mut acknowledged = None;
+    let mut acknowledged_count = 0usize;
+    for (index, slot) in TARGET_MANAGED_AUDIT.iter().enumerate() {
+        let audit = slot.lock();
+        if audit.stage != TARGET_AUDIT_IDLE {
+            active += 1;
+        }
+        if audit.stage == TARGET_AUDIT_ACKNOWLEDGED {
+            acknowledged_count += 1;
+            acknowledged.get_or_insert(index);
+        }
+    }
+
+    let (input_bytes, output_bytes, normal_eof, normal_close, successful_terminal) = acknowledged
+        .map(|index| {
+            let audit = TARGET_MANAGED_AUDIT[index].lock();
+            (
+                audit.input_bytes,
+                audit.output_bytes,
+                audit.normal_eof,
+                audit.normal_close,
+                audit.terminal == Some(ComponentTerminal::Success),
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, false));
+    let passed = active == 1
+        && acknowledged_count == 1
+        && status == 0
+        && route_exact
+        && gates_open
+        && successful_terminal
+        && input_bytes == TARGET_NATIVE_FIXTURE_BYTES
+        && output_bytes == TARGET_NATIVE_FIXTURE_BYTES
+        && normal_eof == 1
+        && normal_close == 1
+        && pending_shadows == 0
+        && registry_occupied == 0
+        && registry_header_mismatches == 0
+        && control_live == 0
+        && stream_bindings == 0
+        && cleanup_shadows == 0
+        && reaper_slots == 0
+        && reaper_waiters == 0
+        && starts == shadow_retires
+        && starts == terminals
+        && starts == cspace_resets
+        && starts == reaper_notifies
+        && starts == acknowledgements
+        && acknowledgements == completions.saturating_add(1);
+
+    if passed {
+        TARGET_MANAGED_AUDIT[acknowledged.expect("checked target acknowledgement")]
+            .lock()
+            .clear_active();
+        TARGET_MANAGED_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    TargetManagedReport {
+        passed,
+        starts,
+        shadow_retires,
+        terminals,
+        cspace_resets,
+        reaper_notifies,
+        acknowledgements,
+        input_bytes,
+        output_bytes,
+        normal_eof,
+        normal_close,
+        pending_shadows,
+        registry_occupied,
+        registry_header_mismatches,
+        control_live,
+        stream_bindings,
+        cleanup_shadows,
+        reaper_slots,
+        reaper_waiters,
+        route_exact,
+        gates_open,
+    }
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn target_report_passed(report: TargetManagedReport) -> bool {
+    report.passed
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(super) fn publish_target_report(report: TargetManagedReport) {
+    let result = if report.passed { "PASS" } else { "FAIL" };
+    crate::println!(
+        "WASM_C53_NATIVE_SSH_ACCEPTANCE {} starts={} shadow_retires={} terminals={} cspace_resets={} reaper_notifies={} acks={} input_bytes={} output_bytes={} normal_eof={} normal_close={} pending_shadows={} registry_occupied={} registry_header_mismatches={} control_live={} stream_bindings={} cleanup_shadows={} reaper_slots={} reaper_waiters={} route_exact={} gates_open={}",
+        result,
+        report.starts,
+        report.shadow_retires,
+        report.terminals,
+        report.cspace_resets,
+        report.reaper_notifies,
+        report.acknowledgements,
+        report.input_bytes,
+        report.output_bytes,
+        report.normal_eof,
+        report.normal_close,
+        report.pending_shadows,
+        report.registry_occupied,
+        report.registry_header_mismatches,
+        report.control_live,
+        report.stream_bindings,
+        report.cleanup_shadows,
+        report.reaper_slots,
+        report.reaper_waiters,
+        usize::from(report.route_exact),
+        usize::from(report.gates_open),
+    );
+}
+
 type NativePendingShadow = PendingShadow<InstanceToken, RegistryStreamBindings, HostOperationToken>;
 type NativePendingSnapshot =
     PendingSnapshot<InstanceToken, RegistryStreamBindings, HostOperationToken>;
@@ -725,12 +1181,20 @@ pub(super) fn retire_terminal_shadow(
     token: InstanceToken,
     streams: RegistryStreamBindings,
 ) -> bool {
-    shadow_retire(DriverIdentity {
+    let identity = DriverIdentity {
         key,
         instance: token,
         streams,
-    })
-    .is_ok()
+    };
+    if shadow_retire(identity).is_err() {
+        return false;
+    }
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    if !target_record_shadow_retired(identity) {
+        quarantine_shadow(identity);
+        return false;
+    }
+    true
 }
 
 /// Resolve the SYSTEM pending-operation projection while the registry has
@@ -1205,6 +1669,13 @@ async fn drive_input_stream(
             quarantine_shadow(identity);
             return Err(terminal);
         }
+        #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+        if !target_record_input_bytes(identity, progress) {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "target input byte ledger mismatch",
+            ));
+        }
         if !spill.consume(progress) {
             return Err(unexpected_native_driver_error(
                 identity,
@@ -1295,6 +1766,13 @@ async fn drive_input_stream(
         quarantine_shadow(identity);
         return Err(terminal);
     }
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    if !target_record_input_bytes(identity, progress) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "target input byte ledger mismatch",
+        ));
+    }
     if !spill.consume(progress) {
         return Err(unexpected_native_driver_error(
             identity,
@@ -1343,9 +1821,20 @@ async fn drive_input_closed(
     loop {
         match dispatch {
             StreamTerminalDispatch::Ready(reason) => {
-                return invocation
+                let committed = invocation
                     .commit_host_input_closed(runtime_prepared, stream_reason_value(reason))
-                    .map_err(|error| unexpected_native_driver_error(identity, error));
+                    .map_err(|error| unexpected_native_driver_error(identity, error))?;
+                #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+                if reason == StreamCloseReason::Normal
+                    && poll_terminal(committed).is_none()
+                    && !target_record_normal_eof(identity)
+                {
+                    return Err(unexpected_native_driver_error(
+                        identity,
+                        "target normal EOF ledger mismatch",
+                    ));
+                }
+                return Ok(committed);
             }
             StreamTerminalDispatch::Waiting(operation) => {
                 let current = shadow.expect("terminal waiting has a SYSTEM shadow");
@@ -1414,6 +1903,8 @@ async fn drive_output_stream(
     let send = send_output(identity, staging.prepared()).await;
     match send {
         Ok(Ok(())) => {
+            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            let output_bytes = staging.prepared().len();
             let committed = invocation
                 .commit_host_output(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
@@ -1423,6 +1914,13 @@ async fn drive_output_stream(
                 // runtime commit after it is a global lifecycle divergence.
                 quarantine_shadow(identity);
                 return Err(terminal);
+            }
+            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            if !target_record_output_bytes(identity, output_bytes) {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "target output byte ledger mismatch",
+                ));
             }
             Ok(committed)
         }
@@ -1489,6 +1987,13 @@ async fn drive_output_closed(
                 quarantine_shadow(identity);
                 Err(terminal)
             } else {
+                #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+                if reason == StreamCloseReason::Normal && !target_record_normal_close(identity) {
+                    return Err(unexpected_native_driver_error(
+                        identity,
+                        "target normal close ledger mismatch",
+                    ));
+                }
                 Ok(committed)
             }
         }

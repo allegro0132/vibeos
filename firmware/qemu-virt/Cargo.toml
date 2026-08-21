@@ -14,6 +14,12 @@ ssh-test = [
     "vibeos-kernel/ssh-test",
     "vibeos-kernel/wasm-c48-qemu-acceptance",
 ]
+# Explicitly default-off standard OpenSSH gate for the formal managed native
+# command. It retains every existing ssh-test/C4.8 assertion in one image.
+ssh-native-async-qemu-acceptance = [
+    "ssh-test",
+    "vibeos-kernel/ssh-native-async-qemu-acceptance",
+]
 
 [[bin]]
 name = "vibeos-qemu-virt"

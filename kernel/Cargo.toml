@@ -102,6 +102,13 @@ ssh-native-async-command = [
     "vibeos-component-image-adapter/native-async-command-projection",
     "vibeos-component-runtime/native-async-acceptance",
 ]
+# Standard QEMU/OpenSSH promotion gate for the formal managed native command.
+# Keeping the telemetry and VSH aggregate behind this explicit composite
+# feature leaves the reusable formal command and every physical image inert.
+ssh-native-async-qemu-acceptance = [
+    "ssh-native-async-command",
+    "vibeos-vsh/managed-component-target-acceptance",
+]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.

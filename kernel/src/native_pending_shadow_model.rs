@@ -284,6 +284,12 @@ impl<I: Copy + Eq, B: Copy + Eq, O: Copy + Eq> PendingShadow<I, B, O> {
         self.quarantined
     }
 
+    /// A retired slot retains only its monotonic generation watermark. No
+    /// exact invocation identity or backend operation remains reachable.
+    pub(crate) const fn is_retired(&self) -> bool {
+        !self.quarantined && self.identity.is_none() && self.operation.is_none()
+    }
+
     fn check_live(&self) -> Result<(), PendingShadowError> {
         if self.quarantined {
             Err(PendingShadowError::Quarantined)
@@ -348,6 +354,7 @@ mod tests {
         }
         shadow.retire(exact).unwrap();
         assert!(!shadow.is_quarantined());
+        assert!(shadow.is_retired());
     }
 
     #[test]
@@ -411,9 +418,11 @@ mod tests {
         let mut shadow: PendingShadow<u64, u64, u64> = PendingShadow::new();
         let exact = identity(15, 101, 111);
         shadow.bind(exact).unwrap();
+        assert!(!shadow.is_retired());
         assert_eq!(shadow.snapshot(exact), Ok(None));
         shadow.retire(exact).unwrap();
         assert!(!shadow.is_quarantined());
+        assert!(shadow.is_retired());
     }
 
     #[test]

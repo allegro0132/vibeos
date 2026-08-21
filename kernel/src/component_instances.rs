@@ -1421,6 +1421,17 @@ impl ControlGate {
         true
     }
 
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    fn target_cleanup_shadow_residue(&self) -> usize {
+        self.cleanup_shadow
+            .iter()
+            .filter(|shadow| {
+                let shadow = shadow.lock();
+                shadow.cleanup.is_some() || shadow.state.is_some()
+            })
+            .count()
+    }
+
     fn cleanup_shadow_is_complete(
         &self,
         key: ControlKey,
@@ -2322,10 +2333,14 @@ impl Future for ManagedChildFuture {
             Ok(Poll::Ready(_)) => Poll::Ready(()),
             Ok(Poll::Pending) => match child_start_gate(self.control, self.token, witness) {
                 ChildStartGate::Active | ChildStartGate::AwaitStart => Poll::Pending,
-                ChildStartGate::RetryBusy => {
-                    context.waker().wake_by_ref();
-                    Poll::Pending
-                }
+                // The inner payload has already returned Pending and therefore
+                // owns the exact wake which makes its next poll useful. A
+                // CONTROL collision here is only a failed post-poll proof; a
+                // synthetic self-wake would poll an External continuation
+                // before its signal. Cancellation and fail-stop separately
+                // publish the exact child wake, so preserving Pending cannot
+                // strand this generation.
+                ChildStartGate::RetryBusy => Poll::Pending,
                 ChildStartGate::Isolated => {
                     let _ = registry().quarantine(self.token);
                     lifecycle_fail_stop();
@@ -4168,17 +4183,25 @@ fn start_image_instance_with_io(
 }
 
 #[cfg(feature = "ssh-component-command")]
-fn start_image_instance_with_input(
+#[derive(Clone, Copy)]
+struct ResolvedImageStart {
+    native_mode: bool,
+    root: Option<&'static ImageRoot>,
+    command_name: &'static str,
+}
+
+#[cfg(feature = "ssh-component-command")]
+fn resolve_image_start(
     gate: StartPolicyGate,
     mode: PayloadMode,
-    mut input: ComponentStartInput,
-) -> Result<ManagedComponentToken, ComponentTerminal> {
+    input: &ComponentStartInput,
+) -> Result<ResolvedImageStart, ComponentTerminal> {
     if !start_route_exact(gate, mode, &input) {
         lifecycle_fail_stop();
-        return Err(input.abort_unpublished(ComponentTerminal::RunnerFault));
+        return Err(ComponentTerminal::RunnerFault);
     }
     if !lifecycle_is_healthy() || !gate.permits() {
-        return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
+        return Err(ComponentTerminal::Unavailable);
     }
     #[cfg(any(
         feature = "wasm-c53-native-async-qemu-acceptance",
@@ -4197,13 +4220,13 @@ fn start_image_instance_with_input(
         ))]
         if !native_async_acceptance::root_ready() {
             native_async_acceptance::lifecycle_fail_stop();
-            return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
+            return Err(ComponentTerminal::Unavailable);
         }
         None
     } else {
         let Some(root) = image_root() else {
             lifecycle_fail_stop();
-            return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
+            return Err(ComponentTerminal::Unavailable);
         };
         Some(root)
     };
@@ -4223,7 +4246,24 @@ fn start_image_instance_with_input(
     } else {
         SSH_EXEC_COMPONENT.command_name()
     };
-    let mut control = match CONTROL.try_lock() {
+    Ok(ResolvedImageStart {
+        native_mode,
+        root,
+        command_name,
+    })
+}
+
+#[cfg(feature = "ssh-component-command")]
+fn start_image_instance_with_input(
+    gate: StartPolicyGate,
+    mode: PayloadMode,
+    input: ComponentStartInput,
+) -> Result<ManagedComponentToken, ComponentTerminal> {
+    let resolved = match resolve_image_start(gate, mode, &input) {
+        Ok(resolved) => resolved,
+        Err(terminal) => return Err(input.abort_unpublished(terminal)),
+    };
+    let control = match CONTROL.try_lock() {
         Ok(control) => control,
         Err(ControlGateError::Busy) => {
             return Err(input.abort_unpublished(ComponentTerminal::Unavailable));
@@ -4233,6 +4273,39 @@ fn start_image_instance_with_input(
             return Err(input.abort_unpublished(ComponentTerminal::RunnerFault));
         }
     };
+    start_image_instance_under_control(gate, mode, input, resolved, control)
+}
+
+#[cfg(feature = "wasm-c48-qemu-acceptance")]
+fn start_image_instance_with_io_under_control(
+    control: ControlGuard<'_>,
+    mode: PayloadMode,
+    io: InstalledComponentIo,
+) -> Result<ManagedComponentToken, ComponentTerminal> {
+    let input = ComponentStartInput::Acceptance(Some(io));
+    let resolved = match resolve_image_start(StartPolicyGate::None, mode, &input) {
+        Ok(resolved) => resolved,
+        Err(terminal) => {
+            drop(control);
+            return Err(input.abort_unpublished(terminal));
+        }
+    };
+    start_image_instance_under_control(StartPolicyGate::None, mode, input, resolved, control)
+}
+
+#[cfg(feature = "ssh-component-command")]
+fn start_image_instance_under_control(
+    gate: StartPolicyGate,
+    mode: PayloadMode,
+    mut input: ComponentStartInput,
+    resolved: ResolvedImageStart,
+    mut control: ControlGuard<'_>,
+) -> Result<ManagedComponentToken, ComponentTerminal> {
+    let ResolvedImageStart {
+        native_mode,
+        root,
+        command_name,
+    } = resolved;
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
     if !lifecycle_is_healthy() || !gate.permits() || !start_route_exact(gate, mode, &input) {
         system.restore();
@@ -4666,6 +4739,25 @@ fn start_image_instance_with_input(
         if let Some(record) = control.exact_mut(key) {
             record.quarantine();
         }
+        system.restore();
+        drop(control);
+        quarantine_committed_start(&input, key, core_token, streams);
+        drop(stage);
+        return Err(ComponentTerminal::RunnerFault);
+    }
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    if start_kind == ControlStartKind::ManagedNativeAsync
+        && !native_async_acceptance::target_record_managed_start(
+            key,
+            core_token,
+            streams,
+            managed_token,
+        )
+    {
+        control
+            .exact_mut(key)
+            .expect("target-audited control slot exists")
+            .quarantine();
         system.restore();
         drop(control);
         quarantine_committed_start(&input, key, core_token, streams);
@@ -5326,6 +5418,25 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
             return FinalizeControl::Lost;
         }
     };
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    if tuple.start_kind == ControlStartKind::ManagedNativeAsync
+        && !native_async_acceptance::target_record_managed_terminal(
+            key,
+            tuple.core_token,
+            tuple.streams,
+            terminal,
+        )
+    {
+        CONTROL.child_shadow[key.slot as usize].quarantine(key);
+        CONTROL.supervisor_shadow[key.slot as usize].quarantine(key);
+        control
+            .exact_mut(key)
+            .expect("target-audited terminal control slot exists")
+            .quarantine();
+        lifecycle_fail_stop();
+        system.restore();
+        return FinalizeControl::Lost;
+    }
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     acceptance::record_cspace_reset(
         tuple.handle.id(),
@@ -5459,14 +5570,29 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
                         .is_some_and(|stored| stored.matches_exact(cleanup))
                     && record.start_kind == Some(tuple.start_kind)
             });
-        if wake.is_none()
-            || !complete_projection
-            || !CONTROL.mark_cleanup_complete(key, cleanup, token, terminal)
-            || !lifecycle_is_healthy()
-        {
+        let cleanup_complete = CONTROL.mark_cleanup_complete(key, cleanup, token, terminal);
+        if wake.is_none() || !complete_projection || !cleanup_complete || !lifecycle_is_healthy() {
             control
                 .exact_mut(key)
                 .expect("staged terminal control slot exists")
+                .quarantine();
+            lifecycle_fail_stop();
+            system.restore();
+            return FinalizeControl::Lost;
+        }
+        #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+        if tuple.start_kind == ControlStartKind::ManagedNativeAsync
+            && !native_async_acceptance::target_record_reaper_notified(
+                key,
+                tuple.core_token,
+                tuple.streams,
+                token,
+                terminal,
+            )
+        {
+            control
+                .exact_mut(key)
+                .expect("target-audited reaper notification slot exists")
                 .quarantine();
             lifecycle_fail_stop();
             system.restore();
@@ -5943,6 +6069,8 @@ fn acknowledge_instance(token: ManagedComponentToken) -> ManagedComponentAcknowl
         system.restore();
         return ManagedComponentAcknowledge::Acknowledged;
     }
+    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    let target_native = record.start_kind == Some(ControlStartKind::ManagedNativeAsync);
     let projection_exact = record.core_token.is_none()
         && record.handle.is_none()
         && record.domain.is_none()
@@ -6011,6 +6139,20 @@ fn acknowledge_instance(token: ManagedComponentToken) -> ManagedComponentAcknowl
             record.supervisor = None;
             record.cleanup = None;
             record.start_kind = None;
+            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            if target_native
+                && !native_async_acceptance::target_record_managed_acknowledgement(
+                    key, token, terminal,
+                )
+            {
+                control
+                    .exact_mut(key)
+                    .expect("target-audited acknowledgement slot exists")
+                    .quarantine();
+                lifecycle_fail_stop();
+                system.restore();
+                return ManagedComponentAcknowledge::Lost;
+            }
             system.restore();
             ManagedComponentAcknowledge::Acknowledged
         }
@@ -6173,6 +6315,93 @@ pub(crate) fn install_ssh_exec_component(
         ));
     }
     unsafe { session.install_ssh_exec_managed_component_io(&root.ssh_policy, &LIFECYCLE, io) }
+}
+
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+fn target_control_residue(control: &ControlTable) -> (usize, usize) {
+    let mut live = 0usize;
+    let mut stream_bindings = 0usize;
+    for record in &control.slots {
+        stream_bindings += usize::from(record.streams.is_some());
+        let projection_empty = record.core_token.is_none()
+            && record.handle.is_none()
+            && record.supervisor.is_none()
+            && record.domain.is_none()
+            && record.streams.is_none()
+            && record.cleanup.is_none()
+            && record.start_kind.is_none()
+            && record.terminal_candidate.is_none()
+            && record.candidate_source.is_none();
+        let phase_clean = record.phase == ControlPhase::Vacant
+            || matches!(
+                record.phase,
+                ControlPhase::Complete {
+                    acknowledged: true,
+                    ..
+                }
+            );
+        live += usize::from(!projection_empty || !phase_clean);
+    }
+    (live, stream_bindings)
+}
+
+/// Target-only completion observer called after the SSH peer has received the
+/// exact status/stdout/EOF/CLOSE sequence and VSH has shut down its reaper.
+#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+pub(crate) fn ssh_exec_component_completed(accepted: SshExecComponentSessionPolicy, status: u32) {
+    if accepted.command_name() != native_async_acceptance::command_name() {
+        return;
+    }
+
+    let native_policy = native_async_acceptance::ssh_exec_policy(accepted.profile());
+    let sync_policy = ssh_exec_policy(accepted.profile());
+    let route_exact = native_policy == Some(accepted)
+        && accepted.command_name() == native_async_acceptance::command_name();
+    let gates_open = native_policy.is_some()
+        && sync_policy.is_some_and(|policy| {
+            policy.command_name() == SSH_EXEC_COMPONENT.command_name()
+                && policy.artifact_sha256() == SSH_EXEC_COMPONENT.expected_sha256()
+        });
+
+    let reapers = vibeos_vsh::managed_component_target_snapshot();
+    let pending_shadows = native_async_acceptance::target_pending_shadow_residue();
+    let (registry_occupied, registry_header_mismatches, control_live, stream_bindings, cleanup) =
+        match CONTROL.try_lock() {
+            Ok(control) => {
+                let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+                let registry = registry().occupancy_stats();
+                let (control_live, stream_bindings) = target_control_residue(&control);
+                let cleanup = CONTROL.target_cleanup_shadow_residue();
+                system.restore();
+                drop(control);
+                (
+                    registry.occupied,
+                    registry.header_mismatches,
+                    control_live,
+                    stream_bindings,
+                    cleanup,
+                )
+            }
+            Err(_) => (usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        };
+    let report = native_async_acceptance::target_completion_report(
+        status,
+        route_exact,
+        gates_open,
+        pending_shadows,
+        registry_occupied,
+        registry_header_mismatches,
+        control_live,
+        stream_bindings,
+        cleanup,
+        reapers.reaper_slots,
+        reapers.reaper_waiters,
+    );
+    let passed = native_async_acceptance::target_report_passed(report);
+    native_async_acceptance::publish_target_report(report);
+    if !passed {
+        native_async_acceptance::lifecycle_fail_stop();
+    }
 }
 
 #[cfg(feature = "ssh-component-command")]

@@ -36,6 +36,10 @@ CASE_FILTER_INPUT = bytes(
     (index * 17 + 3) % 251 for index in range(12 * 1024 + 37)
 )
 CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in CASE_FILTER_INPUT)
+NATIVE_CASE_FILTER_INPUT = bytes(
+    (index * 29 + 11) & 0xFF for index in range(13 * 1024 + 73)
+)
+NATIVE_CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in NATIVE_CASE_FILTER_INPUT)
 INTERACTIVE_INPUT = b"discard\x03echo vibeos-vsh-interactivX\x7fe\r\x04"
 INTERACTIVE_OUTPUT = (
     b"vsh> discard^C\r\n"
@@ -334,6 +338,7 @@ def run_acceptance(
     known_hosts: Path,
     bind_address: str | None,
     command_timeout: float,
+    native_case_filter_enabled: bool,
 ) -> None:
     def invoke(
         label: str,
@@ -375,6 +380,25 @@ def run_acceptance(
 
     true_result = invoke("authorized true", accepted_key, ["-T"], ["true"])
     require_result("authorized true", true_result, {0}, b"")
+
+    if native_case_filter_enabled:
+        # subprocess closes the pipe after this complete binary fixture. Exact
+        # stdout length/content plus status zero therefore proves native EOF and
+        # output drain over the real OpenSSH channel, not merely command admission.
+        native_case_filter = invoke(
+            "authorized native async case-filter",
+            accepted_key,
+            ["-T"],
+            ["native-case-filter"],
+            input_bytes=NATIVE_CASE_FILTER_INPUT,
+        )
+        require_result(
+            "authorized native async case-filter",
+            native_case_filter,
+            {0},
+            NATIVE_CASE_FILTER_OUTPUT,
+            stderr_exact=b"",
+        )
 
     case_filter = invoke(
         "authorized WASM case-filter",
@@ -453,6 +477,19 @@ def selftest() -> None:
         raise PeerError("WASM stream fixture lost its exact final 37-byte chunk")
     if bytes(byte ^ 0x20 for byte in CASE_FILTER_OUTPUT) != CASE_FILTER_INPUT:
         raise PeerError("WASM stream fixture transform is not the pinned XOR")
+    if len(NATIVE_CASE_FILTER_INPUT) != 13 * 1024 + 73:
+        raise PeerError("native async stream fixture length changed")
+    if NATIVE_CASE_FILTER_OUTPUT[-73:] != bytes(
+        byte ^ 0x20 for byte in NATIVE_CASE_FILTER_INPUT[-73:]
+    ):
+        raise PeerError("native async stream fixture lost its exact final 73-byte chunk")
+    if (
+        bytes(byte ^ 0x20 for byte in NATIVE_CASE_FILTER_OUTPUT)
+        != NATIVE_CASE_FILTER_INPUT
+    ):
+        raise PeerError("native async stream fixture transform is not the pinned XOR")
+    if NATIVE_CASE_FILTER_INPUT == CASE_FILTER_INPUT:
+        raise PeerError("sync and native async stream fixtures unexpectedly alias")
     command = _base_ssh_command(
         "ssh",
         "localhost",
@@ -523,6 +560,22 @@ def selftest() -> None:
         pass
     else:
         raise PeerError("strict WASM stderr check accepted unexpected output")
+    parser = _parser()
+    if parser.parse_args([]).native_case_filter:
+        raise PeerError("native async probe unexpectedly enabled by default")
+    if not parser.parse_args(["--native-case-filter"]).native_case_filter:
+        raise PeerError("native async probe opt-in was not retained")
+    for incompatible in (
+        ["--scan-only", "--native-case-filter"],
+        ["--pick-port", "--native-case-filter"],
+        ["--selftest", "--native-case-filter"],
+    ):
+        try:
+            _validate_operation_modes(parser.parse_args(incompatible))
+        except PeerError:
+            pass
+        else:
+            raise PeerError(f"incompatible peer modes were accepted: {incompatible!r}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -546,6 +599,11 @@ def _parser() -> argparse.ArgumentParser:
         help="run only the strict authenticated readiness probe",
     )
     parser.add_argument(
+        "--native-case-filter",
+        action="store_true",
+        help="add the QEMU formal managed native-case-filter acceptance probe",
+    )
+    parser.add_argument(
         "--pick-port",
         action="store_true",
         help="print a currently unused IPv4 loopback port and exit",
@@ -554,12 +612,22 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_operation_modes(arguments: argparse.Namespace) -> None:
+    if arguments.selftest and (
+        arguments.pick_port or arguments.scan_only or arguments.native_case_filter
+    ):
+        raise PeerError("--selftest cannot be combined with another operation")
+    if arguments.pick_port and (arguments.scan_only or arguments.native_case_filter):
+        raise PeerError("--pick-port cannot be combined with another operation")
+    if arguments.scan_only and arguments.native_case_filter:
+        raise PeerError("--native-case-filter requires functional acceptance")
+
+
 def main() -> int:
     arguments = _parser().parse_args()
     try:
+        _validate_operation_modes(arguments)
         if arguments.pick_port:
-            if arguments.selftest or arguments.scan_only:
-                raise PeerError("--pick-port cannot be combined with another operation")
             print(pick_loopback_port())
             return 0
         if arguments.selftest:
@@ -634,10 +702,16 @@ def main() -> int:
                 arguments.known_hosts,
                 arguments.bind_address,
                 arguments.command_timeout,
+                arguments.native_case_filter,
+            )
+            component_label = (
+                "native async and WASM case-filter"
+                if arguments.native_case_filter
+                else "WASM case-filter"
             )
             print(
                 "PASS openssh-peer: forced crypto, authorized exec statuses including "
-                "WASM case-filter, interactive PTY/shell, rejected key, and invalid "
+                f"{component_label}, interactive PTY/shell, rejected key, and invalid "
                 "request denial"
             )
         return 0

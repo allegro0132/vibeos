@@ -933,6 +933,38 @@ impl ByteStreamSupervisor {
         publish_close_observed(&self.stream, reason, true, false)
     }
 
+    /// Atomically promotes a drained endpoint-side `Normal` publication to the
+    /// immutable terminal reason.
+    ///
+    /// `None` means either no endpoint has published provisional `Normal` yet,
+    /// or buffered bytes still need to be drained. An existing final reason is
+    /// only observed and is never republished, so a failure which already won
+    /// cannot be turned into a conflicting `Normal` publication.
+    pub fn promote_normal_if_drained_observed(&self) -> Option<StreamCloseObservation> {
+        let mut state = self.stream.state.lock();
+        let observation = if state.fail_stopped {
+            close_observation(StreamCloseOutcome::Conflict, state.lifecycle)
+        } else {
+            match state.lifecycle {
+                Lifecycle::Open => return None,
+                Lifecycle::NormalProvisional if state.ring.depth != 0 => return None,
+                Lifecycle::NormalProvisional => {
+                    state.lifecycle = Lifecycle::Final(StreamCloseReason::Normal);
+                    close_observation(StreamCloseOutcome::Published, state.lifecycle)
+                }
+                Lifecycle::Final(_) => {
+                    close_observation(StreamCloseOutcome::AlreadyPublished, state.lifecycle)
+                }
+            }
+        };
+        let sender = state.take_ready_sender_wake();
+        let receiver = state.take_ready_receiver_wake();
+        let terminal = state.take_ready_terminal_wake();
+        drop(state);
+        wake_all([sender, receiver, terminal]);
+        Some(observation)
+    }
+
     pub fn final_reason(&self) -> Option<StreamCloseReason> {
         self.stream.final_reason()
     }
@@ -1185,6 +1217,12 @@ mod tests {
         let supervisor = stream.supervisor();
         let wakes = stream.state.lock().fail_stop();
         wake_all(wakes);
+
+        let promoted = supervisor
+            .promote_normal_if_drained_observed()
+            .expect("fail-stop must be observed rather than treated as pending");
+        assert_eq!(promoted.outcome(), StreamCloseOutcome::Conflict);
+        assert_eq!(promoted.effective_reason(), None);
 
         let observed = supervisor.finalize_observed(StreamCloseReason::Failure);
         assert_eq!(observed.outcome(), StreamCloseOutcome::Conflict);

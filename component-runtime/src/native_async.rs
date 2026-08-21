@@ -8,13 +8,18 @@
 #![allow(dead_code)]
 
 use crate::{
-    async_abi::{unpack_callback_result, CallbackCode, EventCode},
-    async_state::{AsyncState, AsyncStateError, AsyncStateLimits, TaskHandle},
+    async_abi::{
+        pack_endpoint_pair, unpack_callback_result, CallbackCode, EndpointPair as AbiEndpointPair,
+        EventCode,
+    },
+    async_state::{AsyncState, AsyncStateError, AsyncStateLimits, EndpointKind, TaskHandle},
     decode::ComponentPlan,
     execution::{
         AsyncCoreValueType, NativeAsyncCanonicalFunctionPlan, NativeAsyncCoreImportPlan,
-        NativeAsyncExecutionPlan,
+        NativeAsyncExecutionPlan, NativeAsyncFuturePlan, NativeAsyncStreamPlan,
+        NativeAsyncWaitablePlan,
     },
+    value::{AsyncValueTypeId, EndpointDirection, ValueType},
     world::FunctionEffect,
 };
 use alloc::{string::String, vec::Vec};
@@ -27,6 +32,16 @@ use vibeos_wasm_runtime::{
 
 /// Versioned Vibe fuel charged for resolving one empty native async result.
 const TASK_RETURN_WORK: u64 = 1;
+/// Versioned Vibe fuel charged for one handle-arena transition.
+///
+/// Pair creation can scan each bounded pair/handle table while preparing and
+/// inserting, and a reserve can move their existing entries (at most seven
+/// `max_resources`-sized passes in total). Join and joined-endpoint drop scan
+/// and move at most four such member ranges. Eight full passes plus one fixed
+/// dispatch/commit unit is therefore a conservative upper bound for every
+/// handle action enabled by this executor slice.
+const HANDLE_STATE_SCAN_FACTOR: u64 = 8;
+const HANDLE_STATE_WORK: u64 = 1 + HANDLE_STATE_SCAN_FACTOR * PROFILE_1_LIMITS.max_resources as u64;
 /// Versioned Vibe fuel charged for decoding and committing one callback code.
 const CALLBACK_RESULT_WORK: u64 = 1;
 
@@ -68,6 +83,8 @@ pub(crate) struct NativeAsyncComponent {
     modules: CoreComponentGroup,
     exports: Vec<RuntimeExport>,
     bridges: Vec<RuntimeBridge>,
+    /// Canonical handles belong to the Component instance, not one invocation.
+    state: AsyncState,
     poisoned: bool,
 }
 
@@ -79,9 +96,19 @@ struct RuntimeExport {
     callback: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeAction {
     TaskReturn,
+    StreamNew(AsyncValueTypeId),
+    FutureNew(AsyncValueTypeId),
+    DropEndpoint {
+        kind: EndpointKind,
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+    },
+    WaitableSetNew,
+    WaitableSetDrop,
+    WaitableJoin,
     Unsupported,
 }
 
@@ -217,10 +244,18 @@ impl NativeAsyncComponent {
         modules
             .seal()
             .map_err(|_| NativeAsyncError::CoreInstantiation)?;
+        let state = AsyncState::new(AsyncStateLimits {
+            handles: PROFILE_1_LIMITS.max_resources,
+            pairs: PROFILE_1_LIMITS.max_resources,
+            tasks: 1,
+            waitables_per_set: PROFILE_1_LIMITS.max_resources,
+        })
+        .map_err(map_state_error)?;
         Ok(Self {
             modules,
             exports,
             bridges,
+            state,
             poisoned: false,
         })
     }
@@ -257,14 +292,6 @@ impl NativeAsyncComponent {
             .exports
             .get(export_index)
             .ok_or(NativeAsyncError::InvalidWiring)?;
-        let mut state = AsyncState::new(AsyncStateLimits {
-            handles: 1,
-            pairs: 1,
-            tasks: 1,
-            waitables_per_set: 1,
-        })
-        .map_err(map_state_error)?;
-        let task = state.create_task().map_err(map_state_error)?;
         let callback_reservation = self
             .modules
             .reserve_call(binding.callback_instance, &binding.callback)
@@ -278,10 +305,17 @@ impl NativeAsyncComponent {
                 poll_quantum,
             )
             .map_err(|_| NativeAsyncError::InvalidWiring)?;
+        let task = match self.state.create_task() {
+            Ok(task) => task,
+            Err(error) => {
+                self.modules.discard_all_calls();
+                self.poisoned = true;
+                return Err(map_state_error(error));
+            }
+        };
         Ok(NativeAsyncInvocation {
             component: self,
             export: export_index,
-            state,
             task,
             stage: InvocationStage::Run,
             total_work,
@@ -393,6 +427,55 @@ fn runtime_bridges(
             {
                 BridgeAction::TaskReturn
             }
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::New {
+                value_type,
+                ..
+            }) => BridgeAction::StreamNew(stream_value_type_id(value_type)?),
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::DropReadable {
+                value_type,
+                ..
+            }) => BridgeAction::DropEndpoint {
+                kind: EndpointKind::Stream,
+                direction: EndpointDirection::Read,
+                value_type: stream_value_type_id(value_type)?,
+            },
+            NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::DropWritable {
+                value_type,
+                ..
+            }) => BridgeAction::DropEndpoint {
+                kind: EndpointKind::Stream,
+                direction: EndpointDirection::Write,
+                value_type: stream_value_type_id(value_type)?,
+            },
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::New {
+                value_type,
+                ..
+            }) => BridgeAction::FutureNew(future_value_type_id(value_type)?),
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::DropReadable {
+                value_type,
+                ..
+            }) => BridgeAction::DropEndpoint {
+                kind: EndpointKind::Future,
+                direction: EndpointDirection::Read,
+                value_type: future_value_type_id(value_type)?,
+            },
+            NativeAsyncCanonicalFunctionPlan::Future(NativeAsyncFuturePlan::DropWritable {
+                value_type,
+                ..
+            }) => BridgeAction::DropEndpoint {
+                kind: EndpointKind::Future,
+                direction: EndpointDirection::Write,
+                value_type: future_value_type_id(value_type)?,
+            },
+            NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::SetNew) => {
+                BridgeAction::WaitableSetNew
+            }
+            NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::SetDrop) => {
+                BridgeAction::WaitableSetDrop
+            }
+            NativeAsyncCanonicalFunctionPlan::Waitable(NativeAsyncWaitablePlan::Join) => {
+                BridgeAction::WaitableJoin
+            }
             _ => BridgeAction::Unsupported,
         };
         bridges.push(RuntimeBridge {
@@ -401,6 +484,20 @@ fn runtime_bridges(
         });
     }
     Ok(bridges)
+}
+
+fn stream_value_type_id(value: &ValueType) -> Result<AsyncValueTypeId, NativeAsyncError> {
+    match value {
+        ValueType::Stream { type_id, .. } => Ok(*type_id),
+        _ => Err(NativeAsyncError::InvalidWiring),
+    }
+}
+
+fn future_value_type_id(value: &ValueType) -> Result<AsyncValueTypeId, NativeAsyncError> {
+    match value {
+        ValueType::Future { type_id, .. } => Ok(*type_id),
+        _ => Err(NativeAsyncError::InvalidWiring),
+    }
 }
 
 fn runtime_exports(
@@ -470,6 +567,67 @@ const fn map_state_error(error: AsyncStateError) -> NativeAsyncError {
     }
 }
 
+/// Maps an async-state failure surfaced at a guest canonical boundary.
+///
+/// Guest-controlled raw handles and legal-but-invalid state transitions are
+/// Canonical ABI misuse. Bounded arena/allocation exhaustion is a profile
+/// limit. Sealed-ticket and executor invariants are validation failures.
+const fn map_runtime_state_error(error: AsyncStateError) -> TrapCode {
+    match error {
+        AsyncStateError::AllocationFailed
+        | AsyncStateError::HandleTableFull
+        | AsyncStateError::PairTableFull
+        | AsyncStateError::ProgressLimit
+        | AsyncStateError::GenerationExhausted
+        | AsyncStateError::WaitableSetFull
+        | AsyncStateError::TaskTableFull => TrapCode::LimitExceeded,
+        AsyncStateError::InvalidLimits
+        | AsyncStateError::WrongState
+        | AsyncStateError::StaleOperation
+        | AsyncStateError::PairInvariant
+        | AsyncStateError::InvalidCopyResult
+        | AsyncStateError::NoPendingEvent
+        | AsyncStateError::EventAlreadyDelivered
+        | AsyncStateError::StaleEvent
+        | AsyncStateError::AuthorityConsumed
+        | AsyncStateError::WaitableNotJoined
+        | AsyncStateError::WaitableSetNotWaiting
+        | AsyncStateError::StaleWait
+        | AsyncStateError::TaskIncomplete => TrapCode::Validation,
+        AsyncStateError::InvalidHandle
+        | AsyncStateError::StaleHandle
+        | AsyncStateError::WrongHandleKind
+        | AsyncStateError::WrongEndpointKind
+        | AsyncStateError::WrongDirection
+        | AsyncStateError::WrongType
+        | AsyncStateError::EndpointBusy
+        | AsyncStateError::EndpointDone
+        | AsyncStateError::OperationNotCopying
+        | AsyncStateError::PairBusy
+        | AsyncStateError::DropWhileCopying
+        | AsyncStateError::FutureWritableNotDone
+        | AsyncStateError::DuplicateHandle
+        | AsyncStateError::WaitableSetNotEmpty
+        | AsyncStateError::WaitableSetWaiting
+        | AsyncStateError::AlreadyWaiting
+        | AsyncStateError::TaskAlreadyResolved
+        | AsyncStateError::TaskNotResolved
+        | AsyncStateError::TaskAlreadyExited
+        | AsyncStateError::TaskCancelState
+        | AsyncStateError::TransferWhileJoined
+        | AsyncStateError::CancelWhileJoined => TrapCode::CanonicalAbi,
+    }
+}
+
+/// Once a guest raw handle has been resolved, loss of that exact sealed slot
+/// is an executor invariant failure rather than a second guest-handle error.
+const fn map_sealed_state_error(error: AsyncStateError) -> TrapCode {
+    match error {
+        AsyncStateError::InvalidHandle | AsyncStateError::StaleHandle => TrapCode::Validation,
+        _ => map_runtime_state_error(error),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InvocationStage {
     Run,
@@ -481,7 +639,6 @@ enum InvocationStage {
 pub(crate) struct NativeAsyncInvocation<'a> {
     component: &'a mut NativeAsyncComponent,
     export: usize,
-    state: AsyncState,
     task: TaskHandle,
     stage: InvocationStage,
     total_work: u64,
@@ -562,33 +719,186 @@ impl NativeAsyncInvocation<'_> {
         if call.origin_instance != bridge.origin_instance {
             return self.finish_trap(TrapCode::Validation);
         }
-        match bridge.action {
-            BridgeAction::TaskReturn if call.arguments.is_empty() => {
-                if self
-                    .component
-                    .modules
-                    .debit_call_fuel(active_instance, TASK_RETURN_WORK)
-                    .is_err()
-                {
-                    return self.finish_trap(TrapCode::FuelExhausted);
+        let action = bridge.action;
+        match (action, call.arguments.as_slice()) {
+            (BridgeAction::TaskReturn, []) => {
+                if let Err(trap) = self.debit_active_work(active_instance, TASK_RETURN_WORK) {
+                    return self.finish_trap(trap);
                 }
-                if !self.settle_metrics(active_instance) {
-                    return self.finish_trap(TrapCode::Validation);
+                if let Err(error) = self.component.state.resolve_task_result(self.task) {
+                    return self.finish_trap(map_sealed_state_error(error));
                 }
-                if self.state.resolve_task_result(self.task).is_err()
-                    || self
-                        .component
+                if let Err(trap) =
+                    self.component
                         .modules
                         .resume_host_call(active_instance, call.id, &[])
-                        .is_err()
                 {
-                    return self.finish_trap(TrapCode::CanonicalAbi);
+                    return self.finish_trap(trap);
                 }
                 NativeAsyncPoll::Resolved(self.metrics())
             }
-            BridgeAction::TaskReturn | BridgeAction::Unsupported => {
-                self.finish_trap(TrapCode::CanonicalAbi)
+            (BridgeAction::StreamNew(value_type), []) => {
+                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                    return self.finish_trap(trap);
+                }
+                let pair = match self.component.state.create_stream_pair(value_type) {
+                    Ok(pair) => pair,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                let Ok(packed) = pack_endpoint_pair(AbiEndpointPair {
+                    readable: pair.readable.raw(),
+                    writable: pair.writable.raw(),
+                }) else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                let results = [CoreValue::I64(packed as i64)];
+                if let Err(trap) =
+                    self.component
+                        .modules
+                        .resume_host_call(active_instance, call.id, &results)
+                {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Pending(self.metrics())
             }
+            (BridgeAction::FutureNew(value_type), []) => {
+                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                    return self.finish_trap(trap);
+                }
+                let pair = match self.component.state.create_future_pair(value_type) {
+                    Ok(pair) => pair,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                let Ok(packed) = pack_endpoint_pair(AbiEndpointPair {
+                    readable: pair.readable.raw(),
+                    writable: pair.writable.raw(),
+                }) else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                let results = [CoreValue::I64(packed as i64)];
+                if let Err(trap) =
+                    self.component
+                        .modules
+                        .resume_host_call(active_instance, call.id, &results)
+                {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Pending(self.metrics())
+            }
+            (
+                BridgeAction::DropEndpoint {
+                    kind,
+                    direction,
+                    value_type,
+                },
+                [CoreValue::I32(raw)],
+            ) => {
+                let handle = match self.component.state.resolve_guest_handle(*raw as u32) {
+                    Ok(handle) => handle,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                    return self.finish_trap(trap);
+                }
+                if let Err(error) = self
+                    .component
+                    .state
+                    .drop_endpoint(handle, kind, direction, value_type)
+                {
+                    return self.finish_trap(map_sealed_state_error(error));
+                }
+                if let Err(trap) =
+                    self.component
+                        .modules
+                        .resume_host_call(active_instance, call.id, &[])
+                {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Pending(self.metrics())
+            }
+            (BridgeAction::WaitableSetNew, []) => {
+                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                    return self.finish_trap(trap);
+                }
+                let set = match self.component.state.create_waitable_set() {
+                    Ok(set) => set,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                let results = [CoreValue::I32(set.raw() as i32)];
+                if let Err(trap) =
+                    self.component
+                        .modules
+                        .resume_host_call(active_instance, call.id, &results)
+                {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Pending(self.metrics())
+            }
+            (BridgeAction::WaitableSetDrop, [CoreValue::I32(raw)]) => {
+                let set = match self.component.state.resolve_guest_handle(*raw as u32) {
+                    Ok(set) => set,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                    return self.finish_trap(trap);
+                }
+                if let Err(error) = self.component.state.drop_waitable_set(set) {
+                    return self.finish_trap(map_sealed_state_error(error));
+                }
+                if let Err(trap) =
+                    self.component
+                        .modules
+                        .resume_host_call(active_instance, call.id, &[])
+                {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Pending(self.metrics())
+            }
+            (
+                BridgeAction::WaitableJoin,
+                [CoreValue::I32(waitable_raw), CoreValue::I32(set_raw)],
+            ) => {
+                let waitable = match self
+                    .component
+                    .state
+                    .resolve_guest_handle(*waitable_raw as u32)
+                {
+                    Ok(waitable) => waitable,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                if let Err(trap) = self.debit_active_work(active_instance, HANDLE_STATE_WORK) {
+                    return self.finish_trap(trap);
+                }
+                if let Err(error) = self
+                    .component
+                    .state
+                    .join_waitable(waitable, *set_raw as u32)
+                {
+                    return self.finish_trap(map_runtime_state_error(error));
+                }
+                if let Err(trap) =
+                    self.component
+                        .modules
+                        .resume_host_call(active_instance, call.id, &[])
+                {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Pending(self.metrics())
+            }
+            (BridgeAction::Unsupported, _) => self.finish_trap(TrapCode::CanonicalAbi),
+            _ => self.finish_trap(TrapCode::Validation),
+        }
+    }
+
+    fn debit_active_work(&mut self, active_instance: usize, amount: u64) -> Result<(), TrapCode> {
+        debug_assert!(amount > 0);
+        self.component
+            .modules
+            .debit_call_fuel(active_instance, amount)?;
+        if self.settle_metrics(active_instance) {
+            Ok(())
+        } else {
+            Err(TrapCode::Validation)
         }
     }
 
@@ -604,10 +914,11 @@ impl NativeAsyncInvocation<'_> {
         }
         match result.code {
             CallbackCode::Exit => {
-                if self.state.callback_exit(self.task).is_err()
-                    || self.state.drop_task(self.task).is_err()
-                {
-                    return self.finish_trap(TrapCode::CanonicalAbi);
+                if let Err(error) = self.component.state.callback_exit(self.task) {
+                    return self.finish_trap(map_sealed_state_error(error));
+                }
+                if let Err(error) = self.component.state.drop_task(self.task) {
+                    return self.finish_trap(map_sealed_state_error(error));
                 }
                 self.stage = InvocationStage::Terminal;
                 self.terminal = true;
@@ -675,7 +986,7 @@ impl NativeAsyncInvocation<'_> {
 
     #[cfg(test)]
     fn task_info(&self) -> TaskInfo {
-        self.state.task_info(self.task).unwrap()
+        self.component.state.task_info(self.task).unwrap()
     }
 }
 
@@ -697,6 +1008,7 @@ mod tests {
         async_state::{TaskCallbackState, TaskResultState},
         decode::inspect_component_for_profile,
     };
+    use alloc::format;
     use vibeos_wasm_runtime::CoreHostCall;
 
     const SMOKE: &str = include_str!(
@@ -723,6 +1035,176 @@ mod tests {
     fn replace_once(source: &str, from: &str, to: &str) -> String {
         assert_eq!(source.matches(from).count(), 1);
         source.replacen(from, to, 1)
+    }
+
+    fn handle_component(run_body: &str) -> String {
+        format!(
+            r#"(component
+              (type $bytes (stream u8))
+              (type $words (stream u16))
+              (type $future (future u8))
+              (type $run-type (func async))
+
+              (core func $task-return (canon task.return))
+              (core func $task-cancel (canon task.cancel))
+              (core func $stream-new (canon stream.new $bytes))
+              (core func $stream-drop-readable
+                (canon stream.drop-readable $bytes))
+              (core func $stream-drop-readable-words
+                (canon stream.drop-readable $words))
+              (core func $stream-drop-writable
+                (canon stream.drop-writable $bytes))
+              (core func $future-new (canon future.new $future))
+              (core func $future-drop-readable
+                (canon future.drop-readable $future))
+              (core func $future-drop-writable
+                (canon future.drop-writable $future))
+              (core func $waitable-set-new (canon waitable-set.new))
+              (core func $waitable-set-drop (canon waitable-set.drop))
+              (core func $waitable-join (canon waitable.join))
+
+              (core instance $builtins
+                (export "task-return" (func $task-return))
+                (export "task-cancel" (func $task-cancel))
+                (export "stream-new" (func $stream-new))
+                (export "stream-drop-readable" (func $stream-drop-readable))
+                (export "stream-drop-readable-words"
+                  (func $stream-drop-readable-words))
+                (export "stream-drop-writable" (func $stream-drop-writable))
+                (export "future-new" (func $future-new))
+                (export "future-drop-readable" (func $future-drop-readable))
+                (export "future-drop-writable" (func $future-drop-writable))
+                (export "waitable-set-new" (func $waitable-set-new))
+                (export "waitable-set-drop" (func $waitable-set-drop))
+                (export "waitable-join" (func $waitable-join)))
+
+              (core module $guest
+                (import "vibe:async" "task-return" (func $task-return))
+                (import "vibe:async" "task-cancel" (func $task-cancel))
+                (import "vibe:async" "stream-new"
+                  (func $stream-new (result i64)))
+                (import "vibe:async" "stream-drop-readable"
+                  (func $stream-drop-readable (param i32)))
+                (import "vibe:async" "stream-drop-readable-words"
+                  (func $stream-drop-readable-words (param i32)))
+                (import "vibe:async" "stream-drop-writable"
+                  (func $stream-drop-writable (param i32)))
+                (import "vibe:async" "future-new"
+                  (func $future-new (result i64)))
+                (import "vibe:async" "future-drop-readable"
+                  (func $future-drop-readable (param i32)))
+                (import "vibe:async" "future-drop-writable"
+                  (func $future-drop-writable (param i32)))
+                (import "vibe:async" "waitable-set-new"
+                  (func $waitable-set-new (result i32)))
+                (import "vibe:async" "waitable-set-drop"
+                  (func $waitable-set-drop (param i32)))
+                (import "vibe:async" "waitable-join"
+                  (func $waitable-join (param i32 i32)))
+                (memory $state 1 1)
+                (func (export "run") (result i32)
+                  (local $pair i64)
+                  (local $set i32)
+                  {run_body}
+                  call $task-return
+                  i32.const 1)
+                (func (export "callback") (param i32 i32 i32) (result i32)
+                  i32.const 0))
+
+              (core instance $guest-instance
+                (instantiate $guest
+                  (with "vibe:async" (instance $builtins))))
+              (alias core export $guest-instance "run" (core func $run))
+              (alias core export $guest-instance "callback" (core func $callback))
+              (func $lifted (type $run-type)
+                (canon lift (core func $run)
+                  async
+                  (callback (core func $callback))))
+              (export "run" (func $lifted)))"#
+        )
+    }
+
+    fn trap_call(component: &mut NativeAsyncComponent) -> TrapCode {
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Trapped(trap) => return trap,
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Complete(_) => panic!("invalid handle fixture completed"),
+            }
+        }
+    }
+
+    fn assert_exact_run_bridge_debits(call: &mut NativeAsyncInvocation<'_>) -> usize {
+        let active = call.binding().core_instance;
+        let mut handle_transitions = 0;
+        loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(active));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => {
+                    let action = call.component.bridges[host.id as usize].action;
+                    let expected = match action {
+                        BridgeAction::TaskReturn => TASK_RETURN_WORK,
+                        BridgeAction::StreamNew(_)
+                        | BridgeAction::FutureNew(_)
+                        | BridgeAction::DropEndpoint { .. }
+                        | BridgeAction::WaitableSetNew
+                        | BridgeAction::WaitableSetDrop
+                        | BridgeAction::WaitableJoin => {
+                            handle_transitions += 1;
+                            HANDLE_STATE_WORK
+                        }
+                        BridgeAction::Unsupported => {
+                            panic!("fixture reached an unsupported bridge")
+                        }
+                    };
+                    let before = call.metrics();
+                    let progress = call.handle_host_call(active, host);
+                    if action == BridgeAction::TaskReturn {
+                        assert!(matches!(progress, NativeAsyncPoll::Resolved(_)));
+                    } else {
+                        assert!(matches!(progress, NativeAsyncPoll::Pending(_)));
+                    }
+                    let after = call.metrics();
+                    assert_eq!(before.remaining_work - after.remaining_work, expected);
+                    assert_eq!(after.consumed_work - before.consumed_work, expected);
+                }
+                PollResult::Ready(values) => {
+                    let before = call.metrics();
+                    assert!(matches!(
+                        call.handle_callback_result(values),
+                        NativeAsyncPoll::Yielded(_)
+                    ));
+                    let after = call.metrics();
+                    assert_eq!(
+                        before.remaining_work - after.remaining_work,
+                        CALLBACK_RESULT_WORK
+                    );
+                    assert_eq!(
+                        after.consumed_work - before.consumed_work,
+                        CALLBACK_RESULT_WORK
+                    );
+                    return handle_transitions;
+                }
+                PollResult::Trapped(trap) => panic!("run trapped before callback: {trap:?}"),
+            }
+        }
+    }
+
+    fn finish_yielded_call(call: &mut NativeAsyncInvocation<'_>) {
+        assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Complete(_) => return,
+                NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Resolved(_) => {}
+                NativeAsyncPoll::Yielded(_) => panic!("callback unexpectedly yielded"),
+                NativeAsyncPoll::Trapped(trap) => panic!("callback trapped: {trap:?}"),
+            }
+        }
     }
 
     fn assert_smoke_sequence(component: &mut NativeAsyncComponent) -> NativeAsyncMetrics {
@@ -913,6 +1395,328 @@ mod tests {
     }
 
     #[test]
+    fn component_handle_state_persists_across_invocations_with_exact_fuel() {
+        let source = handle_component(
+            r#"i32.const 8
+                  i32.load
+                  if
+                    call $waitable-set-new
+                    local.set $set
+                    i32.const 0
+                    i64.load
+                    i32.wrap_i64
+                    local.get $set
+                    call $waitable-join
+                    i32.const 0
+                    i64.load
+                    i32.wrap_i64
+                    i32.const 0
+                    call $waitable-join
+                    local.get $set
+                    call $waitable-set-drop
+                    i32.const 0
+                    i64.load
+                    i32.wrap_i64
+                    call $stream-drop-readable
+                    i32.const 0
+                    i64.load
+                    i64.const 32
+                    i64.shr_u
+                    i32.wrap_i64
+                    call $stream-drop-writable
+                  else
+                    i32.const 0
+                    call $stream-new
+                    i64.store
+                    i32.const 8
+                    i32.const 1
+                    i32.store
+                  end"#,
+        );
+        let mut component = instantiate(&source);
+
+        {
+            let mut first = component.start("run", WORK, QUANTUM).unwrap();
+            assert_eq!(assert_exact_run_bridge_debits(&mut first), 1);
+            finish_yielded_call(&mut first);
+        }
+        assert!(!component.is_poisoned());
+
+        {
+            let mut second = component.start("run", WORK, QUANTUM).unwrap();
+            assert_eq!(assert_exact_run_bridge_debits(&mut second), 6);
+            finish_yielded_call(&mut second);
+        }
+        assert!(!component.is_poisoned());
+    }
+
+    #[test]
+    fn future_handle_actions_are_classified_and_readable_drop_executes() {
+        let source = handle_component(
+            r#"call $future-new
+                  local.set $pair
+                  local.get $pair
+                  i32.wrap_i64
+                  call $future-drop-readable"#,
+        );
+        let mut component = instantiate(&source);
+        assert!(component.bridges.iter().any(|bridge| matches!(
+            bridge.action,
+            BridgeAction::DropEndpoint {
+                kind: EndpointKind::Future,
+                direction: EndpointDirection::Write,
+                ..
+            }
+        )));
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        assert_eq!(assert_exact_run_bridge_debits(&mut call), 2);
+        finish_yielded_call(&mut call);
+    }
+
+    #[test]
+    fn future_writer_drop_requires_a_write_terminal_even_after_reader_drop() {
+        let source = handle_component(
+            r#"call $future-new
+                  local.set $pair
+                  local.get $pair
+                  i32.wrap_i64
+                  call $future-drop-readable
+                  local.get $pair
+                  i64.const 32
+                  i64.shr_u
+                  i32.wrap_i64
+                  call $future-drop-writable"#,
+        );
+        let mut component = instantiate(&source);
+        assert_eq!(trap_call(&mut component), TrapCode::CanonicalAbi);
+        assert!(component.is_poisoned());
+    }
+
+    #[test]
+    fn read_write_cancel_and_task_cancel_bridges_remain_unsupported() {
+        let smoke = instantiate(SMOKE);
+        assert_eq!(
+            smoke
+                .bridges
+                .iter()
+                .filter(|bridge| bridge.action == BridgeAction::Unsupported)
+                .count(),
+            8
+        );
+
+        let mut task_cancel = instantiate(&handle_component("call $task-cancel"));
+        assert_eq!(trap_call(&mut task_cancel), TrapCode::CanonicalAbi);
+        assert!(task_cancel.is_poisoned());
+    }
+
+    #[test]
+    fn runtime_state_errors_preserve_guest_limit_and_invariant_classes() {
+        for error in [
+            AsyncStateError::AllocationFailed,
+            AsyncStateError::HandleTableFull,
+            AsyncStateError::PairTableFull,
+            AsyncStateError::WaitableSetFull,
+            AsyncStateError::TaskTableFull,
+        ] {
+            assert_eq!(map_runtime_state_error(error), TrapCode::LimitExceeded);
+        }
+        for error in [
+            AsyncStateError::PairInvariant,
+            AsyncStateError::WrongState,
+            AsyncStateError::StaleOperation,
+            AsyncStateError::StaleEvent,
+            AsyncStateError::StaleWait,
+        ] {
+            assert_eq!(map_runtime_state_error(error), TrapCode::Validation);
+        }
+        for error in [
+            AsyncStateError::InvalidHandle,
+            AsyncStateError::StaleHandle,
+            AsyncStateError::WrongHandleKind,
+            AsyncStateError::WrongEndpointKind,
+            AsyncStateError::WrongDirection,
+            AsyncStateError::WrongType,
+            AsyncStateError::DropWhileCopying,
+        ] {
+            assert_eq!(map_runtime_state_error(error), TrapCode::CanonicalAbi);
+        }
+        assert_eq!(
+            map_sealed_state_error(AsyncStateError::StaleHandle),
+            TrapCode::Validation
+        );
+    }
+
+    #[test]
+    fn full_handle_arena_traps_as_limit_after_exact_transition_debit() {
+        let source = handle_component("call $stream-new\n                  drop");
+        let mut component = instantiate(&source);
+        let value_type = component
+            .bridges
+            .iter()
+            .find_map(|bridge| match bridge.action {
+                BridgeAction::StreamNew(value_type) => Some(value_type),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(PROFILE_1_LIMITS.max_resources % 2, 0);
+        for _ in 0..PROFILE_1_LIMITS.max_resources / 2 {
+            component.state.create_stream_pair(value_type).unwrap();
+        }
+
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let active = call.binding().core_instance;
+            let host = loop {
+                let result = call.component.modules.poll_call(active);
+                assert!(call.settle_metrics(active));
+                match result {
+                    PollResult::Pending { .. } => {}
+                    PollResult::HostCall(host) => break host,
+                    other => panic!("expected stream.new host call, got {other:?}"),
+                }
+            };
+            let before = call.metrics();
+            assert_eq!(
+                call.handle_host_call(active, host),
+                NativeAsyncPoll::Trapped(TrapCode::LimitExceeded)
+            );
+            let after = call.metrics();
+            assert_eq!(
+                before.remaining_work - after.remaining_work,
+                HANDLE_STATE_WORK
+            );
+            assert_eq!(
+                after.consumed_work - before.consumed_work,
+                HANDLE_STATE_WORK
+            );
+        }
+        assert!(component.is_poisoned());
+    }
+
+    #[test]
+    fn wrong_handle_kind_endpoint_kind_direction_type_stale_and_raw_handles_fail_stop() {
+        let invalid_bodies = [
+            r#"call $waitable-set-new
+                  call $stream-drop-readable"#,
+            r#"call $stream-new
+                  local.set $pair
+                  local.get $pair
+                  i32.wrap_i64
+                  call $future-drop-readable"#,
+            r#"call $stream-new
+                  local.set $pair
+                  local.get $pair
+                  i32.wrap_i64
+                  call $stream-drop-writable"#,
+            r#"call $stream-new
+                  local.set $pair
+                  local.get $pair
+                  i32.wrap_i64
+                  call $stream-drop-readable-words"#,
+            r#"call $stream-new
+                  local.set $pair
+                  local.get $pair
+                  i32.wrap_i64
+                  call $stream-drop-readable
+                  local.get $pair
+                  i32.wrap_i64
+                  call $stream-drop-readable"#,
+            r#"i32.const -1
+                  call $stream-drop-readable"#,
+        ];
+        for body in invalid_bodies {
+            let mut component = instantiate(&handle_component(body));
+            assert_eq!(trap_call(&mut component), TrapCode::CanonicalAbi);
+            assert!(component.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn dropping_a_nonempty_waitable_set_fails_stop() {
+        let source = handle_component(
+            r#"call $stream-new
+                  local.set $pair
+                  call $waitable-set-new
+                  local.set $set
+                  local.get $pair
+                  i32.wrap_i64
+                  local.get $set
+                  call $waitable-join
+                  local.get $set
+                  call $waitable-set-drop"#,
+        );
+        let mut component = instantiate(&source);
+        assert_eq!(trap_call(&mut component), TrapCode::CanonicalAbi);
+        assert!(component.is_poisoned());
+    }
+
+    #[test]
+    fn fabricated_bridge_value_shape_is_an_executor_validation_failure() {
+        let source = handle_component("call $stream-new\n                  drop");
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        let mut host = loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(active));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => break host,
+                other => panic!("expected stream.new host call, got {other:?}"),
+            }
+        };
+        host.arguments.push(CoreValue::I32(0));
+        let before = call.metrics();
+        assert_eq!(
+            call.handle_host_call(active, host),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
+        assert_eq!(call.metrics(), before);
+        assert!(call.component.is_poisoned());
+    }
+
+    #[test]
+    fn post_commit_resume_failure_preserves_the_runtime_trap_class() {
+        let source = handle_component("call $waitable-set-new\n                  drop");
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        let host = loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(active));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => break host,
+                other => panic!("expected waitable-set.new host call, got {other:?}"),
+            }
+        };
+
+        // Seal a correctly typed response first so the dispatcher reaches a
+        // post-state-commit duplicate-resume invariant instead of a guest ABI
+        // error. The runtime's Validation class must survive fail-stop.
+        call.component
+            .modules
+            .resume_host_call(active, host.id, &[CoreValue::I32(1)])
+            .unwrap();
+        let before = call.metrics();
+        assert_eq!(
+            call.handle_host_call(active, host),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
+        let after = call.metrics();
+        assert_eq!(
+            before.remaining_work - after.remaining_work,
+            HANDLE_STATE_WORK
+        );
+        assert_eq!(
+            after.consumed_work - before.consumed_work,
+            HANDLE_STATE_WORK
+        );
+        assert!(call.component.is_poisoned());
+        assert!(!call.component.modules.any_active_call());
+    }
+
+    #[test]
     fn exit_before_task_return_and_duplicate_task_return_fail_stop() {
         let early = replace_once(
             SMOKE,
@@ -1058,7 +1862,7 @@ mod tests {
         let unsupported = replace_once(
             SMOKE,
             "      call $task-return\n      i32.const 1",
-            "      call $stream-new\n      drop\n      call $task-return\n      i32.const 1",
+            "      i32.const 1\n      call $stream-cancel-read\n      drop\n      call $task-return\n      i32.const 1",
         );
         let mut component = instantiate(&unsupported);
         {

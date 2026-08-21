@@ -93,6 +93,15 @@ wasm-c53-native-async-qemu-acceptance = [
     "vibeos-component-runtime/native-async-acceptance",
     "vibeos-image-policy/c53-native-async-qemu-acceptance",
 ]
+# Explicit, default-off promotion of the sealed C5.3 artifact into a distinct
+# managed SSH/VSH command. The projection remains validation-only; this feature
+# selects only the reviewed kernel driver and lifecycle adapter around it.
+ssh-native-async-command = [
+    "ssh-component-command",
+    "dep:vibeos-component-image-adapter",
+    "vibeos-component-image-adapter/native-async-command-projection",
+    "vibeos-component-runtime/native-async-acceptance",
+]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.
@@ -123,6 +132,7 @@ vibeos-component-admission = { path = "../services/component-admission", optiona
 vibeos-component-command = { path = "../services/component-command", optional = true }
 vibeos-component-format = { path = "../component-format", optional = true }
 vibeos-component-host = { path = "../services/component-host", optional = true }
+vibeos-component-image-adapter = { path = "../services/component-image-adapter", optional = true }
 vibeos-component-runtime = { path = "../component-runtime", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }

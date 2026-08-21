@@ -296,6 +296,20 @@ pub trait Platform: Sync {
     ) -> Option<SshExecComponentSessionPolicy> {
         None
     }
+    /// Select one exact Component descriptor for this raw exec request.
+    /// Platforms with multiple independently pinned commands override this
+    /// method; the compatibility default preserves the original single-slot
+    /// policy and still applies the exact VSH grammar/name gate.
+    fn select_ssh_exec_component_policy(
+        &self,
+        profile: AuthorizedProfile,
+        source: &str,
+    ) -> Option<SshExecComponentSessionPolicy> {
+        self.ssh_exec_component_policy(profile).filter(|policy| {
+            vibeos_vsh::validate_ssh_exec_with_component_name(source, policy.command_name())
+                == Ok(true)
+        })
+    }
     #[cfg(feature = "qualification-stream")]
     fn accepts_streaming_exec(&self, _command: &str) -> bool {
         false
@@ -2445,7 +2459,7 @@ fn accepted_ssh_component_policy(
         return None;
     }
     space
-        .ssh_exec_component_policy(profile)
+        .select_ssh_exec_component_policy(profile, source)
         .filter(|policy| policy.matches(profile))
         .filter(|policy| {
             vibeos_vsh::validate_ssh_exec_with_component_name(source, policy.command_name())
@@ -3875,7 +3889,7 @@ fn install_accepted_ssh_component(
     if onboarding
         || !accepted.matches(profile)
         || selected != Ok(true)
-        || space.ssh_exec_component_policy(profile) != Some(accepted)
+        || space.select_ssh_exec_component_policy(profile, command) != Some(accepted)
     {
         return Err(AcceptedComponentInstallError::PolicyChanged);
     }
@@ -4867,6 +4881,7 @@ mod tests {
 
     struct TestPolicyPlatform {
         component_policy: Option<SshExecComponentSessionPolicy>,
+        secondary_component_policy: Option<SshExecComponentSessionPolicy>,
         component_lifecycle: Option<&'static TestManagedLifecycle>,
     }
 
@@ -4963,6 +4978,28 @@ mod tests {
                 .filter(|policy| policy.matches(profile))
         }
 
+        fn select_ssh_exec_component_policy(
+            &self,
+            profile: AuthorizedProfile,
+            source: &str,
+        ) -> Option<SshExecComponentSessionPolicy> {
+            let select = |policy: SshExecComponentSessionPolicy| {
+                policy.matches(profile)
+                    && vibeos_vsh::validate_ssh_exec_with_component_name(
+                        source,
+                        policy.command_name(),
+                    ) == Ok(true)
+            };
+            let primary = self.component_policy.filter(|policy| select(*policy));
+            let secondary = self
+                .secondary_component_policy
+                .filter(|policy| select(*policy));
+            match (primary, secondary) {
+                (Some(policy), None) | (None, Some(policy)) => Some(policy),
+                (None, None) | (Some(_), Some(_)) => None,
+            }
+        }
+
         fn log(&self, _args: fmt::Arguments<'_>) {}
     }
 
@@ -4976,6 +5013,7 @@ mod tests {
         let (install, _pump) = vibeos_vsh::new_ssh_exec_component_io();
         TestPolicyPlatform {
             component_policy: None,
+            secondary_component_policy: None,
             component_lifecycle: None,
         }
         .install_ssh_exec_component_commands(
@@ -5027,6 +5065,7 @@ mod tests {
         };
         let platform = TestPolicyPlatform {
             component_policy: Some(component_policy(admitted, 7, [0x33; 32])),
+            secondary_component_policy: None,
             component_lifecycle: None,
         };
         assert!(accepted_ssh_component_policy(&platform, admitted, true, "case-filter").is_some());
@@ -5062,6 +5101,68 @@ mod tests {
     }
 
     #[test]
+    fn ssh_component_selector_keeps_two_exact_routes_and_rechecks_before_install() {
+        let profile = AuthorizedProfile {
+            generation: 17,
+            profile: CapabilityProfileId::new(3).unwrap(),
+        };
+        let sync = component_policy(profile, 21, [0x31; 32]);
+        let native = SshExecComponentSessionPolicy::new(
+            profile,
+            NonZeroU64::new(22).unwrap(),
+            "native-case-filter",
+            [0x53; 32],
+        );
+        let platform = TestPolicyPlatform {
+            component_policy: Some(sync),
+            secondary_component_policy: Some(native),
+            component_lifecycle: None,
+        };
+        assert_eq!(
+            accepted_ssh_component_policy(&platform, profile, true, "case-filter"),
+            Some(sync)
+        );
+        assert_eq!(
+            accepted_ssh_component_policy(&platform, profile, true, "native-case-filter"),
+            Some(native)
+        );
+        for source in [
+            "native-case-filter | true",
+            "native-case-filter > @console",
+            "native-case-filter $(true)",
+        ] {
+            assert!(accepted_ssh_component_policy(&platform, profile, true, source).is_none());
+        }
+
+        let rotated = TestPolicyPlatform {
+            component_policy: Some(sync),
+            secondary_component_policy: Some(SshExecComponentSessionPolicy::new(
+                profile,
+                NonZeroU64::new(23).unwrap(),
+                "native-case-filter",
+                [0x53; 32],
+            )),
+            component_lifecycle: None,
+        };
+        let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
+        assert!(matches!(
+            install_accepted_ssh_component(
+                &rotated,
+                &mut session,
+                profile,
+                false,
+                "native-case-filter",
+                Some(native),
+            ),
+            Err(AcceptedComponentInstallError::PolicyChanged)
+        ));
+        assert!(!session
+            .completion_candidates()
+            .iter()
+            .any(|name| name == "native-case-filter"));
+    }
+
+    #[test]
     fn accepted_component_policy_fails_closed_across_rotation_and_revocation() {
         let profile = AuthorizedProfile {
             generation: 7,
@@ -5070,6 +5171,7 @@ mod tests {
         let accepted = component_policy(profile, 10, [0x33; 32]);
         let gate = TestPolicyPlatform {
             component_policy: Some(accepted),
+            secondary_component_policy: None,
             component_lifecycle: None,
         };
         assert_eq!(
@@ -5101,6 +5203,7 @@ mod tests {
         for current in changed {
             let platform = TestPolicyPlatform {
                 component_policy: current,
+                secondary_component_policy: None,
                 component_lifecycle: None,
             };
             let mut session =
@@ -5133,6 +5236,7 @@ mod tests {
         let wrong_artifact = component_policy(profile, 10, [0x44; 32]);
         let platform = TestPolicyPlatform {
             component_policy: Some(wrong_artifact),
+            secondary_component_policy: None,
             component_lifecycle: Some(lifecycle),
         };
         assert_eq!(
@@ -5167,6 +5271,7 @@ mod tests {
         };
         let platform = TestPolicyPlatform {
             component_policy: Some(component_policy(profile, 10, [0x33; 32])),
+            secondary_component_policy: None,
             component_lifecycle: None,
         };
         let mut session = vibeos_vsh::Session::with_profile(vibeos_vsh::SessionProfile::SshExec);
@@ -5317,6 +5422,7 @@ mod tests {
 
         let no_policy = TestPolicyPlatform {
             component_policy: None,
+            secondary_component_policy: None,
             component_lifecycle: Some(lifecycle),
         };
         assert!(accepted_ssh_component_policy(&no_policy, profile, true, "case-filter").is_none());
@@ -5334,6 +5440,7 @@ mod tests {
                 41,
                 SSH_EXEC_COMPONENT.expected_sha256(),
             )),
+            secondary_component_policy: None,
             component_lifecycle: Some(lifecycle),
         };
         let accepted =

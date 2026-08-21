@@ -436,6 +436,14 @@ impl SshdPlatform for SshPlatform {
         crate::component_instances::ssh_exec_policy(profile)
     }
 
+    fn select_ssh_exec_component_policy(
+        &self,
+        profile: AuthorizedProfile,
+        source: &str,
+    ) -> Option<SshExecComponentSessionPolicy> {
+        crate::component_instances::select_ssh_exec_component_policy(profile, source)
+    }
+
     #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
     fn accepts_streaming_exec(&self, command: &str) -> bool {
         crate::jitterentropy_probe::accepts_ssh_stream(command)

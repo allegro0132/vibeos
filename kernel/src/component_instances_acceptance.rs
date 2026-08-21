@@ -2176,7 +2176,7 @@ async fn start_c53_instance(
         stdout_supervisor: stdout.supervisor(),
     };
     let result =
-        start_image_instance_with_io(false, PayloadMode::AcceptanceStream { round, hart }, io).ok();
+        start_image_instance_with_io(PayloadMode::AcceptanceStream { round, hart }, io).ok();
     C53_START_INTENT.store(false, Ordering::Release);
     result
 }
@@ -2669,7 +2669,7 @@ async fn acknowledge_until_stable(token: ManagedComponentToken) -> bool {
 async fn start_positive(round: u8, hart: u8) -> Option<ManagedComponentToken> {
     let started = crate::sbi::time();
     loop {
-        match start_image_instance(false, PayloadMode::AcceptanceFault { round, hart }) {
+        match start_image_instance(PayloadMode::AcceptanceFault { round, hart }) {
             Ok(token) => return Some(token),
             Err(ComponentTerminal::Unavailable) if !deadline_expired(started) => {
                 crate::exec::yield_now().await;
@@ -3569,10 +3569,7 @@ async fn start_terminal_race(
 ) -> Option<ManagedComponentToken> {
     let started = crate::sbi::time();
     loop {
-        match start_image_instance(
-            false,
-            PayloadMode::AcceptanceTerminalRace { case, terminal },
-        ) {
+        match start_image_instance(PayloadMode::AcceptanceTerminalRace { case, terminal }) {
             Ok(token) => return Some(token),
             Err(ComponentTerminal::Unavailable) if !deadline_expired(started) => {
                 crate::exec::yield_now().await;
@@ -3705,7 +3702,7 @@ async fn run_normal_production_probe() {
 async fn start_positive_command() -> Option<ManagedComponentToken> {
     let started = crate::sbi::time();
     loop {
-        match start_image_instance(false, PayloadMode::Command) {
+        match start_image_instance(PayloadMode::CommandSync) {
             Ok(token) => return Some(token),
             Err(ComponentTerminal::Unavailable) if !deadline_expired(started) => {
                 crate::exec::yield_now().await;

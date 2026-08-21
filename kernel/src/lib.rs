@@ -46,6 +46,13 @@ compile_error!("feature `wasm-c53-native-async-qemu-acceptance` requires the QEM
 compile_error!(
     "feature `wasm-c53-native-async-qemu-acceptance` is isolated from every SSH/older WASM image"
 );
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
+compile_error!(
+    "the direct native-async acceptance image and formal managed command are distinct roots"
+);
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]

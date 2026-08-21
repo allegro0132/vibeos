@@ -1023,15 +1023,14 @@ pub fn admit_native_async_acceptance_candidate(
 
 #[cfg(feature = "native-async-acceptance")]
 fn native_async_acceptance_plan_matches(plan: &ComponentPlan<'_>, entrypoint: &str) -> bool {
-    use vibeos_component_runtime::decode::NativeAsyncCanonicalFunctionPlan;
-
     if plan.profile() != ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
         || plan.profile().stage != ProfileStage::ValidationOnly
         || plan.runtime_ready()
         || plan.native_async_runtime_ready()
         || plan.summary().resources != 0
-        || plan.embedded_modules().len() != 1
-        || plan.runtime_instance_count() != 1
+        || plan.embedded_modules().len() != 2
+        || plan.runtime_instance_count() != 2
+        || !native_async_memory_provider_matches(plan.embedded_modules()[0])
         || plan.exports().len() != 1
         || plan.executable_exports().next().is_some()
         || plan.host_imports().next().is_some()
@@ -1041,32 +1040,330 @@ fn native_async_acceptance_plan_matches(plan: &ComponentPlan<'_>, entrypoint: &s
     let Some(native) = plan.native_async_execution_plan() else {
         return false;
     };
-    if native.instances().len() != 1
-        || native.instances()[0].module != 0
-        || !native.instances()[0].imports.is_empty()
-        || native.canonical_plans().len() != 1
-        || native.canonical_plans()[0].canonical_index != 0
-        || !native.canonical_import_bridges().is_empty()
+    if !native_async_instances_match(native)
+        || !native_async_canonical_plans_match(native)
+        || !native_async_import_bridges_match(native)
         || native.exports().len() != 1
         || native.exports()[0].name != entrypoint
-        || native.exports()[0].canonical != 0
+        || native.exports()[0].canonical != 14
     {
         return false;
     }
+    true
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_async_memory_provider_matches(bytes: &[u8]) -> bool {
+    let Ok(summary) = inspect_core(bytes) else {
+        return false;
+    };
+    summary.types == 0
+        && summary.functions == 0
+        && summary.max_params == 0
+        && summary.max_results == 0
+        && summary.imports == 0
+        && summary.exports == 1
+        && summary.globals == 0
+        && summary.locals == 0
+        && summary.memories == 1
+        && summary.tables == 0
+        && summary.data_segments == 0
+        && summary.element_segments == 0
+        // The version-pinned WAT encoder emits one name section for the
+        // provider's symbolic module/memory labels. No other custom payload
+        // is admitted by this exact artifact topology.
+        && summary.custom_sections == 1
+        && summary.custom_section_bytes == 18
+        && summary.max_control_depth == 0
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_async_instances_match(
+    native: &vibeos_component_runtime::decode::NativeAsyncExecutionPlan,
+) -> bool {
+    use vibeos_component_runtime::decode::NativeAsyncCoreImportPlan;
+
+    let [memory, guest] = native.instances() else {
+        return false;
+    };
+    if memory.module != 0 || !memory.imports.is_empty() || guest.module != 1 {
+        return false;
+    }
+    let Some((first, canonical)) = guest.imports.split_first() else {
+        return false;
+    };
+    if !matches!(
+        first,
+        NativeAsyncCoreImportPlan::InstanceExport {
+            module,
+            field,
+            core_instance: 0,
+            export,
+        } if module == "env" && field == "memory" && export == "memory"
+    ) || canonical.len() != 14
+    {
+        return false;
+    }
+    canonical.iter().enumerate().all(|(index, import)| {
+        matches!(
+            import,
+            NativeAsyncCoreImportPlan::Canonical { bridge }
+                if usize::try_from(*bridge).ok() == Some(index)
+        )
+    })
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_async_canonical_plans_match(
+    native: &vibeos_component_runtime::decode::NativeAsyncExecutionPlan,
+) -> bool {
+    use vibeos_component_runtime::decode::{
+        NativeAsyncCanonicalFunctionPlan as Function, NativeAsyncFuturePlan as Future,
+        NativeAsyncStreamPlan as Stream, NativeAsyncWaitablePlan as Waitable,
+    };
+    use vibeos_component_runtime::world::FunctionEffect;
+
+    let plans = native.canonical_plans();
+    if plans.len() != 15
+        || !plans
+            .iter()
+            .enumerate()
+            .all(|(index, plan)| usize::try_from(plan.canonical_index).ok() == Some(index))
+    {
+        return false;
+    }
+    for (index, plan) in plans.iter().enumerate() {
+        let matches = match (index, &plan.function) {
+            (0, Function::TaskReturn { result, options }) => {
+                result.as_ref().is_some_and(native_byte_stream_type)
+                    && native_options_match(options, false, false)
+            }
+            (
+                1,
+                Function::Stream(Stream::New {
+                    type_index,
+                    value_type,
+                }),
+            ) => *type_index == 3 && native_bytes_type(value_type),
+            (
+                2,
+                Function::Stream(Stream::Read {
+                    type_index,
+                    value_type,
+                    options,
+                }),
+            )
+            | (
+                3,
+                Function::Stream(Stream::Write {
+                    type_index,
+                    value_type,
+                    options,
+                }),
+            ) => {
+                *type_index == 3
+                    && native_bytes_type(value_type)
+                    && native_options_match(options, true, true)
+            }
+            (
+                4,
+                Function::Stream(Stream::DropReadable {
+                    type_index,
+                    value_type,
+                }),
+            )
+            | (
+                5,
+                Function::Stream(Stream::DropWritable {
+                    type_index,
+                    value_type,
+                }),
+            ) => *type_index == 3 && native_bytes_type(value_type),
+            (
+                6,
+                Function::Future(Future::New {
+                    type_index,
+                    value_type,
+                }),
+            ) => *type_index == 5 && native_closed_type(value_type),
+            (
+                7,
+                Function::Future(Future::Read {
+                    type_index,
+                    value_type,
+                    options,
+                }),
+            )
+            | (
+                8,
+                Function::Future(Future::Write {
+                    type_index,
+                    value_type,
+                    options,
+                }),
+            ) => {
+                *type_index == 5
+                    && native_closed_type(value_type)
+                    && native_options_match(options, true, true)
+            }
+            (
+                9,
+                Function::Future(Future::DropReadable {
+                    type_index,
+                    value_type,
+                }),
+            )
+            | (
+                10,
+                Function::Future(Future::DropWritable {
+                    type_index,
+                    value_type,
+                }),
+            ) => *type_index == 5 && native_closed_type(value_type),
+            (11, Function::Waitable(Waitable::SetNew))
+            | (12, Function::Waitable(Waitable::SetDrop))
+            | (13, Function::Waitable(Waitable::Join)) => true,
+            (
+                14,
+                Function::Lift {
+                    core_function,
+                    function_type,
+                    callback,
+                    options,
+                },
+            ) => {
+                core_function.core_instance == 1
+                    && core_function.export == "run"
+                    && callback.core_instance == 1
+                    && callback.export == "callback"
+                    && native_options_match(options, true, false)
+                    && function_type.effect == FunctionEffect::Async
+                    && function_type.parameters.len() == 1
+                    && function_type.parameters[0].name == "input"
+                    && native_byte_stream_type(&function_type.parameters[0].value)
+                    && function_type
+                        .result
+                        .as_ref()
+                        .is_some_and(native_byte_stream_type)
+            }
+            _ => false,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_async_import_bridges_match(
+    native: &vibeos_component_runtime::decode::NativeAsyncExecutionPlan,
+) -> bool {
+    use vibeos_component_runtime::decode::AsyncCoreValueType::{I32, I64};
+
+    const FIELDS: [&str; 14] = [
+        "task-return",
+        "stream-new",
+        "stream-read",
+        "stream-write",
+        "stream-drop-readable",
+        "stream-drop-writable",
+        "future-new",
+        "future-read",
+        "future-write",
+        "future-drop-readable",
+        "future-drop-writable",
+        "waitable-set-new",
+        "waitable-set-drop",
+        "waitable-join",
+    ];
+    let bridges = native.canonical_import_bridges();
+    if bridges.len() != FIELDS.len() {
+        return false;
+    }
+    bridges.iter().enumerate().all(|(index, bridge)| {
+        bridge.core_instance == 1
+            && bridge.core_module == "vibe:async"
+            && bridge.core_field == FIELDS[index]
+            && usize::try_from(bridge.canonical).ok() == Some(index)
+            && match index {
+                0 => {
+                    bridge.signature.parameters == [I32, I32] && bridge.signature.results.is_empty()
+                }
+                1 | 6 => {
+                    bridge.signature.parameters.is_empty() && bridge.signature.results == [I64]
+                }
+                2 | 3 => {
+                    bridge.signature.parameters == [I32, I32, I32]
+                        && bridge.signature.results == [I32]
+                }
+                4 | 5 | 9 | 10 | 12 => {
+                    bridge.signature.parameters == [I32] && bridge.signature.results.is_empty()
+                }
+                7 | 8 => {
+                    bridge.signature.parameters == [I32, I32] && bridge.signature.results == [I32]
+                }
+                11 => bridge.signature.parameters.is_empty() && bridge.signature.results == [I32],
+                13 => {
+                    bridge.signature.parameters == [I32, I32] && bridge.signature.results.is_empty()
+                }
+                _ => false,
+            }
+    })
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_options_match(
+    options: &vibeos_component_runtime::decode::NativeAsyncCanonicalOptionsPlan,
+    async_: bool,
+    memory: bool,
+) -> bool {
+    options.string_encoding.is_none()
+        && options.async_ == async_
+        && options.realloc.is_none()
+        && match (&options.memory, memory) {
+            (None, false) => true,
+            (Some(memory), true) => memory.core_instance == 0 && memory.export == "memory",
+            _ => false,
+        }
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_bytes_type(value: &vibeos_component_runtime::value::ValueType) -> bool {
+    use vibeos_component_runtime::value::ValueType;
+
     matches!(
-        &native.canonical_plans()[0].function,
-        NativeAsyncCanonicalFunctionPlan::Lift {
-            core_function,
-            callback,
-            options,
-            ..
-        } if core_function.core_instance == 0
-            && core_function.export == "run"
-            && callback.core_instance == 0
-            && callback.export == "callback"
-            && options.async_
-            && options.memory.is_none()
-            && options.realloc.is_none()
+        value,
+        ValueType::Stream {
+            type_id,
+            element: Some(element),
+        } if type_id.get() == 1 && **element == ValueType::U8
+    )
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_closed_type(value: &vibeos_component_runtime::value::ValueType) -> bool {
+    use vibeos_component_runtime::value::ValueType;
+
+    matches!(
+        value,
+        ValueType::Future {
+            type_id,
+            payload: Some(payload),
+        } if type_id.get() == 2 && **payload == ValueType::Enum(8)
+    )
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_byte_stream_type(value: &vibeos_component_runtime::value::ValueType) -> bool {
+    use vibeos_component_runtime::value::ValueType;
+
+    matches!(
+        value,
+        ValueType::Record(fields)
+            if fields.len() == 2
+                && native_bytes_type(&fields[0])
+                && native_closed_type(&fields[1])
     )
 }
 

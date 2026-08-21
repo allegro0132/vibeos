@@ -24,9 +24,8 @@ const STREAM_COMPONENT: &str =
     include_str!("../../../component-runtime/tests/fixtures/host-stream.component.wat");
 const STREAM_WIT: &str = include_str!("../../../component-format/tests/corpus/wit/stream.wit");
 #[cfg(feature = "native-async-acceptance")]
-const NATIVE_STREAM_COMPONENT: &str = include_str!(
-    "../../../component-format/tests/corpus/component/native-async-stream-0.255.0.component.wat"
-);
+const NATIVE_STREAM_COMPONENT: &str =
+    include_str!("../../../policy/image/artifacts/c53-native-async-filter.component.wat");
 
 fn artifact_and_exact_world(source: &str) -> (ComponentArtifact, WorldContract) {
     let bytes = wat::parse_str(source).unwrap();
@@ -451,15 +450,19 @@ fn native_async_acceptance_candidate_is_sealed_inert_and_authority_free() {
     let plan = candidate.validated_plan().unwrap();
     assert!(!plan.runtime_ready());
     assert!(!plan.native_async_runtime_ready());
-    assert_eq!(plan.runtime_instance_count(), 1);
+    assert_eq!(plan.embedded_modules().len(), 2);
+    assert_eq!(plan.runtime_instance_count(), 2);
     assert_eq!(plan.summary().resources, 0);
     assert_eq!(plan.executable_exports().count(), 0);
     let native = plan.native_async_execution_plan().unwrap();
-    assert_eq!(native.instances().len(), 1);
-    assert_eq!(native.canonical_plans().len(), 1);
-    assert!(native.canonical_import_bridges().is_empty());
+    assert_eq!(native.instances().len(), 2);
+    assert!(native.instances()[0].imports.is_empty());
+    assert_eq!(native.instances()[1].imports.len(), 15);
+    assert_eq!(native.canonical_plans().len(), 15);
+    assert_eq!(native.canonical_import_bridges().len(), 14);
     assert_eq!(native.exports().len(), 1);
     assert_eq!(native.exports()[0].name, "run");
+    assert_eq!(native.exports()[0].canonical, 14);
 }
 
 #[cfg(feature = "native-async-acceptance")]
@@ -511,6 +514,62 @@ fn native_async_acceptance_rejects_authority_modes_limits_and_adjacent_topology(
         1,
     );
     let bytes = wat::parse_str(&adjacent).unwrap();
+    let artifact = ComponentArtifact::copy_from(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    let policy = native_policy(artifact.identity(), &world, &[]);
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+
+    let nonminimal_provider = NATIVE_STREAM_COMPONENT.replacen(
+        "  (core module $memory-provider\n    (memory (export \"memory\") 1 1))",
+        "  (core module $memory-provider\n    (func (export \"unexpected\"))\n    (memory (export \"memory\") 1 1))",
+        1,
+    );
+    assert_ne!(nonminimal_provider, NATIVE_STREAM_COMPONENT);
+    let bytes = wat::parse_str(&nonminimal_provider).unwrap();
+    let artifact = ComponentArtifact::copy_from(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    let policy = native_policy(artifact.identity(), &world, &[]);
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+
+    let extra_bridge = NATIVE_STREAM_COMPONENT
+        .replacen(
+            "  (core instance $builtins",
+            "  (core func $extra-task-cancel (canon task.cancel))\n  (core instance $builtins",
+            1,
+        )
+        .replacen(
+            "    (export \"task-return\" (func $task-return))",
+            "    (export \"task-return\" (func $task-return))\n    (export \"extra-task-cancel\" (func $extra-task-cancel))",
+            1,
+        )
+        .replacen(
+            "    (import \"vibe:async\" \"task-return\"\n      (func $task-return (param i32 i32)))",
+            "    (import \"vibe:async\" \"task-return\"\n      (func $task-return (param i32 i32)))\n    (import \"vibe:async\" \"extra-task-cancel\"\n      (func $extra-task-cancel))",
+            1,
+        );
+    let bytes = wat::parse_str(&extra_bridge).unwrap();
     let artifact = ComponentArtifact::copy_from(
         &bytes,
         ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,

@@ -109,6 +109,14 @@ ssh-native-async-qemu-acceptance = [
     "ssh-native-async-command",
     "vibeos-vsh/managed-component-target-acceptance",
 ]
+# C5.4c QEMU-only exact-incarnation revoke/fault gate. The firmware image must
+# still select ssh-test and C4.8 explicitly; this feature contributes only the
+# formal native route and target-only SSH/VSH coordination surfaces.
+ssh-native-async-revoke-qemu-acceptance = [
+    "ssh-native-async-command",
+    "vibeos-sshd/native-revoke-target-acceptance",
+    "vibeos-vsh/managed-component-target-acceptance",
+]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
 # until the Rust rewrite's validation and independent review gates have passed.

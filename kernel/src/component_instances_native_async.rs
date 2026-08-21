@@ -7,6 +7,8 @@
 //! pending-operation shadow while the validation-only profile and runtime
 //! readiness bits remain inert.
 
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+use super::native_pending_shadow_model::ExactRevokeDecision;
 use super::native_pending_shadow_model::{
     BackendEffect, ExactBackendAction, ExactBackendPendingKind as PendingKind, ExactBackendReturn,
     ExactCancelCause, ExactCancelPlan, ExactCleanupDecision, ExactContinuation,
@@ -1005,6 +1007,161 @@ type NativeResidualCancelPlan = ExactResidualCancelPlan<
 type NativeResourceRevokePlan =
     ExactResourceRevokePlan<InstanceToken, TaskId, AllocationDomain, RegistryStreamBindings>;
 
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_TARGET_EVENT: u64 = 1;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_PARTIAL_FIRST: usize = 257;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_PARTIAL_SECOND: usize = DRIVER_CHUNK_BYTES - C54_PARTIAL_FIRST;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_HEALTHY_MAGIC: &[u8] = b"VIBE-C54-HEALTHY\n";
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_LINEARIZED_MAGIC: &[u8] = b"VIBE-C54-LINEARIZED\n";
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_RAW_INVOKING_MAGIC: &[u8] = b"VIBE-C54-RAW-INVOKING\n";
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_RAW_LINEARIZED_MAGIC: &[u8] = b"VIBE-C54-RAW-LINEARIZED\n";
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum C54Scenario {
+    Undecided,
+    Healthy,
+    LinearizedGuard,
+    RawInvoking,
+    RawLinearized,
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum C54WorkerKind {
+    ConsumedPending,
+    InvokingDeferred,
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct C54ManagedIdentity {
+    driver: DriverIdentity,
+    managed: ManagedComponentToken,
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+#[derive(Clone, Copy)]
+struct C54WorkerRequest {
+    kind: C54WorkerKind,
+    identity: DriverIdentity,
+    continuation: Option<InstanceContinuationToken>,
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+struct C54TargetAudit {
+    primary: Option<C54ManagedIdentity>,
+    replacement: Option<C54ManagedIdentity>,
+    scenario: C54Scenario,
+    drain_open: bool,
+    worker_request: Option<C54WorkerRequest>,
+    worker_complete: bool,
+    cancel_plan: Option<NativeCancelPlan>,
+    stale_snapshot: Option<NativeLedgerSnapshot>,
+    stale_continuation: Option<InstanceContinuationToken>,
+    starts: u64,
+    shadow_retires: u64,
+    claims: u64,
+    pending_claims: u64,
+    deferred_claims: u64,
+    cap_revokes: u64,
+    backend_cancels: u64,
+    core_already_consumed: u64,
+    consumed_deltas: u64,
+    runtime_cancel_acks: u64,
+    cancel_idles: u64,
+    partial_total: u64,
+    partial_first: u64,
+    partial_second: u64,
+    partial_commits: u8,
+    waiting_ops: u64,
+    cancelled_terminals: u64,
+    terminals: u64,
+    cspace_resets: u64,
+    reaper_notifies: u64,
+    acknowledgements: u64,
+    ssh_completions: u64,
+    late_wake_stale: u64,
+    restart_stale_claim: u64,
+    restart_stale_backend: u64,
+    replacement_success: u64,
+    backend_effects: u64,
+    raw_faults: u64,
+    raw_reclaims: u64,
+    raw_phase: Option<ExactLedgerPhase>,
+    failed: bool,
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+impl C54TargetAudit {
+    const fn new() -> Self {
+        Self {
+            primary: None,
+            replacement: None,
+            scenario: C54Scenario::Undecided,
+            drain_open: false,
+            worker_request: None,
+            worker_complete: false,
+            cancel_plan: None,
+            stale_snapshot: None,
+            stale_continuation: None,
+            starts: 0,
+            shadow_retires: 0,
+            claims: 0,
+            pending_claims: 0,
+            deferred_claims: 0,
+            cap_revokes: 0,
+            backend_cancels: 0,
+            core_already_consumed: 0,
+            consumed_deltas: 0,
+            runtime_cancel_acks: 0,
+            cancel_idles: 0,
+            partial_total: 0,
+            partial_first: 0,
+            partial_second: 0,
+            partial_commits: 0,
+            waiting_ops: 0,
+            cancelled_terminals: 0,
+            terminals: 0,
+            cspace_resets: 0,
+            reaper_notifies: 0,
+            acknowledgements: 0,
+            ssh_completions: 0,
+            late_wake_stale: 0,
+            restart_stale_claim: 0,
+            restart_stale_backend: 0,
+            replacement_success: 0,
+            backend_effects: 0,
+            raw_faults: 0,
+            raw_reclaims: 0,
+            raw_phase: None,
+            failed: false,
+        }
+    }
+
+    fn is_primary(&self, identity: DriverIdentity) -> bool {
+        self.primary.is_some_and(|target| target.driver == identity)
+    }
+
+    fn is_replacement(&self, identity: DriverIdentity) -> bool {
+        self.replacement
+            .is_some_and(|target| target.driver == identity)
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+static C54_TARGET: SpinLock<C54TargetAudit> = SpinLock::new(C54TargetAudit::new());
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+static C54_WORK_READY: OneShotWaitQueue = OneShotWaitQueue::new();
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+static C54_WORK_COMPLETE: OneShotWaitQueue = OneShotWaitQueue::new();
+
 static PENDING_LEDGERS: [SpinLock<NativeOperationLedger>; CONTROL_SLOTS] =
     [const { SpinLock::new(NativeOperationLedger::new()) }; CONTROL_SLOTS];
 static SHADOW_KIND_INSTALLS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -1041,6 +1198,645 @@ fn with_ledger<T>(
         return Err(ExactLedgerError::IdentityMismatch);
     };
     operation(&mut slot.lock())
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_policy_exact(policy: SshExecComponentSessionPolicy) -> bool {
+    policy.command_name() == command_name()
+        && ssh_exec_policy(policy.profile()) == Some(policy)
+        && policy_gate_passed()
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_fail(reason: &'static str) {
+    let publish = {
+        let mut audit = C54_TARGET.lock();
+        let publish = !audit.failed;
+        audit.failed = true;
+        publish
+    };
+    if publish {
+        crate::println!("WASM_C54_NATIVE_REVOKE FAIL reason={}", reason);
+    }
+    lifecycle_fail_stop();
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_revoke_fail(reason: &'static str) {
+    c54_fail(reason);
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_record_revoke_start(
+    key: ControlKey,
+    instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+    managed: ManagedComponentToken,
+) -> bool {
+    let identity = C54ManagedIdentity {
+        driver: DriverIdentity {
+            key,
+            instance,
+            task,
+            domain,
+            streams,
+        },
+        managed,
+    };
+    let (starts, primary, stale) = {
+        let audit = C54_TARGET.lock();
+        (
+            audit.starts,
+            audit.primary,
+            audit.stale_snapshot.map(|snapshot| {
+                (
+                    audit.primary.expect("stale snapshot has a primary").driver,
+                    snapshot,
+                )
+            }),
+        )
+    };
+    match starts {
+        0 => {
+            let mut audit = C54_TARGET.lock();
+            if audit.starts != 0 || audit.primary.is_some() || audit.failed {
+                return false;
+            }
+            audit.primary = Some(identity);
+            audit.starts = 1;
+            audit.drain_open = false;
+            true
+        }
+        1 => {
+            let Some((old_identity, stale_snapshot)) = stale else {
+                return false;
+            };
+            if primary.is_none()
+                || primary == Some(identity)
+                || with_ledger(old_identity, |ledger| {
+                    ledger.claim_revoke(
+                        old_identity
+                            .exact()
+                            .ok_or(ExactLedgerError::IdentityMismatch)?,
+                        ExactStreamResource::StdoutWriter,
+                    )
+                }) != Err(ExactLedgerError::StaleGeneration)
+                || with_ledger(old_identity, |ledger| {
+                    ledger.begin_backend(stale_snapshot, ExactBackendAction::Resume)
+                }) != Err(ExactLedgerError::StaleGeneration)
+            {
+                return false;
+            }
+            let mut audit = C54_TARGET.lock();
+            if audit.starts != 1
+                || audit.scenario != C54Scenario::Healthy
+                || audit.acknowledgements != 1
+                || audit.ssh_completions != 1
+                || audit.replacement.is_some()
+                || audit.failed
+            {
+                return false;
+            }
+            audit.replacement = Some(identity);
+            audit.starts = 2;
+            audit.restart_stale_claim = 1;
+            audit.restart_stale_backend = 1;
+            audit.drain_open = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_stdout_drain_permitted(policy: SshExecComponentSessionPolicy) -> bool {
+    if !c54_policy_exact(policy) {
+        return false;
+    }
+    let audit = C54_TARGET.lock();
+    // Close from admission so the permit check and the later stdout consume
+    // cannot straddle a target transition. The ninth output operation opens
+    // the gate monotonically after registering its real stream wake.
+    !audit.failed && audit.drain_open
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_stdin_chunk_limit(
+    policy: SshExecComponentSessionPolicy,
+    accepted_bytes: usize,
+) -> Result<usize, &'static str> {
+    if !c54_policy_exact(policy) {
+        return Err("native revoke stdin policy changed");
+    }
+    let audit = C54_TARGET.lock();
+    if audit.failed {
+        return Err("native revoke stdin audit failed");
+    }
+    match accepted_bytes {
+        0 => Ok(C54_PARTIAL_FIRST),
+        C54_PARTIAL_FIRST => Ok(C54_PARTIAL_SECOND),
+        _ => Ok(DRIVER_CHUNK_BYTES),
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_select_scenario(identity: DriverIdentity, input: &[u8]) -> bool {
+    {
+        let audit = C54_TARGET.lock();
+        if audit.is_replacement(identity) && !audit.failed {
+            return true;
+        }
+        if audit.is_primary(identity) && audit.scenario != C54Scenario::Undecided && !audit.failed {
+            return true;
+        }
+    }
+    let scenario = if input.starts_with(C54_HEALTHY_MAGIC) {
+        C54Scenario::Healthy
+    } else if input.starts_with(C54_LINEARIZED_MAGIC) {
+        C54Scenario::LinearizedGuard
+    } else if input.starts_with(C54_RAW_INVOKING_MAGIC) {
+        C54Scenario::RawInvoking
+    } else if input.starts_with(C54_RAW_LINEARIZED_MAGIC) {
+        C54Scenario::RawLinearized
+    } else {
+        return false;
+    };
+    let mut audit = C54_TARGET.lock();
+    if !audit.is_primary(identity)
+        || audit.scenario != C54Scenario::Undecided
+        || audit.partial_commits != 0
+        || audit.failed
+    {
+        return false;
+    }
+    audit.scenario = scenario;
+    true
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_input_progress(identity: DriverIdentity, progress: usize) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if audit.is_replacement(identity) && !audit.failed {
+        return true;
+    }
+    if !audit.is_primary(identity) || audit.failed || audit.scenario == C54Scenario::Undecided {
+        return false;
+    }
+    match audit.partial_commits {
+        0 if progress == C54_PARTIAL_FIRST => {
+            audit.partial_first = progress as u64;
+            audit.partial_total = progress as u64;
+            audit.partial_commits = 1;
+            true
+        }
+        1 if progress == C54_PARTIAL_SECOND => {
+            audit.partial_second = progress as u64;
+            audit.partial_total = audit.partial_total.saturating_add(progress as u64);
+            audit.partial_commits = 2;
+            true
+        }
+        2.. => true,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_is_healthy_primary(identity: DriverIdentity) -> bool {
+    let audit = C54_TARGET.lock();
+    audit.is_primary(identity) && audit.scenario == C54Scenario::Healthy && !audit.failed
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_cap_revoke(identity: DriverIdentity) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if !audit.is_primary(identity) || audit.scenario != C54Scenario::Healthy || audit.failed {
+        return false;
+    }
+    audit.cap_revokes += 1;
+    audit.cap_revokes == 1
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_backend_cancel(identity: DriverIdentity) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if !audit.is_primary(identity) || audit.scenario != C54Scenario::Healthy || audit.failed {
+        return false;
+    }
+    audit.backend_cancels += 1;
+    audit.backend_cancels == 1
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_runtime_cancel(identity: DriverIdentity) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if !audit.is_primary(identity) || audit.scenario != C54Scenario::Healthy || audit.failed {
+        return false;
+    }
+    audit.runtime_cancel_acks += 1;
+    audit.runtime_cancel_acks == 1
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_cancel_idle(identity: DriverIdentity) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if !audit.is_primary(identity) || audit.scenario != C54Scenario::Healthy || audit.failed {
+        return false;
+    }
+    audit.cancel_idles += 1;
+    audit.cancel_idles == 1
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_preserve_cancelled_after_stdout_revoke(
+    key: ControlKey,
+    instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+) -> bool {
+    let identity = DriverIdentity {
+        key,
+        instance,
+        task,
+        domain,
+        streams,
+    };
+    let Some(exact) = identity.exact() else {
+        return false;
+    };
+    let resources = with_ledger(identity, |ledger| {
+        Ok((
+            ledger.resource_state(exact, ExactStreamResource::StdinReader)?,
+            ledger.resource_state(exact, ExactStreamResource::StdoutWriter)?,
+        ))
+    });
+    if resources != Ok((ExactResourceState::Live, ExactResourceState::Revoked)) {
+        return false;
+    }
+    let audit = C54_TARGET.lock();
+    audit.is_primary(identity)
+        && audit.scenario == C54Scenario::Healthy
+        && audit.worker_complete
+        && audit.worker_request.is_some_and(|request| {
+            request.kind == C54WorkerKind::ConsumedPending && request.identity == identity
+        })
+        && audit.cancel_plan.is_none()
+        && audit.claims == 1
+        && audit.pending_claims == 1
+        && audit.deferred_claims == 0
+        && audit.cap_revokes == 1
+        && audit.backend_cancels == 1
+        && audit.core_already_consumed == 1
+        && audit.consumed_deltas == 1
+        && audit.runtime_cancel_acks == 1
+        && audit.cancel_idles == 1
+        && audit.waiting_ops == 1
+        && audit.cancelled_terminals == 0
+        && audit.terminals == 0
+        && !audit.failed
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_terminal_projection_exact(
+    identity: DriverIdentity,
+    terminal: ComponentTerminal,
+    stdin: ExactResourceState,
+    stdout: ExactResourceState,
+) -> bool {
+    let audit = C54_TARGET.lock();
+    if audit.failed {
+        return false;
+    }
+    if audit.is_primary(identity) {
+        audit.scenario == C54Scenario::Healthy
+            && terminal == ComponentTerminal::Cancelled
+            && stdin == ExactResourceState::Live
+            && stdout == ExactResourceState::Revoked
+            && audit.cap_revokes == 1
+            && audit.backend_cancels == 1
+            && audit.runtime_cancel_acks == 1
+            && audit.cancel_idles == 1
+    } else if audit.is_replacement(identity) {
+        terminal == ComponentTerminal::Success
+            && stdin == ExactResourceState::Live
+            && stdout == ExactResourceState::Live
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_shadow_retired(identity: DriverIdentity) -> bool {
+    let continuation = {
+        let audit = C54_TARGET.lock();
+        if audit.failed {
+            return false;
+        }
+        if audit.is_primary(identity) {
+            if audit.shadow_retires != 0 {
+                return false;
+            }
+            audit.stale_continuation
+        } else if audit.is_replacement(identity) {
+            if audit.shadow_retires != 1 {
+                return false;
+            }
+            None
+        } else {
+            return false;
+        }
+    };
+    if let Some(continuation) = continuation {
+        if registry().signal_continuation(continuation)
+            != crate::instance::InstanceContinuationSignal::Stale
+        {
+            return false;
+        }
+    }
+    let mut audit = C54_TARGET.lock();
+    if continuation.is_some() {
+        audit.late_wake_stale += 1;
+    }
+    audit.shadow_retires += 1;
+    audit.shadow_retires == audit.starts
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_record_revoke_terminal(
+    key: ControlKey,
+    instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+    terminal: ComponentTerminal,
+) -> bool {
+    let identity = DriverIdentity {
+        key,
+        instance,
+        task,
+        domain,
+        streams,
+    };
+    let mut audit = C54_TARGET.lock();
+    if audit.failed || audit.shadow_retires != audit.terminals.saturating_add(1) {
+        return false;
+    }
+    if audit.is_primary(identity) {
+        if audit.scenario != C54Scenario::Healthy
+            || terminal != ComponentTerminal::Cancelled
+            || audit.cancelled_terminals != 0
+        {
+            return false;
+        }
+        audit.cancelled_terminals = 1;
+    } else if audit.is_replacement(identity) {
+        if terminal != ComponentTerminal::Success || audit.replacement_success != 0 {
+            return false;
+        }
+        audit.replacement_success = 1;
+    } else {
+        return false;
+    }
+    audit.terminals += 1;
+    audit.cspace_resets += 1;
+    audit.terminals == audit.starts && audit.cspace_resets == audit.starts
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_record_revoke_reaper(
+    key: ControlKey,
+    instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+    managed: ManagedComponentToken,
+    terminal: ComponentTerminal,
+) -> bool {
+    let expected = C54ManagedIdentity {
+        driver: DriverIdentity {
+            key,
+            instance,
+            task,
+            domain,
+            streams,
+        },
+        managed,
+    };
+    let mut audit = C54_TARGET.lock();
+    if audit.failed || audit.terminals != audit.reaper_notifies.saturating_add(1) {
+        return false;
+    }
+    let exact = if audit.primary == Some(expected) {
+        terminal == ComponentTerminal::Cancelled
+    } else if audit.replacement == Some(expected) {
+        terminal == ComponentTerminal::Success
+    } else {
+        false
+    };
+    if !exact {
+        return false;
+    }
+    audit.reaper_notifies += 1;
+    audit.reaper_notifies == audit.terminals
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_record_revoke_ack(
+    key: ControlKey,
+    managed: ManagedComponentToken,
+    terminal: ComponentTerminal,
+) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if audit.failed || audit.reaper_notifies != audit.acknowledgements.saturating_add(1) {
+        return false;
+    }
+    let exact = audit
+        .primary
+        .is_some_and(|identity| identity.driver.key == key && identity.managed == managed)
+        && terminal == ComponentTerminal::Cancelled
+        || audit
+            .replacement
+            .is_some_and(|identity| identity.driver.key == key && identity.managed == managed)
+            && terminal == ComponentTerminal::Success;
+    if !exact {
+        return false;
+    }
+    audit.acknowledgements += 1;
+    audit.acknowledgements == audit.reaper_notifies
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_revoke_pending_shadow_residue() -> usize {
+    PENDING_LEDGERS
+        .iter()
+        .filter(|ledger| ledger.lock().phase() != ExactLedgerPhase::Retired)
+        .count()
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_raw_fault_seen(identity: DriverIdentity, phase: ExactLedgerPhase) -> bool {
+    let mut audit = C54_TARGET.lock();
+    let expected = match audit.scenario {
+        C54Scenario::RawInvoking => ExactLedgerPhase::BackendInvoking,
+        C54Scenario::RawLinearized => ExactLedgerPhase::BackendLinearized,
+        _ => return false,
+    };
+    if !audit.is_primary(identity)
+        || audit.failed
+        || phase != expected
+        || audit.raw_faults != 0
+        || audit.raw_phase.is_some()
+    {
+        return false;
+    }
+    audit.raw_faults = 1;
+    audit.raw_phase = Some(phase);
+    true
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) fn target_record_raw_fault_outcome(
+    key: ControlKey,
+    instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+    reclaimed: bool,
+) {
+    let identity = DriverIdentity {
+        key,
+        instance,
+        task,
+        domain,
+        streams,
+    };
+    let (passed, phase) = {
+        let mut audit = C54_TARGET.lock();
+        if reclaimed {
+            audit.raw_reclaims += 1;
+        }
+        let phase = match audit.raw_phase {
+            Some(ExactLedgerPhase::BackendInvoking) => "backend-invoking",
+            Some(ExactLedgerPhase::BackendLinearized) => "backend-linearized",
+            _ => "invalid",
+        };
+        let passed = audit.is_primary(identity)
+            && !reclaimed
+            && !audit.failed
+            && audit.starts == 1
+            && audit.raw_faults == 1
+            && audit.raw_reclaims == 0
+            && audit.terminals == 0
+            && audit.cspace_resets == 0
+            && audit.reaper_notifies == 0
+            && audit.acknowledgements == 0
+            && ((audit.scenario == C54Scenario::RawInvoking
+                && audit.raw_phase == Some(ExactLedgerPhase::BackendInvoking)
+                && audit.backend_effects == 0)
+                || (audit.scenario == C54Scenario::RawLinearized
+                    && audit.raw_phase == Some(ExactLedgerPhase::BackendLinearized)
+                    && audit.backend_effects == 1));
+        (passed, phase)
+    };
+    if passed {
+        crate::println!(
+            "WASM_C54_NATIVE_RAW_FAULT_GUARD PASS phase={} starts=1 raw_faults=1 raw_reclaims=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0",
+            phase,
+        );
+    } else {
+        c54_fail("raw-fault-guard-evidence");
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn target_revoke_ssh_completed(
+    status: u32,
+    route_exact: bool,
+    gates_open: bool,
+    pending_shadows: usize,
+    registry_occupied: usize,
+    registry_header_mismatches: usize,
+    control_live: usize,
+    stream_bindings: usize,
+    cleanup_shadows: usize,
+    reaper_slots: usize,
+    reaper_waiters: usize,
+) -> bool {
+    let residues_zero = pending_shadows == 0
+        && registry_occupied == 0
+        && registry_header_mismatches == 0
+        && control_live == 0
+        && stream_bindings == 0
+        && cleanup_shadows == 0
+        && reaper_slots == 0
+        && reaper_waiters == 0;
+    let mut audit = C54_TARGET.lock();
+    let common = !audit.failed
+        && audit.scenario == C54Scenario::Healthy
+        && route_exact
+        && gates_open
+        && residues_zero
+        && audit.claims == 1
+        && audit.pending_claims == 1
+        && audit.deferred_claims == 0
+        && audit.cap_revokes == 1
+        && audit.backend_cancels == 1
+        && audit.core_already_consumed == 1
+        && audit.consumed_deltas == 1
+        && audit.runtime_cancel_acks == 1
+        && audit.cancel_idles == 1
+        && audit.partial_total == DRIVER_CHUNK_BYTES as u64
+        && audit.partial_first == C54_PARTIAL_FIRST as u64
+        && audit.partial_second == C54_PARTIAL_SECOND as u64
+        && audit.partial_commits == 2
+        && audit.waiting_ops == 1
+        && audit.cancelled_terminals == 1
+        && audit.late_wake_stale == 1
+        && audit.raw_faults == 0
+        && audit.raw_reclaims == 0;
+    match audit.ssh_completions {
+        0 => {
+            let passed = common
+                && status == 130
+                && audit.starts == 1
+                && audit.shadow_retires == 1
+                && audit.terminals == 1
+                && audit.cspace_resets == 1
+                && audit.reaper_notifies == 1
+                && audit.acknowledgements == 1
+                && audit.replacement.is_none()
+                && audit.replacement_success == 0
+                && audit.restart_stale_claim == 0
+                && audit.restart_stale_backend == 0;
+            if passed {
+                audit.ssh_completions = 1;
+            }
+            passed
+        }
+        1 => {
+            let passed = common
+                && status == 0
+                && audit.starts == 2
+                && audit.shadow_retires == 2
+                && audit.terminals == 2
+                && audit.cspace_resets == 2
+                && audit.reaper_notifies == 2
+                && audit.acknowledgements == 2
+                && audit.replacement.is_some()
+                && audit.replacement_success == 1
+                && audit.restart_stale_claim == 1
+                && audit.restart_stale_backend == 1;
+            if passed {
+                audit.ssh_completions = 2;
+                crate::println!("WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 partial_total=1024 partial_first=257 partial_second=767 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1");
+            }
+            passed
+        }
+        _ => false,
+    }
 }
 
 fn ledger_error_terminal(identity: DriverIdentity, error: ExactLedgerError) -> ComponentTerminal {
@@ -1311,16 +2107,28 @@ fn cancel_plan_in_space(
         return Err(());
     }
     let lease = if plan.claim().cause() == ExactCancelCause::Revoke {
-        revoke_endpoint_and_retain_cancel_lease(
+        let lease = revoke_endpoint_and_retain_cancel_lease(
             space,
             identity,
             plan.resource_revoke_plan(),
             plan.kind(),
-        )?
+        )?;
+        #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+        if c54_is_healthy_primary(identity) && !c54_record_cap_revoke(identity) {
+            return Err(());
+        }
+        lease
     } else {
         backend_cancel_lease(space, identity, plan.kind()).ok_or(())?
     };
     invoke_backend_cancel(lease, plan.backend()).map_err(|_| ())?;
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if plan.claim().cause() == ExactCancelCause::Revoke
+        && c54_is_healthy_primary(identity)
+        && !c54_record_backend_cancel(identity)
+    {
+        return Err(());
+    }
     let continuation = plan.continuation();
     let mut cancelled =
         with_ledger(identity, |ledger| ledger.finish_cancel(plan)).map_err(|_| ())?;
@@ -1422,10 +2230,25 @@ fn finish_live_revoke(
             ledger.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Cancelled)
         }),
     )?;
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if c54_is_healthy_primary(identity) && !c54_record_runtime_cancel(identity) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "C5.4 runtime cancel acknowledgement count",
+        ));
+    }
     model_result(
         identity,
         with_ledger(identity, |ledger| ledger.consume_cancelled(acknowledged)),
-    )
+    )?;
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if c54_is_healthy_primary(identity) && !c54_record_cancel_idle(identity) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "C5.4 cancel idle count",
+        ));
+    }
+    Ok(())
 }
 
 fn cancel_residual_in_current(
@@ -1597,10 +2420,21 @@ pub(super) fn retire_terminal_shadow(
         quarantine_shadow(identity);
         return false;
     }
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if !c54_record_shadow_retired(identity) {
+        quarantine_shadow(identity);
+        return false;
+    }
     true
 }
 
-fn validate_terminal_resource_projection(space: &InstanceSpace, identity: DriverIdentity) -> bool {
+fn validate_terminal_resource_projection(
+    space: &InstanceSpace,
+    identity: DriverIdentity,
+    terminal: ComponentTerminal,
+) -> bool {
+    #[cfg(not(feature = "ssh-native-async-revoke-qemu-acceptance"))]
+    let _ = terminal;
     let Some(exact) = identity.exact() else {
         return false;
     };
@@ -1652,6 +2486,10 @@ fn validate_terminal_resource_projection(space: &InstanceSpace, identity: Driver
         ),
         ExactResourceState::Revoking => false,
     };
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if !c54_terminal_projection_exact(identity, terminal, stdin, stdout) {
+        return false;
+    }
     stdin_exact && stdout_exact
 }
 
@@ -1682,7 +2520,7 @@ pub(super) fn prepare_terminal_shadow(
             return false;
         }
     };
-    if !validate_terminal_resource_projection(space, identity) {
+    if !validate_terminal_resource_projection(space, identity, terminal) {
         quarantine_shadow(identity);
         return false;
     }
@@ -1767,6 +2605,8 @@ pub(super) fn raw_fault_cleanup(
             return false;
         }
     };
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    let raw_phase = snapshot.map(NativeLedgerSnapshot::phase);
     if let Some(continuation) = snapshot.and_then(|snapshot| snapshot.continuation().token()) {
         if !receipt.matches_continuation(Some(continuation)) {
             quarantine_shadow(identity);
@@ -1778,6 +2618,22 @@ pub(super) fn raw_fault_cleanup(
         Ok(ExactCleanupDecision::ReclaimSafe) => return true,
         Ok(ExactCleanupDecision::Cancel(plan)) => plan,
         Ok(ExactCleanupDecision::Quarantined) | Err(_) => {
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            {
+                let expects_raw = {
+                    let audit = C54_TARGET.lock();
+                    audit.is_primary(identity)
+                        && matches!(
+                            audit.scenario,
+                            C54Scenario::RawInvoking | C54Scenario::RawLinearized
+                        )
+                };
+                if expects_raw
+                    && raw_phase.is_none_or(|phase| !c54_record_raw_fault_seen(identity, phase))
+                {
+                    c54_fail("raw-fault-phase");
+                }
+            }
             quarantine_shadow(identity);
             return false;
         }
@@ -1928,12 +2784,8 @@ async fn quantum(instance: InstanceToken) -> Result<(), ()> {
         .arm_continuation_current(instance, InstanceContinuationKind::Quantum)
         .map_err(|_| ())?;
     let continuation = registry().wait_continuation(operation).map_err(|_| ())?;
-    continuation
-        .await
-        .map_err(|_| ())?
-        .matches_token(operation)
-        .then_some(())
-        .ok_or(())
+    let consumed = continuation.await.map_err(|_| ())?;
+    consumed.matches_token(operation).then_some(()).ok_or(())
 }
 
 fn stream_wake(words: [usize; 4]) {
@@ -1951,6 +2803,347 @@ fn model_result<T>(
     result: Result<T, ExactLedgerError>,
 ) -> Result<T, ComponentTerminal> {
     result.map_err(|error| ledger_error_terminal(identity, error))
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+async fn c54_request_worker(
+    identity: DriverIdentity,
+    kind: C54WorkerKind,
+    continuation: Option<InstanceContinuationToken>,
+) -> Result<Option<NativeCancelPlan>, ComponentTerminal> {
+    let listener = C54_WORK_COMPLETE.wait(C54_TARGET_EVENT);
+    {
+        let mut audit = C54_TARGET.lock();
+        let scenario_exact = matches!(
+            (kind, audit.scenario),
+            (C54WorkerKind::ConsumedPending, C54Scenario::Healthy)
+                | (
+                    C54WorkerKind::InvokingDeferred,
+                    C54Scenario::LinearizedGuard
+                )
+        );
+        if !audit.is_primary(identity)
+            || !scenario_exact
+            || audit.worker_request.is_some()
+            || audit.worker_complete
+            || audit.cancel_plan.is_some()
+            || audit.failed
+            || (kind == C54WorkerKind::ConsumedPending) != continuation.is_some()
+        {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "C5.4 worker request mismatch",
+            ));
+        }
+        audit.worker_request = Some(C54WorkerRequest {
+            kind,
+            identity,
+            continuation,
+        });
+    }
+    let wake = C54_WORK_READY.publish(C54_TARGET_EVENT).map_err(|error| {
+        unexpected_native_driver_error(identity, ("C5.4 worker publish", error))
+    })?;
+    wake.dispatch();
+    listener.await.map_err(|error| {
+        unexpected_native_driver_error(identity, ("C5.4 worker completion", error))
+    })?;
+    let mut audit = C54_TARGET.lock();
+    if !audit.worker_complete || audit.failed {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "C5.4 worker did not complete exactly",
+        ));
+    }
+    match kind {
+        C54WorkerKind::ConsumedPending => audit.cancel_plan.take().map(Some).ok_or_else(|| {
+            unexpected_native_driver_error(identity, "C5.4 worker lost cancel plan")
+        }),
+        C54WorkerKind::InvokingDeferred if audit.cancel_plan.is_none() => Ok(None),
+        C54WorkerKind::InvokingDeferred => Err(unexpected_native_driver_error(
+            identity,
+            "C5.4 deferred claim manufactured a cancel plan",
+        )),
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_finish_worker(request: C54WorkerRequest, plan: Option<NativeCancelPlan>) -> bool {
+    {
+        let mut audit = C54_TARGET.lock();
+        if audit.worker_request.is_none_or(|current| {
+            current.kind != request.kind
+                || current.identity != request.identity
+                || current.continuation != request.continuation
+        }) || audit.worker_complete
+            || audit.failed
+        {
+            return false;
+        }
+        audit.cancel_plan = plan;
+        audit.worker_complete = true;
+    }
+    match C54_WORK_COMPLETE.publish(C54_TARGET_EVENT) {
+        Ok(wake) => {
+            wake.dispatch();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_abort_worker(reason: &'static str) {
+    c54_fail(reason);
+    if let Ok(wake) = C54_WORK_COMPLETE.publish(C54_TARGET_EVENT) {
+        wake.dispatch();
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(super) async fn run_revoke_worker() {
+    let listener = C54_WORK_READY.wait(C54_TARGET_EVENT);
+    let ready = C54_TARGET.lock().worker_request.is_some();
+    if !ready && listener.await.is_err() {
+        c54_abort_worker("worker-registration");
+        return;
+    }
+    let Some(request) = C54_TARGET.lock().worker_request else {
+        c54_abort_worker("worker-request-missing");
+        return;
+    };
+    let exact = match request.identity.exact() {
+        Some(exact) => exact,
+        None => {
+            c54_abort_worker("worker-identity");
+            return;
+        }
+    };
+    let decision = with_ledger(request.identity, |ledger| {
+        ledger.claim_revoke(exact, ExactStreamResource::StdoutWriter)
+    });
+    match (request.kind, decision) {
+        (C54WorkerKind::ConsumedPending, Ok(ExactRevokeDecision::Cancel(plan))) => {
+            let Some(continuation) = request.continuation else {
+                c54_abort_worker("pending-continuation-missing");
+                return;
+            };
+            if !matches!(
+                plan.continuation(),
+                ExactContinuation::WakeRegistered(current) if current == continuation
+            ) {
+                c54_abort_worker("pending-plan-continuation");
+                return;
+            }
+            let receipt = match registry().signal_continuation(continuation) {
+                crate::instance::InstanceContinuationSignal::AlreadyConsumed(receipt)
+                    if receipt.matches_token(continuation) =>
+                {
+                    receipt
+                }
+                _ => {
+                    c54_abort_worker("pending-core-not-consumed");
+                    return;
+                }
+            };
+            let projected = with_ledger(request.identity, |ledger| {
+                ledger.project_consumed_continuation(exact, receipt.token())
+            });
+            if !matches!(
+                projected,
+                Ok(snapshot)
+                    if snapshot.phase() == ExactLedgerPhase::CancelClaimed
+                        && snapshot.continuation()
+                            == ExactContinuation::Consumed(continuation)
+            ) {
+                c54_abort_worker("pending-consumed-projection");
+                return;
+            }
+            {
+                let mut audit = C54_TARGET.lock();
+                audit.claims += 1;
+                audit.pending_claims += 1;
+                audit.core_already_consumed += 1;
+                audit.consumed_deltas += 1;
+            }
+            if !c54_finish_worker(request, Some(plan)) {
+                c54_abort_worker("pending-worker-completion");
+            }
+        }
+        (C54WorkerKind::InvokingDeferred, Ok(ExactRevokeDecision::Deferred(_))) => {
+            {
+                let mut audit = C54_TARGET.lock();
+                audit.claims += 1;
+                audit.deferred_claims += 1;
+            }
+            if !c54_finish_worker(request, None) {
+                c54_abort_worker("deferred-worker-completion");
+            }
+        }
+        _ => c54_abort_worker("worker-revoke-decision"),
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+async fn c54_before_output_backend(
+    identity: DriverIdentity,
+    invoking: NativeLedgerSnapshot,
+) -> Result<(), ComponentTerminal> {
+    let scenario = {
+        let audit = C54_TARGET.lock();
+        if !audit.is_primary(identity) || audit.failed {
+            return Ok(());
+        }
+        audit.scenario
+    };
+    if invoking.phase() != ExactLedgerPhase::BackendInvoking {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "C5.4 output did not enter BackendInvoking",
+        ));
+    }
+    match scenario {
+        C54Scenario::LinearizedGuard => {
+            c54_request_worker(identity, C54WorkerKind::InvokingDeferred, None)
+                .await
+                .map(|_| ())
+        }
+        C54Scenario::RawInvoking => {
+            panic!("deliberate C5.4 raw fault at BackendInvoking");
+        }
+        C54Scenario::Undecided => Err(unexpected_native_driver_error(
+            identity,
+            "C5.4 output preceded scenario selection",
+        )),
+        C54Scenario::Healthy | C54Scenario::RawLinearized => Ok(()),
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_after_output_linearized(identity: DriverIdentity, linearized: NativeLedgerSnapshot) {
+    let raw = {
+        let mut audit = C54_TARGET.lock();
+        if !audit.is_primary(identity) || audit.failed {
+            return;
+        }
+        if audit.scenario == C54Scenario::RawLinearized {
+            audit.backend_effects += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if raw {
+        assert_eq!(linearized.phase(), ExactLedgerPhase::BackendLinearized);
+        panic!("deliberate C5.4 raw fault at BackendLinearized");
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_linearized_guard(identity: DriverIdentity) {
+    let exact_ledger = ledger_slot(identity.key).is_some_and(|slot| {
+        let ledger = slot.lock();
+        ledger.phase() == ExactLedgerPhase::Quarantined
+            && ledger.is_quarantined()
+            && ledger.quarantined_effect()
+                == Some(BackendEffect::OutputSent {
+                    length: C54_PARTIAL_FIRST as u16,
+                })
+            && identity.exact().is_some_and(|exact| {
+                ledger.quarantined_resource_state(exact, ExactStreamResource::StdoutWriter)
+                    == Some(ExactResourceState::Revoking)
+            })
+    });
+    let passed = {
+        let mut audit = C54_TARGET.lock();
+        if !audit.is_primary(identity)
+            || audit.scenario != C54Scenario::LinearizedGuard
+            || audit.failed
+        {
+            return;
+        }
+        audit.backend_effects += 1;
+        exact_ledger
+            && audit.starts == 1
+            && audit.claims == 1
+            && audit.deferred_claims == 1
+            && audit.backend_effects == 1
+            && audit.cap_revokes == 0
+            && audit.backend_cancels == 0
+            && audit.runtime_cancel_acks == 0
+            && audit.terminals == 0
+            && audit.cspace_resets == 0
+            && audit.reaper_notifies == 0
+            && audit.acknowledgements == 0
+            && audit.raw_reclaims == 0
+    };
+    if passed {
+        crate::println!("WASM_C54_NATIVE_LINEARIZED_GUARD PASS starts=1 claims=1 deferred_claims=1 backend_effects=1 cap_revokes=0 backend_cancels=0 runtime_cancel_acks=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0 raw_reclaims=0");
+    } else {
+        c54_fail("linearized-guard-evidence");
+    }
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_open_stdout_drain(
+    identity: DriverIdentity,
+    registered: NativeLedgerSnapshot,
+) -> Result<(), ComponentTerminal> {
+    let continuation = match registered.continuation() {
+        ExactContinuation::WakeRegistered(continuation) => continuation,
+        _ => {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "C5.4 waiting output lacked registered continuation",
+            ));
+        }
+    };
+    {
+        let mut audit = C54_TARGET.lock();
+        if !audit.is_primary(identity) || audit.scenario != C54Scenario::Healthy {
+            return Ok(());
+        }
+        if audit.waiting_ops != 0
+            || audit.drain_open
+            || registered.pending_kind() != Some(PendingKind::WriteWaiting)
+            || audit.partial_total != DRIVER_CHUNK_BYTES as u64
+            || audit.failed
+        {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "C5.4 waiting output evidence mismatch",
+            ));
+        }
+        audit.waiting_ops = 1;
+        audit.stale_snapshot = Some(registered);
+        audit.stale_continuation = Some(continuation);
+        audit.drain_open = true;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+async fn c54_claim_after_consumed(
+    identity: DriverIdentity,
+    receipt: InstanceContinuationConsumed,
+) -> Result<Option<NativeCancelPlan>, ComponentTerminal> {
+    let target = {
+        let audit = C54_TARGET.lock();
+        audit.is_primary(identity)
+            && audit.scenario == C54Scenario::Healthy
+            && audit.waiting_ops == 1
+            && audit.stale_continuation == Some(receipt.token())
+            && !audit.failed
+    };
+    if !target {
+        return Ok(None);
+    }
+    c54_request_worker(
+        identity,
+        C54WorkerKind::ConsumedPending,
+        Some(receipt.token()),
+    )
+    .await
 }
 
 fn abort_backend_call(
@@ -2130,6 +3323,10 @@ async fn await_writer_wake(
         }),
     )?;
     let returned = backend_return_pending(identity, registered)?;
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if let BackendPendingOutcome::Pending(registered) = returned {
+        c54_open_stdout_drain(identity, registered)?;
+    }
     let consumed = continuation
         .await
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
@@ -2138,6 +3335,13 @@ async fn await_writer_wake(
             identity,
             "writer continuation receipt mismatch",
         ));
+    }
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if let Some(plan) = c54_claim_after_consumed(identity, consumed).await? {
+        let cancelled = cancel_plan_in_current(identity, plan).map_err(|()| {
+            unexpected_native_driver_error(identity, "C5.4 exact pending cancellation")
+        })?;
+        return Ok(WakeOutcome::Revoked(cancelled));
     }
     finish_wake_receipt(identity, returned, consumed)
 }
@@ -2296,6 +3500,8 @@ async fn send_output(
         identity,
         ledger_begin_backend(identity, runtime, ExactBackendAction::Start),
     )?;
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    c54_before_output_backend(identity, invoking).await?;
     let mut dispatch = match with_active_writer(identity.instance, identity.streams, |writer| {
         writer.start(bytes)
     }) {
@@ -2305,16 +3511,27 @@ async fn send_output(
     loop {
         match dispatch {
             StreamSendDispatch::Sent => {
-                return backend_effect(
-                    identity,
-                    invoking,
-                    BackendEffect::OutputSent {
-                        length: u16::try_from(bytes.len()).map_err(|_| {
-                            unexpected_native_driver_error(identity, "output length overflow")
-                        })?,
-                    },
-                )
-                .map(OutputDispatch::Sent);
+                let effect = BackendEffect::OutputSent {
+                    length: u16::try_from(bytes.len()).map_err(|_| {
+                        unexpected_native_driver_error(identity, "output length overflow")
+                    })?,
+                };
+                #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+                match with_ledger(identity, |ledger| {
+                    ledger.backend_linearized(invoking, effect)
+                }) {
+                    Ok(linearized) => {
+                        c54_after_output_linearized(identity, linearized);
+                        return Ok(OutputDispatch::Sent(linearized));
+                    }
+                    Err(ExactLedgerError::Quarantined) => {
+                        c54_record_linearized_guard(identity);
+                        return Err(ComponentTerminal::RunnerFault);
+                    }
+                    Err(error) => return Err(ledger_error_terminal(identity, error)),
+                }
+                #[cfg(not(feature = "ssh-native-async-revoke-qemu-acceptance"))]
+                return backend_effect(identity, invoking, effect).map(OutputDispatch::Sent);
             }
             StreamSendDispatch::Closed(reason) => {
                 return backend_effect(
@@ -2446,6 +3663,13 @@ async fn drive_input_stream(
                 "target input byte ledger mismatch",
             ));
         }
+        #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+        if !c54_record_input_progress(identity, progress) {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "C5.4 partial spill ledger mismatch",
+            ));
+        }
         if !spill.consume(progress) {
             return Err(unexpected_native_driver_error(
                 identity,
@@ -2550,6 +3774,13 @@ async fn drive_input_stream(
     };
     match committed {
         StreamReceiveCommit::Received(received) if received == length => {
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            if !c54_select_scenario(identity, spill.remaining_prefix(length)) {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "C5.4 scenario fixture mismatch",
+                ));
+            }
             let linearized = backend_effect(
                 identity,
                 invoking,
@@ -2581,6 +3812,13 @@ async fn drive_input_stream(
                 return Err(unexpected_native_driver_error(
                     identity,
                     "target input byte ledger mismatch",
+                ));
+            }
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            if !c54_record_input_progress(identity, progress) {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "C5.4 initial partial input ledger mismatch",
                 ));
             }
             if !spill.consume(progress) {
@@ -2858,11 +4096,18 @@ async fn drive_output_stream(
             Ok(dropped)
         }
         OutputDispatch::Revoked(cancelled) => {
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            let target_cancelled = c54_is_healthy_primary(identity);
             staging.clear();
             let dropped = invocation
                 .drop_host_copy_peer(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
             finish_live_revoke(identity, cancelled)?;
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            if target_cancelled {
+                let _ = dropped;
+                return Err(ComponentTerminal::Cancelled);
+            }
             Ok(dropped)
         }
     }

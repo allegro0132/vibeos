@@ -20,6 +20,12 @@ ssh-native-async-qemu-acceptance = [
     "ssh-test",
     "vibeos-kernel/ssh-native-async-qemu-acceptance",
 ]
+# Explicitly separate from the standard formal-native gate: C5.4c deliberately
+# runs destructive linearization/fault scenarios in independent QEMU boots.
+ssh-native-async-revoke-qemu-acceptance = [
+    "ssh-test",
+    "vibeos-kernel/ssh-native-async-revoke-qemu-acceptance",
+]
 
 [[bin]]
 name = "vibeos-qemu-virt"

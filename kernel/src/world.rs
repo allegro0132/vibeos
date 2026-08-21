@@ -34,7 +34,10 @@ const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
     any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
     not(feature = "milkv-jitterentropy-ssh-probe"),
-    not(feature = "ssh-native-async-qemu-acceptance")
+    not(any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ))
 ))]
 const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
 // The target-only same-image gate sends a distinct 13,385-byte native command
@@ -44,7 +47,10 @@ const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
 // Keep the production, Milk-V, and ordinary ssh-test ceiling unchanged.
 #[cfg(all(
     feature = "ssh-test",
-    feature = "ssh-native-async-qemu-acceptance",
+    any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ),
     not(feature = "milkv-jitterentropy-ssh-probe")
 ))]
 const SSH_TEST_MEMORY_BUDGET: usize = 512 * 1024;

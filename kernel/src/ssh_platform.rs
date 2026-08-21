@@ -444,9 +444,32 @@ impl SshdPlatform for SshPlatform {
         crate::component_instances::select_ssh_exec_component_policy(profile, source)
     }
 
-    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    #[cfg(any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ))]
     fn ssh_exec_component_completed(&self, policy: SshExecComponentSessionPolicy, status: u32) {
+        #[cfg(feature = "ssh-native-async-qemu-acceptance")]
         crate::component_instances::ssh_exec_component_completed(policy, status);
+        #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+        crate::component_instances::ssh_exec_component_revoke_completed(policy, status);
+    }
+
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    fn ssh_exec_component_stdout_drain_permitted(
+        &self,
+        policy: SshExecComponentSessionPolicy,
+    ) -> bool {
+        crate::component_instances::ssh_exec_component_stdout_drain_permitted(policy)
+    }
+
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    fn ssh_exec_component_stdin_chunk_limit(
+        &self,
+        policy: SshExecComponentSessionPolicy,
+        accepted_bytes: usize,
+    ) -> Result<usize, &'static str> {
+        crate::component_instances::ssh_exec_component_stdin_chunk_limit(policy, accepted_bytes)
     }
 
     #[cfg(feature = "milkv-jitterentropy-ssh-probe")]

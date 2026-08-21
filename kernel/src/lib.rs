@@ -62,6 +62,24 @@ compile_error!(
     ))
 ))]
 compile_error!("feature `ssh-native-async-qemu-acceptance` requires the QEMU ssh-test/C4.8 image");
+#[cfg(all(
+    feature = "ssh-native-async-revoke-qemu-acceptance",
+    not(all(
+        feature = "qemu-virt",
+        feature = "ssh-test",
+        feature = "wasm-c48-qemu-acceptance"
+    ))
+))]
+compile_error!(
+    "feature `ssh-native-async-revoke-qemu-acceptance` requires the QEMU ssh-test/C4.8 image"
+);
+#[cfg(all(
+    feature = "ssh-native-async-revoke-qemu-acceptance",
+    feature = "ssh-native-async-qemu-acceptance"
+))]
+compile_error!(
+    "the C5.4c native revoke gate and standard formal-native SSH gate are isolated images"
+);
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
@@ -549,6 +567,11 @@ pub extern "C" fn kmain() -> ! {
             sbi::shutdown(true);
         }
     });
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    exec::spawn(
+        "wasm-c54-native-revoke-worker",
+        component_instances::run_native_async_revoke_worker(),
+    );
     #[cfg(feature = "milkv-duo")]
     if dwc2_host::info().is_some() {
         exec::spawn("usb-hid", dwc2_host::service_task());
@@ -846,6 +869,11 @@ fn oom(layout: core::alloc::Layout) -> ! {
             live_bytes,
             quota_bytes,
         }) if owner != heap::OwnerId::SYSTEM => {
+            #[cfg(all(
+                feature = "ssh-native-async-revoke-qemu-acceptance",
+                not(feature = "ssh-native-async-qemu-acceptance")
+            ))]
+            let _ = (requested_bytes, live_bytes, quota_bytes);
             #[cfg(feature = "ssh-native-async-qemu-acceptance")]
             {
                 let mut w = SbiWriter;

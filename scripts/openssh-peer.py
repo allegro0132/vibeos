@@ -40,6 +40,32 @@ NATIVE_CASE_FILTER_INPUT = bytes(
     (index * 29 + 11) & 0xFF for index in range(13 * 1024 + 73)
 )
 NATIVE_CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in NATIVE_CASE_FILTER_INPUT)
+NATIVE_REVOKE_FIXTURE_BYTES = 13 * 1024 + 73
+NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES = 257 + 767 + 6 * 1024
+NATIVE_REVOKE_MAGICS = {
+    "healthy": b"VIBE-C54-HEALTHY\n",
+    "linearized": b"VIBE-C54-LINEARIZED\n",
+    "raw-invoking": b"VIBE-C54-RAW-INVOKING\n",
+    "raw-linearized": b"VIBE-C54-RAW-LINEARIZED\n",
+}
+
+
+def _native_revoke_fixture(scenario: str) -> bytes:
+    magic = NATIVE_REVOKE_MAGICS[scenario]
+    fixture = bytearray(
+        (index * 43 + 19) & 0xFF for index in range(NATIVE_REVOKE_FIXTURE_BYTES)
+    )
+    fixture[: len(magic)] = magic
+    return bytes(fixture)
+
+
+NATIVE_REVOKE_INPUTS = {
+    scenario: _native_revoke_fixture(scenario) for scenario in NATIVE_REVOKE_MAGICS
+}
+NATIVE_REVOKE_HEALTHY_OUTPUT = bytes(
+    byte ^ 0x20
+    for byte in NATIVE_REVOKE_INPUTS["healthy"][:NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES]
+)
 INTERACTIVE_INPUT = b"discard\x03echo vibeos-vsh-interactivX\x7fe\r\x04"
 INTERACTIVE_OUTPUT = (
     b"vsh> discard^C\r\n"
@@ -213,7 +239,10 @@ def require_result(
     if result.returncode not in returncodes:
         raise PeerError(_display_failure(label, result))
     if stdout is not None and result.stdout != stdout:
-        raise PeerError(_display_failure(label, result))
+        raise PeerError(
+            f"{label} stdout mismatch expected_bytes={len(stdout)} "
+            f"actual_bytes={len(result.stdout)}; " + _display_failure(label, result)
+        )
     if stderr_exact is not None and result.stderr != stderr_exact:
         raise PeerError(_display_failure(label, result))
     if stderr_pattern is not None:
@@ -339,6 +368,7 @@ def run_acceptance(
     bind_address: str | None,
     command_timeout: float,
     native_case_filter_enabled: bool,
+    native_revoke_scenario: str | None,
 ) -> None:
     def invoke(
         label: str,
@@ -381,7 +411,40 @@ def run_acceptance(
     true_result = invoke("authorized true", accepted_key, ["-T"], ["true"])
     require_result("authorized true", true_result, {0}, b"")
 
-    if native_case_filter_enabled:
+    if native_revoke_scenario == "healthy":
+        native_revoke = invoke(
+            "authorized native revoke winner",
+            accepted_key,
+            ["-T"],
+            ["native-case-filter"],
+            input_bytes=NATIVE_REVOKE_INPUTS["healthy"],
+        )
+        require_result(
+            "authorized native revoke winner",
+            native_revoke,
+            {130},
+            NATIVE_REVOKE_HEALTHY_OUTPUT,
+            stderr_exact=b"",
+        )
+
+        # A second exact formal-native invocation after cleanup proves that the
+        # old operation token, detached wake, and revoked endpoint incarnation
+        # did not mutate or strand the replacement.
+        native_replacement = invoke(
+            "authorized native revoke replacement",
+            accepted_key,
+            ["-T"],
+            ["native-case-filter"],
+            input_bytes=NATIVE_CASE_FILTER_INPUT,
+        )
+        require_result(
+            "authorized native revoke replacement",
+            native_replacement,
+            {0},
+            NATIVE_CASE_FILTER_OUTPUT,
+            stderr_exact=b"",
+        )
+    elif native_case_filter_enabled:
         # subprocess closes the pipe after this complete binary fixture. Exact
         # stdout length/content plus status zero therefore proves native EOF and
         # output drain over the real OpenSSH channel, not merely command admission.
@@ -460,6 +523,30 @@ def run_acceptance(
         r"subsystem request failed.*channel",
     )
 
+    if native_revoke_scenario not in (None, "healthy"):
+        # These scenarios intentionally leave the managed-native structural
+        # fault domain quarantined. The UART guard, not an inferred SSH status,
+        # is the acceptance authority; OpenSSH must merely fail or remain
+        # blocked without receiving invented stdout.
+        try:
+            guard = invoke(
+                f"authorized native {native_revoke_scenario} guard",
+                accepted_key,
+                ["-T"],
+                ["native-case-filter"],
+                input_bytes=NATIVE_REVOKE_INPUTS[native_revoke_scenario],
+            )
+        except PeerError as error:
+            if " timed out after " not in str(error):
+                raise
+        else:
+            if guard.returncode == 0 or guard.stdout:
+                raise PeerError(
+                    _display_failure(
+                        f"authorized native {native_revoke_scenario} guard", guard
+                    )
+                )
+
 
 def selftest() -> None:
     if _fingerprint(_expected_host_blob()) != TEST_HOST_FINGERPRINT:
@@ -490,6 +577,19 @@ def selftest() -> None:
         raise PeerError("native async stream fixture transform is not the pinned XOR")
     if NATIVE_CASE_FILTER_INPUT == CASE_FILTER_INPUT:
         raise PeerError("sync and native async stream fixtures unexpectedly alias")
+    if set(NATIVE_REVOKE_INPUTS) != set(NATIVE_REVOKE_MAGICS):
+        raise PeerError("native revoke fixture scenarios changed")
+    if len(set(NATIVE_REVOKE_INPUTS.values())) != len(NATIVE_REVOKE_MAGICS):
+        raise PeerError("native revoke scenario fixtures unexpectedly alias")
+    for scenario, magic in NATIVE_REVOKE_MAGICS.items():
+        fixture = NATIVE_REVOKE_INPUTS[scenario]
+        if len(fixture) != NATIVE_REVOKE_FIXTURE_BYTES or not fixture.startswith(magic):
+            raise PeerError(f"native revoke {scenario} fixture changed")
+    if NATIVE_REVOKE_HEALTHY_OUTPUT != bytes(
+        byte ^ 0x20
+        for byte in NATIVE_REVOKE_INPUTS["healthy"][:NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES]
+    ):
+        raise PeerError("native revoke healthy XOR prefix changed")
     command = _base_ssh_command(
         "ssh",
         "localhost",
@@ -563,12 +663,23 @@ def selftest() -> None:
     parser = _parser()
     if parser.parse_args([]).native_case_filter:
         raise PeerError("native async probe unexpectedly enabled by default")
+    if parser.parse_args([]).native_revoke_scenario is not None:
+        raise PeerError("native revoke probe unexpectedly enabled by default")
     if not parser.parse_args(["--native-case-filter"]).native_case_filter:
         raise PeerError("native async probe opt-in was not retained")
+    for scenario in NATIVE_REVOKE_MAGICS:
+        if parser.parse_args(
+            ["--native-revoke-scenario", scenario]
+        ).native_revoke_scenario != scenario:
+            raise PeerError(f"native revoke {scenario} opt-in was not retained")
     for incompatible in (
         ["--scan-only", "--native-case-filter"],
         ["--pick-port", "--native-case-filter"],
         ["--selftest", "--native-case-filter"],
+        ["--scan-only", "--native-revoke-scenario", "healthy"],
+        ["--pick-port", "--native-revoke-scenario", "healthy"],
+        ["--selftest", "--native-revoke-scenario", "healthy"],
+        ["--native-case-filter", "--native-revoke-scenario", "healthy"],
     ):
         try:
             _validate_operation_modes(parser.parse_args(incompatible))
@@ -604,6 +715,11 @@ def _parser() -> argparse.ArgumentParser:
         help="add the QEMU formal managed native-case-filter acceptance probe",
     )
     parser.add_argument(
+        "--native-revoke-scenario",
+        choices=tuple(NATIVE_REVOKE_MAGICS),
+        help="run one isolated QEMU C5.4c managed-native revoke/fault scenario",
+    )
+    parser.add_argument(
         "--pick-port",
         action="store_true",
         help="print a currently unused IPv4 loopback port and exit",
@@ -613,14 +729,22 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _validate_operation_modes(arguments: argparse.Namespace) -> None:
+    native_revoke = arguments.native_revoke_scenario is not None
     if arguments.selftest and (
-        arguments.pick_port or arguments.scan_only or arguments.native_case_filter
+        arguments.pick_port
+        or arguments.scan_only
+        or arguments.native_case_filter
+        or native_revoke
     ):
         raise PeerError("--selftest cannot be combined with another operation")
-    if arguments.pick_port and (arguments.scan_only or arguments.native_case_filter):
+    if arguments.pick_port and (
+        arguments.scan_only or arguments.native_case_filter or native_revoke
+    ):
         raise PeerError("--pick-port cannot be combined with another operation")
-    if arguments.scan_only and arguments.native_case_filter:
-        raise PeerError("--native-case-filter requires functional acceptance")
+    if arguments.scan_only and (arguments.native_case_filter or native_revoke):
+        raise PeerError("native Component probes require functional acceptance")
+    if arguments.native_case_filter and native_revoke:
+        raise PeerError("native standard and revoke probes are isolated modes")
 
 
 def main() -> int:
@@ -703,11 +827,16 @@ def main() -> int:
                 arguments.bind_address,
                 arguments.command_timeout,
                 arguments.native_case_filter,
+                arguments.native_revoke_scenario,
             )
             component_label = (
-                "native async and WASM case-filter"
-                if arguments.native_case_filter
-                else "WASM case-filter"
+                f"native revoke {arguments.native_revoke_scenario} and WASM case-filter"
+                if arguments.native_revoke_scenario
+                else (
+                    "native async and WASM case-filter"
+                    if arguments.native_case_filter
+                    else "WASM case-filter"
+                )
             )
             print(
                 "PASS openssh-peer: forced crypto, authorized exec statuses including "

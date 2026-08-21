@@ -4,7 +4,8 @@ use std::thread;
 
 use vibeos_component_host::{
     ByteStream, StreamCloseOutcome, StreamCloseReason, StreamError, StreamReceiveCommit,
-    StreamReceiveDispatch, StreamSendDispatch, MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
+    StreamReceiveDispatch, StreamSendDispatch, StreamTerminalDispatch, MAX_STREAM_CHUNK_BYTES,
+    STREAM_BUFFER_CHUNKS,
 };
 use vibeos_component_runtime::host::HostWakeToken;
 use vibeos_core::cap::{CSpace, Resource, Rights};
@@ -292,6 +293,268 @@ fn every_spurious_resume_replaces_the_consumed_wait_generation() {
     assert_eq!(writer.cancel(first_send), Err(StreamError::TokenMismatch));
     writer.cancel(second_send).unwrap();
     reader.cancel(second).unwrap();
+}
+
+#[test]
+fn terminal_wait_rotates_tokens_and_normal_is_not_ready_until_finalized() {
+    let stream = ByteStream::new();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(WakeProbe {
+        count: AtomicUsize::new(0),
+    });
+
+    let first = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected terminal wait, got {other:?}"),
+    };
+    assert_eq!(supervisor.start_terminal(), Err(StreamError::Busy));
+    supervisor
+        .register_terminal_wake(first, wake_token(&probe))
+        .unwrap();
+    assert_eq!(
+        writer.close(StreamCloseReason::Normal),
+        StreamCloseOutcome::Published
+    );
+    assert!(supervisor.is_normal_provisional());
+    assert_eq!(supervisor.final_reason(), None);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+
+    let second = match supervisor.resume_terminal(first).unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("provisional close must remain pending, got {other:?}"),
+    };
+    assert_ne!(first, second);
+    assert_eq!(
+        supervisor.resume_terminal(first),
+        Err(StreamError::TokenMismatch)
+    );
+    supervisor
+        .register_terminal_wake(second, wake_token(&probe))
+        .unwrap();
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Normal),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        supervisor.resume_terminal(second),
+        Ok(StreamTerminalDispatch::Ready(StreamCloseReason::Normal))
+    );
+    assert_eq!(
+        supervisor.resume_terminal(second),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(
+        supervisor.start_terminal(),
+        Ok(StreamTerminalDispatch::Ready(StreamCloseReason::Normal))
+    );
+}
+
+#[test]
+fn terminal_wrong_stale_and_cancelled_tokens_are_inert() {
+    let stream = ByteStream::new();
+    let supervisor = stream.supervisor();
+    let other = ByteStream::new();
+    let other_supervisor = other.supervisor();
+    let probe = Arc::new(WakeProbe {
+        count: AtomicUsize::new(0),
+    });
+
+    let first = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected terminal wait, got {other:?}"),
+    };
+    let foreign = match other_supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected foreign terminal wait, got {other:?}"),
+    };
+    assert_eq!(
+        supervisor.resume_terminal(foreign),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(
+        supervisor.register_terminal_wake(foreign, wake_token(&probe)),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(
+        supervisor.cancel_terminal(foreign),
+        Err(StreamError::TokenMismatch)
+    );
+
+    let second = match supervisor.resume_terminal(first).unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected replacement terminal wait, got {other:?}"),
+    };
+    assert_ne!(first, second);
+    assert_eq!(
+        supervisor.cancel_terminal(first),
+        Err(StreamError::TokenMismatch)
+    );
+    supervisor
+        .register_terminal_wake(second, wake_token(&probe))
+        .unwrap();
+    assert_eq!(
+        supervisor.register_terminal_wake(second, wake_token(&probe)),
+        Err(StreamError::WakeAlreadyRegistered)
+    );
+    supervisor.cancel_terminal(second).unwrap();
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        supervisor.cancel_terminal(second),
+        Err(StreamError::TokenMismatch)
+    );
+
+    let replacement = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected replacement after cancel, got {other:?}"),
+    };
+    assert_ne!(second, replacement);
+    supervisor.cancel_terminal(replacement).unwrap();
+    other_supervisor.cancel_terminal(foreign).unwrap();
+}
+
+#[test]
+fn terminal_wait_is_independent_from_a_prepared_reader() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(WakeProbe {
+        count: AtomicUsize::new(0),
+    });
+
+    assert_eq!(writer.start(&[1, 2, 3]), Ok(StreamSendDispatch::Sent));
+    let prepared = match reader.start().unwrap() {
+        StreamReceiveDispatch::Prepared(prepared) => prepared,
+        other => panic!("expected prepared receive, got {other:?}"),
+    };
+    let terminal = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("prepared receive must not occupy terminal slot: {other:?}"),
+    };
+    supervisor
+        .register_terminal_wake(terminal, wake_token(&probe))
+        .unwrap();
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Normal),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        supervisor.resume_terminal(terminal),
+        Ok(StreamTerminalDispatch::Ready(StreamCloseReason::Normal))
+    );
+
+    let mut bytes = [0_u8; 3];
+    assert_eq!(
+        reader.commit(prepared.operation(), &mut bytes),
+        Ok(StreamReceiveCommit::Received(3))
+    );
+    assert_eq!(bytes, [1, 2, 3]);
+}
+
+#[test]
+fn every_non_normal_close_reason_completes_the_exact_terminal_wait() {
+    for reason in [
+        StreamCloseReason::Failure,
+        StreamCloseReason::Cancelled,
+        StreamCloseReason::Denied,
+        StreamCloseReason::Unavailable,
+        StreamCloseReason::Exhausted,
+        StreamCloseReason::Invalid,
+        StreamCloseReason::BackendFault,
+    ] {
+        let stream = ByteStream::new();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        let probe = Arc::new(WakeProbe {
+            count: AtomicUsize::new(0),
+        });
+        let terminal = match supervisor.start_terminal().unwrap() {
+            StreamTerminalDispatch::Waiting(operation) => operation,
+            other => panic!("expected terminal wait, got {other:?}"),
+        };
+        supervisor
+            .register_terminal_wake(terminal, wake_token(&probe))
+            .unwrap();
+
+        assert_eq!(writer.close(reason), StreamCloseOutcome::Published);
+        assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervisor.resume_terminal(terminal),
+            Ok(StreamTerminalDispatch::Ready(reason))
+        );
+        assert_eq!(supervisor.final_reason(), Some(reason));
+    }
+}
+
+#[test]
+fn late_terminal_listener_is_woken_once_and_may_reenter_stream_state() {
+    let stream = ByteStream::new();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(ReentrantWakeProbe {
+        stream: stream.clone(),
+        count: AtomicUsize::new(0),
+    });
+    let terminal = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected terminal wait, got {other:?}"),
+    };
+
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::BackendFault),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    supervisor
+        .register_terminal_wake(terminal, reentrant_wake_token(&probe))
+        .unwrap();
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        supervisor.resume_terminal(terminal),
+        Ok(StreamTerminalDispatch::Ready(
+            StreamCloseReason::BackendFault
+        ))
+    );
+}
+
+#[test]
+fn terminal_wait_is_woken_once_and_cleaned_by_conflict_fail_stop() {
+    let stream = ByteStream::new();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(WakeProbe {
+        count: AtomicUsize::new(0),
+    });
+    let terminal = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected terminal wait, got {other:?}"),
+    };
+    supervisor
+        .register_terminal_wake(terminal, wake_token(&probe))
+        .unwrap();
+
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Failure),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Cancelled),
+        StreamCloseOutcome::Conflict
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert!(supervisor.is_fail_stopped());
+    assert_eq!(supervisor.final_reason(), Some(StreamCloseReason::Failure));
+    assert_eq!(
+        supervisor.resume_terminal(terminal),
+        Err(StreamError::FailStopped)
+    );
+    assert_eq!(
+        supervisor.cancel_terminal(terminal),
+        Err(StreamError::FailStopped)
+    );
+    assert_eq!(supervisor.start_terminal(), Err(StreamError::FailStopped));
 }
 
 #[test]

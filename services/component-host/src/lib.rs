@@ -51,7 +51,8 @@ pub use service::{ComponentCallError, ComponentHostServices};
 pub use stream::{
     ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseOutcome,
     StreamCloseReason, StreamError, StreamPreparedReceive, StreamReceiveCommit,
-    StreamReceiveDispatch, StreamSendDispatch, MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
+    StreamReceiveDispatch, StreamSendDispatch, StreamTerminalDispatch, MAX_STREAM_CHUNK_BYTES,
+    STREAM_BUFFER_CHUNKS,
 };
 pub use transfer::{transfer_owned, OwnedTransferError};
 

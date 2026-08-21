@@ -428,12 +428,26 @@ impl BufferRegistry {
         modules.read_authorized_memory(&source.memory, source_pointer, output)
     }
 
+    /// Revalidates an exact host-to-guest copy without publishing bytes.
+    ///
+    /// Native transport uses this before it asks a backend to linearize an
+    /// input operation. The later commit still calls [`Self::copy_from_host`]
+    /// and therefore repeats every seal, role, range, and progress check.
+    pub(crate) fn preflight_copy_from_host(
+        &self,
+        modules: &CoreComponentGroup,
+        target: &BufferLease,
+        progress: usize,
+    ) -> Result<(), TrapCode> {
+        self.resolve_host_copy(modules, target, BufferRole::TargetRead, progress)
+            .map(|_| ())
+    }
+
     /// Copies one host-owned byte slice into an authorized read-buffer prefix.
     ///
     /// The input slice length is the copy progress. All registry and memory
     /// checks complete before guest memory is touched, so rejected host copies
     /// cannot partially publish bytes into the guest.
-    #[allow(dead_code)] // Wired into the native host transport in the next activation slice.
     pub(crate) fn copy_from_host(
         &self,
         modules: &mut CoreComponentGroup,
@@ -466,7 +480,6 @@ impl BufferRegistry {
 
     /// Lowers one host-supplied eight-case enum only after validating its
     /// domain, so a rejected value leaves the guest target untouched.
-    #[allow(dead_code)] // Wired into the native host input future in the next activation slice.
     pub(crate) fn lower_enum8(
         &self,
         modules: &mut CoreComponentGroup,
@@ -1042,6 +1055,15 @@ mod tests {
             .copy_to_host(&modules, &source, &mut output)
             .unwrap();
         assert_eq!(output, [1, 2, 3]);
+
+        registry
+            .preflight_copy_from_host(&modules, &target, 3)
+            .unwrap();
+        let mut before_commit = [0_u8; 6];
+        modules
+            .read_authorized_memory(&memory, 64, &mut before_commit)
+            .unwrap();
+        assert_eq!(before_commit, [9, 9, 9, 9, 9, 9]);
 
         registry
             .copy_from_host(&mut modules, &target, &[7, 8, 10])

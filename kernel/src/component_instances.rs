@@ -438,19 +438,21 @@ fn quarantine_committed_start(
     input: &ComponentStartInput,
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 ) {
     #[cfg(not(any(
         feature = "wasm-c53-native-async-qemu-acceptance",
         feature = "ssh-native-async-command"
     )))]
-    let _ = streams;
+    let _ = (task, domain, streams);
     #[cfg(any(
         feature = "wasm-c53-native-async-qemu-acceptance",
         feature = "ssh-native-async-command"
     ))]
     if input.kind().is_native_async() {
-        native_async_acceptance::quarantine_fault_shadow(key, token, streams);
+        native_async_acceptance::quarantine_fault_shadow(key, token, task, domain, streams);
     }
     CONTROL.child_shadow[key.slot as usize].quarantine(key);
     CONTROL.supervisor_shadow[key.slot as usize].quarantine(key);
@@ -2170,6 +2172,8 @@ struct LazyComponentPayload {
     root: Option<&'static ImageRoot>,
     control: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     resource_generation: u64,
     streams: RegistryStreamBindings,
     mode: PayloadMode,
@@ -2364,6 +2368,8 @@ impl LazyComponentPayload {
         root: Option<&'static ImageRoot>,
         control: ControlKey,
         token: InstanceToken,
+        task: TaskId,
+        domain: AllocationDomain,
         resource_generation: u64,
         streams: RegistryStreamBindings,
         mode: PayloadMode,
@@ -2372,6 +2378,8 @@ impl LazyComponentPayload {
             root,
             control,
             token,
+            task,
+            domain,
             resource_generation,
             streams,
             mode,
@@ -2393,7 +2401,19 @@ impl Drop for LazyComponentPayload {
             feature = "ssh-native-async-command"
         ))]
         if self.mode.is_native_async() {
-            native_async_acceptance::payload_drop(self.control, self.token, self.streams);
+            // The runtime future may own the exact InstanceContinuation and
+            // backend-local state. Drop it first so the continuation's
+            // cancellation state is visible before the stable pending ledger
+            // acknowledges the runtime owner and decides whether cleanup is
+            // reclaim-safe.
+            drop(self.driver.take());
+            native_async_acceptance::payload_drop(
+                self.control,
+                self.token,
+                self.task,
+                self.domain,
+                self.streams,
+            );
         }
         #[cfg(feature = "wasm-c48-qemu-acceptance")]
         if matches!(self.mode, PayloadMode::AcceptanceFault { .. }) {
@@ -2425,6 +2445,8 @@ unsafe impl InstancePayload for LazyComponentPayload {
                 self.root,
                 self.control,
                 self.token,
+                self.task,
+                self.domain,
                 self.resource_generation,
                 self.streams,
                 self.mode,
@@ -3423,6 +3445,7 @@ fn stream_wake(words: [usize; 4]) {
     match outcome {
         crate::instance::InstanceContinuationSignal::Signalled
         | crate::instance::InstanceContinuationSignal::AlreadySignalled
+        | crate::instance::InstanceContinuationSignal::AlreadyConsumed(_)
         | crate::instance::InstanceContinuationSignal::Stale => {}
         crate::instance::InstanceContinuationSignal::Quarantined => lifecycle_fail_stop(),
     }
@@ -3720,6 +3743,8 @@ async fn run_image_component(
     root: Option<&'static ImageRoot>,
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     generation: u64,
     streams: RegistryStreamBindings,
     mode: PayloadMode,
@@ -3728,13 +3753,13 @@ async fn run_image_component(
         feature = "wasm-c53-native-async-qemu-acceptance",
         feature = "ssh-native-async-command"
     )))]
-    let _ = key;
+    let _ = (key, task, domain);
     #[cfg(any(
         feature = "wasm-c53-native-async-qemu-acceptance",
         feature = "ssh-native-async-command"
     ))]
     if mode.is_native_async() {
-        return native_async_acceptance::run(key, token, streams).await;
+        return native_async_acceptance::run(key, token, task, domain, streams).await;
     }
     let Some(root) = root else {
         lifecycle_fail_stop();
@@ -3852,7 +3877,8 @@ async fn run_image_component(
                     }
                     return terminal_word(host_error_terminal(error));
                 }
-                if continuation.await.is_err() {
+                let consumed = continuation.await;
+                if !consumed.is_ok_and(|consumed| consumed.matches_token(continuation_token)) {
                     lifecycle_fail_stop();
                     return terminal_word(ComponentTerminal::RunnerFault);
                 }
@@ -4560,7 +4586,16 @@ fn start_image_instance_under_control(
     }
     if unsafe {
         registry().install_payload(core_token, || {
-            LazyComponentPayload::new(root, key, core_token, key.generation, streams, mode)
+            LazyComponentPayload::new(
+                root,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                key.generation,
+                streams,
+                mode,
+            )
         })
     }
     .is_err()
@@ -4636,7 +4671,13 @@ fn start_image_instance_under_control(
         feature = "ssh-native-async-command"
     ))]
     let pending_shadow_bound = !start_kind.is_native_async()
-        || native_async_acceptance::bind_pending_shadow(key, core_token, streams);
+        || native_async_acceptance::bind_pending_shadow(
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
     #[cfg(not(any(
         feature = "wasm-c53-native-async-qemu-acceptance",
         feature = "ssh-native-async-command"
@@ -4651,7 +4692,14 @@ fn start_image_instance_under_control(
             system.restore();
             drop(control);
         }
-        quarantine_committed_start(&input, key, core_token, streams);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
         return Err(ComponentTerminal::RunnerFault);
     }
     // SCHED may invoke only the fixed registry activation transaction.
@@ -4661,7 +4709,14 @@ fn start_image_instance_under_control(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4674,7 +4729,14 @@ fn start_image_instance_under_control(
             }
             system.restore();
             drop(control);
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4696,7 +4758,14 @@ fn start_image_instance_under_control(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token, streams);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
         drop(stage);
         return Err(ComponentTerminal::RunnerFault);
     }
@@ -4707,7 +4776,14 @@ fn start_image_instance_under_control(
     let suspended = match control.suspend_for_scheduler(key, cleanup) {
         Ok(suspended) => suspended,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4716,7 +4792,14 @@ fn start_image_instance_under_control(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4741,7 +4824,14 @@ fn start_image_instance_under_control(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token, streams);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
         drop(stage);
         return Err(ComponentTerminal::RunnerFault);
     }
@@ -4750,6 +4840,8 @@ fn start_image_instance_under_control(
         && !native_async_acceptance::target_record_managed_start(
             key,
             core_token,
+            prepared_child.id(),
+            domain,
             streams,
             managed_token,
         )
@@ -4760,7 +4852,14 @@ fn start_image_instance_under_control(
             .quarantine();
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token, streams);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
         drop(stage);
         return Err(ComponentTerminal::RunnerFault);
     }
@@ -4776,7 +4875,14 @@ fn start_image_instance_under_control(
     let suspended = match control.suspend_for_scheduler(key, cleanup) {
         Ok(suspended) => suspended,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4785,7 +4891,14 @@ fn start_image_instance_under_control(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4798,7 +4911,14 @@ fn start_image_instance_under_control(
             }
             system.restore();
             drop(control);
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             drop(stage);
             return Err(ComponentTerminal::RunnerFault);
         }
@@ -4829,7 +4949,14 @@ fn start_image_instance_under_control(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token, streams);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
         return Err(ComponentTerminal::RunnerFault);
     }
 
@@ -4841,7 +4968,14 @@ fn start_image_instance_under_control(
     let suspended = match control.suspend_for_scheduler(key, cleanup) {
         Ok(suspended) => suspended,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4867,7 +5001,14 @@ fn start_image_instance_under_control(
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
-            quarantine_committed_start(&input, key, core_token, streams);
+            quarantine_committed_start(
+                &input,
+                key,
+                core_token,
+                prepared_child.id(),
+                domain,
+                streams,
+            );
             return Err(ComponentTerminal::RunnerFault);
         }
     };
@@ -4895,7 +5036,14 @@ fn start_image_instance_under_control(
         }
         system.restore();
         drop(control);
-        quarantine_committed_start(&input, key, core_token, streams);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
         return Err(ComponentTerminal::RunnerFault);
     }
     control
@@ -5206,20 +5354,87 @@ fn finalize_stream_state(
     feature = "wasm-c53-native-async-qemu-acceptance",
     feature = "ssh-native-async-command"
 ))]
+fn finalize_stream_state_from_supervisors(
+    space: &InstanceSpace,
+    streams: RegistryStreamBindings,
+    terminal: ComponentTerminal,
+) -> bool {
+    let (stdin_supervisor, stdout_supervisor) = {
+        let cspace = space.cspace().lock();
+        if validate_stream_space(&cspace, streams).is_err() {
+            return false;
+        }
+        let Ok(stdin_supervisor) =
+            exact_lease::<ByteStreamSupervisor>(&cspace, streams.stdin_supervisor, Rights::INVOKE)
+        else {
+            return false;
+        };
+        let Ok(stdout_supervisor) =
+            exact_lease::<ByteStreamSupervisor>(&cspace, streams.stdout_supervisor, Rights::INVOKE)
+        else {
+            return false;
+        };
+        (stdin_supervisor, stdout_supervisor)
+    };
+
+    // Native finalization reaches this helper only after the exact pending
+    // ledger has resolved backend operations and any required endpoint
+    // revocation. The two supervisor caps retain terminal authority
+    // independently of revoked endpoint caps, while the Space
+    // identity/incarnation proof above prevents a stale binding from publishing
+    // into a replacement CSpace.
+    let reason = terminal.stream_close_reason();
+    stdout_supervisor.with(|supervisor| {
+        if supervisor.is_fail_stopped() {
+            return false;
+        }
+        let stdout_observed = supervisor.finalize_preserving_first_observed(reason);
+        if !matches!(
+            stdout_observed.outcome(),
+            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
+        ) || stdout_observed.effective_reason().is_none()
+            || supervisor.is_fail_stopped()
+        {
+            return false;
+        }
+
+        let stdin_published = stdin_supervisor.with(|stdin| {
+            if stdin.is_fail_stopped() {
+                return false;
+            }
+            let stdin_observed = stdin.finalize_preserving_first_observed(reason);
+            matches!(
+                stdin_observed.outcome(),
+                StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
+            ) && !stdin.is_fail_stopped()
+                && stdin_observed.effective_reason().is_some()
+        });
+        stdin_published && !supervisor.is_fail_stopped()
+    })
+}
+
+#[cfg(any(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
 fn finalize_native_stream_state(
     space: &InstanceSpace,
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
     terminal: ComponentTerminal,
 ) -> bool {
-    if !native_async_acceptance::prepare_terminal_shadow(space, key, token, streams, terminal) {
+    if !native_async_acceptance::prepare_terminal_shadow(
+        space, key, token, task, domain, streams, terminal,
+    ) {
         return false;
     }
-    if !finalize_stream_state(space, streams, terminal) {
+    if !finalize_stream_state_from_supervisors(space, streams, terminal) {
         return false;
     }
-    native_async_acceptance::retire_terminal_shadow(key, token, streams)
+    native_async_acceptance::retire_terminal_shadow(key, token, task, domain, streams)
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -5249,6 +5464,8 @@ unsafe fn finalize_registry_terminal(
                         space,
                         key,
                         tuple.core_token,
+                        tuple.handle.id(),
+                        tuple.domain,
                         tuple.streams,
                         terminal,
                     )
@@ -5423,6 +5640,8 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
         && !native_async_acceptance::target_record_managed_terminal(
             key,
             tuple.core_token,
+            tuple.handle.id(),
+            tuple.domain,
             tuple.streams,
             terminal,
         )
@@ -5585,6 +5804,8 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
             && !native_async_acceptance::target_record_reaper_notified(
                 key,
                 tuple.core_token,
+                tuple.handle.id(),
+                tuple.domain,
                 tuple.streams,
                 token,
                 terminal,
@@ -6523,36 +6744,26 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
         feature = "ssh-native-async-command"
     ))]
     if tuple.start_kind.is_native_async() {
-        // Snapshot and release SYSTEM shadow authority only after the complete
-        // CONTROL tuple is proven. The core callback runs after it has restored
-        // the exact Space and released its registry lock; CONTROL is released
-        // here as well. cancel_fault_snapshot itself releases the CSpace lease
-        // before touching the stream, then clears the shadow only after exact
-        // backend cancellation. A false result quarantines in core before raw
-        // arena reclaim or any CSpace reset can occur.
+        // Release CONTROL only after its complete task/domain projection is
+        // proven. The core callback runs after it has restored the exact Space,
+        // abandoned the exact continuation, and released its registry lock.
+        // Native cleanup consumes that receipt and releases every backend
+        // operation before raw arena reclaim or any CSpace reset can occur.
         drop(control);
-        let snapshot =
-            match native_async_acceptance::fault_snapshot(key, tuple.core_token, tuple.streams) {
-                Ok(snapshot) => snapshot,
-                Err(_) => {
-                    native_async_acceptance::quarantine_fault_shadow(
-                        key,
-                        tuple.core_token,
-                        tuple.streams,
-                    );
-                    return FaultRoute::Quarantined;
-                }
-            };
         let outcome = unsafe {
-            registry().fault_reclaim_with_space(witness, |domain, space| {
-                if !lifecycle_is_healthy()
+            registry().fault_reclaim_with_space(witness, |domain, space, continuation| {
+                if domain != tuple.domain
+                    || !continuation.matches_instance(tuple.core_token)
+                    || !lifecycle_is_healthy()
                     || !native_async_acceptance::lifecycle_is_healthy()
-                    || !native_async_acceptance::cancel_fault_snapshot(
+                    || !native_async_acceptance::raw_fault_cleanup(
                         space,
                         key,
                         tuple.core_token,
+                        tuple.handle.id(),
+                        domain,
                         tuple.streams,
-                        snapshot,
+                        continuation,
                     )
                 {
                     return false;
@@ -6566,6 +6777,8 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
                 native_async_acceptance::quarantine_fault_shadow(
                     key,
                     tuple.core_token,
+                    tuple.handle.id(),
+                    tuple.domain,
                     tuple.streams,
                 );
                 FaultRoute::Quarantined

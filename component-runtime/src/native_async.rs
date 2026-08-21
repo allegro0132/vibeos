@@ -129,6 +129,14 @@ impl core::fmt::Debug for NativeAsyncHostToken {
     }
 }
 
+impl NativeAsyncHostToken {
+    /// Prove strict rotation within one opaque native task seal without
+    /// exposing either identity or numeric generation to the kernel adapter.
+    pub fn strictly_after(self, previous: Self) -> bool {
+        self.task == previous.task && self.generation > previous.generation
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeAsyncHostRequest {
     InputStream { maximum: u32 },
@@ -4784,6 +4792,9 @@ mod tests {
             other => panic!("input stream prepare must stay host-blocked: {other:?}"),
         };
         assert_ne!(prepared, offered);
+        assert!(prepared.strictly_after(offered));
+        assert!(!offered.strictly_after(prepared));
+        assert!(!cross_component.strictly_after(offered));
         assert_eq!(prepared_request, request);
         assert_eq!(
             prepared_metrics.consumed_work - metrics.consumed_work,
@@ -4819,6 +4830,7 @@ mod tests {
         assert_eq!(closed_request, NativeAsyncHostRequest::InputClosed);
         assert_ne!(closed_offered, offered);
         assert_ne!(closed_offered, prepared);
+        assert!(closed_offered.strictly_after(prepared));
         assert_eq!(
             call.prepare_host_input_stream(prepared, 1),
             Err(NativeAsyncHostError::InvalidToken)

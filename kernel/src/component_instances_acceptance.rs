@@ -932,7 +932,7 @@ impl Future for ResumableContinuation {
                 fail(ERROR_CONTINUATION_FAULT);
                 Poll::Ready(Err(()))
             }
-            Poll::Ready(Ok(())) if self.parked => {
+            Poll::Ready(Ok(consumed)) if self.parked && consumed.matches_token(self.operation) => {
                 let witness = crate::exec::current_reclaimable_task_witness();
                 let resume_polls = slot.handle().polls();
                 let exact = witness.is_some_and(|witness| {
@@ -971,7 +971,7 @@ impl Future for ResumableContinuation {
                 C52_RESUMES.fetch_add(1, Ordering::AcqRel);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+            Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
                 println!(
                     "WASM_C52_DIAG round={} hart={} first-resume-terminal-shape",
                     self.round, self.hart
@@ -985,6 +985,7 @@ impl Future for ResumableContinuation {
 
 struct PendingContinuationFault {
     continuation: InstanceContinuation<'static>,
+    operation: InstanceContinuationToken,
     token: InstanceToken,
     round: u8,
     hart: u8,
@@ -1050,7 +1051,11 @@ impl Future for PendingContinuationFault {
                 // raw arena reclamation.
                 panic!("deliberate C5.2 fault with a live continuation wait");
             }
-            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+            Poll::Ready(Ok(consumed)) if consumed.matches_token(self.operation) => {
+                fail(ERROR_CONTINUATION_FAULT);
+                Poll::Ready(())
+            }
+            Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
                 fail(ERROR_CONTINUATION_FAULT);
                 Poll::Ready(())
             }
@@ -1107,11 +1112,16 @@ pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round:
     let before_stale = registry().acceptance_probe(token);
     let stale = registry().signal_continuation(operation);
     let after_stale = registry().acceptance_probe(token);
+    let stale_rejected = matches!(
+        stale,
+        InstanceContinuationSignal::AlreadyConsumed(receipt)
+            if receipt.matches_token(operation)
+    );
     let Some(index) = positive_index(round, hart) else {
         fail(ERROR_CONTINUATION_FAULT);
         return;
     };
-    if stale != InstanceContinuationSignal::Stale
+    if !stale_rejected
         || before_stale.is_none()
         || before_stale != after_stale
         || !after_stale.is_some_and(|probe| {
@@ -1173,6 +1183,7 @@ pub(super) async fn fault_with_pending_continuation(token: InstanceToken, round:
     };
     PendingContinuationFault {
         continuation,
+        operation: fault_operation,
         token,
         round,
         hart,

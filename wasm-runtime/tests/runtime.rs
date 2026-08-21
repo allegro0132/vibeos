@@ -3,9 +3,10 @@ use dlr_wasm_interpreter::{
 };
 use vibeos_component_format::{LimitKind, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
-    inspect_core, inspect_core_with_limits, AdmissionDetail, CoreComponentGroup, CoreHostCall,
-    CoreHostImport, CoreInstanceExportImport, CoreModuleImport, CoreValue, CoreValueType,
-    OwnerAllocationReservation, PollResult, ProfileEngine, ValidatedCore,
+    inspect_core, inspect_core_with_limits, AdmissionDetail, CoreCallSlot, CoreCallSlotState,
+    CoreComponentGroup, CoreHostCall, CoreHostImport, CoreInstanceExportImport, CoreModuleImport,
+    CoreSlotPollResult, CoreValue, CoreValueType, OwnerAllocationReservation, PollResult,
+    ProfileEngine, ValidatedCore,
 };
 
 fn compile(wat: &str) -> ValidatedCore {
@@ -79,6 +80,21 @@ fn poll_group_to_terminal(group: &mut CoreComponentGroup, instance: usize) -> Po
             PollResult::Pending { .. } => {}
             result @ (PollResult::Ready(_) | PollResult::Trapped(_)) => return result,
             PollResult::HostCall(call) => panic!("unexpected host call: {call:?}"),
+        }
+    }
+}
+
+fn poll_group_slot_to_terminal(
+    group: &mut CoreComponentGroup,
+    slot: &mut CoreCallSlot,
+) -> CoreSlotPollResult {
+    loop {
+        match group.poll_call_slot(slot) {
+            CoreSlotPollResult::Pending { .. } => {}
+            result @ (CoreSlotPollResult::Ready(_) | CoreSlotPollResult::Trapped(_)) => {
+                return result;
+            }
+            CoreSlotPollResult::HostCall(call) => panic!("unexpected host call: {call:?}"),
         }
     }
 }
@@ -212,6 +228,382 @@ fn reserved_group_start_is_exact_linear_and_failure_atomic() {
     assert_eq!(
         poll_group_to_terminal(&mut group, 0),
         PollResult::Ready(vec![CoreValue::I32(42)])
+    );
+}
+
+#[test]
+fn reusable_group_slot_returns_inline_results_across_many_calls() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (func (export "identity") (param i32) (result i32)
+                local.get 0))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 1).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    let mut slot = group.reserve_call_slot(0, "identity").unwrap();
+    let generation = slot.generation();
+    assert_ne!(generation, 0);
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+
+    for value in 0..512_i32 {
+        group
+            .start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(value)], 100, 10)
+            .unwrap();
+        assert_eq!(slot.state(), CoreCallSlotState::Active);
+        assert_eq!(slot.generation(), generation);
+        let result = poll_group_slot_to_terminal(&mut group, &mut slot);
+        let CoreSlotPollResult::Ready(results) = result else {
+            panic!("expected reusable call result, got {result:?}");
+        };
+        assert_eq!(results.as_slice(), &[CoreValue::I32(value)]);
+        assert_eq!(results.len(), 1);
+        assert!(!results.is_empty());
+        assert_eq!(slot.state(), CoreCallSlotState::Idle);
+        assert_eq!(group.call_metrics(0), None);
+        let metrics = group.call_metrics_slot(&slot).unwrap();
+        assert_eq!(metrics.consumed_fuel + metrics.remaining_fuel, 100);
+    }
+}
+
+#[test]
+fn reusable_group_slot_preserves_host_origin_resume_fuel_and_metrics() {
+    let engine = ProfileEngine::new();
+    let provider = compile_in(
+        &engine,
+        r#"(module
+              (import "host" "value" (func $value (param i32) (result i32)))
+              (func (export "wrapper") (param i32) (result i32)
+                local.get 0
+                call $value
+                i32.const 1
+                i32.add))"#,
+    );
+    let outer = compile_in(
+        &engine,
+        r#"(module
+              (import "provider" "wrapper" (func $wrapper (param i32) (result i32)))
+              (func (export "run") (param i32) (result i32)
+                (local i32)
+                i32.const 64
+                local.set 1
+                block $done
+                  loop $again
+                    local.get 1
+                    i32.eqz
+                    br_if $done
+                    local.get 1
+                    i32.const 1
+                    i32.sub
+                    local.set 1
+                    br $again
+                  end
+                end
+                local.get 0
+                call $wrapper))"#,
+    );
+    let params = [CoreValueType::I32];
+    let results = [CoreValueType::I32];
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group
+        .add_instance(
+            &provider,
+            &[CoreModuleImport::Host(CoreHostImport {
+                id: 414,
+                module: "host",
+                name: "value",
+                params: &params,
+                results: &results,
+            })],
+        )
+        .unwrap();
+    group
+        .add_instance(
+            &outer,
+            &[CoreModuleImport::InstanceExport(CoreInstanceExportImport {
+                module: "provider",
+                name: "wrapper",
+                instance: 0,
+                export: "wrapper",
+            })],
+        )
+        .unwrap();
+    let mut slot = group.reserve_call_slot(1, "run").unwrap();
+    let wrong_slot = group.reserve_call_slot(1, "run").unwrap();
+    group
+        .start_call_slot(&mut slot, 1, "run", &[CoreValue::I32(40)], 10_000, 7)
+        .unwrap();
+
+    let mut pending_polls = 0;
+    let host = loop {
+        match group.poll_call_slot(&mut slot) {
+            CoreSlotPollResult::Pending {
+                consumed_fuel,
+                remaining_fuel,
+            } => {
+                pending_polls += 1;
+                assert_eq!(consumed_fuel + remaining_fuel, 10_000);
+            }
+            CoreSlotPollResult::HostCall(call) => break call,
+            other => panic!("expected slot host call, got {other:?}"),
+        }
+    };
+    assert!(pending_polls > 2);
+    assert_eq!(
+        host,
+        CoreHostCall {
+            origin_instance: 0,
+            id: 414,
+            arguments: vec![CoreValue::I32(40)],
+        }
+    );
+    assert!(!group.has_active_call(0));
+    assert!(group.has_active_call(1));
+    assert_eq!(group.call_metrics(1), None);
+    assert_eq!(group.call_metrics_slot(&wrong_slot), None);
+    let before_debit = group.call_metrics_slot(&slot).unwrap();
+    assert_eq!(group.debit_call_fuel(1, 7), Err(TrapCode::Validation));
+    assert_eq!(
+        group.debit_call_fuel_slot(&wrong_slot, 7),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(group.call_metrics_slot(&slot), Some(before_debit));
+    group.debit_call_fuel_slot(&slot, 7).unwrap();
+    let after_debit = group.call_metrics_slot(&slot).unwrap();
+    assert_eq!(after_debit.consumed_fuel, before_debit.consumed_fuel + 7);
+    assert_eq!(after_debit.remaining_fuel + 7, before_debit.remaining_fuel);
+    assert_eq!(group.credit_call_fuel(1, 2), Err(TrapCode::Validation));
+    assert_eq!(
+        group.credit_call_fuel_slot(&wrong_slot, 2),
+        Err(TrapCode::Validation)
+    );
+    group.credit_call_fuel_slot(&slot, 2).unwrap();
+    let after_credit = group.call_metrics_slot(&slot).unwrap();
+    assert_eq!(after_credit.consumed_fuel + 2, after_debit.consumed_fuel);
+    assert_eq!(after_credit.consumed_fuel, before_debit.consumed_fuel + 5);
+    assert_eq!(after_credit.remaining_fuel, after_debit.remaining_fuel + 2);
+    assert_eq!(group.cancel_call(1), Err(TrapCode::Validation));
+    assert_eq!(
+        group.cancel_call_slot(&wrong_slot),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        group.resume_host_call(1, 414, &[CoreValue::I32(41)]),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        group.resume_host_call_slot(&wrong_slot, 414, &[CoreValue::I32(41)]),
+        Err(TrapCode::Validation)
+    );
+    group
+        .resume_host_call_slot(&slot, 414, &[CoreValue::I32(41)])
+        .unwrap();
+
+    let result = poll_group_slot_to_terminal(&mut group, &mut slot);
+    let CoreSlotPollResult::Ready(results) = result else {
+        panic!("expected resumed slot result, got {result:?}");
+    };
+    assert_eq!(results.as_slice(), &[CoreValue::I32(42)]);
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+    assert_eq!(group.call_metrics(1), None);
+    assert_eq!(group.call_metrics_slot(&wrong_slot), None);
+    let terminal = group.call_metrics_slot(&slot).unwrap();
+    assert_eq!(terminal.consumed_fuel + terminal.remaining_fuel, 10_000);
+
+    group
+        .start_call_slot(&mut slot, 1, "run", &[CoreValue::I32(50)], 10_000, 7)
+        .unwrap();
+    loop {
+        match group.poll_call_slot(&mut slot) {
+            CoreSlotPollResult::Pending { .. } => {}
+            CoreSlotPollResult::HostCall(_) => break,
+            other => panic!("expected second slot host call, got {other:?}"),
+        }
+    }
+    group.discard_call_slot(&mut slot).unwrap();
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+    assert_eq!(
+        group.resume_host_call(1, 414, &[CoreValue::I32(51)]),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        group.resume_host_call_slot(&slot, 414, &[CoreValue::I32(51)]),
+        Err(TrapCode::Validation)
+    );
+}
+
+#[test]
+fn reusable_group_slot_restores_scratch_after_guest_trap() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (func (export "maybe") (param i32) (result i32)
+                local.get 0
+                i32.eqz
+                if
+                  unreachable
+                end
+                local.get 0))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 1).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    let mut slot = group.reserve_call_slot(0, "maybe").unwrap();
+
+    group
+        .start_call_slot(&mut slot, 0, "maybe", &[CoreValue::I32(0)], 100, 10)
+        .unwrap();
+    assert!(matches!(
+        poll_group_slot_to_terminal(&mut group, &mut slot),
+        CoreSlotPollResult::Trapped(_)
+    ));
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+
+    group
+        .start_call_slot(&mut slot, 0, "maybe", &[CoreValue::I32(9)], 100, 10)
+        .unwrap();
+    let CoreSlotPollResult::Ready(results) = poll_group_slot_to_terminal(&mut group, &mut slot)
+    else {
+        panic!("reusable slot did not recover from a terminal guest trap");
+    };
+    assert_eq!(results.as_slice(), &[CoreValue::I32(9)]);
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+
+    group
+        .start_call_slot(&mut slot, 0, "maybe", &[CoreValue::I32(9)], 100, 10)
+        .unwrap();
+    assert_eq!(group.cancel_call(0), Err(TrapCode::Validation));
+    group.cancel_call_slot(&slot).unwrap();
+    assert_eq!(
+        group.poll_call_slot(&mut slot),
+        CoreSlotPollResult::Trapped(TrapCode::Cancelled)
+    );
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+}
+
+#[test]
+fn reusable_group_slot_is_provenance_exact_and_generic_poll_fails_closed() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (func (export "identity") (param i32) (result i32) local.get 0)
+              (func (export "same-type") (param i32) (result i32) local.get 0))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 2).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    let mut slot = group.reserve_call_slot(0, "identity").unwrap();
+    let mut other_group = CoreComponentGroup::new(&engine, 1).unwrap();
+    other_group.add_instance(&module, &[]).unwrap();
+
+    assert_eq!(
+        other_group.start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(1)], 100, 10,),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+    for (instance, export) in [(1, "identity"), (0, "same-type")] {
+        assert_eq!(
+            group.start_call_slot(&mut slot, instance, export, &[CoreValue::I32(1)], 100, 10,),
+            Err(TrapCode::Validation)
+        );
+        assert_eq!(slot.state(), CoreCallSlotState::Idle);
+        assert!(!group.any_active_call());
+    }
+    assert_eq!(
+        group.start_call_slot(&mut slot, 0, "identity", &[], 100, 10),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(
+        group.start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(1)], 10, 11,),
+        Err(TrapCode::LimitExceeded)
+    );
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+
+    group
+        .start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(7)], 100, 10)
+        .unwrap();
+    assert_eq!(
+        group.start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(8)], 100, 10,),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(other_group.call_metrics_slot(&slot), None);
+    assert_eq!(
+        other_group.cancel_call_slot(&slot),
+        Err(TrapCode::Validation)
+    );
+    assert_eq!(slot.state(), CoreCallSlotState::Active);
+    let CoreSlotPollResult::Ready(results) = poll_group_slot_to_terminal(&mut group, &mut slot)
+    else {
+        panic!("exact slot poll failed after double-start rejection");
+    };
+    assert_eq!(results.as_slice(), &[CoreValue::I32(7)]);
+    let first_terminal = group.call_metrics_slot(&slot).unwrap();
+    assert_eq!(group.call_metrics(0), None);
+
+    let mut second = group.reserve_call_slot(0, "identity").unwrap();
+    assert_ne!(slot.generation(), second.generation());
+    assert_eq!(group.call_metrics_slot(&slot), Some(first_terminal));
+    assert_eq!(group.call_metrics_slot(&second), None);
+    group
+        .start_call_slot(&mut second, 0, "identity", &[CoreValue::I32(8)], 100, 10)
+        .unwrap();
+    group
+        .start_call(1, "identity", &[CoreValue::I32(9)], 100, 10)
+        .unwrap();
+    assert_eq!(group.call_metrics(0), None);
+    assert_eq!(group.call_metrics_slot(&slot), None);
+    assert!(group.call_metrics_slot(&second).is_some());
+    assert_eq!(
+        group.poll_call(0),
+        PollResult::Trapped(TrapCode::Validation)
+    );
+    assert!(!group.any_active_call());
+    assert_eq!(second.state(), CoreCallSlotState::Active);
+    assert_eq!(
+        group.poll_call_slot(&mut second),
+        CoreSlotPollResult::Trapped(TrapCode::Validation)
+    );
+    assert_eq!(second.state(), CoreCallSlotState::Poisoned);
+}
+
+#[test]
+fn reusable_group_slot_has_exact_discard_and_generic_teardown_poisoning() {
+    let engine = ProfileEngine::new();
+    let module = compile_in(
+        &engine,
+        r#"(module
+              (func (export "identity") (param i32) (result i32) local.get 0))"#,
+    );
+    let mut group = CoreComponentGroup::new(&engine, 1).unwrap();
+    group.add_instance(&module, &[]).unwrap();
+    let mut slot = group.reserve_call_slot(0, "identity").unwrap();
+
+    group
+        .start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(3)], 100, 10)
+        .unwrap();
+    assert_eq!(group.discard_call(0), Err(TrapCode::Validation));
+    assert!(group.has_active_call(0));
+    assert_eq!(slot.state(), CoreCallSlotState::Active);
+    group.discard_call_slot(&mut slot).unwrap();
+    assert!(!group.any_active_call());
+    assert_eq!(slot.state(), CoreCallSlotState::Idle);
+
+    group
+        .start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(4)], 100, 10)
+        .unwrap();
+    group.discard_all_calls();
+    assert!(!group.any_active_call());
+    assert_eq!(slot.state(), CoreCallSlotState::Active);
+    assert_eq!(
+        group.poll_call_slot(&mut slot),
+        CoreSlotPollResult::Trapped(TrapCode::Validation)
+    );
+    assert_eq!(slot.state(), CoreCallSlotState::Poisoned);
+    assert_eq!(
+        group.start_call_slot(&mut slot, 0, "identity", &[CoreValue::I32(5)], 100, 10,),
+        Err(TrapCode::Validation)
     );
 }
 

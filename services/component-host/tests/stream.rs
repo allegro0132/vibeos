@@ -915,6 +915,171 @@ fn observed_close_wakes_after_unlock_and_allows_reentrant_state_queries() {
 }
 
 #[test]
+fn drained_normal_promotion_is_atomic_idempotent_and_does_not_publish_from_open() {
+    let stream = ByteStream::new();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+
+    assert_eq!(supervisor.promote_normal_if_drained_observed(), None);
+    assert_eq!(
+        writer.close(StreamCloseReason::Normal),
+        StreamCloseOutcome::Published
+    );
+
+    let promoted = supervisor
+        .promote_normal_if_drained_observed()
+        .expect("drained provisional Normal must promote");
+    assert_eq!(promoted.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(promoted.effective_reason(), Some(StreamCloseReason::Normal));
+    assert_eq!(supervisor.final_reason(), Some(StreamCloseReason::Normal));
+
+    let repeated = supervisor
+        .promote_normal_if_drained_observed()
+        .expect("an existing final reason must remain observable");
+    assert_eq!(repeated.outcome(), StreamCloseOutcome::AlreadyPublished);
+    assert_eq!(repeated.effective_reason(), Some(StreamCloseReason::Normal));
+    assert!(!stream.is_fail_stopped());
+}
+
+#[test]
+fn normal_promotion_waits_for_the_exact_buffer_to_drain() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+
+    assert_eq!(writer.start(&[4, 5, 6]), Ok(StreamSendDispatch::Sent));
+    assert_eq!(
+        writer.close(StreamCloseReason::Normal),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(supervisor.promote_normal_if_drained_observed(), None);
+    assert_eq!(supervisor.final_reason(), None);
+    assert_eq!(receive_one(&reader), [4, 5, 6]);
+
+    let promoted = supervisor
+        .promote_normal_if_drained_observed()
+        .expect("the drained provisional close must promote");
+    assert_eq!(promoted.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(promoted.effective_reason(), Some(StreamCloseReason::Normal));
+}
+
+#[test]
+fn normal_promotion_only_observes_an_established_failure_or_fail_stop() {
+    let stream = ByteStream::new();
+    let supervisor = stream.supervisor();
+
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Failure),
+        StreamCloseOutcome::Published
+    );
+    let failure = supervisor
+        .promote_normal_if_drained_observed()
+        .expect("an established failure must be observed");
+    assert_eq!(failure.outcome(), StreamCloseOutcome::AlreadyPublished);
+    assert_eq!(failure.effective_reason(), Some(StreamCloseReason::Failure));
+    assert!(!stream.is_fail_stopped());
+
+    assert_eq!(
+        supervisor.finalize(StreamCloseReason::Cancelled),
+        StreamCloseOutcome::Conflict
+    );
+    let failed = supervisor
+        .promote_normal_if_drained_observed()
+        .expect("fail-stop remains observable");
+    assert_eq!(failed.outcome(), StreamCloseOutcome::Conflict);
+    assert_eq!(failed.effective_reason(), Some(StreamCloseReason::Failure));
+    assert!(stream.is_fail_stopped());
+}
+
+#[test]
+fn normal_promotion_wakes_terminal_wait_after_unlock_and_allows_reentry() {
+    let stream = ByteStream::new();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(ReentrantWakeProbe {
+        stream: stream.clone(),
+        count: AtomicUsize::new(0),
+    });
+    let terminal = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected terminal wait, got {other:?}"),
+    };
+    supervisor
+        .register_terminal_wake(terminal, reentrant_wake_token(&probe))
+        .unwrap();
+
+    assert_eq!(
+        writer.close(StreamCloseReason::Normal),
+        StreamCloseOutcome::Published
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    let promoted = supervisor
+        .promote_normal_if_drained_observed()
+        .expect("drained provisional Normal must promote");
+    assert_eq!(promoted.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        supervisor.resume_terminal(terminal),
+        Ok(StreamTerminalDispatch::Ready(StreamCloseReason::Normal))
+    );
+}
+
+#[test]
+fn normal_promotion_and_failure_publication_are_linearizable_across_harts() {
+    for _ in 0..128 {
+        let stream = ByteStream::new();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        assert_eq!(
+            writer.close(StreamCloseReason::Normal),
+            StreamCloseOutcome::Published
+        );
+
+        let barrier = Arc::new(Barrier::new(3));
+        let promotion_supervisor = supervisor.clone();
+        let promotion_barrier = barrier.clone();
+        let promotion = thread::spawn(move || {
+            promotion_barrier.wait();
+            promotion_supervisor
+                .promote_normal_if_drained_observed()
+                .expect("provisional or final lifecycle must be observable")
+        });
+        let failure_supervisor = supervisor.clone();
+        let failure_barrier = barrier.clone();
+        let failure = thread::spawn(move || {
+            failure_barrier.wait();
+            failure_supervisor.finalize_observed(StreamCloseReason::Failure)
+        });
+
+        barrier.wait();
+        let promotion = promotion.join().unwrap();
+        let failure = failure.join().unwrap();
+        match (promotion.outcome(), failure.outcome()) {
+            (StreamCloseOutcome::Published, StreamCloseOutcome::Conflict) => {
+                assert_eq!(
+                    promotion.effective_reason(),
+                    Some(StreamCloseReason::Normal)
+                );
+                assert_eq!(failure.effective_reason(), Some(StreamCloseReason::Normal));
+                assert_eq!(supervisor.final_reason(), Some(StreamCloseReason::Normal));
+                assert!(stream.is_fail_stopped());
+            }
+            (StreamCloseOutcome::AlreadyPublished, StreamCloseOutcome::Published) => {
+                assert_eq!(
+                    promotion.effective_reason(),
+                    Some(StreamCloseReason::Failure)
+                );
+                assert_eq!(failure.effective_reason(), Some(StreamCloseReason::Failure));
+                assert_eq!(supervisor.final_reason(), Some(StreamCloseReason::Failure));
+                assert!(!stream.is_fail_stopped());
+            }
+            pair => panic!("non-linearizable promotion/failure outcomes: {pair:?}"),
+        }
+    }
+}
+
+#[test]
 fn observed_producer_done_and_failure_are_linearizable_across_harts() {
     for _ in 0..128 {
         let stream = ByteStream::new();

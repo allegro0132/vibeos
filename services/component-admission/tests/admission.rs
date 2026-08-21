@@ -1,8 +1,11 @@
 use vibeos_component_admission::{
     admit, AdmissionError, AdmissionPolicy, ArtifactTrust, AuthorityOffer, CallerAuthority,
     CommandStreamMode, ComponentArtifact, InstanceLimits, InterfaceCeiling, ProfileIdentity,
+    STREAM_FILTER_WORLD,
 };
-use vibeos_component_host::{HostManifestError, HostResourceKind, CLOCK_INTERFACE};
+use vibeos_component_host::{
+    HostManifestError, HostResourceKind, CLOCK_INTERFACE, STREAM_INTERFACE,
+};
 use vibeos_component_runtime::{decode::inspect_component, world::WorldContract};
 use vibeos_core::cap::Rights;
 
@@ -12,6 +15,9 @@ const FOREIGN_COMPONENT: &str =
     include_str!("../../../component-runtime/tests/fixtures/host-pair.component.wat");
 const PURE_COMPONENT: &str =
     include_str!("../../../component-format/tests/corpus/component/typed.component.wat");
+const STREAM_COMPONENT: &str =
+    include_str!("../../../component-runtime/tests/fixtures/host-stream.component.wat");
+const STREAM_WIT: &str = include_str!("../../../component-format/tests/corpus/wit/stream.wit");
 
 fn artifact_and_exact_world(source: &str) -> (ComponentArtifact, WorldContract) {
     let bytes = wat::parse_str(source).unwrap();
@@ -63,6 +69,141 @@ fn policy<'a>(
         stderr: CommandStreamMode::Optional,
         interfaces,
     }
+}
+
+fn stream_artifact_and_world() -> (ComponentArtifact, WorldContract) {
+    let bytes = wat::parse_str(STREAM_COMPONENT).unwrap();
+    let world = WorldContract::parse(STREAM_WIT, STREAM_FILTER_WORLD).unwrap();
+    (
+        ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap(),
+        world,
+    )
+}
+
+fn stream_policy<'a>(
+    identity: vibeos_component_admission::ComponentIdentity,
+    world: &'a WorldContract,
+    interfaces: &'a [InterfaceCeiling<'a>],
+) -> AdmissionPolicy<'a> {
+    AdmissionPolicy {
+        command_name: "stream-filter",
+        entrypoint: "run",
+        min_args: 0,
+        max_args: 0,
+        exact_world: world,
+        profile: ProfileIdentity::PROFILE_1,
+        trust: ArtifactTrust::ImagePinned(identity),
+        limits: InstanceLimits {
+            memory_bytes: 1024 * 1024,
+            total_fuel: 500_000,
+            poll_quantum: 100,
+            resources: 4,
+        },
+        stdin: CommandStreamMode::Required,
+        stdout: CommandStreamMode::Required,
+        stderr: CommandStreamMode::Optional,
+        interfaces,
+    }
+}
+
+#[test]
+fn exact_stream_transport_is_not_ambient_authority() {
+    let (artifact, world) = stream_artifact_and_world();
+    let identity = artifact.identity();
+    let admitted = admit(
+        artifact,
+        &stream_policy(identity, &world, &[]),
+        &CallerAuthority { offers: &[] },
+    )
+    .unwrap();
+    let manifest = admitted.command_manifest();
+    assert_eq!(manifest.world(), STREAM_FILTER_WORLD);
+    assert_eq!(manifest.stdin(), CommandStreamMode::Required);
+    assert_eq!(manifest.stdout(), CommandStreamMode::Required);
+    assert_eq!(manifest.stderr(), CommandStreamMode::Optional);
+    assert!(manifest.uses_stream_transport());
+    assert!(manifest.requirements().is_empty());
+    assert!(admitted.grants().is_empty());
+    assert!(admitted.validated_plan().is_ok());
+
+    let (artifact, world) = stream_artifact_and_world();
+    let mut closed_stderr = stream_policy(artifact.identity(), &world, &[]);
+    closed_stderr.stderr = CommandStreamMode::Closed;
+    let admitted = admit(artifact, &closed_stderr, &CallerAuthority { offers: &[] }).unwrap();
+    assert_eq!(
+        admitted.command_manifest().stderr(),
+        CommandStreamMode::Closed
+    );
+    assert!(admitted.validated_plan().is_ok());
+}
+
+#[test]
+fn stream_transport_modes_and_authority_tables_fail_closed() {
+    for (stdin, stdout) in [
+        (CommandStreamMode::Optional, CommandStreamMode::Required),
+        (CommandStreamMode::Closed, CommandStreamMode::Required),
+        (CommandStreamMode::Required, CommandStreamMode::Optional),
+        (CommandStreamMode::Required, CommandStreamMode::Closed),
+    ] {
+        let (artifact, world) = stream_artifact_and_world();
+        let mut policy = stream_policy(artifact.identity(), &world, &[]);
+        policy.stdin = stdin;
+        policy.stdout = stdout;
+        assert_eq!(
+            admit(artifact, &policy, &CallerAuthority { offers: &[] }).err(),
+            Some(AdmissionError::InvalidPolicy),
+            "stdin={stdin:?} stdout={stdout:?}"
+        );
+    }
+
+    for (min_args, max_args, stderr) in [
+        (0, 1, CommandStreamMode::Optional),
+        (1, 1, CommandStreamMode::Optional),
+        (0, 0, CommandStreamMode::Required),
+    ] {
+        let (artifact, world) = stream_artifact_and_world();
+        let mut policy = stream_policy(artifact.identity(), &world, &[]);
+        policy.min_args = min_args;
+        policy.max_args = max_args;
+        policy.stderr = stderr;
+        assert_eq!(
+            admit(artifact, &policy, &CallerAuthority { offers: &[] }).err(),
+            Some(AdmissionError::InvalidPolicy),
+            "min_args={min_args} max_args={max_args} stderr={stderr:?}"
+        );
+    }
+
+    let reader_ceiling = [InterfaceCeiling {
+        label: "stdin",
+        interface: STREAM_INTERFACE,
+        kind: HostResourceKind::ByteStreamReader,
+        rights: Rights::RECV,
+    }];
+    let (artifact, world) = stream_artifact_and_world();
+    let policy = stream_policy(artifact.identity(), &world, &reader_ceiling);
+    assert_eq!(
+        admit(artifact, &policy, &CallerAuthority { offers: &[] }).err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+
+    let writer_offer = [AuthorityOffer {
+        label: "stdout",
+        kind: HostResourceKind::ByteStreamWriter,
+        grantable: Rights::SEND,
+    }];
+    let (artifact, world) = stream_artifact_and_world();
+    let policy = stream_policy(artifact.identity(), &world, &[]);
+    assert_eq!(
+        admit(
+            artifact,
+            &policy,
+            &CallerAuthority {
+                offers: &writer_offer,
+            },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
 }
 
 #[test]

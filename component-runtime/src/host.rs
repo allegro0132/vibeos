@@ -11,6 +11,8 @@ use crate::{
     value::{CanonicalValue, ResourceOwnership, ValueType},
 };
 use alloc::vec::Vec;
+use core::{fmt, num::NonZeroU64};
+use vibeos_component_format::PROFILE_1_LIMITS;
 
 /// Stable failures at the trusted host-import boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +24,14 @@ pub enum HostError {
     InvalidArgument = 4,
     BackendFault = 5,
     BudgetExceeded = 6,
+    /// The backend published an ordinary typed failure, distinct from a
+    /// structural or authority fault.
+    Failed = 7,
+    /// The exact operation was cancelled by its owning supervisor.
+    Cancelled = 8,
+    /// The backend published a typed invalid-state terminal. This is distinct
+    /// from malformed guest arguments at the host-call boundary.
+    InvalidState = 9,
 }
 
 impl HostError {
@@ -48,6 +58,135 @@ pub struct HostResponse {
 pub struct HostPayloadAllocation {
     pub size: u32,
     pub alignment: u32,
+}
+
+/// Copy-only identity for one dispatcher-owned suspended operation.
+///
+/// The token carries no authority and does not own the operation. Its sole
+/// purpose is exact-generation comparison at the runtime/dispatcher boundary;
+/// the dispatcher remains responsible for minting globally non-repeating
+/// generations and for owning every waiter and backend reservation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostOperationToken(NonZeroU64);
+
+impl HostOperationToken {
+    /// Wrap one dispatcher-minted non-zero generation.
+    ///
+    /// There is deliberately no inverse accessor: portable continuation state
+    /// may compare or return this token, but cannot derive a registry index or
+    /// otherwise treat it as authority.
+    pub const fn from_generation(generation: u64) -> Option<Self> {
+        match NonZeroU64::new(generation) {
+            Some(generation) => Some(Self(generation)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn strictly_after(self, previous: Self) -> bool {
+        self.0.get() > previous.0.get()
+    }
+}
+
+impl fmt::Debug for HostOperationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostOperationToken(..)")
+    }
+}
+
+/// Fixed-size wake envelope copied into a dispatcher-owned wait slot.
+///
+/// The four machine words are intentionally uninterpreted by the Component
+/// runtime. Invoking `wake` never grants access to guest memory, a resource
+/// table, or a dispatcher; it merely calls the supervisor-selected callback.
+#[derive(Clone, Copy)]
+pub struct HostWakeToken {
+    words: [usize; 4],
+    callback: fn([usize; 4]),
+}
+
+impl HostWakeToken {
+    pub const fn new(words: [usize; 4], callback: fn([usize; 4])) -> Self {
+        Self { words, callback }
+    }
+
+    pub fn wake(self) {
+        (self.callback)(self.words);
+    }
+}
+
+impl fmt::Debug for HostWakeToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostWakeToken(..)")
+    }
+}
+
+/// A dispatcher reservation whose backend effect has not happened yet.
+///
+/// `allocations` are the exact Canonical ABI payload spans required by the
+/// eventual response. The runtime validates and prepares them before calling
+/// [`HostDispatcher::commit_prepared`]. Private fields prevent callers from
+/// manufacturing a response or treating the operation token as owning state.
+pub struct HostPrepared {
+    operation: HostOperationToken,
+    allocations: Vec<HostPayloadAllocation>,
+}
+
+impl HostPrepared {
+    pub fn new(
+        operation: HostOperationToken,
+        allocations: Vec<HostPayloadAllocation>,
+    ) -> Result<Self, HostError> {
+        if allocations.is_empty()
+            || allocations.len() > PROFILE_1_LIMITS.max_abi_allocations as usize
+            || allocations.iter().any(|allocation| {
+                allocation.size == 0
+                    || allocation.alignment == 0
+                    || !allocation.alignment.is_power_of_two()
+            })
+        {
+            return Err(HostError::InvalidArgument);
+        }
+        Ok(Self {
+            operation,
+            allocations,
+        })
+    }
+
+    pub const fn operation(&self) -> HostOperationToken {
+        self.operation
+    }
+
+    pub fn allocations(&self) -> &[HostPayloadAllocation] {
+        &self.allocations
+    }
+
+    pub(crate) fn into_parts(self) -> (HostOperationToken, Vec<HostPayloadAllocation>) {
+        (self.operation, self.allocations)
+    }
+}
+
+impl fmt::Debug for HostPrepared {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostPrepared")
+            .field("operation", &self.operation)
+            .field("allocations", &self.allocations)
+            .finish()
+    }
+}
+
+/// One attempt to cross an async-capable host boundary.
+pub enum HostDispatch {
+    /// The operation completed without suspension or a deferred backend
+    /// mutation. Legacy scalar imports normally use this path.
+    Ready(HostResponse),
+    /// The SYSTEM dispatcher owns a wait registration. Ordinary `poll` calls
+    /// must return this token without retrying the backend.
+    Pending(HostOperationToken),
+    /// The dispatcher has reserved an exact result but has not performed its
+    /// backend mutation. Only exact allocation preparation followed by
+    /// `commit_prepared` may consume it.
+    Prepared(HostPrepared),
 }
 
 impl HostResponse {
@@ -208,7 +347,65 @@ pub trait HostDispatcher<A>: Send {
         Ok(Vec::new())
     }
 
-    fn dispatch(&mut self, request: HostRequest<'_, A>) -> Result<HostResponse, HostError>;
+    /// Begin one exact operation. The default preserves the pre-C5 synchronous
+    /// dispatcher contract.
+    fn start(&mut self, request: HostRequest<'_, A>) -> Result<HostDispatch, HostError> {
+        self.dispatch(request).map(HostDispatch::Ready)
+    }
+
+    /// Legacy synchronous entry point. Async-only dispatchers may leave this
+    /// default in place and implement `start` instead.
+    fn dispatch(&mut self, _request: HostRequest<'_, A>) -> Result<HostResponse, HostError> {
+        Err(HostError::Denied)
+    }
+
+    /// Install the sole copy-only wake envelope for an exact pending token.
+    /// Implementations must register before rechecking readiness and invoke a
+    /// raced wake outside internal locks.
+    fn register_wake(
+        &mut self,
+        _operation: HostOperationToken,
+        _wake: HostWakeToken,
+    ) -> Result<(), HostError> {
+        Err(HostError::InvalidArgument)
+    }
+
+    /// Retry only after an explicit supervisor wake. Every return consumes the
+    /// supplied operation. A new `Pending` or `Prepared` return must carry a
+    /// freshly minted token, never the consumed generation.
+    fn resume(
+        &mut self,
+        _operation: HostOperationToken,
+        _request: HostRequest<'_, A>,
+    ) -> Result<HostDispatch, HostError> {
+        Err(HostError::InvalidArgument)
+    }
+
+    /// Perform the deferred backend mutation for one prepared result.
+    ///
+    /// The runtime calls this only after all exact guest allocations and
+    /// reallocations have succeeded. A successful return consumes
+    /// `operation`. An ordinary error before backend publication must preserve
+    /// the exact reservation so the runtime can cancel it before rolling back
+    /// known guest spans. Returning an error after mutation is a dispatcher
+    /// invariant failure: the subsequent exact cancel must fail, causing the
+    /// runtime to poison the instance and conservatively leak ambiguous spans.
+    /// Implementations must therefore reserve the response envelope and
+    /// validate the fresh request before mutating the backend.
+    fn commit_prepared(
+        &mut self,
+        _operation: HostOperationToken,
+        _request: HostRequest<'_, A>,
+    ) -> Result<HostResponse, HostError> {
+        Err(HostError::InvalidArgument)
+    }
+
+    /// Detach a not-yet-committed pending/prepared operation. Cancellation is
+    /// exact and idempotence is deliberately not implied: a stale, duplicate,
+    /// or mismatched token must fail closed in the dispatcher.
+    fn cancel(&mut self, _operation: HostOperationToken) -> Result<(), HostError> {
+        Err(HostError::InvalidArgument)
+    }
 }
 
 /// Default policy for components which declared no executable host imports.

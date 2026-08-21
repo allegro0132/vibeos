@@ -424,8 +424,9 @@ impl SshdPlatform for SshPlatform {
         &self,
         session: &mut vibeos_vsh::Session,
         policy: SshExecComponentSessionPolicy,
+        io: vibeos_vsh::SshExecComponentIoInstall,
     ) -> Result<(), vibeos_vsh::Diagnostic> {
-        crate::component_instances::install_ssh_exec_component(session, policy)
+        crate::component_instances::install_ssh_exec_component(session, policy, io)
     }
 
     fn ssh_exec_component_policy(

@@ -20,7 +20,11 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::Poll;
 
-use vibeos_core::cap::{self, CSpace, Cap, CapError, Resource, Revocable, Rights};
+use vibeos_component_host::{
+    ByteStream as ComponentByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter,
+    StreamCloseOutcome,
+};
+use vibeos_core::cap::{self, CSpace, CSpaceIdentity, Cap, CapError, Resource, Revocable, Rights};
 use vibeos_core::exec::{
     self, OneShotWaitError, OneShotWaitQueue, TaskHandle, TaskState, WaitQueue,
 };
@@ -51,6 +55,8 @@ pub const MAX_SCRIPT_CALL_DEPTH: usize = 8;
 /// Maximum command-string size accepted by the deliberately small SSH `exec`
 /// profile. The general interactive shell retains [`MAX_INPUT_BYTES`].
 pub const SSH_EXEC_MAX_INPUT_BYTES: usize = 1024;
+/// Exact managed command world authorized for the C5.3 SSH stream path.
+pub const VIBE_STREAM_FILTER_WORLD: &str = "vibe:stream/filter@1.0.0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -1485,6 +1491,7 @@ impl ComponentTrapCode {
 pub enum ComponentTerminal {
     Success,
     Returned(u8),
+    Usage,
     Denied,
     Unavailable,
     BackendFault,
@@ -1499,6 +1506,7 @@ impl ComponentTerminal {
         match self {
             Self::Success => Status::Success,
             Self::Returned(code) => Status::Returned(code),
+            Self::Usage => Status::Usage,
             Self::Denied => Status::Denied,
             Self::Unavailable => Status::Unavailable,
             Self::BackendFault => Status::BackendFault,
@@ -1506,6 +1514,25 @@ impl ComponentTerminal {
             Self::Cancelled => Status::Cancelled,
             Self::RunnerFault => Status::Faulted,
             Self::Trapped(_) => Status::Faulted,
+        }
+    }
+
+    /// Stable C5.3 close mapping. `Returned` is a generic component failure;
+    /// malformed command use maps to the WIT `invalid` case, and lifecycle or
+    /// trap corruption maps to `backend-fault` without exposing detail.
+    pub const fn stream_close_reason(self) -> vibeos_component_host::StreamCloseReason {
+        use vibeos_component_host::StreamCloseReason;
+        match self {
+            Self::Success => StreamCloseReason::Normal,
+            Self::Returned(_) => StreamCloseReason::Failure,
+            Self::Usage => StreamCloseReason::Invalid,
+            Self::Denied => StreamCloseReason::Denied,
+            Self::Unavailable => StreamCloseReason::Unavailable,
+            Self::BudgetExceeded => StreamCloseReason::Exhausted,
+            Self::Cancelled => StreamCloseReason::Cancelled,
+            Self::BackendFault | Self::RunnerFault | Self::Trapped(_) => {
+                StreamCloseReason::BackendFault
+            }
         }
     }
 }
@@ -1609,16 +1636,14 @@ impl CancellationSignal {
     /// Publish cancellation once and wake the exact registered task after the
     /// queue lock has been released. Returns `true` only for the first signal.
     pub fn cancel(&self) -> bool {
-        if self.inner.cancelled.swap(true, Ordering::AcqRel) {
-            return false;
-        }
+        let first = !self.inner.cancelled.swap(true, Ordering::AcqRel);
         let wake = self
             .inner
             .waiter
             .publish(1)
             .expect("cancellation signal generation is fixed and monotonic");
         wake.dispatch();
-        true
+        first
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -1801,6 +1826,10 @@ impl core::fmt::Debug for ManagedComponentToken {
 /// Copy-only state published by a trusted managed Component lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedComponentState {
+    /// The lifecycle control gate is held by another bounded operation. This
+    /// is not a semantic instance state; asynchronous observers must yield and
+    /// retry rather than interpreting transient contention as Running or Lost.
+    Busy,
     /// The child remains live. VSH awaits the lifecycle's bounded state-change
     /// future; the SSH supervisor provides the enclosing cancellation bound.
     Running,
@@ -1818,18 +1847,394 @@ pub type ManagedComponentStateFuture<'a> =
 /// Result of a cooperative cancellation request for a managed invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedComponentCancel {
+    /// The lifecycle control gate is held by another bounded operation. The
+    /// caller must asynchronously yield and retry the same opaque token.
+    Busy,
     /// The lifecycle atomically published a cooperative cancel word and woke
     /// the exact child. `state` may remain `Running` until a next/future child
     /// poll observes the word and publishes terminal state; under the enclosing
     /// SSH supervisor bound it must eventually leave `Running`, or return
     /// `Lost` and apply the mismatch quarantine contract.
     Requested,
+    /// An exact terminal candidate or core terminal transition already won
+    /// the race, but outer terminal publication is not necessarily complete.
+    /// Cancellation did not mutate the candidate or publish a cancel word.
+    AlreadyCompleting,
     /// The exact token already has a stable [`ManagedComponentState::Complete`]
     /// value; cancellation did not change or republish terminal state.
     AlreadyComplete,
     /// The token did not resolve exactly. The lifecycle remains responsible
     /// for quarantining or conservatively leaking the ambiguous instance.
     Lost,
+}
+
+/// Exact result of consuming one stable managed terminal tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedComponentAcknowledge {
+    /// The lifecycle CONTROL gate is transiently held. The SYSTEM reaper must
+    /// yield and retry without releasing its slot or publishing completion.
+    Busy,
+    /// The exact terminal generation is acknowledged and may be reused.
+    Acknowledged,
+    /// The token or its complete identity tuple was lost. The reaper must stop
+    /// conservatively and must never make its own slot reusable.
+    Lost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedComponentStartAbort {
+    CleanAborted,
+    Quarantined,
+}
+
+const MANAGED_REAPER_SLOTS: usize = 16;
+const MANAGED_REAPER_SLOT_BITS: u32 = 8;
+const MAX_MANAGED_REAPER_GENERATION: u64 = u64::MAX >> MANAGED_REAPER_SLOT_BITS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManagedReaperKey {
+    slot: u8,
+    generation: u64,
+}
+
+impl ManagedReaperKey {
+    const fn encode(self) -> Option<u64> {
+        let slot = self.slot as u64 + 1;
+        let raw = (self.generation << MANAGED_REAPER_SLOT_BITS) | slot;
+        if self.generation == 0 || self.generation > MAX_MANAGED_REAPER_GENERATION {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
+    const fn decode(raw: u64) -> Option<Self> {
+        let slot = (raw & ((1 << MANAGED_REAPER_SLOT_BITS) - 1)) as usize;
+        let generation = raw >> MANAGED_REAPER_SLOT_BITS;
+        if slot == 0 || slot > MANAGED_REAPER_SLOTS || generation == 0 {
+            None
+        } else {
+            Some(Self {
+                slot: (slot - 1) as u8,
+                generation,
+            })
+        }
+    }
+}
+
+/// Copy-only handoff installed before a managed child can become runnable.
+///
+/// The private fields contain only generation/task/domain/status-registration
+/// scalars. They own no Session, endpoint, CSpace, task handle, queue, arena,
+/// runtime payload, or reference-counted object. The stable state they name is
+/// held exclusively by the fixed SYSTEM reaper registry and TaskStatus ledger.
+#[derive(Clone, Copy)]
+pub struct ManagedComponentStartLease {
+    reaper: ManagedReaperKey,
+    parent: exec::CurrentTaskDetachLease,
+}
+
+/// Deferred scheduler wake detached from a fixed SYSTEM reaper queue.
+/// Lifecycle CONTROL code publishes the state edge while holding its own
+/// serialization gate, then dispatches this value only after releasing every
+/// CONTROL/registry/scheduler lock.
+#[must_use = "the reaper wake must be dispatched after CONTROL and scheduler locks are released"]
+pub struct ManagedComponentReaperWake {
+    wake: Option<exec::OneShotWake>,
+    reaper: Option<exec::ExactTaskWake>,
+}
+
+impl ManagedComponentReaperWake {
+    pub fn dispatch(mut self) -> bool {
+        let dispatched = self.wake.take().is_some_and(exec::OneShotWake::dispatch);
+        dispatched
+            || self
+                .reaper
+                .take()
+                .is_some_and(|reaper| reaper.wake_if_exact())
+    }
+}
+
+impl core::fmt::Debug for ManagedComponentStartLease {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ManagedComponentStartLease(<opaque>)")
+    }
+}
+
+impl ManagedComponentStartLease {
+    /// Exact parent identity captured from the executor's private TaskStatus
+    /// projection. Shared raw-reclaimable SSH parents are accepted.
+    pub const fn parent_task_id(self) -> exec::TaskId {
+        self.parent.task_id()
+    }
+
+    pub const fn parent_allocation_domain(self) -> heap::AllocationDomain {
+        self.parent.allocation_domain()
+    }
+
+    /// Compare the hidden reaper generation and exact parent TaskStatus
+    /// registration without exposing either scalar. Kernel CONTROL retains
+    /// the original copy and uses this only as an ABA/mismatch gate.
+    pub fn matches_exact(self, other: Self) -> bool {
+        self.reaper == other.reaper && self.parent.matches_exact(other.parent)
+    }
+
+    /// Bind the opaque child token before the child batch is published to any
+    /// hart. This does not wake the reaper: CONTROL must first commit the
+    /// child and its SYSTEM supervisor as one publication transaction.
+    pub fn bind_before_child_publication(self, token: ManagedComponentToken) -> bool {
+        bind_managed_reaper(self, token)
+    }
+
+    /// Move the stable prestart IO envelope into lifecycle CONTROL only after
+    /// this exact token has been bound. No parent future owns endpoints across
+    /// the preceding Armed await.
+    pub fn claim_bound_io(self, token: ManagedComponentToken) -> Option<ManagedComponentIo> {
+        claim_managed_reaper_io(self, token)
+    }
+
+    /// Commit the already-bound child publication and wake the armed reaper.
+    /// No allocation or task creation is permitted between child publication
+    /// and this fixed state transition.
+    pub fn commit_child_publication(
+        self,
+        token: ManagedComponentToken,
+    ) -> Option<ManagedComponentReaperWake> {
+        commit_managed_reaper_publication(self, token)
+    }
+
+    /// Revalidate the exact prepublication binding retained in CONTROL.
+    pub fn is_bound_for(self, token: ManagedComponentToken) -> bool {
+        let Some(slot) = managed_reaper_slot(self.reaper) else {
+            return false;
+        };
+        let record = slot.record.lock();
+        managed_reaper_matches_lease(&record, self)
+            && record.phase == ManagedReaperPhase::Bound
+            && record.component == Some(token)
+            && record
+                .reaper_task
+                .as_ref()
+                .is_some_and(|handle| handle.is_published() && handle.state() == TaskState::Running)
+    }
+
+    /// Revalidate the exact live SYSTEM reaper task and bound child token.
+    /// CONTROL uses this before publication and whenever it validates its
+    /// retained orphan projection.
+    pub fn is_active_for(self, token: ManagedComponentToken) -> bool {
+        let Some(slot) = managed_reaper_slot(self.reaper) else {
+            return false;
+        };
+        let record = slot.record.lock();
+        managed_reaper_matches_lease(&record, self)
+            && record.phase == ManagedReaperPhase::Active
+            && record.component == Some(token)
+            && record
+                .reaper_task
+                .as_ref()
+                .is_some_and(|handle| handle.is_published() && handle.state() == TaskState::Running)
+    }
+
+    /// Publish a lifecycle state-change edge after stable CONTROL state has
+    /// changed. This performs no lookup or lifecycle action itself.
+    pub fn notify_state_change(self) -> Option<ManagedComponentReaperWake> {
+        notify_managed_reaper_state(self)
+    }
+
+    /// Stage one exact lifecycle terminal together with its sole reaper edge.
+    /// The unsafe lifecycle implementation is the only holder of this bound
+    /// lease/token pair after IO claim; later fail-stop code may preserve this
+    /// value but cannot introduce a different terminal.
+    pub fn notify_complete(
+        self,
+        token: ManagedComponentToken,
+        terminal: ComponentTerminal,
+    ) -> Option<ManagedComponentReaperWake> {
+        notify_managed_reaper_complete(self, token, terminal)
+    }
+
+    /// Quarantine only an already-staged exact terminal. This is the poisoned
+    /// CONTROL fallback for the window before acknowledgement and deliberately
+    /// refuses to manufacture a terminal in an empty/mismatched record.
+    pub fn quarantine_staged_complete(
+        self,
+        token: ManagedComponentToken,
+        terminal: ComponentTerminal,
+    ) -> bool {
+        quarantine_managed_reaper_staged_complete(self, token, terminal)
+    }
+
+    /// Mark a start failure which is known to precede child publication.
+    /// Unpublished resources may be released after the exact parent detach
+    /// registration is disarmed.
+    pub fn abort_before_child_publication(
+        self,
+        terminal: ComponentTerminal,
+    ) -> ManagedComponentStartAbort {
+        abort_managed_reaper_start(self, false, terminal)
+    }
+
+    /// Mark an ambiguous or post-publication start failure. This wakes the
+    /// reaper but permanently quarantines its generation.
+    pub fn quarantine_partial_start(self) {
+        let _ = abort_managed_reaper_start(self, true, ComponentTerminal::RunnerFault);
+    }
+}
+
+/// One invocation's exact C5.3 transport endpoints.
+///
+/// The endpoint implementations guarantee SYSTEM-owned backing storage. This
+/// envelope is constructed only after source capability and CSpace checks,
+/// then consumed by the lifecycle start transaction. It is intentionally not
+/// cloneable: once `start` returns, VSH retains only a
+/// [`ManagedComponentToken`].
+pub struct ManagedComponentIo {
+    stdin: Arc<ByteStreamReader>,
+    stdout: Arc<ByteStreamWriter>,
+    stdin_supervisor: Arc<ByteStreamSupervisor>,
+    stdout_supervisor: Arc<ByteStreamSupervisor>,
+}
+
+impl core::fmt::Debug for ManagedComponentIo {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ManagedComponentIo")
+            .field("stdin", &"<system-owned>")
+            .field("stdout", &"<system-owned>")
+            .field("stdin_supervisor", &"<system-owned>")
+            .field("stdout_supervisor", &"<system-owned>")
+            .finish()
+    }
+}
+
+impl ManagedComponentIo {
+    fn new(
+        stdin: Arc<ByteStreamReader>,
+        stdout: Arc<ByteStreamWriter>,
+        stdin_supervisor: Arc<ByteStreamSupervisor>,
+        stdout_supervisor: Arc<ByteStreamSupervisor>,
+    ) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stdin_supervisor,
+            stdout_supervisor,
+        }
+    }
+
+    /// Make a pre-lifecycle terminal observable on both transport directions.
+    /// No child or registry owner exists while this envelope remains in VSH.
+    fn finalize_unpublished(&self, terminal: ComponentTerminal) -> ComponentTerminal {
+        let reason = terminal.stream_close_reason();
+        let stdin = self.stdin_supervisor.finalize(reason);
+        let stdout = self.stdout_supervisor.finalize(reason);
+        if matches!(
+            stdin,
+            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
+        ) && matches!(
+            stdout,
+            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
+        ) && self.stdin_supervisor.final_reason() == Some(reason)
+            && self.stdout_supervisor.final_reason() == Some(reason)
+            && !self.stdin_supervisor.is_fail_stopped()
+            && !self.stdout_supervisor.is_fail_stopped()
+        {
+            terminal
+        } else {
+            ComponentTerminal::RunnerFault
+        }
+    }
+
+    /// Transfer the exact endpoint and terminal-authority objects into the
+    /// stable lifecycle registry.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<ByteStreamReader>,
+        Arc<ByteStreamWriter>,
+        Arc<ByteStreamSupervisor>,
+        Arc<ByteStreamSupervisor>,
+    ) {
+        (
+            self.stdin,
+            self.stdout,
+            self.stdin_supervisor,
+            self.stdout_supervisor,
+        )
+    }
+}
+
+/// Opaque component-facing half of one SSH stream installation. Only the
+/// explicit image/session-policy installer can consume this value.
+pub struct SshExecComponentIoInstall {
+    component: ManagedComponentIo,
+}
+
+/// Pump-facing half of one SSH stream installation. It exposes only the
+/// directions needed by the trusted transport pump, never the component's
+/// reader/writer capabilities.
+///
+/// The terminal-authority accessors deliberately do not exist:
+///
+/// ```compile_fail
+/// let (_, pump) = vibeos_vsh::new_ssh_exec_component_io();
+/// let _ = pump.stdin_supervisor();
+/// ```
+pub struct SshExecComponentIoPump {
+    stdin: Arc<ByteStreamWriter>,
+    stdout: Arc<ByteStreamReader>,
+}
+
+impl core::fmt::Debug for SshExecComponentIoPump {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("SshExecComponentIoPump(<opaque>)")
+    }
+}
+
+impl SshExecComponentIoPump {
+    pub fn stdin(&self) -> &Arc<ByteStreamWriter> {
+        &self.stdin
+    }
+
+    pub fn stdout(&self) -> &Arc<ByteStreamReader> {
+        &self.stdout
+    }
+}
+
+/// Create two distinct fixed-capacity SYSTEM-owned streams and split their
+/// directional authority. The install half can only enter a managed component
+/// through [`Session::install_ssh_exec_managed_component_io`].
+pub fn new_ssh_exec_component_io() -> (SshExecComponentIoInstall, SshExecComponentIoPump) {
+    let stdin = ComponentByteStream::new();
+    let stdout = ComponentByteStream::new();
+    let component = ManagedComponentIo::new(
+        stdin.reader(),
+        stdout.writer(),
+        stdin.supervisor(),
+        stdout.supervisor(),
+    );
+    let pump = SshExecComponentIoPump {
+        stdin: stdin.writer(),
+        stdout: stdout.reader(),
+    };
+    (SshExecComponentIoInstall { component }, pump)
+}
+
+#[derive(Clone, Copy)]
+struct ManagedComponentIoSource {
+    space: CSpaceIdentity,
+    incarnation: u64,
+    stdin: Cap,
+    stdout: Cap,
+    stdin_supervisor: Cap,
+    stdout_supervisor: Cap,
+}
+
+struct ValidatedManagedComponentIo {
+    stdin: Arc<ByteStreamReader>,
+    stdout: Arc<ByteStreamWriter>,
+    stdin_supervisor: Arc<ByteStreamSupervisor>,
+    stdout_supervisor: Arc<ByteStreamSupervisor>,
 }
 
 /// Trusted SYSTEM boundary for the narrow, scalar-only SSH Component path.
@@ -1848,15 +2253,22 @@ pub enum ManagedComponentCancel {
 /// arena, and CSpace. The published Component child future may contain only
 /// the opaque core registry token; VSH's token is a separate non-owning lookup
 /// key. A failed or partially published `start` leaves no resource owned by
-/// VSH: the lifecycle must fail-stop, quarantine, or conservatively leak it.
+/// VSH. If `start` fails before any object is published into the registry, it
+/// must use the two supplied supervisors to finalize both streams with the
+/// exact returned terminal reason before returning `Err`; no later lifecycle
+/// owner exists for that invocation. A partially published or identity-unsafe
+/// failure must instead fail-stop, quarantine, or conservatively leak it.
 /// `start` may install a registry-owned lazy driver containing only static pin
 /// and copy fields; no trait method may construct, poll, or drop the runtime
 /// payload on the VSH caller, or re-enter/drive executor task polling.
 ///
 /// Every method must be bounded and nonblocking. No method may poll WASM, call
 /// `TaskHandle::cancel`, allocate in caller-owned storage, or retain any caller
-/// reference, `Arc`, CSpace, `OutputSink`, or other VSH execution object. Any
-/// allocation must be charged to lifecycle-owned SYSTEM/reserved storage.
+/// reference, caller-owned `Arc`, CSpace, `OutputSink`, or other VSH execution
+/// object. `start` is the sole exception for the four SYSTEM-owned objects in
+/// [`ManagedComponentIo`]: it must transfer them into the stable registry and
+/// must not leave any of their `Arc`s in a child future. Any allocation must be
+/// charged to lifecycle-owned SYSTEM/reserved storage.
 /// `state` may only read a stable copy-only scalar; `Complete` is immutable.
 /// `request_cancel` may only atomically set a cooperative cancellation word
 /// and wake the exact child. No trait method may terminalize, drop, reclaim,
@@ -1882,10 +2294,19 @@ pub unsafe trait ManagedComponentLifecycle: Send + Sync + 'static {
     /// policy before the command becomes visible.
     fn manifest(&self) -> &ComponentCommandManifest;
 
-    /// Allocate and start one zero-argument, closed-input invocation. This is
-    /// called only after every shell grammar, image-policy, session-policy,
-    /// and immutable-manifest gate has passed.
-    fn start(&self) -> Result<ManagedComponentToken, ComponentTerminal>;
+    /// Allocate and start one zero-shell-argument stream invocation. This is
+    /// called only after every grammar, image-policy, session-policy,
+    /// immutable-manifest, source-CSpace, endpoint-kind, and exact-rights gate
+    /// has passed. The lifecycle must move both endpoints and their two
+    /// terminal authorities into the registry's candidate CSpace before
+    /// publishing a token; on return VSH owns none of those objects and
+    /// retains only that opaque non-owning token. An unpublished `Err` must
+    /// first make both streams immutably observable with
+    /// `terminal.stream_close_reason()` as required by the trait contract.
+    fn start(
+        &self,
+        cleanup: ManagedComponentStartLease,
+    ) -> Result<ManagedComponentToken, ComponentTerminal>;
 
     /// Read copy-only lifecycle state for a token. This is a completion-table
     /// lookup, not a future/WASM poll operation.
@@ -1900,7 +2321,11 @@ pub unsafe trait ManagedComponentLifecycle: Send + Sync + 'static {
 
     /// Request cooperative cancellation. The lifecycle wakes its owned child;
     /// VSH never cancels or retains that child's executor handle.
-    fn request_cancel(&self, token: ManagedComponentToken) -> ManagedComponentCancel;
+    fn request_cancel(
+        &self,
+        token: ManagedComponentToken,
+        terminal: ComponentTerminal,
+    ) -> ManagedComponentCancel;
 
     /// Acknowledge that VSH consumed the exact stable terminal scalar.
     ///
@@ -1909,7 +2334,1913 @@ pub unsafe trait ManagedComponentLifecycle: Send + Sync + 'static {
     /// or otherwise participate in child teardown: all of those actions must
     /// already have completed before `state` returned `Complete`. Unknown,
     /// stale, running, or quarantined tokens are ignored conservatively.
-    fn acknowledge_complete(&self, _token: ManagedComponentToken) {}
+    fn acknowledge_complete(&self, _token: ManagedComponentToken) -> ManagedComponentAcknowledge {
+        ManagedComponentAcknowledge::Lost
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedReaperPhase {
+    Vacant,
+    Reserved,
+    Armed,
+    Bound,
+    Active,
+    Terminal,
+    Aborted,
+    Quarantined,
+}
+
+struct ManagedReaperRecord {
+    generation: u64,
+    phase: ManagedReaperPhase,
+    lifecycle: Option<&'static dyn ManagedComponentLifecycle>,
+    parent_task: Option<exec::TaskId>,
+    parent_domain: Option<heap::AllocationDomain>,
+    parent_wake: Option<exec::CurrentTaskDetachLease>,
+    component: Option<ManagedComponentToken>,
+    terminal: Option<ComponentTerminal>,
+    prestart_io: Option<ManagedComponentIo>,
+    prestart_terminal: Option<ComponentTerminal>,
+    prestart_finalized: bool,
+    cancel_terminal: Option<ComponentTerminal>,
+    detached: bool,
+    foreground_disarmed: bool,
+    reaper_finished: bool,
+    reaper_task: Option<TaskHandle>,
+}
+
+impl ManagedReaperRecord {
+    const fn new() -> Self {
+        Self {
+            generation: 0,
+            phase: ManagedReaperPhase::Vacant,
+            lifecycle: None,
+            parent_task: None,
+            parent_domain: None,
+            parent_wake: None,
+            component: None,
+            terminal: None,
+            prestart_io: None,
+            prestart_terminal: None,
+            prestart_finalized: false,
+            cancel_terminal: None,
+            detached: false,
+            foreground_disarmed: false,
+            reaper_finished: false,
+            reaper_task: None,
+        }
+    }
+
+    fn exact(&self, key: ManagedReaperKey) -> bool {
+        self.generation == key.generation && self.phase != ManagedReaperPhase::Vacant
+    }
+
+    fn clear_for_reuse(&mut self) {
+        debug_assert!(matches!(
+            self.phase,
+            ManagedReaperPhase::Terminal | ManagedReaperPhase::Aborted
+        ));
+        debug_assert!(self.reaper_finished);
+        debug_assert!(self.detached || self.foreground_disarmed);
+        self.phase = ManagedReaperPhase::Vacant;
+        self.lifecycle = None;
+        self.parent_task = None;
+        self.parent_domain = None;
+        self.parent_wake = None;
+        self.component = None;
+        self.terminal = None;
+        self.prestart_io = None;
+        self.prestart_terminal = None;
+        self.prestart_finalized = false;
+        self.cancel_terminal = None;
+        self.detached = false;
+        self.foreground_disarmed = false;
+        self.reaper_finished = false;
+        self.reaper_task = None;
+    }
+
+    fn maybe_clear_for_reuse(&mut self) {
+        if self.reaper_finished
+            && (self.detached || self.foreground_disarmed)
+            && (self.phase == ManagedReaperPhase::Terminal
+                || (self.phase == ManagedReaperPhase::Aborted && self.prestart_finalized))
+        {
+            self.clear_for_reuse();
+        }
+    }
+}
+
+struct ManagedReaperSlot {
+    record: SpinLock<ManagedReaperRecord>,
+    activation: OneShotWaitQueue,
+    control: OneShotWaitQueue,
+    lifecycle: OneShotWaitQueue,
+    completion: OneShotWaitQueue,
+}
+
+impl ManagedReaperSlot {
+    const fn new() -> Self {
+        Self {
+            record: SpinLock::new(ManagedReaperRecord::new()),
+            activation: OneShotWaitQueue::new(),
+            control: OneShotWaitQueue::new(),
+            lifecycle: OneShotWaitQueue::new(),
+            completion: OneShotWaitQueue::new(),
+        }
+    }
+}
+
+static MANAGED_REAPERS: [ManagedReaperSlot; MANAGED_REAPER_SLOTS] =
+    [const { ManagedReaperSlot::new() }; MANAGED_REAPER_SLOTS];
+
+fn managed_reaper_slot(key: ManagedReaperKey) -> Option<&'static ManagedReaperSlot> {
+    MANAGED_REAPERS.get(key.slot as usize)
+}
+
+fn managed_reaper_matches_lease(
+    record: &ManagedReaperRecord,
+    lease: ManagedComponentStartLease,
+) -> bool {
+    record.exact(lease.reaper)
+        && record.parent_task == Some(lease.parent.task_id())
+        && record.parent_domain == Some(lease.parent.allocation_domain())
+        && record
+            .parent_wake
+            .is_some_and(|stored| stored.matches_exact(lease.parent))
+}
+
+struct ManagedReaperDispatch {
+    activation: Option<exec::OneShotWake>,
+    control: Option<exec::OneShotWake>,
+    lifecycle: Option<exec::OneShotWake>,
+    completion: Option<exec::OneShotWake>,
+    reaper: Option<exec::ExactTaskWake>,
+    parent: Option<exec::CurrentTaskDetachLease>,
+}
+
+impl ManagedReaperDispatch {
+    const fn empty() -> Self {
+        Self {
+            activation: None,
+            control: None,
+            lifecycle: None,
+            completion: None,
+            reaper: None,
+            parent: None,
+        }
+    }
+
+    fn dispatch(self) {
+        let reaper_dispatched = self.activation.is_some_and(exec::OneShotWake::dispatch)
+            | self.control.is_some_and(exec::OneShotWake::dispatch)
+            | self.lifecycle.is_some_and(exec::OneShotWake::dispatch);
+        let completion_dispatched = self.completion.is_some_and(exec::OneShotWake::dispatch);
+        if !reaper_dispatched {
+            if let Some(reaper) = self.reaper {
+                let _ = reaper.wake_if_exact();
+            }
+        }
+        if !completion_dispatched {
+            if let Some(parent) = self.parent {
+                let _ = parent.wake_if_exact();
+            }
+        }
+    }
+}
+
+fn quarantine_managed_reaper_locked(
+    slot: &ManagedReaperSlot,
+    key: ManagedReaperKey,
+    record: &mut ManagedReaperRecord,
+) -> ManagedReaperDispatch {
+    record.phase = ManagedReaperPhase::Quarantined;
+    let mut dispatch = ManagedReaperDispatch {
+        activation: slot.activation.publish(key.generation).ok(),
+        control: slot.control.publish(key.generation).ok(),
+        lifecycle: slot.lifecycle.publish(key.generation).ok(),
+        completion: None,
+        reaper: record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+        parent: record.parent_wake,
+    };
+    match slot.completion.publish(key.generation) {
+        Ok(wake) => dispatch.completion = Some(wake),
+        Err(_) => {}
+    }
+    dispatch
+}
+
+unsafe fn managed_parent_detached(
+    raw: u64,
+    task: exec::TaskId,
+    domain: heap::AllocationDomain,
+    reason: exec::TaskDetachReason,
+) {
+    let Some(key) = ManagedReaperKey::decode(raw) else {
+        return;
+    };
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let prestart_terminal = match reason {
+        exec::TaskDetachReason::Cancelled => ComponentTerminal::Cancelled,
+        exec::TaskDetachReason::Exited | exec::TaskDetachReason::Faulted => {
+            ComponentTerminal::RunnerFault
+        }
+    };
+    let dispatch = {
+        let mut record = slot.record.lock();
+        if !record.exact(key) {
+            // A delayed old-generation callback is observationally inert.
+            return;
+        }
+        if record.parent_task != Some(task) || record.parent_domain != Some(domain) {
+            record.reaper_finished = false;
+            quarantine_managed_reaper_locked(slot, key, &mut record)
+        } else {
+            record.detached = true;
+            record.cancel_terminal.get_or_insert(prestart_terminal);
+            match record.phase {
+                ManagedReaperPhase::Reserved | ManagedReaperPhase::Armed => {
+                    let unpublished = record
+                        .reaper_task
+                        .as_ref()
+                        .is_none_or(|handle| !handle.is_published());
+                    if record.prestart_io.is_none() || unpublished {
+                        quarantine_managed_reaper_locked(slot, key, &mut record)
+                    } else {
+                        record.phase = ManagedReaperPhase::Aborted;
+                        record.prestart_terminal = Some(prestart_terminal);
+                        record.prestart_finalized = false;
+                        record.reaper_finished = false;
+                        match slot.activation.publish(key.generation) {
+                            Ok(wake) => ManagedReaperDispatch {
+                                activation: Some(wake),
+                                reaper: record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                                ..ManagedReaperDispatch::empty()
+                            },
+                            Err(_) => quarantine_managed_reaper_locked(slot, key, &mut record),
+                        }
+                    }
+                }
+                // A permanently detached starter can no longer complete the
+                // Bound publication transaction. Quarantine the partial start
+                // and release both preinstalled reaper waits; registry/arena/
+                // CSpace state is deliberately leaked rather than observed or
+                // reclaimed through a token that was never Active.
+                ManagedReaperPhase::Bound => {
+                    quarantine_managed_reaper_locked(slot, key, &mut record)
+                }
+                ManagedReaperPhase::Active => match slot.control.publish(key.generation) {
+                    Ok(wake) => ManagedReaperDispatch {
+                        control: Some(wake),
+                        reaper: record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                        ..ManagedReaperDispatch::empty()
+                    },
+                    Err(_) => quarantine_managed_reaper_locked(slot, key, &mut record),
+                },
+                ManagedReaperPhase::Terminal => {
+                    record.maybe_clear_for_reuse();
+                    ManagedReaperDispatch::empty()
+                }
+                ManagedReaperPhase::Aborted => {
+                    let reaper = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+                    record.maybe_clear_for_reuse();
+                    ManagedReaperDispatch {
+                        reaper,
+                        ..ManagedReaperDispatch::empty()
+                    }
+                }
+                ManagedReaperPhase::Quarantined => {
+                    quarantine_managed_reaper_locked(slot, key, &mut record)
+                }
+                ManagedReaperPhase::Vacant => ManagedReaperDispatch::empty(),
+            }
+        }
+    };
+    dispatch.dispatch();
+}
+
+/// Fault/cancellation fallback for the SYSTEM reaper itself. Executor detach
+/// invokes this only after removing every activation/control/lifecycle waiter
+/// owned by that exact TaskStatus, so publishing outer completion cannot race
+/// a stale self-listener.
+unsafe fn managed_reaper_detached(
+    raw: u64,
+    task: exec::TaskId,
+    domain: heap::AllocationDomain,
+    _reason: exec::TaskDetachReason,
+) {
+    let Some(key) = ManagedReaperKey::decode(raw) else {
+        return;
+    };
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let (completion, fallback) = {
+        let mut record = slot.record.lock();
+        if !record.exact(key) {
+            return;
+        }
+        let self_exact = record
+            .reaper_task
+            .as_ref()
+            .is_some_and(|handle| handle.id() == task && handle.allocation_domain() == domain);
+        if !self_exact {
+            record.terminal = None;
+        }
+        record.phase = ManagedReaperPhase::Quarantined;
+        record.reaper_finished = true;
+        let fallback = record.parent_wake;
+        match slot.completion.publish(key.generation) {
+            Ok(wake) => (Some(wake), fallback),
+            Err(_) => (None, fallback),
+        }
+    };
+    if !completion.is_some_and(exec::OneShotWake::dispatch) {
+        if let Some(parent) = fallback {
+            let _ = parent.wake_if_exact();
+        }
+    }
+}
+
+fn reserve_managed_reaper(
+    lifecycle: &'static dyn ManagedComponentLifecycle,
+) -> Result<ManagedComponentStartLease, ComponentTerminal> {
+    for (index, slot) in MANAGED_REAPERS.iter().enumerate() {
+        let key = {
+            let mut record = slot.record.lock();
+            if record.phase != ManagedReaperPhase::Vacant
+                || slot.activation.waiter_count() != 0
+                || slot.control.waiter_count() != 0
+                || slot.lifecycle.waiter_count() != 0
+                || slot.completion.waiter_count() != 0
+            {
+                continue;
+            }
+            let Some(generation) = record.generation.checked_add(1).filter(|generation| {
+                *generation != 0 && *generation <= MAX_MANAGED_REAPER_GENERATION
+            }) else {
+                record.phase = ManagedReaperPhase::Quarantined;
+                continue;
+            };
+            let key = ManagedReaperKey {
+                slot: index as u8,
+                generation,
+            };
+            record.generation = generation;
+            record.phase = ManagedReaperPhase::Reserved;
+            record.lifecycle = Some(lifecycle);
+            record.parent_task = None;
+            record.parent_domain = None;
+            record.parent_wake = None;
+            record.component = None;
+            record.terminal = None;
+            record.prestart_io = None;
+            record.prestart_terminal = None;
+            record.prestart_finalized = false;
+            record.cancel_terminal = None;
+            record.detached = false;
+            record.foreground_disarmed = false;
+            record.reaper_finished = false;
+            record.reaper_task = None;
+            key
+        };
+        let Some(raw) = key.encode() else {
+            slot.record.lock().phase = ManagedReaperPhase::Quarantined;
+            continue;
+        };
+        let target = unsafe { exec::TaskDetachTarget::new(raw, managed_parent_detached) };
+        let parent = match unsafe { exec::register_current_task_detach(target) } {
+            Ok(parent) => parent,
+            Err(_) => {
+                let mut record = slot.record.lock();
+                if record.exact(key) && record.phase == ManagedReaperPhase::Reserved {
+                    record.phase = ManagedReaperPhase::Aborted;
+                    // No IO envelope or reaper task exists yet, so this is an
+                    // exact clean rollback with no pending terminalization.
+                    record.prestart_finalized = true;
+                    record.reaper_finished = true;
+                    record.foreground_disarmed = true;
+                    record.maybe_clear_for_reuse();
+                }
+                return Err(ComponentTerminal::RunnerFault);
+            }
+        };
+        {
+            let mut record = slot.record.lock();
+            if !record.exact(key)
+                || record.phase != ManagedReaperPhase::Reserved
+                || record.parent_task.is_some()
+                || record.parent_domain.is_some()
+            {
+                let _ = parent.disarm();
+                record.phase = ManagedReaperPhase::Quarantined;
+                return Err(ComponentTerminal::RunnerFault);
+            }
+            record.parent_task = Some(parent.task_id());
+            record.parent_domain = Some(parent.allocation_domain());
+            record.parent_wake = Some(parent);
+        }
+        return Ok(ManagedComponentStartLease {
+            reaper: key,
+            parent,
+        });
+    }
+    Err(ComponentTerminal::Unavailable)
+}
+
+fn install_managed_reaper_io(
+    lease: ManagedComponentStartLease,
+    io: ManagedComponentIo,
+) -> Result<(), ManagedComponentIo> {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return Err(io);
+    };
+    let mut record = slot.record.lock();
+    if !managed_reaper_matches_lease(&record, lease)
+        || record.phase != ManagedReaperPhase::Reserved
+        || record.prestart_io.is_some()
+    {
+        if record.exact(lease.reaper) {
+            record.phase = ManagedReaperPhase::Quarantined;
+        }
+        return Err(io);
+    }
+    record.prestart_io = Some(io);
+    Ok(())
+}
+
+fn publish_managed_reaper_task(lease: ManagedComponentStartLease) -> Result<(), ComponentTerminal> {
+    let mut system = heap::enter_owner(heap::OwnerId::SYSTEM);
+    let result = (|| {
+        let mut batch = exec::PreparedTaskBatch::new();
+        batch
+            .try_reserve(1)
+            .map_err(|_| ComponentTerminal::RunnerFault)?;
+        batch.prepare(
+            "vsh-managed-system-reaper",
+            run_managed_reaper(lease.reaper),
+        );
+        let prepared_handle = batch
+            .prepared_handles()
+            .first()
+            .expect("managed reaper batch contains one prepared handle")
+            .clone();
+        {
+            let Some(slot) = managed_reaper_slot(lease.reaper) else {
+                return Err(ComponentTerminal::RunnerFault);
+            };
+            let mut record = slot.record.lock();
+            if !managed_reaper_matches_lease(&record, lease)
+                || record.phase != ManagedReaperPhase::Reserved
+                || record.reaper_task.is_some()
+            {
+                record.phase = ManagedReaperPhase::Quarantined;
+                return Err(ComponentTerminal::RunnerFault);
+            }
+            record.reaper_task = Some(prepared_handle);
+        }
+        let mut handles = batch
+            .publish()
+            .map_err(|_| ComponentTerminal::RunnerFault)?;
+        let Some(handle) = handles.pop() else {
+            return Err(ComponentTerminal::RunnerFault);
+        };
+        if !handles.is_empty() || !handle.is_published() {
+            return Err(ComponentTerminal::RunnerFault);
+        }
+        let Some(slot) = managed_reaper_slot(lease.reaper) else {
+            return Err(ComponentTerminal::RunnerFault);
+        };
+        let record = slot.record.lock();
+        let exact_handle = record.reaper_task.as_ref().is_some_and(|prepared| {
+            prepared.id() == handle.id()
+                && prepared.shares_status_with(&handle)
+                && prepared.is_published()
+        });
+        let clean_reaper_abort = managed_reaper_matches_lease(&record, lease)
+            && exact_handle
+            && record.phase == ManagedReaperPhase::Aborted
+            && record.prestart_finalized
+            && record.reaper_finished
+            && record.prestart_io.is_none()
+            && record.prestart_terminal == Some(ComponentTerminal::RunnerFault)
+            && matches!(handle.state(), TaskState::Running | TaskState::Exited);
+        if clean_reaper_abort {
+            return Err(ComponentTerminal::RunnerFault);
+        }
+        if !managed_reaper_matches_lease(&record, lease)
+            || !exact_handle
+            || !matches!(
+                record.phase,
+                ManagedReaperPhase::Reserved | ManagedReaperPhase::Armed
+            )
+            || handle.state() != TaskState::Running
+            || record.reaper_task.as_ref().is_none_or(|prepared| {
+                prepared.id() != handle.id()
+                    || !prepared.shares_status_with(&handle)
+                    || !prepared.is_published()
+                    || prepared.state() != TaskState::Running
+            })
+        {
+            drop(record);
+            slot.record.lock().phase = ManagedReaperPhase::Quarantined;
+            return Err(ComponentTerminal::RunnerFault);
+        }
+        Ok(())
+    })();
+    system.restore();
+    result
+}
+
+enum ManagedPrepareFailure {
+    Terminal(ComponentTerminal),
+    Lost,
+}
+
+async fn prepare_managed_reaper(
+    lifecycle: &'static dyn ManagedComponentLifecycle,
+    io: ManagedComponentIo,
+) -> Result<ManagedComponentStartLease, ManagedPrepareFailure> {
+    let lease = match reserve_managed_reaper(lifecycle) {
+        Ok(lease) => lease,
+        Err(terminal) => {
+            return Err(ManagedPrepareFailure::Terminal(
+                io.finalize_unpublished(terminal),
+            ));
+        }
+    };
+    let mut foreground = ManagedForegroundGuard::new(lease);
+    if let Err(io) = install_managed_reaper_io(lease, io) {
+        let terminal = io.finalize_unpublished(ComponentTerminal::RunnerFault);
+        disarm_managed_reaper_foreground(lease);
+        return Err(ManagedPrepareFailure::Terminal(terminal));
+    }
+    if !exec::try_reserve_current_task_registrations(2) {
+        let outcome = abort_managed_reaper_start(lease, false, ComponentTerminal::RunnerFault);
+        disarm_managed_reaper_foreground(lease);
+        return Err(match outcome {
+            ManagedComponentStartAbort::CleanAborted => {
+                ManagedPrepareFailure::Terminal(ComponentTerminal::RunnerFault)
+            }
+            ManagedComponentStartAbort::Quarantined => ManagedPrepareFailure::Lost,
+        });
+    }
+    if publish_managed_reaper_task(lease).is_err() {
+        let outcome = abort_managed_reaper_start(lease, false, ComponentTerminal::RunnerFault);
+        disarm_managed_reaper_foreground(lease);
+        return Err(match outcome {
+            ManagedComponentStartAbort::CleanAborted => {
+                ManagedPrepareFailure::Terminal(ComponentTerminal::RunnerFault)
+            }
+            ManagedComponentStartAbort::Quarantined => ManagedPrepareFailure::Lost,
+        });
+    }
+    loop {
+        let (phase, reaper_running, prestart_terminal, prestart_finalized) =
+            managed_reaper_slot(lease.reaper)
+                .map(|slot| {
+                    let record = slot.record.lock();
+                    if managed_reaper_matches_lease(&record, lease) {
+                        (
+                            record.phase,
+                            record.reaper_task.as_ref().is_some_and(|handle| {
+                                handle.is_published() && handle.state() == TaskState::Running
+                            }),
+                            record.prestart_terminal,
+                            record.prestart_finalized,
+                        )
+                    } else {
+                        (ManagedReaperPhase::Quarantined, false, None, false)
+                    }
+                })
+                .unwrap_or((ManagedReaperPhase::Quarantined, false, None, false));
+        match phase {
+            ManagedReaperPhase::Armed => {
+                foreground.release();
+                return Ok(lease);
+            }
+            ManagedReaperPhase::Reserved if reaper_running => exec::yield_now().await,
+            ManagedReaperPhase::Aborted if reaper_running && !prestart_finalized => {
+                exec::yield_now().await
+            }
+            ManagedReaperPhase::Vacant
+            | ManagedReaperPhase::Bound
+            | ManagedReaperPhase::Active
+            | ManagedReaperPhase::Terminal
+            | ManagedReaperPhase::Aborted
+            | ManagedReaperPhase::Quarantined => {
+                disarm_managed_reaper_foreground(lease);
+                return Err(match (phase, prestart_terminal) {
+                    (ManagedReaperPhase::Aborted, Some(terminal)) => {
+                        ManagedPrepareFailure::Terminal(terminal)
+                    }
+                    _ => ManagedPrepareFailure::Lost,
+                });
+            }
+            ManagedReaperPhase::Reserved => {
+                let _ = abort_managed_reaper_start(lease, true, ComponentTerminal::RunnerFault);
+                disarm_managed_reaper_foreground(lease);
+                return Err(ManagedPrepareFailure::Lost);
+            }
+        }
+    }
+}
+
+fn bind_managed_reaper(lease: ManagedComponentStartLease, token: ManagedComponentToken) -> bool {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return false;
+    };
+    {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease)
+            || record.phase != ManagedReaperPhase::Armed
+            || record.component.is_some()
+            || record.prestart_io.is_none()
+            || record
+                .reaper_task
+                .as_ref()
+                .is_none_or(|handle| !handle.is_published() || handle.state() != TaskState::Running)
+        {
+            if record.exact(lease.reaper) {
+                record.phase = ManagedReaperPhase::Quarantined;
+            }
+            return false;
+        }
+        record.component = Some(token);
+        record.phase = ManagedReaperPhase::Bound;
+    }
+    true
+}
+
+fn claim_managed_reaper_io(
+    lease: ManagedComponentStartLease,
+    token: ManagedComponentToken,
+) -> Option<ManagedComponentIo> {
+    let slot = managed_reaper_slot(lease.reaper)?;
+    let mut record = slot.record.lock();
+    if !managed_reaper_matches_lease(&record, lease)
+        || record.phase != ManagedReaperPhase::Bound
+        || record.component != Some(token)
+    {
+        if record.exact(lease.reaper) {
+            record.phase = ManagedReaperPhase::Quarantined;
+        }
+        return None;
+    }
+    record.prestart_io.take()
+}
+
+fn commit_managed_reaper_publication(
+    lease: ManagedComponentStartLease,
+    token: ManagedComponentToken,
+) -> Option<ManagedComponentReaperWake> {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return None;
+    };
+    let (wake, reaper) = {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease)
+            || record.phase != ManagedReaperPhase::Bound
+            || record.component != Some(token)
+            || record.prestart_io.is_some()
+            || record.reaper_finished
+            || record
+                .reaper_task
+                .as_ref()
+                .is_none_or(|handle| !handle.is_published() || handle.state() != TaskState::Running)
+        {
+            if record.exact(lease.reaper) {
+                record.phase = ManagedReaperPhase::Quarantined;
+            }
+            return None;
+        }
+        record.phase = ManagedReaperPhase::Active;
+        let reaper = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+        match slot.activation.publish(lease.reaper.generation) {
+            Ok(wake) => (wake, reaper),
+            Err(_) => {
+                record.phase = ManagedReaperPhase::Quarantined;
+                return None;
+            }
+        }
+    };
+    Some(ManagedComponentReaperWake {
+        wake: Some(wake),
+        reaper,
+    })
+}
+
+fn notify_managed_reaper_state(
+    lease: ManagedComponentStartLease,
+) -> Option<ManagedComponentReaperWake> {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return None;
+    };
+    let (wake, reaper) = {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease) {
+            return None;
+        }
+        if record.phase == ManagedReaperPhase::Terminal
+            || (record.phase == ManagedReaperPhase::Quarantined && record.terminal.is_some())
+        {
+            return Some(ManagedComponentReaperWake {
+                wake: None,
+                reaper: record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+            });
+        }
+        if record.phase != ManagedReaperPhase::Active || record.component.is_none() {
+            return None;
+        }
+        let reaper = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+        match slot.lifecycle.publish(lease.reaper.generation) {
+            Ok(wake) => (wake, reaper),
+            Err(_) => {
+                record.phase = ManagedReaperPhase::Quarantined;
+                return None;
+            }
+        }
+    };
+    Some(ManagedComponentReaperWake {
+        wake: Some(wake),
+        reaper,
+    })
+}
+
+fn notify_managed_reaper_complete(
+    lease: ManagedComponentStartLease,
+    token: ManagedComponentToken,
+    terminal: ComponentTerminal,
+) -> Option<ManagedComponentReaperWake> {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return None;
+    };
+    let (wake, reaper) = {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease)
+            || record.phase != ManagedReaperPhase::Active
+            || record.component != Some(token)
+            || record.reaper_finished
+        {
+            return None;
+        }
+        match record.terminal {
+            None => record.terminal = Some(terminal),
+            Some(existing) if existing == terminal => {}
+            Some(_) => {
+                record.phase = ManagedReaperPhase::Quarantined;
+                return None;
+            }
+        }
+        let reaper = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+        match slot.lifecycle.publish(lease.reaper.generation) {
+            Ok(wake) => (wake, reaper),
+            Err(_) => {
+                record.phase = ManagedReaperPhase::Quarantined;
+                return None;
+            }
+        }
+    };
+    Some(ManagedComponentReaperWake {
+        wake: Some(wake),
+        reaper,
+    })
+}
+
+fn quarantine_managed_reaper_staged_complete(
+    lease: ManagedComponentStartLease,
+    token: ManagedComponentToken,
+    terminal: ComponentTerminal,
+) -> bool {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return false;
+    };
+    let (wake, publish_failed, parent_fallback, reaper_fallback) = {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease)
+            || record.component != Some(token)
+            || !matches!(
+                record.phase,
+                ManagedReaperPhase::Active | ManagedReaperPhase::Quarantined
+            )
+        {
+            return false;
+        }
+        match record.terminal {
+            None => record.terminal = Some(terminal),
+            Some(existing) if existing == terminal => {}
+            Some(_) => return false,
+        }
+        record.phase = ManagedReaperPhase::Quarantined;
+        let parent_fallback = record.parent_wake;
+        let reaper_fallback = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+        match slot.lifecycle.publish(lease.reaper.generation) {
+            Ok(wake) => (Some(wake), false, parent_fallback, reaper_fallback),
+            Err(_) => (None, true, parent_fallback, reaper_fallback),
+        }
+    };
+    let dispatched = wake.is_some_and(exec::OneShotWake::dispatch);
+    // `publish` removes the registered waiter before returning its detached
+    // wake. If the lifecycle publisher faults after staging the terminal but
+    // before dispatch, replaying the same generation succeeds with no queue
+    // wake. A failed publication likewise cannot be trusted to retain one.
+    // The stable reaper TaskStatus is the exact recovery edge which makes it
+    // poll the already-published watermark instead of remaining parked.
+    if !dispatched {
+        if let Some(fallback) = reaper_fallback {
+            let _ = fallback.wake_if_exact();
+        }
+    }
+    if publish_failed {
+        if let Some(fallback) = parent_fallback {
+            let _ = fallback.wake_if_exact();
+        }
+    }
+    true
+}
+
+fn abort_managed_reaper_start(
+    lease: ManagedComponentStartLease,
+    quarantine: bool,
+    terminal: ComponentTerminal,
+) -> ManagedComponentStartAbort {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return ManagedComponentStartAbort::Quarantined;
+    };
+    let (
+        mut activation,
+        mut lifecycle,
+        io,
+        definitely_no_reaper,
+        mut outcome,
+        mut reaper_fallback,
+        mut reaper_wake_required,
+    ) = {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease) {
+            return ManagedComponentStartAbort::Quarantined;
+        }
+        if quarantine
+            || matches!(
+                record.phase,
+                ManagedReaperPhase::Bound | ManagedReaperPhase::Active
+            )
+        {
+            record.phase = ManagedReaperPhase::Quarantined;
+            (
+                slot.activation.publish(lease.reaper.generation).ok(),
+                slot.lifecycle.publish(lease.reaper.generation).ok(),
+                None,
+                false,
+                ManagedComponentStartAbort::Quarantined,
+                record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                true,
+            )
+        } else if matches!(
+            record.phase,
+            ManagedReaperPhase::Reserved | ManagedReaperPhase::Armed
+        ) && record.prestart_io.is_some()
+        {
+            // Move the envelope only into this caller's local finalization
+            // transaction. Keep the phase Reserved/Armed until the immutable
+            // stream terminal is committed: a concurrently polling reaper
+            // must not observe Aborted with an empty envelope and mistake the
+            // in-flight finalization for identity loss.
+            let io = record.prestart_io.take();
+            let definitely_no_reaper = record
+                .reaper_task
+                .as_ref()
+                .is_none_or(|handle| !handle.is_published());
+            record.prestart_terminal = Some(terminal);
+            if definitely_no_reaper {
+                record.reaper_finished = true;
+                record.reaper_task = None;
+            }
+            (
+                None,
+                None,
+                io,
+                definitely_no_reaper,
+                ManagedComponentStartAbort::CleanAborted,
+                record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                false,
+            )
+        } else if record.phase == ManagedReaperPhase::Aborted
+            && record.prestart_terminal == Some(terminal)
+            && record.prestart_finalized
+        {
+            (
+                None,
+                None,
+                None,
+                false,
+                ManagedComponentStartAbort::CleanAborted,
+                record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                !record.reaper_finished,
+            )
+        } else {
+            record.phase = ManagedReaperPhase::Quarantined;
+            (
+                slot.activation.publish(lease.reaper.generation).ok(),
+                slot.lifecycle.publish(lease.reaper.generation).ok(),
+                None,
+                false,
+                ManagedComponentStartAbort::Quarantined,
+                record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                true,
+            )
+        }
+    };
+    if let Some(io) = io {
+        let finalized = io.finalize_unpublished(terminal) == terminal;
+        let mut record = slot.record.lock();
+        if managed_reaper_matches_lease(&record, lease)
+            && matches!(
+                record.phase,
+                ManagedReaperPhase::Reserved | ManagedReaperPhase::Armed
+            )
+            && record.prestart_terminal == Some(terminal)
+            && record.prestart_io.is_none()
+        {
+            if finalized {
+                record.phase = ManagedReaperPhase::Aborted;
+                record.prestart_finalized = true;
+                if !definitely_no_reaper {
+                    activation = slot.activation.publish(lease.reaper.generation).ok();
+                    reaper_fallback = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+                    reaper_wake_required = true;
+                }
+                record.maybe_clear_for_reuse();
+            } else {
+                record.phase = ManagedReaperPhase::Quarantined;
+                record.prestart_terminal = None;
+                record.prestart_finalized = false;
+                activation = slot.activation.publish(lease.reaper.generation).ok();
+                lifecycle = slot.lifecycle.publish(lease.reaper.generation).ok();
+                reaper_fallback = record.reaper_task.as_ref().map(TaskHandle::exact_wake);
+                reaper_wake_required = true;
+            }
+        } else {
+            // A detach/self-fault or identity mismatch won while finalization
+            // ran outside the fixed lock. Never turn that partial result back
+            // into a clean abort or make the generation reusable.
+            outcome = ManagedComponentStartAbort::Quarantined;
+        }
+        if !finalized {
+            outcome = ManagedComponentStartAbort::Quarantined;
+        }
+    }
+    let reaper_dispatched = activation.is_some_and(exec::OneShotWake::dispatch)
+        | lifecycle.is_some_and(exec::OneShotWake::dispatch);
+    if reaper_wake_required && !reaper_dispatched {
+        if let Some(reaper) = reaper_fallback {
+            let _ = reaper.wake_if_exact();
+        }
+    }
+    outcome
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedReaperCancelOwnership {
+    Published,
+    Retired,
+    Lost,
+}
+
+fn request_managed_reaper_cancel(
+    lease: ManagedComponentStartLease,
+) -> ManagedReaperCancelOwnership {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return ManagedReaperCancelOwnership::Lost;
+    };
+    let prestart = {
+        let record = slot.record.lock();
+        managed_reaper_matches_lease(&record, lease)
+            && matches!(
+                record.phase,
+                ManagedReaperPhase::Reserved | ManagedReaperPhase::Armed
+            )
+    };
+    if prestart {
+        return match abort_managed_reaper_start(lease, false, ComponentTerminal::Cancelled) {
+            ManagedComponentStartAbort::CleanAborted => ManagedReaperCancelOwnership::Retired,
+            ManagedComponentStartAbort::Quarantined => ManagedReaperCancelOwnership::Lost,
+        };
+    }
+    let (control, activation, lifecycle, completion, fallback, reaper_fallback, outcome) = {
+        let mut record = slot.record.lock();
+        if !managed_reaper_matches_lease(&record, lease) {
+            return ManagedReaperCancelOwnership::Lost;
+        }
+        match record.phase {
+            ManagedReaperPhase::Active => {
+                record
+                    .cancel_terminal
+                    .get_or_insert(ComponentTerminal::Cancelled);
+                match slot.control.publish(lease.reaper.generation) {
+                    Ok(wake) => (
+                        Some(wake),
+                        None,
+                        None,
+                        None,
+                        None,
+                        record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                        ManagedReaperCancelOwnership::Published,
+                    ),
+                    Err(_) => {
+                        record.phase = ManagedReaperPhase::Quarantined;
+                        let activation = slot.activation.publish(lease.reaper.generation).ok();
+                        let lifecycle = slot.lifecycle.publish(lease.reaper.generation).ok();
+                        match slot.completion.publish(lease.reaper.generation) {
+                            Ok(completion) => (
+                                None,
+                                activation,
+                                lifecycle,
+                                Some(completion),
+                                record.parent_wake,
+                                record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                                ManagedReaperCancelOwnership::Lost,
+                            ),
+                            Err(_) => (
+                                None,
+                                activation,
+                                lifecycle,
+                                None,
+                                record.parent_wake,
+                                record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                                ManagedReaperCancelOwnership::Lost,
+                            ),
+                        }
+                    }
+                }
+            }
+            // A foreground operation cannot safely retire a Bound partial
+            // start. Quarantine and release every installed SYSTEM listener;
+            // the child-side publication transaction must fail-stop/leak.
+            ManagedReaperPhase::Bound => {
+                record.phase = ManagedReaperPhase::Quarantined;
+                let activation = slot.activation.publish(lease.reaper.generation).ok();
+                let lifecycle = slot.lifecycle.publish(lease.reaper.generation).ok();
+                match slot.completion.publish(lease.reaper.generation) {
+                    Ok(completion) => (
+                        None,
+                        activation,
+                        lifecycle,
+                        Some(completion),
+                        record.parent_wake,
+                        record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                        ManagedReaperCancelOwnership::Lost,
+                    ),
+                    Err(_) => (
+                        None,
+                        activation,
+                        lifecycle,
+                        None,
+                        record.parent_wake,
+                        record.reaper_task.as_ref().map(TaskHandle::exact_wake),
+                        ManagedReaperCancelOwnership::Lost,
+                    ),
+                }
+            }
+            ManagedReaperPhase::Terminal | ManagedReaperPhase::Aborted => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ManagedReaperCancelOwnership::Retired,
+            ),
+            ManagedReaperPhase::Reserved
+            | ManagedReaperPhase::Armed
+            | ManagedReaperPhase::Vacant
+            | ManagedReaperPhase::Quarantined => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ManagedReaperCancelOwnership::Lost,
+            ),
+        }
+    };
+    let reaper_dispatched = control.is_some_and(exec::OneShotWake::dispatch)
+        | activation.is_some_and(exec::OneShotWake::dispatch)
+        | lifecycle.is_some_and(exec::OneShotWake::dispatch);
+    if !reaper_dispatched {
+        if let Some(reaper) = reaper_fallback {
+            let _ = reaper.wake_if_exact();
+        }
+    }
+    if !completion.is_some_and(exec::OneShotWake::dispatch) {
+        if let Some(parent) = fallback {
+            let _ = parent.wake_if_exact();
+        }
+    }
+    outcome
+}
+
+fn disarm_managed_reaper_foreground(lease: ManagedComponentStartLease) {
+    disarm_managed_reaper_foreground_after_handoff(lease, false);
+}
+
+fn disarm_managed_reaper_foreground_after_handoff(
+    lease: ManagedComponentStartLease,
+    handoff_published: bool,
+) {
+    let disarmed = lease.parent.disarm();
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return;
+    };
+    let mut record = slot.record.lock();
+    if managed_reaper_matches_lease(&record, lease) {
+        let terminal_or_aborted = matches!(
+            record.phase,
+            ManagedReaperPhase::Terminal | ManagedReaperPhase::Aborted
+        );
+        if matches!(
+            disarmed,
+            exec::TaskDetachDisarm::Disarmed | exec::TaskDetachDisarm::AlreadyDisarmed
+        ) || handoff_published
+            || terminal_or_aborted
+        {
+            // A cross-task Session handoff cannot remove the old TaskStatus
+            // entry, but the SYSTEM slot already owns cancellation. Reuse is
+            // safe: the later old-generation callback decodes this retired
+            // key and is inert against the incremented slot generation.
+            record.foreground_disarmed = true;
+            record.maybe_clear_for_reuse();
+        }
+    }
+}
+
+fn handoff_managed_reaper(lease: ManagedComponentStartLease) {
+    if lease.parent.is_current_reclaiming_exact() {
+        // Whole-task Drop has not established its final reason yet. The core
+        // detach pass runs after Drop (and after any destructor fault) and is
+        // the only authority allowed to publish Cancelled versus RunnerFault.
+        return;
+    }
+    // Publish independent ownership/cancellation before removing the parent's
+    // exact detach callback. A fault between these operations therefore still
+    // leaves the SYSTEM reaper responsible for the token.
+    if !matches!(
+        request_managed_reaper_cancel(lease),
+        ManagedReaperCancelOwnership::Lost
+    ) {
+        disarm_managed_reaper_foreground_after_handoff(lease, true);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedReaperCompletion {
+    Terminal(ComponentTerminal),
+    Lost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedReaperStatus {
+    Waiting,
+    Acknowledged(ComponentTerminal),
+    Quarantined(ManagedReaperCompletion),
+    CleanRetired,
+    IdentityLost,
+}
+
+fn managed_reaper_status(lease: ManagedComponentStartLease) -> ManagedReaperStatus {
+    let Some(slot) = managed_reaper_slot(lease.reaper) else {
+        return ManagedReaperStatus::IdentityLost;
+    };
+    let record = slot.record.lock();
+    if record.generation > lease.reaper.generation {
+        return ManagedReaperStatus::CleanRetired;
+    }
+    if record.generation != lease.reaper.generation {
+        return ManagedReaperStatus::IdentityLost;
+    }
+    if record.phase == ManagedReaperPhase::Vacant {
+        return ManagedReaperStatus::CleanRetired;
+    }
+    if !managed_reaper_matches_lease(&record, lease) {
+        return ManagedReaperStatus::IdentityLost;
+    }
+    match (record.phase, record.terminal, record.reaper_finished) {
+        (ManagedReaperPhase::Terminal, Some(terminal), true) => {
+            ManagedReaperStatus::Acknowledged(terminal)
+        }
+        (ManagedReaperPhase::Quarantined, Some(terminal), true) => {
+            ManagedReaperStatus::Quarantined(ManagedReaperCompletion::Terminal(terminal))
+        }
+        (ManagedReaperPhase::Quarantined, None, true) => {
+            ManagedReaperStatus::Quarantined(ManagedReaperCompletion::Lost)
+        }
+        _ => ManagedReaperStatus::Waiting,
+    }
+}
+
+fn managed_reaper_completion(lease: ManagedComponentStartLease) -> Option<ManagedReaperCompletion> {
+    match managed_reaper_status(lease) {
+        ManagedReaperStatus::Acknowledged(terminal) => {
+            Some(ManagedReaperCompletion::Terminal(terminal))
+        }
+        ManagedReaperStatus::Quarantined(completion) => Some(completion),
+        ManagedReaperStatus::Waiting
+        | ManagedReaperStatus::CleanRetired
+        | ManagedReaperStatus::IdentityLost => None,
+    }
+}
+
+fn managed_reaper_completion_listener(
+    lease: ManagedComponentStartLease,
+) -> Option<exec::OneShotWaitFuture<'static>> {
+    let slot = managed_reaper_slot(lease.reaper)?;
+    if !managed_reaper_matches_lease(&slot.record.lock(), lease) {
+        return None;
+    }
+    Some(slot.completion.wait(lease.reaper.generation))
+}
+
+fn finish_reaper_prearm_failure(key: ManagedReaperKey) {
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let io = {
+        let mut record = slot.record.lock();
+        if !record.exact(key) {
+            drop(record);
+            finish_reaper_lost(key);
+            return;
+        }
+        if record.phase == ManagedReaperPhase::Aborted {
+            drop(record);
+            finish_reaper_aborted(key);
+            return;
+        }
+        if record.phase == ManagedReaperPhase::Reserved
+            && record.prestart_terminal.is_some()
+            && record.prestart_io.is_none()
+            && !record.prestart_finalized
+        {
+            // The parent already owns an exact lock-free stream finalization
+            // transaction. Do not replace its first-winner terminal or expose
+            // Aborted before that immutable close commits; simply retire this
+            // reaper. A parent fault in the outside-lock interval changes the
+            // still-Reserved slot to Quarantined via TaskDetach.
+            record.reaper_finished = true;
+            return;
+        }
+        if record.phase != ManagedReaperPhase::Reserved {
+            drop(record);
+            finish_reaper_lost(key);
+            return;
+        }
+        record.phase = ManagedReaperPhase::Aborted;
+        record.prestart_terminal = Some(ComponentTerminal::RunnerFault);
+        record.reaper_finished = true;
+        record.prestart_io.take()
+    };
+    let finalized = io.is_some_and(|io| {
+        io.finalize_unpublished(ComponentTerminal::RunnerFault) == ComponentTerminal::RunnerFault
+    });
+    let mut record = slot.record.lock();
+    if record.exact(key) && record.phase == ManagedReaperPhase::Aborted {
+        if finalized {
+            record.prestart_finalized = true;
+            record.maybe_clear_for_reuse();
+        } else {
+            record.phase = ManagedReaperPhase::Quarantined;
+            record.prestart_terminal = None;
+        }
+    }
+}
+
+fn finish_reaper_aborted(key: ManagedReaperKey) {
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let (io, terminal) = {
+        let mut record = slot.record.lock();
+        if !record.exact(key) || record.phase != ManagedReaperPhase::Aborted {
+            drop(record);
+            finish_reaper_lost(key);
+            return;
+        }
+        let Some(terminal) = record.prestart_terminal else {
+            drop(record);
+            finish_reaper_lost(key);
+            return;
+        };
+        if record.prestart_finalized {
+            record.reaper_finished = true;
+            record.maybe_clear_for_reuse();
+            return;
+        }
+        (record.prestart_io.take(), terminal)
+    };
+    let finalized = io.is_some_and(|io| io.finalize_unpublished(terminal) == terminal);
+    let mut record = slot.record.lock();
+    if record.exact(key)
+        && record.phase == ManagedReaperPhase::Aborted
+        && record.prestart_terminal == Some(terminal)
+    {
+        record.reaper_finished = true;
+        if finalized {
+            record.prestart_finalized = true;
+            record.maybe_clear_for_reuse();
+        } else {
+            record.phase = ManagedReaperPhase::Quarantined;
+            record.prestart_terminal = None;
+            record.prestart_finalized = false;
+        }
+    }
+}
+
+fn stage_reaper_terminal(key: ManagedReaperKey, terminal: ComponentTerminal) -> bool {
+    let Some(slot) = managed_reaper_slot(key) else {
+        return false;
+    };
+    let mut record = slot.record.lock();
+    if !record.exact(key) || record.phase != ManagedReaperPhase::Active {
+        return false;
+    }
+    match record.terminal {
+        None => {
+            record.terminal = Some(terminal);
+            true
+        }
+        Some(existing) => existing == terminal,
+    }
+}
+
+fn finish_reaper_terminal(key: ManagedReaperKey, terminal: ComponentTerminal, reusable: bool) {
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let (wake, fallback) = {
+        let mut record = slot.record.lock();
+        if !record.exact(key) {
+            return;
+        }
+        // Complete(T) was staged before CONTROL acknowledgement. Never repair
+        // an absent or different value after ack: that would turn an identity
+        // mismatch into a fabricated exact terminal/reuse proof.
+        let staged_exact = record.terminal == Some(terminal);
+        let phase_allows_reuse = staged_exact && record.phase == ManagedReaperPhase::Active;
+        record.reaper_finished = true;
+        record.phase = if staged_exact && reusable && phase_allows_reuse {
+            ManagedReaperPhase::Terminal
+        } else {
+            ManagedReaperPhase::Quarantined
+        };
+        let fallback = record.parent_wake;
+        match slot.completion.publish(key.generation) {
+            Ok(wake) => {
+                record.maybe_clear_for_reuse();
+                (Some(wake), fallback)
+            }
+            Err(_) => {
+                record.phase = ManagedReaperPhase::Quarantined;
+                (None, fallback)
+            }
+        }
+    };
+    if !wake.is_some_and(exec::OneShotWake::dispatch) {
+        if let Some(parent) = fallback {
+            let _ = parent.wake_if_exact();
+        }
+    }
+}
+
+fn finish_reaper_lost(key: ManagedReaperKey) {
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let (wake, fallback) = {
+        let mut record = slot.record.lock();
+        if !record.exact(key) {
+            return;
+        }
+        record.phase = ManagedReaperPhase::Quarantined;
+        // Never overwrite an exact terminal observed before a later Lost.
+        // A terminal-less Lost remains distinguishable so callers cannot
+        // fabricate a Component terminal reason.
+        record.reaper_finished = true;
+        let fallback = record.parent_wake;
+        match slot.completion.publish(key.generation) {
+            Ok(wake) => (Some(wake), fallback),
+            Err(_) => (None, fallback),
+        }
+    };
+    if !wake.is_some_and(exec::OneShotWake::dispatch) {
+        if let Some(parent) = fallback {
+            let _ = parent.wake_if_exact();
+        }
+    }
+}
+
+async fn run_managed_reaper(key: ManagedReaperKey) {
+    if !exec::try_reserve_current_task_registrations(3) {
+        finish_reaper_prearm_failure(key);
+        return;
+    }
+    let Some(raw) = key.encode() else {
+        finish_reaper_prearm_failure(key);
+        return;
+    };
+    let target = unsafe { exec::TaskDetachTarget::new(raw, managed_reaper_detached) };
+    let self_detach = match unsafe { exec::register_current_task_detach(target) } {
+        Ok(lease) => lease,
+        Err(_) => {
+            finish_reaper_prearm_failure(key);
+            return;
+        }
+    };
+    run_managed_reaper_inner(key).await;
+    if !matches!(
+        self_detach.disarm(),
+        exec::TaskDetachDisarm::Disarmed | exec::TaskDetachDisarm::AlreadyDisarmed
+    ) {
+        finish_reaper_lost(key);
+    }
+}
+
+async fn run_managed_reaper_inner(key: ManagedReaperKey) {
+    enum ReaperWake {
+        Lifecycle(Result<(), OneShotWaitError>),
+        Control(Result<(), OneShotWaitError>),
+    }
+
+    let Some(slot) = managed_reaper_slot(key) else {
+        return;
+    };
+    let mut activation = core::pin::pin!(slot.activation.wait(key.generation));
+    let mut initial_control = core::pin::pin!(slot.control.wait(key.generation));
+    // Armed is published only after both fixed waiter registrations really
+    // reached Pending. The parent awaits this phase before entering start, so
+    // no post-child allocation/registration failure can remove the reaper.
+    let armed = poll_fn(|context| {
+        if !matches!(activation.as_mut().poll(context), Poll::Pending)
+            || !matches!(initial_control.as_mut().poll(context), Poll::Pending)
+        {
+            return Poll::Ready(false);
+        }
+        let mut record = slot.record.lock();
+        if record.exact(key)
+            && record.phase == ManagedReaperPhase::Reserved
+            && record
+                .reaper_task
+                .as_ref()
+                .is_some_and(|handle| handle.is_published() && handle.state() == TaskState::Running)
+        {
+            record.phase = ManagedReaperPhase::Armed;
+            Poll::Ready(true)
+        } else {
+            Poll::Ready(false)
+        }
+    })
+    .await;
+    if !armed {
+        if slot.record.lock().phase == ManagedReaperPhase::Aborted {
+            finish_reaper_aborted(key);
+        } else {
+            finish_reaper_lost(key);
+        }
+        return;
+    }
+    let mut activation_consumed = false;
+    let mut control_consumed = false;
+    let (lifecycle, token) = loop {
+        let mut lost = false;
+        let mut aborted = false;
+        let snapshot = {
+            let record = slot.record.lock();
+            if !record.exact(key) {
+                return;
+            }
+            match record.phase {
+                ManagedReaperPhase::Reserved | ManagedReaperPhase::Armed => None,
+                ManagedReaperPhase::Bound => None,
+                ManagedReaperPhase::Active => record
+                    .lifecycle
+                    .zip(record.component)
+                    .map(|(lifecycle, token)| (lifecycle, token)),
+                ManagedReaperPhase::Aborted => {
+                    aborted = true;
+                    None
+                }
+                ManagedReaperPhase::Quarantined => {
+                    lost = true;
+                    None
+                }
+                ManagedReaperPhase::Terminal | ManagedReaperPhase::Vacant => return,
+            }
+        };
+        if lost {
+            finish_reaper_lost(key);
+            return;
+        }
+        if aborted {
+            finish_reaper_aborted(key);
+            return;
+        }
+        if let Some(snapshot) = snapshot {
+            // Active is published together with this exact activation
+            // watermark. Consume it before installing the terminal listener
+            // so its TaskStatus registration is deterministically disarmed.
+            if !activation_consumed {
+                if activation.as_mut().await.is_err() {
+                    finish_reaper_lost(key);
+                    return;
+                }
+            }
+            break snapshot;
+        }
+        let wake = if control_consumed {
+            ReaperWake::Lifecycle(activation.as_mut().await)
+        } else {
+            poll_fn(|context| {
+                if let Poll::Ready(result) = activation.as_mut().poll(context) {
+                    return Poll::Ready(ReaperWake::Lifecycle(result));
+                }
+                initial_control
+                    .as_mut()
+                    .poll(context)
+                    .map(ReaperWake::Control)
+            })
+            .await
+        };
+        match wake {
+            ReaperWake::Lifecycle(Ok(())) => activation_consumed = true,
+            ReaperWake::Control(Ok(())) => control_consumed = true,
+            ReaperWake::Lifecycle(Err(_)) | ReaperWake::Control(Err(_)) => {
+                finish_reaper_lost(key);
+                return;
+            }
+        }
+    };
+
+    let mut cancel_accepted = false;
+    let mut lifecycle_notified = false;
+    loop {
+        let (phase, cancel_terminal) = {
+            let record = slot.record.lock();
+            if !record.exact(key) {
+                return;
+            }
+            (record.phase, record.cancel_terminal)
+        };
+        if phase == ManagedReaperPhase::Quarantined {
+            finish_reaper_lost(key);
+            return;
+        }
+        if let Some(cancel_terminal) = cancel_terminal.filter(|_| !cancel_accepted) {
+            match lifecycle.request_cancel(token, cancel_terminal) {
+                ManagedComponentCancel::Busy => {
+                    exec::yield_now().await;
+                    continue;
+                }
+                ManagedComponentCancel::Requested
+                | ManagedComponentCancel::AlreadyCompleting
+                | ManagedComponentCancel::AlreadyComplete => {
+                    cancel_accepted = true;
+                    control_consumed = true;
+                }
+                ManagedComponentCancel::Lost => {
+                    finish_reaper_lost(key);
+                    return;
+                }
+            }
+        }
+
+        // The sole reaper is edge-driven. It never observes or acknowledges a
+        // terminal before lifecycle CONTROL has published Complete and then
+        // published this exact generation's terminal-only edge.
+        if !lifecycle_notified {
+            let mut lifecycle_event = core::pin::pin!(slot.lifecycle.wait(key.generation));
+            if control_consumed {
+                if lifecycle_event.await.is_err() {
+                    finish_reaper_lost(key);
+                    return;
+                }
+                lifecycle_notified = true;
+                continue;
+            }
+            let wake = poll_fn(|context| {
+                if let Poll::Ready(result) = lifecycle_event.as_mut().poll(context) {
+                    return Poll::Ready(ReaperWake::Lifecycle(result));
+                }
+                initial_control
+                    .as_mut()
+                    .poll(context)
+                    .map(ReaperWake::Control)
+            })
+            .await;
+            match wake {
+                ReaperWake::Lifecycle(Ok(())) => lifecycle_notified = true,
+                ReaperWake::Control(Ok(())) => control_consumed = true,
+                ReaperWake::Lifecycle(Err(_)) | ReaperWake::Control(Err(_)) => {
+                    finish_reaper_lost(key);
+                    return;
+                }
+            }
+            continue;
+        }
+
+        match lifecycle.state(token) {
+            ManagedComponentState::Busy => exec::yield_now().await,
+            ManagedComponentState::Complete(terminal) => {
+                if !stage_reaper_terminal(key, terminal) {
+                    finish_reaper_lost(key);
+                    return;
+                }
+                loop {
+                    match lifecycle.acknowledge_complete(token) {
+                        ManagedComponentAcknowledge::Busy => exec::yield_now().await,
+                        ManagedComponentAcknowledge::Acknowledged => {
+                            finish_reaper_terminal(key, terminal, true);
+                            return;
+                        }
+                        ManagedComponentAcknowledge::Lost => {
+                            finish_reaper_terminal(key, terminal, false);
+                            return;
+                        }
+                    }
+                }
+            }
+            ManagedComponentState::Lost | ManagedComponentState::Running => {
+                finish_reaper_lost(key);
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_reaper_boundary_tests {
+    use super::*;
+    use core::num::NonZeroU64;
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    struct AckLostLifecycle {
+        manifest: ComponentCommandManifest,
+        acknowledgements: AtomicUsize,
+        next_token: AtomicU64,
+    }
+
+    impl AckLostLifecycle {
+        fn leaked() -> &'static Self {
+            Box::leak(Box::new(Self {
+                manifest: ComponentCommandManifest::new(
+                    "managed-ack-lost-boundary",
+                    1,
+                    ComponentArtifactIdentity::new([0xac; 32]),
+                    VIBE_STREAM_FILTER_WORLD,
+                    "run",
+                    0,
+                    0,
+                    StreamMode::Required,
+                    StreamMode::Required,
+                    StreamMode::Optional,
+                    DEFAULT_STAGE_MEMORY,
+                    10_000,
+                    100,
+                    256,
+                    Vec::new(),
+                )
+                .unwrap(),
+                acknowledgements: AtomicUsize::new(0),
+                next_token: AtomicU64::new(3),
+            }))
+        }
+    }
+
+    unsafe impl ManagedComponentLifecycle for AckLostLifecycle {
+        fn manifest(&self) -> &ComponentCommandManifest {
+            &self.manifest
+        }
+
+        fn start(
+            &self,
+            cleanup: ManagedComponentStartLease,
+        ) -> Result<ManagedComponentToken, ComponentTerminal> {
+            let token = unsafe {
+                ManagedComponentToken::from_trusted_raw(
+                    NonZeroU64::new(self.next_token.fetch_add(1, Ordering::SeqCst)).unwrap(),
+                )
+            };
+            assert!(cleanup.bind_before_child_publication(token));
+            let io = cleanup
+                .claim_bound_io(token)
+                .expect("ack-lost fake claims exact bound IO");
+            let (_, _, stdin, stdout) = io.into_parts();
+            let reason = ComponentTerminal::Success.stream_close_reason();
+            let _ = stdin.finalize(reason);
+            let _ = stdout.finalize(reason);
+            cleanup
+                .commit_child_publication(token)
+                .expect("ack-lost fake commits exact child")
+                .dispatch();
+            cleanup
+                .notify_state_change()
+                .expect("ack-lost fake publishes terminal edge")
+                .dispatch();
+            Ok(token)
+        }
+
+        fn state(&self, _token: ManagedComponentToken) -> ManagedComponentState {
+            ManagedComponentState::Complete(ComponentTerminal::Success)
+        }
+
+        fn wait_state<'a>(
+            &'a self,
+            _token: ManagedComponentToken,
+        ) -> ManagedComponentStateFuture<'a> {
+            Box::pin(async { ManagedComponentState::Complete(ComponentTerminal::Success) })
+        }
+
+        fn request_cancel(
+            &self,
+            _token: ManagedComponentToken,
+            _terminal: ComponentTerminal,
+        ) -> ManagedComponentCancel {
+            ManagedComponentCancel::AlreadyComplete
+        }
+
+        fn acknowledge_complete(
+            &self,
+            _token: ManagedComponentToken,
+        ) -> ManagedComponentAcknowledge {
+            self.acknowledgements.fetch_add(1, Ordering::SeqCst);
+            ManagedComponentAcknowledge::Lost
+        }
+    }
+
+    struct DroppedTerminalWakeLifecycle {
+        manifest: ComponentCommandManifest,
+    }
+
+    impl DroppedTerminalWakeLifecycle {
+        fn leaked() -> &'static Self {
+            Box::leak(Box::new(Self {
+                manifest: ComponentCommandManifest::new(
+                    "managed-dropped-terminal-wake",
+                    1,
+                    ComponentArtifactIdentity::new([0xdd; 32]),
+                    VIBE_STREAM_FILTER_WORLD,
+                    "run",
+                    0,
+                    0,
+                    StreamMode::Required,
+                    StreamMode::Required,
+                    StreamMode::Optional,
+                    DEFAULT_STAGE_MEMORY,
+                    10_000,
+                    100,
+                    256,
+                    Vec::new(),
+                )
+                .unwrap(),
+            }))
+        }
+    }
+
+    unsafe impl ManagedComponentLifecycle for DroppedTerminalWakeLifecycle {
+        fn manifest(&self) -> &ComponentCommandManifest {
+            &self.manifest
+        }
+
+        fn start(
+            &self,
+            cleanup: ManagedComponentStartLease,
+        ) -> Result<ManagedComponentToken, ComponentTerminal> {
+            let token =
+                unsafe { ManagedComponentToken::from_trusted_raw(NonZeroU64::new(2).unwrap()) };
+            assert!(cleanup.bind_before_child_publication(token));
+            let io = cleanup
+                .claim_bound_io(token)
+                .expect("dropped-wake fake claims exact bound IO");
+            let (_, _, stdin, stdout) = io.into_parts();
+            let reason = ComponentTerminal::Success.stream_close_reason();
+            let _ = stdin.finalize(reason);
+            let _ = stdout.finalize(reason);
+            cleanup
+                .commit_child_publication(token)
+                .expect("dropped-wake fake commits exact child")
+                .dispatch();
+            Ok(token)
+        }
+
+        fn state(&self, _token: ManagedComponentToken) -> ManagedComponentState {
+            ManagedComponentState::Lost
+        }
+
+        fn wait_state<'a>(
+            &'a self,
+            _token: ManagedComponentToken,
+        ) -> ManagedComponentStateFuture<'a> {
+            Box::pin(async { ManagedComponentState::Lost })
+        }
+
+        fn request_cancel(
+            &self,
+            _token: ManagedComponentToken,
+            _terminal: ComponentTerminal,
+        ) -> ManagedComponentCancel {
+            ManagedComponentCancel::Lost
+        }
+
+        fn acknowledge_complete(
+            &self,
+            _token: ManagedComponentToken,
+        ) -> ManagedComponentAcknowledge {
+            ManagedComponentAcknowledge::Lost
+        }
+    }
+
+    #[test]
+    fn lost_terminal_edges_quarantine_all_sixteen_slots_without_stranding_reapers() {
+        let lifecycle = AckLostLifecycle::leaked();
+        let dropped_wake_lifecycle = DroppedTerminalWakeLifecycle::leaked();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_task = completed.clone();
+        let parent = exec::spawn_tracked("managed-ack-lost-boundary-parent", async move {
+            let (install, _pump) = new_ssh_exec_component_io();
+            let dropped_wake_lease =
+                match prepare_managed_reaper(dropped_wake_lifecycle, install.component).await {
+                    Ok(lease) => lease,
+                    Err(_) => panic!("a fresh fixed reaper slot is available"),
+                };
+            let token = dropped_wake_lifecycle
+                .start(dropped_wake_lease)
+                .expect("fake start commits exact child");
+            let dropped_wake_slot = managed_reaper_slot(dropped_wake_lease.reaper)
+                .expect("prepared lease names one fixed reaper slot");
+            while dropped_wake_slot.lifecycle.waiter_count() == 0 {
+                exec::yield_now().await;
+            }
+            assert_eq!(dropped_wake_slot.lifecycle.waiter_count(), 1);
+
+            // Model a lifecycle fault after the one-shot queue removed its
+            // installed waiter but before the detached wake was dispatched.
+            drop(
+                dropped_wake_lease
+                    .notify_complete(token, ComponentTerminal::Success)
+                    .expect("dropped-wake fake stages exact terminal"),
+            );
+            assert_eq!(dropped_wake_slot.lifecycle.waiter_count(), 0);
+            assert!(
+                dropped_wake_lease.quarantine_staged_complete(token, ComponentTerminal::Success)
+            );
+            loop {
+                match managed_reaper_status(dropped_wake_lease) {
+                    ManagedReaperStatus::Quarantined(ManagedReaperCompletion::Terminal(
+                        ComponentTerminal::Success,
+                    )) => break,
+                    ManagedReaperStatus::Waiting => exec::yield_now().await,
+                    other => panic!("unexpected dropped-wake status: {other:?}"),
+                }
+            }
+            disarm_managed_reaper_foreground(dropped_wake_lease);
+
+            for _ in 1..MANAGED_REAPER_SLOTS {
+                let (install, _pump) = new_ssh_exec_component_io();
+                let lease = match prepare_managed_reaper(lifecycle, install.component).await {
+                    Ok(lease) => lease,
+                    Err(_) => panic!("a fresh fixed reaper slot is available"),
+                };
+                let _token = lifecycle.start(lease).expect("fake start commits");
+                loop {
+                    match managed_reaper_status(lease) {
+                        ManagedReaperStatus::Quarantined(ManagedReaperCompletion::Terminal(
+                            ComponentTerminal::Success,
+                        )) => break,
+                        ManagedReaperStatus::Waiting => exec::yield_now().await,
+                        other => panic!("unexpected ack-lost status: {other:?}"),
+                    }
+                }
+                disarm_managed_reaper_foreground(lease);
+            }
+
+            let (install, _pump) = new_ssh_exec_component_io();
+            assert!(matches!(
+                prepare_managed_reaper(lifecycle, install.component).await,
+                Err(ManagedPrepareFailure::Terminal(
+                    ComponentTerminal::Unavailable
+                ))
+            ));
+            completed_task.store(true, Ordering::Release);
+        });
+        exec::run_until_idle(1_000_000);
+        assert_eq!(parent.state(), TaskState::Exited);
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(
+            lifecycle.acknowledgements.load(Ordering::SeqCst),
+            MANAGED_REAPER_SLOTS - 1
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -1936,6 +4267,7 @@ enum Applet {
     ManagedComponent {
         manifest: Arc<ComponentCommandManifest>,
         lifecycle: &'static dyn ManagedComponentLifecycle,
+        io: ManagedComponentIoSource,
     },
 }
 
@@ -2324,6 +4656,7 @@ struct PreflightStage {
     manifest: CommandManifest,
     component: Option<Arc<ComponentCommandManifest>>,
     managed_component: bool,
+    managed_io: Option<ManagedComponentIoSource>,
 }
 
 /// Synchronous, inert result of validating every stage in one pipeline.
@@ -2358,7 +4691,29 @@ struct PreparedStage {
     component_authorities: Vec<PreparedComponentAuthority>,
     is_component: bool,
     is_managed_component: bool,
+    managed_io: Option<(ManagedComponentIo, Cap, Cap, Cap, Cap)>,
     result: Arc<SpinLock<Option<StageExit>>>,
+}
+
+impl PreparedStage {
+    fn finalize_unpublished_managed_io(
+        &mut self,
+        terminal: ComponentTerminal,
+    ) -> ComponentTerminal {
+        self.managed_io.take().map_or(terminal, |(io, _, _, _, _)| {
+            io.finalize_unpublished(terminal)
+        })
+    }
+}
+
+impl Drop for PreparedStage {
+    fn drop(&mut self) {
+        // Any unexpected pre-start unwind/error still leaves the pump with a
+        // conservative immutable terminal instead of an indefinitely Open
+        // stream. Explicit error paths take this field first with their exact
+        // typed reason; after lifecycle.start it is also necessarily None.
+        let _ = self.finalize_unpublished_managed_io(ComponentTerminal::RunnerFault);
+    }
 }
 
 /// Fully admitted but unpublished pipeline candidates. Construction may await
@@ -2377,6 +4732,137 @@ impl PreparedPipeline {
     pub fn stage_count(&self) -> usize {
         self.stages.len()
     }
+}
+
+fn validate_managed_component_io_source(
+    cspace: &CSpace,
+    stdin: Cap,
+    stdout: Cap,
+    stdin_supervisor: Cap,
+    stdout_supervisor: Cap,
+    span: Span,
+) -> Result<ValidatedManagedComponentIo, Diagnostic> {
+    let stdin_rights = cspace.rights_of(stdin).map_err(|_| {
+        Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component stdin authority is unavailable",
+        )
+    })?;
+    let stdout_rights = cspace.rights_of(stdout).map_err(|_| {
+        Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component stdout authority is unavailable",
+        )
+    })?;
+    let stdin_supervisor_rights = cspace.rights_of(stdin_supervisor).map_err(|_| {
+        Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component stdin terminal authority is unavailable",
+        )
+    })?;
+    let stdout_supervisor_rights = cspace.rights_of(stdout_supervisor).map_err(|_| {
+        Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component stdout terminal authority is unavailable",
+        )
+    })?;
+    let stdin_required = Rights::RECV.union(Rights::GRANT);
+    let stdout_required = Rights::SEND.union(Rights::GRANT);
+    let stdin_forbidden = Rights::SEND
+        .union(Rights::READ)
+        .union(Rights::WRITE)
+        .union(Rights::INVOKE);
+    let stdout_forbidden = Rights::RECV
+        .union(Rights::READ)
+        .union(Rights::WRITE)
+        .union(Rights::INVOKE);
+    let supervisor_required = Rights::INVOKE.union(Rights::GRANT);
+    let supervisor_forbidden = Rights::READ
+        .union(Rights::WRITE)
+        .union(Rights::SEND)
+        .union(Rights::RECV);
+    if !stdin_rights.contains(stdin_required)
+        || stdin_rights.intersect(stdin_forbidden) != Rights::NONE
+    {
+        return Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component stdin rights are not exact",
+        ));
+    }
+    if !stdout_rights.contains(stdout_required)
+        || stdout_rights.intersect(stdout_forbidden) != Rights::NONE
+    {
+        return Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component stdout rights are not exact",
+        ));
+    }
+    if !stdin_supervisor_rights.contains(supervisor_required)
+        || stdin_supervisor_rights.intersect(supervisor_forbidden) != Rights::NONE
+        || !stdout_supervisor_rights.contains(supervisor_required)
+        || stdout_supervisor_rights.intersect(supervisor_forbidden) != Rights::NONE
+    {
+        return Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component terminal rights are not exact",
+        ));
+    }
+    let reader = cspace
+        .lookup_as::<ByteStreamReader>(stdin, Rights::RECV)
+        .map_err(|_| {
+            Diagnostic::new(
+                span.start,
+                span.end,
+                "managed component stdin has the wrong resource kind",
+            )
+        })?;
+    let writer = cspace
+        .lookup_as::<ByteStreamWriter>(stdout, Rights::SEND)
+        .map_err(|_| {
+            Diagnostic::new(
+                span.start,
+                span.end,
+                "managed component stdout has the wrong resource kind",
+            )
+        })?;
+    let stdin_supervisor = cspace
+        .lookup_as::<ByteStreamSupervisor>(stdin_supervisor, Rights::INVOKE)
+        .map_err(|_| {
+            Diagnostic::new(
+                span.start,
+                span.end,
+                "managed component stdin has the wrong terminal resource kind",
+            )
+        })?;
+    let stdout_supervisor = cspace
+        .lookup_as::<ByteStreamSupervisor>(stdout_supervisor, Rights::INVOKE)
+        .map_err(|_| {
+            Diagnostic::new(
+                span.start,
+                span.end,
+                "managed component stdout has the wrong terminal resource kind",
+            )
+        })?;
+    if Arc::ptr_eq(&stdin_supervisor, &stdout_supervisor) {
+        return Err(Diagnostic::new(
+            span.start,
+            span.end,
+            "managed component terminal authorities must be distinct",
+        ));
+    }
+    Ok(ValidatedManagedComponentIo {
+        stdin: reader,
+        stdout: writer,
+        stdin_supervisor,
+        stdout_supervisor,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2490,6 +4976,7 @@ pub struct Session {
     cancel_next_job: bool,
     jobs: BTreeMap<u64, BackgroundJob>,
     external_cancel: Option<Arc<CancellationSignal>>,
+    managed_cleanup: Option<ManagedInvocationCleanup>,
     function_depth: usize,
     substitution_depth: usize,
     script_depth: usize,
@@ -2502,6 +4989,64 @@ pub struct Session {
 /// bound to this object as well as its CSpace so two SSH sessions sharing a
 /// supervisor-provided CSpace cannot reuse each other's installed policy.
 struct SessionIdentity;
+
+#[derive(Clone, Copy)]
+struct ManagedInvocationCleanup {
+    lease: ManagedComponentStartLease,
+}
+
+impl ManagedInvocationCleanup {
+    fn matches(self, other: Self) -> bool {
+        self.lease.matches_exact(other.lease)
+    }
+}
+
+/// Parent-side RAII for the interval in which the exact detach lease is live.
+/// Dropping an execution future hands ownership to SYSTEM before attempting
+/// to disarm the parent ledger, so ordinary future cancellation has the same
+/// no-gap guarantee as permanent raw-fault detach.
+struct ManagedForegroundGuard {
+    lease: ManagedComponentStartLease,
+    armed: bool,
+}
+
+impl ManagedForegroundGuard {
+    const fn new(lease: ManagedComponentStartLease) -> Self {
+        Self { lease, armed: true }
+    }
+
+    fn release(&mut self) {
+        self.armed = false;
+    }
+
+    fn complete(&mut self) {
+        if self.armed {
+            disarm_managed_reaper_foreground(self.lease);
+            self.armed = false;
+        }
+    }
+
+    fn handoff(&mut self) {
+        if self.armed {
+            // A nested execution future dropped from an otherwise live parent
+            // must synchronously publish Cancelled ownership. During teardown
+            // of the whole parent task, however, the scheduler running slot is
+            // already detached: leave the exact TaskDetach lease armed so the
+            // executor can report the final Exited/Cancelled/Faulted reason
+            // after every destructor (including a faulting later destructor).
+            if self.lease.parent.is_current_running_exact() {
+                handoff_managed_reaper(self.lease);
+            }
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ManagedForegroundGuard {
+    fn drop(&mut self) {
+        self.handoff();
+    }
+}
 
 /// Commands and syntax made available when constructing a shell session.
 ///
@@ -2551,6 +5096,7 @@ impl Session {
             cancel_next_job: false,
             jobs: BTreeMap::new(),
             external_cancel: None,
+            managed_cleanup: None,
             function_depth: 0,
             substitution_depth: 0,
             script_depth: 0,
@@ -2653,6 +5199,13 @@ impl Session {
                 "SSH component policy requires an SSH exec session",
             ));
         }
+        if source_manifest.world == VIBE_STREAM_FILTER_WORLD {
+            return Err(Diagnostic::new(
+                0,
+                source_manifest.name.len(),
+                "stream components require the managed SSH lifecycle",
+            ));
+        }
         if !policy.admits_manifest(source_manifest) {
             return Err(Diagnostic::new(
                 0,
@@ -2670,15 +5223,19 @@ impl Session {
         Ok(())
     }
 
-    /// Install the narrow managed-Component path selected by explicit image
-    /// and SSH-session policy.
+    /// Install the narrow managed stream-Component path selected by explicit
+    /// image and SSH-session policy.
     ///
     /// Unlike [`Self::install_ssh_exec_component_command`], this accepts only
     /// a globally stable trusted lifecycle service and installs the distinct
     /// [`Applet::ManagedComponent`] variant. An ordinary runner can therefore
     /// never masquerade as a registry-managed invocation. The current managed
-    /// ABI is deliberately scalar-only: zero arguments, closed stdin, and no
-    /// delegated authorities.
+    /// ABI has zero shell arguments and exactly one Required stdin reader plus
+    /// one Required stdout writer. Those transport caps are not ambient
+    /// requirements: installation verifies them in this session's exact
+    /// CSpace, and atomic stage preparation attenuates them to only `RECV` and
+    /// `SEND` respectively. The two lifecycle-only terminal authorities are
+    /// independently attenuated to `INVOKE`; the pump never receives them.
     ///
     /// # Safety
     ///
@@ -2691,10 +5248,11 @@ impl Session {
     /// must never call this function, even if they can construct an `SshExec`
     /// Session value. `lifecycle` must satisfy every invariant of the unsafe
     /// [`ManagedComponentLifecycle`] contract.
-    pub unsafe fn install_ssh_exec_managed_component_command(
+    pub unsafe fn install_ssh_exec_managed_component_io(
         &mut self,
         policy: &SshExecComponentPolicy,
         lifecycle: &'static dyn ManagedComponentLifecycle,
+        io: SshExecComponentIoInstall,
     ) -> Result<(), Diagnostic> {
         if self.profile != SessionProfile::SshExec {
             return Err(Diagnostic::new(
@@ -2713,13 +5271,16 @@ impl Session {
         }
         if source_manifest.min_args != 0
             || source_manifest.max_args != 0
-            || source_manifest.stdin != StreamMode::Closed
+            || source_manifest.world != VIBE_STREAM_FILTER_WORLD
+            || source_manifest.stdin != StreamMode::Required
+            || source_manifest.stdout != StreamMode::Required
+            || source_manifest.stderr == StreamMode::Required
             || !source_manifest.requirements.is_empty()
         {
             return Err(Diagnostic::new(
                 0,
                 source_manifest.name.len(),
-                "managed SSH component contract is not scalar-only",
+                "managed SSH component contract is not the exact stream world",
             ));
         }
 
@@ -2728,7 +5289,7 @@ impl Session {
         // fresh read before `start` and fail closed if trusted setup mutated.
         let manifest = Self::snapshot_component_manifest(source_manifest)?;
         let name = manifest.name.clone();
-        self.install_managed_component_command_inner(manifest, lifecycle)?;
+        self.install_managed_component_command_inner(manifest, lifecycle, io.component)?;
         self.ssh_exec_policy_commands.insert(name);
         Ok(())
     }
@@ -2817,6 +5378,7 @@ impl Session {
         &mut self,
         manifest: ComponentCommandManifest,
         lifecycle: &'static dyn ManagedComponentLifecycle,
+        io: ManagedComponentIo,
     ) -> Result<(), Diagnostic> {
         manifest.validate(Span {
             start: 0,
@@ -2839,6 +5401,46 @@ impl Session {
                 "visible command limit exceeded",
             ));
         }
+        let io = {
+            let (stdin, stdout, stdin_supervisor, stdout_supervisor) = io.into_parts();
+            if stdin.same_stream_as(&stdout)
+                || !stdin_supervisor.same_stream_as_reader(&stdin)
+                || stdin_supervisor.same_stream_as_writer(&stdout)
+                || !stdout_supervisor.same_stream_as_writer(&stdout)
+                || stdout_supervisor.same_stream_as_reader(&stdin)
+            {
+                return Err(Diagnostic::new(
+                    0,
+                    manifest.name.len(),
+                    "managed component stdin and stdout must be distinct",
+                ));
+            }
+            let mut cspace = self.cspace.lock();
+            let stdin = cspace.mint(
+                stdin,
+                Rights::RECV.union(Rights::GRANT).union(Rights::REVOKE),
+            );
+            let stdout = cspace.mint(
+                stdout,
+                Rights::SEND.union(Rights::GRANT).union(Rights::REVOKE),
+            );
+            let stdin_supervisor = cspace.mint(
+                stdin_supervisor,
+                Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
+            );
+            let stdout_supervisor = cspace.mint(
+                stdout_supervisor,
+                Rights::INVOKE.union(Rights::GRANT).union(Rights::REVOKE),
+            );
+            ManagedComponentIoSource {
+                space: cspace.identity(),
+                incarnation: cspace.incarnation(),
+                stdin,
+                stdout,
+                stdin_supervisor,
+                stdout_supervisor,
+            }
+        };
         let name = manifest.name.clone();
         let general = manifest.command_manifest();
         let manifest = Arc::new(manifest);
@@ -2847,6 +5449,7 @@ impl Session {
             applet: Applet::ManagedComponent {
                 manifest,
                 lifecycle,
+                io,
             },
         });
         let cap = self.cspace.lock().mint(
@@ -3010,7 +5613,12 @@ impl Session {
     /// Acceptance hook modelling an asynchronous parent revocation after a Job
     /// is published but before its next resource operation.
     pub fn revoke_during_next_job_for_test(&mut self, name: &str) -> bool {
-        let Some(cap) = self.capabilities.get(name).copied() else {
+        let Some(cap) = self
+            .capabilities
+            .get(name)
+            .or_else(|| self.commands.get(name))
+            .copied()
+        else {
             return false;
         };
         self.revoke_next_job = Some(cap);
@@ -3028,6 +5636,7 @@ impl Session {
     /// session that admitted it.
     pub async fn shutdown(&mut self) {
         self.request_shutdown();
+        self.finish_managed_cleanup().await;
         let jobs = core::mem::take(&mut self.jobs);
         for (_, job) in jobs {
             for stage in &job.stages {
@@ -3041,8 +5650,50 @@ impl Session {
         if let Some(cancel) = self.external_cancel.take() {
             cancel.cancel();
         }
+        if let Some(cleanup) = self.managed_cleanup {
+            handoff_managed_reaper(cleanup.lease);
+        }
         for job in self.jobs.values() {
             job.request_cancel();
+        }
+    }
+
+    async fn finish_managed_cleanup(&mut self) {
+        let Some(cleanup) = self.managed_cleanup else {
+            return;
+        };
+        handoff_managed_reaper(cleanup.lease);
+        let mut listener = managed_reaper_completion_listener(cleanup.lease);
+        loop {
+            match managed_reaper_status(cleanup.lease) {
+                ManagedReaperStatus::Acknowledged(_) | ManagedReaperStatus::CleanRetired => {
+                    self.clear_managed_cleanup(cleanup);
+                    return;
+                }
+                ManagedReaperStatus::Quarantined(_) | ManagedReaperStatus::IdentityLost => {
+                    // Shutdown has no exact proof that the child tombstone was
+                    // acknowledged. Returning would silently authorize the
+                    // caller to release transport around an ambiguous live
+                    // instance, so fail-stop while the fixed slot remains
+                    // conservatively retained.
+                    panic!("managed component cleanup was not acknowledged");
+                }
+                ManagedReaperStatus::Waiting => {}
+            }
+            if let Some(wait) = listener.take() {
+                let _ = wait.await;
+            } else {
+                exec::yield_now().await;
+            }
+        }
+    }
+
+    fn clear_managed_cleanup(&mut self, expected: ManagedInvocationCleanup) {
+        if self
+            .managed_cleanup
+            .is_some_and(|current| current.matches(expected))
+        {
+            self.managed_cleanup = None;
         }
     }
 
@@ -3695,7 +6346,11 @@ impl Session {
                 .redirects
                 .iter()
                 .any(|redirect| redirect.kind == RedirectKind::Stdin);
-            let stdin_present = index > 0 || has_stdin_redirect;
+            let managed_io_source = match &command.applet {
+                Applet::ManagedComponent { io, .. } => Some(*io),
+                _ => None,
+            };
+            let stdin_present = index > 0 || has_stdin_redirect || managed_io_source.is_some();
             if manifest.stdin == StreamMode::Required && !stdin_present {
                 return Err(Diagnostic::new(
                     command_ast.span.start,
@@ -3713,15 +6368,17 @@ impl Session {
 
             // Candidate construction installs inherited defaults before
             // applying redirects, so validate those exact grants as well.
-            if index + 1 == ast.commands.len() {
-                self.preflight_console(command_ast.span, "default stdout cannot be delegated")?;
+            if managed_io_source.is_none() {
+                if index + 1 == ast.commands.len() {
+                    self.preflight_console(command_ast.span, "default stdout cannot be delegated")?;
+                }
+                self.preflight_console(command_ast.span, "default stderr cannot be delegated")?;
             }
-            self.preflight_console(command_ast.span, "default stderr cannot be delegated")?;
             for redirect in &command_ast.redirects {
                 self.preflight_redirect(redirect)?;
             }
 
-            let (component, managed_component) = match &command.applet {
+            let (component, managed_component, managed_io) = match &command.applet {
                 Applet::Component { manifest, runner } => {
                     manifest.validate(command_ast.span)?;
                     if runner.manifest() != manifest.as_ref() {
@@ -3735,11 +6392,12 @@ impl Session {
                         self.preflight_component_authority(requirement, command_ast.span)?;
                     }
                     component_preflights.push((command_ast.span, manifest.clone(), runner.clone()));
-                    (Some(manifest.clone()), false)
+                    (Some(manifest.clone()), false, None)
                 }
                 Applet::ManagedComponent {
                     manifest,
                     lifecycle,
+                    io,
                 } => {
                     manifest.validate(command_ast.span)?;
                     if ast.commands.len() != 1 {
@@ -3780,18 +6438,37 @@ impl Session {
                     }
                     if manifest.min_args != 0
                         || manifest.max_args != 0
-                        || manifest.stdin != StreamMode::Closed
+                        || manifest.world != VIBE_STREAM_FILTER_WORLD
+                        || manifest.stdin != StreamMode::Required
+                        || manifest.stdout != StreamMode::Required
+                        || manifest.stderr == StreamMode::Required
                         || !manifest.requirements.is_empty()
                     {
                         return Err(Diagnostic::new(
                             command_ast.span.start,
                             command_ast.span.end,
-                            "managed SSH component contract is not scalar-only",
+                            "managed SSH component contract is not the exact stream world",
                         ));
                     }
-                    (Some(manifest.clone()), true)
+                    let cspace = self.cspace.lock();
+                    if cspace.identity() != io.space || cspace.incarnation() != io.incarnation {
+                        return Err(Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component IO belongs to another CSpace incarnation",
+                        ));
+                    }
+                    validate_managed_component_io_source(
+                        &cspace,
+                        io.stdin,
+                        io.stdout,
+                        io.stdin_supervisor,
+                        io.stdout_supervisor,
+                        command_ast.span,
+                    )?;
+                    (Some(manifest.clone()), true, Some(*io))
                 }
-                _ => (None, false),
+                _ => (None, false, None),
             };
             stages.push(PreflightStage {
                 command: command_ast.clone(),
@@ -3800,6 +6477,7 @@ impl Session {
                 manifest,
                 component,
                 managed_component,
+                managed_io,
             });
         }
 
@@ -4218,7 +6896,149 @@ impl Session {
                     "missing GRANT on command",
                 )
             })?;
-            let mut stdin = if index > 0 {
+            let managed_io = if let Some(source) = preflight_stage.managed_io {
+                let mut owner = self.cspace.lock();
+                if owner.identity() != source.space || owner.incarnation() != source.incarnation {
+                    return Err(Diagnostic::new(
+                        command_ast.span.start,
+                        command_ast.span.end,
+                        "managed component IO belongs to another CSpace incarnation",
+                    ));
+                }
+                let ValidatedManagedComponentIo {
+                    stdin: source_reader,
+                    stdout: source_writer,
+                    stdin_supervisor: source_stdin_supervisor,
+                    stdout_supervisor: source_stdout_supervisor,
+                } = validate_managed_component_io_source(
+                    &owner,
+                    source.stdin,
+                    source.stdout,
+                    source.stdin_supervisor,
+                    source.stdout_supervisor,
+                    command_ast.span,
+                )?;
+                // This is the one-shot move linearization point. Stage caps
+                // are fresh exact roots, rather than derivations: revoking
+                // the Session roots below therefore cannot invalidate the
+                // sole prepared invocation. Holding the same owner lock from
+                // lookup through all four revocations prevents a second
+                // preflight copy from acquiring any endpoint or supervisor.
+                let reader_cap = stage.mint(source_reader.clone(), Rights::RECV);
+                let writer_cap = stage.mint(source_writer.clone(), Rights::SEND);
+                let stdin_supervisor_cap =
+                    stage.mint(source_stdin_supervisor.clone(), Rights::INVOKE);
+                let stdout_supervisor_cap =
+                    stage.mint(source_stdout_supervisor.clone(), Rights::INVOKE);
+                if stage.rights_of(reader_cap) != Ok(Rights::RECV)
+                    || stage.rights_of(writer_cap) != Ok(Rights::SEND)
+                    || stage.rights_of(stdin_supervisor_cap) != Ok(Rights::INVOKE)
+                    || stage.rights_of(stdout_supervisor_cap) != Ok(Rights::INVOKE)
+                {
+                    return Err(Diagnostic::new(
+                        command_ast.span.start,
+                        command_ast.span.end,
+                        "managed component IO attenuation is not exact",
+                    ));
+                }
+                let reader = stage
+                    .lookup_as::<ByteStreamReader>(reader_cap, Rights::RECV)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component stdin binding changed during admission",
+                        )
+                    })?;
+                let writer = stage
+                    .lookup_as::<ByteStreamWriter>(writer_cap, Rights::SEND)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component stdout binding changed during admission",
+                        )
+                    })?;
+                let stdin_supervisor = stage
+                    .lookup_as::<ByteStreamSupervisor>(stdin_supervisor_cap, Rights::INVOKE)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component stdin terminal binding changed during admission",
+                        )
+                    })?;
+                let stdout_supervisor = stage
+                    .lookup_as::<ByteStreamSupervisor>(stdout_supervisor_cap, Rights::INVOKE)
+                    .map_err(|_| {
+                        Diagnostic::new(
+                            command_ast.span.start,
+                            command_ast.span.end,
+                            "managed component stdout terminal binding changed during admission",
+                        )
+                    })?;
+                if !Arc::ptr_eq(&reader, &source_reader)
+                    || !Arc::ptr_eq(&writer, &source_writer)
+                    || !Arc::ptr_eq(&stdin_supervisor, &source_stdin_supervisor)
+                    || !Arc::ptr_eq(&stdout_supervisor, &source_stdout_supervisor)
+                    || reader.same_stream_as(&writer)
+                    || Arc::ptr_eq(&stdin_supervisor, &stdout_supervisor)
+                    || !stdin_supervisor.same_stream_as_reader(&reader)
+                    || stdin_supervisor.same_stream_as_writer(&writer)
+                    || !stdout_supervisor.same_stream_as_writer(&writer)
+                    || stdout_supervisor.same_stream_as_reader(&reader)
+                {
+                    return Err(Diagnostic::new(
+                        command_ast.span.start,
+                        command_ast.span.end,
+                        "managed component IO object identity changed during admission",
+                    ));
+                }
+                let mut exact_source_move = true;
+                for source_cap in [
+                    source.stdin,
+                    source.stdout,
+                    source.stdin_supervisor,
+                    source.stdout_supervisor,
+                ] {
+                    if owner.revoke(source_cap) != Ok(1) {
+                        exact_source_move = false;
+                    }
+                }
+                drop(owner);
+                if !exact_source_move {
+                    let io = ManagedComponentIo::new(
+                        reader,
+                        writer,
+                        stdin_supervisor,
+                        stdout_supervisor,
+                    );
+                    let _ = io.finalize_unpublished(ComponentTerminal::RunnerFault);
+                    stage.revoke_all();
+                    return Err(Diagnostic::new(
+                        command_ast.span.start,
+                        command_ast.span.end,
+                        "managed component IO one-shot transfer failed",
+                    ));
+                }
+                Some((
+                    ManagedComponentIo {
+                        stdin: reader,
+                        stdout: writer,
+                        stdin_supervisor,
+                        stdout_supervisor,
+                    },
+                    reader_cap,
+                    writer_cap,
+                    stdin_supervisor_cap,
+                    stdout_supervisor_cap,
+                ))
+            } else {
+                None
+            };
+            let mut stdin = if managed_io.is_some() {
+                LocalIo::Closed
+            } else if index > 0 {
                 LocalIo::Stream(
                     cap::grant(&admission, roots[index - 1], Rights::RECV, &mut stage).map_err(
                         |_| {
@@ -4233,7 +7053,9 @@ impl Session {
             } else {
                 LocalIo::Closed
             };
-            let mut stdout = if index + 1 < preflight_stages.len() {
+            let mut stdout = if managed_io.is_some() {
+                LocalIo::Closed
+            } else if index + 1 < preflight_stages.len() {
                 LocalIo::Stream(
                     cap::grant(&admission, roots[index], Rights::SEND, &mut stage).map_err(
                         |_| {
@@ -4259,18 +7081,22 @@ impl Session {
                     )?,
                 )
             };
-            let console = self.capabilities["console"];
-            let mut stderr = LocalIo::Sink(
-                cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage).map_err(
-                    |_| {
-                        Diagnostic::new(
-                            command_ast.span.start,
-                            command_ast.span.end,
-                            "default stderr cannot be delegated",
-                        )
-                    },
-                )?,
-            );
+            let mut stderr = if managed_io.is_some() {
+                LocalIo::Closed
+            } else {
+                let console = self.capabilities["console"];
+                LocalIo::Sink(
+                    cap::grant(&self.cspace.lock(), console, Rights::WRITE, &mut stage).map_err(
+                        |_| {
+                            Diagnostic::new(
+                                command_ast.span.start,
+                                command_ast.span.end,
+                                "default stderr cannot be delegated",
+                            )
+                        },
+                    )?,
+                )
+            };
             for redirect in &command_ast.redirects {
                 let source = self.capabilities[&redirect.target];
                 match redirect.kind {
@@ -4349,6 +7175,7 @@ impl Session {
                 component_authorities,
                 is_component: preflight_stage.component.is_some(),
                 is_managed_component: preflight_stage.managed_component,
+                managed_io,
                 result: Arc::new(SpinLock::new(None)),
             });
         }
@@ -4681,15 +7508,38 @@ async fn commit_managed_component(
         job.fail(Status::Cancelled);
     }
     let external_cancel = session.external_cancel.clone();
-    let stage = stages.pop().expect("managed stage gate required one stage");
-    let exit = run_managed_component_stage(&stage, &job, external_cancel.as_ref()).await;
-    *stage.result.lock() = Some(exit.clone());
-    close_stage_outputs(&stage, exit.status);
+    let mut stage = stages.pop().expect("managed stage gate required one stage");
+    if external_cancel
+        .as_ref()
+        .is_some_and(|cancel| cancel.is_cancelled())
+    {
+        job.fail(Status::Cancelled);
+    }
+    let prepared = if session.managed_cleanup.is_some() {
+        let terminal = stage.finalize_unpublished_managed_io(ComponentTerminal::RunnerFault);
+        stage.cspace.lock().revoke_all();
+        Err(terminal)
+    } else if job.live.load(Ordering::Acquire) {
+        prepare_managed_component_start(stage)
+    } else {
+        let terminal = stage.finalize_unpublished_managed_io(ComponentTerminal::Cancelled);
+        stage.cspace.lock().revoke_all();
+        Err(terminal)
+    };
+    // No admission capability is needed after the exact managed start
+    // envelope has been extracted. In particular, neither CSpace survives
+    // across the lifecycle await below.
+    admission.revoke_all();
+    let exit = match prepared {
+        Ok(prepared) => {
+            run_prepared_managed_component(session, prepared, &job, external_cancel.as_ref())
+                .await?
+        }
+        Err(terminal) => managed_component_exit(terminal),
+    };
     if severe(exit.status) {
         job.fail(exit.status);
     }
-    stage.cspace.lock().revoke_all();
-    admission.revoke_all();
     job.finish();
 
     Ok(JobReport {
@@ -4705,110 +7555,267 @@ async fn commit_managed_component(
     })
 }
 
-async fn run_managed_component_stage(
-    stage: &PreparedStage,
+struct PreparedManagedComponentStart {
+    lifecycle: &'static dyn ManagedComponentLifecycle,
+    io: ManagedComponentIo,
+}
+
+fn prepare_managed_component_start(
+    mut stage: PreparedStage,
+) -> Result<PreparedManagedComponentStart, ComponentTerminal> {
+    let (io, stdin_cap, stdout_cap, stdin_supervisor_cap, stdout_supervisor_cap) = stage
+        .managed_io
+        .take()
+        .ok_or(ComponentTerminal::BackendFault)?;
+    let preflight = (|| {
+        let command = stage
+            .cspace
+            .lock()
+            .lookup_as::<Command>(stage.command, Rights::INVOKE)
+            .map_err(|_| ComponentTerminal::Denied)?;
+        let lifecycle = match &command.applet {
+            Applet::ManagedComponent {
+                manifest,
+                lifecycle,
+                ..
+            } if lifecycle.manifest() == manifest.as_ref() => *lifecycle,
+            _ => return Err(ComponentTerminal::BackendFault),
+        };
+        let (
+            observed_stdin,
+            observed_stdout,
+            observed_stdin_supervisor,
+            observed_stdout_supervisor,
+        ) = {
+            let cspace = stage.cspace.lock();
+            if cspace.rights_of(stdin_cap) != Ok(Rights::RECV)
+                || cspace.rights_of(stdout_cap) != Ok(Rights::SEND)
+                || cspace.rights_of(stdin_supervisor_cap) != Ok(Rights::INVOKE)
+                || cspace.rights_of(stdout_supervisor_cap) != Ok(Rights::INVOKE)
+            {
+                return Err(ComponentTerminal::Denied);
+            }
+            let stdin = cspace
+                .lookup_as::<ByteStreamReader>(stdin_cap, Rights::RECV)
+                .map_err(|_| ComponentTerminal::Denied)?;
+            let stdout = cspace
+                .lookup_as::<ByteStreamWriter>(stdout_cap, Rights::SEND)
+                .map_err(|_| ComponentTerminal::Denied)?;
+            let stdin_supervisor = cspace
+                .lookup_as::<ByteStreamSupervisor>(stdin_supervisor_cap, Rights::INVOKE)
+                .map_err(|_| ComponentTerminal::Denied)?;
+            let stdout_supervisor = cspace
+                .lookup_as::<ByteStreamSupervisor>(stdout_supervisor_cap, Rights::INVOKE)
+                .map_err(|_| ComponentTerminal::Denied)?;
+            (stdin, stdout, stdin_supervisor, stdout_supervisor)
+        };
+        if !Arc::ptr_eq(&observed_stdin, &io.stdin)
+            || !Arc::ptr_eq(&observed_stdout, &io.stdout)
+            || !Arc::ptr_eq(&observed_stdin_supervisor, &io.stdin_supervisor)
+            || !Arc::ptr_eq(&observed_stdout_supervisor, &io.stdout_supervisor)
+            || observed_stdin.same_stream_as(&observed_stdout)
+            || Arc::ptr_eq(&observed_stdin_supervisor, &observed_stdout_supervisor)
+            || !observed_stdin_supervisor.same_stream_as_reader(&observed_stdin)
+            || observed_stdin_supervisor.same_stream_as_writer(&observed_stdout)
+            || !observed_stdout_supervisor.same_stream_as_writer(&observed_stdout)
+            || observed_stdout_supervisor.same_stream_as_reader(&observed_stdin)
+        {
+            return Err(ComponentTerminal::BackendFault);
+        }
+        drop(command);
+        Ok(lifecycle)
+    })();
+    let lifecycle = match preflight {
+        Ok(lifecycle) => lifecycle,
+        Err(terminal) => {
+            let terminal = io.finalize_unpublished(terminal);
+            stage.cspace.lock().revoke_all();
+            return Err(terminal);
+        }
+    };
+    // The Session roots were consumed by the one-shot prepare transaction.
+    // Revoke the four temporary stage roots before `start` can publish and
+    // wake a child on another hart; the non-cloneable envelope is then the
+    // only VSH-held ownership and moves directly into the registry call.
+    stage.cspace.lock().revoke_all();
+    drop(stage);
+    Ok(PreparedManagedComponentStart { lifecycle, io })
+}
+
+async fn run_prepared_managed_component(
+    session: &mut Session,
+    prepared: PreparedManagedComponentStart,
     job: &JobControl,
     external_cancel: Option<&Arc<CancellationSignal>>,
-) -> StageExit {
-    let command = match stage
-        .cspace
-        .lock()
-        .lookup_as::<Command>(stage.command, Rights::INVOKE)
-    {
-        Ok(command) => command,
-        Err(_) => return managed_component_exit(ComponentTerminal::Denied),
-    };
-    let lifecycle = match &command.applet {
-        Applet::ManagedComponent {
-            manifest,
-            lifecycle,
-        } if lifecycle.manifest() == manifest.as_ref() => *lifecycle,
-        _ => {
-            return managed_component_exit(ComponentTerminal::BackendFault);
-        }
-    };
-    // The async adapter retains only the static service reference across
-    // `start` and subsequent yields. In particular, it does not keep the
-    // stage-local Command Arc (and its manifest) live alongside the child.
-    drop(command);
-    if external_cancel.is_some_and(|cancel| cancel.is_cancelled()) {
-        job.fail(Status::Cancelled);
-    }
-    if !job.live.load(Ordering::Acquire) {
-        return managed_component_exit(ComponentTerminal::Cancelled);
+) -> Result<StageExit, Diagnostic> {
+    enum PrestartWait {
+        Installed,
+        Cancelled,
+        Lost,
     }
 
-    let token = match lifecycle.start() {
-        Ok(token) => token,
-        Err(
-            terminal @ (ComponentTerminal::Denied
-            | ComponentTerminal::Unavailable
-            | ComponentTerminal::BackendFault
-            | ComponentTerminal::BudgetExceeded
-            | ComponentTerminal::Cancelled
-            | ComponentTerminal::RunnerFault
-            | ComponentTerminal::Trapped(_)),
-        ) => return managed_component_exit(terminal),
-        Err(ComponentTerminal::Success | ComponentTerminal::Returned(_)) => {
-            return managed_component_exit(ComponentTerminal::BackendFault);
-        }
-    };
     enum ManagedWake {
-        State(ManagedComponentState),
+        Completion(Result<(), OneShotWaitError>),
+        CompletionScalar,
         Cancelled(Result<(), OneShotWaitError>),
     }
 
-    let mut cancel_requested = false;
+    let PreparedManagedComponentStart { lifecycle, io } = prepared;
+    // The complete endpoint envelope moves into the fixed SYSTEM registry
+    // before the first await. Across Armed, the parent retains no endpoint or
+    // reference-counted cleanup object.
+    let lease = match prepare_managed_reaper(lifecycle, io).await {
+        Ok(lease) => lease,
+        Err(ManagedPrepareFailure::Terminal(terminal)) => {
+            return Ok(managed_component_exit(terminal));
+        }
+        Err(ManagedPrepareFailure::Lost) => {
+            return Err(Diagnostic::new(
+                0,
+                0,
+                "managed component reaper preparation was quarantined",
+            ));
+        }
+    };
+    let mut foreground = ManagedForegroundGuard::new(lease);
+    let Some(listener) = managed_reaper_completion_listener(lease) else {
+        let outcome = lease.abort_before_child_publication(ComponentTerminal::RunnerFault);
+        foreground.complete();
+        return match outcome {
+            ManagedComponentStartAbort::CleanAborted => {
+                Ok(managed_component_exit(ComponentTerminal::RunnerFault))
+            }
+            ManagedComponentStartAbort::Quarantined => Err(Diagnostic::new(
+                0,
+                0,
+                "managed component prestart identity was lost",
+            )),
+        };
+    };
+    let mut completion = Box::pin(listener);
     let mut cancellation = external_cancel.map(|cancel| Box::pin(cancel.cancelled()));
-    loop {
-        if !job.live.load(Ordering::Acquire) && !cancel_requested {
-            match lifecycle.request_cancel(token) {
-                ManagedComponentCancel::Requested | ManagedComponentCancel::AlreadyComplete => {
-                    cancel_requested = true;
-                }
-                ManagedComponentCancel::Lost => {
-                    return managed_component_exit(ComponentTerminal::RunnerFault);
-                }
+
+    // Both possible parent wake registrations are installed while no child is
+    // live. `prepare_managed_reaper` pre-reserved their TaskStatus ledger
+    // capacity, so a post-publication RegistrationFailed cannot open an orphan
+    // window. This poll returns synchronously once both futures are Pending.
+    let prestart = poll_fn(|context| {
+        match completion.as_mut().poll(context) {
+            Poll::Pending => {}
+            Poll::Ready(_) => return Poll::Ready(PrestartWait::Lost),
+        }
+        if let Some(wait) = cancellation.as_mut() {
+            match wait.as_mut().poll(context) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(())) => return Poll::Ready(PrestartWait::Cancelled),
+                Poll::Ready(Err(_)) => return Poll::Ready(PrestartWait::Lost),
             }
         }
-        let mut state = lifecycle.wait_state(token);
-        let observed = if cancel_requested || cancellation.is_none() {
-            ManagedWake::State(state.await)
-        } else {
-            poll_fn(|context| {
-                if let Some(wait) = cancellation.as_mut() {
-                    if let Poll::Ready(result) = wait.as_mut().poll(context) {
-                        return Poll::Ready(ManagedWake::Cancelled(result));
-                    }
-                }
-                state.as_mut().poll(context).map(ManagedWake::State)
-            })
-            .await
+        Poll::Ready(PrestartWait::Installed)
+    })
+    .await;
+    let prestart_terminal = match prestart {
+        PrestartWait::Installed if job.live.load(Ordering::Acquire) => None,
+        PrestartWait::Installed | PrestartWait::Cancelled => {
+            job.fail(Status::Cancelled);
+            Some(ComponentTerminal::Cancelled)
+        }
+        PrestartWait::Lost => Some(ComponentTerminal::RunnerFault),
+    };
+    if let Some(terminal) = prestart_terminal {
+        let outcome = lease.abort_before_child_publication(terminal);
+        foreground.complete();
+        return match outcome {
+            ManagedComponentStartAbort::CleanAborted => Ok(managed_component_exit(terminal)),
+            ManagedComponentStartAbort::Quarantined => Err(Diagnostic::new(
+                0,
+                0,
+                "managed component prestart identity was lost",
+            )),
         };
-        let observed = match observed {
-            ManagedWake::State(state) => state,
+    }
+
+    let token = match lifecycle.start(lease) {
+        Ok(token) => token,
+        Err(terminal) => {
+            // A conforming lifecycle used the same exact lease to distinguish
+            // unpublished abort from ambiguous partial publication. Repeating
+            // this operation is idempotent and can only make the result more
+            // conservative.
+            let outcome = lease.abort_before_child_publication(terminal);
+            foreground.complete();
+            return match outcome {
+                ManagedComponentStartAbort::CleanAborted => Ok(managed_component_exit(terminal)),
+                ManagedComponentStartAbort::Quarantined => Err(Diagnostic::new(
+                    0,
+                    0,
+                    "managed component partial start was quarantined",
+                )),
+            };
+        }
+    };
+    let cleanup = ManagedInvocationCleanup { lease };
+    session.managed_cleanup = Some(cleanup);
+    if !lease.is_active_for(token) && managed_reaper_completion(lease).is_none() {
+        lease.quarantine_partial_start();
+    }
+
+    let mut completion_registration_lost = false;
+    loop {
+        if let Some(observed) = managed_reaper_completion(lease) {
+            foreground.complete();
+            session.clear_managed_cleanup(cleanup);
+            return match observed {
+                ManagedReaperCompletion::Terminal(terminal) => Ok(managed_component_exit(terminal)),
+                ManagedReaperCompletion::Lost => Err(Diagnostic::new(
+                    0,
+                    0,
+                    "managed component lifecycle identity was lost",
+                )),
+            };
+        }
+
+        if !job.live.load(Ordering::Acquire) {
+            request_managed_reaper_cancel(lease);
+        }
+        if completion_registration_lost {
+            // The sole SYSTEM reaper remains authoritative. Keep the exact
+            // detach lease armed and wait for its stable scalar instead of
+            // guessing a Component terminal from a broken parent listener.
+            exec::yield_now().await;
+            continue;
+        }
+
+        let wake = poll_fn(|context| {
+            if managed_reaper_completion(lease).is_some() {
+                return Poll::Ready(ManagedWake::CompletionScalar);
+            }
+            if let Poll::Ready(result) = completion.as_mut().poll(context) {
+                return Poll::Ready(ManagedWake::Completion(result));
+            }
+            if let Some(cancel) = cancellation.as_mut() {
+                return cancel.as_mut().poll(context).map(ManagedWake::Cancelled);
+            }
+            Poll::Pending
+        })
+        .await;
+        match wake {
+            ManagedWake::CompletionScalar => {}
+            ManagedWake::Completion(Ok(())) => {
+                // The completion scalar was stored before this exact edge.
+            }
+            ManagedWake::Completion(Err(_)) => {
+                request_managed_reaper_cancel(lease);
+                completion_registration_lost = true;
+            }
             ManagedWake::Cancelled(Ok(())) => {
                 cancellation = None;
                 job.fail(Status::Cancelled);
-                continue;
+                request_managed_reaper_cancel(lease);
             }
             ManagedWake::Cancelled(Err(_)) => {
-                return managed_component_exit(ComponentTerminal::RunnerFault);
-            }
-        };
-        match observed {
-            ManagedComponentState::Running => {
-                // A state-change future must never report a fresh Running
-                // value after parking. Treat a broken lifecycle adapter as a
-                // fail-closed protocol error rather than polling it again.
-                return managed_component_exit(ComponentTerminal::RunnerFault);
-            }
-            ManagedComponentState::Complete(terminal) => {
-                lifecycle.acknowledge_complete(token);
-                return managed_component_exit(terminal);
-            }
-            ManagedComponentState::Lost => {
-                return managed_component_exit(ComponentTerminal::RunnerFault);
+                cancellation = None;
+                request_managed_reaper_cancel(lease);
             }
         }
     }
@@ -5251,6 +8258,7 @@ fn validate_command_manifest(
 
 fn component_preflight_diagnostic(span: Span, terminal: ComponentTerminal) -> Diagnostic {
     let message = match terminal {
+        ComponentTerminal::Usage => "component runner rejected command use",
         ComponentTerminal::Denied => "component runner preflight denied",
         ComponentTerminal::Unavailable => "component runner is unavailable",
         ComponentTerminal::BackendFault => "component runner backend fault",
@@ -5448,6 +8456,7 @@ async fn run_component_stage(
         let write = write_all(&stage.cspace, &stage.stdout, output, job).await;
         if write != Status::Success {
             terminal = match write {
+                Status::Usage => ComponentTerminal::Usage,
                 Status::Denied => ComponentTerminal::Denied,
                 Status::Unavailable => ComponentTerminal::Unavailable,
                 Status::BackendFault => ComponentTerminal::BackendFault,

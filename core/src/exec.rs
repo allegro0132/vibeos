@@ -84,6 +84,403 @@ impl fmt::Display for TaskId {
     }
 }
 
+/// Stable, allocation-free callback installed in one exact task's cleanup
+/// ledger before an independently owned SYSTEM supervisor publishes work.
+///
+/// The executor invokes this target only after the task has crossed permanent
+/// detach and after every ordinary wait/timer/join registration in the same
+/// ledger has been removed. `context` is deliberately opaque: it commonly
+/// carries a generational index into a fixed SYSTEM registry, never a pointer
+/// into the task's allocation domain.
+#[derive(Clone, Copy)]
+pub struct TaskDetachTarget {
+    context: u64,
+    notify: unsafe fn(u64, TaskId, AllocationDomain, TaskDetachReason),
+}
+
+/// Exact executor terminal transition which caused permanent TaskStatus
+/// detach. Stable supervisors use this to distinguish raw poll fault from
+/// cooperative cancellation without inspecting or retaining the future.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskDetachReason {
+    Exited,
+    Cancelled,
+    Faulted,
+}
+
+impl TaskDetachTarget {
+    /// Construct one supervisor callback target.
+    ///
+    /// # Safety
+    ///
+    /// `notify` must remain executable for the lifetime of the kernel. It must
+    /// be allocation-free, bounded, nonblocking, and safe to invoke in SYSTEM
+    /// after the exact task and its wake registrations are permanently
+    /// detached. `context` must resolve only stable SYSTEM state and must carry
+    /// its own generation/ABA protection.
+    pub const unsafe fn new(
+        context: u64,
+        notify: unsafe fn(u64, TaskId, AllocationDomain, TaskDetachReason),
+    ) -> Self {
+        Self { context, notify }
+    }
+
+    fn matches(self, other: Self) -> bool {
+        self.context == other.context && core::ptr::fn_addr_eq(self.notify, other.notify)
+    }
+}
+
+/// Copy-only proof that one exact current TaskStatus owns a detach callback.
+///
+/// This token owns no task handle, future, queue, allocator, or callback
+/// state. Its private status seal prevents a same-number TaskId or same-domain
+/// task from disarming another incarnation's cleanup entry.
+#[derive(Clone, Copy)]
+pub struct CurrentTaskDetachLease {
+    task: TaskId,
+    domain: AllocationDomain,
+    status_identity: usize,
+    registration: u64,
+    target: TaskDetachTarget,
+}
+
+impl CurrentTaskDetachLease {
+    pub const fn task_id(self) -> TaskId {
+        self.task
+    }
+
+    pub const fn allocation_domain(self) -> AllocationDomain {
+        self.domain
+    }
+
+    /// Compare every private identity dimension of two copy-only leases.
+    /// This reveals no TaskStatus address or registration token; stable
+    /// registries use it only to reject a same-number task/domain projection
+    /// whose status incarnation, callback, or ledger generation differs.
+    pub fn matches_exact(self, other: Self) -> bool {
+        self.task == other.task
+            && self.domain == other.domain
+            && self.status_identity == other.status_identity
+            && self.registration == other.registration
+            && self.target.matches(other.target)
+    }
+
+    /// Whether this lease's exact parent is still in its ordinary poll stack.
+    ///
+    /// A task-wide reclaim destructor retains CurrentTaskScope but has already
+    /// detached the scheduler `running` slot. Supervisors use this distinction
+    /// to avoid guessing Cancelled from a nested guard Drop before the executor
+    /// knows whether a later destructor fault changes the final reason.
+    pub fn is_current_running_exact(self) -> bool {
+        let Some(hart) = current_scheduler_hart() else {
+            return false;
+        };
+        let Some(status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+            return false;
+        };
+        let sched = SCHED.lock();
+        sched.harts[hart.index()]
+            .running
+            .as_ref()
+            .is_some_and(|running| {
+                running.id == self.task
+                    && running.domain == self.domain
+                    && Arc::ptr_eq(&running.status, &status)
+                    && Arc::as_ptr(&status) as usize == self.status_identity
+            })
+    }
+
+    /// Whether Drop is reclaiming this exact whole task after its running slot
+    /// was detached. In this state callers must leave the detach callback
+    /// armed until the executor determines the final destructor outcome.
+    pub fn is_current_reclaiming_exact(self) -> bool {
+        let Some(hart) = current_scheduler_hart() else {
+            return false;
+        };
+        let Some(status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+            return false;
+        };
+        let scope_exact = CURRENT_TASK_ID[hart.index()].load(Ordering::Acquire) == self.task.0
+            && Arc::as_ptr(&status) as usize == self.status_identity
+            && heap::current_domain() == self.domain;
+        scope_exact && !self.is_current_running_exact()
+    }
+
+    /// Remove this exact callback while the original task incarnation is
+    /// still executing. Repeating an already successful disarm is idempotent;
+    /// a different task/status/domain can never consume the entry.
+    pub fn disarm(self) -> TaskDetachDisarm {
+        let Some(hart) = current_scheduler_hart() else {
+            return TaskDetachDisarm::IdentityMismatch;
+        };
+        let Some(status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+            return TaskDetachDisarm::IdentityMismatch;
+        };
+        // A normal future destructor runs after its scheduler `running` slot
+        // has been detached, but the executor reinstalls the same private
+        // CurrentTaskScope and allocation domain around Drop. Validate that
+        // scope directly so RAII can disarm; a longjmp fault skips the guard
+        // and leaves the entry for the executor's final-reason detach pass.
+        let exact = CURRENT_TASK_ID[hart.index()].load(Ordering::Acquire) == self.task.0
+            && Arc::as_ptr(&status) as usize == self.status_identity
+            && heap::current_domain() == self.domain;
+        if !exact {
+            return TaskDetachDisarm::IdentityMismatch;
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let removed = status.disarm_owned(self.registration);
+        system.restore();
+        match removed {
+            Some(OwnedRegistration::TaskDetach {
+                target,
+                task,
+                domain,
+            }) if target.matches(self.target) && task == self.task && domain == self.domain => {
+                TaskDetachDisarm::Disarmed
+            }
+            Some(_) => panic!("task detach registration identity changed"),
+            None => TaskDetachDisarm::AlreadyDisarmed,
+        }
+    }
+
+    /// Wake only the exact TaskStatus incarnation captured by this lease.
+    /// TaskId values are monotonic and never reused; after the locked identity
+    /// check, a concurrent permanent detach can only make the wake inactive.
+    pub fn wake_if_exact(self) -> bool {
+        let exact = {
+            let sched = SCHED.lock();
+            sched.tasks.get(&self.task).is_some_and(|task| {
+                task.domain == self.domain
+                    && Arc::as_ptr(&task.status) as usize == self.status_identity
+            }) || sched.harts.iter().any(|hart| {
+                hart.running.as_ref().is_some_and(|running| {
+                    running.id == self.task
+                        && running.domain == self.domain
+                        && Arc::as_ptr(&running.status) as usize == self.status_identity
+                })
+            })
+        };
+        exact && !matches!(wake_with_disposition(self.task), WakeDisposition::Inactive)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskDetachRegistrationError {
+    NotInTask,
+    RegistrationFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskDetachDisarm {
+    Disarmed,
+    AlreadyDisarmed,
+    IdentityMismatch,
+}
+
+/// Copy-only scheduler wake projection sealed to one exact TaskStatus.
+/// Stable SYSTEM registries may retain this scalar without retaining a task
+/// handle or allocation-domain object.
+#[derive(Clone, Copy)]
+pub struct ExactTaskWake {
+    task: TaskId,
+    domain: AllocationDomain,
+    status_identity: usize,
+}
+
+impl ExactTaskWake {
+    /// Wake only while all three identity dimensions still resolve to the
+    /// same live scheduler record. A terminal/detached or replaced task is
+    /// observationally inert.
+    pub fn wake_if_exact(self) -> bool {
+        let exact = {
+            let sched = SCHED.lock();
+            sched.tasks.get(&self.task).is_some_and(|task| {
+                task.domain == self.domain
+                    && Arc::as_ptr(&task.status) as usize == self.status_identity
+            }) || sched.harts.iter().any(|hart| {
+                hart.running.as_ref().is_some_and(|running| {
+                    running.id == self.task
+                        && running.domain == self.domain
+                        && Arc::as_ptr(&running.status) as usize == self.status_identity
+                })
+            })
+        };
+        exact && !matches!(wake_with_disposition(self.task), WakeDisposition::Inactive)
+    }
+}
+
+/// Attach a stable orphan-handoff target to the exact task poll currently
+/// executing.
+///
+/// Unlike [`current_reclaimable_task_witness`], this accepts both shared and
+/// exclusive tracked domains (and ordinary untracked tasks). Production SSH
+/// parents use the shared raw-reclaimable mode. The private TaskStatus object
+/// seal is captured together with TaskId and allocation domain.
+///
+/// # Safety
+///
+/// `target` must satisfy [`TaskDetachTarget::new`]. The caller must retain its
+/// target registry generation until this lease is exactly disarmed or the
+/// callback has run.
+pub unsafe fn register_current_task_detach(
+    target: TaskDetachTarget,
+) -> Result<CurrentTaskDetachLease, TaskDetachRegistrationError> {
+    let Some(hart) = current_scheduler_hart() else {
+        return Err(TaskDetachRegistrationError::NotInTask);
+    };
+    let Some(status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+        return Err(TaskDetachRegistrationError::NotInTask);
+    };
+    let (task, domain) = {
+        let sched = SCHED.lock();
+        let Some(running) = sched.harts[hart.index()].running.as_ref() else {
+            return Err(TaskDetachRegistrationError::NotInTask);
+        };
+        if running.hart != hart || !Arc::ptr_eq(&running.status, &status) {
+            return Err(TaskDetachRegistrationError::NotInTask);
+        }
+        (running.id, running.domain)
+    };
+    let status_identity = Arc::as_ptr(&status) as usize;
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let registration = status
+        .register_owned(OwnedRegistration::TaskDetach {
+            target,
+            task,
+            domain,
+        })
+        .map_err(|_| TaskDetachRegistrationError::RegistrationFailed);
+    system.restore();
+    Ok(CurrentTaskDetachLease {
+        task,
+        domain,
+        status_identity,
+        registration: registration?,
+        target,
+    })
+}
+
+/// Remove the exact detach target installed for the task whose poll is
+/// currently executing.
+///
+/// Prepared SYSTEM supervisors cannot capture a lease minted only after their
+/// future has already been boxed into a [`PreparedTaskBatch`].  They instead
+/// capture the same copy-only target used by
+/// [`PreparedTaskBatch::install_prepared_task_detach`] and disarm it at the
+/// final safe point before returning.  No other task or callback target can be
+/// consumed by this operation.
+pub fn disarm_current_task_detach(target: TaskDetachTarget) -> TaskDetachDisarm {
+    let Some(status) = current_task_status() else {
+        return TaskDetachDisarm::IdentityMismatch;
+    };
+    let Some(task) = current_task_scope_id() else {
+        return TaskDetachDisarm::IdentityMismatch;
+    };
+    let domain = heap::current_domain();
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let removed = {
+        let mut registrations = status.registrations.lock();
+        let mut matching =
+            registrations
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| match entry.registration {
+                    OwnedRegistration::TaskDetach {
+                        target: registered,
+                        task: registered_task,
+                        domain: registered_domain,
+                    } if registered.matches(target)
+                        && registered_task == task
+                        && registered_domain == domain =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                });
+        let index = matching.next();
+        assert!(
+            matching.next().is_none(),
+            "one task cannot own duplicate exact detach targets"
+        );
+        index.map(|index| registrations.swap_remove(index).registration)
+    };
+    system.restore();
+    match removed {
+        Some(OwnedRegistration::TaskDetach {
+            target: registered,
+            task: registered_task,
+            domain: registered_domain,
+        }) if registered.matches(target)
+            && registered_task == task
+            && registered_domain == domain =>
+        {
+            TaskDetachDisarm::Disarmed
+        }
+        Some(_) => panic!("task detach registration identity changed"),
+        None => TaskDetachDisarm::AlreadyDisarmed,
+    }
+}
+
+/// Read-only proof that the current exact task still owns one matching detach
+/// target. This does not consume or clone the registration and grants no wake
+/// or cleanup authority; it exists so a SYSTEM supervisor can prove its
+/// fail-stop callback remains armed immediately before an irreversible
+/// lifecycle transaction.
+pub fn current_task_detach_is_armed(target: TaskDetachTarget) -> bool {
+    let Some(status) = current_task_status() else {
+        return false;
+    };
+    let Some(task) = current_task_scope_id() else {
+        return false;
+    };
+    let domain = heap::current_domain();
+    let registrations = status.registrations.lock();
+    let mut matches = registrations.iter().filter(|entry| {
+        matches!(
+            entry.registration,
+            OwnedRegistration::TaskDetach {
+                target: registered,
+                task: registered_task,
+                domain: registered_domain,
+            } if registered.matches(target)
+                && registered_task == task
+                && registered_domain == domain
+        )
+    });
+    let armed = matches.next().is_some();
+    assert!(
+        matches.next().is_none(),
+        "one task cannot own duplicate exact detach targets"
+    );
+    armed
+}
+
+/// Preallocate fixed TaskStatus cleanup-ledger capacity for the task whose
+/// poll is currently executing.
+///
+/// SYSTEM supervisors use this before publishing dependent work so later
+/// fixed-queue waits cannot encounter a recoverable allocation failure after
+/// that work is live. Capacity is retained when individual registrations are
+/// disarmed. This function never reserves a wait target or grants authority.
+pub fn try_reserve_current_task_registrations(additional: usize) -> bool {
+    const MAX_SUPERVISOR_REGISTRATION_RESERVE: usize = 4;
+    if additional == 0 || additional > MAX_SUPERVISOR_REGISTRATION_RESERVE {
+        return false;
+    }
+    let Some(status) = current_task_status() else {
+        return false;
+    };
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    let reserved = status
+        .registrations
+        .lock()
+        .try_reserve_exact(additional)
+        .is_ok();
+    system.restore();
+    reserved
+}
+
 /// The lifecycle states shared by the executor and a supervising component.
 ///
 /// Cancellation is a terminal state of a task incarnation; the supervising
@@ -145,11 +542,29 @@ struct JoinWaiter {
 
 #[derive(Clone)]
 enum OwnedRegistration {
-    Wait { queue: usize, id: u64 },
-    OneShotWait { queue: usize, generation: u64 },
-    Timer { id: u64 },
-    Join { status: Arc<TaskStatus>, id: u64 },
-    IrqPollProbe { generation: u64 },
+    Wait {
+        queue: usize,
+        id: u64,
+    },
+    OneShotWait {
+        queue: usize,
+        generation: u64,
+    },
+    Timer {
+        id: u64,
+    },
+    Join {
+        status: Arc<TaskStatus>,
+        id: u64,
+    },
+    IrqPollProbe {
+        generation: u64,
+    },
+    TaskDetach {
+        target: TaskDetachTarget,
+        task: TaskId,
+        domain: AllocationDomain,
+    },
 }
 
 struct OwnedRegistrationEntry {
@@ -355,11 +770,6 @@ impl TaskStatus {
             .position(|entry| entry.token == token)
             .map(|index| registrations.swap_remove(index).registration)
     }
-
-    fn take_owned_registrations(&self) -> Vec<OwnedRegistrationEntry> {
-        let mut registrations = self.registrations.lock();
-        core::mem::take(&mut *registrations)
-    }
 }
 
 static CURRENT_TASK_STATUS: [SpinLock<Option<Arc<TaskStatus>>>; MAX_HARTS] =
@@ -503,6 +913,21 @@ pub fn current_task_id() -> Option<TaskId> {
         .map(|running| running.id)
 }
 
+fn current_task_exact_wake() -> Option<ExactTaskWake> {
+    let hart = current_scheduler_hart()?;
+    let status = CURRENT_TASK_STATUS[hart.index()].lock().clone()?;
+    let sched = SCHED.lock();
+    let running = sched.harts[hart.index()]
+        .running
+        .as_ref()
+        .filter(|running| running.hart == hart && Arc::ptr_eq(&running.status, &status))?;
+    Some(ExactTaskWake {
+        task: running.id,
+        domain: running.domain,
+        status_identity: Arc::as_ptr(&status) as usize,
+    })
+}
+
 fn current_task_scope_id() -> Option<TaskId> {
     let hart = current_scheduler_hart()?;
     let current = CURRENT_TASK_STATUS[hart.index()].lock();
@@ -588,10 +1013,46 @@ fn disarm_owned_for_task(task: TaskId, token: Option<u64>) {
     }
 }
 
-fn drain_task_registrations(status: &TaskStatus) {
-    let registrations = status.take_owned_registrations();
-    for entry in registrations {
-        cleanup_owned_registration(entry.registration);
+fn take_owned_registration(status: &TaskStatus, task_detach: bool) -> Option<OwnedRegistration> {
+    let mut registrations = status.registrations.lock();
+    let index = registrations.iter().position(|entry| {
+        matches!(entry.registration, OwnedRegistration::TaskDetach { .. }) == task_detach
+    })?;
+    Some(registrations.swap_remove(index).registration)
+}
+
+fn drain_ordinary_task_registrations(status: &TaskStatus) {
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    while let Some(registration) = take_owned_registration(status, false) {
+        cleanup_owned_registration(registration, None);
+    }
+    system.restore();
+}
+
+fn drain_task_detach_registrations(status: &TaskStatus, reason: TaskDetachReason) {
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    while let Some(registration) = take_owned_registration(status, true) {
+        cleanup_owned_registration(registration, Some(reason));
+    }
+    system.restore();
+}
+
+fn drain_task_registrations(status: &TaskStatus, reason: TaskDetachReason) {
+    // Remove all old wait/timer/join edges before any SYSTEM orphan callback.
+    drain_ordinary_task_registrations(status);
+    drain_task_detach_registrations(status, reason);
+}
+
+fn task_detach_reason(status: &TaskStatus) -> TaskDetachReason {
+    match status.raw_state() {
+        x if x == TaskState::Exited as u8 || x == EXIT_COMMITTED => TaskDetachReason::Exited,
+        x if x == TaskState::Faulted as u8 || x == FAULT_COMMITTED => TaskDetachReason::Faulted,
+        x if x == TaskState::Cancelled as u8 || x == CANCEL_REQUESTED || x == CANCEL_COMMITTED => {
+            TaskDetachReason::Cancelled
+        }
+        // An unpublished/never-polled task is being rolled back rather than
+        // faulted; no future state is inferred from that administrative path.
+        _ => TaskDetachReason::Cancelled,
     }
 }
 
@@ -666,6 +1127,7 @@ pub struct AcceptanceTaskRegistrationStats {
     pub timers: usize,
     pub joins: usize,
     pub irq_poll_probes: usize,
+    pub task_detaches: usize,
 }
 
 impl TaskHandle {
@@ -683,6 +1145,14 @@ impl TaskHandle {
 
     pub fn allocation_domain(&self) -> AllocationDomain {
         self.domain
+    }
+
+    pub fn exact_wake(&self) -> ExactTaskWake {
+        ExactTaskWake {
+            task: self.id,
+            domain: self.domain,
+            status_identity: Arc::as_ptr(&self.status) as usize,
+        }
     }
 
     /// Compare the stable, unforgeable status object behind two retained
@@ -748,6 +1218,7 @@ impl TaskHandle {
             timers: 0,
             joins: 0,
             irq_poll_probes: 0,
+            task_detaches: 0,
         };
         for entry in registrations.iter() {
             match entry.registration {
@@ -757,6 +1228,7 @@ impl TaskHandle {
                 OwnedRegistration::Timer { .. } => stats.timers += 1,
                 OwnedRegistration::Join { .. } => stats.joins += 1,
                 OwnedRegistration::IrqPollProbe { .. } => stats.irq_poll_probes += 1,
+                OwnedRegistration::TaskDetach { .. } => stats.task_detaches += 1,
             }
         }
         stats
@@ -933,6 +1405,7 @@ struct Task {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TaskPublication {
     Prepared(u64),
+    Staged(u64),
     Published,
 }
 
@@ -1981,7 +2454,10 @@ fn assert_sched_invariants(s: &Sched) {
             task.ready.then_some(task.queue_owner),
             "task {id} queue metadata has a second or missing owner"
         );
-        if let TaskPublication::Prepared(_) = task.publication {
+        if matches!(
+            task.publication,
+            TaskPublication::Prepared(_) | TaskPublication::Staged(_)
+        ) {
             debug_assert!(
                 !task.ready,
                 "unpublished task {id} acquired ready ownership"
@@ -2540,6 +3016,7 @@ pub struct PreparedTaskBatch {
     handles: Vec<TaskHandle>,
     reclaimable_bindings: Vec<PreparedReclaimableBinding>,
     published: bool,
+    staged: bool,
     binding_rejected: bool,
     publication: Arc<AtomicBool>,
 }
@@ -2555,6 +3032,7 @@ impl PreparedTaskBatch {
             handles: Vec::new(),
             reclaimable_bindings: Vec::new(),
             published: false,
+            staged: false,
             binding_rejected: false,
             publication,
         }
@@ -2580,6 +3058,100 @@ impl PreparedTaskBatch {
     /// and is the only object that can publish or roll it back.
     pub fn prepared_handles(&self) -> &[TaskHandle] {
         &self.handles
+    }
+
+    /// Reserve a small, fixed number of outbound cleanup-ledger entries for
+    /// one still-hidden prepared task.
+    ///
+    /// This is the batch-local counterpart of
+    /// [`try_reserve_current_task_registrations`]. It is used when a SYSTEM
+    /// supervisor will await a fixed lifecycle edge rather than retain an
+    /// owning [`TaskHandle::join`] future. The narrow bound prevents this from
+    /// becoming a caller-sized SYSTEM allocation surface.
+    pub fn try_reserve_prepared_task_registrations(
+        &mut self,
+        task_index: usize,
+        additional: usize,
+    ) -> bool {
+        const MAX_PREPARED_REGISTRATION_RESERVE: usize = 2;
+        if self.published
+            || self.binding_rejected
+            || task_index >= self.handles.len()
+            || additional == 0
+            || additional > MAX_PREPARED_REGISTRATION_RESERVE
+        {
+            return false;
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let reserved = self.handles[task_index]
+            .status
+            .registrations
+            .lock()
+            .try_reserve_exact(additional)
+            .is_ok();
+        system.restore();
+        reserved
+    }
+
+    /// Install a detach callback directly on one still-hidden prepared task.
+    ///
+    /// This closes the publication-to-first-poll window for a SYSTEM
+    /// supervisor: the callback is already part of its `TaskStatus` ledger
+    /// before any raw-reclaimable child in the batch becomes runnable.  The
+    /// future captures the same copy-only `target` and removes it with
+    /// [`disarm_current_task_detach`] only after its stable lifecycle commit.
+    /// Callers that also await a fixed SYSTEM edge install this entry first and
+    /// then reserve one additional outbound slot with
+    /// [`Self::try_reserve_prepared_task_registrations`].
+    pub fn install_prepared_task_detach(
+        &mut self,
+        task_index: usize,
+        target: TaskDetachTarget,
+    ) -> bool {
+        if self.published || self.binding_rejected || task_index >= self.handles.len() {
+            return false;
+        }
+
+        let handle = &self.handles[task_index];
+        let task = handle.id;
+        let domain = handle.domain;
+        let status = &handle.status;
+        let token = status
+            .next_registration
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("task registration token space exhausted");
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let installed = {
+            let mut registrations = status.registrations.lock();
+            let duplicate = registrations.iter().any(|entry| {
+                matches!(
+                    entry.registration,
+                    OwnedRegistration::TaskDetach {
+                        target: registered,
+                        task: registered_task,
+                        domain: registered_domain,
+                    } if registered.matches(target)
+                        && registered_task == task
+                        && registered_domain == domain
+                )
+            });
+            if duplicate || registrations.try_reserve_exact(1).is_err() {
+                false
+            } else {
+                registrations.push(OwnedRegistrationEntry {
+                    token,
+                    registration: OwnedRegistration::TaskDetach {
+                        target,
+                        task,
+                        domain,
+                    },
+                });
+                true
+            }
+        };
+        system.restore();
+        installed
     }
 
     /// Exact, non-owning executor identities for the raw-reclaimable members
@@ -2837,17 +3409,19 @@ impl PreparedTaskBatch {
         Ok(core::mem::take(&mut self.handles))
     }
 
-    /// Publish a mixed batch containing one or more exclusive raw-reclaimable
+    /// Stage a mixed batch containing one or more exclusive raw-reclaimable
     /// tasks after a SYSTEM-owned registry has already bound their exact
-    /// identities. Ordinary safe candidates in the same batch share the same
-    /// all-or-none scheduler publication.
+    /// identities. Staging installs the scheduler/domain identities but keeps
+    /// every future unpublished, not-ready, and impossible to poll.
     ///
     /// The executor first simulates every tracked admission in a private copy
     /// of its fixed domain table, reserves all queues, and constructs a private
     /// BTree node set. It then calls `activate` while holding `SCHED`, but before
     /// changing any global scheduler projection. Only an accepted, complete
-    /// registry transaction is followed by the map/ready/publication commit
-    /// and post-lock notifications. The map merge remains SYSTEM-charged; a
+    /// registry transaction is followed only by the map/domain commit. The
+    /// caller may then commit an independent fixed lifecycle record without
+    /// holding SCHED, before invoking the returned stage's allocation-free
+    /// ready publication. The map merge remains SYSTEM-charged; a
     /// target allocation failure takes the kernel's explicit fatal allocator
     /// path and cannot return through a component landing pad.
     ///
@@ -2861,10 +3435,10 @@ impl PreparedTaskBatch {
     /// [`PreparedReclaimableActivation::Quarantined`], it must leave every
     /// involved record sticky-quarantined. It must never reset or reclaim an
     /// arena. Code that holds the registry lock must never call this method.
-    pub unsafe fn publish_exclusive_reclaimable_with(
+    pub unsafe fn stage_exclusive_reclaimable_with(
         &mut self,
         activate: impl FnOnce(&[PreparedReclaimableBinding]) -> PreparedReclaimableActivation,
-    ) -> Result<Vec<TaskHandle>, PreparedTaskBatchError> {
+    ) -> Result<PreparedReclaimableStage<'_>, PreparedTaskBatchError> {
         if self.published {
             return Err(PreparedTaskBatchError::AlreadyPublished);
         }
@@ -3021,35 +3595,149 @@ impl PreparedTaskBatch {
         // No recoverable branch follows registry activation. BTreeMap::append
         // may split a nonempty SYSTEM tree; target SYSTEM OOM is an explicit
         // machine fail-stop, not a component fault. The SCHED lock keeps every
-        // internally ready task undispatchable until the shared publication
-        // flag and complete domain table agree.
+        // staged task absent from every ready queue. A dropped stage is a
+        // deliberate stable leak: activated registry/domain state is never
+        // guessed back into a prepublication rollback.
         s.tasks.append(&mut staged_tasks);
         debug_assert!(staged_tasks.is_empty());
         s.reclaimable_domains = staged;
         for prepared in &self.tasks {
+            s.tasks
+                .get_mut(&prepared.id)
+                .expect("activated staged task remains installed")
+                .publication = TaskPublication::Staged(self.id);
+        }
+        self.staged = true;
+        check_sched!(&s);
+        drop(s);
+        system.restore();
+        Ok(PreparedReclaimableStage { batch: self })
+    }
+
+    /// Preserve the original one-call API for callers which need no external
+    /// lifecycle commit between registry activation and ready publication.
+    pub unsafe fn publish_exclusive_reclaimable_with(
+        &mut self,
+        activate: impl FnOnce(&[PreparedReclaimableBinding]) -> PreparedReclaimableActivation,
+    ) -> Result<Vec<TaskHandle>, PreparedTaskBatchError> {
+        let stage = unsafe { self.stage_exclusive_reclaimable_with(activate) }?;
+        Ok(stage.publish_ready_unconditional())
+    }
+}
+
+/// Activated scheduler/domain staging which is still impossible to poll.
+/// Every future has moved into SCHED, remains unpublished and not-ready, and
+/// is explicitly excluded from `PreparedTaskBatch` rollback.
+#[must_use = "an activated stage must be published ready or quarantined"]
+pub struct PreparedReclaimableStage<'a> {
+    batch: &'a mut PreparedTaskBatch,
+}
+
+impl PreparedReclaimableStage<'_> {
+    /// Make the complete staged batch visible and ready in one fixed scheduler
+    /// transaction. All map nodes and ready capacity were installed/reserved
+    /// during staging; this method allocates nothing and invokes no caller code.
+    fn publish_ready_unconditional(self) -> Vec<TaskHandle> {
+        match self.publish_ready_inner(None) {
+            Ok(handles) => handles,
+            Err(_) => unreachable!("internal immediate publication has no external permit"),
+        }
+    }
+
+    /// Publish only while one boot-static monotonic SYSTEM permit still has
+    /// the expected value. The permit is sampled under SCHED before the first
+    /// mutation; a fail-stop which linearized first leaves all tasks staged.
+    ///
+    /// # Safety
+    ///
+    /// `permit` must be boot-static SYSTEM state whose mismatch is monotonic
+    /// for this stage's lifetime. It may not point into a task arena or be
+    /// restored to `expected` after lifecycle rejection.
+    pub unsafe fn publish_ready_if(
+        self,
+        permit: &'static AtomicU64,
+        expected: u64,
+    ) -> Result<Vec<TaskHandle>, Self> {
+        self.publish_ready_inner(Some((permit, expected)))
+    }
+
+    fn publish_ready_inner(
+        self,
+        permit: Option<(&'static AtomicU64, u64)>,
+    ) -> Result<Vec<TaskHandle>, Self> {
+        if permit.is_some_and(|(permit, expected)| permit.load(Ordering::Acquire) != expected) {
+            return Err(self);
+        }
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut s = SCHED.lock();
+        if permit.is_some_and(|(permit, expected)| permit.load(Ordering::Acquire) != expected) {
+            drop(s);
+            system.restore();
+            return Err(self);
+        }
+        assert!(!self.batch.published);
+        assert!(self.batch.staged);
+        assert!(self.batch.binding_rejected);
+        assert_eq!(self.batch.tasks.len(), self.batch.handles.len());
+        for (prepared, handle) in self.batch.tasks.iter().zip(&self.batch.handles) {
+            let task = s
+                .tasks
+                .get(&prepared.id)
+                .expect("activated stage lost its scheduler task");
+            assert_eq!(task.publication, TaskPublication::Staged(self.batch.id));
+            assert!(!task.ready);
+            assert_eq!(task.id, handle.id);
+            assert_eq!(task.domain, handle.domain);
+            assert!(Arc::ptr_eq(&task.status, &handle.status));
+            assert!(!s.ready.contains(prepared.id));
+            if prepared.exclusive_reclaimable {
+                let binding = self
+                    .batch
+                    .reclaimable_bindings
+                    .iter()
+                    .find(|binding| binding.task == prepared.id)
+                    .expect("staged tracked task lost its binding");
+                let scheduler = binding
+                    .scheduler
+                    .expect("activated tracked binding has no scheduler generation");
+                assert!(s
+                    .reclaimable_domains
+                    .validate_active_task(
+                        scheduler.0,
+                        task.domain,
+                        task.queue_owner,
+                        task.id,
+                        &task.status,
+                        task.instance_token,
+                    )
+                    .is_ok());
+            }
+        }
+        for prepared in &self.batch.tasks {
             let (owner, stealable) = {
                 let task = s
                     .tasks
                     .get_mut(&prepared.id)
-                    .expect("activated prepared task remains installed");
+                    .expect("validated staged task remains installed");
                 task.publication = TaskPublication::Published;
                 task.ready = true;
                 (task.queue_owner, task.stealable)
             };
             s.ready
                 .enqueue(owner, prepared.id, stealable)
-                .expect("activated task has unique reserved queue capacity");
+                .expect("staging reserved exact ready capacity");
         }
-        self.publication.store(true, Ordering::Release);
-        self.published = true;
-        self.binding_rejected = false;
+        self.batch.publication.store(true, Ordering::Release);
+        self.batch.published = true;
+        self.batch.staged = false;
+        self.batch.binding_rejected = false;
         check_sched!(&s);
         drop(s);
         system.restore();
-        for prepared in &self.tasks {
+        for prepared in &self.batch.tasks {
             notify_ready_hart(prepared.queue_owner);
         }
-        Ok(core::mem::take(&mut self.handles))
+        Ok(core::mem::take(&mut self.batch.handles))
     }
 }
 
@@ -3084,7 +3772,7 @@ impl Default for PreparedTaskBatch {
 
 impl Drop for PreparedTaskBatch {
     fn drop(&mut self) {
-        if self.published {
+        if self.published || self.staged {
             return;
         }
         for prepared in &mut self.tasks {
@@ -3301,15 +3989,13 @@ fn reclaim_task(task: Task) -> ReclaimResult {
         ..
     } = task;
 
-    // Registration targets may themselves live inside the future. This is the
-    // normal destructor precondition, performed before it is known whether
-    // Drop will fault; it is not component-state recovery or arena reclaim.
-    // Detach all exact TaskStatus-owned references before entering user Drop:
-    // a destructor fault may longjmp past the rest of that destructor, after
-    // it already destroyed a WaitQueue (or another registration target).
-    // Individual future drops unregister again, idempotently, on the normal
-    // path.
-    drain_task_registrations(&status);
+    // Registration targets may themselves live inside the future. Remove the
+    // ordinary wait/timer/join edges before entering user Drop: a destructor
+    // fault may longjmp past the rest of that destructor after it already
+    // destroyed one of those targets. Keep TaskDetach registrations armed
+    // across Drop so a normal destructor can disarm its lease and a faulting
+    // destructor is reported with the final Faulted reason.
+    drain_ordinary_task_registrations(&status);
     let future = unsafe { ManuallyDrop::take(&mut future) };
 
     let guard = load_fault_guard();
@@ -3343,6 +4029,13 @@ fn reclaim_task(task: Task) -> ReclaimResult {
     // the guarded closure. Restore explicitly after the landing pad returns.
     owner_scope.restore();
     current_task.restore();
+
+    let detach_reason = if faulted {
+        TaskDetachReason::Faulted
+    } else {
+        task_detach_reason(&status)
+    };
+    drain_task_detach_registrations(&status, detach_reason);
 
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
     drop(name);
@@ -3422,7 +4115,7 @@ fn teardown_faulted_domain(
         // Store/device cleanup and raw arena reclaim stay behind the
         // reclaimer's complete managed-instance gate below. The legacy World
         // hook remains exclusive to the legacy route.
-        drain_task_registrations(&primary_status);
+        drain_task_registrations(&primary_status, TaskDetachReason::Faulted);
         if let Some(task) = primary_task.take() {
             abandon_task_without_drop(task);
         }
@@ -3527,7 +4220,7 @@ fn teardown_faulted_domain(
     // Registration targets may point into any sibling future. Drain every
     // ledger while all arena memory is still intact, then abandon holders.
     for victim in &victims {
-        drain_task_registrations(&victim.status);
+        drain_task_registrations(&victim.status, TaskDetachReason::Faulted);
     }
     for victim in &mut victims {
         if let Some(task) = victim.task.take() {
@@ -4434,7 +5127,7 @@ fn poll_once_on(hart: HartId) -> bool {
             // Ordinary tasks have no audited escape contract. Clean external
             // registrations, but conservatively leak their future allocation.
             let domain = task.domain;
-            drain_task_registrations(&status);
+            drain_task_registrations(&status, TaskDetachReason::Faulted);
             core::mem::forget(task);
             // Safety: this remains inside the same hart-pinned executor turn.
             let mut system = unsafe { heap::enter_owner_on_hart(OwnerId::SYSTEM, hart) };
@@ -4713,6 +5406,10 @@ struct OneShotWaitQueueInner {
     /// replacement registered without an event, so epoch alone is not an ABA
     /// barrier for task-owned cleanup.
     next_generation: u64,
+    /// Exact TaskStatus target detached by the latest published generation.
+    /// Retaining only this copy scalar lets a same-generation recovery replay
+    /// repair a publisher fault after the ordinary Waker was removed.
+    published_exact_wake: Option<ExactTaskWake>,
     waiter: Option<OneShotWaiter>,
 }
 
@@ -4720,6 +5417,7 @@ struct OneShotWaiter {
     registration_generation: u64,
     event_generation: u64,
     waker: Waker,
+    exact_wake: Option<ExactTaskWake>,
 }
 
 /// A waker detached from one exact event while the caller still held its
@@ -4731,6 +5429,7 @@ struct OneShotWaiter {
 #[must_use = "a published one-shot event must dispatch its detached waker"]
 pub struct OneShotWake {
     waker: Option<Waker>,
+    exact_wake: Option<ExactTaskWake>,
 }
 
 impl OneShotWake {
@@ -4745,6 +5444,10 @@ impl OneShotWake {
         };
         system.restore();
         dispatched
+            || self
+                .exact_wake
+                .take()
+                .is_some_and(ExactTaskWake::wake_if_exact)
     }
 }
 
@@ -4780,6 +5483,7 @@ impl OneShotWaitQueue {
             inner: SpinLock::new(OneShotWaitQueueInner {
                 published_generation: 0,
                 next_generation: 1,
+                published_exact_wake: None,
                 waiter: None,
             }),
         }
@@ -4798,7 +5502,10 @@ impl OneShotWaitQueue {
             return Err(OneShotWaitError::RegistrationMismatch);
         }
         if event_generation == inner.published_generation {
-            return Ok(OneShotWake { waker: None });
+            return Ok(OneShotWake {
+                waker: None,
+                exact_wake: inner.published_exact_wake,
+            });
         }
         if inner
             .waiter
@@ -4808,8 +5515,11 @@ impl OneShotWaitQueue {
             return Err(OneShotWaitError::RegistrationMismatch);
         }
         inner.published_generation = event_generation;
+        let waiter = inner.waiter.take();
+        inner.published_exact_wake = waiter.as_ref().and_then(|waiter| waiter.exact_wake);
         Ok(OneShotWake {
-            waker: inner.waiter.take().map(|waiter| waiter.waker),
+            waker: waiter.map(|waiter| waiter.waker),
+            exact_wake: inner.published_exact_wake,
         })
     }
 
@@ -4882,6 +5592,7 @@ impl Future for OneShotWaitFuture<'_> {
         }
 
         let current_owner = current_task_scope_id();
+        let current_exact_wake = current_task_exact_wake();
         if this.owner_task.is_some() && this.owner_task != current_owner {
             let mut system = heap::enter_owner(OwnerId::SYSTEM);
             disarm_owned_for_task(
@@ -4981,6 +5692,7 @@ impl Future for OneShotWaitFuture<'_> {
                             registration_generation: generation,
                             event_generation: this.event_generation,
                             waker: candidate.take().expect("waker candidate exists"),
+                            exact_wake: current_exact_wake,
                         });
                         this.registration_generation = Some(generation);
                         this.owned_registration = Some(token);
@@ -5277,7 +5989,10 @@ fn unregister_timer(id: u64) -> Option<Waker> {
     removed
 }
 
-fn cleanup_owned_registration(registration: OwnedRegistration) {
+fn cleanup_owned_registration(
+    registration: OwnedRegistration,
+    detach_reason: Option<TaskDetachReason>,
+) {
     match registration {
         OwnedRegistration::Wait { queue, id } => {
             // Safety: the WaitFuture that registered this token remains inside
@@ -5295,6 +6010,17 @@ fn cleanup_owned_registration(registration: OwnedRegistration) {
         OwnedRegistration::Timer { id } => drop(unregister_timer(id)),
         OwnedRegistration::Join { status, id } => drop(status.unregister_joiner(id)),
         OwnedRegistration::IrqPollProbe { generation } => clear_irq_poll_probe(generation),
+        OwnedRegistration::TaskDetach {
+            target,
+            task,
+            domain,
+        } => {
+            // Safety: registration required a kernel-static callback and a
+            // generational SYSTEM context. `drain_task_registrations` invokes
+            // this arm only after removing all ordinary wake edges.
+            let reason = detach_reason.expect("task detach cleanup requires terminal reason");
+            unsafe { (target.notify)(target.context, task, domain, reason) };
+        }
     }
 }
 
@@ -5510,6 +6236,37 @@ mod one_shot_wait_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Wake;
 
+    static DETACH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DETACH_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+    static DETACH_TASK: AtomicUsize = AtomicUsize::new(0);
+    static DETACH_REASON: AtomicUsize = AtomicUsize::new(0);
+    static DETACH_QUEUE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn record_task_detach(
+        context: u64,
+        task: TaskId,
+        _domain: AllocationDomain,
+        reason: TaskDetachReason,
+    ) {
+        let queue = DETACH_QUEUE.load(Ordering::SeqCst) as *const OneShotWaitQueue;
+        if !queue.is_null() {
+            // Safety: the serial test retains the queue until the synchronous
+            // detach callback returns.
+            assert_eq!(unsafe { (*queue).waiter_count() }, 0);
+        }
+        DETACH_CONTEXT.store(context as usize, Ordering::SeqCst);
+        DETACH_TASK.store(task.0 as usize, Ordering::SeqCst);
+        DETACH_REASON.store(
+            match reason {
+                TaskDetachReason::Exited => 1,
+                TaskDetachReason::Cancelled => 2,
+                TaskDetachReason::Faulted => 3,
+            },
+            Ordering::SeqCst,
+        );
+        DETACH_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
     struct CountWake(AtomicUsize);
 
     impl Wake for CountWake {
@@ -5548,6 +6305,171 @@ mod one_shot_wait_tests {
                 .store(self.queue.waiter_count(), Ordering::SeqCst);
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn prepared_detach_and_wait_capacity_exist_before_publication() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        DETACH_CONTEXT.store(0, Ordering::SeqCst);
+        run_until_idle(10_000);
+
+        let queue: &'static OneShotWaitQueue = Box::leak(Box::new(OneShotWaitQueue::new()));
+        let detach = unsafe { TaskDetachTarget::new(700, record_task_detach) };
+        let mut batch = PreparedTaskBatch::new();
+        batch.prepare("prepared-edge-supervisor", async move {
+            queue.wait(1).await.expect("fixed edge remains exact");
+            assert_eq!(
+                disarm_current_task_detach(detach),
+                TaskDetachDisarm::Disarmed
+            );
+        });
+
+        assert!(!batch.install_prepared_task_detach(1, detach));
+        assert!(batch.install_prepared_task_detach(0, detach));
+        assert!(!batch.install_prepared_task_detach(0, detach));
+        assert!(!batch.try_reserve_prepared_task_registrations(0, 0));
+        assert!(!batch.try_reserve_prepared_task_registrations(0, 3));
+        assert!(!batch.try_reserve_prepared_task_registrations(1, 1));
+        assert!(batch.try_reserve_prepared_task_registrations(0, 1));
+
+        let waiter_capacity = batch.prepared_handles()[0]
+            .status
+            .registrations
+            .lock()
+            .capacity();
+        let handles = batch.publish().expect("prepared edge supervisor publishes");
+        run_until_idle(10_000);
+
+        assert_eq!(queue.waiter_count(), 1);
+        assert_eq!(handles[0].status.registrations.lock().len(), 2);
+        assert_eq!(
+            handles[0].status.registrations.lock().capacity(),
+            waiter_capacity,
+            "waiting did not grow the supervisor outbound ledger"
+        );
+        assert!(!batch.try_reserve_prepared_task_registrations(0, 1));
+
+        let lost = queue
+            .publish(1)
+            .expect("first publication detaches the waiter");
+        assert_eq!(queue.waiter_count(), 0);
+        drop(lost);
+        assert_eq!(handles[0].state(), TaskState::Running);
+        assert!(
+            queue.publish(1).unwrap().dispatch(),
+            "same-generation replay uses the retained exact TaskStatus wake"
+        );
+        run_until_idle(10_000);
+        assert_eq!(handles[0].state(), TaskState::Exited);
+        assert_eq!(queue.waiter_count(), 0);
+        assert!(handles[0].status.registrations.lock().is_empty());
+        assert_eq!(
+            DETACH_CONTEXT.load(Ordering::SeqCst),
+            0,
+            "normal supervisor exit disarmed its preinstalled callback"
+        );
+    }
+
+    #[test]
+    fn task_detach_is_exact_bounded_and_runs_after_ordinary_wait_cleanup() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        DETACH_CALLS.store(0, Ordering::SeqCst);
+        DETACH_QUEUE.store(0, Ordering::SeqCst);
+
+        let status = Arc::new(TaskStatus::new(Arc::new(AtomicBool::new(true))));
+        let task = TaskId(90_000);
+        let domain = heap::current_domain();
+        // Safety: the serial host test stays on hart zero for the scope.
+        let _task = unsafe { enter_current_task_on_hart(HartId::BOOT, task, status.clone()) };
+
+        assert!(!try_reserve_current_task_registrations(0));
+        assert!(!try_reserve_current_task_registrations(5));
+        assert!(try_reserve_current_task_registrations(3));
+
+        let target = unsafe { TaskDetachTarget::new(17, record_task_detach) };
+        let registration = status
+            .register_owned(OwnedRegistration::TaskDetach {
+                target,
+                task,
+                domain,
+            })
+            .unwrap_or_else(|_| panic!("reserved detach registration failed"));
+        let lease = CurrentTaskDetachLease {
+            task,
+            domain,
+            status_identity: Arc::as_ptr(&status) as usize,
+            registration,
+            target,
+        };
+        assert_eq!(lease.disarm(), TaskDetachDisarm::Disarmed);
+
+        // A copied stale token cannot consume a later registration even when
+        // its callback address and task identity are otherwise unchanged.
+        let next_registration = status
+            .register_owned(OwnedRegistration::TaskDetach {
+                target,
+                task,
+                domain,
+            })
+            .unwrap_or_else(|_| panic!("replacement detach registration failed"));
+        assert_eq!(lease.disarm(), TaskDetachDisarm::AlreadyDisarmed);
+        assert_eq!(status.registrations.lock().len(), 1);
+        let next_lease = CurrentTaskDetachLease {
+            task,
+            domain,
+            status_identity: Arc::as_ptr(&status) as usize,
+            registration: next_registration,
+            target,
+        };
+        assert_eq!(next_lease.disarm(), TaskDetachDisarm::Disarmed);
+        assert_eq!(next_lease.disarm(), TaskDetachDisarm::AlreadyDisarmed);
+
+        let queue = OneShotWaitQueue::new();
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake);
+        DETACH_QUEUE.store(
+            (&queue as *const OneShotWaitQueue) as usize,
+            Ordering::SeqCst,
+        );
+        for (index, reason) in [
+            TaskDetachReason::Exited,
+            TaskDetachReason::Cancelled,
+            TaskDetachReason::Faulted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut listener = Box::pin(queue.wait(index as u64 + 1));
+            assert_eq!(
+                listener.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Pending
+            );
+            let target = unsafe { TaskDetachTarget::new(index as u64 + 101, record_task_detach) };
+            status
+                .register_owned(OwnedRegistration::TaskDetach {
+                    target,
+                    task,
+                    domain,
+                })
+                .unwrap_or_else(|_| panic!("reserved reason registration failed"));
+            let before = DETACH_CALLS.load(Ordering::SeqCst);
+            drain_task_registrations(&status, reason);
+            assert_eq!(DETACH_CALLS.load(Ordering::SeqCst), before + 1);
+            assert_eq!(DETACH_CONTEXT.load(Ordering::SeqCst), index + 101);
+            assert_eq!(DETACH_TASK.load(Ordering::SeqCst), task.0 as usize);
+            assert_eq!(DETACH_REASON.load(Ordering::SeqCst), index + 1);
+            assert_eq!(queue.waiter_count(), 0);
+            assert!(status.registrations.lock().is_empty());
+            drop(listener);
+            assert_eq!(DETACH_CALLS.load(Ordering::SeqCst), before + 1);
+        }
+        DETACH_QUEUE.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -5644,10 +6566,13 @@ mod one_shot_wait_tests {
                 .poll(&mut Context::from_waker(&second_waker)),
             Poll::Pending
         );
-        cleanup_owned_registration(OwnedRegistration::OneShotWait {
-            queue: Arc::as_ptr(&queue) as usize,
-            generation: stale_generation,
-        });
+        cleanup_owned_registration(
+            OwnedRegistration::OneShotWait {
+                queue: Arc::as_ptr(&queue) as usize,
+                generation: stale_generation,
+            },
+            None,
+        );
         assert_eq!(queue.waiter_count(), 1, "stale generation is inert");
         assert!(delayed.dispatch());
         assert_eq!(second.0.load(Ordering::SeqCst), 1);
@@ -5686,7 +6611,7 @@ mod one_shot_wait_tests {
             Poll::Pending
         );
         assert_eq!(queue.waiter_count(), 1);
-        drain_task_registrations(&status);
+        drain_task_registrations(&status, TaskDetachReason::Cancelled);
         assert_eq!(queue.waiter_count(), 0);
         assert!(status.registrations.lock().is_empty());
         drop(detached);

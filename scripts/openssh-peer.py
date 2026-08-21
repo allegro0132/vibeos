@@ -32,6 +32,10 @@ TEST_HOST_PUBLIC = bytes.fromhex(
 KEX_ALGORITHM = "curve25519-sha256"
 CIPHER = "chacha20-poly1305@openssh.com"
 ECHO_PAYLOAD = "vibeos-ssh-acceptance"
+CASE_FILTER_INPUT = bytes(
+    (index * 17 + 3) % 251 for index in range(12 * 1024 + 37)
+)
+CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in CASE_FILTER_INPUT)
 INTERACTIVE_INPUT = b"discard\x03echo vibeos-vsh-interactivX\x7fe\r\x04"
 INTERACTIVE_OUTPUT = (
     b"vsh> discard^C\r\n"
@@ -377,12 +381,13 @@ def run_acceptance(
         accepted_key,
         ["-T"],
         ["case-filter"],
+        input_bytes=CASE_FILTER_INPUT,
     )
     require_result(
         "authorized WASM case-filter",
         case_filter,
         {0},
-        b"",
+        CASE_FILTER_OUTPUT,
         stderr_exact=b"",
     )
 
@@ -440,6 +445,14 @@ def selftest() -> None:
         != "AAAAC3NzaC1lZDI1NTE5AAAAICnlgzqRWmQppOOnlIR1wzjvQ264K+ickvBZcEQD251V"
     ):
         raise PeerError("host-key fixture OpenSSH blob changed")
+    if len(CASE_FILTER_INPUT) != 12 * 1024 + 37:
+        raise PeerError("WASM stream fixture length changed")
+    if CASE_FILTER_OUTPUT[-37:] != bytes(
+        byte ^ 0x20 for byte in CASE_FILTER_INPUT[-37:]
+    ):
+        raise PeerError("WASM stream fixture lost its exact final 37-byte chunk")
+    if bytes(byte ^ 0x20 for byte in CASE_FILTER_OUTPUT) != CASE_FILTER_INPUT:
+        raise PeerError("WASM stream fixture transform is not the pinned XOR")
     command = _base_ssh_command(
         "ssh",
         "localhost",

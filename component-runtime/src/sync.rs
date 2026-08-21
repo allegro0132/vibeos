@@ -12,7 +12,10 @@ use crate::{
     execution::{
         CoreImportPlan, ExecutableExportPlan, HostCoreExportInfo, HostImportInfo, HostImportPlan,
     },
-    host::{HostDispatcher, HostError, HostRequest},
+    host::{
+        HostDispatch, HostDispatcher, HostError, HostOperationToken, HostPrepared, HostRequest,
+        HostWakeToken,
+    },
     memory::{AbiError, GuestMemory},
     resource::{GuestCallResources, ResourceTable, ResourceToken, ResourceTypeId},
     types::FunctionType,
@@ -570,6 +573,68 @@ fn valid_bound_allocation(
     true
 }
 
+struct ReallocationSpan {
+    replaced: usize,
+    pointer: u32,
+    size: u32,
+}
+
+fn valid_bound_reallocation(
+    modules: &CoreComponentGroup,
+    memory: Option<&HostCoreExportInfo>,
+    pointers: &[u32],
+    requests: &[AllocationRequest],
+    replacement: ReallocationSpan,
+    protected: Option<(u32, u32)>,
+) -> bool {
+    let Some(memory) = memory else {
+        return false;
+    };
+    let Ok(length) = modules.memory_size(memory.core_instance, &memory.export) else {
+        return false;
+    };
+    let start = u64::from(replacement.pointer);
+    let end = start + u64::from(replacement.size);
+    if end > length as u64 {
+        return false;
+    }
+    if let Some((protected_pointer, protected_size)) = protected {
+        let protected_start = u64::from(protected_pointer);
+        let protected_end = protected_start + u64::from(protected_size);
+        if start < protected_end && protected_start < end {
+            return false;
+        }
+    }
+    let Some(old_pointer) = pointers.get(replacement.replaced).copied() else {
+        return false;
+    };
+    let Some(old_request) = requests.get(replacement.replaced) else {
+        return false;
+    };
+    let old_start = u64::from(old_pointer);
+    let old_end = old_start + u64::from(old_request.size);
+    // A canonical realloc may retain its base pointer or return a disjoint
+    // allocation. An interior pointer is never a valid moved allocation even
+    // if the smaller exact span would fit inside the old block.
+    if replacement.pointer != old_pointer && start < old_end && old_start < end {
+        return false;
+    }
+    for (index, previous) in pointers.iter().copied().enumerate() {
+        if index == replacement.replaced {
+            continue;
+        }
+        let Some(request) = requests.get(index) else {
+            return false;
+        };
+        let previous_start = u64::from(previous);
+        let previous_end = previous_start + u64::from(request.size);
+        if start < previous_end && previous_start < end {
+            return false;
+        }
+    }
+    true
+}
+
 fn lower_host_response(
     modules: &mut CoreComponentGroup,
     pending: &mut PendingHostLower,
@@ -866,6 +931,10 @@ pub struct TypedCallMetrics {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TypedPoll {
     Pending(TypedCallMetrics),
+    /// The Core guest is suspended at one exact host operation. Repeated
+    /// ordinary polls return the same copy-only token without consulting the
+    /// dispatcher; the supervisor must register a wake and explicitly resume.
+    HostPending(HostOperationToken),
     Ready(CanonicalValue),
     /// A typed failure returned by the trusted host boundary. This is kept
     /// distinct from a guest/runtime trap so supervisors can preserve denied,
@@ -898,6 +967,9 @@ enum TypedStage {
     Transform,
     HostAllocate,
     HostDispatch,
+    HostShrink,
+    HostCommit,
+    HostWaiting,
     HostFreeUnused,
     Lift,
     PostReturn,
@@ -942,8 +1014,12 @@ struct PendingHostLower {
     realloc: Option<HostCoreExportInfo>,
     allocations: Vec<AllocationRequest>,
     pointers: Vec<u32>,
+    shrink_reservations: Vec<Option<CoreCallReservation>>,
     free_reservations: Vec<CoreCallReservation>,
     allocation_index: usize,
+    shrink_index: usize,
+    exact_allocations: Option<Vec<AllocationRequest>>,
+    phase: PendingHostPhase,
     required_host_work: u64,
     lower_reservation: u64,
     actual_lower_work: u64,
@@ -956,6 +1032,18 @@ struct PendingHostLower {
     failure_after_free: Option<CallFailure>,
     lowering_journal: LoweringJournal,
     flat_results: Option<PreparedFlatResults>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingHostPhase {
+    Start,
+    Waiting {
+        operation: HostOperationToken,
+        wake_registered: bool,
+    },
+    ResumeRequested(HostOperationToken),
+    Prepared(HostOperationToken),
+    Consumed,
 }
 
 impl<'a, A> TypedCall<'a, A> {
@@ -999,10 +1087,71 @@ impl<'a, A> TypedCall<'a, A> {
         }
     }
 
+    /// Register the supervisor's sole wake envelope for the exact operation
+    /// returned by [`TypedPoll::HostPending`]. A duplicate or stale token is
+    /// rejected before the dispatcher is called.
+    pub fn register_host_wake(
+        &mut self,
+        operation: HostOperationToken,
+        wake: HostWakeToken,
+    ) -> Result<(), HostError> {
+        let matches = self.host_lower.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.phase,
+                PendingHostPhase::Waiting {
+                    operation: expected,
+                    wake_registered: false,
+                } if expected == operation
+            )
+        });
+        if !matches || !matches!(self.stage, TypedStage::HostWaiting) {
+            return Err(HostError::InvalidArgument);
+        }
+        self.dispatcher
+            .as_deref_mut()
+            .ok_or(HostError::BackendFault)?
+            .register_wake(operation, wake)?;
+        let Some(pending) = self.host_lower.as_mut() else {
+            return Err(HostError::BackendFault);
+        };
+        pending.phase = PendingHostPhase::Waiting {
+            operation,
+            wake_registered: true,
+        };
+        Ok(())
+    }
+
+    /// Authorize one dispatcher retry after the registered wake fired.
+    ///
+    /// This method only records the exact resume intent. The next `poll` makes
+    /// one `HostDispatcher::resume` call; further ordinary polls never retry
+    /// it implicitly.
+    pub fn resume_host(&mut self, operation: HostOperationToken) -> Result<(), HostError> {
+        let matches = self.host_lower.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.phase,
+                PendingHostPhase::Waiting {
+                    operation: expected,
+                    wake_registered: true,
+                } if expected == operation
+            )
+        });
+        if !matches || !matches!(self.stage, TypedStage::HostWaiting) {
+            return Err(HostError::InvalidArgument);
+        }
+        self.host_lower
+            .as_mut()
+            .expect("validated pending host lower")
+            .phase = PendingHostPhase::ResumeRequested(operation);
+        self.stage = TypedStage::HostDispatch;
+        Ok(())
+    }
+
     pub fn cancel(&mut self) {
         if matches!(self.stage, TypedStage::Terminal(_) | TypedStage::Complete) {
             return;
         }
+        let _ = self.cancel_live_host_operation();
         self.cancelled = true;
         self.component.poisoned = true;
         self.component.modules.discard_all_calls();
@@ -1026,6 +1175,9 @@ impl<'a, A> TypedCall<'a, A> {
             TypedStage::Transform => self.poll_transform(),
             TypedStage::HostAllocate => self.poll_host_allocate(),
             TypedStage::HostDispatch => self.dispatch_host_call(),
+            TypedStage::HostShrink => self.poll_host_shrink(),
+            TypedStage::HostCommit => self.commit_prepared_host_call(),
+            TypedStage::HostWaiting => self.poll_host_waiting(),
             TypedStage::HostFreeUnused => self.poll_host_free_unused(),
             TypedStage::Lift => self.lift(),
             TypedStage::PostReturn => self.poll_post_return(),
@@ -1314,12 +1466,13 @@ impl<'a, A> TypedCall<'a, A> {
             validate_host_retptr(&self.component.modules, memory.as_ref(), &function, pointer)?;
         }
         let provider_fuel_per_call = self.poll_quantum;
-        // Reserve allocation plus worst-case rollback free fuel before any
-        // provider or backend side effect. The unused portion is released
-        // only after result lowering and rollback have completed.
+        // Reserve initial allocation, exact prepared-result shrink, and
+        // worst-case rollback free fuel before any provider or backend side
+        // effect. The unused portion is released only after result lowering
+        // and rollback have completed.
         let provider_calls = u64::try_from(allocations.len())
             .map_err(|_| TrapCode::LimitExceeded)?
-            .checked_mul(2)
+            .checked_mul(3)
             .ok_or(TrapCode::LimitExceeded)?;
         let provider_reservation = provider_calls
             .checked_mul(provider_fuel_per_call)
@@ -1350,8 +1503,17 @@ impl<'a, A> TypedCall<'a, A> {
         free_reservations
             .try_reserve_exact(allocations.len())
             .map_err(|_| TrapCode::LimitExceeded)?;
+        let mut shrink_reservations = Vec::new();
+        shrink_reservations
+            .try_reserve_exact(allocations.len())
+            .map_err(|_| TrapCode::LimitExceeded)?;
         if let Some(provider) = realloc.as_ref() {
             for _ in &allocations {
+                shrink_reservations.push(Some(
+                    self.component
+                        .modules
+                        .reserve_call(provider.core_instance, &provider.export)?,
+                ));
                 free_reservations.push(
                     self.component
                         .modules
@@ -1386,8 +1548,12 @@ impl<'a, A> TypedCall<'a, A> {
             realloc,
             allocations,
             pointers,
+            shrink_reservations,
             free_reservations,
             allocation_index: 0,
+            shrink_index: 0,
+            exact_allocations: None,
+            phase: PendingHostPhase::Start,
             required_host_work,
             lower_reservation,
             actual_lower_work: 0,
@@ -1497,6 +1663,251 @@ impl<'a, A> TypedCall<'a, A> {
         let Some(mut pending) = self.host_lower.take() else {
             return self.finish_trap(TrapCode::Validation);
         };
+        let previous_operation = match pending.phase {
+            PendingHostPhase::Start => None,
+            PendingHostPhase::ResumeRequested(operation) => Some(operation),
+            _ => {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            }
+        };
+        // `start` and `resume` each consume their action exactly once, on
+        // every return. Mark it consumed before crossing the trusted boundary
+        // so cancellation cannot race a completed dispatcher action.
+        pending.phase = PendingHostPhase::Consumed;
+        let dispatch = {
+            let Some(dispatcher) = self.dispatcher.as_deref_mut() else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(import) = self.component.host_imports.get(pending.import_index) else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(scope) = self.guest_resources.as_ref() else {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let request = HostRequest::new(import, &pending.arguments, &*self.resources, scope);
+            match previous_operation {
+                Some(operation) => dispatcher.resume(operation, request),
+                None => dispatcher.start(request),
+            }
+        };
+        let dispatch = match dispatch {
+            Ok(dispatch) => dispatch,
+            Err(error) => {
+                return self.defer_host_failure_after_cleanup(pending, CallFailure::Host(error));
+            }
+        };
+        match dispatch {
+            HostDispatch::Ready(response) => self.accept_host_response(pending, response),
+            HostDispatch::Pending(operation) => {
+                if previous_operation.is_some_and(|previous| !operation.strictly_after(previous)) {
+                    pending.phase = PendingHostPhase::Waiting {
+                        operation,
+                        wake_registered: false,
+                    };
+                    return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+                }
+                pending.phase = PendingHostPhase::Waiting {
+                    operation,
+                    wake_registered: false,
+                };
+                self.host_lower = Some(pending);
+                self.stage = TypedStage::HostWaiting;
+                TypedPoll::HostPending(operation)
+            }
+            HostDispatch::Prepared(prepared) => {
+                if previous_operation
+                    .is_some_and(|previous| !prepared.operation().strictly_after(previous))
+                {
+                    pending.phase = PendingHostPhase::Prepared(prepared.operation());
+                    return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+                }
+                self.accept_host_prepared(pending, prepared)
+            }
+        }
+    }
+
+    fn poll_host_waiting(&mut self) -> TypedPoll {
+        let Some(pending) = self.host_lower.as_ref() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        match pending.phase {
+            PendingHostPhase::Waiting { operation, .. } => TypedPoll::HostPending(operation),
+            _ => self.finish_trap(TrapCode::Validation),
+        }
+    }
+
+    fn accept_host_prepared(
+        &mut self,
+        mut pending: PendingHostLower,
+        prepared: HostPrepared,
+    ) -> TypedPoll {
+        let (operation, exact) = prepared.into_parts();
+        pending.phase = PendingHostPhase::Prepared(operation);
+        if exact.len() != pending.allocations.len()
+            || exact.len() > PROFILE_1_LIMITS.max_abi_allocations as usize
+        {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+        }
+        let mut exact_allocations = Vec::new();
+        if exact_allocations.try_reserve_exact(exact.len()).is_err() {
+            return self.defer_host_trap_after_cleanup(pending, TrapCode::LimitExceeded);
+        }
+        for (maximum, exact) in pending.allocations.iter().zip(exact) {
+            if exact.size == 0
+                || exact.size > maximum.size
+                || exact.alignment != maximum.alignment
+                || exact.alignment == 0
+                || !exact.alignment.is_power_of_two()
+            {
+                return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
+            }
+            exact_allocations.push(AllocationRequest {
+                size: exact.size,
+                alignment: exact.alignment,
+            });
+        }
+        pending.exact_allocations = Some(exact_allocations);
+        pending.shrink_index = 0;
+        self.host_lower = Some(pending);
+        self.stage = TypedStage::HostShrink;
+        TypedPoll::Pending(self.metrics())
+    }
+
+    fn poll_host_shrink(&mut self) -> TypedPoll {
+        let (index, old, exact, provider_instance) = {
+            let Some(pending) = self.host_lower.as_ref() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            if !matches!(pending.phase, PendingHostPhase::Prepared(_)) {
+                return self.finish_trap(TrapCode::Validation);
+            }
+            let Some(exact_allocations) = pending.exact_allocations.as_ref() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            if pending.shrink_index >= exact_allocations.len() {
+                self.stage = TypedStage::HostCommit;
+                return TypedPoll::Pending(self.metrics());
+            }
+            let index = pending.shrink_index;
+            let Some(old) = pending.allocations.get(index).copied() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let exact = exact_allocations[index];
+            let Some(provider) = pending.realloc.as_ref() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            (index, old, exact, provider.core_instance)
+        };
+        if old == exact {
+            self.host_lower
+                .as_mut()
+                .expect("validated pending host lower")
+                .shrink_index += 1;
+            return TypedPoll::Pending(self.metrics());
+        }
+        if !self.component.modules.has_active_call(provider_instance) {
+            let poll_quantum = self.poll_quantum;
+            let modules = &mut self.component.modules;
+            let active_baselines = &mut self.active_baselines;
+            let Some(pending) = self.host_lower.as_mut() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(provider) = pending.realloc.as_ref() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(pointer) = pending.pointers.get(index).copied() else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let Some(reservation) = pending
+                .shrink_reservations
+                .get_mut(index)
+                .and_then(Option::take)
+            else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            let provider_fuel = pending.provider_fuel_per_call;
+            let inputs = [
+                CoreValue::I32(pointer as i32),
+                CoreValue::I32(old.size as i32),
+                CoreValue::I32(old.alignment as i32),
+                CoreValue::I32(exact.size as i32),
+            ];
+            if modules
+                .start_call_reserved(
+                    reservation,
+                    provider_instance,
+                    &provider.export,
+                    &inputs,
+                    provider_fuel,
+                    poll_quantum.min(provider_fuel),
+                )
+                .is_err()
+            {
+                return self.finish_trap(TrapCode::Validation);
+            }
+            let Some(baseline) = active_baselines.get_mut(provider_instance) else {
+                return self.finish_trap(TrapCode::Validation);
+            };
+            *baseline = 0;
+            self.guest_started = true;
+        }
+        let (result, consumed) = self.poll_instance_measured(provider_instance, true);
+        let pending = self.host_lower.as_mut().expect("pending host lower");
+        pending.provider_consumed = match pending.provider_consumed.checked_add(consumed) {
+            Some(consumed) => consumed,
+            None => return self.finish_trap(TrapCode::FuelExhausted),
+        };
+        match result {
+            PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
+            PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
+            PollResult::Trapped(trap) => self.finish_trap(trap),
+            PollResult::Ready(values) => match values.as_slice() {
+                [CoreValue::I32(pointer)] if *pointer != 0 => {
+                    let pointer = *pointer as u32;
+                    let pending = self.host_lower.as_mut().expect("pending host lower");
+                    if pointer & (exact.alignment - 1) != 0
+                        || !valid_bound_reallocation(
+                            &self.component.modules,
+                            pending.memory.as_ref(),
+                            &pending.pointers,
+                            &pending.allocations,
+                            ReallocationSpan {
+                                replaced: index,
+                                pointer,
+                                size: exact.size,
+                            },
+                            pending.caller_retptr.and_then(|retptr| {
+                                host_retptr_span(&pending.function, retptr).ok()
+                            }),
+                        )
+                    {
+                        return self.finish_trap(TrapCode::CanonicalAbi);
+                    }
+                    pending.pointers[index] = pointer;
+                    pending.allocations[index] = exact;
+                    pending.shrink_index += 1;
+                    TypedPoll::Pending(self.metrics())
+                }
+                _ => self.finish_trap(TrapCode::CanonicalAbi),
+            },
+        }
+    }
+
+    fn commit_prepared_host_call(&mut self) -> TypedPoll {
+        let Some(mut pending) = self.host_lower.take() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        let operation = match pending.phase {
+            PendingHostPhase::Prepared(operation) => operation,
+            _ => {
+                self.host_lower = Some(pending);
+                return self.finish_trap(TrapCode::Validation);
+            }
+        };
         let response = {
             let Some(dispatcher) = self.dispatcher.as_deref_mut() else {
                 self.host_lower = Some(pending);
@@ -1510,19 +1921,25 @@ impl<'a, A> TypedCall<'a, A> {
                 self.host_lower = Some(pending);
                 return self.finish_trap(TrapCode::Validation);
             };
-            dispatcher.dispatch(HostRequest::new(
-                import,
-                &pending.arguments,
-                &*self.resources,
-                scope,
-            ))
+            dispatcher.commit_prepared(
+                operation,
+                HostRequest::new(import, &pending.arguments, &*self.resources, scope),
+            )
         };
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                return self.defer_host_failure_after_cleanup(pending, CallFailure::Host(error));
+        match response {
+            Ok(response) => {
+                pending.phase = PendingHostPhase::Consumed;
+                self.accept_host_response(pending, response)
             }
-        };
+            Err(error) => self.defer_host_failure_after_cleanup(pending, CallFailure::Host(error)),
+        }
+    }
+
+    fn accept_host_response(
+        &mut self,
+        mut pending: PendingHostLower,
+        response: crate::host::HostResponse,
+    ) -> TypedPoll {
         let (mut values, host_work) = response.into_parts();
         if host_work != pending.required_host_work {
             return self.defer_host_trap_after_cleanup(pending, TrapCode::Validation);
@@ -1603,6 +2020,12 @@ impl<'a, A> TypedCall<'a, A> {
         mut pending: PendingHostLower,
         failure: CallFailure,
     ) -> TypedPoll {
+        if self.cancel_pending_host_operation(&mut pending).is_err() {
+            // The dispatcher could not prove that the exact reservation was
+            // detached. Do not run guest rollback code against ambiguous
+            // state; poison the instance and conservatively leak its spans.
+            return self.finish_failure(failure);
+        }
         if pending.pointers.is_empty() {
             return self.finish_failure(failure);
         }
@@ -1612,6 +2035,34 @@ impl<'a, A> TypedCall<'a, A> {
         self.host_lower = Some(pending);
         self.stage = TypedStage::HostFreeUnused;
         TypedPoll::Pending(self.metrics())
+    }
+
+    fn cancel_pending_host_operation(
+        &mut self,
+        pending: &mut PendingHostLower,
+    ) -> Result<(), HostError> {
+        let operation = match pending.phase {
+            PendingHostPhase::Waiting { operation, .. }
+            | PendingHostPhase::ResumeRequested(operation)
+            | PendingHostPhase::Prepared(operation) => operation,
+            PendingHostPhase::Start | PendingHostPhase::Consumed => return Ok(()),
+        };
+        // Regardless of the dispatcher result this token must never be used a
+        // second time by portable runtime state.
+        pending.phase = PendingHostPhase::Consumed;
+        self.dispatcher
+            .as_deref_mut()
+            .ok_or(HostError::BackendFault)?
+            .cancel(operation)
+    }
+
+    fn cancel_live_host_operation(&mut self) -> Result<(), HostError> {
+        let Some(mut pending) = self.host_lower.take() else {
+            return Ok(());
+        };
+        let result = self.cancel_pending_host_operation(&mut pending);
+        self.host_lower = Some(pending);
+        result
     }
 
     fn poll_host_free_unused(&mut self) -> TypedPoll {
@@ -1721,12 +2172,24 @@ impl<'a, A> TypedCall<'a, A> {
             Ok(function) => function,
             Err(_) => return self.finish_trap(TrapCode::LimitExceeded),
         };
-        let Some(result_type) = function_type.result.as_ref() else {
-            return self.finish_trap(TrapCode::Validation);
-        };
         let results = match self.core_results.as_deref() {
             Some(results) => results,
             None => return self.finish_trap(TrapCode::Validation),
+        };
+        let Some(result_type) = function_type.result.as_ref() else {
+            if !results.is_empty() {
+                return self.finish_trap(TrapCode::CanonicalAbi);
+            }
+            // `CanonicalValue` has no unit scalar. Preserve the established
+            // one-value completion API with the canonical empty tuple sentinel
+            // while keeping the declared function result absent.
+            self.result = Some(CanonicalValue::Tuple(Vec::new()));
+            if self.component.exports[self.export].post_return.is_some() {
+                self.stage = TypedStage::PostReturn;
+            } else {
+                self.stage = TypedStage::Cleanup;
+            }
+            return TypedPoll::Pending(self.metrics());
         };
         let binder = TableBinder {
             table: &*self.resources,
@@ -2030,6 +2493,7 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     fn finish_failure(&mut self, failure: CallFailure) -> TypedPoll {
+        let _ = self.cancel_live_host_operation();
         self.component.poisoned = true;
         self.component.modules.discard_all_calls();
         let _ = self.close_resources(false);
@@ -2057,6 +2521,7 @@ impl<A> Drop for TypedCall<'_, A> {
         if self.guest_started && !matches!(self.stage, TypedStage::Complete) {
             self.component.poisoned = true;
         }
+        let _ = self.cancel_live_host_operation();
         self.component.modules.discard_all_calls();
         let _ = self.close_resources(false);
     }
@@ -2070,7 +2535,7 @@ enum Subcall {
     Free,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllocationRequest {
     size: u32,
     alignment: u32,

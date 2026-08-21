@@ -3,6 +3,7 @@ const RESOURCES: &str = include_str!("corpus/wit/resources.wit");
 const CLOCK: &str = include_str!("corpus/wit/clock.wit");
 const BLOB: &str = include_str!("corpus/wit/blob.wit");
 const LOG: &str = include_str!("corpus/wit/log.wit");
+const STREAM: &str = include_str!("corpus/wit/stream.wit");
 const VALID_CORE: &str = include_str!("corpus/core/integer.wat");
 const LIMIT_CORE: &str = include_str!("corpus/core/limits.wat");
 const UNSUPPORTED_CORE: &str = include_str!("corpus/core/unsupported-float.wat");
@@ -49,6 +50,31 @@ fn corpus_covers_the_profile_contract() {
         "enum log-error { denied, invalid, failed }",
     ] {
         assert!(LOG.contains(marker), "{marker}");
+    }
+    for marker in [
+        "package vibe:%stream@1.0.0",
+        "resource reader",
+        "resource writer",
+        "enum close-reason",
+        "read: func(input: borrow<reader>) -> list<u8>",
+        "write: func(output: borrow<writer>, bytes: list<u8>)",
+        "close-reader: func(input: borrow<reader>, reason: close-reason)",
+        "close-writer: func(output: borrow<writer>, reason: close-reason)",
+        "export run: func(input: borrow<reader>, output: borrow<writer>)",
+    ] {
+        assert!(STREAM.contains(marker), "{marker}");
+    }
+    for reason in [
+        "normal",
+        "failure",
+        "cancelled",
+        "denied",
+        "unavailable",
+        "exhausted",
+        "invalid",
+        "backend-fault",
+    ] {
+        assert!(STREAM.contains(reason), "{reason}");
     }
     assert!(VALID_CORE.contains("i32.add"));
     assert!(LIMIT_CORE.contains("memory 1 256"));

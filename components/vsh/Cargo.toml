@@ -10,3 +10,4 @@ network = []
 
 [dependencies]
 vibeos-core = { path = "../../core" }
+vibeos-component-host = { path = "../../services/component-host" }

@@ -1037,7 +1037,11 @@ name = "vibeos-image-policy"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "vibeos-component-admission",
+ "vibeos-component-command",
  "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-wasm-runtime",
  "wat",
 ]
 
@@ -1052,6 +1056,7 @@ dependencies = [
  "vibeos-component-admission",
  "vibeos-component-command",
  "vibeos-component-format",
+ "vibeos-component-host",
  "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-driver-dwc2-host",
@@ -1203,6 +1208,7 @@ dependencies = [
  "sunset",
  "vibeos-component-admission",
  "vibeos-component-command",
+ "vibeos-component-host",
  "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-image-policy",
@@ -1221,6 +1227,7 @@ version = "0.1.0"
 name = "vibeos-vsh"
 version = "0.1.0"
 dependencies = [
+ "vibeos-component-host",
  "vibeos-core",
 ]
 

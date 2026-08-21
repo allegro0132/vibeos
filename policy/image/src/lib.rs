@@ -153,42 +153,66 @@ impl core::fmt::Debug for ComponentCommandPin {
     }
 }
 
-const C4_BYTE_FILTER_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/c4-byte-filter.component.wasm"));
+const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/c53-stream-filter.component.wasm"
+));
 
-const C4_BYTE_FILTER_SHA256: [u8; 32] =
-    include!(concat!(env!("OUT_DIR"), "/c4-byte-filter.sha256.rs"));
+const C53_STREAM_FILTER_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c53-stream-filter.sha256.rs"));
 
-const C4_BYTE_FILTER_WIT: &str = r#"
-package vibe:filters@1.0.0;
+const C53_STREAM_FILTER_WIT: &str = r#"
+package vibe:%stream@1.0.0;
+
+interface streams {
+    resource reader;
+    resource writer;
+
+    enum close-reason {
+        normal,
+        failure,
+        cancelled,
+        denied,
+        unavailable,
+        exhausted,
+        invalid,
+        backend-fault,
+    }
+
+    read: func(input: borrow<reader>) -> list<u8>;
+    write: func(output: borrow<writer>, bytes: list<u8>);
+    close-reader: func(input: borrow<reader>, reason: close-reason);
+    close-writer: func(output: borrow<writer>, reason: close-reason);
+}
 
 world filter {
-    export run: func(input: list<u8>) -> list<u8>;
+    use streams.{reader, writer};
+    import streams;
+    export run: func(input: borrow<reader>, output: borrow<writer>);
 }
 "#;
 
-/// The one synchronous Component made available to trusted session setup by
+/// The one streaming Component made available to trusted SSH session setup by
 /// the current QEMU and Duo image policies. Merely linking these bytes does not
-/// install a command: admission and an explicit per-session policy witness are
-/// still required.
+/// install a command: exact admission and an explicit per-session policy
+/// witness are still required. The two stream resources are lifecycle-owned
+/// transport, never ambient authority or shell value arguments.
 pub const SSH_EXEC_COMPONENT: ComponentCommandPin = ComponentCommandPin {
-    artifact_bytes: C4_BYTE_FILTER_BYTES,
-    expected_sha256: C4_BYTE_FILTER_SHA256,
+    artifact_bytes: C53_STREAM_FILTER_BYTES,
+    expected_sha256: C53_STREAM_FILTER_SHA256,
     command_name: "case-filter",
     profile: ProfileIdentity::PROFILE_1,
-    wit_source: C4_BYTE_FILTER_WIT,
-    world: "vibe:filters/filter@1.0.0",
+    wit_source: C53_STREAM_FILTER_WIT,
+    world: "vibe:stream/filter@1.0.0",
     entrypoint: "run",
     min_args: 0,
     max_args: 0,
-    // SSH exec deliberately exposes no channel stdin to Component commands.
-    // This byte filter therefore runs over the exact empty byte sequence.
-    stdin: ComponentStreamMode::Closed,
+    stdin: ComponentStreamMode::Required,
     stdout: ComponentStreamMode::Required,
     stderr: ComponentStreamMode::Optional,
     limits: ComponentInstanceLimits {
         memory_bytes: 512 * 1024,
-        total_fuel: 100_000,
+        total_fuel: 500_000,
         poll_quantum: 100,
         resources: 4,
     },
@@ -226,7 +250,7 @@ mod tests {
     fn ssh_component_policy_pins_every_admission_field() {
         let pin = SSH_EXEC_COMPONENT;
         assert!(!pin.artifact_bytes().is_empty());
-        assert_eq!(pin.expected_sha256(), C4_BYTE_FILTER_SHA256);
+        assert_eq!(pin.expected_sha256(), C53_STREAM_FILTER_SHA256);
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(pin.artifact_bytes())),
             pin.expected_sha256()
@@ -234,22 +258,25 @@ mod tests {
         assert_eq!(pin.command_name(), "case-filter");
         assert_eq!(pin.profile(), ProfileIdentity::PROFILE_1);
         assert_eq!(pin.abi(), ProfileIdentity::PROFILE_1.runtime_abi);
-        assert_eq!(pin.world(), "vibe:filters/filter@1.0.0");
+        assert_eq!(pin.world(), "vibe:stream/filter@1.0.0");
         assert_eq!(pin.entrypoint(), "run");
         assert_eq!((pin.min_args(), pin.max_args()), (0, 0));
-        assert_eq!(pin.stdin(), ComponentStreamMode::Closed);
+        assert_eq!(pin.stdin(), ComponentStreamMode::Required);
         assert_eq!(pin.stdout(), ComponentStreamMode::Required);
         assert_eq!(pin.stderr(), ComponentStreamMode::Optional);
         assert_eq!(
             pin.limits(),
             ComponentInstanceLimits {
                 memory_bytes: 512 * 1024,
-                total_fuel: 100_000,
+                total_fuel: 500_000,
                 poll_quantum: 100,
                 resources: 4,
             }
         );
-        assert!(pin.wit_source().contains("export run: func"));
+        assert!(pin.wit_source().contains("import streams;"));
+        assert!(pin
+            .wit_source()
+            .contains("export run: func(input: borrow<reader>, output: borrow<writer>);"));
     }
 
     #[cfg(feature = "qemu-default")]

@@ -2,10 +2,11 @@ use std::sync::{Arc, Mutex};
 
 use vibeos_component_admission::{
     admit, AdmissionPolicy, ArtifactTrust, CallerAuthority, CommandStreamMode, ComponentArtifact,
-    InstanceLimits, ProfileIdentity,
+    InstanceLimits, ProfileIdentity, STREAM_FILTER_WORLD,
 };
 use vibeos_component_command::{
-    try_manifest_from_admitted, RunnerBuildError, SynchronousCommandRunner,
+    try_manifest_from_admitted, validate_admitted_stream_filter, RunnerBuildError,
+    SynchronousCommandRunner,
 };
 use vibeos_component_runtime::{decode::inspect_component, world::WorldContract};
 use vibeos_core::cap::Rights;
@@ -16,6 +17,9 @@ use vibeos_vsh::{
 };
 
 const FILTER: &str = include_str!("fixtures/byte-filter.component.wat");
+const STREAM_FILTER: &str =
+    include_str!("../../../component-runtime/tests/fixtures/host-stream.component.wat");
+const STREAM_WIT: &str = include_str!("../../../component-format/tests/corpus/wit/stream.wit");
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn admitted(
@@ -59,6 +63,93 @@ fn admitted(
         )
         .unwrap(),
     )
+}
+
+fn admitted_stream() -> Arc<vibeos_component_admission::AdmittedComponent> {
+    admitted_stream_from(STREAM_FILTER)
+}
+
+fn admitted_stream_from(source: &str) -> Arc<vibeos_component_admission::AdmittedComponent> {
+    let bytes = wat::parse_str(source).unwrap();
+    let world = WorldContract::parse(STREAM_WIT, STREAM_FILTER_WORLD).unwrap();
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
+    let identity = artifact.identity();
+    Arc::new(
+        admit(
+            artifact,
+            &AdmissionPolicy {
+                command_name: "stream-filter",
+                entrypoint: "run",
+                min_args: 0,
+                max_args: 0,
+                exact_world: &world,
+                profile: ProfileIdentity::PROFILE_1,
+                trust: ArtifactTrust::ImagePinned(identity),
+                limits: InstanceLimits {
+                    memory_bytes: 512 * 1024,
+                    total_fuel: 500_000,
+                    poll_quantum: 100,
+                    resources: 4,
+                },
+                stdin: CommandStreamMode::Required,
+                stdout: CommandStreamMode::Required,
+                stderr: CommandStreamMode::Optional,
+                interfaces: &[],
+            },
+            &CallerAuthority { offers: &[] },
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn exact_stream_filter_uses_the_managed_lifecycle_only() {
+    let admitted = admitted_stream();
+    let manifest = try_manifest_from_admitted(&admitted).unwrap();
+    assert_eq!(manifest.world(), STREAM_FILTER_WORLD);
+    assert_eq!(manifest.stdin(), StreamMode::Required);
+    assert_eq!(manifest.stdout(), StreamMode::Required);
+    assert_eq!(manifest.stderr(), StreamMode::Optional);
+    assert!(manifest.requirements().is_empty());
+    validate_admitted_stream_filter(&admitted, &manifest).unwrap();
+    assert!(matches!(
+        SynchronousCommandRunner::new(admitted),
+        Err(RunnerBuildError::UnsupportedImports)
+    ));
+}
+
+#[test]
+fn stream_filter_rejects_an_adjacent_third_runtime_instance() {
+    let source = STREAM_FILTER.replacen(
+        "  (core instance $memory-instance (instantiate $memory-provider))",
+        "  (core instance $unused-memory-instance (instantiate $memory-provider))\n  (core instance $memory-instance (instantiate $memory-provider))",
+        1,
+    );
+    assert_ne!(
+        source, STREAM_FILTER,
+        "fixture insertion point must remain stable"
+    );
+    let bytes = wat::parse_str(&source).unwrap();
+    assert_eq!(
+        inspect_component(&bytes).unwrap().runtime_instance_count(),
+        3
+    );
+    let admitted = admitted_stream_from(&source);
+    let manifest = try_manifest_from_admitted(&admitted).unwrap();
+    assert_eq!(
+        validate_admitted_stream_filter(&admitted, &manifest),
+        Err(RunnerBuildError::UnsupportedRuntimeInstances)
+    );
+}
+
+#[test]
+fn ordinary_byte_filter_never_masquerades_as_the_stream_transport() {
+    let admitted = admitted("legacy-byte-filter", "run", 0, 0);
+    let manifest = try_manifest_from_admitted(&admitted).unwrap();
+    assert_eq!(
+        validate_admitted_stream_filter(&admitted, &manifest),
+        Err(RunnerBuildError::UnsupportedStreams)
+    );
 }
 
 fn execute(

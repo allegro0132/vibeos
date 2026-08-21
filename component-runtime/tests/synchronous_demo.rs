@@ -72,6 +72,9 @@ fn drive(call: &mut TypedCall<'_, u32>) -> (CanonicalValue, usize) {
                 assert_eq!(metrics.consumed_work + metrics.remaining_work, 100_000);
                 previous = metrics;
             }
+            TypedPoll::HostPending(operation) => {
+                panic!("host-free demo unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Ready(value) => return (value, pending),
             TypedPoll::HostFailed(error) => panic!("unexpected host failure: {error:?}"),
             TypedPoll::Trapped(trap) => panic!("unexpected typed-call trap: {trap:?}"),
@@ -384,6 +387,9 @@ fn overlapping_realloc_result_traps_and_permanently_poisons() {
     let trap = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("hostile allocator unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Trapped(trap) => break trap,
             TypedPoll::HostFailed(error) => panic!("hostile allocator host failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("hostile allocator returned {value:?}"),
@@ -431,6 +437,9 @@ fn post_return_trap_is_observed_and_permanently_poisons() {
     let trap = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("hostile post-return unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Trapped(trap) => break trap,
             TypedPoll::HostFailed(error) => {
                 panic!("hostile post-return host failed: {error:?}")
@@ -481,6 +490,9 @@ fn argument_free_trap_after_post_return_permanently_poisons() {
     let trap = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("hostile free unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Trapped(trap) => break trap,
             TypedPoll::HostFailed(error) => panic!("hostile free host failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("hostile free returned {value:?}"),

@@ -139,9 +139,12 @@ impl WorldContract {
         let (package_name, world_name) = exact_world
             .rsplit_once('/')
             .ok_or(WorldError::VersionMismatch)?;
-        let (_, version) = world_name
+        let (local_world_name, version) = world_name
             .rsplit_once('@')
             .ok_or(WorldError::VersionMismatch)?;
+        if local_world_name.is_empty() || version.is_empty() {
+            return Err(WorldError::VersionMismatch);
+        }
         let mut expected_package = copied(package_name)?;
         expected_package
             .try_reserve(version.len() + 1)
@@ -152,7 +155,15 @@ impl WorldContract {
             return Err(WorldError::VersionMismatch);
         }
         let world_id = resolve
-            .select_world(&[package], Some(exact_world))
+            // The source parser has already normalized escaped WIT keywords
+            // such as `package vibe:%stream`, while `exact_world` deliberately
+            // carries the canonical identity `vibe:stream/filter@1.0.0`.
+            // Passing that canonical package spelling back through the WIT
+            // selector would lex `stream` as a keyword and reject the exact
+            // package we just proved. Select the local world in the one exact
+            // package instead, then independently compare the normalized full
+            // identity below.
+            .select_world(&[package], Some(local_world_name))
             .map_err(|_| WorldError::MissingWorld)?;
         let world = &resolve.worlds[world_id];
         let owner = world.package.ok_or(WorldError::VersionMismatch)?;
@@ -165,9 +176,15 @@ impl WorldContract {
         {
             return Err(WorldError::TypeGraphLimit);
         }
+        let resources = collect_wit_world_resources(
+            &resolve,
+            world.imports.iter().chain(world.exports.iter()),
+        )?;
         let mut budget = ShapeBudget::default();
-        let imports = normalize_wit_entities(&resolve, world.imports.iter(), &mut budget)?;
-        let exports = normalize_wit_entities(&resolve, world.exports.iter(), &mut budget)?;
+        let imports =
+            normalize_wit_entities(&resolve, world.imports.iter(), &resources, &mut budget)?;
+        let exports =
+            normalize_wit_entities(&resolve, world.exports.iter(), &resources, &mut budget)?;
         Ok(Self {
             identity,
             imports,
@@ -272,25 +289,89 @@ fn push_named_entity(
 fn normalize_wit_entities<'a>(
     resolve: &Resolve,
     items: impl Iterator<Item = (&'a wit_parser::WorldKey, &'a WorldItem)>,
+    resources: &[(TypeId, String)],
     budget: &mut ShapeBudget,
 ) -> Result<Vec<NamedEntityShape>, WorldError> {
+    let mut items = items;
+    let mut entries = Vec::new();
+    if let Some(upper) = items.size_hint().1 {
+        entries
+            .try_reserve_exact(upper)
+            .map_err(|_| WorldError::Allocation)?;
+    }
+    for entry in items.by_ref() {
+        entries.try_reserve(1).map_err(|_| WorldError::Allocation)?;
+        entries.push(entry);
+    }
+
     let mut result = Vec::new();
-    for (key, item) in items {
+    result
+        .try_reserve_exact(entries.len())
+        .map_err(|_| WorldError::Allocation)?;
+    for (key, item) in entries {
         let name = resolve.name_world_key(key);
+        if matches!(item, WorldItem::Type { id, .. }
+            if resolve_wit_resource_alias(resolve, *id)?.is_some())
+        {
+            // `use interface.{resource}` is a local nominal alias used to
+            // type world-level functions, not an additional external
+            // component import/export. Its canonical root remains available
+            // through `resources`, but publishing it here would require a
+            // top-level entity which no matching component type contains.
+            continue;
+        }
         let entity = match item {
             WorldItem::Interface { id, .. } => {
                 EntityShape::Interface(normalize_wit_interface(resolve, *id, budget, 1)?)
             }
-            WorldItem::Function(function) => {
-                EntityShape::Function(normalize_wit_function(resolve, function, &[], budget, 1)?)
-            }
-            WorldItem::Type { id, .. } => {
-                EntityShape::Type(normalize_wit_type_entity(resolve, *id, &[], budget, 1)?)
-            }
+            WorldItem::Function(function) => EntityShape::Function(normalize_wit_function(
+                resolve, function, resources, budget, 1,
+            )?),
+            WorldItem::Type { id, .. } => EntityShape::Type(normalize_wit_type_entity(
+                resolve, *id, resources, budget, 1,
+            )?),
         };
         push_named_entity(&mut result, &name, entity)?;
     }
     Ok(result)
+}
+
+fn collect_wit_world_resources<'a>(
+    resolve: &Resolve,
+    items: impl Iterator<Item = (&'a wit_parser::WorldKey, &'a WorldItem)>,
+) -> Result<Vec<(TypeId, String)>, WorldError> {
+    // A world may import `use interface.{resource}` aliases while exporting a
+    // function which borrows them. Build one canonical table across both
+    // sides before normalizing either side.
+    let mut resources = Vec::new();
+    for (key, item) in items {
+        let WorldItem::Type { id, .. } = item else {
+            continue;
+        };
+        let Some(resource) = resolve_wit_resource_alias(resolve, *id)? else {
+            continue;
+        };
+        let name = resolve.name_world_key(key);
+        if resources
+            .iter()
+            .any(|(existing, existing_name): &(TypeId, String)| {
+                (*existing == resource) != (existing_name == &name)
+            })
+        {
+            return Err(WorldError::TypeMismatch);
+        }
+        if resources
+            .iter()
+            .any(|(existing, existing_name)| *existing == resource && existing_name == &name)
+        {
+            continue;
+        }
+        resources
+            .try_reserve(1)
+            .map_err(|_| WorldError::Allocation)?;
+        resources.push((resource, copied(&name)?));
+    }
+    Ok(resources)
 }
 
 fn normalize_wit_interface(

@@ -50,6 +50,27 @@ static MANAGED_SECOND_POLLS: AtomicU64 = AtomicU64::new(0);
 static MANAGED_DROPS: AtomicU64 = AtomicU64::new(0);
 static MANAGED_ABANDONED_GUARD_READY: AtomicBool = AtomicBool::new(false);
 static MANAGED_EARLY_FINALIZE_DONE: AtomicBool = AtomicBool::new(false);
+static TASK_DETACH_CALLS: AtomicU64 = AtomicU64::new(0);
+static TASK_DETACH_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static TASK_DETACH_REASON: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn record_task_detach_reason(
+    context: u64,
+    _task: exec::TaskId,
+    _domain: AllocationDomain,
+    reason: exec::TaskDetachReason,
+) {
+    TASK_DETACH_CONTEXT.store(context, Ordering::SeqCst);
+    TASK_DETACH_REASON.store(
+        match reason {
+            exec::TaskDetachReason::Exited => 1,
+            exec::TaskDetachReason::Cancelled => 2,
+            exec::TaskDetachReason::Faulted => 3,
+        },
+        Ordering::SeqCst,
+    );
+    TASK_DETACH_CALLS.fetch_add(1, Ordering::SeqCst);
+}
 
 struct PendingManagedPayload;
 
@@ -1517,6 +1538,57 @@ fn fault_and_destructor_paths_restore_the_system_owner() {
     assert_eq!(*faulting_drop_owner.lock().unwrap(), Some(destructor_owner));
     assert_eq!(heap::current_owner(), OwnerId::SYSTEM);
     exec::set_fault_guard(fault_once_then_passthrough);
+}
+
+#[test]
+fn task_detach_observes_final_exit_cancel_and_destructor_fault_reasons_once() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_guard(fault_once_then_passthrough);
+
+    let reset = || {
+        TASK_DETACH_CALLS.store(0, Ordering::SeqCst);
+        TASK_DETACH_CONTEXT.store(0, Ordering::SeqCst);
+        TASK_DETACH_REASON.store(0, Ordering::SeqCst);
+    };
+    let assert_event = |context, reason| {
+        assert_eq!(TASK_DETACH_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(TASK_DETACH_CONTEXT.load(Ordering::SeqCst), context);
+        assert_eq!(TASK_DETACH_REASON.load(Ordering::SeqCst), reason);
+    };
+
+    reset();
+    let exited = exec::spawn_tracked("task-detach-exited", async {
+        let target = unsafe { exec::TaskDetachTarget::new(11, record_task_detach_reason) };
+        unsafe { exec::register_current_task_detach(target) }.unwrap();
+    });
+    exec::run_until_idle(BUDGET);
+    assert_eq!(exited.state(), TaskState::Exited);
+    assert_event(11, 1);
+
+    reset();
+    let cancelled = exec::spawn_tracked("task-detach-cancelled", async {
+        let target = unsafe { exec::TaskDetachTarget::new(12, record_task_detach_reason) };
+        unsafe { exec::register_current_task_detach(target) }.unwrap();
+        std::future::pending::<()>().await;
+    });
+    assert!(exec::poll_once());
+    assert_eq!(cancelled.cancel(), CancelOutcome::Requested);
+    assert_eq!(cancelled.state(), TaskState::Cancelled);
+    assert_event(12, 2);
+
+    reset();
+    let faulted = exec::spawn_tracked("task-detach-destructor-fault", async {
+        let target = unsafe { exec::TaskDetachTarget::new(13, record_task_detach_reason) };
+        unsafe { exec::register_current_task_detach(target) }.unwrap();
+        std::future::pending::<()>().await;
+    });
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_after_poll);
+    assert_eq!(faulted.cancel(), CancelOutcome::Requested);
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(faulted.state(), TaskState::Faulted);
+    assert_event(13, 3);
 }
 
 #[test]

@@ -139,6 +139,9 @@ fn transform_host_call_lifts_borrow_dispatches_charges_and_resumes() {
     for _ in 0..100 {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("synchronous clock unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Ready(value) => {
                 result = Some(value);
                 break;
@@ -187,6 +190,9 @@ fn prior_instance_host_wrapper_resumes_the_outer_consumer() {
     let result = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("transitive clock unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Ready(value) => break value,
             TypedPoll::HostFailed(error) => {
                 panic!("transitive host call failed: {error:?}")
@@ -218,6 +224,9 @@ fn absent_dispatcher_and_oversized_host_work_fail_closed() {
     let trap = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("hostless call unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Trapped(trap) => break trap,
             TypedPoll::HostFailed(error) => panic!("hostless call failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("hostless call returned {value:?}"),
@@ -250,6 +259,9 @@ fn absent_dispatcher_and_oversized_host_work_fail_closed() {
     let trap = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("over-budget call unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Trapped(trap) => break trap,
             TypedPoll::HostFailed(error) => panic!("over-budget host call failed: {error:?}"),
             TypedPoll::Ready(value) => panic!("over-budget host call returned {value:?}"),
@@ -285,6 +297,9 @@ fn indirect_host_result_uses_the_callers_retptr_in_its_bound_memory() {
     let result = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("pair call unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Ready(value) => break value,
             TypedPoll::HostFailed(error) => panic!("indirect host result failed: {error:?}"),
             TypedPoll::Trapped(trap) => panic!("indirect host result trapped: {trap:?}"),
@@ -313,6 +328,9 @@ fn result_lowering_budget_is_reserved_before_dispatch() {
     let trap = loop {
         match call.poll() {
             TypedPoll::Pending(_) => {}
+            TypedPoll::HostPending(operation) => {
+                panic!("under-budget call unexpectedly suspended at {operation:?}")
+            }
             TypedPoll::Trapped(trap) => break trap,
             TypedPoll::HostFailed(error) => {
                 panic!("under-budget pair call failed: {error:?}")
@@ -327,13 +345,16 @@ fn result_lowering_budget_is_reserved_before_dispatch() {
 
 #[test]
 fn every_host_boundary_failure_remains_typed_at_the_supervisor_boundary() {
-    const ERRORS: [HostError; 6] = [
+    const ERRORS: [HostError; 9] = [
         HostError::Denied,
         HostError::Unavailable,
         HostError::Exhausted,
         HostError::InvalidArgument,
         HostError::BackendFault,
         HostError::BudgetExceeded,
+        HostError::Failed,
+        HostError::Cancelled,
+        HostError::InvalidState,
     ];
 
     for error in ERRORS {
@@ -359,6 +380,9 @@ fn every_host_boundary_failure_remains_typed_at_the_supervisor_boundary() {
             let observed = loop {
                 match call.poll() {
                     TypedPoll::Pending(_) => {}
+                    TypedPoll::HostPending(operation) => {
+                        panic!("failing call unexpectedly suspended at {operation:?}")
+                    }
                     TypedPoll::HostFailed(observed) => break observed,
                     TypedPoll::Ready(value) => panic!("failing host returned {value:?}"),
                     TypedPoll::Trapped(trap) => panic!("host failure collapsed to {trap:?}"),

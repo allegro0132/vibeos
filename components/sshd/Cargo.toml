@@ -9,6 +9,8 @@ qualification-stream = []
 
 [dependencies]
 vibeos-core = { path = "../../core" }
+vibeos-component-host = { path = "../../services/component-host" }
+vibeos-component-runtime = { path = "../../component-runtime" }
 vibeos-net-api = { path = "../net-api" }
 vibeos-net-protocol = { path = "../net-protocol" }
 vibeos-random = { path = "../../random" }
@@ -19,5 +21,4 @@ sunset = { path = "../../vendor/sunset", default-features = false, features = ["
 [dev-dependencies]
 vibeos-component-admission = { path = "../../services/component-admission" }
 vibeos-component-command = { path = "../../services/component-command" }
-vibeos-component-runtime = { path = "../../component-runtime" }
 vibeos-image-policy = { path = "../../policy/image" }

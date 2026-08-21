@@ -12,8 +12,9 @@ use crate::{
         pack_endpoint_pair, unpack_callback_result, CallbackCode, EndpointPair as AbiEndpointPair,
     },
     async_state::{
-        AsyncState, AsyncStateError, AsyncStateLimits, EndpointKind, TaskCancelState, TaskHandle,
-        TaskResultState,
+        AsyncState, AsyncStateError, AsyncStateLimits, EndpointKind, Event, EventLease,
+        EventLeaseState, TaskCancelState, TaskHandle, TaskResultState, WaitBegin, WaitResume,
+        WaitTicket,
     },
     decode::ComponentPlan,
     execution::{
@@ -44,6 +45,12 @@ const TASK_RETURN_WORK: u64 = 1;
 /// handle action enabled by this executor slice.
 const HANDLE_STATE_SCAN_FACTOR: u64 = 8;
 const HANDLE_STATE_WORK: u64 = 1 + HANDLE_STATE_SCAN_FACTOR * PROFILE_1_LIMITS.max_resources as u64;
+/// Versioned Vibe fuel charged for one actual callback wait selection.
+///
+/// Beginning or explicitly resuming a wait may scan the same bounded handle
+/// arena as another handle transition. Merely observing an already-blocked
+/// invocation does no state work and therefore spends no fuel.
+const WAIT_STATE_WORK: u64 = HANDLE_STATE_WORK;
 /// Versioned Vibe fuel charged for decoding and committing one callback code.
 const CALLBACK_RESULT_WORK: u64 = 1;
 
@@ -77,8 +84,29 @@ pub(crate) enum NativeAsyncPoll {
     Pending(NativeAsyncMetrics),
     Resolved(NativeAsyncMetrics),
     Yielded(NativeAsyncMetrics),
+    WaitPending {
+        token: NativeAsyncWaitToken,
+        metrics: NativeAsyncMetrics,
+    },
     Complete(NativeAsyncMetrics),
     Trapped(TrapCode),
+}
+
+/// Exact owner authority for one blocked callback wait.
+///
+/// The task seal binds the token to one Component instance and invocation;
+/// the monotonically increasing generation prevents reuse across successive
+/// waits by the same task. Fields remain private so callers cannot forge it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeAsyncWaitToken {
+    task: TaskHandle,
+    generation: u64,
+}
+
+impl core::fmt::Debug for NativeAsyncWaitToken {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("NativeAsyncWaitToken(<opaque>)")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +119,8 @@ pub(crate) enum NativeAsyncCancelOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeAsyncControlError {
     Invariant,
+    InvalidWaitToken,
+    NotWaiting,
 }
 
 pub(crate) struct NativeAsyncComponent {
@@ -361,6 +391,9 @@ impl NativeAsyncComponent {
             active_call_budget: total_work,
             poll_quantum,
             callback_pending: false,
+            wait_ticket: None,
+            wait_token: None,
+            next_wait_generation: 1,
             terminal: false,
         })
     }
@@ -679,11 +712,46 @@ const fn map_callback_yield_error(error: AsyncStateError) -> TrapCode {
     }
 }
 
+/// Maps failures after the guest's raw waitable-set handle has been sealed.
+///
+/// The raw set's seal and kind were already checked, so task/set authority loss
+/// and duplicate wait registrations are executor invariants. Bounded
+/// exhaustion retains its limit class.
+const fn map_callback_wait_begin_error(error: AsyncStateError) -> TrapCode {
+    match error {
+        AsyncStateError::AllocationFailed
+        | AsyncStateError::HandleTableFull
+        | AsyncStateError::PairTableFull
+        | AsyncStateError::ProgressLimit
+        | AsyncStateError::GenerationExhausted
+        | AsyncStateError::WaitableSetFull
+        | AsyncStateError::TaskTableFull => TrapCode::LimitExceeded,
+        _ => TrapCode::Validation,
+    }
+}
+
+/// An explicit resume carries an exact unforgeable wait ticket. Any rejected
+/// state authority is therefore an executor invariant, except genuine bounded
+/// exhaustion which keeps the profile's limit trap.
+const fn map_callback_wait_resume_error(error: AsyncStateError) -> TrapCode {
+    match error {
+        AsyncStateError::AllocationFailed
+        | AsyncStateError::HandleTableFull
+        | AsyncStateError::PairTableFull
+        | AsyncStateError::ProgressLimit
+        | AsyncStateError::GenerationExhausted
+        | AsyncStateError::WaitableSetFull
+        | AsyncStateError::TaskTableFull => TrapCode::LimitExceeded,
+        _ => TrapCode::Validation,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InvocationStage {
     Run,
     StartCallback,
     Callback,
+    WaitBlocked,
     Terminal,
 }
 
@@ -703,6 +771,9 @@ pub(crate) struct NativeAsyncInvocation<'a> {
     active_call_budget: u64,
     poll_quantum: u64,
     callback_pending: bool,
+    wait_ticket: Option<WaitTicket>,
+    wait_token: Option<NativeAsyncWaitToken>,
+    next_wait_generation: u64,
     terminal: bool,
 }
 
@@ -718,6 +789,7 @@ impl NativeAsyncInvocation<'_> {
             }
             InvocationStage::StartCallback => self.start_callback(),
             InvocationStage::Callback => self.poll_callback(),
+            InvocationStage::WaitBlocked => self.poll_wait_blocked(),
             InvocationStage::Terminal => NativeAsyncPoll::Trapped(TrapCode::Cancelled),
         }
     }
@@ -760,8 +832,83 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
+    /// Uses one exact owner token to perform one real blocked-wait scan.
+    ///
+    /// Ordinary [`Self::poll`] calls never scan a blocked wait. A pending
+    /// explicit resume spends one bounded state-transition charge and rotates
+    /// the token, making retries and spurious wakes observable and linear.
+    pub(crate) fn resume_wait(
+        &mut self,
+        token: NativeAsyncWaitToken,
+    ) -> Result<NativeAsyncPoll, NativeAsyncControlError> {
+        if !matches!(self.stage, InvocationStage::WaitBlocked) {
+            return Err(NativeAsyncControlError::NotWaiting);
+        }
+        let Some(expected) = self.wait_token else {
+            return Ok(self.finish_trap(TrapCode::Validation));
+        };
+        if token != expected {
+            return Err(NativeAsyncControlError::InvalidWaitToken);
+        }
+        if self.wait_ticket.is_none() {
+            return Ok(self.finish_trap(TrapCode::Validation));
+        }
+        if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+            || self.callback_pending
+        {
+            return Ok(self.finish_trap(TrapCode::Validation));
+        }
+
+        // Consume the exact wake authority before doing state work. If the
+        // selector remains pending, `park_wait` mints a fresh authority.
+        self.wait_token = None;
+        if !self.charge_wait_state_work() {
+            return Ok(self.finish_trap(TrapCode::FuelExhausted));
+        }
+        let resumed = {
+            let Some(ticket) = self.wait_ticket.as_mut() else {
+                return Ok(self.finish_trap(TrapCode::Validation));
+            };
+            self.component.state.resume_callback_wait(ticket)
+        };
+        match resumed {
+            Ok(WaitResume::Pending) => {
+                let token = match self.mint_wait_token() {
+                    Ok(token) => token,
+                    Err(trap) => return Ok(self.finish_trap(trap)),
+                };
+                self.wait_token = Some(token);
+                Ok(NativeAsyncPoll::WaitPending {
+                    token,
+                    metrics: self.metrics(),
+                })
+            }
+            Ok(WaitResume::Ready(lease)) => {
+                self.wait_ticket = None;
+                Ok(self.handle_wait_event(lease))
+            }
+            Err(error) => Ok(self.finish_trap(map_callback_wait_resume_error(error))),
+        }
+    }
+
     fn binding(&self) -> &RuntimeExport {
         &self.component.exports[self.export]
+    }
+
+    fn poll_wait_blocked(&mut self) -> NativeAsyncPoll {
+        let Some(token) = self.wait_token else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        if self.wait_ticket.is_none()
+            || self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+            || self.callback_pending
+        {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        NativeAsyncPoll::WaitPending {
+            token,
+            metrics: self.metrics(),
+        }
     }
 
     fn poll_run(&mut self, active_instance: usize) -> NativeAsyncPoll {
@@ -1026,7 +1173,11 @@ impl NativeAsyncInvocation<'_> {
         }
         match result.code {
             CallbackCode::Exit => {
-                if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle {
+                if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+                    || self.callback_pending
+                    || self.wait_ticket.is_some()
+                    || self.wait_token.is_some()
+                {
                     return self.finish_trap(TrapCode::Validation);
                 }
                 if let Err(error) = self.component.state.callback_exit(self.task) {
@@ -1042,6 +1193,8 @@ impl NativeAsyncInvocation<'_> {
             CallbackCode::Yield => {
                 if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
                     || self.callback_pending
+                    || self.wait_ticket.is_some()
+                    || self.wait_token.is_some()
                 {
                     return self.finish_trap(TrapCode::Validation);
                 }
@@ -1049,7 +1202,86 @@ impl NativeAsyncInvocation<'_> {
                 self.stage = InvocationStage::StartCallback;
                 NativeAsyncPoll::Yielded(self.metrics())
             }
-            CallbackCode::Wait => self.finish_trap(TrapCode::CanonicalAbi),
+            CallbackCode::Wait => {
+                let Some(raw_set) = result.waitable_set else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                self.begin_callback_wait(raw_set)
+            }
+        }
+    }
+
+    fn begin_callback_wait(&mut self, raw_set: u32) -> NativeAsyncPoll {
+        if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+            || self.callback_pending
+            || self.wait_ticket.is_some()
+            || self.wait_token.is_some()
+        {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        // Resolve the guest's raw set before charging or mutating the wait
+        // selector. A malformed or wrong-kind handle is guest ABI misuse.
+        let set = match self.component.state.resolve_guest_waitable_set(raw_set) {
+            Ok(set) => set,
+            Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+        };
+        // A selected cancellation/event must be able to start its callback in
+        // this same transition, so retain at least one unit of Core fuel.
+        if !self.charge_wait_state_work() {
+            return self.finish_trap(TrapCode::FuelExhausted);
+        }
+        match self.component.state.begin_callback_wait(self.task, set) {
+            Ok(WaitBegin::Ready(lease)) => self.handle_wait_event(lease),
+            Ok(WaitBegin::Blocked { ticket }) => self.park_wait(ticket),
+            Err(error) => self.finish_trap(map_callback_wait_begin_error(error)),
+        }
+    }
+
+    fn park_wait(&mut self, ticket: WaitTicket) -> NativeAsyncPoll {
+        if self.wait_ticket.is_some() || self.wait_token.is_some() {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        self.wait_ticket = Some(ticket);
+        let token = match self.mint_wait_token() {
+            Ok(token) => token,
+            Err(trap) => return self.finish_trap(trap),
+        };
+        self.wait_token = Some(token);
+        self.stage = InvocationStage::WaitBlocked;
+        NativeAsyncPoll::WaitPending {
+            token,
+            metrics: self.metrics(),
+        }
+    }
+
+    fn mint_wait_token(&mut self) -> Result<NativeAsyncWaitToken, TrapCode> {
+        let generation = self.next_wait_generation;
+        let next = generation.checked_add(1).ok_or(TrapCode::LimitExceeded)?;
+        if generation == 0 {
+            return Err(TrapCode::Validation);
+        }
+        self.next_wait_generation = next;
+        Ok(NativeAsyncWaitToken {
+            task: self.task,
+            generation,
+        })
+    }
+
+    fn handle_wait_event(&mut self, mut lease: EventLease) -> NativeAsyncPoll {
+        self.wait_token = None;
+        match lease.state() {
+            EventLeaseState::TaskCancelled => {
+                let Some(event) = lease.take_task_cancelled() else {
+                    return self.finish_trap(TrapCode::Validation);
+                };
+                self.start_callback_event(event)
+            }
+            // Copy bridges and the component-owned buffer registry are still
+            // sealed. Do not deliver or reclaim the selected endpoint event:
+            // leaving it Pending preserves its future teardown authority.
+            EventLeaseState::EndpointPending
+            | EventLeaseState::EndpointDelivered
+            | EventLeaseState::Consumed => self.finish_trap(TrapCode::Validation),
         }
     }
 
@@ -1071,6 +1303,19 @@ impl NativeAsyncInvocation<'_> {
             Ok(event) => event,
             Err(error) => return self.finish_trap(map_callback_yield_error(error)),
         };
+        self.start_callback_event(event)
+    }
+
+    fn start_callback_event(&mut self, event: Event) -> NativeAsyncPoll {
+        if self.remaining_work == 0
+            || self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+        {
+            return self.finish_trap(if self.remaining_work == 0 {
+                TrapCode::FuelExhausted
+            } else {
+                TrapCode::Validation
+            });
+        }
         let inputs = [
             CoreValue::I32(event.code as i32),
             CoreValue::I32(event.p1 as i32),
@@ -1111,14 +1356,28 @@ impl NativeAsyncInvocation<'_> {
         true
     }
 
+    fn charge_wait_state_work(&mut self) -> bool {
+        let Some(remaining) = self.remaining_work.checked_sub(WAIT_STATE_WORK) else {
+            return false;
+        };
+        if remaining == 0 {
+            return false;
+        }
+        self.remaining_work = remaining;
+        true
+    }
+
     fn finish_trap(&mut self, trap: TrapCode) -> NativeAsyncPoll {
-        self.poison_and_discard();
         self.stage = InvocationStage::Terminal;
         self.terminal = true;
+        self.poison_and_discard();
         NativeAsyncPoll::Trapped(trap)
     }
 
     fn poison_and_discard(&mut self) {
+        // Latch fail-stop before touching any independently fallible cleanup
+        // authority. No cleanup error may make this Component reusable.
+        self.component.poisoned = true;
         // A reusable call's storage can only be recovered with its exact slot
         // authority. Recover every active slot before the principal-wide
         // fallback so no slot can be left looking reusable after its storage
@@ -1133,7 +1392,17 @@ impl NativeAsyncInvocation<'_> {
             }
         }
         modules.discard_all_calls();
-        self.component.poisoned = true;
+
+        let wait_cancelled = match self.wait_ticket.as_mut() {
+            Some(ticket) => self.component.state.cancel_callback_wait(ticket).is_ok(),
+            None => true,
+        };
+        if wait_cancelled {
+            self.wait_ticket = None;
+        }
+        self.wait_token = None;
+        self.callback_pending = false;
+        let _ = self.component.state.abort_task(self.task);
     }
 
     #[cfg(test)]
@@ -1145,9 +1414,9 @@ impl NativeAsyncInvocation<'_> {
 impl Drop for NativeAsyncInvocation<'_> {
     fn drop(&mut self) {
         if !self.terminal {
-            self.poison_and_discard();
             self.stage = InvocationStage::Terminal;
             self.terminal = true;
+            self.poison_and_discard();
         }
     }
 }
@@ -1155,7 +1424,10 @@ impl Drop for NativeAsyncInvocation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{async_state::TaskCallbackState, decode::inspect_component_for_profile};
+    use crate::{
+        async_state::{BufferLease, CopyBegin, TaskCallbackState},
+        decode::inspect_component_for_profile,
+    };
     use alloc::format;
     use vibeos_wasm_runtime::CoreHostCall;
 
@@ -1183,6 +1455,90 @@ mod tests {
     fn replace_once(source: &str, from: &str, to: &str) -> String {
         assert_eq!(source.matches(from).count(), 1);
         source.replacen(from, to, 1)
+    }
+
+    fn wait_component(resolve_before_wait: bool, callback: &str) -> String {
+        let task_return = if resolve_before_wait {
+            "      call $task-return\n"
+        } else {
+            ""
+        };
+        let run = format!(
+            r#"    (func (export "run") (result i32)
+      (local $set i32)
+      call $waitable-set-new
+      local.set $set
+      i32.const 0
+      local.get $set
+      i32.store
+{task_return}      local.get $set
+      i32.const 4
+      i32.shl
+      i32.const 2
+      i32.or)"#
+        );
+        replace_once(
+            &replace_once(
+                SMOKE,
+                "    (func (export \"run\") (result i32)\n      call $task-return\n      i32.const 1)",
+                &run,
+            ),
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+            callback,
+        )
+    }
+
+    fn cancellation_exit_callback() -> &'static str {
+        r#"    (func (export "callback") (param $event i32) (param $p1 i32) (param $p2 i32) (result i32)
+      local.get $event
+      i32.const 6
+      i32.ne
+      if
+        unreachable
+      end
+      local.get $p1
+      local.get $p2
+      i32.or
+      if
+        unreachable
+      end
+      i32.const 0
+      i32.load
+      call $waitable-set-drop
+      call $task-return
+      i32.const 0)"#
+    }
+
+    fn poll_to_wait(
+        call: &mut NativeAsyncInvocation<'_>,
+    ) -> (NativeAsyncWaitToken, NativeAsyncMetrics) {
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::WaitPending { token, metrics } => return (token, metrics),
+                NativeAsyncPoll::Complete(_) => panic!("wait fixture completed before WAIT"),
+                NativeAsyncPoll::Trapped(trap) => panic!("wait fixture trapped: {trap:?}"),
+            }
+        }
+    }
+
+    fn finish_cancelled_wait_callback(call: &mut NativeAsyncInvocation<'_>) {
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Complete(_) => return,
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("cancel callback unexpectedly waited")
+                }
+                NativeAsyncPoll::Trapped(trap) => {
+                    panic!("cancel callback trapped: {trap:?}")
+                }
+            }
+        }
     }
 
     fn handle_component(run_body: &str) -> String {
@@ -1280,6 +1636,9 @@ mod tests {
                 NativeAsyncPoll::Pending(_)
                 | NativeAsyncPoll::Resolved(_)
                 | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("invalid handle fixture unexpectedly waited")
+                }
                 NativeAsyncPoll::Complete(_) => panic!("invalid handle fixture completed"),
             }
         }
@@ -1350,6 +1709,9 @@ mod tests {
                 NativeAsyncPoll::Complete(_) => return,
                 NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Resolved(_) => {}
                 NativeAsyncPoll::Yielded(_) => panic!("callback unexpectedly yielded"),
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("callback unexpectedly waited")
+                }
                 NativeAsyncPoll::Trapped(trap) => panic!("callback trapped: {trap:?}"),
             }
         }
@@ -1683,6 +2045,9 @@ mod tests {
         loop {
             match call.poll() {
                 NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("cancel delivery fixture unexpectedly waited")
+                }
                 NativeAsyncPoll::Resolved(_) => {
                     saw_resolved = true;
                     assert_eq!(call.task_info().result, TaskResultState::Resolved);
@@ -1742,11 +2107,15 @@ mod tests {
             call.poll(),
             NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
         );
-        assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
+        assert_eq!(
+            call.component.state.task_info(call.task).err(),
+            Some(AsyncStateError::StaleHandle)
+        );
         assert_eq!(
             call.component.callback_slots[call.export].state(),
             CoreCallSlotState::Idle
         );
+        assert!(!call.component.modules.any_active_call());
         assert_eq!(
             call.request_cancel(),
             Ok(NativeAsyncCancelOutcome::AlreadyTerminal)
@@ -1914,6 +2283,9 @@ mod tests {
                 NativeAsyncPoll::Complete(_) => break,
                 NativeAsyncPoll::Resolved(_) | NativeAsyncPoll::Yielded(_) => {
                     panic!("callback host-call fixture surfaced unexpected progress")
+                }
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("callback host-call fixture unexpectedly waited")
                 }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("callback host-call fixture trapped: {trap:?}")
@@ -2083,6 +2455,25 @@ mod tests {
         assert_eq!(
             map_callback_yield_error(AsyncStateError::AlreadyWaiting),
             TrapCode::Validation
+        );
+        for error in [
+            AsyncStateError::InvalidHandle,
+            AsyncStateError::StaleHandle,
+            AsyncStateError::WrongHandleKind,
+            AsyncStateError::WrongState,
+            AsyncStateError::WaitableSetWaiting,
+            AsyncStateError::AlreadyWaiting,
+        ] {
+            assert_eq!(map_callback_wait_begin_error(error), TrapCode::Validation);
+            assert_eq!(map_callback_wait_resume_error(error), TrapCode::Validation);
+        }
+        assert_eq!(
+            map_callback_wait_begin_error(AsyncStateError::GenerationExhausted),
+            TrapCode::LimitExceeded
+        );
+        assert_eq!(
+            map_callback_wait_resume_error(AsyncStateError::WaitableSetFull),
+            TrapCode::LimitExceeded
         );
     }
 
@@ -2416,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_wait_remains_unsupported_and_restores_slot_before_poison() {
+    fn invalid_zero_wait_handle_restores_slot_before_poison() {
         let source = replace_once(
             SMOKE,
             "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
@@ -2442,6 +2833,468 @@ mod tests {
     }
 
     #[test]
+    fn empty_callback_wait_has_a_stable_zero_cost_poll_token() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, blocked_metrics) = poll_to_wait(&mut call);
+        assert!(call.task_info().waiting);
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+        assert!(!call.component.modules.any_active_call());
+
+        for _ in 0..3 {
+            assert_eq!(
+                call.poll(),
+                NativeAsyncPoll::WaitPending {
+                    token,
+                    metrics: blocked_metrics,
+                }
+            );
+            assert_eq!(call.metrics(), blocked_metrics);
+            assert!(call.task_info().waiting);
+        }
+    }
+
+    #[test]
+    fn exact_wait_resume_charges_once_rotates_and_rejects_stale_or_foreign_tokens() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut foreign_component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let mut foreign_call = foreign_component.start("run", WORK, QUANTUM).unwrap();
+        let (token, blocked_metrics) = poll_to_wait(&mut call);
+        let (foreign, _) = poll_to_wait(&mut foreign_call);
+        assert_ne!(token, foreign);
+
+        assert_eq!(
+            call.resume_wait(foreign),
+            Err(NativeAsyncControlError::InvalidWaitToken)
+        );
+        assert_eq!(call.metrics(), blocked_metrics);
+        let NativeAsyncPoll::WaitPending {
+            token: rotated,
+            metrics: resumed_metrics,
+        } = call.resume_wait(token).unwrap()
+        else {
+            panic!("empty wait must remain blocked")
+        };
+        assert_ne!(rotated, token);
+        assert_eq!(
+            blocked_metrics.remaining_work - resumed_metrics.remaining_work,
+            WAIT_STATE_WORK
+        );
+        assert_eq!(
+            resumed_metrics.consumed_work - blocked_metrics.consumed_work,
+            WAIT_STATE_WORK
+        );
+
+        assert_eq!(
+            call.resume_wait(token),
+            Err(NativeAsyncControlError::InvalidWaitToken)
+        );
+        assert_eq!(call.metrics(), resumed_metrics);
+        assert_eq!(
+            call.poll(),
+            NativeAsyncPoll::WaitPending {
+                token: rotated,
+                metrics: resumed_metrics,
+            }
+        );
+
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        assert_eq!(
+            call.poll(),
+            NativeAsyncPoll::WaitPending {
+                token: rotated,
+                metrics: resumed_metrics,
+            }
+        );
+        assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
+        let before_cancel_resume = call.metrics();
+        assert!(matches!(
+            call.resume_wait(rotated),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        assert_eq!(
+            before_cancel_resume.remaining_work - call.metrics().remaining_work,
+            WAIT_STATE_WORK
+        );
+        assert_eq!(call.task_info().cancel, TaskCancelState::Delivered);
+        assert_eq!(
+            call.resume_wait(rotated),
+            Err(NativeAsyncControlError::NotWaiting)
+        );
+        finish_cancelled_wait_callback(&mut call);
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+        assert!(call.wait_ticket.is_none());
+        assert!(call.wait_token.is_none());
+        assert!(!call.component.is_poisoned());
+        let old_invocation_token = rotated;
+        drop(call);
+
+        let mut next_call = component.start("run", WORK, QUANTUM).unwrap();
+        let (next_token, next_metrics) = poll_to_wait(&mut next_call);
+        assert_ne!(next_token, old_invocation_token);
+        assert_eq!(
+            next_call.resume_wait(old_invocation_token),
+            Err(NativeAsyncControlError::InvalidWaitToken)
+        );
+        assert_eq!(next_call.metrics(), next_metrics);
+    }
+
+    #[test]
+    fn cancellation_before_wait_is_selected_and_started_immediately() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        let mut saw_delivered = false;
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Resolved(_) => {
+                    if let Ok(info) = call.component.state.task_info(call.task) {
+                        saw_delivered |= info.cancel == TaskCancelState::Delivered;
+                    }
+                }
+                NativeAsyncPoll::Complete(_) => break,
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("pre-WAIT cancellation must not park")
+                }
+                NativeAsyncPoll::Yielded(_) => panic!("WAIT fixture unexpectedly yielded"),
+                NativeAsyncPoll::Trapped(trap) => {
+                    panic!("pre-WAIT cancellation callback trapped: {trap:?}")
+                }
+            }
+        }
+        assert!(saw_delivered);
+        drop(call);
+        assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
+        assert!(!component.is_poisoned());
+    }
+
+    #[test]
+    fn resolved_tasks_can_wait_but_owner_cancellation_is_too_late() {
+        let source = wait_component(
+            true,
+            "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, metrics) = poll_to_wait(&mut call);
+        assert_eq!(call.task_info().result, TaskResultState::Resolved);
+        assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
+        let NativeAsyncPoll::WaitPending {
+            token: rotated,
+            metrics: resumed,
+        } = call.resume_wait(token).unwrap()
+        else {
+            panic!("resolved empty wait must remain pending")
+        };
+        assert_ne!(rotated, token);
+        assert_eq!(
+            metrics.remaining_work - resumed.remaining_work,
+            WAIT_STATE_WORK
+        );
+        assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
+        assert!(call.task_info().waiting);
+    }
+
+    #[test]
+    fn invalid_and_wrong_kind_wait_sets_trap_before_selector_fuel() {
+        let invalid = replace_once(
+            SMOKE,
+            "    (func (export \"run\") (result i32)\n      call $task-return\n      i32.const 1)",
+            "    (func (export \"run\") (result i32)\n      i32.const 2)",
+        );
+        let wrong_kind = replace_once(
+            SMOKE,
+            "    (func (export \"run\") (result i32)\n      call $task-return\n      i32.const 1)",
+            r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      local.get $pair
+      i32.wrap_i64
+      i32.const 4
+      i32.shl
+      i32.const 2
+      i32.or)"#,
+        );
+
+        for source in [invalid, wrong_kind] {
+            let mut component = instantiate(&source);
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let active = call.binding().core_instance;
+            loop {
+                let result = call.component.modules.poll_call(active);
+                assert!(call.settle_metrics(CallAuthority::Run(active)));
+                match result {
+                    PollResult::Pending { .. } => {}
+                    PollResult::HostCall(host) => assert!(matches!(
+                        call.handle_host_call(CallAuthority::Run(active), host),
+                        NativeAsyncPoll::Pending(_)
+                    )),
+                    PollResult::Ready(values) => {
+                        let before = call.metrics();
+                        assert_eq!(
+                            call.handle_callback_result(values.as_slice()),
+                            NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                        );
+                        let after = call.metrics();
+                        assert_eq!(
+                            before.remaining_work - after.remaining_work,
+                            CALLBACK_RESULT_WORK
+                        );
+                        assert_eq!(
+                            after.consumed_work - before.consumed_work,
+                            CALLBACK_RESULT_WORK
+                        );
+                        break;
+                    }
+                    PollResult::Trapped(trap) => panic!("wait handle fixture trapped: {trap:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_wait_drop_and_trap_cancel_ticket_abort_task_and_poison() {
+        for trap in [false, true] {
+            let source = wait_component(false, cancellation_exit_callback());
+            let mut component = instantiate(&source);
+            let (task, set) = {
+                let mut call = component.start("run", WORK, QUANTUM).unwrap();
+                let _ = poll_to_wait(&mut call);
+                let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
+                let task = call.task;
+                if trap {
+                    assert_eq!(
+                        call.finish_trap(TrapCode::Validation),
+                        NativeAsyncPoll::Trapped(TrapCode::Validation)
+                    );
+                }
+                (task, set)
+            };
+            assert!(component.is_poisoned());
+            assert!(!component.modules.any_active_call());
+            assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
+            assert_eq!(
+                component.state.task_info(task).err(),
+                Some(AsyncStateError::StaleHandle)
+            );
+            component.state.drop_waitable_set(set).unwrap();
+        }
+    }
+
+    #[test]
+    fn endpoint_wait_lease_fails_validation_without_delivery_or_reclaim() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, blocked) = poll_to_wait(&mut call);
+        let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
+        let value_type = AsyncValueTypeId::new(99).unwrap();
+        let pair = call.component.state.create_stream_pair(value_type).unwrap();
+        call.component
+            .state
+            .join_waitable(pair.readable, set.raw())
+            .unwrap();
+        call.component
+            .state
+            .drop_endpoint(
+                pair.writable,
+                EndpointKind::Stream,
+                EndpointDirection::Write,
+                value_type,
+            )
+            .unwrap();
+        assert!(matches!(
+            call.component.state.begin_copy(
+                pair.readable,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                value_type,
+                BufferLease::issue(1, 1, 1, 4).unwrap(),
+            ),
+            Ok(CopyBegin::Ready(_))
+        ));
+
+        assert_eq!(
+            call.resume_wait(token),
+            Ok(NativeAsyncPoll::Trapped(TrapCode::Validation))
+        );
+        assert_eq!(
+            blocked.remaining_work - call.metrics().remaining_work,
+            WAIT_STATE_WORK
+        );
+        let endpoint = call.component.state.endpoint_info(pair.readable).unwrap();
+        assert!(endpoint.has_pending_event);
+        assert!(!endpoint.event_delivered);
+        assert_eq!(
+            call.component.state.task_info(call.task).err(),
+            Some(AsyncStateError::StaleHandle)
+        );
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+        assert!(call.component.is_poisoned());
+    }
+
+    #[test]
+    fn wait_selector_fuel_is_precharged_without_consuming_begin_or_resume_state() {
+        let source = wait_component(false, cancellation_exit_callback());
+
+        // Begin: stop with the decoded Core result in hand, then leave exactly
+        // the selector charge after CALLBACK_RESULT_WORK. The required one
+        // unit callback reserve makes selection fail before registration or
+        // cancellation delivery.
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        let values = loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(CallAuthority::Run(active)));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => assert!(matches!(
+                    call.handle_host_call(CallAuthority::Run(active), host),
+                    NativeAsyncPoll::Pending(_)
+                )),
+                PollResult::Ready(values) => break values,
+                PollResult::Trapped(trap) => panic!("WAIT begin fixture trapped: {trap:?}"),
+            }
+        };
+        let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
+        let task = call.task;
+        call.remaining_work = CALLBACK_RESULT_WORK + WAIT_STATE_WORK;
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        let before = call.metrics();
+        assert_eq!(
+            call.handle_callback_result(values.as_slice()),
+            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
+        );
+        let after = call.metrics();
+        assert_eq!(
+            before.remaining_work - after.remaining_work,
+            CALLBACK_RESULT_WORK
+        );
+        assert_eq!(after.remaining_work, WAIT_STATE_WORK);
+        assert_eq!(
+            call.component.state.task_info(task).err(),
+            Some(AsyncStateError::StaleHandle)
+        );
+        call.component.state.drop_waitable_set(set).unwrap();
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+        drop(call);
+
+        // Resume: an exact token with no spare callback unit spends nothing
+        // and teardown cancels the still-live registration before aborting the
+        // task, so the set can be dropped cleanly.
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, _) = poll_to_wait(&mut call);
+        let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
+        let task = call.task;
+        call.remaining_work = WAIT_STATE_WORK;
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        let before = call.metrics();
+        assert_eq!(
+            call.resume_wait(token),
+            Ok(NativeAsyncPoll::Trapped(TrapCode::FuelExhausted))
+        );
+        assert_eq!(call.metrics(), before);
+        assert_eq!(
+            call.component.state.task_info(task).err(),
+            Some(AsyncStateError::StaleHandle)
+        );
+        call.component.state.drop_waitable_set(set).unwrap();
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+    }
+
+    #[test]
+    fn blocked_wait_rejects_corrupt_callback_slot_before_fuel_or_selector_work() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, _) = poll_to_wait(&mut call);
+        let inputs = [CoreValue::I32(0), CoreValue::I32(0), CoreValue::I32(0)];
+        let (modules, exports, slots) = (
+            &mut call.component.modules,
+            &call.component.exports,
+            &mut call.component.callback_slots,
+        );
+        let binding = &exports[call.export];
+        modules
+            .start_call_slot(
+                &mut slots[call.export],
+                binding.callback_instance,
+                &binding.callback,
+                &inputs,
+                call.remaining_work,
+                call.poll_quantum.min(call.remaining_work),
+            )
+            .unwrap();
+        assert_eq!(slots[call.export].state(), CoreCallSlotState::Active);
+        let before = call.metrics();
+        assert_eq!(
+            call.resume_wait(token),
+            Ok(NativeAsyncPoll::Trapped(TrapCode::Validation))
+        );
+        assert_eq!(call.metrics(), before);
+        assert_eq!(
+            call.component.callback_slots[call.export].state(),
+            CoreCallSlotState::Idle
+        );
+        assert!(!call.component.modules.any_active_call());
+        assert!(call.component.is_poisoned());
+    }
+
+    #[test]
+    fn blocked_wait_missing_internal_authority_is_fail_stop_not_a_control_error() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, _) = poll_to_wait(&mut call);
+        call.wait_token = None;
+        let before = call.metrics();
+        assert_eq!(
+            call.resume_wait(token),
+            Ok(NativeAsyncPoll::Trapped(TrapCode::Validation))
+        );
+        assert_eq!(call.metrics(), before);
+        assert!(call.component.is_poisoned());
+        assert_eq!(
+            call.component.state.task_info(call.task).err(),
+            Some(AsyncStateError::StaleHandle)
+        );
+    }
+
+    #[test]
     fn callback_trap_and_drop_clean_up_the_exact_active_slot() {
         let trapping = replace_once(
             SMOKE,
@@ -2455,12 +3308,14 @@ mod tests {
             assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
             assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
             assert!(matches!(call.poll(), NativeAsyncPoll::Trapped(_)));
-            let task = call.task_info();
             assert_eq!(
                 call.request_cancel(),
                 Ok(NativeAsyncCancelOutcome::AlreadyTerminal)
             );
-            assert_eq!(call.task_info(), task);
+            assert_eq!(
+                call.component.state.task_info(call.task).err(),
+                Some(AsyncStateError::StaleHandle)
+            );
             assert_eq!(
                 call.component.callback_slots[call.export].state(),
                 CoreCallSlotState::Idle
@@ -2711,6 +3566,9 @@ mod tests {
                     NativeAsyncPoll::Yielded(metrics) => run_consumed = Some(metrics.consumed_work),
                     NativeAsyncPoll::Complete(metrics) => break metrics.consumed_work,
                     NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Resolved(_) => {}
+                    NativeAsyncPoll::WaitPending { .. } => {
+                        panic!("shared-fuel fixture unexpectedly waited")
+                    }
                     NativeAsyncPoll::Trapped(trap) => panic!("high-budget call trapped: {trap:?}"),
                 }
             };
@@ -2733,6 +3591,9 @@ mod tests {
                 NativeAsyncPoll::Pending(_)
                 | NativeAsyncPoll::Resolved(_)
                 | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("shared-fuel fixture unexpectedly waited")
+                }
             }
         };
         assert_eq!(trap, TrapCode::FuelExhausted);

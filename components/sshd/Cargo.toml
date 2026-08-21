@@ -6,6 +6,9 @@ edition = "2021"
 [features]
 default = []
 qualification-stream = []
+# Target-only coordination for the C5.4c managed-native revoke gate. The
+# production/Milk-V Platform surface remains default-open when this is absent.
+native-revoke-target-acceptance = []
 
 [dependencies]
 vibeos-core = { path = "../../core" }

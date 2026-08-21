@@ -4875,6 +4875,31 @@ mod tests {
             }
             other => panic!("consumed continuation did not return an exact receipt: {other:?}"),
         }
+        mutate_active_record_for_test(&registry, token, |record| {
+            let generation = record
+                .continuation
+                .generation
+                .checked_add(1)
+                .expect("continuation generation exhausted in directed stale-token test");
+            record.continuation.generation = generation;
+            record
+                .continuation
+                .seal
+                .as_mut()
+                .expect("consumed continuation lost its exact seal")
+                .operation_generation = generation;
+        });
+        let successor = registry.slot(token).unwrap().record.lock().continuation;
+        assert_eq!(
+            registry.signal_continuation(operation),
+            InstanceContinuationSignal::Stale,
+            "an older operation generation must not receive the current consumed receipt"
+        );
+        assert_eq!(
+            registry.slot(token).unwrap().record.lock().continuation,
+            successor,
+            "a stale signal must be inert for the exact current continuation"
+        );
         assert_eq!(
             registry
                 .slot(token)

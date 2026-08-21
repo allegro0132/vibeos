@@ -1204,6 +1204,10 @@ mod tests {
         count.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn test_wake(count: &Arc<core::sync::atomic::AtomicUsize>) -> HostWakeToken {
+        HostWakeToken::new([Arc::as_ptr(count) as usize, 0, 0, 0], count_test_wake)
+    }
+
     #[test]
     fn local_generation_exhaustion_never_wraps_or_reuses_zero() {
         let counter = AtomicU64::new(u64::MAX);
@@ -1293,6 +1297,115 @@ mod tests {
     }
 
     #[test]
+    fn wrong_supervisor_and_rotated_token_are_inert() {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let supervisor = stream.supervisor();
+        let StreamReceiveDispatch::Waiting(old) = reader.start().unwrap() else {
+            panic!("empty stream must publish a reader wait")
+        };
+
+        let foreign_stream = ByteStream::new();
+        let foreign_reader = foreign_stream.reader();
+        let foreign_supervisor = foreign_stream.supervisor();
+        let StreamReceiveDispatch::Waiting(foreign) = foreign_reader.start().unwrap() else {
+            panic!("empty foreign stream must publish a reader wait")
+        };
+        assert_eq!(
+            foreign_supervisor.cancel_reader_operation_exact(old),
+            Err(StreamError::TokenMismatch)
+        );
+        foreign_supervisor
+            .cancel_reader_operation_exact(foreign)
+            .expect("foreign cancellation changed its exact current operation");
+
+        let StreamReceiveDispatch::Waiting(current) = reader.resume(old).unwrap() else {
+            panic!("an empty resumed reader must rotate to a fresh wait")
+        };
+        assert_ne!(old, current);
+        assert_eq!(
+            supervisor.cancel_reader_operation_exact(old),
+            Err(StreamError::TokenMismatch)
+        );
+        supervisor
+            .cancel_reader_operation_exact(current)
+            .expect("stale cancellation changed the exact current operation");
+        assert_eq!(stream.depth(), 0);
+        assert_eq!(stream.final_reason(), None);
+        assert!(!stream.is_fail_stopped());
+    }
+
+    #[test]
+    fn exact_cancellation_drops_registered_wakes_without_invoking_them() {
+        let reader_stream = ByteStream::new();
+        let reader = reader_stream.reader();
+        let writer = reader_stream.writer();
+        let supervisor = reader_stream.supervisor();
+        let reader_wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamReceiveDispatch::Waiting(reader_operation) = reader.start().unwrap() else {
+            panic!("empty stream must publish a reader wait")
+        };
+        reader
+            .register_wake(reader_operation, test_wake(&reader_wakes))
+            .unwrap();
+        supervisor
+            .cancel_reader_operation_exact(reader_operation)
+            .unwrap();
+        assert_eq!(reader_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.start(&[1]), Ok(StreamSendDispatch::Sent));
+        assert_eq!(reader_wakes.load(Ordering::SeqCst), 0);
+
+        let writer_stream = ByteStream::new();
+        let reader = writer_stream.reader();
+        let writer = writer_stream.writer();
+        let supervisor = writer_stream.supervisor();
+        for byte in 0..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[byte as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let writer_wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamSendDispatch::Waiting(writer_operation) = writer.start(&[0xff]).unwrap() else {
+            panic!("a full stream must publish a writer wait")
+        };
+        writer
+            .register_wake(writer_operation, test_wake(&writer_wakes))
+            .unwrap();
+        supervisor
+            .cancel_writer_operation_exact(writer_operation)
+            .unwrap();
+        assert_eq!(writer_wakes.load(Ordering::SeqCst), 0);
+        let StreamReceiveDispatch::Prepared(prepared) = reader.start().unwrap() else {
+            panic!("the full stream must expose its front chunk")
+        };
+        let mut output = [0_u8];
+        assert_eq!(
+            reader.commit(prepared.operation(), &mut output),
+            Ok(StreamReceiveCommit::Received(1))
+        );
+        assert_eq!(writer_wakes.load(Ordering::SeqCst), 0);
+
+        let terminal_stream = ByteStream::new();
+        let terminal_supervisor = terminal_stream.supervisor();
+        let terminal_wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamTerminalDispatch::Waiting(terminal_operation) =
+            terminal_supervisor.start_terminal().unwrap()
+        else {
+            panic!("open stream must publish a terminal wait")
+        };
+        terminal_supervisor
+            .register_terminal_wake(terminal_operation, test_wake(&terminal_wakes))
+            .unwrap();
+        terminal_supervisor
+            .cancel_terminal(terminal_operation)
+            .unwrap();
+        assert_eq!(terminal_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            terminal_supervisor.finalize(StreamCloseReason::Failure),
+            StreamCloseOutcome::Published
+        );
+        assert_eq!(terminal_wakes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn close_observation_has_no_reason_when_fail_stop_precedes_publication() {
         let stream = ByteStream::new();
         let supervisor = stream.supervisor();
@@ -1316,6 +1429,23 @@ mod tests {
         let supervisor = stream.supervisor();
 
         let first = supervisor.finalize_preserving_first_observed(StreamCloseReason::Failure);
+        assert_eq!(first.outcome(), StreamCloseOutcome::Published);
+        assert_eq!(first.effective_reason(), Some(StreamCloseReason::Failure));
+
+        let late = supervisor.finalize_preserving_first_observed(StreamCloseReason::Cancelled);
+        assert_eq!(late.outcome(), StreamCloseOutcome::AlreadyPublished);
+        assert_eq!(late.effective_reason(), Some(StreamCloseReason::Failure));
+        assert_eq!(stream.final_reason(), Some(StreamCloseReason::Failure));
+        assert!(!stream.is_fail_stopped());
+    }
+
+    #[test]
+    fn endpoint_close_first_winner_survives_late_lifecycle_finalization() {
+        let stream = ByteStream::new();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+
+        let first = writer.close_observed(StreamCloseReason::Failure);
         assert_eq!(first.outcome(), StreamCloseOutcome::Published);
         assert_eq!(first.effective_reason(), Some(StreamCloseReason::Failure));
 

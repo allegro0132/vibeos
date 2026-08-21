@@ -2146,6 +2146,25 @@ impl<
         }
     }
 
+    /// Read-only fail-stop evidence for an exact identity. Quarantine blocks
+    /// every mutating protocol operation, but the trusted acceptance auditor
+    /// must still be able to prove which endpoint latch accompanied the
+    /// irreversible effect that forced quarantine.
+    pub(crate) fn quarantined_resource_state(
+        &self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        resource: ExactStreamResource,
+    ) -> Option<ExactResourceState> {
+        if !self.quarantined || self.identity != Some(identity) {
+            return None;
+        }
+        Some(match self.resources[resource.index()] {
+            ResourceLatch::Live => ExactResourceState::Live,
+            ResourceLatch::Revoking(_) => ExactResourceState::Revoking,
+            ResourceLatch::Revoked(_) => ExactResourceState::Revoked,
+        })
+    }
+
     pub(crate) fn quarantine(&mut self) {
         self.quarantined = true;
     }
@@ -3384,6 +3403,10 @@ mod tests {
         );
         assert_eq!(ledger.phase(), ExactLedgerPhase::Quarantined);
         assert_eq!(ledger.quarantined_effect(), Some(effect));
+        assert_eq!(
+            ledger.quarantined_resource_state(identity, ExactStreamResource::StdoutWriter),
+            Some(ExactResourceState::Revoking)
+        );
     }
 
     #[test]
@@ -4346,14 +4369,18 @@ mod tests {
     }
 
     #[test]
-    fn typed_consumed_projection_survives_the_exact_cancel_claim_race() {
+    fn core_consumed_before_revoke_projects_through_the_exact_cancel_claim() {
         let identity = exact_identity(45);
         let mut ledger = TestLedger::new();
         ledger.bind(identity).unwrap();
         let registered = registered_output_operation(&mut ledger, identity, 1_050, 1_060, 1_070, 4);
+        // Core has already returned this exact typed receipt to the task, but
+        // the SYSTEM ledger must remain WakeRegistered until that receipt is
+        // projected under its own lock.
+        let typed_consumed_receipt = 1_070;
         assert_eq!(
             registered.continuation(),
-            ExactContinuation::WakeRegistered(1_070)
+            ExactContinuation::WakeRegistered(typed_consumed_receipt)
         );
         let plan = match ledger
             .claim_revoke(identity, ExactStreamResource::StdoutWriter)
@@ -4362,15 +4389,25 @@ mod tests {
             ExactRevokeDecision::Cancel(plan) => plan,
             other => panic!("pending operation must cancel, got {other:?}"),
         };
+        assert_eq!(
+            plan.continuation(),
+            ExactContinuation::WakeRegistered(typed_consumed_receipt)
+        );
         let consumed = ledger
-            .project_consumed_continuation(identity, 1_070)
+            .project_consumed_continuation(identity, typed_consumed_receipt)
             .unwrap();
-        assert_eq!(consumed.continuation(), ExactContinuation::Consumed(1_070));
+        assert_eq!(
+            consumed.continuation(),
+            ExactContinuation::Consumed(typed_consumed_receipt)
+        );
         ledger
             .finish_cap_revoke(plan.resource_revoke_plan())
             .unwrap();
         let cancelled = ledger.finish_cancel(plan).unwrap();
-        assert_eq!(cancelled.continuation(), ExactContinuation::Consumed(1_070));
+        assert_eq!(
+            cancelled.continuation(),
+            ExactContinuation::Consumed(typed_consumed_receipt)
+        );
         let acknowledged = ledger
             .acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Cancelled)
             .unwrap();
@@ -4558,5 +4595,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(offered.phase(), ExactLedgerPhase::RuntimeOffered);
+    }
+
+    #[test]
+    fn invoking_and_linearized_revoke_fault_races_fail_closed() {
+        let identity = exact_identity(52);
+
+        let mut invoking_revoke = TestLedger::new();
+        invoking_revoke.bind(identity).unwrap();
+        let prepared = prepared_operation(
+            &mut invoking_revoke,
+            identity,
+            1_200,
+            1_201,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        let invoking = invoking_revoke
+            .begin_backend(prepared, ExactBackendAction::Start)
+            .unwrap();
+        assert!(matches!(
+            invoking_revoke
+                .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+                .unwrap(),
+            ExactRevokeDecision::Deferred(_)
+        ));
+        assert_eq!(invoking_revoke.phase(), ExactLedgerPhase::BackendInvoking);
+        assert_eq!(
+            invoking_revoke.resource_state(identity, ExactStreamResource::StdoutWriter),
+            Ok(ExactResourceState::Revoking)
+        );
+        let effect = BackendEffect::OutputSent { length: 1 };
+        assert_eq!(
+            invoking_revoke.backend_linearized(invoking, effect),
+            Err(ExactLedgerError::Quarantined)
+        );
+        assert_eq!(invoking_revoke.quarantined_effect(), Some(effect));
+
+        let mut invoking_fault = TestLedger::new();
+        invoking_fault.bind(identity).unwrap();
+        let prepared = prepared_operation(
+            &mut invoking_fault,
+            identity,
+            1_210,
+            1_211,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        let _invoking = invoking_fault
+            .begin_backend(prepared, ExactBackendAction::Start)
+            .unwrap();
+        assert_eq!(
+            invoking_fault.raw_fault(identity),
+            Ok(ExactCleanupDecision::Quarantined)
+        );
+        assert!(invoking_fault.is_quarantined());
+
+        let mut linearized_revoke = TestLedger::new();
+        linearized_revoke.bind(identity).unwrap();
+        let prepared = prepared_operation(
+            &mut linearized_revoke,
+            identity,
+            1_220,
+            1_221,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        let invoking = linearized_revoke
+            .begin_backend(prepared, ExactBackendAction::Start)
+            .unwrap();
+        let effect = BackendEffect::OutputSent { length: 1 };
+        let _linearized = linearized_revoke
+            .backend_linearized(invoking, effect)
+            .unwrap();
+        assert_eq!(
+            linearized_revoke.claim_revoke(identity, ExactStreamResource::StdoutWriter),
+            Err(ExactLedgerError::InvalidTransition)
+        );
+        assert_eq!(linearized_revoke.quarantined_effect(), Some(effect));
+
+        let mut linearized_fault = TestLedger::new();
+        linearized_fault.bind(identity).unwrap();
+        let prepared = prepared_operation(
+            &mut linearized_fault,
+            identity,
+            1_230,
+            1_231,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        let invoking = linearized_fault
+            .begin_backend(prepared, ExactBackendAction::Start)
+            .unwrap();
+        let effect = BackendEffect::OutputSent { length: 1 };
+        let _linearized = linearized_fault
+            .backend_linearized(invoking, effect)
+            .unwrap();
+        assert_eq!(
+            linearized_fault.raw_fault(identity),
+            Ok(ExactCleanupDecision::Quarantined)
+        );
+        assert_eq!(linearized_fault.quarantined_effect(), Some(effect));
+    }
+
+    #[test]
+    fn retired_and_restarted_stale_events_never_consume_or_pollute_replacement() {
+        let mut ledger = TestLedger::new();
+        let old = exact_identity(53);
+        ledger.bind(old).unwrap();
+        ledger.acknowledge_runtime_owner_drop(old).unwrap();
+        ledger.retire(old).unwrap();
+        assert_eq!(ledger.snapshot(old), Err(ExactLedgerError::StaleGeneration));
+        assert_eq!(ledger.bind(old), Err(ExactLedgerError::StaleGeneration));
+        assert!(!ledger.is_quarantined());
+
+        let mut replacement = exact_identity(54);
+        replacement.instance = 0x5511;
+        replacement.task = 0x6622;
+        replacement.domain = 0x7733;
+        replacement.bindings = 0x8844;
+        ledger.bind(replacement).unwrap();
+        let registered =
+            registered_output_operation(&mut ledger, replacement, 1_240, 1_250, 1_260, 2);
+        assert_eq!(
+            registered.continuation(),
+            ExactContinuation::WakeRegistered(1_260)
+        );
+
+        assert_eq!(
+            ledger.project_consumed_continuation(old, 1_260),
+            Err(ExactLedgerError::StaleGeneration)
+        );
+        assert_eq!(
+            ledger.claim_revoke(old, ExactStreamResource::StdoutWriter),
+            Err(ExactLedgerError::StaleGeneration)
+        );
+        assert_eq!(
+            ledger.raw_fault(old),
+            Err(ExactLedgerError::StaleGeneration)
+        );
+        assert_eq!(ledger.snapshot(replacement), Ok(Some(registered)));
+        assert_eq!(
+            ledger.resource_state(replacement, ExactStreamResource::StdoutWriter),
+            Ok(ExactResourceState::Live)
+        );
+        assert!(!ledger.is_quarantined());
+
+        let consumed = ledger
+            .project_consumed_continuation(replacement, 1_260)
+            .unwrap();
+        let invoking = ledger
+            .begin_backend(consumed, ExactBackendAction::Resume)
+            .unwrap();
+        let sent = ledger
+            .backend_linearized(invoking, BackendEffect::OutputSent { length: 2 })
+            .unwrap();
+        ledger.commit_runtime(sent).unwrap();
+        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
     }
 }

@@ -33,6 +33,8 @@ use sunset::{
     ChanData, ChanFail, ChanHandle, Ed25519HostSigner, Event, PubKey, Runner, ServEvent, Server,
     TerminalSize,
 };
+#[cfg(feature = "native-revoke-target-acceptance")]
+use vibeos_component_host::STREAM_BUFFER_CHUNKS;
 use vibeos_component_host::{
     ByteStreamReader, ByteStreamWriter, StreamCloseOutcome, StreamCloseReason, StreamError,
     StreamPreparedReceive, StreamReceiveCommit, StreamReceiveDispatch, StreamSendDispatch,
@@ -315,6 +317,27 @@ pub trait Platform: Sync {
     /// platforms need no completion observer; target gates can correlate this
     /// descriptor and status with private lifecycle evidence.
     fn ssh_exec_component_completed(&self, _policy: SshExecComponentSessionPolicy, _status: u32) {}
+    /// Gate Component stdout consumption for the isolated C5.4c target image.
+    /// The default is permanently open. The managed pump rechecks this gate on
+    /// each bounded network/deadline turn; a target transition is monotonic for
+    /// one accepted exec request.
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    fn ssh_exec_component_stdout_drain_permitted(
+        &self,
+        _policy: SshExecComponentSessionPolicy,
+    ) -> bool {
+        true
+    }
+    /// Bound the next SSH-to-Component stdin chunk for the isolated C5.4c
+    /// target. Production retains the normal 1 KiB stream chunk exactly.
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    fn ssh_exec_component_stdin_chunk_limit(
+        &self,
+        _policy: SshExecComponentSessionPolicy,
+        _accepted_bytes: usize,
+    ) -> Result<usize, &'static str> {
+        Ok(MAX_STREAM_CHUNK_BYTES)
+    }
     #[cfg(feature = "qualification-stream")]
     fn accepts_streaming_exec(&self, _command: &str) -> bool {
         false
@@ -913,10 +936,17 @@ struct PendingComponentInput {
 }
 
 struct PendingComponentOutput {
-    bytes: [u8; MAX_STREAM_CHUNK_BYTES],
+    bytes: [u8; COMPONENT_STDOUT_PENDING_BYTES],
     length: usize,
     offset: usize,
 }
+
+#[cfg(feature = "native-revoke-target-acceptance")]
+const COMPONENT_STDOUT_PENDING_BYTES: usize = MAX_STREAM_CHUNK_BYTES * STREAM_BUFFER_CHUNKS;
+#[cfg(feature = "native-revoke-target-acceptance")]
+const NATIVE_REVOKE_PREFETCH_BYTES: usize = 7 * MAX_STREAM_CHUNK_BYTES;
+#[cfg(not(feature = "native-revoke-target-acceptance"))]
+const COMPONENT_STDOUT_PENDING_BYTES: usize = MAX_STREAM_CHUNK_BYTES;
 
 /// The SSH-owned half of one admitted Component transport.
 ///
@@ -930,9 +960,19 @@ struct ComponentStreamPump {
     stdout: Arc<ByteStreamReader>,
     stdin_pending: Option<PendingComponentInput>,
     stdin_source_closed: bool,
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    stdin_accepted_bytes: usize,
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    stdin_staging: [u8; MAX_STREAM_CHUNK_BYTES],
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    stdin_staging_length: usize,
     stdout_waiting: Option<HostOperationToken>,
     stdout_pending: Option<PendingComponentOutput>,
     stdout_terminal: Option<StreamCloseReason>,
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    stdout_ring_prefetched: bool,
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    stdout_drain_was_blocked: bool,
 }
 
 impl ComponentStreamPump {
@@ -946,9 +986,19 @@ impl ComponentStreamPump {
             stdout,
             stdin_pending: None,
             stdin_source_closed: false,
+            #[cfg(feature = "native-revoke-target-acceptance")]
+            stdin_accepted_bytes: 0,
+            #[cfg(feature = "native-revoke-target-acceptance")]
+            stdin_staging: [0; MAX_STREAM_CHUNK_BYTES],
+            #[cfg(feature = "native-revoke-target-acceptance")]
+            stdin_staging_length: 0,
             stdout_waiting: None,
             stdout_pending: None,
             stdout_terminal: None,
+            #[cfg(feature = "native-revoke-target-acceptance")]
+            stdout_ring_prefetched: false,
+            #[cfg(feature = "native-revoke-target-acceptance")]
+            stdout_drain_was_blocked: false,
         }
     }
 
@@ -958,6 +1008,24 @@ impl ComponentStreamPump {
 
     fn stdin_source_closed(&self) -> bool {
         self.stdin_source_closed
+    }
+
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    fn stdin_accepted_bytes(&self) -> usize {
+        self.stdin_accepted_bytes
+    }
+
+    fn record_stdin_accepted(&mut self, length: usize) -> Result<(), &'static str> {
+        #[cfg(feature = "native-revoke-target-acceptance")]
+        {
+            self.stdin_accepted_bytes = self
+                .stdin_accepted_bytes
+                .checked_add(length)
+                .ok_or("SSH Component stdin byte accounting overflowed")?;
+        }
+        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        let _ = length;
+        Ok(())
     }
 
     fn send_stdin(&mut self, bytes: &[u8]) -> Result<bool, &'static str> {
@@ -973,7 +1041,10 @@ impl ComponentStreamPump {
         let mut retained = [0u8; MAX_STREAM_CHUNK_BYTES];
         retained[..bytes.len()].copy_from_slice(bytes);
         match self.stdin.start(bytes).map_err(component_stream_error)? {
-            StreamSendDispatch::Sent => Ok(true),
+            StreamSendDispatch::Sent => {
+                self.record_stdin_accepted(bytes.len())?;
+                Ok(true)
+            }
             StreamSendDispatch::Waiting(operation) => {
                 self.stdin_pending = Some(PendingComponentInput {
                     operation,
@@ -1004,6 +1075,7 @@ impl ComponentStreamPump {
             .map_err(component_stream_error)?
         {
             StreamSendDispatch::Sent => {
+                self.record_stdin_accepted(pending.length)?;
                 self.stdin_pending = None;
                 Ok(true)
             }
@@ -1068,7 +1140,7 @@ impl ComponentStreamPump {
             let _ = self.stdout.cancel(prepared.operation());
             return Err("SSH Component stdout prepared an invalid chunk");
         }
-        let mut bytes = [0u8; MAX_STREAM_CHUNK_BYTES];
+        let mut bytes = [0u8; COMPONENT_STDOUT_PENDING_BYTES];
         match self
             .stdout
             .commit(prepared.operation(), &mut bytes[..length])
@@ -1095,6 +1167,106 @@ impl ComponentStreamPump {
                 self.stdout_terminal = Some(reason);
                 Ok(true)
             }
+        }
+    }
+
+    /// Move one exact full stream-ring generation into SSH-owned storage in a
+    /// single parent-task poll. The managed child is non-stealable and bound
+    /// to this task's queue/hart, so the first commit may enqueue its writer
+    /// continuation but cannot poll it until this synchronous loop returns and
+    /// the parent cooperates. All eight production receive operations therefore
+    /// linearize before the child can request the cross-hart revoke worker.
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    fn prefetch_stdout_ring(&mut self) -> Result<bool, &'static str> {
+        if self.stdout_pending.is_some() || self.stdout_terminal.is_some() {
+            return Ok(false);
+        }
+        let mut pending = PendingComponentOutput {
+            bytes: [0; COMPONENT_STDOUT_PENDING_BYTES],
+            length: 0,
+            offset: 0,
+        };
+        let mut chunks = 0usize;
+        for _ in 0..STREAM_BUFFER_CHUNKS {
+            let dispatch = match self.stdout_waiting.take() {
+                Some(operation) => self
+                    .stdout
+                    .resume(operation)
+                    .map_err(component_stream_error)?,
+                None => self.stdout.start().map_err(component_stream_error)?,
+            };
+            let StreamReceiveDispatch::Prepared(prepared) = dispatch else {
+                match dispatch {
+                    StreamReceiveDispatch::Waiting(operation) => {
+                        self.stdout_waiting = Some(operation);
+                    }
+                    StreamReceiveDispatch::Closed(reason) => {
+                        self.stdout_terminal = Some(reason);
+                    }
+                    StreamReceiveDispatch::Prepared(_) => unreachable!(),
+                }
+                break;
+            };
+            let length = prepared.length();
+            if length == 0
+                || length > MAX_STREAM_CHUNK_BYTES
+                || pending.length.saturating_add(length) > pending.bytes.len()
+            {
+                let _ = self.stdout.cancel(prepared.operation());
+                return Err("SSH native revoke stdout prefetch chunk was invalid");
+            }
+            match self
+                .stdout
+                .commit(
+                    prepared.operation(),
+                    &mut pending.bytes[pending.length..pending.length + length],
+                )
+                .map_err(component_stream_error)?
+            {
+                StreamReceiveCommit::Received(received) if received == length => {
+                    pending.length += received;
+                    chunks += 1;
+                }
+                StreamReceiveCommit::Received(_) => {
+                    return Err("SSH native revoke stdout prefetch length changed");
+                }
+                StreamReceiveCommit::Closed(reason) => {
+                    self.stdout
+                        .cancel(prepared.operation())
+                        .map_err(component_stream_error)?;
+                    self.stdout_terminal = Some(reason);
+                    break;
+                }
+            }
+        }
+        if chunks != STREAM_BUFFER_CHUNKS {
+            return Err("SSH native revoke stdout ring chunk count was not exact");
+        }
+        if pending.length != NATIVE_REVOKE_PREFETCH_BYTES {
+            return Err("SSH native revoke stdout ring byte count was not exact");
+        }
+        if self.stdout_waiting.is_some() {
+            return Err("SSH native revoke stdout ring unexpectedly waited");
+        }
+        if self.stdout_terminal.is_some() {
+            return Err("SSH native revoke stdout ring terminated during prefetch");
+        }
+        self.stdout_pending = Some(pending);
+        self.stdout_ring_prefetched = true;
+        Ok(true)
+    }
+
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    fn note_stdout_drain_blocked(&mut self) {
+        self.stdout_drain_was_blocked = true;
+    }
+
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    fn poll_stdout_target(&mut self) -> Result<bool, &'static str> {
+        if self.stdout_drain_was_blocked && !self.stdout_ring_prefetched {
+            self.prefetch_stdout_ring()
+        } else {
+            self.poll_stdout()
         }
     }
 
@@ -2505,7 +2677,12 @@ fn pump_component_stdin_turn(
     pump: &mut ComponentStreamPump,
     runner: &mut Runner<'_, Server>,
     state: &ProtocolState,
+    maximum: usize,
+    one_send_attempt: bool,
 ) -> Result<bool, &'static str> {
+    if maximum == 0 || maximum > MAX_STREAM_CHUNK_BYTES {
+        return Err("SSH Component stdin chunk limit was invalid");
+    }
     if pump.stdin_source_closed() {
         return Ok(false);
     }
@@ -2526,7 +2703,72 @@ fn pump_component_stdin_turn(
             // Cancelled terminal cannot be downgraded to a transport reset.
             return Ok(true);
         }
+        if one_send_attempt {
+            return Ok(true);
+        }
     }
+
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    if one_send_attempt {
+        if pump.stdin_staging_length > maximum {
+            return Err("SSH Component stdin staging exceeded its exact chunk");
+        }
+        for _ in 0..MAX_CHANNEL_DISCARDS_PER_TURN {
+            let remaining = maximum.saturating_sub(pump.stdin_staging_length);
+            if remaining == 0 {
+                break;
+            }
+            let Some((number, data, ready)) = runner.read_channel_ready() else {
+                break;
+            };
+            let channel = state
+                .channel
+                .as_ref()
+                .ok_or("data arrived without an accepted Component channel")?;
+            if channel.num() != number {
+                return Err("data arrived on an unowned Component channel");
+            }
+            if data != ChanData::Normal {
+                return Err("extended data is not valid Component stdin");
+            }
+            let length = ready.min(remaining);
+            let read = runner
+                .read_channel(
+                    channel,
+                    ChanData::Normal,
+                    &mut pump.stdin_staging
+                        [pump.stdin_staging_length..pump.stdin_staging_length + length],
+                )
+                .map_err(|_| "failed to read SSH Component stdin")?;
+            if read == 0 {
+                break;
+            }
+            pump.stdin_staging_length += read;
+            worked = true;
+        }
+
+        let channel = state
+            .channel
+            .as_ref()
+            .ok_or("accepted Component session lost its channel")?;
+        let eof = runner.read_channel_ready().is_none() && runner.is_channel_eof(channel);
+        if pump.stdin_staging_length == maximum || (eof && pump.stdin_staging_length != 0) {
+            let length = pump.stdin_staging_length;
+            let staged = pump.stdin_staging;
+            worked |= pump.send_stdin(&staged[..length])?;
+            pump.stdin_staging_length = 0;
+        }
+        if !pump.stdin_source_closed()
+            && !pump.has_pending_stdin()
+            && pump.stdin_staging_length == 0
+            && eof
+        {
+            worked |= pump.close_stdin_normal()?;
+        }
+        return Ok(worked);
+    }
+    #[cfg(not(feature = "native-revoke-target-acceptance"))]
+    let _ = one_send_attempt;
 
     let mut chunk = [0u8; MAX_STREAM_CHUNK_BYTES];
     for _ in 0..MAX_CHANNEL_DISCARDS_PER_TURN {
@@ -2543,7 +2785,7 @@ fn pump_component_stdin_turn(
         if data != ChanData::Normal {
             return Err("extended data is not valid Component stdin");
         }
-        let length = ready.min(chunk.len());
+        let length = ready.min(chunk.len()).min(maximum);
         let read = runner
             .read_channel(channel, ChanData::Normal, &mut chunk[..length])
             .map_err(|_| "failed to read SSH Component stdin")?;
@@ -2597,7 +2839,14 @@ fn pump_component_stdout_turn(
         }
     }
     if pump.pending_stdout().is_empty() && pump.stdout_terminal().is_none() {
-        worked |= pump.poll_stdout()?;
+        #[cfg(feature = "native-revoke-target-acceptance")]
+        {
+            worked |= pump.poll_stdout_target()?;
+        }
+        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        {
+            worked |= pump.poll_stdout()?;
+        }
     }
     Ok(worked)
 }
@@ -3482,6 +3731,7 @@ async fn execute_with_network(
         return execute_managed_component_with_network(
             &mut session,
             command,
+            accepted_component.expect("managed Component pump lost its accepted policy"),
             cancel,
             pump,
             runner,
@@ -3617,6 +3867,7 @@ async fn execute_with_network(
 async fn execute_managed_component_with_network(
     session: &mut vibeos_vsh::Session,
     command: &str,
+    _accepted_policy: SshExecComponentSessionPolicy,
     cancel: Arc<vibeos_vsh::CancellationSignal>,
     io: vibeos_vsh::SshExecComponentIoPump,
     runner: &mut Runner<'_, Server>,
@@ -3770,7 +4021,41 @@ async fn execute_managed_component_with_network(
             continue;
         }
 
-        let input_work = match pump_component_stdin_turn(&mut pump, runner, protocol) {
+        #[cfg(feature = "native-revoke-target-acceptance")]
+        let stdin_chunk_limit = match space
+            .ssh_exec_component_stdin_chunk_limit(_accepted_policy, pump.stdin_accepted_bytes())
+        {
+            Ok(limit) => limit,
+            Err(reason) => {
+                if let Some(end) = arm_managed_component_cancellation(
+                    completed.is_some(),
+                    &cancel,
+                    &mut cancellation,
+                    ExecutionCancellation::Reset(reason),
+                    now + CANCEL_GRACE_MS,
+                ) {
+                    break end;
+                }
+                continue;
+            }
+        };
+        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        let stdin_chunk_limit = MAX_STREAM_CHUNK_BYTES;
+        #[cfg(feature = "native-revoke-target-acceptance")]
+        let drain_permitted = space.ssh_exec_component_stdout_drain_permitted(_accepted_policy);
+        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        let drain_permitted = true;
+        #[cfg(feature = "native-revoke-target-acceptance")]
+        let stage_exact_stdin = stdin_chunk_limit < MAX_STREAM_CHUNK_BYTES || !drain_permitted;
+        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        let stage_exact_stdin = false;
+        let input_work = match pump_component_stdin_turn(
+            &mut pump,
+            runner,
+            protocol,
+            stdin_chunk_limit,
+            stage_exact_stdin,
+        ) {
             Ok(worked) => worked,
             Err(reason) => {
                 if let Some(end) = arm_managed_component_cancellation(
@@ -3785,20 +4070,26 @@ async fn execute_managed_component_with_network(
                 continue;
             }
         };
-        let output_work = match pump_component_stdout_turn(&mut pump, runner, protocol) {
-            Ok(worked) => worked,
-            Err(reason) => {
-                if let Some(end) = arm_managed_component_cancellation(
-                    completed.is_some(),
-                    &cancel,
-                    &mut cancellation,
-                    ExecutionCancellation::Reset(reason),
-                    now + CANCEL_GRACE_MS,
-                ) {
-                    break end;
+        let output_work = if drain_permitted {
+            match pump_component_stdout_turn(&mut pump, runner, protocol) {
+                Ok(worked) => worked,
+                Err(reason) => {
+                    if let Some(end) = arm_managed_component_cancellation(
+                        completed.is_some(),
+                        &cancel,
+                        &mut cancellation,
+                        ExecutionCancellation::Reset(reason),
+                        now + CANCEL_GRACE_MS,
+                    ) {
+                        break end;
+                    }
+                    continue;
                 }
-                continue;
             }
+        } else {
+            #[cfg(feature = "native-revoke-target-acceptance")]
+            pump.note_stdout_drain_blocked();
+            false
         };
 
         if let (Some(expected), Some(observed)) = (expected_terminal, pump.stdout_terminal()) {
@@ -3824,6 +4115,28 @@ async fn execute_managed_component_with_network(
                 signal,
                 ProtocolSignal::Progressed | ProtocolSignal::Interrupt
             );
+        #[cfg(feature = "native-revoke-target-acceptance")]
+        if completed.is_none() {
+            if let Some(reports) = wait_for_execution_turn(
+                execution.as_mut(),
+                worked && drain_permitted,
+                wire.next_poll_delay_ms,
+                Some(execution_deadline),
+            )
+            .await
+            {
+                let terminal = match validated_managed_component_terminal(&reports) {
+                    Ok(terminal) => terminal,
+                    Err(reason) => break ExecutionEnd::Reset(reason),
+                };
+                expected_terminal = Some(terminal.stream_close_reason());
+                drain_deadline = Some(monotonic_ms().saturating_add(CLOSE_TIMEOUT_MS));
+                completed = Some(reports);
+            }
+        } else {
+            cooperate(worked && drain_permitted, wire.next_poll_delay_ms).await;
+        }
+        #[cfg(not(feature = "native-revoke-target-acceptance"))]
         if completed.is_none() {
             if let Some(reports) = wait_for_execution_turn(
                 execution.as_mut(),
@@ -4457,6 +4770,71 @@ mod tests {
             retained_reader.start(),
             Ok(StreamReceiveDispatch::Closed(StreamCloseReason::Failure))
         );
+    }
+
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    #[test]
+    fn native_revoke_prefetch_retains_exact_output_after_cancelled_terminal() {
+        let stdin_stream = ByteStream::new();
+        let stdout_stream = ByteStream::new();
+        let component_output = stdout_stream.writer();
+        let stdout_supervisor = stdout_stream.supervisor();
+        let mut pump =
+            ComponentStreamPump::from_endpoints(stdin_stream.writer(), stdout_stream.reader());
+        let lengths = [257, 767, 1024, 1024, 1024, 1024, 1024, 1024];
+        let mut expected = [0u8; NATIVE_REVOKE_PREFETCH_BYTES];
+        let mut expected_bytes = 0usize;
+        for (index, length) in lengths.into_iter().enumerate() {
+            let chunk = [0x40 | index as u8; MAX_STREAM_CHUNK_BYTES];
+            assert_eq!(
+                component_output.start(&chunk[..length]),
+                Ok(StreamSendDispatch::Sent)
+            );
+            expected[expected_bytes..expected_bytes + length].copy_from_slice(&chunk[..length]);
+            expected_bytes += length;
+        }
+        assert_eq!(expected_bytes, NATIVE_REVOKE_PREFETCH_BYTES);
+        let StreamSendDispatch::Waiting(ninth) = component_output
+            .start(&[0xfe; MAX_STREAM_CHUNK_BYTES])
+            .unwrap()
+        else {
+            panic!("native revoke fixture did not retain its ninth writer")
+        };
+
+        pump.note_stdout_drain_blocked();
+        assert!(pump.poll_stdout_target().unwrap());
+        assert_eq!(pump.pending_stdout(), expected);
+        assert_eq!(stdout_stream.depth(), 0);
+        stdout_supervisor
+            .cancel_writer_operation_exact(ninth)
+            .unwrap();
+        assert_eq!(
+            stdout_supervisor.finalize(StreamCloseReason::Cancelled),
+            StreamCloseOutcome::Published
+        );
+
+        assert!(!pump.consume_stdout(2_000).unwrap());
+        assert_eq!(pump.pending_stdout(), &expected[2_000..]);
+        let remaining = pump.pending_stdout().len();
+        assert!(pump.consume_stdout(remaining).unwrap());
+        assert!(pump.poll_stdout_target().unwrap());
+        assert_eq!(pump.stdout_terminal(), Some(StreamCloseReason::Cancelled));
+    }
+
+    #[cfg(feature = "native-revoke-target-acceptance")]
+    #[test]
+    fn target_feature_keeps_unblocked_component_stdout_on_normal_single_chunk_path() {
+        let stdin_stream = ByteStream::new();
+        let stdout_stream = ByteStream::new();
+        let component_output = stdout_stream.writer();
+        let mut pump =
+            ComponentStreamPump::from_endpoints(stdin_stream.writer(), stdout_stream.reader());
+        let chunk = [0x53, 0x54, 0x41, 0x42, 0x4c, 0x45];
+
+        assert_eq!(component_output.start(&chunk), Ok(StreamSendDispatch::Sent));
+        assert!(pump.poll_stdout_target().unwrap());
+        assert_eq!(pump.pending_stdout(), chunk);
+        assert!(!pump.stdout_ring_prefetched);
     }
 
     #[test]

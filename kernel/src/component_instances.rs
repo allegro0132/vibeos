@@ -1423,7 +1423,10 @@ impl ControlGate {
         true
     }
 
-    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    #[cfg(any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ))]
     fn target_cleanup_shadow_residue(&self) -> usize {
         self.cleanup_shadow
             .iter()
@@ -4044,25 +4047,41 @@ fn publish_payload_terminal(
     if !lifecycle_is_healthy() {
         return PayloadTerminalPublish::Failed;
     }
-
-    // Reacquire the complete current-task registry proof and both exact endpoint
-    // types before publishing any terminal candidate. Ordinary cap revocation
-    // attenuates the candidate to Denied; seal/type/rights corruption fail-stops.
-    let terminal = match with_active_reader(token, streams, |_, _| ()) {
-        Ok(()) => match with_active_writer(token, streams, |_| ()) {
-            Ok(()) => terminal,
-            Err(HostError::Denied) => ComponentTerminal::Denied,
-            Err(_) => return PayloadTerminalPublish::Failed,
-        },
-        Err(HostError::Denied) => ComponentTerminal::Denied,
-        Err(_) => return PayloadTerminalPublish::Failed,
-    };
     let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
         return PayloadTerminalPublish::Failed;
     };
     if witness.instance_token() != Some(token) {
         return PayloadTerminalPublish::Failed;
     }
+
+    // Reacquire the complete current-task registry proof and both exact endpoint
+    // types before publishing any terminal candidate. Ordinary cap revocation
+    // attenuates the candidate to Denied; seal/type/rights corruption fail-stops.
+    // The isolated C5.4c image is the sole exception: its exact revoke winner
+    // deliberately removed stdout and independently proves the full pending
+    // cancellation transaction before preserving Cancelled.
+    let terminal = match with_active_reader(token, streams, |_, _| ()) {
+        Ok(()) => match with_active_writer(token, streams, |_| ()) {
+            Ok(()) => terminal,
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            Err(HostError::Denied)
+                if terminal == ComponentTerminal::Cancelled
+                    && native_async_acceptance::target_preserve_cancelled_after_stdout_revoke(
+                        key,
+                        token,
+                        witness.task_id(),
+                        witness.allocation_domain(),
+                        streams,
+                    ) =>
+            {
+                terminal
+            }
+            Err(HostError::Denied) => ComponentTerminal::Denied,
+            Err(_) => return PayloadTerminalPublish::Failed,
+        },
+        Err(HostError::Denied) => ComponentTerminal::Denied,
+        Err(_) => return PayloadTerminalPublish::Failed,
+    };
 
     let mut control = match CONTROL.try_lock() {
         Ok(control) => control,
@@ -4849,6 +4868,34 @@ fn start_image_instance_under_control(
         control
             .exact_mut(key)
             .expect("target-audited control slot exists")
+            .quarantine();
+        system.restore();
+        drop(control);
+        quarantine_committed_start(
+            &input,
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+        );
+        drop(stage);
+        return Err(ComponentTerminal::RunnerFault);
+    }
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if start_kind == ControlStartKind::ManagedNativeAsync
+        && !native_async_acceptance::target_record_revoke_start(
+            key,
+            core_token,
+            prepared_child.id(),
+            domain,
+            streams,
+            managed_token,
+        )
+    {
+        control
+            .exact_mut(key)
+            .expect("C5.4 target-audited control slot exists")
             .quarantine();
         system.restore();
         drop(control);
@@ -5656,6 +5703,27 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
         system.restore();
         return FinalizeControl::Lost;
     }
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    if tuple.start_kind == ControlStartKind::ManagedNativeAsync
+        && !native_async_acceptance::target_record_revoke_terminal(
+            key,
+            tuple.core_token,
+            tuple.handle.id(),
+            tuple.domain,
+            tuple.streams,
+            terminal,
+        )
+    {
+        CONTROL.child_shadow[key.slot as usize].quarantine(key);
+        CONTROL.supervisor_shadow[key.slot as usize].quarantine(key);
+        control
+            .exact_mut(key)
+            .expect("C5.4 target-audited terminal control slot exists")
+            .quarantine();
+        lifecycle_fail_stop();
+        system.restore();
+        return FinalizeControl::Lost;
+    }
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     acceptance::record_cspace_reset(
         tuple.handle.id(),
@@ -5814,6 +5882,26 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
             control
                 .exact_mut(key)
                 .expect("target-audited reaper notification slot exists")
+                .quarantine();
+            lifecycle_fail_stop();
+            system.restore();
+            return FinalizeControl::Lost;
+        }
+        #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+        if tuple.start_kind == ControlStartKind::ManagedNativeAsync
+            && !native_async_acceptance::target_record_revoke_reaper(
+                key,
+                tuple.core_token,
+                tuple.handle.id(),
+                tuple.domain,
+                tuple.streams,
+                token,
+                terminal,
+            )
+        {
+            control
+                .exact_mut(key)
+                .expect("C5.4 target-audited reaper slot exists")
                 .quarantine();
             lifecycle_fail_stop();
             system.restore();
@@ -6290,7 +6378,10 @@ fn acknowledge_instance(token: ManagedComponentToken) -> ManagedComponentAcknowl
         system.restore();
         return ManagedComponentAcknowledge::Acknowledged;
     }
-    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+    #[cfg(any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ))]
     let target_native = record.start_kind == Some(ControlStartKind::ManagedNativeAsync);
     let projection_exact = record.core_token.is_none()
         && record.handle.is_none()
@@ -6369,6 +6460,18 @@ fn acknowledge_instance(token: ManagedComponentToken) -> ManagedComponentAcknowl
                 control
                     .exact_mut(key)
                     .expect("target-audited acknowledgement slot exists")
+                    .quarantine();
+                lifecycle_fail_stop();
+                system.restore();
+                return ManagedComponentAcknowledge::Lost;
+            }
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            if target_native
+                && !native_async_acceptance::target_record_revoke_ack(key, token, terminal)
+            {
+                control
+                    .exact_mut(key)
+                    .expect("C5.4 target-audited acknowledgement slot exists")
                     .quarantine();
                 lifecycle_fail_stop();
                 system.restore();
@@ -6538,7 +6641,30 @@ pub(crate) fn install_ssh_exec_component(
     unsafe { session.install_ssh_exec_managed_component_io(&root.ssh_policy, &LIFECYCLE, io) }
 }
 
-#[cfg(feature = "ssh-native-async-qemu-acceptance")]
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(crate) fn ssh_exec_component_stdout_drain_permitted(
+    policy: SshExecComponentSessionPolicy,
+) -> bool {
+    ssh_exec_policy(policy.profile()) == Some(policy)
+        || native_async_acceptance::target_stdout_drain_permitted(policy)
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(crate) fn ssh_exec_component_stdin_chunk_limit(
+    policy: SshExecComponentSessionPolicy,
+    accepted_bytes: usize,
+) -> Result<usize, &'static str> {
+    if ssh_exec_policy(policy.profile()) == Some(policy) {
+        Ok(vibeos_vsh::MAX_STREAM_CHUNK_BYTES)
+    } else {
+        native_async_acceptance::target_stdin_chunk_limit(policy, accepted_bytes)
+    }
+}
+
+#[cfg(any(
+    feature = "ssh-native-async-qemu-acceptance",
+    feature = "ssh-native-async-revoke-qemu-acceptance"
+))]
 fn target_control_residue(control: &ControlTable) -> (usize, usize) {
     let mut live = 0usize;
     let mut stream_bindings = 0usize;
@@ -6622,6 +6748,66 @@ pub(crate) fn ssh_exec_component_completed(accepted: SshExecComponentSessionPoli
     native_async_acceptance::publish_target_report(report);
     if !passed {
         native_async_acceptance::lifecycle_fail_stop();
+    }
+}
+
+/// C5.4c completion observer. The first exact native request must terminate as
+/// Cancelled after live stdout revocation; a second fresh incarnation must
+/// still complete successfully before the aggregate marker can be published.
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(crate) fn ssh_exec_component_revoke_completed(
+    accepted: SshExecComponentSessionPolicy,
+    status: u32,
+) {
+    if accepted.command_name() != native_async_acceptance::command_name() {
+        return;
+    }
+
+    let native_policy = native_async_acceptance::ssh_exec_policy(accepted.profile());
+    let sync_policy = ssh_exec_policy(accepted.profile());
+    let route_exact = native_policy == Some(accepted)
+        && accepted.command_name() == native_async_acceptance::command_name();
+    let gates_open = native_policy.is_some()
+        && sync_policy.is_some_and(|policy| {
+            policy.command_name() == SSH_EXEC_COMPONENT.command_name()
+                && policy.artifact_sha256() == SSH_EXEC_COMPONENT.expected_sha256()
+        });
+
+    let reapers = vibeos_vsh::managed_component_target_snapshot();
+    let pending_shadows = native_async_acceptance::target_revoke_pending_shadow_residue();
+    let (registry_occupied, registry_header_mismatches, control_live, stream_bindings, cleanup) =
+        match CONTROL.try_lock() {
+            Ok(control) => {
+                let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+                let registry = registry().occupancy_stats();
+                let (control_live, stream_bindings) = target_control_residue(&control);
+                let cleanup = CONTROL.target_cleanup_shadow_residue();
+                system.restore();
+                drop(control);
+                (
+                    registry.occupied,
+                    registry.header_mismatches,
+                    control_live,
+                    stream_bindings,
+                    cleanup,
+                )
+            }
+            Err(_) => (usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        };
+    if !native_async_acceptance::target_revoke_ssh_completed(
+        status,
+        route_exact,
+        gates_open,
+        pending_shadows,
+        registry_occupied,
+        registry_header_mismatches,
+        control_live,
+        stream_bindings,
+        cleanup,
+        reapers.reaper_slots,
+        reapers.reaper_waiters,
+    ) {
+        native_async_acceptance::target_revoke_fail("ssh-completion-evidence");
     }
 }
 
@@ -6771,6 +6957,15 @@ unsafe fn reclaim_faulted_managed(witness: ReclaimableFaultWitness) -> FaultRout
                 reclaim_authorized_domain(task, domain, true)
             })
         };
+        #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+        native_async_acceptance::target_record_raw_fault_outcome(
+            key,
+            tuple.core_token,
+            tuple.handle.id(),
+            tuple.domain,
+            tuple.streams,
+            outcome == FaultGateOutcome::ManagedReclaimed,
+        );
         return match outcome {
             FaultGateOutcome::ManagedReclaimed => FaultRoute::ManagedReclaimed,
             FaultGateOutcome::NotManaged | FaultGateOutcome::Quarantined => {
@@ -6858,4 +7053,9 @@ pub(crate) async fn run_qemu_acceptance() -> bool {
 #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
 pub(crate) async fn run_native_async_qemu_acceptance() -> bool {
     native_async_acceptance::run_acceptance().await
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+pub(crate) async fn run_native_async_revoke_worker() {
+    native_async_acceptance::run_revoke_worker().await;
 }

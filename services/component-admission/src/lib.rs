@@ -6,6 +6,20 @@
 //! but never stores a self-referential [`ComponentPlan`], a live capability, a
 //! CSpace identity, or a guest resource token.
 
+#![cfg_attr(
+    not(feature = "native-async-acceptance"),
+    doc = r#"
+The validation-only native async admission surface is structurally absent by
+default:
+
+```compile_fail
+use vibeos_component_admission::{
+    admit_native_async_acceptance_candidate,
+    AdmittedNativeAsyncAcceptanceCandidate,
+};
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;
@@ -14,6 +28,8 @@ use alloc::{string::String, vec::Vec};
 use core::fmt;
 use sha2::{Digest, Sha256};
 pub use vibeos_component_format::ProfileIdentity;
+#[cfg(feature = "native-async-acceptance")]
+use vibeos_component_format::ProfileStage;
 use vibeos_component_format::{ProfileLimits, PROFILE_1_LIMITS};
 use vibeos_component_host::{
     HostManifestError, HostResourceKind, VibeHostManifest, VibeHostRequirement,
@@ -28,6 +44,12 @@ use vibeos_wasm_runtime::{inspect_core, AdmissionError as CoreAdmissionError, Co
 /// Exact Profile-1 command world that binds shell byte streams to the nominal
 /// `reader` and `writer` resources in `vibe:stream/streams@1.0.0`.
 pub const STREAM_FILTER_WORLD: &str = "vibe:stream/filter@1.0.0";
+
+/// Exact validation-only native async stream world used by the isolated C5.3
+/// acceptance candidate. This does not replace [`STREAM_FILTER_WORLD`] and is
+/// never accepted by the synchronous command path.
+#[cfg(feature = "native-async-acceptance")]
+pub const NATIVE_STREAM_FILTER_WORLD: &str = "vibe:stream/native-filter@1.0.0";
 
 /// Stable SHA-256 identity of the exact immutable Component bytes.
 ///
@@ -443,6 +465,124 @@ mod private {
     pub struct Seal;
 }
 
+/// Sealed, authority-free C5.3 validation candidate.
+///
+/// This type is deliberately distinct from [`AdmittedComponent`]: it has no
+/// ordinary command manifest, no grants, and no conversion into the
+/// synchronous runner. The native identity remains `ValidationOnly`; a later
+/// kernel acceptance driver may borrow a freshly revalidated plan only through
+/// [`Self::validated_plan`].
+#[cfg(feature = "native-async-acceptance")]
+pub struct AdmittedNativeAsyncAcceptanceCandidate {
+    artifact: ComponentArtifact,
+    inspection: InspectionSummary,
+    command_name: String,
+    entrypoint: String,
+    min_args: usize,
+    max_args: usize,
+    limits: InstanceLimits,
+    stdin: CommandStreamMode,
+    stdout: CommandStreamMode,
+    stderr: CommandStreamMode,
+    _sealed: private::Seal,
+}
+
+#[cfg(feature = "native-async-acceptance")]
+impl AdmittedNativeAsyncAcceptanceCandidate {
+    pub const fn identity(&self) -> ComponentIdentity {
+        self.artifact.identity
+    }
+
+    pub fn inspection(&self) -> &InspectionSummary {
+        &self.inspection
+    }
+
+    pub fn command_name(&self) -> &str {
+        &self.command_name
+    }
+
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.inspection.profile
+    }
+
+    pub const fn abi(&self) -> u16 {
+        self.inspection.profile.runtime_abi
+    }
+
+    pub fn world(&self) -> &str {
+        &self.inspection.world
+    }
+
+    pub fn entrypoint(&self) -> &str {
+        &self.entrypoint
+    }
+
+    pub const fn min_args(&self) -> usize {
+        self.min_args
+    }
+
+    pub const fn max_args(&self) -> usize {
+        self.max_args
+    }
+
+    pub const fn limits(&self) -> InstanceLimits {
+        self.limits
+    }
+
+    pub const fn stdin(&self) -> CommandStreamMode {
+        self.stdin
+    }
+
+    pub const fn stdout(&self) -> CommandStreamMode {
+        self.stdout
+    }
+
+    pub const fn stderr(&self) -> CommandStreamMode {
+        self.stderr
+    }
+
+    /// Revalidate the exact immutable bytes and the closed native executor
+    /// topology without changing either runtime-readiness bit.
+    pub fn validated_plan(&self) -> Result<ComponentPlan<'_>, AdmissionError> {
+        let identity = ComponentIdentity(Sha256::digest(&self.artifact.bytes).into());
+        if identity != self.artifact.identity
+            || self.artifact.profile != ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+            || self.inspection.profile != self.artifact.profile
+            || self.inspection.world != NATIVE_STREAM_FILTER_WORLD
+            || !valid_name(&self.command_name)
+            || !valid_entrypoint(&self.entrypoint)
+            || self.entrypoint != "run"
+            || self.min_args != 0
+            || self.max_args != 0
+            || self.limits.validate().is_err()
+            || usize::from(self.limits.resources) != PROFILE_1_LIMITS.max_resources as usize
+            || self.stdin != CommandStreamMode::Required
+            || self.stdout != CommandStreamMode::Required
+            || self.stderr == CommandStreamMode::Required
+        {
+            return Err(AdmissionError::RevalidationMismatch);
+        }
+
+        let plan = inspect_component_for_profile(&self.artifact.bytes, self.artifact.profile)
+            .map_err(AdmissionError::Decode)?;
+        if plan.summary() != self.inspection.component
+            || plan.profile() != self.inspection.profile
+            || plan.imports() != self.inspection.imports
+            || plan.exports() != self.inspection.exports
+            || plan.embedded_modules().len() != self.inspection.modules.len()
+            || !native_async_acceptance_plan_matches(&plan, &self.entrypoint)
+        {
+            return Err(AdmissionError::RevalidationMismatch);
+        }
+        for (bytes, expected) in plan.embedded_modules().iter().zip(&self.inspection.modules) {
+            if inspect_core(bytes).map_err(AdmissionError::Core)? != *expected {
+                return Err(AdmissionError::RevalidationMismatch);
+            }
+        }
+        Ok(plan)
+    }
+}
+
 /// Volatile, sealed result of complete inspection and policy intersection.
 pub struct AdmittedComponent {
     artifact: ComponentArtifact,
@@ -793,6 +933,141 @@ pub fn admit(
         grants,
         _sealed: private::Seal,
     })
+}
+
+/// Admit the one isolated, validation-only native async acceptance shape.
+///
+/// The caller and image-policy authority tables must both be empty. Native
+/// stream endpoints are lifecycle-owned transport in the later kernel driver;
+/// WIT types and immutable bytes cannot mint ambient authority here.
+#[cfg(feature = "native-async-acceptance")]
+pub fn admit_native_async_acceptance_candidate(
+    artifact: ComponentArtifact,
+    policy: &AdmissionPolicy<'_>,
+    caller: &CallerAuthority<'_>,
+) -> Result<AdmittedNativeAsyncAcceptanceCandidate, AdmissionError> {
+    let profile = ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE;
+    if policy.profile != profile || artifact.profile != profile {
+        return Err(AdmissionError::BadProfile);
+    }
+    if profile.stage != ProfileStage::ValidationOnly || profile.execution_enabled() {
+        return Err(AdmissionError::BadProfile);
+    }
+    if policy.trust != ArtifactTrust::ImagePinned(artifact.identity) {
+        return Err(AdmissionError::UntrustedArtifact);
+    }
+    policy.limits.validate()?;
+    if usize::from(policy.limits.resources) != PROFILE_1_LIMITS.max_resources as usize {
+        return Err(AdmissionError::InvalidLimits);
+    }
+    if !valid_name(policy.command_name) {
+        return Err(AdmissionError::InvalidCommandName);
+    }
+    if policy.entrypoint != "run" || !valid_entrypoint(policy.entrypoint) {
+        return Err(AdmissionError::InvalidEntrypoint);
+    }
+    if policy.min_args != 0 || policy.max_args != 0 {
+        return Err(AdmissionError::InvalidArgumentLimits);
+    }
+    if policy.exact_world.identity != NATIVE_STREAM_FILTER_WORLD
+        || !valid_manifest_text(&policy.exact_world.identity, 256)
+        || policy.stdin != CommandStreamMode::Required
+        || policy.stdout != CommandStreamMode::Required
+        || policy.stderr == CommandStreamMode::Required
+        || !policy.interfaces.is_empty()
+        || !caller.offers.is_empty()
+    {
+        return Err(AdmissionError::InvalidPolicy);
+    }
+
+    let (component, modules, imports, exports) = {
+        let plan = inspect_component_for_profile(&artifact.bytes, profile)
+            .map_err(AdmissionError::Decode)?;
+        plan.check_world(policy.exact_world)
+            .map_err(AdmissionError::World)?;
+        if !native_async_acceptance_plan_matches(&plan, policy.entrypoint) {
+            return Err(AdmissionError::InvalidPolicy);
+        }
+
+        let mut modules = Vec::new();
+        modules
+            .try_reserve_exact(plan.embedded_modules().len())
+            .map_err(|_| AdmissionError::Allocation)?;
+        for bytes in plan.embedded_modules() {
+            modules.push(inspect_core(bytes).map_err(AdmissionError::Core)?);
+        }
+        (plan.summary(), modules, plan.imports, plan.exports)
+    };
+
+    Ok(AdmittedNativeAsyncAcceptanceCandidate {
+        artifact,
+        inspection: InspectionSummary {
+            profile,
+            world: copied(&policy.exact_world.identity)?,
+            component,
+            modules,
+            imports,
+            exports,
+        },
+        command_name: copied(policy.command_name)?,
+        entrypoint: copied(policy.entrypoint)?,
+        min_args: policy.min_args,
+        max_args: policy.max_args,
+        limits: policy.limits,
+        stdin: policy.stdin,
+        stdout: policy.stdout,
+        stderr: policy.stderr,
+        _sealed: private::Seal,
+    })
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_async_acceptance_plan_matches(plan: &ComponentPlan<'_>, entrypoint: &str) -> bool {
+    use vibeos_component_runtime::decode::NativeAsyncCanonicalFunctionPlan;
+
+    if plan.profile() != ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+        || plan.profile().stage != ProfileStage::ValidationOnly
+        || plan.runtime_ready()
+        || plan.native_async_runtime_ready()
+        || plan.summary().resources != 0
+        || plan.embedded_modules().len() != 1
+        || plan.runtime_instance_count() != 1
+        || plan.exports().len() != 1
+        || plan.executable_exports().next().is_some()
+        || plan.host_imports().next().is_some()
+    {
+        return false;
+    }
+    let Some(native) = plan.native_async_execution_plan() else {
+        return false;
+    };
+    if native.instances().len() != 1
+        || native.instances()[0].module != 0
+        || !native.instances()[0].imports.is_empty()
+        || native.canonical_plans().len() != 1
+        || native.canonical_plans()[0].canonical_index != 0
+        || !native.canonical_import_bridges().is_empty()
+        || native.exports().len() != 1
+        || native.exports()[0].name != entrypoint
+        || native.exports()[0].canonical != 0
+    {
+        return false;
+    }
+    matches!(
+        &native.canonical_plans()[0].function,
+        NativeAsyncCanonicalFunctionPlan::Lift {
+            core_function,
+            callback,
+            options,
+            ..
+        } if core_function.core_instance == 0
+            && core_function.export == "run"
+            && callback.core_instance == 0
+            && callback.export == "callback"
+            && options.async_
+            && options.memory.is_none()
+            && options.realloc.is_none()
+    )
 }
 
 fn host_manifest_matches(

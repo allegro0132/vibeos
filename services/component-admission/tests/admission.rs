@@ -3,6 +3,11 @@ use vibeos_component_admission::{
     CommandStreamMode, ComponentArtifact, InstanceLimits, InterfaceCeiling, ProfileIdentity,
     STREAM_FILTER_WORLD,
 };
+#[cfg(feature = "native-async-acceptance")]
+use vibeos_component_admission::{
+    admit_native_async_acceptance_candidate, AdmittedNativeAsyncAcceptanceCandidate,
+    NATIVE_STREAM_FILTER_WORLD,
+};
 use vibeos_component_host::{
     HostManifestError, HostResourceKind, CLOCK_INTERFACE, STREAM_INTERFACE,
 };
@@ -18,6 +23,10 @@ const PURE_COMPONENT: &str =
 const STREAM_COMPONENT: &str =
     include_str!("../../../component-runtime/tests/fixtures/host-stream.component.wat");
 const STREAM_WIT: &str = include_str!("../../../component-format/tests/corpus/wit/stream.wit");
+#[cfg(feature = "native-async-acceptance")]
+const NATIVE_STREAM_COMPONENT: &str = include_str!(
+    "../../../component-format/tests/corpus/component/native-async-stream-0.255.0.component.wat"
+);
 
 fn artifact_and_exact_world(source: &str) -> (ComponentArtifact, WorldContract) {
     let bytes = wat::parse_str(source).unwrap();
@@ -338,6 +347,248 @@ fn selected_async_profile_is_inspectable_but_cannot_be_admitted_before_c52() {
     adjacent.canonical_abi_revision = "canonical-abi-adjacent-rc";
     let artifact = ComponentArtifact::copy_from(&bytes, adjacent).unwrap();
     assert_eq!(artifact.inspect().err(), Some(AdmissionError::BadProfile));
+}
+
+#[test]
+fn native_validation_identity_never_enters_the_ordinary_admission_path() {
+    let bytes =
+        wat::parse_str("(component (type (func async)) (import \"source\" (func (type 0))))")
+            .unwrap();
+    let artifact = ComponentArtifact::copy_from(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    let identity = artifact.identity();
+    let (_, world) = artifact_and_exact_world(PURE_COMPONENT);
+    let mut native_policy = policy(identity, &world, &[]);
+    native_policy.profile = ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE;
+    assert_eq!(
+        admit(artifact, &native_policy, &CallerAuthority { offers: &[] },).err(),
+        Some(AdmissionError::BadProfile)
+    );
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_artifact() -> ComponentArtifact {
+    let bytes = wat::parse_str(NATIVE_STREAM_COMPONENT).unwrap();
+    ComponentArtifact::copy_from(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_world() -> WorldContract {
+    WorldContract::parse(STREAM_WIT, NATIVE_STREAM_FILTER_WORLD).unwrap()
+}
+
+#[cfg(feature = "native-async-acceptance")]
+fn native_policy<'a>(
+    identity: vibeos_component_admission::ComponentIdentity,
+    world: &'a WorldContract,
+    interfaces: &'a [InterfaceCeiling<'a>],
+) -> AdmissionPolicy<'a> {
+    AdmissionPolicy {
+        command_name: "c53-native-filter",
+        entrypoint: "run",
+        min_args: 0,
+        max_args: 0,
+        exact_world: world,
+        profile: ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+        trust: ArtifactTrust::ImagePinned(identity),
+        limits: InstanceLimits {
+            memory_bytes: 64 * 1024,
+            total_fuel: 500_000,
+            poll_quantum: 100,
+            // The current native executor allocates the frozen profile-wide
+            // handle/pair/waitable tables. Do not advertise a paper ceiling it
+            // does not enforce yet.
+            resources: vibeos_component_format::PROFILE_1_LIMITS.max_resources as u16,
+        },
+        stdin: CommandStreamMode::Required,
+        stdout: CommandStreamMode::Required,
+        stderr: CommandStreamMode::Optional,
+        interfaces,
+    }
+}
+
+#[cfg(feature = "native-async-acceptance")]
+#[test]
+fn native_async_acceptance_candidate_is_sealed_inert_and_authority_free() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AdmittedNativeAsyncAcceptanceCandidate>();
+
+    let artifact = native_artifact();
+    let identity = artifact.identity();
+    let world = native_world();
+    let candidate = admit_native_async_acceptance_candidate(
+        artifact,
+        &native_policy(identity, &world, &[]),
+        &CallerAuthority { offers: &[] },
+    )
+    .unwrap();
+
+    assert_eq!(candidate.identity(), identity);
+    assert_eq!(candidate.command_name(), "c53-native-filter");
+    assert_eq!(
+        candidate.profile(),
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+    );
+    assert_eq!(candidate.abi(), 3);
+    assert_eq!(candidate.world(), NATIVE_STREAM_FILTER_WORLD);
+    assert_eq!(candidate.entrypoint(), "run");
+    assert_eq!((candidate.min_args(), candidate.max_args()), (0, 0));
+    assert_eq!(candidate.stdin(), CommandStreamMode::Required);
+    assert_eq!(candidate.stdout(), CommandStreamMode::Required);
+    assert_eq!(candidate.stderr(), CommandStreamMode::Optional);
+    assert_eq!(
+        usize::from(candidate.limits().resources),
+        vibeos_component_format::PROFILE_1_LIMITS.max_resources as usize
+    );
+
+    let plan = candidate.validated_plan().unwrap();
+    assert!(!plan.runtime_ready());
+    assert!(!plan.native_async_runtime_ready());
+    assert_eq!(plan.runtime_instance_count(), 1);
+    assert_eq!(plan.summary().resources, 0);
+    assert_eq!(plan.executable_exports().count(), 0);
+    let native = plan.native_async_execution_plan().unwrap();
+    assert_eq!(native.instances().len(), 1);
+    assert_eq!(native.canonical_plans().len(), 1);
+    assert!(native.canonical_import_bridges().is_empty());
+    assert_eq!(native.exports().len(), 1);
+    assert_eq!(native.exports()[0].name, "run");
+}
+
+#[cfg(feature = "native-async-acceptance")]
+#[test]
+fn native_async_acceptance_rejects_authority_modes_limits_and_adjacent_topology() {
+    let ceiling = [clock_ceiling()];
+    let artifact = native_artifact();
+    let world = native_world();
+    let policy = native_policy(artifact.identity(), &world, &ceiling);
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+
+    let offer = [clock_offer()];
+    let artifact = native_artifact();
+    let policy = native_policy(artifact.identity(), &world, &[]);
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &offer },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+
+    let artifact = native_artifact();
+    let mut policy = native_policy(artifact.identity(), &world, &[]);
+    policy.limits.resources -= 1;
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidLimits)
+    );
+
+    let adjacent = NATIVE_STREAM_COMPONENT.replacen(
+        "(component",
+        "(component\n  (core module $spare)\n  (core instance $spare-instance (instantiate $spare))",
+        1,
+    );
+    let bytes = wat::parse_str(&adjacent).unwrap();
+    let artifact = ComponentArtifact::copy_from(
+        &bytes,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap();
+    let policy = native_policy(artifact.identity(), &world, &[]);
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+}
+
+#[cfg(feature = "native-async-acceptance")]
+#[test]
+fn native_async_acceptance_rejects_wrong_hash_world_entry_and_profile() {
+    let artifact = native_artifact();
+    let world = native_world();
+    let wrong_identity = ComponentArtifact::copy_from(
+        b"different bytes",
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    )
+    .unwrap()
+    .identity();
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &native_policy(wrong_identity, &world, &[]),
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::UntrustedArtifact)
+    );
+
+    let artifact = native_artifact();
+    let mut wrong_world = native_world();
+    wrong_world.identity = String::from("vibe:stream/native-filter-adjacent@1.0.0");
+    let policy = native_policy(artifact.identity(), &wrong_world, &[]);
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidPolicy)
+    );
+
+    let artifact = native_artifact();
+    let mut policy = native_policy(artifact.identity(), &world, &[]);
+    policy.entrypoint = "run-adjacent";
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::InvalidEntrypoint)
+    );
+
+    let bytes = wat::parse_str(NATIVE_STREAM_COMPONENT).unwrap();
+    let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1_ASYNC).unwrap();
+    let mut policy = native_policy(artifact.identity(), &world, &[]);
+    policy.profile = ProfileIdentity::PROFILE_1_ASYNC;
+    assert_eq!(
+        admit_native_async_acceptance_candidate(
+            artifact,
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .err(),
+        Some(AdmissionError::BadProfile)
+    );
 }
 
 #[test]

@@ -11,5 +11,9 @@ vibeos-component-runtime = { path = "../../component-runtime" }
 vibeos-core = { path = "../../core" }
 vibeos-wasm-runtime = { path = "../../wasm-runtime" }
 
+[features]
+default = []
+native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
+
 [dev-dependencies]
 wat = { version = "=1.255.0", features = ["component-model"] }

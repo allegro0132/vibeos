@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf};
 
 const SOURCE: &str = include_str!("artifacts/c53-stream-filter.component.wat");
+const NATIVE_ASYNC_SOURCE: &str = include_str!("artifacts/c53-native-async-filter.component.wat");
 
 // This is deliberately independent of the artifact bytes produced below.
 // Updating the WAT source or pinned parser must fail the build until review
@@ -11,8 +12,16 @@ const EXPECTED_SHA256: [u8; 32] = [
     0x78, 0x37, 0x58, 0xef, 0x22, 0xc0, 0xb1, 0x71, 0x70, 0x68, 0x2d, 0x71, 0xf2, 0xfd, 0x0e, 0x72,
 ];
 
+// This is an independent validation-only identity. It must never reuse the
+// executable synchronous C5.3/C4.8 pin above.
+const NATIVE_ASYNC_EXPECTED_SHA256: [u8; 32] = [
+    0x67, 0xe1, 0xe1, 0xb6, 0x4e, 0xd8, 0xe8, 0x76, 0x94, 0xee, 0xbf, 0x9a, 0xfd, 0xd8, 0xc9, 0x85,
+    0x4a, 0xa7, 0x4e, 0x5d, 0xc7, 0xb4, 0xf6, 0x46, 0xbd, 0xf9, 0x36, 0x10, 0x16, 0x21, 0x75, 0x46,
+];
+
 fn main() {
     println!("cargo:rerun-if-changed=artifacts/c53-stream-filter.component.wat");
+    println!("cargo:rerun-if-changed=artifacts/c53-native-async-filter.component.wat");
 
     let bytes = wat::parse_str(SOURCE).expect("pinned Component WAT must parse");
     let observed: [u8; 32] = Sha256::digest(&bytes).into();
@@ -29,4 +38,21 @@ fn main() {
         format!("{EXPECTED_SHA256:?}"),
     )
     .expect("write checked Component identity constant");
+
+    if env::var_os("CARGO_FEATURE_C53_NATIVE_ASYNC_QEMU_ACCEPTANCE").is_some() {
+        let bytes = wat::parse_str(NATIVE_ASYNC_SOURCE)
+            .expect("pinned native async Component WAT must parse");
+        let observed: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(
+            observed, NATIVE_ASYNC_EXPECTED_SHA256,
+            "pinned native async C5.3 Component digest changed: {observed:02x?}"
+        );
+        fs::write(output.join("c53-native-async-filter.component.wasm"), bytes)
+            .expect("write pinned native async Component artifact");
+        fs::write(
+            output.join("c53-native-async-filter.sha256.rs"),
+            format!("{NATIVE_ASYNC_EXPECTED_SHA256:?}"),
+        )
+        .expect("write checked native async Component identity constant");
+    }
 }

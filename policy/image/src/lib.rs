@@ -4,12 +4,20 @@
 //! firmware images. Physical hardware descriptions remain in the BSP/HAL.
 
 use vibeos_component_format::ProfileIdentity;
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+use vibeos_component_format::PROFILE_1_LIMITS;
 
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
 compile_error!("image policies `qemu-default` and `milkv-duo-sd` are mutually exclusive");
 
 #[cfg(not(any(feature = "qemu-default", feature = "milkv-duo-sd")))]
 compile_error!("exactly one image policy must be selected");
+
+#[cfg(all(
+    feature = "c53-native-async-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c53-native-async-qemu-acceptance` requires `qemu-default`");
 
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +161,109 @@ impl core::fmt::Debug for ComponentCommandPin {
     }
 }
 
+/// Isolated image-policy root for the C5.3 native async validation candidate.
+///
+/// This type is intentionally not [`ComponentCommandPin`]. It cannot enter the
+/// synchronous command runner or the existing SSH C4.8 policy gate. Enabling
+/// its feature merely makes immutable validation inputs available to a later,
+/// separately reviewed native acceptance driver.
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct NativeAsyncAcceptancePin {
+    artifact_bytes: &'static [u8],
+    expected_sha256: [u8; 32],
+    command_name: &'static str,
+    profile: ProfileIdentity,
+    wit_source: &'static str,
+    world: &'static str,
+    entrypoint: &'static str,
+    min_args: usize,
+    max_args: usize,
+    stdin: ComponentStreamMode,
+    stdout: ComponentStreamMode,
+    stderr: ComponentStreamMode,
+    limits: ComponentInstanceLimits,
+}
+
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+impl NativeAsyncAcceptancePin {
+    pub const fn artifact_bytes(self) -> &'static [u8] {
+        self.artifact_bytes
+    }
+
+    pub const fn expected_sha256(self) -> [u8; 32] {
+        self.expected_sha256
+    }
+
+    pub const fn command_name(self) -> &'static str {
+        self.command_name
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn abi(self) -> u16 {
+        self.profile.runtime_abi
+    }
+
+    pub const fn wit_source(self) -> &'static str {
+        self.wit_source
+    }
+
+    pub const fn world(self) -> &'static str {
+        self.world
+    }
+
+    pub const fn entrypoint(self) -> &'static str {
+        self.entrypoint
+    }
+
+    pub const fn min_args(self) -> usize {
+        self.min_args
+    }
+
+    pub const fn max_args(self) -> usize {
+        self.max_args
+    }
+
+    pub const fn stdin(self) -> ComponentStreamMode {
+        self.stdin
+    }
+
+    pub const fn stdout(self) -> ComponentStreamMode {
+        self.stdout
+    }
+
+    pub const fn stderr(self) -> ComponentStreamMode {
+        self.stderr
+    }
+
+    pub const fn limits(self) -> ComponentInstanceLimits {
+        self.limits
+    }
+}
+
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+impl core::fmt::Debug for NativeAsyncAcceptancePin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativeAsyncAcceptancePin")
+            .field("artifact", &"<redacted>")
+            .field("command_name", &self.command_name)
+            .field("profile", &self.profile)
+            .field("world", &self.world)
+            .field("entrypoint", &self.entrypoint)
+            .field("min_args", &self.min_args)
+            .field("max_args", &self.max_args)
+            .field("stdin", &self.stdin)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
 const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/c53-stream-filter.component.wasm"
@@ -160,6 +271,18 @@ const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
 
 const C53_STREAM_FILTER_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c53-stream-filter.sha256.rs"));
+
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+const C53_NATIVE_ASYNC_FILTER_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/c53-native-async-filter.component.wasm"
+));
+
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+const C53_NATIVE_ASYNC_FILTER_SHA256: [u8; 32] = include!(concat!(
+    env!("OUT_DIR"),
+    "/c53-native-async-filter.sha256.rs"
+));
 
 const C53_STREAM_FILTER_WIT: &str = r#"
 package vibe:%stream@1.0.0;
@@ -192,6 +315,34 @@ world filter {
 }
 "#;
 
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+const C53_NATIVE_ASYNC_FILTER_WIT: &str = r#"
+package vibe:%stream@1.0.0;
+
+world native-filter {
+    enum close-reason {
+        normal,
+        failure,
+        cancelled,
+        denied,
+        unavailable,
+        exhausted,
+        invalid,
+        backend-fault,
+    }
+
+    type bytes = stream<u8>;
+    type closed = future<close-reason>;
+
+    record byte-stream {
+        bytes: bytes,
+        closed: closed,
+    }
+
+    export run: async func(input: byte-stream) -> byte-stream;
+}
+"#;
+
 /// The one streaming Component made available to trusted SSH session setup by
 /// the current QEMU and Duo image policies. Merely linking these bytes does not
 /// install a command: exact admission and an explicit per-session policy
@@ -215,6 +366,37 @@ pub const SSH_EXEC_COMPONENT: ComponentCommandPin = ComponentCommandPin {
         total_fuel: 500_000,
         poll_quantum: 100,
         resources: 4,
+    },
+};
+
+/// Immutable validation candidate for the future C5.3 native async QEMU gate.
+///
+/// The checked-in fixture proves exact Profile-ABI-3 parsing, WIT binding, and
+/// native executor-plan topology. It deliberately does **not** claim real
+/// stream transport behavior; the kernel driver, SYSTEM pending shadow, and
+/// backpressure/terminal QEMU evidence remain separate later nodes.
+#[cfg(feature = "c53-native-async-qemu-acceptance")]
+pub const C53_NATIVE_ASYNC_QEMU_ACCEPTANCE: NativeAsyncAcceptancePin = NativeAsyncAcceptancePin {
+    artifact_bytes: C53_NATIVE_ASYNC_FILTER_BYTES,
+    expected_sha256: C53_NATIVE_ASYNC_FILTER_SHA256,
+    command_name: "c53-native-filter",
+    profile: ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+    wit_source: C53_NATIVE_ASYNC_FILTER_WIT,
+    world: "vibe:stream/native-filter@1.0.0",
+    entrypoint: "run",
+    min_args: 0,
+    max_args: 0,
+    stdin: ComponentStreamMode::Required,
+    stdout: ComponentStreamMode::Required,
+    stderr: ComponentStreamMode::Optional,
+    limits: ComponentInstanceLimits {
+        memory_bytes: 64 * 1024,
+        total_fuel: 500_000,
+        poll_quantum: 100,
+        // The native runtime currently enforces the Profile-1-wide table
+        // capacity. A smaller value here would be documentation, not a
+        // real ceiling.
+        resources: PROFILE_1_LIMITS.max_resources as u16,
     },
 };
 
@@ -277,6 +459,39 @@ mod tests {
         assert!(pin
             .wit_source()
             .contains("export run: func(input: borrow<reader>, output: borrow<writer>);"));
+    }
+
+    #[cfg(feature = "c53-native-async-qemu-acceptance")]
+    #[test]
+    fn native_async_candidate_has_an_independent_validation_only_identity() {
+        let pin = C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
+        assert_ne!(pin.artifact_bytes(), SSH_EXEC_COMPONENT.artifact_bytes());
+        assert_ne!(pin.expected_sha256(), SSH_EXEC_COMPONENT.expected_sha256());
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.artifact_bytes())),
+            pin.expected_sha256()
+        );
+        assert_eq!(pin.command_name(), "c53-native-filter");
+        assert_eq!(
+            pin.profile(),
+            ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+        );
+        assert!(!pin.profile().execution_enabled());
+        assert_eq!(pin.abi(), 3);
+        assert_eq!(pin.world(), "vibe:stream/native-filter@1.0.0");
+        assert_eq!(pin.entrypoint(), "run");
+        assert_eq!((pin.min_args(), pin.max_args()), (0, 0));
+        assert_eq!(pin.stdin(), ComponentStreamMode::Required);
+        assert_eq!(pin.stdout(), ComponentStreamMode::Required);
+        assert_eq!(pin.stderr(), ComponentStreamMode::Optional);
+        assert_eq!(
+            usize::from(pin.limits().resources),
+            PROFILE_1_LIMITS.max_resources as usize
+        );
+        assert!(pin.wit_source().contains("type bytes = stream<u8>;"));
+        assert!(pin
+            .wit_source()
+            .contains("export run: async func(input: byte-stream) -> byte-stream;"));
     }
 
     #[cfg(feature = "qemu-default")]

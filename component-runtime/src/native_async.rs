@@ -14,8 +14,9 @@ use crate::{
     },
     async_state::{
         AsyncState, AsyncStateError, AsyncStateLimits, CommitError, CopyBegin, EndpointKind, Event,
-        EventLease, EventLeaseState, EventToken, ReclaimError, TaskCancelState, TaskHandle,
-        TaskResultState, WaitBegin, WaitResume, WaitTicket,
+        EventLease, EventLeaseState, EventToken, HostReadableBindingsPair, ReadableTransferRequest,
+        ReclaimError, TaskCancelState, TaskHandle, TaskResultState, TransferredReadableEndpoint,
+        WaitBegin, WaitResume, WaitTicket,
     },
     buffer_registry::{BufferPlanId, BufferRegistry, BufferRole},
     decode::ComponentPlan,
@@ -24,7 +25,10 @@ use crate::{
         NativeAsyncExecutionPlan, NativeAsyncFuturePlan, NativeAsyncStreamPlan,
         NativeAsyncWaitablePlan,
     },
-    value::{AsyncValueTypeId, EndpointDirection, ValueType},
+    value::{
+        AsyncValueTypeId, EndpointDirection, ReadableFutureEndpointToken,
+        ReadableStreamEndpointToken, ValueType,
+    },
     world::FunctionEffect,
 };
 use alloc::{string::String, vec::Vec};
@@ -154,11 +158,24 @@ struct RuntimeExport {
     core_function: String,
     callback_instance: usize,
     callback: String,
+    contract: RuntimeExportContract,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteStreamContract {
+    stream: AsyncValueTypeId,
+    closed: AsyncValueTypeId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeExportContract {
+    Unit,
+    ByteStream(ByteStreamContract),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeAction {
-    TaskReturn,
+    TaskReturn(RuntimeExportContract),
     StreamNew(AsyncValueTypeId),
     FutureNew(AsyncValueTypeId),
     DropEndpoint {
@@ -409,6 +426,9 @@ impl NativeAsyncComponent {
             .exports
             .get(export_index)
             .ok_or(NativeAsyncError::InvalidWiring)?;
+        if binding.contract != RuntimeExportContract::Unit {
+            return Err(NativeAsyncError::UnsupportedFeature);
+        }
         let callback_slot = self
             .callback_slots
             .get(export_index)
@@ -447,6 +467,129 @@ impl NativeAsyncComponent {
             wait_ticket: None,
             wait_token: None,
             next_wait_generation: 1,
+            input: None,
+            output_stream: None,
+            output_closed: None,
+            terminal: false,
+        })
+    }
+
+    /// Starts the exact resource-free C5.3 byte-stream filter contract.
+    ///
+    /// This entry point remains crate-private while the profile identity is
+    /// validation-only. Both input endpoints are installed atomically before
+    /// Core entry, and no raw handle or host endpoint authority crosses this
+    /// executor boundary.
+    pub(crate) fn start_filter<'a>(
+        &'a mut self,
+        export: &str,
+        total_work: u64,
+        poll_quantum: u64,
+    ) -> Result<NativeAsyncInvocation<'a>, NativeAsyncError> {
+        if self.poisoned {
+            return Err(NativeAsyncError::Poisoned);
+        }
+        if self.modules.any_active_call() {
+            return Err(NativeAsyncError::Busy);
+        }
+        if total_work == 0
+            || total_work > PROFILE_1_LIMITS.total_fuel
+            || poll_quantum == 0
+            || poll_quantum > PROFILE_1_LIMITS.poll_quantum
+            || poll_quantum > total_work
+        {
+            return Err(NativeAsyncError::InvalidBudget);
+        }
+        let export_index = self
+            .exports
+            .iter()
+            .position(|candidate| candidate.name == export)
+            .ok_or(NativeAsyncError::MissingExport)?;
+        let binding = self
+            .exports
+            .get(export_index)
+            .ok_or(NativeAsyncError::InvalidWiring)?;
+        let RuntimeExportContract::ByteStream(contract) = binding.contract else {
+            return Err(NativeAsyncError::UnsupportedFeature);
+        };
+        let callback_slot = self
+            .callback_slots
+            .get(export_index)
+            .ok_or(NativeAsyncError::InvalidWiring)?;
+        if callback_slot.state() != CoreCallSlotState::Idle {
+            self.poisoned = true;
+            return Err(NativeAsyncError::Poisoned);
+        }
+
+        // A filter start is transactional across the task arena, both input
+        // endpoint pairs, and Core continuation state. Expected bounded-state
+        // failures roll back without poisoning; only loss of a sealed cleanup
+        // authority or validated Core wiring latches fail-stop.
+        let task = match self.state.create_task() {
+            Ok(task) => task,
+            Err(error) => {
+                if start_state_failure_is_invariant(error) {
+                    self.poisoned = true;
+                }
+                return Err(map_state_error(error));
+            }
+        };
+        let mut input = match self.state.insert_host_readables_pair(
+            (EndpointKind::Stream, contract.stream),
+            (EndpointKind::Future, contract.closed),
+        ) {
+            Ok(input) => input,
+            Err(error) => {
+                if self.state.abort_task(task).is_err() {
+                    self.poisoned = true;
+                    return Err(NativeAsyncError::Poisoned);
+                }
+                if start_state_failure_is_invariant(error) {
+                    self.poisoned = true;
+                }
+                return Err(map_state_error(error));
+            }
+        };
+        let inputs = [
+            CoreValue::I32(input.first.guest.raw() as i32),
+            CoreValue::I32(input.second.guest.raw() as i32),
+        ];
+        if self
+            .modules
+            .start_call(
+                binding.core_instance,
+                &binding.core_function,
+                &inputs,
+                total_work,
+                poll_quantum,
+            )
+            .is_err()
+        {
+            self.modules.discard_all_calls();
+            let endpoints_clean = self.state.discard_host_readables_pair(&mut input).is_ok();
+            let task_clean = self.state.abort_task(task).is_ok();
+            if endpoints_clean && task_clean {
+                return Err(NativeAsyncError::InvalidWiring);
+            }
+            self.poisoned = true;
+            return Err(NativeAsyncError::Poisoned);
+        }
+        Ok(NativeAsyncInvocation {
+            component: self,
+            export: export_index,
+            task,
+            stage: InvocationStage::Run,
+            total_work,
+            remaining_work: total_work,
+            active_call_budget: total_work,
+            poll_quantum,
+            callback_pending: false,
+            wait_ticket: None,
+            wait_token: None,
+            next_wait_generation: 1,
+            input: Some(input),
+            output_stream: None,
+            output_closed: None,
             terminal: false,
         })
     }
@@ -543,13 +686,17 @@ fn runtime_bridges(
             .get(bridge.canonical as usize)
             .ok_or(NativeAsyncError::InvalidWiring)?;
         let (action, memory_binding) = match &canonical.function {
-            NativeAsyncCanonicalFunctionPlan::TaskReturn { result, options }
-                if result.is_none()
-                    && !options.async_
-                    && options.memory.is_none()
-                    && options.realloc.is_none() =>
-            {
-                (BridgeAction::TaskReturn, None)
+            NativeAsyncCanonicalFunctionPlan::TaskReturn { result, options } => {
+                if options.async_ || options.memory.is_some() || options.realloc.is_some() {
+                    return Err(NativeAsyncError::UnsupportedFeature);
+                }
+                let contract = match result {
+                    None => RuntimeExportContract::Unit,
+                    Some(result) => RuntimeExportContract::ByteStream(
+                        byte_stream_contract(result).ok_or(NativeAsyncError::UnsupportedFeature)?,
+                    ),
+                };
+                (BridgeAction::TaskReturn(contract), None)
             }
             NativeAsyncCanonicalFunctionPlan::Stream(NativeAsyncStreamPlan::New {
                 value_type,
@@ -804,6 +951,47 @@ fn future_enum8_value_type_id(value: &ValueType) -> Option<AsyncValueTypeId> {
     }
 }
 
+/// Recognizes only the scalar-flattened C5.3 transport aggregate, including
+/// its field order. Record field names are intentionally not represented in
+/// [`ValueType`]; admission binds those names through the exact WIT world.
+fn byte_stream_contract(value: &ValueType) -> Option<ByteStreamContract> {
+    let ValueType::Record(fields) = value else {
+        return None;
+    };
+    let [stream, closed] = fields.as_slice() else {
+        return None;
+    };
+    Some(ByteStreamContract {
+        stream: stream_u8_value_type_id(stream)?,
+        closed: future_enum8_value_type_id(closed)?,
+    })
+}
+
+fn export_contract(
+    function_type: &crate::types::FunctionType,
+) -> Result<RuntimeExportContract, NativeAsyncError> {
+    if function_type.effect != FunctionEffect::Async {
+        return Err(NativeAsyncError::UnsupportedFeature);
+    }
+    match (
+        function_type.parameters.as_slice(),
+        function_type.result.as_ref(),
+    ) {
+        ([], None) => Ok(RuntimeExportContract::Unit),
+        ([input], Some(result)) => {
+            let input =
+                byte_stream_contract(&input.value).ok_or(NativeAsyncError::UnsupportedFeature)?;
+            let result =
+                byte_stream_contract(result).ok_or(NativeAsyncError::UnsupportedFeature)?;
+            if input != result {
+                return Err(NativeAsyncError::UnsupportedFeature);
+            }
+            Ok(RuntimeExportContract::ByteStream(input))
+        }
+        _ => Err(NativeAsyncError::UnsupportedFeature),
+    }
+}
+
 fn runtime_exports(
     execution: &NativeAsyncExecutionPlan,
 ) -> Result<Vec<RuntimeExport>, NativeAsyncError> {
@@ -825,21 +1013,17 @@ fn runtime_exports(
         else {
             return Err(NativeAsyncError::InvalidWiring);
         };
-        if function_type.effect != FunctionEffect::Async
-            || !function_type.parameters.is_empty()
-            || function_type.result.is_some()
-            || !options.async_
-            || options.memory.is_some()
-            || options.realloc.is_some()
-        {
+        if !options.async_ || options.memory.is_some() || options.realloc.is_some() {
             return Err(NativeAsyncError::UnsupportedFeature);
         }
+        let contract = export_contract(function_type)?;
         exports.push(RuntimeExport {
             name: copied(&export.name)?,
             core_instance: core_function.core_instance,
             core_function: copied(&core_function.export)?,
             callback_instance: callback.core_instance,
             callback: copied(&callback.export)?,
+            contract,
         });
     }
     Ok(exports)
@@ -899,6 +1083,20 @@ const fn map_state_error(error: AsyncStateError) -> NativeAsyncError {
         | AsyncStateError::TaskTableFull => NativeAsyncError::InvalidWiring,
         _ => NativeAsyncError::InvalidWiring,
     }
+}
+
+/// Classifies native-filter setup failures before any guest-observable Core
+/// entry. Exhausted bounded endpoint capacity is recoverable; every other
+/// state rejection means an executor-owned precondition or rollback seal was
+/// lost and therefore latches the Component fail-stop bit.
+const fn start_state_failure_is_invariant(error: AsyncStateError) -> bool {
+    !matches!(
+        error,
+        AsyncStateError::AllocationFailed
+            | AsyncStateError::HandleTableFull
+            | AsyncStateError::PairTableFull
+            | AsyncStateError::GenerationExhausted
+    )
 }
 
 /// Maps an async-state failure surfaced at a guest canonical boundary.
@@ -1053,6 +1251,12 @@ pub(crate) struct NativeAsyncInvocation<'a> {
     wait_ticket: Option<WaitTicket>,
     wait_token: Option<NativeAsyncWaitToken>,
     next_wait_generation: u64,
+    /// Exact input-side host authorities and the guest handles passed to Core.
+    /// This aggregate is deliberately private and non-cloneable.
+    input: Option<HostReadableBindingsPair>,
+    /// Exact output-side tokens lifted atomically by `task.return`.
+    output_stream: Option<ReadableStreamEndpointToken>,
+    output_closed: Option<ReadableFutureEndpointToken>,
     terminal: bool,
 }
 
@@ -1261,10 +1465,89 @@ impl NativeAsyncInvocation<'_> {
         let action = bridge.action;
         let memory = bridge.memory;
         match (action, call.arguments.as_slice()) {
-            (BridgeAction::TaskReturn, []) => {
+            (BridgeAction::TaskReturn(RuntimeExportContract::Unit), []) => {
+                if self.binding().contract != RuntimeExportContract::Unit {
+                    return self.finish_trap(TrapCode::CanonicalAbi);
+                }
                 if let Err(trap) = self.debit_active_work(authority, TASK_RETURN_WORK) {
                     return self.finish_trap(trap);
                 }
+                if let Err(error) = self.component.state.resolve_task_result(self.task) {
+                    return self.finish_trap(map_sealed_state_error(error));
+                }
+                if let Err(trap) = self.resume_active_host_call(authority, call.id, &[]) {
+                    return self.finish_trap(trap);
+                }
+                NativeAsyncPoll::Resolved(self.metrics())
+            }
+            (
+                BridgeAction::TaskReturn(RuntimeExportContract::ByteStream(contract)),
+                [CoreValue::I32(stream_raw), CoreValue::I32(closed_raw)],
+            ) => {
+                if self.binding().contract != RuntimeExportContract::ByteStream(contract) {
+                    return self.finish_trap(TrapCode::CanonicalAbi);
+                }
+                match (self.output_stream.is_some(), self.output_closed.is_some()) {
+                    (false, false) => {}
+                    (true, true) => return self.finish_trap(TrapCode::CanonicalAbi),
+                    (true, false) | (false, true) => {
+                        return self.finish_trap(TrapCode::Validation);
+                    }
+                }
+                // Seal both guest handles before charging fuel. The fixed-pair
+                // transfer then performs all remaining busy/join/type checks
+                // before either endpoint is detached.
+                let stream = match self.component.state.resolve_guest_endpoint(
+                    *stream_raw as u32,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    contract.stream,
+                ) {
+                    Ok(stream) => stream,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                let closed = match self.component.state.resolve_guest_endpoint(
+                    *closed_raw as u32,
+                    EndpointKind::Future,
+                    EndpointDirection::Read,
+                    contract.closed,
+                ) {
+                    Ok(closed) => closed,
+                    Err(error) => return self.finish_trap(map_runtime_state_error(error)),
+                };
+                if let Err(trap) = self.debit_active_work(authority, TASK_RETURN_WORK) {
+                    return self.finish_trap(trap);
+                }
+                let detached = self.component.state.detach_readables_pair(
+                    ReadableTransferRequest {
+                        handle: stream,
+                        kind: EndpointKind::Stream,
+                        value_type: contract.stream,
+                    },
+                    ReadableTransferRequest {
+                        handle: closed,
+                        kind: EndpointKind::Future,
+                        value_type: contract.closed,
+                    },
+                );
+                let (stream, closed) = match detached {
+                    Ok((
+                        TransferredReadableEndpoint::Stream(stream),
+                        TransferredReadableEndpoint::Future(closed),
+                    )) if stream.value_type() == contract.stream
+                        && closed.value_type() == contract.closed =>
+                    {
+                        (stream, closed)
+                    }
+                    Ok(_) => return self.finish_trap(TrapCode::Validation),
+                    Err(error) => return self.finish_trap(map_exact_endpoint_state_error(error)),
+                };
+                // Store both linear output authorities before the next
+                // fallible operation. Fail-stop cleanup can consequently
+                // reclaim them even if task resolution or Core resume detects
+                // an executor invariant.
+                self.output_stream = Some(stream);
+                self.output_closed = Some(closed);
                 if let Err(error) = self.component.state.resolve_task_result(self.task) {
                     return self.finish_trap(map_sealed_state_error(error));
                 }
@@ -1982,6 +2265,40 @@ impl NativeAsyncInvocation<'_> {
             });
             buffers.poison();
         }
+        // Result endpoints have already crossed the guest-to-host ownership
+        // boundary, so retain and use their exact tokens for best-effort
+        // fail-stop reclamation. Clear an authority only after the state
+        // accepted that exact token.
+        if self.output_stream.as_ref().is_some_and(|stream| {
+            self.component
+                .state
+                .drop_stream_host_readable(stream)
+                .is_ok()
+        }) {
+            self.output_stream = None;
+        }
+        if self.output_closed.as_ref().is_some_and(|closed| {
+            self.component
+                .state
+                .drop_future_host_readable(closed)
+                .is_ok()
+        }) {
+            self.output_closed = None;
+        }
+        // Before task.return, an untouched input aggregate can be rolled back
+        // exactly. Once guest code has dropped, copied, joined, or transferred
+        // either readable end, the narrow startup rollback authority correctly
+        // rejects it. Its host-writer authority then remains confined to this
+        // unusable poisoned Component and is reclaimed only when the whole
+        // Component is dropped; it is never exposed or reused.
+        if self.input.as_mut().is_some_and(|input| {
+            self.component
+                .state
+                .discard_host_readables_pair(input)
+                .is_ok()
+        }) {
+            self.input = None;
+        }
         self.wait_token = None;
         self.callback_pending = false;
         let _ = self.component.state.abort_task(self.task);
@@ -1995,7 +2312,17 @@ impl NativeAsyncInvocation<'_> {
 
 impl Drop for NativeAsyncInvocation<'_> {
     fn drop(&mut self) {
-        if !self.terminal {
+        // A unit invocation owns no transport authority after a clean exit and
+        // can leave its Component reusable. The filter transport is not yet
+        // externally drivable while this profile remains validation-only, so
+        // silently dropping any retained input or result authority would lose
+        // its exact Host holder while leaving the pair arena live. Fail-stop
+        // until the host-pending slice has explicitly consumed every one of
+        // those authorities; a partially wired caller must never turn a clean
+        // callback exit into bounded per-invocation leakage.
+        let retained_transport =
+            self.input.is_some() || self.output_stream.is_some() || self.output_closed.is_some();
+        if !self.terminal || (!self.component.poisoned && retained_transport) {
             self.stage = InvocationStage::Terminal;
             self.terminal = true;
             self.poison_and_discard();
@@ -2016,6 +2343,56 @@ mod tests {
     const SMOKE: &str = include_str!(
         "../../component-format/tests/corpus/component/native-async-smoke-0.255.0.component.wat"
     );
+    const FILTER: &str = r#"(component
+      (type $close-reason-private
+        (enum "normal" "failure" "cancelled" "denied" "unavailable"
+          "exhausted" "invalid" "backend-fault"))
+      (import "close-reason"
+        (type $close-reason (eq $close-reason-private)))
+      (type $bytes-private (stream u8))
+      (import "bytes" (type $bytes (eq $bytes-private)))
+      (type $closed-private (future $close-reason))
+      (import "closed" (type $closed (eq $closed-private)))
+      (type $byte-stream-private
+        (record (field "bytes" $bytes) (field "closed" $closed)))
+      (import "byte-stream"
+        (type $byte-stream (eq $byte-stream-private)))
+      (type $run-type
+        (func async (param "input" $byte-stream) (result $byte-stream)))
+
+      (core func $task-return
+        (canon task.return (result $byte-stream)))
+      (core instance $builtins
+        (export "task-return" (func $task-return)))
+      (core module $guest
+        (import "vibe:async" "task-return"
+          (func $task-return (param i32 i32)))
+        (func (export "run")
+          (param $input-bytes i32) (param $input-closed i32) (result i32)
+          local.get $input-bytes
+          i32.eqz
+          if unreachable end
+          local.get $input-closed
+          i32.eqz
+          if unreachable end
+          local.get $input-bytes
+          local.get $input-closed
+          i32.eq
+          if unreachable end
+          local.get $input-bytes
+          local.get $input-closed
+          call $task-return
+          i32.const 1)
+        (func (export "callback") (param i32 i32 i32) (result i32)
+          i32.const 0))
+      (core instance $guest-instance
+        (instantiate $guest (with "vibe:async" (instance $builtins))))
+      (alias core export $guest-instance "run" (core func $run))
+      (alias core export $guest-instance "callback" (core func $callback))
+      (func $lifted (type $run-type)
+        (canon lift (core func $run) async
+          (callback (core func $callback))))
+      (export "run" (func $lifted)))"#;
     const WORK: u64 = 100_000;
     const QUANTUM: u64 = 10_000;
 
@@ -2037,6 +2414,37 @@ mod tests {
     fn replace_once(source: &str, from: &str, to: &str) -> String {
         assert_eq!(source.matches(from).count(), 1);
         source.replacen(from, to, 1)
+    }
+
+    fn filter_core_without_inputs(function_type: &str) -> String {
+        replace_once(
+            &replace_once(
+                FILTER,
+                "(func async (param \"input\" $byte-stream) (result $byte-stream))",
+                function_type,
+            ),
+            r#"(func (export "run")
+          (param $input-bytes i32) (param $input-closed i32) (result i32)
+          local.get $input-bytes
+          i32.eqz
+          if unreachable end
+          local.get $input-closed
+          i32.eqz
+          if unreachable end
+          local.get $input-bytes
+          local.get $input-closed
+          i32.eq
+          if unreachable end
+          local.get $input-bytes
+          local.get $input-closed
+          call $task-return
+          i32.const 1)"#,
+            r#"(func (export "run") (result i32)
+          i32.const 1
+          i32.const 2
+          call $task-return
+          i32.const 1)"#,
+        )
     }
 
     fn wait_component(resolve_before_wait: bool, callback: &str) -> String {
@@ -2260,7 +2668,7 @@ mod tests {
                 PollResult::HostCall(host) => {
                     let action = call.component.bridges[host.id as usize].action;
                     let expected = match action {
-                        BridgeAction::TaskReturn => TASK_RETURN_WORK,
+                        BridgeAction::TaskReturn(_) => TASK_RETURN_WORK,
                         BridgeAction::StreamNew(_)
                         | BridgeAction::FutureNew(_)
                         | BridgeAction::DropEndpoint { .. }
@@ -2283,7 +2691,7 @@ mod tests {
                     };
                     let before = call.metrics();
                     let progress = call.handle_host_call(CallAuthority::Run(active), host);
-                    if action == BridgeAction::TaskReturn {
+                    if matches!(action, BridgeAction::TaskReturn(_)) {
                         assert!(matches!(progress, NativeAsyncPoll::Resolved(_)));
                     } else {
                         assert!(matches!(progress, NativeAsyncPoll::Pending(_)));
@@ -2383,7 +2791,310 @@ mod tests {
     }
 
     #[test]
-    fn result_or_memory_bearing_task_return_is_rejected_before_guest_entry() {
+    fn native_filter_receives_nonzero_inputs_and_atomically_returns_the_exact_pair() {
+        let mut component = instantiate(FILTER);
+        assert_eq!(
+            component.start("run", WORK, QUANTUM).err(),
+            Some(NativeAsyncError::UnsupportedFeature)
+        );
+        assert!(!component.is_poisoned());
+
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let input = call.input.as_ref().expect("filter input authorities");
+        let stream_raw = input.first.guest.raw();
+        let closed_raw = input.second.guest.raw();
+        assert_ne!(stream_raw, 0);
+        assert_ne!(closed_raw, 0);
+        assert_ne!(stream_raw, closed_raw);
+
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Resolved(_) => break,
+                other => panic!("filter must resolve its exact output pair: {other:?}"),
+            }
+        }
+        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
+            panic!("filter binding lost its exact contract")
+        };
+        assert_eq!(
+            call.output_stream.as_ref().unwrap().value_type(),
+            contract.stream
+        );
+        assert_eq!(
+            call.output_closed.as_ref().unwrap().value_type(),
+            contract.closed
+        );
+        assert_eq!(call.task_info().result, TaskResultState::Resolved);
+
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Complete(_) => break,
+                other => panic!("filter callback must exit cleanly: {other:?}"),
+            }
+        }
+        assert!(call.output_stream.is_some());
+        assert!(call.output_closed.is_some());
+        assert!(!call.component.is_poisoned());
+        drop(call);
+
+        // Until the host-pending transport consumes the retained linear
+        // authorities, a completed validation-only filter is deliberately
+        // one-shot rather than silently leaking arena capacity across reuse.
+        assert!(component.is_poisoned());
+        assert_eq!(
+            component.start_filter("run", WORK, QUANTUM).err(),
+            Some(NativeAsyncError::Poisoned)
+        );
+    }
+
+    #[test]
+    fn repeated_filter_task_return_is_canonical_abi_misuse_without_a_second_transfer() {
+        let source = replace_once(
+            FILTER,
+            "          local.get $input-bytes\n          local.get $input-closed\n          call $task-return\n          i32.const 1",
+            "          local.get $input-bytes\n          local.get $input-closed\n          call $task-return\n          local.get $input-bytes\n          local.get $input-closed\n          call $task-return\n          i32.const 1",
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::Resolved(_) => break,
+                other => panic!("first filter result must resolve: {other:?}"),
+            }
+        }
+        assert!(call.output_stream.is_some());
+        assert!(call.output_closed.is_some());
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                other => panic!("duplicate filter result must fail closed: {other:?}"),
+            }
+        }
+        // Fail-stop consumed the exact first result tokens. The duplicate was
+        // classified before any second handle resolution or transfer.
+        assert!(call.output_stream.is_none());
+        assert!(call.output_closed.is_none());
+        assert!(call.component.is_poisoned());
+    }
+
+    #[test]
+    fn malformed_filter_task_return_does_not_partially_detach_the_stream() {
+        let source = replace_once(
+            FILTER,
+            "          local.get $input-bytes\n          local.get $input-closed\n          call $task-return",
+            "          local.get $input-bytes\n          i32.const 0\n          call $task-return",
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                other => panic!("bad result handle must trap: {other:?}"),
+            }
+        }
+        assert!(call.output_stream.is_none());
+        assert!(call.output_closed.is_none());
+        // Fail-stop can discard the exact untouched input aggregate only if
+        // the failed fixed-pair detach left *both* guest handles in place.
+        // This observes atomicity without moving either host authority out of
+        // its invocation owner.
+        assert!(call.input.is_none());
+    }
+
+    fn assert_filter_contract_rejected_before_core_entry(source: &str) {
+        let bytes = wat::parse_str(source).unwrap();
+        let plan = inspect_component_for_profile(
+            &bytes,
+            ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+        )
+        .unwrap();
+        assert_eq!(
+            NativeAsyncComponent::instantiate_validation_plan(
+                &plan,
+                &ProfileEngine::new(),
+                OwnerAllocationReservation::profile_default(),
+            )
+            .err(),
+            Some(NativeAsyncError::UnsupportedFeature)
+        );
+    }
+
+    #[test]
+    fn adjacent_native_filter_shapes_are_rejected_before_core_entry() {
+        let extra_parameter = replace_once(
+            &replace_once(
+                FILTER,
+                "(func async (param \"input\" $byte-stream) (result $byte-stream))",
+                "(func async (param \"input\" $byte-stream) (param \"extra\" u32) (result $byte-stream))",
+            ),
+            "(param $input-bytes i32) (param $input-closed i32) (result i32)",
+            "(param $input-bytes i32) (param $input-closed i32) (param i32) (result i32)",
+        );
+        let missing_parameter = filter_core_without_inputs("(func async (result $byte-stream))");
+        let reversed_record = replace_once(
+            FILTER,
+            "(record (field \"bytes\" $bytes) (field \"closed\" $closed))",
+            "(record (field \"closed\" $closed) (field \"bytes\" $bytes))",
+        );
+        let u16_stream = replace_once(
+            FILTER,
+            "(type $bytes-private (stream u8))",
+            "(type $bytes-private (stream u16))",
+        );
+        let enum7 = replace_once(
+            FILTER,
+            "\"exhausted\" \"invalid\" \"backend-fault\"))",
+            "\"exhausted\" \"invalid\"))",
+        );
+        let enum9 = replace_once(
+            FILTER,
+            "\"exhausted\" \"invalid\" \"backend-fault\"))",
+            "\"exhausted\" \"invalid\" \"backend-fault\" \"other\"))",
+        );
+
+        let different_result_ids = replace_once(
+            &FILTER.replace("(result $byte-stream)", "(result $byte-stream-output)"),
+            "      (type $run-type",
+            r#"      (type $close-reason-output-private
+        (enum "other-normal" "failure" "cancelled" "denied" "unavailable"
+          "exhausted" "invalid" "backend-fault"))
+      (import "close-reason-output"
+        (type $close-reason-output (eq $close-reason-output-private)))
+      (type $closed-output-private (future $close-reason-output))
+      (import "closed-output"
+        (type $closed-output (eq $closed-output-private)))
+      (type $byte-stream-output-private
+        (record (field "bytes" $bytes) (field "closed" $closed-output)))
+      (import "byte-stream-output"
+        (type $byte-stream-output (eq $byte-stream-output-private)))
+      (type $run-type"#,
+        );
+
+        for source in [
+            extra_parameter,
+            missing_parameter,
+            reversed_record,
+            u16_stream,
+            enum7,
+            enum9,
+            different_result_ids,
+        ] {
+            assert_filter_contract_rejected_before_core_entry(&source);
+        }
+    }
+
+    #[test]
+    fn task_return_record_names_are_admission_metadata_not_runtime_authority() {
+        let source = replace_once(
+            FILTER,
+            "      (core func $task-return\n        (canon task.return (result $byte-stream)))",
+            r#"      (type $canonical-result
+        (record (field "foo" $bytes) (field "bar" $closed)))
+      (core func $task-return
+        (canon task.return (result $canonical-result)))"#,
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Resolved(_) => break,
+                other => {
+                    panic!("canonical name-only alias must retain endpoint identity: {other:?}")
+                }
+            }
+        }
+        assert!(call.output_stream.is_some());
+        assert!(call.output_closed.is_some());
+        // Field names are checked on the exported WIT world by admission.
+        // This executor boundary deliberately compares only fixed order and
+        // the exact stream/future identities that carry linear authority.
+        drop(call);
+        assert!(component.is_poisoned());
+    }
+
+    #[test]
+    fn filter_core_start_failure_rolls_back_task_and_both_input_pairs() {
+        let mut component = instantiate(FILTER);
+        let RuntimeExportContract::ByteStream(contract) = component.exports[0].contract else {
+            panic!("filter fixture must have the exact contract")
+        };
+        component.exports[0].core_function = String::from("missing");
+        assert_eq!(
+            component.start_filter("run", WORK, QUANTUM).err(),
+            Some(NativeAsyncError::InvalidWiring)
+        );
+        assert!(!component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+        assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
+
+        // Task capacity is one, so this succeeds only if the failed start
+        // removed its exact task seal.
+        let task = component.state.create_task().unwrap();
+        component.state.abort_task(task).unwrap();
+
+        // Each aggregate consumes two handle and two pair slots. Filling the
+        // complete advertised capacity proves neither failed input survived.
+        let mut retained = Vec::new();
+        for _ in 0..PROFILE_1_LIMITS.max_resources / 2 {
+            retained.push(
+                component
+                    .state
+                    .insert_host_readables_pair(
+                        (EndpointKind::Stream, contract.stream),
+                        (EndpointKind::Future, contract.closed),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            component.state.insert_host_readables_pair(
+                (EndpointKind::Stream, contract.stream),
+                (EndpointKind::Future, contract.closed),
+            ),
+            Err(AsyncStateError::HandleTableFull | AsyncStateError::PairTableFull)
+        ));
+        drop(retained);
+    }
+
+    #[test]
+    fn filter_input_capacity_failure_removes_the_task_without_poisoning() {
+        let mut component = instantiate(FILTER);
+        let RuntimeExportContract::ByteStream(contract) = component.exports[0].contract else {
+            panic!("filter fixture must have the exact contract")
+        };
+        let mut retained = Vec::new();
+        for _ in 0..PROFILE_1_LIMITS.max_resources / 2 {
+            retained.push(
+                component
+                    .state
+                    .insert_host_readables_pair(
+                        (EndpointKind::Stream, contract.stream),
+                        (EndpointKind::Future, contract.closed),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            component.start_filter("run", WORK, QUANTUM).err(),
+            Some(NativeAsyncError::InvalidWiring)
+        );
+        assert!(!component.is_poisoned());
+        assert!(!component.modules.any_active_call());
+        let task = component.state.create_task().unwrap();
+        component.state.abort_task(task).unwrap();
+        drop(retained);
+    }
+
+    #[test]
+    fn non_filter_result_or_memory_bearing_task_return_is_rejected_before_guest_entry() {
         let result_only = r#"(component
           (type $run-type (func async (result u32)))
           (core func $task-return (canon task.return (result u32)))
@@ -2834,7 +3545,7 @@ mod tests {
         };
         assert!(matches!(
             call.component.bridges[host.id as usize].action,
-            BridgeAction::TaskReturn
+            BridgeAction::TaskReturn(RuntimeExportContract::Unit)
         ));
         assert_ne!(host.origin_instance, callback_instance);
         let exact_before = call
@@ -4191,32 +4902,9 @@ mod tests {
     }
 
     #[test]
-    fn dynamically_mismatched_task_return_type_traps_fail_closed() {
-        let source = r#"(component
-          (type $run-type (func async))
-          (core func $wrong-return (canon task.return (result u32)))
-          (core instance $builtins
-            (export "wrong-return" (func $wrong-return)))
-          (core module $guest
-            (import "vibe:async" "wrong-return"
-              (func $wrong-return (param i32)))
-            (func (export "run") (result i32)
-              i32.const 7
-              call $wrong-return
-              i32.const 1)
-            (func (export "callback") (param i32 i32 i32) (result i32)
-              i32.const 0))
-          (core instance $guest-instance
-            (instantiate $guest
-              (with "vibe:async" (instance $builtins))))
-          (alias core export $guest-instance "run" (core func $run))
-          (alias core export $guest-instance "callback" (core func $callback))
-          (func $lifted (type $run-type)
-            (canon lift (core func $run)
-              async
-              (callback (core func $callback))))
-          (export "run" (func $lifted)))"#;
-        let mut component = instantiate(source);
+    fn dynamically_mismatched_supported_task_return_contract_traps_canonical_abi() {
+        let source = filter_core_without_inputs("(func async)");
+        let mut component = instantiate(&source);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
             assert_eq!(

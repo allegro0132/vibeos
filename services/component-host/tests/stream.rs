@@ -806,7 +806,116 @@ fn late_producer_done_preserves_an_existing_failure_terminal() {
 }
 
 #[test]
-fn producer_done_and_failure_finalize_are_linearizable_across_harts() {
+fn observed_close_reports_provisional_and_final_normal_in_the_publication_lock() {
+    let stream = ByteStream::new();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+
+    let provisional = writer.close_observed(StreamCloseReason::Normal);
+    assert_eq!(provisional.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(
+        provisional.effective_reason(),
+        Some(StreamCloseReason::Normal)
+    );
+    assert!(supervisor.is_normal_provisional());
+    assert_eq!(supervisor.final_reason(), None);
+
+    let repeated = writer.close_observed(StreamCloseReason::Normal);
+    assert_eq!(repeated.outcome(), StreamCloseOutcome::AlreadyPublished);
+    assert_eq!(repeated.effective_reason(), Some(StreamCloseReason::Normal));
+
+    let finalized = supervisor.finalize_observed(StreamCloseReason::Normal);
+    assert_eq!(finalized.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(
+        finalized.effective_reason(),
+        Some(StreamCloseReason::Normal)
+    );
+    let same_final = supervisor.finalize_observed(StreamCloseReason::Normal);
+    assert_eq!(same_final.outcome(), StreamCloseOutcome::AlreadyPublished);
+    assert_eq!(
+        same_final.effective_reason(),
+        Some(StreamCloseReason::Normal)
+    );
+}
+
+#[test]
+fn observed_late_normal_exposes_the_failure_that_already_won() {
+    let stream = ByteStream::new();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+
+    let failure = supervisor.finalize_observed(StreamCloseReason::Failure);
+    assert_eq!(failure.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(failure.effective_reason(), Some(StreamCloseReason::Failure));
+
+    let requested = StreamCloseReason::Normal;
+    let late = writer.close_observed(requested);
+    assert_eq!(late.outcome(), StreamCloseOutcome::AlreadyPublished);
+    assert_eq!(late.effective_reason(), Some(StreamCloseReason::Failure));
+    assert_ne!(late.effective_reason(), Some(requested));
+    assert!(!stream.is_fail_stopped());
+}
+
+#[test]
+fn observed_conflict_preserves_the_established_reason_and_fail_stops() {
+    let stream = ByteStream::new();
+    let writer = stream.writer();
+    let supervisor = stream.supervisor();
+
+    assert_eq!(
+        supervisor
+            .finalize_observed(StreamCloseReason::Failure)
+            .effective_reason(),
+        Some(StreamCloseReason::Failure)
+    );
+    let conflict = supervisor.finalize_observed(StreamCloseReason::Cancelled);
+    assert_eq!(conflict.outcome(), StreamCloseOutcome::Conflict);
+    assert_eq!(
+        conflict.effective_reason(),
+        Some(StreamCloseReason::Failure)
+    );
+    assert!(stream.is_fail_stopped());
+
+    let repeated = writer.close_observed(StreamCloseReason::Normal);
+    assert_eq!(repeated.outcome(), StreamCloseOutcome::Conflict);
+    assert_eq!(
+        repeated.effective_reason(),
+        Some(StreamCloseReason::Failure)
+    );
+}
+
+#[test]
+fn observed_close_wakes_after_unlock_and_allows_reentrant_state_queries() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let probe = Arc::new(ReentrantWakeProbe {
+        stream: stream.clone(),
+        count: AtomicUsize::new(0),
+    });
+    let waiting = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected empty wait, got {other:?}"),
+    };
+    reader
+        .register_wake(waiting, reentrant_wake_token(&probe))
+        .unwrap();
+
+    let observed = writer.close_observed(StreamCloseReason::Failure);
+    assert_eq!(observed.outcome(), StreamCloseOutcome::Published);
+    assert_eq!(
+        observed.effective_reason(),
+        Some(StreamCloseReason::Failure)
+    );
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reader.resume(waiting),
+        Ok(StreamReceiveDispatch::Closed(StreamCloseReason::Failure))
+    );
+}
+
+#[test]
+fn observed_producer_done_and_failure_are_linearizable_across_harts() {
     for _ in 0..128 {
         let stream = ByteStream::new();
         let writer = stream.writer();
@@ -815,20 +924,28 @@ fn producer_done_and_failure_finalize_are_linearizable_across_harts() {
         let writer_barrier = barrier.clone();
         let producer_done = thread::spawn(move || {
             writer_barrier.wait();
-            writer.close(StreamCloseReason::Normal)
+            writer.close_observed(StreamCloseReason::Normal)
         });
         let supervisor_barrier = barrier.clone();
         let finalize = thread::spawn(move || {
             supervisor_barrier.wait();
-            supervisor.finalize(StreamCloseReason::Failure)
+            supervisor.finalize_observed(StreamCloseReason::Failure)
         });
 
         barrier.wait();
-        assert!(matches!(
-            producer_done.join().unwrap(),
-            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
-        ));
-        assert_eq!(finalize.join().unwrap(), StreamCloseOutcome::Published);
+        let producer_done = producer_done.join().unwrap();
+        assert!(
+            (producer_done.outcome() == StreamCloseOutcome::Published
+                && producer_done.effective_reason() == Some(StreamCloseReason::Normal))
+                || (producer_done.outcome() == StreamCloseOutcome::AlreadyPublished
+                    && producer_done.effective_reason() == Some(StreamCloseReason::Failure))
+        );
+        let finalize = finalize.join().unwrap();
+        assert_eq!(finalize.outcome(), StreamCloseOutcome::Published);
+        assert_eq!(
+            finalize.effective_reason(),
+            Some(StreamCloseReason::Failure)
+        );
         assert_eq!(stream.final_reason(), Some(StreamCloseReason::Failure));
         assert!(!stream.is_fail_stopped());
     }

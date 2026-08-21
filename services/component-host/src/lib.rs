@@ -49,8 +49,8 @@ pub use runtime_dispatch::{
 };
 pub use service::{ComponentCallError, ComponentHostServices};
 pub use stream::{
-    ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseOutcome,
-    StreamCloseReason, StreamError, StreamPreparedReceive, StreamReceiveCommit,
+    ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseObservation,
+    StreamCloseOutcome, StreamCloseReason, StreamError, StreamPreparedReceive, StreamReceiveCommit,
     StreamReceiveDispatch, StreamSendDispatch, StreamTerminalDispatch, MAX_STREAM_CHUNK_BYTES,
     STREAM_BUFFER_CHUNKS,
 };

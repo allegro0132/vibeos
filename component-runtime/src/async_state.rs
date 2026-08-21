@@ -2514,6 +2514,28 @@ impl AsyncState {
         Ok(())
     }
 
+    /// Selects the event for one stackless callback `YIELD` transition.
+    ///
+    /// Cancellation is delivered at most once: an exact pending request is
+    /// atomically advanced to `Delivered`; all other cancellation states yield
+    /// `NONE`. A callback which has exited or already owns a blocked `WAIT`
+    /// cannot yield again.
+    pub fn callback_yield(&mut self, task: TaskHandle) -> Result<Event, AsyncStateError> {
+        let task = self.task_mut(task)?;
+        if task.callback != TaskCallbackState::Running {
+            return Err(AsyncStateError::TaskAlreadyExited);
+        }
+        if task.waiting.is_some() {
+            return Err(AsyncStateError::AlreadyWaiting);
+        }
+        if task.cancel == TaskCancelState::Requested {
+            task.cancel = TaskCancelState::Delivered;
+            Ok(task_cancelled_event())
+        } else {
+            Ok(none_event())
+        }
+    }
+
     /// Implements the selected `task.cancel` builtin after a cancellable wait
     /// delivered `TASK_CANCELLED` to this exact task.
     pub fn acknowledge_task_cancel(&mut self, task: TaskHandle) -> Result<(), AsyncStateError> {
@@ -2701,6 +2723,14 @@ impl AsyncState {
 const fn task_cancelled_event() -> Event {
     Event {
         code: EventCode::TaskCancelled,
+        p1: 0,
+        p2: 0,
+    }
+}
+
+const fn none_event() -> Event {
+    Event {
+        code: EventCode::None,
         p1: 0,
         p2: 0,
     }
@@ -3553,6 +3583,98 @@ mod tests {
         state.drop_task(task).unwrap();
         state.join_waitable(pair.readable, 0).unwrap();
         state.drop_waitable_set(set).unwrap();
+    }
+
+    #[test]
+    fn callback_yield_delivers_requested_cancellation_exactly_once() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let task = state.create_task().unwrap();
+        assert_eq!(state.callback_yield(task), Ok(none_event()));
+
+        state.request_task_cancel(task).unwrap();
+        assert_eq!(state.callback_yield(task), Ok(task_cancelled_event()));
+        assert_eq!(
+            state.task_info(task).unwrap().cancel,
+            TaskCancelState::Delivered
+        );
+        assert_eq!(state.callback_yield(task), Ok(none_event()));
+
+        state.acknowledge_task_cancel(task).unwrap();
+        assert_eq!(state.callback_yield(task), Ok(none_event()));
+        state.callback_exit(task).unwrap();
+        state.drop_task(task).unwrap();
+    }
+
+    #[test]
+    fn callback_yield_rejects_wrong_state_and_stale_task_seals() {
+        let mut first = AsyncState::new(limits()).unwrap();
+        let mut second = AsyncState::new(limits()).unwrap();
+        let task = first.create_task().unwrap();
+        assert_eq!(
+            second.callback_yield(task),
+            Err(AsyncStateError::WrongState)
+        );
+
+        first.resolve_task_result(task).unwrap();
+        first.callback_exit(task).unwrap();
+        first.drop_task(task).unwrap();
+        assert_eq!(
+            first.callback_yield(task),
+            Err(AsyncStateError::StaleHandle)
+        );
+    }
+
+    #[test]
+    fn callback_yield_rejects_waiting_and_exited_callbacks() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let set = state.create_waitable_set().unwrap();
+        let task = state.create_task().unwrap();
+        let mut wait = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Blocked { ticket } => ticket,
+            WaitBegin::Ready(_) => panic!("empty set became ready"),
+        };
+        assert_eq!(
+            state.callback_yield(task),
+            Err(AsyncStateError::AlreadyWaiting)
+        );
+
+        state.cancel_callback_wait(&mut wait).unwrap();
+        state.resolve_task_result(task).unwrap();
+        state.callback_exit(task).unwrap();
+        assert_eq!(
+            state.callback_yield(task),
+            Err(AsyncStateError::TaskAlreadyExited)
+        );
+        state.drop_task(task).unwrap();
+        state.drop_waitable_set(set).unwrap();
+    }
+
+    #[test]
+    fn task_return_clears_pending_and_delivered_yield_cancellation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+
+        let pending = state.create_task().unwrap();
+        state.request_task_cancel(pending).unwrap();
+        state.resolve_task_result(pending).unwrap();
+        assert_eq!(state.callback_yield(pending), Ok(none_event()));
+        assert_eq!(
+            state.task_info(pending).unwrap().cancel,
+            TaskCancelState::None
+        );
+        state.callback_exit(pending).unwrap();
+        state.drop_task(pending).unwrap();
+
+        let delivered = state.create_task().unwrap();
+        state.request_task_cancel(delivered).unwrap();
+        assert_eq!(state.callback_yield(delivered), Ok(task_cancelled_event()));
+        state.resolve_task_result(delivered).unwrap();
+        assert_eq!(state.callback_yield(delivered), Ok(none_event()));
+        assert_eq!(
+            state.task_info(delivered).unwrap().cancel,
+            TaskCancelState::None
+        );
+        state.callback_exit(delivered).unwrap();
+        state.drop_task(delivered).unwrap();
     }
 
     #[test]

@@ -2505,6 +2505,11 @@ fn push_native_async_export(
     ) {
         return Err(DecodeError::InvalidWiring);
     }
+    if exports.len() >= PROFILE_1_LIMITS.max_canonical_functions as usize
+        || exports.iter().any(|export| export.name == name)
+    {
+        return Err(DecodeError::InvalidWiring);
+    }
     exports
         .try_reserve(1)
         .map_err(|_| DecodeError::Allocation)?;
@@ -3810,4 +3815,100 @@ fn execution_options(options: &[CanonicalOption]) -> Result<LiftOptionsDraft, De
         realloc,
         post_return,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn native_lift(canonical_index: u32) -> NativeAsyncCanonicalPlan {
+        NativeAsyncCanonicalPlan {
+            canonical_index,
+            function: NativeAsyncCanonicalFunctionPlan::Lift {
+                core_function: NativeAsyncCoreExportRef {
+                    core_instance: 0,
+                    export: String::new(),
+                },
+                function_type: crate::types::FunctionType {
+                    effect: crate::world::FunctionEffect::Async,
+                    parameters: Vec::new(),
+                    result: None,
+                },
+                callback: NativeAsyncCoreExportRef {
+                    core_instance: 0,
+                    export: String::new(),
+                },
+                options: NativeAsyncCanonicalOptionsPlan {
+                    string_encoding: None,
+                    async_: true,
+                    memory: None,
+                    realloc: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn native_top_level_export_cannot_collide_with_flattened_interface_member() {
+        let component_functions = [
+            Some(ComponentFunctionDraft::AsyncLift { canonical_index: 0 }),
+            Some(ComponentFunctionDraft::AsyncLift { canonical_index: 1 }),
+        ];
+        let canonical_drafts = [
+            AsyncCanonicalDraft {
+                canonical_index: 0,
+                function: AsyncCanonicalFunctionDraft::Lift {
+                    core_function: 0,
+                    function_type: 0,
+                    callback: 1,
+                    options: AsyncOptionsDraft {
+                        string_encoding: None,
+                        async_: true,
+                        memory: None,
+                        realloc: None,
+                    },
+                },
+            },
+            AsyncCanonicalDraft {
+                canonical_index: 1,
+                function: AsyncCanonicalFunctionDraft::Lift {
+                    core_function: 2,
+                    function_type: 0,
+                    callback: 3,
+                    options: AsyncOptionsDraft {
+                        string_encoding: None,
+                        async_: true,
+                        memory: None,
+                        realloc: None,
+                    },
+                },
+            },
+        ];
+        let canonical = [native_lift(0), native_lift(1)];
+        let mut exports = Vec::new();
+
+        push_native_async_export(
+            &mut exports,
+            "api#member",
+            0,
+            &component_functions,
+            &canonical_drafts,
+            &canonical,
+        )
+        .unwrap();
+        assert_eq!(exports[0].canonical, 0);
+
+        assert_eq!(
+            push_native_async_export(
+                &mut exports,
+                "api#member",
+                1,
+                &component_functions,
+                &canonical_drafts,
+                &canonical,
+            ),
+            Err(DecodeError::InvalidWiring)
+        );
+        assert_eq!(exports.len(), 1);
+    }
 }

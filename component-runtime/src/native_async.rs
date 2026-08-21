@@ -14,9 +14,9 @@ use crate::{
     },
     async_state::{
         AsyncState, AsyncStateError, AsyncStateLimits, CommitError, CopyBegin, EndpointKind, Event,
-        EventLease, EventLeaseState, EventToken, HostReadableBindingsPair, ReadableTransferRequest,
-        ReclaimError, TaskCancelState, TaskHandle, TaskResultState, TransferredReadableEndpoint,
-        WaitBegin, WaitResume, WaitTicket,
+        EventLease, EventLeaseState, EventToken, HostCopyTicket, HostReadableBindingsPair,
+        ReadableTransferRequest, ReclaimError, TaskCancelState, TaskHandle, TaskResultState,
+        TransferredReadableEndpoint, WaitBegin, WaitResume, WaitTicket,
     },
     buffer_registry::{BufferPlanId, BufferRegistry, BufferRole},
     decode::ComponentPlan,
@@ -32,6 +32,7 @@ use crate::{
     world::FunctionEffect,
 };
 use alloc::{string::String, vec::Vec};
+use core::num::NonZeroU64;
 use vibeos_component_format::{ProfileIdentity, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
     CoreCallSlot, CoreCallSlotState, CoreComponentGroup, CoreHostImport, CoreInstanceExportImport,
@@ -100,8 +101,47 @@ pub(crate) enum NativeAsyncPoll {
         token: NativeAsyncWaitToken,
         metrics: NativeAsyncMetrics,
     },
+    HostPending {
+        token: NativeAsyncHostToken,
+        request: NativeAsyncHostRequest,
+        metrics: NativeAsyncMetrics,
+    },
     Complete(NativeAsyncMetrics),
     Trapped(TrapCode),
+}
+
+/// Exact owner authority for one native guest/host copy transition.
+///
+/// The task seal prevents cross-invocation reuse and the non-zero generation
+/// rotates at every two-phase driver transition. Private fields make tokens
+/// unforgeable outside this executor module.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeAsyncHostToken {
+    task: TaskHandle,
+    generation: NonZeroU64,
+}
+
+impl core::fmt::Debug for NativeAsyncHostToken {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("NativeAsyncHostToken(<opaque>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeAsyncHostRequest {
+    InputStream { maximum: u32 },
+    InputClosed,
+    OutputStream { maximum: u32 },
+    OutputClosed { value: Option<u8> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeAsyncHostError {
+    InvalidToken,
+    NotPending,
+    WrongRequest,
+    WrongPhase,
+    InvalidProgress,
 }
 
 /// Exact owner authority for one blocked callback wait.
@@ -470,6 +510,10 @@ impl NativeAsyncComponent {
             input: None,
             output_stream: None,
             output_closed: None,
+            host_current: None,
+            host_next: None,
+            host_token: None,
+            next_host_generation: 1,
             terminal: false,
         })
     }
@@ -590,6 +634,10 @@ impl NativeAsyncComponent {
             input: Some(input),
             output_stream: None,
             output_closed: None,
+            host_current: None,
+            host_next: None,
+            host_token: None,
+            next_host_generation: 1,
             terminal: false,
         })
     }
@@ -1074,6 +1122,19 @@ fn buffer_copy_work(progress: u32, scratch_bytes: usize) -> Option<u64> {
         .checked_add(chunks)
 }
 
+/// Host transport freezes one guest buffer and moves each selected byte once.
+/// The Canonical ABI bridge transition was already charged separately.
+const fn host_copy_work(progress: u32) -> Option<u64> {
+    BUFFER_COPY_BASE_WORK.checked_add(progress as u64)
+}
+
+const fn map_host_commit_error(error: CommitError<TrapCode>) -> TrapCode {
+    match error {
+        CommitError::State(_) => TrapCode::Validation,
+        CommitError::Operation(trap) => trap,
+    }
+}
+
 const fn map_state_error(error: AsyncStateError) -> NativeAsyncError {
     match error {
         AsyncStateError::AllocationFailed => NativeAsyncError::Allocation,
@@ -1223,19 +1284,64 @@ const fn map_callback_wait_resume_error(error: AsyncStateError) -> TrapCode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationStage {
     Run,
     StartCallback,
     Callback,
     WaitBlocked,
+    HostBlocked,
     Terminal,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CallAuthority {
     Run(usize),
     Callback,
+}
+
+const fn call_stage(authority: CallAuthority) -> InvocationStage {
+    match authority {
+        CallAuthority::Run(_) => InvocationStage::Run,
+        CallAuthority::Callback => InvocationStage::Callback,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostCopyPhase {
+    Offered,
+    Prepared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostRequestKind {
+    InputStream,
+    InputClosed,
+    OutputStream,
+    OutputClosed,
+}
+
+const fn host_request_kind(request: NativeAsyncHostRequest) -> HostRequestKind {
+    match request {
+        NativeAsyncHostRequest::InputStream { .. } => HostRequestKind::InputStream,
+        NativeAsyncHostRequest::InputClosed => HostRequestKind::InputClosed,
+        NativeAsyncHostRequest::OutputStream { .. } => HostRequestKind::OutputStream,
+        NativeAsyncHostRequest::OutputClosed { .. } => HostRequestKind::OutputClosed,
+    }
+}
+
+struct PendingHostCopy {
+    ticket: HostCopyTicket,
+    authority: CallAuthority,
+    request: NativeAsyncHostRequest,
+    kind: EndpointKind,
+    direction: EndpointDirection,
+    value_type: AsyncValueTypeId,
+    resume_stage: InvocationStage,
+    phase: HostCopyPhase,
+    limit: u32,
+    progress: u32,
+    charged: bool,
 }
 
 pub(crate) struct NativeAsyncInvocation<'a> {
@@ -1257,6 +1363,11 @@ pub(crate) struct NativeAsyncInvocation<'a> {
     /// Exact output-side tokens lifted atomically by `task.return`.
     output_stream: Option<ReadableStreamEndpointToken>,
     output_closed: Option<ReadableFutureEndpointToken>,
+    /// At most two native host copies can exist: byte stream before close.
+    host_current: Option<PendingHostCopy>,
+    host_next: Option<PendingHostCopy>,
+    host_token: Option<NativeAsyncHostToken>,
+    next_host_generation: u64,
     terminal: bool,
 }
 
@@ -1273,6 +1384,7 @@ impl NativeAsyncInvocation<'_> {
             InvocationStage::StartCallback => self.start_callback(),
             InvocationStage::Callback => self.poll_callback(),
             InvocationStage::WaitBlocked => self.poll_wait_blocked(),
+            InvocationStage::HostBlocked => self.poll_host_blocked(),
             InvocationStage::Terminal => NativeAsyncPoll::Trapped(TrapCode::Cancelled),
         }
     }
@@ -1312,6 +1424,255 @@ impl NativeAsyncInvocation<'_> {
             TaskCancelState::Delivered | TaskCancelState::Acknowledged => {
                 Ok(NativeAsyncCancelOutcome::TooLate)
             }
+        }
+    }
+
+    /// Reserves byte work and validates the exact guest input target before a
+    /// backend is allowed to linearize an input receive.
+    pub(crate) fn prepare_host_input_stream(
+        &mut self,
+        token: NativeAsyncHostToken,
+        progress: u32,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_host_driver(token, HostRequestKind::InputStream, HostCopyPhase::Offered)?;
+        let limit = self.host_current.as_ref().unwrap().limit;
+        if progress > limit {
+            return Err(NativeAsyncHostError::InvalidProgress);
+        }
+        let preflight = {
+            let host = self.host_current.as_ref().unwrap();
+            let (state, buffers, modules) = (
+                &self.component.state,
+                &self.component.buffers,
+                &self.component.modules,
+            );
+            state.with_host_input_buffer(&host.ticket, progress, |lease| {
+                buffers.preflight_copy_from_host(modules, lease, progress as usize)
+            })
+        };
+        if let Err(error) = preflight {
+            let trap = map_host_commit_error(error);
+            return Ok(self.finish_trap(trap));
+        }
+        Ok(self.finish_host_prepare(progress, None))
+    }
+
+    pub(crate) fn prepare_host_input_closed(
+        &mut self,
+        token: NativeAsyncHostToken,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_host_driver(token, HostRequestKind::InputClosed, HostCopyPhase::Offered)?;
+        let preflight = {
+            let host = self.host_current.as_ref().unwrap();
+            let (state, buffers, modules) = (
+                &self.component.state,
+                &self.component.buffers,
+                &self.component.modules,
+            );
+            state.with_host_input_buffer(&host.ticket, 1, |lease| {
+                buffers.preflight_copy_from_host(modules, lease, 1)
+            })
+        };
+        if let Err(error) = preflight {
+            let trap = map_host_commit_error(error);
+            return Ok(self.finish_trap(trap));
+        }
+        Ok(self.finish_host_prepare(1, None))
+    }
+
+    /// Copies the exact frozen guest source once into caller-owned fixed
+    /// storage. The caller may linearize its backend send before committing.
+    pub(crate) fn prepare_host_output_stream(
+        &mut self,
+        token: NativeAsyncHostToken,
+        output: &mut [u8],
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_host_driver(token, HostRequestKind::OutputStream, HostCopyPhase::Offered)?;
+        let Ok(progress) = u32::try_from(output.len()) else {
+            return Err(NativeAsyncHostError::InvalidProgress);
+        };
+        if progress > self.host_current.as_ref().unwrap().limit {
+            return Err(NativeAsyncHostError::InvalidProgress);
+        }
+        let ticket_preflight = {
+            let host = self.host_current.as_ref().unwrap();
+            self.component
+                .state
+                .with_host_copy_buffer(&host.ticket, progress, |_| Ok::<(), TrapCode>(()))
+        };
+        if let Err(error) = ticket_preflight {
+            return Ok(self.finish_trap(map_host_commit_error(error)));
+        }
+        let prepared_token = match self.charge_host_prepare(progress) {
+            Ok(token) => token,
+            Err(trap) => return Ok(self.finish_trap(trap)),
+        };
+        let copied = {
+            let host = self.host_current.as_ref().unwrap();
+            let (state, buffers, modules) = (
+                &self.component.state,
+                &self.component.buffers,
+                &self.component.modules,
+            );
+            state.with_host_copy_buffer(&host.ticket, progress, |lease| {
+                buffers.copy_to_host(modules, lease, output)
+            })
+        };
+        if let Err(error) = copied {
+            return Ok(self.finish_trap(map_host_commit_error(error)));
+        }
+        Ok(self.mark_host_prepared(progress, None, prepared_token))
+    }
+
+    /// Lifts the exact frozen close discriminant once. The value is retained
+    /// in the stable HostPending request until backend linearization commits.
+    pub(crate) fn prepare_host_output_closed(
+        &mut self,
+        token: NativeAsyncHostToken,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_host_driver(token, HostRequestKind::OutputClosed, HostCopyPhase::Offered)?;
+        let ticket_preflight = {
+            let host = self.host_current.as_ref().unwrap();
+            self.component
+                .state
+                .with_host_copy_buffer(&host.ticket, 1, |_| Ok::<(), TrapCode>(()))
+        };
+        if let Err(error) = ticket_preflight {
+            return Ok(self.finish_trap(map_host_commit_error(error)));
+        }
+        let prepared_token = match self.charge_host_prepare(1) {
+            Ok(token) => token,
+            Err(trap) => return Ok(self.finish_trap(trap)),
+        };
+        let lifted = {
+            let host = self.host_current.as_ref().unwrap();
+            let (state, buffers, modules) = (
+                &self.component.state,
+                &self.component.buffers,
+                &self.component.modules,
+            );
+            state.with_host_copy_buffer(&host.ticket, 1, |lease| buffers.lift_enum8(modules, lease))
+        };
+        match lifted {
+            Ok(value) => Ok(self.mark_host_prepared(1, Some(value), prepared_token)),
+            Err(error) => Ok(self.finish_trap(map_host_commit_error(error))),
+        }
+    }
+
+    pub(crate) fn commit_host_input_stream(
+        &mut self,
+        token: NativeAsyncHostToken,
+        input: &[u8],
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_host_driver(token, HostRequestKind::InputStream, HostCopyPhase::Prepared)?;
+        if usize::try_from(self.host_current.as_ref().unwrap().progress).ok() != Some(input.len()) {
+            return Err(NativeAsyncHostError::InvalidProgress);
+        }
+        self.host_token = None;
+        let committed = {
+            let host = self.host_current.as_mut().unwrap();
+            let (state, buffers, modules) = (
+                &mut self.component.state,
+                &self.component.buffers,
+                &mut self.component.modules,
+            );
+            state.commit_host_copy(
+                &mut host.ticket,
+                crate::async_abi::CopyResult::Completed,
+                host.progress,
+                |lease, _| buffers.copy_from_host(modules, lease, input),
+            )
+        };
+        match committed {
+            Ok(_event) => Ok(self.finish_host_commit()),
+            Err(error) => Ok(self.finish_trap(map_host_commit_error(error))),
+        }
+    }
+
+    pub(crate) fn commit_host_input_closed(
+        &mut self,
+        token: NativeAsyncHostToken,
+        value: u8,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_host_driver(token, HostRequestKind::InputClosed, HostCopyPhase::Prepared)?;
+        if value >= 8 {
+            self.host_token = None;
+            return Ok(self.finish_trap(TrapCode::CanonicalAbi));
+        }
+        self.host_token = None;
+        let committed = {
+            let host = self.host_current.as_mut().unwrap();
+            let (state, buffers, modules) = (
+                &mut self.component.state,
+                &self.component.buffers,
+                &mut self.component.modules,
+            );
+            state.commit_host_copy(
+                &mut host.ticket,
+                crate::async_abi::CopyResult::Completed,
+                1,
+                |lease, _| buffers.lower_enum8(modules, lease, value),
+            )
+        };
+        match committed {
+            Ok(_event) => Ok(self.finish_host_commit()),
+            Err(error) => Ok(self.finish_trap(map_host_commit_error(error))),
+        }
+    }
+
+    pub(crate) fn commit_host_output(
+        &mut self,
+        token: NativeAsyncHostToken,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_any_output_host_driver(token, HostCopyPhase::Prepared)?;
+        self.host_token = None;
+        let committed = {
+            let host = self.host_current.as_mut().unwrap();
+            self.component
+                .state
+                .commit_prepared_host_copy(&mut host.ticket, host.progress)
+        };
+        match committed {
+            Ok(_event) => Ok(self.finish_host_commit()),
+            Err(_) => Ok(self.finish_trap(TrapCode::Validation)),
+        }
+    }
+
+    pub(crate) fn cancel_host_copy(
+        &mut self,
+        token: NativeAsyncHostToken,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_any_host_driver(token)?;
+        self.host_token = None;
+        let cancelled = {
+            let host = self.host_current.as_mut().unwrap();
+            self.component.state.cancel_host_copy(&mut host.ticket)
+        };
+        match cancelled {
+            Ok(_event) => Ok(self.finish_host_commit()),
+            Err(_) => Ok(self.finish_trap(TrapCode::Validation)),
+        }
+    }
+
+    pub(crate) fn drop_host_copy_peer(
+        &mut self,
+        token: NativeAsyncHostToken,
+    ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
+        self.validate_any_host_driver(token)?;
+        if matches!(
+            self.host_current.as_ref().map(|host| host.request),
+            Some(NativeAsyncHostRequest::InputClosed)
+        ) {
+            return Err(NativeAsyncHostError::WrongRequest);
+        }
+        self.host_token = None;
+        let dropped = {
+            let host = self.host_current.as_mut().unwrap();
+            self.component.state.drop_host_copy_peer(&mut host.ticket)
+        };
+        match dropped {
+            Ok(_event) => Ok(self.finish_host_commit()),
+            Err(error) => Ok(self.finish_trap(map_runtime_state_error(error))),
         }
     }
 
@@ -1392,6 +1753,250 @@ impl NativeAsyncInvocation<'_> {
             token,
             metrics: self.metrics(),
         }
+    }
+
+    fn poll_host_blocked(&mut self) -> NativeAsyncPoll {
+        let Some(token) = self.host_token else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        let Some(host) = self.host_current.as_ref() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        let next_is_exact = match self.host_next.as_ref() {
+            Some(next) => {
+                matches!(host.request, NativeAsyncHostRequest::OutputStream { .. })
+                    && next.authority == host.authority
+                    && next.resume_stage == host.resume_stage
+                    && self.host_copy_invariant(next, true)
+            }
+            None => true,
+        };
+        if token.task != self.task
+            || token != self.host_token.unwrap()
+            || !self.host_copy_invariant(host, false)
+            || !next_is_exact
+        {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        NativeAsyncPoll::HostPending {
+            token,
+            request: host.request,
+            metrics: self.metrics(),
+        }
+    }
+
+    fn host_copy_invariant(&self, host: &PendingHostCopy, queued: bool) -> bool {
+        let RuntimeExportContract::ByteStream(contract) = self.binding().contract else {
+            return false;
+        };
+        if host.resume_stage != call_stage(host.authority)
+            || matches!(host.authority, CallAuthority::Run(active) if active != self.binding().core_instance)
+            || host.charged != (host.phase == HostCopyPhase::Prepared)
+            || host.progress > host.limit
+            || (host.phase == HostCopyPhase::Offered && host.progress != 0)
+            || (host.kind == EndpointKind::Future
+                && (host.limit != 1
+                    || host.progress
+                        != if host.phase == HostCopyPhase::Prepared {
+                            1
+                        } else {
+                            0
+                        }))
+        {
+            return false;
+        }
+        match host.request {
+            NativeAsyncHostRequest::InputStream { maximum } => {
+                !queued
+                    && maximum == host.limit
+                    && host.kind == EndpointKind::Stream
+                    && host.direction == EndpointDirection::Read
+                    && host.value_type == contract.stream
+                    && self.input.as_ref().is_some_and(|input| {
+                        input.first.host.kind() == EndpointKind::Stream
+                            && input.first.host.direction() == EndpointDirection::Write
+                            && input.first.host.value_type() == contract.stream
+                    })
+            }
+            NativeAsyncHostRequest::InputClosed => {
+                !queued
+                    && host.limit == 1
+                    && host.progress <= 1
+                    && host.kind == EndpointKind::Future
+                    && host.direction == EndpointDirection::Read
+                    && host.value_type == contract.closed
+                    && self.input.as_ref().is_some_and(|input| {
+                        input.second.host.kind() == EndpointKind::Future
+                            && input.second.host.direction() == EndpointDirection::Write
+                            && input.second.host.value_type() == contract.closed
+                    })
+            }
+            NativeAsyncHostRequest::OutputStream { maximum } => {
+                !queued
+                    && maximum == host.limit
+                    && host.kind == EndpointKind::Stream
+                    && host.direction == EndpointDirection::Write
+                    && host.value_type == contract.stream
+                    && self
+                        .output_stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.value_type() == contract.stream)
+            }
+            NativeAsyncHostRequest::OutputClosed { value } => {
+                host.limit == 1
+                    && host.progress <= 1
+                    && value.is_some() == (host.phase == HostCopyPhase::Prepared)
+                    && (!queued || host.phase == HostCopyPhase::Offered)
+                    && host.kind == EndpointKind::Future
+                    && host.direction == EndpointDirection::Write
+                    && host.value_type == contract.closed
+                    && self
+                        .output_closed
+                        .as_ref()
+                        .is_some_and(|closed| closed.value_type() == contract.closed)
+            }
+        }
+    }
+
+    fn validate_host_driver(
+        &self,
+        token: NativeAsyncHostToken,
+        request: HostRequestKind,
+        phase: HostCopyPhase,
+    ) -> Result<(), NativeAsyncHostError> {
+        self.validate_any_host_driver(token)?;
+        let host = self
+            .host_current
+            .as_ref()
+            .ok_or(NativeAsyncHostError::NotPending)?;
+        if host_request_kind(host.request) != request {
+            return Err(NativeAsyncHostError::WrongRequest);
+        }
+        if host.phase != phase {
+            return Err(NativeAsyncHostError::WrongPhase);
+        }
+        Ok(())
+    }
+
+    fn validate_any_output_host_driver(
+        &self,
+        token: NativeAsyncHostToken,
+        phase: HostCopyPhase,
+    ) -> Result<(), NativeAsyncHostError> {
+        self.validate_any_host_driver(token)?;
+        let host = self
+            .host_current
+            .as_ref()
+            .ok_or(NativeAsyncHostError::NotPending)?;
+        if !matches!(
+            host.request,
+            NativeAsyncHostRequest::OutputStream { .. }
+                | NativeAsyncHostRequest::OutputClosed { .. }
+        ) {
+            return Err(NativeAsyncHostError::WrongRequest);
+        }
+        if host.phase != phase {
+            return Err(NativeAsyncHostError::WrongPhase);
+        }
+        Ok(())
+    }
+
+    fn validate_any_host_driver(
+        &self,
+        token: NativeAsyncHostToken,
+    ) -> Result<(), NativeAsyncHostError> {
+        if !matches!(self.stage, InvocationStage::HostBlocked)
+            || self.host_current.is_none()
+            || self.host_token.is_none()
+        {
+            return Err(NativeAsyncHostError::NotPending);
+        }
+        if token.task != self.task || self.host_token != Some(token) {
+            return Err(NativeAsyncHostError::InvalidToken);
+        }
+        Ok(())
+    }
+
+    fn finish_host_prepare(&mut self, progress: u32, value: Option<u8>) -> NativeAsyncPoll {
+        let token = match self.charge_host_prepare(progress) {
+            Ok(token) => token,
+            Err(trap) => return self.finish_trap(trap),
+        };
+        self.mark_host_prepared(progress, value, token)
+    }
+
+    fn charge_host_prepare(&mut self, progress: u32) -> Result<NativeAsyncHostToken, TrapCode> {
+        let host = self.host_current.as_ref().ok_or(TrapCode::Validation)?;
+        if host.phase != HostCopyPhase::Offered
+            || host.charged
+            || host.progress != 0
+            || progress > host.limit
+        {
+            return Err(TrapCode::Validation);
+        }
+        let authority = host.authority;
+        let work = host_copy_work(progress).ok_or(TrapCode::FuelExhausted)?;
+        // Revoke the offered token before the first fuel mutation. A failed
+        // prepare can never be retried through the old generation.
+        self.host_token = None;
+        let token = self.mint_host_token()?;
+        self.debit_active_work_with_reserve(authority, work)?;
+        let host = self.host_current.as_mut().ok_or(TrapCode::Validation)?;
+        host.progress = progress;
+        host.charged = true;
+        Ok(token)
+    }
+
+    fn mark_host_prepared(
+        &mut self,
+        progress: u32,
+        value: Option<u8>,
+        token: NativeAsyncHostToken,
+    ) -> NativeAsyncPoll {
+        let Some(host) = self.host_current.as_mut() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        if host.phase != HostCopyPhase::Offered
+            || !host.charged
+            || host.progress != progress
+            || self.host_token.is_some()
+        {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        match (&mut host.request, value) {
+            (NativeAsyncHostRequest::OutputClosed { value: slot }, Some(value)) => {
+                *slot = Some(value);
+            }
+            (NativeAsyncHostRequest::InputStream { .. }, None)
+            | (NativeAsyncHostRequest::InputClosed, None)
+            | (NativeAsyncHostRequest::OutputStream { .. }, None) => {}
+            _ => return self.finish_trap(TrapCode::Validation),
+        }
+        host.phase = HostCopyPhase::Prepared;
+        self.host_token = Some(token);
+        self.poll_host_blocked()
+    }
+
+    fn finish_host_commit(&mut self) -> NativeAsyncPoll {
+        self.host_token = None;
+        let Some(completed) = self.host_current.take() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        if let Some(next) = self.host_next.take() {
+            if !matches!(
+                (completed.request, next.request),
+                (
+                    NativeAsyncHostRequest::OutputStream { .. },
+                    NativeAsyncHostRequest::OutputClosed { value: None }
+                )
+            ) {
+                return self.finish_trap(TrapCode::Validation);
+            }
+            self.host_current = Some(next);
+            return self.activate_queued_host_copy();
+        }
+        self.stage = completed.resume_stage;
+        NativeAsyncPoll::Pending(self.metrics())
     }
 
     fn poll_run(&mut self, active_instance: usize) -> NativeAsyncPoll {
@@ -1515,10 +2120,21 @@ impl NativeAsyncInvocation<'_> {
                     Ok(closed) => closed,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
+                // A component input's peer is already owned by the host. It
+                // cannot be turned into a drivable output by echoing the
+                // guest-readable handle: there is no guest write operation or
+                // frozen guest source for the HostPending protocol to settle.
+                // Compare sealed handles, not raw integers, so reuse cannot
+                // turn this topology check into an ABA alias.
+                if self.input.as_ref().is_some_and(|input| {
+                    input.first.guest == stream || input.second.guest == closed
+                }) {
+                    return self.finish_trap(TrapCode::CanonicalAbi);
+                }
                 if let Err(trap) = self.debit_active_work(authority, TASK_RETURN_WORK) {
                     return self.finish_trap(trap);
                 }
-                let detached = self.component.state.detach_readables_pair(
+                let detached = self.component.state.detach_readables_pair_with_pending(
                     ReadableTransferRequest {
                         handle: stream,
                         kind: EndpointKind::Stream,
@@ -1530,16 +2146,23 @@ impl NativeAsyncInvocation<'_> {
                         value_type: contract.closed,
                     },
                 );
-                let (stream, closed) = match detached {
-                    Ok((
-                        TransferredReadableEndpoint::Stream(stream),
-                        TransferredReadableEndpoint::Future(closed),
-                    )) if stream.value_type() == contract.stream
-                        && closed.value_type() == contract.closed =>
-                    {
-                        (stream, closed)
-                    }
-                    Ok(_) => return self.finish_trap(TrapCode::Validation),
+                let (stream, closed, stream_pending, closed_pending) = match detached {
+                    Ok(detached) => match (detached.first.endpoint, detached.second.endpoint) {
+                        (
+                            TransferredReadableEndpoint::Stream(stream),
+                            TransferredReadableEndpoint::Future(closed),
+                        ) if stream.value_type() == contract.stream
+                            && closed.value_type() == contract.closed =>
+                        {
+                            (
+                                stream,
+                                closed,
+                                detached.first.pending,
+                                detached.second.pending,
+                            )
+                        }
+                        _ => return self.finish_trap(TrapCode::Validation),
+                    },
                     Err(error) => return self.finish_trap(map_exact_endpoint_state_error(error)),
                 };
                 // Store both linear output authorities before the next
@@ -1548,13 +2171,51 @@ impl NativeAsyncInvocation<'_> {
                 // an executor invariant.
                 self.output_stream = Some(stream);
                 self.output_closed = Some(closed);
+                self.host_current = stream_pending.map(|ticket| PendingHostCopy {
+                    ticket,
+                    authority,
+                    request: NativeAsyncHostRequest::OutputStream { maximum: 0 },
+                    kind: EndpointKind::Stream,
+                    direction: EndpointDirection::Write,
+                    value_type: contract.stream,
+                    resume_stage: call_stage(authority),
+                    phase: HostCopyPhase::Offered,
+                    limit: 0,
+                    progress: 0,
+                    charged: false,
+                });
+                let closed_host = closed_pending.map(|ticket| PendingHostCopy {
+                    ticket,
+                    authority,
+                    request: NativeAsyncHostRequest::OutputClosed { value: None },
+                    kind: EndpointKind::Future,
+                    direction: EndpointDirection::Write,
+                    value_type: contract.closed,
+                    resume_stage: call_stage(authority),
+                    phase: HostCopyPhase::Offered,
+                    limit: 0,
+                    progress: 0,
+                    charged: false,
+                });
+                if self.host_current.is_some() {
+                    self.host_next = closed_host;
+                } else {
+                    self.host_current = closed_host;
+                }
+                if self.initialize_output_host_copies().is_err() {
+                    return self.finish_trap(TrapCode::Validation);
+                }
                 if let Err(error) = self.component.state.resolve_task_result(self.task) {
                     return self.finish_trap(map_sealed_state_error(error));
                 }
                 if let Err(trap) = self.resume_active_host_call(authority, call.id, &[]) {
                     return self.finish_trap(trap);
                 }
-                NativeAsyncPoll::Resolved(self.metrics())
+                if self.host_current.is_some() {
+                    self.activate_queued_host_copy()
+                } else {
+                    NativeAsyncPoll::Resolved(self.metrics())
+                }
             }
             (BridgeAction::StreamNew(value_type), []) => {
                 if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
@@ -1828,12 +2489,18 @@ impl NativeAsyncInvocation<'_> {
         };
 
         let event = match begun {
-            CopyBegin::Blocked { abi, .. } => {
+            CopyBegin::Blocked { abi, operation } => {
                 let results = [CoreValue::I32(abi as i32)];
                 if let Err(trap) = self.resume_active_host_call(authority, host_id, &results) {
                     return self.finish_trap(trap);
                 }
-                return NativeAsyncPoll::Pending(self.metrics());
+                match self
+                    .capture_host_copy(authority, kind, direction, value_type, handle, operation)
+                {
+                    Ok(Some(host)) => return self.activate_host_copy(host),
+                    Ok(None) => return NativeAsyncPoll::Pending(self.metrics()),
+                    Err(trap) => return self.finish_trap(trap),
+                }
             }
             CopyBegin::Ready(event) => event,
             CopyBegin::Local(mut ticket) => {
@@ -1881,6 +2548,190 @@ impl NativeAsyncInvocation<'_> {
             }
         };
         self.finish_copy_event(authority, host_id, event, kind, direction, raw)
+    }
+
+    fn capture_host_copy(
+        &mut self,
+        authority: CallAuthority,
+        kind: EndpointKind,
+        direction: EndpointDirection,
+        value_type: AsyncValueTypeId,
+        handle: crate::async_state::AsyncHandle,
+        operation: crate::async_state::CopyOpToken,
+    ) -> Result<Option<PendingHostCopy>, TrapCode> {
+        if direction == EndpointDirection::Write {
+            let prepared = match kind {
+                EndpointKind::Stream => {
+                    let Some(stream) = self
+                        .output_stream
+                        .as_ref()
+                        .filter(|stream| stream.value_type() == value_type)
+                    else {
+                        return Ok(None);
+                    };
+                    self.component
+                        .state
+                        .prepare_stream_host_copy(stream, &operation)
+                }
+                EndpointKind::Future => {
+                    let Some(closed) = self
+                        .output_closed
+                        .as_ref()
+                        .filter(|closed| closed.value_type() == value_type)
+                    else {
+                        return Ok(None);
+                    };
+                    self.component
+                        .state
+                        .prepare_future_host_copy(closed, &operation)
+                }
+            };
+            let ticket = match prepared {
+                Ok(ticket) => ticket,
+                Err(AsyncStateError::StaleOperation) => return Ok(None),
+                Err(_) => return Err(TrapCode::Validation),
+            };
+            let limit = self
+                .component
+                .state
+                .host_copy_progress_limit(&ticket)
+                .map_err(|_| TrapCode::Validation)?;
+            let request = match kind {
+                EndpointKind::Stream => NativeAsyncHostRequest::OutputStream { maximum: limit },
+                EndpointKind::Future if limit == 1 => {
+                    NativeAsyncHostRequest::OutputClosed { value: None }
+                }
+                EndpointKind::Future => return Err(TrapCode::Validation),
+            };
+            return Ok(Some(PendingHostCopy {
+                ticket,
+                authority,
+                request,
+                kind,
+                direction,
+                value_type,
+                resume_stage: call_stage(authority),
+                phase: HostCopyPhase::Offered,
+                limit,
+                progress: 0,
+                charged: false,
+            }));
+        }
+        if direction != EndpointDirection::Read {
+            return Ok(None);
+        }
+        let Some(input) = self.input.as_ref() else {
+            return Ok(None);
+        };
+        let binding = match kind {
+            EndpointKind::Stream
+                if input.first.guest == handle
+                    && input.first.host.kind() == EndpointKind::Stream
+                    && input.first.host.direction() == EndpointDirection::Write
+                    && input.first.host.value_type() == value_type =>
+            {
+                &input.first.host
+            }
+            EndpointKind::Future
+                if input.second.guest == handle
+                    && input.second.host.kind() == EndpointKind::Future
+                    && input.second.host.direction() == EndpointDirection::Write
+                    && input.second.host.value_type() == value_type =>
+            {
+                &input.second.host
+            }
+            _ => return Ok(None),
+        };
+        let ticket = self
+            .component
+            .state
+            .prepare_host_copy(binding, &operation)
+            .map_err(|_| TrapCode::Validation)?;
+        let limit = self
+            .component
+            .state
+            .host_copy_progress_limit(&ticket)
+            .map_err(|_| TrapCode::Validation)?;
+        let request = match kind {
+            EndpointKind::Stream => NativeAsyncHostRequest::InputStream { maximum: limit },
+            EndpointKind::Future if limit == 1 => NativeAsyncHostRequest::InputClosed,
+            EndpointKind::Future => return Err(TrapCode::Validation),
+        };
+        Ok(Some(PendingHostCopy {
+            ticket,
+            authority,
+            request,
+            kind,
+            direction,
+            value_type,
+            resume_stage: call_stage(authority),
+            phase: HostCopyPhase::Offered,
+            limit,
+            progress: 0,
+            charged: false,
+        }))
+    }
+
+    fn activate_host_copy(&mut self, host: PendingHostCopy) -> NativeAsyncPoll {
+        if self.host_current.is_some() || self.host_token.is_some() {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        self.host_current = Some(host);
+        self.activate_queued_host_copy()
+    }
+
+    fn activate_queued_host_copy(&mut self) -> NativeAsyncPoll {
+        if self.host_current.is_none() || self.host_token.is_some() {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        let token = match self.mint_host_token() {
+            Ok(token) => token,
+            Err(trap) => return self.finish_trap(trap),
+        };
+        let Some(request) = self.host_current.as_ref().map(|host| host.request) else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        self.host_token = Some(token);
+        self.stage = InvocationStage::HostBlocked;
+        NativeAsyncPoll::HostPending {
+            token,
+            request,
+            metrics: self.metrics(),
+        }
+    }
+
+    fn initialize_output_host_copies(&mut self) -> Result<(), ()> {
+        for host in [&mut self.host_current, &mut self.host_next]
+            .into_iter()
+            .flatten()
+        {
+            let limit = self
+                .component
+                .state
+                .host_copy_progress_limit(&host.ticket)
+                .map_err(|_| ())?;
+            host.limit = limit;
+            host.request = match host.kind {
+                EndpointKind::Stream => NativeAsyncHostRequest::OutputStream { maximum: limit },
+                EndpointKind::Future if limit == 1 => {
+                    NativeAsyncHostRequest::OutputClosed { value: None }
+                }
+                EndpointKind::Future => return Err(()),
+            };
+        }
+        Ok(())
+    }
+
+    fn mint_host_token(&mut self) -> Result<NativeAsyncHostToken, TrapCode> {
+        let generation = NonZeroU64::new(self.next_host_generation).ok_or(TrapCode::Validation)?;
+        self.next_host_generation = self
+            .next_host_generation
+            .checked_add(1)
+            .ok_or(TrapCode::LimitExceeded)?;
+        Ok(NativeAsyncHostToken {
+            task: self.task,
+            generation,
+        })
     }
 
     fn handle_copy_cancel(
@@ -2223,6 +3074,8 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn finish_trap(&mut self, trap: TrapCode) -> NativeAsyncPoll {
+        // Revoke owner-visible host authority before any fail-stop cleanup.
+        self.host_token = None;
         self.stage = InvocationStage::Terminal;
         self.terminal = true;
         self.poison_and_discard();
@@ -2233,6 +3086,7 @@ impl NativeAsyncInvocation<'_> {
         // Latch fail-stop before touching any independently fallible cleanup
         // authority. No cleanup error may make this Component reusable.
         self.component.poisoned = true;
+        self.host_token = None;
         // A reusable call's storage can only be recovered with its exact slot
         // authority. Recover every active slot before the principal-wide
         // fallback so no slot can be left looking reusable after its storage
@@ -2265,6 +3119,9 @@ impl NativeAsyncInvocation<'_> {
             });
             buffers.poison();
         }
+        // `abort_all_copies` invalidated both tickets before they are dropped.
+        self.host_current = None;
+        self.host_next = None;
         // Result endpoints have already crossed the guest-to-host ownership
         // boundary, so retain and use their exact tokens for best-effort
         // fail-stop reclamation. Clear an authority only after the state
@@ -2416,6 +3273,236 @@ mod tests {
         source.replacen(from, to, 1)
     }
 
+    fn filter_transport_component(run: &str, callback: &str) -> String {
+        format!(
+            r#"(component
+              (core module $memory-provider
+                (memory (export "memory") 1 1))
+              (core instance $memory-instance (instantiate $memory-provider))
+              (alias core export $memory-instance "memory" (core memory $memory))
+
+              (type $close-reason-private
+                (enum "normal" "failure" "cancelled" "denied" "unavailable"
+                  "exhausted" "invalid" "backend-fault"))
+              (import "close-reason"
+                (type $close-reason (eq $close-reason-private)))
+              (type $bytes-private (stream u8))
+              (import "bytes" (type $bytes (eq $bytes-private)))
+              (type $closed-private (future $close-reason))
+              (import "closed" (type $closed (eq $closed-private)))
+              (type $byte-stream-private
+                (record (field "bytes" $bytes) (field "closed" $closed)))
+              (import "byte-stream"
+                (type $byte-stream (eq $byte-stream-private)))
+              (type $run-type
+                (func async (param "input" $byte-stream) (result $byte-stream)))
+
+              (core func $task-return
+                (canon task.return (result $byte-stream)))
+              (core func $stream-new (canon stream.new $bytes))
+              (core func $stream-read
+                (canon stream.read $bytes async (memory $memory)))
+              (core func $stream-write
+                (canon stream.write $bytes async (memory $memory)))
+              (core func $stream-drop-readable
+                (canon stream.drop-readable $bytes))
+              (core func $future-new (canon future.new $closed))
+              (core func $future-read
+                (canon future.read $closed async (memory $memory)))
+              (core func $future-write
+                (canon future.write $closed async (memory $memory)))
+              (core func $future-drop-readable
+                (canon future.drop-readable $closed))
+              (core instance $builtins
+                (export "task-return" (func $task-return))
+                (export "stream-new" (func $stream-new))
+                (export "stream-read" (func $stream-read))
+                (export "stream-write" (func $stream-write))
+                (export "stream-drop-readable" (func $stream-drop-readable))
+                (export "future-new" (func $future-new))
+                (export "future-read" (func $future-read))
+                (export "future-write" (func $future-write))
+                (export "future-drop-readable" (func $future-drop-readable)))
+
+              (core module $guest
+                (import "env" "memory" (memory 1 1))
+                (import "vibe:async" "task-return"
+                  (func $task-return (param i32 i32)))
+                (import "vibe:async" "stream-new"
+                  (func $stream-new (result i64)))
+                (import "vibe:async" "stream-read"
+                  (func $stream-read (param i32 i32 i32) (result i32)))
+                (import "vibe:async" "stream-write"
+                  (func $stream-write (param i32 i32 i32) (result i32)))
+                (import "vibe:async" "stream-drop-readable"
+                  (func $stream-drop-readable (param i32)))
+                (import "vibe:async" "future-new"
+                  (func $future-new (result i64)))
+                (import "vibe:async" "future-read"
+                  (func $future-read (param i32 i32) (result i32)))
+                (import "vibe:async" "future-write"
+                  (func $future-write (param i32 i32) (result i32)))
+                (import "vibe:async" "future-drop-readable"
+                  (func $future-drop-readable (param i32)))
+                (func (export "run")
+                  (param $input-bytes i32) (param $input-closed i32) (result i32)
+                  (local $stream-pair i64)
+                  (local $closed-pair i64)
+                  {run})
+                (func (export "callback")
+                  (param $event i32) (param $p1 i32) (param $p2 i32) (result i32)
+                  {callback}))
+              (core instance $guest-instance
+                (instantiate $guest
+                  (with "env" (instance $memory-instance))
+                  (with "vibe:async" (instance $builtins))))
+              (alias core export $guest-instance "run" (core func $run))
+              (alias core export $guest-instance "callback" (core func $callback))
+              (func $lifted (type $run-type)
+                (canon lift (core func $run) async
+                  (callback (core func $callback))))
+              (export "run" (func $lifted)))"#
+        )
+    }
+
+    fn poll_to_host(
+        call: &mut NativeAsyncInvocation<'_>,
+    ) -> (
+        NativeAsyncHostToken,
+        NativeAsyncHostRequest,
+        NativeAsyncMetrics,
+    ) {
+        loop {
+            match call.poll() {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request,
+                    metrics,
+                } => return (token, request, metrics),
+                NativeAsyncPoll::WaitPending { .. } => {
+                    panic!("host transport fixture unexpectedly waited")
+                }
+                NativeAsyncPoll::Complete(_) => {
+                    panic!("host transport fixture completed before HostPending")
+                }
+                NativeAsyncPoll::Trapped(trap) => {
+                    panic!("host transport fixture trapped: {trap:?}")
+                }
+            }
+        }
+    }
+
+    fn input_transport_component() -> String {
+        filter_transport_component(
+            r#"local.get $input-bytes
+              i32.const 16
+              i32.const 4
+              call $stream-read
+              i32.const -1
+              i32.ne
+              if unreachable end
+              local.get $input-closed
+              i32.const 32
+              call $future-read
+              i32.const -1
+              i32.ne
+              if unreachable end
+              unreachable"#,
+            "i32.const 0",
+        )
+    }
+
+    fn output_transport_component(
+        stream_before_return: bool,
+        closed_before_return: bool,
+        stream_after_return: bool,
+    ) -> String {
+        let stream_before = if stream_before_return {
+            r#"local.get $stream-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.const 64
+              i32.const 4
+              call $stream-write
+              i32.const -1
+              i32.ne
+              if unreachable end"#
+        } else {
+            ""
+        };
+        let closed_before = if closed_before_return {
+            r#"local.get $closed-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.const 72
+              call $future-write
+              i32.const -1
+              i32.ne
+              if unreachable end"#
+        } else {
+            ""
+        };
+        let stream_after = if stream_after_return {
+            r#"local.get $stream-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.const 64
+              i32.const 4
+              call $stream-write
+              i32.const -1
+              i32.ne
+              if unreachable end"#
+        } else {
+            ""
+        };
+        let run = format!(
+            r#"call $stream-new
+              local.set $stream-pair
+              call $future-new
+              local.set $closed-pair
+              i32.const 0
+              local.get $stream-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.store
+              i32.const 4
+              local.get $closed-pair
+              i64.const 32
+              i64.shr_u
+              i32.wrap_i64
+              i32.store
+              i32.const 64
+              i32.const 67305985
+              i32.store
+              i32.const 72
+              i32.const 6
+              i32.store8
+              {stream_before}
+              {closed_before}
+              local.get $stream-pair
+              i32.wrap_i64
+              local.get $closed-pair
+              i32.wrap_i64
+              call $task-return
+              {stream_after}
+              i32.const 64
+              i32.const 151587081
+              i32.store
+              i32.const 72
+              i32.const 7
+              i32.store8
+              i32.const 1"#
+        );
+        filter_transport_component(&run, "i32.const 0")
+    }
+
     fn filter_core_without_inputs(function_type: &str) -> String {
         replace_once(
             &replace_once(
@@ -2508,6 +3595,9 @@ mod tests {
                 | NativeAsyncPoll::Resolved(_)
                 | NativeAsyncPoll::Yielded(_) => {}
                 NativeAsyncPoll::WaitPending { token, metrics } => return (token, metrics),
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("wait fixture unexpectedly requested host transport")
+                }
                 NativeAsyncPoll::Complete(_) => panic!("wait fixture completed before WAIT"),
                 NativeAsyncPoll::Trapped(trap) => panic!("wait fixture trapped: {trap:?}"),
             }
@@ -2523,6 +3613,9 @@ mod tests {
                 NativeAsyncPoll::Complete(_) => return,
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("cancel callback unexpectedly waited")
+                }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("cancel callback unexpectedly requested host transport")
                 }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("cancel callback trapped: {trap:?}")
@@ -2652,6 +3745,9 @@ mod tests {
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("invalid handle fixture unexpectedly waited")
                 }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("invalid handle fixture unexpectedly requested host transport")
+                }
                 NativeAsyncPoll::Complete(_) => panic!("invalid handle fixture completed"),
             }
         }
@@ -2732,6 +3828,9 @@ mod tests {
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("callback unexpectedly waited")
                 }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("callback unexpectedly requested host transport")
+                }
                 NativeAsyncPoll::Trapped(trap) => panic!("callback trapped: {trap:?}"),
             }
         }
@@ -2791,7 +3890,7 @@ mod tests {
     }
 
     #[test]
-    fn native_filter_receives_nonzero_inputs_and_atomically_returns_the_exact_pair() {
+    fn native_filter_rejects_an_undrivable_host_backed_input_echo_atomically() {
         let mut component = instantiate(FILTER);
         assert_eq!(
             component.start("run", WORK, QUANTUM).err(),
@@ -2809,54 +3908,716 @@ mod tests {
 
         loop {
             match call.poll() {
-                NativeAsyncPoll::Pending(_) | NativeAsyncPoll::Yielded(_) => {}
-                NativeAsyncPoll::Resolved(_) => break,
-                other => panic!("filter must resolve its exact output pair: {other:?}"),
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                other => panic!("host-backed input echo must fail closed: {other:?}"),
             }
         }
-        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
-            panic!("filter binding lost its exact contract")
-        };
-        assert_eq!(
-            call.output_stream.as_ref().unwrap().value_type(),
-            contract.stream
-        );
-        assert_eq!(
-            call.output_closed.as_ref().unwrap().value_type(),
-            contract.closed
-        );
-        assert_eq!(call.task_info().result, TaskResultState::Resolved);
+        assert!(call.output_stream.is_none());
+        assert!(call.output_closed.is_none());
+        assert!(call.input.is_none());
+        assert!(call.component.is_poisoned());
+    }
 
+    #[test]
+    fn native_filter_rejects_a_mixed_host_backed_result_before_partial_transfer() {
+        let source = filter_transport_component(
+            r#"call $stream-new
+              local.set $stream-pair
+              local.get $stream-pair
+              i32.wrap_i64
+              local.get $input-closed
+              call $task-return
+              unreachable"#,
+            "i32.const 0",
+        );
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
         loop {
             match call.poll() {
-                NativeAsyncPoll::Pending(_)
-                | NativeAsyncPoll::Resolved(_)
-                | NativeAsyncPoll::Yielded(_) => {}
-                NativeAsyncPoll::Complete(_) => break,
-                other => panic!("filter callback must exit cleanly: {other:?}"),
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                other => panic!("mixed host-backed result must fail closed: {other:?}"),
             }
         }
-        assert!(call.output_stream.is_some());
-        assert!(call.output_closed.is_some());
-        assert!(!call.component.is_poisoned());
-        drop(call);
+        assert!(call.output_stream.is_none());
+        assert!(call.output_closed.is_none());
+        assert!(call.component.is_poisoned());
+    }
 
-        // Until the host-pending transport consumes the retained linear
-        // authorities, a completed validation-only filter is deliberately
-        // one-shot rather than silently leaking arena capacity across reuse.
-        assert!(component.is_poisoned());
+    #[test]
+    fn input_host_transport_is_stable_two_phase_and_token_exact_in_both_directions() {
+        let source = input_transport_component();
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let input_stream = call.input.as_ref().unwrap().first.guest;
+        let input_closed = call.input.as_ref().unwrap().second.guest;
+        let (offered, request, metrics) = poll_to_host(&mut call);
+        assert_eq!(request, NativeAsyncHostRequest::InputStream { maximum: 4 });
+        assert_eq!(format!("{offered:?}"), "NativeAsyncHostToken(<opaque>)");
+
+        let active = call.binding().core_instance;
+        let core_metrics = call.component.modules.call_metrics(active).unwrap();
+        let mut target = [0xff; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 16, &mut target)
+            .unwrap();
+        assert_eq!(target, [0; 4]);
         assert_eq!(
-            component.start_filter("run", WORK, QUANTUM).err(),
-            Some(NativeAsyncError::Poisoned)
+            call.poll(),
+            NativeAsyncPoll::HostPending {
+                token: offered,
+                request,
+                metrics,
+            }
+        );
+        assert_eq!(call.metrics(), metrics);
+        assert_eq!(
+            call.component.modules.call_metrics(active),
+            Some(core_metrics)
+        );
+
+        let wrong_generation = NativeAsyncHostToken {
+            task: offered.task,
+            generation: NonZeroU64::new(offered.generation.get() + 37).unwrap(),
+        };
+        assert_eq!(
+            call.prepare_host_input_stream(wrong_generation, 4),
+            Err(NativeAsyncHostError::InvalidToken)
+        );
+        assert_eq!(
+            call.prepare_host_input_closed(offered),
+            Err(NativeAsyncHostError::WrongRequest)
+        );
+        assert_eq!(call.metrics(), metrics);
+
+        let mut other_component = instantiate(&source);
+        let mut other_call = other_component.start_filter("run", WORK, QUANTUM).unwrap();
+        let (cross_component, _, _) = poll_to_host(&mut other_call);
+        assert_eq!(
+            call.prepare_host_input_stream(cross_component, 4),
+            Err(NativeAsyncHostError::InvalidToken)
+        );
+        assert_eq!(call.metrics(), metrics);
+
+        let prepared = call.prepare_host_input_stream(offered, 4).unwrap();
+        let (prepared, prepared_request, prepared_metrics) = match prepared {
+            NativeAsyncPoll::HostPending {
+                token,
+                request,
+                metrics,
+            } => (token, request, metrics),
+            other => panic!("input stream prepare must stay host-blocked: {other:?}"),
+        };
+        assert_ne!(prepared, offered);
+        assert_eq!(prepared_request, request);
+        assert_eq!(
+            prepared_metrics.consumed_work - metrics.consumed_work,
+            host_copy_work(4).unwrap()
+        );
+        assert_eq!(
+            call.commit_host_input_stream(offered, &[1, 2, 3, 4]),
+            Err(NativeAsyncHostError::InvalidToken)
+        );
+        assert_eq!(
+            call.commit_host_input_stream(prepared, &[1, 2, 3]),
+            Err(NativeAsyncHostError::InvalidProgress)
+        );
+        assert_eq!(call.metrics(), prepared_metrics);
+        assert!(matches!(
+            call.commit_host_input_stream(prepared, &[1, 2, 3, 4]),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        call.component
+            .modules
+            .read_memory(0, "memory", 16, &mut target)
+            .unwrap();
+        assert_eq!(target, [1, 2, 3, 4]);
+        assert!(
+            call.component
+                .state
+                .endpoint_info(input_stream)
+                .unwrap()
+                .has_pending_event
+        );
+
+        let (closed_offered, closed_request, closed_metrics) = poll_to_host(&mut call);
+        assert_eq!(closed_request, NativeAsyncHostRequest::InputClosed);
+        assert_ne!(closed_offered, offered);
+        assert_ne!(closed_offered, prepared);
+        assert_eq!(
+            call.prepare_host_input_stream(prepared, 1),
+            Err(NativeAsyncHostError::InvalidToken)
+        );
+        assert_eq!(
+            call.drop_host_copy_peer(closed_offered),
+            Err(NativeAsyncHostError::WrongRequest)
+        );
+        assert_eq!(call.metrics(), closed_metrics);
+        assert_eq!(
+            call.poll(),
+            NativeAsyncPoll::HostPending {
+                token: closed_offered,
+                request: closed_request,
+                metrics: closed_metrics,
+            }
+        );
+        let closed_prepared = match call.prepare_host_input_closed(closed_offered).unwrap() {
+            NativeAsyncPoll::HostPending { token, metrics, .. } => {
+                assert_eq!(
+                    metrics.consumed_work - closed_metrics.consumed_work,
+                    host_copy_work(1).unwrap()
+                );
+                token
+            }
+            other => panic!("input close prepare must stay host-blocked: {other:?}"),
+        };
+        assert!(matches!(
+            call.commit_host_input_closed(closed_prepared, 6),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        let mut closed = [0xff];
+        call.component
+            .modules
+            .read_memory(0, "memory", 32, &mut closed)
+            .unwrap();
+        assert_eq!(closed, [6]);
+        assert!(
+            call.component
+                .state
+                .endpoint_info(input_closed)
+                .unwrap()
+                .has_pending_event
         );
     }
 
     #[test]
+    fn two_pending_outputs_are_ordered_frozen_and_read_once_before_commit() {
+        let source = output_transport_component(true, true, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let (stream_offered, stream_request, stream_metrics) = poll_to_host(&mut call);
+        assert_eq!(
+            stream_request,
+            NativeAsyncHostRequest::OutputStream { maximum: 4 }
+        );
+        assert!(call.host_next.is_some());
+        assert_eq!(call.task_info().result, TaskResultState::Resolved);
+        assert!(call.output_stream.is_some());
+        assert!(call.output_closed.is_some());
+
+        let active = call.binding().core_instance;
+        let core_metrics = call.component.modules.call_metrics(active).unwrap();
+        let mut source_bytes = [0; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 64, &mut source_bytes)
+            .unwrap();
+        assert_eq!(source_bytes, [1, 2, 3, 4]);
+        assert_eq!(
+            call.poll(),
+            NativeAsyncPoll::HostPending {
+                token: stream_offered,
+                request: stream_request,
+                metrics: stream_metrics,
+            }
+        );
+        assert_eq!(
+            call.component.modules.call_metrics(active),
+            Some(core_metrics)
+        );
+
+        let mut oversized = [0xaa; 5];
+        assert_eq!(
+            call.prepare_host_output_stream(stream_offered, &mut oversized),
+            Err(NativeAsyncHostError::InvalidProgress)
+        );
+        assert_eq!(oversized, [0xaa; 5]);
+        assert_eq!(call.metrics(), stream_metrics);
+
+        let mut output = [0; 4];
+        let stream_prepared = match call
+            .prepare_host_output_stream(stream_offered, &mut output)
+            .unwrap()
+        {
+            NativeAsyncPoll::HostPending { token, metrics, .. } => {
+                assert_eq!(
+                    metrics.consumed_work - stream_metrics.consumed_work,
+                    host_copy_work(4).unwrap()
+                );
+                token
+            }
+            other => panic!("output stream prepare must stay host-blocked: {other:?}"),
+        };
+        assert_eq!(output, [1, 2, 3, 4]);
+        let prepared_metrics = call.metrics();
+        let prepared_core_metrics = call.component.modules.call_metrics(active).unwrap();
+        assert!(matches!(
+            call.poll(),
+            NativeAsyncPoll::HostPending {
+                token,
+                request: NativeAsyncHostRequest::OutputStream { maximum: 4 },
+                metrics,
+            } if token == stream_prepared && metrics == prepared_metrics
+        ));
+        assert_eq!(
+            call.component.modules.call_metrics(active),
+            Some(prepared_core_metrics)
+        );
+
+        // Deliberately perturb Core memory after the one permitted lift. A
+        // correct commit settles only the prepared ticket and never rereads.
+        call.component
+            .modules
+            .write_memory(0, "memory", 64, &[8, 8, 8, 8])
+            .unwrap();
+        let closed_offered = match call.commit_host_output(stream_prepared).unwrap() {
+            NativeAsyncPoll::HostPending {
+                token,
+                request: NativeAsyncHostRequest::OutputClosed { value: None },
+                metrics,
+            } => {
+                assert_eq!(metrics, prepared_metrics);
+                token
+            }
+            other => panic!("second pending output must be close: {other:?}"),
+        };
+        assert_eq!(output, [1, 2, 3, 4]);
+
+        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
+            panic!("transport fixture lost its filter contract")
+        };
+        let mut raw = [0; 8];
+        call.component
+            .modules
+            .read_memory(0, "memory", 0, &mut raw)
+            .unwrap();
+        let stream_writer_raw = u32::from_le_bytes(raw[..4].try_into().unwrap());
+        let closed_writer_raw = u32::from_le_bytes(raw[4..].try_into().unwrap());
+        let stream_writer = call
+            .component
+            .state
+            .resolve_guest_endpoint(
+                stream_writer_raw,
+                EndpointKind::Stream,
+                EndpointDirection::Write,
+                contract.stream,
+            )
+            .unwrap();
+        assert!(
+            call.component
+                .state
+                .endpoint_info(stream_writer)
+                .unwrap()
+                .has_pending_event
+        );
+
+        let closed_metrics = call.metrics();
+        let closed_prepared = match call.prepare_host_output_closed(closed_offered).unwrap() {
+            NativeAsyncPoll::HostPending {
+                token,
+                request: NativeAsyncHostRequest::OutputClosed { value: Some(6) },
+                metrics,
+            } => {
+                assert_eq!(
+                    metrics.consumed_work - closed_metrics.consumed_work,
+                    host_copy_work(1).unwrap()
+                );
+                token
+            }
+            other => panic!("output close prepare must lift enum8 once: {other:?}"),
+        };
+        let close_prepared_metrics = call.metrics();
+        assert!(matches!(
+            call.poll(),
+            NativeAsyncPoll::HostPending {
+                token,
+                request: NativeAsyncHostRequest::OutputClosed { value: Some(6) },
+                metrics,
+            } if token == closed_prepared && metrics == close_prepared_metrics
+        ));
+        call.component
+            .modules
+            .write_memory(0, "memory", 72, &[0xff])
+            .unwrap();
+        assert!(matches!(
+            call.commit_host_output(closed_prepared),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        let closed_writer = call
+            .component
+            .state
+            .resolve_guest_endpoint(
+                closed_writer_raw,
+                EndpointKind::Future,
+                EndpointDirection::Write,
+                contract.closed,
+            )
+            .unwrap();
+        assert!(
+            call.component
+                .state
+                .endpoint_info(closed_writer)
+                .unwrap()
+                .has_pending_event
+        );
+
+        // No Core instruction ran during either HostPending phase. Only the
+        // explicit test perturbations above changed memory; the guest's post-
+        // return stores execute after both commits release the continuation.
+        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        call.component
+            .modules
+            .read_memory(0, "memory", 64, &mut source_bytes)
+            .unwrap();
+        assert_eq!(source_bytes, [9, 9, 9, 9]);
+        let mut closed_source = [0];
+        call.component
+            .modules
+            .read_memory(0, "memory", 72, &mut closed_source)
+            .unwrap();
+        assert_eq!(closed_source, [7]);
+    }
+
+    #[test]
+    fn zero_one_and_post_return_pending_outputs_preserve_cancel_and_drop_events() {
+        // Zero pending copies at task.return: the guest write begins only
+        // after the exact result pair has transferred to the host.
+        let source = output_transport_component(false, false, true);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let mut saw_zero_pending_detach = false;
+        let (token, request, metrics) = loop {
+            match call.poll() {
+                NativeAsyncPoll::Resolved(_) => {
+                    saw_zero_pending_detach = true;
+                    assert!(call.host_current.is_none());
+                    assert!(call.host_next.is_none());
+                }
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request,
+                    metrics,
+                } => break (token, request, metrics),
+                other => panic!("post-return output write failed: {other:?}"),
+            }
+        };
+        assert!(saw_zero_pending_detach);
+        assert_eq!(request, NativeAsyncHostRequest::OutputStream { maximum: 4 });
+        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
+            panic!("transport fixture lost its filter contract")
+        };
+        let mut raw = [0; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 0, &mut raw)
+            .unwrap();
+        let writer = call
+            .component
+            .state
+            .resolve_guest_endpoint(
+                u32::from_le_bytes(raw),
+                EndpointKind::Stream,
+                EndpointDirection::Write,
+                contract.stream,
+            )
+            .unwrap();
+        assert!(matches!(
+            call.cancel_host_copy(token),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        assert_eq!(call.metrics(), metrics);
+        assert!(
+            call.component
+                .state
+                .endpoint_info(writer)
+                .unwrap()
+                .has_pending_event
+        );
+
+        // Exactly one pending copy at task.return, in the future position.
+        let source = output_transport_component(false, true, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let (token, request, metrics) = poll_to_host(&mut call);
+        assert_eq!(
+            request,
+            NativeAsyncHostRequest::OutputClosed { value: None }
+        );
+        assert!(call.host_next.is_none());
+        let RuntimeExportContract::ByteStream(contract) = call.binding().contract else {
+            panic!("transport fixture lost its filter contract")
+        };
+        let mut raw = [0; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 4, &mut raw)
+            .unwrap();
+        let writer = call
+            .component
+            .state
+            .resolve_guest_endpoint(
+                u32::from_le_bytes(raw),
+                EndpointKind::Future,
+                EndpointDirection::Write,
+                contract.closed,
+            )
+            .unwrap();
+        assert!(matches!(
+            call.drop_host_copy_peer(token),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        assert_eq!(call.metrics(), metrics);
+        assert!(
+            call.component
+                .state
+                .endpoint_info(writer)
+                .unwrap()
+                .has_pending_event
+        );
+    }
+
+    #[test]
+    fn host_input_zero_length_invalid_enum_and_low_fuel_fail_at_exact_boundaries() {
+        let source = input_transport_component();
+
+        // A zero-byte stream transfer is a real completed event and charges
+        // only the fixed host-copy unit.
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let input_stream = call.input.as_ref().unwrap().first.guest;
+        let (offered, _, before) = poll_to_host(&mut call);
+        let prepared = match call.prepare_host_input_stream(offered, 0).unwrap() {
+            NativeAsyncPoll::HostPending { token, metrics, .. } => {
+                assert_eq!(
+                    metrics.consumed_work - before.consumed_work,
+                    host_copy_work(0).unwrap()
+                );
+                token
+            }
+            other => panic!("zero input prepare failed: {other:?}"),
+        };
+        assert!(matches!(
+            call.commit_host_input_stream(prepared, &[]),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        assert!(
+            call.component
+                .state
+                .endpoint_info(input_stream)
+                .unwrap()
+                .has_pending_event
+        );
+        let mut target = [0xff; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 16, &mut target)
+            .unwrap();
+        assert_eq!(target, [0; 4]);
+
+        // Future input lowering validates enum8 before publication and
+        // revokes the prepared owner token before trapping.
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let (stream, _, _) = poll_to_host(&mut call);
+        assert!(matches!(
+            call.cancel_host_copy(stream),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        let (closed, NativeAsyncHostRequest::InputClosed, _) = poll_to_host(&mut call) else {
+            panic!("cancelled stream must advance to input close")
+        };
+        call.component
+            .modules
+            .write_memory(0, "memory", 32, &[0xaa])
+            .unwrap();
+        let prepared = match call.prepare_host_input_closed(closed).unwrap() {
+            NativeAsyncPoll::HostPending { token, .. } => token,
+            other => panic!("input close prepare failed: {other:?}"),
+        };
+        assert_eq!(
+            call.commit_host_input_closed(prepared, 8),
+            Ok(NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi))
+        );
+        let mut target = [0];
+        call.component
+            .modules
+            .read_memory(0, "memory", 32, &mut target)
+            .unwrap();
+        assert_eq!(target, [0xaa]);
+        assert!(call.host_token.is_none());
+
+        // Leaving exactly the requested host-copy work is insufficient: one
+        // Core fuel unit is reserved for the eventual continuation.
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let (offered, _, _) = poll_to_host(&mut call);
+        let work = host_copy_work(4).unwrap();
+        let authority = call.host_current.as_ref().unwrap().authority;
+        let debit = call.remaining_work.checked_sub(work).unwrap();
+        call.debit_active_work(authority, debit).unwrap();
+        assert_eq!(call.remaining_work, work);
+        let before = call.metrics();
+        assert_eq!(
+            call.prepare_host_input_stream(offered, 4),
+            Ok(NativeAsyncPoll::Trapped(TrapCode::FuelExhausted))
+        );
+        assert_eq!(call.metrics(), before);
+        assert!(call.host_token.is_none());
+        let mut target = [0xff; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 16, &mut target)
+            .unwrap();
+        assert_eq!(target, [0; 4]);
+    }
+
+    #[test]
+    fn host_blocked_corruption_of_limit_type_or_value_phase_is_fail_stop() {
+        let source = input_transport_component();
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let _ = poll_to_host(&mut call);
+        let NativeAsyncHostRequest::InputStream { maximum } =
+            &mut call.host_current.as_mut().unwrap().request
+        else {
+            panic!("input fixture did not block on its stream")
+        };
+        *maximum += 1;
+        assert_eq!(call.poll(), NativeAsyncPoll::Trapped(TrapCode::Validation));
+
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let _ = poll_to_host(&mut call);
+        let host = call.host_current.as_mut().unwrap();
+        host.value_type = AsyncValueTypeId::new(host.value_type.get() + 1).unwrap();
+        assert_eq!(call.poll(), NativeAsyncPoll::Trapped(TrapCode::Validation));
+
+        let source = output_transport_component(false, true, false);
+        let mut component = instantiate(&source);
+        let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+        let _ = poll_to_host(&mut call);
+        call.host_current.as_mut().unwrap().request =
+            NativeAsyncHostRequest::OutputClosed { value: Some(6) };
+        assert_eq!(call.poll(), NativeAsyncPoll::Trapped(TrapCode::Validation));
+    }
+
+    #[test]
+    fn reused_raw_input_slots_do_not_rebind_stale_host_authority() {
+        for (run, label) in [
+            (
+                r#"local.get $input-bytes
+                  call $stream-drop-readable
+                  call $stream-new
+                  local.set $stream-pair
+                  i32.const 96
+                  local.get $stream-pair
+                  i32.wrap_i64
+                  i32.store
+                  local.get $stream-pair
+                  i32.wrap_i64
+                  local.get $input-bytes
+                  i32.ne
+                  if unreachable end
+                  local.get $stream-pair
+                  i32.wrap_i64
+                  i32.const 16
+                  i32.const 4
+                  call $stream-read
+                  i32.const -1
+                  i32.ne
+                  if unreachable end
+                  i32.const 100
+                  i32.const 1
+                  i32.store
+                  unreachable"#,
+                "stream",
+            ),
+            (
+                r#"local.get $input-closed
+                  call $future-drop-readable
+                  call $future-new
+                  local.set $closed-pair
+                  i32.const 96
+                  local.get $closed-pair
+                  i32.wrap_i64
+                  i32.store
+                  local.get $closed-pair
+                  i32.wrap_i64
+                  local.get $input-closed
+                  i32.ne
+                  if unreachable end
+                  local.get $closed-pair
+                  i32.wrap_i64
+                  i32.const 32
+                  call $future-read
+                  i32.const -1
+                  i32.ne
+                  if unreachable end
+                  i32.const 100
+                  i32.const 1
+                  i32.store
+                  unreachable"#,
+                "future",
+            ),
+        ] {
+            let source = filter_transport_component(run, "i32.const 0");
+            let mut component = instantiate(&source);
+            let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
+            let input_raw = match label {
+                "stream" => call.input.as_ref().unwrap().first.guest.raw(),
+                "future" => call.input.as_ref().unwrap().second.guest.raw(),
+                _ => unreachable!(),
+            };
+            let mut pending = 0;
+            loop {
+                match call.poll() {
+                    NativeAsyncPoll::Pending(_) => pending += 1,
+                    NativeAsyncPoll::Trapped(TrapCode::Unreachable) => break,
+                    NativeAsyncPoll::HostPending { .. } => {
+                        panic!("{label} raw ABA rebound the stale input authority")
+                    }
+                    NativeAsyncPoll::Trapped(trap) => {
+                        panic!("{label} raw ABA trapped as {trap:?}")
+                    }
+                    other => panic!("{label} raw ABA produced unexpected progress: {other:?}"),
+                }
+            }
+            assert!(pending >= 3);
+            let mut proof = [0_u8; 8];
+            call.component
+                .modules
+                .read_memory(0, "memory", 96, &mut proof)
+                .unwrap();
+            assert_eq!(
+                u32::from_le_bytes(proof[..4].try_into().unwrap()),
+                input_raw
+            );
+            assert_eq!(u32::from_le_bytes(proof[4..].try_into().unwrap()), 1);
+        }
+    }
+
+    #[test]
     fn repeated_filter_task_return_is_canonical_abi_misuse_without_a_second_transfer() {
-        let source = replace_once(
-            FILTER,
-            "          local.get $input-bytes\n          local.get $input-closed\n          call $task-return\n          i32.const 1",
-            "          local.get $input-bytes\n          local.get $input-closed\n          call $task-return\n          local.get $input-bytes\n          local.get $input-closed\n          call $task-return\n          i32.const 1",
+        let source = filter_transport_component(
+            r#"call $stream-new
+              local.set $stream-pair
+              call $future-new
+              local.set $closed-pair
+              local.get $stream-pair
+              i32.wrap_i64
+              local.get $closed-pair
+              i32.wrap_i64
+              call $task-return
+              local.get $stream-pair
+              i32.wrap_i64
+              local.get $closed-pair
+              i32.wrap_i64
+              call $task-return
+              i32.const 1"#,
+            "i32.const 0",
         );
         let mut component = instantiate(&source);
         let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
@@ -2992,12 +4753,25 @@ mod tests {
 
     #[test]
     fn task_return_record_names_are_admission_metadata_not_runtime_authority() {
+        let fixture = filter_transport_component(
+            r#"call $stream-new
+              local.set $stream-pair
+              call $future-new
+              local.set $closed-pair
+              local.get $stream-pair
+              i32.wrap_i64
+              local.get $closed-pair
+              i32.wrap_i64
+              call $task-return
+              i32.const 1"#,
+            "i32.const 0",
+        );
         let source = replace_once(
-            FILTER,
-            "      (core func $task-return\n        (canon task.return (result $byte-stream)))",
-            r#"      (type $canonical-result
+            &fixture,
+            "              (core func $task-return\n                (canon task.return (result $byte-stream)))",
+            r#"              (type $canonical-result
         (record (field "foo" $bytes) (field "bar" $closed)))
-      (core func $task-return
+              (core func $task-return
         (canon task.return (result $canonical-result)))"#,
         );
         let mut component = instantiate(&source);
@@ -3371,6 +5145,9 @@ mod tests {
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("cancel delivery fixture unexpectedly waited")
                 }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("cancel delivery fixture unexpectedly requested host transport")
+                }
                 NativeAsyncPoll::Resolved(_) => {
                     saw_resolved = true;
                     assert_eq!(call.task_info().result, TaskResultState::Resolved);
@@ -3609,6 +5386,9 @@ mod tests {
                 }
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("callback host-call fixture unexpectedly waited")
+                }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("callback host-call fixture unexpectedly requested host transport")
                 }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("callback host-call fixture trapped: {trap:?}")
@@ -3898,6 +5678,9 @@ mod tests {
                     NativeAsyncPoll::WaitPending { .. } => {
                         panic!("local close future unexpectedly waited")
                     }
+                    NativeAsyncPoll::HostPending { .. } => {
+                        panic!("local close future unexpectedly requested host transport")
+                    }
                     NativeAsyncPoll::Trapped(trap) => {
                         panic!("local close future trapped: {trap:?}")
                     }
@@ -4026,6 +5809,9 @@ mod tests {
                     | NativeAsyncPoll::Yielded(_) => {}
                     NativeAsyncPoll::WaitPending { .. } => {
                         panic!("local byte-stream fixture unexpectedly waited")
+                    }
+                    NativeAsyncPoll::HostPending { .. } => {
+                        panic!("local byte-stream fixture unexpectedly requested host transport")
                     }
                     NativeAsyncPoll::Trapped(trap) => {
                         panic!("local byte-stream fixture trapped: {trap:?}")
@@ -4184,6 +5970,9 @@ mod tests {
                     NativeAsyncPoll::WaitPending { .. } => {
                         panic!("ready endpoint wait must start its callback immediately")
                     }
+                    NativeAsyncPoll::HostPending { .. } => {
+                        panic!("ready endpoint wait unexpectedly requested host transport")
+                    }
                     NativeAsyncPoll::Trapped(trap) => {
                         panic!("endpoint wait fixture trapped: {trap:?}")
                     }
@@ -4247,6 +6036,9 @@ mod tests {
                     | NativeAsyncPoll::Resolved(_)
                     | NativeAsyncPoll::Yielded(_) => {}
                     NativeAsyncPoll::WaitPending { .. } => panic!("zero copy unexpectedly waited"),
+                    NativeAsyncPoll::HostPending { .. } => {
+                        panic!("zero copy unexpectedly requested host transport")
+                    }
                     NativeAsyncPoll::Trapped(trap) => panic!("zero copy trapped: {trap:?}"),
                 }
             }
@@ -5117,6 +6909,9 @@ mod tests {
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("pre-WAIT cancellation must not park")
                 }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("pre-WAIT cancellation unexpectedly requested host transport")
+                }
                 NativeAsyncPoll::Yielded(_) => panic!("WAIT fixture unexpectedly yielded"),
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("pre-WAIT cancellation callback trapped: {trap:?}")
@@ -5717,6 +7512,9 @@ mod tests {
                     NativeAsyncPoll::WaitPending { .. } => {
                         panic!("shared-fuel fixture unexpectedly waited")
                     }
+                    NativeAsyncPoll::HostPending { .. } => {
+                        panic!("shared-fuel fixture unexpectedly requested host transport")
+                    }
                     NativeAsyncPoll::Trapped(trap) => panic!("high-budget call trapped: {trap:?}"),
                 }
             };
@@ -5741,6 +7539,9 @@ mod tests {
                 | NativeAsyncPoll::Yielded(_) => {}
                 NativeAsyncPoll::WaitPending { .. } => {
                     panic!("shared-fuel fixture unexpectedly waited")
+                }
+                NativeAsyncPoll::HostPending { .. } => {
+                    panic!("shared-fuel fixture unexpectedly requested host transport")
                 }
             }
         };

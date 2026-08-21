@@ -186,6 +186,21 @@ pub enum TransferredReadableEndpoint {
     Future(ReadableFutureEndpointToken),
 }
 
+/// One transferred readable endpoint and the exact guest write which was
+/// already parked against it, if any.
+#[derive(Debug)]
+pub struct TransferredReadableBinding {
+    pub endpoint: TransferredReadableEndpoint,
+    pub pending: Option<HostCopyTicket>,
+}
+
+/// Fixed-shape result for the native filter's two readable outputs.
+#[derive(Debug)]
+pub struct TransferredReadablesPair {
+    pub first: TransferredReadableBinding,
+    pub second: TransferredReadableBinding,
+}
+
 impl TransferredReadableEndpoint {
     pub const fn kind(&self) -> EndpointKind {
         match self {
@@ -1629,7 +1644,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 let next_event = match endpoint.next_event.checked_add(1) {
@@ -1638,7 +1653,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 endpoint.next_operation = next_operation;
@@ -1698,7 +1713,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 let next_event = match endpoint.next_event.checked_add(1) {
@@ -1707,7 +1722,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 endpoint.next_operation = next_operation;
@@ -1758,7 +1773,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 let next_event = match peer_endpoint.next_event.checked_add(1) {
@@ -1767,7 +1782,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 current_endpoint.next_operation = next_operation;
@@ -1808,7 +1823,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 let next_match = match shared.next_match.checked_add(1) {
@@ -1817,7 +1832,7 @@ impl AsyncState {
                         return Err(BeginCopyFailure {
                             error: AsyncStateError::GenerationExhausted,
                             lease,
-                        })
+                        });
                     }
                 };
                 let entry = match self.handles.get_mut(endpoint_seal) {
@@ -2160,6 +2175,58 @@ impl AsyncState {
         Ok(self.active_for(ticket.operation)?.lease.elements())
     }
 
+    /// Borrows the exact guest output buffer after revalidating the pending
+    /// host-read operation and its intended completion progress.
+    ///
+    /// The closure cannot retain or replace the linear lease. Neither the
+    /// ticket nor async state changes if validation or the closure fails.
+    pub(crate) fn with_host_copy_buffer<R, E>(
+        &self,
+        ticket: &HostCopyTicket,
+        progress: u32,
+        access: impl FnOnce(&BufferLease) -> Result<R, E>,
+    ) -> Result<R, CommitError<E>> {
+        self.prepare_host_settle(
+            ticket,
+            CopyResult::Completed,
+            progress,
+            Some(EndpointDirection::Read),
+        )
+        .map_err(CommitError::State)?;
+        let active = self
+            .active_for(ticket.operation)
+            .map_err(CommitError::State)?;
+        access(&active.lease).map_err(CommitError::Operation)
+    }
+
+    /// Borrows the exact guest input buffer for a checked host-write
+    /// preflight. This validates the same completion which
+    /// [`Self::commit_host_copy`] will repeat, but performs no copy or state
+    /// transition itself.
+    pub(crate) fn with_host_input_buffer<R, E>(
+        &self,
+        ticket: &HostCopyTicket,
+        progress: u32,
+        access: impl FnOnce(&BufferLease) -> Result<R, E>,
+    ) -> Result<R, CommitError<E>> {
+        self.prepare_host_settle(
+            ticket,
+            CopyResult::Completed,
+            progress,
+            Some(EndpointDirection::Write),
+        )
+        .map_err(CommitError::State)?;
+        let active = self
+            .active_for(ticket.operation)
+            .map_err(CommitError::State)?;
+        access(&active.lease).map_err(CommitError::Operation)
+    }
+
+    /// Completes either direction of host operation after copying through the
+    /// exact guest buffer. Native output reads use
+    /// [`Self::with_host_copy_buffer`] followed by
+    /// [`Self::commit_prepared_host_copy`] so a backend retry never rereads
+    /// guest memory; this legacy one-shot entry point remains bidirectional.
     pub fn commit_host_copy<E>(
         &mut self,
         ticket: &mut HostCopyTicket,
@@ -2172,44 +2239,193 @@ impl AsyncState {
         if result != CopyResult::Completed {
             return Err(CommitError::State(AsyncStateError::InvalidCopyResult));
         }
-        let (kind, direction, elements) = {
-            let endpoint = self
-                .endpoint_by_seal(ticket.operation.endpoint)
-                .map_err(CommitError::State)?;
-            let active = endpoint
+        let prepared = self
+            .prepare_host_settle(ticket, CopyResult::Completed, progress, None)
+            .map_err(CommitError::State)?;
+        let active = self
+            .active_for(ticket.operation)
+            .map_err(CommitError::State)?;
+        copy(&active.lease, progress).map_err(CommitError::Operation)?;
+        self.commit_preflighted_host_settle(ticket, prepared)
+            .map_err(CommitError::State)
+    }
+
+    /// Commits a host-read operation whose output was already copied through
+    /// [`Self::with_host_copy_buffer`]. The result is exactly `Completed`.
+    pub(crate) fn commit_prepared_host_copy(
+        &mut self,
+        ticket: &mut HostCopyTicket,
+        progress: u32,
+    ) -> Result<EventToken, AsyncStateError> {
+        let prepared = self.prepare_host_settle(
+            ticket,
+            CopyResult::Completed,
+            progress,
+            Some(EndpointDirection::Read),
+        )?;
+        self.commit_preflighted_host_settle(ticket, prepared)
+    }
+
+    /// Cancels the exact pending guest operation while retaining the host
+    /// endpoint for a later copy.
+    pub fn cancel_host_copy(
+        &mut self,
+        ticket: &mut HostCopyTicket,
+    ) -> Result<EventToken, AsyncStateError> {
+        let prepared = self.prepare_host_settle(ticket, CopyResult::Cancelled, 0, None)?;
+        self.commit_preflighted_host_settle(ticket, prepared)
+    }
+
+    /// Drops the host peer while settling the exact pending guest operation.
+    /// This consumes the pair's host holder, unlike [`Self::cancel_host_copy`].
+    pub fn drop_host_copy_peer(
+        &mut self,
+        ticket: &mut HostCopyTicket,
+    ) -> Result<EventToken, AsyncStateError> {
+        let prepared = self.prepare_host_settle(ticket, CopyResult::Dropped, 0, None)?;
+        self.commit_preflighted_host_settle(ticket, prepared)
+    }
+
+    fn prepare_host_settle(
+        &self,
+        ticket: &HostCopyTicket,
+        result: CopyResult,
+        progress: u32,
+        required_authority_direction: Option<EndpointDirection>,
+    ) -> Result<PreparedHostSettle, AsyncStateError> {
+        self.validate_host_ticket(ticket)?;
+        if required_authority_direction
+            .is_some_and(|direction| ticket.authority_direction != direction)
+        {
+            return Err(AsyncStateError::WrongDirection);
+        }
+        let endpoint = self.endpoint_by_seal(ticket.operation.endpoint)?;
+        let active = endpoint
+            .active
+            .as_ref()
+            .filter(|active| active.operation == ticket.operation.operation)
+            .ok_or(AsyncStateError::StaleOperation)?;
+        let event_progress = validate_host_result(
+            endpoint.kind,
+            endpoint.direction,
+            result,
+            progress,
+            active.lease.elements,
+        )?;
+        validate_event_result(
+            endpoint.kind,
+            endpoint.direction,
+            result,
+            event_progress,
+            active.lease.elements,
+        )?;
+        if endpoint.event.is_some() || endpoint.next_event == 0 || endpoint.next_event == u64::MAX {
+            return Err(AsyncStateError::GenerationExhausted);
+        }
+        let generation =
+            NonZeroU64::new(endpoint.next_event).ok_or(AsyncStateError::GenerationExhausted)?;
+        let next_event = endpoint
+            .next_event
+            .checked_add(1)
+            .ok_or(AsyncStateError::GenerationExhausted)?;
+        Ok(PreparedHostSettle {
+            pair: ticket.pair,
+            operation: ticket.operation,
+            authority_direction: ticket.authority_direction,
+            kind: endpoint.kind,
+            result,
+            event_progress,
+            generation,
+            next_event,
+        })
+    }
+
+    fn commit_preflighted_host_settle(
+        &mut self,
+        ticket: &mut HostCopyTicket,
+        prepared: PreparedHostSettle,
+    ) -> Result<EventToken, AsyncStateError> {
+        self.validate_host_ticket(ticket)?;
+        if ticket.pair != prepared.pair
+            || ticket.operation != prepared.operation
+            || ticket.authority_direction != prepared.authority_direction
+        {
+            return Err(AsyncStateError::StaleOperation);
+        }
+
+        // Resolve and recheck every fallible invariant before the first write.
+        // The two tables are disjoint, so both mutable references can then be
+        // committed without a lookup, allocation, or counter operation.
+        let shared = self.pairs.get_mut(prepared.pair)?;
+        let entry = self.handles.get_mut(prepared.operation.endpoint)?;
+        let endpoint = entry.endpoint_mut()?;
+        let host_holder = match prepared.authority_direction {
+            EndpointDirection::Read => shared.readable,
+            EndpointDirection::Write => shared.writable,
+        };
+        let guest_holder = match endpoint.direction {
+            EndpointDirection::Read => shared.readable,
+            EndpointDirection::Write => shared.writable,
+        };
+        if shared.phase != PairPhase::Waiting(prepared.operation)
+            || shared.peer_dropped
+            || host_holder != Holder::Host
+            || guest_holder != Holder::Guest(prepared.operation.endpoint)
+            || shared.kind != prepared.kind
+            || endpoint.pair != prepared.pair
+            || endpoint.kind != shared.kind
+            || endpoint.value_type != shared.value_type
+            || endpoint.direction == prepared.authority_direction
+            || endpoint.copy_state != CopyState::Copying
+            || endpoint.event.is_some()
+            || endpoint.next_event != prepared.generation.get()
+            || endpoint
                 .active
                 .as_ref()
-                .filter(|active| active.operation == ticket.operation.operation)
-                .ok_or(CommitError::State(AsyncStateError::StaleOperation))?;
-            (endpoint.kind, endpoint.direction, active.lease.elements)
-        };
-        let event_progress = validate_host_result(kind, direction, result, progress, elements)
-            .map_err(CommitError::State)?;
-        self.prepare_event(ticket.operation, result, event_progress)
-            .map_err(CommitError::State)?;
-        if result == CopyResult::Completed {
-            let active = self
-                .active_for(ticket.operation)
-                .map_err(CommitError::State)?;
-            copy(&active.lease, progress).map_err(CommitError::Operation)?;
-        }
-        self.queue_event(ticket.operation, result, event_progress)
-            .map_err(CommitError::State)?;
+                .is_none_or(|active| active.operation != prepared.operation.operation)
         {
-            let shared = self
-                .pairs
-                .get_mut(ticket.pair)
-                .map_err(CommitError::State)?;
-            shared.phase = PairPhase::Idle;
-            if shared.kind == EndpointKind::Future
-                && ticket.authority_direction == EndpointDirection::Write
-            {
-                shared.host_writable_done = true;
+            return Err(AsyncStateError::PairInvariant);
+        }
+        if endpoint.next_event.checked_add(1) != Some(prepared.next_event) {
+            return Err(AsyncStateError::GenerationExhausted);
+        }
+
+        endpoint.next_event = prepared.next_event;
+        endpoint.event = Some(PendingEvent {
+            operation: prepared.operation.operation,
+            result: prepared.result,
+            progress: prepared.event_progress,
+            generation: prepared.generation,
+            phase: EventPhase::Pending,
+        });
+        if prepared.result == CopyResult::Cancelled {
+            endpoint.copy_state = CopyState::Cancelling;
+        }
+        shared.phase = PairPhase::Idle;
+        match prepared.result {
+            CopyResult::Completed => {
+                if prepared.kind == EndpointKind::Future
+                    && prepared.authority_direction == EndpointDirection::Write
+                {
+                    shared.host_writable_done = true;
+                }
             }
+            CopyResult::Dropped => {
+                shared.peer_dropped = true;
+                match prepared.authority_direction {
+                    EndpointDirection::Read => shared.readable = Holder::Dropped,
+                    EndpointDirection::Write => shared.writable = Holder::Dropped,
+                }
+            }
+            CopyResult::Cancelled => {}
         }
         ticket.committed = true;
-        self.event_token(ticket.operation)
-            .map_err(CommitError::State)
+        Ok(EventToken {
+            state_id: self.id,
+            endpoint: prepared.operation.endpoint,
+            operation: prepared.operation.operation,
+            generation: prepared.generation,
+        })
     }
 
     fn validate_host_ticket(&self, ticket: &HostCopyTicket) -> Result<(), AsyncStateError> {
@@ -2226,6 +2442,22 @@ impl AsyncState {
         };
         if host_holder != Holder::Host {
             return Err(AsyncStateError::AuthorityConsumed);
+        }
+        let endpoint = self.endpoint_by_seal(ticket.operation.endpoint)?;
+        let guest_holder = match endpoint.direction {
+            EndpointDirection::Read => shared.readable,
+            EndpointDirection::Write => shared.writable,
+        };
+        if shared.peer_dropped
+            || guest_holder != Holder::Guest(ticket.operation.endpoint)
+            || endpoint.pair != ticket.pair
+            || endpoint.kind != shared.kind
+            || endpoint.value_type != shared.value_type
+            || endpoint.direction == ticket.authority_direction
+            || endpoint.copy_state != CopyState::Copying
+            || endpoint.event.is_some()
+        {
+            return Err(AsyncStateError::PairInvariant);
         }
         self.active_for(ticket.operation)?;
         Ok(())
@@ -2611,21 +2843,72 @@ impl AsyncState {
         first: ReadableTransferRequest,
         second: ReadableTransferRequest,
     ) -> Result<(TransferredReadableEndpoint, TransferredReadableEndpoint), AsyncStateError> {
-        let (first_seal, first_pair, first_token) = self.prepare_readable_transfer(first)?;
+        let pair = self.detach_readables_pair_inner(first, second, false)?;
+        debug_assert!(pair.first.pending.is_none());
+        debug_assert!(pair.second.pending.is_none());
+        Ok((pair.first.endpoint, pair.second.endpoint))
+    }
+
+    /// Atomically lifts two readable endpoints while preserving any guest
+    /// writes which were already waiting on their host readers.
+    ///
+    /// Each optional ticket occupies the same position as its endpoint and is
+    /// valid immediately after this method returns. No allocation occurs.
+    pub fn detach_readables_pair_with_pending(
+        &mut self,
+        first: ReadableTransferRequest,
+        second: ReadableTransferRequest,
+    ) -> Result<TransferredReadablesPair, AsyncStateError> {
+        self.detach_readables_pair_inner(first, second, true)
+    }
+
+    fn detach_readables_pair_inner(
+        &mut self,
+        first: ReadableTransferRequest,
+        second: ReadableTransferRequest,
+        allow_pending: bool,
+    ) -> Result<TransferredReadablesPair, AsyncStateError> {
+        let first_prepared = self.prepare_readable_transfer(first, allow_pending)?;
         if first.handle == second.handle {
             return Err(AsyncStateError::DuplicateHandle);
         }
-        let (second_seal, second_pair, second_token) = self.prepare_readable_transfer(second)?;
+        let second_prepared = self.prepare_readable_transfer(second, allow_pending)?;
 
         // These mutable resolutions are the last fallible pair-side step. The
-        // holders are rechecked before either guest handle is removed.
-        let (first_shared, second_shared) = self.pairs.get_two_mut(first_pair, second_pair)?;
-        if first_shared.readable != Holder::Guest(first_seal)
+        // holders and exact pending operations are rechecked before either
+        // guest handle moves.
+        let (first_shared, second_shared) = self
+            .pairs
+            .get_two_mut(first_prepared.pair, second_prepared.pair)?;
+        let first_phase = first_prepared
+            .pending
+            .as_ref()
+            .map_or(PairPhase::Idle, |ticket| {
+                PairPhase::Waiting(ticket.operation)
+            });
+        let second_phase = second_prepared
+            .pending
+            .as_ref()
+            .map_or(PairPhase::Idle, |ticket| {
+                PairPhase::Waiting(ticket.operation)
+            });
+        let first_pending_holder = first_prepared
+            .pending
+            .as_ref()
+            .is_none_or(|ticket| first_shared.writable == Holder::Guest(ticket.operation.endpoint));
+        let second_pending_holder = second_prepared.pending.as_ref().is_none_or(|ticket| {
+            second_shared.writable == Holder::Guest(ticket.operation.endpoint)
+        });
+        if first_shared.readable != Holder::Guest(first_prepared.seal)
             || first_shared.kind != first.kind
             || first_shared.value_type != first.value_type
-            || second_shared.readable != Holder::Guest(second_seal)
+            || first_shared.phase != first_phase
+            || !first_pending_holder
+            || second_shared.readable != Holder::Guest(second_prepared.seal)
             || second_shared.kind != second.kind
             || second_shared.value_type != second.value_type
+            || second_shared.phase != second_phase
+            || !second_pending_holder
         {
             return Err(AsyncStateError::PairInvariant);
         }
@@ -2634,12 +2917,23 @@ impl AsyncState {
         // rolls the first value back if a corrupted second slot disappears.
         // Once it succeeds, changing these already-borrowed holders cannot
         // fail, so the aggregate cannot be left half transferred.
-        let (first_entry, second_entry) = self.handles.remove_two(first_seal, second_seal)?;
+        let (first_entry, second_entry) = self
+            .handles
+            .remove_two(first_prepared.seal, second_prepared.seal)?;
         debug_assert!(matches!(first_entry, HandleEntry::Endpoint(_)));
         debug_assert!(matches!(second_entry, HandleEntry::Endpoint(_)));
         first_shared.readable = Holder::Host;
         second_shared.readable = Holder::Host;
-        Ok((first_token, second_token))
+        Ok(TransferredReadablesPair {
+            first: TransferredReadableBinding {
+                endpoint: first_prepared.token,
+                pending: first_prepared.pending,
+            },
+            second: TransferredReadableBinding {
+                endpoint: second_prepared.token,
+                pending: second_prepared.pending,
+            },
+        })
     }
 
     /// Atomically lifts every readable endpoint in one aggregate.
@@ -2729,7 +3023,8 @@ impl AsyncState {
     fn prepare_readable_transfer(
         &self,
         request: ReadableTransferRequest,
-    ) -> Result<(Seal, Seal, TransferredReadableEndpoint), AsyncStateError> {
+        allow_pending: bool,
+    ) -> Result<PreparedReadableTransfer, AsyncStateError> {
         let seal = self.handle_seal(request.handle)?;
         let endpoint = self.endpoint_by_seal(seal)?;
         validate_endpoint(
@@ -2755,6 +3050,44 @@ impl AsyncState {
         {
             return Err(AsyncStateError::PairInvariant);
         }
+        let pending = match shared.phase {
+            PairPhase::Idle => None,
+            PairPhase::Matching { .. } => return Err(AsyncStateError::PairBusy),
+            PairPhase::Waiting(operation) => {
+                if !allow_pending {
+                    return Err(AsyncStateError::EndpointBusy);
+                }
+                if operation.endpoint == seal
+                    || shared.writable != Holder::Guest(operation.endpoint)
+                {
+                    return Err(AsyncStateError::PairInvariant);
+                }
+                let writable = self.endpoint_by_seal(operation.endpoint)?;
+                if writable.pair != pair
+                    || writable.kind != request.kind
+                    || writable.direction != EndpointDirection::Write
+                    || writable.value_type != request.value_type
+                    || writable.copy_state != CopyState::Copying
+                    || writable.event.is_some()
+                    || writable
+                        .active
+                        .as_ref()
+                        .is_none_or(|active| active.operation != operation.operation)
+                {
+                    return Err(AsyncStateError::PairInvariant);
+                }
+                if writable.next_event == 0 || writable.next_event == u64::MAX {
+                    return Err(AsyncStateError::GenerationExhausted);
+                }
+                Some(HostCopyTicket {
+                    state_id: self.id,
+                    pair,
+                    operation,
+                    authority_direction: EndpointDirection::Read,
+                    committed: false,
+                })
+            }
+        };
         let token = match request.kind {
             EndpointKind::Stream => TransferredReadableEndpoint::Stream(
                 ReadableStreamEndpointToken::issue(
@@ -2777,7 +3110,12 @@ impl AsyncState {
                 .map_err(|_| AsyncStateError::PairInvariant)?,
             ),
         };
-        Ok((seal, pair, token))
+        Ok(PreparedReadableTransfer {
+            seal,
+            pair,
+            token,
+            pending,
+        })
     }
 
     pub fn prepare_stream_host_copy(
@@ -6353,6 +6691,824 @@ mod tests {
     }
 
     #[test]
+    fn host_output_buffer_access_and_prepared_commit_are_exact_and_atomic() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(80)).unwrap();
+        let future = state.create_future_pair(ty(81)).unwrap();
+        let _operation = blocked(
+            state
+                .begin_copy(
+                    stream.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(80),
+                    lease(21, 5),
+                )
+                .unwrap(),
+        );
+        let mut transferred = state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(80),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(81),
+                },
+            )
+            .unwrap();
+        assert!(transferred.second.pending.is_none());
+        let mut ticket = transferred.first.pending.take().unwrap();
+        assert_eq!(state.host_copy_progress_limit(&ticket), Ok(5));
+
+        let before = endpoint_snapshot(&state, stream.writable);
+        let phase = state.pairs.get(ticket.pair).unwrap().phase;
+        let mut called = false;
+        assert_eq!(
+            state.with_host_copy_buffer(&ticket, 6, |_| {
+                called = true;
+                Ok::<_, u8>(())
+            }),
+            Err(CommitError::State(AsyncStateError::ProgressLimit))
+        );
+        assert!(!called);
+        assert_eq!(
+            state.with_host_copy_buffer(&ticket, 3, |_| Err::<(), _>(7_u8)),
+            Err(CommitError::Operation(7))
+        );
+        assert_eq!(
+            state.with_host_input_buffer(&ticket, 3, |_| Ok::<_, ()>(())),
+            Err(CommitError::State(AsyncStateError::WrongDirection))
+        );
+        assert_eq!(endpoint_snapshot(&state, stream.writable), before);
+        assert!(state.pairs.get(ticket.pair).unwrap().phase == phase);
+        assert_eq!(state.host_copy_progress_limit(&ticket), Ok(5));
+
+        assert_eq!(
+            state.with_host_copy_buffer(&ticket, 3, |buffer| {
+                Ok::<_, u8>((buffer.slot(), buffer.elements()))
+            }),
+            Ok((21, 5))
+        );
+        let event = state.commit_prepared_host_copy(&mut ticket, 3).unwrap();
+        let committed = endpoint_snapshot(&state, stream.writable);
+        let committed_phase = state.pairs.get(ticket.pair).unwrap().phase;
+        assert_eq!(
+            state.commit_prepared_host_copy(&mut ticket, 3),
+            Err(AsyncStateError::StaleOperation)
+        );
+        assert_eq!(endpoint_snapshot(&state, stream.writable), committed);
+        assert!(state.pairs.get(ticket.pair).unwrap().phase == committed_phase);
+        let delivered = reclaim_ok(&mut state, &event);
+        assert_eq!(delivered.code, EventCode::StreamWrite);
+        assert_eq!(
+            unpack_stream_copy_result(delivered.p2).unwrap(),
+            StreamCopyResult {
+                result: CopyResult::Completed,
+                progress: 3,
+            }
+        );
+        assert_eq!(
+            state.endpoint_info(stream.writable).unwrap().copy_state,
+            CopyState::Idle
+        );
+    }
+
+    #[test]
+    fn legacy_host_copy_remains_bidirectional_and_output_failure_is_retryable() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(91)).unwrap();
+        let future = state.create_future_pair(ty(92)).unwrap();
+        let _operation = blocked(
+            state
+                .begin_copy(
+                    stream.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(91),
+                    lease(31, 4),
+                )
+                .unwrap(),
+        );
+        let mut transferred = state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(91),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(92),
+                },
+            )
+            .unwrap();
+        let mut ticket = transferred.first.pending.take().unwrap();
+        let before = endpoint_snapshot(&state, stream.writable);
+        let phase = state.pairs.get(ticket.pair).unwrap().phase;
+        let mut failed_calls = 0;
+        assert_eq!(
+            state.commit_host_copy(&mut ticket, CopyResult::Completed, 3, |buffer, progress| {
+                failed_calls += 1;
+                assert_eq!((buffer.slot(), buffer.elements(), progress), (31, 4, 3));
+                Err::<(), _>(93_u8)
+            }),
+            Err(CommitError::Operation(93))
+        );
+        assert_eq!(failed_calls, 1);
+        assert_eq!(endpoint_snapshot(&state, stream.writable), before);
+        assert!(state.pairs.get(ticket.pair).unwrap().phase == phase);
+        assert_eq!(state.host_copy_progress_limit(&ticket), Ok(4));
+
+        let mut completed_calls = 0;
+        let event = state
+            .commit_host_copy(&mut ticket, CopyResult::Completed, 3, |buffer, progress| {
+                completed_calls += 1;
+                assert_eq!((buffer.slot(), buffer.elements(), progress), (31, 4, 3));
+                Ok::<_, u8>(())
+            })
+            .unwrap();
+        assert_eq!(completed_calls, 1);
+        let delivered = reclaim_ok(&mut state, &event);
+        assert_eq!(delivered.code, EventCode::StreamWrite);
+        assert_eq!(
+            unpack_stream_copy_result(delivered.p2).unwrap(),
+            StreamCopyResult {
+                result: CopyResult::Completed,
+                progress: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn host_input_copy_rejects_output_api_and_closure_failure_is_zero_mutation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut foreign = AsyncState::new(limits()).unwrap();
+        let (readable, authority) = state
+            .insert_host_readable(EndpointKind::Stream, ty(82))
+            .unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(82),
+                    lease(22, 4),
+                )
+                .unwrap(),
+        );
+        let mut ticket = state.prepare_host_copy(&authority, &operation).unwrap();
+        let before = endpoint_snapshot(&state, readable);
+        let phase = state.pairs.get(ticket.pair).unwrap().phase;
+
+        assert_eq!(
+            state.with_host_copy_buffer(&ticket, 2, |_| Ok::<_, ()>(())),
+            Err(CommitError::State(AsyncStateError::WrongDirection))
+        );
+        assert_eq!(
+            state.commit_prepared_host_copy(&mut ticket, 2),
+            Err(AsyncStateError::WrongDirection)
+        );
+        assert_eq!(
+            foreign.with_host_copy_buffer(&ticket, 2, |_| Ok::<_, ()>(())),
+            Err(CommitError::State(AsyncStateError::StaleOperation))
+        );
+        assert_eq!(
+            foreign.cancel_host_copy(&mut ticket),
+            Err(AsyncStateError::StaleOperation)
+        );
+        assert_eq!(
+            state.commit_host_copy(&mut ticket, CopyResult::Cancelled, 0, |_, _| {
+                Ok::<_, u8>(())
+            }),
+            Err(CommitError::State(AsyncStateError::InvalidCopyResult))
+        );
+        assert_eq!(
+            state.commit_host_copy(&mut ticket, CopyResult::Completed, 5, |_, _| {
+                Ok::<_, u8>(())
+            }),
+            Err(CommitError::State(AsyncStateError::ProgressLimit))
+        );
+        assert_eq!(
+            state.commit_host_copy(&mut ticket, CopyResult::Completed, 2, |_, _| {
+                Err::<(), _>(9_u8)
+            }),
+            Err(CommitError::Operation(9))
+        );
+        assert_eq!(
+            state.with_host_input_buffer(&ticket, 2, |_| Err::<(), _>(8_u8)),
+            Err(CommitError::Operation(8))
+        );
+        assert_eq!(endpoint_snapshot(&state, readable), before);
+        assert!(state.pairs.get(ticket.pair).unwrap().phase == phase);
+        assert_eq!(state.host_copy_progress_limit(&ticket), Ok(4));
+        assert_eq!(
+            state.with_host_input_buffer(&ticket, 2, |buffer| {
+                Ok::<_, u8>((buffer.slot(), buffer.elements()))
+            }),
+            Ok((22, 4))
+        );
+
+        let event = state
+            .commit_host_copy(&mut ticket, CopyResult::Completed, 2, |buffer, progress| {
+                assert_eq!((buffer.slot(), progress), (22, 2));
+                Ok::<_, u8>(())
+            })
+            .unwrap();
+        assert_eq!(
+            unpack_stream_copy_result(reclaim_ok(&mut state, &event).p2)
+                .unwrap()
+                .progress,
+            2
+        );
+    }
+
+    #[test]
+    fn cancel_host_copy_retains_holder_and_stale_ticket_cannot_hit_restart() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let (readable, authority) = state
+            .insert_host_readable(EndpointKind::Stream, ty(83))
+            .unwrap();
+        let operation_a = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(83),
+                    lease(23, 3),
+                )
+                .unwrap(),
+        );
+        let mut committed = state.prepare_host_copy(&authority, &operation_a).unwrap();
+        let cancelled = state.cancel_host_copy(&mut committed).unwrap();
+        assert_eq!(
+            state.endpoint_info(readable).unwrap().copy_state,
+            CopyState::Cancelling
+        );
+        assert_eq!(
+            state.host_copy_progress_limit(&committed),
+            Err(AsyncStateError::StaleOperation)
+        );
+        assert_eq!(
+            unpack_stream_copy_result(reclaim_ok(&mut state, &cancelled).p2)
+                .unwrap()
+                .result,
+            CopyResult::Cancelled
+        );
+
+        let operation_b = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(83),
+                    lease(24, 3),
+                )
+                .unwrap(),
+        );
+        assert_ne!(operation_a.operation, operation_b.operation);
+        let mut current = state.prepare_host_copy(&authority, &operation_b).unwrap();
+        let event = state
+            .commit_host_copy(&mut current, CopyResult::Completed, 3, |_, _| {
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        reclaim_ok(&mut state, &event);
+
+        let operation_c = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(83),
+                    lease(25, 3),
+                )
+                .unwrap(),
+        );
+        let stale = state.prepare_host_copy(&authority, &operation_c).unwrap();
+        let guest_cancelled = state
+            .cancel_copy(
+                readable,
+                EndpointKind::Stream,
+                EndpointDirection::Read,
+                ty(83),
+            )
+            .unwrap();
+        reclaim_ok(&mut state, &guest_cancelled);
+        let operation_d = blocked(
+            state
+                .begin_copy(
+                    readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(83),
+                    lease(26, 3),
+                )
+                .unwrap(),
+        );
+        assert_ne!(operation_c.operation, operation_d.operation);
+        assert_eq!(
+            state.host_copy_progress_limit(&stale),
+            Err(AsyncStateError::StaleOperation)
+        );
+        let restarted = endpoint_snapshot(&state, readable);
+        let restarted_phase = state.pairs.get(operation_d.pair).unwrap().phase;
+        let mut stale = stale;
+        assert_eq!(
+            state.commit_host_copy(&mut stale, CopyResult::Completed, 3, |_, _| Ok::<_, ()>(()),),
+            Err(CommitError::State(AsyncStateError::StaleOperation))
+        );
+        assert_eq!(endpoint_snapshot(&state, readable), restarted);
+        assert!(state.pairs.get(operation_d.pair).unwrap().phase == restarted_phase);
+        let mut current = state.prepare_host_copy(&authority, &operation_d).unwrap();
+        let event = state.cancel_host_copy(&mut current).unwrap();
+        reclaim_ok(&mut state, &event);
+    }
+
+    #[test]
+    fn drop_host_copy_peer_consumes_stream_holder_and_future_rules_are_exact() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(84)).unwrap();
+        let idle_future = state.create_future_pair(ty(85)).unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    stream.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(84),
+                    lease(27, 2),
+                )
+                .unwrap(),
+        );
+        let mut transferred = state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(84),
+                },
+                ReadableTransferRequest {
+                    handle: idle_future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(85),
+                },
+            )
+            .unwrap();
+        let mut ticket = transferred.first.pending.take().unwrap();
+        let pair = ticket.pair;
+        let event = state.drop_host_copy_peer(&mut ticket).unwrap();
+        let shared = state.pairs.get(pair).unwrap();
+        assert!(shared.phase == PairPhase::Idle);
+        assert!(shared.peer_dropped);
+        assert!(shared.readable == Holder::Dropped);
+        assert_eq!(
+            state.cancel_host_copy(&mut ticket),
+            Err(AsyncStateError::StaleOperation)
+        );
+        let token = match &transferred.first.endpoint {
+            TransferredReadableEndpoint::Stream(token) => token,
+            TransferredReadableEndpoint::Future(_) => panic!("stream token changed kind"),
+        };
+        assert!(matches!(
+            state.prepare_stream_host_copy(token, &operation),
+            Err(AsyncStateError::AuthorityConsumed)
+        ));
+        let delivered = reclaim_ok(&mut state, &event);
+        assert_eq!(
+            unpack_stream_copy_result(delivered.p2).unwrap().result,
+            CopyResult::Dropped
+        );
+        assert_eq!(
+            state.endpoint_info(stream.writable).unwrap().copy_state,
+            CopyState::Done
+        );
+
+        let (future_readable, future_writer) = state
+            .insert_host_readable(EndpointKind::Future, ty(86))
+            .unwrap();
+        let future_operation = blocked(
+            state
+                .begin_copy(
+                    future_readable,
+                    EndpointKind::Future,
+                    EndpointDirection::Read,
+                    ty(86),
+                    lease(28, 1),
+                )
+                .unwrap(),
+        );
+        let mut future_ticket = state
+            .prepare_host_copy(&future_writer, &future_operation)
+            .unwrap();
+        let before = endpoint_snapshot(&state, future_readable);
+        let phase = state.pairs.get(future_ticket.pair).unwrap().phase;
+        assert_eq!(
+            state.drop_host_copy_peer(&mut future_ticket),
+            Err(AsyncStateError::InvalidCopyResult)
+        );
+        assert_eq!(endpoint_snapshot(&state, future_readable), before);
+        let shared = state.pairs.get(future_ticket.pair).unwrap();
+        assert!(shared.phase == phase);
+        assert!(!shared.peer_dropped);
+        assert!(shared.writable == Holder::Host);
+        assert_eq!(state.host_copy_progress_limit(&future_ticket), Ok(1));
+        let cancelled = state.cancel_host_copy(&mut future_ticket).unwrap();
+        assert_eq!(
+            reclaim_ok(&mut state, &cancelled).p2,
+            CopyResult::Cancelled as u32
+        );
+    }
+
+    #[test]
+    fn future_output_prepared_completion_and_peer_drop_queue_future_write_events() {
+        let mut completed_state = AsyncState::new(limits()).unwrap();
+        let stream = completed_state.create_stream_pair(ty(87)).unwrap();
+        let future = completed_state.create_future_pair(ty(88)).unwrap();
+        let _operation = blocked(
+            completed_state
+                .begin_copy(
+                    future.writable,
+                    EndpointKind::Future,
+                    EndpointDirection::Write,
+                    ty(88),
+                    lease(29, 1),
+                )
+                .unwrap(),
+        );
+        let mut transferred = completed_state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(87),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(88),
+                },
+            )
+            .unwrap();
+        let mut ticket = transferred.second.pending.take().unwrap();
+        completed_state
+            .with_host_copy_buffer(&ticket, 1, |buffer| {
+                assert_eq!((buffer.slot(), buffer.elements()), (29, 1));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        let event = completed_state
+            .commit_prepared_host_copy(&mut ticket, 1)
+            .unwrap();
+        let delivered = reclaim_ok(&mut completed_state, &event);
+        assert_eq!(delivered.code, EventCode::FutureWrite);
+        assert_eq!(delivered.p2, CopyResult::Completed as u32);
+        assert_eq!(
+            completed_state
+                .endpoint_info(future.writable)
+                .unwrap()
+                .copy_state,
+            CopyState::Done
+        );
+        assert!(
+            !completed_state
+                .pairs
+                .get(ticket.pair)
+                .unwrap()
+                .host_writable_done
+        );
+
+        let mut dropped_state = AsyncState::new(limits()).unwrap();
+        let stream = dropped_state.create_stream_pair(ty(89)).unwrap();
+        let future = dropped_state.create_future_pair(ty(90)).unwrap();
+        let _operation = blocked(
+            dropped_state
+                .begin_copy(
+                    future.writable,
+                    EndpointKind::Future,
+                    EndpointDirection::Write,
+                    ty(90),
+                    lease(30, 1),
+                )
+                .unwrap(),
+        );
+        let mut transferred = dropped_state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(89),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(90),
+                },
+            )
+            .unwrap();
+        let mut ticket = transferred.second.pending.take().unwrap();
+        let event = dropped_state.drop_host_copy_peer(&mut ticket).unwrap();
+        let delivered = reclaim_ok(&mut dropped_state, &event);
+        assert_eq!(delivered.code, EventCode::FutureWrite);
+        assert_eq!(delivered.p2, CopyResult::Dropped as u32);
+        assert_eq!(
+            dropped_state
+                .endpoint_info(future.writable)
+                .unwrap()
+                .copy_state,
+            CopyState::Done
+        );
+    }
+
+    #[test]
+    fn pair_detach_with_pending_preserves_zero_one_and_two_ticket_order() {
+        let mut idle_state = AsyncState::new(limits()).unwrap();
+        let idle_stream = idle_state.create_stream_pair(ty(91)).unwrap();
+        let idle_future = idle_state.create_future_pair(ty(92)).unwrap();
+        let idle = idle_state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: idle_stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(91),
+                },
+                ReadableTransferRequest {
+                    handle: idle_future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(92),
+                },
+            )
+            .unwrap();
+        assert!(idle.first.pending.is_none());
+        assert!(idle.second.pending.is_none());
+        assert_eq!(idle.first.endpoint.kind(), EndpointKind::Stream);
+        assert_eq!(idle.second.endpoint.kind(), EndpointKind::Future);
+
+        let mut one_state = AsyncState::new(limits()).unwrap();
+        let one_stream = one_state.create_stream_pair(ty(93)).unwrap();
+        let one_future = one_state.create_future_pair(ty(94)).unwrap();
+        let _operation = blocked(
+            one_state
+                .begin_copy(
+                    one_future.writable,
+                    EndpointKind::Future,
+                    EndpointDirection::Write,
+                    ty(94),
+                    lease(31, 1),
+                )
+                .unwrap(),
+        );
+        let first_before = endpoint_snapshot(&one_state, one_stream.readable);
+        let second_before = endpoint_snapshot(&one_state, one_future.readable);
+        assert_eq!(
+            one_state.detach_readables_pair(
+                ReadableTransferRequest {
+                    handle: one_stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(93),
+                },
+                ReadableTransferRequest {
+                    handle: one_future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(94),
+                },
+            ),
+            Err(AsyncStateError::EndpointBusy)
+        );
+        assert_eq!(
+            endpoint_snapshot(&one_state, one_stream.readable),
+            first_before
+        );
+        assert_eq!(
+            endpoint_snapshot(&one_state, one_future.readable),
+            second_before
+        );
+        let mut one = one_state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: one_stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(93),
+                },
+                ReadableTransferRequest {
+                    handle: one_future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(94),
+                },
+            )
+            .unwrap();
+        assert!(one.first.pending.is_none());
+        let mut one_ticket = one.second.pending.take().unwrap();
+        assert_eq!(one_state.host_copy_progress_limit(&one_ticket), Ok(1));
+        let event = one_state.cancel_host_copy(&mut one_ticket).unwrap();
+        reclaim_ok(&mut one_state, &event);
+
+        let mut two_state = AsyncState::new(limits()).unwrap();
+        let two_stream = two_state.create_stream_pair(ty(95)).unwrap();
+        let two_future = two_state.create_future_pair(ty(96)).unwrap();
+        let _stream_operation = blocked(
+            two_state
+                .begin_copy(
+                    two_stream.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(95),
+                    lease(32, 6),
+                )
+                .unwrap(),
+        );
+        let _future_operation = blocked(
+            two_state
+                .begin_copy(
+                    two_future.writable,
+                    EndpointKind::Future,
+                    EndpointDirection::Write,
+                    ty(96),
+                    lease(33, 1),
+                )
+                .unwrap(),
+        );
+        let mut two = two_state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: two_future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(96),
+                },
+                ReadableTransferRequest {
+                    handle: two_stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(95),
+                },
+            )
+            .unwrap();
+        assert_eq!(two.first.endpoint.kind(), EndpointKind::Future);
+        assert_eq!(two.second.endpoint.kind(), EndpointKind::Stream);
+        let mut first_ticket = two.first.pending.take().unwrap();
+        let mut second_ticket = two.second.pending.take().unwrap();
+        assert_eq!(two_state.host_copy_progress_limit(&first_ticket), Ok(1));
+        assert_eq!(two_state.host_copy_progress_limit(&second_ticket), Ok(6));
+        let first_event = two_state.cancel_host_copy(&mut first_ticket).unwrap();
+        let second_event = two_state.cancel_host_copy(&mut second_ticket).unwrap();
+        assert_eq!(
+            reclaim_ok(&mut two_state, &first_event).code,
+            EventCode::FutureWrite
+        );
+        assert_eq!(
+            reclaim_ok(&mut two_state, &second_event).code,
+            EventCode::StreamWrite
+        );
+    }
+
+    #[test]
+    fn pair_detach_second_pending_validation_failure_is_zero_mutation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(97)).unwrap();
+        let future = state.create_future_pair(ty(98)).unwrap();
+        let stream_operation = blocked(
+            state
+                .begin_copy(
+                    stream.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(97),
+                    lease(34, 2),
+                )
+                .unwrap(),
+        );
+        let future_operation = blocked(
+            state
+                .begin_copy(
+                    future.writable,
+                    EndpointKind::Future,
+                    EndpointDirection::Write,
+                    ty(98),
+                    lease(35, 1),
+                )
+                .unwrap(),
+        );
+        let wrong_operation = NonZeroU64::new(future_operation.operation.get() + 1).unwrap();
+        state
+            .endpoint_by_seal_mut(future_operation.endpoint)
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .operation = wrong_operation;
+        let handles_live = state.handles.live;
+        let first_readable = endpoint_snapshot(&state, stream.readable);
+        let first_writable = endpoint_snapshot(&state, stream.writable);
+        let second_readable = endpoint_snapshot(&state, future.readable);
+        let second_writable = endpoint_snapshot(&state, future.writable);
+
+        assert!(matches!(
+            state.detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(97),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(98),
+                },
+            ),
+            Err(AsyncStateError::PairInvariant)
+        ));
+        assert_eq!(state.handles.live, handles_live);
+        assert_eq!(endpoint_snapshot(&state, stream.readable), first_readable);
+        assert_eq!(endpoint_snapshot(&state, stream.writable), first_writable);
+        assert_eq!(endpoint_snapshot(&state, future.readable), second_readable);
+        assert_eq!(endpoint_snapshot(&state, future.writable), second_writable);
+        assert!(
+            state.pairs.get(stream_operation.pair).unwrap().phase
+                == PairPhase::Waiting(OpRef {
+                    endpoint: stream_operation.endpoint,
+                    operation: stream_operation.operation,
+                })
+        );
+
+        state
+            .endpoint_by_seal_mut(future_operation.endpoint)
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .operation = future_operation.operation;
+        let transferred = state
+            .detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(97),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(98),
+                },
+            )
+            .unwrap();
+        assert!(transferred.first.pending.is_some());
+        assert!(transferred.second.pending.is_some());
+    }
+
+    #[test]
+    fn pair_detach_pending_event_generation_exhaustion_is_zero_mutation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let stream = state.create_stream_pair(ty(99)).unwrap();
+        let future = state.create_future_pair(ty(100)).unwrap();
+        let operation = blocked(
+            state
+                .begin_copy(
+                    future.writable,
+                    EndpointKind::Future,
+                    EndpointDirection::Write,
+                    ty(100),
+                    lease(36, 1),
+                )
+                .unwrap(),
+        );
+        state
+            .endpoint_by_seal_mut(operation.endpoint)
+            .unwrap()
+            .next_event = u64::MAX;
+        let handles_live = state.handles.live;
+        let stream_before = endpoint_snapshot(&state, stream.readable);
+        let future_before = endpoint_snapshot(&state, future.readable);
+        let writable_before = endpoint_snapshot(&state, future.writable);
+
+        assert!(matches!(
+            state.detach_readables_pair_with_pending(
+                ReadableTransferRequest {
+                    handle: stream.readable,
+                    kind: EndpointKind::Stream,
+                    value_type: ty(99),
+                },
+                ReadableTransferRequest {
+                    handle: future.readable,
+                    kind: EndpointKind::Future,
+                    value_type: ty(100),
+                },
+            ),
+            Err(AsyncStateError::GenerationExhausted)
+        ));
+        assert_eq!(state.handles.live, handles_live);
+        assert_eq!(endpoint_snapshot(&state, stream.readable), stream_before);
+        assert_eq!(endpoint_snapshot(&state, future.readable), future_before);
+        assert_eq!(endpoint_snapshot(&state, future.writable), writable_before);
+    }
+
+    #[test]
     fn host_future_writer_drop_requires_completed_write() {
         let mut state = AsyncState::new(limits()).unwrap();
         let (readable, mut writer) = state
@@ -6424,6 +7580,24 @@ struct PreparedCancelCopy {
     endpoint: Seal,
     operation: OpRef,
     action: CancelAction,
+}
+
+struct PreparedHostSettle {
+    pair: Seal,
+    operation: OpRef,
+    authority_direction: EndpointDirection,
+    kind: EndpointKind,
+    result: CopyResult,
+    event_progress: u32,
+    generation: NonZeroU64,
+    next_event: u64,
+}
+
+struct PreparedReadableTransfer {
+    seal: Seal,
+    pair: Seal,
+    token: TransferredReadableEndpoint,
+    pending: Option<HostCopyTicket>,
 }
 
 fn validate_endpoint(

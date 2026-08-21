@@ -90,6 +90,17 @@ pub enum StreamReceiveDispatch {
     Closed(StreamCloseReason),
 }
 
+/// Result of observing the immutable terminal reason without consuming bytes.
+///
+/// A terminal wait is independent from both the producer and consumer
+/// operation slots. In particular, a reader may retain a prepared receive
+/// while the supervisor waits for lifecycle finalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamTerminalDispatch {
+    Waiting(HostOperationToken),
+    Ready(StreamCloseReason),
+}
+
 /// Result of committing an exact prepared receive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamReceiveCommit {
@@ -218,6 +229,7 @@ struct StreamState {
     lifecycle: Lifecycle,
     send: Option<WaitingOperation>,
     receive: Option<ReceiveOperation>,
+    terminal: Option<WaitingOperation>,
     consumer_stopped: bool,
     fail_stopped: bool,
 }
@@ -229,6 +241,7 @@ impl StreamState {
             lifecycle: Lifecycle::Open,
             send: None,
             receive: None,
+            terminal: None,
             consumer_stopped: false,
             fail_stopped: false,
         }
@@ -273,7 +286,16 @@ impl StreamState {
         }
     }
 
-    fn fail_stop(&mut self) -> (Option<HostWakeToken>, Option<HostWakeToken>) {
+    fn take_ready_terminal_wake(&mut self) -> Option<HostWakeToken> {
+        if !matches!(self.lifecycle, Lifecycle::Final(_)) && !self.fail_stopped {
+            return None;
+        }
+        self.terminal
+            .as_mut()
+            .and_then(|pending| pending.wake.take())
+    }
+
+    fn fail_stop(&mut self) -> [Option<HostWakeToken>; 3] {
         self.fail_stopped = true;
         self.ring.clear();
         let send = self.send.as_mut().and_then(|pending| pending.wake.take());
@@ -281,7 +303,8 @@ impl StreamState {
             Some(ReceiveOperation::Waiting(pending)) => pending.wake.take(),
             _ => None,
         };
-        (send, receive)
+        let terminal = self.terminal.take().and_then(|pending| pending.wake);
+        [send, receive, terminal]
     }
 }
 
@@ -390,7 +413,7 @@ impl ByteStreamReader {
                 Err(error) => {
                     let wakes = state.fail_stop();
                     drop(state);
-                    wake_pair(wakes);
+                    wake_all(wakes);
                     return Err(error);
                 }
             };
@@ -408,7 +431,7 @@ impl ByteStreamReader {
             Err(error) => {
                 let wakes = state.fail_stop();
                 drop(state);
-                wake_pair(wakes);
+                wake_all(wakes);
                 return Err(error);
             }
         };
@@ -450,7 +473,7 @@ impl ByteStreamReader {
                 Err(error) => {
                     let wakes = state.fail_stop();
                     drop(state);
-                    wake_pair(wakes);
+                    wake_all(wakes);
                     return Err(error);
                 }
             };
@@ -465,7 +488,7 @@ impl ByteStreamReader {
             Err(error) => {
                 let wakes = state.fail_stop();
                 drop(state);
-                wake_pair(wakes);
+                wake_all(wakes);
                 return Err(error);
             }
         };
@@ -533,13 +556,13 @@ impl ByteStreamReader {
         {
             let wakes = state.fail_stop();
             drop(state);
-            wake_pair(wakes);
+            wake_all(wakes);
             return Err(StreamError::FailStopped);
         }
         if !state.ring.pop_into(output) {
             let wakes = state.fail_stop();
             drop(state);
-            wake_pair(wakes);
+            wake_all(wakes);
             return Err(StreamError::FailStopped);
         }
         state.receive = None;
@@ -614,7 +637,7 @@ impl ByteStreamWriter {
                 Err(error) => {
                     let wakes = state.fail_stop();
                     drop(state);
-                    wake_pair(wakes);
+                    wake_all(wakes);
                     return Err(error);
                 }
             };
@@ -624,7 +647,7 @@ impl ByteStreamWriter {
         if state.ring.push(bytes).is_err() {
             let wakes = state.fail_stop();
             drop(state);
-            wake_pair(wakes);
+            wake_all(wakes);
             return Err(StreamError::TokenExhausted);
         }
         let receiver = state.take_ready_receiver_wake();
@@ -657,7 +680,7 @@ impl ByteStreamWriter {
                 Err(error) => {
                     let wakes = state.fail_stop();
                     drop(state);
-                    wake_pair(wakes);
+                    wake_all(wakes);
                     return Err(error);
                 }
             };
@@ -671,7 +694,7 @@ impl ByteStreamWriter {
         if state.ring.push(bytes).is_err() {
             let wakes = state.fail_stop();
             drop(state);
-            wake_pair(wakes);
+            wake_all(wakes);
             return Err(StreamError::TokenExhausted);
         }
         let receiver = state.take_ready_receiver_wake();
@@ -764,6 +787,106 @@ impl ByteStreamSupervisor {
         Arc::ptr_eq(&self.stream, &writer.stream)
     }
 
+    /// Starts an observation of the one immutable terminal reason.
+    ///
+    /// This operation uses a dedicated fixed slot and therefore neither
+    /// reserves nor consumes a byte-stream send or receive operation. Endpoint
+    /// publication of provisional `Normal` is deliberately not terminal.
+    pub fn start_terminal(&self) -> Result<StreamTerminalDispatch, StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        if state.terminal.is_some() {
+            return Err(StreamError::Busy);
+        }
+        if let Lifecycle::Final(reason) = state.lifecycle {
+            return Ok(StreamTerminalDispatch::Ready(reason));
+        }
+        let token = match next_operation_token() {
+            Ok(token) => token,
+            Err(error) => {
+                let wakes = state.fail_stop();
+                drop(state);
+                wake_all(wakes);
+                return Err(error);
+            }
+        };
+        state.terminal = Some(WaitingOperation { token, wake: None });
+        Ok(StreamTerminalDispatch::Waiting(token))
+    }
+
+    /// Resumes one exact terminal observation. A still-pending observation
+    /// consumes its supplied token and publishes a fresh generation.
+    pub fn resume_terminal(
+        &self,
+        operation: HostOperationToken,
+    ) -> Result<StreamTerminalDispatch, StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        let Some(pending) = state.terminal else {
+            return Err(StreamError::TokenMismatch);
+        };
+        if pending.token != operation {
+            return Err(StreamError::TokenMismatch);
+        }
+        if let Lifecycle::Final(reason) = state.lifecycle {
+            state.terminal = None;
+            return Ok(StreamTerminalDispatch::Ready(reason));
+        }
+        let fresh = match next_operation_token() {
+            Ok(token) => token,
+            Err(error) => {
+                let wakes = state.fail_stop();
+                drop(state);
+                wake_all(wakes);
+                return Err(error);
+            }
+        };
+        state.terminal = Some(WaitingOperation {
+            token: fresh,
+            wake: None,
+        });
+        Ok(StreamTerminalDispatch::Waiting(fresh))
+    }
+
+    /// Registers one wake authority for the exact current terminal wait.
+    /// Readiness is rechecked while holding the stream lock and the callback is
+    /// invoked only after releasing it, making late and reentrant listeners
+    /// safe.
+    pub fn register_terminal_wake(
+        &self,
+        operation: HostOperationToken,
+        wake: HostWakeToken,
+    ) -> Result<(), StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        let Some(pending) = state.terminal.as_mut() else {
+            return Err(StreamError::TokenMismatch);
+        };
+        if pending.token != operation {
+            return Err(StreamError::TokenMismatch);
+        }
+        if pending.wake.is_some() {
+            return Err(StreamError::WakeAlreadyRegistered);
+        }
+        pending.wake = Some(wake);
+        let ready = state.take_ready_terminal_wake();
+        drop(state);
+        wake_one(ready);
+        Ok(())
+    }
+
+    /// Cancels one exact terminal observation without affecting send, receive,
+    /// buffered chunks, or lifecycle state.
+    pub fn cancel_terminal(&self, operation: HostOperationToken) -> Result<(), StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        if state.terminal.map(|pending| pending.token) != Some(operation) {
+            return Err(StreamError::TokenMismatch);
+        }
+        state.terminal = None;
+        Ok(())
+    }
+
     /// Publish the one immutable terminal reason.  Finalizing `Normal` is the
     /// only transition which makes drained EOF observable to the reader.
     pub fn finalize(&self, reason: StreamCloseReason) -> StreamCloseOutcome {
@@ -820,7 +943,7 @@ fn publish_close(
         Lifecycle::Final(_) => {
             let wakes = state.fail_stop();
             drop(state);
-            wake_pair(wakes);
+            wake_all(wakes);
             return StreamCloseOutcome::Conflict;
         }
         Lifecycle::Open | Lifecycle::NormalProvisional if reason.is_normal() && !supervisor => {
@@ -845,8 +968,9 @@ fn publish_close(
     };
     let sender = state.take_ready_sender_wake();
     let receiver = state.take_ready_receiver_wake();
+    let terminal = state.take_ready_terminal_wake();
     drop(state);
-    wake_pair((sender, receiver));
+    wake_all([sender, receiver, terminal]);
     outcome
 }
 
@@ -895,14 +1019,20 @@ fn wake_one(wake: Option<HostWakeToken>) {
     }
 }
 
-fn wake_pair(wakes: (Option<HostWakeToken>, Option<HostWakeToken>)) {
-    wake_one(wakes.0);
-    wake_one(wakes.1);
+fn wake_all(wakes: [Option<HostWakeToken>; 3]) {
+    for wake in wakes {
+        wake_one(wake);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn count_test_wake(words: [usize; 4]) {
+        let count = unsafe { &*(words[0] as *const core::sync::atomic::AtomicUsize) };
+        count.fetch_add(1, Ordering::SeqCst);
+    }
 
     #[test]
     fn local_generation_exhaustion_never_wraps_or_reuses_zero() {
@@ -953,5 +1083,42 @@ mod tests {
         assert!(ring.pop_into(&mut [0]));
         assert_eq!(ring.push(&[2]), Err(StreamError::TokenExhausted));
         assert_eq!(ring.depth, 0);
+    }
+
+    #[test]
+    fn fail_stop_wakes_and_removes_the_exact_terminal_waiter_once() {
+        let stream = ByteStream::new();
+        let supervisor = stream.supervisor();
+        let count = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamTerminalDispatch::Waiting(operation) = supervisor.start_terminal().unwrap()
+        else {
+            panic!("open stream must publish a terminal wait")
+        };
+        supervisor
+            .register_terminal_wake(
+                operation,
+                HostWakeToken::new([Arc::as_ptr(&count) as usize, 0, 0, 0], count_test_wake),
+            )
+            .unwrap();
+
+        let wakes = {
+            let mut state = stream.state.lock();
+            let wakes = state.fail_stop();
+            assert!(state.terminal.is_none());
+            wakes
+        };
+        wake_all(wakes);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let repeated = {
+            let mut state = stream.state.lock();
+            state.fail_stop()
+        };
+        wake_all(repeated);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervisor.resume_terminal(operation),
+            Err(StreamError::FailStopped)
+        );
     }
 }

@@ -1704,6 +1704,33 @@ impl InstanceRegistry {
     where
         F: FnOnce(AllocationDomain) -> bool,
     {
+        unsafe { self.fault_reclaim_with_space(witness, |domain, _space| reclaim(domain)) }
+    }
+
+    /// Validate one permanently detached managed fault arena and expose its
+    /// already-recovered, exactly sealed Space to the reclaim callback.
+    ///
+    /// This is the resource-cleanup form of [`Self::fault_reclaim`]. The
+    /// borrowed Space is exposed only after the complete token/task/domain/
+    /// scheduler/Space/CSpace proof has linearized `FaultReclaiming`, and no
+    /// registry lock is held while the callback runs. This lets a SYSTEM
+    /// lifecycle coordinator cancel fixed backend operations which would
+    /// otherwise survive raw arena reclamation. The callback must release all
+    /// CSpace leases before returning and may not reset the CSpace.
+    ///
+    /// # Safety
+    ///
+    /// This has every requirement of [`Self::fault_reclaim`]. In addition,
+    /// `reclaim` must not retain any reference, pointer, lease, capability, or
+    /// resource obtained from `space` after it returns.
+    pub unsafe fn fault_reclaim_with_space<F>(
+        &self,
+        witness: ReclaimableFaultWitness,
+        reclaim: F,
+    ) -> FaultGateOutcome
+    where
+        F: FnOnce(AllocationDomain, &InstanceSpace) -> bool,
+    {
         let Some(token) = witness.instance_token() else {
             // Absence is `NotManaged` only when no live registry record names
             // this exact globally-unique TaskId or exact allocation domain.
@@ -1721,7 +1748,7 @@ impl InstanceRegistry {
         };
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
 
-        let (domain, abandoned_payload) = {
+        let (domain, abandoned_payload, space_pointer) = {
             let _transaction = self.transaction.lock();
             if self.fault_reclaiming_alias_locked(witness) {
                 drop(_transaction);
@@ -1806,6 +1833,7 @@ impl InstanceRegistry {
                 system.restore();
                 return FaultGateOutcome::Quarantined;
             }
+            let space_pointer = core::ptr::from_ref(space);
 
             // The executor drained every TaskStatus-owned wait edge before it
             // invoked this fault gate. A retained waiter means the arena still
@@ -1858,14 +1886,17 @@ impl InstanceRegistry {
             record.payload_abandoned = true;
             record.phase = InstancePhase::FaultReclaiming;
             Self::publish_header(slot, &record);
-            (domain, abandoned_payload)
+            (domain, abandoned_payload, space_pointer)
         };
 
         core::mem::forget(abandoned_payload);
 
         // No registry lock is held across the target's allocator operation.
         // FaultReclaiming prevents a replay from authorizing a second reclaim.
-        let reclaimed = reclaim(domain);
+        // Safety: `FaultReclaiming` is an immutable in-flight lease which
+        // excludes finalization and CSpace reset until this callback returns.
+        // The exact Space object remains owned by the stable registry record.
+        let reclaimed = reclaim(domain, unsafe { &*space_pointer });
 
         let _transaction = self.transaction.lock();
         let Some(slot) = self.slot(token) else {
@@ -6443,6 +6474,106 @@ mod tests {
         assert_eq!(cspace_incarnation(&registry, token), incarnation);
 
         TEST_REGISTRY.store(core::ptr::null_mut(), AtomicOrdering::Release);
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn fault_reclaim_space_callback_runs_unlocked_before_reclaim_and_reset() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        exec::set_fault_reclaimer(capture_fault_witness);
+        exec::set_fault_guard(fault_next_guard);
+
+        let allocation = domain(10_199);
+        let token = registry.reserve(allocation).unwrap();
+        let incarnation = cspace_incarnation(&registry, token);
+        let handle = publish_pending_managed(&registry, token, allocation, "fault-space-callback");
+        TEST_FAULT_NEXT.store(true, AtomicOrdering::SeqCst);
+        assert!(exec::poll_once());
+        assert_eq!(handle.state(), TaskState::Faulted);
+        let exact = TEST_FAULT_WITNESS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("capture-only fault hook lost its witness");
+
+        let mut callback_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.fault_reclaim_with_space(exact, |domain, space| {
+                    callback_calls += 1;
+                    assert_eq!(domain, allocation);
+                    // Reentrant observation proves that no registry lock is
+                    // retained across the callback.
+                    assert_eq!(
+                        registry.snapshot(token).unwrap().phase,
+                        InstancePhase::FaultReclaiming
+                    );
+                    // Taking the CSpace guard proves that recovery and seal
+                    // validation completed and the guard is not retained.
+                    let cspace = space.cspace().lock();
+                    assert_eq!(cspace.incarnation(), incarnation);
+                    drop(cspace);
+                    true
+                })
+            },
+            FaultGateOutcome::ManagedReclaimed
+        );
+        assert_eq!(callback_calls, 1);
+        assert_eq!(
+            registry.snapshot(token).unwrap().phase,
+            InstancePhase::FaultReclaimed
+        );
+        assert_eq!(cspace_incarnation(&registry, token), incarnation);
+
+        exec::set_fault_guard(pass_fault_guard);
+        exec::set_fault_reclaimer(reject_unexpected_fault);
+    }
+
+    #[test]
+    fn refused_fault_space_cleanup_quarantines_before_any_reset() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        exec::set_fault_reclaimer(capture_fault_witness);
+        exec::set_fault_guard(fault_next_guard);
+
+        let allocation = domain(10_203);
+        let token = registry.reserve(allocation).unwrap();
+        let incarnation = cspace_incarnation(&registry, token);
+        let handle = publish_pending_managed(&registry, token, allocation, "fault-space-refused");
+        TEST_FAULT_NEXT.store(true, AtomicOrdering::SeqCst);
+        assert!(exec::poll_once());
+        let exact = TEST_FAULT_WITNESS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("capture-only fault hook lost its witness");
+
+        let mut callback_calls = 0;
+        assert_eq!(
+            unsafe {
+                registry.fault_reclaim_with_space(exact, |domain, space| {
+                    callback_calls += 1;
+                    assert_eq!(domain, allocation);
+                    assert_eq!(space.cspace().lock().incarnation(), incarnation);
+                    false
+                })
+            },
+            FaultGateOutcome::Quarantined
+        );
+        assert_eq!(callback_calls, 1);
+        assert_eq!(
+            registry.slot(token).unwrap().record.lock().phase,
+            InstancePhase::Quarantined
+        );
+        assert_eq!(cspace_incarnation(&registry, token), incarnation);
+        assert_eq!(
+            unsafe { registry.finalize(token, &handle, |_, _| true) },
+            Err(RegistryError::WrongPhase)
+        );
+        assert_eq!(cspace_incarnation(&registry, token), incarnation);
+
         exec::set_fault_guard(pass_fault_guard);
         exec::set_fault_reclaimer(reject_unexpected_fault);
     }

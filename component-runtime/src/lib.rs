@@ -6,6 +6,7 @@ extern crate alloc;
 
 pub mod abi_value;
 pub mod async_abi;
+pub mod async_state;
 pub mod canonical;
 pub mod decode;
 mod execution;

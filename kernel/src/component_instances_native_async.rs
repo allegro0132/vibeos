@@ -8,10 +8,17 @@
 //! readiness bits remain inert.
 
 use super::native_pending_shadow_model::{
-    InputSpill, OutputStaging, PendingIdentity, PendingKind, PendingShadow, PendingShadowError,
-    PendingSnapshot, DRIVER_CHUNK_BYTES,
+    BackendEffect, ExactBackendAction, ExactBackendPendingKind as PendingKind, ExactBackendReturn,
+    ExactCancelCause, ExactCancelPlan, ExactCleanupDecision, ExactContinuation,
+    ExactContinuationCleanup, ExactHostFunction, ExactInstanceIdentity, ExactLedgerError,
+    ExactLedgerPhase, ExactLedgerSnapshot, ExactOperationLedger, ExactResidualCancelPlan,
+    ExactResourceRevokePlan, ExactResourceState, ExactRuntimeCleanup, ExactRuntimeToken,
+    ExactStreamResource, InputSpill, OutputStaging, DRIVER_CHUNK_BYTES,
 };
 use super::*;
+use crate::instance::{
+    FaultContinuationAbandonReceipt, InstanceContinuationConsumed, InstanceContinuationToken,
+};
 
 #[cfg(all(
     feature = "wasm-c53-native-async-qemu-acceptance",
@@ -452,16 +459,25 @@ fn revalidate_image_root(_root: &NativeImageRoot) -> bool {
 struct DriverIdentity {
     key: ControlKey,
     instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 }
 
 impl DriverIdentity {
-    const fn shadow(self) -> PendingIdentity<InstanceToken, RegistryStreamBindings> {
-        PendingIdentity {
+    fn exact(
+        self,
+    ) -> Option<
+        ExactInstanceIdentity<InstanceToken, TaskId, AllocationDomain, RegistryStreamBindings>,
+    > {
+        Some(ExactInstanceIdentity {
+            control: self.key.encode()?.get(),
             control_generation: self.key.generation,
             instance: self.instance,
+            task: self.task,
+            domain: self.domain,
             bindings: self.streams,
-        }
+        })
     }
 }
 
@@ -578,6 +594,8 @@ fn target_managed_slot(key: ControlKey) -> Option<&'static SpinLock<TargetManage
 pub(super) fn target_record_managed_start(
     key: ControlKey,
     instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
     managed: ManagedComponentToken,
 ) -> bool {
@@ -597,6 +615,8 @@ pub(super) fn target_record_managed_start(
         driver: DriverIdentity {
             key,
             instance,
+            task,
+            domain,
             streams,
         },
         managed,
@@ -693,12 +713,16 @@ fn target_record_shadow_retired(identity: DriverIdentity) -> bool {
 pub(super) fn target_record_managed_terminal(
     key: ControlKey,
     instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
     terminal: ComponentTerminal,
 ) -> bool {
     let identity = DriverIdentity {
         key,
         instance,
+        task,
+        domain,
         streams,
     };
     let Some(slot) = target_managed_slot(key) else {
@@ -724,6 +748,8 @@ pub(super) fn target_record_managed_terminal(
 pub(super) fn target_record_reaper_notified(
     key: ControlKey,
     instance: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
     managed: ManagedComponentToken,
     terminal: ComponentTerminal,
@@ -732,6 +758,8 @@ pub(super) fn target_record_reaper_notified(
         driver: DriverIdentity {
             key,
             instance,
+            task,
+            domain,
             streams,
         },
         managed,
@@ -776,9 +804,11 @@ pub(super) fn target_record_managed_acknowledgement(
 
 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
 pub(super) fn target_pending_shadow_residue() -> usize {
-    PENDING_SHADOWS
+    PENDING_LEDGERS
         .iter()
-        .filter(|shadow| !shadow.lock().is_retired())
+        .filter(|ledger| {
+            ledger.lock().phase() != super::native_pending_shadow_model::ExactLedgerPhase::Retired
+        })
         .count()
 }
 
@@ -921,12 +951,62 @@ pub(super) fn publish_target_report(report: TargetManagedReport) {
     );
 }
 
-type NativePendingShadow = PendingShadow<InstanceToken, RegistryStreamBindings, HostOperationToken>;
-type NativePendingSnapshot =
-    PendingSnapshot<InstanceToken, RegistryStreamBindings, HostOperationToken>;
+impl ExactRuntimeToken for NativeHostToken {
+    fn strictly_after(self, previous: Self) -> bool {
+        NativeHostToken::strictly_after(self, previous)
+    }
+}
 
-static PENDING_SHADOWS: [SpinLock<NativePendingShadow>; CONTROL_SLOTS] =
-    [const { SpinLock::new(NativePendingShadow::new()) }; CONTROL_SLOTS];
+type NativeOperationLedger = ExactOperationLedger<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
+    NativeHostToken,
+    HostOperationToken,
+    InstanceContinuationToken,
+>;
+type NativeLedgerSnapshot = ExactLedgerSnapshot<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
+    NativeHostToken,
+    HostOperationToken,
+    InstanceContinuationToken,
+>;
+type NativeCancelPlan = ExactCancelPlan<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
+    NativeHostToken,
+    HostOperationToken,
+    InstanceContinuationToken,
+>;
+type NativeBackendReturn = ExactBackendReturn<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
+    NativeHostToken,
+    HostOperationToken,
+    InstanceContinuationToken,
+>;
+type NativeResidualCancelPlan = ExactResidualCancelPlan<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
+    NativeHostToken,
+    HostOperationToken,
+    InstanceContinuationToken,
+>;
+type NativeResourceRevokePlan =
+    ExactResourceRevokePlan<InstanceToken, TaskId, AllocationDomain, RegistryStreamBindings>;
+
+static PENDING_LEDGERS: [SpinLock<NativeOperationLedger>; CONTROL_SLOTS] =
+    [const { SpinLock::new(NativeOperationLedger::new()) }; CONTROL_SLOTS];
 static SHADOW_KIND_INSTALLS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 const fn pending_kind_index(kind: PendingKind) -> usize {
@@ -946,120 +1026,153 @@ fn shadow_kind_install_counts() -> [u64; 4] {
     core::array::from_fn(|index| SHADOW_KIND_INSTALLS[index].load(Ordering::Acquire))
 }
 
-fn shadow_slot(key: ControlKey) -> Option<&'static SpinLock<NativePendingShadow>> {
-    PENDING_SHADOWS.get(key.slot as usize)
+fn ledger_slot(key: ControlKey) -> Option<&'static SpinLock<NativeOperationLedger>> {
+    PENDING_LEDGERS.get(key.slot as usize)
 }
 
-fn shadow_bind(identity: DriverIdentity) -> Result<(), PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
+fn with_ledger<T>(
+    identity: DriverIdentity,
+    operation: impl FnOnce(&mut NativeOperationLedger) -> Result<T, ExactLedgerError>,
+) -> Result<T, ExactLedgerError> {
+    if identity.exact().is_none() {
+        return Err(ExactLedgerError::IdentityMismatch);
+    }
+    let Some(slot) = ledger_slot(identity.key) else {
+        return Err(ExactLedgerError::IdentityMismatch);
     };
-    slot.lock().bind(identity.shadow())
+    operation(&mut slot.lock())
+}
+
+fn ledger_error_terminal(identity: DriverIdentity, error: ExactLedgerError) -> ComponentTerminal {
+    // A caller from an older CONTROL generation is inert. In particular it may
+    // not quarantine a replacement which now owns the same fixed slot.
+    if error != ExactLedgerError::StaleGeneration {
+        quarantine_shadow(identity);
+    }
+    ComponentTerminal::RunnerFault
 }
 
 pub(super) fn bind_pending_shadow(
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 ) -> bool {
     let identity = DriverIdentity {
         key,
         instance: token,
+        task,
+        domain,
         streams,
     };
-    if shadow_bind(identity).is_ok() {
-        true
-    } else {
-        quarantine_shadow(identity);
-        false
+    let result = with_ledger(identity, |ledger| {
+        let exact = identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?;
+        ledger.bind(exact)
+    });
+    match result {
+        Ok(()) => true,
+        Err(ExactLedgerError::StaleGeneration) => false,
+        Err(_) => {
+            quarantine_shadow(identity);
+            false
+        }
     }
 }
 
-fn shadow_install(
+fn ledger_begin_runtime(
     identity: DriverIdentity,
+    runtime: NativeHostToken,
+    resource: ExactStreamResource,
+    function: ExactHostFunction,
+    request_units: usize,
+) -> Result<NativeLedgerSnapshot, ExactLedgerError> {
+    with_ledger(identity, |ledger| {
+        ledger.begin_runtime(
+            identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?,
+            runtime,
+            resource,
+            function,
+            request_units,
+        )
+    })
+}
+
+fn ledger_prepare_runtime(
+    identity: DriverIdentity,
+    previous: NativeLedgerSnapshot,
+    runtime: NativeHostToken,
+) -> Result<NativeLedgerSnapshot, ExactLedgerError> {
+    with_ledger(identity, |ledger| ledger.prepare_runtime(previous, runtime))
+}
+
+fn ledger_begin_backend(
+    identity: DriverIdentity,
+    previous: NativeLedgerSnapshot,
+    action: ExactBackendAction,
+) -> Result<NativeLedgerSnapshot, ExactLedgerError> {
+    with_ledger(identity, |ledger| ledger.begin_backend(previous, action))
+}
+
+fn ledger_backend_pending(
+    identity: DriverIdentity,
+    invoking: NativeLedgerSnapshot,
     kind: PendingKind,
-    operation: HostOperationToken,
-) -> Result<NativePendingSnapshot, PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
-    };
-    let installed = slot.lock().install(identity.shadow(), kind, operation);
-    if installed.is_ok() {
+    backend: HostOperationToken,
+) -> Result<NativeBackendReturn, ExactLedgerError> {
+    let returned = with_ledger(identity, |ledger| {
+        ledger.backend_pending(invoking, kind, backend)
+    });
+    if returned.is_ok() {
         record_shadow_kind_install(kind);
     }
-    installed
+    returned
 }
 
-fn shadow_replace_for(
+fn ledger_snapshot(
     identity: DriverIdentity,
-    previous: NativePendingSnapshot,
-    kind: PendingKind,
-    operation: HostOperationToken,
-) -> Result<NativePendingSnapshot, PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
-    };
-    if previous.identity != identity.shadow() {
-        slot.lock().quarantine();
-        return Err(PendingShadowError::IdentityMismatch);
-    }
-    let replaced = slot.lock().replace(previous, kind, operation);
-    if replaced.is_ok() {
-        record_shadow_kind_install(kind);
-    }
-    replaced
+) -> Result<Option<NativeLedgerSnapshot>, ExactLedgerError> {
+    with_ledger(identity, |ledger| {
+        ledger.snapshot(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)
+    })
 }
 
-fn shadow_snapshot(
-    identity: DriverIdentity,
-) -> Result<Option<NativePendingSnapshot>, PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
-    };
-    slot.lock().snapshot(identity.shadow())
-}
-
-fn shadow_observe_kind_if_installed(
-    identity: DriverIdentity,
-) -> Result<Option<PendingKind>, PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
-    };
-    slot.lock().observe_kind_if_installed(identity.shadow())
-}
-
-fn shadow_clear(
-    identity: DriverIdentity,
-    expected: NativePendingSnapshot,
-) -> Result<(), PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
-    };
-    if expected.identity != identity.shadow() {
-        slot.lock().quarantine();
-        return Err(PendingShadowError::IdentityMismatch);
-    }
-    slot.lock().clear(expected)
-}
-
-fn shadow_retire(identity: DriverIdentity) -> Result<(), PendingShadowError> {
-    let Some(slot) = shadow_slot(identity.key) else {
-        return Err(PendingShadowError::IdentityMismatch);
-    };
-    slot.lock().retire(identity.shadow())
+fn ledger_pending_kind(identity: DriverIdentity) -> Result<Option<PendingKind>, ExactLedgerError> {
+    ledger_snapshot(identity).map(|snapshot| snapshot.and_then(NativeLedgerSnapshot::pending_kind))
 }
 
 fn quarantine_shadow(identity: DriverIdentity) {
-    if let Some(slot) = shadow_slot(identity.key) {
-        slot.lock().quarantine();
+    let Some(exact) = identity.exact() else {
+        lifecycle_fail_stop();
+        return;
+    };
+    let Some(slot) = ledger_slot(identity.key) else {
+        lifecycle_fail_stop();
+        return;
+    };
+    let stale = {
+        let mut ledger = slot.lock();
+        if ledger.snapshot(exact) == Err(ExactLedgerError::StaleGeneration) {
+            true
+        } else {
+            ledger.quarantine();
+            false
+        }
+    };
+    if stale {
+        return;
     }
-    CONTROL.child_shadow[identity.key.slot as usize].quarantine(identity.key);
-    CONTROL.supervisor_shadow[identity.key.slot as usize].quarantine(identity.key);
+    if let Some(shadow) = CONTROL.child_shadow.get(identity.key.slot as usize) {
+        shadow.quarantine(identity.key);
+    }
+    if let Some(shadow) = CONTROL.supervisor_shadow.get(identity.key.slot as usize) {
+        shadow.quarantine(identity.key);
+    }
     let _ = registry().quarantine(identity.instance);
     lifecycle_fail_stop();
 }
 
-fn exact_shadow_lease<T: Resource>(
+fn exact_ledger_lease<T: Resource>(
     cspace: &CSpace,
     cap: Cap,
     rights: Rights,
@@ -1070,123 +1183,413 @@ fn exact_shadow_lease<T: Resource>(
     cspace.lookup_lease::<T>(cap, rights).ok()
 }
 
-/// Cancel one snapshotted backend operation without retaining any lock across
-/// layers. The caller takes/releases the shadow lock before this function;
-/// this function takes/releases the CSpace lock before invoking the stream;
-/// only after the stream returns does it reacquire the shadow lock to clear.
-fn cancel_snapshot_in_space(
+enum BackendCancelLease {
+    Reader(InvocationLease<ByteStreamSupervisor>),
+    Writer(InvocationLease<ByteStreamSupervisor>),
+    Terminal(InvocationLease<ByteStreamSupervisor>),
+}
+
+fn backend_cancel_lease(
     space: &InstanceSpace,
     identity: DriverIdentity,
-    snapshot: NativePendingSnapshot,
-) -> bool {
-    if snapshot.identity != identity.shadow() {
-        return false;
+    kind: PendingKind,
+) -> Option<BackendCancelLease> {
+    let cspace = space.cspace().lock();
+    backend_cancel_lease_from_cspace(&cspace, identity, kind)
+}
+
+fn backend_cancel_lease_from_cspace(
+    cspace: &CSpace,
+    identity: DriverIdentity,
+    kind: PendingKind,
+) -> Option<BackendCancelLease> {
+    if validate_stream_space(cspace, identity.streams).is_err() {
+        return None;
     }
-    enum Lease {
-        Reader(InvocationLease<ByteStreamReader>),
-        Writer(InvocationLease<ByteStreamWriter>),
-        Supervisor(InvocationLease<ByteStreamSupervisor>),
-    }
-    let lease = {
-        let cspace = space.cspace().lock();
-        if validate_stream_space(&cspace, identity.streams).is_err() {
-            return false;
-        }
-        match snapshot.kind {
-            PendingKind::ReadWaiting | PendingKind::ReadPrepared => {
-                exact_shadow_lease::<ByteStreamReader>(
-                    &cspace,
-                    identity.streams.stdin,
-                    Rights::RECV,
-                )
-                .map(Lease::Reader)
-            }
-            PendingKind::WriteWaiting => exact_shadow_lease::<ByteStreamWriter>(
-                &cspace,
-                identity.streams.stdout,
-                Rights::SEND,
-            )
-            .map(Lease::Writer),
-            PendingKind::TerminalWaiting => exact_shadow_lease::<ByteStreamSupervisor>(
-                &cspace,
+    match kind {
+        PendingKind::ReadWaiting | PendingKind::ReadPrepared => {
+            exact_ledger_lease::<ByteStreamSupervisor>(
+                cspace,
                 identity.streams.stdin_supervisor,
                 Rights::INVOKE,
             )
-            .map(Lease::Supervisor),
+            .map(BackendCancelLease::Reader)
         }
-    };
-    let Some(lease) = lease else {
-        return false;
-    };
-    let cancelled = match lease {
-        Lease::Reader(reader) => reader.with(|reader| reader.cancel(snapshot.operation)),
-        Lease::Writer(writer) => writer.with(|writer| writer.cancel(snapshot.operation)),
-        Lease::Supervisor(supervisor) => {
-            supervisor.with(|supervisor| supervisor.cancel_terminal(snapshot.operation))
-        }
-    };
-    if cancelled.is_err() {
-        return false;
+        PendingKind::WriteWaiting => exact_ledger_lease::<ByteStreamSupervisor>(
+            cspace,
+            identity.streams.stdout_supervisor,
+            Rights::INVOKE,
+        )
+        .map(BackendCancelLease::Writer),
+        PendingKind::TerminalWaiting => exact_ledger_lease::<ByteStreamSupervisor>(
+            cspace,
+            identity.streams.stdin_supervisor,
+            Rights::INVOKE,
+        )
+        .map(BackendCancelLease::Terminal),
     }
-    shadow_clear(identity, snapshot).is_ok()
 }
 
-fn cancel_current_shadow(identity: DriverIdentity) -> bool {
-    let snapshot = match shadow_snapshot(identity) {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => return true,
-        Err(_) => return false,
+fn invoke_backend_cancel(
+    lease: BackendCancelLease,
+    backend: HostOperationToken,
+) -> Result<(), StreamError> {
+    match lease {
+        BackendCancelLease::Reader(supervisor) => {
+            supervisor.with(|supervisor| supervisor.cancel_reader_operation_exact(backend))
+        }
+        BackendCancelLease::Writer(supervisor) => {
+            supervisor.with(|supervisor| supervisor.cancel_writer_operation_exact(backend))
+        }
+        BackendCancelLease::Terminal(supervisor) => {
+            supervisor.with(|supervisor| supervisor.cancel_terminal(backend))
+        }
+    }
+}
+
+fn endpoint_cap(identity: DriverIdentity, resource: ExactStreamResource) -> Result<Cap, ()> {
+    match resource {
+        ExactStreamResource::StdinReader => Ok(identity.streams.stdin),
+        ExactStreamResource::StdoutWriter => Ok(identity.streams.stdout),
+        ExactStreamResource::StdinSupervisor | ExactStreamResource::StdoutSupervisor => Err(()),
+    }
+}
+
+fn revoke_endpoint_cap_in_space(
+    space: &InstanceSpace,
+    identity: DriverIdentity,
+    plan: NativeResourceRevokePlan,
+) -> Result<(), ()> {
+    if plan.identity() != identity.exact().ok_or(())? {
+        return Err(());
+    }
+    let endpoint = endpoint_cap(identity, plan.resource())?;
+    {
+        let mut cspace = space.cspace().lock();
+        if validate_stream_space(&cspace, identity.streams).is_err() {
+            return Err(());
+        }
+        if cspace.revoke_exact_admin(endpoint).map_err(|_| ())? == 0 {
+            return Err(());
+        }
+    }
+    with_ledger(identity, |ledger| ledger.finish_cap_revoke(plan)).map_err(|_| ())?;
+    Ok(())
+}
+
+fn revoke_endpoint_and_retain_cancel_lease(
+    space: &InstanceSpace,
+    identity: DriverIdentity,
+    plan: NativeResourceRevokePlan,
+    kind: PendingKind,
+) -> Result<BackendCancelLease, ()> {
+    if plan.identity() != identity.exact().ok_or(())? {
+        return Err(());
+    }
+    let endpoint = endpoint_cap(identity, plan.resource())?;
+    let lease = {
+        let mut cspace = space.cspace().lock();
+        let lease = backend_cancel_lease_from_cspace(&cspace, identity, kind).ok_or(())?;
+        if cspace.revoke_exact_admin(endpoint).map_err(|_| ())? == 0 {
+            return Err(());
+        }
+        lease
     };
-    let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
-        return false;
+    with_ledger(identity, |ledger| ledger.finish_cap_revoke(plan)).map_err(|_| ())?;
+    Ok(lease)
+}
+
+/// Complete a SYSTEM cancellation without holding the ledger, CSpace, or
+/// stream lock across another layer. The endpoint cap may already be revoked;
+/// only the independently retained supervisor capability is used here.
+fn cancel_plan_in_space(
+    space: &InstanceSpace,
+    identity: DriverIdentity,
+    plan: NativeCancelPlan,
+) -> Result<NativeLedgerSnapshot, ()> {
+    if plan.snapshot().identity() != identity.exact().ok_or(())? {
+        return Err(());
+    }
+    let lease = if plan.claim().cause() == ExactCancelCause::Revoke {
+        revoke_endpoint_and_retain_cancel_lease(
+            space,
+            identity,
+            plan.resource_revoke_plan(),
+            plan.kind(),
+        )?
+    } else {
+        backend_cancel_lease(space, identity, plan.kind()).ok_or(())?
     };
-    if witness.instance_token() != Some(identity.instance) {
-        return false;
+    invoke_backend_cancel(lease, plan.backend()).map_err(|_| ())?;
+    let continuation = plan.continuation();
+    let mut cancelled =
+        with_ledger(identity, |ledger| ledger.finish_cancel(plan)).map_err(|_| ())?;
+    if plan.claim().cause() == ExactCancelCause::Revoke {
+        match continuation {
+            ExactContinuation::Armed(token) | ExactContinuation::WakeRegistered(token) => {
+                let cleanup = match registry().signal_continuation(token) {
+                    crate::instance::InstanceContinuationSignal::Signalled => {
+                        Some(ExactContinuationCleanup::Signalled)
+                    }
+                    crate::instance::InstanceContinuationSignal::AlreadySignalled => {
+                        Some(ExactContinuationCleanup::AlreadySignalled)
+                    }
+                    crate::instance::InstanceContinuationSignal::AlreadyConsumed(receipt) => {
+                        if !receipt.matches_token(token) {
+                            return Err(());
+                        }
+                        if cancelled.continuation() != ExactContinuation::Consumed(token) {
+                            cancelled = with_ledger(identity, |ledger| {
+                                ledger.project_consumed_continuation(
+                                    identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?,
+                                    token,
+                                )
+                            })
+                            .map_err(|_| ())?;
+                        }
+                        None
+                    }
+                    crate::instance::InstanceContinuationSignal::Stale
+                    | crate::instance::InstanceContinuationSignal::Quarantined => return Err(()),
+                };
+                if let Some(cleanup) = cleanup {
+                    cancelled = with_ledger(identity, |ledger| {
+                        ledger.finish_continuation_cleanup(cancelled, token, cleanup)
+                    })
+                    .map_err(|_| ())?;
+                }
+            }
+            ExactContinuation::None | ExactContinuation::Consumed(_) => {}
+            ExactContinuation::Signalled(_)
+            | ExactContinuation::Cancelled(_)
+            | ExactContinuation::Abandoned(_) => return Err(()),
+        }
+    }
+    Ok(cancelled)
+}
+
+fn cancel_plan_in_current(
+    identity: DriverIdentity,
+    plan: NativeCancelPlan,
+) -> Result<NativeLedgerSnapshot, ()> {
+    let witness = crate::exec::current_reclaimable_task_witness().ok_or(())?;
+    if witness.instance_token() != Some(identity.instance)
+        || witness.task_id() != identity.task
+        || witness.allocation_domain() != identity.domain
+    {
+        return Err(());
     }
     unsafe {
         registry()
             .with_current_space_for_cleanup(witness, |space| {
-                cancel_snapshot_in_space(space, identity, snapshot)
+                cancel_plan_in_space(space, identity, plan)
             })
-            .is_ok_and(|cancelled| cancelled)
+            .map_err(|_| ())?
     }
 }
 
-pub(super) fn payload_drop(key: ControlKey, token: InstanceToken, streams: RegistryStreamBindings) {
+#[derive(Clone, Copy)]
+enum BackendPendingOutcome {
+    Pending(NativeLedgerSnapshot),
+    Revoked(NativeLedgerSnapshot),
+}
+
+fn backend_return_pending(
+    identity: DriverIdentity,
+    returned: NativeBackendReturn,
+) -> Result<BackendPendingOutcome, ComponentTerminal> {
+    match returned {
+        ExactBackendReturn::Pending(snapshot) => Ok(BackendPendingOutcome::Pending(snapshot)),
+        ExactBackendReturn::Cancel(plan) => {
+            // The revoke claim won while the backend method was outside the
+            // ledger. Revoke the exact endpoint cap and cancel only through its
+            // supervisor. The driver still owns the runtime token and must
+            // explicitly drop it before the cancellation can be consumed.
+            cancel_plan_in_current(identity, plan)
+                .map(BackendPendingOutcome::Revoked)
+                .map_err(|()| unexpected_native_driver_error(identity, "deferred revoke cancel"))
+        }
+    }
+}
+
+fn finish_live_revoke(
+    identity: DriverIdentity,
+    cancelled: NativeLedgerSnapshot,
+) -> Result<(), ComponentTerminal> {
+    let acknowledged = model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            ledger.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Cancelled)
+        }),
+    )?;
+    model_result(
+        identity,
+        with_ledger(identity, |ledger| ledger.consume_cancelled(acknowledged)),
+    )
+}
+
+fn cancel_residual_in_current(
+    identity: DriverIdentity,
+    plan: NativeResidualCancelPlan,
+) -> Result<NativeLedgerSnapshot, ()> {
+    let witness = crate::exec::current_reclaimable_task_witness().ok_or(())?;
+    if witness.instance_token() != Some(identity.instance)
+        || witness.task_id() != identity.task
+        || witness.allocation_domain() != identity.domain
+    {
+        return Err(());
+    }
+    unsafe {
+        registry()
+            .with_current_space_for_cleanup(witness, |space| {
+                let lease =
+                    backend_cancel_lease(space, identity, PendingKind::ReadPrepared).ok_or(())?;
+                invoke_backend_cancel(lease, plan.backend()).map_err(|_| ())?;
+                with_ledger(identity, |ledger| {
+                    ledger.finish_backend_residual_cancel(plan)
+                })
+                .map_err(|_| ())
+            })
+            .map_err(|_| ())?
+    }
+}
+
+pub(super) fn payload_drop(
+    key: ControlKey,
+    token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+) {
     let identity = DriverIdentity {
         key,
         instance: token,
+        task,
+        domain,
         streams,
     };
-    if !cancel_current_shadow(identity) {
+    let exact = match identity.exact() {
+        Some(exact) => exact,
+        None => {
+            quarantine_shadow(identity);
+            return;
+        }
+    };
+    let before = match ledger_snapshot(identity) {
+        Ok(snapshot) => snapshot,
+        Err(ExactLedgerError::StaleGeneration) => return,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return;
+        }
+    };
+    let waiter = before.and_then(|snapshot| match snapshot.continuation() {
+        ExactContinuation::Armed(token) | ExactContinuation::WakeRegistered(token) => Some(token),
+        _ => None,
+    });
+    let cancelled_waiter = match waiter {
+        Some(waiter) => match registry().confirm_cancelled_continuation_current(waiter) {
+            Ok(receipt) if receipt.matches_token(waiter) => Some(receipt),
+            _ => {
+                quarantine_shadow(identity);
+                return;
+            }
+        },
+        None => None,
+    };
+    if let Err(error) = with_ledger(identity, |ledger| {
+        ledger.acknowledge_runtime_owner_drop(exact)
+    }) {
+        if error != ExactLedgerError::StaleGeneration {
+            quarantine_shadow(identity);
+        }
+        return;
+    }
+    let decision = match with_ledger(identity, |ledger| ledger.prepare_finalizer(exact, false)) {
+        Ok(decision) => decision,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return;
+        }
+    };
+    let plan = match decision {
+        ExactCleanupDecision::ReclaimSafe => return,
+        ExactCleanupDecision::Quarantined => {
+            quarantine_shadow(identity);
+            return;
+        }
+        ExactCleanupDecision::Cancel(plan) => plan,
+    };
+    let continuation = plan.continuation();
+    let mut cancelled = match cancel_plan_in_current(identity, plan) {
+        Ok(cancelled) => cancelled,
+        Err(()) => {
+            quarantine_shadow(identity);
+            return;
+        }
+    };
+    match (continuation, waiter, cancelled_waiter) {
+        (
+            ExactContinuation::Armed(current) | ExactContinuation::WakeRegistered(current),
+            Some(waiter),
+            Some(receipt),
+        ) if current == waiter && receipt.matches_token(waiter) => {
+            cancelled = match with_ledger(identity, |ledger| {
+                ledger.finish_continuation_cleanup(
+                    cancelled,
+                    waiter,
+                    ExactContinuationCleanup::Cancelled,
+                )
+            }) {
+                Ok(cancelled) => cancelled,
+                Err(_) => {
+                    quarantine_shadow(identity);
+                    return;
+                }
+            };
+        }
+        (ExactContinuation::None | ExactContinuation::Consumed(_), None, None) => {}
+        _ => {
+            quarantine_shadow(identity);
+            return;
+        }
+    }
+    cancelled = match with_ledger(identity, |ledger| {
+        ledger.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Dropped)
+    }) {
+        Ok(cancelled) => cancelled,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return;
+        }
+    };
+    if with_ledger(identity, |ledger| ledger.consume_cancelled(cancelled)).is_err() {
         quarantine_shadow(identity);
     }
 }
 
-pub(super) fn terminal_shadow_empty(
-    key: ControlKey,
-    token: InstanceToken,
-    streams: RegistryStreamBindings,
-) -> bool {
-    shadow_snapshot(DriverIdentity {
-        key,
-        instance: token,
-        streams,
-    })
-    .is_ok_and(|snapshot| snapshot.is_none())
+fn terminal_shadow_empty(identity: DriverIdentity) -> bool {
+    ledger_snapshot(identity).is_ok_and(|snapshot| snapshot.is_none())
 }
 
 pub(super) fn retire_terminal_shadow(
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 ) -> bool {
     let identity = DriverIdentity {
         key,
         instance: token,
+        task,
+        domain,
         streams,
     };
-    if shadow_retire(identity).is_err() {
+    let retired = with_ledger(identity, |ledger| {
+        ledger.retire(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)
+    });
+    if retired.is_err() {
         return false;
     }
     #[cfg(feature = "ssh-native-async-qemu-acceptance")]
@@ -1197,6 +1600,61 @@ pub(super) fn retire_terminal_shadow(
     true
 }
 
+fn validate_terminal_resource_projection(space: &InstanceSpace, identity: DriverIdentity) -> bool {
+    let Some(exact) = identity.exact() else {
+        return false;
+    };
+    let stdin = with_ledger(identity, |ledger| {
+        ledger.resource_state(exact, ExactStreamResource::StdinReader)
+    });
+    let stdout = with_ledger(identity, |ledger| {
+        ledger.resource_state(exact, ExactStreamResource::StdoutWriter)
+    });
+    let (Ok(stdin), Ok(stdout)) = (stdin, stdout) else {
+        return false;
+    };
+    let cspace = space.cspace().lock();
+    if validate_stream_space(&cspace, identity.streams).is_err()
+        || exact_ledger_lease::<ByteStreamSupervisor>(
+            &cspace,
+            identity.streams.stdin_supervisor,
+            Rights::INVOKE,
+        )
+        .is_none()
+        || exact_ledger_lease::<ByteStreamSupervisor>(
+            &cspace,
+            identity.streams.stdout_supervisor,
+            Rights::INVOKE,
+        )
+        .is_none()
+    {
+        return false;
+    }
+    let stdin_exact = match stdin {
+        ExactResourceState::Live => {
+            exact_ledger_lease::<ByteStreamReader>(&cspace, identity.streams.stdin, Rights::RECV)
+                .is_some()
+        }
+        ExactResourceState::Revoked => matches!(
+            cspace.rights_of(identity.streams.stdin),
+            Err(CapError::Invalid)
+        ),
+        ExactResourceState::Revoking => false,
+    };
+    let stdout_exact = match stdout {
+        ExactResourceState::Live => {
+            exact_ledger_lease::<ByteStreamWriter>(&cspace, identity.streams.stdout, Rights::SEND)
+                .is_some()
+        }
+        ExactResourceState::Revoked => matches!(
+            cspace.rights_of(identity.streams.stdout),
+            Err(CapError::Invalid)
+        ),
+        ExactResourceState::Revoking => false,
+    };
+    stdin_exact && stdout_exact
+}
+
 /// Resolve the SYSTEM pending-operation projection while the registry has
 /// restored and revalidated the exact Space, but before either raw arena
 /// reclaim or the terminal CSpace reset is allowed to proceed. The registry,
@@ -1205,79 +1663,193 @@ pub(super) fn prepare_terminal_shadow(
     space: &InstanceSpace,
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
     terminal: ComponentTerminal,
 ) -> bool {
     let identity = DriverIdentity {
         key,
         instance: token,
+        task,
+        domain,
         streams,
     };
-    let snapshot = match shadow_snapshot(identity) {
+    let exact = match identity.exact() {
+        Some(exact) => exact,
+        None => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    };
+    if !validate_terminal_resource_projection(space, identity) {
+        quarantine_shadow(identity);
+        return false;
+    }
+    let decision = with_ledger(identity, |ledger| {
+        ledger.prepare_finalizer(exact, terminal == ComponentTerminal::Success)
+    });
+    match decision {
+        Ok(ExactCleanupDecision::ReclaimSafe) => true,
+        Ok(ExactCleanupDecision::Quarantined) | Err(_) => {
+            quarantine_shadow(identity);
+            false
+        }
+        Ok(ExactCleanupDecision::Cancel(plan)) => {
+            let continuation = plan.continuation();
+            let mut cancelled = match cancel_plan_in_space(space, identity, plan) {
+                Ok(cancelled) => cancelled,
+                Err(()) => {
+                    quarantine_shadow(identity);
+                    return false;
+                }
+            };
+            // The payload-drop gate must already have consumed Core's exact
+            // Cancelled receipt. Only a waiter that was consumed normally can
+            // therefore reach this supervisor-only finalizer.
+            if !matches!(
+                continuation,
+                ExactContinuation::None | ExactContinuation::Consumed(_)
+            ) {
+                quarantine_shadow(identity);
+                return false;
+            }
+            cancelled = match with_ledger(identity, |ledger| {
+                ledger.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Dropped)
+            }) {
+                Ok(cancelled) => cancelled,
+                Err(_) => {
+                    quarantine_shadow(identity);
+                    return false;
+                }
+            };
+            let _ = cancelled;
+            match with_ledger(identity, |ledger| ledger.prepare_finalizer(exact, false)) {
+                Ok(ExactCleanupDecision::ReclaimSafe) => true,
+                Ok(ExactCleanupDecision::Cancel(_) | ExactCleanupDecision::Quarantined)
+                | Err(_) => {
+                    quarantine_shadow(identity);
+                    false
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn raw_fault_cleanup(
+    space: &InstanceSpace,
+    key: ControlKey,
+    token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+    receipt: FaultContinuationAbandonReceipt,
+) -> bool {
+    let identity = DriverIdentity {
+        key,
+        instance: token,
+        task,
+        domain,
+        streams,
+    };
+    let Some(exact) = identity.exact() else {
+        quarantine_shadow(identity);
+        return false;
+    };
+    if !receipt.matches_instance(token) {
+        quarantine_shadow(identity);
+        return false;
+    }
+    let snapshot = match ledger_snapshot(identity) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             quarantine_shadow(identity);
             return false;
         }
     };
-    match snapshot {
-        // Success must have crossed every backend/runtime linearization point
-        // and therefore cannot retain a backend pending operation.
-        Some(_) if terminal == ComponentTerminal::Success => {
+    if let Some(continuation) = snapshot.and_then(|snapshot| snapshot.continuation().token()) {
+        if !receipt.matches_continuation(Some(continuation)) {
+            quarantine_shadow(identity);
+            return false;
+        }
+    }
+    let decision = with_ledger(identity, |ledger| ledger.raw_fault(exact));
+    let plan = match decision {
+        Ok(ExactCleanupDecision::ReclaimSafe) => return true,
+        Ok(ExactCleanupDecision::Cancel(plan)) => plan,
+        Ok(ExactCleanupDecision::Quarantined) | Err(_) => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    };
+    let continuation = plan.continuation();
+    let mut cancelled = match cancel_plan_in_space(space, identity, plan) {
+        Ok(cancelled) => cancelled,
+        Err(()) => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    };
+    match continuation {
+        ExactContinuation::Armed(continuation)
+        | ExactContinuation::WakeRegistered(continuation) => {
+            if !receipt.matches_continuation(Some(continuation)) {
+                quarantine_shadow(identity);
+                return false;
+            }
+            cancelled = match with_ledger(identity, |ledger| {
+                ledger.finish_continuation_cleanup(
+                    cancelled,
+                    continuation,
+                    ExactContinuationCleanup::Abandoned,
+                )
+            }) {
+                Ok(cancelled) => cancelled,
+                Err(_) => {
+                    quarantine_shadow(identity);
+                    return false;
+                }
+            };
+        }
+        ExactContinuation::None | ExactContinuation::Consumed(_) => {}
+        ExactContinuation::Signalled(_)
+        | ExactContinuation::Cancelled(_)
+        | ExactContinuation::Abandoned(_) => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    }
+    cancelled = match with_ledger(identity, |ledger| {
+        ledger.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Abandoned)
+    }) {
+        Ok(cancelled) => cancelled,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    };
+    let _ = cancelled;
+    match with_ledger(identity, |ledger| ledger.raw_fault(exact)) {
+        Ok(ExactCleanupDecision::ReclaimSafe) => true,
+        Ok(ExactCleanupDecision::Cancel(_) | ExactCleanupDecision::Quarantined) | Err(_) => {
             quarantine_shadow(identity);
             false
         }
-        // Fault/cancel terminals may finally cancel the exact backend token.
-        Some(snapshot) => {
-            if cancel_snapshot_in_space(space, identity, snapshot) {
-                true
-            } else {
-                quarantine_shadow(identity);
-                false
-            }
-        }
-        None => true,
-    }
-}
-
-pub(super) fn fault_snapshot(
-    key: ControlKey,
-    token: InstanceToken,
-    streams: RegistryStreamBindings,
-) -> Result<Option<NativePendingSnapshot>, PendingShadowError> {
-    shadow_snapshot(DriverIdentity {
-        key,
-        instance: token,
-        streams,
-    })
-}
-
-pub(super) fn cancel_fault_snapshot(
-    space: &InstanceSpace,
-    key: ControlKey,
-    token: InstanceToken,
-    streams: RegistryStreamBindings,
-    snapshot: Option<NativePendingSnapshot>,
-) -> bool {
-    let identity = DriverIdentity {
-        key,
-        instance: token,
-        streams,
-    };
-    match snapshot {
-        Some(snapshot) => cancel_snapshot_in_space(space, identity, snapshot),
-        None => true,
     }
 }
 
 pub(super) fn quarantine_fault_shadow(
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 ) {
     quarantine_shadow(DriverIdentity {
         key,
         instance: token,
+        task,
+        domain,
         streams,
     });
 }
@@ -1352,184 +1924,342 @@ fn poll_terminal(poll: NativePoll) -> Option<ComponentTerminal> {
 }
 
 async fn quantum(instance: InstanceToken) -> Result<(), ()> {
-    let continuation = registry()
-        .yield_continuation_current(instance)
+    let operation = registry()
+        .arm_continuation_current(instance, InstanceContinuationKind::Quantum)
         .map_err(|_| ())?;
-    continuation.await.map_err(|_| ())
+    let continuation = registry().wait_continuation(operation).map_err(|_| ())?;
+    continuation
+        .await
+        .map_err(|_| ())?
+        .matches_token(operation)
+        .then_some(())
+        .ok_or(())
 }
 
 fn stream_wake(words: [usize; 4]) {
     match registry().signal_continuation_words(words) {
         crate::instance::InstanceContinuationSignal::Signalled
         | crate::instance::InstanceContinuationSignal::AlreadySignalled
+        | crate::instance::InstanceContinuationSignal::AlreadyConsumed(_)
         | crate::instance::InstanceContinuationSignal::Stale => {}
         crate::instance::InstanceContinuationSignal::Quarantined => lifecycle_fail_stop(),
     }
 }
 
+fn model_result<T>(
+    identity: DriverIdentity,
+    result: Result<T, ExactLedgerError>,
+) -> Result<T, ComponentTerminal> {
+    result.map_err(|error| ledger_error_terminal(identity, error))
+}
+
+fn abort_backend_call(
+    identity: DriverIdentity,
+    invoking: NativeLedgerSnapshot,
+) -> ComponentTerminal {
+    let _ = with_ledger(identity, |ledger| ledger.abort_backend_invoke(invoking));
+    quarantine_shadow(identity);
+    ComponentTerminal::RunnerFault
+}
+
+fn backend_effect(
+    identity: DriverIdentity,
+    invoking: NativeLedgerSnapshot,
+    effect: BackendEffect,
+) -> Result<NativeLedgerSnapshot, ComponentTerminal> {
+    model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            ledger.backend_linearized(invoking, effect)
+        }),
+    )
+}
+
+enum WakeOutcome {
+    Resume(NativeLedgerSnapshot),
+    Revoked(NativeLedgerSnapshot),
+}
+
+fn begin_register_wake(
+    identity: DriverIdentity,
+    pending: NativeLedgerSnapshot,
+    continuation: InstanceContinuationToken,
+) -> Result<WakeOutcome, ComponentTerminal> {
+    model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            let current = ledger
+                .snapshot(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)?
+                .ok_or(ExactLedgerError::Vacant)?;
+            if current == pending {
+                let armed = ledger.arm_continuation(current, continuation)?;
+                return ledger
+                    .begin_backend(armed, ExactBackendAction::RegisterWake)
+                    .map(WakeOutcome::Resume);
+            }
+            if current.phase() == ExactLedgerPhase::BackendCancelled
+                && current.resource() == pending.resource()
+                && current.function() == pending.function()
+                && current.continuation() == ExactContinuation::None
+            {
+                return Ok(WakeOutcome::Revoked(current));
+            }
+            Err(ExactLedgerError::SnapshotMismatch)
+        }),
+    )
+}
+
+fn finish_wake_receipt(
+    identity: DriverIdentity,
+    returned: BackendPendingOutcome,
+    receipt: InstanceContinuationConsumed,
+) -> Result<WakeOutcome, ComponentTerminal> {
+    let continuation = receipt.token();
+    model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            let current = ledger
+                .snapshot(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)?
+                .ok_or(ExactLedgerError::Vacant)?;
+            if matches!(returned, BackendPendingOutcome::Pending(expected) if current == expected) {
+                let consumed = ledger.consume_continuation(current, continuation)?;
+                return ledger
+                    .begin_backend(consumed, ExactBackendAction::Resume)
+                    .map(WakeOutcome::Resume);
+            }
+            if current.phase() == ExactLedgerPhase::BackendCancelled
+                && current.continuation() == ExactContinuation::Signalled(continuation)
+            {
+                return ledger
+                    .acknowledge_cancelled_continuation(current, continuation)
+                    .map(WakeOutcome::Revoked);
+            }
+            if current.phase() == ExactLedgerPhase::BackendCancelled
+                && current.continuation() == ExactContinuation::Consumed(continuation)
+            {
+                return Ok(WakeOutcome::Revoked(current));
+            }
+            Err(ExactLedgerError::SnapshotMismatch)
+        }),
+    )
+}
+
 async fn await_reader_wake(
     identity: DriverIdentity,
-    snapshot: NativePendingSnapshot,
-) -> Result<(), ()> {
+    pending: NativeLedgerSnapshot,
+) -> Result<WakeOutcome, ComponentTerminal> {
+    let operation = pending.backend().ok_or_else(|| {
+        unexpected_native_driver_error(identity, "reader waiter without backend token")
+    })?;
     let continuation_token = registry()
         .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
-        .map_err(|_| ())?;
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
     let continuation = registry()
         .wait_continuation(continuation_token)
-        .map_err(|_| ())?;
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let invoking = match begin_register_wake(identity, pending, continuation_token)? {
+        WakeOutcome::Resume(invoking) => invoking,
+        WakeOutcome::Revoked(cancelled) => {
+            drop(continuation);
+            return Ok(WakeOutcome::Revoked(cancelled));
+        }
+    };
     let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
-    let registered = with_active_reader(identity.instance, identity.streams, |reader, _| {
-        reader.register_wake(snapshot.operation, wake)
-    });
-    if !matches!(registered, Ok(Ok(()))) {
-        let cancelled = cancel_current_shadow(identity);
+    if !matches!(
+        with_active_reader(identity.instance, identity.streams, |reader, _| {
+            reader.register_wake(operation, wake)
+        }),
+        Ok(Ok(()))
+    ) {
         drop(continuation);
-        if !cancelled {
-            quarantine_shadow(identity);
-        }
-        return Err(());
+        return Err(abort_backend_call(identity, invoking));
     }
-    if continuation.await.is_err() {
-        if !cancel_current_shadow(identity) {
-            quarantine_shadow(identity);
-        }
-        return Err(());
+    let registered = model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            ledger.finish_register_wake(invoking, continuation_token)
+        }),
+    )?;
+    let returned = backend_return_pending(identity, registered)?;
+    let consumed = continuation
+        .await
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    if !consumed.matches_token(continuation_token) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "reader continuation receipt mismatch",
+        ));
     }
-    Ok(())
+    finish_wake_receipt(identity, returned, consumed)
 }
 
 async fn await_writer_wake(
     identity: DriverIdentity,
-    snapshot: NativePendingSnapshot,
-) -> Result<(), ()> {
+    pending: NativeLedgerSnapshot,
+) -> Result<WakeOutcome, ComponentTerminal> {
+    let operation = pending.backend().ok_or_else(|| {
+        unexpected_native_driver_error(identity, "writer waiter without backend token")
+    })?;
     let continuation_token = registry()
         .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
-        .map_err(|_| ())?;
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
     let continuation = registry()
         .wait_continuation(continuation_token)
-        .map_err(|_| ())?;
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let invoking = match begin_register_wake(identity, pending, continuation_token)? {
+        WakeOutcome::Resume(invoking) => invoking,
+        WakeOutcome::Revoked(cancelled) => {
+            drop(continuation);
+            return Ok(WakeOutcome::Revoked(cancelled));
+        }
+    };
     let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
-    let registered = with_active_writer(identity.instance, identity.streams, |writer| {
-        writer.register_wake(snapshot.operation, wake)
-    });
-    if !matches!(registered, Ok(Ok(()))) {
-        let cancelled = cancel_current_shadow(identity);
+    if !matches!(
+        with_active_writer(identity.instance, identity.streams, |writer| {
+            writer.register_wake(operation, wake)
+        }),
+        Ok(Ok(()))
+    ) {
         drop(continuation);
-        if !cancelled {
-            quarantine_shadow(identity);
-        }
-        return Err(());
+        return Err(abort_backend_call(identity, invoking));
     }
-    if continuation.await.is_err() {
-        if !cancel_current_shadow(identity) {
-            quarantine_shadow(identity);
-        }
-        return Err(());
+    let registered = model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            ledger.finish_register_wake(invoking, continuation_token)
+        }),
+    )?;
+    let returned = backend_return_pending(identity, registered)?;
+    let consumed = continuation
+        .await
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    if !consumed.matches_token(continuation_token) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "writer continuation receipt mismatch",
+        ));
     }
-    Ok(())
+    finish_wake_receipt(identity, returned, consumed)
 }
 
 async fn await_terminal_wake(
     identity: DriverIdentity,
-    snapshot: NativePendingSnapshot,
-) -> Result<(), ()> {
+    pending: NativeLedgerSnapshot,
+) -> Result<WakeOutcome, ComponentTerminal> {
+    let operation = pending.backend().ok_or_else(|| {
+        unexpected_native_driver_error(identity, "terminal waiter without backend token")
+    })?;
     let continuation_token = registry()
         .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
-        .map_err(|_| ())?;
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
     let continuation = registry()
         .wait_continuation(continuation_token)
-        .map_err(|_| ())?;
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let invoking = match begin_register_wake(identity, pending, continuation_token)? {
+        WakeOutcome::Resume(invoking) => invoking,
+        WakeOutcome::Revoked(cancelled) => {
+            drop(continuation);
+            return Ok(WakeOutcome::Revoked(cancelled));
+        }
+    };
     let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
-    let registered = with_active_reader(identity.instance, identity.streams, |_, supervisor| {
-        supervisor.register_terminal_wake(snapshot.operation, wake)
-    });
-    if !matches!(registered, Ok(Ok(()))) {
-        let cancelled = cancel_current_shadow(identity);
+    if !matches!(
+        with_active_reader(identity.instance, identity.streams, |_, supervisor| {
+            supervisor.register_terminal_wake(operation, wake)
+        }),
+        Ok(Ok(()))
+    ) {
         drop(continuation);
-        if !cancelled {
-            quarantine_shadow(identity);
-        }
-        return Err(());
+        return Err(abort_backend_call(identity, invoking));
     }
-    if continuation.await.is_err() {
-        if !cancel_current_shadow(identity) {
-            quarantine_shadow(identity);
-        }
-        return Err(());
+    let registered = model_result(
+        identity,
+        with_ledger(identity, |ledger| {
+            ledger.finish_register_wake(invoking, continuation_token)
+        }),
+    )?;
+    let returned = backend_return_pending(identity, registered)?;
+    let consumed = continuation
+        .await
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    if !consumed.matches_token(continuation_token) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "terminal continuation receipt mismatch",
+        ));
     }
-    Ok(())
+    finish_wake_receipt(identity, returned, consumed)
 }
 
-fn install_or_replace(
-    identity: DriverIdentity,
-    previous: Option<NativePendingSnapshot>,
-    kind: PendingKind,
-    operation: HostOperationToken,
-) -> Result<NativePendingSnapshot, PendingShadowError> {
-    match previous {
-        Some(previous) => shadow_replace_for(identity, previous, kind, operation),
-        None => shadow_install(identity, kind, operation),
-    }
+enum PreparedReader {
+    Prepared(StreamPreparedReceive, NativeLedgerSnapshot),
+    Closed(StreamCloseReason, NativeLedgerSnapshot),
+    Revoked(NativeLedgerSnapshot),
 }
 
 async fn prepared_reader(
     identity: DriverIdentity,
-    initial: StreamReceiveDispatch,
-) -> Result<Result<(StreamPreparedReceive, NativePendingSnapshot), StreamCloseReason>, ()> {
-    let mut dispatch = initial;
-    let mut previous = None;
+    runtime: NativeLedgerSnapshot,
+) -> Result<PreparedReader, ComponentTerminal> {
+    let mut invoking = model_result(
+        identity,
+        ledger_begin_backend(identity, runtime, ExactBackendAction::Start),
+    )?;
+    let mut dispatch = match with_active_reader(identity.instance, identity.streams, |reader, _| {
+        reader.start()
+    }) {
+        Ok(Ok(dispatch)) => dispatch,
+        Ok(Err(_)) | Err(_) => return Err(abort_backend_call(identity, invoking)),
+    };
     loop {
         match dispatch {
             StreamReceiveDispatch::Prepared(prepared) => {
-                let installed = install_or_replace(
+                let returned = model_result(
                     identity,
-                    previous,
-                    PendingKind::ReadPrepared,
-                    prepared.operation(),
-                );
-                return match installed {
-                    Ok(snapshot) => Ok(Ok((prepared, snapshot))),
-                    Err(_) => {
-                        let _ =
-                            with_active_reader(identity.instance, identity.streams, |reader, _| {
-                                reader.cancel(prepared.operation())
-                            });
-                        quarantine_shadow(identity);
-                        Err(())
+                    ledger_backend_pending(
+                        identity,
+                        invoking,
+                        PendingKind::ReadPrepared,
+                        prepared.operation(),
+                    ),
+                )?;
+                return match backend_return_pending(identity, returned)? {
+                    BackendPendingOutcome::Pending(snapshot) => {
+                        Ok(PreparedReader::Prepared(prepared, snapshot))
+                    }
+                    BackendPendingOutcome::Revoked(cancelled) => {
+                        Ok(PreparedReader::Revoked(cancelled))
                     }
                 };
             }
             StreamReceiveDispatch::Closed(reason) => {
-                if let Some(previous) = previous {
-                    if shadow_clear(identity, previous).is_err() {
-                        quarantine_shadow(identity);
-                        return Err(());
-                    }
-                }
-                return Ok(Err(reason));
+                let linearized = backend_effect(
+                    identity,
+                    invoking,
+                    BackendEffect::InputPeerClosed {
+                        reason: stream_reason_value(reason),
+                    },
+                )?;
+                return Ok(PreparedReader::Closed(reason, linearized));
             }
             StreamReceiveDispatch::Waiting(operation) => {
-                let snapshot = match install_or_replace(
+                let returned = model_result(
                     identity,
-                    previous,
-                    PendingKind::ReadWaiting,
-                    operation,
-                ) {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => {
-                        let _ =
-                            with_active_reader(identity.instance, identity.streams, |reader, _| {
-                                reader.cancel(operation)
-                            });
-                        quarantine_shadow(identity);
-                        return Err(());
+                    ledger_backend_pending(identity, invoking, PendingKind::ReadWaiting, operation),
+                )?;
+                let pending = match backend_return_pending(identity, returned)? {
+                    BackendPendingOutcome::Pending(pending) => pending,
+                    BackendPendingOutcome::Revoked(cancelled) => {
+                        return Ok(PreparedReader::Revoked(cancelled));
                     }
                 };
-                if await_reader_wake(identity, snapshot).await.is_err() {
-                    quarantine_shadow(identity);
-                    return Err(());
-                }
-                dispatch = with_active_reader(
+                invoking = match await_reader_wake(identity, pending).await? {
+                    WakeOutcome::Resume(invoking) => invoking,
+                    WakeOutcome::Revoked(cancelled) => {
+                        return Ok(PreparedReader::Revoked(cancelled));
+                    }
+                };
+                dispatch = match with_active_reader(
                     identity.instance,
                     identity.streams,
                     |reader, supervisor| {
@@ -1542,74 +2272,88 @@ async fn prepared_reader(
                         }
                         reader.resume(operation)
                     },
-                )
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
-                previous = Some(snapshot);
+                ) {
+                    Ok(Ok(dispatch)) => dispatch,
+                    Ok(Err(_)) | Err(_) => return Err(abort_backend_call(identity, invoking)),
+                };
             }
         }
     }
 }
 
+enum OutputDispatch {
+    Sent(NativeLedgerSnapshot),
+    Closed(StreamCloseReason, NativeLedgerSnapshot),
+    Revoked(NativeLedgerSnapshot),
+}
+
 async fn send_output(
     identity: DriverIdentity,
+    runtime: NativeLedgerSnapshot,
     bytes: &[u8],
-) -> Result<Result<(), StreamCloseReason>, ()> {
-    if bytes.is_empty() {
-        return Ok(Ok(()));
-    }
-    let mut dispatch = with_active_writer(identity.instance, identity.streams, |writer| {
+) -> Result<OutputDispatch, ComponentTerminal> {
+    let mut invoking = model_result(
+        identity,
+        ledger_begin_backend(identity, runtime, ExactBackendAction::Start),
+    )?;
+    let mut dispatch = match with_active_writer(identity.instance, identity.streams, |writer| {
         writer.start(bytes)
-    })
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
-    let mut previous = None;
+    }) {
+        Ok(Ok(dispatch)) => dispatch,
+        Ok(Err(_)) | Err(_) => return Err(abort_backend_call(identity, invoking)),
+    };
     loop {
         match dispatch {
             StreamSendDispatch::Sent => {
-                if let Some(previous) = previous {
-                    if shadow_clear(identity, previous).is_err() {
-                        quarantine_shadow(identity);
-                        return Err(());
-                    }
-                }
-                return Ok(Ok(()));
+                return backend_effect(
+                    identity,
+                    invoking,
+                    BackendEffect::OutputSent {
+                        length: u16::try_from(bytes.len()).map_err(|_| {
+                            unexpected_native_driver_error(identity, "output length overflow")
+                        })?,
+                    },
+                )
+                .map(OutputDispatch::Sent);
             }
             StreamSendDispatch::Closed(reason) => {
-                if let Some(previous) = previous {
-                    if shadow_clear(identity, previous).is_err() {
-                        quarantine_shadow(identity);
-                        return Err(());
-                    }
-                }
-                return Ok(Err(reason));
+                return backend_effect(
+                    identity,
+                    invoking,
+                    BackendEffect::OutputPeerClosed {
+                        reason: stream_reason_value(reason),
+                    },
+                )
+                .map(|snapshot| OutputDispatch::Closed(reason, snapshot));
             }
             StreamSendDispatch::Waiting(operation) => {
-                let snapshot = match install_or_replace(
+                let returned = model_result(
                     identity,
-                    previous,
-                    PendingKind::WriteWaiting,
-                    operation,
-                ) {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => {
-                        let _ = with_active_writer(identity.instance, identity.streams, |writer| {
-                            writer.cancel(operation)
-                        });
-                        quarantine_shadow(identity);
-                        return Err(());
+                    ledger_backend_pending(
+                        identity,
+                        invoking,
+                        PendingKind::WriteWaiting,
+                        operation,
+                    ),
+                )?;
+                let pending = match backend_return_pending(identity, returned)? {
+                    BackendPendingOutcome::Pending(pending) => pending,
+                    BackendPendingOutcome::Revoked(cancelled) => {
+                        return Ok(OutputDispatch::Revoked(cancelled));
                     }
                 };
-                if await_writer_wake(identity, snapshot).await.is_err() {
-                    quarantine_shadow(identity);
-                    return Err(());
-                }
-                dispatch = with_active_writer(identity.instance, identity.streams, |writer| {
+                invoking = match await_writer_wake(identity, pending).await? {
+                    WakeOutcome::Resume(invoking) => invoking,
+                    WakeOutcome::Revoked(cancelled) => {
+                        return Ok(OutputDispatch::Revoked(cancelled));
+                    }
+                };
+                dispatch = match with_active_writer(identity.instance, identity.streams, |writer| {
                     writer.resume(operation, bytes)
-                })
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
-                previous = Some(snapshot);
+                }) {
+                    Ok(Ok(dispatch)) => dispatch,
+                    Ok(Err(_)) | Err(_) => return Err(abort_backend_call(identity, invoking)),
+                };
             }
         }
     }
@@ -1658,10 +2402,27 @@ async fn drive_input_stream(
         .min(DRIVER_CHUNK_BYTES);
     if !spill.is_empty() {
         let progress = spill.remaining_prefix(maximum).len();
+        let previous = ledger_snapshot(identity)
+            .map_err(|error| ledger_error_terminal(identity, error))?
+            .ok_or_else(|| {
+                unexpected_native_driver_error(identity, "spill missing linearized receipt")
+            })?;
+        let offered_snapshot = model_result(
+            identity,
+            with_ledger(identity, |ledger| {
+                ledger.attach_input_runtime(previous, offered, maximum)
+            }),
+        )?;
         let prepared = invocation
             .prepare_host_input_stream(offered, progress as u32)
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
         let prepared = prepared_host_token(identity, prepared, is_input_stream)?;
+        let prepared_snapshot = model_result(
+            identity,
+            with_ledger(identity, |ledger| {
+                ledger.prepare_input_runtime(offered_snapshot, prepared)
+            }),
+        )?;
         let committed = invocation
             .commit_host_input_stream(prepared, spill.remaining_prefix(progress))
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
@@ -1669,6 +2430,15 @@ async fn drive_input_stream(
             quarantine_shadow(identity);
             return Err(terminal);
         }
+        model_result(
+            identity,
+            with_ledger(identity, |ledger| {
+                ledger.commit_input_prefix(
+                    prepared_snapshot,
+                    u16::try_from(progress).map_err(|_| ExactLedgerError::InvalidEffect)?,
+                )
+            }),
+        )?;
         #[cfg(feature = "ssh-native-async-qemu-acceptance")]
         if !target_record_input_bytes(identity, progress) {
             return Err(unexpected_native_driver_error(
@@ -1685,27 +2455,64 @@ async fn drive_input_stream(
         return Ok(committed);
     }
 
+    let runtime = model_result(
+        identity,
+        ledger_begin_runtime(
+            identity,
+            offered,
+            ExactStreamResource::StdinReader,
+            ExactHostFunction::InputStream,
+            maximum,
+        ),
+    )?;
+    if maximum == 0 {
+        let prepared = invocation
+            .prepare_host_input_stream(offered, 0)
+            .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        let prepared = prepared_host_token(identity, prepared, is_input_stream)?;
+        let prepared_snapshot = model_result(
+            identity,
+            ledger_prepare_runtime(identity, runtime, prepared),
+        )?;
+        let committed = invocation
+            .commit_host_input_stream(prepared, &[])
+            .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        model_result(
+            identity,
+            with_ledger(identity, |ledger| {
+                ledger.commit_runtime_only(prepared_snapshot)
+            }),
+        )?;
+        return Ok(committed);
+    }
+
     if promote_input_normal(identity).is_err() {
         return Err(unexpected_native_driver_error(
             identity,
             "input normal promotion conflict",
         ));
     }
-    let initial = with_active_reader(identity.instance, identity.streams, |reader, _| {
-        reader.start()
-    })
-    .map_err(|_| unexpected_native_driver_error(identity, "reader CSpace mismatch"))?
-    .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let prepared = match prepared_reader(identity, initial).await {
-        Ok(Ok(prepared)) => prepared,
-        Ok(Err(_reason)) => {
-            return invocation
+    let prepared = match prepared_reader(identity, runtime).await? {
+        PreparedReader::Prepared(prepared, snapshot) => (prepared, snapshot),
+        PreparedReader::Closed(_reason, linearized) => {
+            let dropped = invocation
                 .drop_host_copy_peer(offered)
-                .map_err(|error| unexpected_native_driver_error(identity, error));
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            model_result(
+                identity,
+                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
+            )?;
+            return Ok(dropped);
         }
-        Err(()) => return Err(ComponentTerminal::RunnerFault),
+        PreparedReader::Revoked(cancelled) => {
+            let dropped = invocation
+                .drop_host_copy_peer(offered)
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            finish_live_revoke(identity, cancelled)?;
+            return Ok(dropped);
+        }
     };
-    let (backend, backend_shadow) = prepared;
+    let (backend, backend_pending) = prepared;
     let length = backend.length();
     if length == 0 || length > DRIVER_CHUNK_BYTES {
         quarantine_shadow(identity);
@@ -1715,71 +2522,116 @@ async fn drive_input_stream(
     let runtime_prepared = invocation
         .prepare_host_input_stream(offered, progress as u32)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let runtime_prepared = match prepared_host_token(identity, runtime_prepared, is_input_stream) {
-        Ok(token) => token,
-        Err(terminal) => {
-            if !cancel_current_shadow(identity) {
-                quarantine_shadow(identity);
-            }
-            return Err(terminal);
-        }
-    };
+    let runtime_prepared = prepared_host_token(identity, runtime_prepared, is_input_stream)?;
+    let backend_pending = model_result(
+        identity,
+        ledger_prepare_runtime(identity, backend_pending, runtime_prepared),
+    )?;
     let target = spill
         .receive_target(length)
         .ok_or_else(|| unexpected_native_driver_error(identity, "invalid spill target"))?;
+    let invoking = model_result(
+        identity,
+        ledger_begin_backend(
+            identity,
+            backend_pending,
+            ExactBackendAction::CommitPrepared,
+        ),
+    )?;
     let committed = with_active_reader(identity.instance, identity.streams, |reader, _| {
         reader.commit(backend.operation(), target)
-    })
-    .map_err(|_| unexpected_native_driver_error(identity, "reader commit CSpace mismatch"))?
-    .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    });
+    let committed = match committed {
+        Ok(Ok(committed)) => committed,
+        Ok(Err(_)) | Err(_) => {
+            spill.abort_receive();
+            return Err(abort_backend_call(identity, invoking));
+        }
+    };
     match committed {
         StreamReceiveCommit::Received(received) if received == length => {
-            if shadow_clear(identity, backend_shadow).is_err() {
+            let linearized = backend_effect(
+                identity,
+                invoking,
+                BackendEffect::InputReceived {
+                    total: u16::try_from(length).map_err(|_| {
+                        unexpected_native_driver_error(identity, "input length overflow")
+                    })?,
+                    cursor: 0,
+                },
+            )?;
+            let runtime_committed = invocation
+                .commit_host_input_stream(runtime_prepared, spill.remaining_prefix(progress))
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            if let Some(terminal) = poll_terminal(runtime_committed) {
                 quarantine_shadow(identity);
-                return Err(ComponentTerminal::RunnerFault);
+                return Err(terminal);
             }
+            model_result(
+                identity,
+                with_ledger(identity, |ledger| {
+                    ledger.commit_input_prefix(
+                        linearized,
+                        u16::try_from(progress).map_err(|_| ExactLedgerError::InvalidEffect)?,
+                    )
+                }),
+            )?;
+            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            if !target_record_input_bytes(identity, progress) {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "target input byte ledger mismatch",
+                ));
+            }
+            if !spill.consume(progress) {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "spill commit mismatch",
+                ));
+            }
+            return Ok(runtime_committed);
         }
         StreamReceiveCommit::Received(_) => {
+            spill.abort_receive();
+            let _ = with_ledger(identity, |ledger| ledger.abort_backend_invoke(invoking));
             quarantine_shadow(identity);
             return Err(ComponentTerminal::RunnerFault);
         }
-        StreamReceiveCommit::Closed(_) => {
+        StreamReceiveCommit::Closed(reason) => {
             spill.abort_receive();
-            let cancelled = with_active_reader(identity.instance, identity.streams, |reader, _| {
-                reader.cancel(backend.operation())
-            });
-            if !matches!(cancelled, Ok(Ok(()))) || shadow_clear(identity, backend_shadow).is_err() {
+            let linearized = backend_effect(
+                identity,
+                invoking,
+                BackendEffect::InputPreparedClosed {
+                    reason: stream_reason_value(reason),
+                },
+            )?;
+            let residual = model_result(
+                identity,
+                with_ledger(identity, |ledger| ledger.claim_backend_residual(linearized)),
+            )?;
+            let linearized = match cancel_residual_in_current(identity, residual) {
+                Ok(linearized) => linearized,
+                Err(()) => {
+                    quarantine_shadow(identity);
+                    return Err(ComponentTerminal::RunnerFault);
+                }
+            };
+            let dropped = invocation
+                .drop_host_copy_peer(runtime_prepared)
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            if model_result(
+                identity,
+                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
+            )
+            .is_err()
+            {
                 quarantine_shadow(identity);
                 return Err(ComponentTerminal::RunnerFault);
             }
-            return invocation
-                .drop_host_copy_peer(runtime_prepared)
-                .map_err(|error| unexpected_native_driver_error(identity, error));
+            return Ok(dropped);
         }
     }
-    let runtime_committed = invocation
-        .commit_host_input_stream(runtime_prepared, spill.remaining_prefix(progress))
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    if let Some(terminal) = poll_terminal(runtime_committed) {
-        // The backend chunk has already been popped. Any rejected runtime
-        // commit loses synchronization with transport and is globally fatal.
-        quarantine_shadow(identity);
-        return Err(terminal);
-    }
-    #[cfg(feature = "ssh-native-async-qemu-acceptance")]
-    if !target_record_input_bytes(identity, progress) {
-        return Err(unexpected_native_driver_error(
-            identity,
-            "target input byte ledger mismatch",
-        ));
-    }
-    if !spill.consume(progress) {
-        return Err(unexpected_native_driver_error(
-            identity,
-            "spill commit mismatch",
-        ));
-    }
-    Ok(runtime_committed)
 }
 
 async fn drive_input_closed(
@@ -1794,36 +2646,73 @@ async fn drive_input_closed(
             "input close before drain",
         ));
     }
-    let mut dispatch = with_active_reader(identity.instance, identity.streams, |_, supervisor| {
-        supervisor.start_terminal()
-    })
-    .map_err(|_| unexpected_native_driver_error(identity, "terminal CSpace mismatch"))?
-    .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let mut shadow = match dispatch {
-        StreamTerminalDispatch::Waiting(operation) => Some(
-            shadow_install(identity, PendingKind::TerminalWaiting, operation)
-                .map_err(|error| unexpected_native_driver_error(identity, error))?,
+    let runtime = model_result(
+        identity,
+        ledger_begin_runtime(
+            identity,
+            offered,
+            ExactStreamResource::StdinSupervisor,
+            ExactHostFunction::InputClosed,
+            0,
         ),
-        StreamTerminalDispatch::Ready(_) => None,
+    )?;
+    let mut invoking = model_result(
+        identity,
+        ledger_begin_backend(identity, runtime, ExactBackendAction::Start),
+    )?;
+    let mut dispatch =
+        match with_active_reader(identity.instance, identity.streams, |_, supervisor| {
+            supervisor.start_terminal()
+        }) {
+            Ok(Ok(dispatch)) => dispatch,
+            Ok(Err(_)) | Err(_) => return Err(abort_backend_call(identity, invoking)),
+        };
+    let mut ledger_state = match dispatch {
+        StreamTerminalDispatch::Waiting(operation) => {
+            let returned = model_result(
+                identity,
+                ledger_backend_pending(identity, invoking, PendingKind::TerminalWaiting, operation),
+            )?;
+            match backend_return_pending(identity, returned)? {
+                BackendPendingOutcome::Pending(pending) => pending,
+                BackendPendingOutcome::Revoked(_) => {
+                    return Err(unexpected_native_driver_error(
+                        identity,
+                        "terminal supervisor cannot be revoked",
+                    ));
+                }
+            }
+        }
+        StreamTerminalDispatch::Ready(reason) => backend_effect(
+            identity,
+            invoking,
+            BackendEffect::InputTerminalObserved {
+                reason: stream_reason_value(reason),
+            },
+        )?,
     };
     let runtime_prepared = invocation
         .prepare_host_input_closed(offered)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let runtime_prepared = match prepared_host_token(identity, runtime_prepared, is_input_closed) {
-        Ok(token) => token,
-        Err(terminal) => {
-            if shadow.is_some() && !cancel_current_shadow(identity) {
-                quarantine_shadow(identity);
-            }
-            return Err(terminal);
-        }
-    };
+    let runtime_prepared = prepared_host_token(identity, runtime_prepared, is_input_closed)?;
+    ledger_state = model_result(
+        identity,
+        ledger_prepare_runtime(identity, ledger_state, runtime_prepared),
+    )?;
     loop {
         match dispatch {
             StreamTerminalDispatch::Ready(reason) => {
                 let committed = invocation
                     .commit_host_input_closed(runtime_prepared, stream_reason_value(reason))
                     .map_err(|error| unexpected_native_driver_error(identity, error))?;
+                if let Some(terminal) = poll_terminal(committed) {
+                    quarantine_shadow(identity);
+                    return Err(terminal);
+                }
+                model_result(
+                    identity,
+                    with_ledger(identity, |ledger| ledger.commit_runtime(ledger_state)),
+                )?;
                 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
                 if reason == StreamCloseReason::Normal
                     && poll_terminal(committed).is_none()
@@ -1837,49 +2726,52 @@ async fn drive_input_closed(
                 return Ok(committed);
             }
             StreamTerminalDispatch::Waiting(operation) => {
-                let current = shadow.expect("terminal waiting has a SYSTEM shadow");
-                if await_terminal_wake(identity, current).await.is_err() {
-                    quarantine_shadow(identity);
-                    return Err(ComponentTerminal::RunnerFault);
-                }
-                dispatch =
-                    with_active_reader(identity.instance, identity.streams, |_, supervisor| {
-                        supervisor.resume_terminal(operation)
-                    })
-                    .map_err(|_| {
-                        unexpected_native_driver_error(identity, "terminal resume CSpace mismatch")
-                    })?
-                    .map_err(|error| unexpected_native_driver_error(identity, error))?;
-                match dispatch {
+                invoking = match await_terminal_wake(identity, ledger_state).await? {
+                    WakeOutcome::Resume(invoking) => invoking,
+                    WakeOutcome::Revoked(_) => {
+                        return Err(unexpected_native_driver_error(
+                            identity,
+                            "terminal supervisor cannot be revoked",
+                        ));
+                    }
+                };
+                dispatch = match with_active_reader(
+                    identity.instance,
+                    identity.streams,
+                    |_, supervisor| supervisor.resume_terminal(operation),
+                ) {
+                    Ok(Ok(dispatch)) => dispatch,
+                    Ok(Err(_)) | Err(_) => return Err(abort_backend_call(identity, invoking)),
+                };
+                ledger_state = match dispatch {
                     StreamTerminalDispatch::Waiting(fresh) => {
-                        shadow = Some(
-                            shadow_replace_for(
+                        let returned = model_result(
+                            identity,
+                            ledger_backend_pending(
                                 identity,
-                                current,
+                                invoking,
                                 PendingKind::TerminalWaiting,
                                 fresh,
-                            )
-                            .map_err(|_| {
-                                let _ = with_active_reader(
-                                    identity.instance,
-                                    identity.streams,
-                                    |_, supervisor| supervisor.cancel_terminal(fresh),
-                                );
-                                unexpected_native_driver_error(
+                            ),
+                        )?;
+                        match backend_return_pending(identity, returned)? {
+                            BackendPendingOutcome::Pending(pending) => pending,
+                            BackendPendingOutcome::Revoked(_) => {
+                                return Err(unexpected_native_driver_error(
                                     identity,
-                                    "terminal token replacement",
-                                )
-                            })?,
-                        );
-                    }
-                    StreamTerminalDispatch::Ready(_) => {
-                        if shadow_clear(identity, current).is_err() {
-                            quarantine_shadow(identity);
-                            return Err(ComponentTerminal::RunnerFault);
+                                    "terminal supervisor cannot be revoked",
+                                ));
+                            }
                         }
-                        shadow = None;
                     }
-                }
+                    StreamTerminalDispatch::Ready(reason) => backend_effect(
+                        identity,
+                        invoking,
+                        BackendEffect::InputTerminalObserved {
+                            reason: stream_reason_value(reason),
+                        },
+                    )?,
+                };
             }
         }
     }
@@ -1895,14 +2787,40 @@ async fn drive_output_stream(
     let maximum = usize::try_from(maximum)
         .unwrap_or(usize::MAX)
         .min(DRIVER_CHUNK_BYTES);
+    let runtime = model_result(
+        identity,
+        ledger_begin_runtime(
+            identity,
+            offered,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            maximum,
+        ),
+    )?;
     let output = staging.prepare(maximum);
     let prepared = invocation
         .prepare_host_output_stream(offered, output)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
     let prepared = prepared_host_token(identity, prepared, is_output_stream)?;
-    let send = send_output(identity, staging.prepared()).await;
-    match send {
-        Ok(Ok(())) => {
+    let prepared_snapshot = model_result(
+        identity,
+        ledger_prepare_runtime(identity, runtime, prepared),
+    )?;
+    if staging.prepared().is_empty() {
+        let committed = invocation
+            .commit_host_output(prepared)
+            .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        model_result(
+            identity,
+            with_ledger(identity, |ledger| {
+                ledger.commit_runtime_only(prepared_snapshot)
+            }),
+        )?;
+        staging.clear();
+        return Ok(committed);
+    }
+    match send_output(identity, prepared_snapshot, staging.prepared()).await? {
+        OutputDispatch::Sent(linearized) => {
             #[cfg(feature = "ssh-native-async-qemu-acceptance")]
             let output_bytes = staging.prepared().len();
             let committed = invocation
@@ -1915,6 +2833,10 @@ async fn drive_output_stream(
                 quarantine_shadow(identity);
                 return Err(terminal);
             }
+            model_result(
+                identity,
+                with_ledger(identity, |ledger| ledger.commit_runtime(linearized)),
+            )?;
             #[cfg(feature = "ssh-native-async-qemu-acceptance")]
             if !target_record_output_bytes(identity, output_bytes) {
                 return Err(unexpected_native_driver_error(
@@ -1924,15 +2846,24 @@ async fn drive_output_stream(
             }
             Ok(committed)
         }
-        Ok(Err(_reason)) => {
+        OutputDispatch::Closed(_reason, linearized) => {
             staging.clear();
-            invocation
+            let dropped = invocation
                 .drop_host_copy_peer(prepared)
-                .map_err(|error| unexpected_native_driver_error(identity, error))
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            model_result(
+                identity,
+                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
+            )?;
+            Ok(dropped)
         }
-        Err(()) => {
+        OutputDispatch::Revoked(cancelled) => {
             staging.clear();
-            Err(ComponentTerminal::RunnerFault)
+            let dropped = invocation
+                .drop_host_copy_peer(prepared)
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            finish_live_revoke(identity, cancelled)?;
+            Ok(dropped)
         }
     }
 }
@@ -1952,6 +2883,16 @@ async fn drive_output_closed(
     identity: DriverIdentity,
     offered: NativeHostToken,
 ) -> Result<NativePoll, ComponentTerminal> {
+    let runtime = model_result(
+        identity,
+        ledger_begin_runtime(
+            identity,
+            offered,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputClosed,
+            0,
+        ),
+    )?;
     let prepared_poll = invocation
         .prepare_host_output_closed(offered)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
@@ -1975,7 +2916,32 @@ async fn drive_output_closed(
             "invalid output-close discriminant",
         ));
     };
-    let observation = output_close_observation(identity, reason)?;
+    let prepared_snapshot = model_result(
+        identity,
+        ledger_prepare_runtime(identity, runtime, prepared),
+    )?;
+    let invoking = model_result(
+        identity,
+        ledger_begin_backend(identity, prepared_snapshot, ExactBackendAction::Start),
+    )?;
+    let observation = match output_close_observation(identity, reason) {
+        Ok(observation) => observation,
+        Err(_) => return Err(abort_backend_call(identity, invoking)),
+    };
+    let outcome = match observation.outcome() {
+        StreamCloseOutcome::Published => 0,
+        StreamCloseOutcome::AlreadyPublished => 1,
+        StreamCloseOutcome::Conflict => 2,
+    };
+    let linearized = backend_effect(
+        identity,
+        invoking,
+        BackendEffect::OutputCloseObserved {
+            requested: stream_reason_value(reason),
+            outcome,
+            effective: observation.effective_reason().map(stream_reason_value),
+        },
+    )?;
     match (observation.outcome(), observation.effective_reason()) {
         (StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished, Some(effective))
             if effective == reason =>
@@ -1987,6 +2953,10 @@ async fn drive_output_closed(
                 quarantine_shadow(identity);
                 Err(terminal)
             } else {
+                model_result(
+                    identity,
+                    with_ledger(identity, |ledger| ledger.commit_runtime(linearized)),
+                )?;
                 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
                 if reason == StreamCloseReason::Normal && !target_record_normal_close(identity) {
                     return Err(unexpected_native_driver_error(
@@ -2002,9 +2972,14 @@ async fn drive_output_closed(
         {
             // An established failure owns the terminal. A late guest Normal is
             // not committed and does not publish a conflicting close.
-            invocation
+            let dropped = invocation
                 .drop_host_copy_peer(prepared)
-                .map_err(|error| unexpected_native_driver_error(identity, error))
+                .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            model_result(
+                identity,
+                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
+            )?;
+            Ok(dropped)
         }
         _ => Err(unexpected_native_driver_error(
             identity,
@@ -2017,11 +2992,15 @@ async fn run_driver(
     root: &'static NativeImageRoot,
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 ) -> u64 {
     let identity = DriverIdentity {
         key,
         instance: token,
+        task,
+        domain,
         streams,
     };
     if !revalidate_image_root(root) {
@@ -2103,7 +3082,7 @@ async fn run_driver(
                 // a transport/runtime lifecycle divergence, not Success.
                 if !spill.is_empty()
                     || !staging.is_empty()
-                    || !terminal_shadow_empty(key, token, streams)
+                    || !terminal_shadow_empty(identity)
                     || invocation.finalize_transport().is_err()
                 {
                     quarantine_shadow(identity);
@@ -2123,13 +3102,15 @@ async fn run_driver(
 pub(super) async fn run(
     key: ControlKey,
     token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
     streams: RegistryStreamBindings,
 ) -> u64 {
     let Some(root) = image_root() else {
         lifecycle_fail_stop();
         return terminal_word(ComponentTerminal::Unavailable);
     };
-    run_driver(root, key, token, streams).await
+    run_driver(root, key, token, task, domain, streams).await
 }
 
 #[cfg(feature = "ssh-native-async-command")]
@@ -2260,6 +3241,8 @@ fn acceptance_driver_identity(token: ManagedComponentToken) -> Result<Option<Dri
             Ok(Some(DriverIdentity {
                 key,
                 instance: tuple.core_token,
+                task: tuple.handle.id(),
+                domain: tuple.domain,
                 streams: tuple.streams,
             }))
         }
@@ -2273,7 +3256,7 @@ async fn acceptance_wait_for_shadow(token: ManagedComponentToken, expected: Pend
     let started = crate::sbi::time();
     loop {
         if let Ok(Some(identity)) = acceptance_driver_identity(token) {
-            match shadow_observe_kind_if_installed(identity) {
+            match ledger_pending_kind(identity) {
                 Ok(Some(kind)) if kind == expected => return true,
                 Ok(None | Some(_)) => {}
                 Err(_) => {

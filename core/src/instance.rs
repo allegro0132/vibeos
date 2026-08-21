@@ -136,6 +136,107 @@ impl fmt::Debug for InstanceContinuationToken {
     }
 }
 
+/// Exact proof that one continuation was consumed by its owning task.
+///
+/// The receipt is copy-only and carries no ownership. Its token remains
+/// opaque, but callers which registered an external operation can recover or
+/// compare the exact token before committing the corresponding backend
+/// completion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InstanceContinuationConsumed {
+    token: InstanceContinuationToken,
+}
+
+impl InstanceContinuationConsumed {
+    /// Return the exact continuation token consumed at the success
+    /// linearization point.
+    pub const fn token(self) -> InstanceContinuationToken {
+        self.token
+    }
+
+    /// Test whether this receipt consumed one exact continuation operation.
+    pub fn matches_token(self, token: InstanceContinuationToken) -> bool {
+        self.token == token
+    }
+}
+
+impl fmt::Debug for InstanceContinuationConsumed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InstanceContinuationConsumed(<opaque>)")
+    }
+}
+
+/// Exact proof that the owning task cancelled one continuation during payload
+/// destruction.
+///
+/// `InstanceContinuation::drop` performs the cancellation but cannot return a
+/// value. SYSTEM cleanup may therefore request this copy-only receipt while
+/// the exact payload-drop witness is still current. The receipt carries no
+/// ownership and exposes only equality against the opaque operation token.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InstanceContinuationCancelled {
+    token: InstanceContinuationToken,
+}
+
+impl InstanceContinuationCancelled {
+    /// Return the exact continuation operation cancelled by its owner.
+    pub const fn token(self) -> InstanceContinuationToken {
+        self.token
+    }
+
+    /// Test whether this receipt names one exact cancellation operation.
+    pub fn matches_token(self, token: InstanceContinuationToken) -> bool {
+        self.token == token
+    }
+}
+
+impl fmt::Debug for InstanceContinuationCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InstanceContinuationCancelled(<opaque>)")
+    }
+}
+
+/// Exact fault-gate proof for the continuation projection of one instance.
+///
+/// A receipt always names the validated managed instance. Its continuation is
+/// `None` only when that instance entered the fault gate with an idle
+/// continuation record; otherwise it is the exact operation changed to
+/// `Abandoned` by that invocation. Private fields and match-only accessors keep
+/// both identities opaque to diagnostic formatting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FaultContinuationAbandonReceipt {
+    instance: InstanceToken,
+    continuation: Option<InstanceContinuationToken>,
+}
+
+impl FaultContinuationAbandonReceipt {
+    /// Test the exact managed instance validated by the fault gate.
+    pub fn matches_instance(self, instance: InstanceToken) -> bool {
+        self.instance == instance
+    }
+
+    /// Test the exact continuation abandoned by this gate. Pass `None` only
+    /// when the caller expects the validated continuation record to be idle.
+    pub fn matches_continuation(self, continuation: Option<InstanceContinuationToken>) -> bool {
+        self.continuation == continuation
+    }
+
+    /// Test the complete instance/continuation projection atomically.
+    pub fn matches_exact(
+        self,
+        instance: InstanceToken,
+        continuation: Option<InstanceContinuationToken>,
+    ) -> bool {
+        self.matches_instance(instance) && self.matches_continuation(continuation)
+    }
+}
+
+impl fmt::Debug for FaultContinuationAbandonReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FaultContinuationAbandonReceipt(<opaque>)")
+    }
+}
+
 /// Scheduling contract selected before a continuation becomes visible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceContinuationKind {
@@ -152,6 +253,10 @@ pub enum InstanceContinuationKind {
 pub enum InstanceContinuationSignal {
     Signalled,
     AlreadySignalled,
+    /// The exact operation was already consumed by its owning task before
+    /// this signal attempt. The copy-only receipt proves that precise winner;
+    /// callers must not infer consumption from [`Self::Stale`].
+    AlreadyConsumed(InstanceContinuationConsumed),
     /// The instance or operation generation is no longer current. No current
     /// slot, task, continuation, or wake queue was changed.
     Stale,
@@ -1704,7 +1809,9 @@ impl InstanceRegistry {
     where
         F: FnOnce(AllocationDomain) -> bool,
     {
-        unsafe { self.fault_reclaim_with_space(witness, |domain, _space| reclaim(domain)) }
+        unsafe {
+            self.fault_reclaim_with_space(witness, |domain, _space, _continuation| reclaim(domain))
+        }
     }
 
     /// Validate one permanently detached managed fault arena and expose its
@@ -1716,7 +1823,10 @@ impl InstanceRegistry {
     /// registry lock is held while the callback runs. This lets a SYSTEM
     /// lifecycle coordinator cancel fixed backend operations which would
     /// otherwise survive raw arena reclamation. The callback must release all
-    /// CSpace leases before returning and may not reset the CSpace.
+    /// CSpace leases before returning and may not reset the CSpace. The
+    /// copy-only continuation receipt identifies the exact instance and the
+    /// operation abandoned by this invocation, or proves that its continuation
+    /// was idle.
     ///
     /// # Safety
     ///
@@ -1729,7 +1839,7 @@ impl InstanceRegistry {
         reclaim: F,
     ) -> FaultGateOutcome
     where
-        F: FnOnce(AllocationDomain, &InstanceSpace) -> bool,
+        F: FnOnce(AllocationDomain, &InstanceSpace, FaultContinuationAbandonReceipt) -> bool,
     {
         let Some(token) = witness.instance_token() else {
             // Absence is `NotManaged` only when no live registry record names
@@ -1748,7 +1858,7 @@ impl InstanceRegistry {
         };
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
 
-        let (domain, abandoned_payload, space_pointer) = {
+        let (domain, abandoned_payload, space_pointer, continuation_receipt) = {
             let _transaction = self.transaction.lock();
             if self.fault_reclaiming_alias_locked(witness) {
                 drop(_transaction);
@@ -1845,8 +1955,8 @@ impl InstanceRegistry {
                 system.restore();
                 return FaultGateOutcome::Quarantined;
             }
-            match record.continuation.phase {
-                ContinuationPhase::Idle if Self::continuation_projection_matches(&record) => {}
+            let abandoned_continuation = match record.continuation.phase {
+                ContinuationPhase::Idle if Self::continuation_projection_matches(&record) => None,
                 ContinuationPhase::Armed
                 | ContinuationPhase::Signalled
                 | ContinuationPhase::Consumed
@@ -1866,6 +1976,10 @@ impl InstanceRegistry {
                         return FaultGateOutcome::Quarantined;
                     }
                     record.continuation.phase = ContinuationPhase::Abandoned;
+                    Some(InstanceContinuationToken {
+                        instance: continuation_seal.instance,
+                        generation: continuation_seal.operation_generation,
+                    })
                 }
                 ContinuationPhase::Idle
                 | ContinuationPhase::Abandoned
@@ -1876,7 +1990,11 @@ impl InstanceRegistry {
                     system.restore();
                     return FaultGateOutcome::Quarantined;
                 }
-            }
+            };
+            let continuation_receipt = FaultContinuationAbandonReceipt {
+                instance: token,
+                continuation: abandoned_continuation,
+            };
 
             // This is the fault-path ownership linearization point.  The
             // pointer is removed from the stable record before any raw arena
@@ -1886,7 +2004,12 @@ impl InstanceRegistry {
             record.payload_abandoned = true;
             record.phase = InstancePhase::FaultReclaiming;
             Self::publish_header(slot, &record);
-            (domain, abandoned_payload, space_pointer)
+            (
+                domain,
+                abandoned_payload,
+                space_pointer,
+                continuation_receipt,
+            )
         };
 
         core::mem::forget(abandoned_payload);
@@ -1896,7 +2019,7 @@ impl InstanceRegistry {
         // Safety: `FaultReclaiming` is an immutable in-flight lease which
         // excludes finalization and CSpace reset until this callback returns.
         // The exact Space object remains owned by the stable registry record.
-        let reclaimed = reclaim(domain, unsafe { &*space_pointer });
+        let reclaimed = reclaim(domain, unsafe { &*space_pointer }, continuation_receipt);
 
         let _transaction = self.transaction.lock();
         let Some(slot) = self.slot(token) else {
@@ -2661,12 +2784,13 @@ impl InstanceRegistry {
             }
             match record.continuation.phase {
                 ContinuationPhase::Idle
-                | ContinuationPhase::Consumed
                 | ContinuationPhase::Cancelled
                 | ContinuationPhase::Abandoned => {
                     return InstanceContinuationSignal::Stale;
                 }
-                ContinuationPhase::Armed | ContinuationPhase::Signalled => {}
+                ContinuationPhase::Armed
+                | ContinuationPhase::Signalled
+                | ContinuationPhase::Consumed => {}
                 ContinuationPhase::Quarantined => {
                     return InstanceContinuationSignal::Quarantined;
                 }
@@ -2690,6 +2814,14 @@ impl InstanceRegistry {
                 InstancePhase::Quarantined => {
                     return InstanceContinuationSignal::Quarantined;
                 }
+            }
+            if record.continuation.phase == ContinuationPhase::Consumed
+                && record
+                    .task
+                    .as_ref()
+                    .is_some_and(|handle| handle.try_exit().is_some())
+            {
+                return InstanceContinuationSignal::Stale;
             }
             let Some(seal) = record.continuation.seal else {
                 Self::quarantine_locked(slot, &mut record);
@@ -2715,8 +2847,14 @@ impl InstanceRegistry {
                 ContinuationPhase::Signalled => {
                     (None, fallback, InstanceContinuationSignal::AlreadySignalled)
                 }
+                ContinuationPhase::Consumed => (
+                    None,
+                    None,
+                    InstanceContinuationSignal::AlreadyConsumed(InstanceContinuationConsumed {
+                        token,
+                    }),
+                ),
                 ContinuationPhase::Idle
-                | ContinuationPhase::Consumed
                 | ContinuationPhase::Cancelled
                 | ContinuationPhase::Abandoned => unreachable!(
                     "terminal continuation phases returned before live signal validation"
@@ -2769,7 +2907,7 @@ impl InstanceRegistry {
     fn poll_continuation_current(
         &self,
         token: InstanceContinuationToken,
-    ) -> Result<Poll<()>, InstanceContinuationError> {
+    ) -> Result<Poll<InstanceContinuationConsumed>, InstanceContinuationError> {
         let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
             return Err(InstanceContinuationError::IdentityMismatch);
         };
@@ -2807,7 +2945,7 @@ impl InstanceRegistry {
             ContinuationPhase::Armed => Ok(Poll::Pending),
             ContinuationPhase::Signalled => {
                 record.continuation.phase = ContinuationPhase::Consumed;
-                Ok(Poll::Ready(()))
+                Ok(Poll::Ready(InstanceContinuationConsumed { token }))
             }
             ContinuationPhase::Cancelled => Err(InstanceContinuationError::Cancelled),
             ContinuationPhase::Quarantined | ContinuationPhase::Abandoned => {
@@ -2888,6 +3026,59 @@ impl InstanceRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Confirm that `InstanceContinuation::drop` cancelled one exact external
+    /// operation while the owning payload-drop witness is still current.
+    ///
+    /// The cancellation itself remains owned by the future destructor. This
+    /// method is a read-only typed receipt boundary for a SYSTEM lifecycle
+    /// ledger; it cannot cancel, signal, or otherwise advance a continuation.
+    pub fn confirm_cancelled_continuation_current(
+        &self,
+        token: InstanceContinuationToken,
+    ) -> Result<InstanceContinuationCancelled, InstanceContinuationError> {
+        let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        if witness.instance_token() != Some(token.instance)
+            || heap::current_domain() != witness.allocation_domain()
+        {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        }
+        let _transaction = self.transaction.lock();
+        let Some(slot) = self.slot(token.instance) else {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        };
+        let mut record = slot.record.lock();
+        if !Self::token_matches(slot, &record, token.instance)
+            || record.continuation.generation != token.generation
+        {
+            return Err(InstanceContinuationError::IdentityMismatch);
+        }
+        let phase = record.phase;
+        if !matches!(
+            phase,
+            InstancePhase::Active | InstancePhase::PayloadDropping
+        ) || !Self::active_witness_identity_matches(
+            slot,
+            &record,
+            token.instance,
+            witness,
+            phase,
+        ) || !record
+            .continuation
+            .seal
+            .is_some_and(|seal| Self::continuation_current_seal_matches(&record, seal, phase))
+            || !Self::sealed_cspace_matches(&record)
+        {
+            Self::quarantine_locked(slot, &mut record);
+            return Err(InstanceContinuationError::Quarantined);
+        }
+        if record.continuation.phase != ContinuationPhase::Cancelled {
+            return Err(InstanceContinuationError::WrongPhase);
+        }
+        Ok(InstanceContinuationCancelled { token })
     }
 
     /// Sticky-quarantine one generation after a publication or lifecycle
@@ -3684,7 +3875,7 @@ impl Default for InstanceRegistry {
 }
 
 impl Future for InstanceContinuation<'_> {
-    type Output = Result<(), InstanceContinuationError>;
+    type Output = Result<InstanceContinuationConsumed, InstanceContinuationError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -3696,10 +3887,10 @@ impl Future for InstanceContinuation<'_> {
         // race. This bounded loop is not an interpreter or service spin loop.
         for recheck in 0..2 {
             match this.registry.poll_continuation_current(this.token) {
-                Ok(Poll::Ready(())) => {
+                Ok(Poll::Ready(consumed)) => {
                     this.terminal = true;
                     drop(this.listener.take());
-                    return Poll::Ready(Ok(()));
+                    return Poll::Ready(Ok(consumed));
                 }
                 Ok(Poll::Pending) => {}
                 Err(error) => {
@@ -3730,6 +3921,12 @@ impl Future for InstanceContinuation<'_> {
                 match this.registry.signal_continuation(this.token) {
                     InstanceContinuationSignal::Signalled
                     | InstanceContinuationSignal::AlreadySignalled => {}
+                    InstanceContinuationSignal::AlreadyConsumed(_) => {
+                        this.terminal = true;
+                        drop(this.listener.take());
+                        let _ = this.registry.quarantine(this.token.instance);
+                        return Poll::Ready(Err(InstanceContinuationError::Quarantined));
+                    }
                     InstanceContinuationSignal::Stale => {
                         this.terminal = true;
                         drop(this.listener.take());
@@ -3798,6 +3995,8 @@ mod tests {
     static TEST_CONTINUATION_STAGE: AtomicU64 = AtomicU64::new(0);
     static TEST_CONTINUATION_BUSY: AtomicBool = AtomicBool::new(false);
     static TEST_CONTINUATION_PAYLOAD_DROPS: AtomicU64 = AtomicU64::new(0);
+    static TEST_CONTINUATION_CANCELLED: Mutex<Option<InstanceContinuationCancelled>> =
+        Mutex::new(None);
 
     struct TestSpaceResource;
 
@@ -4039,9 +4238,12 @@ mod tests {
                 .continuation
                 .as_mut()
                 .expect("continuation payload lost its armed future");
-            match Pin::new(continuation).poll(context) {
+            let operation = continuation.token;
+            match Pin::new(&mut *continuation).poll(context) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(())) => {
+                Poll::Ready(Ok(consumed)) => {
+                    assert!(consumed.matches_token(operation));
+                    assert_eq!(consumed.token(), operation);
                     drop(self.continuation.take());
                     Poll::Ready(self.completion)
                 }
@@ -4054,6 +4256,33 @@ mod tests {
 
     impl Drop for TestContinuationPayload {
         fn drop(&mut self) {
+            let operation = self
+                .continuation
+                .as_ref()
+                .map(|continuation| continuation.token);
+            drop(self.continuation.take());
+            if let Some(operation) = operation {
+                let pointer = TEST_REGISTRY.load(AtomicOrdering::Acquire);
+                assert!(
+                    !pointer.is_null(),
+                    "continuation payload registry is absent during Drop"
+                );
+                // Safety: the serialized test retains the registry until the
+                // managed payload has completed its exact Drop transaction.
+                let registry: &'static InstanceRegistry = unsafe { &*pointer };
+                let cancelled = registry
+                    .confirm_cancelled_continuation_current(operation)
+                    .expect("payload Drop did not expose its exact cancellation receipt");
+                assert!(cancelled.matches_token(operation));
+                assert_eq!(cancelled.token(), operation);
+                assert_eq!(
+                    format!("{cancelled:?}"),
+                    "InstanceContinuationCancelled(<opaque>)"
+                );
+                *TEST_CONTINUATION_CANCELLED
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(cancelled);
+            }
             TEST_CONTINUATION_PAYLOAD_DROPS.fetch_add(1, AtomicOrdering::SeqCst);
             if TEST_PAYLOAD_DROP_FAULT.swap(false, AtomicOrdering::SeqCst) {
                 panic!("injected continuation payload Drop fault");
@@ -4158,6 +4387,10 @@ mod tests {
         TEST_CONTINUATION_STAGE.store(0, AtomicOrdering::SeqCst);
         TEST_CONTINUATION_BUSY.store(false, AtomicOrdering::SeqCst);
         TEST_CONTINUATION_PAYLOAD_DROPS.store(0, AtomicOrdering::SeqCst);
+        TEST_CONTINUATION_CANCELLED
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         guard
     }
 
@@ -4226,11 +4459,21 @@ mod tests {
                     AtomicOrdering::SeqCst,
                 );
                 TEST_CONTINUATION_STAGE.store(1, AtomicOrdering::Release);
-                registry
+                let consumed = registry
                     .wait_continuation(operation)
                     .expect("exact continuation wait failed")
                     .await
                     .expect("exact continuation resume failed");
+                assert!(consumed.matches_token(operation));
+                assert_eq!(consumed.token(), operation);
+                assert!(!consumed.matches_token(InstanceContinuationToken {
+                    instance: token,
+                    generation: operation.generation ^ 1,
+                }));
+                assert_eq!(
+                    format!("{consumed:?}"),
+                    "InstanceContinuationConsumed(<opaque>)"
+                );
                 let after = exec::current_reclaimable_task_witness()
                     .expect("continuation task has no resume witness");
                 *TEST_CONTINUATION_AFTER
@@ -4618,6 +4861,31 @@ mod tests {
 
         let projection = record_projection(&registry, token);
         let continuation = registry.slot(token).unwrap().record.lock().continuation;
+        mutate_active_record_for_test(&registry, token, |record| {
+            record.continuation.phase = ContinuationPhase::Consumed;
+        });
+        match registry.signal_continuation(operation) {
+            InstanceContinuationSignal::AlreadyConsumed(consumed) => {
+                assert!(consumed.matches_token(operation));
+                assert_eq!(consumed.token(), operation);
+                assert_eq!(
+                    format!("{consumed:?}"),
+                    "InstanceContinuationConsumed(<opaque>)"
+                );
+            }
+            other => panic!("consumed continuation did not return an exact receipt: {other:?}"),
+        }
+        assert_eq!(
+            registry
+                .slot(token)
+                .unwrap()
+                .continuation_wait
+                .waiter_count(),
+            1,
+            "consumption proof must not detach or wake the parked listener"
+        );
+        restore_continuation_projection_for_test(&registry, token, projection, continuation);
+
         mutate_active_record_for_test(&registry, token, |record| {
             record.phase = InstancePhase::PayloadDropping;
         });
@@ -5153,12 +5421,27 @@ mod tests {
         assert_eq!(raw_calls, 0);
         assert_eq!(cspace_state(&registry, token), expected_cspace);
         restore_continuation_projection_for_test(&registry, token, projection, continuation);
+        let operation = TEST_CONTINUATION_TOKEN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("continuation receipt test lost its operation token");
 
         let mut raw_calls = 0;
         assert_eq!(
             unsafe {
-                registry.fault_reclaim(witness, |reclaimed| {
+                registry.fault_reclaim_with_space(witness, |reclaimed, _space, abandoned| {
                     assert_eq!(reclaimed, allocation);
+                    assert!(abandoned.matches_exact(token, Some(operation)));
+                    assert!(
+                        !abandoned.matches_continuation(Some(InstanceContinuationToken {
+                            instance: token,
+                            generation: operation.generation ^ 1,
+                        }))
+                    );
+                    assert_eq!(
+                        format!("{abandoned:?}"),
+                        "FaultContinuationAbandonReceipt(<opaque>)"
+                    );
                     raw_calls += 1;
                     true
                 })
@@ -5247,6 +5530,15 @@ mod tests {
             TEST_CONTINUATION_PAYLOAD_DROPS.load(AtomicOrdering::Acquire),
             1
         );
+        let cancelled = TEST_CONTINUATION_CANCELLED
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("payload Drop did not retain its cancellation receipt");
+        assert!(cancelled.matches_token(operation));
+        assert!(!cancelled.matches_token(InstanceContinuationToken {
+            instance: token,
+            generation: operation.generation ^ 1,
+        }));
         assert_eq!(handle.owned_registration_count_for_test(), 0);
         assert_eq!(
             registry
@@ -6501,9 +6793,18 @@ mod tests {
         let mut callback_calls = 0;
         assert_eq!(
             unsafe {
-                registry.fault_reclaim_with_space(exact, |domain, space| {
+                registry.fault_reclaim_with_space(exact, |domain, space, continuation| {
                     callback_calls += 1;
                     assert_eq!(domain, allocation);
+                    assert!(continuation.matches_exact(token, None));
+                    assert!(!continuation.matches_instance(InstanceToken {
+                        slot: token.slot,
+                        generation: token.generation ^ 1,
+                    }));
+                    assert_eq!(
+                        format!("{continuation:?}"),
+                        "FaultContinuationAbandonReceipt(<opaque>)"
+                    );
                     // Reentrant observation proves that no registry lock is
                     // retained across the callback.
                     assert_eq!(
@@ -6553,9 +6854,10 @@ mod tests {
         let mut callback_calls = 0;
         assert_eq!(
             unsafe {
-                registry.fault_reclaim_with_space(exact, |domain, space| {
+                registry.fault_reclaim_with_space(exact, |domain, space, continuation| {
                     callback_calls += 1;
                     assert_eq!(domain, allocation);
+                    assert!(continuation.matches_exact(token, None));
                     assert_eq!(space.cspace().lock().incarnation(), incarnation);
                     false
                 })

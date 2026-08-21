@@ -491,6 +491,7 @@ impl fmt::Debug for TaskHandle {
     }
 }
 
+#[must_use = "a live wait registration must be resumed or cancelled"]
 pub struct WaitTicket {
     state_id: NonZeroU64,
     task: Seal,
@@ -506,18 +507,42 @@ impl fmt::Debug for WaitTicket {
 }
 
 pub enum WaitBegin {
-    Ready(WaitEvent),
+    Ready(EventLease),
     Blocked { ticket: WaitTicket },
 }
 
 pub enum WaitResume {
     Pending,
-    Ready(WaitEvent),
+    Ready(EventLease),
 }
 
-pub enum WaitEvent {
-    Endpoint(EventToken),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventLeaseState {
+    TaskCancelled,
+    EndpointPending,
+    EndpointDelivered,
+    Consumed,
+}
+
+#[must_use = "an event lease must be consumed or retained for retry"]
+pub struct EventLease {
+    phase: EventLeasePhase,
+}
+
+enum EventLeasePhase {
     TaskCancelled(Event),
+    EndpointPending(EventToken),
+    EndpointDelivered { event: Event, reclaim: ReclaimToken },
+    Consumed,
+}
+
+impl fmt::Debug for EventLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventLease")
+            .field("state", &self.state())
+            .finish()
+    }
 }
 
 struct Slot<T> {
@@ -827,6 +852,81 @@ pub enum ReclaimError<E> {
     Operation(E),
 }
 
+impl EventLease {
+    fn task_cancelled(event: Event) -> Self {
+        Self {
+            phase: EventLeasePhase::TaskCancelled(event),
+        }
+    }
+
+    fn endpoint_pending(event: EventToken) -> Self {
+        Self {
+            phase: EventLeasePhase::EndpointPending(event),
+        }
+    }
+
+    pub const fn state(&self) -> EventLeaseState {
+        match &self.phase {
+            EventLeasePhase::TaskCancelled(_) => EventLeaseState::TaskCancelled,
+            EventLeasePhase::EndpointPending(_) => EventLeaseState::EndpointPending,
+            EventLeasePhase::EndpointDelivered { .. } => EventLeaseState::EndpointDelivered,
+            EventLeasePhase::Consumed => EventLeaseState::Consumed,
+        }
+    }
+
+    /// Consumes an exact task-cancellation event. Other lease phases are left
+    /// unchanged so an endpoint lease can never be mistaken for cancellation.
+    pub fn take_task_cancelled(&mut self) -> Option<Event> {
+        let event = match &self.phase {
+            EventLeasePhase::TaskCancelled(event) => Some(*event),
+            _ => None,
+        };
+        if event.is_some() {
+            self.phase = EventLeasePhase::Consumed;
+        }
+        event
+    }
+
+    /// Delivers the exact pending endpoint event and retains its reclaim
+    /// authority inside this lease. A failed delivery leaves the original
+    /// pending token available for an exact retry.
+    pub fn prepare_endpoint(&mut self, state: &mut AsyncState) -> Result<(), AsyncStateError> {
+        let (event, reclaim) = match &self.phase {
+            EventLeasePhase::EndpointPending(token) => state.deliver_event(token)?,
+            EventLeasePhase::Consumed => return Err(AsyncStateError::AuthorityConsumed),
+            EventLeasePhase::TaskCancelled(_) | EventLeasePhase::EndpointDelivered { .. } => {
+                return Err(AsyncStateError::StaleEvent);
+            }
+        };
+        self.phase = EventLeasePhase::EndpointDelivered { event, reclaim };
+        Ok(())
+    }
+
+    /// Reclaims the exact endpoint buffer before releasing its event. A
+    /// reclaim failure keeps both the delivered event and the same retryable
+    /// reclaim token in this lease.
+    pub fn finish_endpoint<E>(
+        &mut self,
+        state: &mut AsyncState,
+        reclaim_buffer: impl FnOnce(&BufferLease) -> Result<(), E>,
+    ) -> Result<Event, ReclaimError<E>> {
+        let event = match &mut self.phase {
+            EventLeasePhase::EndpointDelivered { event, reclaim } => {
+                state.reclaim_event(reclaim, reclaim_buffer)?;
+                *event
+            }
+            EventLeasePhase::Consumed => {
+                return Err(ReclaimError::State(AsyncStateError::AuthorityConsumed));
+            }
+            EventLeasePhase::TaskCancelled(_) | EventLeasePhase::EndpointPending(_) => {
+                return Err(ReclaimError::State(AsyncStateError::StaleEvent));
+            }
+        };
+        self.phase = EventLeasePhase::Consumed;
+        Ok(event)
+    }
+}
+
 pub struct AsyncState {
     id: NonZeroU64,
     handles: Table<HandleEntry>,
@@ -867,6 +967,15 @@ impl AsyncState {
 
     pub fn resolve_guest_handle(&self, raw: u32) -> Result<AsyncHandle, AsyncStateError> {
         Ok(self.public_handle(self.handles.seal_for_raw(raw)?))
+    }
+
+    /// Resolves a raw guest handle only when it names a live waitable set.
+    /// Executors use this read-only seal before charging the `WAIT` state
+    /// transition, so a wrong-kind handle cannot consume callback fuel.
+    pub fn resolve_guest_waitable_set(&self, raw: u32) -> Result<AsyncHandle, AsyncStateError> {
+        let seal = self.handles.seal_for_raw(raw)?;
+        self.waitable_set_by_seal(seal)?;
+        Ok(self.public_handle(seal))
     }
 
     pub fn endpoint_info(&self, handle: AsyncHandle) -> Result<EndpointInfo, AsyncStateError> {
@@ -2573,6 +2682,18 @@ impl AsyncState {
         Ok(())
     }
 
+    /// Removes a task after fail-stop executor teardown. An active wait owns a
+    /// registration in both the task and waitable set, so it must be cancelled
+    /// first; rejection leaves both sides of that registration unchanged.
+    pub(crate) fn abort_task(&mut self, task: TaskHandle) -> Result<(), AsyncStateError> {
+        let seal = self.task_seal(task)?;
+        if self.tasks.get(seal)?.waiting.is_some() {
+            return Err(AsyncStateError::AlreadyWaiting);
+        }
+        self.tasks.remove(seal)?;
+        Ok(())
+    }
+
     /// Registers the stackless callback's `WAIT(set)` transition.
     /// Cancellation is selected before an endpoint event, matching the pinned
     /// cancellable-wait ordering.
@@ -2595,12 +2716,12 @@ impl AsyncState {
         }
         if self.tasks.get(task_seal)?.cancel == TaskCancelState::Requested {
             self.tasks.get_mut(task_seal)?.cancel = TaskCancelState::Delivered;
-            return Ok(WaitBegin::Ready(WaitEvent::TaskCancelled(
+            return Ok(WaitBegin::Ready(EventLease::task_cancelled(
                 task_cancelled_event(),
             )));
         }
         if let Some(event) = self.pending_event_in_set(set_seal)? {
-            return Ok(WaitBegin::Ready(WaitEvent::Endpoint(event)));
+            return Ok(WaitBegin::Ready(EventLease::endpoint_pending(event)));
         }
         let epoch = {
             let set = self.waitable_set_by_seal(set_seal)?;
@@ -2641,7 +2762,7 @@ impl AsyncState {
             self.clear_wait_registration(ticket)?;
             self.tasks.get_mut(ticket.task)?.cancel = TaskCancelState::Delivered;
             ticket.active = false;
-            return Ok(WaitResume::Ready(WaitEvent::TaskCancelled(
+            return Ok(WaitResume::Ready(EventLease::task_cancelled(
                 task_cancelled_event(),
             )));
         }
@@ -2650,7 +2771,7 @@ impl AsyncState {
         };
         self.clear_wait_registration(ticket)?;
         ticket.active = false;
-        Ok(WaitResume::Ready(WaitEvent::Endpoint(event)))
+        Ok(WaitResume::Ready(EventLease::endpoint_pending(event)))
     }
 
     pub fn cancel_callback_wait(&mut self, ticket: &mut WaitTicket) -> Result<(), AsyncStateError> {
@@ -2847,6 +2968,11 @@ mod tests {
         event
     }
 
+    fn finish_endpoint_lease(state: &mut AsyncState, lease: &mut EventLease) -> Event {
+        lease.prepare_endpoint(state).unwrap();
+        lease.finish_endpoint(state, |_| Ok::<_, ()>(())).unwrap()
+    }
+
     #[test]
     fn zero_is_reserved_and_state_and_slot_generations_are_sealed() {
         let mut first = AsyncState::new(limits()).unwrap();
@@ -2880,6 +3006,28 @@ mod tests {
                 pair.readable.generation()
             );
         }
+    }
+
+    #[test]
+    fn raw_waitable_set_resolution_seals_kind_before_execution() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let endpoint = state.create_stream_pair(ty(1)).unwrap().readable;
+        let set = state.create_waitable_set().unwrap();
+
+        assert_eq!(state.resolve_guest_waitable_set(set.raw()), Ok(set));
+        assert_eq!(
+            state.resolve_guest_waitable_set(endpoint.raw()),
+            Err(AsyncStateError::WrongHandleKind)
+        );
+        assert_eq!(
+            state.resolve_guest_waitable_set(0),
+            Err(AsyncStateError::InvalidHandle)
+        );
+        state.drop_waitable_set(set).unwrap();
+        assert_eq!(
+            state.resolve_guest_waitable_set(set.raw()),
+            Err(AsyncStateError::StaleHandle)
+        );
     }
 
     #[test]
@@ -3564,15 +3712,20 @@ mod tests {
             .commit_local_copy(&mut matched, 2, |_, _, _| Ok::<_, ()>(()))
             .unwrap();
         reclaim_ok(&mut state, &write_event);
-        let read_event = match state.resume_callback_wait(&mut wait).unwrap() {
-            WaitResume::Ready(WaitEvent::Endpoint(event)) => event,
+        let mut read_event = match state.resume_callback_wait(&mut wait).unwrap() {
+            WaitResume::Ready(event) => event,
             _ => panic!("joined endpoint event not delivered"),
         };
+        assert_eq!(read_event.state(), EventLeaseState::EndpointPending);
         assert_eq!(
             state.cancel_callback_wait(&mut wait),
             Err(AsyncStateError::StaleWait)
         );
-        assert_eq!(reclaim_ok(&mut state, &read_event).p1, pair.readable.raw());
+        assert_eq!(
+            finish_endpoint_lease(&mut state, &mut read_event).p1,
+            pair.readable.raw()
+        );
+        assert_eq!(read_event.state(), EventLeaseState::Consumed);
         assert_eq!(
             state.endpoint_info(pair.readable).unwrap().joined_set,
             Some(set.raw())
@@ -3582,6 +3735,260 @@ mod tests {
         state.callback_exit(task).unwrap();
         state.drop_task(task).unwrap();
         state.join_waitable(pair.readable, 0).unwrap();
+        state.drop_waitable_set(set).unwrap();
+    }
+
+    #[test]
+    fn callback_wait_selects_cancellation_without_consuming_a_ready_endpoint() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let pair = state.create_stream_pair(ty(9)).unwrap();
+        let set = state.create_waitable_set().unwrap();
+        state.join_waitable(pair.readable, set.raw()).unwrap();
+        let task = state.create_task().unwrap();
+        let mut wait = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Blocked { ticket } => ticket,
+            WaitBegin::Ready(_) => panic!("empty set became ready"),
+        };
+
+        let read = blocked(
+            state
+                .begin_copy(
+                    pair.readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(9),
+                    lease(1, 2),
+                )
+                .unwrap(),
+        );
+        let mut matched = local(
+            state
+                .begin_copy(
+                    pair.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(9),
+                    lease(2, 2),
+                )
+                .unwrap(),
+        );
+        let write_event = state
+            .commit_local_copy(&mut matched, 2, |_, _, _| Ok::<_, ()>(()))
+            .unwrap();
+        reclaim_ok(&mut state, &write_event);
+
+        state.request_task_cancel(task).unwrap();
+        let mut cancellation = match state.resume_callback_wait(&mut wait).unwrap() {
+            WaitResume::Ready(event) => event,
+            WaitResume::Pending => panic!("ready cancellation did not wake callback"),
+        };
+        assert_eq!(cancellation.state(), EventLeaseState::TaskCancelled);
+        assert_eq!(
+            cancellation.take_task_cancelled(),
+            Some(task_cancelled_event())
+        );
+        assert!(state.pending_event(pair.readable).unwrap().is_some());
+        assert!(read.operation.get() > 0);
+
+        state.acknowledge_task_cancel(task).unwrap();
+        state.callback_exit(task).unwrap();
+        state.drop_task(task).unwrap();
+
+        let begin_task = state.create_task().unwrap();
+        state.request_task_cancel(begin_task).unwrap();
+        let mut begin_cancellation = match state.begin_callback_wait(begin_task, set).unwrap() {
+            WaitBegin::Ready(event) => event,
+            WaitBegin::Blocked { .. } => panic!("begin did not select ready cancellation first"),
+        };
+        assert_eq!(
+            begin_cancellation.take_task_cancelled(),
+            Some(task_cancelled_event())
+        );
+        assert!(state.pending_event(pair.readable).unwrap().is_some());
+        state.acknowledge_task_cancel(begin_task).unwrap();
+        state.callback_exit(begin_task).unwrap();
+        state.drop_task(begin_task).unwrap();
+
+        let successor = state.create_task().unwrap();
+        let mut endpoint = match state.begin_callback_wait(successor, set).unwrap() {
+            WaitBegin::Ready(event) => event,
+            WaitBegin::Blocked { .. } => panic!("pending endpoint was consumed by cancellation"),
+        };
+        assert_eq!(endpoint.state(), EventLeaseState::EndpointPending);
+        assert_eq!(
+            finish_endpoint_lease(&mut state, &mut endpoint).p1,
+            pair.readable.raw()
+        );
+        state.resolve_task_result(successor).unwrap();
+        state.callback_exit(successor).unwrap();
+        state.drop_task(successor).unwrap();
+    }
+
+    #[test]
+    fn endpoint_event_lease_retries_delivery_and_reclaim_and_releases_once() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let mut wrong_state = AsyncState::new(limits()).unwrap();
+        let pair = state.create_stream_pair(ty(9)).unwrap();
+        let set = state.create_waitable_set().unwrap();
+        state.join_waitable(pair.readable, set.raw()).unwrap();
+        let task = state.create_task().unwrap();
+
+        let _read = blocked(
+            state
+                .begin_copy(
+                    pair.readable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Read,
+                    ty(9),
+                    lease(31, 2),
+                )
+                .unwrap(),
+        );
+        let mut matched = local(
+            state
+                .begin_copy(
+                    pair.writable,
+                    EndpointKind::Stream,
+                    EndpointDirection::Write,
+                    ty(9),
+                    lease(32, 2),
+                )
+                .unwrap(),
+        );
+        let write_event = state
+            .commit_local_copy(&mut matched, 2, |_, _, _| Ok::<_, ()>(()))
+            .unwrap();
+        reclaim_ok(&mut state, &write_event);
+        let mut event = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Ready(event) => event,
+            WaitBegin::Blocked { .. } => panic!("joined endpoint event was not selected"),
+        };
+
+        assert_eq!(event.state(), EventLeaseState::EndpointPending);
+        assert_eq!(event.take_task_cancelled(), None);
+        assert_eq!(event.state(), EventLeaseState::EndpointPending);
+        assert_eq!(
+            event.prepare_endpoint(&mut wrong_state),
+            Err(AsyncStateError::WrongState)
+        );
+        assert_eq!(event.state(), EventLeaseState::EndpointPending);
+        event.prepare_endpoint(&mut state).unwrap();
+        assert_eq!(event.state(), EventLeaseState::EndpointDelivered);
+        assert_eq!(
+            event.prepare_endpoint(&mut state),
+            Err(AsyncStateError::StaleEvent)
+        );
+        assert_eq!(
+            event.finish_endpoint(&mut state, |_| Err::<(), _>(7_u8)),
+            Err(ReclaimError::Operation(7))
+        );
+        assert_eq!(event.state(), EventLeaseState::EndpointDelivered);
+        let delivered = event
+            .finish_endpoint(&mut state, |buffer| {
+                assert_eq!(buffer.slot(), 31);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(delivered.p1, pair.readable.raw());
+        assert_eq!(event.state(), EventLeaseState::Consumed);
+        assert_eq!(
+            event.finish_endpoint(&mut state, |_| Ok::<_, ()>(())),
+            Err(ReclaimError::State(AsyncStateError::AuthorityConsumed))
+        );
+
+        state.resolve_task_result(task).unwrap();
+        state.callback_exit(task).unwrap();
+        state.drop_task(task).unwrap();
+    }
+
+    #[test]
+    fn task_cancellation_event_lease_rejects_endpoint_phases_and_consumes_once() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let task = state.create_task().unwrap();
+        let set = state.create_waitable_set().unwrap();
+        state.request_task_cancel(task).unwrap();
+        let mut event = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Ready(event) => event,
+            WaitBegin::Blocked { .. } => panic!("requested cancellation was not selected"),
+        };
+
+        assert_eq!(event.state(), EventLeaseState::TaskCancelled);
+        assert_eq!(
+            event.prepare_endpoint(&mut state),
+            Err(AsyncStateError::StaleEvent)
+        );
+        assert_eq!(
+            event.finish_endpoint(&mut state, |_| Ok::<_, ()>(())),
+            Err(ReclaimError::State(AsyncStateError::StaleEvent))
+        );
+        assert_eq!(event.take_task_cancelled(), Some(task_cancelled_event()));
+        assert_eq!(event.take_task_cancelled(), None);
+        assert_eq!(event.state(), EventLeaseState::Consumed);
+        assert_eq!(
+            event.prepare_endpoint(&mut state),
+            Err(AsyncStateError::AuthorityConsumed)
+        );
+        assert_eq!(
+            event.finish_endpoint(&mut state, |_| Ok::<_, ()>(())),
+            Err(ReclaimError::State(AsyncStateError::AuthorityConsumed))
+        );
+
+        state.acknowledge_task_cancel(task).unwrap();
+        state.callback_exit(task).unwrap();
+        state.drop_task(task).unwrap();
+        state.drop_waitable_set(set).unwrap();
+    }
+
+    #[test]
+    fn abort_task_rejects_a_live_wait_then_succeeds_after_ticket_cancellation() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let task = state.create_task().unwrap();
+        let set = state.create_waitable_set().unwrap();
+        let mut wait = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Blocked { ticket } => ticket,
+            WaitBegin::Ready(_) => panic!("empty set became ready"),
+        };
+
+        assert_eq!(state.abort_task(task), Err(AsyncStateError::AlreadyWaiting));
+        assert!(
+            state.task_info(task).unwrap().waiting,
+            "failed abort must preserve the wait registration"
+        );
+        assert!(matches!(
+            state.resume_callback_wait(&mut wait),
+            Ok(WaitResume::Pending)
+        ));
+        state.cancel_callback_wait(&mut wait).unwrap();
+        state.abort_task(task).unwrap();
+        assert_eq!(state.task_info(task), Err(AsyncStateError::StaleHandle));
+        state.drop_waitable_set(set).unwrap();
+    }
+
+    #[test]
+    fn stale_wait_ticket_cannot_cancel_a_new_registration_on_the_same_set() {
+        let mut state = AsyncState::new(limits()).unwrap();
+        let task = state.create_task().unwrap();
+        let set = state.create_waitable_set().unwrap();
+        let mut old = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Blocked { ticket } => ticket,
+            WaitBegin::Ready(_) => panic!("empty set became ready"),
+        };
+        state.cancel_callback_wait(&mut old).unwrap();
+        let mut current = match state.begin_callback_wait(task, set).unwrap() {
+            WaitBegin::Blocked { ticket } => ticket,
+            WaitBegin::Ready(_) => panic!("empty set became ready"),
+        };
+
+        assert_eq!(
+            state.cancel_callback_wait(&mut old),
+            Err(AsyncStateError::StaleWait)
+        );
+        assert!(matches!(
+            state.resume_callback_wait(&mut current),
+            Ok(WaitResume::Pending)
+        ));
+        state.cancel_callback_wait(&mut current).unwrap();
+        state.abort_task(task).unwrap();
         state.drop_waitable_set(set).unwrap();
     }
 
@@ -3693,14 +4100,20 @@ mod tests {
             _ => panic!("unexpected ready"),
         };
         state.request_task_cancel(task_a).unwrap();
-        assert!(matches!(
-            state.resume_callback_wait(&mut wait_a),
-            Ok(WaitResume::Ready(WaitEvent::TaskCancelled(Event {
+        let mut cancellation = match state.resume_callback_wait(&mut wait_a).unwrap() {
+            WaitResume::Ready(event) => event,
+            WaitResume::Pending => panic!("task cancellation did not wake its callback"),
+        };
+        assert_eq!(cancellation.state(), EventLeaseState::TaskCancelled);
+        assert_eq!(
+            cancellation.take_task_cancelled(),
+            Some(Event {
                 code: EventCode::TaskCancelled,
                 p1: 0,
                 p2: 0,
-            })))
-        ));
+            })
+        );
+        assert_eq!(cancellation.state(), EventLeaseState::Consumed);
         assert!(matches!(
             state.resume_callback_wait(&mut wait_b),
             Ok(WaitResume::Pending)
@@ -3753,10 +4166,14 @@ mod tests {
             WaitBegin::Ready(_) => panic!("empty set became ready"),
         };
         state.request_task_cancel(delivered).unwrap();
-        assert!(matches!(
-            state.resume_callback_wait(&mut delivered_wait),
-            Ok(WaitResume::Ready(WaitEvent::TaskCancelled(_)))
-        ));
+        let mut cancellation = match state.resume_callback_wait(&mut delivered_wait).unwrap() {
+            WaitResume::Ready(event) => event,
+            WaitResume::Pending => panic!("task cancellation did not wake its callback"),
+        };
+        assert_eq!(
+            cancellation.take_task_cancelled(),
+            Some(task_cancelled_event())
+        );
         state.resolve_task_result(delivered).unwrap();
         assert_eq!(
             state.task_info(delivered).unwrap().cancel,

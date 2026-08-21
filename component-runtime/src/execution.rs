@@ -278,6 +278,204 @@ pub enum AsyncCoreValueType {
     I64,
 }
 
+/// One Core export after Component-instance indices have been translated to
+/// the exact runtime-instance namespace used by the native async executor.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncCoreExportRef {
+    pub core_instance: usize,
+    pub export: String,
+}
+
+/// Canonical options with all Core memory/function provenance resolved.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncCanonicalOptionsPlan {
+    /// `None` is the Canonical ABI UTF-8 default.
+    pub string_encoding: Option<CanonicalStringEncoding>,
+    pub async_: bool,
+    pub memory: Option<NativeAsyncCoreExportRef>,
+    pub realloc: Option<NativeAsyncCoreExportRef>,
+}
+
+/// The closed set of canonical entries retained by the resource-free native
+/// async profile. Every canonical function in the validated Component has one
+/// entry in this table; Core import bridges and Component exports refer to the
+/// table by checked indices rather than reinterpreting binary indices later.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncCanonicalPlan {
+    pub canonical_index: u32,
+    pub function: NativeAsyncCanonicalFunctionPlan,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeAsyncCanonicalFunctionPlan {
+    Lift {
+        core_function: NativeAsyncCoreExportRef,
+        function_type: FunctionType,
+        callback: NativeAsyncCoreExportRef,
+        options: NativeAsyncCanonicalOptionsPlan,
+    },
+    TaskReturn {
+        result: Option<ValueType>,
+        options: NativeAsyncCanonicalOptionsPlan,
+    },
+    TaskCancel,
+    Stream(NativeAsyncStreamPlan),
+    Future(NativeAsyncFuturePlan),
+    Waitable(NativeAsyncWaitablePlan),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeAsyncStreamPlan {
+    New {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    Read {
+        type_index: u32,
+        value_type: ValueType,
+        options: NativeAsyncCanonicalOptionsPlan,
+    },
+    Write {
+        type_index: u32,
+        value_type: ValueType,
+        options: NativeAsyncCanonicalOptionsPlan,
+    },
+    CancelRead {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    CancelWrite {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    DropReadable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    DropWritable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeAsyncFuturePlan {
+    New {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    Read {
+        type_index: u32,
+        value_type: ValueType,
+        options: NativeAsyncCanonicalOptionsPlan,
+    },
+    Write {
+        type_index: u32,
+        value_type: ValueType,
+        options: NativeAsyncCanonicalOptionsPlan,
+    },
+    CancelRead {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    CancelWrite {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    DropReadable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+    DropWritable {
+        type_index: u32,
+        value_type: ValueType,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeAsyncWaitablePlan {
+    SetNew,
+    SetDrop,
+    Join,
+}
+
+/// Exact import wiring for one instantiated Core module. A canonical bridge
+/// is an index into [`NativeAsyncExecutionPlan::canonical_import_bridges`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeAsyncCoreImportPlan {
+    InstanceExport {
+        module: String,
+        field: String,
+        core_instance: usize,
+        export: String,
+    },
+    Canonical {
+        bridge: u32,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncCoreInstancePlan {
+    pub module: usize,
+    pub imports: Vec<NativeAsyncCoreImportPlan>,
+}
+
+/// One exact Core import supplied by a canonical builtin. `canonical` indexes
+/// the total canonical table and is validated to name a non-lift entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncCanonicalImportBridge {
+    pub core_instance: usize,
+    pub core_module: String,
+    pub core_field: String,
+    pub canonical: u32,
+    pub signature: NativeAsyncCoreSignature,
+}
+
+/// Exact validator-derived Core function signature for a canonical import.
+/// The resource-free profile admits only the integer Core value classes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncCoreSignature {
+    pub parameters: Vec<AsyncCoreValueType>,
+    pub results: Vec<AsyncCoreValueType>,
+}
+
+/// One exported async Component function. `canonical` indexes the total
+/// canonical table and is validated to name an async callback lift.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncExportPlan {
+    pub name: String,
+    pub canonical: u32,
+}
+
+/// Owned, validator-derived wiring for the resource-free native async
+/// executor. This plan deliberately remains inert while its profile stage is
+/// `ValidationOnly`; constructing it does not authorize execution.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeAsyncExecutionPlan {
+    pub(crate) instances: Vec<NativeAsyncCoreInstancePlan>,
+    pub(crate) canonical: Vec<NativeAsyncCanonicalPlan>,
+    pub(crate) canonical_import_bridges: Vec<NativeAsyncCanonicalImportBridge>,
+    pub(crate) exports: Vec<NativeAsyncExportPlan>,
+}
+
+impl NativeAsyncExecutionPlan {
+    pub fn instances(&self) -> &[NativeAsyncCoreInstancePlan] {
+        &self.instances
+    }
+
+    pub fn canonical_plans(&self) -> &[NativeAsyncCanonicalPlan] {
+        &self.canonical
+    }
+
+    pub fn canonical_import_bridges(&self) -> &[NativeAsyncCanonicalImportBridge] {
+        &self.canonical_import_bridges
+    }
+
+    pub fn exports(&self) -> &[NativeAsyncExportPlan] {
+        &self.exports
+    }
+}
+
 pub(crate) struct ComponentExecutionPlan {
     pub(crate) instances: Vec<CoreInstancePlan>,
     pub(crate) exports: Vec<ExecutableExportPlan>,

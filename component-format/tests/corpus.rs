@@ -12,6 +12,8 @@ const ASYNC_COMPONENT: &str = include_str!("corpus/component/async-0.255.0.compo
 const ASYNC_WORLD: &str = include_str!("corpus/wit/async-world.wit");
 const NATIVE_ASYNC_STREAM_COMPONENT: &str =
     include_str!("corpus/component/native-async-stream-0.255.0.component.wat");
+const NATIVE_ASYNC_SMOKE_COMPONENT: &str =
+    include_str!("corpus/component/native-async-smoke-0.255.0.component.wat");
 const MALFORMED_COMPONENT: &str = include_str!("corpus/component/malformed.hex");
 const RUST_GUEST: &str = include_str!("corpus/guests/typed_guest.rs");
 const C_GUEST: &str = include_str!("corpus/guests/typed_guest.c");
@@ -106,6 +108,17 @@ fn corpus_covers_the_profile_contract() {
         "(callback (core func $callback))",
     ] {
         assert!(NATIVE_ASYNC_STREAM_COMPONENT.contains(marker), "{marker}");
+    }
+    for marker in [
+        "(canon task.return)",
+        "(canon stream.read $bytes async (memory $memory))",
+        "(canon future.write $closed async (memory $memory))",
+        "(canon waitable.join)",
+        "(import \"vibe:async\" \"task-return\"",
+        "call $task-return",
+        "i32.const 1",
+    ] {
+        assert!(NATIVE_ASYNC_SMOKE_COMPONENT.contains(marker), "{marker}");
     }
     assert!(MALFORMED_COMPONENT.contains("truncated-section"));
     assert!(RUST_GUEST.contains("extern \"C\""));

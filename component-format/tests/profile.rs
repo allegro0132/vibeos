@@ -3,9 +3,13 @@ use vibeos_component_format::{
     TrapCode, ValidationAccount, ARTIFACT_ABI_VERSION, ARTIFACT_MAGIC, ASYNC_ARTIFACT_ABI_VERSION,
     ASYNC_CANONICAL_ABI_REVISION, ASYNC_COMPONENT_MODEL_REVISION, ASYNC_RUNTIME_ABI_VERSION,
     ASYNC_WASM_TOOLS_REVISION, CANONICAL_ABI_REVISION, COMPONENT_MODEL_REVISION,
-    COMPONENT_PROFILE_VERSION, CORE_PROFILE_VERSION, PROFILE_1_LIMITS, RUNTIME_ABI_VERSION,
-    SYNC_WASM_TOOLS_REVISION, WASI_API_REVISION, WASMPARSER_0_255_0_CHECKSUM,
-    WASM_ENCODER_0_255_0_CHECKSUM, WIT_PACKAGES, WIT_PARSER_0_255_0_CHECKSUM,
+    COMPONENT_PROFILE_VERSION, CORE_PROFILE_VERSION,
+    NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION,
+    NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION,
+    NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION, NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION,
+    PROFILE_1_LIMITS, RUNTIME_ABI_VERSION, SYNC_WASM_TOOLS_REVISION, WASI_API_REVISION,
+    WASMPARSER_0_255_0_CHECKSUM, WASM_ENCODER_0_255_0_CHECKSUM, WIT_PACKAGES,
+    WIT_PARSER_0_255_0_CHECKSUM,
 };
 
 type ChargeCounter = fn(&mut ValidationAccount, u32) -> Result<(), LimitError>;
@@ -99,6 +103,93 @@ fn c51_validation_identity_and_feature_vector_are_exact() {
     ] {
         assert!(!feature.enabled_in_async_profile(), "{feature:?}");
     }
+}
+
+#[test]
+fn c53_native_async_resource_free_identity_and_feature_vector_are_exact() {
+    let identity = ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE;
+
+    assert_eq!(NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION, 3);
+    assert_eq!(NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION, 3);
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_SYNC);
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_ASYNC);
+    assert_eq!(
+        identity.artifact_abi,
+        NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION
+    );
+    assert_eq!(identity.component_profile, COMPONENT_PROFILE_VERSION);
+    assert_eq!(identity.core_profile, CORE_PROFILE_VERSION);
+    assert_eq!(
+        identity.runtime_abi,
+        NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION
+    );
+    assert_eq!(identity.core_revision, "webassembly-core-2.0-integer-v1");
+    assert_eq!(identity.component_revision, ASYNC_COMPONENT_MODEL_REVISION);
+    assert_eq!(
+        identity.canonical_abi_revision,
+        NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION
+    );
+    assert_eq!(
+        NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION,
+        "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1-resource-free-exec-1"
+    );
+    assert_eq!(identity.wasm_tools_revision, ASYNC_WASM_TOOLS_REVISION);
+    assert_eq!(
+        identity.wasi_revision,
+        NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION
+    );
+    assert_eq!(
+        NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION,
+        "wasi-not-selected-native-async-resource-free"
+    );
+    assert_eq!(identity.stage, ProfileStage::ValidationOnly);
+    assert!(!identity.execution_enabled());
+    assert_eq!(identity.canonical_features.count_ones(), 7);
+
+    for feature in [
+        CanonicalAbiFeature::Utf8,
+        CanonicalAbiFeature::AsyncFunctions,
+        CanonicalAbiFeature::CallbackLift,
+        CanonicalAbiFeature::Futures,
+        CanonicalAbiFeature::Streams,
+        CanonicalAbiFeature::TaskBuiltins,
+        CanonicalAbiFeature::WaitableSets,
+    ] {
+        assert!(
+            feature.enabled_in_native_async_resource_free_profile(),
+            "{feature:?}"
+        );
+    }
+
+    for feature in [
+        CanonicalAbiFeature::SyncLiftLower,
+        CanonicalAbiFeature::Resources,
+        CanonicalAbiFeature::AsyncLower,
+        CanonicalAbiFeature::ContextI32,
+        CanonicalAbiFeature::Subtasks,
+        CanonicalAbiFeature::CooperativeYield,
+        CanonicalAbiFeature::Backpressure,
+        CanonicalAbiFeature::StackfulAsync,
+        CanonicalAbiFeature::MoreAsyncBuiltins,
+        CanonicalAbiFeature::Threading,
+        CanonicalAbiFeature::ErrorContext,
+        CanonicalAbiFeature::Gc,
+        CanonicalAbiFeature::Component64,
+        CanonicalAbiFeature::Utf16,
+    ] {
+        assert!(
+            !feature.enabled_in_native_async_resource_free_profile(),
+            "{feature:?}"
+        );
+    }
+
+    assert_eq!(ProfileIdentity::PROFILE_1, ProfileIdentity::PROFILE_1_SYNC);
+    assert_eq!(ProfileIdentity::PROFILE_1_ASYNC.artifact_abi, 2);
+    assert_eq!(ProfileIdentity::PROFILE_1_ASYNC.runtime_abi, 2);
+    assert_eq!(
+        ProfileIdentity::PROFILE_1_ASYNC.stage,
+        ProfileStage::ValidationOnly
+    );
 }
 
 #[test]

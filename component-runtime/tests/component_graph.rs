@@ -151,6 +151,19 @@ fn component_with_core_instances(count: usize) -> Vec<u8> {
     wat::parse_str(source).unwrap()
 }
 
+fn async_component_with_core_instances(count: usize) -> Vec<u8> {
+    let mut source = String::from("(component (core module $m)");
+    for index in 0..count {
+        write!(source, " (core instance $instance{index} (instantiate $m))").unwrap();
+    }
+    source.push_str(
+        " (type $pending (future u32))\
+           (type $run (func async (param \"pending\" $pending)))\
+           (import \"source\" (func $source (type $run))))",
+    );
+    wat::parse_str(source).unwrap()
+}
+
 fn component_with_adapters(count: usize) -> Vec<u8> {
     let mut source = String::from("(component (type $t (func)) (import \"f\" (func $f (type $t)))");
     for _ in 0..count {
@@ -295,6 +308,19 @@ fn aggregate_component_bytes_reject_exactly_one_over_the_graph_limit() {
         limits.max_component_bytes + 1,
         limits.max_component_bytes,
     );
+}
+
+#[test]
+fn async_nodes_charge_validator_core_instances_without_an_execution_plan() {
+    let bytes = async_component_with_core_instances(2);
+    let plan = inspect_async(&bytes);
+    assert_eq!(plan.summary().core_instances, 2);
+    assert_eq!(plan.runtime_instance_count(), 0);
+
+    let spec = root(&plan);
+    assert_eq!(spec.budget().core_instances, 2);
+    let graph = plan_component_graph(&[spec], &[], &[], &[]).unwrap();
+    assert_eq!(graph.account().core_instances, 2);
 }
 
 #[test]

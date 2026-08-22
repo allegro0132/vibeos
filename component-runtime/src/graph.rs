@@ -19,10 +19,17 @@ use crate::{
     decode::{ComponentPlan, ComponentSummary},
     world::NamedEntityShape,
 };
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use vibeos_component_format::{
     ComponentGraphAccount, ComponentGraphInstanceBudget, ComponentGraphNodeBudget, LimitError,
     LimitKind, ProfileIdentity, PROFILE_1_COMPONENT_GRAPH_LIMITS, PROFILE_1_LIMITS,
+};
+use wasmparser::{
+    component_types::{
+        AliasableResourceId, ComponentAnyTypeId, ComponentDefinedType, ComponentDefinedTypeId,
+        ComponentEntityType, ComponentValType,
+    },
+    types::Types,
 };
 
 /// Dense, graph-local node address. It is neither durable identity nor
@@ -53,6 +60,454 @@ impl ComponentGraphEntityIndex {
     pub const fn index(self) -> u16 {
         self.0
     }
+}
+
+/// The graph-only classification of one top-level Component entity's
+/// resource surface.
+///
+/// `ExactInterface` is intentionally narrow: every resource is declared as a
+/// direct member of that interface, every `own`/`borrow` refers to exactly one
+/// such declaration, and no second top-level resource-bearing entity exists.
+/// This last rule conservatively excludes cross-entity aliases without
+/// retaining validator IDs. Everything else fails closed as `Unsupported`
+/// for graph resource routing without changing ordinary Component inspection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentGraphResourceStatus {
+    ResourceFree,
+    ExactInterface,
+    Unsupported,
+}
+
+/// A semantic resource declaration in an exact top-level interface.
+///
+/// Only the stable member position is retained. Validator-local nominal IDs
+/// are deliberately discarded before this value is constructed and can
+/// therefore never be logged, persisted, or compared across inspections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentGraphResourceDeclaration {
+    member: ComponentGraphEntityIndex,
+}
+
+impl ComponentGraphResourceDeclaration {
+    pub const fn member(&self) -> ComponentGraphEntityIndex {
+        self.member
+    }
+}
+
+/// Resource provenance for one normalized top-level import or export.
+#[derive(Debug)]
+pub struct ComponentGraphEntityResourceProvenance {
+    status: ComponentGraphResourceStatus,
+    declarations: Vec<ComponentGraphResourceDeclaration>,
+}
+
+impl ComponentGraphEntityResourceProvenance {
+    pub const fn status(&self) -> ComponentGraphResourceStatus {
+        self.status
+    }
+
+    pub fn declarations(&self) -> &[ComponentGraphResourceDeclaration] {
+        &self.declarations
+    }
+}
+
+/// Graph-only nominal-resource evidence captured during validation.
+///
+/// Entries are positionally aligned with [`ComponentPlan::imports`] and
+/// [`ComponentPlan::exports`]. The sidecar is owned but contains no validator
+/// IDs, so a durable manifest must save entity/member names and obtain fresh
+/// evidence by re-inspecting the original bytes.
+#[derive(Debug)]
+pub struct ComponentGraphResourceProvenance {
+    imports: Vec<ComponentGraphEntityResourceProvenance>,
+    exports: Vec<ComponentGraphEntityResourceProvenance>,
+}
+
+impl ComponentGraphResourceProvenance {
+    pub fn imports(&self) -> &[ComponentGraphEntityResourceProvenance] {
+        &self.imports
+    }
+
+    pub fn exports(&self) -> &[ComponentGraphEntityResourceProvenance] {
+        &self.exports
+    }
+
+    pub fn import(
+        &self,
+        index: ComponentGraphEntityIndex,
+    ) -> Option<&ComponentGraphEntityResourceProvenance> {
+        self.imports.get(usize::from(index.index()))
+    }
+
+    pub fn export(
+        &self,
+        index: ComponentGraphEntityIndex,
+    ) -> Option<&ComponentGraphEntityResourceProvenance> {
+        self.exports.get(usize::from(index.index()))
+    }
+}
+
+/// An inspected Component plus opt-in graph resource evidence.
+///
+/// The plan borrows only the original Component bytes. The evidence owns its
+/// semantic indices and never borrows validator internals, avoiding a
+/// self-referential `Types`/plan object.
+pub struct ComponentGraphInspection<'a> {
+    plan: ComponentPlan<'a>,
+    resources: ComponentGraphResourceProvenance,
+}
+
+impl<'a> ComponentGraphInspection<'a> {
+    pub(crate) const fn new(
+        plan: ComponentPlan<'a>,
+        resources: ComponentGraphResourceProvenance,
+    ) -> Self {
+        Self { plan, resources }
+    }
+
+    pub const fn plan(&self) -> &ComponentPlan<'a> {
+        &self.plan
+    }
+
+    pub const fn resources(&self) -> &ComponentGraphResourceProvenance {
+        &self.resources
+    }
+
+    pub fn into_parts(self) -> (ComponentPlan<'a>, ComponentGraphResourceProvenance) {
+        (self.plan, self.resources)
+    }
+}
+
+pub(crate) fn build_component_graph_resource_provenance(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+) -> Result<ComponentGraphResourceProvenance, ComponentGraphProvenanceBuildError> {
+    let mut imports = collect_raw_resource_entities(types, import_names, true)?;
+    let mut exports = collect_raw_resource_entities(types, export_names, false)?;
+    reject_cross_entity_resource_ambiguity(&mut imports, &mut exports);
+    Ok(ComponentGraphResourceProvenance {
+        imports: finish_resource_entities(imports)?,
+        exports: finish_resource_entities(exports)?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComponentGraphProvenanceBuildError {
+    Allocation,
+    InvalidWiring,
+}
+
+#[derive(Clone, Copy)]
+struct RawResourceDeclaration {
+    member: ComponentGraphEntityIndex,
+    resource: AliasableResourceId,
+}
+
+struct RawResourceEntity {
+    has_resources: bool,
+    exact: bool,
+    declarations: Vec<RawResourceDeclaration>,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceScan {
+    has_resources: bool,
+    exact: bool,
+}
+
+impl ResourceScan {
+    const FREE: Self = Self {
+        has_resources: false,
+        exact: true,
+    };
+
+    const fn resource(exact: bool) -> Self {
+        Self {
+            has_resources: true,
+            exact,
+        }
+    }
+
+    fn include(&mut self, other: Self) {
+        self.has_resources |= other.has_resources;
+        self.exact &= other.exact;
+    }
+}
+
+fn collect_raw_resource_entities(
+    types: &Types,
+    names: &[String],
+    imports: bool,
+) -> Result<Vec<RawResourceEntity>, ComponentGraphProvenanceBuildError> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(names.len())
+        .map_err(|_| ComponentGraphProvenanceBuildError::Allocation)?;
+    for name in names {
+        let item = if imports {
+            types.component_item_for_import(name)
+        } else {
+            types.component_item_for_export(name)
+        }
+        .ok_or(ComponentGraphProvenanceBuildError::InvalidWiring)?;
+        result.push(collect_raw_resource_entity(types, item.ty)?);
+    }
+    Ok(result)
+}
+
+fn collect_raw_resource_entity(
+    types: &Types,
+    entity: ComponentEntityType,
+) -> Result<RawResourceEntity, ComponentGraphProvenanceBuildError> {
+    let ComponentEntityType::Instance(instance_id) = entity else {
+        let scan = scan_resource_entity(types, entity, &[], 1);
+        return Ok(RawResourceEntity {
+            has_resources: scan.has_resources,
+            exact: !scan.has_resources,
+            declarations: Vec::new(),
+        });
+    };
+
+    let instance = &types[instance_id];
+    let mut declarations = Vec::new();
+    declarations
+        .try_reserve_exact(instance.exports.len())
+        .map_err(|_| ComponentGraphProvenanceBuildError::Allocation)?;
+    let mut exact = true;
+    for (member_index, (_, member)) in instance.exports.iter().enumerate() {
+        let ComponentEntityType::Type {
+            referenced: ComponentAnyTypeId::Resource(resource),
+            ..
+        } = member.ty
+        else {
+            continue;
+        };
+        let Ok(member_index) = u16::try_from(member_index) else {
+            exact = false;
+            continue;
+        };
+        if declarations
+            .iter()
+            .any(|existing: &RawResourceDeclaration| {
+                existing.resource == resource || existing.resource.resource() == resource.resource()
+            })
+        {
+            exact = false;
+        }
+        declarations.push(RawResourceDeclaration {
+            member: ComponentGraphEntityIndex::new(member_index),
+            resource,
+        });
+    }
+
+    let mut scan = ResourceScan::FREE;
+    for (_, member) in instance.exports.iter() {
+        if matches!(
+            member.ty,
+            ComponentEntityType::Type {
+                referenced: ComponentAnyTypeId::Resource(_),
+                ..
+            }
+        ) {
+            continue;
+        }
+        scan.include(scan_resource_entity(types, member.ty, &declarations, 1));
+    }
+    exact &= scan.exact;
+    Ok(RawResourceEntity {
+        has_resources: !declarations.is_empty() || scan.has_resources,
+        exact,
+        declarations,
+    })
+}
+
+fn scan_resource_entity(
+    types: &Types,
+    entity: ComponentEntityType,
+    declarations: &[RawResourceDeclaration],
+    depth: u32,
+) -> ResourceScan {
+    if depth > PROFILE_1_LIMITS.max_canonical_nesting {
+        return ResourceScan::resource(false);
+    }
+    match entity {
+        ComponentEntityType::Func(id) => {
+            let function = &types[id];
+            let mut scan = ResourceScan::FREE;
+            for (_, value) in function.params.iter() {
+                scan.include(scan_resource_value(types, *value, declarations, depth + 1));
+            }
+            if let Some(value) = function.result {
+                scan.include(scan_resource_value(types, value, declarations, depth + 1));
+            }
+            scan
+        }
+        ComponentEntityType::Instance(id) => {
+            let mut scan = ResourceScan::FREE;
+            for (_, member) in types[id].exports.iter() {
+                scan.include(scan_resource_entity(
+                    types,
+                    member.ty,
+                    declarations,
+                    depth + 1,
+                ));
+            }
+            if scan.has_resources {
+                scan.exact = false;
+            }
+            scan
+        }
+        ComponentEntityType::Type { referenced, .. } => match referenced {
+            ComponentAnyTypeId::Resource(_) => ResourceScan::resource(false),
+            ComponentAnyTypeId::Defined(id) => {
+                scan_resource_defined(types, id, declarations, depth + 1)
+            }
+            _ => ResourceScan::FREE,
+        },
+        ComponentEntityType::Value(value) => {
+            scan_resource_value(types, value, declarations, depth + 1)
+        }
+        ComponentEntityType::Module(_) | ComponentEntityType::Component(_) => ResourceScan::FREE,
+    }
+}
+
+fn scan_resource_value(
+    types: &Types,
+    value: ComponentValType,
+    declarations: &[RawResourceDeclaration],
+    depth: u32,
+) -> ResourceScan {
+    match value {
+        ComponentValType::Primitive(_) => ResourceScan::FREE,
+        ComponentValType::Type(id) => {
+            scan_resource_defined(types, id, declarations, depth.saturating_add(1))
+        }
+    }
+}
+
+fn scan_resource_defined(
+    types: &Types,
+    id: ComponentDefinedTypeId,
+    declarations: &[RawResourceDeclaration],
+    depth: u32,
+) -> ResourceScan {
+    if depth > PROFILE_1_LIMITS.max_canonical_nesting {
+        return ResourceScan::resource(false);
+    }
+    let scan_values = |values: &[ComponentValType]| {
+        let mut scan = ResourceScan::FREE;
+        for value in values {
+            scan.include(scan_resource_value(types, *value, declarations, depth + 1));
+        }
+        scan
+    };
+    match &types[id] {
+        ComponentDefinedType::Primitive(_)
+        | ComponentDefinedType::Flags(_)
+        | ComponentDefinedType::Enum(_) => ResourceScan::FREE,
+        ComponentDefinedType::Record(record) => {
+            let mut scan = ResourceScan::FREE;
+            for (_, value) in record.fields.iter() {
+                scan.include(scan_resource_value(types, *value, declarations, depth + 1));
+            }
+            scan
+        }
+        ComponentDefinedType::Variant(variant) => {
+            let mut scan = ResourceScan::FREE;
+            for (_, case) in variant.cases.iter() {
+                if let Some(value) = case.ty {
+                    scan.include(scan_resource_value(types, value, declarations, depth + 1));
+                }
+            }
+            scan
+        }
+        ComponentDefinedType::List { element, .. }
+        | ComponentDefinedType::Option { ty: element, .. }
+        | ComponentDefinedType::FixedLengthList { element, .. } => {
+            scan_resource_value(types, *element, declarations, depth + 1)
+        }
+        ComponentDefinedType::Map { key, value, .. } => scan_values(&[*key, *value]),
+        ComponentDefinedType::Tuple(tuple) => scan_values(&tuple.types),
+        ComponentDefinedType::Result { ok, err, .. } => {
+            let mut scan = ResourceScan::FREE;
+            if let Some(value) = ok {
+                scan.include(scan_resource_value(types, *value, declarations, depth + 1));
+            }
+            if let Some(value) = err {
+                scan.include(scan_resource_value(types, *value, declarations, depth + 1));
+            }
+            scan
+        }
+        ComponentDefinedType::Own(resource) | ComponentDefinedType::Borrow(resource) => {
+            ResourceScan::resource(
+                declarations
+                    .iter()
+                    .any(|declaration| declaration.resource == *resource),
+            )
+        }
+        ComponentDefinedType::Future { ty, .. } | ComponentDefinedType::Stream { ty, .. } => ty
+            .map_or(ResourceScan::FREE, |value| {
+                scan_resource_value(types, value, declarations, depth + 1)
+            }),
+    }
+}
+
+fn reject_cross_entity_resource_ambiguity(
+    imports: &mut [RawResourceEntity],
+    exports: &mut [RawResourceEntity],
+) {
+    // This intentionally conservative graph profile does not retain raw IDs
+    // or allocate a global reference map. If resources occur in more than one
+    // top-level entity, a handle in one entity may alias a declaration in
+    // another. Mark every resource-bearing entity unsupported rather than
+    // accidentally granting a cross-entity nominal route.
+    let resource_entities = imports
+        .iter()
+        .chain(exports.iter())
+        .filter(|entity| entity.has_resources)
+        .count();
+    if resource_entities > 1 {
+        for entity in imports.iter_mut().chain(exports.iter_mut()) {
+            if entity.has_resources {
+                entity.exact = false;
+            }
+        }
+    }
+}
+
+fn finish_resource_entities(
+    raw: Vec<RawResourceEntity>,
+) -> Result<Vec<ComponentGraphEntityResourceProvenance>, ComponentGraphProvenanceBuildError> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(raw.len())
+        .map_err(|_| ComponentGraphProvenanceBuildError::Allocation)?;
+    for entity in raw {
+        let status = if !entity.has_resources {
+            ComponentGraphResourceStatus::ResourceFree
+        } else if entity.exact {
+            ComponentGraphResourceStatus::ExactInterface
+        } else {
+            ComponentGraphResourceStatus::Unsupported
+        };
+        let mut declarations = Vec::new();
+        if status == ComponentGraphResourceStatus::ExactInterface {
+            declarations
+                .try_reserve_exact(entity.declarations.len())
+                .map_err(|_| ComponentGraphProvenanceBuildError::Allocation)?;
+            for declaration in entity.declarations {
+                declarations.push(ComponentGraphResourceDeclaration {
+                    member: declaration.member,
+                });
+            }
+        }
+        result.push(ComponentGraphEntityResourceProvenance {
+            status,
+            declarations,
+        });
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -183,10 +638,10 @@ impl<'a> ComponentGraphNodeSpec<'a> {
         requested: ComponentGraphInstanceBudget,
     ) -> Self {
         let summary = plan.summary();
-        let core_instances = match u64::try_from(plan.runtime_instance_count()) {
-            Ok(count) => count,
-            Err(_) => u64::MAX,
-        };
+        // Validation-only profiles deliberately have no execution plan. The
+        // validator summary is the profile-independent structural count and
+        // therefore the only sound aggregate-accounting source here.
+        let core_instances = u64::from(summary.core_instances);
         Self {
             label,
             world,

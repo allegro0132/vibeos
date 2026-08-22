@@ -41,6 +41,7 @@ pub const STREAM_CLOSE_WRITER_FUNCTION: &str = "close-writer";
 pub enum HostManifestError {
     Empty,
     Zero,
+    InvalidSelection,
     DuplicateFunction,
     DuplicateResourceType,
     ConflictingResourceType,
@@ -90,19 +91,91 @@ impl VibeHostRequirement {
 }
 
 impl VibeHostManifest {
-    /// Derive nominal resource bindings from the validator-produced plan.
-    /// Every callable host import must match the exact versioned allowlist,
-    /// member name, parameter names, ownership, and result shape.
-    pub fn from_plan(plan: &ComponentPlan<'_>) -> Result<Self, HostManifestError> {
-        validate_normalized_imports(plan.imports())?;
-        let mut manifest = Self {
+    const fn empty() -> Self {
+        Self {
             clock: None,
             random: None,
             blob: None,
             log: None,
             stream_reader: None,
             stream_writer: None,
-        };
+        }
+    }
+
+    /// Derive nominal resource bindings from the validator-produced plan.
+    /// Every callable host import must match the exact versioned allowlist,
+    /// member name, parameter names, ownership, and result shape.
+    pub fn from_plan(plan: &ComponentPlan<'_>) -> Result<Self, HostManifestError> {
+        validate_normalized_imports(plan.imports().iter(), true)?;
+        Self::from_host_imports(plan.host_imports(), true)
+    }
+
+    /// Derive bindings only for explicitly selected normalized imports.
+    ///
+    /// Each index addresses `plan.imports()` directly. Duplicate or out-of-range
+    /// indices fail closed before any shape or flattened-call processing. An
+    /// empty selection yields an empty manifest, while selected imports still
+    /// receive the same exact version, shape, function, and nominal-resource
+    /// checks as the full-plan path. Imports outside the selection and their
+    /// flattened host calls are deliberately ignored.
+    pub fn from_selected_imports(
+        plan: &ComponentPlan<'_>,
+        selected_imports: &[u16],
+    ) -> Result<Self, HostManifestError> {
+        if selected_imports.len() > plan.imports().len() {
+            return Err(HostManifestError::InvalidSelection);
+        }
+        for (position, selected) in selected_imports.iter().enumerate() {
+            if plan.imports().get(usize::from(*selected)).is_none()
+                || selected_imports[..position].contains(selected)
+            {
+                return Err(HostManifestError::InvalidSelection);
+            }
+        }
+
+        validate_normalized_imports(
+            selected_imports
+                .iter()
+                .map(|selected| &plan.imports()[usize::from(*selected)]),
+            false,
+        )?;
+        for import in plan.host_imports() {
+            if !plan
+                .imports()
+                .iter()
+                .any(|normalized| normalized.name == import.interface)
+            {
+                return Err(HostManifestError::UnexpectedImport);
+            }
+        }
+        for selected in selected_imports {
+            let interface = &plan.imports()[usize::from(*selected)].name;
+            if !plan
+                .host_imports()
+                .any(|import| import.interface == *interface)
+            {
+                // A selected external interface without validator-resolved
+                // callable wiring cannot be bound safely. This also keeps a
+                // validation-only async plan from silently producing an empty
+                // authority manifest.
+                return Err(HostManifestError::Empty);
+            }
+        }
+        Self::from_host_imports(
+            plan.host_imports().filter(|import| {
+                selected_imports
+                    .iter()
+                    .any(|selected| plan.imports()[usize::from(*selected)].name == import.interface)
+            }),
+            false,
+        )
+    }
+
+    fn from_host_imports<'a>(
+        imports: impl Iterator<Item = &'a HostImportInfo>,
+        empty_is_error: bool,
+    ) -> Result<Self, HostManifestError> {
+        let mut manifest = Self::empty();
         let mut clock_seen = false;
         let mut random_seen = false;
         let mut blob_len_seen = false;
@@ -114,7 +187,7 @@ impl VibeHostManifest {
         let mut stream_close_writer_seen = false;
         let mut count = 0_usize;
 
-        for import in plan.host_imports() {
+        for import in imports {
             count = count
                 .checked_add(1)
                 .ok_or(HostManifestError::InvalidShape)?;
@@ -190,7 +263,7 @@ impl VibeHostManifest {
                 _ => return Err(HostManifestError::UnexpectedImport),
             }
         }
-        if count == 0 {
+        if count == 0 && empty_is_error {
             return Err(HostManifestError::Empty);
         }
 
@@ -295,16 +368,20 @@ fn validate_stream_import_set(
     Ok(())
 }
 
-fn validate_normalized_imports(imports: &[NamedEntityShape]) -> Result<(), HostManifestError> {
-    if imports.is_empty() {
-        return Err(HostManifestError::Empty);
-    }
+fn validate_normalized_imports<'a>(
+    imports: impl Iterator<Item = &'a NamedEntityShape>,
+    empty_is_error: bool,
+) -> Result<(), HostManifestError> {
     let mut clock = false;
     let mut random = false;
     let mut blob = false;
     let mut log = false;
     let mut stream = false;
+    let mut count = 0_usize;
     for import in imports {
+        count = count
+            .checked_add(1)
+            .ok_or(HostManifestError::InvalidShape)?;
         let valid = match import.name.as_str() {
             CLOCK_INTERFACE => {
                 mark_once(&mut clock)?;
@@ -331,6 +408,9 @@ fn validate_normalized_imports(imports: &[NamedEntityShape]) -> Result<(), HostM
         if !valid {
             return Err(HostManifestError::InvalidShape);
         }
+    }
+    if count == 0 && empty_is_error {
+        return Err(HostManifestError::Empty);
     }
     Ok(())
 }

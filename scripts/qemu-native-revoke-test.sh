@@ -21,8 +21,8 @@ SSH_FAILURE_LOG_PATTERN=${SSH_FAILURE_LOG_PATTERN:-'FAIL ssh-test:'}
 WASM_C48_POLICY_PATTERN='WASM_C48_ACCEPTANCE PASS.*policy=passed'
 WASM_C52_COUNTER_PATTERN='WASM_C52_ACCEPTANCE PASS parks=20 resumes=20 cross_hart_signals=20 stale_rejects=20 live_faults=20'
 WASM_C53_COUNTER_PATTERN='WASM_C53_ACCEPTANCE PASS pairs=20 input_chunks=180 output_chunks=180 xor_bytes=184320 backend_pending=20 backend_wakes=20 host_pending=20 exact_wakes=20 exact_resumes=20 late_wake_rejects=20 eof=20 normal_closes=40 terminal_matches=20 terminal_orders=20 close_races=3 terminal_mappings=3 start_error_terminals=2 terminal_races=3 cancel_busy_retries=3 completion_busy_retries=3 mismatches=9 duplicate_fault_rejects=1 aba_rejects=1 harts=4'
-C54_HEALTHY_PATTERN='WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 partial_total=1024 partial_first=257 partial_second=767 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1'
-C54_LINEARIZED_PATTERN='WASM_C54_NATIVE_LINEARIZED_GUARD PASS starts=1 claims=1 deferred_claims=1 backend_effects=1 cap_revokes=0 backend_cancels=0 runtime_cancel_acks=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0 raw_reclaims=0'
+C54_HEALTHY_PATTERN='WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 backend_first=257 backend_second=767 canonical_total=851 canonical_first=99 canonical_second=99 canonical_commits=9 sent_prefixes=8 sent_total=752 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1'
+C54_LINEARIZED_PATTERN='WASM_C54_NATIVE_LINEARIZED_GUARD PASS starts=1 claims=1 deferred_claims=1 backend_effects=1 output_sent=99 cap_revokes=0 backend_cancels=0 runtime_cancel_acks=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0 raw_reclaims=0'
 C54_RAW_INVOKING_PATTERN='WASM_C54_NATIVE_RAW_FAULT_GUARD PASS phase=backend-invoking starts=1 raw_faults=1 raw_reclaims=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0'
 C54_RAW_LINEARIZED_PATTERN='WASM_C54_NATIVE_RAW_FAULT_GUARD PASS phase=backend-linearized starts=1 raw_faults=1 raw_reclaims=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0'
 C54_FAILURE_PATTERN='WASM_C54_NATIVE_.*FAIL|WASM_C54_NATIVE_.* FAIL'
@@ -53,6 +53,34 @@ stop_qemu() {
     wait "$PEER_PID" 2>/dev/null || true
     PEER_PID=""
   fi
+}
+
+finish_destructive_peer() {
+  scenario=$1
+  [ -n "$PEER_PID" ] \
+    || fail "$scenario OpenSSH peer was not running after its exact guard marker"
+
+  # The structural-fault scenarios intentionally cannot finish their SSH
+  # channel. Stop the isolated guest only after its exact UART marker, then
+  # require the peer to observe EOF and validate that it received no stdout.
+  if [ -n "$KILLER_PID" ]; then
+    kill "$KILLER_PID" 2>/dev/null || true
+    wait "$KILLER_PID" 2>/dev/null || true
+    KILLER_PID=""
+  fi
+  if [ -n "$QEMU_PID" ]; then
+    kill "$QEMU_PID" 2>/dev/null || true
+    wait "$QEMU_PID" 2>/dev/null || true
+    QEMU_PID=""
+  fi
+
+  peer_status=0
+  wait "$PEER_PID" || peer_status=$?
+  PEER_PID=""
+  [ "$peer_status" -eq 0 ] \
+    || fail "$scenario OpenSSH peer rejected the destructive guard outcome"
+  grep -a -F -q 'PASS openssh-peer:' "$PEER_LOG" \
+    || fail "$scenario OpenSSH peer omitted its acceptance marker"
 }
 
 cleanup() {
@@ -336,6 +364,9 @@ for scenario in healthy linearized raw-invoking raw-linearized; do
     raw-linearized) marker=$C54_RAW_LINEARIZED_PATTERN ;;
   esac
   wait_for_pattern "$marker" "$scenario exact guard marker"
+  if [ "$scenario" != healthy ]; then
+    finish_destructive_peer "$scenario"
+  fi
   check_baseline "$scenario"
   marker_count=$(grep -a -F -c "$marker" "$QEMU_LOG" || true)
   [ "$marker_count" -eq 1 ] || fail "$scenario marker count changed after peer exit"
@@ -351,4 +382,4 @@ for scenario in healthy linearized raw-invoking raw-linearized; do
 done
 
 RESULT_REPORTED=1
-echo "PASS qemu-native-revoke-test: healthy exact Pending revoke/AlreadyConsumed/partial-spill/restart cleanup and isolated BackendLinearized/raw-fault no-reclaim guards passed; legacy C4.8/C5.2/C5.3 and OpenSSH auth/PTY/sync policy assertions remained live"
+echo "PASS qemu-native-revoke-test: healthy exact Pending revoke/AlreadyConsumed/canonical-slice spill/restart cleanup and isolated BackendLinearized/raw-fault no-reclaim guards passed; legacy C4.8/C5.2/C5.3 and OpenSSH auth/PTY/sync policy assertions remained live"

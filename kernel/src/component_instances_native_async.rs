@@ -12,10 +12,10 @@ use super::native_pending_shadow_model::ExactRevokeDecision;
 use super::native_pending_shadow_model::{
     BackendEffect, ExactBackendAction, ExactBackendPendingKind as PendingKind, ExactBackendReturn,
     ExactCancelCause, ExactCancelPlan, ExactCleanupDecision, ExactContinuation,
-    ExactContinuationCleanup, ExactHostFunction, ExactInstanceIdentity, ExactLedgerError,
-    ExactLedgerPhase, ExactLedgerSnapshot, ExactOperationLedger, ExactResidualCancelPlan,
-    ExactResourceRevokePlan, ExactResourceState, ExactRuntimeCleanup, ExactRuntimeToken,
-    ExactStreamResource, InputSpill, OutputStaging, DRIVER_CHUNK_BYTES,
+    ExactContinuationCleanup, ExactHostFunction, ExactInputSpillReceipt, ExactInstanceIdentity,
+    ExactLedgerError, ExactLedgerPhase, ExactLedgerSnapshot, ExactOperationLedger,
+    ExactResidualCancelPlan, ExactResourceRevokePlan, ExactResourceState, ExactRuntimeCleanup,
+    ExactRuntimeToken, ExactStreamResource, InputSpill, OutputStaging, DRIVER_CHUNK_BYTES,
 };
 use super::*;
 use crate::instance::{
@@ -46,8 +46,9 @@ use vibeos_component_image_adapter::project_native_async_command;
 use vibeos_component_image_adapter::NativeAsyncCommandProjection;
 use vibeos_component_runtime::decode::ComponentPlan;
 use vibeos_component_runtime::native_async_acceptance::{
-    Component as NativeComponent, Error as NativeError, HostRequest as NativeHostRequest,
-    HostToken as NativeHostToken, Invocation as NativeInvocation, Poll as NativePoll,
+    Component as NativeComponent, Error as NativeError, FinalizeError as NativeFinalizeError,
+    HostRequest as NativeHostRequest, HostToken as NativeHostToken, Invocation as NativeInvocation,
+    Poll as NativePoll,
 };
 #[cfg(feature = "ssh-native-async-command")]
 use vibeos_image_policy::C53_NATIVE_ASYNC_COMMAND;
@@ -991,6 +992,8 @@ type NativeLedgerSnapshot = ExactLedgerSnapshot<
     HostOperationToken,
     InstanceContinuationToken,
 >;
+type NativeInputSpillReceipt =
+    ExactInputSpillReceipt<InstanceToken, TaskId, AllocationDomain, RegistryStreamBindings>;
 type NativeCancelPlan = ExactCancelPlan<
     InstanceToken,
     TaskId,
@@ -1024,9 +1027,43 @@ type NativeResourceRevokePlan =
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
 const C54_TARGET_EVENT: u64 = 1;
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
-const C54_PARTIAL_FIRST: usize = 257;
+const C54_BACKEND_STDIN_FIRST_BYTES: usize = 257;
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
-const C54_PARTIAL_SECOND: usize = DRIVER_CHUNK_BYTES - C54_PARTIAL_FIRST;
+const C54_BACKEND_STDIN_SECOND_BYTES: usize = DRIVER_CHUNK_BYTES - C54_BACKEND_STDIN_FIRST_BYTES;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_CANONICAL_SLICE_BYTES: usize = 99;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_FIRST_BACKEND_TAIL_BYTES: usize =
+    C54_BACKEND_STDIN_FIRST_BYTES - 2 * C54_CANONICAL_SLICE_BYTES;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_REVOKE_CANONICAL_COMMITS: u8 = 9;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_REVOKE_CANONICAL_TOTAL_BYTES: usize = C54_BACKEND_STDIN_FIRST_BYTES
+    + (C54_REVOKE_CANONICAL_COMMITS as usize - 3) * C54_CANONICAL_SLICE_BYTES;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_REVOKE_INPUT_SPILL_BYTES: usize = C54_BACKEND_STDIN_SECOND_BYTES
+    - (C54_REVOKE_CANONICAL_COMMITS as usize - 3) * C54_CANONICAL_SLICE_BYTES;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_SENT_OUTPUT_PREFIXES: u8 = 8;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_SENT_OUTPUT_TOTAL_BYTES: usize = C54_BACKEND_STDIN_FIRST_BYTES
+    + (C54_SENT_OUTPUT_PREFIXES as usize - 3) * C54_CANONICAL_SLICE_BYTES;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const C54_LINEARIZED_OUTPUT_BYTES: usize = C54_CANONICAL_SLICE_BYTES;
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+const _: () = {
+    assert!(C54_BACKEND_STDIN_FIRST_BYTES == 257);
+    assert!(C54_BACKEND_STDIN_SECOND_BYTES == 767);
+    assert!(C54_CANONICAL_SLICE_BYTES == 99);
+    assert!(C54_REVOKE_INPUT_SPILL_BYTES == 173);
+    assert!(C54_FIRST_BACKEND_TAIL_BYTES == 59);
+    assert!(C54_REVOKE_CANONICAL_TOTAL_BYTES == 851);
+    assert!(C54_SENT_OUTPUT_TOTAL_BYTES == 752);
+    assert!(C54_REVOKE_CANONICAL_COMMITS == C54_SENT_OUTPUT_PREFIXES + 1);
+    assert!(
+        C54_REVOKE_CANONICAL_TOTAL_BYTES == C54_SENT_OUTPUT_TOTAL_BYTES + C54_CANONICAL_SLICE_BYTES
+    );
+};
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
 const C54_HEALTHY_MAGIC: &[u8] = b"VIBE-C54-HEALTHY\n";
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
@@ -1090,10 +1127,12 @@ struct C54TargetAudit {
     consumed_deltas: u64,
     runtime_cancel_acks: u64,
     cancel_idles: u64,
-    partial_total: u64,
-    partial_first: u64,
-    partial_second: u64,
-    partial_commits: u8,
+    canonical_total: u64,
+    canonical_first: u64,
+    canonical_second: u64,
+    canonical_commits: u8,
+    sent_output_total: u64,
+    sent_output_prefixes: u8,
     waiting_ops: u64,
     cancelled_terminals: u64,
     terminals: u64,
@@ -1136,10 +1175,12 @@ impl C54TargetAudit {
             consumed_deltas: 0,
             runtime_cancel_acks: 0,
             cancel_idles: 0,
-            partial_total: 0,
-            partial_first: 0,
-            partial_second: 0,
-            partial_commits: 0,
+            canonical_total: 0,
+            canonical_first: 0,
+            canonical_second: 0,
+            canonical_commits: 0,
+            sent_output_total: 0,
+            sent_output_prefixes: 0,
             waiting_ops: 0,
             cancelled_terminals: 0,
             terminals: 0,
@@ -1331,7 +1372,8 @@ pub(super) fn target_stdout_drain_permitted(policy: SshExecComponentSessionPolic
     }
     let audit = C54_TARGET.lock();
     // Close from admission so the permit check and the later stdout consume
-    // cannot straddle a target transition. The ninth output operation opens
+    // cannot straddle a target transition. Eight canonical output prefixes
+    // fill the backend queue with 752 bytes; the ninth 99-byte operation opens
     // the gate monotonically after registering its real stream wake.
     !audit.failed && audit.drain_open
 }
@@ -1349,8 +1391,8 @@ pub(super) fn target_stdin_chunk_limit(
         return Err("native revoke stdin audit failed");
     }
     match accepted_bytes {
-        0 => Ok(C54_PARTIAL_FIRST),
-        C54_PARTIAL_FIRST => Ok(C54_PARTIAL_SECOND),
+        0 => Ok(C54_BACKEND_STDIN_FIRST_BYTES),
+        C54_BACKEND_STDIN_FIRST_BYTES => Ok(C54_BACKEND_STDIN_SECOND_BYTES),
         _ => Ok(DRIVER_CHUNK_BYTES),
     }
 }
@@ -1380,7 +1422,7 @@ fn c54_select_scenario(identity: DriverIdentity, input: &[u8]) -> bool {
     let mut audit = C54_TARGET.lock();
     if !audit.is_primary(identity)
         || audit.scenario != C54Scenario::Undecided
-        || audit.partial_commits != 0
+        || audit.canonical_commits != 0
         || audit.failed
     {
         return false;
@@ -1398,22 +1440,59 @@ fn c54_record_input_progress(identity: DriverIdentity, progress: usize) -> bool 
     if !audit.is_primary(identity) || audit.failed || audit.scenario == C54Scenario::Undecided {
         return false;
     }
-    match audit.partial_commits {
-        0 if progress == C54_PARTIAL_FIRST => {
-            audit.partial_first = progress as u64;
-            audit.partial_total = progress as u64;
-            audit.partial_commits = 1;
-            true
-        }
-        1 if progress == C54_PARTIAL_SECOND => {
-            audit.partial_second = progress as u64;
-            audit.partial_total = audit.partial_total.saturating_add(progress as u64);
-            audit.partial_commits = 2;
-            true
-        }
-        2.. => true,
-        _ => false,
+    let expected = match audit.canonical_commits {
+        0 | 1 => C54_CANONICAL_SLICE_BYTES,
+        2 => C54_FIRST_BACKEND_TAIL_BYTES,
+        3.. if audit.canonical_commits < C54_REVOKE_CANONICAL_COMMITS => C54_CANONICAL_SLICE_BYTES,
+        _ => return false,
+    };
+    if progress != expected {
+        return false;
     }
+    match audit.canonical_commits {
+        0 => audit.canonical_first = progress as u64,
+        1 => audit.canonical_second = progress as u64,
+        _ => {}
+    }
+    let Some(total) = audit.canonical_total.checked_add(progress as u64) else {
+        return false;
+    };
+    let Some(commits) = audit.canonical_commits.checked_add(1) else {
+        return false;
+    };
+    audit.canonical_total = total;
+    audit.canonical_commits = commits;
+    true
+}
+
+#[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+fn c54_record_sent_output_prefix(identity: DriverIdentity, progress: usize) -> bool {
+    let mut audit = C54_TARGET.lock();
+    if audit.is_replacement(identity) && !audit.failed {
+        return true;
+    }
+    if !audit.is_primary(identity)
+        || audit.scenario != C54Scenario::Healthy
+        || audit.failed
+        || audit.sent_output_prefixes >= C54_SENT_OUTPUT_PREFIXES
+        || audit.canonical_commits != audit.sent_output_prefixes.saturating_add(1)
+    {
+        return false;
+    }
+    let expected = if audit.sent_output_prefixes == 2 {
+        C54_FIRST_BACKEND_TAIL_BYTES
+    } else {
+        C54_CANONICAL_SLICE_BYTES
+    };
+    if progress != expected {
+        return false;
+    }
+    let Some(total) = audit.sent_output_total.checked_add(progress as u64) else {
+        return false;
+    };
+    audit.sent_output_total = total;
+    audit.sent_output_prefixes += 1;
+    true
 }
 
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
@@ -1484,9 +1563,16 @@ pub(super) fn target_preserve_cancelled_after_stdout_revoke(
         Ok((
             ledger.resource_state(exact, ExactStreamResource::StdinReader)?,
             ledger.resource_state(exact, ExactStreamResource::StdoutWriter)?,
+            ledger.input_spill_remaining(exact)?,
         ))
     });
-    if resources != Ok((ExactResourceState::Live, ExactResourceState::Revoked)) {
+    if resources
+        != Ok((
+            ExactResourceState::Live,
+            ExactResourceState::Revoked,
+            Some(C54_REVOKE_INPUT_SPILL_BYTES as u16),
+        ))
+    {
         return false;
     }
     let audit = C54_TARGET.lock();
@@ -1506,6 +1592,12 @@ pub(super) fn target_preserve_cancelled_after_stdout_revoke(
         && audit.consumed_deltas == 1
         && audit.runtime_cancel_acks == 1
         && audit.cancel_idles == 1
+        && audit.canonical_total == C54_REVOKE_CANONICAL_TOTAL_BYTES as u64
+        && audit.canonical_first == C54_CANONICAL_SLICE_BYTES as u64
+        && audit.canonical_second == C54_CANONICAL_SLICE_BYTES as u64
+        && audit.canonical_commits == C54_REVOKE_CANONICAL_COMMITS
+        && audit.sent_output_total == C54_SENT_OUTPUT_TOTAL_BYTES as u64
+        && audit.sent_output_prefixes == C54_SENT_OUTPUT_PREFIXES
         && audit.waiting_ops == 1
         && audit.cancelled_terminals == 0
         && audit.terminals == 0
@@ -1802,10 +1894,12 @@ pub(super) fn target_revoke_ssh_completed(
         && audit.consumed_deltas == 1
         && audit.runtime_cancel_acks == 1
         && audit.cancel_idles == 1
-        && audit.partial_total == DRIVER_CHUNK_BYTES as u64
-        && audit.partial_first == C54_PARTIAL_FIRST as u64
-        && audit.partial_second == C54_PARTIAL_SECOND as u64
-        && audit.partial_commits == 2
+        && audit.canonical_total == C54_REVOKE_CANONICAL_TOTAL_BYTES as u64
+        && audit.canonical_first == C54_CANONICAL_SLICE_BYTES as u64
+        && audit.canonical_second == C54_CANONICAL_SLICE_BYTES as u64
+        && audit.canonical_commits == C54_REVOKE_CANONICAL_COMMITS
+        && audit.sent_output_total == C54_SENT_OUTPUT_TOTAL_BYTES as u64
+        && audit.sent_output_prefixes == C54_SENT_OUTPUT_PREFIXES
         && audit.waiting_ops == 1
         && audit.cancelled_terminals == 1
         && audit.late_wake_stale == 1
@@ -1845,7 +1939,7 @@ pub(super) fn target_revoke_ssh_completed(
                 && audit.restart_stale_backend == 1;
             if passed {
                 audit.ssh_completions = 2;
-                crate::println!("WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 partial_total=1024 partial_first=257 partial_second=767 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1");
+                crate::println!("WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 backend_first=257 backend_second=767 canonical_total=851 canonical_first=99 canonical_second=99 canonical_commits=9 sent_prefixes=8 sent_total=752 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1");
             }
             passed
         }
@@ -2406,7 +2500,10 @@ pub(super) fn payload_drop(
 }
 
 fn terminal_shadow_empty(identity: DriverIdentity) -> bool {
-    ledger_snapshot(identity).is_ok_and(|snapshot| snapshot.is_none())
+    let Some(exact) = identity.exact() else {
+        return false;
+    };
+    with_ledger(identity, |ledger| ledger.terminal_empty(exact)).is_ok_and(|empty| empty)
 }
 
 pub(super) fn retire_terminal_shadow(
@@ -2793,6 +2890,63 @@ fn poll_terminal(poll: NativePoll) -> Option<ComponentTerminal> {
     }
 }
 
+/// Normalizes the runtime's fail-stop handoff at one exact owner-visible
+/// boundary. Authority is already fenced when `CleanupPending` is returned;
+/// only the bounded reclamation charge may run after this quantum. No caller
+/// may inspect or commit a runtime result until it has crossed this gate.
+async fn drain_runtime_cleanup(
+    invocation: &mut NativeInvocation<'_>,
+    identity: DriverIdentity,
+    poll: NativePoll,
+) -> Result<NativePoll, ComponentTerminal> {
+    let NativePoll::CleanupPending { trap, .. } = poll else {
+        return Ok(poll);
+    };
+    quantum(identity.instance)
+        .await
+        .map_err(|_| unexpected_native_driver_error(identity, "cleanup quantum"))?;
+    match invocation.poll() {
+        NativePoll::Trapped(observed) if observed == trap => Ok(NativePoll::Trapped(observed)),
+        other => Err(unexpected_native_driver_error(
+            identity,
+            ("invalid cleanup terminal", trap, other),
+        )),
+    }
+}
+
+/// Finalization is itself one charged runtime turn. If that turn detects a
+/// sealed invariant, normalize its distinct handoff through the same exact
+/// quantum-delayed cleanup gate before reporting the runner fault.
+async fn finalize_runtime_transport(
+    invocation: &mut NativeInvocation<'_>,
+    identity: DriverIdentity,
+) -> Result<(), ComponentTerminal> {
+    match invocation.finalize_transport() {
+        Ok(()) => Ok(()),
+        Err(NativeFinalizeError::CleanupPending { trap, metrics }) => {
+            match drain_runtime_cleanup(
+                invocation,
+                identity,
+                NativePoll::CleanupPending { trap, metrics },
+            )
+            .await?
+            {
+                NativePoll::Trapped(observed) if observed == trap => Err(
+                    unexpected_native_driver_error(identity, "transport finalization invariant"),
+                ),
+                other => Err(unexpected_native_driver_error(
+                    identity,
+                    ("invalid finalized cleanup terminal", trap, other),
+                )),
+            }
+        }
+        Err(error) => Err(unexpected_native_driver_error(
+            identity,
+            ("transport finalization rejected", error),
+        )),
+    }
+}
+
 async fn quantum(instance: InstanceToken) -> Result<(), ()> {
     let operation = registry()
         .arm_continuation_current(instance, InstanceContinuationKind::Quantum)
@@ -3061,7 +3215,7 @@ fn c54_record_linearized_guard(identity: DriverIdentity) {
             && ledger.is_quarantined()
             && ledger.quarantined_effect()
                 == Some(BackendEffect::OutputSent {
-                    length: C54_PARTIAL_FIRST as u16,
+                    length: C54_LINEARIZED_OUTPUT_BYTES as u16,
                 })
             && identity.exact().is_some_and(|exact| {
                 ledger.quarantined_resource_state(exact, ExactStreamResource::StdoutWriter)
@@ -3092,7 +3246,7 @@ fn c54_record_linearized_guard(identity: DriverIdentity) {
             && audit.raw_reclaims == 0
     };
     if passed {
-        crate::println!("WASM_C54_NATIVE_LINEARIZED_GUARD PASS starts=1 claims=1 deferred_claims=1 backend_effects=1 cap_revokes=0 backend_cancels=0 runtime_cancel_acks=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0 raw_reclaims=0");
+        crate::println!("WASM_C54_NATIVE_LINEARIZED_GUARD PASS starts=1 claims=1 deferred_claims=1 backend_effects=1 output_sent=99 cap_revokes=0 backend_cancels=0 runtime_cancel_acks=0 terminals=0 cspace_resets=0 reaper_notifies=0 acks=0 raw_reclaims=0");
     } else {
         c54_fail("linearized-guard-evidence");
     }
@@ -3120,7 +3274,12 @@ fn c54_open_stdout_drain(
         if audit.waiting_ops != 0
             || audit.drain_open
             || registered.pending_kind() != Some(PendingKind::WriteWaiting)
-            || audit.partial_total != DRIVER_CHUNK_BYTES as u64
+            || audit.canonical_total != C54_REVOKE_CANONICAL_TOTAL_BYTES as u64
+            || audit.canonical_first != C54_CANONICAL_SLICE_BYTES as u64
+            || audit.canonical_second != C54_CANONICAL_SLICE_BYTES as u64
+            || audit.canonical_commits != C54_REVOKE_CANONICAL_COMMITS
+            || audit.sent_output_total != C54_SENT_OUTPUT_TOTAL_BYTES as u64
+            || audit.sent_output_prefixes != C54_SENT_OUTPUT_PREFIXES
             || audit.failed
         {
             return Err(unexpected_native_driver_error(
@@ -3627,26 +3786,38 @@ async fn drive_input_stream(
     offered: NativeHostToken,
     maximum: u32,
     spill: &mut InputSpill,
+    spill_receipt: &mut Option<NativeInputSpillReceipt>,
 ) -> Result<NativePoll, ComponentTerminal> {
     let maximum = usize::try_from(maximum)
         .unwrap_or(usize::MAX)
         .min(DRIVER_CHUNK_BYTES);
+    if spill.is_empty() != spill_receipt.is_none() {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "input spill receipt divergence",
+        ));
+    }
     if !spill.is_empty() {
         let progress = spill.remaining_prefix(maximum).len();
-        let previous = ledger_snapshot(identity)
-            .map_err(|error| ledger_error_terminal(identity, error))?
-            .ok_or_else(|| {
-                unexpected_native_driver_error(identity, "spill missing linearized receipt")
-            })?;
+        let receipt = spill_receipt.take().ok_or_else(|| {
+            unexpected_native_driver_error(identity, "spill missing linear receipt")
+        })?;
+        if usize::from(receipt.remaining()) != spill.remaining_prefix(DRIVER_CHUNK_BYTES).len() {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "spill receipt extent mismatch",
+            ));
+        }
         let offered_snapshot = model_result(
             identity,
             with_ledger(identity, |ledger| {
-                ledger.attach_input_runtime(previous, offered, maximum)
+                ledger.attach_input_runtime(receipt, offered, maximum)
             }),
         )?;
         let prepared = invocation
             .prepare_host_input_stream(offered, progress as u32)
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        let prepared = drain_runtime_cleanup(invocation, identity, prepared).await?;
         let prepared = prepared_host_token(identity, prepared, is_input_stream)?;
         let prepared_snapshot = model_result(
             identity,
@@ -3657,11 +3828,12 @@ async fn drive_input_stream(
         let committed = invocation
             .commit_host_input_stream(prepared, spill.remaining_prefix(progress))
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        let committed = drain_runtime_cleanup(invocation, identity, committed).await?;
         if let Some(terminal) = poll_terminal(committed) {
             quarantine_shadow(identity);
             return Err(terminal);
         }
-        model_result(
+        let next_receipt = model_result(
             identity,
             with_ledger(identity, |ledger| {
                 ledger.commit_input_prefix(
@@ -3681,7 +3853,7 @@ async fn drive_input_stream(
         if !c54_record_input_progress(identity, progress) {
             return Err(unexpected_native_driver_error(
                 identity,
-                "C5.4 partial spill ledger mismatch",
+                "C5.4 canonical spill ledger mismatch",
             ));
         }
         if !spill.consume(progress) {
@@ -3690,6 +3862,13 @@ async fn drive_input_stream(
                 "spill cursor mismatch",
             ));
         }
+        if spill.is_empty() != next_receipt.is_none() {
+            return Err(unexpected_native_driver_error(
+                identity,
+                "input spill successor divergence",
+            ));
+        }
+        *spill_receipt = next_receipt;
         return Ok(committed);
     }
 
@@ -3707,6 +3886,7 @@ async fn drive_input_stream(
         let prepared = invocation
             .prepare_host_input_stream(offered, 0)
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        let prepared = drain_runtime_cleanup(invocation, identity, prepared).await?;
         let prepared = prepared_host_token(identity, prepared, is_input_stream)?;
         let prepared_snapshot = model_result(
             identity,
@@ -3715,6 +3895,11 @@ async fn drive_input_stream(
         let committed = invocation
             .commit_host_input_stream(prepared, &[])
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        let committed = drain_runtime_cleanup(invocation, identity, committed).await?;
+        if let Some(terminal) = poll_terminal(committed) {
+            quarantine_shadow(identity);
+            return Err(terminal);
+        }
         model_result(
             identity,
             with_ledger(identity, |ledger| {
@@ -3736,6 +3921,11 @@ async fn drive_input_stream(
             let dropped = invocation
                 .drop_host_copy_peer(offered)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let dropped = drain_runtime_cleanup(invocation, identity, dropped).await?;
+            if let Some(terminal) = poll_terminal(dropped) {
+                quarantine_shadow(identity);
+                return Err(terminal);
+            }
             model_result(
                 identity,
                 with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
@@ -3746,6 +3936,11 @@ async fn drive_input_stream(
             let dropped = invocation
                 .drop_host_copy_peer(offered)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let dropped = drain_runtime_cleanup(invocation, identity, dropped).await?;
+            if let Some(terminal) = poll_terminal(dropped) {
+                quarantine_shadow(identity);
+                return Err(terminal);
+            }
             finish_live_revoke(identity, cancelled)?;
             return Ok(dropped);
         }
@@ -3760,6 +3955,7 @@ async fn drive_input_stream(
     let runtime_prepared = invocation
         .prepare_host_input_stream(offered, progress as u32)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let runtime_prepared = drain_runtime_cleanup(invocation, identity, runtime_prepared).await?;
     let runtime_prepared = prepared_host_token(identity, runtime_prepared, is_input_stream)?;
     let backend_pending = model_result(
         identity,
@@ -3808,11 +4004,13 @@ async fn drive_input_stream(
             let runtime_committed = invocation
                 .commit_host_input_stream(runtime_prepared, spill.remaining_prefix(progress))
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let runtime_committed =
+                drain_runtime_cleanup(invocation, identity, runtime_committed).await?;
             if let Some(terminal) = poll_terminal(runtime_committed) {
                 quarantine_shadow(identity);
                 return Err(terminal);
             }
-            model_result(
+            let next_receipt = model_result(
                 identity,
                 with_ledger(identity, |ledger| {
                     ledger.commit_input_prefix(
@@ -3841,6 +4039,13 @@ async fn drive_input_stream(
                     "spill commit mismatch",
                 ));
             }
+            if spill.is_empty() != next_receipt.is_none() {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "initial input spill receipt divergence",
+                ));
+            }
+            *spill_receipt = next_receipt;
             return Ok(runtime_committed);
         }
         StreamReceiveCommit::Received(_) => {
@@ -3872,6 +4077,11 @@ async fn drive_input_stream(
             let dropped = invocation
                 .drop_host_copy_peer(runtime_prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let dropped = drain_runtime_cleanup(invocation, identity, dropped).await?;
+            if let Some(terminal) = poll_terminal(dropped) {
+                quarantine_shadow(identity);
+                return Err(terminal);
+            }
             if model_result(
                 identity,
                 with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
@@ -3891,8 +4101,9 @@ async fn drive_input_closed(
     identity: DriverIdentity,
     offered: NativeHostToken,
     spill: &InputSpill,
+    spill_receipt: &Option<NativeInputSpillReceipt>,
 ) -> Result<NativePoll, ComponentTerminal> {
-    if !spill.is_empty() || promote_input_normal(identity).is_err() {
+    if !spill.is_empty() || spill_receipt.is_some() || promote_input_normal(identity).is_err() {
         return Err(unexpected_native_driver_error(
             identity,
             "input close before drain",
@@ -3946,6 +4157,7 @@ async fn drive_input_closed(
     let runtime_prepared = invocation
         .prepare_host_input_closed(offered)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let runtime_prepared = drain_runtime_cleanup(invocation, identity, runtime_prepared).await?;
     let runtime_prepared = prepared_host_token(identity, runtime_prepared, is_input_closed)?;
     ledger_state = model_result(
         identity,
@@ -3957,6 +4169,7 @@ async fn drive_input_closed(
                 let committed = invocation
                     .commit_host_input_closed(runtime_prepared, stream_reason_value(reason))
                     .map_err(|error| unexpected_native_driver_error(identity, error))?;
+                let committed = drain_runtime_cleanup(invocation, identity, committed).await?;
                 if let Some(terminal) = poll_terminal(committed) {
                     quarantine_shadow(identity);
                     return Err(terminal);
@@ -4053,6 +4266,7 @@ async fn drive_output_stream(
     let prepared = invocation
         .prepare_host_output_stream(offered, output)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let prepared = drain_runtime_cleanup(invocation, identity, prepared).await?;
     let prepared = prepared_host_token(identity, prepared, is_output_stream)?;
     let prepared_snapshot = model_result(
         identity,
@@ -4062,6 +4276,11 @@ async fn drive_output_stream(
         let committed = invocation
             .commit_host_output(prepared)
             .map_err(|error| unexpected_native_driver_error(identity, error))?;
+        let committed = drain_runtime_cleanup(invocation, identity, committed).await?;
+        if let Some(terminal) = poll_terminal(committed) {
+            quarantine_shadow(identity);
+            return Err(terminal);
+        }
         model_result(
             identity,
             with_ledger(identity, |ledger| {
@@ -4073,18 +4292,22 @@ async fn drive_output_stream(
     }
     match send_output(identity, prepared_snapshot, staging.prepared()).await? {
         OutputDispatch::Sent(linearized) => {
-            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            #[cfg(any(
+                feature = "ssh-native-async-qemu-acceptance",
+                feature = "ssh-native-async-revoke-qemu-acceptance"
+            ))]
             let output_bytes = staging.prepared().len();
             let committed = invocation
                 .commit_host_output(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
-            staging.clear();
+            let committed = drain_runtime_cleanup(invocation, identity, committed).await?;
             if let Some(terminal) = poll_terminal(committed) {
                 // Sent is the transport linearization point. A rejected
                 // runtime commit after it is a global lifecycle divergence.
                 quarantine_shadow(identity);
                 return Err(terminal);
             }
+            staging.clear();
             model_result(
                 identity,
                 with_ledger(identity, |ledger| ledger.commit_runtime(linearized)),
@@ -4096,13 +4319,25 @@ async fn drive_output_stream(
                     "target output byte ledger mismatch",
                 ));
             }
+            #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+            if !c54_record_sent_output_prefix(identity, output_bytes) {
+                return Err(unexpected_native_driver_error(
+                    identity,
+                    "C5.4 sent output prefix mismatch",
+                ));
+            }
             Ok(committed)
         }
         OutputDispatch::Closed(_reason, linearized) => {
-            staging.clear();
             let dropped = invocation
                 .drop_host_copy_peer(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let dropped = drain_runtime_cleanup(invocation, identity, dropped).await?;
+            if let Some(terminal) = poll_terminal(dropped) {
+                quarantine_shadow(identity);
+                return Err(terminal);
+            }
+            staging.clear();
             model_result(
                 identity,
                 with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
@@ -4112,10 +4347,15 @@ async fn drive_output_stream(
         OutputDispatch::Revoked(cancelled) => {
             #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
             let target_cancelled = c54_is_healthy_primary(identity);
-            staging.clear();
             let dropped = invocation
                 .drop_host_copy_peer(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let dropped = drain_runtime_cleanup(invocation, identity, dropped).await?;
+            if let Some(terminal) = poll_terminal(dropped) {
+                quarantine_shadow(identity);
+                return Err(terminal);
+            }
+            staging.clear();
             finish_live_revoke(identity, cancelled)?;
             #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
             if target_cancelled {
@@ -4155,6 +4395,7 @@ async fn drive_output_closed(
     let prepared_poll = invocation
         .prepare_host_output_closed(offered)
         .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let prepared_poll = drain_runtime_cleanup(invocation, identity, prepared_poll).await?;
     let (prepared, value) = match prepared_poll {
         NativePoll::HostPending {
             token,
@@ -4208,6 +4449,7 @@ async fn drive_output_closed(
             let committed = invocation
                 .commit_host_output(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let committed = drain_runtime_cleanup(invocation, identity, committed).await?;
             if let Some(terminal) = poll_terminal(committed) {
                 quarantine_shadow(identity);
                 Err(terminal)
@@ -4234,6 +4476,11 @@ async fn drive_output_closed(
             let dropped = invocation
                 .drop_host_copy_peer(prepared)
                 .map_err(|error| unexpected_native_driver_error(identity, error))?;
+            let dropped = drain_runtime_cleanup(invocation, identity, dropped).await?;
+            if let Some(terminal) = poll_terminal(dropped) {
+                quarantine_shadow(identity);
+                return Err(terminal);
+            }
             model_result(
                 identity,
                 with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
@@ -4290,10 +4537,15 @@ async fn run_driver(
             Err(error) => return terminal_word(native_error_terminal(error)),
         };
     let mut spill = InputSpill::new();
+    let mut spill_receipt = None;
     let mut staging = OutputStaging::new();
     let mut next = None;
     loop {
         let poll = next.take().unwrap_or_else(|| invocation.poll());
+        let poll = match drain_runtime_cleanup(&mut invocation, identity, poll).await {
+            Ok(poll) => poll,
+            Err(terminal) => return terminal_word(terminal),
+        };
         let result = match poll {
             NativePoll::Pending(_) | NativePoll::Resolved(_) | NativePoll::Yielded(_) => {
                 if quantum(token).await.is_err() {
@@ -4310,21 +4562,32 @@ async fn run_driver(
                 if quantum(token).await.is_err() {
                     Err(unexpected_native_driver_error(identity, "wait quantum"))
                 } else {
-                    invocation
-                        .resume_wait(wait)
-                        .map_err(|error| unexpected_native_driver_error(identity, error))
+                    match invocation.resume_wait(wait) {
+                        Ok(poll) => drain_runtime_cleanup(&mut invocation, identity, poll).await,
+                        Err(error) => Err(unexpected_native_driver_error(identity, error)),
+                    }
                 }
             }
             NativePoll::HostPending {
                 token: host,
                 request: NativeHostRequest::InputStream { maximum },
                 ..
-            } => drive_input_stream(&mut invocation, identity, host, maximum, &mut spill).await,
+            } => {
+                drive_input_stream(
+                    &mut invocation,
+                    identity,
+                    host,
+                    maximum,
+                    &mut spill,
+                    &mut spill_receipt,
+                )
+                .await
+            }
             NativePoll::HostPending {
                 token: host,
                 request: NativeHostRequest::InputClosed,
                 ..
-            } => drive_input_closed(&mut invocation, identity, host, &spill).await,
+            } => drive_input_closed(&mut invocation, identity, host, &spill, &spill_receipt).await,
             NativePoll::HostPending {
                 token: host,
                 request: NativeHostRequest::OutputStream { maximum },
@@ -4341,15 +4604,22 @@ async fn run_driver(
                 // it cross an in-flight frozen output buffer. Either state is
                 // a transport/runtime lifecycle divergence, not Success.
                 if !spill.is_empty()
+                    || spill_receipt.is_some()
                     || !staging.is_empty()
                     || !terminal_shadow_empty(identity)
-                    || invocation.finalize_transport().is_err()
                 {
                     quarantine_shadow(identity);
                     return terminal_word(ComponentTerminal::RunnerFault);
                 }
-                return terminal_word(ComponentTerminal::Success);
+                match finalize_runtime_transport(&mut invocation, identity).await {
+                    Ok(()) => return terminal_word(ComponentTerminal::Success),
+                    Err(terminal) => return terminal_word(terminal),
+                }
             }
+            NativePoll::CleanupPending { .. } => Err(unexpected_native_driver_error(
+                identity,
+                "undrained runtime cleanup",
+            )),
             NativePoll::Trapped(trap) => Err(trap_terminal(trap)),
         };
         match result {

@@ -78,6 +78,18 @@ compile_error!(
     "the direct native-async acceptance image and formal managed command are distinct roots"
 );
 #[cfg(all(
+    feature = "wasm-c63-graph-principal-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c63-graph-principal-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "component-graph-principals",
+    feature = "ssh-component-command"
+))]
+compile_error!(
+    "features `component-graph-principals` and `ssh-component-command` are fail-closed lifecycle-isolation alternatives"
+);
+#[cfg(all(
     feature = "ssh-native-async-qemu-acceptance",
     not(all(
         feature = "qemu-virt",
@@ -175,6 +187,8 @@ mod bench_platform;
 mod board_led;
 mod cap_table_pool;
 mod code_pool;
+#[cfg(feature = "component-graph-principals")]
+pub mod component_graph_principals;
 mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
@@ -460,6 +474,11 @@ pub extern "C" fn kmain() -> ! {
     exec::set_fault_guard(trampoline::guard_task);
     exec::set_fault_cleanup(cleanup_faulted_task);
     exec::set_fault_reclaimer(reclaim_faulted_component);
+    #[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+    assert!(
+        component_graph_principals::run_host_model_selftest(),
+        "C6.3 graph principal host model failed"
+    );
 
     let online = start_secondary_harts();
     println!("  smp       {} hart(s) online", online);
@@ -643,6 +662,15 @@ pub extern "C" fn kmain() -> ! {
     exec::spawn("wasm-c53-native-async-acceptance", async {
         if !component_instances::run_native_async_qemu_acceptance().await {
             crate::println!("WASM_C53_NATIVE_ASYNC_FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+    exec::spawn("wasm-c63-graph-principal-acceptance", async {
+        if component_graph_principals::run_qemu_acceptance().await {
+            crate::println!("WASM_C63_GRAPH_PRINCIPAL PASS nodes=2 runtime_unavailable=2 fuel_consumed=0 peak_slots=0 live_slots=0 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C63_GRAPH_PRINCIPAL FAIL");
             sbi::shutdown(true);
         }
     });

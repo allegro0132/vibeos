@@ -15,6 +15,9 @@ storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 iperf3-server = ["vibeos-kernel/iperf3-server"]
+wasm-c63-graph-principal-acceptance = [
+    "vibeos-kernel/wasm-c63-graph-principal-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

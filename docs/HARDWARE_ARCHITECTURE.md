@@ -35,7 +35,7 @@ feature:
 | Firmware crate | Kernel composition features | BSP and hardware drivers |
 |---|---|---|
 | `firmware/qemu-virt` | `qemu-virt`, `qemu-default-image` | `boards/qemu-virt`, PCI, VirtIO MMIO, VirtIO block/network/RNG, XHCI |
-| `firmware/milkv-duo` | `milkv-duo`, `milkv-duo-sd-image` | `boards/milkv-duo`, DWMAC network, SDHCI block |
+| `firmware/milkv-duo` | `milkv-duo`, `milkv-duo-sd-image` | `boards/milkv-duo`, DWMAC + DWC2/CDC-ECM network, SDHCI block |
 
 Firmware image features such as `legacy-shell`, `tcp-echo`, `ssh-test`, and
 `net-shell` are exposed by the firmware crates and forwarded to the kernel.
@@ -54,8 +54,9 @@ does not combine both board features into one kernel archive.
 | `drivers/virtio-net` | RX/TX split queues, fixed DMA slab, feature handshake, completion validation and reset boundary | Packet sessions, network identity, IRQ routing, scheduling and supervisor policy |
 | `drivers/virtio-rng` | Synchronous entropy queue, fixed DMA slab and completion validation | Random capability policy, deadlines, scheduling, interrupts and restart policy |
 | `drivers/xhci` | XHCI and USB protocol state using caller-provided permanent DMA storage | PCI discovery, bus mastering, PLIC routing, synchronization and input/storage publication |
-| `drivers/dwc2-host` | CV1800B USB clocks/role wiring, DWC2 reset/root-port power, buffer-DMA host channels, hub split transactions, EP0 enumeration, and HID boot/report keyboard interrupt-IN decoding | PLIC routing, storage classes and HID capability publication; the kernel adapter owns polling and hotplug recovery policy |
-| `drivers/dwmac-net` | CV1800B DWMAC registers, clock/ePHY/MDIO setup, cache maintenance and fixed RX/TX DMA storage | Network capabilities and sessions, MAC policy, supervision and interrupt policy |
+| `drivers/dwc2-host` | CV1800B USB clocks/role wiring, DWC2 reset/root-port power, buffer-DMA host channels using caller-supplied instance storage, hub split transactions, EP0 enumeration, USB class transactions, and CDC-ECM carrier notification decoding | PLIC routing and class capability publication; the kernel adapter owns polling, carrier publication, and hotplug recovery policy |
+| `drivers/rtl815x` | Realtek USB product/personality classification, the bounded RTL8151 virtual-CD mode-switch protocol, and authoritative PLA PHY carrier decoding | DWC2 topology/endpoints/DMA, vendor control transport, CDC-ECM traffic and network policy |
+| `drivers/dwmac-net` | CV1800B DWMAC registers, clock/ePHY/MDIO setup, cache maintenance, and caller-supplied instance-owned RX/TX DMA plus telemetry state | Network capabilities and sessions, MAC policy, supervision and interrupt policy |
 | `drivers/milkv-duo-led` | CV1800B pad mux, GPIO output sequencing and status readback for the board LED | Boot-status policy and diagnostic reporting |
 | `drivers/sdhci-blk` | CV1800B clock/pad/power setup, SD discovery and 512-byte PIO sector I/O | Block capabilities, locking, supervision and logical partition mapping |
 
@@ -69,3 +70,21 @@ obligations that the embedding kernel adapter must uphold.
 This separation does not create a privilege boundary: all layers currently
 share one address space. It makes ownership and review boundaries explicit and
 allows driver protocol tests to run on the host without selecting a board.
+
+The Milk-V DWMAC and DWC2 engines are polling drivers today: their BSP IRQ
+numbers live in each `Engine`/`Controller` description, but no shared IRQ wait
+queue or interrupt-cause state is active. Each adapter supplies two distinct
+objects: device-visible bytes in the linker `NOLOAD` `.dma` section, and
+CPU-only claim/telemetry state in normally initialized `.bss`. The latter must
+never be embedded in `.dma`, whose boot contents are unspecified. If a future
+policy enables IRQ delivery, its wait queue, pending causes and counters must be
+added to the CPU-only per-instance state rather than reintroduced as crate
+globals.
+
+Network interface ordinals are also policy results rather than driver names.
+The boot world collects every admitted NIC capability bundle, sorts stable
+locations (MMIO base or USB controller plus physical port path), and only then
+assigns the boot-local `netN` sequence. The netstack allocates state for that
+runtime list; it has no fixed interface-count table. A service listener stays
+attached to the policy root that minted it, even if another topology changes
+that root's ordinal on a later boot.

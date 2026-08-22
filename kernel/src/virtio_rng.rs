@@ -28,7 +28,7 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, SPLIT_QUEUE_SIZE};
+use crate::virtio::{self, ENTROPY_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
 use vibeos_driver_virtio_rng::{Engine, Submission};
@@ -222,7 +222,7 @@ impl RandomSource {
             online: control.online,
             quarantined: control.quarantined,
             max_request_bytes: MAX_RANDOM_BYTES as u16,
-            queue_size: SPLIT_QUEUE_SIZE,
+            queue_size: ENTROPY_QUEUE_SIZE,
             session_epoch: control.epoch,
             irq: control.transport.map_or(0, MmioTransport::irq),
             used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),

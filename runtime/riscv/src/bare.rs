@@ -15,6 +15,12 @@ const SBI_EXT_IPI_SEND: usize = 0;
 const SBI_EXT_HSM: usize = 0x48534D;
 const SBI_EXT_HSM_HART_START: usize = 0;
 const SBI_EXT_HSM_HART_STATUS: usize = 2;
+const SBI_EXT_SRST: usize = 0x5352_5354;
+const SBI_EXT_SRST_SYSTEM_RESET: usize = 0;
+const SBI_SRST_RESET_TYPE_SHUTDOWN: usize = 0;
+const SBI_SRST_RESET_TYPE_COLD_REBOOT: usize = 1;
+const SBI_SRST_RESET_REASON_NONE: usize = 0;
+const SBI_SRST_RESET_REASON_SYSTEM_FAILURE: usize = 1;
 pub const RFENCE_EXTENSION_ID: usize = 0x52464E43;
 const SBI_EXT_RFENCE_REMOTE_FENCE_I: usize = 0;
 const SBI_EXT_RFENCE_REMOTE_SFENCE_VMA: usize = 1;
@@ -276,9 +282,53 @@ pub fn legacy_putchar(c: u8) {
     ecall(0x01, 0, c as usize, 0, 0, 0);
 }
 
-/// SBI System Reset.
+/// Issue an SBI System Reset request and return the SBI error code *without*
+/// looping.
+///
+/// On conformant firmware (e.g. QEMU's OpenSBI) a supported reset never
+/// returns. But some vendor firmware accepts the call and then fails to reset:
+/// the CV1800B's OpenSBI registers a T-Head reset device whose
+/// `system_reset_check` returns "supported" for every type while its
+/// `system_reset` merely executes `ebreak`, so the ecall returns here having
+/// done nothing. Callers that have a board-specific hardware reset can use the
+/// return to fall back to it instead of hanging in a wait-for-interrupt loop.
+pub fn request_system_reset(reset_type: usize, reason: usize) -> isize {
+    let (error, _) = ecall(
+        SBI_EXT_SRST,
+        SBI_EXT_SRST_SYSTEM_RESET,
+        reset_type,
+        reason,
+        0,
+        0,
+    );
+    error
+}
+
+pub const RESET_TYPE_SHUTDOWN: usize = SBI_SRST_RESET_TYPE_SHUTDOWN;
+pub const RESET_TYPE_COLD_REBOOT: usize = SBI_SRST_RESET_TYPE_COLD_REBOOT;
+pub const RESET_REASON_NONE: usize = SBI_SRST_RESET_REASON_NONE;
+pub const RESET_REASON_SYSTEM_FAILURE: usize = SBI_SRST_RESET_REASON_SYSTEM_FAILURE;
+
+/// SBI System Reset (shutdown). Returns only if the firmware does not implement
+/// the reset, leaving the caller to decide on a fallback.
 pub fn shutdown(failure: bool) -> ! {
-    ecall(0x53525354, 0, 0, if failure { 1 } else { 0 }, 0, 0);
+    request_system_reset(
+        SBI_SRST_RESET_TYPE_SHUTDOWN,
+        if failure {
+            SBI_SRST_RESET_REASON_SYSTEM_FAILURE
+        } else {
+            SBI_SRST_RESET_REASON_NONE
+        },
+    );
+    loop {
+        wait_for_interrupt();
+    }
+}
+
+/// Ask the platform to perform a full cold reboot via SBI. Returns only if the
+/// firmware does not actually reset (see [`request_system_reset`]).
+pub fn reboot() -> ! {
+    request_system_reset(SBI_SRST_RESET_TYPE_COLD_REBOOT, SBI_SRST_RESET_REASON_NONE);
     loop {
         wait_for_interrupt();
     }

@@ -26,7 +26,7 @@ use smoltcp::iface::{
     Config as InterfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle,
     SocketSet,
 };
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
@@ -70,15 +70,15 @@ pub enum Ipv4RuntimeStatus {
 }
 
 /// Bytes reserved in each direction of the single TCP connection.
-pub const TCP_BUFFER_BYTES: usize = 4 * 1024;
+pub const TCP_BUFFER_BYTES: usize = 32 * 1024;
 /// At most this many ingress frames are consumed by one cooperative poll.
-pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 8;
+pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 32;
 /// At most this many bounded egress passes are made by one cooperative poll.
-pub const MAX_EGRESS_PASSES_PER_POLL: usize = 8;
+pub const MAX_EGRESS_PASSES_PER_POLL: usize = 32;
 /// Bound application work independently from packet parsing work.
 pub const MAX_ECHO_CHUNKS_PER_POLL: usize = 4;
 /// At most this many application bytes are copied by one stream I/O call.
-pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 1_024;
+pub const MAX_TCP_STREAM_BYTES_PER_CALL: usize = 32 * 1024;
 const ECHO_CHUNK_BYTES: usize = MAX_TCP_STREAM_BYTES_PER_CALL;
 const TCP_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -131,6 +131,11 @@ pub struct Ipv4StackConfig {
     pub default_gateway: Option<[u8; 4]>,
     /// Seeds TCP initial sequence numbers. It is not application entropy.
     pub tcp_random_seed: u64,
+    /// The physical egress backend generates IPv4 and TCP/UDP checksums.
+    pub tx_checksum_offload: bool,
+    /// The physical ingress backend verifies IPv4 and TCP/UDP checksums and
+    /// discards frames for which the descriptor reports an error.
+    pub rx_checksum_offload: bool,
 }
 
 impl Ipv4StackConfig {
@@ -146,11 +151,23 @@ impl Ipv4StackConfig {
             prefix_len,
             default_gateway: None,
             tcp_random_seed,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
         }
     }
 
     pub const fn with_default_gateway(mut self, gateway: [u8; 4]) -> Self {
         self.default_gateway = Some(gateway);
+        self
+    }
+
+    pub const fn with_tx_checksum_offload(mut self, enabled: bool) -> Self {
+        self.tx_checksum_offload = enabled;
+        self
+    }
+
+    pub const fn with_rx_checksum_offload(mut self, enabled: bool) -> Self {
+        self.rx_checksum_offload = enabled;
         self
     }
 }
@@ -163,6 +180,8 @@ impl From<StaticIpv4Config> for Ipv4StackConfig {
             prefix_len: config.prefix_len,
             default_gateway: config.default_gateway,
             tcp_random_seed: config.tcp_random_seed,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
         }
     }
 }
@@ -243,6 +262,8 @@ pub struct PacketDevice {
     pending_egress: Option<StampedPacket>,
     stats: PacketDeviceStats,
     authority_revoked: bool,
+    tx_checksum_offload: bool,
+    rx_checksum_offload: bool,
 }
 
 impl PacketDevice {
@@ -258,7 +279,17 @@ impl PacketDevice {
             pending_egress: None,
             stats: PacketDeviceStats::default(),
             authority_revoked: false,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
         }
+    }
+
+    pub const fn set_tx_checksum_offload(&mut self, enabled: bool) {
+        self.tx_checksum_offload = enabled;
+    }
+
+    pub const fn set_rx_checksum_offload(&mut self, enabled: bool) {
+        self.rx_checksum_offload = enabled;
     }
 
     pub const fn stamp(&self) -> PacketStamp {
@@ -366,13 +397,9 @@ impl phy::TxToken for PacketTxToken<'_> {
         );
         debug_assert!(self.pending_egress.is_none());
 
-        let mut frame = [0u8; MAX_PACKET_LEN];
-        let result = f(&mut frame[..len]);
-        let packet = StampedPacket::new(
-            Packet::copy_from(&frame[..len])
-                .expect("smoltcp emitted an empty or oversized Ethernet frame"),
-            self.stamp,
-        );
+        let (frame, result) = Packet::write_with(len, f)
+            .expect("smoltcp emitted an empty or oversized Ethernet frame");
+        let packet = StampedPacket::new(frame, self.stamp);
         match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
@@ -460,7 +487,20 @@ impl phy::Device for PacketDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ethernet;
         capabilities.max_transmission_unit = MAX_PACKET_LEN;
-        capabilities.max_burst_size = Some(1);
+        // Bound the advertised TCP window to the number of frames the physical
+        // DWMAC RX ring can absorb before software runs again. The image packet
+        // endpoints use the same or greater depth, and QEMU can safely honor
+        // this conservative hardware-derived burst contract as well.
+        capabilities.max_burst_size = Some(32);
+        let checksum = match (self.rx_checksum_offload, self.tx_checksum_offload) {
+            (false, false) => Checksum::Both,
+            (false, true) => Checksum::Rx,
+            (true, false) => Checksum::Tx,
+            (true, true) => Checksum::None,
+        };
+        capabilities.checksum.ipv4 = checksum;
+        capabilities.checksum.tcp = checksum;
+        capabilities.checksum.udp = checksum;
         capabilities
     }
 }
@@ -547,6 +587,7 @@ impl From<TcpFrontendError> for TcpFrontendDriveError {
 struct TcpListenerEntry {
     socket: SocketHandle,
     port: u16,
+    port_group: Option<u64>,
     generation: u64,
     connection_active: bool,
     reset_requested: bool,
@@ -588,6 +629,8 @@ impl SharedIpv4TcpStack {
         validate_stack_config(config)?;
 
         let mut device = PacketDevice::new(stamp, inbound, outbound);
+        device.set_tx_checksum_offload(config.tx_checksum_offload);
+        device.set_rx_checksum_offload(config.rx_checksum_offload);
         device.revalidate_authority()?;
         let ethernet_address = EthernetAddress(config.ethernet_address);
         let mut interface_config = InterfaceConfig::new(ethernet_address.into());
@@ -633,11 +676,42 @@ impl SharedIpv4TcpStack {
 
     /// Allocate one exclusive passive port from this shared stack.
     pub fn add_tcp_listener(&mut self, port: u16) -> Result<TcpListenerHandle, StackError> {
+        self.add_tcp_listener_with_group(port, None)
+    }
+
+    /// Allocate another passive socket in an explicitly shared port group.
+    ///
+    /// All sockets on a repeated port must carry the same non-zero group id.
+    /// This keeps ordinary service ports exclusive while supporting protocols
+    /// whose control and data connections intentionally share one port.
+    pub fn add_shared_tcp_listener(
+        &mut self,
+        port: u16,
+        port_group: u64,
+    ) -> Result<TcpListenerHandle, StackError> {
+        if port_group == 0 {
+            return Err(StackError::ListenPortInUse);
+        }
+        self.add_tcp_listener_with_group(port, Some(port_group))
+    }
+
+    fn add_tcp_listener_with_group(
+        &mut self,
+        port: u16,
+        port_group: Option<u64>,
+    ) -> Result<TcpListenerHandle, StackError> {
         self.device.revalidate_authority()?;
         if port == 0 {
             return Err(StackError::InvalidListenPort);
         }
-        if self.listeners.iter().any(|listener| listener.port == port) {
+        if self
+            .listeners
+            .iter()
+            .any(|listener| listener.port == port && listener.port_group != port_group)
+        {
+            return Err(StackError::ListenPortInUse);
+        }
+        if port_group.is_none() && self.listeners.iter().any(|listener| listener.port == port) {
             return Err(StackError::ListenPortInUse);
         }
         if self.listeners.len() >= MAX_TCP_LISTENERS {
@@ -649,6 +723,13 @@ impl SharedIpv4TcpStack {
         let mut socket = tcp::Socket::new(receive, transmit);
         socket.set_congestion_control(tcp::CongestionControl::Reno);
         socket.set_nagle_enabled(false);
+        // The packet backends are polled and currently cannot wake this task
+        // when a frame arrives.  smoltcp's default 10 ms delayed ACK would
+        // therefore be observed only on a later protocol poll.  On the Duo's
+        // one-descriptor DWMAC receive path that turns TCP into stop-and-wait:
+        // one MSS followed by roughly 20 ms of silence.  ACK immediately so
+        // the peer can refill the deliberately bounded receive window.
+        socket.set_ack_delay(None);
         socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
         socket
             .listen(port)
@@ -665,6 +746,7 @@ impl SharedIpv4TcpStack {
         self.listeners.push(TcpListenerEntry {
             socket,
             port,
+            port_group,
             generation,
             connection_active: false,
             reset_requested: false,

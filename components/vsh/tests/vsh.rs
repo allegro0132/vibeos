@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use vibeos_core::cap::{Resource, Rights};
+use vibeos_core::cap::{BlockRangeInfo, BlockRangeState, Resource, Rights};
 use vibeos_core::exec;
 use vibeos_vsh as vsh;
 use vibeos_vsh::{
@@ -142,6 +142,282 @@ fn parser_preserves_capability_value_separation_and_quotes() {
     assert_eq!(item.command.rest.len(), 1);
     assert!(vsh::parse("echo hi > '$sink'").is_err());
     assert!(vsh::parse("(echo hi)").is_err());
+}
+
+#[test]
+fn capability_path_root_is_lexical_and_tail_remains_structured() {
+    let ast =
+        vsh::parse("cat @home/etc/config @home/\"file with spaces\" @home/$relative").unwrap();
+    let vsh::Statement::Command(item) = &ast.statements[0] else {
+        panic!("command")
+    };
+    let args = &item.command.first.commands[0].args;
+    assert!(matches!(&args[0], vsh::Argument::CapabilityPath { root, .. } if root == "home"));
+    assert!(
+        matches!(&args[1], vsh::Argument::CapabilityPath { root, tail, .. }
+        if root == "home" && tail.parts == [vsh::WordPart::Literal(String::from("file with spaces"))])
+    );
+    assert!(
+        matches!(&args[2], vsh::Argument::CapabilityPath { root, tail, .. }
+        if root == "home" && tail.parts == [vsh::WordPart::Value(String::from("relative"))])
+    );
+
+    // Authority cannot come from value expansion: this remains one value word.
+    let forged = vsh::parse("cat $path").unwrap();
+    let vsh::Statement::Command(item) = &forged.statements[0] else {
+        panic!("command")
+    };
+    assert!(matches!(
+        item.command.first.commands[0].args[0],
+        vsh::Argument::Word(_)
+    ));
+}
+
+struct TestFileRoot;
+impl Resource for TestFileRoot {
+    fn kind(&self) -> &'static str {
+        "file-tree-root"
+    }
+    fn describe(&self) -> String {
+        String::from("test file root")
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+fn read_path_planner(
+    args: &[vsh::ExpandedArgument],
+) -> Result<Vec<vsh::PathRequirement>, vsh::PlannerError> {
+    let mut requirements = Vec::new();
+    for (argument, arg) in args.iter().enumerate() {
+        if arg.path().is_some() {
+            requirements.push(vsh::PathRequirement {
+                argument,
+                rights: Rights::READ,
+            });
+        }
+    }
+    Ok(requirements)
+}
+
+fn test_path_handler(ctx: vsh::CapabilityCommandContext) -> vsh::CapabilityCommandFuture {
+    Box::pin(async move {
+        let vsh::ResolvedArgument::CapabilityPath { root, tail, .. } = &ctx.args[0] else {
+            return Err(Status::Faulted);
+        };
+        let lease = ctx.lookup::<TestFileRoot>(*root, Rights::READ)?;
+        lease.with(|_| ());
+        Ok(format!("{tail}\n"))
+    })
+}
+
+#[test]
+fn capability_path_admission_is_complete_before_stage_start() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    session.install_capability_host_command(
+        "path-read",
+        1,
+        1,
+        vsh::StreamMode::Closed,
+        read_path_planner,
+        test_path_handler,
+    );
+    session
+        .install_capability(
+            "home",
+            Arc::new(TestFileRoot),
+            Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+        )
+        .unwrap();
+    let (_, reports) = execute(session, "path-read @home/etc/$name");
+    assert_eq!(reports.unwrap()[0].output, "etc/\n");
+
+    let mut session = Session::new();
+    session.set_value("name", "config").unwrap();
+    session.install_capability_host_command(
+        "path-read",
+        1,
+        1,
+        vsh::StreamMode::Closed,
+        read_path_planner,
+        test_path_handler,
+    );
+    session
+        .install_capability(
+            "home",
+            Arc::new(TestFileRoot),
+            Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+        )
+        .unwrap();
+    let (_, reports) = execute(session, "path-read @home/etc/$name");
+    assert_eq!(reports.unwrap()[0].output, "etc/config\n");
+
+    let mut no_grant = Session::new();
+    no_grant.install_capability_host_command(
+        "path-read",
+        1,
+        1,
+        vsh::StreamMode::Closed,
+        read_path_planner,
+        test_path_handler,
+    );
+    no_grant
+        .install_capability("home", Arc::new(TestFileRoot), Rights::READ)
+        .unwrap();
+    let (_, denied) = execute(no_grant, "path-read @home/file");
+    assert_eq!(
+        denied.unwrap_err().message,
+        "path-root capability cannot be delegated"
+    );
+}
+
+struct TestBlockRange(BlockRangeInfo);
+
+impl Resource for TestBlockRange {
+    fn kind(&self) -> &'static str {
+        "block-range"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn block_range_info(&self) -> Option<BlockRangeInfo> {
+        Some(self.0)
+    }
+}
+
+#[test]
+fn lsblk_lists_only_delegatable_session_block_ranges() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    vsh::install_lsblk_command(&mut session);
+    let range = BlockRangeInfo {
+        start_block: 8,
+        block_count: 4,
+        logical_sector_size: 512,
+        physical_sector_size: 4096,
+        device_read_only: false,
+        state: BlockRangeState::Online,
+    };
+    session
+        .install_capability(
+            "disk",
+            Arc::new(TestBlockRange(range)),
+            Rights::READ
+                .union(Rights::WRITE)
+                .union(Rights::GRANT)
+                .union(Rights::REVOKE),
+        )
+        .unwrap();
+    session
+        .install_capability(
+            "readonly",
+            Arc::new(TestBlockRange(BlockRangeInfo {
+                start_block: 20,
+                block_count: 2,
+                ..range
+            })),
+            Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+        )
+        .unwrap();
+    session
+        .install_capability("private", Arc::new(TestBlockRange(range)), Rights::READ)
+        .unwrap();
+
+    let (session, reports) = execute(
+        session,
+        "lsblk -bn -o NAME,SIZE,RO,START,LOG-SEC,PHY-SEC,STATE",
+    );
+    assert_eq!(
+        reports.unwrap()[0].output,
+        "disk 2048 0 8 512 4096 online\nreadonly 1024 1 20 512 4096 online\n"
+    );
+    let (_, reports) = execute(session, "lsblk -J -o NAME,TYPE @readonly");
+    assert_eq!(
+        reports.unwrap()[0].output,
+        "{\"blockdevices\":[{\"name\":\"readonly\",\"type\":\"range\"}]}\n"
+    );
+}
+
+#[cfg(feature = "file-tree")]
+#[test]
+fn file_applets_use_one_capability_root_and_real_pipeline_streams() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    vsh::install_file_commands(&mut session);
+    session
+        .install_capability(
+            "home",
+            Arc::new(vibeos_file_store::FileTreeRoot::new_empty(0x1234).unwrap()),
+            Rights::READ
+                .union(Rights::WRITE)
+                .union(Rights::GRANT)
+                .union(Rights::REVOKE),
+        )
+        .unwrap();
+    let (session, reports) = execute(
+        session,
+        "mkdir @home/etc; echo hello | write @home/etc/config; cat @home/etc/config",
+    );
+    let reports = reports.unwrap();
+    assert_eq!(reports.last().unwrap().output, "hello\n");
+
+    let (session, reports) = execute(session, "stat @home/etc/config; ls -l @home/etc");
+    let reports = reports.unwrap();
+    assert!(reports[0]
+        .output
+        .contains("type=file size=6 links=1 inode=3 generation=2"));
+    assert_eq!(reports[1].output, "file 1 6 2 config\n");
+
+    let (session, reports) = execute(
+        session,
+        "ln @home/etc/config @home/etc/alias; echo changed | write @home/etc/alias; ln -s config @home/etc/link; cat @home/etc/link",
+    );
+    assert_eq!(reports.unwrap().last().unwrap().output, "changed\n");
+    let (session, reports) = execute(
+        session,
+        "cp @home/etc/config @home/copy; mv @home/copy @home/moved; cat @home/moved",
+    );
+    assert_eq!(reports.unwrap().last().unwrap().output, "changed\n");
+    let (_, reports) = execute(session, "rm @home/moved; readlink -f @home/etc/link");
+    assert_eq!(
+        reports.unwrap().last().unwrap().output,
+        "@home/etc/config\n"
+    );
+}
+
+#[cfg(feature = "file-tree")]
+#[test]
+fn cp_overwrite_and_ln_force_preserve_linux_inode_semantics() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    vsh::install_file_commands(&mut session);
+    session
+        .install_capability(
+            "home",
+            Arc::new(vibeos_file_store::FileTreeRoot::new_empty(0x5678).unwrap()),
+            Rights::READ
+                .union(Rights::WRITE)
+                .union(Rights::GRANT)
+                .union(Rights::REVOKE),
+        )
+        .unwrap();
+    let (session, reports) = execute(
+        session,
+        "echo source | write @home/src; echo old | write @home/dst; ln @home/dst @home/dst-link; cp @home/src @home/dst; cat @home/dst-link",
+    );
+    assert_eq!(reports.unwrap().last().unwrap().output, "source\n");
+    let (_, reports) = execute(
+        session,
+        "ln -f @home/src @home/dst; stat -c %i:%h @home/src @home/dst",
+    );
+    let reports = reports.unwrap();
+    let output = &reports.last().unwrap().output;
+    let lines: Vec<_> = output.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], lines[1]);
+    assert!(output.ends_with(":2\n"));
 }
 
 #[test]

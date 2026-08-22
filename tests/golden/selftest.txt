@@ -42,6 +42,6 @@ component allocation quota exceeded
 component allocation quota exceeded
 [!] panic: panicked at kernel/src/lib.rs:LINE:COL:
 component allocation quota exceeded
-  selftest: 388 passed, 0 failed
-  SELFTEST OK (388 checks)
+  selftest: 390 passed, 0 failed
+  SELFTEST OK (390 checks)
 vibe> 

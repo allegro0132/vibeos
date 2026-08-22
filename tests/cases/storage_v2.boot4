@@ -1,0 +1,7 @@
+quiet
+run hello
+storage status
+storage migrate-stage
+@sleep 5
+storage status
+halt

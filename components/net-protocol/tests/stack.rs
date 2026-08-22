@@ -114,6 +114,38 @@ fn packet_device_retains_one_frame_across_endpoint_backpressure() {
 }
 
 #[test]
+fn packet_device_only_suppresses_checksums_for_enabled_offloads() {
+    let inbound = Endpoint::new("checksum-in", 1);
+    let outbound = Endpoint::new("checksum-out", 1);
+    let mut space = CSpace::new("checksum-device");
+    let (_, inbound_authority) = authority(&mut space, &inbound, Rights::RECV);
+    let (_, outbound_authority) = authority(&mut space, &outbound, Rights::SEND);
+    let mut device = PacketDevice::new(session_stamp(), inbound_authority, outbound_authority);
+
+    assert!(device.capabilities().checksum.tcp.tx());
+    device.set_tx_checksum_offload(true);
+    let checksum = device.capabilities().checksum;
+    assert!(checksum.ipv4.rx() && !checksum.ipv4.tx());
+    assert!(checksum.tcp.rx() && !checksum.tcp.tx());
+    assert!(checksum.udp.rx() && !checksum.udp.tx());
+    assert!(checksum.icmpv4.rx() && checksum.icmpv4.tx());
+
+    device.set_tx_checksum_offload(false);
+    device.set_rx_checksum_offload(true);
+    let checksum = device.capabilities().checksum;
+    assert!(!checksum.ipv4.rx() && checksum.ipv4.tx());
+    assert!(!checksum.tcp.rx() && checksum.tcp.tx());
+    assert!(!checksum.udp.rx() && checksum.udp.tx());
+
+    device.set_tx_checksum_offload(true);
+    let checksum = device.capabilities().checksum;
+    assert!(!checksum.ipv4.rx() && !checksum.ipv4.tx());
+    assert!(!checksum.tcp.rx() && !checksum.tcp.tx());
+    assert!(!checksum.udp.rx() && !checksum.udp.tx());
+    assert!(checksum.icmpv4.rx() && checksum.icmpv4.tx());
+}
+
+#[test]
 fn packet_device_rejects_stale_ingress_without_blocking_fresh_traffic() {
     let inbound = Endpoint::new("stale-device-in", 1);
     let outbound = Endpoint::new("stale-device-out", 1);
@@ -472,6 +504,53 @@ fn one_interface_serves_two_independent_tcp_ports() {
     assert_eq!(&second_client_received[..6], b"second");
     assert_eq!(server.tcp_listener_port(first), Ok(SERVER_PORT));
     assert_eq!(server.tcp_listener_port(second), Ok(SECOND_PORT));
+}
+
+#[test]
+fn explicit_port_group_accepts_two_simultaneous_tcp_connections() {
+    const GROUP: u64 = 0x4950_4552_4633;
+    let client_to_server = Endpoint::new("group-client-to-server", 128);
+    let server_to_client = Endpoint::new("group-server-to-client", 128);
+    let mut space = CSpace::new("group-test-link");
+    let (_, server_in) = authority(&mut space, &client_to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &server_to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &server_to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &client_to_server, Rights::SEND);
+
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server =
+        SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let control = server.add_shared_tcp_listener(SERVER_PORT, GROUP).unwrap();
+    let data = server.add_shared_tcp_listener(SERVER_PORT, GROUP).unwrap();
+    assert_eq!(
+        server.add_shared_tcp_listener(SERVER_PORT, GROUP + 1),
+        Err(StackError::ListenPortInUse)
+    );
+    assert_eq!(
+        server.add_tcp_listener(SERVER_PORT),
+        Err(StackError::ListenPortInUse)
+    );
+
+    let mut client = TestClient::new(client_in, client_out);
+    let second_client = client.open_connection_to(SERVER_PORT, 49_153);
+    let mut both_active = false;
+    for now_ms in 0..5_000 {
+        client.poll(now_ms);
+        server.poll_network(now_ms).unwrap();
+        client.poll(now_ms);
+        if server.tcp_connection_active(control).unwrap()
+            && server.tcp_connection_active(data).unwrap()
+        {
+            both_active = true;
+            break;
+        }
+        let _ = client.socket_by_handle(second_client);
+    }
+
+    assert!(
+        both_active,
+        "both sockets in the shared port group must accept"
+    );
 }
 
 #[test]

@@ -10,7 +10,7 @@ use core::cell::UnsafeCell;
 
 use vibeos_driver_virtio_core as virtio;
 use vibeos_driver_virtio_core::{
-    AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE, SPLIT_QUEUE_SIZE,
+    AvailableRing, Descriptor, ModernInit, UsedElement, UsedRing, DESC_F_WRITE, ENTROPY_QUEUE_SIZE,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
 
@@ -83,7 +83,7 @@ impl QueueModel {
         let submission = Submission {
             epoch: self.epoch,
             requested: requested as u16,
-            available_slot: virtio::ring_slot(old),
+            available_slot: virtio::entropy_ring_slot(old),
             expected_used_index: self.used_index.wrapping_add(1),
         };
         self.active = Some(submission);
@@ -114,7 +114,7 @@ impl QueueModel {
 
 #[repr(C, align(4096))]
 struct DmaSlab {
-    descriptors: [Descriptor; SPLIT_QUEUE_SIZE as usize],
+    descriptors: [Descriptor; ENTROPY_QUEUE_SIZE as usize],
     available: AvailableRing,
     used: UsedRing,
     data: [u8; MAX_RANDOM_BYTES],
@@ -122,16 +122,17 @@ struct DmaSlab {
 
 impl DmaSlab {
     const ZERO: Self = Self {
-        descriptors: [Descriptor::new(0, 0, 0, 0); SPLIT_QUEUE_SIZE as usize],
+        descriptors: [Descriptor::new(0, 0, 0, 0); ENTROPY_QUEUE_SIZE as usize],
         available: AvailableRing {
             flags: 0,
             index: 0,
-            ring: [0; SPLIT_QUEUE_SIZE as usize],
+            ring: [0; vibeos_driver_virtio_core::MAX_SPLIT_QUEUE_SIZE as usize],
         },
         used: UsedRing {
             flags: 0,
             index: 0,
-            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
+            ring: [UsedElement::new(0, 0);
+                vibeos_driver_virtio_core::MAX_SPLIT_QUEUE_SIZE as usize],
         },
         data: [0; MAX_RANDOM_BYTES],
     };
@@ -216,7 +217,7 @@ impl Engine {
         if used_index == submission.previous_used_index() {
             return None;
         }
-        let slot = virtio::ring_slot(submission.previous_used_index()) as usize;
+        let slot = virtio::entropy_ring_slot(submission.previous_used_index()) as usize;
         Some((used_index, read_used_element(slot)))
     }
 
@@ -303,11 +304,11 @@ fn initialize_transport(
     init.confirm_features(transport.status())
         .map_err(|_| Error::Unsupported)?;
     transport.select_queue(ENTROPY_QUEUE);
-    if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
+    if transport.queue_ready() || transport.queue_num_max() < ENTROPY_QUEUE_SIZE {
         return Err(Error::Unsupported);
     }
     let (descriptors, available, used) = dma_addresses();
-    transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
+    transport.configure_queue(ENTROPY_QUEUE_SIZE, descriptors, available, used);
     let ready = init.set_driver_ok().map_err(|_| Error::Protocol)?;
     Ok((features.accepted(), ready))
 }
@@ -475,6 +476,31 @@ mod tests {
             queue.complete(submission, 2, UsedElement::new(0, 0)),
             Err(Error::Protocol)
         );
+    }
+
+    #[test]
+    fn entropy_ring_wraps_at_its_negotiated_queue_size() {
+        let mut queue = QueueModel::new(1).unwrap();
+        for index in 0..=ENTROPY_QUEUE_SIZE {
+            let submission = queue.submit(8).unwrap();
+            assert_eq!(
+                submission.available_slot,
+                index % ENTROPY_QUEUE_SIZE,
+                "entropy request {index} used a slot outside the negotiated queue"
+            );
+            assert_eq!(
+                virtio::entropy_ring_slot(submission.previous_used_index()),
+                index % ENTROPY_QUEUE_SIZE
+            );
+            assert_eq!(
+                queue.complete(
+                    submission,
+                    index.wrapping_add(1),
+                    UsedElement::new(ENTROPY_DESCRIPTOR.into(), 8),
+                ),
+                Ok(8)
+            );
+        }
     }
 
     #[test]

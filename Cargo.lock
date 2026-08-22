@@ -949,6 +949,7 @@ dependencies = [
 name = "vibeos-driver-dwc2-host"
 version = "0.1.0"
 dependencies = [
+ "vibeos-driver-rtl815x",
  "vibeos-hal",
 ]
 
@@ -972,6 +973,10 @@ version = "0.1.0"
 dependencies = [
  "vibeos-hal",
 ]
+
+[[package]]
+name = "vibeos-driver-rtl815x"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-driver-sdhci-blk"
@@ -1026,6 +1031,17 @@ name = "vibeos-durable-format"
 version = "0.1.0"
 
 [[package]]
+name = "vibeos-file-store"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-durable-format",
+ "vibeos-segment-format",
+ "vibeos-segment-store",
+ "vibeos-storage-device",
+]
+
+[[package]]
 name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
@@ -1057,6 +1073,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-iperf3-server"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-net-api",
+]
+
+[[package]]
 name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -1083,8 +1107,10 @@ dependencies = [
  "vibeos-driver-virtio-rng",
  "vibeos-driver-xhci",
  "vibeos-durable-format",
+ "vibeos-file-store",
  "vibeos-hal",
  "vibeos-image-policy",
+ "vibeos-iperf3-server",
  "vibeos-kernel-acceptance",
  "vibeos-net-api",
  "vibeos-net-echo",
@@ -1094,6 +1120,8 @@ dependencies = [
  "vibeos-random",
  "vibeos-runtime-riscv",
  "vibeos-rustc",
+ "vibeos-segment-format",
+ "vibeos-segment-store",
  "vibeos-ssh-identity",
  "vibeos-sshd",
  "vibeos-storage-device",
@@ -1199,6 +1227,7 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "vibeos-blob-format",
+ "vibeos-durable-format",
  "vibeos-segment-format",
  "vibeos-storage-device",
 ]
@@ -1241,6 +1270,7 @@ version = "0.1.0"
 dependencies = [
  "vibeos-component-host",
  "vibeos-core",
+ "vibeos-file-store",
 ]
 
 [[package]]

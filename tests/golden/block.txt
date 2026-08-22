@@ -2,10 +2,10 @@ VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
 vibe> quiet
   background components muted; they keep running (`ps` proves it)
 vibe> blk info
-  virtio-blk: ready, capacity 2048 sectors, queue size 8
+  virtio-blk: ready, capacity 131072 sectors, queue size 128
 vibe> blk scope
   block range: [0, 64), 64 blocks, logical 512 B
-  geometry: physical unknown, preferred 1 @ +0, max 1, cache unknown
+  geometry: physical unknown, preferred 1 @ +0, max 256, cache unknown
   durability: flush yes, FUA no, discard no, incarnation 1
   range boundary: out-of-range refused
 vibe> blk test

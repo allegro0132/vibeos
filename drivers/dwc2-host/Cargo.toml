@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 vibeos-hal = { path = "../../hal" }
+vibeos-driver-rtl815x = { path = "../rtl815x" }

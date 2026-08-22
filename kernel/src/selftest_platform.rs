@@ -202,6 +202,14 @@ pub async fn run() -> Report {
     component_memory(&mut h).await;
     fault_arena_restart(&mut h).await;
     capabilities(&mut h);
+    #[cfg(feature = "legacy-shell")]
+    crate::durable_cspace::run_storage_v2_policy_selftests();
+    #[cfg(feature = "legacy-shell")]
+    h.check("Storage V2 production authority policy", true);
+    #[cfg(feature = "legacy-shell")]
+    crate::segment_store_platform::run_storage_v2_transition_selftests();
+    #[cfg(feature = "legacy-shell")]
+    h.check("Storage V2 rollback/close transition policy", true);
     compiler(&mut h);
 
     for f in h.failures() {

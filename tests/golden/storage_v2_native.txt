@@ -1,0 +1,53 @@
+=== Storage V2 native boot 1 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> storage status
+  Storage V2: boot V2, migration RollbackClosed generation 1
+vibe> rustc save hello
+  saved `hello`: 45 B source + 636 B canonical VIBEEXE
+  durable artifact cap: slot 0 generation 0, rights r
+  authority manifest: console=w memory=rw; Store WRITE absent
+vibe> run hello
+Hello, world!
+  recovered `hello`: cap slot 0 generation 0, 45 B source + 636 B VIBEEXE
+  verified current compiler match; linked 1 fn -> 460 B RV64 + 14 B data
+  authority: console=w memory=rw; Store WRITE absent
+  --- running recovered program ---
+  --- exited with 0 in N us ---
+vibe> pcspace test
+  durable CSpace gate: ready, dependent started
+  boot1 root: slot 0 generation 0, rights r---gx
+  boot1 child: slot 1 generation 0 (descendant readback ok)
+  persistent-test Store WRITE: absent
+vibe> halt
+  powering off.
+=== Storage V2 native boot 2 ===
+VibeOS shell ready -- type `help` for commands, `quiet` to mute components.
+vibe> quiet
+  background components muted; they keep running (`ps` proves it)
+vibe> run hello
+Hello, world!
+  recovered `hello`: cap slot 0 generation 0, 45 B source + 636 B VIBEEXE
+  verified current compiler match; linked 1 fn -> 460 B RV64 + 14 B data
+  authority: console=w memory=rw; Store WRITE absent
+  --- running recovered program ---
+  --- exited with 0 in N us ---
+vibe> storage status
+  Storage V2: boot V2, migration RollbackClosed generation 1
+vibe> pcspace test
+  durable CSpace gate: ready, dependent started
+  boot2 restored child: slot 1 generation 0, readback ok
+  tombstone-first ancestor revoke: child absent, descendant absent
+  persistent-test Store WRITE: absent
+vibe> store test
+  read-only store put: refused
+  900-byte object commit + disk readback: ok
+  object-cap revocation: next read refused
+  namespace check: capability only; no path or ObjectId lookup
+vibe> blob test
+  BlobFS commit + full verification: 4203 bytes, 2 leaves
+  BlobFS chunk proof: leaf 1, 107 bytes, 1 sibling(s), root bound
+  BlobFS namespace: immutable capability; no path lookup
+vibe> halt
+  powering off.

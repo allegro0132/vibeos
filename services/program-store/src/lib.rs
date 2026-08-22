@@ -9,6 +9,7 @@ mod model;
 pub use model::*;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate as program;
@@ -22,19 +23,31 @@ use vibeos_object_store::{StoreError, StoredObject};
 #[repr(u8)]
 pub enum SavedProgramState {
     Cold = 0,
-    ReadyEmpty = 1,
-    Ready = 2,
-    FailedClosed = 3,
+    /// Durable graph installation completed, but the unified boot coordinator
+    /// has not yet activated dependent authority.
+    Staging = 1,
+    ReadyEmpty = 2,
+    Ready = 3,
+    FailedClosed = 4,
 }
 
 impl SavedProgramState {
     pub fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::Cold,
-            1 => Self::ReadyEmpty,
-            2 => Self::Ready,
+            1 => Self::Staging,
+            2 => Self::ReadyEmpty,
+            3 => Self::Ready,
             _ => Self::FailedClosed,
         }
+    }
+
+    pub const fn recovery_pending(self) -> bool {
+        matches!(self, Self::Cold | Self::Staging)
+    }
+
+    pub const fn client_ready(self) -> bool {
+        matches!(self, Self::ReadyEmpty | Self::Ready)
     }
 }
 
@@ -105,6 +118,42 @@ pub struct TrustedProgram {
 pub fn authorize_recovered(
     recovered: &RecoveredStore,
 ) -> Result<TrustedProgram, SavedProgramError> {
+    authorize_recovered_with(recovered, |object| Ok(StoredObject::from_recovered(object)))
+}
+
+/// Authorize a recovered program while requiring the selected persistence
+/// backend to materialize the exact object resource. Storage V2 uses this hook
+/// to bind the durable graph identity to an opaque CAS capability; callers
+/// cannot substitute a media ObjectId lookup.
+/// Identity of a program artifact that already passed
+/// [`validate_recovered_object`] this boot. Object ids are unique within a
+/// validated stream and the commit sequence pins the exact committing record,
+/// so a matching identity names byte-identical, already-proven content; any
+/// mismatch (including a compacted rewrite's fresh sequences) revalidates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedArtifact {
+    object_id: u128,
+    commit_sequence: u64,
+    byte_len: usize,
+}
+
+pub fn authorize_recovered_with(
+    recovered: &RecoveredStore,
+    resolve: impl FnOnce(&RecoveredObject) -> Result<Arc<StoredObject>, SavedProgramError>,
+) -> Result<TrustedProgram, SavedProgramError> {
+    authorize_recovered_with_memo(recovered, resolve, None).map(|(program, _)| program)
+}
+
+/// Like [`authorize_recovered_with`], but skipping the artifact recompilation
+/// proof when `memo` names the exact object this stream commits. Every other
+/// graph and slot check still runs in full; only the source-to-executable
+/// equivalence proof — a deterministic function of the already-authenticated
+/// artifact bytes — is reused.
+pub fn authorize_recovered_with_memo(
+    recovered: &RecoveredStore,
+    resolve: impl FnOnce(&RecoveredObject) -> Result<Arc<StoredObject>, SavedProgramError>,
+    memo: Option<ValidatedArtifact>,
+) -> Result<(TrustedProgram, Option<ValidatedArtifact>), SavedProgramError> {
     if !recovered.tombstones.is_empty()
         || recovered
             .slots
@@ -130,12 +179,15 @@ pub fn authorize_recovered(
         .cloned()
         .collect();
     if slots.is_empty() && grants.is_empty() {
-        return Ok(TrustedProgram {
-            slots,
-            grants,
-            resources: Vec::new(),
-            live: false,
-        });
+        return Ok((
+            TrustedProgram {
+                slots,
+                grants,
+                resources: Vec::new(),
+                live: false,
+            },
+            None,
+        ));
     }
     if slots.len() != 1 || grants.len() != 1 {
         return Err(SavedProgramError::UnexpectedGraph);
@@ -163,17 +215,28 @@ pub fn authorize_recovered(
                 && object.object_kind == program::program_artifact_object_kind()
         })
         .ok_or(SavedProgramError::UnexpectedGraph)?;
-    validate_recovered_object(object)?;
-    Ok(TrustedProgram {
-        slots,
-        grants,
-        resources: alloc::vec![PersistentResourceWitness::new(
-            object_id,
-            program::stored_object_resource_kind(),
-            StoredObject::from_recovered(object),
-        )],
-        live: true,
-    })
+    let identity = ValidatedArtifact {
+        object_id: object.object_id.get(),
+        commit_sequence: object.commit_sequence,
+        byte_len: object.byte_len() as usize,
+    };
+    if memo != Some(identity) {
+        validate_recovered_object(object)?;
+    }
+    let resource = resolve(object)?;
+    Ok((
+        TrustedProgram {
+            slots,
+            grants,
+            resources: alloc::vec![PersistentResourceWitness::new(
+                object_id,
+                program::stored_object_resource_kind(),
+                resource,
+            )],
+            live: true,
+        },
+        Some(identity),
+    ))
 }
 
 fn validate_recovered_object(object: &RecoveredObject) -> Result<(), SavedProgramError> {

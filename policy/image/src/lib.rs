@@ -38,7 +38,7 @@ pub struct NetworkFrontendPolicy {
 
 /// Bounded capacity of each stable packet endpoint. This is independent of a
 /// device backend's descriptor-ring size.
-pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 8 };
+pub const NETWORK_FRONTEND: NetworkFrontendPolicy = NetworkFrontendPolicy { queue_depth: 64 };
 
 /// Stream contract pinned for an image-provided Component command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -544,21 +544,51 @@ pub const C53_NATIVE_ASYNC_COMMAND: NativeAsyncCommandPin = NativeAsyncCommandPi
     },
 };
 
-/// The default QEMU image admits exactly the 1 MiB raw device created by the
-/// run and acceptance harnesses. A larger attachment is not ambient authority;
-/// later capacity must be admitted explicitly through Storage V2 growth.
-#[cfg(feature = "qemu-default")]
+/// The default QEMU image admits a bounded managed slice. Storage V2 initially
+/// formats only its policy range within this slice; unused suffix capacity is
+/// not ambient store capacity and may be admitted only by explicit growth.
+#[cfg(all(feature = "qemu-default", feature = "storage-bench"))]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 0,
-    sector_count: 2_048,
+    // The benchmark harness always provisions a 1 GiB data disk; admit all of
+    // it so large-file workloads exercise real growth instead of an
+    // artificially small window. The raw-block benchmark range parks in the
+    // final 64 MiB.
+    sector_count: 2_097_152,
+});
+
+#[cfg(all(
+    feature = "qemu-default",
+    not(feature = "storage-bench"),
+    not(feature = "file-tree")
+))]
+pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
+    first_sector: 0,
+    sector_count: 131_072,
+});
+
+/// The capability-rooted file-tree acceptance image uses a dedicated 128 MiB
+/// managed slice. The initial V2 ABI remains the same 8-segment window; the
+/// aligned suffix becomes usable only through the maintenance growth protocol.
+#[cfg(all(
+    feature = "qemu-default",
+    feature = "file-tree",
+    not(feature = "storage-bench")
+))]
+pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
+    first_sector: 0,
+    sector_count: 262_144,
 });
 
 /// The packaged Duo image places raw service data immediately after its
-/// 128 MiB FAT boot partition.
+/// 128 MiB FAT boot partition. The slice is 512 MiB: Storage V2's segment
+/// granule is 4 MiB and its foreground free-segment policy needs dozens of
+/// segments of headroom, so the previous 64 MiB (sixteen segments) forced a
+/// full garbage-collection walk on nearly every commit.
 #[cfg(feature = "milkv-duo-sd")]
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 262_145,
-    sector_count: 8_192,
+    sector_count: 1_048_576,
 });
 
 #[cfg(test)]
@@ -682,12 +712,21 @@ mod tests {
     #[cfg(feature = "qemu-default")]
     #[test]
     fn qemu_data_slice_is_exact_and_checked() {
-        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(2_048));
+        assert_eq!(
+            BLOCK_DATA_SLICE.unwrap().end_sector(),
+            Some(if cfg!(feature = "storage-bench") {
+                2_097_152
+            } else if cfg!(feature = "file-tree") {
+                262_144
+            } else {
+                131_072
+            })
+        );
     }
 
     #[cfg(feature = "milkv-duo-sd")]
     #[test]
     fn duo_data_slice_does_not_overflow() {
-        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(270_337));
+        assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(1_310_721));
     }
 }

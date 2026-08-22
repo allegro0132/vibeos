@@ -4,11 +4,13 @@ use alloc::vec::Vec;
 
 use vibeos_durable_format::preflight_recovery;
 pub use vibeos_durable_format::{
-    encode_object_transaction, preview_object_transaction, ChainCheckpoint, DecodeError,
+    encode_object_transaction, preview_external_object_transaction, preview_object_transaction,
+    ChainCheckpoint, DecodeError,
     DecodeStatus, DecodedRecord, EncodeError, EncodedObjectTransaction, LogRecord as StoreRecord,
     ObjectChunk, ObjectCommit, ObjectId, ObjectKind, ObjectMetadata, RecordBody, RecordChain,
     RecoveredObject, RecoveryError, StoreId, TransactionId, CHUNK_DATA_SIZE, CRC_OFFSET,
-    FORMAT_VERSION, HEADER_LEN, MAX_OBJECT_CHUNKS, MAX_OBJECT_SIZE, PAYLOAD_CAPACITY,
+    FORMAT_VERSION, HEADER_LEN, MAX_EXTERNAL_OBJECT_SIZE, MAX_OBJECT_CHUNKS, MAX_OBJECT_SIZE,
+    PAYLOAD_CAPACITY,
     PAYLOAD_OFFSET, RECORD_SIZE, SEAL_OFFSET,
 };
 

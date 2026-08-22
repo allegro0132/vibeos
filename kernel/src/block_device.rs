@@ -12,7 +12,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::cap::{InvocationLease, Resource, Rights, ScopedResource};
+use crate::cap::{
+    BlockRangeInfo, BlockRangeState, InvocationLease, Resource, Rights, ScopedResource,
+};
 use vibeos_storage_device::{
     successful_write_durability, validate_flush, validate_request, BlockRange, ContractError,
     DeviceGeometry, DeviceId, DeviceInfo, DeviceSession, MutationFailure, MutationResult,
@@ -74,6 +76,24 @@ impl Resource for BlockDevice {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn block_range_info(&self) -> Option<BlockRangeInfo> {
+        let raw = backend::raw_info();
+        Some(BlockRangeInfo {
+            start_block: self.range.first_block(),
+            block_count: self.range.block_count(),
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            device_read_only: raw.read_only,
+            state: if raw.quarantined {
+                BlockRangeState::Quarantined
+            } else if raw.online {
+                BlockRangeState::Online
+            } else {
+                BlockRangeState::Offline
+            },
+        })
     }
 }
 
@@ -205,14 +225,13 @@ pub async fn read_blocks_with_session(
         block_count,
         output.len(),
     )?;
-    // Both admitted backends currently truthfully report max_transfer=1 and a
-    // 512-byte logical block. The slice API remains stable as those limits grow.
-    let data = backend::raw_read_at(
+    backend::raw_read_blocks_at(
         current.session().incarnation(),
         request.physical_first_block(),
+        block_count,
+        output,
     )
     .await?;
-    output.copy_from_slice(&data);
     Ok(())
 }
 
@@ -267,15 +286,11 @@ pub async fn write_blocks_with_session(
     let durability = successful_write_durability(session.geometry, fua)
         .map_err(map_contract_error)
         .map_err(MutationFailure::not_submitted)?;
-    if request.byte_len() != 512 {
-        return Err(MutationFailure::not_submitted(BlockError::Unsupported));
-    }
-    let mut block = [0; 512];
-    block.copy_from_slice(data);
-    backend::raw_write_at(
+    backend::raw_write_blocks_at(
         current.session().incarnation(),
         request.physical_first_block(),
-        block,
+        block_count,
+        data,
     )
     .await?;
     Ok(durability)
@@ -359,12 +374,16 @@ fn current_device_info() -> Result<DeviceInfo, BlockError> {
     }
     let session =
         DeviceSession::new(MANAGED_DEVICE_ID, raw.session_epoch).map_err(map_contract_error)?;
+    #[cfg(feature = "qemu-virt")]
+    let max_transfer_blocks = vibeos_driver_virtio_core::BLOCK_MAX_TRANSFER_BLOCKS;
+    #[cfg(feature = "milkv-duo")]
+    let max_transfer_blocks = backend::MAX_TRANSFER_BLOCKS;
     let geometry = DeviceGeometry::new(
         512,
         None,
         1,
         0,
-        1,
+        max_transfer_blocks,
         None,
         WriteCache::Unknown,
         raw.supports_flush,

@@ -22,6 +22,10 @@ use crate::{
         ExecutableExportPlan, HostImportPlan, ImportedFunctionDraft, LiftDraft, LiftOptionsDraft,
         LowerDraft,
     },
+    graph::{
+        build_component_graph_resource_provenance, ComponentGraphInspection,
+        ComponentGraphProvenanceBuildError, ComponentGraphResourceProvenance,
+    },
     predecode::{predecode_component_for_profile, PredecodeError},
     types::TypeBuilder,
     value::ValueType,
@@ -359,6 +363,34 @@ pub fn inspect_component_for_profile(
     bytes: &[u8],
     profile: ProfileIdentity,
 ) -> Result<ComponentPlan<'_>, DecodeError> {
+    inspect_component_for_profile_impl(bytes, profile, false).map(|(plan, _)| plan)
+}
+
+/// Inspect a Component and additionally capture narrow, graph-only nominal
+/// resource provenance from the validator's live type graph.
+///
+/// This opt-in entrypoint does not alter ordinary inspection. Unsupported
+/// resource relationships are represented in the sidecar and do not change
+/// whether the Component itself is accepted by the selected profile.
+pub fn inspect_component_graph_for_profile(
+    bytes: &[u8],
+    profile: ProfileIdentity,
+) -> Result<ComponentGraphInspection<'_>, DecodeError> {
+    let (plan, resources) = inspect_component_for_profile_impl(bytes, profile, true)?;
+    let resources = resources.ok_or(DecodeError::InvalidWiring)?;
+    Ok(ComponentGraphInspection::new(plan, resources))
+}
+
+/// Profile-1 sync convenience wrapper for graph-only inspection.
+pub fn inspect_component_graph(bytes: &[u8]) -> Result<ComponentGraphInspection<'_>, DecodeError> {
+    inspect_component_graph_for_profile(bytes, ProfileIdentity::PROFILE_1)
+}
+
+fn inspect_component_for_profile_impl<'a>(
+    bytes: &'a [u8],
+    profile: ProfileIdentity,
+    collect_graph_resources: bool,
+) -> Result<(ComponentPlan<'a>, Option<ComponentGraphResourceProvenance>), DecodeError> {
     let mode = InspectionMode::for_profile(profile).ok_or(DecodeError::Unsupported)?;
     if bytes.len() > PROFILE_1_LIMITS.max_component_bytes || bytes.len() > u32::MAX as usize {
         return Err(DecodeError::Limit);
@@ -1142,6 +1174,17 @@ pub fn inspect_component_for_profile(
     let (imports, exports) =
         normalize_component_world_entities(&types, &import_names, &export_names)
             .map_err(shape_error)?;
+    let graph_resources = if collect_graph_resources {
+        Some(
+            build_component_graph_resource_provenance(&types, &import_names, &export_names)
+                .map_err(|error| match error {
+                    ComponentGraphProvenanceBuildError::Allocation => DecodeError::Allocation,
+                    ComponentGraphProvenanceBuildError::InvalidWiring => DecodeError::InvalidWiring,
+                })?,
+        )
+    } else {
+        None
+    };
     let native_async_execution = if mode.is_native_async() {
         Some(build_native_async_execution_plan(
             &modules,
@@ -1247,22 +1290,25 @@ pub fn inspect_component_for_profile(
             )?;
         }
     }
-    Ok(ComponentPlan {
-        profile,
-        summary,
-        embedded_modules: modules,
-        imports,
-        exports,
-        async_lifts,
-        async_lowers,
-        async_canonical,
-        native_async_execution,
-        execution: ComponentExecutionPlan {
-            instances,
-            exports: executable_exports,
-            host_imports,
+    Ok((
+        ComponentPlan {
+            profile,
+            summary,
+            embedded_modules: modules,
+            imports,
+            exports,
+            async_lifts,
+            async_lowers,
+            async_canonical,
+            native_async_execution,
+            execution: ComponentExecutionPlan {
+                instances,
+                exports: executable_exports,
+                host_imports,
+            },
         },
-    })
+        graph_resources,
+    ))
 }
 
 fn check_canonical_effects(

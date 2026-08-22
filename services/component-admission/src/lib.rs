@@ -39,6 +39,10 @@ use vibeos_component_admission::{
 
 extern crate alloc;
 
+mod graph;
+
+pub use graph::*;
+
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 use sha2::{Digest, Sha256};

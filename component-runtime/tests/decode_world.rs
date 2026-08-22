@@ -76,11 +76,11 @@ const RICH_COMPONENT: &str = r#"
 fn exact_world_matches_validated_component_types() {
     let bytes = wat::parse_str(COMPONENT).unwrap();
     let plan = inspect_component(&bytes).unwrap();
-    assert_eq!(plan.summary.embedded_modules, 1);
-    assert_eq!(plan.summary.core_instances, 1);
-    assert_eq!(plan.summary.canonical_functions, 2);
-    assert_eq!(plan.summary.adapters, 1);
-    assert_eq!(plan.exports.len(), 1);
+    assert_eq!(plan.summary().embedded_modules, 1);
+    assert_eq!(plan.summary().core_instances, 1);
+    assert_eq!(plan.summary().canonical_functions, 2);
+    assert_eq!(plan.summary().adapters, 1);
+    assert_eq!(plan.exports().len(), 1);
     let world = WorldContract::parse(WORLD, "vibe:fixture/calculator@1.0.0").unwrap();
     plan.check_world(&world).unwrap();
 }
@@ -258,7 +258,7 @@ fn clock_import_plan_preserves_exact_component_and_core_wiring() {
         .unwrap();
 
     let plan = inspect_component(&bytes).unwrap();
-    assert_eq!(plan.summary.core_instances, 2);
+    assert_eq!(plan.summary().core_instances, 2);
     let imports: Vec<_> = plan.host_imports().collect();
     assert_eq!(imports.len(), 1);
     let import = imports[0];

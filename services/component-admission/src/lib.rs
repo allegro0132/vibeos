@@ -1078,11 +1078,12 @@ pub fn admit(
             return Err(AdmissionError::InvalidPolicy);
         }
         let component = plan.summary();
+        let (imports, exports) = plan.into_world_shapes();
         (
             component,
             modules,
-            plan.imports,
-            plan.exports,
+            imports,
+            exports,
             requirements,
             stream_transport,
         )
@@ -1209,7 +1210,9 @@ pub fn admit_selected_wasi_candidate(
         for bytes in plan.embedded_modules() {
             modules.push(inspect_core(bytes).map_err(AdmissionError::Core)?);
         }
-        (plan.summary(), modules, plan.imports, plan.exports)
+        let summary = plan.summary();
+        let (imports, exports) = plan.into_world_shapes();
+        (summary, modules, imports, exports)
     };
 
     let manifest = SelectedWasiManifest {
@@ -1439,7 +1442,9 @@ pub fn admit_native_async_acceptance_candidate(
         for bytes in plan.embedded_modules() {
             modules.push(inspect_core(bytes).map_err(AdmissionError::Core)?);
         }
-        (plan.summary(), modules, plan.imports, plan.exports)
+        let summary = plan.summary();
+        let (imports, exports) = plan.into_world_shapes();
+        (summary, modules, imports, exports)
     };
 
     Ok(AdmittedNativeAsyncAcceptanceCandidate {

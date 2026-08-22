@@ -21,6 +21,7 @@ pub(crate) mod buffer_registry;
 pub mod canonical;
 pub mod decode;
 mod execution;
+pub mod graph;
 pub mod host;
 pub mod memory;
 mod native_async;

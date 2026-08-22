@@ -32,10 +32,11 @@ const NATIVE_STREAM_COMPONENT: &str =
 fn artifact_and_exact_world(source: &str) -> (ComponentArtifact, WorldContract) {
     let bytes = wat::parse_str(source).unwrap();
     let plan = inspect_component(&bytes).unwrap();
+    let (imports, exports) = plan.into_world_shapes();
     let world = WorldContract {
         identity: String::from("vibe:test/admitted@1.0.0"),
-        imports: plan.imports,
-        exports: plan.exports,
+        imports,
+        exports,
     };
     (
         ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap(),

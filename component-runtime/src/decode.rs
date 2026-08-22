@@ -138,13 +138,25 @@ impl DecodeError {
     }
 }
 
+/// Sealed result of complete Component validation. Derived counters and world
+/// shapes are read-only so downstream accounting cannot be fed caller-forged
+/// validation facts.
+///
+/// ```compile_fail
+/// use vibeos_component_runtime::decode::ComponentPlan;
+///
+/// fn forge(plan: &mut ComponentPlan<'_>) {
+///     plan.summary.adapters = 0;
+///     plan.imports.clear();
+/// }
+/// ```
 pub struct ComponentPlan<'a> {
     profile: ProfileIdentity,
-    pub summary: ComponentSummary,
+    summary: ComponentSummary,
     /// Exact borrowed byte ranges from the validated parent artifact.
-    pub embedded_modules: Vec<&'a [u8]>,
-    pub imports: Vec<NamedEntityShape>,
-    pub exports: Vec<NamedEntityShape>,
+    embedded_modules: Vec<&'a [u8]>,
+    imports: Vec<NamedEntityShape>,
+    exports: Vec<NamedEntityShape>,
     async_lifts: Vec<AsyncLiftInfo>,
     async_lowers: Vec<AsyncLowerInfo>,
     async_canonical: Vec<AsyncCanonicalPlan>,
@@ -171,6 +183,13 @@ impl ComponentPlan<'_> {
 
     pub fn exports(&self) -> &[NamedEntityShape] {
         &self.exports
+    }
+
+    /// Consume the sealed plan and transfer its normalized world shapes to an
+    /// owned manifest. The returned vectors no longer carry plan provenance
+    /// and cannot be fed back into runtime graph accounting.
+    pub fn into_world_shapes(self) -> (Vec<NamedEntityShape>, Vec<NamedEntityShape>) {
+        (self.imports, self.exports)
     }
 
     pub fn async_lifts(&self) -> &[AsyncLiftInfo] {

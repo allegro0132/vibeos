@@ -30,10 +30,11 @@ fn admitted(
 ) -> Arc<vibeos_component_admission::AdmittedComponent> {
     let bytes = wat::parse_str(FILTER).unwrap();
     let plan = inspect_component(&bytes).unwrap();
+    let (imports, exports) = plan.into_world_shapes();
     let world = WorldContract {
         identity: String::from("vibe:stream/filter@1.0.0"),
-        imports: plan.imports,
-        exports: plan.exports,
+        imports,
+        exports,
     };
     let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
     let identity = artifact.identity();
@@ -318,10 +319,11 @@ fn only_the_exact_import_free_byte_filter_signature_is_executable() {
     // runner then performs its independent exact type check on every use.
     let bytes = wat::parse_str("(component (core module (func (export \"run\") (result i32) i32.const 1)) (core instance $i (instantiate 0)) (func $f (result s32) (canon lift (core func $i \"run\"))) (export \"run\" (func $f)))").unwrap();
     let plan = inspect_component(&bytes).unwrap();
+    let (imports, exports) = plan.into_world_shapes();
     let world = WorldContract {
         identity: String::from("vibe:stream/not-a-filter@1.0.0"),
-        imports: plan.imports,
-        exports: plan.exports,
+        imports,
+        exports,
     };
     let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
     let identity = artifact.identity();
@@ -368,10 +370,11 @@ fn aggregate_memory_limit_requires_exactly_one_runtime_instance() {
     let bytes = wat::parse_str(source).unwrap();
     let plan = inspect_component(&bytes).unwrap();
     assert_eq!(plan.runtime_instance_count(), 2);
+    let (imports, exports) = plan.into_world_shapes();
     let world = WorldContract {
         identity: String::from("vibe:stream/filter@1.0.0"),
-        imports: plan.imports,
-        exports: plan.exports,
+        imports,
+        exports,
     };
     let artifact = ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1).unwrap();
     let identity = artifact.identity();

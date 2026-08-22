@@ -19,7 +19,8 @@ ObjectId. Its operation mask has three closed bits:
 | 1 | scrub and anonymous health reporting |
 | 2 | explicit migration or destructive maintenance |
 
-A root maintenance capability is bound to one store runtime and store UUID.
+A root maintenance capability is bound to one store runtime, store UUID,
+stable device ID, and the exact initial block range sealed by the superblock.
 Attenuation may only intersect the operation mask and may never change the
 store binding. Every operation rechecks the binding and required bit at the
 point of use and then holds a non-cloneable operation lease through the entire
@@ -30,6 +31,13 @@ revocation succeeds, every old root and attenuated child collapses to
 `Unauthorized` before device mutation. A stale runtime is rejected the same
 way. An ordinary writer has no method which constructs, widens, or extracts
 maintenance authority.
+
+Migration-control publication is stricter than ordinary M7.6 maintenance. In
+addition to an `ExplicitMaintenance` token with exact UUID/device/range fields,
+the controller requires the runtime's private non-cloneable provisioner as a
+sealed domain witness and compares its domain identity before the first media
+read. A structurally identical token minted by another runtime cannot control
+this selector.
 
 The Rust crate seals the root mint inside `segment-store`. Trusted boot policy
 creates one opaque provisioner together with the store runtime context; the
@@ -101,10 +109,10 @@ permit catalog enumeration. Trusted policy receives the sole
 `StorageQuotaProvisioner` with a governed runtime, installs non-zero logical
 and physical ceilings, and may attenuate either ceiling only downward. A
 governed runtime rejects raw, typed, foreground, and legacy Object writes that
-omit a principal before device I/O. A principal account is scoped to the store runtime domain;
-M7.6 does not encode a principal identifier in Object mappings. M7.7 must bind
-restored persistent CSpace principals to stable quota policy before the V2
-backend becomes the reboot default.
+omit a principal before device I/O. A principal account is scoped to the store
+runtime domain. The M7.7 `VIBEAUT2` authority snapshot binds the externally
+admitted persistent closure to a stable system-principal policy and exact
+logical/attributable-physical totals before V2 becomes the reboot backend.
 
 Admission reserves both charges before the first Blob page is written:
 
@@ -138,8 +146,8 @@ reservation exactly once. A committed charge remains owned by the runtime
 Object-authority resource until its final object handle or derived runtime pin
 is released; dropping a temporary future cannot release a live Object's
 charge. A cold reboot destroys all runtime-only Object and principal resources
-together. Persistent-root quota reconstruction is therefore an M7.7 cutover
-requirement, not an implicit M7.6 media identity.
+together. M7.7 reconstructs persistent-root quota from the authenticated
+authority snapshot; it does not infer ownership from a CAS mapping or digest.
 Quota-charged Objects therefore fail closed before entering persistent GC root
 policy, and persistent publication targets reject them through a target-bound,
 non-forgeable publication token. A runtime pin retains its Object authority in
@@ -177,6 +185,18 @@ orphan. It checks, in bounded memory:
 6. persistent-root closure plus every policy-admitted typed object and edge,
    including runtime-only objects when no persistent root exists, without
    treating a media tag as parser authority.
+
+For a `VIBEAUT2` store, the selected physical checkpoint generation MAY be
+newer than the persistent-authority snapshot generation. This is the
+crash-consistent result of committing a CAS Object before an authority append
+names it. Scrub still verifies that Object's mapping, manifest, every Blob byte,
+tree, allocation state, and checkpoint transition, but it does not invent a
+persistent root for it. The authority snapshot generation MUST NOT exceed the
+selected checkpoint; its binding table remains the exact persistent-policy
+closure and any additional valid CAS objects are anonymous non-persistent
+objects. Selector activation-floor comparison uses the authority snapshot
+generation and digest, while physical health uses the selected checkpoint and
+the complete scrub.
 
 Scrub reports a closed anonymous `ScrubReport`: selected generation, admitted/
 allocated/free/retired segment counts, object and Blob counts, verified byte

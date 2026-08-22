@@ -10,6 +10,13 @@ use vibeos_hal::{
 
 pub const NAME: &str = "QEMU virt";
 pub const RAM_START: usize = 0x8020_0000;
+/// The golden/test contract boots QEMU virt with -m 128M; the storage
+/// benchmark contract boots with -m 512M and its qualification workloads
+/// legitimately hold multi-MiB record streams in transit. The linker script
+/// variant selected by the same feature sizes the heap to match.
+#[cfg(feature = "storage-bench")]
+pub const RAM_END: usize = 0xa000_0000;
+#[cfg(not(feature = "storage-bench"))]
 pub const RAM_END: usize = 0x8800_0000;
 pub const PLIC_BASE: usize = 0x0c00_0000;
 pub const PLIC_MMIO_END: usize = PLIC_BASE + 0x0040_0000;
@@ -73,6 +80,17 @@ pub const MMU: MmuDescription = MmuDescription {
     device_level1_tables: 1,
     device_level0_tables: 4,
 };
+
+/// Board hardware-reset fallback. QEMU's OpenSBI performs a real SBI SRST
+/// reset, so the SBI reboot ecall never returns here and this is unreachable in
+/// practice; it exists to satisfy the same `platform::cold_reset()` contract
+/// the CV1800B board uses for its no-op-SRST firmware. If it is ever reached,
+/// spin rather than pretend to reset.
+pub fn cold_reset() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 pub struct Board;
 

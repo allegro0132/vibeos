@@ -17,8 +17,32 @@
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
 #[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
 compile_error!("feature `net-shell` is the Milk-V Duo production IPv4 image");
+#[cfg(all(feature = "iperf3-server", not(feature = "qemu-virt")))]
+compile_error!("feature `iperf3-server` is the QEMU iperf3 server image");
+#[cfg(all(feature = "milkv-iperf3-server", not(feature = "milkv-duo")))]
+compile_error!("feature `milkv-iperf3-server` is the Milk-V Duo iperf3 server image");
 #[cfg(all(feature = "net-shell", feature = "tcp-echo"))]
 compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 images");
+#[cfg(all(
+    feature = "iperf3-server",
+    any(
+        feature = "tcp-echo",
+        feature = "ssh-test",
+        feature = "ssh-security-test"
+    )
+))]
+compile_error!("feature `iperf3-server` is an isolated QEMU network image");
+#[cfg(all(
+    feature = "milkv-iperf3-server",
+    any(
+        feature = "net-shell",
+        feature = "milkv-ssh",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-jitterentropy-probe",
+        feature = "milkv-jitterentropy-ssh-probe"
+    )
+))]
+compile_error!("feature `milkv-iperf3-server` is an isolated Milk-V network image");
 #[cfg(all(feature = "ssh-security-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 #[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
@@ -155,6 +179,8 @@ mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
+#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+mod iperf3_platform;
 #[cfg(any(
     feature = "milkv-jitterentropy-probe",
     feature = "milkv-jitterentropy-ssh-probe"
@@ -172,7 +198,9 @@ mod net_echo_platform;
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "milkv-ssh",
+    feature = "iperf3-server",
+    feature = "milkv-iperf3-server"
 ))]
 mod netstack_platform;
 #[cfg(feature = "qemu-virt")]
@@ -211,11 +239,14 @@ mod dwmac_net;
 mod net_device;
 #[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
+mod segment_store_platform;
 mod store_platform;
 mod trampoline;
 mod trap;
 mod tty;
 mod uart;
+#[cfg(feature = "milkv-duo")]
+mod usb_ecm_net;
 #[cfg(feature = "qemu-virt")]
 mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
@@ -279,7 +310,8 @@ vibeos_kernel_start:
     addi t0, t0, 8
     j .Lbss
 .Ldone:
-    j kmain
+    // See the secondary path: `tail` avoids the +-1 MiB JAL range limit.
+    tail kmain
 
 .align 4
 .global _secondary_start
@@ -307,7 +339,10 @@ _secondary_start:
     li t1, 1
     slli t1, t1, 18
     add sp, sp, t1
-    j secondary_kmain
+    // A plain `j` limits the kernel to +-1 MiB between this boot stub and
+    // secondary_kmain; `tail` expands to auipc+jalr and never becomes a
+    // link-time range constraint on text layout.
+    tail secondary_kmain
 
 .Lsecondary_park:
     wfi
@@ -511,6 +546,48 @@ pub extern "C" fn kmain() -> ! {
                     Ok(None) => println!("  usb hid   no supported keyboard interface"),
                     Err(error) => println!("  usb hid   configuration FAILED: {:?}", error),
                 }
+                let rtl8151_switched = match dwc2_host::switch_rtl8151_install_mode() {
+                    Ok(switched) => switched,
+                    Err(error) => {
+                        println!("  usb net   RTL8151 mode switch FAILED: {:?}", error);
+                        false
+                    }
+                };
+                if rtl8151_switched {
+                    println!(
+                        "  usb net   sent RTL8151 install-mode switch; waiting for Ethernet re-enumeration"
+                    );
+                }
+                if !rtl8151_switched {
+                    match dwc2_host::configure_cdc_ecm() {
+                        Ok(Some(ecm)) => println!(
+                            "  usb net   CDC-ECM configured, interface {} alt {}, IN ep {}, OUT ep {}, MAC {:?}",
+                            ecm.data_interface,
+                            ecm.data_alternate,
+                            ecm.endpoint_in & 0x0f,
+                            ecm.endpoint_out & 0x0f,
+                            ecm.mac_address,
+                        ),
+                        Ok(None) => {}
+                        Err(error) => println!("  usb net   CDC-ECM configuration FAILED: {:?}", error),
+                    }
+                }
+                match if rtl8151_switched {
+                    Ok(None)
+                } else {
+                    dwc2_host::configure_mass_storage()
+                } {
+                    Ok(Some(storage)) => println!(
+                        "  usb disk  SCSI/BOT interface {}, IN ep {}, OUT ep {}, {} sectors x {} bytes",
+                        storage.interface,
+                        storage.endpoint_in & 0x0f,
+                        storage.endpoint_out & 0x0f,
+                        storage.capacity_sectors.unwrap_or(0),
+                        storage.block_size.unwrap_or(0),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => println!("  usb disk  configuration FAILED: {:?}", error),
+                }
             }
             Ok(None) => println!("  usb dev   disconnected during enumeration"),
             Err(error) => println!("  usb dev   enumeration FAILED: {:?}", error),
@@ -554,6 +631,8 @@ pub extern "C" fn kmain() -> ! {
     let world = world::world();
     world::start_block_supervisor();
     world::start_net_supervisor();
+    #[cfg(feature = "milkv-duo")]
+    world::start_usb_net_supervisor();
     #[cfg(feature = "qemu-virt")]
     world::start_rng_supervisor();
     #[cfg(feature = "qemu-virt")]
@@ -581,7 +660,9 @@ pub extern "C" fn kmain() -> ! {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "milkv-ssh",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server"
     ))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
@@ -598,6 +679,11 @@ pub extern "C" fn kmain() -> ! {
         let space = world.spaces["vsh"].clone();
         let mut session = vsh::Session::with_cspace(space.0.clone());
         vsh_platform::install_standard_commands(&mut session);
+        if let Some(block) = world.vsh_block {
+            session
+                .bind_capability("diagnostic", block)
+                .expect("fixed vsh block binding name is valid");
+        }
         #[cfg(feature = "tcp-echo-recovery-test")]
         session.install_host_command("tcp-fault", 0, 0, netstack_platform::vsh_inject_fault);
         #[cfg(feature = "tcp-echo-recovery-test")]
@@ -783,6 +869,8 @@ unsafe fn reclaim_faulted_component(
         // visible to safe lifecycle callers.
         block_device::recover_faulted_domain(domain);
         net_device::recover_faulted_domain(domain);
+        #[cfg(feature = "milkv-duo")]
+        usb_ecm_net::recover_faulted_domain(domain);
         #[cfg(feature = "qemu-virt")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
@@ -814,6 +902,7 @@ unsafe fn cleanup_faulted_task_after_component_gate(
 ) {
     unsafe {
         store::recover_faulted_task(task, domain);
+        segment_store_platform::recover_faulted_task(task, domain);
         // Durable boot recovery installs and fail-closes the saved-program
         // target. Repair all saved-program locks first so durable quarantine
         // cannot spin on a guard abandoned by this same faulted task. Both
@@ -869,11 +958,6 @@ fn oom(layout: core::alloc::Layout) -> ! {
             live_bytes,
             quota_bytes,
         }) if owner != heap::OwnerId::SYSTEM => {
-            #[cfg(all(
-                feature = "ssh-native-async-revoke-qemu-acceptance",
-                not(feature = "ssh-native-async-qemu-acceptance")
-            ))]
-            let _ = (requested_bytes, live_bytes, quota_bytes);
             #[cfg(feature = "ssh-native-async-qemu-acceptance")]
             {
                 let mut w = SbiWriter;
@@ -885,9 +969,21 @@ fn oom(layout: core::alloc::Layout) -> ! {
                     ),
                 );
             }
-            // Keep the panic text deterministic; the account snapshot carries
-            // exact live/peak/request evidence for diagnostics and tests.
-            panic!("component allocation quota exceeded")
+            // Keep the production panic text deterministic; the account
+            // snapshot carries exact live/peak/request evidence for
+            // diagnostics and tests. Benchmark images print the numbers,
+            // because oversized transient envelopes are exactly what their
+            // qualification workloads probe.
+            #[cfg(feature = "storage-bench")]
+            panic!(
+                "component allocation quota exceeded: owner={} live={} requested={} quota={}",
+                owner, live_bytes, requested_bytes, quota_bytes
+            );
+            #[cfg(not(feature = "storage-bench"))]
+            {
+                let _ = (owner, requested_bytes, live_bytes, quota_bytes);
+                panic!("component allocation quota exceeded")
+            }
         }
         failure => {
             // A global allocator failure is kernel state, even if it happened

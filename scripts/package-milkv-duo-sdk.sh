@@ -9,6 +9,8 @@ diagnostic=false
 ssh_acceptance=false
 jitterentropy_probe=false
 jitterentropy_ssh_probe=false
+iperf3_server=false
+file_tree=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -16,10 +18,12 @@ for arg in "$@"; do
     --ssh-acceptance) ssh_acceptance=true ;;
     --jitterentropy-probe) jitterentropy_probe=true ;;
     --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
-    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    --iperf3-server) iperf3_server=true ;;
+    --file-tree) file_tree=true ;;
+    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -31,13 +35,15 @@ mode_count=0
 [[ "$ssh_acceptance" == true ]] && ((mode_count += 1))
 [[ "$jitterentropy_probe" == true ]] && ((mode_count += 1))
 [[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
+[[ "$iperf3_server" == true ]] && ((mode_count += 1))
+[[ "$file_tree" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
   echo "package-milkv-duo-sdk.sh: image mode options are mutually exclusive" >&2
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
@@ -59,6 +65,12 @@ elif [[ "$jitterentropy_probe" == true ]]; then
 elif [[ "$jitterentropy_ssh_probe" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-jitterentropy-ssh-probe"
   image_name="vibeos-milkv-duo-jitterentropy-ssh-probe-sd.img"
+elif [[ "$iperf3_server" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-iperf3-server"
+  image_name="vibeos-milkv-duo-iperf3-server-sd.img"
+elif [[ "$file_tree" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-file-tree"
+  image_name="vibeos-milkv-duo-file-tree-sd.img"
 fi
 kernel_bin="$output_dir/vibeos-milkv-duo.bin"
 output_its="$output_dir/milkv-duo.its"
@@ -140,7 +152,7 @@ path = sys.argv[1]
 sector_size = 512
 seed = b"VIBEOS-BLK-SECTOR-7-SEED-v1"
 with open(path, "wb") as data:
-    data.truncate(4 * 1024 * 1024)
+    data.truncate(512 * 1024 * 1024)
 with open(path, "r+b") as data:
     data.seek(7 * sector_size)
     data.write(seed)
@@ -171,6 +183,10 @@ elif [[ "$jitterentropy_probe" == true ]]; then
   verify_args=(--jitterentropy-probe "$sdk_root")
 elif [[ "$jitterentropy_ssh_probe" == true ]]; then
   verify_args=(--jitterentropy-ssh-probe "$sdk_root")
+elif [[ "$iperf3_server" == true ]]; then
+  verify_args=(--iperf3-server "$sdk_root")
+elif [[ "$file_tree" == true ]]; then
+  verify_args=(--file-tree "$sdk_root")
 fi
 if ! "$script_dir/verify-milkv-duo-image.sh" "${verify_args[@]}"; then
   echo "package-milkv-duo-sdk.sh: refusing to publish an unverified SD image" >&2

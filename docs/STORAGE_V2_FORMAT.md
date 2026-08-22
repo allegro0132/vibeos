@@ -481,6 +481,17 @@ FUA may replace a flush only when the admitted device contract proves the same
 ordering and durability for the exact dependency. Discard is never part of
 publication.
 
+A fused publication transaction may share the per-phase barriers: when a
+single writer builds new segments whose only durable name is the checkpoint it
+is about to publish, every intra-segment flush above may be deferred into the
+checkpoint slot protocol's first flush (the exact-zero seal barrier). That
+barrier precedes the checkpoint body write, so all deferred phases are durable
+before any checkpoint can reference them. A cut anywhere before it leaves only
+unreferenced segment content, which recovery already ignores; the segment
+reuse protocol's own zero-seal flush and read-back are never deferred. This
+weakens no recovery invariant because a checkpoint may still reference only
+segments whose complete structure precedes its slot protocol.
+
 ## Checkpoint replacement and selection
 
 Checkpoint slots alternate. Before replacing a previously used target slot,

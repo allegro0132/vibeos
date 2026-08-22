@@ -1,5 +1,7 @@
 //! Append, checkpoint, and bounded recovery state machine.
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,9 +27,13 @@ use crate::allocation_v2::{
     decode_allocation_v2, AllocationV2, SegmentAllocation, ALLOCATION_V2_HEADER_LEN,
     MAX_ALLOCATION_V2_SEGMENTS, RETIRED_SEGMENT_ENTRY_LEN,
 };
+use crate::authority_snapshot::{
+    decode_persistent_authority_snapshot, PersistentAuthoritySnapshot,
+    PERSISTENT_AUTHORITY_HEADER_LEN,
+};
 use crate::cas_codec::{
-    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping, CasCodecContext,
-    ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
+    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping,
+    CasCodecContext, ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
     CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, OBJECT_MAPPING_LEN,
 };
 use crate::codec::{
@@ -35,7 +41,7 @@ use crate::codec::{
     CatalogEntry, CatalogPayload, CatalogPayloadKind, CodecError, CATALOG_ENTRY_LEN,
     CATALOG_SNAPSHOT_HEADER_LEN,
 };
-use crate::device::PageDevice;
+use crate::device::{PageDevice, PageDeviceInfo};
 use crate::maintenance::{
     MaintenanceDomain, MaintenanceOperation, MaintenanceOperationLease, StoreMaintenance,
     StoreMaintenanceProvisioner,
@@ -53,7 +59,11 @@ use crate::root_codec::{
 const METADATA_KIND_CATALOG: u32 = 0xffff_0001;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 
-pub(crate) const ROOT_PIN_SLOTS: usize = 256;
+/// Every persistent file held open by a namespace pins its stream tail, so
+/// this bounds how many files an open file tree can carry, not merely how
+/// many reads are in flight. 1024 keeps a directory of several hundred files
+/// recoverable with headroom for transaction-scoped pins.
+pub(crate) const ROOT_PIN_SLOTS: usize = 1024;
 pub(crate) const READER_PIN_SLOTS: usize = 256;
 pub(crate) const RESERVED_ROOT_PIN_SLOTS: usize = 8;
 pub(crate) const RESERVED_READER_PIN_SLOTS: usize = 8;
@@ -243,6 +253,98 @@ pub struct FormatOptions {
     pub limits: StoreLimits,
 }
 
+const INITIAL_FORMAT_WRITE_ORDER: [u64; 6] = [0, 2, 1, 3, 4, 5];
+
+struct InitialFormatPlan {
+    pages: Box<[Page; 6]>,
+}
+
+fn initial_format_plan<E>(
+    device_info: PageDeviceInfo,
+    options: FormatOptions,
+) -> Result<InitialFormatPlan, StoreError<E>> {
+    validate_limits(options.limits)?;
+    let segments = segments_for_page_count(device_info.page_count)?;
+    let initial_allocation_bytes = allocation_v2_bitmap_bytes(segments)?;
+    let ordinary_floor = u64::from(options.cleaner_reserve_segments)
+        .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))
+        .ok_or(StoreError::InvalidConfig)?;
+    if options.cleaner_reserve_segments < 2
+        || ordinary_floor >= segments
+        || options.limits.max_replay_records == 0
+        || segments > MAX_ALLOCATION_V2_SEGMENTS as u64
+        || initial_allocation_bytes > options.limits.recovery_memory_bytes
+    {
+        return Err(StoreError::InvalidConfig);
+    }
+
+    let base_binding = RecordBinding {
+        store_uuid: options.store_uuid,
+        generation: 1,
+        segment_no: ANCHOR_SEGMENT_NO,
+        ordinal: 0,
+        self_page: 0,
+        target_checkpoint_generation: 0,
+    };
+    let superblock_base = Superblock {
+        binding: base_binding,
+        copy: 0,
+        geometry: FormatGeometry::STORAGE_V2,
+        cleaner_reserve_segments: options.cleaner_reserve_segments,
+        initial_range_pages: device_info.page_count,
+        initial_segments: segments,
+        device_id: device_info.device_id,
+        range_first_logical_block: device_info.range_first_logical_block,
+        initial_block_count: device_info.logical_block_count,
+        logical_block_size: device_info.logical_block_size,
+        max_replay_records: options.limits.max_replay_records,
+    };
+    let mut superblocks = [superblock_base; 2];
+    superblocks[1].copy = 1;
+    superblocks[1].binding.ordinal = 1;
+    superblocks[1].binding.self_page = 2;
+
+    let mut pages = Box::new([[0; PAGE_SIZE]; 6]);
+    for (index, page) in [0usize, 2].into_iter().enumerate() {
+        let digest = encode_superblock_body(&superblocks[index], &mut pages[page])?;
+        encode_record_seal(digest, &mut pages[page + 1])?;
+    }
+    let checkpoint = Checkpoint {
+        binding: RecordBinding {
+            store_uuid: options.store_uuid,
+            generation: 1,
+            segment_no: ANCHOR_SEGMENT_NO,
+            ordinal: 0,
+            self_page: 4,
+            target_checkpoint_generation: 1,
+        },
+        slot: 0,
+        previous_generation: 0,
+        admitted_range_pages: device_info.page_count,
+        admitted_segments: segments,
+        next_segment_generation: 1,
+        replay_count: 0,
+        max_replay_records: options.limits.max_replay_records,
+        cleaner_reserve_segments: options.cleaner_reserve_segments,
+        catalog_root: PhysicalPointer::Null,
+        authority_root: PhysicalPointer::Null,
+        allocation_root: PhysicalPointer::Null,
+        replay_tail: PhysicalPointer::Null,
+    };
+    let digest = encode_checkpoint_body(&checkpoint, &mut pages[4])?;
+    encode_record_seal(digest, &mut pages[5])?;
+    Ok(InitialFormatPlan { pages })
+}
+
+fn is_canonical_block_write_prefix(observed: &Page, expected: &Page) -> bool {
+    const FORMAT_BLOCK_SIZE: usize = 512;
+    (0..=PAGE_SIZE / FORMAT_BLOCK_SIZE).any(|written| {
+        let boundary = written * FORMAT_BLOCK_SIZE;
+        observed[..boundary] == expected[..boundary]
+            && observed[boundary..].iter().all(|byte| *byte == 0)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectHandle {
     store_uuid: StoreUuid,
@@ -373,6 +475,7 @@ pub(crate) struct MountedState {
     pub(crate) allocation: AllocationV2,
     pub(crate) allocation_version: u16,
     pub(crate) persistent_roots: Option<PersistentRootSet>,
+    pub(crate) persistent_authority: Option<PersistentAuthoritySnapshot>,
     pub(crate) catalog: Vec<CatalogEntry>,
     pub(crate) cas: Option<CasMountedState>,
     pub(crate) recovery_peak_bytes: usize,
@@ -426,9 +529,50 @@ pub struct SegmentStore<D> {
     pub(crate) poisoned: bool,
     pub(crate) pins: SharedStorePinRegistry,
     pub(crate) published_generation: alloc::sync::Arc<AtomicU64>,
+    /// Runtime-only proof that every CAS payload/tree in this exact mounted
+    /// generation passed a complete scrub or an equivalent verified successor.
+    /// It is never reconstructed from checkpoint metadata alone.
+    pub(crate) verified_cas_generation: AtomicU64,
     pub(crate) typed_reference_kinds: alloc::sync::Arc<Vec<u32>>,
     pub(crate) maintenance_domain: alloc::sync::Arc<MaintenanceDomain>,
     pub(crate) quota: Option<PrincipalQuotaTable>,
+    /// Runtime cache of CAS blob keys whose payloads were verified against
+    /// the logical record stream during a promotion readback. Entries are
+    /// content-addressed and refer to immutable sealed segments, so the cache
+    /// remains valid across in-process GC mounts and prevents the steady-state
+    /// append path from re-verifying every historical object on each commit.
+    pub(crate) promotion_verified: alloc::collections::BTreeSet<crate::cas_codec::BlobKey>,
+    /// Runtime cache of CAS blob keys whose existing on-media manifest was
+    /// fully compare-verified against freshly recomputed content hashes by a
+    /// deduplicating commit. Sealed segments are immutable and a mismatch is
+    /// already the fatal hash-collision path, so one verification per key per
+    /// process carries the same guarantee as re-scanning on every duplicate.
+    pub(crate) dedup_verified: alloc::collections::BTreeSet<crate::cas_codec::BlobKey>,
+    /// Runtime cache of logical-object Merkle roots keyed by stable M4
+    /// ObjectId with the (kind, exact length) they were computed for. A valid
+    /// record stream never redefines an ObjectId's content, and every
+    /// non-successor authority installation clears this cache, so an append
+    /// does not re-hash the whole logical history on every commit.
+    pub(crate) logical_roots:
+        alloc::collections::BTreeMap<u128, (u32, u64, vibeos_blob_format::Hash)>,
+    /// The committed M4 ObjectId set of the exact installed authority
+    /// generation, captured at installation so a strict-successor append does
+    /// not re-decode the whole predecessor stream to learn it.
+    pub(crate) committed_ids_cache: Option<(u64, alloc::collections::BTreeSet<u128>)>,
+    /// Promotion claims computed by the last live authority append, keyed by
+    /// the exact logical stream they were computed against. A strict stream
+    /// extension reuses them for still-unbound objects instead of re-running
+    /// promotion over the whole committed set.
+    pub(crate) promotion_claims_cache: Option<crate::persistent_authority::PromotionClaims>,
+    /// Decoded successor trees of the last fused file transaction, keyed by
+    /// the exact root they belong to.
+    pub(crate) fs_tree_cache: Option<crate::fs_api::FsTreeCache>,
+    /// When set, commits skip the publication-time read-back verification of
+    /// the pages they just wrote. See [`SegmentStore::set_deferred_commit_readback`].
+    pub(crate) defer_commit_readback: bool,
+    /// See [`VerifiedSegmentScans`]: chain-authentication memo for sealed
+    /// segments, cleared around every collection round.
+    pub(crate) verified_scans: VerifiedSegmentScans,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -448,9 +592,18 @@ impl<D: PageDevice> SegmentStore<D> {
             poisoned: false,
             pins: runtime.pins,
             published_generation: runtime.published_generation,
+            verified_cas_generation: AtomicU64::new(0),
             typed_reference_kinds: runtime.typed_reference_kinds,
             maintenance_domain: runtime.maintenance_domain,
             quota: runtime.quota,
+            promotion_verified: alloc::collections::BTreeSet::new(),
+            dedup_verified: alloc::collections::BTreeSet::new(),
+            logical_roots: alloc::collections::BTreeMap::new(),
+            committed_ids_cache: None,
+            promotion_claims_cache: None,
+            fs_tree_cache: None,
+            defer_commit_readback: false,
+            verified_scans: VerifiedSegmentScans::new(),
         }
     }
 
@@ -494,6 +647,7 @@ impl<D: PageDevice> SegmentStore<D> {
             state.superblock.binding.store_uuid,
             state.superblock.device_id,
             state.superblock.range_first_logical_block,
+            state.superblock.initial_block_count,
         ))
     }
 
@@ -505,6 +659,7 @@ impl<D: PageDevice> SegmentStore<D> {
             state.superblock.binding.store_uuid,
             state.superblock.device_id,
             state.superblock.range_first_logical_block,
+            state.superblock.initial_block_count,
         ))
     }
 
@@ -520,12 +675,33 @@ impl<D: PageDevice> SegmentStore<D> {
                 state.superblock.binding.store_uuid,
                 state.superblock.device_id,
                 state.superblock.range_first_logical_block,
+                state.superblock.initial_block_count,
             )
         })
     }
 
     pub fn into_device(self) -> D {
         self.device
+    }
+
+    /// True when the store's continuable state is gone (a staged transaction
+    /// failed or is still in flight) and only a fresh mount can proceed.
+    /// Callers use this to distinguish a cleanly declined operation, which
+    /// leaves the store serviceable, from an interrupted one.
+    pub fn needs_remount(&self) -> bool {
+        self.poisoned || self.mounted.is_none()
+    }
+
+    /// Select the commit-time verification profile. The default profile
+    /// re-reads and verifies every page a commit just wrote before the
+    /// successor mounts, failing the commit on any device write that was
+    /// acknowledged but damaged. The deferred profile skips that read-back:
+    /// every read path still fails closed on the content's Merkle identity
+    /// and cold recovery re-verifies checkpoint state, so damaged data is
+    /// never served as valid — it is simply detected at the first read or
+    /// scrub instead of at the commit that wrote it.
+    pub fn set_deferred_commit_readback(&mut self, deferred: bool) {
+        self.defer_commit_readback = deferred;
     }
 
     pub fn info(&self) -> Result<StoreInfo, StoreError<D::Error>> {
@@ -541,33 +717,20 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         options: FormatOptions,
     ) -> Result<StoreInfo, StoreError<D::Error>> {
-        validate_limits(options.limits)?;
         if self.mounted.is_some() {
             return Err(StoreError::AlreadyFormatted);
         }
         let device_info = self.device.info();
-        let segments = segments_for_page_count(device_info.page_count)?;
-        let initial_allocation_bytes = allocation_v2_bitmap_bytes(segments)?;
-        let ordinary_floor = u64::from(options.cleaner_reserve_segments)
-            .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))
-            .ok_or(StoreError::InvalidConfig)?;
-        if options.cleaner_reserve_segments < 2
-            || ordinary_floor >= segments
-            || options.limits.max_replay_records == 0
-            || segments > MAX_ALLOCATION_V2_SEGMENTS as u64
-            || initial_allocation_bytes > options.limits.recovery_memory_bytes
-        {
-            return Err(StoreError::InvalidConfig);
-        }
+        let plan = initial_format_plan(device_info, options)?;
 
         // Formatting never guesses whether anchor bytes are disposable.  Data
         // segments are outside the format-identification boundary and may hold
         // bytes from an unrelated earlier use of an explicitly provisioned
         // range; the new superblock/checkpoint initially reference none of them.
-        let mut page = [0; PAGE_SIZE];
+        let mut page = Box::new([0; PAGE_SIZE]);
         for page_no in 0..ANCHOR_PAGES {
             self.device
-                .read_page(page_no, &mut page)
+                .read_page(page_no, page.as_mut())
                 .await
                 .map_err(StoreError::Device)?;
             if page.iter().any(|byte| *byte != 0) {
@@ -577,73 +740,128 @@ impl<D: PageDevice> SegmentStore<D> {
 
         self.limits = options.limits;
         self.poisoned = true;
-        let base_binding = RecordBinding {
-            store_uuid: options.store_uuid,
-            generation: 1,
-            segment_no: ANCHOR_SEGMENT_NO,
-            ordinal: 0,
-            self_page: 0,
-            target_checkpoint_generation: 0,
-        };
-        let superblock_base = Superblock {
-            binding: base_binding,
-            copy: 0,
-            geometry: FormatGeometry::STORAGE_V2,
-            cleaner_reserve_segments: options.cleaner_reserve_segments,
-            initial_range_pages: device_info.page_count,
-            initial_segments: segments,
-            device_id: device_info.device_id,
-            range_first_logical_block: device_info.range_first_logical_block,
-            initial_block_count: device_info.logical_block_count,
-            logical_block_size: device_info.logical_block_size,
-            max_replay_records: options.limits.max_replay_records,
-        };
-        let mut superblocks = [superblock_base; 2];
-        superblocks[1].copy = 1;
-        superblocks[1].binding.ordinal = 1;
-        superblocks[1].binding.self_page = 2;
-
-        let mut bodies = [[0; PAGE_SIZE]; 2];
-        let mut seals = [[0; PAGE_SIZE]; 2];
-        for index in 0..2 {
-            let digest = encode_superblock_body(&superblocks[index], &mut bodies[index])?;
-            encode_record_seal(digest, &mut seals[index])?;
-            write_page(&self.device, (index * 2) as u64, &bodies[index]).await?;
+        for page_no in INITIAL_FORMAT_WRITE_ORDER {
+            write_page(&self.device, page_no, &plan.pages[page_no as usize]).await?;
             flush(&self.device).await?;
         }
-        for (index, seal) in seals.iter().enumerate() {
-            write_page(&self.device, (index * 2 + 1) as u64, seal).await?;
-            flush(&self.device).await?;
-        }
-
-        let checkpoint = Checkpoint {
-            binding: RecordBinding {
-                store_uuid: options.store_uuid,
-                generation: 1,
-                segment_no: ANCHOR_SEGMENT_NO,
-                ordinal: 0,
-                self_page: 4,
-                target_checkpoint_generation: 1,
-            },
-            slot: 0,
-            previous_generation: 0,
-            admitted_range_pages: device_info.page_count,
-            admitted_segments: segments,
-            next_segment_generation: 1,
-            replay_count: 0,
-            max_replay_records: options.limits.max_replay_records,
-            cleaner_reserve_segments: options.cleaner_reserve_segments,
-            catalog_root: PhysicalPointer::Null,
-            authority_root: PhysicalPointer::Null,
-            allocation_root: PhysicalPointer::Null,
-            replay_tail: PhysicalPointer::Null,
-        };
-        write_checkpoint(&self.device, &checkpoint, false).await?;
         self.poisoned = false;
         self.mount().await
     }
 
+    /// Resume only an exact crash prefix of this formatter's deterministic
+    /// initial anchor image. Arbitrary non-zero, foreign, or reordered anchor
+    /// bytes are corruption and are never erased or reformatted.
+    pub async fn format_or_resume_canonical(
+        &mut self,
+        options: FormatOptions,
+    ) -> Result<StoreInfo, StoreError<D::Error>> {
+        if self.mounted.is_some() {
+            return Err(StoreError::AlreadyFormatted);
+        }
+        let device_info = self.device.info();
+        if device_info.logical_block_size != 512 {
+            return Err(StoreError::InvalidConfig);
+        }
+        let plan = initial_format_plan(device_info, options)?;
+        let mut observed = Box::new([0; PAGE_SIZE]);
+        let mut first_incomplete = None;
+        for (index, page_no) in INITIAL_FORMAT_WRITE_ORDER.into_iter().enumerate() {
+            self.device
+                .read_page(page_no, observed.as_mut())
+                .await
+                .map_err(StoreError::Device)?;
+            let expected = &plan.pages[page_no as usize];
+            if first_incomplete.is_none() && observed.as_ref() == expected {
+                continue;
+            }
+            if first_incomplete.is_none() && is_canonical_block_write_prefix(&observed, expected) {
+                first_incomplete = Some(index);
+                continue;
+            }
+            if observed.iter().any(|byte| *byte != 0) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        for page_no in 6..ANCHOR_PAGES {
+            self.device
+                .read_page(page_no, observed.as_mut())
+                .await
+                .map_err(StoreError::Device)?;
+            if observed.iter().any(|byte| *byte != 0) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+
+        self.limits = options.limits;
+        let next = first_incomplete.unwrap_or(INITIAL_FORMAT_WRITE_ORDER.len());
+        if next == INITIAL_FORMAT_WRITE_ORDER.len() {
+            return self.mount().await;
+        }
+        self.poisoned = true;
+        // Continue at the first incomplete page. Rewriting an earlier complete
+        // page and then crashing part-way through it would leave later complete
+        // pages behind a torn predecessor, which is deliberately rejected as
+        // a reordered/foreign image on the following boot.
+        for page_no in INITIAL_FORMAT_WRITE_ORDER[next..].iter().copied() {
+            write_page(&self.device, page_no, &plan.pages[page_no as usize]).await?;
+            flush(&self.device).await?;
+        }
+        self.poisoned = false;
+        self.mount().await
+    }
+
+    /// Recognize the only formatted-but-authority-missing state admitted by
+    /// native provisioning. A merely mountable foreign or previously used V2
+    /// store is not an initializer residue.
+    pub fn is_canonical_initial_format(
+        &self,
+        options: FormatOptions,
+    ) -> Result<bool, StoreError<D::Error>> {
+        let state = self.require_current_generation()?;
+        Ok(state.superblock.binding.store_uuid == options.store_uuid
+            && state.superblock.cleaner_reserve_segments == options.cleaner_reserve_segments
+            && state.superblock.max_replay_records == options.limits.max_replay_records
+            && state.generation == 1
+            && state.replay_count == 0
+            && state.next_segment_generation == 1
+            && state.next_physical_segment == 0
+            && state.next_object_id == 1
+            && state.allocation_version == 1
+            && state.last_segment_target_checkpoint_generation == 1
+            && state.catalog_root == PhysicalPointer::Null
+            && state.replay_tail == PhysicalPointer::Null
+            && state.authority_root == PhysicalPointer::Null
+            && state.allocation_root == PhysicalPointer::Null
+            && state.persistent_roots.is_none()
+            && state.persistent_authority.is_none()
+            && state.catalog.is_empty()
+            && state.cas.is_none()
+            && state.last_segment.is_none()
+            && state.last_segment_previous.is_none()
+            && state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .allocated
+                == 0
+            && state
+                .allocation
+                .counts()
+                .map_err(|_| StoreError::Corrupt)?
+                .retired
+                == 0)
+    }
+
     pub async fn mount(&mut self) -> Result<StoreInfo, StoreError<D::Error>> {
+        self.verified_cas_generation.store(0, Ordering::Release);
+        // A fresh mount may observe different media; runtime verification
+        // caches must not outlive the mounted state they were built against.
+        self.promotion_verified.clear();
+        self.dedup_verified.clear();
+        self.logical_roots.clear();
+        self.committed_ids_cache = None;
+        self.promotion_claims_cache = None;
+        self.fs_tree_cache = None;
         self.mounted = None;
         self.poisoned = false;
         validate_limits(self.limits)?;
@@ -754,6 +972,107 @@ impl<D: PageDevice> SegmentStore<D> {
         self.mounted = Some(state);
         self.poisoned = false;
         Ok(info)
+    }
+
+    /// Install an ordinary commit successor without decoding the already
+    /// mounted predecessor from media a second time. The successor is built
+    /// only from the transaction bytes that were durably read back before its
+    /// checkpoint was published; this method re-reads the publication pair and
+    /// reduces the predecessor to the same allocation witness used by mount().
+    pub(crate) async fn mount_verified_successor(
+        &mut self,
+        previous: MountedState,
+        expected: Checkpoint,
+        mut successor: MountedState,
+        verifies_all_cas: bool,
+    ) -> Result<StoreInfo, StoreError<D::Error>> {
+        self.mounted = None;
+        self.poisoned = true;
+        validate_limits(self.limits)?;
+        let successor_generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or(StoreError::RecoveryRequired)?;
+        if self.published_generation.load(Ordering::Acquire) != previous.generation
+            || expected.previous_generation != previous.generation
+            || expected.binding.generation != successor_generation
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+
+        let device_info = self.device.info();
+        segments_for_page_count(device_info.page_count)?;
+        // One batched read serves both superblock pairs and both checkpoint
+        // slots; the decode path below is unchanged.
+        let anchor = crate::cas::SpanSnapshotDevice::capture(&self.device, &[(0, 8)]).await?;
+        let selected_super = select_superblock(
+            read_superblock(&anchor, 0).await?,
+            read_superblock(&anchor, 2).await?,
+        )?
+        .ok_or(StoreError::Unformatted)?;
+        if selected_super.value() != &previous.superblock {
+            return Err(StoreError::Corrupt);
+        }
+
+        let left = read_checkpoint(&anchor, 4).await?;
+        let right = read_checkpoint(&anchor, 6).await?;
+        let selected =
+            select_checkpoint_for_superblock(selected_super, left, right, device_info.page_count)?
+                .ok_or(StoreError::Unformatted)?;
+        if selected.value() != &expected {
+            return Err(StoreError::Corrupt);
+        }
+        let predecessor =
+            if expected.slot == 0 { right } else { left }.ok_or(StoreError::Corrupt)?;
+        if !checkpoint_matches_mounted(predecessor.value(), &previous, self.limits) {
+            return Err(StoreError::Corrupt);
+        }
+        if !checkpoint_matches_mounted(&expected, &successor, self.limits) {
+            return Err(StoreError::Corrupt);
+        }
+
+        let predecessor_cas_verified =
+            self.verified_cas_generation.load(Ordering::Acquire) == previous.generation;
+        let previous_peak = previous.recovery_peak_bytes;
+        let witness = CheckpointTransitionWitness::from_mounted(previous);
+        let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
+        validate_checkpoint_transition(&witness, &successor)?;
+        let pair_peak = witness_bytes
+            .checked_add(successor.recovery_peak_bytes)
+            .ok_or(StoreError::MemoryLimit)?;
+        successor.recovery_peak_bytes = previous_peak.max(pair_peak).max(
+            successor
+                .resident_heap_bytes()
+                .ok_or(StoreError::MemoryLimit)?,
+        );
+        if successor.recovery_peak_bytes > self.limits.recovery_memory_bytes {
+            return Err(StoreError::MemoryLimit);
+        }
+        let info = successor.info();
+        if !publish_runtime_generation(&self.published_generation, successor.generation) {
+            return Err(StoreError::RecoveryRequired);
+        }
+        self.mounted = Some(successor);
+        self.verified_cas_generation.store(
+            if predecessor_cas_verified && verifies_all_cas {
+                expected.binding.generation
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
+        self.poisoned = false;
+        Ok(info)
+    }
+
+    pub(crate) fn cas_payloads_verified(&self, generation: u64) -> bool {
+        self.verified_cas_generation.load(Ordering::Acquire) == generation
+    }
+
+    pub fn current_cas_payloads_verified(&self) -> bool {
+        self.mounted
+            .as_ref()
+            .is_some_and(|state| self.cas_payloads_verified(state.generation))
     }
 
     pub async fn put(
@@ -886,6 +1205,7 @@ impl<D: PageDevice> SegmentStore<D> {
             entry.blob,
             ExtentKind::Blob,
             self.limits.max_compat_object_bytes as usize,
+            None,
         )
         .await?;
         if resolved.bytes.len() as u64 != entry.exact_len
@@ -901,6 +1221,31 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         Ok(resolved.bytes)
     }
+}
+
+fn checkpoint_matches_mounted(
+    checkpoint: &Checkpoint,
+    state: &MountedState,
+    limits: StoreLimits,
+) -> bool {
+    checkpoint.binding.store_uuid == state.superblock.binding.store_uuid
+        && checkpoint.binding.generation == state.generation
+        && checkpoint.binding.segment_no == ANCHOR_SEGMENT_NO
+        && checkpoint.binding.ordinal == u32::from(checkpoint.slot)
+        && checkpoint.binding.self_page == 4 + u64::from(checkpoint.slot) * 2
+        && checkpoint.binding.target_checkpoint_generation == state.generation
+        && checkpoint.slot == ((state.generation - 1) & 1) as u8
+        && admitted_pages(state.admitted_segments)
+            .is_ok_and(|pages| checkpoint.admitted_range_pages == pages)
+        && checkpoint.admitted_segments == state.admitted_segments
+        && checkpoint.next_segment_generation == state.next_segment_generation
+        && checkpoint.replay_count == state.replay_count
+        && checkpoint.max_replay_records == limits.max_replay_records
+        && checkpoint.cleaner_reserve_segments == state.cleaner_reserve_segments
+        && checkpoint.catalog_root == state.catalog_root
+        && checkpoint.authority_root == state.authority_root
+        && checkpoint.allocation_root == state.allocation_root
+        && checkpoint.replay_tail == state.replay_tail
 }
 
 impl MountedState {
@@ -925,6 +1270,9 @@ impl MountedState {
         }
         if let Some(roots) = &self.persistent_roots {
             bytes = bytes.checked_add(roots.allocated_bytes()?)?;
+        }
+        if let Some(authority) = &self.persistent_authority {
+            bytes = bytes.checked_add(authority.allocated_bytes()?)?;
         }
         Some(bytes)
     }
@@ -1026,16 +1374,22 @@ fn root_resident_bytes(roots: Option<&PersistentRootSet>) -> Result<usize, ()> {
     roots.map_or(Ok(0), |roots| roots.allocated_bytes().ok_or(()))
 }
 
+fn authority_resident_bytes(authority: Option<&PersistentAuthoritySnapshot>) -> Result<usize, ()> {
+    authority.map_or(Ok(0), |value| value.allocated_bytes().ok_or(()))
+}
+
 fn recovery_resident_bytes(
     allocation: &AllocationV2,
     catalog: &Vec<CatalogEntry>,
     cas: Option<&CasMountedState>,
     roots: Option<&PersistentRootSet>,
+    authority: Option<&PersistentAuthoritySnapshot>,
 ) -> Result<usize, ()> {
     allocation_resident_bytes(allocation)?
         .checked_add(measured_catalog_bytes(catalog))
         .and_then(|bytes| cas_resident_bytes(cas).ok()?.checked_add(bytes))
         .and_then(|bytes| root_resident_bytes(roots).ok()?.checked_add(bytes))
+        .and_then(|bytes| authority_resident_bytes(authority).ok()?.checked_add(bytes))
         .ok_or(())
 }
 
@@ -1095,18 +1449,13 @@ async fn flush<D: PageDevice>(device: &D) -> Result<(), StoreError<D::Error>> {
 async fn read_pair<D: PageDevice>(
     device: &D,
     body_page: u64,
-) -> Result<(Page, Page), StoreError<D::Error>> {
-    let mut body = [0; PAGE_SIZE];
-    let mut seal = [0; PAGE_SIZE];
+) -> Result<Box<[Page; 2]>, StoreError<D::Error>> {
+    let mut pages = alloc::vec![[0; PAGE_SIZE]; 2].into_boxed_slice();
     device
-        .read_page(body_page, &mut body)
+        .read_pages(body_page, &mut pages)
         .await
         .map_err(StoreError::Device)?;
-    device
-        .read_page(body_page + 1, &mut seal)
-        .await
-        .map_err(StoreError::Device)?;
-    Ok((body, seal))
+    pages.try_into().map_err(|_| StoreError::Corrupt)
 }
 
 fn optional_verified<T>(status: DecodeStatus<VerifiedRecord<T>>) -> Option<VerifiedRecord<T>> {
@@ -1120,16 +1469,20 @@ pub(crate) async fn read_superblock<D: PageDevice>(
     device: &D,
     page: u64,
 ) -> Result<Option<VerifiedRecord<Superblock>>, StoreError<D::Error>> {
-    let (body, seal) = read_pair(device, page).await?;
-    Ok(optional_verified(decode_superblock_verified(&body, &seal)?))
+    let pages = read_pair(device, page).await?;
+    Ok(optional_verified(decode_superblock_verified(
+        &pages[0], &pages[1],
+    )?))
 }
 
 pub(crate) async fn read_checkpoint<D: PageDevice>(
     device: &D,
     page: u64,
 ) -> Result<Option<VerifiedRecord<Checkpoint>>, StoreError<D::Error>> {
-    let (body, seal) = read_pair(device, page).await?;
-    Ok(optional_verified(decode_checkpoint_verified(&body, &seal)?))
+    let pages = read_pair(device, page).await?;
+    Ok(optional_verified(decode_checkpoint_verified(
+        &pages[0], &pages[1],
+    )?))
 }
 
 pub(crate) async fn write_checkpoint<D: PageDevice>(
@@ -1139,31 +1492,31 @@ pub(crate) async fn write_checkpoint<D: PageDevice>(
 ) -> Result<VerifiedRecord<Checkpoint>, StoreError<D::Error>> {
     let body_page = 4 + u64::from(checkpoint.slot) * 2;
     if clear_first {
-        let zero = [0; PAGE_SIZE];
+        let zero = Box::new([0; PAGE_SIZE]);
         // Remove the old publication marker before touching its body.  Clearing
         // the body first could leave a durable old seal authenticating zero or
         // torn bytes, which is correctly fatal to the strict decoder.
         write_page(device, body_page + 1, &zero).await?;
         flush(device).await?;
-        let mut observed_seal = [0; PAGE_SIZE];
+        let mut observed_seal = Box::new([0; PAGE_SIZE]);
         device
-            .read_page(body_page + 1, &mut observed_seal)
+            .read_page(body_page + 1, observed_seal.as_mut())
             .await
             .map_err(StoreError::Device)?;
         if observed_seal.iter().any(|byte| *byte != 0) {
             return Err(StoreError::Corrupt);
         }
     }
-    let mut body = [0; PAGE_SIZE];
-    let mut seal = [0; PAGE_SIZE];
-    let digest = encode_checkpoint_body(checkpoint, &mut body)?;
-    encode_record_seal(digest, &mut seal)?;
+    let mut body = Box::new([0; PAGE_SIZE]);
+    let mut seal = Box::new([0; PAGE_SIZE]);
+    let digest = encode_checkpoint_body(checkpoint, body.as_mut())?;
+    encode_record_seal(digest, seal.as_mut())?;
     write_page(device, body_page, &body).await?;
     flush(device).await?;
     write_page(device, body_page + 1, &seal).await?;
     flush(device).await?;
-    let (observed_body, observed_seal) = read_pair(device, body_page).await?;
-    match decode_checkpoint_verified(&observed_body, &observed_seal)? {
+    let observed = read_pair(device, body_page).await?;
+    match decode_checkpoint_verified(&observed[0], &observed[1])? {
         DecodeStatus::Sealed(value) if value.value() == checkpoint => Ok(value),
         _ => Err(StoreError::Corrupt),
     }
@@ -1179,11 +1532,105 @@ fn codec_error<E>(error: CodecError) -> StoreError<E> {
 
 pub(crate) struct ScannedSegment {
     pub(crate) matched: Option<ExtentRecord>,
+    additional_matches: Vec<ExtentRecord>,
+    authority_siblings: Vec<ExtentRecord>,
     pub(crate) record_count: u32,
     pub(crate) total_payload_bytes: u64,
     pub(crate) segment_seal_body_sha256: [u8; 32],
     pub(crate) previous_segment: (u64, u64, [u8; 32]),
     pub(crate) header_target_checkpoint_generation: u64,
+}
+
+/// Session-scoped memo of segments whose complete descriptor/summary/seal
+/// chain [`scan_segment_with_matches`] has already authenticated. A sealed
+/// segment is immutable for its exact `(segment_no, generation)` key, so —
+/// exactly like the promotion/dedup verification caches on `SegmentStore` —
+/// one chain authentication per process carries the same guarantee as
+/// re-walking the whole chain on every pointer dereference, which measures
+/// as the dominant read amplification of small-store commits. Collection is
+/// the only path that retires and eventually reuses segment numbers, so the
+/// memo is cleared around every GC round; cold scrub and migration passes
+/// never consult it.
+pub(crate) struct VerifiedSegmentScans {
+    entries: ScanMemoCell,
+}
+
+struct ScanMemoCell(core::cell::RefCell<BTreeMap<(u64, u64), VerifiedSegment>>);
+
+// Safety: the memo lives inside `SegmentStore`, whose every operation runs
+// through `&mut self`, and shared kernel handles serialize all store access
+// behind one active-operation claim (the same argument as the kernel's
+// `StableSegmentStore`). Every borrow below is taken and released within one
+// synchronous call — none is held across an await point.
+unsafe impl Sync for ScanMemoCell {}
+unsafe impl Send for ScanMemoCell {}
+
+/// Everything a chain walk proves about one sealed segment, independent of
+/// which extent the caller asked for.
+struct VerifiedSegment {
+    extents: Vec<ExtentRecord>,
+    record_count: u32,
+    total_payload_bytes: u64,
+    segment_seal_body_sha256: [u8; 32],
+    previous_segment: (u64, u64, [u8; 32]),
+    header_target_checkpoint_generation: u64,
+    last_target_checkpoint_generation: u64,
+}
+
+/// Bounded so a large store cannot grow the memo without limit; eviction is
+/// oldest-key-first and only costs a re-walk on the next access.
+const VERIFIED_SEGMENT_SCAN_CAPACITY: usize = 48;
+
+impl VerifiedSegmentScans {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: ScanMemoCell(core::cell::RefCell::new(BTreeMap::new())),
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.entries.0.borrow_mut().clear();
+    }
+
+    /// Run `interpret` against the cached proof for this exact sealed
+    /// segment, if present and provable at the caller's checkpoint horizon.
+    fn with_verified<T>(
+        &self,
+        segment_no: u64,
+        segment_generation: u64,
+        checkpoint_generation: u64,
+        interpret: impl FnOnce(&VerifiedSegment) -> T,
+    ) -> Option<T> {
+        let entries = self.entries.0.borrow();
+        let cached = entries.get(&(segment_no, segment_generation))?;
+        if cached.header_target_checkpoint_generation > checkpoint_generation
+            || cached.last_target_checkpoint_generation > checkpoint_generation
+        {
+            return None;
+        }
+        Some(interpret(cached))
+    }
+
+    /// Drop every entry whose segment is no longer Allocated: only such
+    /// segments can be handed back to a writer and later re-sealed under a
+    /// fresh generation, so proofs for them must not outlive the round that
+    /// freed them. Allocated sealed segments remain immutable and provable.
+    pub(crate) fn retain_allocated(&self, allocation: &crate::allocation_v2::AllocationV2) {
+        self.entries.0.borrow_mut().retain(|(segment_no, _), _| {
+            matches!(
+                allocation.segment_state(*segment_no),
+                Some(crate::allocation_v2::SegmentAllocation::Allocated)
+            )
+        });
+    }
+
+    fn insert(&self, segment_no: u64, segment_generation: u64, verified: VerifiedSegment) {
+        let mut entries = self.entries.0.borrow_mut();
+        while entries.len() >= VERIFIED_SEGMENT_SCAN_CAPACITY {
+            entries.pop_first();
+        }
+        entries.insert((segment_no, segment_generation), verified);
+    }
 }
 
 pub(crate) async fn scan_segment<D: PageDevice>(
@@ -1193,6 +1640,35 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     next_segment_generation: u64,
     checkpoint_generation: u64,
     pointer: PointerValue,
+    memo: Option<&VerifiedSegmentScans>,
+) -> Result<ScannedSegment, StoreError<D::Error>> {
+    scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        &[],
+        false,
+        false,
+        memo,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_segment_with_matches<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PointerValue,
+    additional: &[PointerValue],
+    collect_authority_siblings: bool,
+    collect_authority_records: bool,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<ScannedSegment, StoreError<D::Error>> {
     if pointer.store_uuid != store_uuid
         || pointer.segment_no >= admitted_segments
@@ -1202,8 +1678,27 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
     let base = segment_base_page(pointer.segment_no)?;
-    let (header_body, header_seal) = read_pair(device, base).await?;
-    let header = match decode_segment_header_verified(&header_body, &header_seal)? {
+    if let Some(memo) = memo {
+        if let Some(interpreted) = memo.with_verified(
+            pointer.segment_no,
+            pointer.segment_generation,
+            checkpoint_generation,
+            |verified| {
+                interpret_verified_extents(
+                    verified,
+                    base,
+                    pointer,
+                    additional,
+                    collect_authority_siblings,
+                    collect_authority_records,
+                )
+            },
+        ) {
+            return interpreted;
+        }
+    }
+    let header_pages = read_pair(device, base).await?;
+    let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
@@ -1215,18 +1710,17 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
 
-    let (summary_body, summary_seal_page) =
-        read_pair(device, base + u64::from(SUMMARY_BODY_PAGE)).await?;
-    let summary = match decode_segment_summary_verified(&summary_body, &summary_seal_page)? {
+    let summary_pages = read_pair(device, base + u64::from(SUMMARY_BODY_PAGE)).await?;
+    let summary = match decode_segment_summary_verified(&summary_pages[0], &summary_pages[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
-    let (segment_seal_body, final_seal_page) =
-        read_pair(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE)).await?;
-    let segment_seal = match decode_segment_seal_verified(&segment_seal_body, &final_seal_page)? {
-        DecodeStatus::Sealed(value) => value,
-        _ => return Err(StoreError::Corrupt),
-    };
+    let segment_seal_pages = read_pair(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE)).await?;
+    let segment_seal =
+        match decode_segment_seal_verified(&segment_seal_pages[0], &segment_seal_pages[1])? {
+            DecodeStatus::Sealed(value) => value,
+            _ => return Err(StoreError::Corrupt),
+        };
 
     let mut relative = DATA_FIRST_PAGE;
     let mut descriptor_chain =
@@ -1239,10 +1733,13 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     let mut kind_bytes = [0_u64; 5];
     let mut first_target = 0_u64;
     let mut last_target = 0_u64;
-    let mut matched = None;
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(summary.value().record_count as usize)
+        .map_err(|_| StoreError::MemoryLimit)?;
     for ordinal in 1..=summary.value().record_count {
-        let (body, seal) = read_pair(device, base + u64::from(relative)).await?;
-        let extent = match decode_extent_verified(&body, &seal)? {
+        let descriptor_pages = read_pair(device, base + u64::from(relative)).await?;
+        let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };
@@ -1293,9 +1790,7 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         kind_bytes[kind] = kind_bytes[kind]
             .checked_add(value.payload_byte_len)
             .ok_or(StoreError::Corrupt)?;
-        if relative == pointer.descriptor_relative_page && ordinal == pointer.ordinal {
-            matched = Some(value);
-        }
+        extents.push(value);
         relative = relative
             .checked_add(value.record_span_pages)
             .ok_or(StoreError::Corrupt)?;
@@ -1328,8 +1823,8 @@ pub(crate) async fn scan_segment<D: PageDevice>(
     {
         return Err(StoreError::Corrupt);
     }
-    Ok(ScannedSegment {
-        matched,
+    let verified = VerifiedSegment {
+        extents,
         record_count: summary_value.record_count,
         total_payload_bytes: summary_value.total_payload_bytes,
         segment_seal_body_sha256: segment_seal.digest().body_sha256(),
@@ -1339,6 +1834,109 @@ pub(crate) async fn scan_segment<D: PageDevice>(
             header.value().previous_segment_seal_body_sha256,
         ),
         header_target_checkpoint_generation: header.value().binding.target_checkpoint_generation,
+        last_target_checkpoint_generation: last_target,
+    };
+    let interpreted = interpret_verified_extents(
+        &verified,
+        base,
+        pointer,
+        additional,
+        collect_authority_siblings,
+        collect_authority_records,
+    );
+    if let Some(memo) = memo {
+        memo.insert(pointer.segment_no, pointer.segment_generation, verified);
+    }
+    interpreted
+}
+
+/// Resolve one scan request against a segment's already-authenticated extent
+/// list. Every check here is a pure function of the extent values and the
+/// request, so the walk path and the memoized path share it verbatim.
+fn interpret_verified_extents<E>(
+    verified: &VerifiedSegment,
+    base: u64,
+    pointer: PointerValue,
+    additional: &[PointerValue],
+    collect_authority_siblings: bool,
+    collect_authority_records: bool,
+) -> Result<ScannedSegment, StoreError<E>> {
+    let mut matched = None;
+    let mut additional_matches = Vec::new();
+    additional_matches
+        .try_reserve_exact(additional.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    let mut authority_siblings = Vec::new();
+    for value in &verified.extents {
+        let value = *value;
+        let ordinal = value.binding.ordinal;
+        let relative = u32::try_from(value.binding.self_page.saturating_sub(base))
+            .map_err(|_| StoreError::Corrupt)?;
+        if relative == pointer.descriptor_relative_page && ordinal == pointer.ordinal {
+            matched = Some(value);
+        }
+        if collect_authority_records && value.extent_kind == ExtentKind::Authority {
+            authority_siblings.push(value);
+        }
+        if collect_authority_siblings && ordinal > pointer.ordinal {
+            let still_collecting = matched.as_ref().is_some_and(|first| {
+                authority_siblings.len() as u32 + 1 < first.extent_count
+            });
+            if still_collecting {
+                let first = matched.as_ref().expect("collecting implies matched");
+                let expected_index = authority_siblings.len() as u32 + 1;
+                if value.extent_kind != ExtentKind::Authority
+                    || value.binding.target_checkpoint_generation
+                        != first.binding.target_checkpoint_generation
+                    || value.extent_index != expected_index
+                    || value.extent_count != first.extent_count
+                    || value.object_kind != first.object_kind
+                    || value.content_byte_len != first.content_byte_len
+                    || value.encoded_blob_len != first.encoded_blob_len
+                    || value.encoded_offset
+                        != first
+                            .payload_byte_len
+                            .checked_mul(u64::from(expected_index))
+                            .ok_or(StoreError::Corrupt)?
+                    || value.merkle_root != first.merkle_root
+                    || value.payload_byte_len
+                        > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                authority_siblings.push(value);
+            }
+        }
+        for wanted in additional {
+            if relative == wanted.descriptor_relative_page && ordinal == wanted.ordinal {
+                additional_matches.push(value);
+            }
+        }
+    }
+    if additional_matches.len() != additional.len() {
+        return Err(StoreError::Corrupt);
+    }
+    if collect_authority_siblings {
+        let first = matched.ok_or(StoreError::Corrupt)?;
+        if first.extent_kind != ExtentKind::Authority
+            || first.extent_index != 0
+            || first.extent_count == 0
+            || first.encoded_offset != 0
+            || first.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+            || authority_siblings.len() as u32 + 1 > first.extent_count
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(ScannedSegment {
+        matched,
+        additional_matches,
+        authority_siblings,
+        record_count: verified.record_count,
+        total_payload_bytes: verified.total_payload_bytes,
+        segment_seal_body_sha256: verified.segment_seal_body_sha256,
+        previous_segment: verified.previous_segment,
+        header_target_checkpoint_generation: verified.header_target_checkpoint_generation,
     })
 }
 
@@ -1351,6 +1949,44 @@ pub(crate) struct ResolvedPayload {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Validate the semantic chain of one multi-extent authority payload.
+/// Extent 0 carries extent_count and the whole-payload merkle root; every
+/// sibling must continue the ascending index/offset sequence with identical
+/// logical shape. Binding shape is authenticated separately by the scan.
+fn validate_authority_extent_chain<E>(extents: &[ExtentRecord]) -> Result<(), StoreError<E>> {
+    let Some(first) = extents.first() else {
+        return Ok(());
+    };
+    if first.extent_index != 0
+        || first.extent_count == 0
+        || first.encoded_offset != 0
+        || first.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        || extents.len() as u32 != first.extent_count
+    {
+        return Err(StoreError::Corrupt);
+    }
+    for (index, extent) in extents.iter().enumerate().skip(1) {
+        let expected_offset = first
+            .payload_byte_len
+            .checked_mul(index as u64)
+            .ok_or(StoreError::Corrupt)?;
+        if extent.extent_index != index as u32
+            || extent.extent_count != first.extent_count
+            || extent.object_kind != first.object_kind
+            || extent.content_byte_len != first.content_byte_len
+            || extent.encoded_blob_len != first.encoded_blob_len
+            || extent.encoded_offset != expected_offset
+            || extent.merkle_root != first.merkle_root
+            || extent.binding.target_checkpoint_generation
+                != first.binding.target_checkpoint_generation
+            || extent.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn read_pointer_payload<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
@@ -1360,6 +1996,7 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     pointer: PhysicalPointer,
     expected_kind: ExtentKind,
     maximum_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<ResolvedPayload, StoreError<D::Error>> {
     let PhysicalPointer::Value(pointer) = pointer else {
         return Err(StoreError::Corrupt);
@@ -1377,10 +2014,199 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
         next_segment_generation,
         checkpoint_generation,
         pointer,
+        memo,
     )
     .await?;
     let extent = scanned.matched.ok_or(StoreError::Corrupt)?;
-    if extent.extent_kind != pointer.extent_kind
+    read_pointer_payload_after_scan(
+        device,
+        pointer,
+        expected_kind,
+        checkpoint_generation,
+        extent,
+        &scanned,
+    )
+    .await
+}
+
+/// Resolve several pointers from one immutable sealed segment while paying
+/// for its descriptor-chain authentication only once. Every requested
+/// descriptor seal and payload is still read back and checked independently.
+pub(crate) async fn read_pointer_payloads<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    requests: &[(PhysicalPointer, ExtentKind, usize)],
+    memo: Option<&VerifiedSegmentScans>,
+) -> Result<Vec<ResolvedPayload>, StoreError<D::Error>> {
+    let Some((PhysicalPointer::Value(first), _, _)) = requests.first().copied() else {
+        return if requests.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(StoreError::Corrupt)
+        };
+    };
+    if requests.len() == 1 {
+        let (pointer, kind, maximum_bytes) = requests[0];
+        let resolved = vec![
+            read_pointer_payload(
+                device,
+                store_uuid,
+                admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                pointer,
+                kind,
+                maximum_bytes,
+                memo,
+            )
+            .await?,
+        ];
+        validate_resolved_authority_chains(&resolved)?;
+        return Ok(resolved);
+    }
+    let one_segment = requests.iter().all(|(pointer, _, _)| {
+        matches!(
+            pointer,
+            PhysicalPointer::Value(value)
+                if value.store_uuid == first.store_uuid
+                    && value.segment_no == first.segment_no
+                    && value.segment_generation == first.segment_generation
+        )
+    });
+    if !one_segment {
+        let mut resolved = Vec::new();
+        resolved
+            .try_reserve_exact(requests.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for (pointer, kind, maximum_bytes) in requests.iter().copied() {
+            resolved.push(
+                read_pointer_payload(
+                    device,
+                    store_uuid,
+                    admitted_segments,
+                    next_segment_generation,
+                    checkpoint_generation,
+                    pointer,
+                    kind,
+                    maximum_bytes,
+                    memo,
+                )
+                .await?,
+            );
+        }
+        return Ok(resolved);
+    }
+    let mut additional = Vec::new();
+    additional
+        .try_reserve_exact(requests.len().saturating_sub(1))
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (pointer, _, _) in &requests[1..] {
+        let PhysicalPointer::Value(pointer) = pointer else {
+            return Err(StoreError::Corrupt);
+        };
+        additional.push(*pointer);
+    }
+    let scanned = scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        first,
+        &additional,
+        false,
+        false,
+        memo,
+    )
+    .await?;
+    let base = segment_base_page(first.segment_no)?;
+    let mut resolved = Vec::new();
+    resolved
+        .try_reserve_exact(requests.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (request_index, (physical, kind, maximum_bytes)) in requests.iter().copied().enumerate() {
+        let PhysicalPointer::Value(pointer) = physical else {
+            return Err(StoreError::Corrupt);
+        };
+        if pointer.store_uuid != first.store_uuid
+            || pointer.segment_no != first.segment_no
+            || pointer.segment_generation != first.segment_generation
+            || pointer.extent_kind != kind
+            || pointer.exact_byte_len > maximum_bytes as u64
+            || pointer.exact_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+            || pointer.ordinal == 0
+            || pointer.ordinal > scanned.record_count
+        {
+            return Err(StoreError::Corrupt);
+        }
+        let extent = if request_index == 0 {
+            scanned.matched.ok_or(StoreError::Corrupt)?
+        } else {
+            scanned
+                .additional_matches
+                .iter()
+                .copied()
+                .find(|extent| {
+                    extent.binding.ordinal == pointer.ordinal
+                        && extent.binding.self_page
+                            == base + u64::from(pointer.descriptor_relative_page)
+                })
+                .ok_or(StoreError::Corrupt)?
+        };
+        resolved.push(
+            read_pointer_payload_after_scan(
+                device,
+                pointer,
+                kind,
+                checkpoint_generation,
+                extent,
+                &scanned,
+            )
+            .await?,
+        );
+    }
+    validate_resolved_authority_chains(&resolved)?;
+    Ok(resolved)
+}
+
+fn validate_resolved_authority_chains<E>(resolved: &[ResolvedPayload]) -> Result<(), StoreError<E>> {
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(resolved.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    extents.extend(
+        resolved
+            .iter()
+            .filter(|payload| payload.extent.extent_kind == ExtentKind::Authority)
+            .map(|payload| payload.extent),
+    );
+    validate_authority_extent_chain(&extents)
+}
+
+async fn read_pointer_payload_after_scan<D: PageDevice>(
+    device: &D,
+    pointer: PointerValue,
+    expected_kind: ExtentKind,
+    checkpoint_generation: u64,
+    extent: ExtentRecord,
+    scanned: &ScannedSegment,
+) -> Result<ResolvedPayload, StoreError<D::Error>> {
+    let base = segment_base_page(pointer.segment_no)?;
+    if pointer.payload_relative_page
+        != pointer
+            .descriptor_relative_page
+            .checked_add(2)
+            .ok_or(StoreError::Corrupt)?
+        || extent.binding.store_uuid != pointer.store_uuid
+        || extent.binding.segment_no != pointer.segment_no
+        || extent.binding.generation != pointer.segment_generation
+        || extent.binding.ordinal != pointer.ordinal
+        || extent.binding.self_page != base + u64::from(pointer.descriptor_relative_page)
+        || extent.binding.target_checkpoint_generation > checkpoint_generation
+        || extent.extent_kind != pointer.extent_kind
         || extent.payload_first_relative_page != pointer.payload_relative_page
         || extent.payload_pages != pointer.payload_pages
         || extent.payload_byte_len != pointer.exact_byte_len
@@ -1391,20 +2217,22 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
                 || extent.content_byte_len != pointer.exact_byte_len
                 || extent.encoded_blob_len != pointer.exact_byte_len
                 || extent.encoded_offset != 0
-                || extent.merkle_root != pointer.payload_sha256))
+                || extent.merkle_root != pointer.payload_sha256)
+            && expected_kind != ExtentKind::Authority)
+        || (expected_kind == ExtentKind::Authority
+            && (extent.extent_count == 0 || extent.extent_index >= extent.extent_count))
     {
         return Err(StoreError::Corrupt);
     }
     let exact_len = usize::try_from(pointer.exact_byte_len).map_err(|_| StoreError::Corrupt)?;
     let mut bytes = vec![0; exact_len];
-    let base = segment_base_page(pointer.segment_no)?;
     let mut copied = 0;
     for index in 0..pointer.payload_pages {
-        let mut page = [0; PAGE_SIZE];
+        let mut page = Box::new([0; PAGE_SIZE]);
         device
             .read_page(
                 base + u64::from(pointer.payload_relative_page) + u64::from(index),
-                &mut page,
+                page.as_mut(),
             )
             .await
             .map_err(StoreError::Device)?;
@@ -1541,6 +2369,32 @@ fn persistent_roots_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize
         .ok_or(StoreError::MemoryLimit)
 }
 
+fn persistent_authority_decode_capacity_upper_bound<E>(
+    input: &[u8],
+) -> Result<usize, StoreError<E>> {
+    if input.len() < PERSISTENT_AUTHORITY_HEADER_LEN {
+        return Err(StoreError::Corrupt);
+    }
+    let object_count = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
+    let principal_count = input_u32(input, 0x3c).ok_or(StoreError::Corrupt)? as usize;
+    let record_count = input_u32(input, 0x40).ok_or(StoreError::Corrupt)? as usize;
+    object_count
+        .checked_mul(core::mem::size_of::<
+            crate::authority_snapshot::PersistentObjectBinding,
+        >())
+        .and_then(|bytes| {
+            principal_count
+                .checked_mul(core::mem::size_of::<crate::PersistentPrincipalPolicy>())?
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| {
+            record_count
+                .checked_mul(vibeos_durable_format::RECORD_SIZE)?
+                .checked_add(bytes)
+        })
+        .ok_or(StoreError::MemoryLimit)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn read_recovery_pointer_payload<D: PageDevice>(
     device: &D,
@@ -1571,6 +2425,216 @@ async fn read_recovery_pointer_payload<D: PageDevice>(
         checkpoint_generation,
         pointer,
         expected_kind,
+        remaining,
+        None,
+    )
+    .await
+}
+
+/// Scan one allocated segment and return every Authority extent record it
+/// contains, authenticated by the segment's full descriptor/summary/seal
+/// chain. Used to reassemble authority chains whose extents span segments.
+pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    segment_no: u64,
+    maximum: usize,
+) -> Result<Vec<ExtentRecord>, StoreError<D::Error>> {
+    let base = segment_base_page(segment_no)?;
+    let header_pages = read_pair(device, base).await?;
+    let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
+        DecodeStatus::Sealed(value) => value,
+        _ => return Err(StoreError::Corrupt),
+    };
+    let generation = header.value().binding.generation;
+    if header.value().binding.store_uuid != store_uuid
+        || header.value().binding.segment_no != segment_no
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let pointer = PointerValue {
+        store_uuid,
+        segment_no,
+        segment_generation: generation,
+        descriptor_relative_page: DATA_FIRST_PAGE,
+        payload_relative_page: DATA_FIRST_PAGE + 2,
+        payload_pages: 0,
+        ordinal: 0,
+        exact_byte_len: 0,
+        extent_kind: ExtentKind::Authority,
+        payload_sha256: [0; 32],
+    };
+    let scanned = scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        &[],
+        false,
+        true,
+        None,
+    )
+    .await?;
+    if scanned.authority_siblings.len() > maximum {
+        return Err(StoreError::MemoryLimit);
+    }
+    Ok(scanned.authority_siblings)
+}
+
+/// Resolve a possibly multi-extent authority payload. Extent 0 is named by
+/// the checkpoint; sibling extents are collected from the extent 0 segment
+/// scan and, when the chain spans segments, from authenticated scans of
+/// every allocated segment. The returned bytes are the concatenated logical
+/// authority snapshot payload.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    allocated_segments: &[u64],
+    maximum_bytes: usize,
+) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
+    let PhysicalPointer::Value(pointer) = pointer else {
+        return Err(StoreError::Corrupt);
+    };
+    if pointer.extent_kind != ExtentKind::Authority
+        || pointer.exact_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let scanned = scan_segment_with_matches(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        &[],
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let first = scanned.matched.ok_or(StoreError::Corrupt)?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(first.extent_count as usize)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    records.push(first);
+    records.extend(scanned.authority_siblings.iter().copied());
+    if records.len() as u32 != first.extent_count {
+        for segment_no in allocated_segments.iter().copied() {
+            if segment_no == pointer.segment_no {
+                continue;
+            }
+            let found = scan_segment_authority_records(
+                device,
+                store_uuid,
+                admitted_segments,
+                next_segment_generation,
+                checkpoint_generation,
+                segment_no,
+                first.extent_count as usize,
+            )
+            .await?;
+            records.extend(found);
+        }
+    }
+    // Older generations' authority chains remain allocated on media; only
+    // extents targeting this checkpoint's generation belong to the chain.
+    records.retain(|extent| {
+        extent.binding.target_checkpoint_generation == first.binding.target_checkpoint_generation
+    });
+    records.sort_unstable_by_key(|extent| extent.extent_index);
+    validate_authority_extent_chain(&records)?;
+    if records.len() as u32 != first.extent_count {
+        return Err(StoreError::Corrupt);
+    }
+    let total = records.iter().try_fold(0usize, |total, extent| {
+        usize::try_from(extent.payload_byte_len)
+            .map_err(|_| StoreError::Corrupt)
+            .and_then(|bytes| total.checked_add(bytes).ok_or(StoreError::Corrupt))
+    })?;
+    if total > maximum_bytes {
+        return Err(StoreError::MemoryLimit);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for extent in &records {
+        let exact_len =
+            usize::try_from(extent.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
+        let base = segment_base_page(extent.binding.segment_no)?;
+        let mut chunk = Vec::new();
+        chunk
+            .try_reserve_exact(exact_len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let mut copied = 0;
+        for index in 0..extent.payload_pages {
+            let mut page = Box::new([0; PAGE_SIZE]);
+            device
+                .read_page(
+                    base + u64::from(extent.payload_first_relative_page) + u64::from(index),
+                    page.as_mut(),
+                )
+                .await
+                .map_err(StoreError::Device)?;
+            let remaining = exact_len - copied;
+            let take = remaining.min(PAGE_SIZE);
+            chunk.extend_from_slice(&page[..take]);
+            copied += take;
+        }
+        if copied != exact_len || payload_sha256(&chunk) != extent.payload_sha256 {
+            return Err(StoreError::Corrupt);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != total || payload_sha256(&bytes) != records[0].merkle_root {
+        return Err(StoreError::Corrupt);
+    }
+    Ok((bytes, first))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_recovery_authority_payload<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    allocated_segments: &[u64],
+    memory_limit: usize,
+    resident_bytes: usize,
+) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
+    let remaining = recovery_remaining(memory_limit, resident_bytes)?;
+    if let PhysicalPointer::Value(pointer) = pointer {
+        if pointer.extent_kind != ExtentKind::Authority
+            || pointer.exact_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        {
+            return Err(StoreError::Corrupt);
+        }
+        if pointer.exact_byte_len > remaining as u64 {
+            return Err(StoreError::MemoryLimit);
+        }
+    }
+    read_pointer_authority_payload(
+        device,
+        store_uuid,
+        admitted_segments,
+        next_segment_generation,
+        checkpoint_generation,
+        pointer,
+        allocated_segments,
         remaining,
     )
     .await
@@ -1831,6 +2895,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                     checkpoint.next_segment_generation,
                     checkpoint.binding.generation,
                     &decoded_manifest,
+                    None,
                 )
                 .await?;
                 recovery_observe(
@@ -1888,43 +2953,87 @@ pub(crate) async fn recover_state<D: PageDevice>(
     }
 
     let mut persistent_roots = None;
+    let mut persistent_authority = None;
     if checkpoint.authority_root != PhysicalPointer::Null {
         let resident_before_roots =
-            recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None)
+            recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None, None)
                 .map_err(|_| StoreError::MemoryLimit)?;
-        let authority = read_recovery_pointer_payload(
+        let mut allocated_segments = Vec::new();
+        allocated_segments
+            .try_reserve_exact(usize::try_from(allocation.counts().map_err(|_| StoreError::Corrupt)?.allocated).unwrap_or(0))
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for segment_no in 0..checkpoint.admitted_segments {
+            if allocation.segment_state(segment_no) == Some(SegmentAllocation::Allocated) {
+                allocated_segments.push(segment_no);
+            }
+        }
+        let (authority_bytes, authority_extent) = read_recovery_authority_payload(
             device,
             superblock.binding.store_uuid,
             checkpoint.admitted_segments,
             checkpoint.next_segment_generation,
             checkpoint.binding.generation,
             checkpoint.authority_root,
-            ExtentKind::Authority,
+            &allocated_segments,
             limits.recovery_memory_bytes,
             resident_before_roots,
         )
         .await?;
-        recovery_preflight_decode(
-            limits.recovery_memory_bytes,
-            resident_before_roots,
-            authority.bytes.capacity(),
-            persistent_roots_decode_capacity_upper_bound(&authority.bytes)?,
-        )?;
-        let decoded =
-            decode_persistent_root_set(&authority.bytes).map_err(|_| StoreError::Corrupt)?;
-        if decoded.checkpoint_generation > checkpoint.binding.generation
-            || decoded.checkpoint_generation
-                != authority.extent.binding.target_checkpoint_generation
-        {
-            return Err(StoreError::Corrupt);
-        }
-        let cas_state = cas.as_ref().ok_or(StoreError::Corrupt)?;
-        for root in decoded.entries() {
-            let object = cas_state
+        // A freshly formatted V2 store has a null catalog root. Installing an
+        // explicit empty authority snapshot is still valid: there are no
+        // bindings which would require CAS resolution yet.
+        let cas_objects: &[ObjectMapping] =
+            cas.as_ref().map_or(&[], |state| state.objects.as_slice());
+        let (decoded_roots, decoded_authority) = if authority_bytes.starts_with(b"VIBEAUT2") {
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                resident_before_roots,
+                authority_bytes.capacity(),
+                persistent_authority_decode_capacity_upper_bound(&authority_bytes)?,
+            )?;
+            let decoded = decode_persistent_authority_snapshot(&authority_bytes)
+                .map_err(|_| StoreError::Corrupt)?;
+            if decoded.checkpoint_generation()
+                != authority_extent.binding.target_checkpoint_generation
+            {
+                return Err(StoreError::Corrupt);
+            }
+            let mut entries: Vec<PersistentRootEntry> = decoded
                 .objects
+                .iter()
+                .map(|binding| PersistentRootEntry {
+                    object_id: binding.v2_object_id,
+                    commit_generation: binding.commit_generation,
+                    object_kind: binding.object_kind,
+                })
+                .collect();
+            entries.extend_from_slice(decoded.external_roots());
+            entries.sort_unstable_by_key(|entry| entry.object_id);
+            let roots = PersistentRootSet::new(decoded.checkpoint_generation(), entries)
+                .map_err(|_| StoreError::Corrupt)?;
+            (roots, Some(decoded))
+        } else {
+            recovery_preflight_decode(
+                limits.recovery_memory_bytes,
+                resident_before_roots,
+                authority_bytes.capacity(),
+                persistent_roots_decode_capacity_upper_bound(&authority_bytes)?,
+            )?;
+            let decoded =
+                decode_persistent_root_set(&authority_bytes).map_err(|_| StoreError::Corrupt)?;
+            if decoded.checkpoint_generation > checkpoint.binding.generation
+                || decoded.checkpoint_generation
+                    != authority_extent.binding.target_checkpoint_generation
+            {
+                return Err(StoreError::Corrupt);
+            }
+            (decoded, None)
+        };
+        for root in decoded_roots.entries() {
+            let object = cas_objects
                 .binary_search_by_key(&root.object_id, |object| object.object_id)
                 .ok()
-                .map(|index| cas_state.objects[index])
+                .map(|index| cas_objects[index])
                 .ok_or(StoreError::Corrupt)?;
             if object.commit_generation != root.commit_generation
                 || object.blob_key.object_kind() != root.object_kind
@@ -1936,11 +3045,19 @@ pub(crate) async fn recover_state<D: PageDevice>(
             &mut recovery_peak,
             limits.recovery_memory_bytes,
             resident_before_roots
-                .checked_add(authority.bytes.capacity())
-                .and_then(|bytes| bytes.checked_add(decoded.allocated_bytes()?))
+                .checked_add(authority_bytes.capacity())
+                .and_then(|bytes| bytes.checked_add(decoded_roots.allocated_bytes()?))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        decoded_authority
+                            .as_ref()
+                            .map_or(0, |value| value.allocated_bytes().unwrap_or(usize::MAX)),
+                    )
+                })
                 .ok_or(StoreError::MemoryLimit)?,
         )?;
-        persistent_roots = Some(decoded);
+        persistent_roots = Some(decoded_roots);
+        persistent_authority = decoded_authority;
     }
 
     let mut reverse_deltas = Vec::new();
@@ -1953,6 +3070,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         &catalog,
         cas.as_ref(),
         persistent_roots.as_ref(),
+        persistent_authority.as_ref(),
     )
     .map_err(|_| StoreError::MemoryLimit)?;
     let replay_allocation_peak = resident_bytes
@@ -2088,6 +3206,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
             &catalog,
             cas.as_ref(),
             persistent_roots.as_ref(),
+            persistent_authority.as_ref(),
         )
         .map_err(|_| StoreError::MemoryLimit)?,
     );
@@ -2109,6 +3228,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                 checkpoint.binding.generation,
                 entry,
                 pointer,
+                None,
             )
             .await?;
         }
@@ -2168,6 +3288,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         allocation,
         allocation_version,
         persistent_roots,
+        persistent_authority,
         catalog,
         cas,
         recovery_peak_bytes: recovery_peak,
@@ -2386,6 +3507,7 @@ async fn validate_blob_descriptor<D: PageDevice>(
     checkpoint_generation: u64,
     entry: &CatalogEntry,
     pointer: PointerValue,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), StoreError<D::Error>> {
     let scanned = scan_segment(
         device,
@@ -2394,6 +3516,7 @@ async fn validate_blob_descriptor<D: PageDevice>(
         next_segment_generation,
         checkpoint_generation,
         pointer,
+        memo,
     )
     .await?;
     let extent = scanned.matched.ok_or(StoreError::Corrupt)?;
@@ -2424,6 +3547,7 @@ pub(crate) async fn validate_cas_blob_descriptors<D: PageDevice>(
     next_segment_generation: u64,
     checkpoint_generation: u64,
     manifest: &BlobManifest,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), StoreError<D::Error>> {
     for declared in &manifest.extents {
         let PhysicalPointer::Value(pointer) = declared.pointer else {
@@ -2436,6 +3560,7 @@ pub(crate) async fn validate_cas_blob_descriptors<D: PageDevice>(
             next_segment_generation,
             checkpoint_generation,
             pointer,
+            memo,
         )
         .await?;
         let extent = scanned.matched.ok_or(StoreError::Corrupt)?;
@@ -2592,18 +3717,24 @@ async fn write_extent<D: PageDevice>(
 ) -> Result<(), StoreError<D::Error>> {
     let relative = extent.value.binding.self_page - base;
     let mut copied = 0;
-    for page_index in 0..extent.value.payload_pages {
-        let mut page = [0; PAGE_SIZE];
-        let remaining = extent.payload.len() - copied;
-        let take = remaining.min(PAGE_SIZE);
-        page[..take].copy_from_slice(&extent.payload[copied..copied + take]);
-        write_page(
-            device,
-            base + u64::from(extent.value.payload_first_relative_page + page_index),
-            &page,
-        )
-        .await?;
-        copied += take;
+    let mut page_index = 0_u32;
+    while page_index < extent.value.payload_pages {
+        let batch_pages = (extent.value.payload_pages - page_index).min(32) as usize;
+        let mut pages = vec![[0; PAGE_SIZE]; batch_pages];
+        for page in &mut pages {
+            let remaining = extent.payload.len() - copied;
+            let take = remaining.min(PAGE_SIZE);
+            page[..take].copy_from_slice(&extent.payload[copied..copied + take]);
+            copied += take;
+        }
+        device
+            .write_pages(
+                base + u64::from(extent.value.payload_first_relative_page + page_index),
+                &pages,
+            )
+            .await
+            .map_err(StoreError::Mutation)?;
+        page_index += batch_pages as u32;
     }
     flush(device).await?;
     write_page(device, base + relative, &extent.body).await?;
@@ -2931,6 +4062,7 @@ async fn append_object<D: PageDevice>(
             blob.pointer(),
             ExtentKind::Blob,
             limits.max_compat_object_bytes as usize,
+            None,
         )
         .await?;
         if verified.bytes.as_slice() != bytes {
@@ -2946,6 +4078,7 @@ async fn append_object<D: PageDevice>(
         catalog_pointer,
         catalog_extent_kind,
         limits.recovery_memory_bytes,
+        None,
     )
     .await?;
     if verified_catalog.bytes != catalog_bytes {
@@ -2960,6 +4093,7 @@ async fn append_object<D: PageDevice>(
         allocation_pointer,
         ExtentKind::Allocation,
         limits.recovery_memory_bytes,
+        None,
     )
     .await?;
     if verified_allocation.bytes.as_slice() != allocation_bytes {

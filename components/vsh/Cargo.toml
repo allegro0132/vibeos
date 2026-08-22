@@ -10,7 +10,9 @@ network = []
 # Target-only aggregate visibility for the standard managed-component QEMU
 # acceptance gate. Normal VSH and physical images expose no reaper snapshot.
 managed-component-target-acceptance = []
+file-tree = ["dep:vibeos-file-store"]
 
 [dependencies]
 vibeos-core = { path = "../../core" }
 vibeos-component-host = { path = "../../services/component-host" }
+vibeos-file-store = { path = "../../services/file-store", optional = true }

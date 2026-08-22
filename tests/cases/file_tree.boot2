@@ -1,0 +1,14 @@
+quiet
+cat @home/etc/config
+stat -c cfg:%i:%h:%s @home/etc/config
+stat -c hard:%i:%h:%s @home/etc/hard
+readlink -f @home/etc/link
+rm -r @home/etc
+echo gc00 | write @home/gc
+echo gc01 | write @home/gc
+echo gc02 | write @home/gc
+echo gc03 | write @home/gc
+echo gc04 | write @home/gc
+echo gc05 | write @home/gc
+rm @home/gc
+@quit

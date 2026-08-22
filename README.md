@@ -46,12 +46,18 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   ABI, crash model, transaction ordering, recovery algorithm, and proof limits.
 - **[docs/OBJECT_STORE.md](docs/OBJECT_STORE.md)** — the capability-only object
   API, unified on-disk journal, publication boundary, and raw-media acceptance.
+- **[docs/FILE_TREE.md](docs/FILE_TREE.md)** — the opt-in `file-tree` VSH
+  profile: `@NAME/path` capability syntax, namespace/transaction semantics,
+  and powered-off verification.
 - **[docs/PERSISTENT_CSPACE.md](docs/PERSISTENT_CSPACE.md)** — the fixed
   `persistent-test` CSpace, external root policy, atomic recovery install, and
   three-boot acceptance boundary.
 - **[docs/PROGRAM_PERSISTENCE.md](docs/PROGRAM_PERSISTENCE.md)** — canonical
   source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
   restored least authority.
+- **[docs/WASM_ROADMAP.md](docs/WASM_ROADMAP.md)** — the Component Model-first
+  admitted-code plan: WIT contracts, bounded Core-WASM execution, CSpace-backed
+  resources, native async, composition, durable installation, and later adapters/AOT.
 - **[docs/VIRTIO_NET.md](docs/VIRTIO_NET.md)** — the modern virtio-net subset,
   typed packet boundary, device-wide reset contract, and localhost L2 evidence.
 - **[docs/SSH.md](docs/SSH.md)** — the staged capability-native path from raw
@@ -81,6 +87,7 @@ cargo check -p vibeos-sshd # board-neutral SSH component
 ./scripts/qemu-test.sh       # QEMU goldens plus the differential corpus
 ./scripts/qemu-tcp-test.sh   # N1 static/DHCP IPv4 and TCP echo through host forwarding
 ./scripts/qemu-tcp-test.sh recovery # N2 stack/driver generation-recovery gate
+./scripts/qemu-iperf3-test.sh # real iperf3 client, forward and reverse TCP
 ./scripts/qemu-ssh-security-test.sh # N3 entropy/identity capability gate
 ./scripts/qemu-ssh-test.sh   # N4/N5 real OpenSSH exec and rejection gate
 python3 -B scripts/milkv-tcp-test.py ADDRESS # physical Duo TCP/rearm gate
@@ -88,6 +95,7 @@ python3 -B scripts/milkv-dhcp-test.py # isolated direct-link DHCP peer
 ./scripts/milkv-ssh-test.sh ADDRESS # explicit insecure physical SSH/VSH gate
 ./scripts/build-milkv-duo.sh --jitterentropy-probe # isolated Duo entropy probe
 ./scripts/build-milkv-duo.sh --jitterentropy-ssh-probe # fixed-key SSH evidence transport
+./scripts/build-milkv-duo.sh --iperf3-server # DHCP iperf3 server image for Duo
 ./scripts/bench.py           # fixed QEMU/TCG baseline + regression policy
 ./scripts/bench.py --smp-scaling # four-hart equal-work throughput acceptance
 python3 -B scripts/storage-v2-image.py --selftest # independent format verifier
@@ -417,6 +425,7 @@ its process owns. Here, authority is not a property of the code.
 | `random/` | bounded ChaCha20 DRBG and explicit entropy-source contract (`no_std`) |
 | `runtime/riscv/` | bare-metal RISC-V CSR, assembly, and SBI runtime seam (`no_std`) |
 | `components/netstack/` | configurable IPv4/TCP stack and VSH network control plane (`no_std`) |
+| `components/iperf3-server/` | bounded iperf3-compatible single-stream TCP server (`no_std`) |
 | `kernel/src/netstack_platform.rs` | thin packet/network-control adapter plus recovery-only test hooks |
 | `components/vsh/` | capability-native interactive loop, foreground cancellation, rendering, and command registration (`no_std`) |
 | `kernel/src/vsh_platform.rs` | console capability and hardware/management command adapters |
@@ -458,12 +467,16 @@ caps [space]    sanitized capability summary
 mem             bounded-memory accounts
 quiet           mute background component output
 verbose         restore background component output
+reboot          cold reboot
 poweroff        power off
 ```
 
 The dedicated QEMU `tcp-echo` image and the production Milk-V Duo image install
-a bounded Linux-style IPv4 control surface. `net0` is the canonical device name
-and `eth0` is an accepted compatibility alias. Milk-V Duo starts in DHCP mode:
+a bounded Linux-style IPv4 control surface. Admitted devices are sorted by a
+stable bus-topology key and exposed as the boot-local `netN` list; `ethN` is an
+accepted compatibility spelling for the same index. Milk-V Duo starts in DHCP
+mode. Inspect `ip link show` before selecting an interface; a single-NIC QEMU
+boot normally exposes `net0`:
 
 ```text
 ip link show
@@ -476,6 +489,15 @@ dhclient -r net0
 
 Possession of each installed vsh command capability is the authority to invoke
 the operation. Images without an IPv4 stack do not install these commands.
+
+The dedicated iperf3 images listen on TCP port `5201` and support one TCP
+stream in the normal client-to-server direction or reverse mode. Build and
+exercise the QEMU image with `./scripts/qemu-iperf3-test.sh`. For Milk-V Duo,
+build `./scripts/build-milkv-duo.sh --iperf3-server`, boot the generated image,
+wait for DHCP, inspect the address with `ip -4 addr show dev net0`, then run
+`iperf3 -c ADDRESS` or `iperf3 -c ADDRESS -R` from the peer. UDP, parallel
+streams, bidirectional mode, authentication, IPv6, and non-zero omit intervals
+are rejected; test duration is capped at 60 seconds.
 
 Interactive editing is shared by the default and test shells: `Up`/`Down`
 browse command history, while `Left`/`Right` move the insertion cursor.
@@ -524,6 +546,7 @@ quiet           mute background components (`verbose` restores)
 mem             kernel heap usage
 uptime          seconds since boot
 echo <text>     write via init's console capability
+reboot          cold reboot the machine
 halt            shut the machine down
 ```
 
@@ -619,21 +642,32 @@ Deliberate, not overlooked:
   checked descriptor builder remains hardware-facing TCB. An unconfirmed reset
   quarantines the slab instead of pretending revocation stopped in-flight DMA.
 - **Networking remains deliberately feature-gated.** Diagnostic images expose
-  only bounded raw-L2 service. Driver/stack queues now carry owned
-  `StampedPacket` values tied to one boot-local device epoch and stack
-  generation. One independent `net-stack` component owns the sole smoltcp
-  interface, ARP, one IPv4 address, one default route, and DHCPv4. Bounded
-  `TcpListener` capability frontends give each service exclusive authority over
-  its own port and generation-bound connections; SSH no longer owns the IPv4
-  stack. The shared core supports eight listeners and has a two-port isolation
-  test, while current image policy wires one service listener per image. It
+  only bounded raw-L2 service. Driver/stack queues carry owned `StampedPacket`
+  values tied to one boot-local device epoch and stack generation. One
+  independent `net-stack` component can fairly drive the runtime-discovered
+  list of explicitly capability-backed `netN` interfaces; each owns separate packet endpoints,
+  smoltcp state, ARP, IPv4 address, route, DHCPv4 client, session generation,
+  and listener set. Revocation or quarantine retires only the affected
+  interface. Bounded `TcpListener` capability frontends give each service
+  exclusive authority over its own port and generation-bound connections; SSH
+  no longer owns the IPv4 stack. The QEMU policy still wires one VirtIO NIC.
+  The Milk-V policy sorts DWMAC and any detected USB CDC-ECM function by stable
+  MMIO/USB topology and then assigns boot-local `netN` names. They have distinct
+  packet endpoints, controls, DHCP clients, and restart supervision; the
+  service listener remains deliberately attached to the DWMAC capability root,
+  independent of its assigned ordinal. Any further
+  multi-NIC policy must grant one distinct endpoint/control/listener bundle per
+  admitted device; parsing `net1` never creates hardware authority.
+  The shared core supports eight listeners per interface and has a two-port
+  isolation test. It
   still provides no DNS resolver, IPv6, general UDP API, or POSIX socket
   namespace. `qemu-tcp-test.sh recovery` defines a test-only N2 gate for
   stack and virtio-driver restart coordinates. Its synthetic stale-packet hooks
   are absent from normal images and do not model delayed DMA completion or a
   late IRQ. The native DWMAC DHCP/IP path has passed carrier, lease acquisition,
-  and eight fresh exact-echo TCP streams on a live board; restart coordinates,
-  delayed completion, late IRQ, and long-duration stress remain open.
+  and eight fresh exact-echo TCP streams on a live board. Simultaneous DWMAC +
+  CDC-ECM physical acceptance, restart coordinates, delayed completion, late
+  IRQ, and long-duration stress remain open.
 - **SSH acceptance fixtures remain separate from production provisioning.** A
   bounded, fail-closed virtio-rng capability now feeds a domain-separated,
   zeroizing ChaCha20 DRBG; tracked fault reclamation scrubs complete allocator

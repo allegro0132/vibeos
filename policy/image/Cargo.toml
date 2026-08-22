@@ -12,6 +12,8 @@ qemu-default = []
 milkv-duo-sd = []
 c53-native-async-qemu-acceptance = []
 c53-native-async-command-projection = []
+file-tree = []
+storage-bench = []
 
 [build-dependencies]
 sha2 = { version = "=0.11.0", default-features = false }

@@ -2,8 +2,8 @@
 
 VibeOS provides **single-core board support for the Milk-V Duo C906B**. Current
 support includes a fixed memory layout, Sv39 mappings, UART0, the PLIC, a 25 MHz
-timebase, native microSD/DWMAC backends, DWC2 USB host and HID keyboard input, and a
-FIT/SD image packaging flow based on the official Buildroot SDK.
+timebase, native microSD/DWMAC backends, DWC2 USB host with HID and CDC-ECM
+classes, and a FIT/SD image packaging flow based on the official Buildroot SDK.
 
 The separate `--jitterentropy-probe` image loads the exactly pinned
 `jitterentropy-rs` 0.1.1 crate against `rdtime` and exposes conditioned smoke
@@ -41,15 +41,45 @@ exercise ordinary bidirectional traffic through that path. They do not yet
 cover driver restart coordinates, deliberately delayed DMA completion, late
 IRQs, or long-duration link stress.
 
-The production image enables `milkv-ssh`. An independent `net-stack` component
-exclusively owns the DWMAC packet endpoints, the sole smoltcp interface, routes,
-and DHCPv4 state. SSH receives only its port-22 listener capability and observes
-the lease published by Netstack before announcing readiness. The image contains
+The CV1800B EPHY page-10 link-pulse table uses Milk-V's alternate tuning for
+cable-removal detection. The original table can leave standard MII BMSR link
+status asserted after unplug; the official
+[CVITEK PHY driver](https://github.com/milkv-duo/duo-buildroot-sdk/blob/23eb84fecb29585dbb5728d6b7e2475ff273baac/linux_5.10/drivers/net/phy/cvitek.c)
+documents that failure beside the replacement values. On carrier loss VibeOS
+retires the interface's live protocol-stack instance and clears its displayed
+IPv4 address and routes while retaining operator intent. Reconnection creates a
+fresh stack and restarts DHCP (or reapplies static configuration).
+
+CDC-ECM keeps USB presence separate from Ethernet carrier. The USB network
+frontend remains online while the adapter is enumerated, but `LOWER_UP` follows
+the class control interface's interrupt-IN `NETWORK_CONNECTION` notifications.
+Removing the RJ45 cable therefore retires only that interface's live stack and
+clears its DHCP address and route; reconnecting it starts DHCP again. Removing
+the USB device still advances the device epoch during re-enumeration.
+
+Realtek RTL8152/RTL8153/RTL8156 firmware is an explicit exception: an RTL8153
+was observed reporting `NETWORK_CONNECTION=1` with no RJ45 cable. For those
+identified products, `drivers/rtl815x` reads the vendor PLA `PHYSTATUS`
+register and uses its `LINK_STATUS` bit as the carrier authority, matching the
+official Linux r8152 driver's link-state source. Non-Realtek CDC-ECM devices
+continue to use the class notification.
+
+The production image enables `milkv-ssh`. One independent `net-stack` component
+fairly drives the interfaces discovered at boot. The image policy sorts each
+NIC's stable physical location (`mmio@...` or the DWC2 controller plus USB port
+path) and assigns the boot-local `netN` ordinals from that order; no ordinal is
+reserved for DWMAC, CDC-ECM, or RTL815x. Each admitted NIC has its own packet
+endpoints, device epoch, MAC identity, ARP cache, route table, DHCPv4 client and
+fault boundary. SSH receives only the port-22 listener capability attached to
+the DWMAC policy root and observes that interface's lease before announcing
+readiness; another NIC does not acquire SSH authority merely by appearing. The image contains
 no fixed host or client private key. It uses the accepted
 OSR=3 jitterentropy-rs source to seed a ChaCha20 DRBG, and refuses to listen
 until a device host key and an authorized client key have both been persisted
 and verified. This is a project deployment decision based on the recorded
-board evidence, not a claim of NIST/CMVP certification.
+board evidence, not a claim of NIST/CMVP certification. The dual-interface
+composition builds, but its simultaneous physical gate remains unchecked until
+the UART procedure below is run with both links attached.
 
 ## CPU model and support boundaries
 
@@ -86,7 +116,7 @@ bound.
 | virtio-mmio | 0 slots; native SDIO0 and DWMAC backends are selected instead |
 | microSD / SDIO0 | `0x0431_0000`, IRQ 36; 1-bit 25 MHz PIO baseline |
 | Ethernet / DWMAC | `0x0407_0000`, IRQ 31; RMII, Ethernet IO Board |
-| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration and HID boot/report keyboards |
+| USB 2.0 OTG / DWC2 | `0x0434_0000..0x0435_0000`, PHY `0x0300_6000..0x0300_6058`, IRQ 30; host bring-up, EP0 enumeration, HID and CDC-ECM |
 | Blue status LED | active-high GPIOC24; `drivers/milkv-duo-led` configures and verifies it after enabling Sv39 |
 
 The Duo USB & Ethernet IO Board V1.11 does not route the RJ45 LED terminals to
@@ -146,9 +176,17 @@ as the QEMU xHCI console and feed the kernel console input queue. The boot log
 prints speed, VID:PID, USB version, endpoint-zero packet size, keyboard protocol,
 and the selected HID interface/endpoint. A resident polling task
 detects root-port disconnect and reconnect transitions, clears stale device
-state, and repeats enumeration and HID configuration after reinsertion. USB
-storage remains absent. The official SDK describes the same core/PHY ranges and
-IRQ in
+state, and repeats enumeration and HID configuration after reinsertion.
+
+SCSI transparent-command-set, Bulk-Only USB storage is also supported on LUN
+zero. The driver discovers the bulk-IN and bulk-OUT endpoints, issues TEST UNIT
+READY, REQUEST SENSE and READ CAPACITY(10), and accepts 512-byte logical blocks.
+READ(10) and WRITE(10) transfer one raw sector at a time; failed BOT transport
+or phase transactions perform the required Mass Storage Reset followed by
+CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints. VibeOS does not yet mount a
+FAT or other filesystem from USB, so this is raw block access rather than a
+file-oriented `mount`, `cp`, or directory interface. The official SDK describes
+the same core/PHY ranges and IRQ in
 [`cv180x_base.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x/cv180x_base.dtsi)
 and
 [`cv180x_base_riscv.dtsi`](https://github.com/milkv-duo/duo-buildroot-sdk/blob/develop/build/boards/default/dts/cv180x_riscv/cv180x_base_riscv.dtsi).
@@ -160,15 +198,25 @@ Authenticated SSH sessions install the same shared VSH command profile, so
 `lsusb` and other read-only platform diagnostics are available over either
 transport. The default-password onboarding profile remains deliberately
 restricted until a public key is authorized.
+For an attached disk, `usb info` prints endpoint packet sizes and capacity, and
+`usb read N` dumps one 512-byte sector. The hardware acceptance image also
+provides `usb write-test CONFIRM`, locked to the explicitly reserved LBA
+4,000,000. It saves that sector, writes a deterministic pattern, reads it back,
+restores the original bytes, and verifies the restoration. It must only be run
+on media where that LBA is known to be disposable, and power and USB must remain
+stable until the restoration message appears.
 For a usable keyboard it also prints `HID keyboard protocol=Boot` or
 `protocol=Report` with the selected interface and interrupt-IN endpoint. It
 also reports each interface class tuple and the HID report-descriptor length.
 `connected, not enumerated` distinguishes
 an electrical connection from successful USB protocol enumeration.
 For a directly attached high-speed hub it also configures hub power, resets the
-first connected downstream port, and reports that child's negotiated speed and
-raw port status. This provides the topology needed to select native high-speed
-transactions or USB 2.0 split transactions before assigning the child address.
+connected downstream ports, assigns each child a unique address, and reports
+each child's negotiated speed and raw port status. HID and Mass Storage keep
+independent address, endpoint-toggle and split-transaction state, so their
+transfers can be interleaved through the same hub. This provides the topology
+needed to select native high-speed transactions or USB 2.0 split transactions
+before assigning each child address.
 On 2026-08-12, UART and an authenticated SSH PTY returned the same physical
 topology: hub `05e3:0610`, four ports, with a connected, enabled and powered
 Full-Speed child on port 1 (`wPortStatus = 0x0103`).
@@ -186,6 +234,26 @@ advertised both Report ID 1's five-key array and Report ID 2's 104-key NKRO
 bitmap. Typing `hidtest123` on that keyboard produced the exact ten-byte VSH
 command and the expected `unknown command at bytes 0..10` response, with no
 missing, duplicated or reordered key.
+
+The multi-device gate on the same date simultaneously enumerated that keyboard
+as address 2 on hub port 1 and a high-speed `1f75:0903` SCSI/BOT disk as address
+3 on port 3. `echo hidusbcombo` entered through HID exactly, followed by a
+successful 512-byte `usb read 0` from the disk with the `55 aa` MBR signature.
+Removing the keyboard caused a bounded re-enumeration that left the disk online
+at address 2 and READ(10) working. Reinserting it restored both functions;
+removing only the disk then left the keyboard online, where `echo hidok7`
+arrived exactly. The hub polling task checks port membership every 250 ms and
+rebuilds function bindings when it changes.
+
+The recursive-hub gate on 2026-08-12 placed a high-speed `1a40:0101` hub on
+root-hub address 1 / port 1, then the Full-Speed Apple keyboard on the nested
+hub's address 2 / port 3. `lsusb` reported the keyboard at address 3 with the
+complete parent chain, and `echo nestedhidok` arrived exactly through split
+transactions targeting the nearest high-speed hub. Removing only the keyboard
+reduced the descendant count from two to one while preserving both hubs.
+Reinsertion restored Report HID without reboot, and `echo n2ok` arrived exactly.
+Traversal is bounded to four hub levels and fifteen non-root devices; nested
+hubs must currently negotiate High Speed.
 
 The CV1800B adapter also reproduces the vendor FSBL's UTMI wrapper reset pulse
 (`USB20_PHY_WRAP + 0x14 = 0x18b`, restore, then wait 100 microseconds) after
@@ -359,20 +427,138 @@ ssh -i ~/.ssh/vibeos_duo root@BOARD_ADDRESS
 
 The same shared Netstack control plane is exposed to the local production VSH
 and to an authenticated production SSH profile. The legacy `net-shell` image
-remains available as a network-only diagnostic. Its bounded commands are:
+remains available as a network-only diagnostic. First list the admitted
+interfaces, then substitute the chosen name for `netN`:
 
 ```text
 ip link show
-ip -4 addr show dev net0
-ip addr replace 192.168.1.20/24 dev net0
-ip route replace default via 192.168.1.1 dev net0
-dhclient net0
-dhclient -r net0
+ip -4 addr show dev netN
+ip addr replace 192.168.1.20/24 dev netN
+ip route replace default via 192.168.1.1 dev netN
+dhclient netN
+dhclient -r netN
 ```
 
-`eth0` is accepted as an alias for `net0`. `dhclient -r` stops the client and
+`ethN` is accepted as an alias for the corresponding `netN`. `dhclient -r` stops the client and
 clears the local IPv4 configuration; smoltcp does not currently emit a DHCP
 RELEASE packet.
+
+### File-tree image
+
+The production image built above (`milkv-ssh` alone) does not link the
+capability-rooted file tree: `mkdir`, `ls`, `cat`, `write`, `rm`, `cp`, `mv`,
+`ln`, `readlink`, `stat`, and the RW `@home` capability binding all require the
+opt-in `file-tree` Cargo feature described in [FILE_TREE.md](FILE_TREE.md). A
+plain `milkv-ssh` image reports `unknown command` for `mkdir @home/...` because
+that feature, and the file commands it installs, were never compiled in.
+
+To get file-tree commands together with production SSH, build the combined
+`milkv-ssh,file-tree` feature set with `--file-tree`:
+
+```sh
+./scripts/build-milkv-duo.sh --file-tree
+```
+
+Then package it in the same SDK environment used above:
+
+```sh
+./scripts/package-milkv-duo-sdk.sh --file-tree /path/to/duo-buildroot-sdk
+```
+
+The flashable result is
+`target/milkv-duo-file-tree/vibeos-milkv-duo-file-tree-sd.img`. It boots the
+same DWMAC/DHCP/SSH production stack as the plain `milkv-ssh` image, plus a
+persistent, Storage-V2-backed `@home` namespace bound at VSH/SSH session start.
+See [FILE_TREE.md](FILE_TREE.md) for the `@NAME/path` capability syntax — there
+is no bare path, `/`, `~`, cwd, or globbing.
+
+#### Storage I/O performance status (2026-08-17: batched path landed on hardware)
+
+Multi-block I/O is now wired into the production milkv-duo path and validated
+on a physical board across many flash/boot cycles. Interactive `mkdir`/`ls`
+under `@home` measure ~0.1 s sustained (previously 15–30 s). The load-bearing
+findings, all reproduced with UART evidence:
+
+- **The earlier "bricks" were misdiagnosed.** A plain `reboot` (SBI reset)
+  hangs this board with total UART silence *on the unmodified known-good
+  image too* — reproduced with zero multi-block code involved. The two
+  historical failures attributed to multi-block wiring were this warm-reboot
+  hang; "revert + power cycle" recovered because reverting implied reflashing.
+  Always power-cycle instead of `reboot` until the warm-reset hang is fixed.
+- **Batched reads (CMD18, up to 256 blocks) work as-is** through the
+  production capability/session path.
+- **The CV1800B SDHCI integration never raises the initial buffer-write-ready
+  for PIO writes** (neither the interrupt nor PRESENT_STATE bit 10), so every
+  standard CMD25 shape stalls before its data phase: Auto CMD12, manual
+  CMD12, open-ended, and CMD23-prefixed all fail identically, on 1-bit and
+  4-bit widths, while the card correctly sits in `rcv` state (R1 decode). The
+  signal *does* fire on full-to-space transitions once the FIFO has been
+  saturated. No vendor software hits this: Linux writes via DMA, U-Boot and
+  the FSBL barely write.
+- **Production writes therefore use a "blind PIO" CMD25 feed**: the first
+  8 blocks (hardware-verified FIFO-safe) are pushed without the ready signal,
+  and later blocks strictly wait for the now-live signal. The kernel probes
+  the protocol ladder once per session, locks the working mode, read-back
+  verifies each newly used burst size before trusting it, retries transient
+  failures, and falls back to proven single-sector CMD24 only after repeated
+  failures. Failed transfers are aborted (CMD12 abort + CMD/DAT line reset)
+  so the card is never left wedged in a data state.
+- **Driver waits are wall-clock deadlines (10 s via the timebase), not spin
+  budgets**: cards legitimately stall >1 s during internal garbage
+  collection, and the old ~0.7 s spin budgets converted that into spurious
+  TimedOut failures under sustained load.
+- **A 2 MiB write-through LRU page cache in `CapabilityPageDevice`** now
+  serves ~99.9% of storage-stack page reads. Measured before the cache: tens
+  of megabytes of *repeat* reads of the same hot B+tree/manifest pages per
+  small mutation (invisible on a RAM-backed QEMU disk, fatal at 25 MHz PIO).
+  Writes update or drop affected entries; an ambiguous write failure drops
+  them.
+
+The sustained-commit slowdown (20–60 s per `mkdir`/`write` on a populated
+store, growing with live file count) was traced to three storage-engine
+causes and fixed (QEMU-validated; `mkdir` p50 dropped to ~35 ms against a
+130–220 ms baseline, and `write` from 26–70 s to ~0.1–0.3 s at the same
+operation counts, with a 200-operation sustained run completing with zero
+failures):
+
+- every pointer dereference re-authenticated the complete descriptor chain
+  of its immutable sealed segment — now memoized per session
+  (`VerifiedSegmentScans`, cleared around every collection round);
+- the foreground free-segment policy was tuned for large devices and
+  structurally unreachable on a small slice, forcing a full GC mark walk on
+  nearly every commit — floors and hysteresis now scale with the device,
+  and the data slice grew from 64 MiB (16 segments) to 512 MiB;
+- the fused commit's capacity loop checked only the free-segment *count*
+  while blob admission needs a *contiguous* run, so fragmentation caused an
+  instant `Capacity(CleanerReserve)` failure — and a failed staged batch
+  poisoned the store into returning Unavailable for the rest of the session.
+  The loop is now run-aware, and the file-tree entry points re-establish the
+  cold boot proof after an invalidation instead of failing forever.
+
+The former remaining issue — one small object per 4 MiB segment at staging
+time forcing a full O(live-objects) GC mark walk every ~15–30 commits — is
+fixed: staged batches now pack every small (≤256 KiB encoded) blob into a
+shared scratch segment whose header/descriptors/summary/seal are deferred
+until the segment closes, and the publication's metadata records (manifests,
+CAS snapshot, allocation map) join that same segment when they fit. A small
+fused file transaction (`mkdir`, small `write`) therefore consumes one
+segment instead of one per staged node plus a metadata segment, so the
+free-segment floor that triggers a mark walk is reached an order of
+magnitude less often. The mark walk itself is still O(live objects) per
+round; only its frequency changed. Large blobs keep whole-segment
+placement, deduplicated entries roll the shared cursor back, and the
+segment-seal chain's strictly-increasing-generation invariant is preserved
+by closing the shared segment before any younger segment seals. The packed
+layout is byte-compatible with what the GC compactor already writes, and is
+exercised by the staged-batch crash matrix, the packing unit tests, and the
+file-tree QEMU case's powered-off verifier.
+- One spontaneous board reset was observed under sustained write load
+  (possible supply dip; worth checking the Duo's power source). Data written
+  minutes before the reset survived except one subtree, consistent with the
+  card's own volatile write cache on abrupt power loss — SD gives no
+  power-loss durability guarantee for recently programmed data.
+- `blk multiblock-probe` on the `--diagnostic` image remains available for
+  bare CMD18 bring-up experiments.
 
 ### Explicit SSH/VSH hardware acceptance image (insecure)
 
@@ -519,7 +705,7 @@ fixed peer source and guest destination checked by VibeOS. The QEMU socket peer
 and its unicast frame contract are unchanged.
 
 The image contains a bootable, type `0x0c`, 128 MiB FAT partition followed by a
-4 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
+512 MiB type `0xda` raw VibeOS data partition. It has no Linux partition or ext4
 rootfs. The native block backend translates the data partition's first LBA to
 logical sector zero, so shell block tests and the persistent journal cannot
 overwrite FAT, `fip.bin`, or `boot.sd`. You can use read-only mounts to validate
@@ -573,12 +759,13 @@ In short: **115200 8N1**.
 
 ### Physical IPv4/TCP gate
 
-On the serial `vsh>` prompt, obtain the address assigned to the production
-image and confirm that carrier is present:
+On the serial `vsh>` prompt, read the boot line
+`net map netN <- mmio@0x4070000 (dwmac)`, substitute that name for
+`<DWMAC_NET>`, obtain its address, and confirm that carrier is present:
 
 ```text
 ip link show
-ip -4 addr show dev net0
+ip -4 addr show dev <DWMAC_NET>
 ```
 
 From another machine on the same link, pass that address to the bounded host
@@ -594,6 +781,44 @@ after a reboot or on another network. On 2026-08-10, a physical Duo connected
 through host interface `en7` reported `UP,LOWER_UP` and the dynamic address
 `169.254.184.75/16`; eight consecutive fresh streams passed the exact-echo
 gate. This is DWMAC/IPv4/TCP evidence only and does not claim SSH availability.
+
+### Simultaneous DWMAC + USB CDC-ECM gate
+
+Build a DHCP-enabled image, attach both the Ethernet IO Board and a supported
+USB CDC-ECM function, and connect the two links to DHCP-capable networks. They
+may share one LAN, but the DHCP server must issue distinct addresses for their
+distinct MAC identities. Read the two boot-time `net map` lines and substitute
+the names mapped from `mmio@0x4070000` and `usb@0x4340000/...` below. The
+ordinals come from sorted physical topology, not the driver kind.
+
+Capture UART0 from boot, wait for both leases, then run:
+
+```text
+ip link show
+ip -4 addr show dev <DWMAC_NET>
+ip -4 addr show dev <USB_NET>
+ip route show dev <DWMAC_NET>
+ip route show dev <USB_NET>
+```
+
+The gate requires both links to report `UP,LOWER_UP` at the same time and both
+interfaces to show different dynamic IPv4 leases. First remove only the USB
+adapter's RJ45 cable: `<USB_NET>` must lose `LOWER_UP`, its address and route,
+then reacquire a lease after reconnection without changing its USB device
+epoch. Next unplug and reconnect the entire USB NIC: `<DWMAC_NET>` must retain
+its lease, while `<USB_NET>` must return with a higher device epoch and reacquire
+its own lease. The first simultaneous-online portion of the preserved log is
+machine-checkable with:
+
+```sh
+./scripts/check-milkv-dual-net-log.sh path/to/uart.log
+```
+
+Independent DHCP discovery on both interfaces exercises RX and TX on both data
+paths without sharing a packet session. The production and diagnostic service
+listener remains attached to the DWMAC policy root regardless of its `netN`
+ordinal; the dual-network log gate therefore does not claim that SSH or TCP echo
+is exposed through the USB interface.
 
 ## Hardware validation checklist
 
@@ -619,7 +844,7 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
 - [x] `scripts/build-milkv-duo.sh` successfully generates the bare kernel. The
       native flow or `scripts/package-milkv-duo-sdk.sh` then successfully
       generates `target/milkv-duo/boot.sd`, with no FIT validation errors.
-- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 4 MiB raw
+- [x] The final `*.img` contains a 128 MiB FAT boot partition and a 512 MiB raw
       VibeOS data partition. Its `fip.bin` and `boot.sd` are byte-for-byte
       identical to this build, and no Linux/rootfs partition exists.
 - [x] The serial console displays the FSBL, OpenSBI, U-Boot, and VibeOS banners.
@@ -644,9 +869,19 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       configuration and report-descriptor enumeration on the physical OTG port.
       The Apple `05ac:0220` report keyboard is configured on interface 2 / endpoint
       `0x83`, and `hidtest123` reaches `vsh>` exactly through USB input.
-- [ ] Disconnect/reconnect repeats hub-child enumeration and restores keyboard
-      input. Preserve the UART log and pass `scripts/check-milkv-usb-hid-log.sh`;
-      storage I/O remains a later gate.
+- [x] A high-speed `1f75:0903` SCSI/BOT disk behind hub port 3 reports
+      123,469,824 sectors of 512 bytes. READ(10) returned the complete protective
+      MBR including its `55 aa` signature. On 2026-08-12, the guarded WRITE(10)
+      test on reserved LBA 4,000,000 passed its pattern readback and restoration
+      checks; an independent subsequent READ(10) matched the original 512 bytes.
+- [x] Hub multi-device enumeration runs HID and Mass Storage simultaneously.
+      Removing and reinserting the keyboard preserves disk READ(10); removing
+      the disk preserves exact HID input. Each topology transition reassigns
+      addresses and restores the remaining functions without a reboot.
+- [x] Recursive enumeration traverses the physical `05e3:0610` -> `1a40:0101`
+      -> `05ac:0220` topology. The Full-Speed keyboard works at depth two through
+      the nested high-speed hub's transaction translator, and nested-port
+      removal/reinsertion clears and restores HID without removing either hub.
 - [ ] `blk info` reports the SD data partition online; `blk test` survives a
       reboot without changing either boot payload.
 - [ ] With the Ethernet IO Board attached, `net info` reports the CV1800B
@@ -656,6 +891,21 @@ keyboard-entered `uptime` commands, with no panic or USB failure marker.
       reached the bounded listener through the assigned address and returned
       exact binary echoes. Lease renewal still belongs to the longer-duration
       network stress gate.
+- [ ] Removing the DWMAC cable clears `LOWER_UP`, its dynamic IPv4 address, and
+      its DHCP route; reconnecting the cable restores carrier and obtains a
+      fresh lease without rebooting. The fix builds and has host tests, but
+      fresh-board UART evidence is still required.
+- [x] On 2026-08-13, a physical `0bda:8153` in CDC-ECM mode remained `<UP>`
+      without an RJ45 cable while both `usb-ecm-net` and `net-stack` continued
+      running. Inserting the cable changed RTL815x `PHYSTATUS` from link-down to
+      `0x00f3`, published `LOWER_UP`, and acquired `192.168.77.11/24` by DHCP.
+      Removing it produced `PHYSTATUS 0x0090`, removed `LOWER_UP`, and cleared
+      the IPv4 address and route without detaching the USB device.
+- [ ] With DWMAC and USB CDC-ECM attached together, both topology-mapped `netN`
+      interfaces report `UP,LOWER_UP`, acquire distinct DHCP leases, and pass
+      `scripts/check-milkv-dual-net-log.sh`. USB unplug/reconnect retires and
+      rebinds only the USB-mapped interface; fresh-board UART evidence is still
+      required.
 - [ ] A live DWMAC reset/restart advances the device epoch and stack generation;
       packets from each retired coordinate are rejected in both directions,
       and the retired TCP stream does not resume in the replacement stack.

@@ -1,7 +1,7 @@
 //! Polling Synopsys DWMAC engine for the CV1800B integrated Ethernet MAC.
 //!
 //! The crate owns registers, clock/ePHY setup and one cache-isolated RX/TX
-//! descriptor pair. Kernel capabilities, packet sessions and supervision are
+//! descriptor rings. Kernel capabilities, packet sessions and supervision are
 //! deliberately outside this layer.
 
 #![cfg_attr(not(test), no_std)]
@@ -13,6 +13,8 @@ use core::{
 use vibeos_hal::{DwmacDescription, MAX_PACKET_LEN};
 
 const DMA_BUFFER_LEN: usize = 1_536;
+pub const RX_RING_SIZE: usize = 32;
+pub const TX_RING_SIZE: usize = 32;
 const RESET_BUDGET: usize = 2_000_000;
 const GMAC_CONTROL: usize = 0x0000;
 const GMAC_FRAME_FILTER: usize = 0x0004;
@@ -29,16 +31,27 @@ const DMA_STATUS: usize = 0x1014;
 const DMA_CONTROL: usize = 0x1018;
 const DMA_INT_ENABLE: usize = 0x101c;
 const DMA_AXI_BUS_MODE: usize = 0x1028;
+const DMA_HW_FEATURE: usize = 0x1058;
 const DMA_SOFT_RESET: u32 = 1;
 const DMA_AAL: u32 = 1 << 25;
+// Each enhanced descriptor uses four hardware words and occupies one 64-byte
+// cache line. Tell DMA to skip the remaining twelve words when advancing.
+const DMA_DESCRIPTOR_SKIP_WORDS: u32 = 12 << 2;
 const DMA_START_RX: u32 = 1 << 1;
+// Let DMA begin fetching the next TX descriptor while the current frame is
+// still being drained from the store-and-forward FIFO. Linux stmmac enables
+// this together with TSF specifically to improve sustained throughput.
+const DMA_OPERATE_SECOND_FRAME: u32 = 1 << 2;
 const DMA_START_TX: u32 = 1 << 13;
 const DMA_RX_STORE_FORWARD: u32 = 1 << 25;
 const DMA_TX_STORE_FORWARD: u32 = 1 << 21;
 const DMA_FLUSH_TX: u32 = 1 << 20;
+const DMA_HW_TX_CHECKSUM: u32 = 1 << 16;
+const DMA_HW_RX_CHECKSUM_TYPE2: u32 = 1 << 18;
 const MAC_RX_ENABLE: u32 = 1 << 2;
 const MAC_TX_ENABLE: u32 = 1 << 3;
 const MAC_ACS: u32 = 1 << 7;
+const MAC_IP_CHECKSUM_OFFLOAD: u32 = 1 << 10;
 const MAC_DUPLEX: u32 = 1 << 11;
 const MAC_FAST_ETHERNET: u32 = 1 << 14;
 const MAC_MII_PORT: u32 = 1 << 15;
@@ -50,8 +63,30 @@ const RX_FIRST: u32 = 1 << 9;
 const RX_ERROR: u32 = 1 << 15;
 const RX_END_RING: u32 = 1 << 25;
 const TX_END_RING: u32 = 1 << 25;
+// Normal DWMAC descriptor TDES1 checksum insertion control. Value three asks
+// hardware to generate the IPv4 header plus TCP/UDP pseudoheader checksum.
+const TX_CHECKSUM_INSERTION_FULL: u32 = 3 << 27;
 const TX_FIRST: u32 = 1 << 29;
 const TX_LAST: u32 = 1 << 30;
+
+// CV1800B EPHY page 10 link-pulse tuning. The alternate values shipped next
+// to the original Milk-V settings explicitly fix a latched link-up indication
+// after the cable is removed.
+const EPHY_LINK_PULSE: &[(usize, u32)] = &[
+    (0x40, 0x2000),
+    (0x44, 0x3832),
+    (0x48, 0x3132),
+    (0x4c, 0x2d2f),
+    (0x50, 0x2c2d),
+    (0x54, 0x1b2b),
+    (0x58, 0x94a0),
+    (0x5c, 0x8990),
+    (0x60, 0x8788),
+    (0x64, 0x8485),
+    (0x68, 0x8283),
+    (0x6c, 0x8182),
+    (0x70, 0x0081),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -75,6 +110,8 @@ pub struct Telemetry {
     pub resets: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -88,17 +125,17 @@ impl Descriptor {
 
 #[repr(C, align(64))]
 struct Slab {
-    rx_desc: Descriptor,
-    tx_desc: Descriptor,
-    rx: [u8; DMA_BUFFER_LEN],
-    tx: [u8; DMA_BUFFER_LEN],
+    rx_desc: [Descriptor; RX_RING_SIZE],
+    tx_desc: [Descriptor; TX_RING_SIZE],
+    rx: [[u8; DMA_BUFFER_LEN]; RX_RING_SIZE],
+    tx: [[u8; DMA_BUFFER_LEN]; TX_RING_SIZE],
 }
 impl Slab {
     const ZERO: Self = Self {
-        rx_desc: Descriptor::ZERO,
-        tx_desc: Descriptor::ZERO,
-        rx: [0; DMA_BUFFER_LEN],
-        tx: [0; DMA_BUFFER_LEN],
+        rx_desc: [Descriptor::ZERO; RX_RING_SIZE],
+        tx_desc: [Descriptor::ZERO; TX_RING_SIZE],
+        rx: [[0; DMA_BUFFER_LEN]; RX_RING_SIZE],
+        tx: [[0; DMA_BUFFER_LEN]; TX_RING_SIZE],
     };
 }
 
@@ -109,18 +146,64 @@ const _: () = {
     assert!(core::mem::offset_of!(Slab, tx_desc) % 64 == 0);
     assert!(core::mem::offset_of!(Slab, rx) % 64 == 0);
     assert!(core::mem::offset_of!(Slab, tx) % 64 == 0);
+    assert!(DMA_BUFFER_LEN % 64 == 0);
 };
 
-struct StableDma(UnsafeCell<Slab>);
-unsafe impl Sync for StableDma {}
-#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
-static DMA: StableDma = StableDma(UnsafeCell::new(Slab::ZERO));
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-static PHY_LINK_UP: AtomicBool = AtomicBool::new(false);
-static RESETS: AtomicU64 = AtomicU64::new(0);
-static RX_PACKETS: AtomicU64 = AtomicU64::new(0);
-static TX_PACKETS: AtomicU64 = AtomicU64::new(0);
-static TX_STATUS: AtomicU64 = AtomicU64::new(0);
+pub struct DmaStorage {
+    slab: UnsafeCell<Slab>,
+}
+
+/// CPU-only ownership and telemetry for one DWMAC instance.
+///
+/// This must live in normally initialized memory, not in a linker `NOLOAD`
+/// DMA section. Only [`DmaStorage`] is device-visible.
+pub struct InstanceState {
+    claimed: AtomicBool,
+    phy_link_up: AtomicBool,
+    resets: AtomicU64,
+    rx_packets: AtomicU64,
+    tx_packets: AtomicU64,
+    tx_status: AtomicU64,
+}
+
+unsafe impl Sync for DmaStorage {}
+
+impl DmaStorage {
+    pub const fn new() -> Self {
+        Self {
+            slab: UnsafeCell::new(Slab::ZERO),
+        }
+    }
+
+    pub fn base(&self) -> usize {
+        self.slab.get() as usize
+    }
+}
+
+impl Default for DmaStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InstanceState {
+    pub const fn new() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            phy_link_up: AtomicBool::new(false),
+            resets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
+            tx_status: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for InstanceState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Validate invariants required by the fixed CV1800B engine without touching
 /// hardware. This is also suitable for BSP table tests on the host.
@@ -128,7 +211,7 @@ pub const fn validate_description(description: DwmacDescription) -> bool {
     range_contains_bytes(
         description.registers.start,
         description.registers.end,
-        DMA_AXI_BUS_MODE + 4,
+        DMA_HW_FEATURE + 4,
     ) && range_contains_bytes(
         description.soc_control.start,
         description.soc_control.end,
@@ -146,11 +229,19 @@ const fn range_contains_bytes(start: usize, end: usize, bytes: usize) -> bool {
     }
 }
 
-/// Exclusive live ownership of the fixed DMA slab and the DWMAC instance.
+/// Exclusive live ownership of one caller-supplied DMA slab and DWMAC instance.
 pub struct Engine {
     description: DwmacDescription,
+    dma: &'static DmaStorage,
+    state: &'static InstanceState,
     time: fn() -> u64,
     timebase_hz: u64,
+    rx_index: usize,
+    tx_produce: usize,
+    tx_reclaim: usize,
+    tx_in_flight: usize,
+    tx_checksum_offload: bool,
+    rx_checksum_offload: bool,
     live: bool,
 }
 
@@ -160,12 +251,14 @@ impl Engine {
     /// # Safety
     /// `time` must be monotonic in `timebase_hz` ticks and every described
     /// MMIO range must remain mapped with exclusive device ownership for the
-    /// returned engine's lifetime. The crate-owned `.dma` slab must be
+    /// returned engine's lifetime. The supplied `.dma` slab must be
     /// identity mapped, physically contiguous, coherent with the explicit
     /// cache maintenance below, and reachable within `dma_address_bits`;
     /// descriptor addresses are published directly from their Rust address.
     pub unsafe fn claim(
         description: DwmacDescription,
+        dma: &'static DmaStorage,
+        state: &'static InstanceState,
         guest_mac: [u8; 6],
         time: fn() -> u64,
         timebase_hz: u64,
@@ -173,7 +266,8 @@ impl Engine {
         if !validate_description(description) {
             return Err(Error::InvalidDescription);
         }
-        if CLAIMED
+        if state
+            .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -181,13 +275,21 @@ impl Engine {
         }
         let mut engine = Self {
             description,
+            dma,
+            state,
             time,
             timebase_hz,
+            rx_index: 0,
+            tx_produce: 0,
+            tx_reclaim: 0,
+            tx_in_flight: 0,
+            tx_checksum_offload: false,
+            rx_checksum_offload: false,
             live: false,
         };
         if let Err(error) = unsafe { engine.initialize(guest_mac) } {
-            let _ = shutdown(description);
-            CLAIMED.store(false, Ordering::Release);
+            let _ = shutdown(description, state);
+            state.claimed.store(false, Ordering::Release);
             return Err(error);
         }
         engine.live = true;
@@ -198,59 +300,84 @@ impl Engine {
         self.description.irq
     }
 
-    pub fn tx_owned(&self) -> bool {
-        let dma = unsafe { &*DMA.0.get() };
-        invalidate_range(
-            self.description.cache_line_bytes,
-            descriptor_address(&dma.tx_desc),
-            core::mem::size_of_val(&dma.tx_desc),
-        );
-        let status = dma.tx_desc.words[0];
-        TX_STATUS.store(u64::from(status), Ordering::Release);
-        status & DESC_OWN != 0
+    pub const fn tx_checksum_offload(&self) -> bool {
+        self.tx_checksum_offload
+    }
+
+    pub const fn rx_checksum_offload(&self) -> bool {
+        self.rx_checksum_offload
+    }
+
+    pub fn tx_owned(&mut self) -> bool {
+        self.reap_transmit();
+        self.tx_in_flight != 0
     }
 
     pub fn transmit(&mut self, packet: &[u8]) -> Result<(), Error> {
         if packet.len() > DMA_BUFFER_LEN {
             return Err(Error::PacketTooLarge);
         }
-        let dma = unsafe { &mut *DMA.0.get() };
-        invalidate_range(
-            self.description.cache_line_bytes,
-            descriptor_address(&dma.tx_desc),
-            core::mem::size_of_val(&dma.tx_desc),
-        );
-        if dma.tx_desc.words[0] & DESC_OWN != 0 {
-            TX_STATUS.store(u64::from(dma.tx_desc.words[0]), Ordering::Release);
+        self.reap_transmit();
+        if self.tx_in_flight == TX_RING_SIZE {
             return Err(Error::QueueFull);
         }
-        dma.tx[..packet.len()].copy_from_slice(packet);
-        dma.tx_desc.words[1] = packet.len() as u32 | TX_END_RING | TX_FIRST | TX_LAST;
-        dma.tx_desc.words[0] = DESC_OWN;
-        TX_STATUS.store(u64::from(DESC_OWN), Ordering::Release);
+        let index = self.tx_produce;
+        let dma = unsafe { &mut *self.dma.slab.get() };
+        invalidate_range(
+            self.description.cache_line_bytes,
+            descriptor_address(&dma.tx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
+        );
+        if dma.tx_desc[index].words[0] & DESC_OWN != 0 {
+            self.state
+                .tx_status
+                .store(u64::from(dma.tx_desc[index].words[0]), Ordering::Release);
+            return Err(Error::QueueFull);
+        }
+        dma.tx[index][..packet.len()].copy_from_slice(packet);
+        dma.tx_desc[index].words[1] = packet.len() as u32
+            | TX_FIRST
+            | TX_LAST
+            | if self.tx_checksum_offload {
+                TX_CHECKSUM_INSERTION_FULL
+            } else {
+                0
+            }
+            | if index + 1 == TX_RING_SIZE {
+                TX_END_RING
+            } else {
+                0
+            };
+        dma.tx_desc[index].words[0] = DESC_OWN;
+        self.state
+            .tx_status
+            .store(u64::from(DESC_OWN), Ordering::Release);
         clean_range(
             self.description.cache_line_bytes,
-            buffer_address(&dma.tx),
+            buffer_address(&dma.tx[index]),
             packet.len(),
         );
         clean_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.tx_desc),
-            core::mem::size_of_val(&dma.tx_desc),
+            descriptor_address(&dma.tx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
+        self.tx_produce = (index + 1) % TX_RING_SIZE;
+        self.tx_in_flight += 1;
         write32(self.description, DMA_TX_POLL, 1);
-        TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        self.state.tx_packets.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
-        let dma = unsafe { &mut *DMA.0.get() };
+        let index = self.rx_index;
+        let dma = unsafe { &mut *self.dma.slab.get() };
         invalidate_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.rx_desc),
-            core::mem::size_of_val(&dma.rx_desc),
+            descriptor_address(&dma.rx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
-        let status = dma.rx_desc.words[0];
+        let status = dma.rx_desc[index].words[0];
         if status & DESC_OWN != 0 {
             return None;
         }
@@ -264,35 +391,62 @@ impl Engine {
         let result = if valid {
             invalidate_range(
                 self.description.cache_line_bytes,
-                buffer_address(&dma.rx),
+                buffer_address(&dma.rx[index]),
                 with_fcs.min(DMA_BUFFER_LEN),
             );
-            output[..length].copy_from_slice(&dma.rx[..length]);
-            RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+            output[..length].copy_from_slice(&dma.rx[index][..length]);
+            self.state.rx_packets.fetch_add(1, Ordering::Relaxed);
             Some(length)
         } else {
             None
         };
-        dma.rx_desc.words[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
-        dma.rx_desc.words[0] = DESC_OWN;
+        dma.rx_desc[index].words[1] = DMA_BUFFER_LEN as u32
+            | if index + 1 == RX_RING_SIZE {
+                RX_END_RING
+            } else {
+                0
+            };
+        dma.rx_desc[index].words[0] = DESC_OWN;
         clean_range(
             self.description.cache_line_bytes,
-            descriptor_address(&dma.rx_desc),
-            core::mem::size_of_val(&dma.rx_desc),
+            descriptor_address(&dma.rx_desc[index]),
+            core::mem::size_of::<Descriptor>(),
         );
+        self.rx_index = (index + 1) % RX_RING_SIZE;
         write32(self.description, DMA_RX_POLL, 1);
         result
     }
 
-    pub fn poll_link(&mut self) {
-        update_phy_link(self.description);
+    fn reap_transmit(&mut self) {
+        let dma = unsafe { &*self.dma.slab.get() };
+        while self.tx_in_flight != 0 {
+            let descriptor = &dma.tx_desc[self.tx_reclaim];
+            invalidate_range(
+                self.description.cache_line_bytes,
+                descriptor_address(descriptor),
+                core::mem::size_of::<Descriptor>(),
+            );
+            let status = descriptor.words[0];
+            self.state
+                .tx_status
+                .store(u64::from(status), Ordering::Release);
+            if status & DESC_OWN != 0 {
+                break;
+            }
+            self.tx_reclaim = (self.tx_reclaim + 1) % TX_RING_SIZE;
+            self.tx_in_flight -= 1;
+        }
     }
 
-    /// Stop DMA and release the static DMA ownership claim.
+    pub fn poll_link(&mut self) {
+        update_phy_link(self.description, self.state);
+    }
+
+    /// Stop DMA and release this instance's DMA ownership claim.
     pub fn shutdown(mut self) -> bool {
-        let reset = shutdown(self.description);
+        let reset = shutdown(self.description, self.state);
         self.live = false;
-        CLAIMED.store(false, Ordering::Release);
+        self.state.claimed.store(false, Ordering::Release);
         reset
     }
 
@@ -306,34 +460,51 @@ impl Engine {
         if !wait_reset(self.description) {
             return Err(Error::TimedOut);
         }
-        RESETS.fetch_add(1, Ordering::Relaxed);
-        let dma = unsafe { &mut *DMA.0.get() };
+        self.state.resets.fetch_add(1, Ordering::Relaxed);
+        let dma = unsafe { &mut *self.dma.slab.get() };
         *dma = Slab::ZERO;
-        let rx = descriptor_address(&dma.rx_desc);
-        let tx = descriptor_address(&dma.tx_desc);
-        let rxb = buffer_address(&dma.rx);
-        let txb = buffer_address(&dma.tx);
-        if [rx, tx, rxb, txb]
-            .iter()
-            .any(|&address| address > u32::MAX as usize)
+        let rx = descriptor_address(&dma.rx_desc[0]);
+        let tx = descriptor_address(&dma.tx_desc[0]);
+        if self.dma.base() > u32::MAX as usize
+            || self
+                .dma
+                .base()
+                .checked_add(core::mem::size_of::<Slab>() - 1)
+                .is_none_or(|end| end > u32::MAX as usize)
         {
             return Err(Error::AddressTooWide);
         }
-        dma.rx_desc.words[1] = DMA_BUFFER_LEN as u32 | RX_END_RING;
-        dma.rx_desc.words[2] = rxb as u32;
-        dma.rx_desc.words[0] = DESC_OWN;
-        dma.tx_desc.words[1] = TX_END_RING;
-        dma.tx_desc.words[2] = txb as u32;
+        for index in 0..RX_RING_SIZE {
+            dma.rx_desc[index].words[1] = DMA_BUFFER_LEN as u32
+                | if index + 1 == RX_RING_SIZE {
+                    RX_END_RING
+                } else {
+                    0
+                };
+            dma.rx_desc[index].words[2] = buffer_address(&dma.rx[index]) as u32;
+            dma.rx_desc[index].words[0] = DESC_OWN;
+        }
+        for index in 0..TX_RING_SIZE {
+            dma.tx_desc[index].words[1] = if index + 1 == TX_RING_SIZE {
+                TX_END_RING
+            } else {
+                0
+            };
+            dma.tx_desc[index].words[2] = buffer_address(&dma.tx[index]) as u32;
+        }
         clean_range(
             self.description.cache_line_bytes,
-            dma_base(),
+            self.dma.base(),
             core::mem::size_of::<Slab>(),
         );
         write32(
             self.description,
             DMA_BUS_MODE,
-            DMA_AAL | (8 << 8) | (8 << 17),
+            DMA_AAL | DMA_DESCRIPTOR_SKIP_WORDS | (8 << 8) | (8 << 17),
         );
+        let hardware_features = read32(self.description, DMA_HW_FEATURE);
+        self.tx_checksum_offload = hardware_features & DMA_HW_TX_CHECKSUM != 0;
+        self.rx_checksum_offload = hardware_features & DMA_HW_RX_CHECKSUM_TYPE2 != 0;
         write32(
             self.description,
             DMA_AXI_BUS_MODE,
@@ -357,7 +528,17 @@ impl Engine {
         write32(
             self.description,
             GMAC_CONTROL,
-            MAC_MII_PORT | MAC_FAST_ETHERNET | MAC_DUPLEX | MAC_ACS | MAC_RX_ENABLE | MAC_TX_ENABLE,
+            MAC_MII_PORT
+                | MAC_FAST_ETHERNET
+                | MAC_DUPLEX
+                | MAC_ACS
+                | MAC_RX_ENABLE
+                | MAC_TX_ENABLE
+                | if self.rx_checksum_offload {
+                    MAC_IP_CHECKSUM_OFFLOAD
+                } else {
+                    0
+                },
         );
         write32(
             self.description,
@@ -365,11 +546,12 @@ impl Engine {
             DMA_FLUSH_TX
                 | DMA_RX_STORE_FORWARD
                 | DMA_TX_STORE_FORWARD
+                | DMA_OPERATE_SECOND_FRAME
                 | DMA_START_RX
                 | DMA_START_TX,
         );
         write32(self.description, DMA_RX_POLL, 1);
-        update_phy_link(self.description);
+        update_phy_link(self.description, self.state);
         let _ = read32(self.description, GMAC_MII_ADDR);
         Ok(())
     }
@@ -378,8 +560,8 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.live {
-            let _ = shutdown(self.description);
-            CLAIMED.store(false, Ordering::Release);
+            let _ = shutdown(self.description, self.state);
+            self.state.claimed.store(false, Ordering::Release);
         }
     }
 }
@@ -391,26 +573,30 @@ impl Drop for Engine {
 /// readable for this call. The caller must also serialize these diagnostic
 /// reads with platform operations for which the DWMAC, clock, or ePHY
 /// register semantics require exclusive access.
-pub unsafe fn telemetry(description: DwmacDescription) -> Telemetry {
-    let tx_descriptor_status = TX_STATUS.load(Ordering::Acquire) as u32;
+pub unsafe fn telemetry(description: DwmacDescription, state: &InstanceState) -> Telemetry {
+    let tx_descriptor_status = state.tx_status.load(Ordering::Acquire) as u32;
     Telemetry {
-        phy_link_up: PHY_LINK_UP.load(Ordering::Acquire),
+        phy_link_up: state.phy_link_up.load(Ordering::Acquire),
         tx_descriptor_status,
         dma_status: read32(description, DMA_STATUS),
         clock_enable: soc_read32(description.soc_control.start + 0x2000),
         clock_bypass: soc_read32(description.soc_control.start + 0x2030),
         clock_divider: soc_read32(description.soc_control.start + 0x208c),
         ephy_control: soc_read32(description.soc_control.start + 0x9800),
-        resets: RESETS.load(Ordering::Acquire),
-        rx_packets: RX_PACKETS.load(Ordering::Acquire),
-        tx_packets: TX_PACKETS.load(Ordering::Acquire),
+        resets: state.resets.load(Ordering::Acquire),
+        rx_packets: state.rx_packets.load(Ordering::Acquire),
+        tx_packets: state.tx_packets.load(Ordering::Acquire),
+        tx_checksum_offload: read32(description, DMA_HW_FEATURE) & DMA_HW_TX_CHECKSUM != 0,
+        rx_checksum_offload: read32(description, DMA_HW_FEATURE)
+            & DMA_HW_RX_CHECKSUM_TYPE2
+            != 0,
     }
 }
 
-/// Physical address of the crate-owned stable DMA slab, for diagnostics and
+/// Physical address of the caller-owned stable DMA slab, for diagnostics and
 /// kernel resource descriptions only.
-pub fn dma_region_base() -> usize {
-    dma_base()
+pub fn dma_region_base(dma: &DmaStorage) -> usize {
+    dma.base()
 }
 
 /// Force hardware quiescence and clear an ownership claim after the previous
@@ -420,13 +606,13 @@ pub fn dma_region_base() -> usize {
 /// The caller must prove that no old `Engine` can run or be dropped again.
 /// Every range in `description` must still satisfy the mapping and exclusive
 /// MMIO requirements of [`Engine::claim`] while recovery touches the device.
-pub unsafe fn recover_faulted(description: DwmacDescription) -> bool {
-    let reset = shutdown(description);
-    CLAIMED.store(false, Ordering::Release);
+pub unsafe fn recover_faulted(description: DwmacDescription, state: &InstanceState) -> bool {
+    let reset = shutdown(description, state);
+    state.claimed.store(false, Ordering::Release);
     reset
 }
 
-fn shutdown(d: DwmacDescription) -> bool {
+fn shutdown(d: DwmacDescription, state: &InstanceState) -> bool {
     write32(d, DMA_INT_ENABLE, 0);
     write32(d, DMA_CONTROL, 0);
     write32(
@@ -436,8 +622,8 @@ fn shutdown(d: DwmacDescription) -> bool {
     );
     write32(d, DMA_BUS_MODE, read32(d, DMA_BUS_MODE) | DMA_SOFT_RESET);
     let reset = wait_reset(d);
-    PHY_LINK_UP.store(false, Ordering::Release);
-    TX_STATUS.store(0, Ordering::Release);
+    state.phy_link_up.store(false, Ordering::Release);
+    state.tx_status.store(0, Ordering::Release);
     reset
 }
 fn wait_reset(d: DwmacDescription) -> bool {
@@ -450,20 +636,20 @@ fn wait_reset(d: DwmacDescription) -> bool {
     false
 }
 
-fn update_phy_link(d: DwmacDescription) {
+fn update_phy_link(d: DwmacDescription, state: &InstanceState) {
     if mdio_read(d, 1).is_none() {
-        PHY_LINK_UP.store(false, Ordering::Release);
+        state.phy_link_up.store(false, Ordering::Release);
         return;
     }
     let Some(status) = mdio_read(d, 1) else {
-        PHY_LINK_UP.store(false, Ordering::Release);
+        state.phy_link_up.store(false, Ordering::Release);
         return;
     };
     if status & (1 << 2) == 0 {
-        PHY_LINK_UP.store(false, Ordering::Release);
+        state.phy_link_up.store(false, Ordering::Release);
         return;
     }
-    PHY_LINK_UP.store(true, Ordering::Release);
+    state.phy_link_up.store(true, Ordering::Release);
     let control = mdio_read(d, 0).unwrap_or(0);
     let (fast, full) = if control & (1 << 12) != 0 && status & (1 << 5) != 0 {
         let partner = mdio_read(d, 5).unwrap_or(0);
@@ -587,25 +773,7 @@ fn prepare_ephy(d: DwmacDescription, time: fn() -> u64, hz: u64) {
     page(base, 5);
     ew(base, 0x40, er(base, 0x40) | 1);
     ew(base, 0x4c, er(base, 0x4c) | 0x820);
-    table(
-        base,
-        10,
-        &[
-            (0x40, 0x3e00),
-            (0x44, 0x7864),
-            (0x48, 0x6470),
-            (0x4c, 0x5f62),
-            (0x50, 0x5a5a),
-            (0x54, 0x5458),
-            (0x58, 0xb23a),
-            (0x5c, 0x94a0),
-            (0x60, 0x9092),
-            (0x64, 0x8a8e),
-            (0x68, 0x8688),
-            (0x6c, 0x8484),
-            (0x70, 0x82),
-        ],
-    );
+    table(base, 10, EPHY_LINK_PULSE);
     table(
         base,
         11,
@@ -715,9 +883,6 @@ fn delay(time: fn() -> u64, hz: u64, ms: u64) {
         core::hint::spin_loop()
     }
 }
-fn dma_base() -> usize {
-    DMA.0.get() as usize
-}
 fn descriptor_address(v: &Descriptor) -> usize {
     v.words.as_ptr() as usize
 }
@@ -774,8 +939,53 @@ mod tests {
     fn dma_layout_is_cache_isolated() {
         assert_eq!(core::mem::size_of::<Descriptor>(), 64);
         assert_eq!(core::mem::align_of::<Slab>(), 64);
+        assert_eq!(
+            core::mem::size_of::<DmaStorage>(),
+            core::mem::size_of::<Slab>()
+        );
         assert_eq!(core::mem::offset_of!(Slab, rx) % 64, 0);
         assert_eq!(core::mem::offset_of!(Slab, tx) % 64, 0)
+    }
+
+    #[test]
+    fn instance_claim_state_is_separate_and_initialized() {
+        let state = InstanceState::new();
+        assert!(state
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
+        assert!(state
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err());
+        assert_eq!(state.resets.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn link_pulse_tuning_uses_cable_removal_fix() {
+        assert_eq!(EPHY_LINK_PULSE.first(), Some(&(0x40, 0x2000)));
+        assert_eq!(EPHY_LINK_PULSE.get(6), Some(&(0x58, 0x94a0)));
+        assert_eq!(EPHY_LINK_PULSE.last(), Some(&(0x70, 0x0081)));
+    }
+
+    #[test]
+    fn normal_descriptor_requests_full_tx_checksum_insertion() {
+        assert_eq!(TX_CHECKSUM_INSERTION_FULL, 3 << 27);
+        assert_eq!(TX_CHECKSUM_INSERTION_FULL & (TX_FIRST | TX_LAST), 0);
+    }
+
+    #[test]
+    fn checksum_capability_bits_match_dwmac1000_layout() {
+        assert_eq!(DMA_HW_TX_CHECKSUM, 1 << 16);
+        assert_eq!(DMA_HW_RX_CHECKSUM_TYPE2, 1 << 18);
+        assert_eq!(MAC_IP_CHECKSUM_OFFLOAD, 1 << 10);
+    }
+
+    #[test]
+    fn store_and_forward_uses_operate_on_second_frame() {
+        assert_eq!(DMA_OPERATE_SECOND_FRAME, 1 << 2);
+        assert_eq!(DMA_OPERATE_SECOND_FRAME & DMA_START_RX, 0);
+        assert_eq!(DMA_OPERATE_SECOND_FRAME & DMA_START_TX, 0);
     }
     #[test]
     fn error_values_are_stable() {

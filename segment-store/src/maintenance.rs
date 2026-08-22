@@ -115,6 +115,7 @@ pub struct StoreMaintenance {
     store_uuid: StoreUuid,
     device_id: [u8; 16],
     range_first_logical_block: u64,
+    range_logical_block_count: u64,
     operations: u8,
 }
 
@@ -165,12 +166,14 @@ impl StoreMaintenance {
         store_uuid: StoreUuid,
         device_id: [u8; 16],
         range_first_logical_block: u64,
+        range_logical_block_count: u64,
     ) -> Self {
         Self {
             domain,
             store_uuid,
             device_id,
             range_first_logical_block,
+            range_logical_block_count,
             operations: ALL_OPERATIONS,
         }
     }
@@ -195,6 +198,7 @@ impl StoreMaintenance {
             store_uuid: self.store_uuid,
             device_id: self.device_id,
             range_first_logical_block: self.range_first_logical_block,
+            range_logical_block_count: self.range_logical_block_count,
             operations: requested,
         })
     }
@@ -206,12 +210,40 @@ impl StoreMaintenance {
         expected_store_uuid: StoreUuid,
         expected_device_id: [u8; 16],
         expected_range_first_logical_block: u64,
+        expected_range_logical_block_count: u64,
     ) -> Option<MaintenanceOperationLease> {
         if Arc::ptr_eq(&self.domain, expected_domain)
             && self.store_uuid == expected_store_uuid
             && self.device_id == expected_device_id
             && self.range_first_logical_block == expected_range_first_logical_block
+            && self.range_logical_block_count == expected_range_logical_block_count
             && self.operations & operation as u8 != 0
+        {
+            self.domain.try_acquire()
+        } else {
+            None
+        }
+    }
+
+    /// Acquire the one operation lease that may publish migration-control
+    /// state. The controller lives outside the V2 data slice, so the caller
+    /// must also present this runtime's private provisioner witness. Together
+    /// they bind the exact authority domain, target store UUID, stable device,
+    /// and complete V2 block range.
+    pub(crate) fn acquire_explicit_migration(
+        &self,
+        provisioner: &StoreMaintenanceProvisioner,
+        expected_store_uuid: StoreUuid,
+        expected_device_id: [u8; 16],
+        expected_range_first_logical_block: u64,
+        expected_range_logical_block_count: u64,
+    ) -> Option<MaintenanceOperationLease> {
+        if provisioner.authorizes(&self.domain)
+            && self.store_uuid == expected_store_uuid
+            && self.device_id == expected_device_id
+            && self.range_first_logical_block == expected_range_first_logical_block
+            && self.range_logical_block_count == expected_range_logical_block_count
+            && self.operations & MaintenanceOperation::ExplicitMaintenance as u8 != 0
         {
             self.domain.try_acquire()
         } else {
@@ -377,7 +409,12 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
             return Err(GrowError::InvalidGeometry);
         }
 
-        let carrier = state.find_free_run(1, false).ok_or(GrowError::Capacity)?;
+        // Growth is itself the operation that replenishes the free pool. It
+        // may stage its allocation delta in one cleaner-reserve segment: the
+        // admitted suffix replaces that free segment atomically in the same
+        // checkpoint, so no ordinary foreground writer is granted reserve
+        // access and a failed publication leaves the old reserve selected.
+        let carrier = state.find_free_run(1, true).ok_or(GrowError::Capacity)?;
         let generation = state
             .generation
             .checked_add(1)
@@ -485,6 +522,7 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
             allocation_root,
             ExtentKind::Allocation,
             self.limits.recovery_memory_bytes,
+            None,
         )
         .await?;
         if staged.bytes != allocation_bytes {
@@ -537,6 +575,7 @@ mod tests {
             store_uuid,
             device_id,
             range_first_logical_block,
+            256,
         )
         .attenuate(&[MaintenanceOperation::Grow])
         .unwrap();
@@ -547,6 +586,7 @@ mod tests {
                 store_uuid,
                 device_id,
                 range_first_logical_block,
+                256,
             )
             .is_some());
         assert!(grow
@@ -556,6 +596,7 @@ mod tests {
                 store_uuid,
                 device_id,
                 range_first_logical_block,
+                256,
             )
             .is_none());
         assert!(grow
@@ -565,6 +606,7 @@ mod tests {
                 store_uuid,
                 device_id,
                 range_first_logical_block,
+                256,
             )
             .is_none());
         assert!(grow
@@ -574,6 +616,7 @@ mod tests {
                 StoreUuid::new([2; 16]).unwrap(),
                 device_id,
                 range_first_logical_block,
+                256,
             )
             .is_none());
         assert!(grow
@@ -583,6 +626,7 @@ mod tests {
                 store_uuid,
                 [4; 16],
                 range_first_logical_block,
+                256,
             )
             .is_none());
         assert!(grow
@@ -592,6 +636,17 @@ mod tests {
                 store_uuid,
                 device_id,
                 range_first_logical_block + 1,
+                256,
+            )
+            .is_none());
+        assert!(grow
+            .acquire(
+                MaintenanceOperation::Grow,
+                &domain,
+                store_uuid,
+                device_id,
+                range_first_logical_block,
+                255,
             )
             .is_none());
         assert!(matches!(
@@ -610,7 +665,7 @@ mod tests {
         let domain = Arc::new(MaintenanceDomain::new());
         let provisioner = StoreMaintenanceProvisioner::new(domain.clone());
         let store_uuid = StoreUuid::new([1; 16]).unwrap();
-        let root = StoreMaintenance::mint_root(domain.clone(), store_uuid, [3; 16], 128);
+        let root = StoreMaintenance::mint_root(domain.clone(), store_uuid, [3; 16], 128, 256);
         let lease = root
             .acquire(
                 MaintenanceOperation::Grow,
@@ -618,6 +673,7 @@ mod tests {
                 store_uuid,
                 [3; 16],
                 128,
+                256,
             )
             .unwrap();
         assert_eq!(
@@ -633,6 +689,7 @@ mod tests {
                 store_uuid,
                 [3; 16],
                 128,
+                256,
             )
             .is_none());
     }

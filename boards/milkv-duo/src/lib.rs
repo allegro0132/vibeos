@@ -36,6 +36,17 @@ pub const USB_PHY_END: usize = USB_PHY_BASE + 0x58;
 pub const USB_IRQ: u32 = 30;
 pub const SOC_CONTROL_BASE: usize = 0x0300_0000;
 pub const SOC_CONTROL_MMIO_END: usize = SOC_CONTROL_BASE + 0xa000;
+// RTC system block. Its control registers own the SoC's real reset path: the
+// vendor OpenSBI cannot reset this SoC (its SRST handler is a no-op `ebreak`),
+// so a working cold reboot must poke these registers directly, exactly as
+// U-Boot's `cv_system_reset()` does. Only the two pages holding the warm-reset
+// request (0x0502_60cc) and RTC CTRL0 unlock/trigger (0x0502_5004/0x0502_5008)
+// are mapped.
+pub const RTC_RESET_BASE: usize = 0x0502_5000;
+pub const RTC_RESET_MMIO_END: usize = 0x0502_7000;
+const RTC_CTRL0_UNLOCKKEY: usize = 0x0502_5004;
+const RTC_CTRL0: usize = 0x0502_5008;
+const RTC_EN_WARM_RST_REQ: usize = 0x0502_60cc;
 pub const GPIOC_BASE: usize = 0x0302_2000;
 pub const GPIOC_MMIO_END: usize = GPIOC_BASE + 0x1000;
 pub const EFUSE_BASE: usize = 0x0305_0000;
@@ -85,6 +96,7 @@ pub const CONSOLE_CAPABILITIES: ConsoleCapabilities = ConsoleCapabilities {
 pub const MEMORY_MAP: &[MemoryRegion] = &[
     MemoryRegion::ram("kernel RAM", RAM_START, RAM_END),
     MemoryRegion::mmio("SoC control", SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
+    MemoryRegion::mmio("RTC reset", RTC_RESET_BASE, RTC_RESET_MMIO_END),
     MemoryRegion::mmio("GPIOC", GPIOC_BASE, GPIOC_MMIO_END),
     MemoryRegion::mmio("eFuse", EFUSE_BASE, EFUSE_MMIO_END),
     MemoryRegion::mmio("Ethernet", ETHERNET_BASE, ETHERNET_MMIO_END),
@@ -100,6 +112,7 @@ pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
     IdentityMapping::pages("SDHCI", SDHCI_BASE, SDHCI_MMIO_END),
     IdentityMapping::pages("USB DWC2", USB_BASE, USB_MMIO_END),
     IdentityMapping::pages("SoC control", SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
+    IdentityMapping::pages("RTC reset", RTC_RESET_BASE, RTC_RESET_MMIO_END),
     IdentityMapping::pages("GPIOC", GPIOC_BASE, GPIOC_MMIO_END),
     IdentityMapping::pages("eFuse", EFUSE_BASE, EFUSE_MMIO_END),
 ];
@@ -110,8 +123,39 @@ pub const MMU: MmuDescription = MmuDescription {
     mmio_attributes: MemoryAttributes::THeadDevice,
     identity_mappings: MMIO_MAPPINGS,
     device_level1_tables: 2,
-    device_level0_tables: 5,
+    // Three device windows in the first gigapage (0x0300_0000, 0x0400_0000,
+    // 0x0420_0000) plus the new RTC-reset window (0x0500_0000), and two PLIC
+    // windows in the second gigapage.
+    device_level0_tables: 6,
 };
+
+/// Perform a hardware cold reset of the CV1800B.
+///
+/// The vendor OpenSBI cannot reset this SoC, so the SBI SRST ecall returns
+/// without doing anything and a caller that loops on `wait_for_interrupt()`
+/// simply hangs. The real reset path lives in the RTC control block; this
+/// reproduces U-Boot's `cv_system_reset()`: raise the warm-reset request, wait
+/// for it to latch, unlock RTC CTRL0, then set its reset-trigger bits.
+///
+/// # Safety
+/// The RTC-reset pages (`RTC_RESET_BASE..RTC_RESET_MMIO_END`) must be identity
+/// mapped as device memory, which the board [`MMU`] description guarantees.
+pub fn cold_reset() -> ! {
+    unsafe {
+        let warm = RTC_EN_WARM_RST_REQ as *mut u32;
+        warm.write_volatile(0x1);
+        while warm.read_volatile() != 0x1 {
+            core::hint::spin_loop();
+        }
+        (RTC_CTRL0_UNLOCKKEY as *mut u32).write_volatile(0xAB18);
+        let ctrl0 = RTC_CTRL0 as *mut u32;
+        let current = ctrl0.read_volatile();
+        ctrl0.write_volatile(current | 0xFFFF_0800 | (0x1 << 4));
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 pub struct Board;
 

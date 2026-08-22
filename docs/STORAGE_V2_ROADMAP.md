@@ -395,6 +395,13 @@ Acceptance:
 
 ### M7.7 — M4 migration and default cutover
 
+**Status: complete (2026-08-13).** The explicit freeze/stage/activate/rollback/
+close protocol, stable authority/quota snapshot, unified fail-closed backend
+facade, seven-boot QEMU migration, two-boot native-V2 default, and independent
+powered-off verifier are recorded in
+[STORAGE_V2_MIGRATION.md](STORAGE_V2_MIGRATION.md) and
+[STORAGE_V2_EVIDENCE.md](STORAGE_V2_EVIDENCE.md).
+
 **Outcome:** existing persistent programs and admitted capabilities migrate once
 to Storage V2 with independent powered-off evidence and a recoverable rollback
 window.

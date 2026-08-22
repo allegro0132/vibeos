@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["blob-format", "component-format", "component-runtime", "wasm-candidates", "wasm-runtime", "storage-device", "segment-format", "segment-store", "durable-format", "random", "runtime/riscv", "core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "drivers/dwmac-net", "drivers/dwc2-host", "drivers/milkv-duo-led", "drivers/pci", "drivers/sdhci-blk", "drivers/virtio-blk", "drivers/virtio-core", "drivers/virtio-mmio", "drivers/virtio-net", "drivers/virtio-rng", "drivers/xhci", "components/net-api", "components/net-echo", "components/net-protocol", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/component-admission", "services/component-command", "services/component-host", "services/component-image-adapter", "services/object-store", "services/program-store", "services/ssh-identity", "policy/image", "acceptance/kernel-tests", "kernel", "firmware/qemu-virt", "firmware/milkv-duo"]
+members = ["blob-format", "component-format", "component-runtime", "wasm-candidates", "wasm-runtime", "storage-device", "segment-format", "segment-store", "durable-format", "random", "runtime/riscv", "core", "compiler", "hal", "boards/qemu-virt", "boards/milkv-duo", "drivers/dwmac-net", "drivers/dwc2-host", "drivers/rtl815x", "drivers/milkv-duo-led", "drivers/pci", "drivers/sdhci-blk", "drivers/virtio-blk", "drivers/virtio-core", "drivers/virtio-mmio", "drivers/virtio-net", "drivers/virtio-rng", "drivers/xhci", "components/iperf3-server", "components/net-api", "components/net-echo", "components/net-protocol", "components/netstack", "components/sshd", "components/vsh", "services/authority-store", "services/component-admission", "services/component-command", "services/component-host", "services/component-image-adapter", "services/file-store", "services/object-store", "services/program-store", "services/ssh-identity", "policy/image", "acceptance/kernel-tests", "kernel", "firmware/qemu-virt", "firmware/milkv-duo"]
 exclude = ["vendor/sunset"]
 
 [profile.dev]
@@ -12,3 +12,21 @@ panic = "abort"
 lto = true
 opt-level = "z"
 debug = true
+
+# The size-optimized kernel profile keeps the image small, but the storage
+# stack's software SHA-256 and codec loops are latency-critical on the
+# durable put/get path (and painfully slow under TCG emulation at -Oz).
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.digest]
+opt-level = 3
+[profile.release.package.block-buffer]
+opt-level = 3
+[profile.release.package.vibeos-segment-store]
+opt-level = 3
+[profile.release.package.vibeos-durable-format]
+opt-level = 3
+[profile.release.package.vibeos-segment-format]
+opt-level = 3
+[profile.release.package.vibeos-blob-format]
+opt-level = 3

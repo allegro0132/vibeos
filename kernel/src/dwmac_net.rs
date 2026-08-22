@@ -1,7 +1,7 @@
 //! Polling CV1800B DWMAC backend for the Milk-V Duo Ethernet IO Board.
 //!
-//! The minimal profile uses one normal RX descriptor and one normal TX
-//! descriptor. Each descriptor occupies its own non-coherent cache line even
+//! The driver uses bounded normal RX and TX descriptor rings. Each descriptor
+//! occupies its own non-coherent cache line even
 //! though the device consumes only the first four words. Packet transport
 //! remains the same bounded, capability-addressed raw-L2 interface used by the
 //! QEMU virtio-net backend.
@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use vibeos_driver_dwmac_net::{Engine, Error as HardwareError};
+use vibeos_driver_dwmac_net::{DmaStorage, Engine, Error as HardwareError, InstanceState};
 
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
@@ -23,9 +23,14 @@ use crate::sync::SpinLock;
 use crate::world::Space;
 
 const TX_TIMEOUT_MS: u64 = 2_000;
+const DRIVER_BATCH_PACKETS: usize = 32;
 
 const DWMAC: vibeos_hal::DwmacDescription = crate::platform::DWMAC;
 const IRQ: u32 = DWMAC.irq;
+
+#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
+static DMA: DmaStorage = DmaStorage::new();
+static INSTANCE: InstanceState = InstanceState::new();
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -84,6 +89,8 @@ pub struct NetInfo {
     pub used_interrupts: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
     pub stale_ingress_drops: u64,
     pub stale_egress_drops: u64,
     pub stale_egress_device_epoch_drops: u64,
@@ -92,6 +99,7 @@ pub struct NetInfo {
     pub timeouts: u64,
     pub rx_inflight: u8,
     pub tx_inflight: u8,
+    pub ethernet_address: [u8; 6],
     pub phy_link_up: bool,
     pub tx_descriptor_status: u32,
     pub dma_status: u32,
@@ -117,15 +125,23 @@ impl Resource for MmioWindow {
     }
 }
 
-pub struct DmaRegion;
+pub struct DmaRegion {
+    storage: &'static DmaStorage,
+}
+
+impl DmaRegion {
+    fn storage(&self) -> &'static DmaStorage {
+        self.storage
+    }
+}
 impl Resource for DmaRegion {
     fn kind(&self) -> &'static str {
         "dma-region"
     }
     fn describe(&self) -> String {
         format!(
-            "DWMAC stable cache-isolated two-descriptor slab @ {:#x}",
-            vibeos_driver_dwmac_net::dma_region_base()
+            "DWMAC stable cache-isolated descriptor-ring slab @ {:#x}",
+            vibeos_driver_dwmac_net::dma_region_base(self.storage)
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -141,11 +157,12 @@ impl NetDevice {
         // apertures for the firmware lifetime. CONTROL serializes this
         // diagnostic snapshot with kernel packet-engine operations; the
         // selected status registers are non-destructive reads.
-        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC) };
+        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC, &INSTANCE) };
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
-            queue_size: 1,
+            queue_size: u16::try_from(vibeos_driver_dwmac_net::RX_RING_SIZE)
+                .expect("DWMAC ring size fits telemetry"),
             header_size: 0,
             accepted_features: 0,
             session_epoch: state.sessions.device_epoch(),
@@ -157,6 +174,8 @@ impl NetDevice {
             used_interrupts: 0,
             rx_packets: hardware.rx_packets,
             tx_packets: hardware.tx_packets,
+            tx_checksum_offload: hardware.tx_checksum_offload,
+            rx_checksum_offload: hardware.rx_checksum_offload,
             stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
             stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
             stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
@@ -167,6 +186,7 @@ impl NetDevice {
             timeouts: TIMEOUTS.load(Ordering::Acquire),
             rx_inflight: u8::from(state.online),
             tx_inflight: u8::from(state.tx_inflight),
+            ethernet_address: GUEST_MAC,
             phy_link_up: hardware.phy_link_up,
             tx_descriptor_status: hardware.tx_descriptor_status,
             dma_status: hardware.dma_status,
@@ -194,6 +214,7 @@ impl Resource for NetDevice {
 }
 
 pub struct NetResources {
+    pub location: crate::net_device::NetworkLocation,
     pub mmio: Arc<MmioWindow>,
     pub dma: Arc<DmaRegion>,
     pub control: Arc<NetDevice>,
@@ -201,8 +222,11 @@ pub struct NetResources {
 
 pub fn discover() -> Option<NetResources> {
     Some(NetResources {
+        location: crate::net_device::NetworkLocation::Mmio {
+            base: DWMAC.registers.start,
+        },
         mmio: Arc::new(MmioWindow),
-        dma: Arc::new(DmaRegion),
+        dma: Arc::new(DmaRegion { storage: &DMA }),
         control: Arc::new(NetDevice),
     })
 }
@@ -298,6 +322,7 @@ pub async fn driver_task(
         )
     };
     let (Ok(mmio), Ok(dma), Ok(outbound), Ok(inbound), Ok(control)) = authority else {
+        crate::println!("  dwmac net driver capability lookup failed");
         return;
     };
 
@@ -305,14 +330,20 @@ pub async fn driver_task(
     DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
     DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
 
+    let storage = match dma.try_with(DmaRegion::storage) {
+        Ok(storage) => storage,
+        Err(_) => return,
+    };
     let engine = match with_device_authority(&mmio, &dma, &control, || {
         // SAFETY: the retained and currently live capabilities authorize the
-        // identity-mapped BSP apertures and crate-owned `.dma` slab. The
+        // identity-mapped BSP apertures and this resource's `.dma` storage. The
         // firmware linker keeps that slab physically contiguous and below the
         // board's 32-bit DMA limit for this engine's lifetime.
         unsafe {
             Engine::claim(
                 DWMAC,
+                storage,
+                &INSTANCE,
                 GUEST_MAC,
                 crate::sbi::time,
                 crate::exec::timebase_hz(),
@@ -322,6 +353,7 @@ pub async fn driver_task(
     }) {
         Ok(engine) => engine,
         Err(_) => {
+            crate::println!("  dwmac net driver claim failed");
             shutdown_driver_policy(false);
             return;
         }
@@ -342,10 +374,19 @@ pub async fn driver_task(
     })
     .is_err()
     {
+        crate::println!("  dwmac net driver device attach failed");
         let reset = engine.shutdown();
         shutdown_driver_policy(reset);
         return;
     }
+    crate::println!(
+        "  dwmac net online, IRQ {}, DMA {:#x}, epoch {}, tx-csum {}, rx-csum {}",
+        engine.irq(),
+        storage.base(),
+        CONTROL.lock().sessions.device_epoch(),
+        engine.tx_checksum_offload(),
+        engine.rx_checksum_offload(),
+    );
     let mut session = DriverSession {
         engine: Some(engine),
     };
@@ -357,7 +398,7 @@ pub async fn driver_task(
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
-        if with_device_authority(&mmio, &dma, &control, || {
+        let turn = with_device_authority(&mmio, &dma, &control, || {
             driver_turn(
                 session.engine_mut(),
                 &outbound,
@@ -366,12 +407,15 @@ pub async fn driver_task(
                 &mut tx_deadline,
                 &mut link_poll,
             )
-        })
-        .is_err()
-        {
-            return;
+        });
+        match turn {
+            Ok(true) => crate::exec::yield_now().await,
+            Ok(false) => crate::exec::sleep_ms(1).await,
+            Err(error) => {
+                crate::println!("  dwmac net driver stopped: {error:?}");
+                return;
+            }
         }
-        crate::exec::sleep_ms(1).await;
     }
 }
 
@@ -390,7 +434,7 @@ impl Drop for DriverSession {
         let reset = self
             .engine
             .take()
-            .map_or(true, vibeos_driver_dwmac_net::Engine::shutdown);
+            .is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
         shutdown_driver_policy(reset);
     }
 }
@@ -414,47 +458,38 @@ fn driver_turn(
     pending_tx: &mut Option<Packet>,
     tx_deadline: &mut u64,
     link_poll: &mut u16,
-) -> Result<(), NetError> {
-    // Once a packet leaves the bounded endpoint, this task owns it until the
-    // sole TX descriptor accepts it. Descriptor ownership is ordinary
-    // backpressure until the bounded hardware deadline: retain the packet and
-    // do not dequeue a second one while DMA is using the descriptor.
+) -> Result<bool, NetError> {
+    let mut immediate_work = false;
+    // Once a packet leaves the bounded endpoint, this task owns it until a TX
+    // descriptor accepts it. Ring pressure is ordinary backpressure until the
+    // bounded hardware deadline; retain the one packet that did not fit.
     {
         // Binding and DMA publication share CONTROL. Marking the pending/raw
         // descriptor reservation before releasing this guard prevents a new
         // generation from becoming active between stamp validation and OWN.
         let mut state = CONTROL.lock();
         let now = crate::sbi::time();
-        let descriptor_busy = engine.tx_owned();
-        state.tx_inflight = descriptor_busy || pending_tx.is_some();
-        if descriptor_busy {
-            // The deadline covers DMA ownership after publication as well as
-            // software waiting to publish. A corrupted or stalled OWN bit must
-            // restart the supervised driver instead of wedging TX forever.
-            if *tx_deadline == 0 {
-                *tx_deadline = now.saturating_add(tx_timeout_ticks());
-            } else if now >= *tx_deadline {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                panic!("CV1800B DWMAC TX descriptor timed out");
-            }
-        } else if pending_tx.is_none() {
-            *tx_deadline = 0;
-            if let Some(packet) = take_admitted_outbound(outbound, &state.sessions)? {
-                *pending_tx = Some(packet);
-                *tx_deadline = now.saturating_add(tx_timeout_ticks());
-                state.tx_inflight = true;
-            }
+        let was_busy = engine.tx_owned();
+        if was_busy && *tx_deadline != 0 && now >= *tx_deadline {
+            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            panic!("CV1800B DWMAC TX descriptor ring timed out");
         }
-        if let Some(packet) = pending_tx.as_ref() {
+        for _ in 0..DRIVER_BATCH_PACKETS {
+            if pending_tx.is_none() {
+                *pending_tx = take_admitted_outbound(outbound, &state.sessions)?;
+            }
+            let Some(packet) = pending_tx.as_ref() else {
+                break;
+            };
             match engine.transmit(packet.as_bytes()) {
                 Ok(()) => {
                     *pending_tx = None;
-                    state.tx_inflight = true;
+                    *tx_deadline = now.saturating_add(tx_timeout_ticks());
+                    immediate_work = true;
                 }
-                Err(HardwareError::QueueFull) if now < *tx_deadline => {}
                 Err(HardwareError::QueueFull) => {
-                    TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                    panic!("CV1800B DWMAC TX descriptor timed out");
+                    immediate_work = true;
+                    break;
                 }
                 Err(HardwareError::PacketTooLarge) => {
                     // A safely constructed Packet always fits the DMA buffer.
@@ -464,28 +499,46 @@ fn driver_turn(
                 Err(_) => return Err(NetError::DriverFault),
             }
         }
+        let descriptor_busy = engine.tx_owned();
+        state.tx_inflight = descriptor_busy || pending_tx.is_some();
+        immediate_work |= state.tx_inflight;
+        if state.tx_inflight && *tx_deadline == 0 {
+            *tx_deadline = now.saturating_add(tx_timeout_ticks());
+        } else if !state.tx_inflight {
+            *tx_deadline = 0;
+        }
 
         // Keep the same rebind barrier from descriptor consumption through
         // exact session stamping, endpoint publication, and RX rearm. A stack
         // restart cannot relabel a raw frame after the driver consumes it.
         let mut frame = [0u8; MAX_PACKET_LEN];
-        if let Some(length) = engine.receive(&mut frame) {
+        for _ in 0..DRIVER_BATCH_PACKETS {
+            let Some(length) = engine.receive(&mut frame) else {
+                break;
+            };
+            immediate_work = true;
             let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
             match send_inbound(inbound, &state.sessions, packet) {
                 Ok(()) => {}
-                // RX has already consumed and rearmed its sole descriptor, so
-                // bounded client pressure drops this one frame.
-                Err(NetError::QueueFull) => {}
+                // RX has already consumed and rearmed this descriptor. Stop
+                // the batch after one pressure drop so the stack can drain.
+                Err(NetError::QueueFull) => break,
                 Err(error) => return Err(error),
             }
         }
     }
-    *link_poll = link_poll.wrapping_add(1);
-    if *link_poll >= 1_000 {
-        *link_poll = 0;
-        engine.poll_link();
+    // Preserve the original approximately-one-second PHY cadence.  Busy
+    // turns can now run much faster than 1 kHz, so counting them would make
+    // MDIO polling consume the data path.  Once traffic stops, idle turns
+    // resume the link check and promptly observe a disconnected cable.
+    if !immediate_work {
+        *link_poll = link_poll.wrapping_add(1);
+        if *link_poll >= 1_000 {
+            *link_poll = 0;
+            engine.poll_link();
+        }
     }
-    Ok(())
+    Ok(immediate_work)
 }
 
 fn tx_timeout_ticks() -> u64 {
@@ -595,7 +648,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
-    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC) };
+    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC, &INSTANCE) };
     shutdown_driver_policy(reset);
 }
 

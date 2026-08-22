@@ -83,6 +83,16 @@ compile_error!(
 ))]
 compile_error!("feature `wasm-c63-graph-principal-acceptance` requires the QEMU default image");
 #[cfg(all(
+    feature = "wasm-c64-resource-route-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c64-resource-route-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c63-graph-principal-acceptance",
+    feature = "wasm-c64-resource-route-acceptance"
+))]
+compile_error!("the C6.3 and C6.4 graph acceptance images are distinct roots");
+#[cfg(all(
     feature = "component-graph-principals",
     feature = "ssh-component-command"
 ))]
@@ -474,10 +484,13 @@ pub extern "C" fn kmain() -> ! {
     exec::set_fault_guard(trampoline::guard_task);
     exec::set_fault_cleanup(cleanup_faulted_task);
     exec::set_fault_reclaimer(reclaim_faulted_component);
-    #[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+    #[cfg(any(
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance"
+    ))]
     assert!(
         component_graph_principals::run_host_model_selftest(),
-        "C6.3 graph principal host model failed"
+        "component graph principal host model failed"
     );
 
     let online = start_secondary_harts();
@@ -672,6 +685,19 @@ pub extern "C" fn kmain() -> ! {
         } else {
             crate::println!("WASM_C63_GRAPH_PRINCIPAL FAIL");
             sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c64-resource-route-acceptance")]
+    exec::spawn("wasm-c64-resource-route-acceptance", async {
+        match component_graph_principals::run_c64_qemu_acceptance().await {
+            Some(guest_calls) => crate::println!(
+                "WASM_C64_RESOURCE_ROUTE PASS nodes=2 own=1 borrow=1 guest_calls={} fuel_consumed=0 provider_peak=1 provider_live=0 consumer_peak=1 consumer_live=0 target_revoked=1 source_revoked=0 target_first=1 runtime_unavailable=2 registry_occupied=0 registry_header_mismatches=0",
+                guest_calls,
+            ),
+            None => {
+                crate::println!("WASM_C64_RESOURCE_ROUTE FAIL");
+                sbi::shutdown(true);
+            }
         }
     });
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]

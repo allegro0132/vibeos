@@ -18,6 +18,9 @@ iperf3-server = ["vibeos-kernel/iperf3-server"]
 wasm-c63-graph-principal-acceptance = [
     "vibeos-kernel/wasm-c63-graph-principal-acceptance",
 ]
+wasm-c64-resource-route-acceptance = [
+    "vibeos-kernel/wasm-c64-resource-route-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

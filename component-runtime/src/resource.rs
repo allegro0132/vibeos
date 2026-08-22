@@ -7,12 +7,15 @@
 
 use alloc::vec::Vec;
 use core::{
-    fmt, mem,
+    fmt,
+    marker::PhantomData,
+    mem,
     sync::atomic::{AtomicU64, Ordering},
 };
 use vibeos_component_format::PROFILE_1_LIMITS;
 
 static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CROSS_TABLE_BORROW_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceTypeId(pub u32);
@@ -233,6 +236,131 @@ impl<A> BorrowScope<'_, A> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CrossTableBorrowSeal {
+    scope_nonce: u64,
+    source_table_identity: u64,
+    source_generation: u64,
+    source_token: ResourceToken,
+    source_type: ResourceTypeId,
+    target_table_identity: u64,
+    target_generation: u64,
+    target_type: ResourceTypeId,
+}
+
+/// An opaque, non-owning alias branded for exactly one cross-table invocation.
+///
+/// The alias contains no guest handle and cannot be converted into a resource
+/// token. Its fields are private, it implements neither `Clone` nor `Copy`, and
+/// its invariant lifetime brand cannot escape the higher-ranked callback that
+/// created it.
+///
+/// ```compile_fail
+/// use vibeos_component_runtime::resource::{
+///     CrossTableBorrowAlias, ResourceTable, ResourceToken, ResourceTypeId,
+/// };
+///
+/// fn escape<'tables, A, B>(
+///     source: &'tables ResourceTable<A>,
+///     source_token: ResourceToken,
+///     target: &'tables ResourceTable<B>,
+/// ) -> CrossTableBorrowAlias<'tables> {
+///     source
+///         .with_cross_table_borrow(
+///             source_token,
+///             ResourceTypeId(1),
+///             target,
+///             ResourceTypeId(1),
+///             |scope| scope.alias(),
+///         )
+///         .unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_runtime::resource::CrossTableBorrowAlias;
+///
+/// fn duplicate(alias: CrossTableBorrowAlias<'_>) {
+///     let _: CrossTableBorrowAlias<'_> = Clone::clone(&alias);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_runtime::resource::{CrossTableBorrowAlias, ResourceToken};
+///
+/// fn into_token(alias: CrossTableBorrowAlias<'_>) -> ResourceToken {
+///     alias.into()
+/// }
+/// ```
+#[must_use = "a cross-table borrow alias is usable only by its active scope"]
+pub struct CrossTableBorrowAlias<'call> {
+    seal: CrossTableBorrowSeal,
+    // Mentioning the lifetime in both input and output position makes the
+    // invocation brand invariant rather than a lifetime that can be widened.
+    _brand: PhantomData<fn(&'call ()) -> &'call ()>,
+}
+
+impl fmt::Debug for CrossTableBorrowAlias<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CrossTableBorrowAlias(<active>)")
+    }
+}
+
+/// The only resolver for a [`CrossTableBorrowAlias`].
+///
+/// Both tables remain borrowed for the complete callback. The target table is
+/// used only as an exact incarnation and resource-type policy boundary: this
+/// scope never inserts an entry or produces a target token.
+pub struct CrossTableBorrowScope<'call, A, B> {
+    source: &'call ResourceTable<A>,
+    target: &'call ResourceTable<B>,
+    seal: CrossTableBorrowSeal,
+}
+
+impl<A, B> fmt::Debug for CrossTableBorrowScope<'_, A, B> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CrossTableBorrowScope(<active>)")
+    }
+}
+
+impl<'call, A, B> CrossTableBorrowScope<'call, A, B> {
+    /// Creates a non-owning alias for this invocation.
+    pub fn alias(&self) -> CrossTableBorrowAlias<'call> {
+        CrossTableBorrowAlias {
+            seal: self.seal,
+            _brand: PhantomData,
+        }
+    }
+
+    /// Uses an alias only when every private invocation and table seal matches.
+    pub fn with_alias<R>(
+        &self,
+        alias: &CrossTableBorrowAlias<'_>,
+        operation: impl for<'borrow> FnOnce(Borrowed<'borrow, A>) -> R,
+    ) -> Result<R, ResourceError> {
+        if alias.seal != self.seal {
+            return Err(ResourceError::WrongScope);
+        }
+        if self.source.table_identity != self.seal.source_table_identity
+            || self.source.instance_generation != self.seal.source_generation
+            || self.target.table_identity != self.seal.target_table_identity
+            || self.target.instance_generation != self.seal.target_generation
+        {
+            return Err(ResourceError::WrongInstance);
+        }
+        let entry = self
+            .source
+            .live_slot(self.seal.source_token, self.seal.source_type)?
+            .entry
+            .as_ref()
+            .ok_or(ResourceError::Stale)?;
+        Ok(operation(Borrowed {
+            authority: &entry.authority,
+            resource_type: entry.resource_type,
+        }))
+    }
+}
+
 pub struct ResourceTable<A> {
     instance_generation: u64,
     table_identity: u64,
@@ -358,6 +486,45 @@ impl<A> ResourceTable<A> {
         operation: impl for<'borrow> FnOnce(Borrowed<'borrow, A>) -> R,
     ) -> Result<R, ResourceError> {
         self.with_borrow_scope(|scope| scope.with_borrow(token, expected, operation))?
+    }
+
+    /// Opens a non-owning alias from one live source entry into a distinct
+    /// target table's exact incarnation and resource-type policy.
+    ///
+    /// This operation only borrows both tables. It never inserts into the
+    /// target, rotates a handle, or changes ownership in the source.
+    pub fn with_cross_table_borrow<B, R>(
+        &self,
+        source_token: ResourceToken,
+        source_type: ResourceTypeId,
+        target: &ResourceTable<B>,
+        target_type: ResourceTypeId,
+        operation: impl for<'scope> FnOnce(CrossTableBorrowScope<'scope, A, B>) -> R,
+    ) -> Result<R, ResourceError> {
+        if self.table_identity == target.table_identity {
+            return Err(ResourceError::WrongInstance);
+        }
+        self.live_slot(source_token, source_type)?;
+        let scope_nonce = NEXT_CROSS_TABLE_BORROW_SCOPE_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| ResourceError::GenerationExhausted)?;
+        let seal = CrossTableBorrowSeal {
+            scope_nonce,
+            source_table_identity: self.table_identity,
+            source_generation: self.instance_generation,
+            source_token,
+            source_type,
+            target_table_identity: target.table_identity,
+            target_generation: target.instance_generation,
+            target_type,
+        };
+        Ok(operation(CrossTableBorrowScope {
+            source: self,
+            target,
+            seal,
+        }))
     }
 
     pub fn drop_owned(

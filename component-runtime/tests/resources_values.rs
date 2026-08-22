@@ -168,6 +168,93 @@ fn borrow_scope_is_unforgeable_non_escaping_and_unwind_safe() {
 }
 
 #[test]
+fn cross_table_borrow_is_invocation_scoped_and_non_owning() {
+    let mut source = ResourceTable::new(32, 1).unwrap();
+    let target = ResourceTable::<()>::new(33, 1).unwrap();
+    let token = source.insert_owned(RANDOM, 101_u32).unwrap();
+    let source_len = source.len();
+
+    source
+        .with_cross_table_borrow(token, RANDOM, &target, BLOB, |scope| {
+            assert_eq!(format!("{scope:?}"), "CrossTableBorrowScope(<active>)");
+            let alias = scope.alias();
+            assert_eq!(format!("{alias:?}"), "CrossTableBorrowAlias(<active>)");
+            assert_eq!(
+                scope.with_alias(&alias, |borrowed| {
+                    assert_eq!(borrowed.resource_type(), RANDOM);
+                    borrowed.with(|authority| *authority)
+                }),
+                Ok(101)
+            );
+        })
+        .unwrap();
+
+    assert_eq!(source.len(), source_len);
+    assert_eq!(source.contains(token, RANDOM), Ok(true));
+    assert!(target.is_empty());
+    assert_eq!(source.drop_owned(token, RANDOM), Ok(101));
+}
+
+#[test]
+fn cross_table_borrow_rejects_same_table_and_wrong_source_type() {
+    let mut source = ResourceTable::new(34, 1).unwrap();
+    let target = ResourceTable::<()>::new(35, 1).unwrap();
+    let token = source.insert_owned(RANDOM, 102_u32).unwrap();
+
+    assert_eq!(
+        source.with_cross_table_borrow(token, RANDOM, &source, BLOB, |_| ()),
+        Err(ResourceError::WrongInstance)
+    );
+    assert_eq!(
+        source.with_cross_table_borrow(token, BLOB, &target, RANDOM, |_| ()),
+        Err(ResourceError::WrongType)
+    );
+    assert_eq!(source.contains(token, RANDOM), Ok(true));
+    assert!(target.is_empty());
+}
+
+#[test]
+fn nested_cross_table_borrow_scopes_reject_each_others_aliases() {
+    let mut source = ResourceTable::new(36, 1).unwrap();
+    let target = ResourceTable::<()>::new(37, 1).unwrap();
+    let token = source.insert_owned(RANDOM, 103_u32).unwrap();
+
+    source
+        .with_cross_table_borrow(token, RANDOM, &target, BLOB, |outer| {
+            let outer_alias = outer.alias();
+            source
+                .with_cross_table_borrow(token, RANDOM, &target, BLOB, |inner| {
+                    let inner_alias = inner.alias();
+                    assert_eq!(
+                        inner.with_alias(&outer_alias, |_| ()),
+                        Err(ResourceError::WrongScope)
+                    );
+                    assert_eq!(
+                        outer.with_alias(&inner_alias, |_| ()),
+                        Err(ResourceError::WrongScope)
+                    );
+                    assert_eq!(
+                        inner.with_alias(&inner_alias, |borrowed| {
+                            borrowed.with(|authority| *authority)
+                        }),
+                        Ok(103)
+                    );
+                })
+                .unwrap();
+            assert_eq!(
+                outer.with_alias(&outer_alias, |borrowed| {
+                    borrowed.with(|authority| *authority)
+                }),
+                Ok(103)
+            );
+        })
+        .unwrap();
+
+    assert_eq!(source.contains(token, RANDOM), Ok(true));
+    assert!(target.is_empty());
+}
+
+#[test]
 fn table_exhaustion_and_handle_retirement_do_not_lose_authority() {
     let mut table = ResourceTable::new(41, 1).unwrap();
     let mut seen = BTreeSet::new();

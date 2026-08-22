@@ -18,6 +18,7 @@ use vibeos_component_runtime::{
         plan_component_graph, ComponentGraph, ComponentGraphEdgeSpec, ComponentGraphExportEndpoint,
         ComponentGraphExternalImportSpec, ComponentGraphImportEndpoint, ComponentGraphNesting,
         ComponentGraphNodeId, ComponentGraphNodeSpec, ComponentGraphPublishedExportSpec,
+        ComponentGraphResourceProvenance, ComponentGraphResourceStatus,
     },
     world::{
         EntityShape, FunctionShape, NamedCaseShape, NamedEntityShape, NamedValueShape, TypeShape,
@@ -61,6 +62,28 @@ pub struct ComponentGraphAdmissionPolicy<'a> {
     pub cycle_policy: ComponentGraphCyclePolicy,
 }
 
+/// Exact ownership modes authorized for one immutable internal resource edge.
+///
+/// This is inert admission metadata. It is not a capability, does not grant
+/// kernel authority, and cannot make an admitted graph executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentGraphResourceMode {
+    Borrow,
+    Own,
+    OwnAndBorrow,
+}
+
+/// Trusted authorization for the exact pair of graph endpoints in `edge`.
+///
+/// The mode must equal, rather than merely contain, the ownership modes found
+/// in the validator-proven interface. One policy therefore cannot reserve
+/// dormant authority for a future or different interface shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentGraphResourceEdgePolicy {
+    pub edge: ComponentGraphEdgeSpec,
+    pub mode: ComponentGraphResourceMode,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentGraphBindingMismatch {
     InterfaceVersion,
@@ -98,6 +121,9 @@ pub enum ComponentGraphAdmissionError {
         edge: u16,
     },
     UnsupportedResourceBinding {
+        edge: u16,
+    },
+    UnauthorizedResourceBinding {
         edge: u16,
     },
     BindingMismatch {
@@ -155,6 +181,9 @@ impl fmt::Display for ComponentGraphAdmissionError {
             }
             Self::UnsupportedResourceBinding { .. } => {
                 "component graph resource edge lacks nominal provenance"
+            }
+            Self::UnauthorizedResourceBinding { .. } => {
+                "component graph resource edge lacks exact trusted policy"
             }
             Self::BindingMismatch { .. } => "component graph edge types do not match exactly",
             Self::DependencyCycle { .. } => "component graph dependency cycle is forbidden",
@@ -272,6 +301,32 @@ impl ComponentGraphInterfaceCeiling {
     }
 }
 
+/// Capability-free evidence and authorization retained for one resource edge.
+///
+/// Resource names are direct interface declaration names derived from fresh
+/// validator evidence and stored in canonical order. They are never runtime
+/// handles, validator-local IDs, or authority lookup keys.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ComponentGraphResourceEdgeManifest {
+    edge: ComponentGraphEdgeSpec,
+    mode: ComponentGraphResourceMode,
+    resources: Vec<String>,
+}
+
+impl ComponentGraphResourceEdgeManifest {
+    pub const fn edge(&self) -> ComponentGraphEdgeSpec {
+        self.edge
+    }
+
+    pub const fn mode(&self) -> ComponentGraphResourceMode {
+        self.mode
+    }
+
+    pub fn resources(&self) -> &[String] {
+        &self.resources
+    }
+}
+
 /// Capability-free graph manifest. Endpoint values are graph-local ordinals,
 /// never runtime handles or authority tokens.
 #[derive(Debug, PartialEq, Eq)]
@@ -282,6 +337,7 @@ pub struct ComponentGraphManifest {
     account: ComponentGraphAccount,
     nodes: Vec<ComponentGraphNodeManifest>,
     edges: Vec<ComponentGraphEdgeSpec>,
+    resource_edges: Vec<ComponentGraphResourceEdgeManifest>,
     external_imports: Vec<ComponentGraphExternalImportSpec>,
     published_exports: Vec<ComponentGraphPublishedExportSpec>,
 }
@@ -309,6 +365,10 @@ impl ComponentGraphManifest {
 
     pub fn edges(&self) -> &[ComponentGraphEdgeSpec] {
         &self.edges
+    }
+
+    pub fn resource_edges(&self) -> &[ComponentGraphResourceEdgeManifest] {
+        &self.resource_edges
     }
 
     pub fn external_imports(&self) -> &[ComponentGraphExternalImportSpec] {
@@ -833,6 +893,167 @@ fn contains_resource_value(value: &ValueShape) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ResourceModeSet {
+    own: bool,
+    borrow: bool,
+}
+
+impl ResourceModeSet {
+    fn include(&mut self, other: Self) {
+        self.own |= other.own;
+        self.borrow |= other.borrow;
+    }
+
+    const fn exact_mode(self) -> Option<ComponentGraphResourceMode> {
+        match (self.own, self.borrow) {
+            (false, false) => None,
+            (false, true) => Some(ComponentGraphResourceMode::Borrow),
+            (true, false) => Some(ComponentGraphResourceMode::Own),
+            (true, true) => Some(ComponentGraphResourceMode::OwnAndBorrow),
+        }
+    }
+}
+
+fn declared_resource(resources: &[String], name: &str) -> bool {
+    resources.iter().any(|resource| resource == name)
+}
+
+fn collect_value_resource_modes(
+    value: &ValueShape,
+    resources: &[String],
+) -> Option<ResourceModeSet> {
+    use ValueShape::*;
+    let mut modes = ResourceModeSet::default();
+    match value {
+        Own(resource) => {
+            if !declared_resource(resources, resource) {
+                return None;
+            }
+            modes.own = true;
+        }
+        Borrow(resource) => {
+            if !declared_resource(resources, resource) {
+                return None;
+            }
+            modes.borrow = true;
+        }
+        List(value) | Option(value) => {
+            modes.include(collect_value_resource_modes(value, resources)?);
+        }
+        Tuple(values) => {
+            for value in values {
+                modes.include(collect_value_resource_modes(value, resources)?);
+            }
+        }
+        Record(values) => {
+            for value in values {
+                modes.include(collect_value_resource_modes(&value.value, resources)?);
+            }
+        }
+        Result { ok, error } => {
+            if let Some(value) = ok {
+                modes.include(collect_value_resource_modes(value, resources)?);
+            }
+            if let Some(value) = error {
+                modes.include(collect_value_resource_modes(value, resources)?);
+            }
+        }
+        Variant(cases) => {
+            for case in cases {
+                if let Some(value) = &case.value {
+                    modes.include(collect_value_resource_modes(value, resources)?);
+                }
+            }
+        }
+        Future(value) | Stream(value) => {
+            if let Some(value) = value {
+                modes.include(collect_value_resource_modes(value, resources)?);
+            }
+        }
+        Bool | U8 | U16 | U32 | U64 | S8 | S16 | S32 | S64 | Char | String | Flags(_) | Enum(_) => {
+        }
+    }
+    Some(modes)
+}
+
+fn collect_entity_resource_modes(
+    entity: &EntityShape,
+    resources: &[String],
+) -> Option<ResourceModeSet> {
+    let mut modes = ResourceModeSet::default();
+    match entity {
+        EntityShape::Function(function) => {
+            for parameter in &function.parameters {
+                modes.include(collect_value_resource_modes(&parameter.value, resources)?);
+            }
+            if let Some(result) = &function.result {
+                modes.include(collect_value_resource_modes(result, resources)?);
+            }
+        }
+        EntityShape::Interface(members) => {
+            for member in members {
+                modes.include(collect_entity_resource_modes(&member.entity, resources)?);
+            }
+        }
+        // Exact graph provenance permits resource declarations only as direct
+        // members of the bound top-level interface. A nested declaration is
+        // therefore an internal inconsistency and fails closed.
+        EntityShape::Type(TypeShape::Resource) => return None,
+        EntityShape::Type(TypeShape::Value(value)) => {
+            modes.include(collect_value_resource_modes(value, resources)?);
+        }
+    }
+    Some(modes)
+}
+
+fn collect_interface_resource_mode(
+    members: &[NamedEntityShape],
+    resources: &[String],
+) -> Option<ComponentGraphResourceMode> {
+    let mut modes = ResourceModeSet::default();
+    for member in members {
+        if declared_resource(resources, &member.name) {
+            if !matches!(member.entity, EntityShape::Type(TypeShape::Resource)) {
+                return None;
+            }
+            continue;
+        }
+        modes.include(collect_entity_resource_modes(&member.entity, resources)?);
+    }
+    modes.exact_mode()
+}
+
+fn exact_resource_names(
+    members: &[NamedEntityShape],
+    evidence: &vibeos_component_runtime::graph::ComponentGraphEntityResourceProvenance,
+    edge: u16,
+) -> Result<Vec<String>, ComponentGraphAdmissionError> {
+    if evidence.status() != ComponentGraphResourceStatus::ExactInterface
+        || evidence.declarations().is_empty()
+    {
+        return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding { edge });
+    }
+    let mut resources = Vec::new();
+    resources
+        .try_reserve_exact(evidence.declarations().len())
+        .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
+    for declaration in evidence.declarations() {
+        let Some(member) = members.get(usize::from(declaration.member().index())) else {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding { edge });
+        };
+        if !matches!(member.entity, EntityShape::Type(TypeShape::Resource)) {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding { edge });
+        }
+        resources.push(copied(&member.name)?);
+    }
+    resources.sort_unstable();
+    if resources.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding { edge });
+    }
+    Ok(resources)
+}
+
 fn compare_named_values(
     left: &[NamedValueShape],
     right: &[NamedValueShape],
@@ -1092,15 +1313,137 @@ fn check_typed_edges(graph: &ComponentGraph<'_>) -> Result<(), ComponentGraphAdm
                 kind,
             });
         }
-        if source
+    }
+    Ok(())
+}
+
+fn derive_resource_edges(
+    graph: &ComponentGraph<'_>,
+    provenances: &[ComponentGraphResourceProvenance],
+) -> Result<Vec<ComponentGraphResourceEdgeManifest>, ComponentGraphAdmissionError> {
+    let mut routes = Vec::new();
+    routes
+        .try_reserve_exact(graph.edges().len())
+        .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
+    for (index, edge) in graph.edges().iter().enumerate() {
+        let edge_index = edge_index(index)?;
+        let (EntityShape::Interface(source), EntityShape::Interface(target)) =
+            (&edge.source_shape().entity, &edge.target_shape().entity)
+        else {
+            // `check_typed_edges` must run before this helper.
+            return Err(ComponentGraphAdmissionError::UnsupportedBindingSurface {
+                edge: edge_index,
+            });
+        };
+        let resource_bearing = source
             .iter()
             .any(|member| contains_resource_entity(&member.entity))
             || target
                 .iter()
-                .any(|member| contains_resource_entity(&member.entity))
-        {
+                .any(|member| contains_resource_entity(&member.entity));
+        if !resource_bearing {
+            continue;
+        }
+
+        let Some(source_evidence) = provenances
+            .get(usize::from(edge.source().node().index()))
+            .and_then(|resources| resources.export(edge.source().export()))
+        else {
             return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding {
                 edge: edge_index,
+            });
+        };
+        let Some(target_evidence) = provenances
+            .get(usize::from(edge.target().node().index()))
+            .and_then(|resources| resources.import(edge.target().import()))
+        else {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding {
+                edge: edge_index,
+            });
+        };
+        let source_resources = exact_resource_names(source, source_evidence, edge_index)?;
+        let target_resources = exact_resource_names(target, target_evidence, edge_index)?;
+        if source_resources != target_resources {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding {
+                edge: edge_index,
+            });
+        }
+        let Some(source_mode) = collect_interface_resource_mode(source, &source_resources) else {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding {
+                edge: edge_index,
+            });
+        };
+        let Some(target_mode) = collect_interface_resource_mode(target, &target_resources) else {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding {
+                edge: edge_index,
+            });
+        };
+        if source_mode != target_mode {
+            return Err(ComponentGraphAdmissionError::UnsupportedResourceBinding {
+                edge: edge_index,
+            });
+        }
+        routes.push(ComponentGraphResourceEdgeManifest {
+            edge: ComponentGraphEdgeSpec::new(edge.source(), edge.target()),
+            mode: source_mode,
+            resources: source_resources,
+        });
+    }
+    Ok(routes)
+}
+
+fn authorize_resource_edges(
+    graph: &ComponentGraph<'_>,
+    observed: &[ComponentGraphResourceEdgeManifest],
+    policy: &[ComponentGraphResourceEdgePolicy],
+) -> Result<(), ComponentGraphAdmissionError> {
+    // Structural policy ambiguity is rejected only after topology, complete
+    // bindings, exact edge types, and nominal evidence have been checked, so
+    // the established error precedence is preserved.
+    for (index, route) in policy.iter().enumerate() {
+        if policy[..index]
+            .iter()
+            .any(|earlier| earlier.edge == route.edge)
+            || !graph.edges().iter().any(|edge| {
+                edge.source() == route.edge.source() && edge.target() == route.edge.target()
+            })
+        {
+            return Err(ComponentGraphAdmissionError::InvalidPolicy);
+        }
+    }
+
+    for route in observed {
+        let index = graph
+            .edges()
+            .iter()
+            .position(|edge| {
+                edge.source() == route.edge.source() && edge.target() == route.edge.target()
+            })
+            .ok_or(ComponentGraphAdmissionError::InvalidPolicy)?;
+        let Some(authorized) = policy.iter().find(|policy| policy.edge == route.edge) else {
+            return Err(ComponentGraphAdmissionError::UnauthorizedResourceBinding {
+                edge: edge_index(index)?,
+            });
+        };
+        if authorized.mode != route.mode {
+            return Err(ComponentGraphAdmissionError::UnauthorizedResourceBinding {
+                edge: edge_index(index)?,
+            });
+        }
+    }
+
+    for authorized in policy {
+        if observed.iter().all(|route| route.edge != authorized.edge) {
+            let index = graph
+                .edges()
+                .iter()
+                .position(|edge| {
+                    edge.source() == authorized.edge.source()
+                        && edge.target() == authorized.edge.target()
+                })
+                .ok_or(ComponentGraphAdmissionError::InvalidPolicy)?;
+            return Err(ComponentGraphAdmissionError::UnauthorizedResourceBinding {
+                edge: edge_index(index)?,
             });
         }
     }
@@ -1156,10 +1499,9 @@ fn check_acyclic(graph: &ComponentGraph<'_>) -> Result<(), ComponentGraphAdmissi
     Ok(())
 }
 
-fn check_graph_semantics(graph: &ComponentGraph<'_>) -> Result<(), ComponentGraphAdmissionError> {
+fn check_graph_bindings(graph: &ComponentGraph<'_>) -> Result<(), ComponentGraphAdmissionError> {
     check_complete_bindings(graph)?;
-    check_typed_edges(graph)?;
-    check_acyclic(graph)
+    check_typed_edges(graph)
 }
 
 fn copy_specs<T: Copy>(source: &[T]) -> Result<Vec<T>, ComponentGraphAdmissionError> {
@@ -1295,21 +1637,44 @@ pub fn admit_component_graph(
     policy: &ComponentGraphAdmissionPolicy<'_>,
     caller: &CallerAuthority<'_>,
 ) -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
+    admit_component_graph_with_resource_policy(artifacts, policy, &[], caller)
+}
+
+/// Inspect and admit a complete graph with explicit, exact authorization for
+/// its internal resource edges.
+///
+/// This remains a capability-free validation operation. In particular, the
+/// resource policy does not contain or produce a live handle, Cap, CSpace
+/// identity, supervisor operation, or executable route.
+pub fn admit_component_graph_with_resource_policy(
+    artifacts: Vec<ComponentArtifact>,
+    policy: &ComponentGraphAdmissionPolicy<'_>,
+    resource_policy: &[ComponentGraphResourceEdgePolicy],
+    caller: &CallerAuthority<'_>,
+) -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
     validate_policy(&artifacts, policy, caller)?;
+    if resource_policy.len() > PROFILE_1_COMPONENT_GRAPH_LIMITS.max_edges as usize {
+        return Err(ComponentGraphAdmissionError::InvalidPolicy);
+    }
 
     let mut inspected = Vec::new();
     inspected
         .try_reserve_exact(artifacts.len())
         .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
+    let mut provenances = Vec::new();
+    provenances
+        .try_reserve_exact(artifacts.len())
+        .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
     for (index, artifact) in artifacts.iter().enumerate() {
-        inspected.push(
+        let (inspection, provenance) =
             artifact
-                .inspect()
+                .inspect_graph()
                 .map_err(|error| ComponentGraphAdmissionError::Node {
                     node: ComponentGraphNodeId::new(index as u16),
                     error,
-                })?,
-        );
+                })?;
+        inspected.push(inspection);
+        provenances.push(provenance);
     }
 
     for (index, inspection) in inspected.iter().enumerate() {
@@ -1341,7 +1706,10 @@ pub fn admit_component_graph(
         policy.external_imports,
         policy.published_exports,
     )?;
-    check_graph_semantics(&graph)?;
+    check_graph_bindings(&graph)?;
+    let resource_edges = derive_resource_edges(&graph, &provenances)?;
+    authorize_resource_edges(&graph, &resource_edges, resource_policy)?;
+    check_acyclic(&graph)?;
     let grants = build_grants(&inspected, &graph, policy, caller)?;
 
     let name = copied(policy.name)?;
@@ -1398,6 +1766,7 @@ pub fn admit_component_graph(
             account,
             nodes,
             edges,
+            resource_edges,
             external_imports,
             published_exports,
         },
@@ -1423,6 +1792,10 @@ fn revalidate_component_graph(
     inspected
         .try_reserve_exact(admitted.artifacts.len())
         .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
+    let mut provenances = Vec::new();
+    provenances
+        .try_reserve_exact(admitted.artifacts.len())
+        .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
     for (index, artifact) in admitted.artifacts.iter().enumerate() {
         let expected_node = &admitted.manifest.nodes[index];
         let expected = &admitted.inspections[index];
@@ -1444,12 +1817,13 @@ fn revalidate_component_graph(
             return Err(ComponentGraphAdmissionError::RevalidationMismatch);
         }
         validate_owned_ceilings(&expected_node.interfaces)?;
-        let observed = artifact
-            .inspect()
-            .map_err(|error| ComponentGraphAdmissionError::Node {
-                node: expected_node.id,
-                error,
-            })?;
+        let (observed, provenance) =
+            artifact
+                .inspect_graph()
+                .map_err(|error| ComponentGraphAdmissionError::Node {
+                    node: expected_node.id,
+                    error,
+                })?;
         if observed.profile() != expected.profile
             || observed.summary() != expected.component
             || !unique_top_level_names(observed.imports())
@@ -1469,6 +1843,7 @@ fn revalidate_component_graph(
             return Err(ComponentGraphAdmissionError::RevalidationMismatch);
         }
         inspected.push(observed);
+        provenances.push(provenance);
     }
 
     let mut node_specs = Vec::new();
@@ -1490,7 +1865,12 @@ fn revalidate_component_graph(
         &admitted.manifest.external_imports,
         &admitted.manifest.published_exports,
     )?;
-    check_graph_semantics(&graph)?;
+    check_graph_bindings(&graph)?;
+    let observed_resource_edges = derive_resource_edges(&graph, &provenances)?;
+    if observed_resource_edges != admitted.manifest.resource_edges {
+        return Err(ComponentGraphAdmissionError::RevalidationMismatch);
+    }
+    check_acyclic(&graph)?;
     if graph.account() != admitted.manifest.account
         || graph
             .nodes()

@@ -100,6 +100,18 @@ ssh-component-command = [
     "dep:vibeos-sshd",
     "dep:vibeos-wasm-runtime",
 ]
+# Default-off C6.3 lifecycle adapter for an atomically admitted Component
+# graph. This allocates only fresh per-node principal envelopes; the admitted
+# ValidationOnly graph remains non-executable.
+component-graph-principals = [
+    "dep:vibeos-component-command",
+    "dep:vibeos-component-runtime",
+]
+# QEMU image gate for the real two-node C6.3 lifecycle proof.
+wasm-c63-graph-principal-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

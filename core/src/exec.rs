@@ -23,7 +23,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::arch;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
-use crate::instance::InstanceToken;
+use crate::instance::{InstanceToken, MAX_COMPONENT_INSTANCES};
 use crate::ipi;
 use crate::runqueue::{EnqueueError, RunQueues};
 use crate::sync::{SpinLock, TaskRecoveryContext, TaskRecoveryKey};
@@ -608,12 +608,17 @@ struct TaskStatus {
 
 impl TaskStatus {
     fn new(published: Arc<AtomicBool>) -> Self {
+        Self::with_joiners(published, Vec::new())
+    }
+
+    fn with_joiners(published: Arc<AtomicBool>, joiners: Vec<JoinWaiter>) -> Self {
+        debug_assert!(joiners.is_empty());
         Self {
             published,
             polls: AtomicU64::new(0),
             state: AtomicU8::new(TaskState::Running as u8),
             next_joiner: AtomicU64::new(1),
-            joiners: SpinLock::new(Vec::new()),
+            joiners: SpinLock::new(joiners),
             next_registration: AtomicU64::new(1),
             registrations: SpinLock::new(Vec::new()),
         }
@@ -1813,6 +1818,12 @@ enum ReclaimableDomainError {
     LifecycleMismatch,
 }
 
+/// Maximum number of ordinary SYSTEM tasks which may accompany one exact
+/// managed publication reservation. C6.3 uses the single slot for the stable
+/// graph supervisor; keeping this bound narrow prevents the reservation API
+/// from becoming a caller-sized hidden scheduler surface.
+pub const MAX_MANAGED_PUBLICATION_SAFE_TASKS: usize = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReclaimableDomainKey {
     slot: u8,
@@ -1845,6 +1856,20 @@ struct ReclaimableDomainRecord {
     phase: ReclaimableDomainPhase,
 }
 
+/// One exact, still-hidden scheduler-domain incarnation reserved for a
+/// managed member of a prepared batch. It owns no task/status and is invisible
+/// to every public scheduler projection.
+#[derive(Clone, Copy)]
+struct ReclaimableDomainReservation {
+    batch: u64,
+    ordinal: usize,
+    managed_count: usize,
+    safe_count: usize,
+    key: ReclaimableDomainKey,
+    domain: AllocationDomain,
+    instance: InstanceToken,
+}
+
 impl ReclaimableDomainRecord {
     const fn snapshot(self) -> ReclaimableDomainSnapshot {
         ReclaimableDomainSnapshot {
@@ -1856,11 +1881,13 @@ impl ReclaimableDomainRecord {
     }
 }
 
-/// Fixed SYSTEM-owned scheduler metadata for every active allocator arena.
-/// The table never allocates while SCHED is held or during fault teardown.
+/// Fixed SYSTEM-owned scheduler metadata for every active allocator arena and
+/// every exact, still-hidden managed-batch reservation. The table never
+/// allocates while SCHED is held or during fault teardown.
 #[derive(Clone, Copy)]
 struct ReclaimableDomains {
     records: [Option<ReclaimableDomainRecord>; heap::MAX_ALLOCATION_ARENAS],
+    reservations: [Option<ReclaimableDomainReservation>; heap::MAX_ALLOCATION_ARENAS],
     generations: [u64; heap::MAX_ALLOCATION_ARENAS],
 }
 
@@ -1868,6 +1895,7 @@ impl ReclaimableDomains {
     const fn new() -> Self {
         Self {
             records: [None; heap::MAX_ALLOCATION_ARENAS],
+            reservations: [None; heap::MAX_ALLOCATION_ARENAS],
             generations: [0; heap::MAX_ALLOCATION_ARENAS],
         }
     }
@@ -1884,6 +1912,202 @@ impl ReclaimableDomains {
         self.index_of_arena(domain.arena)
             .and_then(|index| self.records[index])
             .filter(|record| record.domain == domain)
+    }
+
+    fn reservation_index_of_arena(&self, arena: ArenaId) -> Option<usize> {
+        self.reservations.iter().position(|reservation| {
+            reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.domain.arena == arena)
+        })
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn reserved_count(&self) -> usize {
+        self.reservations
+            .iter()
+            .filter(|reservation| reservation.is_some())
+            .count()
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn pending_task_count(&self) -> usize {
+        self.reservations
+            .iter()
+            .flatten()
+            .filter(|reservation| reservation.ordinal == 0)
+            .map(|reservation| {
+                reservation
+                    .managed_count
+                    .checked_add(reservation.safe_count)
+                    .expect("hidden managed-batch task count overflow")
+            })
+            .fold(0usize, |total, batch| {
+                total
+                    .checked_add(batch)
+                    .expect("hidden prepared-task count overflow")
+            })
+    }
+
+    fn reservation_matches(
+        &self,
+        batch: u64,
+        ordinal: usize,
+        instance: InstanceToken,
+        domain: AllocationDomain,
+        managed_count: usize,
+        safe_count: usize,
+    ) -> bool {
+        self.reservations.iter().flatten().any(|reservation| {
+            reservation.batch == batch
+                && reservation.ordinal == ordinal
+                && reservation.instance == instance
+                && reservation.domain == domain
+                && reservation.managed_count == managed_count
+                && reservation.safe_count == safe_count
+        })
+    }
+
+    /// Reserve exact vacant slots and their next generations in a private
+    /// table copy. No generation is advanced until later activation.
+    fn reserve_managed_batch(
+        &mut self,
+        batch: u64,
+        entries: &[(InstanceToken, AllocationDomain)],
+        safe_count: usize,
+    ) -> Result<(), ReclaimableDomainError> {
+        for (_, domain) in entries {
+            if let Some(index) = self.index_of_arena(domain.arena) {
+                let record = self.records[index].expect("active arena index remains occupied");
+                return Err(if record.domain == *domain {
+                    ReclaimableDomainError::Exclusive
+                } else {
+                    ReclaimableDomainError::DomainMismatch
+                });
+            }
+            if let Some(index) = self.reservation_index_of_arena(domain.arena) {
+                let reservation =
+                    self.reservations[index].expect("reserved arena index remains occupied");
+                return Err(if reservation.domain == *domain {
+                    ReclaimableDomainError::NotActive
+                } else {
+                    ReclaimableDomainError::DomainMismatch
+                });
+            }
+        }
+
+        for (ordinal, (instance, domain)) in entries.iter().copied().enumerate() {
+            let index = self
+                .records
+                .iter()
+                .zip(&self.reservations)
+                .enumerate()
+                .find_map(|(index, (record, reservation))| {
+                    (record.is_none()
+                        && reservation.is_none()
+                        && self.generations[index] != u64::MAX)
+                        .then_some(index)
+                })
+                .ok_or(ReclaimableDomainError::TableFull)?;
+            let generation = self.generations[index]
+                .checked_add(1)
+                .ok_or(ReclaimableDomainError::GenerationExhausted)?;
+            self.reservations[index] = Some(ReclaimableDomainReservation {
+                batch,
+                ordinal,
+                managed_count: entries.len(),
+                safe_count,
+                key: ReclaimableDomainKey {
+                    slot: u8::try_from(index).expect("reclaimable-domain table exceeds u8"),
+                    generation,
+                },
+                domain,
+                instance,
+            });
+        }
+        Ok(())
+    }
+
+    fn release_managed_batch(
+        &mut self,
+        batch: u64,
+        expected: usize,
+        expected_safe: usize,
+    ) -> Result<(), ReclaimableDomainError> {
+        let retained = self
+            .reservations
+            .iter()
+            .flatten()
+            .filter(|reservation| reservation.batch == batch)
+            .count();
+        if retained != expected {
+            return Err(ReclaimableDomainError::LifecycleMismatch);
+        }
+        if self.reservations.iter().flatten().any(|reservation| {
+            reservation.batch == batch
+                && (reservation.managed_count != expected
+                    || reservation.safe_count != expected_safe)
+        }) {
+            return Err(ReclaimableDomainError::LifecycleMismatch);
+        }
+        for reservation in &mut self.reservations {
+            if reservation.is_some_and(|reservation| reservation.batch == batch) {
+                *reservation = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_reserved_managed(
+        &mut self,
+        batch: u64,
+        ordinal: usize,
+        domain: AllocationDomain,
+        home_hart: HartId,
+        task: TaskId,
+        status: &Arc<TaskStatus>,
+        instance: InstanceToken,
+    ) -> Result<ReclaimableDomainKey, ReclaimableDomainError> {
+        let index = self
+            .reservations
+            .iter()
+            .position(|candidate| {
+                candidate.is_some_and(|reservation| {
+                    reservation.batch == batch && reservation.ordinal == ordinal
+                })
+            })
+            .ok_or(ReclaimableDomainError::Missing)?;
+        let reservation = self.reservations[index].ok_or(ReclaimableDomainError::Missing)?;
+        if reservation.domain != domain {
+            return Err(ReclaimableDomainError::DomainMismatch);
+        }
+        if reservation.instance != instance {
+            return Err(ReclaimableDomainError::InstanceMismatch);
+        }
+        if self.records[index].is_some()
+            || reservation.key.slot as usize != index
+            || self.generations[index]
+                .checked_add(1)
+                .ok_or(ReclaimableDomainError::GenerationExhausted)?
+                != reservation.key.generation
+        {
+            return Err(ReclaimableDomainError::LifecycleMismatch);
+        }
+
+        self.generations[index] = reservation.key.generation;
+        self.reservations[index] = None;
+        self.records[index] = Some(ReclaimableDomainRecord {
+            key: reservation.key,
+            domain,
+            home_hart,
+            live_tasks: 1,
+            exclusive: true,
+            exclusive_task: Some(task),
+            exclusive_status: Some(Arc::as_ptr(status) as usize),
+            exclusive_instance: Some(instance),
+            phase: ReclaimableDomainPhase::Active,
+        });
+        Ok(reservation.key)
     }
 
     fn record_exact(
@@ -1962,12 +2186,14 @@ impl ReclaimableDomains {
                 .ok_or(ReclaimableDomainError::LiveTaskOverflow)?;
             return Ok(());
         }
-        if !self
-            .records
-            .iter()
-            .enumerate()
-            .any(|(index, record)| record.is_none() && self.generations[index] != u64::MAX)
-        {
+        if self.reservation_index_of_arena(domain.arena).is_some() {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        if !self.records.iter().zip(&self.reservations).enumerate().any(
+            |(index, (record, reservation))| {
+                record.is_none() && reservation.is_none() && self.generations[index] != u64::MAX
+            },
+        ) {
             return Err(ReclaimableDomainError::TableFull);
         }
         Ok(())
@@ -1993,9 +2219,11 @@ impl ReclaimableDomains {
         let index = self
             .records
             .iter()
+            .zip(&self.reservations)
             .enumerate()
-            .find_map(|(index, record)| {
-                (record.is_none() && self.generations[index] != u64::MAX).then_some(index)
+            .find_map(|(index, (record, reservation))| {
+                (record.is_none() && reservation.is_none() && self.generations[index] != u64::MAX)
+                    .then_some(index)
             })
             .ok_or(ReclaimableDomainError::TableFull)?;
         let generation = self.generations[index]
@@ -2048,6 +2276,9 @@ struct Sched {
     tasks: BTreeMap<TaskId, Task>,
     ready: RunQueues<TaskId>,
     reclaimable_domains: ReclaimableDomains,
+    /// Ready capacity promised to still-hidden managed batches. Every ordinary
+    /// admission includes these credits in its live bound.
+    pending_prepared_tasks: usize,
     /// Each hart owns one independently polled task. A task is lifted out of
     /// `tasks` while its future is executing, so lifecycle and wake paths must
     /// inspect all hart slots before treating an id as inactive.
@@ -2118,6 +2349,7 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     tasks: BTreeMap::new(),
     ready: RunQueues::new(),
     reclaimable_domains: ReclaimableDomains::new(),
+    pending_prepared_tasks: 0,
     harts: [const { HartRunState::new() }; MAX_HARTS],
     completed: 0,
     faulted: 0,
@@ -2125,6 +2357,14 @@ static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
 });
 
 impl Sched {
+    fn ready_live_bound(&self) -> usize {
+        self.tasks
+            .len()
+            .checked_add(self.running_count())
+            .and_then(|live| live.checked_add(self.pending_prepared_tasks))
+            .expect("ready live/reservation bound overflow")
+    }
+
     fn running_count(&self) -> usize {
         self.harts
             .iter()
@@ -2388,12 +2628,12 @@ impl Sched {
 /// appear in `Sched`; retained `TaskStatus` is their sole owner until publish.
 #[cfg(debug_assertions)]
 fn assert_sched_invariants(s: &Sched) {
-    let live = s.tasks.len() + s.running_count();
+    let live = s.ready_live_bound();
     for index in 0..MAX_HARTS {
         let hart = HartId::new(index).expect("scheduler hart index is valid");
         debug_assert!(
             s.ready.capacity(hart) >= live,
-            "hart {index} ready capacity {} is below live-task bound {live}",
+            "hart {index} ready capacity {} is below live/reservation bound {live}",
             s.ready.capacity(hart)
         );
         debug_assert!(
@@ -2560,6 +2800,50 @@ fn assert_sched_invariants(s: &Sched) {
         if record.exclusive {
             debug_assert_eq!(record.live_tasks, 1);
         }
+    }
+
+    debug_assert_eq!(
+        s.reclaimable_domains.reserved_count() + s.reclaimable_domains.active_count(),
+        s.reclaimable_domains
+            .records
+            .iter()
+            .zip(&s.reclaimable_domains.reservations)
+            .filter(|(record, reservation)| record.is_some() || reservation.is_some())
+            .count(),
+        "one scheduler-domain slot contains both active and hidden state"
+    );
+    debug_assert_eq!(
+        s.pending_prepared_tasks,
+        s.reclaimable_domains.pending_task_count(),
+        "pending ready credits disagree with hidden managed batches"
+    );
+    for (index, reservation) in s
+        .reclaimable_domains
+        .reservations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reservation)| reservation.map(|reservation| (index, reservation)))
+    {
+        debug_assert!(s.reclaimable_domains.records[index].is_none());
+        debug_assert_eq!(reservation.key.slot as usize, index);
+        debug_assert!(reservation.ordinal < reservation.managed_count);
+        debug_assert!(reservation.managed_count <= MAX_COMPONENT_INSTANCES);
+        debug_assert!(reservation.safe_count <= MAX_MANAGED_PUBLICATION_SAFE_TASKS);
+        debug_assert_eq!(
+            s.reclaimable_domains
+                .reservations
+                .iter()
+                .flatten()
+                .filter(|other| other.batch == reservation.batch)
+                .count(),
+            reservation.managed_count,
+            "hidden managed batch lost an exact domain reservation"
+        );
+        debug_assert_eq!(
+            s.reclaimable_domains.generations[index].checked_add(1),
+            Some(reservation.key.generation),
+            "hidden scheduler-domain reservation changed its proposed generation"
+        );
     }
 }
 
@@ -3018,6 +3302,12 @@ pub struct PreparedTaskBatch {
     published: bool,
     staged: bool,
     binding_rejected: bool,
+    reserved_managed_tasks: usize,
+    reserved_safe_tasks: usize,
+    /// One still-empty, one-entry inbound join ledger for each exact managed
+    /// prefix member. Reservation allocates every buffer before the first raw
+    /// future; ordered managed preparation moves each buffer into TaskStatus.
+    reserved_managed_joiners: Vec<Option<Vec<JoinWaiter>>>,
     publication: Arc<AtomicBool>,
 }
 
@@ -3034,6 +3324,9 @@ impl PreparedTaskBatch {
             published: false,
             staged: false,
             binding_rejected: false,
+            reserved_managed_tasks: 0,
+            reserved_safe_tasks: 0,
+            reserved_managed_joiners: Vec::new(),
             publication,
         }
     }
@@ -3049,6 +3342,140 @@ impl PreparedTaskBatch {
         self.tasks.try_reserve_exact(additional)?;
         self.handles.try_reserve_exact(additional)?;
         self.reclaimable_bindings.try_reserve_exact(additional)
+    }
+
+    /// Reserve every recoverable scheduler resource for one exact managed
+    /// batch before any tracked future is allocated or registry record bound.
+    ///
+    /// `managed` fixes the ordered `(instance, domain)` projection for the
+    /// exclusive members. They must be prepared first and exactly in that
+    /// order. Up to [`MAX_MANAGED_PUBLICATION_SAFE_TASKS`] ordinary untracked
+    /// tasks may then follow in the same atomic batch; C6.3 uses one as its
+    /// SYSTEM supervisor. Raw exclusive members which lack an exact managed
+    /// token are forbidden.
+    ///
+    /// Success installs hidden, batch-owned scheduler-domain slots without
+    /// advancing their generations, retains enough ready capacity for all
+    /// managed and safe members, and preallocates one inbound joiner entry for
+    /// every managed member. Ordered managed preparation moves those buffers
+    /// into the exact TaskStatus objects without allocating. This lets the
+    /// SYSTEM supervisor register its one lifecycle join per managed task after
+    /// publication without growing a raw task's status ledger.
+    ///
+    /// The reservation is invisible to task/domain reports and is released by
+    /// `Drop` unless staging consumes it. Therefore every recoverable setup
+    /// step precedes the first managed `prepare`: unpublished tracked futures
+    /// are deliberately abandoned rather than normally dropped. Every returned
+    /// error precedes registry binding and is safe for the caller's exact
+    /// pristine-reservation rollback, irrespective of
+    /// [`PreparedTaskBatchError::requires_registry_quarantine`].
+    pub fn reserve_managed_publication(
+        &mut self,
+        managed: &[(InstanceToken, AllocationDomain)],
+        additional_safe_tasks: usize,
+    ) -> Result<(), PreparedTaskBatchError> {
+        if self.published {
+            return Err(PreparedTaskBatchError::AlreadyPublished);
+        }
+        if self.binding_rejected {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRejected);
+        }
+        if self.staged
+            || !self.tasks.is_empty()
+            || !self.handles.is_empty()
+            || !self.reclaimable_bindings.is_empty()
+            || self.reserved_managed_tasks != 0
+            || self.reserved_safe_tasks != 0
+            || !self.reserved_managed_joiners.is_empty()
+        {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRequired);
+        }
+        if managed.is_empty()
+            || managed.len() > MAX_COMPONENT_INSTANCES
+            || additional_safe_tasks > MAX_MANAGED_PUBLICATION_SAFE_TASKS
+        {
+            return Err(PreparedTaskBatchError::ReclaimableCapacity);
+        }
+        for (index, (instance, domain)) in managed.iter().copied().enumerate() {
+            if !domain.arena.is_tracked() || domain.owner == OwnerId::SYSTEM {
+                return Err(PreparedTaskBatchError::ReclaimableDomainMismatch);
+            }
+            if managed[index + 1..]
+                .iter()
+                .any(|(other, _)| instance.shares_stable_slot(*other))
+            {
+                return Err(PreparedTaskBatchError::DuplicateReclaimableArena);
+            }
+            if managed[index + 1..]
+                .iter()
+                .any(|(_, other)| domain.arena == other.arena)
+            {
+                return Err(PreparedTaskBatchError::DuplicateReclaimableArena);
+            }
+        }
+
+        let total = managed
+            .len()
+            .checked_add(additional_safe_tasks)
+            .ok_or(PreparedTaskBatchError::Capacity)?;
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut managed_joiners = Vec::new();
+        let metadata_reserved = (|| {
+            self.try_reserve(total).map_err(|_| ())?;
+            managed_joiners
+                .try_reserve_exact(managed.len())
+                .map_err(|_| ())?;
+            for _ in managed {
+                let mut joiners = Vec::new();
+                joiners.try_reserve_exact(1).map_err(|_| ())?;
+                managed_joiners.push(Some(joiners));
+            }
+            Ok::<(), ()>(())
+        })()
+        .is_ok();
+        if !metadata_reserved {
+            drop(managed_joiners);
+            system.restore();
+            return Err(PreparedTaskBatchError::Capacity);
+        }
+        system.restore();
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut s = SCHED.lock();
+        let mut staged_domains = s.reclaimable_domains;
+        if let Err(error) =
+            staged_domains.reserve_managed_batch(self.id, managed, additional_safe_tasks)
+        {
+            drop(s);
+            drop(managed_joiners);
+            system.restore();
+            return Err(map_prepared_reclaimable_error(error));
+        }
+        let live_after_reservation = s
+            .ready_live_bound()
+            .checked_add(total)
+            .expect("managed ready reservation bound overflow");
+        if s.ready.reserve_live_bound(live_after_reservation).is_err() {
+            drop(s);
+            drop(managed_joiners);
+            system.restore();
+            return Err(PreparedTaskBatchError::Capacity);
+        }
+
+        // Linearization point. The private domain plan and ready credits become
+        // visible together; no recoverable branch follows this assignment.
+        s.reclaimable_domains = staged_domains;
+        s.pending_prepared_tasks = s
+            .pending_prepared_tasks
+            .checked_add(total)
+            .expect("pending prepared-task credit overflow");
+        self.reserved_managed_tasks = managed.len();
+        self.reserved_safe_tasks = additional_safe_tasks;
+        self.reserved_managed_joiners = managed_joiners;
+        check_sched!(&s);
+        drop(s);
+        system.restore();
+        Ok(())
     }
 
     /// Borrow opaque, non-owning lifecycle tokens for the candidates already
@@ -3171,11 +3598,35 @@ impl PreparedTaskBatch {
             "a closed task batch is immutable"
         );
         let domain = heap::current_domain();
+        if self.reserved_managed_tasks != 0 {
+            assert!(
+                self.tasks.len() >= self.reserved_managed_tasks,
+                "reserved safe tasks must follow every managed member"
+            );
+            assert!(
+                self.tasks.len() - self.reserved_managed_tasks < self.reserved_safe_tasks,
+                "managed publication reserved no additional safe task"
+            );
+            assert_eq!(
+                domain,
+                AllocationDomain::SYSTEM,
+                "a reserved managed-batch supervisor must be SYSTEM-owned"
+            );
+        }
         assert!(
             !domain.arena.is_tracked(),
             "safe prepared tasks cannot enter a raw-reclaimable arena"
         );
-        self.prepare_domain(domain, current_queue_hart(), true, false, None, name, fut)
+        self.prepare_domain(
+            domain,
+            current_queue_hart(),
+            true,
+            false,
+            None,
+            Vec::new(),
+            name,
+            fut,
+        )
     }
 
     /// Prepare one hart-affine task whose future allocation belongs to an
@@ -3202,6 +3653,10 @@ impl PreparedTaskBatch {
             !self.published && !self.binding_rejected,
             "a closed task batch is immutable"
         );
+        assert_eq!(
+            self.reserved_managed_tasks, 0,
+            "a managed publication reservation forbids raw exclusive members"
+        );
         assert!(
             domain.arena.is_tracked(),
             "an exclusive prepared task needs a tracked arena"
@@ -3214,7 +3669,16 @@ impl PreparedTaskBatch {
             load_fault_reclaimer().is_some(),
             "an exclusive prepared task needs an installed fault reclaimer"
         );
-        self.prepare_domain(domain, current_queue_hart(), false, true, None, name, fut)
+        self.prepare_domain(
+            domain,
+            current_queue_hart(),
+            false,
+            true,
+            None,
+            Vec::new(),
+            name,
+            fut,
+        )
     }
 
     /// Prepare the sole executor future for one SYSTEM-registry-managed
@@ -3251,12 +3715,41 @@ impl PreparedTaskBatch {
             load_fault_reclaimer().is_some(),
             "a managed instance task needs an installed fault reclaimer"
         );
+        let joiners = if self.reserved_managed_tasks != 0 {
+            let ordinal = self.tasks.len();
+            assert!(
+                ordinal < self.reserved_managed_tasks,
+                "reserved managed members must precede every safe task"
+            );
+            assert!(
+                SCHED.lock().reclaimable_domains.reservation_matches(
+                    self.id,
+                    ordinal,
+                    instance,
+                    domain,
+                    self.reserved_managed_tasks,
+                    self.reserved_safe_tasks,
+                ),
+                "managed prepared member does not match its exact scheduler reservation"
+            );
+            assert_eq!(
+                self.reserved_managed_joiners.len(),
+                self.reserved_managed_tasks,
+                "managed publication lost its preallocated join ledgers"
+            );
+            self.reserved_managed_joiners[ordinal]
+                .take()
+                .expect("managed prepared member consumed its join ledger twice")
+        } else {
+            Vec::new()
+        };
         self.prepare_domain(
             domain,
             current_queue_hart(),
             false,
             true,
             Some(instance),
+            joiners,
             name,
             fut,
         )
@@ -3269,6 +3762,7 @@ impl PreparedTaskBatch {
         stealable: bool,
         exclusive_reclaimable: bool,
         instance_token: Option<InstanceToken>,
+        joiners: Vec<JoinWaiter>,
         name: &str,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> &PreparedTask {
@@ -3291,6 +3785,7 @@ impl PreparedTaskBatch {
             fut,
             self.publication.clone(),
             instance_token,
+            joiners,
         );
         task.publication = TaskPublication::Prepared(self.id);
         let id = task.id;
@@ -3339,10 +3834,8 @@ impl PreparedTaskBatch {
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
         let mut s = SCHED.lock();
         let live_after_publish = s
-            .tasks
-            .len()
-            .checked_add(s.running_count())
-            .and_then(|live| live.checked_add(self.tasks.len()))
+            .ready_live_bound()
+            .checked_add(self.tasks.len())
             .expect("live task count overflow");
         if s.ready.reserve_live_bound(live_after_publish).is_err() {
             drop(s);
@@ -3452,6 +3945,27 @@ impl PreparedTaskBatch {
             return Err(PreparedTaskBatchError::ExclusiveBindingRequired);
         }
 
+        let reserved_total = self
+            .reserved_managed_tasks
+            .checked_add(self.reserved_safe_tasks)
+            .expect("managed reservation task count overflow");
+        if self.reserved_managed_tasks != 0
+            && (self.tasks.len() != reserved_total
+                || self.handles.len() != reserved_total
+                || self.reclaimable_bindings.len() != self.reserved_managed_tasks
+                || self.reserved_managed_joiners.len() != self.reserved_managed_tasks
+                || self.reserved_managed_joiners.iter().any(Option::is_some)
+                || self.tasks[..self.reserved_managed_tasks]
+                    .iter()
+                    .any(|prepared| !prepared.exclusive_reclaimable)
+                || self.tasks[self.reserved_managed_tasks..]
+                    .iter()
+                    .any(|prepared| prepared.exclusive_reclaimable))
+        {
+            self.binding_rejected = true;
+            return Err(PreparedTaskBatchError::ReclaimableDomainMismatch);
+        }
+
         // Reject aliases before entering the scheduler or invoking registry
         // code. Equality by ArenaId is deliberate: a wrong OwnerId must not
         // turn the same raw allocation incarnation into a second domain.
@@ -3471,6 +3985,30 @@ impl PreparedTaskBatch {
 
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
         let mut s = SCHED.lock();
+
+        if self.reserved_managed_tasks != 0 {
+            for (ordinal, binding) in self.reclaimable_bindings.iter().copied().enumerate() {
+                let Some(instance) = binding.instance_token() else {
+                    self.binding_rejected = true;
+                    drop(s);
+                    system.restore();
+                    return Err(PreparedTaskBatchError::ReclaimableDomainMismatch);
+                };
+                if !s.reclaimable_domains.reservation_matches(
+                    self.id,
+                    ordinal,
+                    instance,
+                    binding.allocation_domain(),
+                    self.reserved_managed_tasks,
+                    self.reserved_safe_tasks,
+                ) {
+                    self.binding_rejected = true;
+                    drop(s);
+                    system.restore();
+                    return Err(PreparedTaskBatchError::ReclaimableDomainMismatch);
+                }
+            }
+        }
 
         // Validate all batch-local envelopes before planning any admission.
         for prepared in &self.tasks {
@@ -3492,42 +4030,81 @@ impl PreparedTaskBatch {
         // `staged` owns the complete generational admission plan. Failure of a
         // later member cannot leave an earlier domain record in global state.
         let mut staged = s.reclaimable_domains;
-        for prepared in &self.tasks {
-            if !prepared.exclusive_reclaimable {
-                continue;
-            }
-            let task = prepared
-                .task
-                .as_ref()
-                .expect("validated tracked candidate remains batch-local");
-            if let Err(error) = staged.admit(
-                task.domain,
-                task.queue_owner,
-                ReclaimableDomainMode::Exclusive,
-                task.id,
-                &task.status,
-                task.instance_token,
-            ) {
-                let error = map_prepared_reclaimable_error(error);
-                if error.requires_registry_quarantine() {
+        if self.reserved_managed_tasks != 0 {
+            for (ordinal, prepared) in self.tasks[..self.reserved_managed_tasks].iter().enumerate()
+            {
+                let task = prepared
+                    .task
+                    .as_ref()
+                    .expect("validated managed candidate remains batch-local");
+                let instance = task
+                    .instance_token
+                    .expect("reserved managed candidate has no instance token");
+                if let Err(error) = staged.admit_reserved_managed(
+                    self.id,
+                    ordinal,
+                    task.domain,
+                    task.queue_owner,
+                    task.id,
+                    &task.status,
+                    instance,
+                ) {
+                    if matches!(
+                        error,
+                        ReclaimableDomainError::TableFull
+                            | ReclaimableDomainError::GenerationExhausted
+                    ) {
+                        panic!("reserved managed scheduler capacity disappeared: {error:?}");
+                    }
                     self.binding_rejected = true;
+                    drop(s);
+                    system.restore();
+                    return Err(PreparedTaskBatchError::ReclaimableDomainMismatch);
                 }
-                drop(s);
-                system.restore();
-                return Err(error);
+            }
+        } else {
+            for prepared in &self.tasks {
+                if !prepared.exclusive_reclaimable {
+                    continue;
+                }
+                let task = prepared
+                    .task
+                    .as_ref()
+                    .expect("validated tracked candidate remains batch-local");
+                if let Err(error) = staged.admit(
+                    task.domain,
+                    task.queue_owner,
+                    ReclaimableDomainMode::Exclusive,
+                    task.id,
+                    &task.status,
+                    task.instance_token,
+                ) {
+                    let error = map_prepared_reclaimable_error(error);
+                    if error.requires_registry_quarantine() {
+                        self.binding_rejected = true;
+                    }
+                    drop(s);
+                    system.restore();
+                    return Err(error);
+                }
             }
         }
 
-        let live_after_publish = s
-            .tasks
-            .len()
-            .checked_add(s.running_count())
-            .and_then(|live| live.checked_add(self.tasks.len()))
-            .expect("live task count overflow");
-        if s.ready.reserve_live_bound(live_after_publish).is_err() {
-            drop(s);
-            system.restore();
-            return Err(PreparedTaskBatchError::Capacity);
+        if self.reserved_managed_tasks != 0 {
+            assert!(
+                s.ready.min_capacity() >= s.ready_live_bound(),
+                "managed publication lost its reserved ready capacity"
+            );
+        } else {
+            let live_after_publish = s
+                .ready_live_bound()
+                .checked_add(self.tasks.len())
+                .expect("live task count overflow");
+            if s.ready.reserve_live_bound(live_after_publish).is_err() {
+                drop(s);
+                system.restore();
+                return Err(PreparedTaskBatchError::Capacity);
+            }
         }
 
         // The scheduler slot/generation exists only after the complete domain
@@ -3576,8 +4153,11 @@ impl PreparedTaskBatch {
         self.binding_rejected = true;
         if activate(&self.reclaimable_bindings) != PreparedReclaimableActivation::Activated {
             // Registry rejection is sticky, while global executor state was
-            // never changed. Restore local envelopes without allocation so
-            // Drop forgets tracked futures and normally reclaims safe ones.
+            // never changed. Release any still-hidden managed reservation
+            // immediately so a caller which retains this sticky-closed batch
+            // cannot pin domain slots or ready credits until Drop. Restore
+            // local envelopes without allocation so Drop forgets tracked
+            // futures and normally reclaims safe ones.
             for prepared in &mut self.tasks {
                 prepared.task = Some(
                     staged_tasks
@@ -3586,6 +4166,25 @@ impl PreparedTaskBatch {
                 );
             }
             debug_assert!(staged_tasks.is_empty());
+            if self.reserved_managed_tasks != 0 {
+                let mut retained_domains = s.reclaimable_domains;
+                retained_domains
+                    .release_managed_batch(
+                        self.id,
+                        self.reserved_managed_tasks,
+                        self.reserved_safe_tasks,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("managed scheduler reservation changed before rejection: {error:?}")
+                    });
+                s.pending_prepared_tasks = s
+                    .pending_prepared_tasks
+                    .checked_sub(reserved_total)
+                    .expect("managed ready credits changed before rejection");
+                s.reclaimable_domains = retained_domains;
+                self.reserved_managed_tasks = 0;
+                self.reserved_safe_tasks = 0;
+            }
             check_sched!(&s);
             drop(s);
             system.restore();
@@ -3601,6 +4200,14 @@ impl PreparedTaskBatch {
         s.tasks.append(&mut staged_tasks);
         debug_assert!(staged_tasks.is_empty());
         s.reclaimable_domains = staged;
+        if self.reserved_managed_tasks != 0 {
+            s.pending_prepared_tasks = s
+                .pending_prepared_tasks
+                .checked_sub(reserved_total)
+                .expect("managed publication lost its ready credits");
+            self.reserved_managed_tasks = 0;
+            self.reserved_safe_tasks = 0;
+        }
         for prepared in &self.tasks {
             s.tasks
                 .get_mut(&prepared.id)
@@ -3772,6 +4379,38 @@ impl Default for PreparedTaskBatch {
 
 impl Drop for PreparedTaskBatch {
     fn drop(&mut self) {
+        if self.reserved_managed_tasks != 0 {
+            assert!(
+                !self.published && !self.staged,
+                "published managed batch retained hidden scheduler credits"
+            );
+            let reserved_total = self
+                .reserved_managed_tasks
+                .checked_add(self.reserved_safe_tasks)
+                .expect("managed reservation task count overflow during drop");
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            let mut s = SCHED.lock();
+            let mut staged_domains = s.reclaimable_domains;
+            staged_domains
+                .release_managed_batch(
+                    self.id,
+                    self.reserved_managed_tasks,
+                    self.reserved_safe_tasks,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("managed scheduler reservation changed before drop: {error:?}")
+                });
+            s.pending_prepared_tasks = s
+                .pending_prepared_tasks
+                .checked_sub(reserved_total)
+                .expect("managed ready credits changed before drop");
+            s.reclaimable_domains = staged_domains;
+            self.reserved_managed_tasks = 0;
+            self.reserved_safe_tasks = 0;
+            check_sched!(&s);
+            drop(s);
+            system.restore();
+        }
         if self.published || self.staged {
             return;
         }
@@ -3809,10 +4448,11 @@ fn make_task(
     fut: impl Future<Output = ()> + Send + 'static,
     publication: Arc<AtomicBool>,
     instance_token: Option<InstanceToken>,
+    joiners: Vec<JoinWaiter>,
 ) -> (Task, TaskHandle) {
     let id = next_task_id();
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    let status = Arc::new(TaskStatus::new(publication));
+    let status = Arc::new(TaskStatus::with_joiners(publication, joiners));
     let task_name = Arc::<str>::from(name);
     system.restore();
 
@@ -3904,7 +4544,10 @@ fn spawn_tracked_domain_mode(
     // Every live task can migrate to any queue after a steal and then become
     // ready at once. Reserve that upper bound in all four queues in task
     // context so an IRQ wake never allocates while holding SCHED.
-    let live_after_spawn = s.tasks.len() + 1 + s.running_count();
+    let live_after_spawn = s
+        .ready_live_bound()
+        .checked_add(1)
+        .expect("spawn live/reservation bound overflow");
     if s.ready.reserve_live_bound(live_after_spawn).is_err() {
         drop(s);
         system.restore();
@@ -6709,6 +7352,147 @@ mod one_shot_wait_tests {
 #[cfg(test)]
 mod reclaimable_domain_tests {
     use super::*;
+    use alloc::task::Wake;
+
+    struct SilentWake;
+
+    impl Wake for SilentWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    unsafe fn accept_join_capacity_reclaim(
+        _witness: ReclaimableFaultWitness,
+    ) -> FaultReclaimOutcome {
+        FaultReclaimOutcome::Reclaimed
+    }
+
+    #[test]
+    fn managed_reservation_installs_exact_inbound_join_capacity_before_publication() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        set_fault_reclaimer(accept_join_capacity_reclaim);
+
+        let registry = crate::instance::InstanceRegistry::new();
+        let domains = [
+            AllocationDomain::new(OwnerId::new(86), ArenaId::new(87)),
+            AllocationDomain::new(OwnerId::new(88), ArenaId::new(89)),
+        ];
+        let tokens = [
+            registry.reserve(domains[0]).unwrap(),
+            registry.reserve(domains[1]).unwrap(),
+        ];
+        let plan = [(tokens[0], domains[0]), (tokens[1], domains[1])];
+        let mut batch = PreparedTaskBatch::new();
+        batch.reserve_managed_publication(&plan, 0).unwrap();
+        assert_eq!(batch.reserved_managed_joiners.len(), plan.len());
+        let planned_capacity = [
+            batch.reserved_managed_joiners[0]
+                .as_ref()
+                .expect("first managed join ledger is reserved")
+                .capacity(),
+            batch.reserved_managed_joiners[1]
+                .as_ref()
+                .expect("second managed join ledger is reserved")
+                .capacity(),
+        ];
+        assert!(planned_capacity.into_iter().all(|capacity| capacity >= 1));
+
+        for (token, domain) in plan {
+            unsafe {
+                batch.prepare_managed_instance_owned(
+                    token,
+                    domain,
+                    "managed-preallocated-join-target",
+                    core::future::pending::<()>(),
+                );
+            }
+        }
+        assert!(batch.reserved_managed_joiners.iter().all(Option::is_none));
+        for (index, handle) in batch.prepared_handles().iter().enumerate() {
+            assert_eq!(
+                handle.status.joiners.lock().capacity(),
+                planned_capacity[index]
+            );
+        }
+
+        let prepared_handles = batch.prepared_handles().to_vec();
+        let bindings = batch.prepared_reclaimable_bindings().to_vec();
+        for index in 0..plan.len() {
+            registry
+                .bind(tokens[index], bindings[index], &prepared_handles[index])
+                .unwrap();
+        }
+        let handles = unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+        }
+        .unwrap();
+
+        let waker = Waker::from(Arc::new(SilentWake));
+        for (index, handle) in handles.iter().enumerate() {
+            let capacity_before = handle.status.joiners.lock().capacity();
+            assert_eq!(capacity_before, planned_capacity[index]);
+            let mut join = Box::pin(handle.join());
+            assert_eq!(
+                join.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Pending
+            );
+            let joiners = handle.status.joiners.lock();
+            assert_eq!(joiners.len(), 1);
+            assert_eq!(
+                joiners.capacity(),
+                capacity_before,
+                "post-publication managed join grew its inbound ledger"
+            );
+            drop(joiners);
+            drop(join);
+            assert_eq!(handle.status.joiners.lock().len(), 0);
+        }
+        for handle in handles {
+            assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        }
+    }
+
+    #[test]
+    fn releasing_a_hidden_managed_slot_does_not_burn_its_generation() {
+        let registry = crate::instance::InstanceRegistry::new();
+        let domain = AllocationDomain::new(OwnerId::new(89), ArenaId::new(90));
+        let token = registry.reserve(domain).unwrap();
+        let entries = [(token, domain)];
+        let mut domains = ReclaimableDomains::new();
+        let generations_before = domains.generations;
+
+        domains.reserve_managed_batch(71, &entries, 1).unwrap();
+        let first = domains
+            .reservations
+            .iter()
+            .flatten()
+            .find(|reservation| reservation.batch == 71)
+            .copied()
+            .expect("hidden managed reservation was not installed");
+        assert_eq!(domains.active_count(), 0);
+        assert_eq!(domains.reserved_count(), 1);
+        assert_eq!(domains.pending_task_count(), 2);
+        assert_eq!(domains.generations, generations_before);
+
+        domains.release_managed_batch(71, 1, 1).unwrap();
+        assert_eq!(domains.reserved_count(), 0);
+        assert_eq!(domains.pending_task_count(), 0);
+        assert_eq!(domains.generations, generations_before);
+
+        domains.reserve_managed_batch(72, &entries, 1).unwrap();
+        let second = domains
+            .reservations
+            .iter()
+            .flatten()
+            .find(|reservation| reservation.batch == 72)
+            .copied()
+            .expect("replacement managed reservation was not installed");
+        assert_eq!(second.key, first.key);
+        assert_eq!(domains.generations, generations_before);
+    }
 
     #[test]
     fn prepared_binding_rejects_a_same_number_counterfeit_status() {

@@ -7,7 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 use vibeos_core::arch;
 use vibeos_core::heap::{
     current_domain, current_owner, enter_domain, enter_owner, AllocationDomain, AllocationFailure,
-    ArenaError, ArenaId, Heap, OwnerError, OwnerId,
+    ArenaError, ArenaId, FreshDomainBatchError, FreshDomainBatchRetireError, Heap, OwnerError,
+    OwnerId, MAX_ALLOCATION_ARENAS, MAX_FRESH_ALLOCATION_DOMAIN_BATCH, MAX_OWNER_ACCOUNTS,
 };
 use vibeos_core::runqueue::MAX_HARTS;
 
@@ -852,4 +853,299 @@ fn arena_reclaim_never_touches_untracked_owner_allocations() {
     let _ = tracked; // deliberately dangling after the unsafe reclaim contract
     unsafe { h.dealloc(untracked, l) };
     h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn fresh_domain_batch_validation_preserves_the_fresh_sequences() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+
+    assert_eq!(
+        h.create_fresh_domains_batch(&[]),
+        Err(FreshDomainBatchError::Empty)
+    );
+    assert_eq!(
+        h.create_fresh_domains_batch(&vec![1; MAX_FRESH_ALLOCATION_DOMAIN_BATCH + 1]),
+        Err(FreshDomainBatchError::TooMany)
+    );
+    assert_eq!(
+        h.create_fresh_domains_batch(&[1024, 0, 2048]),
+        Err(FreshDomainBatchError::ZeroQuota)
+    );
+
+    let domains = h.create_fresh_domains_batch(&[1024, 2048]).unwrap();
+    assert_eq!(domains[0].owner, OwnerId::new(1));
+    assert_eq!(domains[0].arena, ArenaId::new(1));
+    assert_eq!(domains[1].owner, OwnerId::new(2));
+    assert_eq!(domains[1].arena, ArenaId::new(2));
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains)
+            .unwrap()
+            .retired_count(),
+        domains.len()
+    );
+}
+
+#[test]
+fn fresh_domain_batch_success_is_ordered_distinct_and_reuses_slots() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let quotas = [1024, 4096, 2048, 8192];
+    let domains = h.create_fresh_domains_batch(&quotas).unwrap();
+
+    assert_eq!(domains.len(), quotas.len());
+    for (index, domain) in domains.iter().copied().enumerate() {
+        assert_ne!(domain.owner, OwnerId::SYSTEM);
+        assert!(domain.arena.is_tracked());
+        assert_eq!(
+            h.account_stats(domain.owner).unwrap().quota_bytes,
+            quotas[index]
+        );
+        assert_eq!(h.arena_stats(domain.arena).unwrap().owner, domain.owner);
+        assert!(domains[..index]
+            .iter()
+            .all(|prior| prior.owner != domain.owner && prior.arena != domain.arena));
+    }
+
+    let retired = h.retire_empty_domains_batch(&domains).unwrap();
+    assert_eq!(retired.retired_count(), domains.len());
+    for domain in &domains {
+        assert_eq!(h.account_stats(domain.owner), None);
+        assert_eq!(h.arena_stats(domain.arena), None);
+    }
+
+    let replacement_quotas = [16384, 32768, 65536, 131072];
+    let replacements = h.create_fresh_domains_batch(&replacement_quotas).unwrap();
+    assert_eq!(replacements.len(), domains.len());
+    for (index, domain) in replacements.iter().copied().enumerate() {
+        assert_eq!(
+            h.account_stats(domain.owner).unwrap().quota_bytes,
+            replacement_quotas[index]
+        );
+        assert!(domains
+            .iter()
+            .all(|retired| retired.owner != domain.owner && retired.arena != domain.arena));
+    }
+    h.retire_empty_domains_batch(&replacements).unwrap();
+}
+
+#[test]
+fn fresh_domain_batch_owner_capacity_failure_has_no_partial_registration() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let mut owners = Vec::new();
+    for _ in 1..MAX_OWNER_ACCOUNTS {
+        owners.push(h.create_owner(1024).unwrap());
+    }
+    let before: Vec<_> = owners
+        .iter()
+        .map(|owner| h.account_stats(*owner).unwrap())
+        .collect();
+    let live_before = h.snapshot().live_bytes;
+
+    assert_eq!(
+        h.create_fresh_domains_batch(&[2048]),
+        Err(FreshDomainBatchError::OwnerCapacity)
+    );
+    assert_eq!(
+        owners
+            .iter()
+            .map(|owner| h.account_stats(*owner).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(h.snapshot().live_bytes, live_before);
+    for owner in owners {
+        h.unregister_owner(owner).unwrap();
+    }
+}
+
+#[test]
+fn fresh_domain_batch_arena_capacity_failure_has_no_partial_registration() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(1024).unwrap();
+    let mut arenas = Vec::new();
+    for _ in 0..MAX_ALLOCATION_ARENAS {
+        arenas.push(h.create_arena(owner).unwrap());
+    }
+    let owner_before = h.account_stats(owner).unwrap();
+    let arenas_before: Vec<_> = arenas
+        .iter()
+        .map(|arena| h.arena_stats(*arena).unwrap())
+        .collect();
+    let live_before = h.snapshot().live_bytes;
+
+    assert_eq!(
+        h.create_fresh_domains_batch(&[2048]),
+        Err(FreshDomainBatchError::ArenaCapacity)
+    );
+    assert_eq!(h.account_stats(owner), Some(owner_before));
+    assert_eq!(
+        arenas
+            .iter()
+            .map(|arena| h.arena_stats(*arena).unwrap())
+            .collect::<Vec<_>>(),
+        arenas_before
+    );
+    assert_eq!(h.snapshot().live_bytes, live_before);
+    for arena in arenas {
+        h.close_empty_domain(AllocationDomain::new(owner, arena))
+            .unwrap();
+    }
+    h.unregister_owner(owner).unwrap();
+}
+
+fn fresh_domain_states(
+    h: &Heap,
+    domains: &[AllocationDomain],
+) -> Vec<(
+    Option<vibeos_core::heap::OwnerStats>,
+    Option<vibeos_core::heap::ArenaStats>,
+)> {
+    domains
+        .iter()
+        .map(|domain| (h.account_stats(domain.owner), h.arena_stats(domain.arena)))
+        .collect()
+}
+
+#[test]
+fn fresh_domain_batch_retire_rejects_duplicate_and_mismatched_identity_without_mutation() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let domains = h.create_fresh_domains_batch(&[4096, 4096, 4096]).unwrap();
+    let before = fresh_domain_states(h, &domains);
+
+    let duplicate_owner = [
+        domains[0],
+        AllocationDomain::new(domains[0].owner, domains[1].arena),
+    ];
+    assert_eq!(
+        h.retire_empty_domains_batch(&duplicate_owner),
+        Err(FreshDomainBatchRetireError::DuplicateOwner)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let duplicate_arena = [
+        domains[0],
+        AllocationDomain::new(domains[1].owner, domains[0].arena),
+    ];
+    assert_eq!(
+        h.retire_empty_domains_batch(&duplicate_arena),
+        Err(FreshDomainBatchRetireError::DuplicateArena)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let mismatch = [AllocationDomain::new(domains[1].owner, domains[0].arena)];
+    assert_eq!(
+        h.retire_empty_domains_batch(&mismatch),
+        Err(FreshDomainBatchRetireError::DomainMismatch)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    assert_eq!(
+        h.retire_empty_domains_batch(&[]),
+        Err(FreshDomainBatchRetireError::Empty)
+    );
+    assert_eq!(
+        h.retire_empty_domains_batch(&vec![
+            AllocationDomain::SYSTEM;
+            MAX_FRESH_ALLOCATION_DOMAIN_BATCH + 1
+        ]),
+        Err(FreshDomainBatchRetireError::TooMany)
+    );
+    assert_eq!(
+        h.retire_empty_domains_batch(&[AllocationDomain::SYSTEM]),
+        Err(FreshDomainBatchRetireError::InvalidDomain)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+    h.retire_empty_domains_batch(&domains).unwrap();
+}
+
+#[test]
+fn fresh_domain_batch_retire_preflight_is_read_only_and_matches_commit_validation() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let domains = h.create_fresh_domains_batch(&[4096, 8192]).unwrap();
+    let before = fresh_domain_states(h, &domains);
+
+    h.preflight_retire_empty_domains_batch(&domains).unwrap();
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let mismatch = [AllocationDomain::new(domains[1].owner, domains[0].arena)];
+    assert_eq!(
+        h.preflight_retire_empty_domains_batch(&mismatch),
+        Err(FreshDomainBatchRetireError::DomainMismatch)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let unavailable = [AllocationDomain::new(
+        OwnerId::new(u64::MAX - 1),
+        ArenaId::new(u64::MAX - 1),
+    )];
+    assert_eq!(
+        h.preflight_retire_empty_domains_batch(&unavailable),
+        Err(FreshDomainBatchRetireError::DomainUnavailable)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains)
+            .unwrap()
+            .retired_count(),
+        domains.len()
+    );
+}
+
+#[test]
+fn fresh_domain_batch_retire_busy_or_extra_arena_never_consumes_a_peer() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let domains = h.create_fresh_domains_batch(&[32768, 32768]).unwrap();
+    let l = layout(64, 16);
+
+    let tracked = {
+        let _scope = unsafe { enter_domain(domains[0]) };
+        unsafe { h.alloc(l) }
+    };
+    assert!(!tracked.is_null());
+    let before_tracked = fresh_domain_states(h, &domains);
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains),
+        Err(FreshDomainBatchRetireError::ArenaBusy)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before_tracked);
+    unsafe { h.dealloc(tracked, l) };
+
+    let untracked = {
+        let _scope = enter_owner(domains[0].owner);
+        unsafe { h.alloc(l) }
+    };
+    assert!(!untracked.is_null());
+    let before_untracked = fresh_domain_states(h, &domains);
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains),
+        Err(FreshDomainBatchRetireError::OwnerBusy)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before_untracked);
+    unsafe { h.dealloc(untracked, l) };
+
+    let extra = h.create_arena(domains[0].owner).unwrap();
+    let before_extra = fresh_domain_states(h, &domains);
+    let extra_before = h.arena_stats(extra);
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains),
+        Err(FreshDomainBatchRetireError::OwnerHasOtherArena)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before_extra);
+    assert_eq!(h.arena_stats(extra), extra_before);
+
+    h.close_empty_domain(AllocationDomain::new(domains[0].owner, extra))
+        .unwrap();
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains)
+            .unwrap()
+            .retired_count(),
+        domains.len()
+    );
 }

@@ -770,6 +770,292 @@ fn empty_prepared_batch_fails_without_scheduler_effect() {
 }
 
 #[test]
+fn managed_publication_reservation_is_hidden_and_drop_restores_exact_admission() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let reports_before = exec::task_report();
+    let domains_before = exec::reclaimable_domain_count();
+    let registry = InstanceRegistry::new();
+    let domains = [
+        AllocationDomain::new(OwnerId::new(21_200), ArenaId::new(31_200)),
+        AllocationDomain::new(OwnerId::new(21_201), ArenaId::new(31_201)),
+    ];
+    let tokens = [
+        registry.reserve(domains[0]).unwrap(),
+        registry.reserve(domains[1]).unwrap(),
+    ];
+    let plan = [(tokens[0], domains[0]), (tokens[1], domains[1])];
+
+    let mut reserved = exec::PreparedTaskBatch::new();
+    reserved.reserve_managed_publication(&plan, 1).unwrap();
+    assert_eq!(exec::task_report(), reports_before);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+    assert!(domains
+        .iter()
+        .all(|domain| exec::reclaimable_domain_snapshot(*domain).is_none()));
+
+    let mut conflict = exec::PreparedTaskBatch::new();
+    assert!(matches!(
+        conflict.reserve_managed_publication(&plan, 1),
+        Err(exec::PreparedTaskBatchError::ReclaimableDomainUnavailable)
+    ));
+    drop(reserved);
+
+    conflict.reserve_managed_publication(&plan, 1).unwrap();
+    drop(conflict);
+    assert_eq!(exec::task_report(), reports_before);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+    assert!(domains
+        .iter()
+        .all(|domain| exec::reclaimable_domain_snapshot(*domain).is_none()));
+}
+
+#[test]
+fn rejected_managed_publication_releases_credits_without_burning_generation() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let reports_before = exec::task_report();
+    let domains_before = exec::reclaimable_domain_count();
+    let registry = InstanceRegistry::new();
+    let domain = AllocationDomain::new(OwnerId::new(21_207), ArenaId::new(31_207));
+    let token = registry.reserve(domain).unwrap();
+    let plan = [(token, domain)];
+
+    let mut rejected = exec::PreparedTaskBatch::new();
+    rejected.reserve_managed_publication(&plan, 1).unwrap();
+    unsafe {
+        rejected.prepare_managed_instance_owned(
+            token,
+            domain,
+            "rejected-reserved-managed",
+            async {},
+        );
+    }
+    rejected.prepare("rejected-reserved-supervisor", async {});
+    let first_generation = AtomicU64::new(0);
+    assert!(matches!(
+        unsafe {
+            // Adversarial host coverage of the executor's sticky rejection
+            // boundary: a trusted registry callback may quarantine this exact
+            // binding, but must not make its proposed generation observable as
+            // an admitted scheduler incarnation.
+            rejected.publish_exclusive_reclaimable_with(|bindings| {
+                first_generation.store(
+                    bindings[0]
+                        .scheduler_identity()
+                        .expect("staged binding has a scheduler identity")
+                        .generation(),
+                    Ordering::SeqCst,
+                );
+                exec::PreparedReclaimableActivation::Quarantined
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+
+    // Keep the sticky-closed batch alive. A replacement reservation for the
+    // same exact arena proves callback rejection, rather than Drop, released
+    // the hidden domain slot and ready credits.
+    let mut replacement = exec::PreparedTaskBatch::new();
+    replacement.reserve_managed_publication(&plan, 1).unwrap();
+    unsafe {
+        replacement.prepare_managed_instance_owned(
+            token,
+            domain,
+            "replacement-reserved-managed",
+            async {},
+        );
+    }
+    replacement.prepare("replacement-reserved-supervisor", async {});
+    let second_generation = AtomicU64::new(0);
+    assert!(matches!(
+        unsafe {
+            replacement.publish_exclusive_reclaimable_with(|bindings| {
+                second_generation.store(
+                    bindings[0]
+                        .scheduler_identity()
+                        .expect("replacement binding has a scheduler identity")
+                        .generation(),
+                    Ordering::SeqCst,
+                );
+                exec::PreparedReclaimableActivation::Quarantined
+            })
+        },
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRejected)
+    ));
+    assert_ne!(first_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        second_generation.load(Ordering::SeqCst),
+        first_generation.load(Ordering::SeqCst),
+        "rejected hidden reservation burned its proposed generation"
+    );
+    assert_eq!(exec::task_report(), reports_before);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+    drop(replacement);
+    drop(rejected);
+}
+
+#[test]
+fn managed_publication_reservation_rejects_wrong_order_mixed_and_alias_inputs() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let registry = InstanceRegistry::new();
+    let first = AllocationDomain::new(OwnerId::new(21_202), ArenaId::new(31_202));
+    let other = AllocationDomain::new(OwnerId::new(21_203), ArenaId::new(31_203));
+    let token = registry.reserve(first).unwrap();
+    let other_token = registry.reserve(other).unwrap();
+
+    let mut duplicate = exec::PreparedTaskBatch::new();
+    assert!(matches!(
+        duplicate.reserve_managed_publication(&[(token, first), (token, other)], 0),
+        Err(exec::PreparedTaskBatchError::DuplicateReclaimableArena)
+    ));
+    assert!(matches!(
+        duplicate.reserve_managed_publication(&[], 0),
+        Err(exec::PreparedTaskBatchError::ReclaimableCapacity)
+    ));
+    assert!(matches!(
+        duplicate.reserve_managed_publication(
+            &[(token, first)],
+            exec::MAX_MANAGED_PUBLICATION_SAFE_TASKS + 1,
+        ),
+        Err(exec::PreparedTaskBatchError::ReclaimableCapacity)
+    ));
+
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch
+        .reserve_managed_publication(&[(token, first)], 1)
+        .unwrap();
+    let safe_before_managed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        batch.prepare("reserved-safe-too-early", async {});
+    }));
+    assert!(safe_before_managed.is_err());
+    assert!(batch.prepared_handles().is_empty());
+
+    let raw_member = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        batch.prepare_exclusive_reclaimable_owned(first, "reserved-raw-member", async {});
+    }));
+    assert!(raw_member.is_err());
+    assert!(batch.prepared_handles().is_empty());
+
+    let wrong_managed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        batch
+            .prepare_managed_instance_owned(other_token, other, "reserved-wrong-managed", async {});
+    }));
+    assert!(wrong_managed.is_err());
+    assert!(batch.prepared_handles().is_empty());
+    drop(batch);
+
+    let mut nonempty = exec::PreparedTaskBatch::new();
+    nonempty.prepare("reservation-requires-empty", async {});
+    assert!(matches!(
+        nonempty.reserve_managed_publication(&[(token, first)], 0),
+        Err(exec::PreparedTaskBatchError::ExclusiveBindingRequired)
+    ));
+}
+
+#[test]
+fn managed_reservation_protects_ready_capacity_from_intervening_spawn() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let registry = InstanceRegistry::new();
+    let domain = AllocationDomain::new(OwnerId::new(21_204), ArenaId::new(31_204));
+    let token = registry.reserve(domain).unwrap();
+    let live_before = exec::task_report().len();
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch
+        .reserve_managed_publication(&[(token, domain)], 1)
+        .unwrap();
+    let capacity_after_reservation = exec::ready_queue_capacity();
+    assert!(capacity_after_reservation >= live_before + 2);
+
+    // Fill through the capacity which would have sufficed if ordinary spawn
+    // ignored the two hidden credits. The last admission must grow every ready
+    // queue before it can become scheduler-visible.
+    let additions = capacity_after_reservation - live_before - 2 + 1;
+    let mut handles = Vec::with_capacity(additions);
+    for _ in 0..additions {
+        handles.push(exec::spawn_tracked(
+            "managed-reservation-capacity-race",
+            std::future::pending::<()>(),
+        ));
+    }
+    assert!(exec::ready_queue_capacity() > capacity_after_reservation);
+
+    drop(batch);
+    for handle in handles {
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+    }
+}
+
+#[test]
+fn reserved_managed_members_and_system_supervisor_publish_atomically() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let domains_before = exec::reclaimable_domain_count();
+    let registry = InstanceRegistry::new();
+    let domains = [
+        AllocationDomain::new(OwnerId::new(21_205), ArenaId::new(31_205)),
+        AllocationDomain::new(OwnerId::new(21_206), ArenaId::new(31_206)),
+    ];
+    let tokens = [
+        registry.reserve(domains[0]).unwrap(),
+        registry.reserve(domains[1]).unwrap(),
+    ];
+    let plan = [(tokens[0], domains[0]), (tokens[1], domains[1])];
+    let ran = Arc::new(AtomicU64::new(0));
+    let mut batch = exec::PreparedTaskBatch::new();
+    batch.reserve_managed_publication(&plan, 1).unwrap();
+    for (index, (token, domain)) in plan.into_iter().enumerate() {
+        let ran = ran.clone();
+        unsafe {
+            batch.prepare_managed_instance_owned(
+                token,
+                domain,
+                "reserved-managed-node",
+                async move {
+                    ran.fetch_or(1 << index, Ordering::SeqCst);
+                },
+            );
+        }
+    }
+    let managed_handles = batch.prepared_handles().to_vec();
+    let observed = managed_handles.clone();
+    let supervisor_ran = ran.clone();
+    batch.prepare("reserved-managed-supervisor", async move {
+        assert!(observed.iter().all(exec::TaskHandle::is_published));
+        supervisor_ran.fetch_or(4, Ordering::SeqCst);
+    });
+    let bindings = batch.prepared_reclaimable_bindings().to_vec();
+    for index in 0..tokens.len() {
+        registry
+            .bind(tokens[index], bindings[index], &managed_handles[index])
+            .unwrap();
+    }
+
+    let handles = unsafe {
+        batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+    }
+    .unwrap();
+    assert_eq!(handles.len(), 3);
+    assert!(handles.iter().all(exec::TaskHandle::is_published));
+    assert_eq!(exec::reclaimable_domain_count(), domains_before + 2);
+    assert!(domains
+        .iter()
+        .all(|domain| exec::reclaimable_domain_snapshot(*domain).is_some()));
+
+    exec::run_until_idle(BUDGET);
+    assert_eq!(ran.load(Ordering::SeqCst), 7);
+    assert!(handles
+        .iter()
+        .all(|handle| handle.state() == TaskState::Exited));
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+}
+
+#[test]
 fn exclusive_prepared_task_is_inert_until_exact_registry_activation() {
     let _g = scheduler();
     exec::run_until_idle(BUDGET);

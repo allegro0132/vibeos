@@ -658,8 +658,11 @@ impl World {
             );
         }
         let id = next_component_id();
-        let memory_owner = OwnerId::new(id.0);
-        HEAP.register_owner(memory_owner, memory_budget)
+        // Allocation owners share the heap's one generational identity cursor
+        // with dynamically created component domains. ComponentId remains the
+        // stable semantic identity exposed by World and need not alias it.
+        let memory_owner = HEAP
+            .create_owner(memory_budget)
             .expect("a fresh component allocation owner must register");
         let cspace = space.0.lock().name.clone();
         let task = match template {

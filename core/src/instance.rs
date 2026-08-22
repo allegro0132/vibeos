@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
 use core::future::Future;
 use core::mem::ManuallyDrop;
@@ -21,7 +21,7 @@ use core::task::{Context, Poll};
 
 #[cfg(feature = "wasm-c48-target-acceptance")]
 use crate::cap::CapabilityTableRange;
-use crate::cap::{CSpace, CSpaceIdentity};
+use crate::cap::{CSpace, CSpaceIdentity, CSpaceResetError};
 use crate::exec::{
     OneShotWaitFuture, OneShotWaitQueue, OneShotWake, PreparedReclaimableActivation,
     PreparedReclaimableBinding, ReclaimableFaultWitness, ReclaimableSchedulerIdentity,
@@ -35,6 +35,13 @@ use crate::sync::{ConditionalRecovery, SpinLock, TaskRecoveryKey};
 ///
 /// The table is fixed so the scheduler's activation callback never allocates.
 pub const MAX_INSTANCE_SLOTS: usize = 16;
+
+/// Maximum number of component principals which can be reserved atomically.
+///
+/// This name describes the graph-facing admission limit while
+/// [`MAX_INSTANCE_SLOTS`] remains the stable-table compatibility name. They
+/// intentionally denote the same fixed SYSTEM-owned capacity.
+pub const MAX_COMPONENT_INSTANCES: usize = MAX_INSTANCE_SLOTS;
 
 static PAYLOAD_POLL_ALWAYS_ALLOWED: AtomicU8 = AtomicU8::new(1);
 
@@ -377,6 +384,62 @@ pub enum ReserveError {
     ArenaConflict,
     /// Every fixed slot is live, transitional, or permanently quarantined.
     Capacity,
+}
+
+/// Why an atomic component-principal reservation was rejected.
+///
+/// No variant carries a slot, generation, domain, CSpace identity, or name.
+/// Every returned error leaves all registry records and headers unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchReserveError {
+    /// At least one component principal is required.
+    Empty,
+    /// The request exceeds [`MAX_COMPONENT_INSTANCES`].
+    TooMany,
+    /// One input does not name a non-SYSTEM tracked allocation domain.
+    InvalidDomain,
+    /// Two inputs name the same raw arena, even if their owners differ.
+    DuplicateArena,
+    /// A retained registry generation already projects one requested arena.
+    ArenaConflict,
+    /// Too few stable slots are vacant.
+    Capacity,
+    /// Vacant slot or CSpace incarnation generations cannot cover the batch.
+    GenerationExhausted,
+    /// A stable record, header, or reusable CSpace failed structural checks.
+    RegistryMismatch,
+}
+
+/// Why an exact unpublished reservation abort was rejected.
+///
+/// Rejection never resets a CSpace or changes any registry record. Identity is
+/// deliberately classified without embedding the rejected token in the
+/// diagnostic value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedBatchAbortError {
+    Empty,
+    TooMany,
+    /// Two candidates address the same stable slot, including stale
+    /// generations of that slot.
+    DuplicateSlot,
+    IdentityMismatch,
+    /// At least one exact generation is no longer pristine and unpublished in
+    /// `Reserved`.
+    WrongPhase,
+    GenerationExhausted,
+    CSpaceResetRejected,
+}
+
+/// Allocation-free summary of one complete unpublished reservation abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedBatchAbortOutcome {
+    aborted_instances: usize,
+}
+
+impl ReservedBatchAbortOutcome {
+    pub const fn aborted_instances(self) -> usize {
+        self.aborted_instances
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,6 +1059,264 @@ impl InstanceRegistry {
         Err(ReserveError::Capacity)
     }
 
+    /// Reserve one stable, independently named CSpace for every component
+    /// principal in a bounded batch.
+    ///
+    /// Inputs and returned tokens have the same order. Arena identity, rather
+    /// than the caller-provided owner alone, must be distinct across the
+    /// request and every retained registry projection. First-use Space
+    /// allocation and every `Reserved` publication occur under the registry
+    /// transaction in SYSTEM; a reused stable Space retains its original name,
+    /// matching [`Self::reserve_named`].
+    ///
+    /// All validation, capacity, slot-generation, and CSpace-generation checks
+    /// finish before the first record/header mutation. Consequently every
+    /// returned error leaves the registry exactly as it was at entry.
+    pub fn reserve_named_batch(
+        &self,
+        inputs: &[(AllocationDomain, &str)],
+    ) -> Result<Vec<InstanceToken>, BatchReserveError> {
+        self.reserve_named_batch_with_preflight(inputs, |_, cspace| {
+            cspace.preflight_reset_exact(cspace.identity(), cspace.incarnation())
+        })
+    }
+
+    fn reserve_named_batch_with_preflight(
+        &self,
+        inputs: &[(AllocationDomain, &str)],
+        mut preflight_cspace: impl FnMut(usize, &CSpace) -> Result<(), CSpaceResetError>,
+    ) -> Result<Vec<InstanceToken>, BatchReserveError> {
+        if inputs.is_empty() {
+            return Err(BatchReserveError::Empty);
+        }
+        if inputs.len() > MAX_COMPONENT_INSTANCES {
+            return Err(BatchReserveError::TooMany);
+        }
+        for (index, (domain, _)) in inputs.iter().enumerate() {
+            if !domain.arena.is_tracked() || domain.owner == OwnerId::SYSTEM {
+                return Err(BatchReserveError::InvalidDomain);
+            }
+            if inputs[index + 1..]
+                .iter()
+                .any(|(other, _)| other.arena == domain.arena)
+            {
+                return Err(BatchReserveError::DuplicateArena);
+            }
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let result = (|| {
+            let _transaction = self.transaction.lock();
+            let mut vacant = [usize::MAX; MAX_COMPONENT_INSTANCES];
+            let mut vacant_count = 0usize;
+            let mut viable_count = 0usize;
+
+            for (index, slot) in self.slots.iter().enumerate() {
+                let record = slot.record.lock();
+                let projections = Self::projected_domains(&record);
+                if !Self::header_matches(slot, &record)
+                    || Self::domain_projections_disagree(projections)
+                    || (record.phase == InstancePhase::Vacant
+                        && !Self::vacant_record_is_pristine(slot, &record))
+                    || (record.phase != InstancePhase::Vacant
+                        && record.phase != InstancePhase::Quarantined
+                        && projections.iter().all(Option::is_none))
+                {
+                    return Err(BatchReserveError::RegistryMismatch);
+                }
+                if projections.iter().flatten().any(|existing| {
+                    inputs
+                        .iter()
+                        .any(|(requested, _)| requested.arena == existing.arena)
+                }) {
+                    return Err(BatchReserveError::ArenaConflict);
+                }
+                if record.phase != InstancePhase::Vacant {
+                    continue;
+                }
+                vacant_count += 1;
+                if record.generation == MAX_INSTANCE_GENERATION {
+                    continue;
+                }
+                if let Some(space) = record.space.as_deref() {
+                    let cspace = space.cspace().lock();
+                    match preflight_cspace(index, &cspace) {
+                        Ok(()) => {}
+                        Err(CSpaceResetError::IncarnationExhausted) => continue,
+                        Err(_) => return Err(BatchReserveError::RegistryMismatch),
+                    }
+                }
+                vacant[viable_count] = index;
+                viable_count += 1;
+            }
+
+            if vacant_count < inputs.len() {
+                return Err(BatchReserveError::Capacity);
+            }
+            if viable_count < inputs.len() {
+                return Err(BatchReserveError::GenerationExhausted);
+            }
+
+            // Allocate every missing stable Space and all return capacity
+            // before the linearization loop. Target SYSTEM OOM is fail-stop;
+            // no recoverable error can escape after the first publication.
+            let mut allocated_spaces = Vec::with_capacity(inputs.len());
+            let mut tokens = Vec::with_capacity(inputs.len());
+            for ((_, name), index) in inputs.iter().zip(vacant.iter().copied().take(inputs.len())) {
+                let record = self.slots[index].record.lock();
+                allocated_spaces.push(
+                    record
+                        .space
+                        .is_none()
+                        .then(|| Box::new(InstanceSpace::new(name))),
+                );
+            }
+
+            // Linearization point: the transaction excludes every mutating
+            // observer until all selected records and headers are Reserved.
+            for (((domain, _), index), allocated_space) in inputs
+                .iter()
+                .zip(vacant.iter().copied().take(inputs.len()))
+                .zip(allocated_spaces.into_iter())
+            {
+                let slot = &self.slots[index];
+                let mut record = slot.record.lock();
+                assert!(Self::vacant_record_is_pristine(slot, &record));
+                assert_ne!(record.generation, MAX_INSTANCE_GENERATION);
+                if let Some(space) = allocated_space {
+                    assert!(record.space.replace(space).is_none());
+                }
+                let seal = InstanceSpaceSeal::capture(
+                    record
+                        .space
+                        .as_deref()
+                        .expect("batch-reserved slot owns its stable Space"),
+                );
+                if record.generation == 0 {
+                    record.generation = 1;
+                }
+                record.phase = InstancePhase::Reserved;
+                record.domain = Some(*domain);
+                record.space_seal = Some(seal);
+                record.prepared = None;
+                record.task = None;
+                record.scheduler = None;
+                record.home_hart = None;
+                record.payload = None;
+                record.payload_installed = false;
+                record.payload_abandoned = false;
+                record.payload_completion = None;
+                record.payload_cancel = None;
+                record.continuation.retire();
+                Self::publish_header(slot, &record);
+                tokens.push(InstanceToken {
+                    slot: index as u8,
+                    generation: record.generation,
+                });
+            }
+            Ok(tokens)
+        })();
+        system.restore();
+        result
+    }
+
+    /// Reset and vacate a complete set of exact, still-unpublished
+    /// reservations.
+    ///
+    /// Volatile capabilities installed by [`Self::configure_reserved_space`]
+    /// are revoked. No task, prepared binding, payload, scheduler identity,
+    /// continuation, or waiter may have been attached. Every token and CSpace
+    /// is checked before the first reset, so a returned error mutates nothing.
+    pub fn abort_reserved_batch(
+        &self,
+        tokens: &[InstanceToken],
+    ) -> Result<ReservedBatchAbortOutcome, ReservedBatchAbortError> {
+        if tokens.is_empty() {
+            return Err(ReservedBatchAbortError::Empty);
+        }
+        if tokens.len() > MAX_COMPONENT_INSTANCES {
+            return Err(ReservedBatchAbortError::TooMany);
+        }
+        for (index, token) in tokens.iter().enumerate() {
+            if tokens[index + 1..]
+                .iter()
+                .any(|other| token.shares_stable_slot(*other))
+            {
+                return Err(ReservedBatchAbortError::DuplicateSlot);
+            }
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let result = (|| {
+            let _transaction = self.transaction.lock();
+
+            // Validate the whole candidate set without quarantining a stale or
+            // otherwise ineligible generation.
+            for token in tokens {
+                let Some(slot) = self.slot(*token) else {
+                    return Err(ReservedBatchAbortError::IdentityMismatch);
+                };
+                let record = slot.record.lock();
+                if !Self::token_matches(slot, &record, *token) {
+                    return Err(ReservedBatchAbortError::IdentityMismatch);
+                }
+                if !Self::reserved_record_is_unpublished(slot, &record) {
+                    return Err(ReservedBatchAbortError::WrongPhase);
+                }
+                if record.generation == MAX_INSTANCE_GENERATION {
+                    return Err(ReservedBatchAbortError::GenerationExhausted);
+                }
+                let (space, seal) = record
+                    .space
+                    .as_deref()
+                    .zip(record.space_seal)
+                    .expect("validated reserved shape retains its Space seal");
+                if !seal.immutable_objects_match(space) {
+                    return Err(ReservedBatchAbortError::IdentityMismatch);
+                }
+                let cspace = space.cspace().lock();
+                match cspace.preflight_reset_exact(seal.cspace_identity, seal.cspace_incarnation) {
+                    Ok(()) => {}
+                    Err(CSpaceResetError::IncarnationExhausted) => {
+                        return Err(ReservedBatchAbortError::GenerationExhausted);
+                    }
+                    Err(_) => {
+                        return Err(ReservedBatchAbortError::CSpaceResetRejected);
+                    }
+                }
+            }
+
+            // No recoverable branch remains. The transaction prevents record
+            // changes between preflight and these exact CSpace resets.
+            for token in tokens {
+                let slot = self
+                    .slot(*token)
+                    .expect("preflighted opaque token remains in range");
+                let mut record = slot.record.lock();
+                let seal = record
+                    .space_seal
+                    .expect("preflighted reservation retains its Space seal");
+                record
+                    .space
+                    .as_deref()
+                    .expect("preflighted reservation retains its Space")
+                    .cspace()
+                    .lock()
+                    .reset_exact(seal.cspace_identity, seal.cspace_incarnation)
+                    .unwrap_or_else(|error| {
+                        panic!("preflighted unpublished CSpace reset changed: {error:?}")
+                    });
+                record.retire_after_reset();
+                Self::publish_header(slot, &record);
+            }
+            Ok(ReservedBatchAbortOutcome {
+                aborted_instances: tokens.len(),
+            })
+        })();
+        system.restore();
+        result
+    }
+
     /// Configure the exact registry-owned CSpace before an instance is bound
     /// to, or published by, the executor.
     ///
@@ -1294,6 +1615,130 @@ impl InstanceRegistry {
         record.phase = InstancePhase::Bound;
         Self::publish_header(slot, &record);
         drop(record);
+        drop(_transaction);
+        system.restore();
+        Ok(())
+    }
+
+    /// Atomically bind an ordered batch of executor-prepared task identities
+    /// to exact reserved component generations.
+    ///
+    /// The three slices are positional and must be nonempty, equal in length,
+    /// bounded by [`MAX_COMPONENT_INSTANCES`], and address distinct stable
+    /// slots. Every record, binding, and unpublished handle is validated under
+    /// one registry transaction before any record becomes `Bound`. A rejected
+    /// batch therefore never leaves a successfully validated prefix bound;
+    /// exact candidates which can be identified from either token projection
+    /// are quarantined together according to the registry's fail-closed
+    /// convention.
+    pub fn bind_batch(
+        &self,
+        tokens: &[InstanceToken],
+        bindings: &[PreparedReclaimableBinding],
+        handles: &[TaskHandle],
+    ) -> Result<(), RegistryError> {
+        // Reject caller-controlled oversize slices before taking the registry
+        // transaction. Candidate quarantine is intentionally reserved for
+        // structurally bounded batches, so every rejection path remains
+        // bounded by the fixed instance table.
+        if tokens.len() > MAX_COMPONENT_INSTANCES
+            || bindings.len() > MAX_COMPONENT_INSTANCES
+            || handles.len() > MAX_COMPONENT_INSTANCES
+        {
+            return Err(RegistryError::IdentityMismatch);
+        }
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let _transaction = self.transaction.lock();
+        if tokens.is_empty() || tokens.len() != bindings.len() || tokens.len() != handles.len() {
+            self.quarantine_bind_batch_candidates_locked(tokens, bindings);
+            drop(_transaction);
+            system.restore();
+            return Err(RegistryError::IdentityMismatch);
+        }
+
+        // Validation pass: no task handle or Bound phase is retained until
+        // the complete ordered batch has proved exact.
+        for (index, ((token, binding), handle)) in tokens
+            .iter()
+            .copied()
+            .zip(bindings.iter().copied())
+            .zip(handles)
+            .enumerate()
+        {
+            if tokens[..index]
+                .iter()
+                .any(|other| token.shares_stable_slot(*other))
+            {
+                self.quarantine_bind_batch_candidates_locked(tokens, bindings);
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::IdentityMismatch);
+            }
+            let Some(slot) = self.slot(token) else {
+                self.quarantine_bind_batch_candidates_locked(tokens, bindings);
+                drop(_transaction);
+                system.restore();
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let record = slot.record.lock();
+            let already_quarantined = Self::token_matches(slot, &record, token)
+                && record.phase == InstancePhase::Quarantined;
+            let valid = Self::token_matches(slot, &record, token)
+                && record.phase == InstancePhase::Reserved
+                && record.domain == Some(binding.allocation_domain())
+                && record.domain == Some(handle.allocation_domain())
+                && binding.instance_token() == Some(token)
+                && binding.scheduler_identity().is_none()
+                && binding.matches_handle(handle)
+                && !handle.is_published()
+                && record.prepared.is_none()
+                && record.task.is_none()
+                && record.scheduler.is_none()
+                && record.home_hart.is_none()
+                && !record.payload_abandoned
+                && record.payload_completion.is_none()
+                && record.payload_cancel.is_none()
+                && record.continuation.phase == ContinuationPhase::Idle
+                && record.continuation.kind.is_none()
+                && record.continuation.seal.is_none()
+                && slot.continuation_wait.waiter_count() == 0
+                && record
+                    .space
+                    .as_deref()
+                    .zip(record.space_seal)
+                    .is_some_and(|(space, seal)| seal.immutable_objects_match(space));
+            drop(record);
+            if !valid {
+                self.quarantine_bind_batch_candidates_locked(tokens, bindings);
+                drop(_transaction);
+                system.restore();
+                return Err(if already_quarantined {
+                    RegistryError::Quarantined
+                } else {
+                    RegistryError::IdentityMismatch
+                });
+            }
+        }
+
+        // Commit pass. `transaction` excludes every other registry mutation,
+        // and TaskHandle cloning is allocation-free, so no recoverable branch
+        // remains after the first phase transition.
+        for ((token, binding), handle) in tokens
+            .iter()
+            .copied()
+            .zip(bindings.iter().copied())
+            .zip(handles)
+        {
+            let slot = self
+                .slot(token)
+                .expect("preflighted batch token remains in range");
+            let mut record = slot.record.lock();
+            record.prepared = Some(binding);
+            record.task = Some(handle.clone());
+            record.home_hart = Some(binding.home_hart());
+            record.phase = InstancePhase::Bound;
+            Self::publish_header(slot, &record);
+        }
         drop(_transaction);
         system.restore();
         Ok(())
@@ -3449,6 +3894,26 @@ impl InstanceRegistry {
         }
     }
 
+    fn quarantine_bind_batch_candidates_locked(
+        &self,
+        tokens: &[InstanceToken],
+        bindings: &[PreparedReclaimableBinding],
+    ) {
+        for token in tokens.iter().copied().chain(
+            bindings
+                .iter()
+                .filter_map(|binding| binding.instance_token()),
+        ) {
+            let Some(slot) = self.slot(token) else {
+                continue;
+            };
+            let mut record = slot.record.lock();
+            if Self::token_matches(slot, &record, token) {
+                Self::quarantine_locked(slot, &mut record);
+            }
+        }
+    }
+
     fn quarantine_exact_fault_candidates_locked(&self, witness: ReclaimableFaultWitness) -> bool {
         let mut found = false;
         for slot in &self.slots {
@@ -3540,6 +4005,45 @@ impl InstanceRegistry {
                 .prepared
                 .map(PreparedReclaimableBinding::allocation_domain),
         ]
+    }
+
+    fn vacant_record_is_pristine(slot: &InstanceSlot, record: &SlotRecord) -> bool {
+        record.phase == InstancePhase::Vacant
+            && record.domain.is_none()
+            && record.space_seal.is_none()
+            && record.prepared.is_none()
+            && record.task.is_none()
+            && record.scheduler.is_none()
+            && record.home_hart.is_none()
+            && record.payload.is_none()
+            && !record.payload_installed
+            && !record.payload_abandoned
+            && record.payload_completion.is_none()
+            && record.payload_cancel.is_none()
+            && record.continuation.phase == ContinuationPhase::Idle
+            && record.continuation.kind.is_none()
+            && record.continuation.seal.is_none()
+            && slot.continuation_wait.waiter_count() == 0
+    }
+
+    fn reserved_record_is_unpublished(slot: &InstanceSlot, record: &SlotRecord) -> bool {
+        record.phase == InstancePhase::Reserved
+            && record.domain.is_some()
+            && record.space.is_some()
+            && record.space_seal.is_some()
+            && record.prepared.is_none()
+            && record.task.is_none()
+            && record.scheduler.is_none()
+            && record.home_hart.is_none()
+            && record.payload.is_none()
+            && !record.payload_installed
+            && !record.payload_abandoned
+            && record.payload_completion.is_none()
+            && record.payload_cancel.is_none()
+            && record.continuation.phase == ContinuationPhase::Idle
+            && record.continuation.kind.is_none()
+            && record.continuation.seal.is_none()
+            && slot.continuation_wait.waiter_count() == 0
     }
 
     fn domain_projections_disagree(projections: [Option<AllocationDomain>; 3]) -> bool {
@@ -4030,6 +4534,449 @@ mod tests {
         assert!(!first.shares_stable_slot(unrelated));
     }
 
+    #[test]
+    fn named_batch_reservation_is_ordered_distinct_and_atomically_abortable() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let inputs = [
+            (domain(60_001), "graph-node-decoder"),
+            (domain(60_002), "graph-node-filter"),
+            (domain(60_003), "graph-node-sink"),
+        ];
+
+        let tokens = registry.reserve_named_batch(&inputs).unwrap();
+        assert_eq!(tokens.len(), inputs.len());
+        assert_eq!(format!("{:?}", tokens[0]), "InstanceToken(<opaque>)");
+        for (index, token) in tokens.iter().copied().enumerate() {
+            assert!(tokens[index + 1..]
+                .iter()
+                .all(|other| !token.shares_stable_slot(*other)));
+            let record = registry.slots[token.slot as usize].record.lock();
+            assert_eq!(record.phase, InstancePhase::Reserved);
+            assert_eq!(record.domain, Some(inputs[index].0));
+            assert_eq!(
+                record.space.as_deref().unwrap().cspace().lock().name,
+                inputs[index].1
+            );
+        }
+        let stats = registry.occupancy_stats();
+        assert_eq!(stats.occupied, inputs.len());
+        assert_eq!(stats.phase_count(InstancePhase::Reserved), inputs.len());
+
+        let mut before_abort = Vec::new();
+        for token in tokens.iter().copied() {
+            unsafe {
+                registry
+                    .configure_reserved_space(token, |cspace| {
+                        cspace.mint(Arc::new(TestSpaceResource), Rights::READ)
+                    })
+                    .unwrap();
+            }
+            before_abort.push(cspace_state(&registry, token));
+        }
+
+        let outcome = registry.abort_reserved_batch(&tokens).unwrap();
+        assert_eq!(outcome.aborted_instances(), inputs.len());
+        let stats = registry.occupancy_stats();
+        assert_eq!(stats.occupied, 0);
+        assert_eq!(
+            stats.phase_count(InstancePhase::Vacant),
+            MAX_COMPONENT_INSTANCES
+        );
+        for (token, before) in tokens.iter().copied().zip(before_abort) {
+            let record = registry.slots[token.slot as usize].record.lock();
+            assert_eq!(record.phase, InstancePhase::Vacant);
+            assert_eq!(record.generation, token.generation + 1);
+            assert!(record.domain.is_none());
+            assert!(record.space_seal.is_none());
+            let cspace = record.space.as_deref().unwrap().cspace().lock();
+            assert_eq!(cspace.identity(), before.0);
+            assert_eq!(cspace.incarnation(), before.1 + 1);
+            assert!(cspace.list().is_empty());
+        }
+
+        let replacements = registry.reserve_named_batch(&inputs).unwrap();
+        for (old, replacement) in tokens.iter().zip(&replacements) {
+            assert!(old.shares_stable_slot(*replacement));
+            assert_eq!(replacement.generation, old.generation + 1);
+        }
+        registry.abort_reserved_batch(&replacements).unwrap();
+    }
+
+    #[test]
+    fn named_batch_skips_an_early_exhausted_cspace_for_a_later_viable_slot() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let early = registry
+            .reserve_named_batch(&[(domain(60_100), "early-retained-cspace")])
+            .unwrap()
+            .remove(0);
+        registry.abort_reserved_batch(&[early]).unwrap();
+
+        // Model an exhausted retained CSpace in the earliest vacant slot. The
+        // production callback is exactly `preflight_reset_exact`; injecting
+        // its terminal result here avoids iterating an incarnation counter to
+        // u64::MAX while exercising the complete selection/publication path.
+        let exhausted_cspace_before = cspace_state(&registry, early);
+        let fallback = registry
+            .reserve_named_batch_with_preflight(
+                &[(domain(60_101), "later-viable-cspace")],
+                |index, cspace| {
+                    if index == early.slot as usize {
+                        Err(CSpaceResetError::IncarnationExhausted)
+                    } else {
+                        cspace.preflight_reset_exact(cspace.identity(), cspace.incarnation())
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fallback.len(), 1);
+        assert!(!fallback[0].shares_stable_slot(early));
+        {
+            let record = registry.slots[early.slot as usize].record.lock();
+            assert_eq!(record.phase, InstancePhase::Vacant);
+            assert_eq!(record.generation, early.generation + 1);
+        }
+        assert_eq!(cspace_state(&registry, early), exhausted_cspace_before);
+        registry.abort_reserved_batch(&fallback).unwrap();
+        assert_eq!(registry.occupancy_stats().occupied, 0);
+    }
+
+    #[test]
+    fn named_batch_validation_capacity_and_generation_failures_mutate_nothing() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        assert_eq!(
+            registry.reserve_named_batch(&[]),
+            Err(BatchReserveError::Empty)
+        );
+        let too_many: Vec<_> = (0..=MAX_COMPONENT_INSTANCES)
+            .map(|index| (domain(61_000 + index as u64), "too-many"))
+            .collect();
+        assert_eq!(
+            registry.reserve_named_batch(&too_many),
+            Err(BatchReserveError::TooMany)
+        );
+        assert_eq!(
+            registry.reserve_named_batch(&[(
+                AllocationDomain::untracked(OwnerId::new(61_100)),
+                "untracked",
+            )]),
+            Err(BatchReserveError::InvalidDomain)
+        );
+        assert_eq!(
+            registry.reserve_named_batch(&[(
+                AllocationDomain::new(OwnerId::SYSTEM, ArenaId::new(61_101)),
+                "system",
+            )]),
+            Err(BatchReserveError::InvalidDomain)
+        );
+        let alias_arena = ArenaId::new(61_102);
+        assert_eq!(
+            registry.reserve_named_batch(&[
+                (
+                    AllocationDomain::new(OwnerId::new(61_103), alias_arena),
+                    "alias-a",
+                ),
+                (
+                    AllocationDomain::new(OwnerId::new(61_104), alias_arena),
+                    "alias-b",
+                ),
+            ]),
+            Err(BatchReserveError::DuplicateArena)
+        );
+        assert_pristine_registry(&registry);
+
+        let existing_domain = domain(61_200);
+        let existing = registry.reserve(existing_domain).unwrap();
+        let before = registry.occupancy_stats();
+        let conflict = AllocationDomain::new(OwnerId::new(61_201), existing_domain.arena);
+        assert_eq!(
+            registry.reserve_named_batch(&[(conflict, "live-alias")]),
+            Err(BatchReserveError::ArenaConflict)
+        );
+        assert_eq!(registry.occupancy_stats(), before);
+        let capacity_inputs: Vec<_> = (0..MAX_COMPONENT_INSTANCES)
+            .map(|index| (domain(61_300 + index as u64), "capacity"))
+            .collect();
+        assert_eq!(
+            registry.reserve_named_batch(&capacity_inputs),
+            Err(BatchReserveError::Capacity)
+        );
+        assert_eq!(registry.occupancy_stats(), before);
+        assert_eq!(retained_space_count(&registry), 1);
+        registry.abort_reserved_batch(&[existing]).unwrap();
+
+        let exhausted = InstanceRegistry::new();
+        {
+            let slot = &exhausted.slots[0];
+            let mut record = slot.record.lock();
+            record.generation = MAX_INSTANCE_GENERATION;
+            InstanceRegistry::publish_header(slot, &record);
+        }
+        let before_headers: Vec<_> = exhausted
+            .slots
+            .iter()
+            .map(|slot| slot.header.load(Ordering::Acquire))
+            .collect();
+        let generation_inputs: Vec<_> = (0..MAX_COMPONENT_INSTANCES)
+            .map(|index| (domain(61_400 + index as u64), "generation"))
+            .collect();
+        assert_eq!(
+            exhausted.reserve_named_batch(&generation_inputs),
+            Err(BatchReserveError::GenerationExhausted)
+        );
+        assert_eq!(
+            exhausted
+                .slots
+                .iter()
+                .map(|slot| slot.header.load(Ordering::Acquire))
+                .collect::<Vec<_>>(),
+            before_headers
+        );
+        assert_eq!(retained_space_count(&exhausted), 0);
+    }
+
+    #[test]
+    fn reserved_batch_abort_rejects_the_complete_set_before_mutation() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let inputs = [(domain(62_001), "abort-a"), (domain(62_002), "abort-b")];
+        let tokens = registry.reserve_named_batch(&inputs).unwrap();
+        for token in tokens.iter().copied() {
+            unsafe {
+                registry
+                    .configure_reserved_space(token, |cspace| {
+                        cspace.mint(Arc::new(TestSpaceResource), Rights::READ)
+                    })
+                    .unwrap();
+            }
+        }
+        let before = [
+            cspace_state(&registry, tokens[0]),
+            cspace_state(&registry, tokens[1]),
+        ];
+        assert_eq!(
+            registry.abort_reserved_batch(&[]),
+            Err(ReservedBatchAbortError::Empty)
+        );
+        assert_eq!(
+            registry.abort_reserved_batch(&[tokens[0], tokens[0]]),
+            Err(ReservedBatchAbortError::DuplicateSlot)
+        );
+        let stale = InstanceToken {
+            slot: tokens[0].slot,
+            generation: tokens[0].generation + 1,
+        };
+        assert_eq!(
+            registry.abort_reserved_batch(&[stale, tokens[1]]),
+            Err(ReservedBatchAbortError::IdentityMismatch)
+        );
+        assert_eq!(cspace_state(&registry, tokens[0]), before[0]);
+        assert_eq!(cspace_state(&registry, tokens[1]), before[1]);
+
+        {
+            let slot = &registry.slots[tokens[1].slot as usize];
+            let mut record = slot.record.lock();
+            record.phase = InstancePhase::Bound;
+            InstanceRegistry::publish_header(slot, &record);
+        }
+        assert_eq!(
+            registry.abort_reserved_batch(&tokens),
+            Err(ReservedBatchAbortError::WrongPhase)
+        );
+        assert_eq!(cspace_state(&registry, tokens[0]), before[0]);
+        assert_eq!(cspace_state(&registry, tokens[1]), before[1]);
+        {
+            let slot = &registry.slots[tokens[1].slot as usize];
+            let mut record = slot.record.lock();
+            record.phase = InstancePhase::Reserved;
+            InstanceRegistry::publish_header(slot, &record);
+        }
+
+        assert_eq!(
+            registry.abort_reserved_batch(&tokens).unwrap(),
+            ReservedBatchAbortOutcome {
+                aborted_instances: 2,
+            }
+        );
+        assert_eq!(registry.occupancy_stats().occupied, 0);
+    }
+
+    #[test]
+    fn bind_batch_preserves_order_and_is_compatible_with_atomic_activation() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let inputs = [
+            (domain(63_001), "bind-decoder"),
+            (domain(63_002), "bind-filter"),
+            (domain(63_003), "bind-sink"),
+        ];
+        let tokens = registry.reserve_named_batch(&inputs).unwrap();
+        let mut batch = PreparedTaskBatch::new();
+        batch.try_reserve(inputs.len()).unwrap();
+        for ((token, (allocation, name)), index) in tokens
+            .iter()
+            .copied()
+            .zip(inputs.iter().copied())
+            .zip(0u64..)
+        {
+            unsafe {
+                batch.prepare_managed_instance_owned(token, allocation, name, async move {
+                    let _ = (token, index);
+                    core::future::pending::<()>().await;
+                });
+            }
+        }
+
+        registry
+            .bind_batch(
+                &tokens,
+                batch.prepared_reclaimable_bindings(),
+                batch.prepared_handles(),
+            )
+            .unwrap();
+        for (index, token) in tokens.iter().copied().enumerate() {
+            let record = registry.slots[token.slot as usize].record.lock();
+            let prepared = record.prepared.expect("batch-bound record lost binding");
+            let handle = record.task.as_ref().expect("batch-bound record lost task");
+            assert_eq!(record.phase, InstancePhase::Bound);
+            assert_eq!(record.domain, Some(inputs[index].0));
+            assert!(
+                batch.prepared_reclaimable_bindings()[index].matches_prepared_identity(prepared)
+            );
+            assert!(handle.shares_status_with(&batch.prepared_handles()[index]));
+            assert_eq!(
+                record.home_hart,
+                Some(batch.prepared_reclaimable_bindings()[index].home_hart())
+            );
+        }
+
+        let handles = unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+        }
+        .unwrap();
+        assert_eq!(handles.len(), inputs.len());
+        for (token, handle) in tokens.iter().copied().zip(&handles) {
+            assert!(handle.is_published());
+            assert_eq!(
+                registry.snapshot(token).unwrap().phase,
+                InstancePhase::Active
+            );
+            assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        }
+        for ((token, (allocation, _)), handle) in tokens
+            .iter()
+            .copied()
+            .zip(inputs.iter().copied())
+            .zip(&handles)
+        {
+            unsafe {
+                registry
+                    .finalize(token, handle, |closed, kind| {
+                        assert_eq!(closed, allocation);
+                        assert_eq!(kind, TerminalRetireKind::Normal);
+                        true
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(registry.occupancy_stats().occupied, 0);
+    }
+
+    #[test]
+    fn bind_batch_late_mismatch_never_leaves_a_bound_prefix() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        assert_eq!(
+            registry.bind_batch(&[], &[], &[]),
+            Err(RegistryError::IdentityMismatch)
+        );
+        assert_pristine_registry(&registry);
+
+        let inputs = [
+            (domain(63_101), "late-match-a"),
+            (domain(63_102), "late-match-b"),
+            (domain(63_103), "late-mismatch"),
+        ];
+        let tokens = registry.reserve_named_batch(&inputs).unwrap();
+        let mut batch = PreparedTaskBatch::new();
+        batch.try_reserve(inputs.len()).unwrap();
+        for (token, (allocation, name)) in tokens.iter().copied().zip(inputs.iter().copied()) {
+            unsafe {
+                batch.prepare_managed_instance_owned(token, allocation, name, async move {
+                    let _ = token;
+                    core::future::pending::<()>().await;
+                });
+            }
+        }
+        let mut mismatched_handles = batch.prepared_handles().to_vec();
+        mismatched_handles[2] = mismatched_handles[0].clone();
+
+        assert_eq!(
+            registry.bind_batch(
+                &tokens,
+                batch.prepared_reclaimable_bindings(),
+                &mismatched_handles,
+            ),
+            Err(RegistryError::IdentityMismatch)
+        );
+        assert_eq!(
+            registry.occupancy_stats().phase_count(InstancePhase::Bound),
+            0
+        );
+        for token in tokens {
+            let record = registry.slots[token.slot as usize].record.lock();
+            assert_eq!(record.phase, InstancePhase::Quarantined);
+            assert!(record.prepared.is_none());
+            assert!(record.task.is_none());
+            assert!(record.home_hart.is_none());
+        }
+        assert!(batch
+            .prepared_handles()
+            .iter()
+            .all(|handle| !handle.is_published()));
+    }
+
+    #[test]
+    fn bind_batch_rejects_oversize_before_candidate_scan_or_mutation() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let allocation = domain(63_201);
+        let token = registry.reserve(allocation).unwrap();
+        let mut batch = PreparedTaskBatch::new();
+        unsafe {
+            batch.prepare_managed_instance_owned(token, allocation, "oversize", async move {
+                core::future::pending::<()>().await;
+            });
+        }
+        let binding = batch.prepared_reclaimable_bindings()[0];
+        let handle = batch.prepared_handles()[0].clone();
+        let tokens = vec![token; MAX_COMPONENT_INSTANCES + 1];
+        let bindings = vec![binding; MAX_COMPONENT_INSTANCES + 1];
+        let handles = (0..MAX_COMPONENT_INSTANCES + 1)
+            .map(|_| handle.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            registry.bind_batch(&tokens, &bindings, &handles),
+            Err(RegistryError::IdentityMismatch)
+        );
+        let record = registry.slots[token.slot as usize].record.lock();
+        assert_eq!(record.phase, InstancePhase::Reserved);
+        assert!(record.prepared.is_none());
+        assert!(record.task.is_none());
+        assert!(record.home_hart.is_none());
+        drop(record);
+        assert_eq!(
+            registry.abort_reserved_batch(&[token]).unwrap(),
+            ReservedBatchAbortOutcome {
+                aborted_instances: 1,
+            }
+        );
+    }
+
     #[cfg(feature = "wasm-c48-target-acceptance")]
     #[test]
     fn acceptance_probe_and_directed_seal_corruption_preserve_aba_evidence() {
@@ -4396,6 +5343,30 @@ mod tests {
 
     fn domain(index: u64) -> AllocationDomain {
         AllocationDomain::new(OwnerId::new(10_000 + index), ArenaId::new(20_000 + index))
+    }
+
+    fn retained_space_count(registry: &InstanceRegistry) -> usize {
+        registry
+            .slots
+            .iter()
+            .filter(|slot| slot.record.lock().space.is_some())
+            .count()
+    }
+
+    fn assert_pristine_registry(registry: &InstanceRegistry) {
+        let stats = registry.occupancy_stats();
+        assert_eq!(stats.occupied, 0);
+        assert_eq!(stats.header_mismatches, 0);
+        assert_eq!(
+            stats.phase_count(InstancePhase::Vacant),
+            MAX_COMPONENT_INSTANCES
+        );
+        assert_eq!(retained_space_count(registry), 0);
+        for slot in &registry.slots {
+            let record = slot.record.lock();
+            assert_eq!(record.generation, 0);
+            assert!(InstanceRegistry::vacant_record_is_pristine(slot, &record));
+        }
     }
 
     fn publish_pending_managed(

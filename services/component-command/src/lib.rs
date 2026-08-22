@@ -11,6 +11,10 @@
 
 extern crate alloc;
 
+mod graph;
+
+pub use graph::*;
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
